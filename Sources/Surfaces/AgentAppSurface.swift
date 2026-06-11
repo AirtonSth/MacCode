@@ -5990,6 +5990,40 @@ private struct PromptComposerEditor: NSViewRepresentable {
     }
 }
 
+// MARK: - ScrollPinPolicy (pure, testable)
+
+/// Pure pin/unpin decision extracted from TimelineScrollFollower for unit-testing.
+///
+/// Callers supply the geometry they already have; this type owns NO AppKit state.
+/// Extracted to support T040 (PERF-MAC_AGENT-021 regression harness).
+enum ScrollPinTransition {
+    /// Gap has closed to <= slack: re-pin.
+    case reachedBottom
+    /// Origin dropped by more than the noise threshold while NOT at the bottom:
+    /// a genuine user scroll-up.
+    case scrolledAway
+    /// Neither condition: no state change.
+    case unchanged
+}
+
+enum ScrollPinPolicy {
+    /// Decide the pin-state transition that a clip-bounds change implies.
+    ///
+    /// - Parameters:
+    ///   - originDelta: newOriginY - lastOriginY (negative means the user scrolled up).
+    ///   - gap: distance from the bottom of visible content to the bottom of the document.
+    ///   - slack: tolerance in points; gap <= slack is treated as "at bottom".
+    /// - Returns: The transition, if any.
+    nonisolated static func evaluate(originDelta: CGFloat, gap: CGFloat, slack: CGFloat) -> ScrollPinTransition {
+        if gap <= slack {
+            return .reachedBottom
+        } else if originDelta < -0.5 {
+            return .scrolledAway
+        }
+        return .unchanged
+    }
+}
+
 /// Auto-follow + pin/unpin for the timeline, driven from the AppKit layer where the
 /// real post-layout geometry lives. This replaced a timer-based SwiftUI heuristic
 /// (a 0.4s guard window + a 180ms reveal Task + a DragGesture) that was both racy and
@@ -6095,10 +6129,10 @@ private struct TimelineScrollFollower: NSViewRepresentable {
         private func handleScroll() {
             guard let g = geometry() else { return }
             defer { lastOriginY = g.origin }
-            if g.atBottom {
-                report(atBottom: true)
-            } else if g.origin < lastOriginY - 0.5 {
-                report(atBottom: false)
+            switch ScrollPinPolicy.evaluate(originDelta: g.origin - lastOriginY, gap: g.gap, slack: slack) {
+            case .reachedBottom:  report(atBottom: true)
+            case .scrolledAway:   report(atBottom: false)
+            case .unchanged:      break
             }
         }
 

@@ -1,0 +1,135 @@
+import XCTest
+@testable import Surfaces
+
+/// T040 - unit harness for the pin/unpin policy extracted from TimelineScrollFollower.
+///
+/// WHY: PERF-MAC_AGENT-021 identified a layout-storm regression caused by per-delta
+/// SwiftUI @State writes. The policy is now a pure function (ScrollPinPolicy.evaluate)
+/// so we can assert the exact conditions that produce each transition without any
+/// AppKit geometry or scroll view.
+///
+/// Each test encodes the business rule it guards, not just the return value.
+final class ScrollPinPolicyTests: XCTestCase {
+
+    // MARK: - reachedBottom
+
+    /// gap == 0: flush at the bottom => must re-pin.
+    func testExactlyAtBottomPins() {
+        XCTAssertEqual(
+            ScrollPinPolicy.evaluate(originDelta: 0, gap: 0, slack: 4),
+            .reachedBottom,
+            "gap=0 is inside slack(4); must re-pin so streaming content stays visible"
+        )
+    }
+
+    /// gap == slack: boundary case - still within tolerance => must re-pin.
+    func testGapEqualsSlackPins() {
+        XCTAssertEqual(
+            ScrollPinPolicy.evaluate(originDelta: 0, gap: 4, slack: 4),
+            .reachedBottom,
+            "gap <= slack is the at-bottom definition; boundary must re-pin"
+        )
+    }
+
+    /// gap < slack: anywhere inside the slack band => must re-pin.
+    func testGapBelowSlackPins() {
+        XCTAssertEqual(
+            ScrollPinPolicy.evaluate(originDelta: 0, gap: 2, slack: 4),
+            .reachedBottom,
+            "gap inside slack band must re-pin regardless of originDelta"
+        )
+    }
+
+    /// gap <= slack takes priority over a concurrent origin drop (pathological: layout
+    /// forced origin up while content also grew enough to close the gap).
+    func testReachedBottomTakesPriorityOverOriginDrop() {
+        XCTAssertEqual(
+            ScrollPinPolicy.evaluate(originDelta: -10, gap: 1, slack: 4),
+            .reachedBottom,
+            "atBottom wins over originDelta<0; reaching bottom always re-pins"
+        )
+    }
+
+    // MARK: - scrolledAway
+
+    /// Origin dropped by more than 0.5pt while away from the bottom: genuine user scroll-up.
+    func testOriginDropAboveThresholdScrollsAway() {
+        XCTAssertEqual(
+            ScrollPinPolicy.evaluate(originDelta: -1, gap: 200, slack: 4),
+            .scrolledAway,
+            "originDelta < -0.5 while gap > slack is the ONLY signal of a user scroll-up"
+        )
+    }
+
+    /// Larger origin drop: still scrolledAway (not a different case).
+    func testLargeOriginDropScrollsAway() {
+        XCTAssertEqual(
+            ScrollPinPolicy.evaluate(originDelta: -100, gap: 500, slack: 4),
+            .scrolledAway,
+            "magnitude of drop does not change the decision; any drop > 0.5pt while away = scrolledAway"
+        )
+    }
+
+    // MARK: - unchanged
+
+    /// Origin drop exactly at noise threshold: must NOT fire scrolledAway (avoids
+    /// sub-pixel layout jitter being misread as a user scroll).
+    func testOriginDropAtNoiseThresholdIsUnchanged() {
+        XCTAssertEqual(
+            ScrollPinPolicy.evaluate(originDelta: -0.5, gap: 200, slack: 4),
+            .unchanged,
+            "originDelta == -0.5 is the noise floor; must not trigger scrolledAway (< -0.5 required)"
+        )
+    }
+
+    /// Origin unchanged, away from bottom: no transition (content grew but user did not scroll).
+    func testNoMovementAwayFromBottomIsUnchanged() {
+        XCTAssertEqual(
+            ScrollPinPolicy.evaluate(originDelta: 0, gap: 50, slack: 4),
+            .unchanged,
+            "content growth without origin change must not alter pin state"
+        )
+    }
+
+    /// Origin increased (scroll view grew its document upward, rare): not a user scroll-up.
+    func testPositiveOriginDeltaIsUnchanged() {
+        XCTAssertEqual(
+            ScrollPinPolicy.evaluate(originDelta: 5, gap: 100, slack: 4),
+            .unchanged,
+            "origin increasing while away from bottom is not a user scroll-up; no state change"
+        )
+    }
+
+    /// Small sub-threshold drop while away: noise, must be unchanged.
+    func testSubThresholdDropIsUnchanged() {
+        XCTAssertEqual(
+            ScrollPinPolicy.evaluate(originDelta: -0.3, gap: 100, slack: 4),
+            .unchanged,
+            "drop < 0.5pt is within pixel-rounding noise; must not fire scrolledAway"
+        )
+    }
+
+    // MARK: - slack variation
+
+    /// Custom slack of 0: only gap==0 counts as atBottom.
+    func testZeroSlackOnlyExactFlush() {
+        XCTAssertEqual(
+            ScrollPinPolicy.evaluate(originDelta: 0, gap: 0, slack: 0),
+            .reachedBottom
+        )
+        XCTAssertEqual(
+            ScrollPinPolicy.evaluate(originDelta: 0, gap: 1, slack: 0),
+            .unchanged,
+            "gap=1 with slack=0 is outside atBottom; no pin"
+        )
+    }
+
+    /// Large slack: 20pt gap still inside tolerance => re-pin.
+    func testLargeSlackIncludesWiderGap() {
+        XCTAssertEqual(
+            ScrollPinPolicy.evaluate(originDelta: 0, gap: 20, slack: 20),
+            .reachedBottom,
+            "gap <= slack(20) must re-pin even when gap is large"
+        )
+    }
+}
