@@ -24,7 +24,7 @@ final class CodexParserTests: XCTestCase {
     }
 
     func test_realExecSchema_agentMessageSurfacesAsFinal() {
-        // `codex exec --json`: reply arrives as item.completed{item:…},
+        // `codex exec --json`: reply arrives as item.completed{item:...},
         // turn.completed carries NO message.
         let p = CodexParser()
         var state = AssistantTimelineState()
@@ -247,5 +247,179 @@ final class ClaudeParserTests: XCTestCase {
         XCTAssertEqual(state.activePlan?.steps.map(\.title), ["Inspect", "Patch"])
         XCTAssertEqual(state.activePlan?.steps.map(\.status), [.completed, .inProgress],
                        "Claude plan_update events must use the same active-plan contract as Codex")
+    }
+
+    // MARK: - T021: input_json_delta reassembly drives ExitPlanMode plan extraction
+
+    /// WHY (MAC-AGENT-RUNTIME-T021): The Anthropic API sends tool input as a
+    /// stream of input_json_delta fragments. ClaudeParser must concatenate all
+    /// partial_json fragments before content_block_stop and then parse the
+    /// assembled JSON as the tool input. Without this, ExitPlanMode invocations
+    /// (and any other tool) arrive with empty input, so the plan is never
+    /// extracted and the iOS / macOS plan-review flow is never triggered.
+    func test_inputJsonDeltaFragments_assembleAndDriveExitPlanModeProposedPlan() {
+        let p = ClaudeParser()
+        // System init so threadEmitted is set and turn id is allocated.
+        _ = p.parseLine(#"{"type":"system","subtype":"init","session_id":"sess-t021"}"#)
+        _ = p.parseLine(#"{"type":"message_start","message":{"id":"msg-t021"}}"#)
+        // Tool use block start for ExitPlanMode (no pre-loaded input; input arrives via deltas).
+        _ = p.parseLine(#"{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"tool-t021","name":"exit_plan_mode"}}"#)
+        // Three input_json_delta fragments that together form {"plan":"Inspect then Patch"}.
+        // Each partial_json value is a raw fragment (byte slice) of the final JSON.
+        // Fragment 1 outer partial_json = {"plan":"Inspect (quotes inside escaped as \")
+        _ = p.parseLine(#"{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"plan\":\"Inspect"}}"#)
+        // Fragment 2 outer partial_json = " then " (no special chars).
+        _ = p.parseLine(#"{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":" then "}}"#)
+        // Fragment 3 outer partial_json = Patch"} (closing the inner JSON string+object).
+        _ = p.parseLine(#"{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"Patch\"}"}}"#)
+        // content_block_stop triggers parseToolInput and structuredClaudeToolEvents.
+        let stopEvs = p.parseLine(#"{"type":"content_block_stop","index":0}"#)
+
+        let plans = stopEvs.compactMap { ev -> AssistantProposedPlan? in
+            if case .proposedPlan(let plan) = ev { return plan }
+            return nil
+        }
+        XCTAssertEqual(plans.count, 1,
+                       "T021: content_block_stop after 3 input_json_delta fragments must produce exactly one proposedPlan event")
+        XCTAssertEqual(plans.first?.markdown, "Inspect then Patch",
+                       "T021: assembled input_json_delta fragments must parse as the ExitPlanMode plan markdown; " +
+                       "a mismatch means fragments were not concatenated before parsing")
+    }
+
+    // MARK: - T022: result{is_error:true} error message fallback chain
+
+    /// WHY (MAC-AGENT-RUNTIME-T022): When Claude finishes with is_error:true the
+    /// user must see a meaningful error message. The fallback chain is:
+    ///   1. result field  2. error.message  3. hardcoded "claude run failed"
+    /// Without asserting each branch, a future refactor can silently drop the
+    /// fallback and leave the user with a blank or missing error message.
+    func test_resultIsErrorTrue_withResultText_emitsErrorWithResultMessage() {
+        let p = ClaudeParser()
+        _ = p.parseLine(#"{"type":"system","subtype":"init","session_id":"s1"}"#)
+        _ = p.parseLine(#"{"type":"message_start","message":{"id":"m1"}}"#)
+        let evs = p.parseLine(#"{"type":"result","is_error":true,"result":"authentication failed"}"#)
+
+        let errors = evs.compactMap { ev -> (String, Bool)? in
+            if case .error(let msg, let recoverable) = ev { return (msg, recoverable) }
+            return nil
+        }
+        XCTAssertEqual(errors.count, 1, "T022: is_error result must emit exactly one .error event")
+        XCTAssertEqual(errors.first?.0, "authentication failed",
+                       "T022 branch-1: when result field is present it is used as the error message")
+        XCTAssertEqual(errors.first?.1, false,
+                       "T022: errors from a result event are not recoverable (the run is finished)")
+    }
+
+    func test_resultIsErrorTrue_withoutResultText_fallsBackToErrorMessage() {
+        let p = ClaudeParser()
+        _ = p.parseLine(#"{"type":"system","subtype":"init","session_id":"s2"}"#)
+        _ = p.parseLine(#"{"type":"message_start","message":{"id":"m2"}}"#)
+        let evs = p.parseLine(#"{"type":"result","is_error":true,"result":null,"error":{"message":"session expired"}}"#)
+
+        let errors = evs.compactMap { ev -> String? in
+            if case .error(let msg, _) = ev { return msg }
+            return nil
+        }
+        XCTAssertEqual(errors.first, "session expired",
+                       "T022 branch-2: when result is nil/absent, error.message is used as fallback; " +
+                       "losing this fallback makes auth failures show a blank error in the Agent App")
+    }
+
+    func test_resultIsErrorTrue_withNoMessageFields_fallsBackToHardcodedString() {
+        let p = ClaudeParser()
+        _ = p.parseLine(#"{"type":"system","subtype":"init","session_id":"s3"}"#)
+        _ = p.parseLine(#"{"type":"message_start","message":{"id":"m3"}}"#)
+        let evs = p.parseLine(#"{"type":"result","is_error":true}"#)
+
+        let errors = evs.compactMap { ev -> String? in
+            if case .error(let msg, _) = ev { return msg }
+            return nil
+        }
+        XCTAssertEqual(errors.first, "claude run failed",
+                       "T022 branch-3: when neither result nor error.message is present the hardcoded " +
+                       "sentinel string must be used so the Agent App always shows a non-empty error")
+    }
+}
+
+// MARK: - CodexParser: assembled buffer bleed + synthesized turn id
+
+extension CodexParserTests {
+
+    // MARK: - T027: assembled buffer must not bleed across synthesized turns
+
+    /// WHY (MAC-AGENT-RUNTIME-T027): CodexParser.assembled is only reset inside
+    /// turn.started (line 40). After turn.completed it stays populated. If a
+    /// second agent_message item arrives without an intervening turn.started
+    /// (which happens in some codex exec schemas), the second turn's
+    /// finalAssistantMessage would be "A\nB" instead of "B", causing the Agent
+    /// App to display a doubled transcript and iOS to mirror the wrong text.
+    ///
+    /// NOTE: This test documents the EXISTING behavior (bleed present in current
+    /// code). It is written as a characterization test so it fails loudly if the
+    /// behavior changes in either direction.
+    func test_assembledBuffer_bleeds_acrossTurnsWithoutTurnStarted() {
+        let p = CodexParser()
+        _ = p.parseLine(#"{"type":"thread.started","thread_id":"tid"}"#)
+
+        // First turn: turn.started -> item.completed{agent_message:"A"} -> turn.completed
+        _ = p.parseLine(#"{"type":"turn.started","turn_id":"turn-1"}"#)
+        _ = p.parseLine(#"{"type":"item.completed","item":{"id":"i1","type":"agent_message","text":"A"}}"#)
+        let turn1Evs = p.parseLine(#"{"type":"turn.completed","turn_id":"turn-1"}"#)
+        let turn1Final = turn1Evs.compactMap { ev -> String? in
+            if case .turnCompleted(_, let msg) = ev { return msg }
+            return nil
+        }.first
+        XCTAssertEqual(turn1Final, "A",
+                       "T027 setup: first turn must produce final message 'A'")
+
+        // Second turn: item.completed{agent_message:"B"} -> turn.completed WITHOUT turn.started.
+        // assembled was NOT reset because turn.started was skipped.
+        _ = p.parseLine(#"{"type":"item.completed","item":{"id":"i2","type":"agent_message","text":"B"}}"#)
+        let turn2Evs = p.parseLine(#"{"type":"turn.completed"}"#)
+        let turn2Final = turn2Evs.compactMap { ev -> String? in
+            if case .turnCompleted(_, let msg) = ev { return msg }
+            return nil
+        }.first
+
+        // Document the current behavior: assembled bleeds, so the second
+        // finalAssistantMessage is "A\nB" not "B".
+        // When this bug is fixed, change the assertion to XCTAssertEqual(turn2Final, "B").
+        XCTAssertEqual(turn2Final, "A\nB",
+                       "T027 bleed characterization: assembled is not reset on turn.completed, so " +
+                       "a second turn without turn.started concatenates the previous text; " +
+                       "fix = reset assembled in turn.completed, then change this assertion to 'B'")
+    }
+
+    // MARK: - T028: turn.completed without prior turn.started uses ensureTurn id
+
+    /// WHY (MAC-AGENT-RUNTIME-T028): When turn.started is absent, CodexParser
+    /// uses ensureTurn to synthesize a turn id. turn.completed then looks up
+    /// currentTurnId (set by ensureTurn) but also tries obj["turn_id"] from the
+    /// event. If the event carries its OWN id it could orphan the items that
+    /// used the ensureTurn id. This test pins that items and turn.completed share
+    /// the same turn id when no explicit turn id is present in either event.
+    func test_turnCompleted_withoutTurnStarted_usesSynthesizedTurnId() {
+        let p = CodexParser()
+        _ = p.parseLine(#"{"type":"thread.started","thread_id":"tid2"}"#)
+
+        // item.completed triggers ensureTurn which synthesizes a turn id.
+        let itemEvs = p.parseLine(#"{"type":"item.completed","item":{"id":"i3","type":"agent_message","text":"hello"}}"#)
+        let itemTurnId = itemEvs.compactMap { ev -> String? in
+            if case .turnStarted(let tid) = ev { return tid }
+            return nil
+        }.first
+        XCTAssertNotNil(itemTurnId,
+                        "T028: ensureTurn must emit turnStarted when no turn.started preceded item.completed")
+
+        // turn.completed with no turn_id field must use currentTurnId (set by ensureTurn).
+        let completedEvs = p.parseLine(#"{"type":"turn.completed"}"#)
+        let completedTurnId = completedEvs.compactMap { ev -> String? in
+            if case .turnCompleted(let tid, _) = ev { return tid }
+            return nil
+        }.first
+        XCTAssertEqual(completedTurnId, itemTurnId,
+                       "T028: turn.completed without a turn_id must use the same synthesized id that " +
+                       "ensureTurn assigned to the preceding items; a mismatch orphans the items' " +
+                       "turn and the Agent App cannot match them")
     }
 }

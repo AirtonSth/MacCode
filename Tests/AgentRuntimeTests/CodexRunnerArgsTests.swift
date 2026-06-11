@@ -95,7 +95,7 @@ final class CodexRunnerArgsTests: XCTestCase {
     }
 
     /// Regression: the picker once listed gpt-5 / gpt-5-codex / o3, which
-    /// are dead on codex 0.130.0 — `codex --model <dead>` exits non-zero
+    /// are dead on codex 0.130.0 - `codex --model <dead>` exits non-zero
     /// with no assistant output (the "Codex chat doesn't work" report).
     /// The list must be the real models and must NOT contain the dead ids.
     func test_listModels_areRealCodexIds_andOmitDeadOnes() async {
@@ -230,5 +230,71 @@ final class CodexRunnerArgsTests: XCTestCase {
         XCTAssertEqual(event.source, "codex.exec.stderr")
         XCTAssertTrue(event.payloadJSON.contains("websocket closed unexpectedly"),
                       "fatal Codex stderr must be stored as raw provider runtime evidence for later debugging")
+    }
+
+    // MARK: - ProcessLocator pure fixture tests
+
+    /// WHY: ~/.remote-code/bin must be the FIRST entry in the search path so
+    /// RemoteCode-managed binaries win over any system or Homebrew copies.
+    /// If this ordering were reversed, a stale system `codex` could shadow the
+    /// managed one and cause version-mismatch failures without any visible error.
+    func test_processLocator_expandedPath_remoteCodeBinIsFirst() {
+        let home = "/tmp/rc2-home-test"
+        let expanded = ProcessLocator.expandedPath(environmentPath: "/usr/bin:/bin", homeDirectory: home)
+        let components = expanded.split(separator: ":").map(String.init)
+        XCTAssertEqual(components.first, "\(home)/.remote-code/bin",
+                       "~/.remote-code/bin must lead the search path so managed agent CLIs win over stale system copies")
+    }
+
+    /// WHY: if PATH already contains /opt/homebrew/bin the dedup filter must
+    /// prevent it from appearing twice, so the resolved path stays deterministic
+    /// and spawn argument lists are not inflated.
+    func test_processLocator_expandedPath_deduplicatesDuplicateDirectories() {
+        let home = "/tmp/rc2-dedup-test"
+        // PATH already contains /opt/homebrew/bin, which is also a hardcoded fallback.
+        let expanded = ProcessLocator.expandedPath(
+            environmentPath: "/usr/bin:/opt/homebrew/bin:/bin",
+            homeDirectory: home
+        )
+        let components = expanded.split(separator: ":").map(String.init)
+        let homebrewCount = components.filter { $0 == "/opt/homebrew/bin" }.count
+        XCTAssertEqual(homebrewCount, 1,
+                       "a directory already in PATH must not appear twice in the expanded path because duplicate entries produce non-deterministic resolution order")
+    }
+
+    /// WHY: GUI-launched macOS apps receive PATH="" (empty string) or no PATH
+    /// at all. ProcessLocator must still build a usable search path from the
+    /// hardcoded fallbacks; returning an empty or nil path would make every
+    /// agent-CLI launch fail silently at the "binary not found" guard.
+    func test_processLocator_expandedPath_nilEnvPathYieldsNonEmptySearchPath() {
+        let home = "/tmp/rc2-nilpath-test"
+        let expanded = ProcessLocator.expandedPath(environmentPath: nil, homeDirectory: home)
+        XCTAssertFalse(expanded.isEmpty,
+                       "a nil PATH environment variable must still produce a fallback search path; otherwise agent CLIs installed in Homebrew or ~/.local/bin are invisible to GUI-launched RemoteCode")
+        let components = expanded.split(separator: ":").map(String.init)
+        XCTAssertTrue(components.contains("/opt/homebrew/bin"),
+                      "Homebrew bin must appear in the fallback search path so GUI-launched RemoteCode can find Homebrew-installed CLIs")
+    }
+
+    /// WHY: resolve() trims leading and trailing whitespace from the name
+    /// before matching against PATH components. A user who types " claude " in
+    /// Settings must not get "binary not found" - the space is cosmetic.
+    func test_processLocator_resolve_trimsBinaryNameWhitespace() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("rc2-trim-\(UUID().uuidString)")
+        let bin = root.appendingPathComponent("bin")
+        try FileManager.default.createDirectory(at: bin, withIntermediateDirectories: true)
+        let cli = bin.appendingPathComponent("mytool")
+        FileManager.default.createFile(atPath: cli.path, contents: Data("#!/bin/sh\n".utf8))
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: cli.path)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let resolved = ProcessLocator.resolve(
+            " mytool ",
+            environmentPath: bin.path,
+            homeDirectory: root.path
+        )
+        XCTAssertEqual(resolved, cli.path,
+                       "leading and trailing whitespace in the configured CLI name must be trimmed; otherwise a user-typed ' claude ' in Settings produces a silent not-found failure")
     }
 }
