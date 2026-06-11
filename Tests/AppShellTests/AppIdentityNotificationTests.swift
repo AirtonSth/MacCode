@@ -186,10 +186,21 @@ final class AppIdentityNotificationTests: XCTestCase {
         let prompted = PromptFlag()
         auth.onPairingRequest = { _ in prompted.value = true }
 
-        let request = try XCTUnwrap(auth.createPairingRequest(
-            deviceName: "iPhone",
-            privateAccountAccessToken: "ios-access-token"
-        ))
+        // canAutoApprovePairing() (reached via createPairingRequest) blocks up to
+        // 8 s on a DispatchSemaphore and asserts it is NEVER called on the main
+        // thread. Production callers are HTTP listener threads, so exercise the
+        // auto-approve path off the main thread; the main test thread waits.
+        let resultBox = PairingResultBox()
+        let created = expectation(description: "pairing request created off the main thread")
+        DispatchQueue.global().async {
+            resultBox.value = auth.createPairingRequest(
+                deviceName: "iPhone",
+                privateAccountAccessToken: "ios-access-token"
+            )
+            created.fulfill()
+        }
+        wait(for: [created], timeout: 12)
+        let request = try XCTUnwrap(resultBox.value)
         let status = try XCTUnwrap(auth.pairingRequestStatus(requestId: request.requestId))
 
         XCTAssertFalse(prompted.value,
@@ -517,6 +528,17 @@ private final class PromptFlag: @unchecked Sendable {
     private var storage = false
 
     var value: Bool {
+        get { lock.lock(); defer { lock.unlock() }; return storage }
+        set { lock.lock(); storage = newValue; lock.unlock() }
+    }
+}
+
+/// Thread-safe holder for a pairing result produced off the main thread.
+private final class PairingResultBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage: (requestId: String, code: String)?
+
+    var value: (requestId: String, code: String)? {
         get { lock.lock(); defer { lock.unlock() }; return storage }
         set { lock.lock(); storage = newValue; lock.unlock() }
     }

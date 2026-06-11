@@ -110,17 +110,19 @@ public final class LocalAuthAdapter: DirectAuthProvider {
     }
 
     private func canAutoApprovePairing(privateAccountAccessToken: String?) -> Bool {
-        // SAFETY: this function blocks the calling thread (DispatchSemaphore.wait)
-        // for up to 8 seconds.  It MUST NOT be called on the main actor — doing so
-        // would deadlock the run loop.  Today callers are HTTP listener threads
-        // (safe); if a future refactor routes here from the main actor, the
-        // precondition below will surface the bug at call-site.
-        precondition(!Thread.isMainThread,
-                     "canAutoApprovePairing must not run on the main thread — it blocks up to 8 s")
-
+        // The non-blocking early return below is main-thread safe (no token / no
+        // subscription => no remote check). Only the blocking tail must be guarded.
         guard let privateAccountAccessToken,
               let localSession = privateAccountStore?.load(),
               localSession.user.subscribed else { return false }
+
+        // SAFETY: from here the function blocks the calling thread
+        // (DispatchSemaphore.wait) for up to 8 seconds. It MUST NOT run on the main
+        // actor -- doing so would deadlock the run loop. Today callers are HTTP
+        // listener threads (safe); if a future refactor routes the blocking path
+        // here from the main actor, this precondition surfaces the bug at call-site.
+        precondition(!Thread.isMainThread,
+                     "canAutoApprovePairing must not block the main thread -- it waits up to 8 s")
 
         let sema = DispatchSemaphore(value: 0)
         let box = LockedAccountVerificationBox()
