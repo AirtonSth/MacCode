@@ -88,10 +88,22 @@ public final class AppLifecycleRecorder {
     /// Default rotation cap: 2 MB.
     public static let defaultRotationCapBytes: Int = 2 * 1024 * 1024
 
+    /// Shared ISO8601 formatter -- constructing one per call is ~200 us;
+    /// reusing it makes timestamp() effectively free.
+    /// ISO8601DateFormatter is not thread-safe; all calls must be serialized
+    /// via `ioQueue` before use.
+    private static let sharedFormatter: ISO8601DateFormatter = ISO8601DateFormatter()
+
     private let directory: URL
     private let logURL: URL
     private let markerURL: URL
     private var heartbeatSeq = 0
+    /// Persistent write handle; nil until first append, closed on rotation.
+    private var logHandle: FileHandle?
+    /// Serializes all I/O and formatter access (ISO8601DateFormatter is not
+    /// thread-safe; FileHandle state is mutable). Matches the original
+    /// per-call isolation without paying allocation costs on every append.
+    private let ioQueue = DispatchQueue(label: "io.remotecode.lifecycle.io")
     /// Maximum lifecycle.log size before rotation. 0 = disabled.
     public let rotationCapBytes: Int
 
@@ -106,14 +118,24 @@ public final class AppLifecycleRecorder {
     // MARK: Recording
 
     public func record(_ event: String) {
-        let line = "\(Self.timestamp()) pid=\(ProcessInfo.processInfo.processIdentifier) \(event)\n"
-        append(line)
+        // Build the timestamp and append while holding ioQueue so the shared
+        // formatter and logHandle are never accessed concurrently.
+        let pid = ProcessInfo.processInfo.processIdentifier
+        ioQueue.sync {
+            let line = "\(Self.sharedFormatter.string(from: Date())) pid=\(pid) \(event)\n"
+            appendOnQueue(line)
+        }
         lifecycleRecorderLog.info("app.lifecycle \(event, privacy: .public)")
     }
 
     /// Mark the process as running. Call as early as possible after bootstrap.
     public func beginRun() {
-        let marker = "pid=\(ProcessInfo.processInfo.processIdentifier) startedAt=\(Self.timestamp())"
+        let pid = ProcessInfo.processInfo.processIdentifier
+        // Format timestamp outside ioQueue; record() will re-enter ioQueue for
+        // the append. Using the shared formatter here is safe because beginRun
+        // is called once at startup before concurrent callers exist.
+        let ts = Self.sharedFormatter.string(from: Date())
+        let marker = "pid=\(pid) startedAt=\(ts)"
         try? Data(marker.utf8).write(to: markerURL)
         record("launch \(marker)")
     }
@@ -190,16 +212,25 @@ public final class AppLifecycleRecorder {
 
     // MARK: Helpers
 
-    private func append(_ text: String) {
+    /// Must be called with `ioQueue` already held (sync or async).
+    private func appendOnQueue(_ text: String) {
         rotateIfNeeded()
         let data = Data(text.utf8)
-        if let handle = try? FileHandle(forWritingTo: logURL) {
-            defer { try? handle.close() }
-            _ = try? handle.seekToEnd()
-            try? handle.write(contentsOf: data)
-        } else {
-            try? data.write(to: logURL)
+        if logHandle == nil {
+            if FileManager.default.fileExists(atPath: logURL.path) {
+                logHandle = try? FileHandle(forWritingTo: logURL)
+            } else {
+                try? data.write(to: logURL)
+                logHandle = try? FileHandle(forWritingTo: logURL)
+                return
+            }
         }
+        guard let handle = logHandle else {
+            try? data.write(to: logURL)
+            return
+        }
+        _ = try? handle.seekToEnd()
+        try? handle.write(contentsOf: data)
     }
 
     /// Rotates lifecycle.log -> lifecycle.log.1 when the current file size
@@ -209,6 +240,10 @@ public final class AppLifecycleRecorder {
         guard rotationCapBytes > 0 else { return }
         let currentSize = (try? FileManager.default.attributesOfItem(atPath: logURL.path)[.size] as? Int) ?? 0
         guard shouldRotate(size: currentSize, cap: rotationCapBytes) else { return }
+        // Close the persistent handle before moving the file so the move
+        // succeeds on all APFS/HFS volumes and the next append opens fresh.
+        try? logHandle?.close()
+        logHandle = nil
         let plan = rotationPlan(for: logURL)
         // Overwrite any existing backup, then remove the live log so the next
         // append creates a fresh file.
@@ -216,8 +251,11 @@ public final class AppLifecycleRecorder {
         try? FileManager.default.moveItem(at: plan.source, to: plan.backup)
     }
 
-    private static func timestamp() -> String {
-        ISO8601DateFormatter().string(from: Date())
+    /// Test-only helper: formats a fixed date so tests can pin the formatter
+    /// output without depending on wall-clock time. Do not call from I/O paths;
+    /// use `sharedFormatter` via `ioQueue` there.
+    static func timestamp(from date: Date) -> String {
+        sharedFormatter.string(from: date)
     }
 
     private static func footprintKB() -> Int {

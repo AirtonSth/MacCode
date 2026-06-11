@@ -78,6 +78,23 @@ final class AppLifecycleRecorderTests: XCTestCase {
         XCTAssertTrue(log.contains("pid=\(ProcessInfo.processInfo.processIdentifier)"),
                       "each line must carry the pid so an incident can be tied to a specific process")
     }
+
+    // Pins the timestamp format produced by the shared ISO8601DateFormatter so
+    // that hoisting the formatter cannot silently change the log line structure.
+    // WHY: log consumers parse the ISO8601 prefix to correlate events; any
+    // format change (e.g. fractional seconds, timezone offset style) would
+    // break those parsers without this guard.
+    func test_timestampFormatIsISO8601WithUTCTimezone() {
+        // 2024-03-15 11:34:56 UTC -- a fixed epoch second so the assertion is
+        // deterministic regardless of the machine's local timezone.
+        let fixedDate = Date(timeIntervalSince1970: 1_710_502_496)
+        let result = AppLifecycleRecorder.timestamp(from: fixedDate)
+        XCTAssertEqual(
+            result,
+            "2024-03-15T11:34:56Z",
+            "hoisting the ISO8601DateFormatter must not change the timestamp format -- log consumers depend on this exact ISO8601 layout"
+        )
+    }
 }
 
 final class AppLifecycleTests: XCTestCase {
