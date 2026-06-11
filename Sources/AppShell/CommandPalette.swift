@@ -456,6 +456,13 @@ public final class CommandPalette: NSObject, NSWindowDelegate, NSTableViewDataSo
     private func applyFilter(_ q: String) {
         let lower = q.trimmingCharacters(in: .whitespacesAndNewlines)
         currentQuery = lower
+        // PERF-L93: remove only the IDs this method owns (section headers +
+        // no-results row) so the set never accumulates stale entries across
+        // filter passes. Static IDs inserted by rebuildCommands (e.g.
+        // agent.model.loading) are preserved.
+        nonRunnableRowIDs = nonRunnableRowIDs.filter {
+            !Self.isFilterPassNonRunnableID($0)
+        }
         if lower.isEmpty {
             // UX-006: the default view hides the long tail; search sees it all.
             let visible = all.filter { !$0.defaultHidden }
@@ -608,6 +615,16 @@ public final class CommandPalette: NSObject, NSWindowDelegate, NSTableViewDataSo
     /// Exposed as `internal static` so unit tests can assert the policy without
     /// instantiating a full `CommandPalette` (which requires a live AppCommandRouter).
     static func shouldDismissOnResignKey() -> Bool { true }
+
+    // MARK: Filter-pass non-runnable IDs (PERF-L93)
+
+    /// Returns true iff `id` is a row that applyFilter creates and owns for the
+    /// current pass (section headers + no-results placeholder). These are cleared
+    /// at the start of every applyFilter call so the set never grows unboundedly.
+    /// Exposed as `internal static` for unit testing without a live palette instance.
+    static func isFilterPassNonRunnableID(_ id: String) -> Bool {
+        id.hasPrefix("palette.section.") || id == "palette.noresults"
+    }
 
     public func windowDidResignKey(_ notification: Notification) {
         if CommandPalette.shouldDismissOnResignKey() { hide() }
