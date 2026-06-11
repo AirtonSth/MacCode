@@ -16,7 +16,7 @@ import DesignSystemKit
 private final class PalettePanel: NSPanel {
     /// Set by CommandPalette after init.
     var quickRunHandler: ((Int) -> Void)?
-    /// Set by CommandPalette after init — handles Return when the table
+    /// Set by CommandPalette after init - handles Return when the table
     /// (not the search field) holds first-responder focus (P1-CP-1).
     var returnHandler: (() -> Void)?
 
@@ -24,7 +24,7 @@ private final class PalettePanel: NSPanel {
         guard event.type == .keyDown else { return super.performKeyEquivalent(with: event) }
 
         // Return key (keyCode 36 / carriage return character) from any
-        // responder — fires submit() whether the table or the field has focus.
+        // responder - fires submit() whether the table or the field has focus.
         // P1-CP-1: after a mouse click the table became first-responder so the
         // text-field doCommandBy delegate no longer saw insertNewline.
         if event.keyCode == 36, !event.modifierFlags.contains([.command, .control, .option]) {
@@ -69,7 +69,7 @@ public struct PaletteCommand {
     /// Resolved key chord (e.g. "⌘T") shown right-aligned for discoverability.
     public let shortcut: String?
     /// Long-tail entries hidden from the default (empty-query) view but
-    /// reachable by search — see UX-006 so typing a truncated item's name finds it.
+    /// reachable by search - see UX-006 so typing a truncated item's name finds it.
     public let defaultHidden: Bool
     /// UX-003: section this command belongs to (drives default-view headers).
     public let category: PaletteCategory
@@ -92,7 +92,7 @@ public struct PaletteCommand {
 public final class CommandPalette: NSObject, NSWindowDelegate, NSTableViewDataSource, NSTableViewDelegate, NSTextFieldDelegate {
     public let window: NSPanel
     private let searchField = NSTextField()
-    /// P2: footer hint shown below the list: "⌘1–⌘9 quick-run".
+    /// P2: footer hint shown below the list: "⌘1-⌘9 quick-run".
     // P3-CP-7: show full keyboard contract so new users understand navigation.
     private let footerHint = NSTextField(labelWithString: "\u{2191}\u{2193} navigate \u{00B7} \u{23CE} run \u{00B7} esc dismiss \u{00B7} \u{2318}1\u{2013}\u{2318}9 quick-run")
     private let tableView = NSTableView()
@@ -105,7 +105,8 @@ public final class CommandPalette: NSObject, NSWindowDelegate, NSTableViewDataSo
     /// PERF-003: cache project-script discovery so cmd+k never blocks the
     /// open keystroke on a filesystem scan. Keyed by workspace cwd; refreshed
     /// off-main and re-fed into the palette when it resolves.
-    private var scriptCache: [String: [ProjectScript]] = [:]
+    /// Internal so AppShellTests can pre-seed the cache for deterministic tests.
+    var scriptCache: [String: [ProjectScript]] = [:]
 
     /// UX-004: when the palette is open we observe the live agent VM so the
     /// model rows appear as soon as loadModels() resolves, without reopening.
@@ -121,13 +122,13 @@ public final class CommandPalette: NSObject, NSWindowDelegate, NSTableViewDataSo
     private var recentCommandIDs: [String] = []
     private let recentLimit = 3
 
-    /// P2: frecency store — persists use count + last-used timestamp per command
+    /// P2: frecency store - persists use count + last-used timestamp per command
     /// ID so the default-view ranking improves over time ("New Terminal" beats
     /// "New Browser" after the user has run it more).  Nil when no router/repo
     /// is available (safe: frecency is best-effort, degrades to insertion order).
     private var frecencyStore: PaletteFrecencyStore?
 
-    /// QA-002: inspection seam — the ordered IDs currently visible (after
+    /// QA-002: inspection seam - the ordered IDs currently visible (after
     /// filtering / sectioning) so unit tests can assert caps, ordering, and
     /// conditional inclusion without driving the NSPanel.
     var commandIDsForTesting: [String] { filtered.map(\.id) }
@@ -164,7 +165,7 @@ public final class CommandPalette: NSObject, NSWindowDelegate, NSTableViewDataSo
         panel.returnHandler = { [weak self] in self?.submit() }
 
         // UX-012: hint that scripts/threads/workspaces are searchable too.
-        searchField.placeholderString = "Search commands, scripts, threads, workspaces…"
+        searchField.placeholderString = "Search commands, scripts, threads, workspaces..."
         searchField.font = .systemFont(ofSize: 15)
         searchField.delegate = self
         searchField.target = self
@@ -245,7 +246,7 @@ public final class CommandPalette: NSObject, NSWindowDelegate, NSTableViewDataSo
         observedAgentVM = nil
         agentModelObserver = nil
         var cmds: [PaletteCommand] = []
-        cmds.append(PaletteCommand(id: "workspace.new", title: "New Workspace…", subtitle: "Choose a folder to use as cwd", keywords: ["workspace", "create", "open"], shortcut: "⌘N", category: .workspace, iconName: "folder.badge.plus") { [weak self] in
+        cmds.append(PaletteCommand(id: "workspace.new", title: "New Workspace...", subtitle: "Choose a folder to use as cwd", keywords: ["workspace", "create", "open"], shortcut: "⌘N", category: .workspace, iconName: "folder.badge.plus") { [weak self] in
             let panel = NSOpenPanel(); panel.canChooseFiles = false; panel.canChooseDirectories = true
             if panel.runModal() == .OK, let url = panel.url {
                 _ = try? self?.router?.createWorkspace(name: url.lastPathComponent, cwd: url.path)
@@ -283,7 +284,7 @@ public final class CommandPalette: NSObject, NSWindowDelegate, NSTableViewDataSo
                 _ = try? router.projectOpenInEditor(workspace: wid)
             })
 
-            // Agent App commands — reach the live VM of the agent surface
+            // Agent App commands - reach the live VM of the agent surface
             // in the selected workspace (t3code palette parity).
             if let agent = SurfaceRegistry.shared.all()
                 .compactMap({ $0 as? AgentAppSurface })
@@ -308,10 +309,10 @@ public final class CommandPalette: NSObject, NSWindowDelegate, NSTableViewDataSo
                 })
                 // E2/UX-004: surface the provider's model catalog as quick-switches.
                 // While the async load is in flight with no models yet, show a
-                // disabled "Loading models…" row and observe the VM so the rows
-                // appear the moment loadModels() resolves — no reopen required.
+                // disabled "Loading models..." row and observe the VM so the rows
+                // appear the moment loadModels() resolves - no reopen required.
                 if vm.availableModels.isEmpty && vm.modelListLoading {
-                    cmds.append(PaletteCommand(id: "agent.model.loading", title: "Agent: Loading models…", subtitle: "Fetching the provider's model catalog", category: .agent, iconName: "hourglass") {})
+                    cmds.append(PaletteCommand(id: "agent.model.loading", title: "Agent: Loading models...", subtitle: "Fetching the provider's model catalog", category: .agent, iconName: "hourglass") {})
                     nonRunnableRowIDs.insert("agent.model.loading")
                     observeAgentModels(vm)
                 }
@@ -342,7 +343,7 @@ public final class CommandPalette: NSObject, NSWindowDelegate, NSTableViewDataSo
             }
         }
         cmds.append(PaletteCommand(id: "session.save", title: "Save Session Snapshot", keywords: ["snapshot", "session"], category: .app, iconName: "camera") { router.context?.saveSnapshot() })
-        // UX-011: Quit is destructive — red tint + de-prioritized in ranking.
+        // UX-011: Quit is destructive - red tint + de-prioritized in ranking.
         cmds.append(PaletteCommand(id: "app.quit", title: "Quit RemoteCode", keywords: ["exit", "quit"], shortcut: "⌘Q", category: .app, iconName: "power", destructive: true) { NSApp.terminate(nil) })
         self.all = cmds
         applyFilter(currentQuery)
@@ -355,12 +356,12 @@ public final class CommandPalette: NSObject, NSWindowDelegate, NSTableViewDataSo
         return base.isEmpty ? "✓ Current" : "✓ Current · \(base)"
     }
 
-    /// UX-005: append a non-runnable "Show all N more <noun>…" row when the
+    /// UX-005: append a non-runnable "Show all N more <noun>..." row when the
     /// default view truncated a list, so the user knows the rest exist (and
-    /// can reach them by typing — UX-006). No-op when nothing is hidden.
+    /// can reach them by typing - UX-006). No-op when nothing is hidden.
     private func appendOverflowRow(_ cmds: inout [PaletteCommand], hiddenCount: Int, id: String, noun: String, category: PaletteCategory) {
         guard hiddenCount > 0 else { return }
-        cmds.append(PaletteCommand(id: id, title: "Show all \(hiddenCount) more \(noun)…", subtitle: "Type to search the full list", category: category, iconName: "ellipsis.circle") {})
+        cmds.append(PaletteCommand(id: id, title: "Show all \(hiddenCount) more \(noun)...", subtitle: "Type to search the full list", category: category, iconName: "ellipsis.circle") {})
         nonRunnableRowIDs.insert(id)
     }
 
@@ -394,7 +395,7 @@ public final class CommandPalette: NSObject, NSWindowDelegate, NSTableViewDataSo
     }
 
     /// UX-004: refresh the open palette once the agent VM finishes loading
-    /// models, so the disabled "Loading models…" row is replaced live.
+    /// models, so the disabled "Loading models..." row is replaced live.
     private func observeAgentModels(_ vm: AgentAppViewModel) {
         observedAgentVM = vm
         agentModelObserver = vm.$availableModels
@@ -611,7 +612,7 @@ public final class CommandPalette: NSObject, NSWindowDelegate, NSTableViewDataSo
         resolvedFrecencyStore()?.recordUse(id: id)
     }
 
-    // MARK: NSWindowDelegate — resign-key dismissal
+    // MARK: NSWindowDelegate - resign-key dismissal
 
     /// UX-015: floating panels must dismiss when the app loses key focus so the
     /// palette never stays orphaned over Spotlight, Raycast, or any other overlay.
@@ -640,7 +641,7 @@ public final class CommandPalette: NSObject, NSWindowDelegate, NSTableViewDataSo
     }
 
     /// Esc dismisses the palette (documented behaviour); ↑/↓ move the
-    /// selection; ↩ runs it. Without this Esc did nothing — the panel
+    /// selection; ↩ runs it. Without this Esc did nothing - the panel
     /// could only be closed by re-toggling.
     public func control(_ control: NSControl, textView: NSTextView, doCommandBy sel: Selector) -> Bool {
         switch sel {
@@ -739,7 +740,7 @@ public final class CommandPalette: NSObject, NSWindowDelegate, NSTableViewDataSo
 
     public func numberOfRows(in tableView: NSTableView) -> Int { filtered.count }
 
-    /// Empty-state and "Loading models…" rows are not selectable, so a mouse
+    /// Empty-state and "Loading models..." rows are not selectable, so a mouse
     /// click can never land Enter on them (UX-001/UX-004).
     public func tableView(_ tableView: NSTableView, shouldSelectRow row: Int) -> Bool {
         guard row >= 0, row < filtered.count else { return false }

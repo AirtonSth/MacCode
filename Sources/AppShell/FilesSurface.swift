@@ -11,7 +11,7 @@ import DesignSystemKit
 import os
 
 // Structured telemetry for the Files surface. Logs operation + error code + coarse size bucket
-// only — never paths or file contents — so field save/conflict/decode failures are visible
+// only - never paths or file contents - so field save/conflict/decode failures are visible
 // without leaking PII (QA-MAC_FILES-008).
 private let filesLog = Logger(subsystem: "io.remotecode.appshell", category: "files")
 
@@ -271,7 +271,7 @@ extension FileEntry: FileNameFilterable {}
 
 /// Map a filename (or bare extension) to a distinct SF Symbol name based on its extension.
 /// Extension matching is case-insensitive. Returns "doc" for unrecognised extensions.
-/// This is a pure free function — no MainActor, no AppKit — so it can be unit-tested directly.
+/// This is a pure free function - no MainActor, no AppKit - so it can be unit-tested directly.
 func fileIcon(for filename: String) -> String {
     let ext = (filename as NSString).pathExtension.lowercased()
     switch ext {
@@ -364,7 +364,7 @@ nonisolated func shouldClosePriorEditSession(prevPath: String?, prevIsDirty: Boo
 // MARK: - Pure recycle-URL helper (no AppKit, no MainActor; tested in FilesRecycleTests)
 
 /// Build the URL array for NSWorkspace.recycle from absolute file-system paths.
-/// Pure function: no AppKit dependency, no MainActor — accepts the absolute `path` values
+/// Pure function: no AppKit dependency, no MainActor - accepts the absolute `path` values
 /// stored on each FileEntry, so the delete-to-Trash path is testable without constructing
 /// the full FileEntry or touching AppKit.
 func recycleURLs(forAbsolutePaths paths: [String]) -> [URL] {
@@ -429,7 +429,7 @@ func filterFileEntries<T: FileNameFilterable>(_ entries: [T], query: String) -> 
 ///
 /// Algorithm:
 ///  1. Split both strings into lines on "\n". NSString line enumeration is used for the final
-///     range computation so offsets are UTF-16 — matching NSTextStorage expectations — and the
+///     range computation so offsets are UTF-16 - matching NSTextStorage expectations - and the
 ///     helper is safe for any Unicode content (no UTF-16 index arithmetic on grapheme clusters).
 ///  2. Diff line arrays from both ends (common-prefix / common-suffix trim) to find the first
 ///     and last changed line indices in `newText`.
@@ -604,6 +604,29 @@ private extension View {
     }
 }
 
+/// Minimal changed range as a UTF-16 NSRange over `old` plus the UTF-16 replacement,
+/// found by trimming the common prefix and suffix between `old` and `new`.
+/// Extracted from FilesViewModel.minimalEdit so perf/correctness tests can reach it
+/// without constructing the full AppKit surface (QA perf guard, CI-gate P2).
+func filesMinimalEdit(from old: String, to new: String) -> (location: Int, length: Int, replacement: String) {
+    let oldUnits = Array(old.utf16)
+    let newUnits = Array(new.utf16)
+    var prefix = 0
+    let maxPrefix = min(oldUnits.count, newUnits.count)
+    while prefix < maxPrefix && oldUnits[prefix] == newUnits[prefix] {
+        prefix += 1
+    }
+    var suffix = 0
+    let maxSuffix = min(oldUnits.count, newUnits.count) - prefix
+    while suffix < maxSuffix && oldUnits[oldUnits.count - 1 - suffix] == newUnits[newUnits.count - 1 - suffix] {
+        suffix += 1
+    }
+    let location = prefix
+    let length = oldUnits.count - prefix - suffix
+    let replacement = String(utf16CodeUnits: Array(newUnits[prefix..<(newUnits.count - suffix)]), count: newUnits.count - prefix - suffix)
+    return (location, length, replacement)
+}
+
 @MainActor
 private final class FilesViewModel: ObservableObject {
     @Published var currentDirectory = ""
@@ -725,7 +748,7 @@ private final class FilesViewModel: ObservableObject {
 
     /// Map a `fsWorkspaceList` result's entries into `FileEntry` rows, attaching drag payloads to
     /// files. Shared by the top-level directory load and the lazy subtree fetch so both produce
-    /// identical rows. This keeps the existing security-scoped `fsWorkspaceList` IO unchanged —
+    /// identical rows. This keeps the existing security-scoped `fsWorkspaceList` IO unchanged -
     /// only the surrounding tree structure is new (P1).
     private func mapEntries(_ result: JSONValue?) -> [FileEntry] {
         let values = result?.objectValue?["entries"]?.arrayValue ?? []
@@ -1029,25 +1052,10 @@ private final class FilesViewModel: ObservableObject {
         }
     }
 
-    /// Minimal changed range as a UTF-16 NSRange over `old` plus the UTF-16 replacement,
-    /// found by trimming the common prefix and suffix between `old` and `new`.
-    private static func minimalEdit(from old: String, to new: String) -> (location: Int, length: Int, replacement: String) {
-        let oldUnits = Array(old.utf16)
-        let newUnits = Array(new.utf16)
-        var prefix = 0
-        let maxPrefix = min(oldUnits.count, newUnits.count)
-        while prefix < maxPrefix && oldUnits[prefix] == newUnits[prefix] {
-            prefix += 1
-        }
-        var suffix = 0
-        let maxSuffix = min(oldUnits.count, newUnits.count) - prefix
-        while suffix < maxSuffix && oldUnits[oldUnits.count - 1 - suffix] == newUnits[newUnits.count - 1 - suffix] {
-            suffix += 1
-        }
-        let location = prefix
-        let length = oldUnits.count - prefix - suffix
-        let replacement = String(utf16CodeUnits: Array(newUnits[prefix..<(newUnits.count - suffix)]), count: newUnits.count - prefix - suffix)
-        return (location, length, replacement)
+    /// Delegates to the module-level filesMinimalEdit free function so the
+    /// algorithm is unit-testable without constructing the full AppKit surface.
+    static func minimalEdit(from old: String, to new: String) -> (location: Int, length: Int, replacement: String) {
+        filesMinimalEdit(from: old, to: new)
     }
 
     private func receive(_ event: EventBus.Event) {
@@ -1127,8 +1135,8 @@ private final class FilesViewModel: ObservableObject {
         syncDetail = "Revision \(revision)"
     }
 
-    /// Record an operation failure with its RPC error code, file kind, and a coarse size bucket —
-    /// no paths or contents — so flaky save/conflict/decode reports are reproducible (QA-MAC_FILES-008).
+    /// Record an operation failure with its RPC error code, file kind, and a coarse size bucket -
+    /// no paths or contents - so flaky save/conflict/decode reports are reproducible (QA-MAC_FILES-008).
     private func logFailure(_ operation: String, error: Error) {
         let kind = selectedEntry?.kind ?? "none"
         let bucket = sizeBucket(selectedEntry?.size ?? -1)
@@ -1396,7 +1404,7 @@ private struct FilesSurfaceRoot: View {
     }
 
     // Recursive tree renderer (P1): each row gets a disclosure triangle when it is a directory, and
-    // its children are emitted indented and lazily — `model.childEntries` only fetches on first
+    // its children are emitted indented and lazily - `model.childEntries` only fetches on first
     // expand. Selection/open/drag/dirty affordances are unchanged from the old flat row; only the
     // leading disclosure control and indentation are new.
     // Returns AnyView to break the self-referential opaque return type a directly recursive
@@ -1952,7 +1960,7 @@ private struct LargeMediaGuard<Content: View>: View {
                     .foregroundStyle(DS.Palette.textTertiary)
                 Text("Large file")
                     .font(DS.Font.title3)
-                Text("\(ByteCountFormatter.string(fromByteCount: Int64(entry.size), countStyle: .file)) — loading it in RemoteCode may be slow.")
+                Text("\(ByteCountFormatter.string(fromByteCount: Int64(entry.size), countStyle: .file)) - loading it in RemoteCode may be slow.")
                     .font(DS.Font.bodyDense)
                     .foregroundStyle(DS.Palette.textSecondary)
                     .multilineTextAlignment(.center)
@@ -2205,7 +2213,7 @@ private struct BinaryMetadataView: View {
 /// timestamp and the minimum interval between renders.
 ///
 /// Returns `true` when enough time has elapsed (interval has passed or no render has
-/// happened yet), `false` when called within the debounce window. Pure — no side effects.
+/// happened yet), `false` when called within the debounce window. Pure - no side effects.
 struct PreviewDebounceGate {
     /// Minimum seconds between successive preview renders.
     let interval: TimeInterval
@@ -2307,10 +2315,10 @@ private struct WebHTMLView: NSViewRepresentable {
         func scheduleDebounced(in webView: WKWebView) {
             let now = Date().timeIntervalSinceReferenceDate
             if Self.gate.shouldRender(lastRenderAt: lastRenderAt, now: now) {
-                // Enough time has passed — render immediately.
+                // Enough time has passed - render immediately.
                 commit(in: webView, now: now)
             } else {
-                // Within the debounce window — defer to the end of the interval.
+                // Within the debounce window - defer to the end of the interval.
                 debounceTimer?.invalidate()
                 let remaining = Self.gate.interval - (now - (lastRenderAt ?? now))
                 debounceTimer = Timer.scheduledTimer(withTimeInterval: max(remaining, 0.01), repeats: false) { [weak self, weak webView] _ in
@@ -2524,7 +2532,7 @@ private struct CodeTextEditor: NSViewRepresentable {
         /// range covers the whole document (e.g. file replaced entirely).
         ///
         /// Called from `updateNSView` after `textView.string` is set to the new remote content.
-        /// Never calls `setAttributedString` — mutates attributes in place — so cursor position,
+        /// Never calls `setAttributedString` - mutates attributes in place - so cursor position,
         /// scroll offset, and selection are undisturbed.
         func applyHighlightIncremental(oldText: String, to textView: NSTextView) {
             guard !applyingHighlight else { return }
