@@ -56,6 +56,15 @@ public final class SurfaceOutputBus: @unchecked Sendable {
         }
     }
 
+    /// Remove all buffered state for a closed surface, preventing unbounded
+    /// growth from terminal churn. Idempotent: removing an absent id is a no-op.
+    public func remove(surfaceId: SurfaceID) {
+        queue.async {
+            self.pending.removeValue(forKey: surfaceId)
+            self.surfaceSeq.removeValue(forKey: surfaceId)
+        }
+    }
+
     public func flushNow(_ surfaceId: SurfaceID) {
         if DispatchQueue.getSpecific(key: queueKey) != nil {
             flush(surfaceId)

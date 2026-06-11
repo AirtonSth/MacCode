@@ -671,6 +671,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             s.close()
             SurfaceRegistry.shared.unregister(surface)
         }
+        SurfaceOutputBus.shared.remove(surfaceId: surface)
         if let desc = closedDescriptor {
             let entry = ClosedTabEntry(descriptor: desc, workspaceCwd: workspaceCwdForReopen)
             closedTabBuffer.push(entry, for: workspace)
