@@ -133,6 +133,7 @@ public enum DSButtonOpacity {
 
 public struct DSPrimaryButtonStyle: ButtonStyle {
     @Environment(\.isEnabled) private var isEnabled
+    @State private var hovering = false
     public init() {}
     public func makeBody(configuration: Configuration) -> some View {
         configuration.label
@@ -142,7 +143,8 @@ public struct DSPrimaryButtonStyle: ButtonStyle {
             .padding(.vertical, DS.Space.md)
             .background(DS.Palette.accent.opacity(configuration.isPressed ? 0.82 : 1.0))
             .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
-            .opacity(DSButtonOpacity.effectiveOpacity(isEnabled: isEnabled, isHovering: false))
+            .opacity(DSButtonOpacity.effectiveOpacity(isEnabled: isEnabled, isHovering: hovering))
+            .onHover { hovering = $0 }
     }
 }
 

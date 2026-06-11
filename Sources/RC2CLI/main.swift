@@ -16,7 +16,7 @@ let _cleanedArgs: [String] = [args.first ?? ""] + _timeoutResult.remaining
 
 func usage(_ exit: Int32 = 0) -> Never {
     let text = """
-    Usage: \(prog) [--socket PATH] [--json] <command> [args...]
+    Usage: \(prog) [--socket PATH] [--json] [--timeout MS] <command> [args...]
 
     Commands:
       ping
@@ -28,7 +28,10 @@ func usage(_ exit: Int32 = 0) -> Never {
       focus --workspace WID --id SID
       close --workspace WID --id SID
       send-text --id SID --text "..."
+      send-key --id SID --key KEY
       read-text --id SID
+      clear-history --id SID
+      health --id SID
       surface move --workspace WID --id SID --target-pane PID
       surface reorder --workspace WID --id SID --target-pane PID [--position N]
       pane list --workspace WID
@@ -36,17 +39,17 @@ func usage(_ exit: Int32 = 0) -> Never {
       pane resize --workspace WID --split SPLIT_ID --ratios "0.3,0.7"
       window list / window current / window create [--title T] / window focus --id WID / window close --id WID
       workspace move-to-window --workspace WID --window WIDX
-      events recent / events stream
+      events recent / events stream [--after-seq N]
       notification create [--workspace WID] --title T [--body B] [--category C]
       notification list [--workspace WID] [--unread]
       notification mark-read --id N / notification dismiss --id N
-      browser navigate --id SID --url URL / browser back/forward/reload --id SID
+      browser navigate --id SID --url URL / browser back/forward/reload/url --id SID
       browser snapshot --id SID
-      browser click --id SID --ref REF
-      browser fill --id SID --ref REF --value V
-      browser type --id SID --ref REF --value V
+      browser click/focus/hover/check/uncheck --id SID --ref REF
+      browser fill/type/select --id SID --ref REF --value V
       browser wait --id SID --selector CSS [--timeout MS]
       browser screenshot --id SID [--path PATH]
+      browser eval --id SID --script JS
       agent open --workspace WID
       agent thread list [--workspace WID]
       agent thread create [--workspace WID] [--title T] [--provider codex|claude] [--model M]
@@ -151,7 +154,10 @@ struct RPC {
         if conn < 0 {
             let msg = String(cString: strerror(errno))
             close(fd)
-            return ["error": ["code": -1, "message": "connect(\(socketPath)): \(msg). Is the RemoteCode app running?", "_connect_failure": true]]
+            let channelHint = envChannel != "stable"
+                ? " (tip: set RC2_CHANNEL=stable if using the App Store build)"
+                : ""
+            return ["error": ["code": -1, "message": "connect(\(socketPath)): \(msg). Is the RemoteCode app running?\(channelHint)", "_connect_failure": true]]
         }
         // Apply receive timeout when requested via --timeout MS.
         if let ms = receiveTimeoutMS {
