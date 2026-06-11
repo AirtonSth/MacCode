@@ -1777,7 +1777,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     nonisolated public func runCoordinator(_ c: AgentRunCoordinator, didFinish runId: AgentRunID, threadId: AgentThreadID, status: AgentRunStatus, finalMessage: String?, providerThreadId: String?) {
         Task { @MainActor in
             let finishedTid = threadId
-            self.terminalRunIds.insert(runId)
+            self.terminalRunIds = Self.boundedTerminalRunIds(existing: self.terminalRunIds, adding: runId)
             self.runThreads[runId] = nil
             if status == .completed, let msg = finalMessage, !msg.isEmpty {
                 // The coordinator is normally the persistence owner, but
@@ -1842,7 +1842,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                     // coordinator has released the active handle.
                     if !self.coordinator.activeThreadIdsSnapshot().contains(threadId) {
                         self.status = status
-                        self.terminalRunIds.insert(runId)
+                        self.terminalRunIds = Self.boundedTerminalRunIds(existing: self.terminalRunIds, adding: runId)
                         self.currentRunId = nil
                         self.runStartedAt = nil
                         self.runThreads[runId] = nil
@@ -1862,6 +1862,25 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         case .pending, .running:
             return false
         }
+    }
+
+    // PERF-L15: bound the terminal-run-id set so it cannot grow without limit.
+    // Run IDs are fresh UUIDs; they are never re-used, so old finished IDs
+    // accumulate forever. The gate at flushStreamEvents only needs recent IDs
+    // (coordinator has already released any run older than cap). When the set
+    // would exceed cap, drop an arbitrary existing entry (not the new one).
+    // internal (not private) so the test target can call it directly.
+    nonisolated internal static func boundedTerminalRunIds(
+        existing: Set<AgentRunID>,
+        adding newId: AgentRunID,
+        cap: Int = 256
+    ) -> Set<AgentRunID> {
+        var updated = existing
+        updated.insert(newId)
+        if updated.count > cap, let oldest = updated.first(where: { $0 != newId }) {
+            updated.remove(oldest)
+        }
+        return updated
     }
 }
 
