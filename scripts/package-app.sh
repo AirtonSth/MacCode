@@ -56,9 +56,9 @@ if [ "${RC2_REQUIRE_SPARKLE_KEY:-0}" = "1" ] && [ -z "$SPARKLE_PUBLIC_ED_KEY" ];
   exit 1
 fi
 
+BIN_DIR="$(swift build -c "$CONFIG" --show-bin-path)"
 echo "[package] building $CONFIG …"
 swift build -c "$CONFIG"
-BIN_DIR="$(swift build -c "$CONFIG" --show-bin-path)"
 
 BIN="$BIN_DIR/RemoteCode"
 CLI="$BIN_DIR/rc2"

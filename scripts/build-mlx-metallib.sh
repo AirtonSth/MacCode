@@ -21,9 +21,11 @@ mkdir -p "$WORK_DIR"
 mkdir -p "$(dirname "$OUTPUT")"
 
 AIR_FILES=()
-while IFS= read -r metal_file; do
-  name="$(basename "$metal_file" .metal)"
-  air_file="$WORK_DIR/$name.air"
+FAIL_FLAG="$WORK_DIR/.compile_failed"
+
+compile_one() {
+  local metal_file="$1"
+  local air_file="$2"
   xcrun -sdk macosx metal \
     -x metal \
     -Wall \
@@ -34,9 +36,23 @@ while IFS= read -r metal_file; do
     -mmacosx-version-min=14.0 \
     -I"$METAL_DIR" \
     -c "$metal_file" \
-    -o "$air_file"
+    -o "$air_file" \
+    || touch "$FAIL_FLAG"
+}
+
+while IFS= read -r metal_file; do
+  name="$(basename "$metal_file" .metal)"
+  air_file="$WORK_DIR/$name.air"
   AIR_FILES+=("$air_file")
+  compile_one "$metal_file" "$air_file" &
 done < <(find "$METAL_DIR" -maxdepth 1 -name '*.metal' -print | sort)
+
+wait
+
+if [ -f "$FAIL_FLAG" ]; then
+  echo "[mlx-metallib] one or more Metal compiles failed" >&2
+  exit 1
+fi
 
 if [ "${#AIR_FILES[@]}" -eq 0 ]; then
   echo "[mlx-metallib] no Metal kernels found in $METAL_DIR" >&2
