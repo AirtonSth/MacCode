@@ -185,6 +185,69 @@ final class DistillServiceTests: XCTestCase {
         }
     }
 
+    // WHY: fallback frequency must be observable to know how often Token Saver degrades.
+    // When DeadlineDistillRuntime fires the deterministic fallback it calls
+    // metrics.recordFallback(); this test verifies the counter increments and
+    // surfaces in /metrics, while total/success/failed are unaffected.
+    func test_metricsRecorder_fallbackCounterIncrements_andAppearsInSnapshot() async {
+        let recorder = DistillServiceMetricsRecorder()
+
+        // baseline: all counters start at zero
+        let empty = await recorder.snapshot(activeRequests: 0, maxConcurrentRequests: 8)
+        XCTAssertEqual(empty.fallbackRequests, 0)
+        XCTAssertEqual(empty.totalRequests, 0)
+        XCTAssertEqual(empty.successfulRequests, 0)
+        XCTAssertEqual(empty.failedRequests, 0)
+
+        // record one request + one fallback (simulates deadline-exceeded path)
+        await recorder.recordRequest()
+        await recorder.recordFallback()
+
+        let afterFallback = await recorder.snapshot(activeRequests: 1, maxConcurrentRequests: 8)
+        XCTAssertEqual(afterFallback.fallbackRequests, 1,
+                       "fallback counter must reflect every recordFallback() call")
+        // success and failure counters must remain untouched by a fallback
+        XCTAssertEqual(afterFallback.successfulRequests, 0,
+                       "recordFallback must not alter successfulRequests")
+        XCTAssertEqual(afterFallback.failedRequests, 0,
+                       "recordFallback must not alter failedRequests")
+        XCTAssertEqual(afterFallback.totalRequests, 1)
+
+        // a second fallback increments to 2
+        await recorder.recordFallback()
+        let after2 = await recorder.snapshot(activeRequests: 0, maxConcurrentRequests: 8)
+        XCTAssertEqual(after2.fallbackRequests, 2)
+
+        // mixed: one success, one failure -- fallback stays at 2
+        await recorder.recordSuccess()
+        await recorder.recordFailure()
+        let mixed = await recorder.snapshot(activeRequests: 0, maxConcurrentRequests: 8)
+        XCTAssertEqual(mixed.fallbackRequests, 2,
+                       "success/failure recordings must not alter fallbackRequests")
+        XCTAssertEqual(mixed.successfulRequests, 1)
+        XCTAssertEqual(mixed.failedRequests, 1)
+    }
+
+    // WHY: the JSON key "fallback_requests" must round-trip through Codable so
+    // the /metrics endpoint exposes the counter to external observers.
+    func test_metricsSnapshot_fallbackRequests_serializesWithSnakeCaseKey() throws {
+        let metrics = DistillServiceMetrics(
+            activeRequests: 0,
+            totalRequests: 3,
+            successfulRequests: 2,
+            failedRequests: 0,
+            fallbackRequests: 1,
+            maxConcurrentRequests: 8
+        )
+        let data = try JSONEncoder().encode(metrics)
+        let dict = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        XCTAssertEqual(dict["fallback_requests"] as? Int, 1,
+                       "fallback_requests must appear under its snake_case JSON key")
+        // decode round-trip
+        let decoded = try JSONDecoder().decode(DistillServiceMetrics.self, from: data)
+        XCTAssertEqual(decoded, metrics)
+    }
+
     private func response(
         baseURL: String,
         path: String,

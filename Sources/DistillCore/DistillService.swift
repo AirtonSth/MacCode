@@ -178,6 +178,7 @@ public struct DistillServiceMetrics: Codable, Sendable, Equatable {
     public let totalRequests: Int
     public let successfulRequests: Int
     public let failedRequests: Int
+    public let fallbackRequests: Int
     public let maxConcurrentRequests: Int
 
     public enum CodingKeys: String, CodingKey {
@@ -185,6 +186,7 @@ public struct DistillServiceMetrics: Codable, Sendable, Equatable {
         case totalRequests = "total_requests"
         case successfulRequests = "successful_requests"
         case failedRequests = "failed_requests"
+        case fallbackRequests = "fallback_requests"
         case maxConcurrentRequests = "max_concurrent_requests"
     }
 }
@@ -193,6 +195,7 @@ public actor DistillServiceMetricsRecorder {
     private var totalRequests = 0
     private var successfulRequests = 0
     private var failedRequests = 0
+    private var fallbackRequests = 0
 
     public init() {}
 
@@ -208,12 +211,17 @@ public actor DistillServiceMetricsRecorder {
         failedRequests += 1
     }
 
+    public func recordFallback() {
+        fallbackRequests += 1
+    }
+
     public func snapshot(activeRequests: Int, maxConcurrentRequests: Int) -> DistillServiceMetrics {
         DistillServiceMetrics(
             activeRequests: activeRequests,
             totalRequests: totalRequests,
             successfulRequests: successfulRequests,
             failedRequests: failedRequests,
+            fallbackRequests: fallbackRequests,
             maxConcurrentRequests: maxConcurrentRequests
         )
     }
