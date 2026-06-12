@@ -1,5 +1,8 @@
 import Foundation
 
+// Reuses the module-level `iso` ISO8601DateFormatter declared in Repositories.swift
+// (hoisted; no per-append allocation).
+
 public final class EventLogRepository {
     let db: SQLiteDB
     public init(db: SQLiteDB) { self.db = db }
@@ -19,7 +22,7 @@ public final class EventLogRepository {
         try st.bind(1, seq)
         try st.bind(2, kind)
         try st.bind(3, payloadJSON)
-        try st.bind(4, ISO8601DateFormatter().string(from: Date()))
+        try st.bind(4, iso.string(from: Date()))
         _ = try st.step()
         // bounded log
         try db.execute("DELETE FROM events WHERE id NOT IN (SELECT id FROM events ORDER BY id DESC LIMIT 5000);")
