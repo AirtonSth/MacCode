@@ -15,6 +15,16 @@ import DesignSystemKit
 // SCOPE (this version): read-only assist. The pane never writes the JSON file.
 // The record control only displays the normalized chord; the user copies it in.
 
+// MARK: - Reload notification
+
+public extension Notification.Name {
+    /// Posted on the main thread after KeybindingConfig.invalidateCache() and a
+    /// fresh load complete (file-watcher change or manual Reload button). AppDelegate
+    /// observes this to re-apply keybinding overrides to the live menu without
+    /// requiring a relaunch.
+    static let rc2KeybindingsReloaded = Notification.Name("rc2KeybindingsReloaded")
+}
+
 // MARK: - Pure conflict detector (nonisolated, testable)
 
 /// A single detected conflict between a user binding and a built-in menu chord.
@@ -395,5 +405,7 @@ struct KeybindingsSettingsPane: View {
         let loaded = KeybindingConfig.loadDefaultPath()
         config = loaded
         conflicts = KeybindingConflictDetector.conflicts(userBindings: loaded.bindings)
+        // Notify AppDelegate so it re-applies keybinding overrides to the live menu.
+        NotificationCenter.default.post(name: .rc2KeybindingsReloaded, object: nil)
     }
 }

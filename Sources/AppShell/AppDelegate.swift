@@ -52,6 +52,9 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
     private var diagnosticsHeartbeatTimer: Timer?
     private var tokenSaverAccountUsageRefreshTimer: Timer?
     private var lifecycleRecorder: AppLifecycleRecorder?
+    /// Menu items whose keyEquivalent is controlled by keybindings.json.
+    /// Populated by installMainMenu(); refreshed by reapplyKeybindingOverrides().
+    private var keybindableMenuItems: [(item: NSMenuItem, command: String)] = []
     public static let tokenSaverAccountUsageRefreshInterval: TimeInterval = 5 * 60
 
     /// Accumulates server startup failures so Settings can show a status
@@ -189,6 +192,8 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         }
         NotificationCenter.default.addObserver(self, selector: #selector(remoteAccessSettingChanged),
                                                name: .rc2RemoteAccessSettingChanged, object: nil)
+        NotificationCenter.default.addObserver(self, selector: #selector(keybindingsReloaded),
+                                               name: .rc2KeybindingsReloaded, object: nil)
         configureDirectAccess()
 
         palette = CommandPalette(router: router)
@@ -464,6 +469,21 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         configureDirectAccess()
     }
 
+    /// Invoked when KeybindingsSettingsPane posts `.rc2KeybindingsReloaded`
+    /// (file-watcher change or manual Reload). The cache is already invalidated
+    /// by the pane before the post; re-running applyKeybindingOverride here
+    /// reads the updated file and sets the live keyEquivalent on every menu item
+    /// that participates in keybindings.json without a relaunch.
+    @objc private func keybindingsReloaded() {
+        // Cache was already invalidated by the pane; calling invalidateCache()
+        // again here is a no-op except it guarantees correctness if this observer
+        // is ever triggered from a path other than the pane's reload().
+        KeybindingConfig.invalidateCache()
+        for entry in keybindableMenuItems {
+            applyKeybindingOverride(to: entry.item, command: entry.command)
+        }
+    }
+
     /// Records a server startup failure, appends to `serverStartupFailures`,
     /// posts a notification, and logs via the lifecycle recorder.
     /// The method is `nonisolated` in name only — callers on the main actor
@@ -621,6 +641,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         paletteItem.target = self
         // C5: ~/.remotecode/keybindings.json may rebind the palette.
         applyKeybindingOverride(to: paletteItem, command: "commandPalette.toggle")
+        keybindableMenuItems = [(item: paletteItem, command: "commandPalette.toggle")]
         viewMenu.addItem(paletteItem)
         // UX-MAC_APPSHELL-TOKENSAVER-KEYBOARD: keyboard-reachable Token Saver toggle
         // (Cmd+Shift+S). Posts rc2TokenSaverToggle; SidebarViewModel observes and
