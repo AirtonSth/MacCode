@@ -1,4 +1,5 @@
 import Foundation
+import AppKit
 import CoreModel
 import Persistence
 import AgentRuntime
@@ -42,6 +43,18 @@ public final class AppContext {
     private var tokenSaverAccountUsageRefreshTask: Task<Void, Never>?
     private var tokenSaverUsageNotificationTask: Task<Void, Never>?
     private var tokenSaverLastUsageNotificationAt: Date = .distantPast
+    /// Per-run accumulator: sums token counts between debounced flushes so the
+    /// expensive file I/O happens at most once per debounce window rather than
+    /// once per token-usage event.
+    private struct PendingUsage {
+        var provider: AgentProvider
+        var totalTokens: Int
+        var eligibleRuns: Int
+        var currentSessionTokens: Int
+        var currentSessionLimitTokens: Int?
+    }
+    private var pendingUsageByRun: [AgentRunID: PendingUsage] = [:]
+    private var pendingUsageFlushTask: Task<Void, Never>?
     private var cachedDistillClientKey: String?
     private var cachedDistillClient: DistillServiceClient?
     /// Test seam: when set, used instead of resolving a client from the live
@@ -61,6 +74,8 @@ public final class AppContext {
     private static let tokenSaverMinCompressChars = 2_000
     private static let tokenSaverDistillStartupPolls = 300
     private static let tokenSaverUsageNotificationMinimumInterval: TimeInterval = 2
+    /// Debounce window for coalescing per-token usage writes into one disk write.
+    private static let tokenSaverUsageDebounceInterval: TimeInterval = 0.75
 
     public init(
         channel: ReleaseChannel = .debug,
@@ -307,6 +322,9 @@ public final class AppContext {
             let kind = (status == .completed) ? "agent.run.completed" : "agent.run.failed"
             EventBus.shared.publish(kind: kind, payload: agentRunPayload(threadId: tid, status: status))
             EventBus.shared.publish(kind: "agent.run.finished", payload: agentRunPayload(threadId: tid, status: status))
+            // Flush any debounced usage for this run now that the run is done so
+            // the final token batch is never stranded in the accumulator.
+            self.flushPendingTokenSaverUsage(runId: rid)
             self.recordSessionLearnFromRun(runId: rid, status: status) // P5 SessionLearn (off by default)
             if status == .completed || status == .cancelled {
                 Task { @MainActor in
@@ -365,6 +383,20 @@ public final class AppContext {
                 "rows": .number(Double(health.rows)),
                 "cols": .number(Double(health.cols))
             ]))
+        }
+
+        // Flush any pending debounced usage writes before the process exits so no
+        // token counts are lost at quit. The observer fires on MainActor (same as
+        // AppContext), so `self` access is safe. NotificationCenter retains the
+        // observer token; it lives as long as the app process does.
+        if !AppContext.isRunningUnitTests {
+            NotificationCenter.default.addObserver(
+                forName: NSApplication.willTerminateNotification,
+                object: nil,
+                queue: .main
+            ) { [weak self] _ in
+                self?.flushPendingTokenSaverUsage()
+            }
         }
 
         // restore last snapshot if any
@@ -832,18 +864,87 @@ public final class AppContext {
         // compression and SR1 humanization), never synthesized from provider
         // token-usage events.
         let eligibleRuns = settings.tokenSaverEnabled ? 1 : 0
-        do {
-            _ = try TokenSaverUsageStore(appSupportDirectory: appSupportDirectory).record(
+
+        // Accumulate into the pending buffer instead of writing to disk per event.
+        // A debounced Task will flush to disk after the quiet window; the run-end
+        // and app-quit paths force an immediate flush so no tokens are ever lost.
+        if var pending = pendingUsageByRun[runId] {
+            pending.totalTokens += usage.totalTokens
+            pending.eligibleRuns += eligibleRuns
+            pending.currentSessionTokens = max(pending.currentSessionTokens, usage.totalTokens)
+            if let window = usage.contextWindow {
+                pending.currentSessionLimitTokens = max(pending.currentSessionLimitTokens ?? 0, window)
+            }
+            pendingUsageByRun[runId] = pending
+        } else {
+            pendingUsageByRun[runId] = PendingUsage(
                 provider: run.provider,
-                actualProviderTokens: usage.totalTokens,
-                estimatedRawTokens: usage.totalTokens,
+                totalTokens: usage.totalTokens,
                 eligibleRuns: eligibleRuns,
                 currentSessionTokens: usage.totalTokens,
                 currentSessionLimitTokens: usage.contextWindow
             )
-            scheduleTokenSaverUsageChangedNotification()
-        } catch {
-            NSLog("RemoteCode Token Saver usage record failed: \(error)")
+        }
+        schedulePendingUsageFlush()
+    }
+
+    /// Schedules a debounced flush; resets the timer on each call so many rapid
+    /// events coalesce into a single disk write after the quiet window.
+    private func schedulePendingUsageFlush() {
+        pendingUsageFlushTask?.cancel()
+        pendingUsageFlushTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(Self.tokenSaverUsageDebounceInterval * 1_000_000_000))
+            guard !Task.isCancelled else { return }
+            await MainActor.run { [weak self] in
+                self?.flushPendingTokenSaverUsage()
+            }
+        }
+    }
+
+    /// Writes all accumulated usage to disk off the main thread.
+    /// Pass a specific `runId` to flush only that run (used at run-end);
+    /// pass `nil` to flush every pending run (used at app quit).
+    func flushPendingTokenSaverUsage(runId: AgentRunID? = nil) {
+        let keysToFlush: [AgentRunID]
+        if let runId {
+            guard pendingUsageByRun[runId] != nil else { return }
+            keysToFlush = [runId]
+        } else {
+            keysToFlush = Array(pendingUsageByRun.keys)
+        }
+        guard !keysToFlush.isEmpty else { return }
+
+        // Cancel the debounce timer -- the explicit flush supersedes it.
+        if runId == nil {
+            pendingUsageFlushTask?.cancel()
+            pendingUsageFlushTask = nil
+        }
+
+        let snapshots: [(AgentRunID, PendingUsage)] = keysToFlush.compactMap { key in
+            guard let pending = pendingUsageByRun.removeValue(forKey: key) else { return nil }
+            return (key, pending)
+        }
+        guard !snapshots.isEmpty else { return }
+
+        let appSupportDir = appSupportDirectory
+        backgroundWriterQueue.async { [weak self] in
+            for (_, pending) in snapshots {
+                do {
+                    _ = try TokenSaverUsageStore(appSupportDirectory: appSupportDir).record(
+                        provider: pending.provider,
+                        actualProviderTokens: pending.totalTokens,
+                        estimatedRawTokens: pending.totalTokens,
+                        eligibleRuns: pending.eligibleRuns,
+                        currentSessionTokens: pending.currentSessionTokens,
+                        currentSessionLimitTokens: pending.currentSessionLimitTokens
+                    )
+                } catch {
+                    NSLog("RemoteCode Token Saver usage record failed: \(error)")
+                }
+            }
+            DispatchQueue.main.async { [weak self] in
+                self?.scheduleTokenSaverUsageChangedNotification()
+            }
         }
     }
 
