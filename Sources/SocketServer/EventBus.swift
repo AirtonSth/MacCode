@@ -69,15 +69,42 @@ public final class EventBus: @unchecked Sendable {
     }
 
     public func reloadFromPersistence(lastSeq: Int64, recent: [Event]) {
+        // --- snapshot under lock (cheap: set + closure capture) ---
+        lock.lock()
+        let knownSeqs = Set(self.recent.map(\.seq))
+        let retain = shouldRetainRecentEvent  // capture while holding lock, same as publish()
+        lock.unlock()
+
+        // --- precompute off the lock (expensive: filter + encode) ---
+        // `recent` is the caller-provided immutable parameter (no lock needed).
+        // `knownSeqs` and `retain` are immutable snapshots captured under the lock above.
+        // We encode only the events that are new relative to the snapshot; events that
+        // arrive via publish() between the two lock regions are not in `recent` at all
+        // and are handled correctly by the per-event path in publish().
+        var newEncoded: [Int64: Data] = [:]
+        let candidates = recent.filter { ev in
+            guard !knownSeqs.contains(ev.seq) else { return false }
+            guard retain?(ev) ?? true else { return false }
+            let d = (try? encoder.encode(ev)) ?? Data()
+            newEncoded[ev.seq] = d
+            return true
+        }
+
+        // --- assign under lock (cheap: dedup check, append, sort, byte-count, trim) ---
+        // Re-check against the live self.recent to handle events that publish() may have
+        // added between the two lock regions; encoding is already done via newEncoded.
         lock.lock()
         self.lastSeq = max(self.lastSeq, lastSeq)
-        // append unique events
-        let known = Set(self.recent.map(\.seq))
-        for ev in recent where !known.contains(ev.seq) && (shouldRetainRecentEvent?(ev) ?? true) {
-            retainRecent(ev)
+        let liveKnown = Set(self.recent.map(\.seq))
+        for ev in candidates where !liveKnown.contains(ev.seq) {
+            let bytes = newEncoded[ev.seq]?.count ?? 0
+            guard recentLimit > 0, recentByteLimit > 0, bytes <= recentByteLimit else { continue }
+            // populate cache before appending so trimRecent's encodedSize hits the cache
+            if let d = newEncoded[ev.seq] { encodedCache[ev.seq] = d }
+            self.recent.append(ev)
+            self.recentBytes += bytes
         }
         self.recent.sort { $0.seq < $1.seq }
-        rebuildRecentByteCount()
         trimRecent()
         lock.unlock()
     }
@@ -157,10 +184,6 @@ public final class EventBus: @unchecked Sendable {
             recentBytes = max(0, recentBytes - encodedSize(removed))
             encodedCache.removeValue(forKey: removed.seq)
         }
-    }
-
-    private func rebuildRecentByteCount() {
-        recentBytes = recent.reduce(0) { $0 + encodedSize($1) }
     }
 
     /// Returns the JSON-encoded bytes for `ev`, encoding at most once per event.

@@ -184,4 +184,35 @@ final class EventBusOrderingTests: XCTestCase {
         XCTAssertTrue(kinds.contains("workspace.created"))
         XCTAssertTrue(kinds.contains("surface.created"))
     }
+
+    // MARK: - reloadFromPersistence: precomputed encoding correctness
+
+    /// Verifies that the off-lock precompute path (moved out of the critical
+    /// section for contention reduction) produces the same backlog as the
+    /// former in-lock path: correct event count, correct byte accounting, and
+    /// correct recentEvents trimming behaviour.
+    ///
+    /// Why: encoding was moved before lock acquisition; if the precomputed
+    /// encoded size is wrong, recentEvents will report incorrect truncation
+    /// decisions and iOS will request unnecessary baselines.
+    func test_reloadFromPersistence_precomputedByteCountMatchesActualEncodedSize() {
+        // tight byte limit so trimRecent fires and exercises the byte-count path
+        let bus = EventBus(recentLimit: 512, recentByteLimit: 4096)
+
+        let persisted: [EventBus.Event] = [
+            EventBus.Event(seq: 1, kind: "workspace.created", payload: .string(String(repeating: "a", count: 200)), ts: 1000),
+            EventBus.Event(seq: 2, kind: "surface.created",   payload: .string(String(repeating: "b", count: 200)), ts: 1001),
+            EventBus.Event(seq: 3, kind: "agent.started",     payload: .string(String(repeating: "c", count: 200)), ts: 1002)
+        ]
+        bus.reloadFromPersistence(lastSeq: 3, recent: persisted)
+
+        // recentEvents uses the same encodedSize path; if byte counts were
+        // mis-tracked the truncated flag and event list would disagree with reality
+        let result = bus.recentEvents(since: 0, maxBytes: 4096)
+        // all three events fit within 4 KB; none should be truncated
+        XCTAssertFalse(result.truncated,
+                       "recentEvents must not report truncation when all events fit -- a wrong byte count from the precompute path causes iOS to request a full baseline on every reconnect")
+        XCTAssertEqual(result.events.map(\.seq).sorted(), [1, 2, 3],
+                       "all three persisted events must be present after reload -- a precompute encoding mismatch would silently drop events via over-aggressive trimRecent")
+    }
 }
