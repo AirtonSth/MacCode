@@ -33,11 +33,36 @@ public final class PaneTabsView: NSObject {
     private let addMenu = NSMenu()
     private let splitRightMenu = NSMenu()
     private let splitDownMenu = NSMenu()
+    // UX: overflow menu button -- always visible at the leading edge of the
+    // right-control cluster. Pops an NSMenu listing all tabs; selecting one
+    // routes through selectSurface so scroll-into-view fires via reconcile.
+    private let overflowButton: NSButton = {
+        let b = NoDragButton(frame: .zero)
+        b.translatesAutoresizingMaskIntoConstraints = false
+        b.isBordered = false
+        b.bezelStyle = .inline
+        b.imagePosition = .imageOnly
+        b.image = NSImage(systemSymbolName: "chevron.down", accessibilityDescription: "All tabs")
+        b.symbolConfiguration = .init(pointSize: 11, weight: .regular)
+        b.contentTintColor = DS.NS.textSecondary
+        b.toolTip = "All tabs"
+        b.wantsLayer = true
+        b.layer?.cornerRadius = DS.Radius.control
+        NSLayoutConstraint.activate([
+            b.widthAnchor.constraint(equalToConstant: 22),
+            b.heightAnchor.constraint(equalToConstant: 22)
+        ])
+        b.setAccessibilityIdentifier("pane.overflowMenu")
+        return b
+    }()
     private var tabButtons: [SurfaceID: PaneTabButton] = [:]
     // PERF: ordered SurfaceIDs currently rendered in the strip. The diff
     // seam (`PaneTabsView.diffTabs`) compares this against the fresh pane
     // order to patch the strip in place instead of rebuilding it.
     private var currentSurfaceIDs: [SurfaceID] = []
+    // UX: last-known selected surface ID so the non-structural reconcile path
+    // can skip scrolling when only dirty/busy/title changed (no selection change).
+    private var currentSelectedID: SurfaceID?
     private var eventToken: UUID?
     // UX-P3: holds the surface ID shown in a missing-surface placeholder so
     // the "Close Tab" recovery button can route through closeSurface.
@@ -172,7 +197,12 @@ public final class PaneTabsView: NSObject {
             target: self, action: #selector(showSplitDownMenu(_:)))
         splitRows.setAccessibilityIdentifier("pane.splitDown")
 
-        var rightControls: [NSView] = [splitColumns, splitRows]
+        // UX: wire overflow button; target/action set here (not in the lazy
+        // stored-property closure) so `self` is available.
+        overflowButton.target = self
+        overflowButton.action = #selector(showOverflowMenu(_:))
+
+        var rightControls: [NSView] = [overflowButton, splitColumns, splitRows]
         if let splitContext {
             let minimized = Self.isPaneMinimized(paneIndex: splitContext.paneIndex, ratios: splitContext.ratios)
             let paneZoom = Self.makeIconButton(
@@ -254,6 +284,8 @@ public final class PaneTabsView: NSObject {
                       workspaceID: wid) else { return }
             try? router?.focusPane(workspace: target.workspace, pane: target.pane)
         }
+
+        currentSelectedID = selectedID
 
         // PERF-MAC_SHELL_WINDOW-001: the tab strip only reacts to
         // `files.state.updated`. Drop every other kind on the publishing
@@ -354,6 +386,7 @@ public final class PaneTabsView: NSObject {
                 tabStrip.insertArrangedSubview(tab, at: insertIndex)
                 insertIndex += 1
             }
+            currentSelectedID = selectedID
             DispatchQueue.main.async { [weak self] in self?.scrollSelectedTabIntoView(selectedID) }
             return false
         }
@@ -367,6 +400,14 @@ public final class PaneTabsView: NSObject {
             tab.setColorHex(TabColor.from(desc.metadata["color"])?.hex)
             tab.setDirty(surfaceIsUnsaved(desc.id))
             tab.setBusy(Self.isSurfaceBusy(desc, runningWorkspaceIDs: patchRunning, router: router))
+        }
+        // UX: scroll the newly selected tab into view ONLY when selection
+        // changed (non-structural path). Trigger: Cmd+Shift+] / overflow-menu /
+        // rename. Skip if only dirty/busy/title changed to avoid fighting
+        // the user's manual scroll position.
+        if selectedID != currentSelectedID {
+            currentSelectedID = selectedID
+            DispatchQueue.main.async { [weak self] in self?.scrollSelectedTabIntoView(selectedID) }
         }
         return true
     }
@@ -686,6 +727,52 @@ public final class PaneTabsView: NSObject {
 
     @objc private func showSplitDownMenu(_ sender: NSButton) {
         showMenu(splitDownMenu, from: sender)
+    }
+
+    /// Pure seam: builds NSMenuItems for the overflow menu from `surfaces` and
+    /// `selectedID`. Each item carries the SurfaceID as its representedObject.
+    /// Checkmark on the selected tab. Testable without a real NSButton or window.
+    static func overflowMenuItems(
+        surfaces: [SurfaceDescriptor],
+        selectedID: SurfaceID?,
+        target: AnyObject,
+        action: Selector
+    ) -> [NSMenuItem] {
+        surfaces.map { desc in
+            let item = NSMenuItem(title: desc.title, action: action, keyEquivalent: "")
+            item.target = target
+            item.representedObject = desc.id
+            item.state = desc.id == selectedID ? .on : .off
+            let img = NSImage(systemSymbolName: PaneTabsView.symbol(for: desc.type),
+                              accessibilityDescription: desc.title)
+            img?.isTemplate = true
+            item.image = img?.withSymbolConfiguration(.init(pointSize: 13, weight: .regular))
+            return item
+        }
+    }
+
+    @objc private func showOverflowMenu(_ sender: NSButton) {
+        let selectedID = pane.selectedSurfaceID ?? pane.surfaces.first?.id
+        let menu = NSMenu()
+        for item in Self.overflowMenuItems(
+            surfaces: pane.surfaces,
+            selectedID: selectedID,
+            target: self,
+            action: #selector(overflowMenuSelected(_:))
+        ) {
+            menu.addItem(item)
+        }
+        showMenu(menu, from: sender)
+    }
+
+    @objc private func overflowMenuSelected(_ sender: NSMenuItem) {
+        guard let sid = sender.representedObject as? SurfaceID else { return }
+        selectSurface(sid)
+        // Scroll-into-view is driven by the state update that selectSurface
+        // triggers (reconcile -> structural or patch path). Belt-and-suspenders:
+        // also scroll immediately so the strip follows even if reconcile is
+        // delayed or the state is already up to date.
+        DispatchQueue.main.async { [weak self] in self?.scrollSelectedTabIntoView(sid) }
     }
 
     private func showMenu(_ menu: NSMenu, from sender: NSButton) {
