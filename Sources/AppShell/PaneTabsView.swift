@@ -75,8 +75,9 @@ public final class PaneTabsView: NSObject {
         tabStrip.onDropSurface = { [weak self] sid in self?.appendDroppedSurface(sid) ?? false }
         tabScrollView.translatesAutoresizingMaskIntoConstraints = false
         tabScrollView.documentView = tabStrip
+        let initialRunning = Self.runningWorkspaceIDs(for: pane.surfaces, router: router)
         for desc in pane.surfaces {
-            let tab = makeTabButton(for: desc, in: pane, selectedID: selectedID)
+            let tab = makeTabButton(for: desc, in: pane, selectedID: selectedID, runningWorkspaceIDs: initialRunning)
             tabButtons[desc.id] = tab
             currentSurfaceIDs.append(desc.id)
             tabStrip.addArrangedSubview(tab)
@@ -274,14 +275,20 @@ public final class PaneTabsView: NSObject {
     /// Builds one tab button bound to `desc` within `pane`. Shared by the
     /// initial strip build and the reconcile's insert path so a freshly
     /// inserted button is wired identically to an initially-built one.
-    private func makeTabButton(for desc: SurfaceDescriptor, in pane: PaneNode, selectedID: SurfaceID?) -> PaneTabButton {
+    private func makeTabButton(for desc: SurfaceDescriptor, in pane: PaneNode, selectedID: SurfaceID?, runningWorkspaceIDs: Set<WorkspaceID>? = nil) -> PaneTabButton {
         let sid = desc.id
+        let busy: Bool
+        if let running = runningWorkspaceIDs {
+            busy = Self.isSurfaceBusy(desc, runningWorkspaceIDs: running, router: router)
+        } else {
+            busy = Self.isSurfaceBusy(desc, router: router)
+        }
         let btn = PaneTabButton(
             surfaceID: sid,
             title: desc.title,
             symbol: Self.symbol(for: desc.type),
             selected: desc.id == selectedID,
-            busy: Self.isSurfaceBusy(desc, router: router),
+            busy: busy,
             dirty: surfaceIsUnsaved(sid),
             colorHex: TabColor.from(desc.metadata["color"])?.hex,
             onSelect: { [weak self] in self?.selectSurface(sid) },
@@ -332,9 +339,10 @@ public final class PaneTabsView: NSObject {
             }
             tabButtons.removeAll(keepingCapacity: true)
             currentSurfaceIDs.removeAll(keepingCapacity: true)
+            let structuralRunning = Self.runningWorkspaceIDs(for: pane.surfaces, router: router)
             var insertIndex = 0
             for desc in pane.surfaces {
-                let tab = makeTabButton(for: desc, in: pane, selectedID: selectedID)
+                let tab = makeTabButton(for: desc, in: pane, selectedID: selectedID, runningWorkspaceIDs: structuralRunning)
                 tabButtons[desc.id] = tab
                 currentSurfaceIDs.append(desc.id)
                 tabStrip.insertArrangedSubview(tab, at: insertIndex)
@@ -345,13 +353,14 @@ public final class PaneTabsView: NSObject {
         }
 
         // Unchanged shape: patch each surviving button in place.
+        let patchRunning = Self.runningWorkspaceIDs(for: pane.surfaces, router: router)
         for desc in pane.surfaces {
             guard let tab = tabButtons[desc.id] else { continue }
             tab.setSelected(desc.id == selectedID)
             tab.setTitle(desc.title)
             tab.setColorHex(TabColor.from(desc.metadata["color"])?.hex)
             tab.setDirty(surfaceIsUnsaved(desc.id))
-            tab.setBusy(Self.isSurfaceBusy(desc, router: router))
+            tab.setBusy(Self.isSurfaceBusy(desc, runningWorkspaceIDs: patchRunning, router: router))
         }
         return true
     }
@@ -536,8 +545,9 @@ public final class PaneTabsView: NSObject {
     }
 
     func refreshBusyStates() {
+        let running = Self.runningWorkspaceIDs(for: pane.surfaces, router: router)
         for desc in pane.surfaces {
-            tabButtons[desc.id]?.setBusy(Self.isSurfaceBusy(desc, router: router))
+            tabButtons[desc.id]?.setBusy(Self.isSurfaceBusy(desc, runningWorkspaceIDs: running, router: router))
         }
     }
 
@@ -560,6 +570,30 @@ public final class PaneTabsView: NSObject {
               let workspaceID = workspaceID(for: desc, router: router),
               let context = router?.context else { return false }
         return ((try? context.threadRepo.list(workspaceId: workspaceID)) ?? []).contains { $0.status == .running }
+    }
+
+    /// PERF: variant that takes a pre-computed running-workspace set so callers
+    /// iterating multiple tabs share ONE query instead of one per tab.
+    /// Criterion is identical to isSurfaceBusy(_:router:): SurfaceRegistry busy
+    /// check first, then membership in the running set for agentApp surfaces.
+    static func isSurfaceBusy(_ desc: SurfaceDescriptor, runningWorkspaceIDs: Set<WorkspaceID>, router: AppCommandRouter?) -> Bool {
+        if SurfaceRegistry.shared.surface(desc.id)?.isBusy == true { return true }
+        guard desc.type == .agentApp,
+              let wid = workspaceID(for: desc, router: router) else { return false }
+        return runningWorkspaceIDs.contains(wid)
+    }
+
+    /// PERF: collects the unique workspace IDs referenced by agentApp surfaces
+    /// in `surfaces`, then fires ONE runningWorkspaceIds(in:) query. Returns the
+    /// set of workspace IDs that have at least one running thread.
+    static func runningWorkspaceIDs(for surfaces: [SurfaceDescriptor], router: AppCommandRouter?) -> Set<WorkspaceID> {
+        guard let context = router?.context else { return [] }
+        let ids: [WorkspaceID] = surfaces.compactMap { desc in
+            guard desc.type == .agentApp else { return nil }
+            return workspaceID(for: desc, router: router)
+        }
+        guard !ids.isEmpty else { return [] }
+        return (try? context.threadRepo.runningWorkspaceIds(in: ids)) ?? []
     }
 
     private static func workspaceID(for desc: SurfaceDescriptor, router: AppCommandRouter?) -> WorkspaceID? {

@@ -1269,6 +1269,43 @@ final class PaneActionTests: XCTestCase {
         XCTAssertNil(SurfaceRegistry.shared.surface(b.id), "b must be unregistered after batch close")
         XCTAssertNil(SurfaceRegistry.shared.surface(c.id), "c must be unregistered after batch close")
     }
+
+    // PERF: verifies that the batch isSurfaceBusy overload produces the same
+    // result as the per-tab original. If a running thread exists the batch set
+    // must flag that workspace busy; if no thread is running both paths must
+    // agree it is not busy. Catches any drift between the batch criterion and
+    // the original threadRepo.list per-tab check.
+    func test_batchIsSurfaceBusy_matchesPerTabResult() throws {
+        let (ctx, router) = try makeContext()
+        let ws = try router.createWorkspace(name: "batch-busy", cwd: NSTemporaryDirectory())
+        let desc = try router.createSurface(workspace: ws.id, type: .agentApp, paneID: nil, title: "Agent")
+
+        // No running thread: both paths must agree -- not busy.
+        let runningEmpty = PaneTabsView.runningWorkspaceIDs(for: [desc], router: router)
+        XCTAssertFalse(
+            PaneTabsView.isSurfaceBusy(desc, runningWorkspaceIDs: runningEmpty, router: router),
+            "batch path must agree with per-tab: not busy when no thread is running"
+        )
+        XCTAssertFalse(
+            PaneTabsView.isSurfaceBusy(desc, router: router),
+            "per-tab original must also report not busy when no thread is running"
+        )
+
+        // Insert a running thread: both paths must agree -- busy.
+        var thread = AgentThread(workspaceId: ws.id, title: "T", provider: .codex, model: "m")
+        thread.status = .running
+        try ctx.threadRepo.upsert(thread)
+
+        let runningFull = PaneTabsView.runningWorkspaceIDs(for: [desc], router: router)
+        XCTAssertTrue(
+            PaneTabsView.isSurfaceBusy(desc, runningWorkspaceIDs: runningFull, router: router),
+            "batch path must agree with per-tab: busy when a thread in the workspace is running"
+        )
+        XCTAssertTrue(
+            PaneTabsView.isSurfaceBusy(desc, router: router),
+            "per-tab original must also report busy when a running thread exists"
+        )
+    }
 }
 
 @MainActor
