@@ -627,6 +627,39 @@ func filesMinimalEdit(from old: String, to new: String) -> (location: Int, lengt
     return (location, length, replacement)
 }
 
+/// Returns the UTF-16 NSRange that covers the basename of `name` (everything
+/// before the last dot), so a rename text-field can pre-select the basename
+/// and leave the extension intact.
+///
+/// Rules (UTF-16 units; NSTextField selectedRange must be in UTF-16):
+///   - Empty string          -> NSRange(location:0, length:0)
+///   - Dotfile (.gitignore)  -> full range (leading dot is not an extension separator)
+///   - No extension (Makefile) -> full range
+///   - foo.tar.gz            -> covers "foo.tar" (last-dot rule)
+///   - Unicode/emoji names   -> lengths computed via NSString so surrogate pairs count correctly
+func filesBasenameSelectionRange(for name: String) -> NSRange {
+    let ns = name as NSString
+    let totalLength = ns.length
+    guard totalLength > 0 else { return NSRange(location: 0, length: 0) }
+    // Dotfile: name starts with "." and has no other dot -> select all.
+    // Also catches pure dotfiles with extensions like ".env.local": the leading
+    // dot is part of the stem, so we use last-dot on the suffix after index 1.
+    // Find the last dot that is NOT the first character.
+    var lastDotUTF16: Int? = nil
+    // Scan UTF-16 units; '.' is U+002E, a single UTF-16 unit.
+    for i in 1..<totalLength {
+        if ns.character(at: i) == UInt16(UInt8(ascii: ".")) {
+            lastDotUTF16 = i
+        }
+    }
+    guard let dotIndex = lastDotUTF16 else {
+        // No dot after position 0: no extension (or pure dotfile). Select all.
+        return NSRange(location: 0, length: totalLength)
+    }
+    // Basename spans [0, dotIndex).
+    return NSRange(location: 0, length: dotIndex)
+}
+
 @MainActor
 private final class FilesViewModel: ObservableObject {
     @Published var currentDirectory = ""
@@ -1695,6 +1728,15 @@ private struct FilesSurfaceRoot: View {
         selectedFileIDs = [entry.id]
         renamingEntry = entry
         renameText = entry.name
+        // Pre-select the basename (not the extension) once the alert's text field
+        // becomes first responder. The alert is presented asynchronously by SwiftUI,
+        // so we defer one run-loop turn to reach the field editor.
+        let selectionRange = filesBasenameSelectionRange(for: entry.name)
+        DispatchQueue.main.async {
+            guard let window = NSApp.keyWindow,
+                  let editor = window.fieldEditor(false, for: nil) as? NSTextView else { return }
+            editor.selectedRange = selectionRange
+        }
     }
 
     private func commitRename() {
