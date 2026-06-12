@@ -161,7 +161,9 @@ public final class SidebarViewModel: ObservableObject {
     public func reload() {
         guard let ctx = context else { return }
         let loaded = (try? router?.listWorkspaces()) ?? ctx.state.window.workspaces.compactMap { ctx.state.workspaces[$0] }
-        workspaces = loaded
+        if loaded != workspaces {
+            workspaces = loaded
+        }
         selectedWorkspaceID = ctx.state.window.selectedWorkspaceID
         selectedWorkspaceIDs = selectedWorkspaceIDs.intersection(Set(workspaces.map(\.id)))
         reloadPrivateAccount()
