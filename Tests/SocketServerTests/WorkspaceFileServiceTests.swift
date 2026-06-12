@@ -102,6 +102,45 @@ final class WorkspaceFileServiceTests: XCTestCase {
                              "bulk delete must not allow deleting the workspace root")
     }
 
+    func testListUsesExtensionClassificationAndDoesNotReadFileBytes() throws {
+        // Write a .swift file that contains raw binary bytes so content-based
+        // classification would disagree with the extension. Listing must return
+        // the extension-derived kind ("code") and must NOT read the bytes -- which
+        // is verified by confirming the kind matches the extension, not the content.
+        let swiftFile = root.appendingPathComponent("Main.swift")
+        try Data([0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10]).write(to: swiftFile) // JPEG magic bytes
+
+        let listed = try service.list(root: root.path, path: nil)
+        let entries = try XCTUnwrap(listed.objectValue?["entries"]?.arrayValue)
+        let entry = try XCTUnwrap(entries.first(where: { $0.objectValue?["name"]?.stringValue == "Main.swift" }))
+        let identity = try XCTUnwrap(entry.objectValue?["identity"]?.objectValue)
+
+        XCTAssertEqual(identity["kind"]?.stringValue, "code",
+                       "listing must classify by extension only; reading file bytes in a directory listing is wasteful and must not occur")
+        XCTAssertEqual(identity["language"]?.stringValue, "swift",
+                       "language must be derived from the file extension without reading content")
+    }
+
+    func testListIdentitySchemaMatchesAllConsumerFields() throws {
+        // FilesSurface consumes kind, mime, is_editable, editability_reason, language.
+        // All must be present in listing entries so the sidebar can render without a
+        // second round-trip to read the file.
+        let file = root.appendingPathComponent("readme.md")
+        try "# hello".write(to: file, atomically: true, encoding: .utf8)
+
+        let listed = try service.list(root: root.path, path: nil)
+        let entries = try XCTUnwrap(listed.objectValue?["entries"]?.arrayValue)
+        let entry = try XCTUnwrap(entries.first(where: { $0.objectValue?["name"]?.stringValue == "readme.md" }))
+        let identity = try XCTUnwrap(entry.objectValue?["identity"]?.objectValue)
+
+        XCTAssertNotNil(identity["kind"]?.stringValue, "FilesSurface requires identity.kind in listing")
+        XCTAssertNotNil(identity["mime"]?.stringValue, "FilesSurface requires identity.mime in listing")
+        XCTAssertNotNil(identity["is_editable"], "FilesSurface requires identity.is_editable in listing")
+        XCTAssertNotNil(identity["editability_reason"]?.stringValue, "FilesSurface requires identity.editability_reason in listing")
+        // language is optional for md but the key must be present (null is valid)
+        XCTAssertTrue(identity.keys.contains("language"), "FilesSurface reads identity.language; key must exist in listing entries")
+    }
+
     func testEditSaveRejectsExternallyGrownFileBeforeReadingWholeFile() throws {
         let file = root.appendingPathComponent("notes.txt")
         try "small".write(to: file, atomically: true, encoding: .utf8)

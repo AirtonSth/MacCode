@@ -361,6 +361,63 @@ public struct WorkspaceFileService: Sendable {
         !name.isEmpty && name != "." && name != ".." && !name.contains("/") && !name.contains(":")
     }
 
+    /// Cheap classification from extension + metadata only. No file bytes are read.
+    /// Used for directory listings where reading every child's content is wasteful.
+    /// The full content-based classify() is used on read/open.
+    private func classifyByExtension(url: URL, size: Int64, modifiedAt: Date?, isSymlink: Bool) -> FileIdentity {
+        let ext = url.pathExtension.lowercased()
+        let uti = UTType(filenameExtension: ext)
+        let language = languageName(ext: ext)
+        let kind: String
+        if ext == "md" || ext == "markdown" {
+            kind = "markdown"
+        } else if ext == "html" || ext == "htm" {
+            kind = "html"
+        } else if language != nil {
+            kind = "code"
+        } else if imageExtensions.contains(ext) {
+            kind = "image"
+        } else if videoExtensions.contains(ext) {
+            kind = "video"
+        } else if ext == "pdf" {
+            kind = "pdf"
+        } else if let utiVal = uti, utiVal.conforms(to: .text) {
+            kind = "text"
+        } else {
+            kind = "unknown"
+        }
+        let isText = ["markdown", "html", "code", "text"].contains(kind)
+        let writable = FileManager.default.isWritableFile(atPath: url.path)
+        let isEditable = isText && size <= Int64(WorkspaceFileLimits.editBytes) && writable
+        let reason: String
+        if isEditable {
+            reason = "editable \(kind)"
+        } else if isSymlink {
+            reason = "symlink outside workspace or unreadable"
+        } else if !isText {
+            reason = kind == "unknown" ? "binary or unknown file" : "\(kind) preview is read-only"
+        } else if size > Int64(WorkspaceFileLimits.editBytes) {
+            reason = "file is too large to edit"
+        } else if !writable {
+            reason = "file is not writable"
+        } else {
+            reason = "not editable"
+        }
+        return FileIdentity(
+            kind: kind,
+            mime: uti?.preferredMIMEType ?? fallbackMIME(ext: ext, kind: kind),
+            uti: uti?.identifier,
+            ext: ext,
+            size: size,
+            modifiedAt: modifiedAt,
+            isBinary: !isText,
+            isTextReadable: isText,
+            isEditable: isEditable,
+            editabilityReason: reason,
+            language: kind == "markdown" ? "markdown" : (kind == "html" ? "html" : language)
+        )
+    }
+
     private func entryJSON(root: URL, url: URL, values: URLResourceValues? = nil) -> [String: JSONValue] {
         let resourceValues: URLResourceValues?
         if let values {
@@ -369,19 +426,28 @@ public struct WorkspaceFileService: Sendable {
             resourceValues = try? url.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey, .fileSizeKey, .contentModificationDateKey])
         }
         let isDirectory = resourceValues?.isDirectory == true
-        let identity = (try? classify(root: root, path: url.path)) ?? FileIdentity(
-            kind: isDirectory ? "directory" : "unknown",
-            mime: "application/octet-stream",
-            uti: nil,
-            ext: url.pathExtension.lowercased(),
-            size: Int64(resourceValues?.fileSize ?? 0),
-            modifiedAt: resourceValues?.contentModificationDate,
-            isBinary: !isDirectory,
-            isTextReadable: false,
-            isEditable: false,
-            editabilityReason: resourceValues?.isSymbolicLink == true ? "symlink outside workspace or unreadable" : "unreadable",
-            language: nil
-        )
+        let size = Int64(resourceValues?.fileSize ?? 0)
+        let modifiedAt = resourceValues?.contentModificationDate
+        let isSymlink = resourceValues?.isSymbolicLink == true
+        let identity: FileIdentity
+        if isDirectory {
+            let ext = url.pathExtension.lowercased()
+            identity = FileIdentity(
+                kind: "directory",
+                mime: "inode/directory",
+                uti: "public.folder",
+                ext: ext,
+                size: size,
+                modifiedAt: modifiedAt,
+                isBinary: false,
+                isTextReadable: false,
+                isEditable: false,
+                editabilityReason: "directory",
+                language: nil
+            )
+        } else {
+            identity = classifyByExtension(url: url, size: size, modifiedAt: modifiedAt, isSymlink: isSymlink)
+        }
         return [
             "name": .string(url.lastPathComponent),
             "path": .string(url.path),
@@ -391,7 +457,7 @@ public struct WorkspaceFileService: Sendable {
             "size": .number(Double(identity.size)),
             "modified_at": identity.modifiedAt.map { .number($0.timeIntervalSince1970) } ?? .null,
             "is_hidden": .bool(url.lastPathComponent.hasPrefix(".")),
-            "is_symlink": .bool(resourceValues?.isSymbolicLink == true),
+            "is_symlink": .bool(isSymlink),
             "identity": identity.json
         ]
     }
