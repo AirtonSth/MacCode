@@ -668,6 +668,13 @@ private final class FilesViewModel: ObservableObject {
     private var eventToken: UUID?
     private var sessionCache: [String: EditSessionSnapshot] = [:]
     private var sessionPath: String?
+    /// Interval (seconds) used to coalesce rapid keystrokes before sending a patch.
+    /// Named constant so it can be referenced in tests or tuned without a grep.
+    private static let editorDebounceInterval: TimeInterval = 0.15
+    /// Pending debounce timer; (re)set on each editorChanged call, fired once per burst.
+    private var editorDebounceTimer: Timer?
+    /// Text captured by the most recent editorChanged call, applied when the timer fires.
+    private var pendingDebounceText: String?
 
     private struct EditSessionSnapshot {
         var sessionID: String
@@ -695,6 +702,14 @@ private final class FilesViewModel: ObservableObject {
     }
 
     func close() {
+        // Flush any buffered keystroke before tearing down: apply the pending draft
+        // immediately so no unsaved content is lost when the surface closes.
+        editorDebounceTimer?.invalidate()
+        editorDebounceTimer = nil
+        if let text = pendingDebounceText {
+            pendingDebounceText = nil
+            if !applying { applyFullDraft(text) }
+        }
         if let eventToken { EventBus.shared.unsubscribe(eventToken) }
         if let sessionID { _ = try? router?.filesEditClose(sessionID: sessionID) }
     }
@@ -851,11 +866,24 @@ private final class FilesViewModel: ObservableObject {
 
     func editorChanged(_ value: String) {
         guard !suppressEditorChange, sessionID != nil, value != lastSyncedText else { return }
-        if applying {
-            pendingText = value
-            return
+        // Capture the latest text so the timer always applies the final state of the burst.
+        pendingDebounceText = value
+        // Cancel any in-flight timer and reschedule; the last keystroke wins.
+        editorDebounceTimer?.invalidate()
+        editorDebounceTimer = Timer.scheduledTimer(
+            withTimeInterval: Self.editorDebounceInterval,
+            repeats: false
+        ) { [weak self] _ in
+            guard let self else { return }
+            self.editorDebounceTimer = nil
+            guard let text = self.pendingDebounceText else { return }
+            self.pendingDebounceText = nil
+            if self.applying {
+                self.pendingText = text
+                return
+            }
+            self.applyFullDraft(text)
         }
-        applyFullDraft(value)
     }
 
     func save() {
