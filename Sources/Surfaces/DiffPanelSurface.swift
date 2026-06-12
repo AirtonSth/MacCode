@@ -854,6 +854,7 @@ public struct DiffPanelView: View {
                 .textFieldStyle(.plain)
                 .font(DS.Font.monoSmall)
                 .focused($newBranchFocused)
+                .dsFocusRing(isFocused: newBranchFocused)
                 .onSubmit(confirmNewBranch)
                 .onExitCommand(perform: cancelNewBranch)   // UX-013: Esc cancels.
                 .accessibilityIdentifier("diff.newBranch.field")

@@ -1537,6 +1537,7 @@ public struct AccountView: View {
                     .textFieldStyle(.roundedBorder)
                     .font(DS.Font.body)
                     .focused($focusedField, equals: .email)
+                    .dsFocusRing(isFocused: focusedField == .email)
                     .onSubmit { focusedField = .password }
                     .accessibilityIdentifier("account.email")
             }
@@ -1556,6 +1557,7 @@ public struct AccountView: View {
                     .textFieldStyle(.roundedBorder)
                     .font(DS.Font.body)
                     .focused($focusedField, equals: .password)
+                    .dsFocusRing(isFocused: focusedField == .password)
                     .onSubmit { Task { await vm.connectPrivateAccount() } }
                     .accessibilityIdentifier("account.password")
                     Button {
