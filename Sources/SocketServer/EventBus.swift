@@ -211,6 +211,29 @@ public final class EventBus: @unchecked Sendable {
         }
     }
 
+    // MARK: - Test-visible accessors (read-only; no production callers)
+
+    /// WHY: flood stress tests must assert that recent buffer count stays <= recentLimit
+    /// without accessing private state. Read-only; zero production impact.
+    public var subscriberCountForTests: Int {
+        lock.lock(); defer { lock.unlock() }
+        return subscribers.count
+    }
+
+    /// WHY: flood stress tests must assert that recent buffer count stays <= recentLimit.
+    /// Read-only; zero production impact.
+    public var recentCountForTests: Int {
+        lock.lock(); defer { lock.unlock() }
+        return recent.count
+    }
+
+    /// WHY: flood stress tests must assert that accumulated bytes stay <= recentByteLimit.
+    /// Read-only; zero production impact.
+    public var recentBytesForTests: Int {
+        lock.lock(); defer { lock.unlock() }
+        return recentBytes
+    }
+
     /// Returns the JSON-encoded bytes for `ev`, encoding at most once per event.
     /// Callers inside the lock may call this freely; the cache is also lock-protected.
     func encodedData(for ev: Event) -> Data {
