@@ -143,6 +143,10 @@ public final class SidebarViewModel: ObservableObject {
     /// UX-MAC_SHELL_WINDOW-012: the row the drag is currently hovering,
     /// so the list can draw an insertion line instead of reordering live.
     @Published public var dropTargetWorkspaceID: WorkspaceID?
+    /// :18 -- Edge auto-scroll direction during a drag. -1 = scroll up (near top),
+    /// 0 = no scroll, +1 = scroll down (near bottom). Set by WorkspaceDropDelegate;
+    /// observed by SidebarRootView to drive a timer-based NSScrollView scroll.
+    @Published public var dragScrollEdge: Int = 0
     private var selectionAnchorID: WorkspaceID?
     /// Session-local undo stack for removed workspaces. Newest entry at end.
     /// Not persisted; cleared on app quit.
@@ -1024,7 +1028,10 @@ public final class SidebarViewModel: ObservableObject {
     // MARK: cmux-style workspace editing (AppKit prompts — reliable,
     // no SwiftUI sheet plumbing).
 
-    private func prompt(title: String, message: String, initial: String, multiline: Bool = false) -> String? {
+    /// Builds and configures the NSAlert+accessoryView used by rename/description prompts.
+    /// Pure setup -- no modal call. Separated so both the sheet and runModal paths
+    /// share identical alert configuration.
+    private func buildPromptAlert(title: String, message: String, initial: String, multiline: Bool) -> (NSAlert, NSTextField) {
         let alert = NSAlert()
         alert.messageText = title
         alert.informativeText = message
@@ -1047,39 +1054,66 @@ public final class SidebarViewModel: ObservableObject {
         field.placeholderString = title
         alert.accessoryView = field
         alert.window.initialFirstResponder = field
-        return alert.runModal() == .alertFirstButtonReturn
-            ? field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-            : nil
+        return (alert, field)
+    }
+
+    /// :15 -- Presents a text-input prompt as a window sheet when a window is
+    /// available. Falls back to runModal (blocking) when there is no key window
+    /// (e.g. headless tests) so synchronous test callers are unaffected.
+    ///
+    /// WHY sheet: NSAlert.runModal() blocks all windows in the app, including
+    /// detached workspace windows. beginSheetModal attaches the dialog to the
+    /// specific window so other windows remain responsive.
+    private func presentPromptSheet(title: String, message: String, initial: String, multiline: Bool = false, completion: @escaping (String?) -> Void) {
+        let (alert, field) = buildPromptAlert(title: title, message: message, initial: initial, multiline: multiline)
+        if let window = NSApp.keyWindow {
+            alert.beginSheetModal(for: window) { response in
+                completion(response == .alertFirstButtonReturn
+                    ? field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+                    : nil)
+            }
+        } else {
+            // Fallback: no window (headless / test). runModal is synchronous;
+            // completion fires before this function returns.
+            let response = alert.runModal()
+            completion(response == .alertFirstButtonReturn
+                ? field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+                : nil)
+        }
     }
 
     public func renameWorkspace(_ ws: Workspace) {
-        guard let name = prompt(title: "Rename workspace",
-                                message: "New name for \"\(ws.name)\".",
-                                initial: ws.name) else { return }
-        // UX-P3: whitespace-only rename must show an error rather than silently
-        // doing nothing, so the user knows the save was rejected.
-        guard !name.isEmpty else {
-            showOperationError("Rename not saved",
-                               detail: "A workspace name cannot be blank. Please enter at least one non-whitespace character.")
-            return
-        }
-        do {
-            try router?.renameWorkspace(ws.id, name)
-        } catch {
-            showOperationError("Could not rename workspace", detail: error.localizedDescription)
+        presentPromptSheet(title: "Rename workspace",
+                           message: "New name for \"\(ws.name)\".",
+                           initial: ws.name) { [weak self] name in
+            guard let self, let name else { return }
+            // UX-P3: whitespace-only rename must show an error rather than silently
+            // doing nothing, so the user knows the save was rejected.
+            guard !name.isEmpty else {
+                self.showOperationError("Rename not saved",
+                                       detail: "A workspace name cannot be blank. Please enter at least one non-whitespace character.")
+                return
+            }
+            do {
+                try self.router?.renameWorkspace(ws.id, name)
+            } catch {
+                self.showOperationError("Could not rename workspace", detail: error.localizedDescription)
+            }
         }
     }
 
     public func editDescription(_ ws: Workspace) {
         let current = ws.metadata["description"] ?? ""
-        guard let text = prompt(title: "Workspace description",
-                                message: "Optional note for \"\(ws.name)\".",
-                                initial: current,
-                                multiline: true) else { return }
-        do {
-            try router?.setWorkspaceDescription(ws.id, text)
-        } catch {
-            showOperationError("Could not update description", detail: error.localizedDescription)
+        presentPromptSheet(title: "Workspace description",
+                           message: "Optional note for \"\(ws.name)\".",
+                           initial: current,
+                           multiline: true) { [weak self] text in
+            guard let self, let text else { return }
+            do {
+                try self.router?.setWorkspaceDescription(ws.id, text)
+            } catch {
+                self.showOperationError("Could not update description", detail: error.localizedDescription)
+            }
         }
     }
 
@@ -1195,6 +1229,7 @@ public final class SidebarViewModel: ObservableObject {
         try? router?.reorderWorkspace(dragged, position: targetIndex)
         draggingWorkspaceID = nil
         dropTargetWorkspaceID = nil
+        dragScrollEdge = 0
         reload()
     }
 
@@ -1205,16 +1240,24 @@ public final class SidebarViewModel: ObservableObject {
         alert.informativeText = "This removes the workspace and its tabs from RemoteCode. Files on disk are not touched."
         alert.addButton(withTitle: "Remove")
         alert.addButton(withTitle: "Cancel")
-        if alert.runModal() == .alertFirstButtonReturn {
+        // :15 -- Present as a window sheet so detached workspace windows are not
+        // blocked. Falls back to runModal when no key window exists (e.g. tests).
+        let action: (NSApplication.ModalResponse) -> Void = { [weak self] response in
+            guard let self, SidebarRootView.confirmRemoveDecision(response: response) else { return }
             do {
                 let entry = WorkspaceUndoEntry(name: ws.name, cwd: ws.cwd, metadata: ws.metadata)
-                removedWorkspaceStack = WorkspaceUndoStack.push(entry, onto: removedWorkspaceStack)
-                try router?.closeWorkspace(ws.id)
+                self.removedWorkspaceStack = WorkspaceUndoStack.push(entry, onto: self.removedWorkspaceStack)
+                try self.router?.closeWorkspace(ws.id)
             } catch {
                 // Roll back the undo push if close failed.
-                removedWorkspaceStack = WorkspaceUndoStack.pop(from: removedWorkspaceStack)?.remaining ?? removedWorkspaceStack
-                showOperationError("Could not remove workspace", detail: error.localizedDescription)
+                self.removedWorkspaceStack = WorkspaceUndoStack.pop(from: self.removedWorkspaceStack)?.remaining ?? self.removedWorkspaceStack
+                self.showOperationError("Could not remove workspace", detail: error.localizedDescription)
             }
+        }
+        if let window = NSApp.keyWindow {
+            alert.beginSheetModal(for: window, completionHandler: action)
+        } else {
+            action(alert.runModal())
         }
     }
 
@@ -1259,16 +1302,24 @@ public final class SidebarViewModel: ObservableObject {
         alert.informativeText = "This removes the selected workspaces and their tabs from RemoteCode. Files on disk are not touched.\n\n" + names.joined(separator: "\n")
         alert.addButton(withTitle: "Remove")
         alert.addButton(withTitle: "Cancel")
-        guard alert.runModal() == .alertFirstButtonReturn else { return }
-        do {
-            try router?.closeWorkspaces(Array(ids))
-        } catch {
-            showOperationError("Could not remove workspaces", detail: error.localizedDescription)
-            return
+        // :15 -- Sheet so other windows stay live during the confirm prompt.
+        let action: (NSApplication.ModalResponse) -> Void = { [weak self] response in
+            guard let self, SidebarRootView.confirmRemoveDecision(response: response) else { return }
+            do {
+                try self.router?.closeWorkspaces(Array(ids))
+            } catch {
+                self.showOperationError("Could not remove workspaces", detail: error.localizedDescription)
+                return
+            }
+            self.selectedWorkspaceIDs.removeAll()
+            self.selectionAnchorID = nil
+            self.reload()
         }
-        selectedWorkspaceIDs.removeAll()
-        selectionAnchorID = nil
-        reload()
+        if let window = NSApp.keyWindow {
+            alert.beginSheetModal(for: window, completionHandler: action)
+        } else {
+            action(alert.runModal())
+        }
     }
 
     // MARK: Error surfacing
@@ -1279,7 +1330,12 @@ public final class SidebarViewModel: ObservableObject {
         alert.messageText = message
         alert.informativeText = detail
         alert.addButton(withTitle: "OK")
-        alert.runModal()
+        // :15 -- Sheet so other windows are not blocked by error presentation.
+        if let window = NSApp.keyWindow {
+            alert.beginSheetModal(for: window)
+        } else {
+            alert.runModal()
+        }
     }
 
     // MARK: Keyboard navigation
@@ -1549,6 +1605,10 @@ public struct SidebarRootView: View {
     }
     /// Toggled to true to programmatically focus the filter field (Cmd+F).
     @State private var filterFocusRequest: Bool = false
+    /// :18 -- Timer fires at ~16 Hz while vm.dragScrollEdge != 0 to scroll toward
+    /// the top or bottom of the workspace list. Stored so we can invalidate it
+    /// when the drag leaves the edge zone or the drop completes.
+    @State private var dragScrollTimer: Timer? = nil
     private let onOpenSettings: () -> Void
     private let onOpenAccount: () -> Void
     private let keyMapper = SidebarKeyIntentMapper()
@@ -1653,37 +1713,59 @@ public struct SidebarRootView: View {
                     .padding(.bottom, DS.Space.sm)
             }
 
-            ScrollView {
-                let rows = vm.filteredWorkspaces
-                LazyVStack(alignment: .leading, spacing: DS.Space.xxs) {
-                    if vm.workspaces.isEmpty {
-                        Text("No workspaces")
-                            .font(DS.Font.body)
-                            .foregroundColor(DS.Palette.textTertiary)
-                            .padding(.horizontal, DS.Space.md)
-                            .padding(.vertical, DS.Space.sm)
-                    } else if rows.isEmpty {
-                        Text("No matches")
-                            .font(DS.Font.body)
-                            .foregroundColor(DS.Palette.textTertiary)
-                            .padding(.horizontal, DS.Space.md)
-                            .padding(.vertical, DS.Space.sm)
-                    } else {
-                        let separatorIdx = SidebarViewModel.pinnedSeparatorIndex(in: rows)
-                        ForEach(Array(rows.enumerated()), id: \.element.id) { index, ws in
-                            if index == separatorIdx {
-                                pinnedGroupDivider
+            // :18 -- ScrollViewReader exposes a proxy so the edge-scroll timer
+            // can call scrollTo(first/last) while the user holds a drag near
+            // the top or bottom edge of the list.
+            ScrollViewReader { scrollProxy in
+                ScrollView {
+                    let rows = vm.filteredWorkspaces
+                    LazyVStack(alignment: .leading, spacing: DS.Space.xxs) {
+                        if vm.workspaces.isEmpty {
+                            Text("No workspaces")
+                                .font(DS.Font.body)
+                                .foregroundColor(DS.Palette.textTertiary)
+                                .padding(.horizontal, DS.Space.md)
+                                .padding(.vertical, DS.Space.sm)
+                        } else if rows.isEmpty {
+                            Text("No matches")
+                                .font(DS.Font.body)
+                                .foregroundColor(DS.Palette.textTertiary)
+                                .padding(.horizontal, DS.Space.md)
+                                .padding(.vertical, DS.Space.sm)
+                        } else {
+                            let separatorIdx = SidebarViewModel.pinnedSeparatorIndex(in: rows)
+                            ForEach(Array(rows.enumerated()), id: \.element.id) { index, ws in
+                                if index == separatorIdx {
+                                    pinnedGroupDivider
+                                }
+                                workspaceRow(ws)
                             }
-                            workspaceRow(ws)
+                        }
+                    }
+                    .padding(.horizontal, DS.Space.sm)
+                }
+                .frame(maxHeight: .infinity)
+                .focusable()
+                .onKeyPress(phases: .down) { press in
+                    handleKeyPress(press)
+                }
+                // :18 -- Start/stop the edge-scroll timer whenever the drag
+                // edge direction changes. The timer fires at ~16 Hz and scrolls
+                // one step toward the edge until the pointer leaves the zone.
+                .onChange(of: vm.dragScrollEdge) { edge in
+                    dragScrollTimer?.invalidate()
+                    dragScrollTimer = nil
+                    guard edge != 0 else { return }
+                    dragScrollTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 16.0, repeats: true) { _ in
+                        let rows = vm.filteredWorkspaces
+                        guard !rows.isEmpty else { return }
+                        if edge < 0, let first = rows.first {
+                            scrollProxy.scrollTo(first.id, anchor: .top)
+                        } else if edge > 0, let last = rows.last {
+                            scrollProxy.scrollTo(last.id, anchor: .bottom)
                         }
                     }
                 }
-                .padding(.horizontal, DS.Space.sm)
-            }
-            .frame(maxHeight: .infinity)
-            .focusable()
-            .onKeyPress(phases: .down) { press in
-                handleKeyPress(press)
             }
 
             accountFooter
@@ -2687,7 +2769,45 @@ public struct SidebarRootView: View {
         "\(Int((min(max(progress, 0), 1) * 100).rounded()))%"
     }
 
-    // MARK: - Static seams (:186 :187 :188 :195)
+    // MARK: - Static seams (:15 :18 :186 :187 :188 :195)
+
+    /// :15 -- Pure decision: maps an NSAlert response to a confirmed remove action.
+    ///
+    /// WHY separate: the confirmation logic (first button = proceed) must be
+    /// testable without running a modal alert on the main thread. Extracted so
+    /// both removeWorkspace and removeSelectedWorkspaces share identical semantics.
+    ///
+    /// - Returns: true when `response == .alertFirstButtonReturn` (Remove button),
+    ///            false otherwise (Cancel or sheet dismissal).
+    nonisolated public static func confirmRemoveDecision(response: NSApplication.ModalResponse) -> Bool {
+        response == .alertFirstButtonReturn
+    }
+
+    /// :18 -- Pure decision: maps a pointer Y position relative to a scroll view
+    /// to an auto-scroll direction during a drag.
+    ///
+    /// WHY separate: the arithmetic is trivially testable without a real scroll
+    /// view or drag event. The caller (WorkspaceDropDelegate.dropUpdated) passes
+    /// real coordinates; tests pass arbitrary values.
+    ///
+    /// - Parameters:
+    ///   - pointerY: pointer Y in the scroll view's coordinate space.
+    ///     Y increases downward (AppKit window coords are flipped relative to
+    ///     screen; convert before calling if needed).
+    ///   - viewHeight: total height of the scroll view.
+    ///   - edgeZone: distance from the top or bottom edge that triggers scroll.
+    /// - Returns: -1 when pointer is in the top edge zone (scroll up),
+    ///            +1 when in the bottom edge zone (scroll down), 0 otherwise.
+    nonisolated public static func autoScrollDirection(
+        pointerY: CGFloat,
+        viewHeight: CGFloat,
+        edgeZone: CGFloat
+    ) -> Int {
+        guard viewHeight > 0, edgeZone > 0 else { return 0 }
+        if pointerY < edgeZone { return -1 }
+        if pointerY > viewHeight - edgeZone { return 1 }
+        return 0
+    }
 
     /// :186 -- Sums the byte sizes of all regular files under `url` (non-recursive
     /// into sub-directories is fine; the model dir is flat).  Uses a recursive
@@ -3407,6 +3527,7 @@ private struct WorkspaceDropDelegate: DropDelegate {
         if vm.dropTargetWorkspaceID == target.id {
             vm.dropTargetWorkspaceID = nil
         }
+        vm.dragScrollEdge = 0
     }
 
     func performDrop(info: DropInfo) -> Bool {
@@ -3415,11 +3536,34 @@ private struct WorkspaceDropDelegate: DropDelegate {
         }
         vm.draggingWorkspaceID = nil
         vm.dropTargetWorkspaceID = nil
+        vm.dragScrollEdge = 0
         return true
     }
 
     func dropUpdated(info: DropInfo) -> DropProposal? {
-        DropProposal(operation: .move)
+        // :18 -- Edge auto-scroll: while the user holds a drag near the top or
+        // bottom of the sidebar's content window, SidebarRootView's scroll timer
+        // fires and scrolls toward the edge.
+        //
+        // Strategy: convert the current mouse screen position into window Y,
+        // use the key window's content height as a proxy for the scrollable
+        // region height. The 40-pt edge zone matches typical row height so
+        // one-row proximity triggers the scroll.
+        if let window = NSApp.keyWindow {
+            let screenPt = NSEvent.mouseLocation
+            let windowPt = window.convertPoint(fromScreen: screenPt)
+            let contentH = window.contentView?.bounds.height ?? window.frame.height
+            // pointerY in top-left-origin space: flip AppKit's bottom-origin Y.
+            let pointerY = contentH - windowPt.y
+            vm.dragScrollEdge = SidebarRootView.autoScrollDirection(
+                pointerY: pointerY,
+                viewHeight: contentH,
+                edgeZone: 40
+            )
+        } else {
+            vm.dragScrollEdge = 0
+        }
+        return DropProposal(operation: .move)
     }
 }
 
