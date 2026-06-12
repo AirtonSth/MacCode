@@ -746,4 +746,40 @@ public final class ANSIRenderer {
         if row.count > newCols { return Array(row.prefix(newCols)) }
         return row + Array(repeating: Cell.empty, count: newCols - row.count)
     }
+
+    // MARK: - Theme palette export seam
+
+    /// Convert a flat array of up to 16 raw RGB triples (indices 0-15) into an
+    /// `ANSIThemeColors` value suitable for passing to `ANSIRenderer.init(themeColors:)`.
+    ///
+    /// This is a pure, nonisolated static function — it has no dependency on
+    /// AppKit state, actor context, or Ghostty runtime — so it can be unit-tested
+    /// directly and called from any context.
+    ///
+    /// WHY: when a Mac session mirror snapshot is sent to iOS, the ANSI escape
+    /// codes in `ansiSnapshot` carry no color values — they reference palette
+    /// indices (SGR 31 = "red"). iOS re-renders those codes through its own
+    /// ANSIRenderer. If iOS uses hardcoded defaults while the Mac loaded a custom
+    /// Ghostty theme, the same output looks different on each device. Passing the
+    /// resolved Mac palette inside (or alongside) the snapshot eliminates the drift.
+    ///
+    /// - Parameter entries: Array of `(index, r, g, b)` tuples where `index` is
+    ///   the ANSI palette index (0-7 basic, 8-15 bright). Entries outside 0...15
+    ///   are silently ignored.
+    /// - Returns: An `ANSIThemeColors` whose `colors` dictionary contains only the
+    ///   provided entries, mapped to `NSColor(srgbRed:green:blue:alpha:)`.
+    public nonisolated static func ansiThemeColors(
+        from entries: [(index: Int, r: UInt8, g: UInt8, b: UInt8)]
+    ) -> ANSIThemeColors {
+        var map: [Int: NSColor] = [:]
+        for entry in entries where (0...15).contains(entry.index) {
+            map[entry.index] = NSColor(
+                srgbRed:  CGFloat(entry.r) / 255.0,
+                green:    CGFloat(entry.g) / 255.0,
+                blue:     CGFloat(entry.b) / 255.0,
+                alpha:    1.0
+            )
+        }
+        return ANSIThemeColors(map)
+    }
 }

@@ -569,6 +569,37 @@ private final class RemoteCodeGhosttyRuntime {
         return diagnosticsSummary(for: config)
     }
 
+    /// Read the resolved ANSI palette (indices 0-15) from the active Ghostty
+    /// config and return it as an `ANSIThemeColors`.
+    ///
+    /// Uses `ghostty_config_get` with key `"palette"` to obtain the full 256-entry
+    /// palette struct, then extracts only indices 0-15 (the SGR color range that
+    /// `ANSIRenderer` uses). Returns `nil` when no config is loaded.
+    ///
+    /// WHY: `ANSIRenderer` is initialised with `themeColors: ANSIThemeColors?`.
+    /// Without this extraction the renderer always falls back to its hardcoded
+    /// defaults, producing a different visual palette than the Ghostty-rendered
+    /// Mac surface — causing color drift in the iOS mirror.
+    func resolvedANSIThemeColors() -> ANSIThemeColors? {
+        guard let config else { return nil }
+        var palette = ghostty_config_palette_s()
+        let key = "palette"
+        guard ghostty_config_get(config, &palette, key, UInt(key.lengthOfBytes(using: .utf8))) else {
+            return nil
+        }
+        // ghostty_config_palette_s.colors is a C fixed-size array [256] which Swift
+        // imports as a tuple. Access it safely via raw pointer to avoid Swift's
+        // tuple-index limitations.
+        let entries: [(index: Int, r: UInt8, g: UInt8, b: UInt8)] = withUnsafeBytes(of: palette.colors) { raw in
+            let base = raw.baseAddress!.assumingMemoryBound(to: ghostty_config_color_s.self)
+            return (0..<16).map { i in
+                let c = base[i]
+                return (index: i, r: c.r, g: c.g, b: c.b)
+            }
+        }
+        return ANSIRenderer.ansiThemeColors(from: entries)
+    }
+
     private func diagnosticsSummary(for config: ghostty_config_t) -> String {
         let count = Int(ghostty_config_diagnostics_count(config))
         guard count > 0 else { return "diagnostics=0" }
@@ -676,6 +707,23 @@ final class GhosttyTerminalView: NSView {
     private static let immediateOutputFlushBytes = 64 * 1024
     private static let maxPendingOutputBytes = 1024 * 1024
     private static let outputFlushDelay: TimeInterval = 0.02
+
+    // MARK: - Theme palette seam
+
+    /// Return the 16-entry ANSI palette resolved from the active Ghostty theme
+    /// config, or `nil` when no config is loaded (e.g. Ghostty failed to init).
+    ///
+    /// Callers (e.g. `TerminalSurface`) pass the result to
+    /// `ANSIRenderer(themeColors:)` so the mirror ANSI snapshot uses the same
+    /// colors the Mac Ghostty surface renders — eliminating cross-device color drift.
+    ///
+    /// WHY: `TerminalSurface` creates its `ANSIRenderer` without `themeColors`,
+    /// so snapshot ANSI always uses the hardcoded default palette regardless of
+    /// the user's configured Ghostty theme. This accessor exposes the resolved
+    /// palette so `TerminalSurface` (or any other caller) can pass it at init time.
+    static func resolvedANSIThemeColors() -> ANSIThemeColors? {
+        RemoteCodeGhosttyRuntime.shared.resolvedANSIThemeColors()
+    }
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
