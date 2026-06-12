@@ -609,7 +609,7 @@ public final class TerminalSurface: NSObject, Surface {
     public var onRestartRequested: (() -> Void)?
     private static let hiddenBacklogQuietDelay: TimeInterval = 0.25
     private static let busyStateProbeDuration: TimeInterval = 2.0
-    private static let busyStatePollInterval: TimeInterval = 0.10
+    private static let busyStatePollInterval: TimeInterval = 0.25
     private static let outputTelemetryByteInterval = 8 * 1024 * 1024
     private static let outputTelemetryTimeInterval: TimeInterval = 60
     private nonisolated static let maxHistoryChunkBytes = 64 * 1024
