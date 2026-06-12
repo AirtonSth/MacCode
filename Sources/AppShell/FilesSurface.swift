@@ -660,6 +660,42 @@ func filesBasenameSelectionRange(for name: String) -> NSRange {
     return NSRange(location: 0, length: dotIndex)
 }
 
+/// Result of evaluating whether an incoming remote edit should be applied
+/// immediately or held back to avoid clobbering the user's local draft.
+/// Extracted from FilesViewModel so tests can reach it without constructing
+/// the full AppKit surface.
+enum FilesRemoteUpdateDecision: Equatable {
+    /// Apply the remote content to the editor now.
+    case apply
+    /// The user has unsaved local edits that differ from the incoming remote
+    /// content. Preserve the local draft and surface a conflict notice.
+    case conflictKeepLocal
+}
+
+/// Pure decision function: determines how to handle a remote content update.
+///
+/// - Parameters:
+///   - localDirty:     True when the current draft has unsaved local changes.
+///   - localText:      The current draft content in the editor.
+///   - remoteText:     The incoming remote content.
+///   - lastSyncedText: The last content that was in sync between both sides.
+/// - Returns: `.apply` when there is no local-vs-remote conflict;
+///            `.conflictKeepLocal` when the local draft diverges from the remote
+///            content and must be protected.
+func filesRemoteUpdateDecision(
+    localDirty: Bool,
+    localText: String,
+    remoteText: String,
+    lastSyncedText: String
+) -> FilesRemoteUpdateDecision {
+    // No local edits -- safe to apply the remote version unconditionally.
+    guard localDirty else { return .apply }
+    // Local is dirty but remote content matches local -- no real conflict.
+    if remoteText == localText { return .apply }
+    // Local draft differs from remote: protect the user's work.
+    return .conflictKeepLocal
+}
+
 @MainActor
 private final class FilesViewModel: ObservableObject {
     @Published var currentDirectory = ""
@@ -684,6 +720,9 @@ private final class FilesViewModel: ObservableObject {
     @Published var syncLabel = "Up to date"
     @Published var syncDetail = ""
     @Published var conflictActive = false
+    /// True when a remote edit arrived while the user had unsaved local edits.
+    /// The local draft is preserved; the remote version waits in `pendingRemoteText`.
+    @Published var remoteEditConflict = false
     /// Non-nil when the most recent explicit Save failed. Shown as an inline
     /// banner instead of replacing the editor with the empty-state (P1 save-fail).
     @Published var saveError: String?
@@ -701,6 +740,9 @@ private final class FilesViewModel: ObservableObject {
     private var eventToken: UUID?
     private var sessionCache: [String: EditSessionSnapshot] = [:]
     private var sessionPath: String?
+    /// Holds the remote text that arrived during a local-dirty conflict. Discarded
+    /// when the user dismisses the banner; applied when they choose "Load Remote".
+    private var pendingRemoteText: String?
     /// Interval (seconds) used to coalesce rapid keystrokes before sending a patch.
     /// Named constant so it can be referenced in tests or tuned without a grep.
     private static let editorDebounceInterval: TimeInterval = 0.15
@@ -1157,8 +1199,33 @@ private final class FilesViewModel: ObservableObject {
         }
     }
 
+    // MARK: - Remote update decision
+
+    /// Apply the remote content that arrived during a conflict, discarding the
+    /// local draft. Called when the user explicitly taps "Load Remote".
+    func loadRemoteEdit() {
+        guard let remote = pendingRemoteText else { return }
+        pendingRemoteText = nil
+        remoteEditConflict = false
+        setDraft(remote)
+        renderedText = remote
+    }
+
+    /// Dismiss the remote-edit conflict notice and keep the local draft.
+    /// The pending remote text is dropped -- it is no longer needed.
+    func dismissRemoteEditConflict() {
+        pendingRemoteText = nil
+        remoteEditConflict = false
+    }
+
     private func applyEditPayload(_ payload: [String: JSONValue], remote: Bool) {
         conflictActive = false
+        // A non-remote payload means a local open/save/discard -- clear any
+        // stale remote-conflict notice so it does not carry over to the new file.
+        if !remote {
+            remoteEditConflict = false
+            pendingRemoteText = nil
+        }
         if let id = payload["session_id"]?.stringValue { sessionID = id }
         if let revision = payload["draft_revision"]?.intValue { draftRevision = revision }
         if let dirty = payload["dirty"]?.boolValue {
@@ -1173,15 +1240,39 @@ private final class FilesViewModel: ObservableObject {
             }
         }
         if let content = payload["content"]?.stringValue {
-            if remote || draftText != content {
+            if remote {
+                let decision = filesRemoteUpdateDecision(
+                    localDirty: isDirty,
+                    localText: draftText,
+                    remoteText: content,
+                    lastSyncedText: lastSyncedText
+                )
+                switch decision {
+                case .apply:
+                    remoteEditConflict = false
+                    pendingRemoteText = nil
+                    setDraft(content)
+                    renderedText = content
+                case .conflictKeepLocal:
+                    // Preserve the local draft. Park the remote version so the user
+                    // can load it explicitly via the conflict banner ("Load Remote").
+                    pendingRemoteText = content
+                    remoteEditConflict = true
+                    // renderedText is intentionally left unchanged -- the preview keeps
+                    // showing the local draft until the conflict is resolved.
+                }
+            } else if draftText != content {
                 setDraft(content)
+                renderedText = content
             } else {
                 lastSyncedText = content
+                renderedText = content
             }
-            renderedText = content
         }
-        if remote {
+        if remote && !remoteEditConflict {
             setSyncLabel("Edited on another device", revision: draftRevision)
+        } else if remote && remoteEditConflict {
+            setSyncLabel("Remote changes held -- local edits preserved", revision: draftRevision)
         } else if isDirty {
             setSyncLabel("Unsaved", revision: draftRevision)
         } else {
@@ -1766,6 +1857,10 @@ private struct FilesSurfaceRoot: View {
                     conflictBanner
                     Divider().overlay(DS.Palette.line)
                 }
+                if model.remoteEditConflict {
+                    remoteEditConflictBanner
+                    Divider().overlay(DS.Palette.line)
+                }
                 if let saveErr = model.saveError {
                     saveErrorBanner(saveErr)
                     Divider().overlay(DS.Palette.line)
@@ -1846,6 +1941,35 @@ private struct FilesSurfaceRoot: View {
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
         .background(DS.Palette.surfaceRaised)
+    }
+
+    /// Shown when a remote (iOS) edit arrives while the user has unsaved local edits.
+    /// The local draft is always preserved. The user can load the remote version
+    /// explicitly or dismiss to keep typing.
+    private var remoteEditConflictBanner: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "arrow.triangle.2.circlepath")
+                .foregroundStyle(DS.Palette.warning)
+            VStack(alignment: .leading, spacing: 1) {
+                Text("Remote changes arrived")
+                    .font(DS.Font.bodyStrong)
+                Text("Your local edits are preserved. Load the remote version to review it, or keep editing.")
+                    .font(DS.Font.caption)
+                    .foregroundStyle(DS.Palette.textSecondary)
+                    .lineLimit(2)
+            }
+            Spacer(minLength: 8)
+            Button("Keep Editing") { model.dismissRemoteEditConflict() }
+                .help("Dismiss this notice and continue with your local draft")
+                .accessibilityIdentifier("files.remoteConflict.keepEditing")
+            Button("Load Remote") { model.loadRemoteEdit() }
+                .help("Replace your local draft with the incoming remote version")
+                .accessibilityIdentifier("files.remoteConflict.loadRemote")
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .background(DS.Palette.surfaceRaised)
+        .accessibilityIdentifier("files.remoteConflict.banner")
     }
 
     /// Inline banner for save failures (P1: keep editor visible so the user's
