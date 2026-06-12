@@ -21,7 +21,7 @@ public final class DiffPanelViewModel: ObservableObject {
     @Published public var cwd: String
     @Published public var summary: GitSummary
     @Published public var selectedPath: String?
-    @Published public var rawDiff: String = "" { didSet { rebuildStyledDiffAsync() } }
+    @Published public var rawDiff: String = "" { didSet { rebuildStyledDiffAsync(); resetFindIndex() } }
     /// Styled diff rebuilt once when `rawDiff` changes, not on every body
     /// pass, so unrelated @Published changes (wrap toggle, error banner,
     /// summary refresh) don't re-parse the whole diff (PERF-005). Capped
@@ -41,6 +41,85 @@ public final class DiffPanelViewModel: ObservableObject {
     @Published public var actionSuccess: String?
     @Published public var wordWrap: Bool = false { didSet { persistPrefs() } }
     @Published public var ignoreWhitespace: Bool = false { didSet { persistPrefs() } }
+
+    // MARK: - In-diff find (Cmd+F)
+
+    /// True while the find bar is visible.
+    @Published public var findActive: Bool = false
+    /// Current query string typed by the user.
+    @Published public var findQuery: String = "" { didSet { resetFindIndex() } }
+    /// 0-based index of the currently highlighted match. -1 when no matches.
+    @Published public private(set) var findMatchIndex: Int = -1
+    /// Total number of matches for the current query in `rawDiff`.
+    @Published public private(set) var findMatchCount: Int = 0
+
+    /// All NSRange matches in `rawDiff` for the current `findQuery`.
+    /// Recomputed whenever `findQuery` or `rawDiff` changes.
+    public private(set) var findMatchRanges: [NSRange] = []
+
+    /// Show the find bar. Called by Cmd+F.
+    public func activateFind() { findActive = true }
+
+    /// Hide the find bar and clear state.
+    public func dismissFind() {
+        findActive = false
+        findQuery = ""  // didSet -> resetFindIndex() clears ranges, count, index.
+    }
+
+    /// Advance to the next match, wrapping past the last.
+    public func nextFindMatch() {
+        guard findMatchCount > 0 else { return }
+        findMatchIndex = (findMatchIndex + 1) % findMatchCount
+    }
+
+    /// Move to the previous match, wrapping before the first.
+    public func prevFindMatch() {
+        guard findMatchCount > 0 else { return }
+        findMatchIndex = (findMatchIndex - 1 + findMatchCount) % findMatchCount
+    }
+
+    /// Recompute ranges when the query changes; reset the index.
+    private func resetFindIndex() {
+        let ranges = Self.matchRanges(in: rawDiff, query: findQuery, caseInsensitive: true)
+        findMatchRanges = ranges
+        findMatchCount = ranges.count
+        findMatchIndex = ranges.isEmpty ? -1 : 0
+    }
+
+    // MARK: - Pure find seam (testable, nonisolated)
+
+    /// Returns the 0-based line index in `rawDiff` that contains the current
+    /// match, or nil when there is no active match. Used by the find bar to
+    /// scroll the diff to the right line.
+    public var findCurrentMatchLine: Int? {
+        guard findMatchIndex >= 0, findMatchIndex < findMatchRanges.count else { return nil }
+        let r = findMatchRanges[findMatchIndex]
+        guard r.location != NSNotFound, r.location < rawDiff.utf16.count else { return nil }
+        // Count newlines before the match location (UTF-16 offset).
+        let prefix = rawDiff.utf16.prefix(r.location)
+        return prefix.filter { $0 == 0x0A /* \n */ }.count
+    }
+
+    /// Returns all NSRange occurrences of `query` in `text`.
+    /// Returns an empty array when `query` is empty or there are no matches.
+    /// Callers: the find bar cycler + the unit test.
+    nonisolated public static func matchRanges(
+        in text: String,
+        query: String,
+        caseInsensitive: Bool
+    ) -> [NSRange] {
+        guard !query.isEmpty else { return [] }
+        var opts: NSString.CompareOptions = [.literal]
+        if caseInsensitive { opts.insert(.caseInsensitive) }
+        var result: [NSRange] = []
+        var searchRange = text.startIndex..<text.endIndex
+        while !searchRange.isEmpty {
+            guard let r = text.range(of: query, options: opts, range: searchRange) else { break }
+            result.append(NSRange(r, in: text))
+            searchRange = r.upperBound..<text.endIndex
+        }
+        return result
+    }
 
     @Published public var branches: GitBranches
     @Published public var commits: [GitCommit] = []
@@ -707,6 +786,8 @@ public struct DiffPanelView: View {
     /// UX-013: focus the new-branch field the moment it is revealed so the
     /// user can type immediately; Esc cancels.
     @FocusState private var newBranchFocused: Bool
+    /// Focus state for the in-diff find bar text field.
+    @FocusState private var findFieldFocused: Bool
     public init(vm: DiffPanelViewModel) { self.vm = vm }
 
     public var body: some View {
@@ -726,11 +807,17 @@ public struct DiffPanelView: View {
             }
         }
         .background(
-            Button("", action: copyDiff)
-                .keyboardShortcut("c", modifiers: .command)
-                .opacity(0)
-                .disabled(vm.rawDiff.isEmpty)
-                .accessibilityHidden(true)
+            Group {
+                Button("", action: copyDiff)
+                    .keyboardShortcut("c", modifiers: .command)
+                    .disabled(vm.rawDiff.isEmpty)
+                // Cmd+F: open/focus the in-diff find bar.
+                Button("", action: activateFind)
+                    .keyboardShortcut("f", modifiers: .command)
+                    .disabled(vm.rawDiff.isEmpty)
+            }
+            .opacity(0)
+            .accessibilityHidden(true)
         )
     }
 
@@ -1490,12 +1577,13 @@ public struct DiffPanelView: View {
     private var diffBody: some View {
         VStack(alignment: .leading, spacing: 0) {
             diffToolbar
+            if vm.findActive { diffFindBar }
             if vm.rawDiff.isEmpty {
                 if vm.isLoading {
                     DSEmptyState(
                         icon: "doc.text.magnifyingglass",
-                        title: "Loading diff…",
-                        subtitle: "Running git — this can take a moment on large repos."
+                        title: "Loading diff...",
+                        subtitle: "Running git -- this can take a moment on large repos."
                     )
                     .overlay(alignment: .center) {
                         ProgressView().controlSize(.small).padding(.top, 64)
@@ -1510,32 +1598,184 @@ public struct DiffPanelView: View {
                     )
                 }
             } else {
-                ScrollView([.vertical, vm.wordWrap ? .init() : .horizontal]) {
-                    VStack(alignment: .leading, spacing: 0) {
-                        Text(vm.styledDiff)
-                            .font(DS.Font.mono)
-                            .textSelection(.enabled)
-                            .padding(DS.Space.lg)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .accessibilityIdentifier("diff.body")
-                        if vm.diffTruncated {
-                            Text("Diff truncated — too large to render fully. Use Copy diff for the complete text.")
-                                .font(DS.Font.caption2)
-                                .foregroundColor(DS.Palette.textTertiary)
-                                .padding(.horizontal, DS.Space.lg)
-                                .padding(.bottom, DS.Space.lg)
+                // ScrollViewReader lets us scroll to the line containing the
+                // current find match without rebuilding the entire attributed string.
+                ScrollViewReader { proxy in
+                    ScrollView([.vertical, vm.wordWrap ? .init() : .horizontal]) {
+                        VStack(alignment: .leading, spacing: 0) {
+                            // Render each line as a separate Text so each line
+                            // gets an id anchor the find cycler can scroll to.
+                            // When no find query is active we skip the per-line
+                            // split and fall back to the single attributed Text
+                            // (cheaper layout, same appearance).
+                            if vm.findActive && !vm.findQuery.isEmpty {
+                                diffLinesView
+                            } else {
+                                Text(vm.styledDiff)
+                                    .font(DS.Font.mono)
+                                    .textSelection(.enabled)
+                                    .padding(DS.Space.lg)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                    .accessibilityIdentifier("diff.body")
+                            }
+                            if vm.diffTruncated {
+                                Text("Diff truncated -- too large to render fully. Use Copy diff for the complete text.")
+                                    .font(DS.Font.caption2)
+                                    .foregroundColor(DS.Palette.textTertiary)
+                                    .padding(.horizontal, DS.Space.lg)
+                                    .padding(.bottom, DS.Space.lg)
+                            }
                         }
                     }
-                }
-                .background(DS.Palette.bg)
-                .overlay(alignment: .topTrailing) {
-                    if vm.isLoading {
-                        ProgressView().controlSize(.small).padding(DS.Space.md)
+                    .background(DS.Palette.bg)
+                    .overlay(alignment: .topTrailing) {
+                        if vm.isLoading {
+                            ProgressView().controlSize(.small).padding(DS.Space.md)
+                        }
+                    }
+                    // Scroll to the line that contains the current match.
+                    .onChange(of: vm.findMatchIndex) { _ in
+                        if let line = vm.findCurrentMatchLine {
+                            withAnimation(DS.Motion.micro) {
+                                proxy.scrollTo("diff.line.\(line)", anchor: .center)
+                            }
+                        }
                     }
                 }
             }
         }
         .onChange(of: vm.ignoreWhitespace) { _ in vm.reloadDiff() }
+    }
+
+    /// Per-line breakdown of `vm.styledDiff` used while find is active.
+    /// Each row carries an id anchor so `ScrollViewReader` can jump to it.
+    /// This view is only instantiated when find is active with a non-empty
+    /// query, so it does not affect normal diff rendering performance.
+    @ViewBuilder
+    private var diffLinesView: some View {
+        // Split the raw diff into lines and walk segments to assign each
+        // line its styled AttributedString. We pair rawDiff lines with the
+        // pre-built styledDiff segments (one segment per line from
+        // buildDiffSegments). The current-match line gets a distinct
+        // background highlight so it is immediately visible.
+        let rawLines = vm.rawDiff.components(separatedBy: "\n")
+        let currentLine = vm.findCurrentMatchLine ?? -1
+        let segments = DiffPanelViewModel.buildDiffSegments(vm.rawDiff)
+        VStack(alignment: .leading, spacing: 0) {
+            ForEach(rawLines.indices, id: \.self) { idx in
+                let isMatchLine = idx == currentLine
+                // Use the styled segment text if available; fall back to plain.
+                let lineText: AttributedString = {
+                    if idx < segments.count {
+                        var a = AttributedString(segments[idx].text)
+                        switch segments[idx].kind {
+                        case .add:
+                            a.foregroundColor = DS.Palette.success
+                            a.backgroundColor = DS.Palette.success.opacity(0.08)
+                        case .del:
+                            a.foregroundColor = DS.Palette.danger
+                            a.backgroundColor = DS.Palette.danger.opacity(0.08)
+                        case .hunk:
+                            a.foregroundColor = DS.Palette.accent
+                            a.backgroundColor = DS.Palette.accent.opacity(0.08)
+                        case .header:
+                            a.foregroundColor = DS.Palette.warning
+                        case .context:
+                            a.foregroundColor = DS.Palette.textSecondary
+                        }
+                        return a
+                    }
+                    return AttributedString(rawLines[idx])
+                }()
+                Text(lineText)
+                    .font(DS.Font.mono)
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, DS.Space.lg)
+                    .padding(.vertical, 0)
+                    .background(isMatchLine
+                        ? DS.Palette.warning.opacity(0.25)
+                        : Color.clear)
+                    .id("diff.line.\(idx)")
+            }
+        }
+        .padding(.vertical, DS.Space.lg)
+        .accessibilityIdentifier("diff.body")
+    }
+
+    // MARK: In-diff find bar
+
+    private var diffFindBar: some View {
+        HStack(spacing: DS.Space.sm) {
+            Image(systemName: "magnifyingglass")
+                .font(.system(size: 10, weight: .medium))
+                .foregroundColor(DS.Palette.textTertiary)
+            TextField("Find in diff...", text: $vm.findQuery)
+                .textFieldStyle(.plain)
+                .font(DS.Font.monoSmall)
+                .focused($findFieldFocused)
+                .onSubmit { vm.nextFindMatch() }
+                // Esc dismisses the find bar.
+                .onExitCommand { vm.dismissFind(); findFieldFocused = false }
+                .accessibilityIdentifier("diff.find.field")
+                // Cmd+G / Return: next; Shift+Cmd+G: prev (wired via hidden buttons).
+                .background(
+                    Group {
+                        Button("", action: { vm.nextFindMatch() })
+                            .keyboardShortcut("g", modifiers: .command)
+                        Button("", action: { vm.prevFindMatch() })
+                            .keyboardShortcut("g", modifiers: [.command, .shift])
+                    }
+                    .opacity(0)
+                    .accessibilityHidden(true)
+                )
+            if !vm.findQuery.isEmpty {
+                // Match count indicator.
+                Text(vm.findMatchCount == 0
+                     ? "No matches"
+                     : "\(vm.findMatchIndex + 1) of \(vm.findMatchCount)")
+                    .font(DS.Font.caption2.monospacedDigit())
+                    .foregroundColor(vm.findMatchCount == 0
+                                     ? DS.Palette.danger
+                                     : DS.Palette.textSecondary)
+                    .accessibilityIdentifier("diff.find.count")
+                Button { vm.prevFindMatch() } label: {
+                    Image(systemName: "chevron.up")
+                        .font(.system(size: 10, weight: .semibold))
+                }
+                .buttonStyle(.plain)
+                .foregroundColor(DS.Palette.textSecondary)
+                .disabled(vm.findMatchCount == 0)
+                .help("Previous match (Shift+Cmd+G)")
+                .accessibilityIdentifier("diff.find.prev")
+                Button { vm.nextFindMatch() } label: {
+                    Image(systemName: "chevron.down")
+                        .font(.system(size: 10, weight: .semibold))
+                }
+                .buttonStyle(.plain)
+                .foregroundColor(DS.Palette.textSecondary)
+                .disabled(vm.findMatchCount == 0)
+                .help("Next match (Cmd+G)")
+                .accessibilityIdentifier("diff.find.next")
+            }
+            Button { vm.dismissFind(); findFieldFocused = false } label: {
+                Image(systemName: "xmark.circle.fill")
+                    .font(.system(size: 11))
+                    .foregroundColor(DS.Palette.textTertiary)
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Close find bar")
+            .accessibilityIdentifier("diff.find.close")
+            .help("Close find bar (Esc)")
+        }
+        .padding(.horizontal, DS.Space.lg)
+        .padding(.vertical, DS.Space.sm)
+        .background(DS.Palette.surface)
+        .overlay(alignment: .bottom) {
+            Rectangle().fill(DS.Palette.line).frame(height: DS.Border.hairline)
+        }
+        .onAppear { findFieldFocused = true }
+        .accessibilityIdentifier("diff.find.bar")
     }
 
     private var diffToolbar: some View {
@@ -1603,6 +1843,11 @@ public struct DiffPanelView: View {
         .accessibilityAddTraits(binding.wrappedValue ? .isSelected : [])
         .accessibilityIdentifier(identifier)
         .help(title == "Wrap" ? "Toggle line wrapping" : "Ignore whitespace in diff")
+    }
+
+    private func activateFind() {
+        vm.activateFind()
+        findFieldFocused = true
     }
 
     private func copyDiff() {
