@@ -31,6 +31,13 @@ public final class SystemNotifier: NSObject, UNUserNotificationCenterDelegate {
     /// agent run is not invisible on a denied system (UX-MAC_APPSHELL-P2).
     public var onDeniedPost: ((RemoteCodeNotificationContent) -> Void)?
 
+    /// Posted on the main thread the first time a `post(_:)` call is dropped
+    /// because the user has denied OS-level notification permission. Observers
+    /// (e.g. a status-bar notice or settings prompt) can react to this name.
+    /// Posted at most once per app session; the gating flag lives in AppDelegate
+    /// so multiple denied posts never spam the user (UX-MAC_APPSHELL-P2).
+    public static let rc2NotificationsDeniedPost = Notification.Name("rc2NotificationsDeniedPost")
+
     private override init() {
         super.init()
     }

@@ -96,4 +96,73 @@ final class SystemNotifierDeniedPostTests: XCTestCase {
             "cancelled and failed content must have distinct identifiers " +
             "so the in-app fallback can render the correct copy per outcome")
     }
+
+    // MARK: - Once-only gate (AppDelegate.shouldFireDeniedNotice)
+
+    func test_shouldFireDeniedNotice_trueWhenNotFiredYet() {
+        // WHY: a user with notifications off must see the in-app notice on
+        // the first denied post so the run result is not invisible.
+        XCTAssertTrue(
+            AppDelegate.shouldFireDeniedNotice(alreadyFired: false),
+            "shouldFireDeniedNotice must return true on the first denied post " +
+            "so the in-app notice appears and the user learns notifications are off"
+        )
+    }
+
+    func test_shouldFireDeniedNotice_falseWhenAlreadyFired() {
+        // WHY: without the once-only gate every run completion while
+        // notifications are off would trigger a new notice, which is spammy
+        // and trains the user to ignore it.
+        XCTAssertFalse(
+            AppDelegate.shouldFireDeniedNotice(alreadyFired: true),
+            "shouldFireDeniedNotice must return false after the first firing " +
+            "so the user is not spammed on every subsequent denied post"
+        )
+    }
+
+    // MARK: - rc2NotificationsDeniedPost fires exactly once via handleDeniedPost
+
+    func test_handleDeniedPost_postsNotificationExactlyOnce() {
+        let delegate = AppDelegate(channel: .debug)
+        let content = makeContent()
+        var received: [Notification] = []
+        // queue: nil -> synchronous delivery on the posting thread (main actor);
+        // avoids a OperationQueue.main async hop that would race the assertion.
+        let observer = NotificationCenter.default.addObserver(
+            forName: SystemNotifier.rc2NotificationsDeniedPost,
+            object: delegate,
+            queue: nil
+        ) { received.append($0) }
+        defer { NotificationCenter.default.removeObserver(observer) }
+
+        // First call must fire the notice.
+        delegate.handleDeniedPost(content)
+        // Second call must be a no-op.
+        delegate.handleDeniedPost(content)
+
+        XCTAssertEqual(received.count, 1,
+            "handleDeniedPost must post rc2NotificationsDeniedPost exactly once per session " +
+            "so the in-app notice fires on the first denied run but does not spam on subsequent ones")
+    }
+
+    func test_handleDeniedPost_notificationCarriesThreadId() {
+        let delegate = AppDelegate(channel: .debug)
+        let threadId = UUID().uuidString
+        let content = RemoteCodeNotificationContent.threadOutcome(
+            threadId: threadId, title: "Fix", phase: .completed)!
+        var userInfoThreadId: String?
+        // queue: nil -> synchronous delivery on the posting thread (main actor).
+        let observer = NotificationCenter.default.addObserver(
+            forName: SystemNotifier.rc2NotificationsDeniedPost,
+            object: delegate,
+            queue: nil
+        ) { userInfoThreadId = $0.userInfo?["threadId"] as? String }
+        defer { NotificationCenter.default.removeObserver(observer) }
+
+        delegate.handleDeniedPost(content)
+
+        XCTAssertEqual(userInfoThreadId, threadId,
+            "rc2NotificationsDeniedPost userInfo[threadId] must match the denied content " +
+            "so an observer can deep-link to the finished thread from the in-app notice")
+    }
 }

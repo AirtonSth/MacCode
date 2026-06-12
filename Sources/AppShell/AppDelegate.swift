@@ -59,6 +59,11 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
     /// Populated at most once per server per launch; cleared on re-configure.
     public private(set) var serverStartupFailures: [(server: String, reason: String)] = []
 
+    /// True once the first denied-post notice has been fired this session.
+    /// Guards `handleDeniedPost` so the user sees the notice at most once
+    /// per launch regardless of how many runs finish while notifications are off.
+    private var notificationsDeniedNoticeFired = false
+
     /// Notification name posted (on the main thread) when a server startup
     /// failure is recorded. Observers receive the `serverStartupFailures` array
     /// via `AppDelegate.shared?.serverStartupFailures` after the post.
@@ -191,6 +196,12 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         SystemNotifier.shared.bootstrap()
         SystemNotifier.shared.onNotificationResponse = { [weak self] response in
             self?.handleNotificationResponse(response)
+        }
+        // UX-MAC_APPSHELL-P2: when OS permission is denied, surface an in-app
+        // notice so a finished run is not invisible. Fired at most once per
+        // session (notificationsDeniedNoticeFired gate) to avoid spam.
+        SystemNotifier.shared.onDeniedPost = { [weak self] content in
+            self?.handleDeniedPost(content)
         }
         reapIdleProviderSessions()
         providerSessionReaperTimer = Timer.scheduledTimer(withTimeInterval: 10 * 60, repeats: true) { [weak self] _ in
@@ -1048,6 +1059,33 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
     }
 
     private var window: NSWindow? { windowController?.window }
+
+    // MARK: - Denied-notification in-app fallback (UX-MAC_APPSHELL-P2)
+
+    /// Invoked by `SystemNotifier.shared.onDeniedPost`. Posts
+    /// `SystemNotifier.rc2NotificationsDeniedPost` on the default
+    /// `NotificationCenter` the first time it is called; subsequent calls
+    /// are no-ops so the user is never spammed across multiple run completions.
+    ///
+    /// The once-only gate is a session-local `Bool` — intentionally not
+    /// persisted, because the notice is only meaningful when the user is
+    /// present and can act on it (open System Settings > Notifications).
+    func handleDeniedPost(_ content: RemoteCodeNotificationContent) {
+        guard Self.shouldFireDeniedNotice(alreadyFired: notificationsDeniedNoticeFired) else { return }
+        notificationsDeniedNoticeFired = true
+        NotificationCenter.default.post(
+            name: SystemNotifier.rc2NotificationsDeniedPost,
+            object: self,
+            userInfo: ["threadId": content.userInfo["threadId"] ?? ""]
+        )
+    }
+
+    /// Pure gate: returns true iff the once-only denied notice has not yet
+    /// fired this session. Extracted so the decision is testable without
+    /// any AppKit or @MainActor dependency.
+    nonisolated static func shouldFireDeniedNotice(alreadyFired: Bool) -> Bool {
+        !alreadyFired
+    }
 
     // MARK: - Notification deep-link routing
 
