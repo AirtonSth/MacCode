@@ -73,4 +73,50 @@ final class ManagedDistillCLITests: XCTestCase {
         let (_, code) = await cli.run()
         XCTAssertEqual(code, 1, "retrieve has no stdin to preserve => loud non-zero on miss")
     }
+
+    // MARK: - stdin cap (WHY: oversized stdin must not OOM the CLI)
+
+    func test_exceedsStdinCap_pureSeam_rejectsAboveCap() {
+        // Inputs above the cap must be flagged so the reject path fires before any
+        // String/JSONEncoder allocation. Business rule: cap + 1 byte is over limit.
+        XCTAssertTrue(
+            ManagedDistillCLI.exceedsStdinCap(byteCount: ManagedDistillCLI.stdinCapBytes + 1, cap: ManagedDistillCLI.stdinCapBytes),
+            "one byte over cap must be rejected"
+        )
+    }
+
+    func test_exceedsStdinCap_pureSeam_acceptsAtCap() {
+        // Exactly at the cap is allowed; the cap is an exclusive upper bound.
+        XCTAssertFalse(
+            ManagedDistillCLI.exceedsStdinCap(byteCount: ManagedDistillCLI.stdinCapBytes, cap: ManagedDistillCLI.stdinCapBytes),
+            "exactly at cap must be accepted"
+        )
+    }
+
+    func test_exceedsStdinCap_pureSeam_acceptsUnderCap() {
+        XCTAssertFalse(
+            ManagedDistillCLI.exceedsStdinCap(byteCount: 1_024, cap: ManagedDistillCLI.stdinCapBytes),
+            "small input well under cap must be accepted"
+        )
+    }
+
+    func test_compress_overCapStdin_rejectsNonZero() async {
+        // An oversized stdin must exit non-zero (not fail-open) so the caller gets an
+        // actionable error rather than silently discarded data or an OOM crash.
+        let overCap = Data(repeating: UInt8(ascii: "x"), count: ManagedDistillCLI.stdinCapBytes + 1)
+        let cli = ManagedDistillCLI(arguments: ["summarize"], stdin: overCap, state: state) { _ in nil }
+        let (out, code) = await cli.run()
+        XCTAssertEqual(code, 1, "over-cap stdin must exit non-zero")
+        let msg = String(decoding: out, as: UTF8.self)
+        XCTAssertTrue(msg.contains("cap"), "error message must mention the cap so the caller knows what to fix")
+    }
+
+    func test_compress_atCapStdin_proceedsNormally_failsOpenOnTransportFailure() async {
+        // A stdin exactly at the cap must not be rejected; normal fail-open applies.
+        let atCap = Data(repeating: UInt8(ascii: "x"), count: ManagedDistillCLI.stdinCapBytes)
+        let cli = ManagedDistillCLI(arguments: [], stdin: atCap, state: state) { _ in nil }
+        let (out, code) = await cli.run()
+        XCTAssertEqual(code, 0, "at-cap stdin is accepted; transport failure => fail-open, exit 0")
+        XCTAssertEqual(out, atCap, "fail-open echoes stdin verbatim")
+    }
 }

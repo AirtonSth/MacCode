@@ -15,6 +15,19 @@ import Foundation
 public struct ManagedDistillCLI: Sendable {
     public typealias Transport = @Sendable (URLRequest) async -> (data: Data, status: Int)?
 
+    /// Hard cap on stdin bytes. Inputs above this are rejected with a non-zero exit so a
+    /// runaway pipe cannot buffer an arbitrarily large blob into memory.
+    /// 512 KB is well above any realistic single distill request (token-output blobs,
+    /// large git diffs, verbose test logs). Raise only if legitimate inputs are measured
+    /// to exceed this value.
+    public static let stdinCapBytes: Int = 512 * 1_024
+
+    /// Pure seam: returns true when `byteCount` exceeds `cap`. Extracted so tests can
+    /// verify cap logic without constructing a full CLI instance or any I/O.
+    public static func exceedsStdinCap(byteCount: Int, cap: Int) -> Bool {
+        byteCount > cap
+    }
+
     public struct State: Sendable, Equatable {
         public let baseURL: String
         public let authToken: String
@@ -61,6 +74,14 @@ public struct ManagedDistillCLI: Sendable {
         // Fail-open: hand back exactly what was piped in. exit 0 so the agent never
         // sees an error in place of its tool output.
         func failOpen() -> (Data, Int32) { (stdin, 0) }
+
+        // Reject oversized stdin before any allocation. A blob this large would almost
+        // certainly time out or be refused by the service anyway; rejecting early prevents
+        // OOM and gives the caller an actionable error.
+        if ManagedDistillCLI.exceedsStdinCap(byteCount: stdin.count, cap: ManagedDistillCLI.stdinCapBytes) {
+            let msg = "distill: stdin exceeds \(ManagedDistillCLI.stdinCapBytes / 1_024) KB cap (\(stdin.count) bytes); truncate input before piping\n"
+            return (Data(msg.utf8), 1)
+        }
 
         let input = String(decoding: stdin, as: UTF8.self)
         guard !input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
