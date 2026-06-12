@@ -98,6 +98,129 @@ public final class SidebarViewModel: ObservableObject {
     /// NSAlert. Returning true means "proceed with disable".
     public typealias TokenSaverDisableConfirmProvider = @MainActor () -> Bool
 
+    // MARK: - WorkspacePrompting seam (:95)
+
+    /// Decision returned by a text-input prompt (rename, description).
+    /// `.committed(text)` means the user clicked Save; `.cancelled` means Cancel or dismiss.
+    public enum PromptDecision: Equatable {
+        case committed(String)
+        case cancelled
+    }
+
+    /// Decision returned by a confirm-remove alert.
+    public enum RemoveDecision: Equatable {
+        case confirmed
+        case cancelled
+    }
+
+    /// Injectable seam that drives the modal DECISION for rename/remove paths.
+    /// The real implementation shows NSAlert/NSTextField; the test implementation
+    /// returns a hard-coded result without spinning AppKit.
+    ///
+    /// Mirrors the `InsomniaBatteryPrompt` injection pattern (SidebarView.swift:43, :162).
+    public protocol WorkspacePrompting: AnyObject {
+        /// Called by `renameWorkspace`/`editDescription`. Must call `completion`
+        /// exactly once. The string in `.committed` must already be trimmed.
+        @MainActor func promptForText(
+            title: String,
+            message: String,
+            initial: String,
+            multiline: Bool,
+            completion: @escaping @MainActor (PromptDecision) -> Void
+        )
+
+        /// Called by `removeWorkspace` for a single-workspace confirm.
+        @MainActor func confirmRemoveOne(
+            name: String,
+            completion: @escaping @MainActor (RemoveDecision) -> Void
+        )
+
+        /// Called by `removeSelectedWorkspaces` for a multi-workspace confirm.
+        @MainActor func confirmRemoveMany(
+            count: Int,
+            names: [String],
+            completion: @escaping @MainActor (RemoveDecision) -> Void
+        )
+    }
+
+    /// Default production prompter: shows the same NSAlert/beginSheetModal/runModal
+    /// flow that the inline code used before the seam was introduced.
+    /// No behaviour change -- wraps the existing modal calls verbatim.
+    public final class AppKitWorkspacePrompter: WorkspacePrompting {
+        private weak var viewModel: SidebarViewModel?
+
+        public init(viewModel: SidebarViewModel) {
+            self.viewModel = viewModel
+        }
+
+        @MainActor public func promptForText(
+            title: String,
+            message: String,
+            initial: String,
+            multiline: Bool,
+            completion: @escaping @MainActor (PromptDecision) -> Void
+        ) {
+            viewModel?.presentPromptSheet(
+                title: title,
+                message: message,
+                initial: initial,
+                multiline: multiline
+            ) { text in
+                if let text {
+                    completion(.committed(text))
+                } else {
+                    completion(.cancelled)
+                }
+            }
+        }
+
+        @MainActor public func confirmRemoveOne(
+            name: String,
+            completion: @escaping @MainActor (RemoveDecision) -> Void
+        ) {
+            let alert = NSAlert()
+            alert.alertStyle = .warning
+            alert.messageText = "Remove \"\(name)\"?"
+            alert.informativeText = "This removes the workspace and its tabs from RemoteCode. Files on disk are not touched."
+            alert.addButton(withTitle: "Remove")
+            alert.addButton(withTitle: "Cancel")
+            let handler: (NSApplication.ModalResponse) -> Void = { response in
+                completion(SidebarRootView.confirmRemoveDecision(response: response) ? .confirmed : .cancelled)
+            }
+            if let window = NSApp.keyWindow {
+                alert.beginSheetModal(for: window, completionHandler: handler)
+            } else {
+                handler(alert.runModal())
+            }
+        }
+
+        @MainActor public func confirmRemoveMany(
+            count: Int,
+            names: [String],
+            completion: @escaping @MainActor (RemoveDecision) -> Void
+        ) {
+            let alert = NSAlert()
+            alert.alertStyle = .warning
+            alert.messageText = "Remove \(count) workspaces?"
+            alert.informativeText = "This removes the selected workspaces and their tabs from RemoteCode. Files on disk are not touched.\n\n" + names.joined(separator: "\n")
+            alert.addButton(withTitle: "Remove")
+            alert.addButton(withTitle: "Cancel")
+            let handler: (NSApplication.ModalResponse) -> Void = { response in
+                completion(SidebarRootView.confirmRemoveDecision(response: response) ? .confirmed : .cancelled)
+            }
+            if let window = NSApp.keyWindow {
+                alert.beginSheetModal(for: window, completionHandler: handler)
+            } else {
+                handler(alert.runModal())
+            }
+        }
+    }
+
+    /// Injectable workspace prompter. Defaults to `AppKitWorkspacePrompter` (set
+    /// after `self` is available in `init`). Tests replace this with a fake that
+    /// returns a pre-determined decision without spinning AppKit modals.
+    public var workspacePrompter: (any WorkspacePrompting)?
+
     public weak var context: AppContext?
     public weak var router: AppCommandRouter?
 
@@ -244,6 +367,9 @@ public final class SidebarViewModel: ObservableObject {
             self?.handleExternalPowerStateChanged(state)
         }
         self.powerMonitor.start()
+        // :95 -- Wire the default AppKit prompter after self is available.
+        // Tests replace workspacePrompter with a fake before calling any prompt path.
+        workspacePrompter = AppKitWorkspacePrompter(viewModel: self)
         reload()
         reloadInsomnia()
         reloadTokenSaver()
@@ -1083,10 +1209,16 @@ public final class SidebarViewModel: ObservableObject {
     }
 
     public func renameWorkspace(_ ws: Workspace) {
-        presentPromptSheet(title: "Rename workspace",
-                           message: "New name for \"\(ws.name)\".",
-                           initial: ws.name) { [weak self] name in
-            guard let self, let name else { return }
+        // :95 -- Route through workspacePrompter so tests can drive the decision.
+        guard let prompter = workspacePrompter else { return }
+        prompter.promptForText(
+            title: "Rename workspace",
+            message: "New name for \"\(ws.name)\".",
+            initial: ws.name,
+            multiline: false
+        ) { [weak self] decision in
+            guard let self else { return }
+            guard case .committed(let name) = decision else { return }
             // UX-P3: whitespace-only rename must show an error rather than silently
             // doing nothing, so the user knows the save was rejected.
             guard !name.isEmpty else {
@@ -1103,12 +1235,17 @@ public final class SidebarViewModel: ObservableObject {
     }
 
     public func editDescription(_ ws: Workspace) {
+        // :95 -- Route through workspacePrompter so tests can drive the decision.
+        guard let prompter = workspacePrompter else { return }
         let current = ws.metadata["description"] ?? ""
-        presentPromptSheet(title: "Workspace description",
-                           message: "Optional note for \"\(ws.name)\".",
-                           initial: current,
-                           multiline: true) { [weak self] text in
-            guard let self, let text else { return }
+        prompter.promptForText(
+            title: "Workspace description",
+            message: "Optional note for \"\(ws.name)\".",
+            initial: current,
+            multiline: true
+        ) { [weak self] decision in
+            guard let self else { return }
+            guard case .committed(let text) = decision else { return }
             do {
                 try self.router?.setWorkspaceDescription(ws.id, text)
             } catch {
@@ -1234,16 +1371,11 @@ public final class SidebarViewModel: ObservableObject {
     }
 
     public func removeWorkspace(_ ws: Workspace) {
-        let alert = NSAlert()
-        alert.alertStyle = .warning
-        alert.messageText = "Remove \"\(ws.name)\"?"
-        alert.informativeText = "This removes the workspace and its tabs from RemoteCode. Files on disk are not touched."
-        alert.addButton(withTitle: "Remove")
-        alert.addButton(withTitle: "Cancel")
-        // :15 -- Present as a window sheet so detached workspace windows are not
-        // blocked. Falls back to runModal when no key window exists (e.g. tests).
-        let action: (NSApplication.ModalResponse) -> Void = { [weak self] response in
-            guard let self, SidebarRootView.confirmRemoveDecision(response: response) else { return }
+        // :95 -- Route through workspacePrompter so tests can drive the decision.
+        // The AppKitWorkspacePrompter default preserves the :15 sheet/runModal fallback.
+        guard let prompter = workspacePrompter else { return }
+        prompter.confirmRemoveOne(name: ws.name) { [weak self] decision in
+            guard let self, decision == .confirmed else { return }
             do {
                 let entry = WorkspaceUndoEntry(name: ws.name, cwd: ws.cwd, metadata: ws.metadata)
                 self.removedWorkspaceStack = WorkspaceUndoStack.push(entry, onto: self.removedWorkspaceStack)
@@ -1253,11 +1385,6 @@ public final class SidebarViewModel: ObservableObject {
                 self.removedWorkspaceStack = WorkspaceUndoStack.pop(from: self.removedWorkspaceStack)?.remaining ?? self.removedWorkspaceStack
                 self.showOperationError("Could not remove workspace", detail: error.localizedDescription)
             }
-        }
-        if let window = NSApp.keyWindow {
-            alert.beginSheetModal(for: window, completionHandler: action)
-        } else {
-            action(alert.runModal())
         }
     }
 
@@ -1296,15 +1423,11 @@ public final class SidebarViewModel: ObservableObject {
         let ids = selectedWorkspaceIDs
         guard !ids.isEmpty else { return }
         let names = workspaces.filter { ids.contains($0.id) }.map(\.name)
-        let alert = NSAlert()
-        alert.alertStyle = .warning
-        alert.messageText = "Remove \(ids.count) workspaces?"
-        alert.informativeText = "This removes the selected workspaces and their tabs from RemoteCode. Files on disk are not touched.\n\n" + names.joined(separator: "\n")
-        alert.addButton(withTitle: "Remove")
-        alert.addButton(withTitle: "Cancel")
-        // :15 -- Sheet so other windows stay live during the confirm prompt.
-        let action: (NSApplication.ModalResponse) -> Void = { [weak self] response in
-            guard let self, SidebarRootView.confirmRemoveDecision(response: response) else { return }
+        // :95 -- Route through workspacePrompter so tests can drive the decision.
+        // The AppKitWorkspacePrompter default preserves the :15 sheet/runModal fallback.
+        guard let prompter = workspacePrompter else { return }
+        prompter.confirmRemoveMany(count: ids.count, names: names) { [weak self] decision in
+            guard let self, decision == .confirmed else { return }
             do {
                 try self.router?.closeWorkspaces(Array(ids))
             } catch {
@@ -1314,11 +1437,6 @@ public final class SidebarViewModel: ObservableObject {
             self.selectedWorkspaceIDs.removeAll()
             self.selectionAnchorID = nil
             self.reload()
-        }
-        if let window = NSApp.keyWindow {
-            alert.beginSheetModal(for: window, completionHandler: action)
-        } else {
-            action(alert.runModal())
         }
     }
 

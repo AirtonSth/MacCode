@@ -1,4 +1,7 @@
 import Foundation
+import os
+
+private let keybindingLog = Logger(subsystem: "io.remotecode.appshell", category: "keybindings")
 
 public struct Keybinding: Codable, Equatable, Sendable {
     public let key: String
@@ -19,9 +22,24 @@ public struct KeybindingConfig: Equatable {
         self.warnings = warnings
     }
 
+    // MARK: - Warning observer seam (:19 / T037)
+
+    /// Called synchronously from `parse()` whenever warnings are produced.
+    /// Production: nil (warnings go to os_log only).
+    /// Tests: set to a closure that captures warnings so the test can assert them.
+    ///
+    /// WHY this seam exists: parse warnings silently disappeared into nothing
+    /// before :19. os_log entries are invisible to XCTest; this closure lets a
+    /// test prove the fail-loud contract (if warnings exist, something observes
+    /// them) without depending on any AppKit surface.
+    public static var onWarningsEmitted: (([String]) -> Void)? = nil
+
     public static func parse(_ data: Data) -> KeybindingConfig {
         guard let arr = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else {
-            return KeybindingConfig(warnings: ["keybindings.json is not a JSON array — using defaults"])
+            let warns = ["keybindings.json is not a JSON array — using defaults"]
+            for w in warns { keybindingLog.warning("\(w, privacy: .public)") }
+            onWarningsEmitted?(warns)
+            return KeybindingConfig(warnings: warns)
         }
         var out: [Keybinding] = []
         var warns: [String] = []
@@ -32,6 +50,10 @@ public struct KeybindingConfig: Equatable {
                 continue
             }
             out.append(Keybinding(key: normalize(key), command: cmd, when: raw["when"] as? String))
+        }
+        if !warns.isEmpty {
+            for w in warns { keybindingLog.warning("\(w, privacy: .public)") }
+            onWarningsEmitted?(warns)
         }
         return KeybindingConfig(bindings: out, warnings: warns)
     }
