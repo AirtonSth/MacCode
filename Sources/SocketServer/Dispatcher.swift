@@ -1710,15 +1710,18 @@ public final class JSONRPCDispatcher {
         guard isDir.boolValue else {
             throw JSONRPCError(code: -32602, message: "not a directory", data: .string(path))
         }
-        let names = try fm.contentsOfDirectory(atPath: path)
-        let entries = names.map { name -> (Bool, String, JSONValue) in
-            let child = (path as NSString).appendingPathComponent(name)
-            var childDir: ObjCBool = false
-            _ = fm.fileExists(atPath: child, isDirectory: &childDir)
-            let isDirectory = childDir.boolValue
+        let dirURL = URL(fileURLWithPath: path, isDirectory: true)
+        let childURLs = try fm.contentsOfDirectory(at: dirURL,
+                                                    includingPropertiesForKeys: [.isDirectoryKey],
+                                                    options: [])
+        let entries = childURLs.map { url -> (Bool, String, JSONValue) in
+            let name = url.lastPathComponent
+            // resourceValues(forKeys:) is a single prefetched-stat read; falls back to
+            // false (not a directory) if the key is unavailable (e.g. broken symlinks).
+            let isDirectory = (try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) ?? false
             return (isDirectory, name, .object([
                 "name": .string(name),
-                "path": .string(child),
+                "path": .string(url.path),
                 "type": .string(isDirectory ? "directory" : "file"),
             ]))
         }
