@@ -158,6 +158,39 @@ public struct RemoteAccessNotificationPolicy {
     }
 }
 
+/// Reflects whether the HTTP listener actually bound after a remote-access toggle.
+///
+/// WHY: the toggle writes the preference and fires the notification optimistically.
+/// AppDelegate.configureDirectAccess() then calls http.start() which can throw
+/// (port already in use, permission denied, etc.). Without checking the bind result
+/// the toggle reads "on" while nothing is listening. This enum closes that gap.
+///
+/// - .on:        User requested on AND the listener successfully bound. Connections accepted.
+/// - .bindFailed: User requested on BUT the listener failed to bind. Toggle must show
+///               off/error; the stored preference has been rolled back to "0".
+/// - .off:       User requested off (loopback-only mode; no remote connections).
+public enum RemoteAccessStatus: Equatable {
+    case on
+    case bindFailed(reason: String)
+    case off
+
+    /// Pure decision: derive the correct status from the requested state and bind outcome.
+    ///
+    /// - Parameters:
+    ///   - requestedOn: The value the user toggled to.
+    ///   - listenerBound: True iff AppDelegate confirmed the HTTP server started
+    ///                    without error after the toggle.
+    ///   - failureReason: The error description when listenerBound is false.
+    public static func remoteAccessStatus(
+        requestedOn: Bool,
+        listenerBound: Bool,
+        failureReason: String = ""
+    ) -> RemoteAccessStatus {
+        guard requestedOn else { return .off }
+        return listenerBound ? .on : .bindFailed(reason: failureReason)
+    }
+}
+
 @MainActor
 public final class SettingsViewModel: ObservableObject {
     public let settingsRepo: SettingsRepository
@@ -172,10 +205,22 @@ public final class SettingsViewModel: ObservableObject {
     private var changeObservers: [NSObjectProtocol] = []
 
     @Published public var remoteAccessEnabled: Bool = false
+    /// Non-nil when the HTTP listener failed to bind after the last remote-access
+    /// toggle-on. The toggle is reverted to off and the preference rolled back so
+    /// the stored value matches the actual listener state.
+    /// WHY: without this, remoteAccessEnabled stays true even when nothing is
+    /// listening, and the user believes remote access is active when it is not.
+    @Published public var remoteAccessBindFailedReason: String? = nil
     @Published public var appSettings: AppSettings = AppSettings()
     /// True while this VM is mid-post for rc2RemoteAccessSettingChanged so the
     /// observer can skip the redundant self-triggered reload (L91 perf fix).
     private var _postingRemoteAccess = false
+    /// True between setRemoteAccess(true) and the serverStartupFailureNotification
+    /// observation window so the observer can tell whether the failure belongs to
+    /// the current toggle attempt (not a stale failure from a previous launch).
+    /// Internal (not private) so tests can arm it directly to simulate the
+    /// production timing without relying on async-clear ordering.
+    var _pendingRemoteAccessToggle = false
     @Published public var codexPath: String = ""
     @Published public var claudePath: String = ""
     /// Last value that was actually persisted + wired into the coordinator.
@@ -307,6 +352,34 @@ public final class SettingsViewModel: ObservableObject {
                 self.reload()
             }
         })
+        // Observe bind failures from AppDelegate.configureDirectAccess(). When
+        // the HTTP server fails to start after we toggled remote access on, revert
+        // the toggle to off (matching the stored preference AppDelegate already
+        // rolled back) and surface the bind error to the UI.
+        // WHY: without this observer, remoteAccessEnabled stays true even though
+        // nothing is listening -- the toggle shows "on" while no connections are
+        // accepted. The _pendingRemoteAccessToggle guard ensures only failures
+        // that belong to the current toggle attempt are surfaced; stale failures
+        // from a previous launch startup do not affect the toggle state.
+        changeObservers.append(NotificationCenter.default.addObserver(
+            forName: AppDelegate.serverStartupFailureNotification, object: nil, queue: .main
+        ) { [weak self] notification in
+            // Capture synchronously; Task hop cannot capture a mutating let.
+            let pending = self?._pendingRemoteAccessToggle ?? false
+            guard pending else { return }
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self._pendingRemoteAccessToggle = false
+                // Read the HTTP server failure reason, if any.
+                let delegate = notification.object as? AppDelegate
+                let reason = delegate?.serverStartupFailures
+                    .last(where: { $0.server == "HTTP server" })?.reason ?? "Listener failed to bind"
+                // Revert the stored preference so it matches the actual listener state.
+                try? self.settingsRepo.set("remote_access_enabled", "0")
+                self.remoteAccessEnabled = false
+                self.remoteAccessBindFailedReason = reason
+            }
+        })
     }
 
     deinit {
@@ -345,11 +418,30 @@ public final class SettingsViewModel: ObservableObject {
     }
 
     public func setRemoteAccess(_ on: Bool) {
+        // Clear any previous bind-fail state; a new toggle attempt supersedes it.
+        remoteAccessBindFailedReason = nil
         remoteAccessEnabled = on
         try? settingsRepo.set("remote_access_enabled", on ? "1" : "0")
+        // Arm the pending-toggle flag before posting so the serverStartupFailure
+        // observer can attribute the upcoming bind result to this specific toggle.
+        // Only arm when turning on; turning off cannot produce a bind error.
+        _pendingRemoteAccessToggle = on
         _postingRemoteAccess = true
         NotificationCenter.default.post(name: .rc2RemoteAccessSettingChanged, object: nil)
         _postingRemoteAccess = false
+        // AppDelegate's observer runs synchronously during the post above. If the
+        // bind succeeded, no serverStartupFailureNotification is posted and the
+        // pending flag stays armed. Disarm it on the next main-queue cycle so a
+        // later, unrelated startup failure is not misattributed to this toggle.
+        // The failure observer also clears the flag, so if a failure Task runs
+        // before this async clear, no double-clear harm occurs.
+        if on {
+            DispatchQueue.main.async { [weak self] in
+                self?._pendingRemoteAccessToggle = false
+            }
+        } else {
+            _pendingRemoteAccessToggle = false
+        }
     }
 
     public func setDiffWordWrap(_ on: Bool) {
@@ -758,9 +850,16 @@ public struct SettingsView: View {
                 .labelsHidden()
                 .accessibilityIdentifier("settings.remoteAccess.toggle")
             }
-            Text("Off binds the host API to 127.0.0.1. On binds to 0.0.0.0:18217 and publishes Bonjour; paired-device tokens are still required.")
-                .font(DS.Font.caption)
-                .foregroundColor(DS.Palette.textTertiary)
+            if let reason = vm.remoteAccessBindFailedReason {
+                Text("Remote access could not start: \(reason). The toggle has been turned off.")
+                    .font(DS.Font.caption)
+                    .foregroundColor(DS.Palette.danger)
+                    .accessibilityIdentifier("settings.remoteAccess.bindFailedNote")
+            } else {
+                Text("Off binds the host API to 127.0.0.1. On binds to 0.0.0.0:18217 and publishes Bonjour; paired-device tokens are still required.")
+                    .font(DS.Font.caption)
+                    .foregroundColor(DS.Palette.textTertiary)
+            }
         }
         .dsPanel(padding: DS.Space.lg)
     }
