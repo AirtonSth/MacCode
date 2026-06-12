@@ -1112,12 +1112,17 @@ public final class JSONRPCDispatcher {
                 guard let tid = params["thread_id"]?.stringValue.flatMap(UUID.init).map(AgentThreadID.init) else { throw JSONRPCError.invalidParams }
                 return .init(id: id, result: encode(try router.listAgentThreadCheckpoints(thread: tid)))
             case "agent.checkpoint.diff":
+                // QA-XPLAT :19 -- accept both `turn_count` (mac-native) and
+                // `checkpoint_turn_count` (what the iOS client sends). Sending only
+                // one key made revert/diff fail with -32602 against a real Mac while
+                // the iOS fake (which uses checkpoint_turn_count) stayed green.
                 guard let tid = params["thread_id"]?.stringValue.flatMap(UUID.init).map(AgentThreadID.init),
-                      let turnCount = params["turn_count"]?.intValue else { throw JSONRPCError.invalidParams }
+                      let turnCount = (params["turn_count"] ?? params["checkpoint_turn_count"])?.intValue else { throw JSONRPCError.invalidParams }
                 return .init(id: id, result: .string(try router.agentCheckpointDiff(thread: tid, checkpointTurnCount: turnCount, path: params["path"]?.stringValue)))
             case "agent.checkpoint.revert":
+                // QA-XPLAT :19 -- accept both keys (see agent.checkpoint.diff above).
                 guard let tid = params["thread_id"]?.stringValue.flatMap(UUID.init).map(AgentThreadID.init),
-                      let turnCount = params["turn_count"]?.intValue else { throw JSONRPCError.invalidParams }
+                      let turnCount = (params["turn_count"] ?? params["checkpoint_turn_count"])?.intValue else { throw JSONRPCError.invalidParams }
                 let receiptKey = params["client_request_id"]?.stringValue
                 if let (_, cached) = commandReceipt(method: req.method, params: params) {
                     return .init(id: id, result: cached)
@@ -1602,6 +1607,10 @@ public final class JSONRPCDispatcher {
         method.hasPrefix("system.")
             || method == "workspace.list"
             || method == "workspace.current"
+            // QA-XPLAT :10 -- window.current is read-only and the iOS client
+            // batches it (HostSession baseline batch); without this the host
+            // rejected it from a read-only batch, a silent cross-repo gate drift.
+            || method == "window.current"
             || method == "events.recent"
             || method == "settings.get"
             || method == "agent.prompt_history"
