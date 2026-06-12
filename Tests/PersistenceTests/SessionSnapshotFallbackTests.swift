@@ -170,4 +170,58 @@ final class SessionSnapshotFallbackTests: XCTestCase {
             "the dangling selectedSurfaceID must not match any surface in the pane; " +
             "if it does the test fixture is wrong")
     }
+
+    // MARK: - firstDecodable seam
+
+    /// WHY: one corrupt latest snapshot must not lose the user's whole layout when
+    /// older good ones exist. The seam must find the first decodable blob by index.
+    func test_firstDecodable_corruptCorruptValid_returnsIndex2() throws {
+        let valid = minimalSnap()
+        let validData = try JSONEncoder().encode(valid)
+        let corrupt = Data("NOT_VALID_JSON".utf8)
+
+        let blobs: [Data] = [corrupt, corrupt, validData]
+        let decode: (Data) -> SessionSnapshot? = { data in
+            try? JSONDecoder().decode(SessionSnapshot.self, from: data)
+        }
+
+        let result = SessionSnapshotRepository.firstDecodable(blobs, decode: decode)
+        XCTAssertNotNil(result,
+            "firstDecodable must return the valid blob even when the two newest blobs are corrupt")
+        XCTAssertEqual(result?.index, 2,
+            "firstDecodable must report index=2 (zero-based) to let callers log how many were skipped")
+    }
+
+    /// WHY: all-corrupt input must yield nil so the caller starts from empty state
+    /// rather than crashing or returning stale data.
+    func test_firstDecodable_allCorrupt_returnsNil() throws {
+        let corrupt = Data("CORRUPT".utf8)
+        let blobs: [Data] = [corrupt, corrupt, corrupt]
+        let decode: (Data) -> SessionSnapshot? = { data in
+            try? JSONDecoder().decode(SessionSnapshot.self, from: data)
+        }
+
+        let result = SessionSnapshotRepository.firstDecodable(blobs, decode: decode)
+        XCTAssertNil(result,
+            "firstDecodable must return nil when every blob fails to decode; " +
+            "callers must handle this as a clean-slate start, not a crash")
+    }
+
+    /// WHY: when the first (newest) blob decodes, the seam must return index=0
+    /// without checking further blobs - preserving the common-path contract.
+    func test_firstDecodable_validNewest_returnsIndex0() throws {
+        let valid = minimalSnap()
+        let validData = try JSONEncoder().encode(valid)
+        let corrupt = Data("CORRUPT".utf8)
+
+        let blobs: [Data] = [validData, corrupt, corrupt]
+        let decode: (Data) -> SessionSnapshot? = { data in
+            try? JSONDecoder().decode(SessionSnapshot.self, from: data)
+        }
+
+        let result = SessionSnapshotRepository.firstDecodable(blobs, decode: decode)
+        XCTAssertEqual(result?.index, 0,
+            "firstDecodable must short-circuit at index=0 when the newest blob decodes; " +
+            "index > 0 is the signal that fallback was needed")
+    }
 }

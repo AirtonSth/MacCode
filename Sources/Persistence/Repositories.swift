@@ -1613,13 +1613,41 @@ public final class SessionSnapshotRepository {
         try db.execute("DELETE FROM session_snapshots WHERE id NOT IN (SELECT id FROM session_snapshots ORDER BY id DESC LIMIT 20);")
     }
 
-    public func latest() throws -> SessionSnapshot? {
-        let st = try db.prepare("SELECT payload_json FROM session_snapshots ORDER BY id DESC LIMIT 20;")
-        while try st.step() {
-            guard let json = st.columnText(0), let data = json.data(using: .utf8) else { continue }
-            if let snap = try? JSONDecoder().decode(SessionSnapshot.self, from: data) { return snap }
+    /// Pure seam: given blobs newest-first, returns the first that decodes successfully
+    /// and its zero-based index. Index 0 means the newest snapshot decoded fine (common
+    /// case). Index > 0 means that many newer snapshots were corrupt and were skipped.
+    /// Returns nil when every blob fails to decode (all-corrupt or empty input).
+    /// Bound: callers pass at most 10 blobs so startup cannot stall on a fully-corrupt DB.
+    public static func firstDecodable(
+        _ blobs: [Data],
+        decode: (Data) -> SessionSnapshot?
+    ) -> (index: Int, state: SessionSnapshot)? {
+        for (index, blob) in blobs.enumerated() {
+            if let snap = decode(blob) {
+                return (index, snap)
+            }
         }
         return nil
+    }
+
+    public func latest() throws -> SessionSnapshot? {
+        // Fetch up to 10 newest rows (prune keeps at most 20; 10 is a startup-latency
+        // bound so a fully-corrupt DB does not block launch noticeably).
+        let st = try db.prepare("SELECT payload_json FROM session_snapshots ORDER BY id DESC LIMIT 10;")
+        var blobs: [Data] = []
+        while try st.step() {
+            guard let json = st.columnText(0), let data = json.data(using: .utf8) else { continue }
+            blobs.append(data)
+        }
+        guard let found = SessionSnapshotRepository.firstDecodable(blobs, decode: { data in
+            try? JSONDecoder().decode(SessionSnapshot.self, from: data)
+        }) else {
+            return nil
+        }
+        if found.index > 0 {
+            NSLog("RemoteCode SessionSnapshot: newest %d snapshot(s) failed to decode; restored from snapshot at fallback index %d", found.index, found.index)
+        }
+        return found.state
     }
 }
 
