@@ -135,6 +135,11 @@ public final class DirectHTTPServer: @unchecked Sendable {
     static let maxClientFramePayloadBytes = 1024 * 1024
     static let maxWebSocketOutboundQueuedBytes = 1024 * 1024
     static let wsHeartbeatInterval: TimeInterval = 20
+    /// Receive timeout applied to every accepted client fd before the read
+    /// loop starts. Prevents a slow/stuck client from blocking the handler
+    /// thread indefinitely. `read()` will return -1 / EAGAIN after this many
+    /// seconds of silence, and the existing `n <= 0` guard closes the fd.
+    static let clientReceiveTimeoutSeconds: Int = 20
 
     /// Pure helper: decides whether the `/v1/ws` upgrade must present a valid
     /// bearer token. Mirrors the HTTP `/v1/*` auth gate: loopback-only binds are
@@ -280,6 +285,12 @@ public final class DirectHTTPServer: @unchecked Sendable {
             if let s = subID { EventBus.shared.unsubscribe(s) }
             close(fd)
         }
+        // Apply a receive timeout so a slow/stuck client cannot block this
+        // handler thread forever. On timeout, read() returns -1 with errno
+        // EAGAIN/EWOULDBLOCK; the `n <= 0` guard below treats that as a
+        // closed/failed connection and exits, which is the correct outcome.
+        var rcvTimeout = timeval(tv_sec: Self.clientReceiveTimeoutSeconds, tv_usec: 0)
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &rcvTimeout, socklen_t(MemoryLayout<timeval>.size))
         var buffer = Data()
         var tmp = [UInt8](repeating: 0, count: 4096)
         // headerSearchOffset: start each scan from (prevCount - 3) so a
