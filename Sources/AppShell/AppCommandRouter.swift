@@ -308,9 +308,18 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
 
     public func listWorkspaces() throws -> [Workspace] {
         guard let ctx = context else { return [] }
-        return ctx.state.window.workspaces.compactMap { id in
+        let ids = ctx.state.window.workspaces
+        // PERF-008: batch thread-busy check -- one query for all workspace ids
+        // instead of one threadRepo.list(workspaceId:) call per workspace.
+        let runningSet = (try? ctx.threadRepo.runningWorkspaceIds(in: ids)) ?? []
+        return ids.compactMap { id in
             guard var ws = ctx.state.workspaces[id] else { return nil }
-            let busy = isWorkspaceBusy(id)
+            let surfaceBusy = ws.layout.paneIDs().contains { pid in
+                (ws.layout.find(paneID: pid)?.surfaces ?? []).contains {
+                    isWorkspaceActivitySurface($0)
+                }
+            }
+            let busy = surfaceBusy || runningSet.contains(id)
             if busy { ws.metadata["busy"] = "true" }
             else { ws.metadata.removeValue(forKey: "busy") }
             return ws

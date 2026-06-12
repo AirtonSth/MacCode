@@ -243,6 +243,28 @@ public final class AgentThreadRepository {
         for id in ids { try delete(id: id) }
     }
 
+    /// PERF-008: returns the subset of the given workspace ids that have at
+    /// least one thread with status='running'. Single query with WHERE
+    /// workspace_id IN (...) AND status='running'. Used by listWorkspaces()
+    /// to compute the busy flag for every workspace without one query per workspace.
+    public func runningWorkspaceIds(in ids: [WorkspaceID]) throws -> Set<WorkspaceID> {
+        guard !ids.isEmpty else { return [] }
+        let placeholders = ids.map { _ in "?" }.joined(separator: ",")
+        let st = try db.prepare(
+            "SELECT DISTINCT workspace_id FROM agent_threads WHERE workspace_id IN (\(placeholders)) AND status = 'running';"
+        )
+        for (i, wid) in ids.enumerated() {
+            try st.bind(Int32(i + 1), wid.value.uuidString)
+        }
+        var out = Set<WorkspaceID>()
+        while try st.step() {
+            if let uuidStr = st.columnText(0), let uuid = UUID(uuidString: uuidStr) {
+                out.insert(WorkspaceID(uuid))
+            }
+        }
+        return out
+    }
+
     private func normalizeOrder(workspaceId: WorkspaceID, ordered: [AgentThread]? = nil) throws {
         let list: [AgentThread]
         if let ordered {
