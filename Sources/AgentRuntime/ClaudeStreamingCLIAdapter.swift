@@ -60,6 +60,9 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
     private let transcriptStore: ClaudeTranscriptStore
     private let lock = NSLock()
     private var sessions: [AgentThreadID: Session] = [:]
+    // UX-RESUME: set of thread IDs whose last session was killed by interruptTurn.
+    // Cleared when sendTurn begins a new session for that thread. Guarded by `lock`.
+    private var interruptedThreadIds: Set<AgentThreadID> = []
 
     public init(binaryNameOverride: String? = nil, maxReadableEvents: Int = 5_000, transcriptStore: ClaudeTranscriptStore = ClaudeTranscriptStore()) {
         self.binaryNameOverride = binaryNameOverride
@@ -86,8 +89,26 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
         session.inFlightRunId = request.runId
         session.sawError = false
         session.status = .running
+        // UX-RESUME: consume the interrupted flag for this thread so the
+        // emission below fires exactly once per respawn, not on every turn.
+        let wasInterrupted = interruptedThreadIds.remove(request.threadId) != nil
         lock.unlock()
 
+        // UX-RESUME: when this sendTurn is spawning a fresh session after an
+        // interrupt, emit a "resuming session..." providerRuntime event BEFORE
+        // the standard .running status so the UI can show a transient banner.
+        // needsSessionResume is a pure seam; the emit is the only side effect.
+        if Self.needsSessionResume(afterInterrupt: wasInterrupted, hasPersistentSession: request.providerThreadId != nil) {
+            let payload = Self.jsonString(["reason": "session_respawn"]) ?? "{}"
+            let resuming = AssistantEvent.providerRuntime(ProviderRuntimeEvent(
+                provider: .claude,
+                source: "claude.stream-json.session",
+                method: "claude.session.resuming",
+                payloadJSON: payload,
+                receivedAtMs: Int64(Date().timeIntervalSince1970 * 1000)
+            ))
+            onEvent(.event(resuming))
+        }
         onEvent(.status(.running))
         try sendPrompt(request.providerPrompt, to: session)
         return AgentRunHandle(runId: request.runId, process: session.process) { [weak self] in
@@ -98,6 +119,11 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
     public func interruptTurn(threadId: AgentThreadID) throws {
         lock.lock()
         let session = sessions[threadId]
+        // UX-RESUME: record the interrupt before any kill so the next sendTurn
+        // on this thread knows to emit a "resuming session..." signal.
+        if session != nil {
+            interruptedThreadIds.insert(threadId)
+        }
         lock.unlock()
         guard let session else { throw AgentProviderAdapterError.sessionNotFound(threadId) }
         // Attempt graceful interrupt via stream-json control message first.
@@ -114,6 +140,18 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
         if !didSend {
             try stopSession(threadId: threadId)
         }
+    }
+
+    /// Pure decision: should the next sendTurn emit a "resuming session..."
+    /// signal? True only when the previous session for this thread was killed by
+    /// an interrupt AND the new request carries a providerThreadId (so Claude
+    /// CLI will resume the conversation rather than start fresh).
+    ///
+    /// WHY: the user must see that the next turn is respawning a fresh process
+    /// linked to their existing conversation, not silently hanging.
+    /// No I/O, no actor isolation. Extracted for unit testing.
+    nonisolated static func needsSessionResume(afterInterrupt: Bool, hasPersistentSession: Bool) -> Bool {
+        afterInterrupt && hasPersistentSession
     }
 
     /// Builds the newline-terminated stream-json control interrupt payload.

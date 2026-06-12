@@ -37,6 +37,40 @@ final class ClaudeStreamingCLIAdapterInterruptTests: XCTestCase {
                        "stream-json control messages must be newline-terminated for the CLI line reader to flush")
     }
 
+    // MARK: - needsSessionResume pure seam tests
+
+    /// WHY: when an interrupt killed the session and the next turn carries a
+    /// providerThreadId (= Claude CLI will resume the conversation), the UI must
+    /// see "resuming session..." so the user knows a fresh process is spawning
+    /// rather than the UI silently hanging.
+    func test_needsSessionResume_trueWhenInterruptedAndHasPersistentSession() {
+        XCTAssertTrue(
+            ClaudeStreamingCLIAdapter.needsSessionResume(afterInterrupt: true, hasPersistentSession: true),
+            "interrupted + providerThreadId present => must signal session resumption"
+        )
+    }
+
+    /// WHY: a normal (non-interrupted) sendTurn must not emit the resuming event.
+    func test_needsSessionResume_falseWhenNotInterrupted() {
+        XCTAssertFalse(
+            ClaudeStreamingCLIAdapter.needsSessionResume(afterInterrupt: false, hasPersistentSession: true),
+            "no prior interrupt => no resuming signal, regardless of providerThreadId"
+        )
+        XCTAssertFalse(
+            ClaudeStreamingCLIAdapter.needsSessionResume(afterInterrupt: false, hasPersistentSession: false),
+            "no prior interrupt + no session => no resuming signal"
+        )
+    }
+
+    /// WHY: if the request has no providerThreadId the CLI starts fresh (not a
+    /// resume), so the "resuming session..." label would be misleading.
+    func test_needsSessionResume_falseWhenInterruptedButNoPersistentSession() {
+        XCTAssertFalse(
+            ClaudeStreamingCLIAdapter.needsSessionResume(afterInterrupt: true, hasPersistentSession: false),
+            "interrupted but no providerThreadId => CLI starts fresh, not a resume"
+        )
+    }
+
     // MARK: - Fallback path test (process + real pipe)
 
     /// When the process has already exited (process.isRunning == false),
