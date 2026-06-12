@@ -265,6 +265,75 @@ public enum GitDiff {
         return run(args, cwd: cwd).stdout
     }
 
+    /// Runs a single `git diff HEAD --no-color -- <paths>` and returns a
+    /// dictionary keyed by the path of each file that has changes. Files
+    /// absent from the output had no diff (same as calling `diff(in:path:)`
+    /// and getting `""`). Pure split after one subprocess — no per-file I/O.
+    ///
+    /// Renames: git uses `diff --git a/<old> b/<new>` in the header; the key
+    /// in the returned dictionary is the `b/` (new / current) path, matching
+    /// what callers track in `AgentTurnCheckpointFile.path`.
+    ///
+    /// Binary files appear in the output (`Binary files a/f and b/f differ`)
+    /// and are preserved verbatim in the returned slice.
+    public static func diffAll(in cwd: String, paths: [String]) -> [String: String] {
+        guard isGit(cwd), !paths.isEmpty else { return [:] }
+        let args = ["diff", "HEAD", "--no-color", "--"] + paths
+        let combined = run(args, cwd: cwd).stdout
+        return Self.splitCombinedDiff(combined)
+    }
+
+    /// Splits the stdout of a `git diff` invocation that covers multiple files
+    /// into a per-file dictionary. Each key is the `b/<path>` side of the
+    /// `diff --git` header (i.e. the current/new path). The value is the full
+    /// diff block for that file, including its opening `diff --git` line.
+    ///
+    /// Pure string parsing — no I/O. Exposed as `internal` so the test target
+    /// (same module via `@testable import`) can exercise it directly with a
+    /// synthetic diff blob without spawning git.
+    static func splitCombinedDiff(_ combined: String) -> [String: String] {
+        guard !combined.isEmpty else { return [:] }
+        var result: [String: String] = [:]
+        var currentPath: String? = nil
+        var currentLines: [String] = []
+
+        func flush() {
+            guard let path = currentPath, !currentLines.isEmpty else { return }
+            result[path] = currentLines.joined(separator: "\n") + "\n"
+        }
+
+        // Iterate line-by-line; `diff --git a/... b/...` marks a new file block.
+        // Use indices to avoid copying every line into a String.
+        var remaining = combined[...]
+        while !remaining.isEmpty {
+            let lineEnd = remaining.firstIndex(of: "\n") ?? remaining.endIndex
+            let line = String(remaining[..<lineEnd])
+            remaining = lineEnd < remaining.endIndex
+                ? remaining[remaining.index(after: lineEnd)...]
+                : remaining[remaining.endIndex...]
+
+            if line.hasPrefix("diff --git ") {
+                flush()
+                currentLines = [line]
+                // Extract the `b/<path>` component from `diff --git a/X b/Y`.
+                // The `b/` prefix length is 2. Handle spaces in paths: the
+                // split point is the last ` b/` occurrence after ` a/`.
+                if let bRange = line.range(of: " b/", options: .backwards) {
+                    let bPath = String(line[line.index(bRange.lowerBound, offsetBy: 3)...])
+                    currentPath = bPath.isEmpty ? nil : bPath
+                } else {
+                    currentPath = nil
+                }
+            } else {
+                if currentPath != nil {
+                    currentLines.append(line)
+                }
+            }
+        }
+        flush()
+        return result
+    }
+
     /// Synthesizes a unified-diff–style all-addition patch for an untracked
     /// file given its raw text content. No git I/O — pure and unit-testable.
     ///

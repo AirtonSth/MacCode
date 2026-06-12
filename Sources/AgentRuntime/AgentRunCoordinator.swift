@@ -1468,8 +1468,10 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     }
 
     private func captureFileDiffs(files: [AgentTurnCheckpointFile], cwd: String) -> [AgentTurnCheckpointFileDiff] {
-        files.map { file in
-            let patch = GitDiff.diff(in: cwd, path: file.path)
+        let paths = files.map(\.path)
+        let patchByPath = GitDiff.diffAll(in: cwd, paths: paths)
+        return files.map { file in
+            let patch = patchByPath[file.path] ?? ""
             return AgentTurnCheckpointFileDiff(path: file.path, patch: patch.isEmpty ? "Untracked file captured in checkpoint: \(file.path)" : patch)
         }
     }

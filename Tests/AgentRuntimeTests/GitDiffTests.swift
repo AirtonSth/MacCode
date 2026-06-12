@@ -515,6 +515,85 @@ final class GitDiffTests: XCTestCase {
         XCTAssertEqual(GitDiff.branches(in: prep.worktreePath).current, prep.branch)
     }
 
+    // MARK: splitCombinedDiff -- per-file splitting of a combined git diff output
+    //
+    // WHY: captureFileDiffs collapses N per-file git subprocesses into one
+    // `git diff HEAD -- <paths>` call and splits the combined stdout back into
+    // per-file patches. The split MUST reproduce exactly the same patch text
+    // that the old per-file `GitDiff.diff(in:path:)` calls returned. This test
+    // verifies correctness of the pure parser against a synthetic multi-file blob
+    // without spawning git, covering renames, binary-file markers, and the case
+    // where a requested file is absent from the output (no changes / untracked).
+
+    func test_splitCombinedDiff_multiFileBlob_returnsCorrectPerFileSegments() throws {
+        // Synthetic `git diff HEAD --no-color` output covering three files:
+        //   src/foo.swift  -- modified
+        //   README.md      -- binary (git binary-file marker)
+        //   src/bar.swift  -- renamed from src/baz.swift (rename, b/ path is bar.swift)
+        let combined = """
+        diff --git a/src/foo.swift b/src/foo.swift
+        index abc1234..def5678 100644
+        --- a/src/foo.swift
+        +++ b/src/foo.swift
+        @@ -1,3 +1,4 @@
+         line1
+        -line2
+        +line2 modified
+        +line3 new
+         line4
+        diff --git a/README.md b/README.md
+        index 0000000..1111111 100644
+        Binary files a/README.md and b/README.md differ
+        diff --git a/src/baz.swift b/src/bar.swift
+        similarity index 90%
+        rename from src/baz.swift
+        rename to src/bar.swift
+        index aaa1111..bbb2222 100644
+        --- a/src/baz.swift
+        +++ b/src/bar.swift
+        @@ -1 +1,2 @@
+         same
+        +added
+        """
+
+        let result = GitDiff.splitCombinedDiff(combined)
+
+        // Three entries, keyed by b/ path.
+        XCTAssertEqual(result.keys.sorted(), ["README.md", "src/bar.swift", "src/foo.swift"],
+                       "splitCombinedDiff must key each block by the b/ (current/new) path so callers can look up by file.path")
+
+        // foo.swift block starts with the diff --git header and contains all hunk lines.
+        let fooBlock = try XCTUnwrap(result["src/foo.swift"])
+        XCTAssertTrue(fooBlock.hasPrefix("diff --git a/src/foo.swift b/src/foo.swift\n"),
+                      "each block must begin with its own diff --git header line, matching what per-file git diff produced")
+        XCTAssertTrue(fooBlock.contains("+line2 modified"),
+                      "hunk lines must be preserved verbatim inside the per-file block")
+        XCTAssertTrue(fooBlock.contains("+line3 new"))
+
+        // Binary file block must include the Binary files marker line.
+        let readmeBlock = try XCTUnwrap(result["README.md"])
+        XCTAssertTrue(readmeBlock.contains("Binary files a/README.md and b/README.md differ"),
+                      "binary-file diff blocks must be preserved so the diff viewer can show the binary indicator")
+
+        // Rename: key is the b/ path (bar.swift), block spans the full rename header + hunk.
+        let barBlock = try XCTUnwrap(result["src/bar.swift"])
+        XCTAssertTrue(barBlock.hasPrefix("diff --git a/src/baz.swift b/src/bar.swift\n"),
+                      "renames must be keyed by the new (b/) path and include the full rename header")
+        XCTAssertTrue(barBlock.contains("rename from src/baz.swift"))
+        XCTAssertTrue(barBlock.contains("rename to src/bar.swift"))
+        XCTAssertTrue(barBlock.contains("+added"))
+
+        // A path not present in the output maps to nil (absent), not empty string --
+        // caller treats nil / "" the same as "no diff" (untracked fallback message).
+        XCTAssertNil(result["nonexistent.swift"],
+                     "a path absent from the combined diff must be absent from the result so callers apply the untracked-file fallback, matching the old per-file diff behavior")
+    }
+
+    func test_splitCombinedDiff_emptyInput_returnsEmptyDictionary() {
+        XCTAssertTrue(GitDiff.splitCombinedDiff("").isEmpty,
+                      "empty git diff output (nothing to diff) must yield no entries, not a crash or a spurious empty-keyed entry")
+    }
+
     func test_preparePullRequestWorktree_fallsBackToUpstreamRemoteAndTracksIt() throws {
         let dir = try mkTmpRepo()
         let forkBare = NSTemporaryDirectory() + "rc2-pr-fork-" + UUID().uuidString + ".git"
