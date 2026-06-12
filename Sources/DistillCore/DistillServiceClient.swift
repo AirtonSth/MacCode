@@ -123,6 +123,13 @@ public final class DistillServiceClient: @unchecked Sendable {
         }
     }
 
+    /// Release the underlying URLSession, allowing in-flight requests to
+    /// complete before the session is torn down. Call this before discarding
+    /// a client so the OS can reclaim socket/thread resources promptly.
+    public func invalidate() {
+        session.finishTasksAndInvalidate()
+    }
+
     /// Liveness probe against the unauthenticated `/healthz` endpoint.
     public func isHealthy() async -> Bool {
         var request = URLRequest(url: baseURL.appendingPathComponent("healthz"))

@@ -397,4 +397,32 @@ final class DistillServiceTests: XCTestCase {
         let http = try XCTUnwrap(response as? HTTPURLResponse)
         return (http.statusCode, data)
     }
+
+    // MARK: - invalidate
+
+    /// Replacing a cached DistillServiceClient must call invalidate() on the old
+    /// client so the underlying URLSession releases its socket/thread resources.
+    /// The test verifies that invalidate() does not throw and is idempotent:
+    /// if it were absent, the old URLSession would leak until dealloc (which may
+    /// never happen while the cache holds a strong reference).
+    func test_clientInvalidateIsIdempotentAndDoesNotCrash() async throws {
+        let configuration = try DistillServiceConfiguration(
+            authToken: "invalidate-test-token",
+            appSupportDirectory: NSTemporaryDirectory(),
+            maxConcurrentRequests: 1
+        )
+        let scheduler = DistillScheduler(runtime: LocalDistillRuntime(), maxConcurrentRequests: 1)
+        let server = DistillHTTPServer(configuration: configuration, scheduler: scheduler)
+        let ready = try await server.start()
+        defer { server.stop() }
+
+        guard let client = DistillServiceClient(ready: ready, authToken: "invalidate-test-token") else {
+            XCTFail("DistillServiceClient(ready:authToken:) must succeed for a valid ready event")
+            return
+        }
+        // First call: drains in-flight tasks and releases session resources.
+        client.invalidate()
+        // Second call: must not crash -- URLSession tolerates repeated invalidation.
+        client.invalidate()
+    }
 }

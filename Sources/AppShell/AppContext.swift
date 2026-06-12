@@ -582,7 +582,9 @@ public final class AppContext {
         guard case .running(let ready) = tokenSaverDistillServiceController.status,
               let token = tokenSaverDistillServiceController.bearerToken else {
             cachedDistillClientKey = nil
+            let staleClient = cachedDistillClient
             cachedDistillClient = nil
+            staleClient?.invalidate()
             return nil
         }
         let key = "\(ready.baseURL)#\(token)"
@@ -592,8 +594,10 @@ public final class AppContext {
         guard let client = DistillServiceClient(ready: ready, authToken: token) else {
             return nil
         }
+        let oldClient = cachedDistillClient
         cachedDistillClientKey = key
         cachedDistillClient = client
+        oldClient?.invalidate()
         return client
     }
 
