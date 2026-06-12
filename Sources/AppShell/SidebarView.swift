@@ -94,6 +94,7 @@ public final class SidebarViewModel: ObservableObject {
     private var lastPowerState: ExternalPowerState
     private var showingInsomniaBatteryPrompt = false
     private var tokenSaverModelDownloadTask: Task<TokenSaverModelManifest, Error>?
+    private var tokenSaverReloadInFlight = false
 
     public init(
         context: AppContext,
@@ -184,17 +185,41 @@ public final class SidebarViewModel: ObservableObject {
     }
 
     private func reloadTokenSaver() {
-        let settings = settingsStore.load()
-        tokenSaverEnabled = settings.tokenSaverEnabled
-        if let context {
-            tokenSaverUsageSnapshot = TokenSaverUsageStore(
-                appSupportDirectory: context.appSupportDirectory
-            ).load()
-            tokenSaverSavingsSummary = (try? context.tokenSaverSavingsRepo.summary()) ?? .empty
-        } else {
-            tokenSaverUsageSnapshot = .empty()
-            tokenSaverSavingsSummary = .empty
+        guard !tokenSaverReloadInFlight else { return }
+        tokenSaverReloadInFlight = true
+        let store = settingsStore
+        let appSupportDir = context?.appSupportDirectory
+        let savingsRepo = context?.tokenSaverSavingsRepo
+        Task.detached {
+            let result = SidebarViewModel.tokenSaverSnapshot(
+                settingsStore: store,
+                appSupportDirectory: appSupportDir,
+                savingsRepo: savingsRepo
+            )
+            await MainActor.run { [weak self] in
+                guard let self else { return }
+                self.tokenSaverEnabled = result.enabled
+                self.tokenSaverUsageSnapshot = result.usage
+                self.tokenSaverSavingsSummary = result.savings
+                self.tokenSaverReloadInFlight = false
+            }
         }
+    }
+
+    /// Pure, nonisolated helper: reads usage.json + SQL summary off the main actor.
+    /// Captured store references are @unchecked Sendable; all returned types are Sendable.
+    nonisolated static func tokenSaverSnapshot(
+        settingsStore: SettingsStore,
+        appSupportDirectory: URL?,
+        savingsRepo: TokenSaverSavingsRepository?
+    ) -> (enabled: Bool, usage: TokenSaverUsageSnapshot, savings: TokenSaverSavingsSummary) {
+        let enabled = settingsStore.load().tokenSaverEnabled
+        guard let appSupportDirectory else {
+            return (enabled, .empty(), .empty)
+        }
+        let usage = TokenSaverUsageStore(appSupportDirectory: appSupportDirectory).load()
+        let savings = (try? savingsRepo?.summary()) ?? .empty
+        return (enabled, usage, savings)
     }
 
     public func refreshTokenSaverAccountUsageForDetails() {
