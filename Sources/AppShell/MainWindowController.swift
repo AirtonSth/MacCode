@@ -678,6 +678,7 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
     }
 
     private var extraWindows: [WindowID: NSWindow] = [:]
+    private var extraWindowAttachHandlers: [WindowID: OrphanWindowAttachHandler] = [:]
 
     public func openAdditionalWindow(for w: AppWindow) {
         if let existing = extraWindows[w.id] { existing.makeKeyAndOrderFront(nil); return }
@@ -688,18 +689,9 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
             defer: false
         )
         win.title = w.title
-        let v = NSView()
-        v.translatesAutoresizingMaskIntoConstraints = false
-        let label = NSTextField(labelWithString: "Window \(w.id.value.uuidString.prefix(8))\nuse the sidebar / CLI (rc2 workspace.move_to_window) to attach workspaces.")
-        label.alignment = .center
-        label.maximumNumberOfLines = 0
-        label.translatesAutoresizingMaskIntoConstraints = false
-        v.addSubview(label)
-        NSLayoutConstraint.activate([
-            label.centerXAnchor.constraint(equalTo: v.centerXAnchor),
-            label.centerYAnchor.constraint(equalTo: v.centerYAnchor)
-        ])
-        win.contentView = v
+        let handler = OrphanWindowAttachHandler(windowID: w.id, window: win, context: context, router: router)
+        extraWindowAttachHandlers[w.id] = handler
+        win.contentView = handler.buildEmptyStateView()
         win.center()
         win.delegate = self
         win.makeKeyAndOrderFront(nil)
@@ -1023,6 +1015,7 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
             context?.saveSnapshot()
             disableInsomniaForAppClose()
         } else {
+            extraWindowAttachHandlers = extraWindowAttachHandlers.filter { $0.value.window !== closing }
             extraWindows = extraWindowsRemoving(closing, from: extraWindows)
         }
     }
@@ -1171,6 +1164,139 @@ nonisolated func extraWindowsRemoving(
     from windows: [WindowID: NSWindow]
 ) -> [WindowID: NSWindow] {
     windows.filter { $0.value !== closing }
+}
+
+/// Manages the in-GUI affordance for orphan extra windows (windows with no
+/// attached workspace). Presents an "Attach Workspace..." popup button that
+/// lists all known workspaces and moves the selected one into this window via
+/// router.moveWorkspaceToWindow -- the same path used by the sidebar / CLI.
+///
+/// WHY: raw instruction text ("use the sidebar / CLI") is invisible to users
+/// who create an extra window via the GUI. The popup replaces the instruction
+/// with an actionable control that calls the existing attach action directly.
+@MainActor
+private final class OrphanWindowAttachHandler: NSObject {
+    let window: NSWindow
+    private let windowID: WindowID
+    private weak var context: AppContext?
+    private weak var router: AppCommandRouter?
+    private var popup: NSPopUpButton?
+
+    init(windowID: WindowID, window: NSWindow, context: AppContext?, router: AppCommandRouter?) {
+        self.windowID = windowID
+        self.window = window
+        self.context = context
+        self.router = router
+    }
+
+    func buildEmptyStateView() -> NSView {
+        let v = NSView()
+        v.wantsLayer = true
+        v.layer?.backgroundColor = DS.NS.bg.cgColor
+
+        let icon = NSImageView()
+        icon.image = NSImage(systemSymbolName: "macwindow.badge.plus", accessibilityDescription: nil)
+        icon.symbolConfiguration = .init(pointSize: 28, weight: .light)
+        icon.contentTintColor = DS.NS.textTertiary
+        icon.translatesAutoresizingMaskIntoConstraints = false
+
+        let title = NSTextField(labelWithString: "No workspace attached")
+        title.font = NSFont.systemFont(ofSize: 15, weight: .semibold)
+        title.textColor = DS.NS.textSecondary
+        title.translatesAutoresizingMaskIntoConstraints = false
+
+        let sub = NSTextField(labelWithString: "Attach an existing workspace to this window,\nor use the sidebar / CLI (rc2 workspace.move_to_window).")
+        sub.font = NSFont.systemFont(ofSize: 12)
+        sub.textColor = DS.NS.textTertiary
+        sub.alignment = .center
+        sub.maximumNumberOfLines = 0
+        sub.translatesAutoresizingMaskIntoConstraints = false
+
+        let btn = NSPopUpButton(frame: .zero, pullsDown: false)
+        btn.setAccessibilityIdentifier("orphanWindow.attachWorkspace")
+        btn.translatesAutoresizingMaskIntoConstraints = false
+        rebuildPopupItems(btn)
+        btn.target = self
+        btn.action = #selector(attachWorkspaceSelected(_:))
+        self.popup = btn
+
+        let stack = NSStackView(views: [icon, title, sub, btn])
+        stack.orientation = .vertical
+        stack.alignment = .centerX
+        stack.spacing = 10
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        stack.setCustomSpacing(16, after: sub)
+        v.addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.centerXAnchor.constraint(equalTo: v.centerXAnchor),
+            stack.centerYAnchor.constraint(equalTo: v.centerYAnchor),
+            btn.widthAnchor.constraint(greaterThanOrEqualToConstant: 200)
+        ])
+        return v
+    }
+
+    private func rebuildPopupItems(_ btn: NSPopUpButton) {
+        btn.removeAllItems()
+        let workspaces = context?.state.workspaces.values.sorted { $0.name < $1.name } ?? []
+        if workspaces.isEmpty {
+            btn.addItem(withTitle: "No workspaces available")
+            btn.item(at: 0)?.isEnabled = false
+        } else {
+            btn.addItem(withTitle: "Attach Workspace...")
+            btn.item(at: 0)?.isEnabled = false
+            for ws in workspaces {
+                let item = NSMenuItem(title: ws.name.isEmpty ? "Untitled" : ws.name, action: nil, keyEquivalent: "")
+                item.representedObject = ws.id
+                btn.menu?.addItem(item)
+            }
+        }
+    }
+
+    @objc private func attachWorkspaceSelected(_ sender: NSPopUpButton) {
+        guard let wsID = sender.selectedItem?.representedObject as? WorkspaceID,
+              let router else { return }
+        do {
+            try router.moveWorkspaceToWindow(workspace: wsID, target: windowID)
+            let wsName = context?.state.workspaces[wsID]?.name ?? "Workspace"
+            updateToAttachedState(workspaceName: wsName)
+        } catch {
+            let alert = NSAlert()
+            alert.messageText = "Could not attach workspace"
+            alert.informativeText = error.localizedDescription
+            alert.runModal()
+        }
+    }
+
+    private func updateToAttachedState(workspaceName: String) {
+        let v = NSView()
+        v.wantsLayer = true
+        v.layer?.backgroundColor = DS.NS.bg.cgColor
+
+        let icon = NSImageView()
+        icon.image = NSImage(systemSymbolName: "checkmark.circle", accessibilityDescription: nil)
+        icon.symbolConfiguration = .init(pointSize: 28, weight: .light)
+        icon.contentTintColor = DS.NS.textTertiary
+        icon.translatesAutoresizingMaskIntoConstraints = false
+
+        let label = NSTextField(labelWithString: "\"\(workspaceName)\" attached to this window.")
+        label.font = NSFont.systemFont(ofSize: 13)
+        label.textColor = DS.NS.textSecondary
+        label.alignment = .center
+        label.translatesAutoresizingMaskIntoConstraints = false
+
+        let stack = NSStackView(views: [icon, label])
+        stack.orientation = .vertical
+        stack.alignment = .centerX
+        stack.spacing = 10
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        v.addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.centerXAnchor.constraint(equalTo: v.centerXAnchor),
+            stack.centerYAnchor.constraint(equalTo: v.centerYAnchor)
+        ])
+        window.contentView = v
+        window.title = workspaceName
+    }
 }
 
 @MainActor
