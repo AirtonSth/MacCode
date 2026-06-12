@@ -689,10 +689,22 @@ final class GhosttyTerminalView: NSView {
 
     deinit {
         NotificationCenter.default.removeObserver(self)
-        if let surface = surfaceSlot.removeForClose() {
-            ghostty_surface_free(surface)
-        }
+        // Pull the raw C pointer out of the slot now (while self is still valid).
+        // removeForClose() zeroes surfaceSlot.surface, so the pointer can only
+        // come out of here once -- no double-free is possible.
+        let surfaceToFree: ghostty_surface_t? = surfaceSlot.removeForClose()
         surfaceSlot.markClosed()
+        // ghostty_surface_free must be called on the main thread.
+        // Capture only the value-type pointer; never capture self in a deinit closure.
+        if let ptr = surfaceToFree {
+            if Thread.isMainThread {
+                ghostty_surface_free(ptr)
+            } else {
+                DispatchQueue.main.async {
+                    ghostty_surface_free(ptr)
+                }
+            }
+        }
     }
 
     override var acceptsFirstResponder: Bool { true }
