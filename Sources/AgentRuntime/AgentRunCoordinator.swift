@@ -163,6 +163,22 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         try runRepo.get(id: runId)?.status
     }
 
+    /// Returns the persisted start time of the active run for `threadId`, or
+    /// nil when no active run is recorded.
+    /// WHY: the Mac is the host and owns the authoritative run clock; callers
+    /// must use this instead of `Date()` so elapsed-time display is correct
+    /// even when the view reloads mid-run (e.g. selectThread after app relaunch).
+    /// CONTRACT PIN (iOS): iOS must use `agent.run.started` from the host
+    /// mirror event (or the `started_at` field in the run record broadcast)
+    /// to match this value across the connection.
+    public func runStartedAt(threadId: AgentThreadID) throws -> Date? {
+        lock.lock()
+        let runId = activeThreads[threadId]
+        lock.unlock()
+        guard let runId else { return nil }
+        return try runRepo.get(id: runId)?.startedAt
+    }
+
     @discardableResult
     public func startRun(_ request: AgentRunRequest) async throws -> AgentRunID {
         let recoveryContext = request.providerThreadId == nil ? try recoverableResumeContext(for: request) : nil

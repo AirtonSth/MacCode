@@ -73,6 +73,11 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     @Published public var userInputDrafts: [String: String] = [:]
     @Published public var focusTick: Int = 0
     @Published public var prompt: String = ""
+    // UX-XPLAT-009: UTF-16 cursor offset reported by PromptComposerEditor so
+    // suggestions anchor at the actual insertion point, not text.endIndex.
+    // nil means "not yet reported by the editor" -- suggestions fall back to
+    // the endIndex anchor so programmatic prompt mutations (tests, /clear) work.
+    @Published public var composerCursorOffset: Int? = nil
     @Published public var provider: AgentProvider = .codex
     @Published public var providerInstanceId: String = AgentProvider.codex.rawValue
     @Published public var model: String = "gpt-5.5"
@@ -361,7 +366,15 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             worktreePath = t.worktreePath
             status = t.status
             if t.status == .running {
-                if runStartedAt == nil { runStartedAt = Date() }
+                // UX-XPLAT-008: use the host's persisted run start time so
+                // "Working for Xs" reflects real elapsed time even after
+                // selectThread is called mid-run (e.g. after app relaunch or
+                // switching away and back). Fallback to Date() only when the
+                // run record is not yet committed (race on the very first tick).
+                runStartedAt = AgentAppViewModel.resolvedRunStartedAt(
+                    current: runStartedAt,
+                    persisted: try? coordinator.runStartedAt(threadId: id)
+                )
             } else {
                 currentRunId = nil
                 runStartedAt = nil
@@ -1046,13 +1059,18 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     public var composerSuggestions: [AgentComposerSuggestion] {
         AgentComposerSuggestions.suggestions(
             for: prompt,
+            cursorOffset: composerCursorOffset,
             snapshot: selectedProviderSnapshot,
             localSlashCommands: Self.localSlashCommands
         )
     }
 
     public func applyComposerSuggestion(_ suggestion: AgentComposerSuggestion) {
-        prompt = AgentComposerSuggestions.replacingActiveToken(in: prompt, with: suggestion.insertText)
+        prompt = AgentComposerSuggestions.replacingActiveToken(
+            in: prompt,
+            cursorOffset: composerCursorOffset,
+            with: suggestion.insertText
+        )
         promptHistoryCursor = nil
     }
 
@@ -1945,6 +1963,20 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         return isStopping ? .stopping : .stop
     }
 
+    /// Returns the authoritative run-start time.
+    ///
+    /// WHY: the Mac IS the host, so the persisted `AgentRun.startedAt` is the
+    /// ground truth. The `current` argument (the value already held by the
+    /// view model) is returned unchanged when it is already set AND no persisted
+    /// value is available -- this handles the brief race between run creation
+    /// and DB commit. When `persisted` is available it always wins so that
+    /// "Working for Xs" counts from the true start, not from the moment the
+    /// view noticed the run.
+    nonisolated public static func resolvedRunStartedAt(current: Date?, persisted: Date?) -> Date {
+        if let persisted { return persisted }
+        return current ?? Date()
+    }
+
     // PERF-L15: bound the terminal-run-id set so it cannot grow without limit.
     // Run IDs are fresh UUIDs; they are never re-used, so old finished IDs
     // accumulate forever. The gate at flushStreamEvents only needs recent IDs
@@ -2025,11 +2057,12 @@ public struct AgentComposerSuggestion: Identifiable, Equatable, Sendable {
 public enum AgentComposerSuggestions {
     public static func suggestions(
         for text: String,
+        cursorOffset: Int? = nil,
         snapshot: AgentProviderSnapshot?,
         localSlashCommands: [String],
         limit: Int = 8
     ) -> [AgentComposerSuggestion] {
-        let token = activeToken(in: text)
+        let token = activeToken(in: text, cursorOffset: cursorOffset)
         guard token.hasPrefix("/") || token.hasPrefix("$") else { return [] }
         let query = String(token.dropFirst()).lowercased()
         if token.hasPrefix("$") {
@@ -2049,19 +2082,58 @@ public enum AgentComposerSuggestions {
             }
     }
 
-    public static func replacingActiveToken(in text: String, with replacement: String) -> String {
-        guard let range = activeTokenRange(in: text) else { return replacement }
+    public static func replacingActiveToken(in text: String, cursorOffset: Int? = nil, with replacement: String) -> String {
+        guard let range = activeTokenRange(in: text, cursorOffset: cursorOffset) else { return replacement }
         var updated = text
         updated.replaceSubrange(range, with: replacement)
         return updated
     }
 
-    private static func activeToken(in text: String) -> String {
-        guard let range = activeTokenRange(in: text) else { return "" }
+    private static func activeToken(in text: String, cursorOffset: Int? = nil) -> String {
+        guard let range = activeTokenRange(in: text, cursorOffset: cursorOffset) else { return "" }
         return String(text[range])
     }
 
-    private static func activeTokenRange(in text: String) -> Range<String.Index>? {
+    /// Returns the range of the token immediately before the cursor.
+    ///
+    /// WHY: suggestions must anchor at the cursor position, not `text.endIndex`,
+    /// so that editing the middle of a multiline prompt (e.g. inserting a slash
+    /// command on line 2 of 3) produces correct suggestions. When `cursorOffset`
+    /// is nil the old behavior (anchor at endIndex) is preserved for call sites
+    /// that have not yet been wired up.
+    ///
+    /// The token extends from the nearest preceding whitespace (exclusive) to
+    /// the cursor position (exclusive of any text after the cursor).
+    nonisolated public static func activeTokenRange(text: String, cursorOffset: Int) -> Range<String.Index>? {
+        let utf16 = text.utf16
+        // Negative offsets are invalid (buggy caller) -> nil. An offset past the
+        // end (e.g. a transient paste race in NSTextView) clamps to endIndex so
+        // suggestions still resolve the trailing token rather than vanishing.
+        guard cursorOffset >= 0 else { return nil }
+        let cursorOffset = min(cursorOffset, utf16.count)
+        let cursorIdx: String.Index
+        if cursorOffset == utf16.count {
+            cursorIdx = text.endIndex
+        } else if let idx = text.index(text.startIndex, offsetBy: cursorOffset, limitedBy: text.endIndex) {
+            cursorIdx = idx
+        } else {
+            cursorIdx = text.endIndex
+        }
+        var start = cursorIdx
+        while start > text.startIndex {
+            let previous = text.index(before: start)
+            if text[previous].isWhitespace { break }
+            start = previous
+        }
+        guard start < cursorIdx else { return nil }
+        return start..<cursorIdx
+    }
+
+    private static func activeTokenRange(in text: String, cursorOffset: Int? = nil) -> Range<String.Index>? {
+        if let offset = cursorOffset {
+            return activeTokenRange(text: text, cursorOffset: offset)
+        }
+        // Legacy: anchor at text.endIndex (used when cursor position is unknown).
         let end = text.endIndex
         var start = end
         while start > text.startIndex {
@@ -2385,6 +2457,8 @@ public struct AgentAppView: View {
     @State private var declineReasonDrafts: [String: String] = [:]
     // P1: thread delete confirmation — ids staged here until user confirms.
     @State private var pendingDeleteThreadIds: Set<AgentThreadID> = []
+    // UX-XPLAT-007: checkpoint revert confirmation — staged turn count until user confirms.
+    @State private var pendingRevertCheckpointTurnCount: Int?
     // P3: user-message "show more" — message ids the user has expanded past 28 lines.
     @State private var expandedUserMessages: Set<AgentMessageID> = []
     @State private var showModelOptions = false
@@ -2404,6 +2478,14 @@ public struct AgentAppView: View {
     /// decision is independent of view state.
     static func showsTranslatedBadge(wasSR1Translated: Bool) -> Bool {
         wasSR1Translated
+    }
+
+    /// Pure seam: checkpoint revert always needs a destructive confirmation.
+    /// WHY: reverting rolls back the working tree and cannot be undone; any
+    /// checkpoint that is ready to apply is destructive. The predicate is
+    /// extracted so tests can verify the guard without instantiating views.
+    nonisolated static func needsRevertConfirmation(checkpointStatus: AgentTurnCheckpointStatus) -> Bool {
+        checkpointStatus == .ready
     }
 
     static func shouldRenderFinalAssistantMessage(_ turn: AssistantTurnSnapshot, persistedAssistantTexts: [String] = []) -> Bool {
@@ -4838,7 +4920,8 @@ public struct AgentAppView: View {
                 onPreviousHistory: { vm.recallPreviousPrompt() },
                 onNextHistory: { vm.recallNextPrompt() },
                 onTextEdited: { vm.promptWasEdited() },
-                onFileDrop: { paths in vm.insertDroppedFilePaths(paths) }
+                onFileDrop: { paths in vm.insertDroppedFilePaths(paths) },
+                onCursorMoved: { offset in vm.composerCursorOffset = offset }
             )
             .frame(height: composerEditorHeight)
             .padding(.horizontal, DS.Space.lg)
@@ -5786,8 +5869,11 @@ public struct AgentAppView: View {
                                 .foregroundColor(message.hasPrefix("Revert failed") ? DS.Palette.danger : DS.Palette.textSecondary)
                         }
                         Spacer()
+                        // UX-XPLAT-007: stage the revert for confirmation instead
+                        // of executing immediately — rolling back the working tree
+                        // is irreversible without a prior git commit.
                         Button(role: .destructive) {
-                            vm.revertSelectedCheckpoint()
+                            pendingRevertCheckpointTurnCount = checkpoint.checkpointTurnCount
                         } label: {
                             Label("Revert", systemImage: "arrow.uturn.backward")
                         }
@@ -5799,6 +5885,23 @@ public struct AgentAppView: View {
             .padding(DS.Space.md)
             .background(DS.Palette.bg)
             .accessibilityIdentifier("agent.checkpoints.card")
+            // P1: confirm before reverting — rolls back working tree with no undo.
+            .confirmationDialog(
+                "Revert to checkpoint \(pendingRevertCheckpointTurnCount.map { "#\($0)" } ?? "")?",
+                isPresented: Binding(
+                    get: { pendingRevertCheckpointTurnCount != nil },
+                    set: { if !$0 { pendingRevertCheckpointTurnCount = nil } }
+                ),
+                titleVisibility: .visible
+            ) {
+                Button("Revert", role: .destructive) {
+                    vm.revertSelectedCheckpoint()
+                    pendingRevertCheckpointTurnCount = nil
+                }
+                Button("Cancel", role: .cancel) { pendingRevertCheckpointTurnCount = nil }
+            } message: {
+                Text("This will overwrite uncommitted changes in the working tree. This cannot be undone.")
+            }
         }
     }
 
@@ -6064,6 +6167,9 @@ private struct PromptComposerEditor: NSViewRepresentable {
     let onNextHistory: () -> Bool
     let onTextEdited: () -> Void
     let onFileDrop: ([String]) -> Void
+    // UX-XPLAT-009: reports the UTF-16 offset of the insertion point so
+    // suggestion anchoring uses the cursor position, not text.endIndex.
+    let onCursorMoved: (Int) -> Void
 
     func makeNSView(context: Context) -> NSScrollView {
         let scroll = FilePathDropScrollView()
@@ -6132,21 +6238,28 @@ private struct PromptComposerEditor: NSViewRepresentable {
     }
 
     func makeCoordinator() -> Coordinator {
-        Coordinator(text: $text, height: $height, onTextEdited: onTextEdited)
+        Coordinator(text: $text, height: $height, onTextEdited: onTextEdited, onCursorMoved: onCursorMoved)
     }
 
     final class Coordinator: NSObject, NSTextViewDelegate {
         @Binding var text: String
         @Binding var height: CGFloat
         let onTextEdited: () -> Void
+        let onCursorMoved: (Int) -> Void
         weak var textView: PromptComposerTextView?
         var appliedFocusTick: Int?
         private var externallyAppliedText: String?
 
-        init(text: Binding<String>, height: Binding<CGFloat>, onTextEdited: @escaping () -> Void) {
+        init(
+            text: Binding<String>,
+            height: Binding<CGFloat>,
+            onTextEdited: @escaping () -> Void,
+            onCursorMoved: @escaping (Int) -> Void
+        ) {
             _text = text
             _height = height
             self.onTextEdited = onTextEdited
+            self.onCursorMoved = onCursorMoved
         }
 
         func textDidChange(_ notification: Notification) {
@@ -6159,12 +6272,27 @@ private struct PromptComposerEditor: NSViewRepresentable {
             }
             textView.needsDisplay = true
             recalculateHeight()
+            reportCursor(for: textView)
+        }
+
+        // UX-XPLAT-009: selection changes (arrow keys, mouse click, etc.) must
+        // also update the cursor offset so suggestions update immediately.
+        func textViewDidChangeSelection(_ notification: Notification) {
+            guard let textView = notification.object as? NSTextView else { return }
+            reportCursor(for: textView)
+        }
+
+        private func reportCursor(for textView: NSTextView) {
+            let offset = textView.selectedRange().location
+            onCursorMoved(offset)
         }
 
         func applyExternalText(_ value: String, to textView: NSTextView) {
             externallyAppliedText = value
             textView.string = value
-            textView.setSelectedRange(NSRange(location: (value as NSString).length, length: 0))
+            let endOffset = (value as NSString).length
+            textView.setSelectedRange(NSRange(location: endOffset, length: 0))
+            onCursorMoved(endOffset)
         }
 
         func recalculateHeight() {

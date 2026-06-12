@@ -1857,19 +1857,24 @@ final class AgentAppViewModelTests: XCTestCase {
                        "prompt history must persist by workspace and must not leak another workspace's commands")
     }
 
-    func test_promptHistoryKeepsOnlyNewestTwentyEntries() async throws {
+    func test_promptHistoryEvictsOldestBeyondCap() async throws {
+        // WHY: history must retain the newest `PromptHistoryStore.limit` entries
+        // and evict the oldest. Limit-relative so a future cap change (it was
+        // raised 20 -> 200 in commit 43a126d for :93) does not silently rot this
+        // test: send cap+1 commands, then `/status 1` must be the one evicted.
         let (vm, _) = try makeVM()
         vm.createThread(title: "history")
-        for index in 1...21 {
+        let cap = PromptHistoryStore.limit
+        for index in 1...(cap + 1) {
             vm.prompt = "/status \(index)"
             await vm.send()
         }
 
-        for _ in 0..<20 {
+        for _ in 0..<cap {
             XCTAssertTrue(vm.recallPreviousPrompt())
         }
         XCTAssertEqual(vm.prompt, "/status 2",
-                       "prompt history must retain the newest 20 entries and evict the oldest command")
+                       "prompt history must retain the newest \(cap) entries and evict the oldest command")
         XCTAssertTrue(vm.recallPreviousPrompt())
         XCTAssertEqual(vm.prompt, "/status 2",
                        "pressing Up past the retained history must stay on the oldest retained command")
