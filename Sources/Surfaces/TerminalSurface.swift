@@ -565,6 +565,7 @@ public final class TerminalSurface: NSObject, Surface {
     private var terminalSize = TerminalViewportGeometry.fallbackSize
     private var savedSSHPassword: String?
     private var didSendSavedSSHPassword = false
+    private var passwordPromptCount = 0
     private var awaitingSSHFirstOutput = false
     private var isVisible = true
     private let historyRepo: TerminalOutputRepository?
@@ -1014,13 +1015,33 @@ public final class TerminalSurface: NSObject, Surface {
     }
 
     private func autoSubmitSavedSSHPasswordIfNeeded(from data: Data) {
+        guard let raw = String(data: data, encoding: .utf8)?.lowercased(),
+              raw.contains("password:") || raw.contains("passphrase") else { return }
+        passwordPromptCount += 1
+        if let notice = Self.autoSubmitNotice(promptCount: passwordPromptCount) {
+            appendString("\r\n" + notice + "\r\n")
+        }
         guard !didSendSavedSSHPassword,
               let savedSSHPassword,
-              !savedSSHPassword.isEmpty,
-              let raw = String(data: data, encoding: .utf8)?.lowercased(),
-              raw.contains("password:") || raw.contains("passphrase") else { return }
+              !savedSSHPassword.isEmpty else { return }
         didSendSavedSSHPassword = true
         _ = sendTextStatus(savedSSHPassword + "\n")
+    }
+
+    // Pure decision seam -- no state, no secrets.
+    // promptCount 1 -> user sees that the app submitted their saved password (not typed by ghost).
+    // promptCount 2 -> user sees the server rejected it and is asking again; the app will NOT
+    //                  re-submit (didSendSavedSSHPassword guards that), so the prompt is live.
+    // promptCount 0 or <0 -> nil (no notice).
+    nonisolated static func autoSubmitNotice(promptCount: Int) -> String? {
+        switch promptCount {
+        case 1:
+            return "[submitted your saved password automatically -- the app answered this prompt, not you]"
+        case 2:
+            return "[server is asking for the password again -- your saved password was rejected; type it manually]"
+        default:
+            return nil
+        }
     }
 
     @discardableResult
