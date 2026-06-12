@@ -1055,6 +1055,22 @@ extension AppCommandRouter {
     }
 }
 
+// Pure keyboard-navigation helper for the SSH host list.
+// Non-MainActor + pure so the movement math is testable without any UI.
+//
+// moveHostSelection(current:direction:count:)
+//   direction: +1 = down, -1 = up.
+//   Returns nil when count == 0 (empty list -- no movement, no crash).
+//   Clamps result to 0..<count so callers never receive an out-of-range index.
+//   nil current with count > 0 returns 0 (first row) regardless of direction.
+enum SSHHostKeyboardNav {
+    static func moveHostSelection(current: Int?, direction: Int, count: Int) -> Int? {
+        guard count > 0 else { return nil }
+        guard let idx = current else { return 0 }
+        return max(0, min(count - 1, idx + direction))
+    }
+}
+
 // Pure policy for the "large tree" confirm before a recursive transfer (P1:
 // explicit confirm for large trees). Avoids surprising the user with a huge
 // silent copy. Non-MainActor + pure so the threshold logic is testable.
@@ -1889,6 +1905,10 @@ struct SSHHostDraft {
 
 private struct SSHSidebarView: View {
     @ObservedObject var vm: SSHSurfaceViewModel
+    // Keyboard highlight index into vm.filteredHosts. nil means no keyboard
+    // row is highlighted; mouse clicks clear this so the two selections stay
+    // independent. Clamped by SSHHostKeyboardNav so it is always in-range.
+    @State private var keyboardHighlightedHostIndex: Int?
 
     var body: some View {
         Group {
@@ -1921,6 +1941,27 @@ private struct SSHSidebarView: View {
                         .padding(DS.Space.sm)
                     }
                     .focusable()
+                    .onMoveCommand { direction in
+                        let delta: Int
+                        switch direction {
+                        case .up:   delta = -1
+                        case .down: delta = 1
+                        default: return
+                        }
+                        let count = vm.filteredHosts.count
+                        keyboardHighlightedHostIndex = SSHHostKeyboardNav.moveHostSelection(
+                            current: keyboardHighlightedHostIndex,
+                            direction: delta,
+                            count: count
+                        )
+                    }
+                    .onKeyPress(.return) {
+                        guard let idx = keyboardHighlightedHostIndex,
+                              idx < vm.filteredHosts.count else { return .ignored }
+                        vm.onConnect?(vm.filteredHosts[idx])
+                        keyboardHighlightedHostIndex = nil
+                        return .handled
+                    }
                 }
                 .background(DS.Palette.sidebar)
                 .overlay(alignment: .trailing) {
@@ -2012,12 +2053,16 @@ private struct SSHSidebarView: View {
                         .padding(.top, DS.Space.xs)
                         .accessibilityIdentifier("ssh.host.filter.empty")
                 } else {
-                    ForEach(filtered, id: \.id) { host in
+                    ForEach(Array(filtered.enumerated()), id: \.element.id) { idx, host in
                         SSHHostRow(
                             host: host,
                             connected: vm.selectedHost?.id == host.id && vm.status == "Connected",
                             sessionDead: vm.selectedHost?.id == host.id && vm.sessionDead,
-                            onConnect: { vm.onConnect?(host) },
+                            isKeyboardHighlighted: keyboardHighlightedHostIndex == idx,
+                            onConnect: {
+                                keyboardHighlightedHostIndex = nil
+                                vm.onConnect?(host)
+                            },
                             onOpenNewConnection: { vm.onOpenNewConnection?(host) },
                             onEdit: { vm.edit(host) },
                             onDuplicate: { vm.duplicate(host) },
@@ -2864,6 +2909,9 @@ private struct SSHHostRow: View {
     // True when the SSH child exited without an explicit user disconnect;
     // shown as an orange "Disconnected" pill so the user knows to reconnect.
     let sessionDead: Bool
+    // True when keyboard focus (arrow keys) has moved to this row; draws a
+    // focus ring so it is visually distinct from the mouse-selected row.
+    var isKeyboardHighlighted: Bool = false
     let onConnect: () -> Void
     let onOpenNewConnection: () -> Void
     let onEdit: () -> Void
@@ -2953,7 +3001,12 @@ private struct SSHHostRow: View {
             .background(connected ? DS.Palette.selection : Color.clear)
             .overlay {
                 RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
-                    .stroke(connected ? DS.Palette.accent.opacity(0.42) : Color.clear, lineWidth: 1)
+                    .stroke(
+                        isKeyboardHighlighted
+                            ? DS.Palette.accent.opacity(0.70)
+                            : (connected ? DS.Palette.accent.opacity(0.42) : Color.clear),
+                        lineWidth: isKeyboardHighlighted ? 2 : 1
+                    )
             }
             .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
             .contentShape(Rectangle())
