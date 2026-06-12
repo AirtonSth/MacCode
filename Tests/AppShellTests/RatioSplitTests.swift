@@ -157,4 +157,47 @@ final class RatioSplitTests: XCTestCase {
         XCTAssertGreaterThan(sv.subviews[0].frame.height, sv.subviews[1].frame.height,
                              "dragging a stacked divider down must resize the top and bottom panels, not only move a visual line")
     }
+
+    // WHY: Esc during a resize must restore the original layout exactly, not
+    // leave a half-dragged state, and must not persist the mid-drag ratios to
+    // the model (onRatiosChanged must not fire).
+    func test_ratioSplitView_escCancelRestoresDragStartRatiosWithoutCommit() {
+        let sv = RatioSplitView(frame: NSRect(x: 0, y: 0, width: 600, height: 300))
+        sv.isVertical = true
+        sv.ratios = [0.5, 0.5]
+        sv.addSubview(NSView())
+        sv.addSubview(NSView())
+        sv.adjustSubviews()
+
+        // Seed the pre-drag snapshot exactly as mouseDown would (via internal accessor).
+        let snapshot: [CGFloat] = [0.5, 0.5]
+        sv.dragStartRatios = snapshot
+        var committed = false
+        sv.onRatiosChanged = { _ in committed = true }
+
+        // Simulate a mid-drag state (moves divider significantly right).
+        sv.applyDividerDrag(dividerIndex: 0, delta: 180)
+        let midDragRatios = sv.ratios
+        XCTAssertNotEqual(midDragRatios[0], snapshot[0], accuracy: 0.01,
+                          "precondition: drag must have changed the ratios")
+
+        // Pure seam: ratiosOnCancel must return the dragStart snapshot unchanged.
+        let restored = RatioSplitView.ratiosOnCancel(dragStart: snapshot)
+        XCTAssertEqual(restored[0], snapshot[0], accuracy: 0.001,
+                       "ratiosOnCancel must return the pre-drag snapshot, not the mid-drag value")
+        XCTAssertEqual(restored[1], snapshot[1], accuracy: 0.001)
+
+        // Full cancel path: cancelDividerDrag restores ratios and does not commit.
+        sv.cancelDividerDrag()
+
+        XCTAssertFalse(committed,
+                       "Esc-cancel must not fire onRatiosChanged; only mouseUp on a committed drag should persist ratios")
+        XCTAssertEqual(sv.ratios[0], snapshot[0], accuracy: 0.01,
+                       "after Esc-cancel the live ratios must equal the pre-drag snapshot, not the mid-drag value")
+        XCTAssertEqual(sv.ratios[1], snapshot[1], accuracy: 0.01)
+
+        // Happy path: a normal drag + commit after cancel must still fire onRatiosChanged.
+        sv.onRatiosChanged?(sv.ratios)
+        XCTAssertTrue(committed, "a normal mouseUp after cancel must still fire onRatiosChanged")
+    }
 }

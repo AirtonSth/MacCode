@@ -1539,7 +1539,8 @@ final class RatioSplitView: NSView {
     private let minimumDragRatio: CGFloat = 0.08
     private var dragDividerIndex: Int?
     private var dragStartPoint: NSPoint?
-    private var dragStartRatios: [CGFloat] = []
+    // internal (not private) so tests can seed the pre-drag snapshot directly.
+    var dragStartRatios: [CGFloat] = []
     private var dividerLayers: [CALayer] = []
     private var dividerGripLayers: [CALayer] = []
 
@@ -1579,6 +1580,12 @@ final class RatioSplitView: NSView {
         layoutDividerLayers()
     }
 
+    override var acceptsFirstResponder: Bool { true }
+
+    // Pure seam: given the pre-drag snapshot, return the ratios that a
+    // cancel should restore (identity -- the snapshot is authoritative).
+    static func ratiosOnCancel(dragStart: [CGFloat]) -> [CGFloat] { dragStart }
+
     override func mouseDown(with event: NSEvent) {
         let point = convert(event.locationInWindow, from: nil)
         guard let index = dividerIndex(at: point) else {
@@ -1588,6 +1595,7 @@ final class RatioSplitView: NSView {
         dragDividerIndex = index
         dragStartPoint = point
         dragStartRatios = normalizedRatios(for: subviews.count)
+        window?.makeFirstResponder(self)
     }
 
     override func mouseDragged(with event: NSEvent) {
@@ -1609,6 +1617,33 @@ final class RatioSplitView: NSView {
         dragStartPoint = nil
         dragStartRatios = []
         super.mouseUp(with: event)
+    }
+
+    // cancelOperation is triggered by Esc (AppKit standard responder action).
+    override func cancelOperation(_ sender: Any?) {
+        guard dragDividerIndex != nil else { return }
+        cancelDividerDrag()
+    }
+
+    override func keyDown(with event: NSEvent) {
+        // NSEscFunctionKey = 27 (0x1B); also guard on cancelOperation for
+        // standard Esc routing, but keyDown catches direct Esc key presses
+        // in case the window does not route cancelOperation here.
+        if event.keyCode == 53, dragDividerIndex != nil {
+            cancelDividerDrag()
+            return
+        }
+        super.keyDown(with: event)
+    }
+
+    /// Restore pre-drag ratios and end the drag without committing.
+    /// onRatiosChanged is NOT fired -- the original layout is kept.
+    func cancelDividerDrag() {
+        ratios = RatioSplitView.ratiosOnCancel(dragStart: dragStartRatios)
+        layoutByRatios()
+        dragDividerIndex = nil
+        dragStartPoint = nil
+        dragStartRatios = []
     }
 
     func applyDividerDrag(dividerIndex: Int, delta: CGFloat) {
