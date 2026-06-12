@@ -269,7 +269,17 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         lifecycleRecorder?.endRunCleanly(reason: "applicationWillTerminate")
         logDiagnosticsHeartbeat(reason: "will_terminate")
         disableInsomniaForAppClose()
-        context?.reconcileManagedDistillSkills(tokenSaverEnabled: false)
+        // Only tear down the managed distill integration when Token Saver is already
+        // disabled. When it is enabled the integration (PATH symlink + skills) should
+        // survive app-quit so the user's shell keeps working between runs. On the next
+        // launch AppContext.init reconciles again and reinstalls whatever is needed.
+        let tokenSaverEnabled = context.map { SettingsStore(db: $0.db).load().tokenSaverEnabled } ?? false
+        if tokenSaverEnabled {
+            appLifecycleLog.info("app.will_terminate distill_integration=retained token_saver=enabled")
+        } else {
+            appLifecycleLog.info("app.will_terminate distill_integration=removing token_saver=disabled")
+            context?.reconcileManagedDistillSkills(tokenSaverEnabled: false)
+        }
         persistRestorableStateBeforeUpdate()
         stopLiveRuntimesForAppTermination()
         socketServer?.stop()
