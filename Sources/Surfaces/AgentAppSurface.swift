@@ -3007,6 +3007,22 @@ public struct AgentAppView: View {
                     }.padding(DS.Space.sm)
                 }
                 .focusable()
+                .onMoveCommand { direction in
+                    let delta: Int
+                    switch direction {
+                    case .up:   delta = -1
+                    case .down: delta = 1
+                    default: return
+                    }
+                    let threads = vm.filteredThreads
+                    let current = threads.firstIndex(where: { $0.id == vm.selectedThreadId })
+                    guard let next = AgentThreadRailKeyboardNav.moveThreadSelection(
+                        current: current,
+                        direction: delta,
+                        count: threads.count
+                    ) else { return }
+                    vm.selectThread(threads[next].id)
+                }
             }
         }
         .background(DS.Palette.surface)
@@ -6460,6 +6476,22 @@ public final class AgentAppSurface: NSObject, Surface {
 
     // A3: drives the tab/workspace spinner.
     public var isBusy: Bool { viewModel.status == .running || viewModel.activeThreadCount > 0 }
+}
+
+// Pure keyboard-navigation helper for the thread rail.
+// Non-MainActor + pure so the movement math is testable without any UI.
+//
+// moveThreadSelection(current:direction:count:)
+//   direction: +1 = down, -1 = up.
+//   Returns nil when count == 0 (empty rail -- no movement, no crash).
+//   Clamps result to 0..<count so callers never receive an out-of-range index.
+//   nil current with count > 0 returns 0 (first row) regardless of direction.
+enum AgentThreadRailKeyboardNav {
+    static func moveThreadSelection(current: Int?, direction: Int, count: Int) -> Int? {
+        guard count > 0 else { return nil }
+        guard let idx = current else { return 0 }
+        return max(0, min(count - 1, idx + direction))
+    }
 }
 
 private struct TabColorMenuLabel: View {
