@@ -1745,12 +1745,15 @@ public final class JSONRPCDispatcher {
         ])
     }
 
+    private let _encoder = JSONEncoder()
+    private let _decoder = JSONDecoder()
+
     private func encode<T: Encodable>(_ value: T) -> JSONValue {
-        guard let data = try? JSONEncoder().encode(value),
-              let any = try? JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed]) else {
+        guard let data = try? _encoder.encode(value),
+              let result = try? _decoder.decode(JSONValue.self, from: data) else {
             return .null
         }
-        return JSONValue.from(any)
+        return result
     }
 
     private func workspaceID(from params: [String: JSONValue]) throws -> WorkspaceID {

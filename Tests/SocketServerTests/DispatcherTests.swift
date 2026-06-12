@@ -2143,4 +2143,41 @@ final class DispatcherTests: XCTestCase {
         XCTAssertEqual(result["partial_reason"], .string("ghostty_unavailable"),
                        "snapshot reads must say when terminal text is degraded so iOS does not show fake complete output")
     }
+
+    // Verifies that the encode<T> helper's new path (JSONDecoder -> JSONValue) produces the
+    // same structure as the old path (JSONSerialization + JSONValue.from) for a representative
+    // Codable. This guards against any behavioral divergence introduced by the optimization.
+    func test_encodeHelper_newPathMatchesOldPath() throws {
+        struct Sample: Codable {
+            let name: String
+            let count: Int
+            let ratio: Double
+            let flag: Bool
+            let tags: [String]
+            let nested: Nested
+            struct Nested: Codable {
+                let value: String
+            }
+        }
+        let sample = Sample(
+            name: "hello",
+            count: 42,
+            ratio: 1.5,
+            flag: true,
+            tags: ["a", "b"],
+            nested: .init(value: "world")
+        )
+        let encoder = JSONEncoder()
+        let data = try encoder.encode(sample)
+
+        // Old path: JSONSerialization -> JSONValue.from
+        let any = try JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed])
+        let oldResult = JSONValue.from(any)
+
+        // New path: JSONDecoder -> JSONValue directly
+        let newResult = try JSONDecoder().decode(JSONValue.self, from: data)
+
+        XCTAssertEqual(oldResult, newResult,
+                       "encode<T> optimization must produce structurally identical JSONValue output as the original double-round-trip path")
+    }
 }
