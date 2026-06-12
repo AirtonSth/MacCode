@@ -196,4 +196,46 @@ final class CCRRetentionJobTests: XCTestCase {
         XCTAssertNotNil(try store.retrieve(staleRef),  "stale referenced block must survive")
         XCTAssertNotNil(try store.retrieve(recentUnref), "recent unreferenced block must survive")
     }
+
+    // MARK: - Wiring contract: retention actually bounds the store
+
+    func test_retentionBoundsStore_beyondWindowIsRemoved_withinWindowSurvives() throws {
+        // WHY: wiring runRetention/pruneUnreferenced to app launch + a daily timer is
+        // only meaningful if calling runRetention actually removes rows that have grown
+        // beyond the retention window. This test seeds content that exceeds the default
+        // 30-day window, calls runRetention (the production call path), and asserts the
+        // store is bounded: stale rows gone, recent rows intact. A defined-but-uncalled
+        // retention method means unbounded growth; this test fails if the call is removed.
+        let store = try makeStore()
+        let now = Date(timeIntervalSince1970: 5_000_000)
+
+        // Five blocks beyond the 30-day window (35 days old, unreferenced).
+        let staleDate = now.addingTimeInterval(-35 * 86_400)
+        var staleHandles: [String] = []
+        for i in 0..<5 {
+            let h = try store.store("old block \(i) -- should be pruned", at: staleDate)
+            staleHandles.append(h)
+        }
+
+        // Two blocks inside the window (10 days old, unreferenced -- must survive).
+        let recentDate = now.addingTimeInterval(-10 * 86_400)
+        let recentA = try store.store("recent block A -- must survive", at: recentDate)
+        let recentB = try store.store("recent block B -- must survive", at: recentDate)
+
+        XCTAssertEqual(try store.count(), 7, "precondition: 7 rows before retention")
+
+        let cutoffMs = CCRRetentionJob.olderThanMs(now: now, retentionDays: 30)
+        let removed = try CCRRetentionJob.runRetention(store: store, now: now, cutoffMs: cutoffMs)
+
+        XCTAssertEqual(removed, 5,
+            "all 5 stale unreferenced rows must be pruned -- store is bounded after retention runs")
+        XCTAssertEqual(try store.count(), 2,
+            "only the 2 recent rows must remain -- unbounded growth is prevented")
+        for h in staleHandles {
+            XCTAssertNil(try store.retrieve(h),
+                "stale block must be unrecoverable after retention -- it exceeded the 30-day window")
+        }
+        XCTAssertNotNil(try store.retrieve(recentA), "recent block A must still be recoverable")
+        XCTAssertNotNil(try store.retrieve(recentB), "recent block B must still be recoverable")
+    }
 }

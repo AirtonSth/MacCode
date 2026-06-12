@@ -48,6 +48,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
     private let appSupportOverride: String?
     private let dbOverride: String?
     private var providerSessionReaperTimer: Timer?
+    private var ccrRetentionTimer: Timer?
     private var diagnosticsHeartbeatTimer: Timer?
     private var tokenSaverAccountUsageRefreshTimer: Timer?
     private var lifecycleRecorder: AppLifecycleRecorder?
@@ -199,6 +200,14 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
             }
         }
 
+        runCCRRetention()
+        ccrRetentionTimer = Timer.scheduledTimer(withTimeInterval: 24 * 60 * 60, repeats: true) { [weak self] _ in
+            guard let delegate = self else { return }
+            Task { @MainActor in
+                delegate.runCCRRetention()
+            }
+        }
+
         installMainMenu()
         windowController.show()
         refreshTokenSaverAccountUsageOnLaunch()
@@ -256,6 +265,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         httpServer?.stop()
         bonjour?.stop()
         providerSessionReaperTimer?.invalidate()
+        ccrRetentionTimer?.invalidate()
         diagnosticsHeartbeatTimer?.invalidate()
         tokenSaverAccountUsageRefreshTimer?.invalidate()
         NotificationCenter.default.removeObserver(self)
@@ -397,6 +407,27 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
             }
         } catch {
             NSLog("Failed to reap idle provider sessions: \(error)")
+        }
+    }
+
+    /// Run CCR retention off the main thread. Dispatched to backgroundWriterQueue so
+    /// the SQLite DELETE never blocks the main actor. Cadence: once on launch +
+    /// every 24 hours via ccrRetentionTimer. No-op when context is nil (before init).
+    private func runCCRRetention() {
+        guard let ctx = context else { return }
+        let store = ReversibleContentStore(db: ctx.db)
+        let queue = ctx.backgroundWriterQueue
+        queue.async {
+            let now = Date()
+            let cutoffMs = CCRRetentionJob.olderThanMs(now: now)
+            do {
+                let removed = try CCRRetentionJob.runRetention(store: store, now: now, cutoffMs: cutoffMs)
+                if removed > 0 {
+                    NSLog("CCR retention pruned \(removed) stale reversible-content row(s).")
+                }
+            } catch {
+                NSLog("CCR retention failed: \(error)")
+            }
         }
     }
 
