@@ -39,6 +39,12 @@ public final class EventBus: @unchecked Sendable {
     /// at most recentLimit entries.
     private var encodedCache: [Int64: Data] = [:]
 
+    // QA-002: injectable clock so event timestamps (ts field) are deterministic
+    // in tests. Default is real wall time. Protected by `lock` so the closure
+    // swap in setClockForTests is visible to concurrent publish() calls.
+    // publish() reads clock directly while holding lock (no re-entry issue).
+    private var clock: @Sendable () -> Date
+
     public var persister: ((Event) -> Void)?
     public var shouldRetainRecentEvent: ((Event) -> Bool)?
 
@@ -49,15 +55,27 @@ public final class EventBus: @unchecked Sendable {
         public let requiresBaseline: Bool
     }
 
-    public init(recentLimit: Int = 512, recentByteLimit: Int = 2 * 1024 * 1024) {
+    public init(
+        recentLimit: Int = 512,
+        recentByteLimit: Int = 2 * 1024 * 1024,
+        clock: @escaping @Sendable () -> Date = { Date() }
+    ) {
         self.recentLimit = max(0, recentLimit)
         self.recentByteLimit = max(0, recentByteLimit)
+        self.clock = clock
+    }
+
+    /// QA-002: inject a fixed or advancing clock so event timestamps are
+    /// deterministic. Must not be called in production code.
+    public func setClockForTests(_ clock: @escaping @Sendable () -> Date) {
+        lock.lock(); defer { lock.unlock() }
+        self.clock = clock
     }
 
     public func publish(kind: String, payload: JSONValue) {
         lock.lock()
         lastSeq += 1
-        let ev = Event(seq: lastSeq, kind: kind, payload: payload, ts: Date().timeIntervalSince1970)
+        let ev = Event(seq: lastSeq, kind: kind, payload: payload, ts: clock().timeIntervalSince1970)
         if shouldRetainRecentEvent?(ev) ?? true {
             retainRecent(ev)
         }

@@ -522,6 +522,10 @@ public final class FileEditSessionStore: @unchecked Sendable {
         var relativePath: String
         var baseHash: String
         var baseModifiedAt: Date?
+        /// QA-002: records when the session was opened via the injectable clock
+        /// so time-dependent paths (session age, future TTL expiry) are testable
+        /// without a real delay.
+        var openedAt: Date
         var draftRevision: Int
         var draftText: String
         var encoding: String
@@ -533,6 +537,21 @@ public final class FileEditSessionStore: @unchecked Sendable {
     private let lock = NSLock()
     private var sessions: [String: Session] = [:]
     private let service = WorkspaceFileService()
+    // QA-002: injectable clock so session openedAt and any future TTL paths are
+    // deterministically testable. Default is real wall time. Protected by `lock`.
+    private var clock: @Sendable () -> Date = { Date() }
+
+    /// QA-002: inject a fixed or advancing clock so session-timing paths are
+    /// deterministic. Must not be called in production code.
+    public func setClockForTests(_ clock: @escaping @Sendable () -> Date) {
+        lock.lock(); defer { lock.unlock() }
+        self.clock = clock
+    }
+
+    private func currentTime() -> Date {
+        lock.lock(); defer { lock.unlock() }
+        return clock()
+    }
 
     public func open(surfaceID: SurfaceID, workspaceID: WorkspaceID, root: String, path: String) throws -> JSONValue {
         let read = try service.read(root: root, path: path, maxBytes: WorkspaceFileLimits.editBytes)
@@ -557,6 +576,7 @@ public final class FileEditSessionStore: @unchecked Sendable {
             relativePath: relPath,
             baseHash: hash(data),
             baseModifiedAt: (try? FileManager.default.attributesOfItem(atPath: absPath)[.modificationDate]) as? Date,
+            openedAt: currentTime(),
             draftRevision: 1,
             draftText: content,
             encoding: encoding,
@@ -675,6 +695,15 @@ public final class FileEditSessionStore: @unchecked Sendable {
         return session.map { .object(sessionJSON($0, includeContent: true)) }
     }
 
+    /// Clears all sessions and resets the clock to real wall time.
+    /// Call from test tearDown to prevent state bleeding between tests.
+    public func resetForTests() {
+        lock.lock()
+        sessions.removeAll()
+        clock = { Date() }
+        lock.unlock()
+    }
+
     private func readEditableFileData(path: String) throws -> Data {
         let handle = try FileHandle(forReadingFrom: URL(fileURLWithPath: path))
         defer { try? handle.close() }
@@ -695,7 +724,8 @@ public final class FileEditSessionStore: @unchecked Sendable {
             "draft_revision": .number(Double(s.draftRevision)),
             "dirty": .bool(s.dirty),
             "encoding": .string(s.encoding),
-            "language": s.language.map { .string($0) } ?? .null
+            "language": s.language.map { .string($0) } ?? .null,
+            "opened_at": .number(s.openedAt.timeIntervalSince1970)
         ]
         if includeContent { payload["content"] = .string(s.draftText) }
         if let patch { payload["patch"] = .object(patch) }

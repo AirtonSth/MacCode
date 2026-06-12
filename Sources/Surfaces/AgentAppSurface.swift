@@ -200,6 +200,23 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     // the first event of each tick schedules the flush Task.
     private let streamEventBatch = StreamEventBatch()
 
+    // QA-MAC_AGENT-CLOCK: injectable clock so "Working for Xs" elapsed math
+    // and adaptive-sidebar debounce timestamps are deterministically testable.
+    // Default is real wall time; tests inject a fixed/advancing fake clock via
+    // setClockForTests(_:). @MainActor isolation serialises all reads/writes.
+    private var clock: @Sendable () -> Date = { Date() }
+
+    /// Returns the current instant from the injected clock.
+    /// Used by the view for elapsed-time and debounce calculations so tests
+    /// can control "now" without racing against wall time.
+    public func currentTime() -> Date { clock() }
+
+    /// QA-MAC_AGENT-CLOCK: inject a fixed or advancing clock so time-dependent
+    /// view logic is deterministic. Must not be called in production code.
+    public func setClockForTests(_ clock: @escaping @Sendable () -> Date) {
+        self.clock = clock
+    }
+
     public init(
         workspaceID: WorkspaceID,
         cwd: String,
@@ -3442,7 +3459,7 @@ public struct AgentAppView: View {
     }
 
     private func applyAdaptivePlanSidebar(width: CGFloat, event: AdaptiveSidebarLayoutEvent) {
-        let now = Date().timeIntervalSinceReferenceDate
+        let now = vm.currentTime().timeIntervalSinceReferenceDate
         let reservedThreadWidth = showThreadRail ? Self.threadRailIdealWidth : 0
         let decision = AdaptiveSidebarPolicy.nextVisibility(
             availableExtent: width - reservedThreadWidth,
@@ -3469,7 +3486,7 @@ public struct AgentAppView: View {
     }
 
     private func applyAdaptiveThreadRail(width: CGFloat, event: AdaptiveSidebarLayoutEvent) {
-        let now = Date().timeIntervalSinceReferenceDate
+        let now = vm.currentTime().timeIntervalSinceReferenceDate
         let reservedPlanWidth = vm.showPlanSidebar ? Self.planSidebarIdealWidth : 0
         let decision = AdaptiveSidebarPolicy.nextVisibility(
             availableExtent: width - reservedPlanWidth,
@@ -4124,7 +4141,8 @@ public struct AgentAppView: View {
     }
 
     private var elapsedString: String {
-        let s = max(0, Int(Date().timeIntervalSince(vm.runStartedAt ?? Date())))
+        let now = vm.currentTime()
+        let s = max(0, Int(now.timeIntervalSince(vm.runStartedAt ?? now)))
         return s < 60 ? "\(s)s" : "\(s / 60)m \(s % 60)s"
     }
 
