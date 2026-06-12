@@ -975,6 +975,48 @@ public final class AgentTurnCheckpointRepository {
         return Int(st.columnInt64(0))
     }
 
+    // MARK: - Tolerant list
+
+    /// Partition decode attempts into healthy results and a corrupt count.
+    /// Pure function: no I/O, no side-effects. Preserves order of healthy rows.
+    ///
+    /// WHY: one corrupt checkpoint row must not hide the user's other good checkpoints.
+    static func decodableCheckpoints(
+        _ attempts: [Result<AgentTurnCheckpointSummary, Error>]
+    ) -> (healthy: [AgentTurnCheckpointSummary], corruptCount: Int) {
+        var healthy: [AgentTurnCheckpointSummary] = []
+        var corruptCount = 0
+        for result in attempts {
+            switch result {
+            case .success(let cp): healthy.append(cp)
+            case .failure: corruptCount += 1
+            }
+        }
+        return (healthy, corruptCount)
+    }
+
+    /// List checkpoints for a thread, skipping any rows that fail to decode.
+    /// Returns healthy checkpoints in ascending checkpoint_turn_count order,
+    /// plus the number of corrupt rows that were skipped (never silently zero'd).
+    public func listTolerant(threadId: AgentThreadID) throws -> (healthy: [AgentTurnCheckpointSummary], corruptCount: Int) {
+        let st = try db.prepare("""
+            SELECT thread_id, run_id, turn_id, checkpoint_turn_count, checkpoint_ref, status, files_json, assistant_message_id, error_message, completed_at, file_snapshots_json, diff_patch, file_diffs_json
+            FROM agent_turn_checkpoints
+            WHERE thread_id = ?
+            ORDER BY checkpoint_turn_count ASC, completed_at ASC;
+        """)
+        try st.bind(1, threadId.value.uuidString)
+        var attempts: [Result<AgentTurnCheckpointSummary, Error>] = []
+        while try st.step() {
+            do {
+                attempts.append(.success(try decodeCheckpoint(from: st, fallbackThreadId: threadId)))
+            } catch {
+                attempts.append(.failure(error))
+            }
+        }
+        return AgentTurnCheckpointRepository.decodableCheckpoints(attempts)
+    }
+
     public func list(threadId: AgentThreadID) throws -> [AgentTurnCheckpointSummary] {
         let st = try db.prepare("""
             SELECT thread_id, run_id, turn_id, checkpoint_turn_count, checkpoint_ref, status, files_json, assistant_message_id, error_message, completed_at, file_snapshots_json, diff_patch, file_diffs_json
@@ -983,11 +1025,15 @@ public final class AgentTurnCheckpointRepository {
             ORDER BY checkpoint_turn_count ASC, completed_at ASC;
         """)
         try st.bind(1, threadId.value.uuidString)
-        var out: [AgentTurnCheckpointSummary] = []
+        var attempts: [Result<AgentTurnCheckpointSummary, Error>] = []
         while try st.step() {
-            out.append(try decodeCheckpoint(from: st, fallbackThreadId: threadId))
+            do {
+                attempts.append(.success(try decodeCheckpoint(from: st, fallbackThreadId: threadId)))
+            } catch {
+                attempts.append(.failure(error))
+            }
         }
-        return out
+        return AgentTurnCheckpointRepository.decodableCheckpoints(attempts).healthy
     }
 
     public func get(threadId: AgentThreadID, checkpointTurnCount: Int) throws -> AgentTurnCheckpointSummary? {
@@ -1004,6 +1050,26 @@ public final class AgentTurnCheckpointRepository {
         return try decodeCheckpoint(from: st, fallbackThreadId: threadId)
     }
 
+    public func listAfterTolerant(threadId: AgentThreadID, checkpointTurnCount: Int) throws -> (healthy: [AgentTurnCheckpointSummary], corruptCount: Int) {
+        let st = try db.prepare("""
+            SELECT thread_id, run_id, turn_id, checkpoint_turn_count, checkpoint_ref, status, files_json, assistant_message_id, error_message, completed_at, file_snapshots_json, diff_patch, file_diffs_json
+            FROM agent_turn_checkpoints
+            WHERE thread_id = ? AND checkpoint_turn_count > ?
+            ORDER BY checkpoint_turn_count ASC, completed_at ASC;
+        """)
+        try st.bind(1, threadId.value.uuidString)
+        try st.bind(2, Int64(checkpointTurnCount))
+        var attempts: [Result<AgentTurnCheckpointSummary, Error>] = []
+        while try st.step() {
+            do {
+                attempts.append(.success(try decodeCheckpoint(from: st, fallbackThreadId: threadId)))
+            } catch {
+                attempts.append(.failure(error))
+            }
+        }
+        return AgentTurnCheckpointRepository.decodableCheckpoints(attempts)
+    }
+
     public func listAfter(threadId: AgentThreadID, checkpointTurnCount: Int) throws -> [AgentTurnCheckpointSummary] {
         let st = try db.prepare("""
             SELECT thread_id, run_id, turn_id, checkpoint_turn_count, checkpoint_ref, status, files_json, assistant_message_id, error_message, completed_at, file_snapshots_json, diff_patch, file_diffs_json
@@ -1013,11 +1079,15 @@ public final class AgentTurnCheckpointRepository {
         """)
         try st.bind(1, threadId.value.uuidString)
         try st.bind(2, Int64(checkpointTurnCount))
-        var out: [AgentTurnCheckpointSummary] = []
+        var attempts: [Result<AgentTurnCheckpointSummary, Error>] = []
         while try st.step() {
-            out.append(try decodeCheckpoint(from: st, fallbackThreadId: threadId))
+            do {
+                attempts.append(.success(try decodeCheckpoint(from: st, fallbackThreadId: threadId)))
+            } catch {
+                attempts.append(.failure(error))
+            }
         }
-        return out
+        return AgentTurnCheckpointRepository.decodableCheckpoints(attempts).healthy
     }
 
     public func deleteAfter(threadId: AgentThreadID, checkpointTurnCount: Int) throws {
