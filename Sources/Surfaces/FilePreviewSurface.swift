@@ -277,6 +277,12 @@ public final class FilePreviewSurface: NSObject, Surface {
         tv.isIncrementalSearchingEnabled = true
         tv.setAccessibilityIdentifier("filePreview.text")
         scroll.documentView = tv
+        // Line-number ruler: mirrors the Files editor gutter pattern.
+        // PreviewLineNumberRulerView is a read-only NSRulerView subclass defined below.
+        let ruler = PreviewLineNumberRulerView(textView: tv)
+        scroll.hasVerticalRuler = true
+        scroll.verticalRulerView = ruler
+        scroll.rulersVisible = true
         containerStack.addSubview(scroll)
         pin(scroll)
         let saved = scrollCache.entry(for: path)
@@ -306,6 +312,33 @@ public final class FilePreviewSurface: NSObject, Surface {
         guard saved.scrollOffsetY != 0 else { return }
         scroll.contentView.scroll(to: NSPoint(x: 0, y: saved.scrollOffsetY))
         scroll.reflectScrolledClipView(scroll.contentView)
+    }
+
+    /// Pure helper: count 1-based lines in `text`.
+    /// A completely empty string has 1 line. A trailing newline adds one phantom empty line.
+    /// Nonisolated -- no AppKit; callable from any isolation context or test.
+    public nonisolated static func lineCount(for text: String) -> Int {
+        if text.isEmpty { return 1 }
+        var n = 1
+        for c in text.utf16 where c == 0x0A { n += 1 }
+        return n
+    }
+
+    /// Pure helper: return the 1-based line number that contains `charOffset` (UTF-16 offset).
+    /// Scans the UTF-16 code units up to `charOffset` and counts newlines.
+    /// Returns 1 for any offset in an empty string or when offset <= 0.
+    /// Nonisolated -- no AppKit; callable from any isolation context or test.
+    public nonisolated static func lineNumber(forCharacterOffset charOffset: Int, in text: String) -> Int {
+        guard charOffset > 0 else { return 1 }
+        let ns = text as NSString
+        let length = min(charOffset, ns.length)
+        var line = 1
+        var i = 0
+        while i < length {
+            if ns.character(at: i) == 0x0A { line += 1 }
+            i += 1
+        }
+        return line
     }
 
     nonisolated static func previewText(path: String, maxBytes: Int = FilePreviewSurface.maxTextPreviewBytes) -> String {
@@ -373,4 +406,107 @@ public final class FilePreviewSurface: NSObject, Surface {
     public func sendText(_ text: String) {}
     public func readText() -> String { filePath ?? "" }
     public func snapshot() -> [String: String] { ["path": filePath ?? ""] }
+}
+
+// MARK: - Line-number ruler for read-only text preview
+
+/// Minimal NSRulerView subclass that draws 1-based line numbers aligned to the
+/// NSTextView's line-fragment rects. Follows the same AppKit pattern as
+/// CodeLineNumberRulerView in FilesSurface (AppShell), adapted for the read-only
+/// preview context where the palette and edit callbacks are not needed.
+///
+/// Redraws only when the visible glyph range changes (coalesced via boundsChanged).
+private final class PreviewLineNumberRulerView: NSRulerView {
+    private weak var textView: NSTextView?
+    private var lastVisibleGlyphRange = NSRange(location: NSNotFound, length: 0)
+
+    init(textView: NSTextView) {
+        self.textView = textView
+        super.init(scrollView: textView.enclosingScrollView, orientation: .verticalRuler)
+        clientView = textView
+        ruleThickness = 46
+        if let clip = textView.enclosingScrollView?.contentView {
+            clip.postsBoundsChangedNotifications = true
+            NotificationCenter.default.addObserver(
+                self,
+                selector: #selector(boundsChanged),
+                name: NSView.boundsDidChangeNotification,
+                object: clip
+            )
+        }
+    }
+
+    required init(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    deinit {
+        NotificationCenter.default.removeObserver(self)
+    }
+
+    // Redraw only when the set of visible lines actually changes (not on every
+    // scroll tick / horizontal scroll / sub-pixel jitter).
+    @objc private func boundsChanged() {
+        guard let textView,
+              let lm = textView.layoutManager,
+              let tc = textView.textContainer,
+              let clip = textView.enclosingScrollView?.contentView else {
+            needsDisplay = true
+            return
+        }
+        let gr = lm.glyphRange(forBoundingRect: clip.bounds, in: tc)
+        guard !NSEqualRanges(gr, lastVisibleGlyphRange) else { return }
+        lastVisibleGlyphRange = gr
+        needsDisplay = true
+    }
+
+    override func drawHashMarksAndLabels(in rect: NSRect) {
+        guard let textView,
+              let lm = textView.layoutManager,
+              let tc = textView.textContainer,
+              let clip = textView.enclosingScrollView?.contentView else { return }
+
+        // Background
+        let isDark = effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+        let bgColor: NSColor = isDark
+            ? NSColor(red: 0.10, green: 0.10, blue: 0.10, alpha: 1)
+            : NSColor(red: 0.91, green: 0.91, blue: 0.91, alpha: 1)
+        let fgColor: NSColor = isDark
+            ? NSColor(red: 0.45, green: 0.47, blue: 0.50, alpha: 1)
+            : NSColor(red: 0.42, green: 0.44, blue: 0.47, alpha: 1)
+        bgColor.setFill()
+        bounds.fill()
+
+        let attrs: [NSAttributedString.Key: Any] = [
+            .font: NSFont.monospacedSystemFont(ofSize: 11, weight: .regular),
+            .foregroundColor: fgColor
+        ]
+        let visibleRect = clip.bounds
+        let glyphRange = lm.glyphRange(forBoundingRect: visibleRect, in: tc)
+        guard glyphRange.location < lm.numberOfGlyphs else { return }
+
+        // Compute 1-based line number for the first visible glyph by counting
+        // newlines in the text before it (uses pure FilePreviewSurface.lineNumber helper).
+        let firstCharIndex = lm.characterIndexForGlyph(at: glyphRange.location)
+        var lineNumber = FilePreviewSurface.lineNumber(
+            forCharacterOffset: firstCharIndex,
+            in: textView.string
+        )
+
+        var glyphIndex = glyphRange.location
+        while glyphIndex < NSMaxRange(glyphRange) {
+            var lineRange = NSRange()
+            let lineRect = lm.lineFragmentRect(
+                forGlyphAt: glyphIndex,
+                effectiveRange: &lineRange,
+                withoutAdditionalLayout: true
+            )
+            let y = lineRect.minY + textView.textContainerOrigin.y - visibleRect.minY
+            let label = "\(lineNumber)" as NSString
+            let size = label.size(withAttributes: attrs)
+            label.draw(at: NSPoint(x: ruleThickness - size.width - 8, y: y + 1), withAttributes: attrs)
+            glyphIndex = NSMaxRange(lineRange)
+            lineNumber += 1
+        }
+    }
 }
