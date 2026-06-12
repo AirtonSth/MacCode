@@ -233,6 +233,12 @@ public final class PaneTabsView: NSObject {
             contentArea.trailingAnchor.constraint(equalTo: v.trailingAnchor)
         ])
 
+        // Appearance-change: wire chrome subviews so PaneRootView can
+        // re-apply their CGColors when the effective appearance changes.
+        v.chromeHeaderBG = headerBG
+        v.chromeContentArea = contentArea
+        v.chromeDividers = [divider]
+
         // Focus-follows-click: a mouseDown anywhere inside the pane root
         // (content area or tab header) records this pane as focused so
         // Cmd+W / Cmd+D act on the right pane. The closure is pure-ID
@@ -424,6 +430,9 @@ public final class PaneTabsView: NSObject {
             divider.trailingAnchor.constraint(equalTo: root.trailingAnchor),
             divider.widthAnchor.constraint(equalToConstant: 1)
         ])
+        // Appearance-change: wire the rail divider so PaneRootView re-applies
+        // its CGColor when the effective appearance changes.
+        (root as? PaneRootView)?.chromeDividers = [divider]
     }
 
     private func selectSurface(_ id: SurfaceID) {
@@ -1068,6 +1077,8 @@ final class PaneTabButton: NSView {
     private let label = NSTextField(labelWithString: "")
     private let underline = NSView()
     private let colorRail = NSView()
+    private let dirtyBadge = NSView()
+    private let sep = NSView()
     private static let dragActivationDistance: CGFloat = 8
 
     // MARK: - A11y helper (pure, no AppKit dependency, testable without MainActor)
@@ -1131,7 +1142,6 @@ final class PaneTabButton: NSView {
         label.translatesAutoresizingMaskIntoConstraints = false
         label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
-        let dirtyBadge = NSView()
         dirtyBadge.wantsLayer = true
         dirtyBadge.layer?.backgroundColor = DS.NS.warning.cgColor
         dirtyBadge.layer?.cornerRadius = 3.5
@@ -1179,7 +1189,6 @@ final class PaneTabButton: NSView {
         ])
 
         // Right-edge separator between tabs.
-        let sep = NSView()
         sep.wantsLayer = true
         sep.layer?.backgroundColor = DS.NS.line.cgColor
         sep.translatesAutoresizingMaskIntoConstraints = false
@@ -1629,8 +1638,32 @@ final class PaneTabButton: NSView {
 
     func setDirty(_ dirty: Bool) {
         self.dirty = dirty
-        subviews.first { $0.toolTip == "Unsaved changes" }?.isHidden = !dirty
+        dirtyBadge.isHidden = !dirty
         setAccessibilityLabel(Self.tabA11yLabel(title: title, isSelected: selected, isDirty: dirty))
+    }
+
+    // Appearance-change: re-resolves all CGColors captured on CALayers at
+    // construction. Called from both init (via the stored-property setters
+    // above) and viewDidChangeEffectiveAppearance so there is one source of
+    // truth for the color semantics.
+    private func applyChromeColors() {
+        if selected {
+            layer?.backgroundColor = DS.NS.bg.cgColor
+        } else if hovering {
+            layer?.backgroundColor = DS.NS.surfaceRaised.cgColor
+        } else {
+            layer?.backgroundColor = DS.NS.surface.cgColor
+        }
+        dirtyBadge.layer?.backgroundColor = DS.NS.warning.cgColor
+        sep.layer?.backgroundColor = DS.NS.line.cgColor
+        underline.layer?.backgroundColor = DS.NS.accent.cgColor
+        dropIndicator.layer?.backgroundColor = DS.NS.accent.cgColor
+        // colorRail holds a user-chosen hex (appearance-independent); skip.
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        applyChromeColors()
     }
 
     /// A11y: register close and rename as named custom actions so
@@ -1722,6 +1755,16 @@ final class TabDragGhostView: NSView {
 
     override var mouseDownCanMoveWindow: Bool { false }
 
+    private func applyChromeColors() {
+        layer?.backgroundColor = DS.NS.surfaceRaised.withAlphaComponent(0.92).cgColor
+        layer?.borderColor = DS.NS.accent.withAlphaComponent(0.65).cgColor
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        applyChromeColors()
+    }
+
     func move(near point: NSPoint, in bounds: NSRect) {
         let x = min(max(point.x + 12, bounds.minX + 6), bounds.maxX - width - 6)
         let y = min(max(point.y - height - 10, bounds.minY + 6), bounds.maxY - height - 6)
@@ -1750,6 +1793,12 @@ final class PaneRootView: NoDragView {
     var onContentAreaMouseDown: (() -> Void)?
     private let splitDropOverlay = CALayer()
     private var splitDropDirection: SplitDirection?
+    // Appearance-change: weak refs to chrome subviews whose CGColors must be
+    // re-resolved when the effective appearance changes. Wired by PaneTabsView.init
+    // and buildMinimizedSideRail after those views are created.
+    weak var chromeHeaderBG: NSView?
+    weak var chromeContentArea: NSView?
+    var chromeDividers: [NSView] = []
 
     override func mouseDown(with event: NSEvent) {
         onContentAreaMouseDown?()
@@ -1804,6 +1853,24 @@ final class PaneRootView: NoDragView {
         layer?.addSublayer(splitDropOverlay)
     }
 
+    // Appearance-change: re-resolves all CGColors captured on CALayers at
+    // construction time so that light<->dark switches recolor the chrome.
+    // Called from viewDidChangeEffectiveAppearance which already runs inside
+    // the new appearance context, so plain .cgColor reads resolve correctly.
+    private func applyChromeColors() {
+        layer?.backgroundColor = DS.NS.bg.cgColor
+        chromeHeaderBG?.layer?.backgroundColor = DS.NS.surface.cgColor
+        chromeContentArea?.layer?.backgroundColor = DS.NS.bg.cgColor
+        for d in chromeDividers { d.layer?.backgroundColor = DS.NS.line.cgColor }
+        splitDropOverlay.backgroundColor = DS.NS.splitPreviewFill.cgColor
+        splitDropOverlay.borderColor = DS.NS.splitPreviewStroke.cgColor
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        applyChromeColors()
+    }
+
     private func splitDropPreviewFrame(in bounds: NSRect, direction: SplitDirection?) -> NSRect {
         let target: NSRect
         switch direction {
@@ -1853,6 +1920,15 @@ final class PaneTabDropStack: NoDragStack {
         layer?.borderColor = DS.NS.accent.cgColor
         layer?.borderWidth = 0
         layer?.backgroundColor = NSColor.clear.cgColor
+    }
+
+    private func applyChromeColors() {
+        layer?.borderColor = DS.NS.accent.cgColor
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        applyChromeColors()
     }
 
     override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
