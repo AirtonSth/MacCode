@@ -93,6 +93,7 @@ struct RemoteCodeDistillServiceMain {
         let env = ProcessInfo.processInfo.environment
         let provider = env["REMOTE_CODE_AGENT_PROVIDER"]?.trimmingCharacters(in: .whitespacesAndNewlines)
         let maxChars = Int(env["REMOTE_CODE_DISTILL_MAX_OUTPUT_CHARS"] ?? "") ?? 4_000
+        let session = createConfiguredURLSession()
         let cli = ManagedDistillCLI(
             arguments: arguments,
             stdin: stdin,
@@ -101,7 +102,7 @@ struct RemoteCodeDistillServiceMain {
             maxOutputCharacters: maxChars
         ) { request in
             do {
-                let (data, response) = try await URLSession.shared.data(for: request)
+                let (data, response) = try await session.data(for: request)
                 return (data, (response as? HTTPURLResponse)?.statusCode ?? 0)
             } catch {
                 return nil
@@ -117,11 +118,12 @@ struct RemoteCodeDistillServiceMain {
     /// service yields a "not found" tool result, never a crash.
     private static func runMCP() async {
         let state = loadCLIState()
+        let session = createConfiguredURLSession()
         let server = ManagedRetrieveMCP { handle in
             guard let state, let url = URL(string: state.baseURL + "/v1/retrieve/\(handle)") else { return nil }
             var request = URLRequest(url: url)
             request.setValue("Bearer \(state.authToken)", forHTTPHeaderField: "Authorization")
-            guard let (data, response) = try? await URLSession.shared.data(for: request),
+            guard let (data, response) = try? await session.data(for: request),
                   (response as? HTTPURLResponse)?.statusCode == 200,
                   let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                   (obj["found"] as? Bool) == true else {
@@ -134,6 +136,13 @@ struct RemoteCodeDistillServiceMain {
                 FileHandle.standardOutput.write(Data((response + "\n").utf8))
             }
         }
+    }
+
+    private static func createConfiguredURLSession() -> URLSession {
+        let config = URLSessionConfiguration.default
+        config.timeoutIntervalForRequest = 20
+        config.timeoutIntervalForResource = 60
+        return URLSession(configuration: config)
     }
 
     private static func loadCLIState() -> ManagedDistillCLI.State? {
