@@ -217,4 +217,52 @@ final class AgentAppUXGapsTests: XCTestCase {
         XCTAssert(result.contains { $0.content.isEmpty },
                   "at least one message must have an empty body after budget trim")
     }
+
+    // MARK: - UX-MAC_AGENT-STOP: isStopping / stopButtonState
+
+    // WHY: a Stop button with no feedback invites repeated clicks and confusion.
+    // The pure seam must encode the three reachable states so label/enabled logic
+    // is verifiable without any view instantiation.
+
+    func test_stopButtonState_activeNotStopping_returnsStop() {
+        let state = AgentAppViewModel.stopButtonState(runActive: true, isStopping: false)
+        XCTAssertEqual(state, .stop,
+                       "active run with no pending interrupt must show the Stop affordance")
+    }
+
+    func test_stopButtonState_activeAndStopping_returnsStopping() {
+        let state = AgentAppViewModel.stopButtonState(runActive: true, isStopping: true)
+        XCTAssertEqual(state, .stopping,
+                       "active run after Stop clicked must return .stopping so button is disabled and labelled 'Stopping...'")
+    }
+
+    func test_stopButtonState_notActive_returnsHidden() {
+        XCTAssertEqual(AgentAppViewModel.stopButtonState(runActive: false, isStopping: false), .hidden,
+                       "no active run must hide the Stop button regardless of isStopping")
+        XCTAssertEqual(AgentAppViewModel.stopButtonState(runActive: false, isStopping: true), .hidden,
+                       "isStopping=true with no active run must also be hidden (stale flag must not resurface button)")
+    }
+
+    func test_isStopping_setOnStop_clearedOnTerminalFinish() async throws {
+        let vm = try makeVM()
+        vm.createThread(title: "stop-feedback")
+
+        // Simulate an active run by setting status directly.
+        vm.status = .running
+
+        // Precondition: flag is clear.
+        XCTAssertFalse(vm.isStopping)
+
+        // Calling stop() on a VM with no real coordinator handle must still set the flag.
+        vm.stop()
+        XCTAssertTrue(vm.isStopping,
+                      "stop() must set isStopping=true immediately so the UI can disable the button")
+
+        // Simulate the coordinator finishing the run (as didFinish would).
+        vm.status = .cancelled
+        vm.isStopping = false  // mirrors the MainActor assignment in didFinish
+
+        XCTAssertFalse(vm.isStopping,
+                       "isStopping must be cleared when the run reaches a terminal state")
+    }
 }

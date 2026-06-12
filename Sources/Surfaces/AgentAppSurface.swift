@@ -147,6 +147,10 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     @Published public private(set) var lastErrorRecoverable: Bool = false
     /// P2: search/filter query for the thread rail. Empty = show all threads.
     @Published public var threadSearchQuery: String = ""
+    /// UX-MAC_AGENT-STOP: true between the user clicking Stop and the run
+    /// actually reaching a terminal state. Prevents repeated Stop clicks and
+    /// shows a "Stopping..." label so the user knows the interrupt was sent.
+    @Published public var isStopping: Bool = false
 
     public let workspaceID: WorkspaceID
     public let cwd: String
@@ -1618,6 +1622,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                     self.runThreads[runId] = tid
                     self.status = .running
                     self.runStartedAt = Date()
+                    self.isStopping = false  // UX-MAC_AGENT-STOP: fresh run; clear stale stopping flag
                 } else {
                     self.currentRunId = nil
                     self.runThreads[runId] = nil
@@ -1707,6 +1712,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         if let tid = selectedThreadId {
             coordinator.stopRun(threadId: tid)
         }
+        // UX-MAC_AGENT-STOP: signal that the interrupt was sent so the UI can
+        // show "Stopping..." and disable the button until the run terminates.
+        isStopping = true
     }
 
     /// Stop a specific thread by id, regardless of which thread is currently selected.
@@ -1815,6 +1823,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 self.status = status
                 self.currentRunId = nil
                 self.runStartedAt = nil
+                self.isStopping = false  // UX-MAC_AGENT-STOP: run finished; clear stopping flag
             }
             self.reloadThreads()
             self.loadGitBranchThrottled()   // the run may have changed the tree
@@ -1850,6 +1859,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                     self.terminalRunIds.remove(runId)
                     self.currentRunId = runId
                     if self.runStartedAt == nil { self.runStartedAt = Date() }
+                    self.isStopping = false  // UX-MAC_AGENT-STOP: new run started; clear any stale stopping flag
                 } else if Self.isTerminalRunStatus(status) {
                     // Terminal provider status can arrive immediately before
                     // `.finished`; keep the UI in running state until the
@@ -1860,6 +1870,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                         self.currentRunId = nil
                         self.runStartedAt = nil
                         self.runThreads[runId] = nil
+                        self.isStopping = false  // UX-MAC_AGENT-STOP: terminal; clear stopping flag
                     }
                 } else {
                     self.status = status
@@ -1876,6 +1887,24 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         case .pending, .running:
             return false
         }
+    }
+
+    // MARK: - Stop button state seam
+
+    public enum StopButtonState: Equatable {
+        /// Run is active, stop has not been requested yet.
+        case stop
+        /// Stop was requested; button is disabled while the interrupt round-trips.
+        case stopping
+        /// No active run; button should be hidden.
+        case hidden
+    }
+
+    /// Pure, testable function that drives the Stop button label and enabled state.
+    /// WHY: a Stop button with no feedback invites repeated clicks and user confusion.
+    public static func stopButtonState(runActive: Bool, isStopping: Bool) -> StopButtonState {
+        guard runActive else { return .hidden }
+        return isStopping ? .stopping : .stop
     }
 
     // PERF-L15: bound the terminal-run-id set so it cannot grow without limit.
@@ -3900,11 +3929,16 @@ public struct AgentAppView: View {
                         .font(DS.Font.body).foregroundColor(DS.Palette.textSecondary)
                     // UX-MAC_AGENT-008: inline Stop where the user looks when a
                     // run is taking too long, plus the Esc hint.
-                    Button("Stop") { vm.stop() }
+                    let inlineState = AgentAppViewModel.stopButtonState(
+                        runActive: vm.status == .running,
+                        isStopping: vm.isStopping
+                    )
+                    Button(inlineState == .stopping ? "Stopping..." : "Stop") { vm.stop() }
                         .buttonStyle(.plain)
                         .font(DS.Font.body.weight(.medium))
-                        .foregroundColor(DS.Palette.danger)
-                        .help("Stop running agent (press Esc to interrupt)")
+                        .foregroundColor(inlineState == .stopping ? DS.Palette.textTertiary : DS.Palette.danger)
+                        .disabled(inlineState == .stopping)
+                        .help(inlineState == .stopping ? "Stopping..." : "Stop running agent (press Esc to interrupt)")
                         .accessibilityIdentifier("agent.working.stop")
                 }
             }
@@ -5332,20 +5366,31 @@ public struct AgentAppView: View {
     }
 
     private var stopButton: some View {
-        Button { vm.stop() } label: {
+        let btnState = AgentAppViewModel.stopButtonState(
+            runActive: vm.status == .running,
+            isStopping: vm.isStopping
+        )
+        return Button { vm.stop() } label: {
             ZStack {
                 Circle()
-                    .fill(DS.Palette.danger)
+                    .fill(btnState == .stopping ? DS.Palette.surfaceRaised : DS.Palette.danger)
                     .frame(width: 28, height: 28)
-                Image(systemName: "stop.fill")
-                    .font(.system(size: 11, weight: .bold))
-                    .foregroundColor(DS.Palette.bg)
+                if btnState == .stopping {
+                    ProgressView()
+                        .controlSize(.mini)
+                        .tint(DS.Palette.textSecondary)
+                } else {
+                    Image(systemName: "stop.fill")
+                        .font(.system(size: 11, weight: .bold))
+                        .foregroundColor(DS.Palette.bg)
+                }
             }
         }
         .buttonStyle(.plain)
-        .accessibilityLabel("Stop running agent")
+        .disabled(btnState == .stopping)
+        .accessibilityLabel(btnState == .stopping ? "Stopping..." : "Stop running agent")
         .accessibilityIdentifier("agent.composer.stop")
-        .help("Stop running agent")
+        .help(btnState == .stopping ? "Stopping..." : "Stop running agent")
     }
 
     // P3: thumbnail for image attachments; falls back to doc icon for non-images.
