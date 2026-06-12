@@ -14,16 +14,59 @@ public protocol ExternalPowerMonitoring: AnyObject {
     func stop()
 }
 
+// MARK: - PowerSourceProvider DI seam (QA :97)
+
+/// Abstracts the IOKit power-source read so the AC/battery/unknown mapping
+/// in `MacOSExternalPowerMonitor` is unit-testable without real IOKit hardware.
+/// The closure returns an array of state strings (one per power source, in
+/// iteration order). An empty array maps to `.unknown`.
+/// Production code uses `iokitPowerSourceProvider`; tests inject a fixed array.
+public typealias PowerSourceProvider = @Sendable () -> [String]
+
+/// The live provider: reads power-source descriptions from IOKit and returns
+/// the `kIOPSPowerSourceStateKey` value for each source in the list.
+public let iokitPowerSourceProvider: PowerSourceProvider = {
+    guard let info = IOPSCopyPowerSourcesInfo()?.takeRetainedValue(),
+          let sources = IOPSCopyPowerSourcesList(info)?.takeRetainedValue() as? [CFTypeRef] else {
+        return []
+    }
+    return sources.compactMap { source in
+        (IOPSGetPowerSourceDescription(info, source)?
+            .takeUnretainedValue() as NSDictionary?)?[kIOPSPowerSourceStateKey] as? String
+    }
+}
+
+/// Maps an array of power-source state strings (as returned by a
+/// `PowerSourceProvider`) to an `ExternalPowerState`.
+/// Pure and `nonisolated` — no I/O, testable without IOKit.
+public func mapPowerSourceStates(_ states: [String]) -> ExternalPowerState {
+    for state in states {
+        if state == kIOPSACPowerValue   { return .externalPower }
+        if state == kIOPSBatteryPowerValue { return .battery }
+    }
+    return .unknown
+}
+
 public final class MacOSExternalPowerMonitor: ExternalPowerMonitoring {
     private var runLoopSource: CFRunLoopSource?
     private var started = false
     public var onPowerStateChanged: (@MainActor (ExternalPowerState) -> Void)?
 
-    public var currentPowerState: ExternalPowerState {
-        Self.readCurrentPowerState()
+    /// Injected power-source reader. Default = live IOKit. Tests inject a fixed closure.
+    private let powerSourceProvider: PowerSourceProvider
+
+    public convenience init() {
+        self.init(powerSourceProvider: iokitPowerSourceProvider)
     }
 
-    public init() {}
+    /// Designated init for test injection.
+    public init(powerSourceProvider: @escaping PowerSourceProvider) {
+        self.powerSourceProvider = powerSourceProvider
+    }
+
+    public var currentPowerState: ExternalPowerState {
+        mapPowerSourceStates(powerSourceProvider())
+    }
 
     public func start() {
         guard !started else { return }
@@ -54,28 +97,6 @@ public final class MacOSExternalPowerMonitor: ExternalPowerMonitoring {
         Task { @MainActor [onPowerStateChanged] in
             onPowerStateChanged?(state)
         }
-    }
-
-    private static func readCurrentPowerState() -> ExternalPowerState {
-        guard let info = IOPSCopyPowerSourcesInfo()?.takeRetainedValue(),
-              let sources = IOPSCopyPowerSourcesList(info)?.takeRetainedValue() as? [CFTypeRef] else {
-            return .unknown
-        }
-
-        for source in sources {
-            guard let description = IOPSGetPowerSourceDescription(info, source)?
-                .takeUnretainedValue() as NSDictionary?,
-                let powerSourceState = description[kIOPSPowerSourceStateKey] as? String else {
-                continue
-            }
-            if powerSourceState == kIOPSACPowerValue {
-                return .externalPower
-            }
-            if powerSourceState == kIOPSBatteryPowerValue {
-                return .battery
-            }
-        }
-        return .unknown
     }
 
     deinit {

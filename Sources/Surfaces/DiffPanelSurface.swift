@@ -11,6 +11,53 @@ public enum GitPanelMode: String, CaseIterable, Sendable {
     case changes, history
 }
 
+// MARK: - GitClient DI seam (QA :93)
+
+/// Abstracts the static `GitDiff` calls that `DiffPanelViewModel` makes so
+/// unit tests can inject a fake that never shells out to real git.
+/// Production code defaults to `LiveGitClient` which delegates to `GitDiff`.
+public protocol GitClient: Sendable {
+    func summary(in cwd: String) -> GitSummary
+    func branches(in cwd: String) -> GitBranches
+    func log(in cwd: String, limit: Int) -> [GitCommit]
+    func diff(in cwd: String, path: String?, ignoreWhitespace: Bool) -> String
+    func commitDiff(in cwd: String, hash: String, ignoreWhitespace: Bool) -> String
+    func synthesizeUntrackedDiff(content: String, path: String) -> String
+    func checkout(in cwd: String, branch: String) -> GitActionResult
+    func stashAndCheckout(in cwd: String, branch: String) -> GitActionResult
+    func createBranch(in cwd: String, name: String) -> GitActionResult
+    func commitPaths(in cwd: String, message: String, paths: [String]) -> GitActionResult
+    func restorePathToHead(in cwd: String, path: String) -> GitActionResult
+    func suggestCommitMessage(_ summary: GitSummary) -> String
+    func push(in cwd: String) -> GitActionResult
+    func fetch(in cwd: String) -> GitActionResult
+    func pull(in cwd: String) -> GitActionResult
+    func pullRequestURL(in cwd: String) -> String?
+    func humanizeError(_ raw: String) -> String
+}
+
+/// Live implementation that delegates every call to the real `GitDiff` enum.
+public struct LiveGitClient: GitClient {
+    public init() {}
+    public func summary(in cwd: String) -> GitSummary { GitDiff.summary(in: cwd) }
+    public func branches(in cwd: String) -> GitBranches { GitDiff.branches(in: cwd) }
+    public func log(in cwd: String, limit: Int) -> [GitCommit] { GitDiff.log(in: cwd, limit: limit) }
+    public func diff(in cwd: String, path: String?, ignoreWhitespace: Bool) -> String { GitDiff.diff(in: cwd, path: path, ignoreWhitespace: ignoreWhitespace) }
+    public func commitDiff(in cwd: String, hash: String, ignoreWhitespace: Bool) -> String { GitDiff.commitDiff(in: cwd, hash: hash, ignoreWhitespace: ignoreWhitespace) }
+    public func synthesizeUntrackedDiff(content: String, path: String) -> String { GitDiff.synthesizeUntrackedDiff(content: content, path: path) }
+    public func checkout(in cwd: String, branch: String) -> GitActionResult { GitDiff.checkout(in: cwd, branch: branch) }
+    public func stashAndCheckout(in cwd: String, branch: String) -> GitActionResult { GitDiff.stashAndCheckout(in: cwd, branch: branch) }
+    public func createBranch(in cwd: String, name: String) -> GitActionResult { GitDiff.createBranch(in: cwd, name: name) }
+    public func commitPaths(in cwd: String, message: String, paths: [String]) -> GitActionResult { GitDiff.commitPaths(in: cwd, message: message, paths: paths) }
+    public func restorePathToHead(in cwd: String, path: String) -> GitActionResult { GitDiff.restorePathToHead(in: cwd, path: path) }
+    public func suggestCommitMessage(_ summary: GitSummary) -> String { GitDiff.suggestCommitMessage(summary) }
+    public func push(in cwd: String) -> GitActionResult { GitDiff.push(in: cwd) }
+    public func fetch(in cwd: String) -> GitActionResult { GitDiff.fetch(in: cwd) }
+    public func pull(in cwd: String) -> GitActionResult { GitDiff.pull(in: cwd) }
+    public func pullRequestURL(in cwd: String) -> String? { GitDiff.pullRequestURL(in: cwd) }
+    public func humanizeError(_ raw: String) -> String { GitDiff.humanizeError(raw) }
+}
+
 @MainActor
 public final class DiffPanelViewModel: ObservableObject {
     /// Cap the rendered diff so a giant `git show` can't stall TextKit
@@ -150,6 +197,9 @@ public final class DiffPanelViewModel: ObservableObject {
     /// overwrite the diff of a newer selection (PERF-007).
     private var diffGeneration = 0
     private let settings: SettingsStore?
+    /// Injected git operations. Default = LiveGitClient (real git).
+    /// Tests inject a fake to avoid shelling out to git (QA :93).
+    let gitClient: any GitClient
     /// FSEvents stream token for cwd watch; nil until `startFSWatcher()` is called.
     private var fsStream: FSEventStreamRef?
     /// Wall-clock time of the last auto-refresh triggered by FSEvents.
@@ -161,9 +211,13 @@ public final class DiffPanelViewModel: ObservableObject {
     /// When `asyncLoad` is true the init returns instantly with a loading
     /// placeholder; a Task fires the git calls on a background thread and
     /// publishes the result on the main actor (PERF - surface appears fast).
-    public init(cwd: String, settings: SettingsStore? = nil, asyncLoad: Bool = false) {
+    public init(cwd: String,
+                settings: SettingsStore? = nil,
+                asyncLoad: Bool = false,
+                gitClient: any GitClient = LiveGitClient()) {
         self.cwd = cwd
         self.settings = settings
+        self.gitClient = gitClient
         if asyncLoad {
             // Placeholder state: surface renders immediately while git runs.
             self.summary = GitSummary(isGitRepo: false, branch: nil, dirty: false,
@@ -171,8 +225,8 @@ public final class DiffPanelViewModel: ObservableObject {
             self.branches = GitBranches(current: nil, locals: [])
             self.isLoading = true
         } else {
-            self.summary = GitDiff.summary(in: cwd)
-            self.branches = GitDiff.branches(in: cwd)
+            self.summary = gitClient.summary(in: cwd)
+            self.branches = gitClient.branches(in: cwd)
         }
         if let s = settings?.load() {
             // Set within init → property observers don't fire (no echo write).
@@ -181,8 +235,9 @@ public final class DiffPanelViewModel: ObservableObject {
         }
         if asyncLoad {
             let cwdCopy = cwd
+            let gc = gitClient
             Task { [weak self] in
-                let (s, b) = await DiffPanelViewModel.performLoad(cwd: cwdCopy)
+                let (s, b) = await DiffPanelViewModel.performLoad(cwd: cwdCopy, gitClient: gc)
                 guard let self else { return }
                 self.summary = s
                 self.branches = b
@@ -194,11 +249,12 @@ public final class DiffPanelViewModel: ObservableObject {
     /// Loads summary and branches on a background thread, returns on any
     /// actor. Pure coordination helper; exposed `internal` so the new test
     /// can verify load state without hitting real git.
-    nonisolated static func performLoad(cwd: String) async -> (GitSummary, GitBranches) {
+    nonisolated static func performLoad(cwd: String,
+                                        gitClient: any GitClient = LiveGitClient()) async -> (GitSummary, GitBranches) {
         await withCheckedContinuation { cont in
             DispatchQueue.global().async {
-                let s = GitDiff.summary(in: cwd)
-                let b = GitDiff.branches(in: cwd)
+                let s = gitClient.summary(in: cwd)
+                let b = gitClient.branches(in: cwd)
                 cont.resume(returning: (s, b))
             }
         }
@@ -288,8 +344,9 @@ public final class DiffPanelViewModel: ObservableObject {
 
     public func refresh() {
         let cwd = self.cwd
+        let gc = gitClient
         DispatchQueue.global().async { [weak self] in
-            let s = GitDiff.summary(in: cwd)
+            let s = gc.summary(in: cwd)
             DispatchQueue.main.async { self?.summary = s }
         }
     }
@@ -300,11 +357,12 @@ public final class DiffPanelViewModel: ObservableObject {
     public func reloadAll() {
         guard !isLoading else { return }
         let cwd = self.cwd
+        let gc = gitClient
         isLoading = true
         DispatchQueue.global().async { [weak self] in
-            let s = GitDiff.summary(in: cwd)
-            let b = GitDiff.branches(in: cwd)
-            let log = GitDiff.log(in: cwd)
+            let s = gc.summary(in: cwd)
+            let b = gc.branches(in: cwd)
+            let log = gc.log(in: cwd, limit: 100)
             DispatchQueue.main.async {
                 guard let self else { return }
                 self.summary = s
@@ -318,8 +376,9 @@ public final class DiffPanelViewModel: ObservableObject {
 
     public func loadBranches() {
         let cwd = self.cwd
+        let gc = gitClient
         DispatchQueue.global().async { [weak self] in
-            let b = GitDiff.branches(in: cwd)
+            let b = gc.branches(in: cwd)
             DispatchQueue.main.async { self?.branches = b }
         }
     }
@@ -329,8 +388,9 @@ public final class DiffPanelViewModel: ObservableObject {
         historyLoaded = true
         let cwd = self.cwd
         let limit = historyLoadLimit
+        let gc = gitClient
         DispatchQueue.global().async { [weak self] in
-            let c = GitDiff.log(in: cwd, limit: limit)
+            let c = gc.log(in: cwd, limit: limit)
             DispatchQueue.main.async { self?.commits = c }
         }
     }
@@ -343,9 +403,10 @@ public final class DiffPanelViewModel: ObservableObject {
         historyLoadLimit = Self.historyNextLimit(loaded: historyLoadLimit)
         let cwd = self.cwd
         let limit = historyLoadLimit
+        let gc = gitClient
         isLoading = true
         DispatchQueue.global().async { [weak self] in
-            let c = GitDiff.log(in: cwd, limit: limit)
+            let c = gc.log(in: cwd, limit: limit)
             DispatchQueue.main.async {
                 guard let self else { return }
                 self.commits = c
@@ -360,7 +421,12 @@ public final class DiffPanelViewModel: ObservableObject {
         if path != nil {
             reloadDiff()
         } else {
+            // QA-MAC :93 (T025) -- bump the generation so any in-flight diff task
+            // for the previously-selected file is invalidated and cannot overwrite
+            // this clear with a stale patch when it lands.
+            diffGeneration &+= 1
             rawDiff = ""
+            isLoading = false
         }
     }
 
@@ -404,6 +470,7 @@ public final class DiffPanelViewModel: ObservableObject {
         }()
         diffGeneration &+= 1
         let gen = diffGeneration
+        let gc = gitClient
         isLoading = true
         DispatchQueue.global().async { [weak self] in
             let d: String
@@ -414,12 +481,12 @@ public final class DiffPanelViewModel: ObservableObject {
                     // all-addition patch by reading the file content directly.
                     let fullPath = (cwd as NSString).appendingPathComponent(p)
                     let content = (try? String(contentsOfFile: fullPath, encoding: .utf8)) ?? ""
-                    d = GitDiff.synthesizeUntrackedDiff(content: content, path: p)
+                    d = gc.synthesizeUntrackedDiff(content: content, path: p)
                 } else {
-                    d = GitDiff.diff(in: cwd, path: p, ignoreWhitespace: ws)
+                    d = gc.diff(in: cwd, path: p, ignoreWhitespace: ws)
                 }
             } else if let h = commit {
-                d = GitDiff.commitDiff(in: cwd, hash: h, ignoreWhitespace: ws)
+                d = gc.commitDiff(in: cwd, hash: h, ignoreWhitespace: ws)
             } else {
                 d = ""
             }
@@ -432,21 +499,24 @@ public final class DiffPanelViewModel: ObservableObject {
     }
 
     public func switchBranch(_ name: String) {
-        runAction(successMessage: "Switched to \(name)") { GitDiff.checkout(in: $0, branch: name) }
+        let gc = gitClient
+        runAction(successMessage: "Switched to \(name)") { gc.checkout(in: $0, branch: name) }
     }
 
     /// UX-004: stash uncommitted work, then switch — the guarded path
     /// offered when the working tree is dirty.
     public func stashAndSwitchBranch(_ name: String) {
+        let gc = gitClient
         runAction(successMessage: "Stashed changes and switched to \(name)") {
-            GitDiff.stashAndCheckout(in: $0, branch: name)
+            gc.stashAndCheckout(in: $0, branch: name)
         }
     }
 
     public func newBranch(_ name: String) {
         let n = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !n.isEmpty else { return }
-        runAction(successMessage: "Created branch \(n)") { GitDiff.createBranch(in: $0, name: n) }
+        let gc = gitClient
+        runAction(successMessage: "Created branch \(n)") { gc.createBranch(in: $0, name: n) }
     }
 
     public func commit() {
@@ -496,9 +566,10 @@ public final class DiffPanelViewModel: ObservableObject {
             commit(); return
         }
         let n = paths.count
+        let gc = gitClient
         runAction(clearMessageOnOK: true,
                   successMessage: "Committed \(n) selected file\(n == 1 ? "" : "s")") {
-            GitDiff.commitPaths(in: $0, message: msg, paths: paths)
+            gc.commitPaths(in: $0, message: msg, paths: paths)
         }
         selectedFiles = []
         selectedPath = nil
@@ -509,8 +580,9 @@ public final class DiffPanelViewModel: ObservableObject {
     /// UX-006: throw away a file's working-tree edits (git checkout HEAD --).
     /// Clears the diff if the discarded file was the one on screen.
     public func discardFile(_ path: String) {
+        let gc = gitClient
         runAction(successMessage: "Discarded changes in \(path)") {
-            GitDiff.restorePathToHead(in: $0, path: path)
+            gc.restorePathToHead(in: $0, path: path)
         }
         if selectedPath == path {
             selectedPath = nil
@@ -523,26 +595,29 @@ public final class DiffPanelViewModel: ObservableObject {
     /// never silently clobbered.
     public func suggestMessage() {
         guard commitMessage.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
-        commitMessage = GitDiff.suggestCommitMessage(summary)
+        commitMessage = gitClient.suggestCommitMessage(summary)
     }
 
     /// D2: push the current branch (sets upstream if needed).
     public func push() {
         let branch = branches.current ?? "branch"
-        runAction(successMessage: "Pushed \(branch)") { GitDiff.push(in: $0) }
+        let gc = gitClient
+        runAction(successMessage: "Pushed \(branch)") { gc.push(in: $0) }
     }
 
     /// Fetch remote refs (`git fetch --prune`) without touching the working tree.
     /// Safe at any time; surfaces auth/network failures in the error banner.
     public func fetch() {
-        runAction(successMessage: "Fetched remote refs") { GitDiff.fetch(in: $0) }
+        let gc = gitClient
+        runAction(successMessage: "Fetched remote refs") { gc.fetch(in: $0) }
     }
 
     /// Pull the current branch (`git pull --ff-only`). Fails loud on diverged
     /// history or local conflicts so the user is never silently surprised.
     public func pull() {
         let branch = branches.current ?? "branch"
-        runAction(successMessage: "Pulled \(branch)") { GitDiff.pull(in: $0) }
+        let gc = gitClient
+        runAction(successMessage: "Pulled \(branch)") { gc.pull(in: $0) }
     }
 
     /// Called when the panel becomes visible (tab selected, window shown).
@@ -705,7 +780,7 @@ public final class DiffPanelViewModel: ObservableObject {
 
     /// D2: open a PR/MR page for the current branch in the browser.
     public func openPullRequest() {
-        guard let url = GitDiff.pullRequestURL(in: cwd), let u = URL(string: url) else {
+        guard let url = gitClient.pullRequestURL(in: cwd), let u = URL(string: url) else {
             lastErrorRaw = nil
             lastError = "No remote 'origin' / branch to open a pull request for."
             return
@@ -720,13 +795,14 @@ public final class DiffPanelViewModel: ObservableObject {
                            successMessage: String? = nil,
                            _ op: @escaping @Sendable (String) -> GitActionResult) {
         let cwd = self.cwd
+        let gc = gitClient
         isBusy = true
         actionSuccess = nil
         DispatchQueue.global().async { [weak self] in
             let r = op(cwd)
-            let s = GitDiff.summary(in: cwd)
-            let b = GitDiff.branches(in: cwd)
-            let log = GitDiff.log(in: cwd)
+            let s = gc.summary(in: cwd)
+            let b = gc.branches(in: cwd)
+            let log = gc.log(in: cwd, limit: 100)
             DispatchQueue.main.async {
                 guard let self else { return }
                 self.summary = s
@@ -741,7 +817,7 @@ public final class DiffPanelViewModel: ObservableObject {
                 } else {
                     // UX-015: show actionable copy; keep raw stderr for details.
                     self.lastErrorRaw = r.message
-                    self.lastError = GitDiff.humanizeError(r.message)
+                    self.lastError = gc.humanizeError(r.message)
                 }
             }
         }

@@ -2,6 +2,49 @@ import Foundation
 import AppKit
 import UserNotifications
 
+// MARK: - NotificationCenterClient DI seam (QA :96)
+
+/// Abstracts the `UNUserNotificationCenter` calls that `SystemNotifier` makes
+/// so unit tests can intercept posting without a real app bundle (the
+/// `canUseNotificationCenter` guard makes UNCenter a no-op under `swift test`).
+/// Production code uses `LiveNotificationCenterClient` which delegates to
+/// `UNUserNotificationCenter.current()`.
+public protocol NotificationCenterClient: Sendable {
+    /// Schedules a notification request.
+    func add(_ request: UNNotificationRequest, withCompletionHandler: ((Error?) -> Void)?)
+    /// Registers the delegate for presentation callbacks.
+    func setDelegate(_ delegate: UNUserNotificationCenterDelegate?)
+    /// Registers notification categories.
+    func setNotificationCategories(_ categories: Set<UNNotificationCategory>)
+    /// Requests authorization; calls back with (granted, error).
+    func requestAuthorization(options: UNAuthorizationOptions,
+                              completionHandler: @escaping (Bool, Error?) -> Void)
+    /// Returns the current notification settings.
+    func notificationSettings() async -> UNNotificationSettings
+}
+
+/// Live implementation that delegates to `UNUserNotificationCenter.current()`.
+public struct LiveNotificationCenterClient: NotificationCenterClient {
+    public init() {}
+    public func add(_ request: UNNotificationRequest, withCompletionHandler handler: ((Error?) -> Void)?) {
+        UNUserNotificationCenter.current().add(request, withCompletionHandler: handler)
+    }
+    public func setDelegate(_ delegate: UNUserNotificationCenterDelegate?) {
+        UNUserNotificationCenter.current().delegate = delegate
+    }
+    public func setNotificationCategories(_ categories: Set<UNNotificationCategory>) {
+        UNUserNotificationCenter.current().setNotificationCategories(categories)
+    }
+    public func requestAuthorization(options: UNAuthorizationOptions,
+                                     completionHandler: @escaping (Bool, Error?) -> Void) {
+        UNUserNotificationCenter.current().requestAuthorization(options: options,
+                                                                completionHandler: completionHandler)
+    }
+    public func notificationSettings() async -> UNNotificationSettings {
+        await UNUserNotificationCenter.current().notificationSettings()
+    }
+}
+
 /// Thin wrapper around UNUserNotificationCenter. Requests authorization
 /// once; subsequent posts are best-effort. If authorization is denied
 /// notifications still get persisted via the NotificationRepository so
@@ -38,7 +81,18 @@ public final class SystemNotifier: NSObject, UNUserNotificationCenterDelegate {
     /// so multiple denied posts never spam the user (UX-MAC_APPSHELL-P2).
     public static let rc2NotificationsDeniedPost = Notification.Name("rc2NotificationsDeniedPost")
 
+    /// Injected notification center. Default = LiveNotificationCenterClient (real UNCenter).
+    /// Tests inject a fake so posting is unit-testable without a bundled .app (QA :96).
+    let notificationCenterClient: any NotificationCenterClient
+
     private override init() {
+        self.notificationCenterClient = LiveNotificationCenterClient()
+        super.init()
+    }
+
+    /// Designated init for test injection. Not exposed via `shared`.
+    init(notificationCenterClient: any NotificationCenterClient) {
+        self.notificationCenterClient = notificationCenterClient
         super.init()
     }
 
@@ -46,14 +100,20 @@ public final class SystemNotifier: NSObject, UNUserNotificationCenterDelegate {
         Bundle.main.bundleIdentifier != nil && Bundle.main.bundleURL.pathExtension == "app"
     }
 
+    /// Sets the authorization state for tests. Not callable in production because
+    /// `authorized` is always set via the `requestAuthorization` callback.
+    /// Internal so `@testable import AppShell` can reach it without reflection.
+    func setAuthorizedForTesting(_ value: Bool) {
+        authorized = value
+    }
+
     public func bootstrap() {
         // UNUserNotificationCenter requires the process to be a real
         // bundled .app. Running from `swift run` produces a binary
         // without an app bundle and would crash on .current().
         guard Self.canUseNotificationCenter else { return }
-        let center = UNUserNotificationCenter.current()
-        center.delegate = self
-        center.setNotificationCategories([
+        notificationCenterClient.setDelegate(self)
+        notificationCenterClient.setNotificationCategories([
             UNNotificationCategory(
                 identifier: RemoteCodeNotificationContent.threadUpdateCategoryIdentifier,
                 actions: [
@@ -67,7 +127,7 @@ public final class SystemNotifier: NSObject, UNUserNotificationCenterDelegate {
                 options: []
             )
         ])
-        center.requestAuthorization(options: [.alert, .sound]) { granted, _ in
+        notificationCenterClient.requestAuthorization(options: [.alert, .sound]) { granted, _ in
             self.authorized = granted
         }
     }
@@ -79,7 +139,7 @@ public final class SystemNotifier: NSObject, UNUserNotificationCenterDelegate {
         if let b = body { content.body = b }
         if let c = category { content.categoryIdentifier = c }
         let req = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
-        UNUserNotificationCenter.current().add(req, withCompletionHandler: nil)
+        notificationCenterClient.add(req, withCompletionHandler: nil)
     }
 
     public func post(_ content: RemoteCodeNotificationContent) {
@@ -91,7 +151,7 @@ public final class SystemNotifier: NSObject, UNUserNotificationCenterDelegate {
             }
             return
         }
-        UNUserNotificationCenter.current().add(content.makeRequest(), withCompletionHandler: nil)
+        notificationCenterClient.add(content.makeRequest(), withCompletionHandler: nil)
     }
 
     /// Current OS authorization status, used by Settings to decide whether to
@@ -100,7 +160,7 @@ public final class SystemNotifier: NSObject, UNUserNotificationCenterDelegate {
     /// UNUserNotificationCenter is unavailable.
     public func authorizationStatus() async -> UNAuthorizationStatus {
         guard Self.canUseNotificationCenter else { return .notDetermined }
-        return await UNUserNotificationCenter.current().notificationSettings().authorizationStatus
+        return await notificationCenterClient.notificationSettings().authorizationStatus
     }
 
     /// Best-effort test notification for the Settings "Test notification"
@@ -108,19 +168,18 @@ public final class SystemNotifier: NSObject, UNUserNotificationCenterDelegate {
     /// press also triggers the OS prompt.
     public func postTestNotification() {
         guard Self.canUseNotificationCenter else { return }
-        let center = UNUserNotificationCenter.current()
-        let deliver = {
+        let deliver = { [notificationCenterClient] in
             let content = UNMutableNotificationContent()
             content.title = "RemoteCode"
             content.body = "Test notification — delivery is working."
             content.sound = .default
             let req = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
-            center.add(req, withCompletionHandler: nil)
+            notificationCenterClient.add(req, withCompletionHandler: nil)
         }
         if authorized {
             deliver()
         } else {
-            center.requestAuthorization(options: [.alert, .sound]) { granted, _ in
+            notificationCenterClient.requestAuthorization(options: [.alert, .sound]) { granted, _ in
                 self.authorized = granted
                 if granted { deliver() }
             }
