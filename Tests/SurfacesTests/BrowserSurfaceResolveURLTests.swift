@@ -161,4 +161,36 @@ final class BrowserSurfaceResolveURLTests: XCTestCase {
     func test_isGoogleHost_nil_returnsFalse() {
         XCTAssertFalse(BrowserSurface.isGoogleHost(nil))
     }
+
+    // MARK: - isSecureURL (UX-MAC_BROWSER-133)
+
+    // WHY: the security indicator must show a lock when the loaded page uses
+    // https. If isSecureURL returns false for https, the user sees a misleading
+    // "not secure" glyph on a fully encrypted connection.
+    func test_isSecureURL_https_returnsTrue() {
+        XCTAssertTrue(BrowserSurface.isSecureURL("https://example.com"),
+                      "https scheme must be considered secure")
+    }
+
+    // WHY: if isSecureURL returns true for http, the indicator shows a lock on
+    // an unencrypted connection, giving the user a false sense of security.
+    func test_isSecureURL_http_returnsFalse() {
+        XCTAssertFalse(BrowserSurface.isSecureURL("http://example.com"),
+                       "http scheme must not be considered secure")
+    }
+
+    // WHY: about:blank has no meaningful security context; treating it as secure
+    // would cause the indicator to show a lock on the empty page, which is
+    // misleading when the address bar snapshot still reflects a prior http page.
+    func test_isSecureURL_aboutBlank_returnsFalse() {
+        XCTAssertFalse(BrowserSurface.isSecureURL("about:blank"),
+                       "about:blank must not be considered secure")
+    }
+
+    // WHY: an empty string has no scheme; isSecureURL must not crash and must
+    // return false so the indicator defaults to the open-lock glyph.
+    func test_isSecureURL_emptyString_returnsFalse() {
+        XCTAssertFalse(BrowserSurface.isSecureURL(""),
+                       "empty string must not be considered secure")
+    }
 }

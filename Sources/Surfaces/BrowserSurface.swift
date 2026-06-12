@@ -143,6 +143,14 @@ public final class BrowserSurface: NSObject, Surface, WKNavigationDelegate, WKUI
     private let errorOverlay = NSView()
     private let errorLabel = NSTextField(labelWithString: "")
     private let retryButton = NSButton()
+    private let securityIndicator = NSButton()
+    // windowOpenBanner: transient notice shown when window.open loads in-place
+    // (UX-MAC_BROWSER-134). Auto-hides after 2.5 s.
+    private let windowOpenBanner = NSView()
+    private let windowOpenBannerLabel = NSTextField(labelWithString: "")
+    /// Snapshot of the current page URL. Restored when user presses Esc in the
+    /// address bar (UX-MAC_BROWSER-133).
+    private var addressBarSnapshot = ""
     private var googleLegacyLayoutReloads = Set<String>()
     private var googleLegacyLayoutReloadOrder: [String] = []
     // internal (not private) so tests can assert the cap value without
@@ -223,7 +231,16 @@ public final class BrowserSurface: NSObject, Surface, WKNavigationDelegate, WKUI
         let container = BrowserContainerView()
         container.translatesAutoresizingMaskIntoConstraints = false
         for v in [toolbar, wv] { v.translatesAutoresizingMaskIntoConstraints = false }
-        for v in [backButton, forwardButton, reloadButton, tf, openExternalButton] { v.translatesAutoresizingMaskIntoConstraints = false; toolbar.addSubview(v) }
+        securityIndicator.isBordered = false
+        securityIndicator.bezelStyle = .inline
+        securityIndicator.image = NSImage(systemSymbolName: "lock.fill", accessibilityDescription: "Secure")
+        securityIndicator.contentTintColor = DS.NS.textSecondary
+        securityIndicator.imageScaling = .scaleProportionallyDown
+        securityIndicator.toolTip = "Secure"
+        securityIndicator.isEnabled = false
+        securityIndicator.setAccessibilityIdentifier("browser.security-indicator")
+        securityIndicator.setAccessibilityLabel("Security indicator")
+        for v in [backButton, forwardButton, reloadButton, securityIndicator, tf, openExternalButton] { v.translatesAutoresizingMaskIntoConstraints = false; toolbar.addSubview(v) }
         container.addSubview(toolbar)
         container.addSubview(wv)
         NSLayoutConstraint.activate([
@@ -237,7 +254,9 @@ public final class BrowserSurface: NSObject, Surface, WKNavigationDelegate, WKUI
             forwardButton.centerYAnchor.constraint(equalTo: toolbar.centerYAnchor),
             reloadButton.leadingAnchor.constraint(equalTo: forwardButton.trailingAnchor, constant: 2),
             reloadButton.centerYAnchor.constraint(equalTo: toolbar.centerYAnchor),
-            tf.leadingAnchor.constraint(equalTo: reloadButton.trailingAnchor, constant: 6),
+            securityIndicator.leadingAnchor.constraint(equalTo: reloadButton.trailingAnchor, constant: 6),
+            securityIndicator.centerYAnchor.constraint(equalTo: toolbar.centerYAnchor),
+            tf.leadingAnchor.constraint(equalTo: securityIndicator.trailingAnchor, constant: 2),
             tf.trailingAnchor.constraint(equalTo: openExternalButton.leadingAnchor, constant: -6),
             tf.centerYAnchor.constraint(equalTo: toolbar.centerYAnchor),
             openExternalButton.trailingAnchor.constraint(equalTo: toolbar.trailingAnchor, constant: -6),
@@ -360,6 +379,29 @@ public final class BrowserSurface: NSObject, Surface, WKNavigationDelegate, WKUI
             errorIcon.heightAnchor.constraint(equalToConstant: 32)
         ])
 
+        // window.open banner (UX-MAC_BROWSER-134): overlays top of webView;
+        // hidden by default, shown transiently when createWebViewWith fires.
+        windowOpenBanner.wantsLayer = true
+        windowOpenBanner.layer?.backgroundColor = DS.NS.surfaceRaised.cgColor
+        windowOpenBanner.layer?.cornerRadius = 6
+        windowOpenBanner.isHidden = true
+        windowOpenBanner.setAccessibilityIdentifier("browser.window-open-banner")
+        windowOpenBanner.translatesAutoresizingMaskIntoConstraints = false
+        windowOpenBannerLabel.font = .systemFont(ofSize: 11, weight: .regular)
+        windowOpenBannerLabel.textColor = DS.NS.text
+        windowOpenBannerLabel.setAccessibilityIdentifier("browser.window-open-banner-label")
+        windowOpenBannerLabel.translatesAutoresizingMaskIntoConstraints = false
+        windowOpenBanner.addSubview(windowOpenBannerLabel)
+        container.addSubview(windowOpenBanner)
+        NSLayoutConstraint.activate([
+            windowOpenBanner.topAnchor.constraint(equalTo: wv.topAnchor, constant: 8),
+            windowOpenBanner.trailingAnchor.constraint(equalTo: wv.trailingAnchor, constant: -12),
+            windowOpenBannerLabel.topAnchor.constraint(equalTo: windowOpenBanner.topAnchor, constant: 6),
+            windowOpenBannerLabel.bottomAnchor.constraint(equalTo: windowOpenBanner.bottomAnchor, constant: -6),
+            windowOpenBannerLabel.leadingAnchor.constraint(equalTo: windowOpenBanner.leadingAnchor, constant: 10),
+            windowOpenBannerLabel.trailingAnchor.constraint(equalTo: windowOpenBanner.trailingAnchor, constant: -10)
+        ])
+
         container.wantsLayer = true
         container.layer?.backgroundColor = DS.NS.bg.cgColor
         self.view = container
@@ -374,6 +416,7 @@ public final class BrowserSurface: NSObject, Surface, WKNavigationDelegate, WKUI
         openExternalButton.target = self; openExternalButton.action = #selector(openInDefaultBrowser)
         retryButton.target = self; retryButton.action = #selector(reload)
         tf.target = self; tf.action = #selector(goAddress)
+        tf.delegate = self
         findField.target = self; findField.action = #selector(findNext)
         findField.delegate = self
         findPrevButton.target = self; findPrevButton.action = #selector(findPrev)
@@ -500,10 +543,34 @@ public final class BrowserSurface: NSObject, Surface, WKNavigationDelegate, WKUI
         url.absoluteString.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "about:blank"
     }
 
+    /// Returns true iff `s` uses the https scheme. Used by the security
+    /// indicator (UX-MAC_BROWSER-133). Pure: no I/O, no side effects.
+    /// Marked `nonisolated` so tests invoke it without a MainActor context.
+    nonisolated static func isSecureURL(_ s: String) -> Bool {
+        s.lowercased().hasPrefix("https://")
+    }
+
+    /// Updates the lock/insecure glyph beside the address bar to reflect the
+    /// CURRENTLY LOADED page URL (webView.url), not the half-typed field text.
+    /// Called from didFinish and navigate(to:) (the two moments when the loaded
+    /// URL is definitively known).
+    private func updateSecurityIndicator() {
+        let currentURLString = webView.url?.absoluteString ?? retainedURL?.absoluteString ?? ""
+        let secure = Self.isSecureURL(currentURLString)
+        let glyph = secure ? "lock.fill" : "lock.open.fill"
+        let desc = secure ? "Secure" : "Not secure"
+        securityIndicator.image = NSImage(systemSymbolName: glyph, accessibilityDescription: desc)
+        securityIndicator.contentTintColor = secure ? DS.NS.textSecondary : DS.NS.textTertiary
+        securityIndicator.toolTip = desc
+        securityIndicator.setAccessibilityLabel(desc)
+    }
+
     public func navigate(to url: URL) {
         let url = Self.normalizedInitialURL(url)
         retainedURL = url
         addressBar.stringValue = url.absoluteString
+        addressBarSnapshot = url.absoluteString
+        updateSecurityIndicator()
         hideError()
         waitForToken &+= 1
         guard isVisible else { return }
@@ -773,8 +840,10 @@ public final class BrowserSurface: NSObject, Surface, WKNavigationDelegate, WKUI
         Self.log.debug("nav finish host=\(webView.url?.host ?? "?", privacy: .public)")
         if let url = webView.url {
             addressBar.stringValue = url.absoluteString
+            addressBarSnapshot = url.absoluteString
             publishNavigationChange(url: url, title: webView.title)
         }
+        updateSecurityIndicator()
         hideError()
         updateNavigationButtons()
         reloadGoogleOnceAfterClearingLegacyLayoutCookie()
@@ -801,12 +870,23 @@ public final class BrowserSurface: NSObject, Surface, WKNavigationDelegate, WKUI
 
     /// target=_blank / window.open links have no destination view in a
     /// single-webView surface, so WKWebView silently drops them
-    /// (UX-MAC_BROWSER-012). Load the request in this view instead.
+    /// (UX-MAC_BROWSER-012). Load the request in this view instead and surface
+    /// a transient banner so the navigation is not silent (UX-MAC_BROWSER-134).
     public func webView(_ webView: WKWebView, createWebViewWith configuration: WKWebViewConfiguration, for navigationAction: WKNavigationAction, windowFeatures: WKWindowFeatures) -> WKWebView? {
         if navigationAction.targetFrame == nil, let url = navigationAction.request.url {
             webView.load(URLRequest(url: url))
+            showWindowOpenBanner(for: url)
         }
         return nil
+    }
+
+    private func showWindowOpenBanner(for url: URL) {
+        let host = url.host ?? url.absoluteString
+        windowOpenBannerLabel.stringValue = "Opened \(host) in this tab"
+        windowOpenBanner.isHidden = false
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { [weak self] in
+            self?.windowOpenBanner.isHidden = true
+        }
     }
 
     // IMP-MAC_BROWSER-008/012: context-menu link items implemented via
@@ -891,10 +971,20 @@ public final class BrowserSurface: NSObject, Surface, WKNavigationDelegate, WKUI
     // (UX-MAC_BROWSER-009). The field editor consumes the Esc keyDown before it
     // reaches BrowserContainerView.keyDown, so we intercept it here via
     // cancelOperation: instead.
+    // Also handles Esc in the address bar (UX-MAC_BROWSER-133): reverts the
+    // half-typed text to the current page URL and returns focus to the webView.
     public func control(_ control: NSControl, textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
-        guard control === findField, commandSelector == #selector(NSResponder.cancelOperation(_:)) else { return false }
-        closeFind()
-        return true
+        guard commandSelector == #selector(NSResponder.cancelOperation(_:)) else { return false }
+        if control === findField {
+            closeFind()
+            return true
+        }
+        if control === addressBar {
+            addressBar.stringValue = addressBarSnapshot
+            view.window?.makeFirstResponder(webView)
+            return true
+        }
+        return false
     }
 
     @objc private func findNext() { runFind(forward: true) }
