@@ -747,6 +747,14 @@ public final class ANSIRenderer {
         return row + Array(repeating: Cell.empty, count: newCols - row.count)
     }
 
+    // MARK: - Test-visible buffer size accessors
+    // WHY: oscBuffer and utf8Buf are private parser state; exposing raw counts
+    // (not the contents) lets fuzz tests assert the bounded-buffer invariant
+    // without opening any real security surface. These are the narrowest
+    // accessors that satisfy the test contract (todo-QA item 104).
+    var oscBufferCount: Int { oscBuffer.count }
+    var utf8BufCount: Int { utf8Buf.count }
+
     // MARK: - Theme palette export seam
 
     /// Convert a flat array of up to 16 raw RGB triples (indices 0-15) into an
