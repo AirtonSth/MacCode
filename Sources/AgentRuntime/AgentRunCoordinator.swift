@@ -1036,6 +1036,15 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                     emitPersistenceIssue("run.stream_event.prune.finish", error: error, runId: runId, threadId: threadId)
                 }
             }
+            // PERF-MAC_AGENT-009: prune provider event logs unconditionally at run
+            // finish so they are bounded to the default 10,000 per thread. Provider
+            // events are written at lower frequency than stream events, so a per-event
+            // cadence gate is not needed; one DELETE at run-end is cheap and bounded.
+            do {
+                try runRepo.pruneProviderEventLogs(threadId: threadId)
+            } catch {
+                emitPersistenceIssue("run.provider_event.prune.finish", error: error, runId: runId, threadId: threadId)
+            }
             let durationMs = (try? runRepo.get(id: runId)).flatMap { row -> Int64? in
                 guard let finished = row.finishedAt else { return nil }
                 return Int64(finished.timeIntervalSince(row.startedAt) * 1000)
