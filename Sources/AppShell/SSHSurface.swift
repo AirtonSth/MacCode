@@ -787,7 +787,40 @@ final class SSHSurface: NSObject, SSHTransferSurface {
     var queuedCountForTesting: Int { viewModel.queueItems.filter { $0.status == .queued }.count }
     var selectedLocalCountForTesting: Int { viewModel.selectedLocalIDs.count }
     var selectedRemoteCountForTesting: Int { viewModel.selectedRemoteIDs.count }
+    var selectedLocalIDsForTesting: Set<String> { viewModel.selectedLocalIDs }
+    var selectedRemoteIDsForTesting: Set<String> { viewModel.selectedRemoteIDs }
     var transferLogForTesting: [String] { viewModel.transferLogs }
+
+    // Seeds localEntries in the VM so selection tests can exercise range logic
+    // without a router round-trip. Each name becomes one file entry whose id
+    // equals its name (predictable for assertions).
+    func seedLocalEntriesForTesting(_ names: [String]) {
+        let entries = names.map { name in
+            SSHFileEntry(id: name, name: name, path: "/\(name)", kind: "file",
+                         size: "0", fileType: "file", modified: "")
+        }
+        viewModel.localEntries = entries
+        viewModel.localDerived = SSHPaneDerived(entries: entries)
+    }
+
+    // Drives a plain-click on the entry at `index` (sets anchor + single selection).
+    func plainSelectLocalAtForTesting(_ index: Int) {
+        guard index < viewModel.localEntries.count else { return }
+        viewModel.selectLocal(viewModel.localEntries[index], flags: [])
+    }
+
+    // Drives a shift-click on the entry at `index` (range from anchor to index).
+    func shiftSelectLocalAtForTesting(_ index: Int) {
+        guard index < viewModel.localEntries.count else { return }
+        viewModel.selectLocal(viewModel.localEntries[index], flags: .shift)
+    }
+
+    // Drives a cmd-click on the entry at `index` (toggle).
+    func cmdSelectLocalAtForTesting(_ index: Int) {
+        guard index < viewModel.localEntries.count else { return }
+        viewModel.selectLocal(viewModel.localEntries[index], flags: .command)
+    }
+
     var cancelledCountForTesting: Int { viewModel.queueItems.filter { $0.status == .cancelled }.count }
     var transferringCountForTesting: Int { viewModel.queueItems.filter { $0.status == .transferring }.count }
     func queueProgressForTesting(localPath: String, remotePath: String) -> Int? {
@@ -1293,6 +1326,25 @@ private struct SSHQueueColumnWidths {
     var total: CGFloat { local + direction + remote + size + status }
 }
 
+// Pure helper for shift-click range selection in SSH file tables.
+// Returns the closed range lo...hi (inclusive, order-independent) for a
+// contiguous row selection from `anchor` to `clicked` within a list of `count`
+// rows. Returns nil when either index is out of bounds.
+//
+// Convention implemented:
+//   - shift-click selects anchor...clicked, REPLACING the current selection.
+//   - The anchor is set on plain click and held fixed for successive shift-clicks.
+//   - cmd+shift is not handled here (cmd takes priority at the call site).
+//
+// WHY internal (not fileprivate): the pure index math must be testable without
+// constructing SSHFileEntry (private) values.
+func sshRangeIndices(anchor: Int, clicked: Int, count: Int) -> ClosedRange<Int>? {
+    let lo = min(anchor, clicked)
+    let hi = max(anchor, clicked)
+    guard lo >= 0, hi < count else { return nil }
+    return lo...hi
+}
+
 @MainActor
 fileprivate final class SSHSurfaceViewModel: ObservableObject {
     @Published var hosts: [SSHHostProfile] = []
@@ -1328,6 +1380,11 @@ fileprivate final class SSHSurfaceViewModel: ObservableObject {
     @Published var selectedRemoteEntry: SSHFileEntry?
     @Published var selectedLocalIDs: Set<String> = []
     @Published var selectedRemoteIDs: Set<String> = []
+    // Anchor row index for shift-click range selection (Mac convention).
+    // Set on plain click; not updated on cmd-click or shift-click so the range
+    // always extends from the original anchor row.
+    var lastClickedLocalIndex: Int?
+    var lastClickedRemoteIndex: Int?
     @Published var transferLocalPath = ""
     @Published var transferRemotePath = ""
     @Published var transferStatus = "Ready"
@@ -1475,29 +1532,57 @@ fileprivate final class SSHSurfaceViewModel: ObservableObject {
         }
     }
 
-    func selectLocal(_ entry: SSHFileEntry, additive: Bool = false) {
-        selectedLocalEntry = entry
-        if additive {
+    func selectLocal(_ entry: SSHFileEntry, flags: NSEvent.ModifierFlags = []) {
+        let isCmd = flags.contains(.command)
+        let isShift = flags.contains(.shift) && !isCmd
+        let clickedIndex = localEntries.firstIndex(where: { $0.id == entry.id })
+
+        if isShift, let anchor = lastClickedLocalIndex, let clicked = clickedIndex,
+           let range = sshRangeIndices(anchor: anchor, clicked: clicked, count: localEntries.count) {
+            // Shift-click: replace selection with contiguous anchor...clicked range.
+            selectedLocalIDs = Set(localEntries[range].map(\.id))
+            selectedLocalEntry = entry
+            // Do not update lastClickedLocalIndex -- anchor stays fixed for
+            // successive shift-clicks (Mac Finder convention).
+        } else if isCmd {
+            // Cmd-click: toggle this row additively; anchor stays at last plain click.
+            selectedLocalEntry = entry
             if selectedLocalIDs.contains(entry.id) {
                 selectedLocalIDs.remove(entry.id)
             } else {
                 selectedLocalIDs.insert(entry.id)
             }
         } else {
+            // Plain click: single selection + set anchor.
+            selectedLocalEntry = entry
             selectedLocalIDs = [entry.id]
+            lastClickedLocalIndex = clickedIndex
         }
     }
 
-    func selectRemote(_ entry: SSHFileEntry, additive: Bool = false) {
-        selectedRemoteEntry = entry
-        if additive {
+    func selectRemote(_ entry: SSHFileEntry, flags: NSEvent.ModifierFlags = []) {
+        let isCmd = flags.contains(.command)
+        let isShift = flags.contains(.shift) && !isCmd
+        let clickedIndex = remoteEntries.firstIndex(where: { $0.id == entry.id })
+
+        if isShift, let anchor = lastClickedRemoteIndex, let clicked = clickedIndex,
+           let range = sshRangeIndices(anchor: anchor, clicked: clicked, count: remoteEntries.count) {
+            // Shift-click: replace selection with contiguous anchor...clicked range.
+            selectedRemoteIDs = Set(remoteEntries[range].map(\.id))
+            selectedRemoteEntry = entry
+        } else if isCmd {
+            // Cmd-click: toggle this row additively; anchor stays at last plain click.
+            selectedRemoteEntry = entry
             if selectedRemoteIDs.contains(entry.id) {
                 selectedRemoteIDs.remove(entry.id)
             } else {
                 selectedRemoteIDs.insert(entry.id)
             }
         } else {
+            // Plain click: single selection + set anchor.
+            selectedRemoteEntry = entry
             selectedRemoteIDs = [entry.id]
+            lastClickedRemoteIndex = clickedIndex
         }
     }
 
@@ -2044,7 +2129,7 @@ private struct SSHTransferSidebarView: View {
                              up: { vm.goUpLocal() },
                              choose: { vm.onChooseLocalPath?() },
                              open: { vm.openLocal($0) },
-                             select: { vm.selectLocal($0, additive: $1) },
+                             select: { vm.selectLocal($0, flags: $1) },
                              transferTitle: "Upload",
                              transfer: { vm.uploadLocalSelection(anchor: $0) })
                     .frame(width: leftWidth)
@@ -2061,7 +2146,7 @@ private struct SSHTransferSidebarView: View {
                              up: { vm.goUpRemote() },
                              choose: nil,
                              open: { vm.openRemote($0) },
-                             select: { vm.selectRemote($0, additive: $1) },
+                             select: { vm.selectRemote($0, flags: $1) },
                              transferTitle: "Download",
                              transfer: { vm.downloadRemoteSelection(anchor: $0) })
                 // Transparent NSDraggingDestination overlay so Finder and local-pane
@@ -2082,7 +2167,7 @@ private struct SSHTransferSidebarView: View {
                               up: @escaping () -> Void,
                               choose: (() -> Void)?,
                               open: @escaping (SSHFileEntry) -> Void,
-                              select: @escaping (SSHFileEntry, Bool) -> Void,
+                              select: @escaping (SSHFileEntry, NSEvent.ModifierFlags) -> Void,
                               transferTitle: String,
                               transfer: @escaping (SSHFileEntry) -> Void) -> some View {
         // Derive a stable side key (local/remote) for accessibility identifiers
@@ -2177,7 +2262,7 @@ private struct SSHTransferSidebarView: View {
                            selectedIDs: Set<String>,
                            listError: String?,
                            isLocal: Bool,
-                           select: @escaping (SSHFileEntry, Bool) -> Void,
+                           select: @escaping (SSHFileEntry, NSEvent.ModifierFlags) -> Void,
                            open: @escaping (SSHFileEntry) -> Void,
                            transferTitle: String,
                            transfer: @escaping (SSHFileEntry) -> Void) -> some View {
@@ -2208,7 +2293,7 @@ private struct SSHTransferSidebarView: View {
                                 let entry = entries[index]
                                 Button {
                                     let flags = NSEvent.modifierFlags
-                                    select(entry, flags.contains(.command) || flags.contains(.shift))
+                                    select(entry, flags)
                                 } label: {
                                     HStack(spacing: 0) {
                                         HStack(spacing: DS.Space.xs) {
@@ -2261,7 +2346,7 @@ private struct SSHTransferSidebarView: View {
                                         }
                                     }
                                     Button(selectedIDs.contains(entry.id) ? "Deselect" : "Select") {
-                                        select(entry, true)
+                                        select(entry, .command)
                                     }
                                     // Bridge local entries to the rest of macOS:
                                     // reveal in Finder / copy the absolute path
