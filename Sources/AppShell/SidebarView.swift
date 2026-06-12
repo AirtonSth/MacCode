@@ -270,6 +270,51 @@ public final class SidebarViewModel: ObservableObject {
         showsTokenSaverModelDownload = false
     }
 
+    public func retryTokenSaverModelDownload() {
+        beginTokenSaverModelDownload(reason: nil)
+    }
+
+    // Maps a download error to a human-readable headline. Raw detail is available
+    // separately so the UI can show it as secondary copy, not as the headline.
+    nonisolated public static func downloadErrorMessage(_ error: Error) -> String {
+        if let urlError = error as? URLError {
+            switch urlError.code {
+            case .notConnectedToInternet, .networkConnectionLost, .cannotConnectToHost,
+                 .cannotFindHost, .timedOut, .internationalRoamingOff, .callIsActive,
+                 .dataNotAllowed:
+                return "No internet connection. Check your network and try again."
+            case .cancelled:
+                return "Download was cancelled."
+            default:
+                break
+            }
+        }
+        if let downloadError = error as? TokenSaverModelDownloadError {
+            switch downloadError {
+            case .httpStatus(let code, _) where code == 401 || code == 403:
+                return "Access denied. Make sure you are signed in and your subscription is active."
+            case .httpStatus(let code, _) where code == 404:
+                return "Model file not found on the server. Try again later."
+            case .httpStatus(let code, _) where code >= 500:
+                return "Server error (\(code)). Try again in a few minutes."
+            case .httpStatus(let code, _):
+                return "Download failed with server error \(code). Try again later."
+            case .validationFailed:
+                return "Downloaded model failed verification. The file may be corrupt. Retrying usually fixes this."
+            case .noModelFiles, .invalidModelResponse:
+                return "Could not read model information from the server. Try again later."
+            case .invalidDownloadURL:
+                return "Received an invalid download link. Try again later."
+            }
+        }
+        if let nsError = error as? NSError, nsError.domain == NSCocoaErrorDomain {
+            if nsError.code == NSFileWriteOutOfSpaceError || nsError.code == NSFileWriteVolumeReadOnlyError {
+                return "Not enough disk space to save the model. Free up space and try again."
+            }
+        }
+        return "Download failed. Try again."
+    }
+
     public func setTokenSaverModelDownloadStateForTesting(_ state: TokenSaverModelDownloadState) {
         tokenSaverModelDownloadState = state
     }
@@ -326,12 +371,15 @@ public final class SidebarViewModel: ObservableObject {
                 )
                 throw CancellationError()
             } catch {
+                let headline = Self.downloadErrorMessage(error)
+                let detail = String(describing: error)
+                let message = detail == headline ? headline : "\(headline)\n\(detail)"
                 self.tokenSaverModelDownloadState = TokenSaverModelDownloadState(
                     phase: .failed,
                     downloadedBytes: self.tokenSaverModelDownloadState.downloadedBytes,
                     expectedBytes: self.tokenSaverModelDownloadState.expectedBytes,
                     statusText: "Download failed",
-                    errorMessage: String(describing: error)
+                    errorMessage: message
                 )
                 self.showsTokenSaverModelDownload = true
                 throw error
@@ -1361,7 +1409,8 @@ public struct SidebarRootView: View {
         .sheet(isPresented: $vm.showsTokenSaverModelDownload) {
             TokenSaverModelDownloadModal(
                 state: vm.tokenSaverModelDownloadState,
-                onCancel: { vm.cancelTokenSaverModelDownload() }
+                onCancel: { vm.cancelTokenSaverModelDownload() },
+                onRetry: { vm.retryTokenSaverModelDownload() }
             )
         }
     }
@@ -2351,6 +2400,9 @@ public struct SidebarRootView: View {
     private struct TokenSaverModelDownloadModal: View {
         let state: TokenSaverModelDownloadState
         let onCancel: () -> Void
+        let onRetry: () -> Void
+
+        private var isFailed: Bool { state.phase == .failed }
 
         var body: some View {
             VStack(alignment: .leading, spacing: DS.Space.lg) {
@@ -2375,17 +2427,31 @@ public struct SidebarRootView: View {
                     infoRow("Source", "huggingface.co/samuelfaj/distill-1.7B-4bit-MLX")
                     infoRow("Status", state.statusText)
                     infoRow("Progress", progressText)
-                    if let error = state.errorMessage, !error.isEmpty {
-                        Text(error)
-                            .font(DS.Font.caption)
-                            .foregroundColor(DS.Palette.warning)
-                            .fixedSize(horizontal: false, vertical: true)
+                    if let errorMessage = state.errorMessage, !errorMessage.isEmpty {
+                        let parts = errorMessage.split(separator: "\n", maxSplits: 1).map(String.init)
+                        let headline = parts.first ?? errorMessage
+                        let detail = parts.count > 1 ? parts[1] : nil
+                        VStack(alignment: .leading, spacing: DS.Space.xs) {
+                            Text(headline)
+                                .font(DS.Font.caption)
+                                .foregroundColor(DS.Palette.warning)
+                                .fixedSize(horizontal: false, vertical: true)
+                            if let detail {
+                                Text(detail)
+                                    .font(DS.Font.caption)
+                                    .foregroundColor(DS.Palette.textTertiary)
+                                    .fixedSize(horizontal: false, vertical: true)
+                                    .textSelection(.enabled)
+                            }
+                        }
                     }
                 }
 
-                progressView
-                    .accessibilityLabel("Token Saver model download progress")
-                    .accessibilityValue(progressText)
+                if !isFailed {
+                    progressView
+                        .accessibilityLabel("Token Saver model download progress")
+                        .accessibilityValue(progressText)
+                }
 
                 HStack {
                     Spacer()
@@ -2394,6 +2460,13 @@ public struct SidebarRootView: View {
                     }
                     .keyboardShortcut(.cancelAction)
                     .frame(minWidth: 88, minHeight: 44)
+                    if isFailed {
+                        Button("Retry") {
+                            onRetry()
+                        }
+                        .keyboardShortcut(.defaultAction)
+                        .frame(minWidth: 88, minHeight: 44)
+                    }
                 }
             }
             .padding(DS.Space.xxl)
