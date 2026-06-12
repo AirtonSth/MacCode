@@ -24,15 +24,17 @@ final class EventLogRepositoryTests: XCTestCase {
 
     // MARK: - T009: events bound — cap at 5000 rows
 
-    /// WHY: append() runs "DELETE FROM events WHERE id NOT IN (...LIMIT 5000)"
-    /// after every insert. If that DELETE is ever missing or uses the wrong LIMIT,
-    /// the table grows without bound. This test inserts 5005 rows and asserts only
-    /// 5000 survive, pinning the retention policy.
+    /// WHY: append() prunes periodically (every 256 appends). If the prune is ever
+    /// missing or uses the wrong LIMIT, the table grows without bound. This test
+    /// inserts cap + pruneInterval rows (5256) to guarantee at least one prune fires,
+    /// then asserts the row count is bounded, pinning the retention policy.
     func test_T009_append_enforcesCapAt5000Rows() throws {
         let db = try makeDB()
         let repo = EventLogRepository(db: db)
 
-        for i in 0..<5005 {
+        // 5256 = cap(5000) + pruneInterval(256); guarantees the prune at append #256
+        // fires at least once so the DELETE actually executes.
+        for i in 0..<5256 {
             try repo.append(seq: Int64(i), kind: "test", payloadJSON: "{}")
         }
 
@@ -40,27 +42,74 @@ final class EventLogRepositoryTests: XCTestCase {
         XCTAssertTrue(try countSt.step())
         let count = Int(countSt.columnInt64(0))
 
-        XCTAssertEqual(count, 5000,
-            "EventLogRepository must keep at most 5000 rows so the events table cannot grow unboundedly on long-lived installs")
+        // Prune fires at append multiples of 256; after 5256 appends the last prune
+        // was at append #5120 (20 * 256), leaving at most 5000 + 255 = 5255 rows.
+        // But since 5256 is itself a multiple of 256 (5256 / 256 = 20.53... no --
+        // 5120 = 20*256, 5376 = 21*256; so the last prune before 5256 is at 5120,
+        // after which 136 more rows are inserted). Bound: <= 5255.
+        XCTAssertLessThanOrEqual(count, 5255,
+            "EventLogRepository must keep at most cap+pruneInterval-1 rows so the events table cannot grow unboundedly")
     }
 
     /// WHY: the cap must retain the NEWEST rows, not the oldest. If the wrong rows
     /// survive, the WebSocket replay bus would re-send stale events from the past
-    /// instead of the most recent ones.
+    /// instead of the most recent ones. Uses 5256 inserts so at least one prune fires.
     func test_T009_append_capRetainsNewestRows() throws {
         let db = try makeDB()
         let repo = EventLogRepository(db: db)
 
-        for i in 0..<5005 {
+        // 5256 = cap + pruneInterval; at append #256 the prune fires for the first
+        // time, deleting rows with id <= max_id - 5000 (i.e. the oldest 256 rows).
+        for i in 0..<5256 {
             try repo.append(seq: Int64(i), kind: "test", payloadJSON: "{}")
         }
 
-        // read(since:) returns rows with seq > since, ordered ASC.
-        // After the cap the 5 oldest rows (seq 0-4) are deleted.
-        let all = try repo.read(since: -1, limit: 5000)
+        // After the last prune (at append #5120) 120 rows were deleted; the oldest
+        // surviving row has seq >= 120. The newest must always be present.
+        let all = try repo.read(since: -1, limit: 6000)
         XCTAssertFalse(all.isEmpty, "must have retained rows after cap enforcement")
-        XCTAssertEqual(all.first?.seq, 5, "cap must delete the 5 oldest rows (seq 0-4)")
-        XCTAssertEqual(all.last?.seq, 5004, "newest row must still be present after cap")
+        XCTAssertEqual(all.last?.seq, 5255, "newest row (seq=5255) must still be present after cap")
+        // Oldest surviving row must have been pruned at least once (seq > 0 after first prune at #256).
+        XCTAssertGreaterThan(all.first?.seq ?? 0, 0,
+            "cap must delete the oldest rows; seq=0 must not survive a full prune cycle")
+    }
+
+    // MARK: - T009b: periodic prune — bounded growth, newest rows retained
+
+    /// WHY: the prune is now gated to run every 256 appends, not every append, to
+    /// avoid a full anti-join on the publishing thread. This test verifies:
+    ///   1. After cap + pruneInterval rows the table is bounded (<= cap + pruneInterval - 1).
+    ///   2. The newest rows are retained (the oldest are purged).
+    /// Without this test a regression that skips the prune entirely would go undetected
+    /// until the events table grew unboundedly on long-lived installs.
+    func test_T009b_periodicPrune_boundsTableAndRetainsNewestRows() throws {
+        let db = try makeDB()
+        let repo = EventLogRepository(db: db)
+
+        // Insert cap + pruneInterval rows to guarantee at least one prune fires.
+        let total = 5000 + 256
+        for i in 0..<total {
+            try repo.append(seq: Int64(i), kind: "test", payloadJSON: "{}")
+        }
+
+        let countSt = try db.prepare("SELECT COUNT(*) FROM events;")
+        XCTAssertTrue(try countSt.step())
+        let count = Int(countSt.columnInt64(0))
+
+        // After the prune at append #256 the table must be <= cap + pruneInterval - 1
+        // (at most cap + 255 rows transiently between prune runs).
+        XCTAssertLessThanOrEqual(count, 5000 + 256 - 1,
+            "periodic prune must keep the table bounded so growth is O(pruneInterval) above cap, not unbounded")
+
+        // The most recent row (seq = total - 1) must survive.
+        let newest = try repo.read(since: Int64(total - 2), limit: 1)
+        XCTAssertEqual(newest.first?.seq, Int64(total - 1),
+            "periodic prune must retain the newest rows; if it deletes from the wrong end, the event bus loses recent events")
+
+        // The very first row (seq = 0) must be gone after the prune cycle.
+        let oldest = try repo.read(since: -1, limit: 1)
+        XCTAssertNotEqual(oldest.first?.seq, 0,
+            "periodic prune must remove the oldest rows; if seq=0 survives a full prune cycle, the table grows from the wrong end")
     }
 
     // MARK: - T010: ordering — read(since:) returns rows seq ASC

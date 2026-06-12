@@ -5,6 +5,11 @@ import Foundation
 
 public final class EventLogRepository {
     let db: SQLiteDB
+    // Prune runs every 256 appends. Max transient row count: cap + 255 = 5255.
+    private static let cap = 5000
+    private static let pruneInterval = 256
+    private var appendCount = 0
+
     public init(db: SQLiteDB) { self.db = db }
 
     public struct Row: Equatable {
@@ -24,8 +29,16 @@ public final class EventLogRepository {
         try st.bind(3, payloadJSON)
         try st.bind(4, iso.string(from: Date()))
         _ = try st.step()
-        // bounded log
-        try db.execute("DELETE FROM events WHERE id NOT IN (SELECT id FROM events ORDER BY id DESC LIMIT 5000);")
+        appendCount += 1
+        if appendCount % EventLogRepository.pruneInterval == 0 {
+            // Retain only the newest `cap` rows. Uses a correlated max-id subquery
+            // so SQLite can resolve the threshold with a single scan, avoiding the
+            // full anti-join of the NOT IN (...LIMIT) form.
+            try db.execute("""
+                DELETE FROM events
+                WHERE id <= (SELECT MAX(id) FROM events) - \(EventLogRepository.cap);
+            """)
+        }
     }
 
     public func read(since: Int64, limit: Int = 500) throws -> [Row] {
