@@ -61,6 +61,17 @@ func usage(_ exit: Int32 = 0) -> Never {
     Darwin.exit(exit)
 }
 
+/// Write a specific diagnostic to stderr then show usage and exit.
+///
+/// WHY: every guard failure in this file must tell the user WHICH flag or
+/// argument was missing/invalid, not just dump a generic usage block.
+/// The reason line is written to stderr first so it is visible even when
+/// usage output is long.
+func diagError(_ reason: String) -> Never {
+    FileHandle.standardError.write(Data("\(reason)\n".utf8))
+    usage(RC2ExitCode.usageError)
+}
+
 func parseFlags(_ a: [String]) -> ([String: String], [String]) {
     CLIArgParser.parseFlagsWithTerminator(a)
 }
@@ -270,41 +281,49 @@ case "new-workspace":
     emit(rpc.call("workspace.create", params: ["name": name, "cwd": cwd]))
 case "new-surface":
     let (flags, _) = parseFlags(restArgs)
-    guard let wid = flags["workspace"], let type = flags["type"] else { usage(RC2ExitCode.usageError) }
+    guard let wid = flags["workspace"] else { diagError(RC2CLIDiagnostics.missingFlag("workspace")) }
+    guard let type = flags["type"] else { diagError(RC2CLIDiagnostics.missingFlag("type")) }
     var p: [String: Any] = ["workspace_id": wid, "type": type]
     if let t = flags["title"] { p["title"] = t }
     emit(rpc.call("surface.create", params: p))
 case "new-split":
     let (flags, _) = parseFlags(restArgs)
-    guard let wid = flags["workspace"], let pid = flags["pane"], let dir = flags["direction"], let type = flags["type"] else { usage(RC2ExitCode.usageError) }
+    guard let wid = flags["workspace"] else { diagError(RC2CLIDiagnostics.missingFlag("workspace")) }
+    guard let pid = flags["pane"] else { diagError(RC2CLIDiagnostics.missingFlag("pane")) }
+    guard let dir = flags["direction"] else { diagError(RC2CLIDiagnostics.missingFlag("direction")) }
+    guard let type = flags["type"] else { diagError(RC2CLIDiagnostics.missingFlag("type")) }
     emit(rpc.call("surface.split", params: ["workspace_id": wid, "pane_id": pid, "direction": dir, "type": type]))
 case "focus":
     let (flags, _) = parseFlags(restArgs)
-    guard let wid = flags["workspace"], let sid = flags["id"] else { usage(RC2ExitCode.usageError) }
+    guard let wid = flags["workspace"] else { diagError(RC2CLIDiagnostics.missingFlag("workspace")) }
+    guard let sid = flags["id"] else { diagError(RC2CLIDiagnostics.missingFlag("id")) }
     emit(rpc.call("surface.focus", params: ["workspace_id": wid, "id": sid]))
 case "close":
     let (flags, _) = parseFlags(restArgs)
-    guard let wid = flags["workspace"], let sid = flags["id"] else { usage(RC2ExitCode.usageError) }
+    guard let wid = flags["workspace"] else { diagError(RC2CLIDiagnostics.missingFlag("workspace")) }
+    guard let sid = flags["id"] else { diagError(RC2CLIDiagnostics.missingFlag("id")) }
     emit(rpc.call("surface.close", params: ["workspace_id": wid, "id": sid]))
 case "send-text":
     let (flags, _) = parseFlags(restArgs)
-    guard let sid = flags["id"], let text = flags["text"] else { usage(RC2ExitCode.usageError) }
+    guard let sid = flags["id"] else { diagError(RC2CLIDiagnostics.missingFlag("id")) }
+    guard let text = flags["text"] else { diagError(RC2CLIDiagnostics.missingFlag("text")) }
     emit(rpc.call("surface.send_text", params: ["id": sid, "text": text]))
 case "send-key":
     let (flags, _) = parseFlags(restArgs)
-    guard let sid = flags["id"], let key = flags["key"] else { usage(RC2ExitCode.usageError) }
+    guard let sid = flags["id"] else { diagError(RC2CLIDiagnostics.missingFlag("id")) }
+    guard let key = flags["key"] else { diagError(RC2CLIDiagnostics.missingFlag("key")) }
     emit(rpc.call("surface.send_key", params: ["id": sid, "key": key]))
 case "clear-history":
     let (flags, _) = parseFlags(restArgs)
-    guard let sid = flags["id"] else { usage(RC2ExitCode.usageError) }
+    guard let sid = flags["id"] else { diagError(RC2CLIDiagnostics.missingFlag("id")) }
     emit(rpc.call("surface.clear_history", params: ["id": sid]))
 case "health":
     let (flags, _) = parseFlags(restArgs)
-    guard let sid = flags["id"] else { usage(RC2ExitCode.usageError) }
+    guard let sid = flags["id"] else { diagError(RC2CLIDiagnostics.missingFlag("id")) }
     emit(rpc.call("surface.health", params: ["id": sid]))
 case "read-text":
     let (flags, _) = parseFlags(restArgs)
-    guard let sid = flags["id"] else { usage(RC2ExitCode.usageError) }
+    guard let sid = flags["id"] else { diagError(RC2CLIDiagnostics.missingFlag("id")) }
     emit(rpc.call("surface.read_text", params: ["id": sid]))
 case "surface":
     if restArgs.isEmpty { usage(RC2ExitCode.usageError) }
@@ -312,13 +331,17 @@ case "surface":
     let (flags, _) = parseFlags(Array(restArgs.dropFirst()))
     switch sub {
     case "move":
-        guard let w = flags["workspace"], let id = flags["id"], let target = flags["target-pane"] else { usage(RC2ExitCode.usageError) }
+        guard let w = flags["workspace"] else { diagError(RC2CLIDiagnostics.missingFlag("workspace")) }
+        guard let id = flags["id"] else { diagError(RC2CLIDiagnostics.missingFlag("id")) }
+        guard let target = flags["target-pane"] else { diagError(RC2CLIDiagnostics.missingFlag("target-pane")) }
         emit(rpc.call("surface.move", params: ["workspace_id": w, "id": id, "target_pane_id": target]))
     case "reorder":
-        guard let w = flags["workspace"], let id = flags["id"], let target = flags["target-pane"] else { usage(RC2ExitCode.usageError) }
+        guard let w = flags["workspace"] else { diagError(RC2CLIDiagnostics.missingFlag("workspace")) }
+        guard let id = flags["id"] else { diagError(RC2CLIDiagnostics.missingFlag("id")) }
+        guard let target = flags["target-pane"] else { diagError(RC2CLIDiagnostics.missingFlag("target-pane")) }
         let pos = Int(flags["position"] ?? "0") ?? 0
         emit(rpc.call("surface.reorder", params: ["workspace_id": w, "id": id, "target_pane_id": target, "position": pos]))
-    default: usage(RC2ExitCode.usageError)
+    default: diagError(RC2CLIDiagnostics.unknownSubcommand(sub, of: "surface"))
     }
 case "pane":
     if restArgs.isEmpty { usage(RC2ExitCode.usageError) }
@@ -326,16 +349,20 @@ case "pane":
     let (flags, _) = parseFlags(Array(restArgs.dropFirst()))
     switch sub {
     case "list":
-        guard let w = flags["workspace"] else { usage(RC2ExitCode.usageError) }
+        guard let w = flags["workspace"] else { diagError(RC2CLIDiagnostics.missingFlag("workspace")) }
         emit(rpc.call("pane.list", params: ["workspace_id": w]))
     case "swap":
-        guard let w = flags["workspace"], let a = flags["a"], let b = flags["b"] else { usage(RC2ExitCode.usageError) }
+        guard let w = flags["workspace"] else { diagError(RC2CLIDiagnostics.missingFlag("workspace")) }
+        guard let a = flags["a"] else { diagError(RC2CLIDiagnostics.missingFlag("a")) }
+        guard let b = flags["b"] else { diagError(RC2CLIDiagnostics.missingFlag("b")) }
         emit(rpc.call("pane.swap", params: ["workspace_id": w, "a": a, "b": b]))
     case "resize":
-        guard let w = flags["workspace"], let s = flags["split"], let r = flags["ratios"] else { usage(RC2ExitCode.usageError) }
+        guard let w = flags["workspace"] else { diagError(RC2CLIDiagnostics.missingFlag("workspace")) }
+        guard let s = flags["split"] else { diagError(RC2CLIDiagnostics.missingFlag("split")) }
+        guard let r = flags["ratios"] else { diagError(RC2CLIDiagnostics.missingFlag("ratios")) }
         let ratios = r.split(separator: ",").compactMap { Double($0) }
         emit(rpc.call("pane.resize", params: ["workspace_id": w, "split_id": s, "ratios": ratios]))
-    default: usage(RC2ExitCode.usageError)
+    default: diagError(RC2CLIDiagnostics.unknownSubcommand(sub, of: "pane"))
     }
 case "window":
     if restArgs.isEmpty { usage(RC2ExitCode.usageError) }
@@ -348,12 +375,12 @@ case "window":
         var p: [String: Any] = [:]; if let t = flags["title"] { p["title"] = t }
         emit(rpc.call("window.create", params: p))
     case "focus":
-        guard let id = flags["id"] else { usage(RC2ExitCode.usageError) }
+        guard let id = flags["id"] else { diagError(RC2CLIDiagnostics.missingFlag("id")) }
         emit(rpc.call("window.focus", params: ["id": id]))
     case "close":
-        guard let id = flags["id"] else { usage(RC2ExitCode.usageError) }
+        guard let id = flags["id"] else { diagError(RC2CLIDiagnostics.missingFlag("id")) }
         emit(rpc.call("window.close", params: ["id": id]))
-    default: usage(RC2ExitCode.usageError)
+    default: diagError(RC2CLIDiagnostics.unknownSubcommand(sub, of: "window"))
     }
 case "events":
     if restArgs.isEmpty { usage(RC2ExitCode.usageError) }
@@ -433,7 +460,7 @@ case "events":
         }
         Darwin.close(fd)
         Darwin.exit(0)
-    default: usage(RC2ExitCode.usageError)
+    default: diagError(RC2CLIDiagnostics.unknownSubcommand(sub, of: "events"))
     }
 case "notification":
     if restArgs.isEmpty { usage(RC2ExitCode.usageError) }
@@ -451,12 +478,12 @@ case "notification":
         if flags["unread"] != nil { p["unread_only"] = true }
         emit(rpc.call("notification.list", params: p))
     case "mark-read":
-        guard let id = flags["id"] else { usage(RC2ExitCode.usageError) }
+        guard let id = flags["id"] else { diagError(RC2CLIDiagnostics.missingFlag("id")) }
         emit(rpc.call("notification.mark_read", params: ["id": id]))
     case "dismiss":
-        guard let id = flags["id"] else { usage(RC2ExitCode.usageError) }
+        guard let id = flags["id"] else { diagError(RC2CLIDiagnostics.missingFlag("id")) }
         emit(rpc.call("notification.dismiss", params: ["id": id]))
-    default: usage(RC2ExitCode.usageError)
+    default: diagError(RC2CLIDiagnostics.unknownSubcommand(sub, of: "notification"))
     }
 case "browser":
     if restArgs.isEmpty { usage(RC2ExitCode.usageError) }
@@ -464,33 +491,39 @@ case "browser":
     let (flags, _) = parseFlags(Array(restArgs.dropFirst()))
     switch sub {
     case "navigate":
-        guard let id = flags["id"], let url = flags["url"] else { usage(RC2ExitCode.usageError) }
+        guard let id = flags["id"] else { diagError(RC2CLIDiagnostics.missingFlag("id")) }
+        guard let url = flags["url"] else { diagError(RC2CLIDiagnostics.missingFlag("url")) }
         emit(rpc.call("browser.navigate", params: ["id": id, "url": url]))
     case "back", "forward", "reload", "url":
-        guard let id = flags["id"] else { usage(RC2ExitCode.usageError) }
+        guard let id = flags["id"] else { diagError(RC2CLIDiagnostics.missingFlag("id")) }
         emit(rpc.call("browser." + (sub == "url" ? "url.get" : sub), params: ["id": id]))
     case "snapshot":
-        guard let id = flags["id"] else { usage(RC2ExitCode.usageError) }
+        guard let id = flags["id"] else { diagError(RC2CLIDiagnostics.missingFlag("id")) }
         emit(rpc.call("browser.snapshot", params: ["id": id]))
     case "click", "focus", "hover", "check", "uncheck":
-        guard let id = flags["id"], let ref = flags["ref"] else { usage(RC2ExitCode.usageError) }
+        guard let id = flags["id"] else { diagError(RC2CLIDiagnostics.missingFlag("id")) }
+        guard let ref = flags["ref"] else { diagError(RC2CLIDiagnostics.missingFlag("ref")) }
         emit(rpc.call("browser." + sub, params: ["id": id, "ref": ref]))
     case "fill", "type", "select":
-        guard let id = flags["id"], let ref = flags["ref"], let val = flags["value"] else { usage(RC2ExitCode.usageError) }
+        guard let id = flags["id"] else { diagError(RC2CLIDiagnostics.missingFlag("id")) }
+        guard let ref = flags["ref"] else { diagError(RC2CLIDiagnostics.missingFlag("ref")) }
+        guard let val = flags["value"] else { diagError(RC2CLIDiagnostics.missingFlag("value")) }
         emit(rpc.call("browser." + sub, params: ["id": id, "ref": ref, "value": val]))
     case "wait":
-        guard let id = flags["id"], let sel = flags["selector"] else { usage(RC2ExitCode.usageError) }
+        guard let id = flags["id"] else { diagError(RC2CLIDiagnostics.missingFlag("id")) }
+        guard let sel = flags["selector"] else { diagError(RC2CLIDiagnostics.missingFlag("selector")) }
         let t = Int(flags["timeout"] ?? "5000") ?? 5000
         emit(rpc.call("browser.wait", params: ["id": id, "selector": sel, "timeout_ms": t]))
     case "screenshot":
-        guard let id = flags["id"] else { usage(RC2ExitCode.usageError) }
+        guard let id = flags["id"] else { diagError(RC2CLIDiagnostics.missingFlag("id")) }
         var p: [String: Any] = ["id": id]
         if let path = flags["path"] { p["path"] = path }
         emit(rpc.call("browser.screenshot", params: p))
     case "eval":
-        guard let id = flags["id"], let script = flags["script"] else { usage(RC2ExitCode.usageError) }
+        guard let id = flags["id"] else { diagError(RC2CLIDiagnostics.missingFlag("id")) }
+        guard let script = flags["script"] else { diagError(RC2CLIDiagnostics.missingFlag("script")) }
         emit(rpc.call("browser.eval", params: ["id": id, "script": script]))
-    default: usage(RC2ExitCode.usageError)
+    default: diagError(RC2CLIDiagnostics.unknownSubcommand(sub, of: "browser"))
     }
 case "workspace":
     if restArgs.isEmpty { usage(RC2ExitCode.usageError) }
@@ -498,9 +531,10 @@ case "workspace":
     let (flags, _) = parseFlags(Array(restArgs.dropFirst()))
     switch sub {
     case "move-to-window":
-        guard let w = flags["workspace"], let win = flags["window"] else { usage(RC2ExitCode.usageError) }
+        guard let w = flags["workspace"] else { diagError(RC2CLIDiagnostics.missingFlag("workspace")) }
+        guard let win = flags["window"] else { diagError(RC2CLIDiagnostics.missingFlag("window")) }
         emit(rpc.call("workspace.move_to_window", params: ["workspace_id": w, "window_id": win]))
-    default: usage(RC2ExitCode.usageError)
+    default: diagError(RC2CLIDiagnostics.unknownSubcommand(sub, of: "workspace"))
     }
 case "agent":
     if restArgs.isEmpty { usage(RC2ExitCode.usageError) }
@@ -509,7 +543,7 @@ case "agent":
     switch sub {
     case "open":
         let (flags, _) = parseFlags(rest2)
-        guard let wid = flags["workspace"] else { usage(RC2ExitCode.usageError) }
+        guard let wid = flags["workspace"] else { diagError(RC2CLIDiagnostics.missingFlag("workspace")) }
         emit(rpc.call("agent.open", params: ["workspace_id": wid]))
     case "thread":
         if rest2.isEmpty { usage(RC2ExitCode.usageError) }
@@ -527,25 +561,26 @@ case "agent":
             if let pr = flags["provider"] { p["provider"] = pr }
             if let m = flags["model"] { p["model"] = m }
             emit(rpc.call("agent.thread.create", params: p))
-        default: usage(RC2ExitCode.usageError)
+        default: diagError(RC2CLIDiagnostics.unknownSubcommand(op, of: "agent thread"))
         }
     case "send":
         let (flags, _) = parseFlags(rest2)
-        guard let tid = flags["thread"], let text = flags["text"] else { usage(RC2ExitCode.usageError) }
+        guard let tid = flags["thread"] else { diagError(RC2CLIDiagnostics.missingFlag("thread")) }
+        guard let text = flags["text"] else { diagError(RC2CLIDiagnostics.missingFlag("text")) }
         var p: [String: Any] = ["thread_id": tid, "text": text]
         if let pr = flags["provider"] { p["provider"] = pr }
         if let m = flags["model"] { p["model"] = m }
         emit(rpc.call("agent.message.send", params: p))
     case "stop":
         let (flags, _) = parseFlags(rest2)
-        guard let tid = flags["thread"] else { usage(RC2ExitCode.usageError) }
+        guard let tid = flags["thread"] else { diagError(RC2CLIDiagnostics.missingFlag("thread")) }
         emit(rpc.call("agent.run.stop", params: ["thread_id": tid]))
     case "models":
         let (flags, _) = parseFlags(rest2)
         let prov = flags["provider"] ?? "codex"
         emit(rpc.call("agent.models.list", params: ["provider": prov]))
-    default: usage(RC2ExitCode.usageError)
+    default: diagError(RC2CLIDiagnostics.unknownSubcommand(sub, of: "agent"))
     }
 default:
-    usage(RC2ExitCode.usageError)
+    diagError(RC2CLIDiagnostics.unknownSubcommand(cmd, of: prog))
 }
