@@ -85,6 +85,42 @@ public enum KeybindingConflictDetector {
         (KeybindingConfig.normalize("mod+m"), "Minimize")
     ]
 
+    /// Named (non-character) key tokens that AppDelegate cannot write as a raw
+    /// keyEquivalent. AppKit's keyEquivalent expects a single printable character;
+    /// named keys like "f1" or "escape" are not single printable characters, so
+    /// writing them verbatim silently fails (the shortcut never fires).
+    ///
+    /// The set covers: function keys f1-f12, named whitespace/control keys
+    /// (space, tab, return, enter), navigation/delete keys (escape, esc, delete,
+    /// backspace, home, end, pageup, pagedown), and arrow keys (up, down, left,
+    /// right). All tokens are lowercase to match KeybindingConfig.normalize output.
+    private static let nonCharacterKeyTokens: Set<String> = [
+        "f1", "f2", "f3", "f4", "f5", "f6",
+        "f7", "f8", "f9", "f10", "f11", "f12",
+        "space", "tab", "return", "enter",
+        "escape", "esc", "delete", "backspace",
+        "home", "end", "pageup", "pagedown",
+        "up", "down", "left", "right"
+    ]
+
+    /// Returns true when the chord's key token (the non-modifier component after
+    /// KeybindingConfig.normalize) is a named key that AppDelegate cannot write
+    /// as a raw NSMenuItem keyEquivalent — meaning the shortcut will silently not
+    /// fire in the app's menu system.
+    ///
+    /// Key-token extraction: normalize() returns `(mods + rest).joined("+")`.
+    /// We re-normalize the chord defensively, split on "+", filter out the five
+    /// recognized modifier tokens, and take the remainder as the key token.
+    public static func isNonCharacterKey(_ chord: String) -> Bool {
+        let normalized = KeybindingConfig.normalize(chord)
+        let modifierSet: Set<String> = ["mod", "ctrl", "alt", "opt", "shift"]
+        let parts = normalized.split(separator: "+").map(String.init)
+        let keyTokens = parts.filter { !modifierSet.contains($0) }
+        // A well-formed chord has exactly one key token after modifiers.
+        guard let token = keyTokens.first else { return false }
+        return nonCharacterKeyTokens.contains(token)
+    }
+
     /// Detect user bindings whose normalized chord shadows a built-in menu chord.
     ///
     /// Both sides are compared in KeybindingConfig.normalize form so that
@@ -294,10 +330,12 @@ struct KeybindingsSettingsPane: View {
 
     private func bindingRow(_ b: Keybinding) -> some View {
         let conflict = conflicts.first { $0.chord == b.key && $0.userCommand == b.command }
+        let unsupportedKey = KeybindingConflictDetector.isNonCharacterKey(b.key)
+        let hasWarning = conflict != nil || unsupportedKey
         return HStack(spacing: DS.Space.sm) {
-            if let conflict {
+            if hasWarning {
                 Image(systemName: "exclamationmark.triangle.fill")
-                    .foregroundColor(DS.Palette.danger)
+                    .foregroundColor(conflict != nil ? DS.Palette.danger : DS.Palette.warning)
                     .accessibilityHidden(true)
             }
             Text(b.key)
@@ -318,16 +356,26 @@ struct KeybindingsSettingsPane: View {
                         .font(DS.Font.caption)
                         .foregroundColor(DS.Palette.danger)
                 }
+                if unsupportedKey {
+                    Text("Non-character key: won't work as a menu shortcut via AppDelegate")
+                        .font(DS.Font.caption)
+                        .foregroundColor(DS.Palette.warning)
+                }
             }
             Spacer()
         }
         .padding(.vertical, DS.Space.sm)
         .accessibilityElement(children: .combine)
-        .accessibilityLabel(
-            conflict == nil
-                ? "\(b.key) bound to \(b.command)"
-                : "\(b.key) bound to \(b.command), conflict: shadows built-in \(conflict!.builtInMenuLabel)"
-        )
+        .accessibilityLabel({
+            var label = "\(b.key) bound to \(b.command)"
+            if let conflict {
+                label += ", conflict: shadows built-in \(conflict.builtInMenuLabel)"
+            }
+            if unsupportedKey {
+                label += ", warning: non-character key won't work as a menu shortcut"
+            }
+            return label
+        }())
     }
 
     /// settingRow mirror of SettingsView's helper (kept local so this pane is

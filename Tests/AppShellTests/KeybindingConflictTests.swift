@@ -88,4 +88,90 @@ final class KeybindingConflictTests: XCTestCase {
                            "modifiers in \(entry.chord) must be lexically sorted")
         }
     }
+
+    // MARK: - isNonCharacterKey()
+
+    func test_isNonCharacterKey_trueForF1() {
+        // WHY: "f1" is a named function key. AppDelegate writes the key token
+        // directly into NSMenuItem.keyEquivalent, which expects a single printable
+        // character. "f1" is not a printable character, so the shortcut silently
+        // fails. The user must be warned.
+        XCTAssertTrue(KeybindingConflictDetector.isNonCharacterKey("f1"),
+                      "f1 is a named function key and must be flagged as non-character")
+    }
+
+    func test_isNonCharacterKey_trueForSpace() {
+        // WHY: "space" is the spelled-out token for the space bar. As a raw
+        // keyEquivalent it is not interpreted as the space character, so any
+        // binding that relies on it will silently not fire via AppDelegate.
+        XCTAssertTrue(KeybindingConflictDetector.isNonCharacterKey("space"),
+                      "space token must be flagged as non-character")
+    }
+
+    func test_isNonCharacterKey_trueForEscape() {
+        // WHY: "escape" is a control key. Writing "escape" into keyEquivalent
+        // does not map to the Escape key; the shortcut will not trigger.
+        XCTAssertTrue(KeybindingConflictDetector.isNonCharacterKey("escape"),
+                      "escape must be flagged as non-character")
+    }
+
+    func test_isNonCharacterKey_trueForTab() {
+        // WHY: "tab" is a whitespace-control key. Same failure mode: a raw
+        // keyEquivalent of "tab" is not recognized by AppKit as the Tab key.
+        XCTAssertTrue(KeybindingConflictDetector.isNonCharacterKey("tab"),
+                      "tab must be flagged as non-character")
+    }
+
+    func test_isNonCharacterKey_trueForArrowUp() {
+        // WHY: arrow keys are named navigation keys. Writing "up" into
+        // keyEquivalent produces no working shortcut, so the user must be warned.
+        XCTAssertTrue(KeybindingConflictDetector.isNonCharacterKey("up"),
+                      "up (arrow) must be flagged as non-character")
+    }
+
+    func test_isNonCharacterKey_falseForLowercaseLetter() {
+        // WHY: "a" is a single printable character. It maps correctly to
+        // NSMenuItem.keyEquivalent. A false positive here would erode trust in
+        // the warning (users would see warnings on every ordinary binding).
+        XCTAssertFalse(KeybindingConflictDetector.isNonCharacterKey("a"),
+                       "a single letter must not be flagged as non-character")
+    }
+
+    func test_isNonCharacterKey_falseForDigit() {
+        // WHY: "1" is a printable digit and works as a raw keyEquivalent. Same
+        // false-positive risk as letters.
+        XCTAssertFalse(KeybindingConflictDetector.isNonCharacterKey("1"),
+                       "a digit must not be flagged as non-character")
+    }
+
+    func test_isNonCharacterKey_falseForPunctuation() {
+        // WHY: "]" and "," are printable characters used in AppDelegate's own
+        // built-in menu chords (Next Tab, Settings). They work as keyEquivalent.
+        XCTAssertFalse(KeybindingConflictDetector.isNonCharacterKey("]"),
+                       "] must not be flagged as non-character")
+        XCTAssertFalse(KeybindingConflictDetector.isNonCharacterKey(","),
+                       ", must not be flagged as non-character")
+    }
+
+    func test_isNonCharacterKey_stripsModifiersBeforeClassifying() {
+        // WHY: a real binding from the JSON looks like "mod+f1" or "mod+shift+escape"
+        // after normalize(). isNonCharacterKey must strip modifiers first and
+        // classify only the key token, not the full chord string.
+        XCTAssertTrue(KeybindingConflictDetector.isNonCharacterKey("mod+f1"),
+                      "mod+f1 must be flagged: the key token f1 is non-character")
+        XCTAssertTrue(KeybindingConflictDetector.isNonCharacterKey("mod+shift+escape"),
+                      "mod+shift+escape must be flagged: the key token escape is non-character")
+        XCTAssertFalse(KeybindingConflictDetector.isNonCharacterKey("mod+shift+k"),
+                       "mod+shift+k must not be flagged: k is a printable character")
+    }
+
+    func test_isNonCharacterKey_caseInsensitiveViaNormalize() {
+        // WHY: the user might spell "F1" or "Escape" in the JSON. normalize()
+        // lowercases everything, so isNonCharacterKey must handle mixed-case input
+        // correctly via the normalize path.
+        XCTAssertTrue(KeybindingConflictDetector.isNonCharacterKey("F1"),
+                      "F1 (uppercase) must be flagged after normalize lowercases it")
+        XCTAssertTrue(KeybindingConflictDetector.isNonCharacterKey("Escape"),
+                      "Escape (mixed-case) must be flagged after normalize lowercases it")
+    }
 }
