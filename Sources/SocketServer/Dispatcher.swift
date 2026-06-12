@@ -1559,8 +1559,9 @@ public final class JSONRPCDispatcher {
 
     /// UX-005: translate known domain errors into stable JSON-RPC codes.
     /// `-32010` provider/agent, `-32011` persistence, `-32012` missing
-    /// binary. Unknown errors keep `-32000` + `String(describing:)` (the
-    /// previous behavior) but the verbose form is always logged.
+    /// binary. Unknown errors return `-32000` + a generic user-safe message
+    /// ("An unexpected error occurred on the host."); the verbose form is
+    /// always logged host-side via NSLog so no internal detail leaks to iOS.
     static func mapDomainError(_ error: Error, method: String) -> JSONRPCError {
         let verbose = String(describing: error)
         switch error {
@@ -1593,7 +1594,7 @@ public final class JSONRPCDispatcher {
                                     data: .object(["domain": .string("binary"), "detail": .string(verbose)]))
             }
             NSLog("[RC2.Dispatch] %@ unexpected error: %@", method, verbose)
-            return JSONRPCError(code: -32000, message: verbose)
+            return JSONRPCError(code: -32000, message: "An unexpected error occurred on the host.")
         }
     }
 

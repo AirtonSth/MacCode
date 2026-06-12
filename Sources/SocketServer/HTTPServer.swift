@@ -129,6 +129,58 @@ public func serverListenerEventPayload(bound: Bool, address: String, port: UInt1
     ]
 }
 
+/// Pure helper: builds the WS `server_close` frame JSON for slow-client evictions.
+/// CONTRACT (UX-001 / :22):
+///   - `reason` is a STABLE machine code iOS can switch on (e.g. "queue_full", "write_failed").
+///   - `message` is a human-localizable string the iOS banner can display verbatim.
+///   - `type` is always "server_close" so iOS can route without inspecting `reason`.
+///   - `action` hints the recovery strategy; current value "reconnect_with_baseline".
+/// Adding `message` is ADDITIVE -- existing `reason` field is preserved so current
+/// iOS parsers that already read `reason` continue working without any client change.
+/// Extracted as a pure nonisolated function for unit-testability: no I/O, no actor.
+public func wsClosePayload(reason: String) -> [String: Any] {
+    let message: String
+    switch reason {
+    case "queue_full":
+        message = "The server dropped this connection because the outbound queue was full. Reconnect with a baseline to resume."
+    case "write_failed":
+        message = "The server could not write to this connection. Reconnect to resume."
+    default:
+        message = "The server closed this connection (\(reason)). Reconnect to resume."
+    }
+    return [
+        "type": "server_close",
+        "reason": reason,
+        "message": message,
+        "action": "reconnect_with_baseline"
+    ]
+}
+
+/// Pure helper: builds the JSON error body for pairing HTTP error responses.
+/// CONTRACT (:23):
+///   - HTTP status caller must use: 503 for pairing_disabled, 410 for code_expired / code_invalid.
+///   - `code` values are PINNED stable machine codes iOS switches on:
+///       "pairing_disabled"  -- auth provider absent or declined to create a request
+///       "code_expired"      -- code was already redeemed or has expired
+///       "code_invalid"      -- code was never valid (not currently emitted; reserved)
+///   - `message` is a human-localizable string safe to show in iOS UI.
+/// Response shape: `{"error":{"code":"<code>","message":"<human>"}}`
+/// Extracted as a pure nonisolated function for unit-testability: no I/O, no actor.
+public func pairingErrorPayload(code: String) -> [String: Any] {
+    let message: String
+    switch code {
+    case "pairing_disabled":
+        message = "Pairing is not available on this Mac."
+    case "code_expired":
+        message = "The pairing code has expired or was already used."
+    case "code_invalid":
+        message = "The pairing code is not valid."
+    default:
+        message = "Pairing failed (\(code))."
+    }
+    return ["error": ["code": code, "message": message]]
+}
+
 public final class DirectHTTPServer: @unchecked Sendable {
     static let maxRequestHeaderBytes = 64 * 1024
     static let maxRequestBodyBytes = 2 * 1024 * 1024
@@ -406,12 +458,11 @@ public final class DirectHTTPServer: @unchecked Sendable {
                     // UX-001: tell the client *why* the socket is closing and
                     // what to do, so it can show a transient banner and
                     // auto-reconnect with a baseline instead of silently freezing.
+                    // CONTRACT (:22): wsClosePayload keeps stable `reason` + adds
+                    // human-localizable `message` so iOS banner copy does not show
+                    // raw machine tokens. Additive: existing `reason` field preserved.
                     if let self,
-                       let closeObj = try? JSONSerialization.data(withJSONObject: [
-                           "type": "server_close",
-                           "reason": reason,
-                           "action": "reconnect_with_baseline"
-                       ]) {
+                       let closeObj = try? JSONSerialization.data(withJSONObject: wsClosePayload(reason: reason)) {
                         self.sendWSText(fd: fd, data: closeObj)
                     }
                     shutdown(fd, SHUT_RDWR)
@@ -547,7 +598,9 @@ public final class DirectHTTPServer: @unchecked Sendable {
             // Returns immediately; the device polls /v1/pair/status. The
             // server never blocks on the user's decision.
             guard let auth = auth else {
-                send(fd: fd, status: 503, contentType: "text/plain", body: "pairing disabled\n".data(using: .utf8)!); return
+                // CONTRACT (:23): machine code "pairing_disabled" so iOS can
+                // distinguish this from "code_expired" across localizations.
+                sendJSON(fd: fd, status: 503, body: pairingErrorPayload(code: "pairing_disabled"), acceptEncoding: headers["accept-encoding"]); return
             }
             // Cap simultaneously-outstanding requests per peer so one device
             // cannot flood the approve/deny queue.
@@ -559,7 +612,8 @@ public final class DirectHTTPServer: @unchecked Sendable {
             let privateAccountAccessToken = (obj?["private_account_access_token"] as? String).flatMap { $0.isEmpty ? nil : $0 }
             guard let r = auth.createPairingRequest(deviceName: deviceName, privateAccountAccessToken: privateAccountAccessToken) else {
                 pairingThrottle.releaseOutstanding(peer: peer)
-                send(fd: fd, status: 503, contentType: "text/plain", body: "pairing disabled\n".data(using: .utf8)!); return
+                // CONTRACT (:23): same code here -- auth provider declined to create request.
+                sendJSON(fd: fd, status: 503, body: pairingErrorPayload(code: "pairing_disabled"), acceptEncoding: headers["accept-encoding"]); return
             }
             sendJSON(fd: fd, status: 200, body: ["request_id": r.requestId, "code": r.code, "expires_in": 300], acceptEncoding: headers["accept-encoding"])
         case ("POST", "/v1/pair/status"):
@@ -581,7 +635,8 @@ public final class DirectHTTPServer: @unchecked Sendable {
             // and the outstanding-request slot is freed. Unauthenticated,
             // same allowlist as /v1/pair/status above.
             guard let auth = auth else {
-                send(fd: fd, status: 503, contentType: "text/plain", body: "pairing disabled\n".data(using: .utf8)!); return
+                // CONTRACT (:23): consistent machine code for all pairing-disabled paths.
+                sendJSON(fd: fd, status: 503, body: pairingErrorPayload(code: "pairing_disabled"), acceptEncoding: headers["accept-encoding"]); return
             }
             guard let obj = (try? JSONSerialization.jsonObject(with: bodyData)) as? [String: Any],
                   let requestId = obj["request_id"] as? String else {
@@ -614,7 +669,10 @@ public final class DirectHTTPServer: @unchecked Sendable {
                 sendJSON(fd: fd, status: 200, body: ["device_id": deviceId, "token": token], acceptEncoding: headers["accept-encoding"])
             } else {
                 pairingThrottle.recordFailure(peer: peer)
-                send(fd: fd, status: 410, contentType: "text/plain", body: "code expired or already redeemed\n".data(using: .utf8)!)
+                // CONTRACT (:23): "code_expired" covers both expired and already-redeemed
+                // cases -- iOS cannot meaningfully distinguish them, and the stable code
+                // lets the client show a retry/re-pair CTA without parsing a string.
+                sendJSON(fd: fd, status: 410, body: pairingErrorPayload(code: "code_expired"), acceptEncoding: headers["accept-encoding"])
             }
         case ("GET", "/v1/devices"):
             guard let auth = auth else { send(fd: fd, status: 503, contentType: "text/plain", body: "disabled\n".data(using: .utf8)!); return }
@@ -770,9 +828,13 @@ public final class DirectHTTPServer: @unchecked Sendable {
         switch s {
         case 200: return "OK"
         case 400: return "Bad Request"
+        case 401: return "Unauthorized"
         case 404: return "Not Found"
+        case 410: return "Gone"
         case 413: return "Payload Too Large"
+        case 429: return "Too Many Requests"
         case 431: return "Request Header Fields Too Large"
+        case 503: return "Service Unavailable"
         case 101: return "Switching Protocols"
         default: return "OK"
         }

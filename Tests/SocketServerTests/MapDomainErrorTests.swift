@@ -107,19 +107,26 @@ final class MapDomainErrorTests: XCTestCase {
                        "binary errors must declare domain='binary' so the client can link to the install guide")
     }
 
-    // MARK: Unknown error fallback
+    // MARK: Unknown error fallback (UX-005 / todo-ux/cross-platform line 21)
 
-    func test_unknownError_yields_32000_noStructuredData() {
+    /// WHY: iOS displays the JSON-RPC error message verbatim in the UI. Before
+    /// UX-005 the fallback was `String(describing: error)`, which leaks Swift
+    /// type names and internal state to users. The fix pins the fallback to a
+    /// safe generic message; the verbose description is logged server-side only.
+    func test_unknownError_yields_32000_withGenericSafeMessage() {
         struct RandomError: Error, CustomStringConvertible {
-            var description: String { "something_unexpected" }
+            var description: String { "something_unexpected_internal" }
         }
 
         let rpcErr = JSONRPCDispatcher.mapDomainError(RandomError(), method: "workspace.create")
 
         XCTAssertEqual(rpcErr.code, -32000,
                        "unclassified errors must fall back to -32000 so the iOS generic error handler is exercised rather than silently ignored")
-        // message must contain the error description to aid support
-        XCTAssertTrue(rpcErr.message.contains("something_unexpected"),
-                      "the raw description must appear in the message so verbose logs are useful")
+        // Contract pin: iOS must receive this exact string so both platforms
+        // can match on it and the copy is coordinated.
+        XCTAssertEqual(rpcErr.message, "An unexpected error occurred on the host.",
+                       "fallback message must be the pinned safe string — never a Swift debug dump")
+        XCTAssertFalse(rpcErr.message.contains("something_unexpected_internal"),
+                       "internal error description must NOT appear in the user-facing message")
     }
 }
