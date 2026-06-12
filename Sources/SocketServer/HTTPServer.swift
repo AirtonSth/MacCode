@@ -403,6 +403,10 @@ public final class DirectHTTPServer: @unchecked Sendable {
             let heartbeat = DispatchSource.makeTimerSource(queue: DispatchQueue.global())
             heartbeat.schedule(deadline: .now() + Self.wsHeartbeatInterval, repeating: Self.wsHeartbeatInterval)
             heartbeat.setEventHandler {
+                guard Self.shouldSendHeartbeat(
+                    queued: outbound.queuedByteCount,
+                    max: Self.maxWebSocketOutboundQueuedBytes
+                ) else { return }
                 guard let data = try? JSONSerialization.data(withJSONObject: [
                     "type": "heartbeat",
                     "ts": Date().timeIntervalSince1970
@@ -721,7 +725,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
     }
 
     private func sendJSON(fd: Int32, status: Int, body: [String: Any], acceptEncoding: String? = nil) {
-        let data = (try? JSONSerialization.data(withJSONObject: body, options: [.prettyPrinted, .sortedKeys])) ?? Data()
+        let data = (try? JSONSerialization.data(withJSONObject: body, options: [.sortedKeys])) ?? Data()
         send(fd: fd, status: status, contentType: "application/json", body: data, acceptEncoding: acceptEncoding)
     }
 
@@ -738,6 +742,13 @@ public final class DirectHTTPServer: @unchecked Sendable {
     }
 
     // MARK: WebSocket
+
+    // Extracted seam for testing: skip the heartbeat when the outbound queue
+    // is at or above half capacity so a backed-up slow client does not
+    // accumulate pending heartbeat frames on top of its real backlog.
+    static func shouldSendHeartbeat(queued: Int, max: Int) -> Bool {
+        queued < max / 2
+    }
 
     private static let wsGUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
