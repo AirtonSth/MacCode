@@ -541,6 +541,116 @@ final class PersistenceTests: XCTestCase {
         XCTAssertFalse(older.hasMoreOlder)
     }
 
+    // The history cap must allow more than 20 entries so older prompts are not
+    // silently lost when the user types more than 20 commands in a session.
+    func test_promptHistoryStore_capAllowsMoreThan20Entries() throws {
+        let tmp = NSTemporaryDirectory() + "RC2Test-" + UUID().uuidString
+        defer { try? FileManager.default.removeItem(atPath: tmp) }
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let store = PromptHistoryStore(db: db)
+        let ws = WorkspaceID()
+
+        let entries = (1...25).map { "cmd-\($0)" }
+        store.save(entries, workspaceID: ws)
+
+        let loaded = store.load(workspaceID: ws)
+        XCTAssertEqual(loaded.count, 25,
+                       "raising the cap beyond 20 must allow all 25 entries to survive a save/load round-trip; a 20-cap makes older prompts unrecoverable")
+        XCTAssertEqual(loaded.last, "cmd-25",
+                       "most recent entry must appear last (append order) after load")
+        XCTAssertTrue(PromptHistoryStore.limit > 20,
+                      "static limit must be greater than 20 so up-arrow recall is not silently truncated")
+    }
+
+    // search must return entries matching the query (case-insensitive), exclude
+    // non-matches, respect the result limit, and return most-recent-first.
+    func test_promptHistoryStore_search_filtersCaseInsensitiveAndMostRecentFirst() throws {
+        let tmp = NSTemporaryDirectory() + "RC2Test-" + UUID().uuidString
+        defer { try? FileManager.default.removeItem(atPath: tmp) }
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let store = PromptHistoryStore(db: db)
+        let ws = WorkspaceID()
+
+        // Save in chronological order (oldest first); load returns same order.
+        store.save([
+            "swift build",
+            "swift test",
+            "git status",
+            "Swift Package Show Dependencies",
+            "git log --oneline"
+        ], workspaceID: ws)
+
+        // Case-insensitive match: "swift" should hit entries 1, 2, 4 (most-recent-first).
+        let matches = store.search(workspaceID: ws, query: "swift")
+        XCTAssertEqual(matches, [
+            "Swift Package Show Dependencies",
+            "swift test",
+            "swift build"
+        ], "search must return matching entries most-recent-first so the most useful history is surfaced first; a missing search makes older prompts unrecoverable")
+
+        // Non-matching query returns empty.
+        let none = store.search(workspaceID: ws, query: "docker")
+        XCTAssertTrue(none.isEmpty,
+                      "search must exclude entries that do not contain the query string")
+
+        // Limit is respected.
+        let limited = store.search(workspaceID: ws, query: "swift", limit: 2)
+        XCTAssertEqual(limited.count, 2,
+                       "search limit must cap the result set so callers can control result list size")
+        XCTAssertEqual(limited.first, "Swift Package Show Dependencies",
+                       "search with limit must still return most-recent entries first")
+    }
+
+    // search must be scoped per-workspace: entries from another workspace must
+    // not appear in results.
+    func test_promptHistoryStore_search_isScopedToWorkspace() throws {
+        let tmp = NSTemporaryDirectory() + "RC2Test-" + UUID().uuidString
+        defer { try? FileManager.default.removeItem(atPath: tmp) }
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let store = PromptHistoryStore(db: db)
+        let wsA = WorkspaceID()
+        let wsB = WorkspaceID()
+
+        store.save(["swift build", "swift test"], workspaceID: wsA)
+        store.save(["git status"], workspaceID: wsB)
+
+        let resultsA = store.search(workspaceID: wsA, query: "swift")
+        let resultsB = store.search(workspaceID: wsB, query: "swift")
+
+        XCTAssertEqual(resultsA.count, 2,
+                       "search must return matching entries scoped to the requested workspace")
+        XCTAssertTrue(resultsB.isEmpty,
+                      "search must not leak entries across workspace boundaries")
+    }
+
+    // search on empty history must return empty without crashing.
+    func test_promptHistoryStore_search_emptyHistoryReturnsEmpty() throws {
+        let tmp = NSTemporaryDirectory() + "RC2Test-" + UUID().uuidString
+        defer { try? FileManager.default.removeItem(atPath: tmp) }
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let store = PromptHistoryStore(db: db)
+        let ws = WorkspaceID()
+
+        XCTAssertTrue(store.search(workspaceID: ws, query: "anything").isEmpty,
+                      "search on a workspace with no history must return empty without crashing")
+    }
+
+    // search deduplicates: if the same command appears multiple times only the
+    // most-recent occurrence should be returned.
+    func test_promptHistoryStore_search_deduplicatesEntries() throws {
+        let tmp = NSTemporaryDirectory() + "RC2Test-" + UUID().uuidString
+        defer { try? FileManager.default.removeItem(atPath: tmp) }
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let store = PromptHistoryStore(db: db)
+        let ws = WorkspaceID()
+
+        store.save(["swift build", "git status", "swift build", "swift build"], workspaceID: ws)
+
+        let matches = store.search(workspaceID: ws, query: "swift build")
+        XCTAssertEqual(matches, ["swift build"],
+                       "search must deduplicate repeated prompts so the history list is not cluttered with identical entries")
+    }
+
     // Closing a workspace must delete its prompt history so user-typed prompts do
     // not leak on disk indefinitely (privacy + unbounded settings-table growth).
     func test_promptHistoryStore_deleteWorkspace_removesItsHistoryAndPreservesOthers() throws {
