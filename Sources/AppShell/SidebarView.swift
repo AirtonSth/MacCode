@@ -43,6 +43,53 @@ public final class SidebarViewModel: ObservableObject {
         _ progress: @escaping @MainActor (TokenSaverModelDownloadState) -> Void
     ) async throws -> TokenSaverModelManifest
 
+    // MARK: - Download confirm gate
+
+    public enum DownloadConfirmDecision: Equatable {
+        /// Disk has too little free space to safely store the model.
+        case insufficientDisk
+        /// Enough space: caller should show the confirm dialog and may proceed.
+        case confirm
+    }
+
+    /// Estimated model size used for disk-space checks and the confirm dialog
+    /// copy. Derived from the approved 1.7B 4-bit MLX model; no network call
+    /// is made -- the manifest is not available before the download begins.
+    /// Source: samuelfaj/distill-1.7B-4bit-MLX HuggingFace repo (~1.1 GB).
+    public static let approvedModelEstimatedBytes: Int64 = 1_100_000_000
+
+    /// Safety margin added to the estimated model size before comparing with
+    /// free disk space. Covers the partial download file and manifest write.
+    public static let downloadDiskMarginBytes: Int64 = 200_000_000
+
+    /// Pure seam: decides whether a multi-GB download may proceed based solely
+    /// on arithmetic over byte counts.  No I/O, no UI.
+    ///
+    /// Returns `.insufficientDisk` when `freeDiskBytes` is less than
+    /// `modelBytes + downloadDiskMarginBytes`. Returns `.confirm` otherwise.
+    ///
+    /// WHY this exists as a separate function: an accidental click on the
+    /// Token Saver card must not silently start a multi-GB download, and a
+    /// nearly-full disk must warn the user before any bytes are fetched.
+    nonisolated public static func downloadConfirmDecision(
+        modelBytes: Int64,
+        freeDiskBytes: Int64
+    ) -> DownloadConfirmDecision {
+        freeDiskBytes < modelBytes + downloadDiskMarginBytes ? .insufficientDisk : .confirm
+    }
+
+    /// Human-readable size string for `approvedModelEstimatedBytes`, e.g. "1.1 GB".
+    nonisolated public static func humanModelSizeString() -> String {
+        ByteCountFormatter.string(fromByteCount: approvedModelEstimatedBytes, countStyle: .file)
+    }
+
+    /// Seam injected in tests so the confirm prompt can be replaced without
+    /// showing a real NSAlert. Production default shows a blocking NSAlert.
+    public typealias TokenSaverDownloadConfirmProvider = @MainActor (
+        _ sizeString: String,
+        _ hasEnoughDisk: Bool
+    ) -> Bool
+
     public weak var context: AppContext?
     public weak var router: AppCommandRouter?
 
@@ -91,6 +138,7 @@ public final class SidebarViewModel: ObservableObject {
     private let insomniaBatteryPrompt: InsomniaBatteryPrompt
     private let tokenSaverModelValidationProvider: TokenSaverModelValidationProvider?
     private let tokenSaverModelDownloadHandler: TokenSaverModelDownloadHandler?
+    private let tokenSaverDownloadConfirmProvider: TokenSaverDownloadConfirmProvider?
     private var lastPowerState: ExternalPowerState
     private var showingInsomniaBatteryPrompt = false
     private var tokenSaverModelDownloadTask: Task<TokenSaverModelManifest, Error>?
@@ -105,7 +153,8 @@ public final class SidebarViewModel: ObservableObject {
             SidebarViewModel.defaultInsomniaBatteryPrompt()
         },
         tokenSaverModelValidationProvider: TokenSaverModelValidationProvider? = nil,
-        tokenSaverModelDownloadHandler: TokenSaverModelDownloadHandler? = nil
+        tokenSaverModelDownloadHandler: TokenSaverModelDownloadHandler? = nil,
+        tokenSaverDownloadConfirmProvider: TokenSaverDownloadConfirmProvider? = nil
     ) {
         self.context = context
         self.router = router
@@ -117,6 +166,7 @@ public final class SidebarViewModel: ObservableObject {
         self.insomniaBatteryPrompt = insomniaBatteryPrompt
         self.tokenSaverModelValidationProvider = tokenSaverModelValidationProvider
         self.tokenSaverModelDownloadHandler = tokenSaverModelDownloadHandler
+        self.tokenSaverDownloadConfirmProvider = tokenSaverDownloadConfirmProvider
         self.lastPowerState = powerMonitor.currentPowerState
         self.privateAccountObserver = NotificationCenter.default.addObserver(
             forName: .rc2PrivateAccountChanged,
@@ -244,6 +294,23 @@ public final class SidebarViewModel: ObservableObject {
         }
         let validation = validateTokenSaverModel()
         guard validation.state == .installed else {
+            // Model is not present: require confirmation before starting the
+            // multi-GB download. Skip the prompt only when the model is already
+            // installed (no download needed).
+            let freeDisk = Self.volumeFreeDiskBytes()
+            let decision = Self.downloadConfirmDecision(
+                modelBytes: Self.approvedModelEstimatedBytes,
+                freeDiskBytes: freeDisk
+            )
+            let sizeString = Self.humanModelSizeString()
+            let hasEnoughDisk = decision == .confirm
+            let confirmed: Bool
+            if let provider = tokenSaverDownloadConfirmProvider {
+                confirmed = provider(sizeString, hasEnoughDisk)
+            } else {
+                confirmed = Self.defaultTokenSaverDownloadConfirm(sizeString: sizeString, hasEnoughDisk: hasEnoughDisk)
+            }
+            guard confirmed else { return }
             beginTokenSaverModelDownload(reason: validation.reason)
             return
         }
@@ -415,6 +482,48 @@ public final class SidebarViewModel: ObservableObject {
             settings: settingsStore.load(),
             modelValidation: modelValidation
         )
+    }
+
+    /// Returns the number of free bytes on the volume that hosts the home
+    /// directory, or 0 when the query fails. Used only for disk-space checks
+    /// before the download confirm dialog; the real disk write can still fail
+    /// if space changes between the check and the download.
+    nonisolated public static func volumeFreeDiskBytes() -> Int64 {
+        let url = URL(fileURLWithPath: NSHomeDirectory())
+        let values = try? url.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
+        if let available = values?.volumeAvailableCapacityForImportantUsage {
+            return available
+        }
+        // Fall back to the basic free-capacity key.
+        let basic = try? url.resourceValues(forKeys: [.volumeAvailableCapacityKey])
+        if let available = basic?.volumeAvailableCapacity {
+            return Int64(available)
+        }
+        return 0
+    }
+
+    /// Blocking NSAlert confirmation shown before a multi-GB Token Saver model
+    /// download begins. Shows the download size and warns when disk is low.
+    public static func defaultTokenSaverDownloadConfirm(
+        sizeString: String,
+        hasEnoughDisk: Bool
+    ) -> Bool {
+        let alert = NSAlert()
+        if hasEnoughDisk {
+            alert.alertStyle = .informational
+            alert.messageText = "Download Token Saver model (\(sizeString))?"
+            alert.informativeText = "Token Saver uses a local AI model to compress prompts. The model is downloaded once and stored on this Mac."
+        } else {
+            alert.alertStyle = .warning
+            alert.messageText = "Not enough disk space"
+            alert.informativeText = "The Token Saver model requires approximately \(sizeString) of free disk space, but this Mac does not appear to have enough available. Free up space before continuing."
+        }
+        alert.addButton(withTitle: hasEnoughDisk ? "Download" : "OK")
+        if hasEnoughDisk {
+            alert.addButton(withTitle: "Cancel")
+        }
+        let response = alert.runModal()
+        return hasEnoughDisk && response == .alertFirstButtonReturn
     }
 
     public static func defaultInsomniaBatteryPrompt() -> InsomniaBatteryDecision {
