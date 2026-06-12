@@ -51,14 +51,35 @@ public struct DSPill: View {
     let tone: Tone
     public init(_ text: String, tone: Tone = .neutral) { self.text = text; self.tone = tone }
 
+    /// Maps each semantic tone to its SF Symbol name.
+    /// Returns nil for tones that carry no distinct semantic state (neutral, accent).
+    /// Used in body so the pill conveys state by icon+shape, not color alone (WCAG 1.4.1).
+    public static func iconName(for tone: Tone) -> String? {
+        switch tone {
+        case .neutral: return nil
+        case .accent:  return nil
+        case .success: return "checkmark.circle.fill"
+        case .warning: return "exclamationmark.triangle.fill"
+        case .danger:  return "xmark.octagon.fill"
+        }
+    }
+
     public var body: some View {
-        Text(text)
-            .font(DS.Font.caption2.weight(.semibold))
-            .foregroundColor(fg)
-            .padding(.horizontal, DS.Space.sm)
-            .padding(.vertical, DS.Space.xxs)
-            .background(bg)
-            .clipShape(Capsule())
+        HStack(spacing: DS.Space.xxs) {
+            if let symbol = DSPill.iconName(for: tone) {
+                Image(systemName: symbol)
+                    .font(DS.Font.caption2.weight(.semibold))
+                    .foregroundColor(fg)
+                    .accessibilityHidden(true)
+            }
+            Text(text)
+                .font(DS.Font.caption2.weight(.semibold))
+                .foregroundColor(fg)
+        }
+        .padding(.horizontal, DS.Space.sm)
+        .padding(.vertical, DS.Space.xxs)
+        .background(bg)
+        .clipShape(Capsule())
     }
     private var fg: Color {
         switch tone {

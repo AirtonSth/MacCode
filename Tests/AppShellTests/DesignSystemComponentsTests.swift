@@ -95,4 +95,58 @@ final class DesignSystemComponentsTests: XCTestCase {
         XCTAssertGreaterThan(expected, 0,
             "focusRing opacity must be > 0 so focus rings are visible to keyboard users")
     }
+
+    // MARK: - DSPill iconName (WCAG 1.4.1: do not use color as the only visual cue)
+
+    // success must map to a distinct SF Symbol so color-blind users can tell it apart
+    // from warning and danger without relying on green/yellow/red hue.
+    func testPillIconNameSuccessReturnsCheckmark() {
+        XCTAssertEqual(
+            DSPill.iconName(for: .success), "checkmark.circle.fill",
+            "success tone must carry a checkmark icon so it is distinguishable without color"
+        )
+    }
+
+    // warning must carry a triangle symbol -- visually distinct shape from success/danger.
+    func testPillIconNameWarningReturnsTriangle() {
+        XCTAssertEqual(
+            DSPill.iconName(for: .warning), "exclamationmark.triangle.fill",
+            "warning tone must carry an exclamation-triangle icon (unique shape among tones)"
+        )
+    }
+
+    // danger must carry an octagon -- a shape universally associated with stop/error.
+    func testPillIconNameDangerReturnsOctagon() {
+        XCTAssertEqual(
+            DSPill.iconName(for: .danger), "xmark.octagon.fill",
+            "danger tone must carry an xmark-octagon icon (distinct from checkmark and triangle)"
+        )
+    }
+
+    // neutral and accent carry no semantic state; returning nil keeps the pill compact
+    // and avoids adding a non-communicative icon.
+    func testPillIconNameNeutralReturnsNil() {
+        XCTAssertNil(
+            DSPill.iconName(for: .neutral),
+            "neutral tone must not add an icon -- no semantic state to convey"
+        )
+    }
+
+    func testPillIconNameAccentReturnsNil() {
+        XCTAssertNil(
+            DSPill.iconName(for: .accent),
+            "accent tone must not add an icon -- it is a brand highlight, not a semantic state"
+        )
+    }
+
+    // All three semantic-state icons must be pairwise distinct so a color-blind user
+    // receives a unique shape cue for each state (WCAG 1.4.1 pass criterion).
+    func testPillSemanticStateIconsAreAllDistinct() {
+        let success = DSPill.iconName(for: .success)!
+        let warning = DSPill.iconName(for: .warning)!
+        let danger  = DSPill.iconName(for: .danger)!
+        XCTAssertNotEqual(success, warning, "success and warning icons must differ (color-blind disambiguation)")
+        XCTAssertNotEqual(success, danger,  "success and danger icons must differ")
+        XCTAssertNotEqual(warning, danger,  "warning and danger icons must differ")
+    }
 }
