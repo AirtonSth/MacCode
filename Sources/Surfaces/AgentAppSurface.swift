@@ -151,6 +151,10 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// actually reaching a terminal state. Prevents repeated Stop clicks and
     /// shows a "Stopping..." label so the user knows the interrupt was sent.
     @Published public var isStopping: Bool = false
+    /// UX-MAC_AGENT-CONTINUE: true when the selected thread was interrupted by
+    /// an app relaunch and has a recoverable provider session. Drives the inline
+    /// Continue action. Cleared when a run starts or the selected thread changes.
+    @Published public private(set) var selectedThreadHasRecoverableContext: Bool = false
 
     public let workspaceID: WorkspaceID
     public let cwd: String
@@ -353,6 +357,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 runStartedAt = nil
             }
         }
+        // UX-MAC_AGENT-CONTINUE: check whether the newly selected thread was
+        // interrupted by a relaunch and has a recoverable provider session.
+        selectedThreadHasRecoverableContext = coordinator.hasRecoverableContext(threadId: id)
         // B6: opening a thread marks it read (persist + reflect in the rail
         // without re-querying, which would recurse through reloadThreads).
         if var t = try? threadRepo.get(id: id), t.hasUnread {
@@ -1579,6 +1586,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         prompt = ""
         resetTimelineUpdateTick()
         lastErrorRecoverable = false  // UX-MAC_AGENT-009: clear stale Retry on new run
+        selectedThreadHasRecoverableContext = false  // UX-MAC_AGENT-CONTINUE: run started; hide Continue
         let resolvedAttachments: [AgentAttachment]
         do {
             resolvedAttachments = try AgentAttachmentResolver.resolve(paths: attached)
@@ -1887,6 +1895,26 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         case .pending, .running:
             return false
         }
+    }
+
+    // MARK: - Continue (relaunch-interrupted thread) seam
+
+    /// Pure, testable function that decides whether to show the inline Continue
+    /// action. True only when the selected thread has a recoverable provider
+    /// session AND no run is currently active.
+    /// WHY: a relaunch-interrupted thread should be one-click resumable, not a
+    /// dead end requiring the user to re-type their last prompt.
+    nonisolated public static func showsContinueAction(hasRecoverableContext: Bool, runActive: Bool) -> Bool {
+        hasRecoverableContext && !runActive
+    }
+
+    /// Resume a relaunch-interrupted thread by replaying recoverableResumeContext.
+    /// Calls startProviderRun with an empty prompt so the coordinator's existing
+    /// recoverableResumeContext path (AgentRunCoordinator.startRun:163) picks up
+    /// the saved resume cursor without a new user message.
+    public func continueInterruptedThread() async {
+        selectedThreadHasRecoverableContext = false
+        _ = await startProviderRun(text: "", attached: [], recordHistory: false, interactionMode: interactionMode)
     }
 
     // MARK: - Stop button state seam
@@ -3418,6 +3446,13 @@ public struct AgentAppView: View {
                             }
                             if vm.status == .running { workingStatus }
                             if let err = vm.timeline.error { errorRow(err) }
+                            // UX-MAC_AGENT-CONTINUE: show inline Continue only when the
+                            // selected thread was interrupted by a relaunch and is not
+                            // currently running. One tap replays recoverableResumeContext.
+                            if AgentAppViewModel.showsContinueAction(
+                                hasRecoverableContext: vm.selectedThreadHasRecoverableContext,
+                                runActive: vm.status == .running
+                            ) { interruptedContinueRow }
                             // Scroll-to target only. Bottom detection is handled by the
                             // AppKit TimelineScrollFollower above — NOT by a per-layout
                             // GeometryReader preference, which fed onPreferenceChange -> @State
@@ -3913,6 +3948,31 @@ public struct AgentAppView: View {
         guard timelineSticksToBottom || !showScrollDownButton else { return }
         timelineSticksToBottom = false
         showScrollDownButton = true
+    }
+
+    // UX-MAC_AGENT-CONTINUE: shown when the thread was interrupted by relaunch.
+    // One tap resumes via recoverableResumeContext without requiring a retype.
+    @ViewBuilder
+    private var interruptedContinueRow: some View {
+        VStack(alignment: .leading, spacing: DS.Space.sm) {
+            HStack(spacing: DS.Space.sm) {
+                Image(systemName: "exclamationmark.triangle")
+                    .font(.system(size: 11))
+                    .foregroundColor(DS.Palette.warning)
+                Text("This thread was interrupted by an app restart.")
+                    .font(DS.Font.body)
+                    .foregroundColor(DS.Palette.textSecondary)
+            }
+            Button {
+                Task { await vm.continueInterruptedThread() }
+            } label: {
+                Label("Continue", systemImage: "arrow.clockwise")
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+            .accessibilityIdentifier("agent.continue.interrupted")
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     // "Working for 2m 21s" + hairline, while a run is in flight.

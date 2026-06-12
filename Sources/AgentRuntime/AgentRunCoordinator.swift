@@ -479,6 +479,21 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         return Set(activeThreads.keys)
     }
 
+    /// Returns true when the thread has a recoverable provider session (was
+    /// interrupted by relaunch and can be resumed via startRun). Used by the
+    /// surface to decide whether to show the inline Continue action.
+    /// WHY: coordinator owns providerSessionRepo; surface should not reach
+    /// through to the repo directly.
+    public func hasRecoverableContext(threadId: AgentThreadID) -> Bool {
+        guard let repo = providerSessionRepo else { return false }
+        switch (try? repo.recoveryState(threadId: threadId)) ?? .unrecoverable("no repo") {
+        case .recoverable:
+            return true
+        default:
+            return false
+        }
+    }
+
     public func stopAllProviderSessions() {
         lock.lock()
         let adapters = Array(providers.values)
