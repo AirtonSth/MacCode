@@ -147,6 +147,15 @@ public final class SidebarViewModel: ObservableObject {
     private var lastPowerState: ExternalPowerState
     private var showingInsomniaBatteryPrompt = false
     private var tokenSaverModelDownloadTask: Task<TokenSaverModelManifest, Error>?
+    // Aggregate download progress across all files. Reset at the start of each download.
+    @Published public private(set) var tokenSaverAggregatedDownloadedBytes: Int64 = 0
+    @Published public private(set) var tokenSaverAggregatedTotalBytes: Int64 = 0
+    @Published public private(set) var tokenSaverDownloadBytesPerSec: Double = 0
+    // Internal tracking for aggregate accumulation. Not published -- only read on @MainActor.
+    private var _aggregateCompletedBytes: Int64 = 0
+    private var _aggregateCompletedExpected: Int64 = 0
+    private var _aggregateLastFileBytes: Int64 = 0
+    private var _aggregateSpeedSample: (bytes: Int64, time: Date) = (0, .distantPast)
 
     public init(
         context: AppContext,
@@ -400,6 +409,38 @@ public final class SidebarViewModel: ObservableObject {
         return "Download failed. Try again."
     }
 
+    // Pure helper: aggregate % and ETA from cumulative byte counters.
+    // Guards: totalBytes==0 -> (0, nil); bytesPerSec<=0 -> (percent, nil).
+    // The totalBytes value is an estimate until all per-file Content-Length
+    // headers are resolved; it grows as each new file begins downloading.
+    nonisolated public static func aggregateProgress(
+        downloadedBytes: Int64,
+        totalBytes: Int64,
+        bytesPerSec: Double
+    ) -> (percent: Int, etaSeconds: Int?) {
+        guard totalBytes > 0, downloadedBytes >= 0 else { return (0, nil) }
+        let fraction = min(Double(downloadedBytes) / Double(totalBytes), 1.0)
+        let percent = Int((fraction * 100).rounded())
+        guard bytesPerSec > 0 else { return (percent, nil) }
+        let remaining = totalBytes - downloadedBytes
+        let eta = remaining <= 0 ? 0 : Int((Double(remaining) / bytesPerSec).rounded())
+        return (percent, eta)
+    }
+
+    // Formats seconds as "Xs", "Xm Ys", or "Xh Ym".
+    nonisolated public static func formatDownloadETA(_ seconds: Int) -> String {
+        guard seconds > 0 else { return "0s" }
+        if seconds < 60 { return "\(seconds)s" }
+        let mins = seconds / 60
+        let secs = seconds % 60
+        if mins < 60 {
+            return secs > 0 ? "\(mins)m \(secs)s" : "\(mins)m"
+        }
+        let hrs = mins / 60
+        let remMins = mins % 60
+        return remMins > 0 ? "\(hrs)h \(remMins)m" : "\(hrs)h"
+    }
+
     public func setTokenSaverModelDownloadStateForTesting(_ state: TokenSaverModelDownloadState) {
         tokenSaverModelDownloadState = state
     }
@@ -428,12 +469,40 @@ public final class SidebarViewModel: ObservableObject {
         tokenSaverModelDownloadTask?.cancel()
         tokenSaverModelDownloadState = .required(reason: reason)
         showsTokenSaverModelDownload = true
+        // Reset aggregate counters for this download session.
+        _aggregateCompletedBytes = 0
+        _aggregateCompletedExpected = 0
+        _aggregateLastFileBytes = 0
+        _aggregateSpeedSample = (0, Date())
+        tokenSaverAggregatedDownloadedBytes = 0
+        tokenSaverAggregatedTotalBytes = 0
+        tokenSaverDownloadBytesPerSec = 0
 
         let task = Task { @MainActor [weak self] in
             guard let self else { throw CancellationError() }
             do {
                 let manifest = try await self.downloadTokenSaverModel { [weak self] state in
-                    self?.tokenSaverModelDownloadState = state
+                    guard let self else { return }
+                    // Detect per-file resets: if bytes went backward, a file finished.
+                    if state.downloadedBytes < self._aggregateLastFileBytes {
+                        self._aggregateCompletedBytes += self._aggregateLastFileBytes
+                        self._aggregateCompletedExpected += self._aggregateLastFileBytes
+                    }
+                    self._aggregateLastFileBytes = state.downloadedBytes
+                    let aggregateDownloaded = self._aggregateCompletedBytes + state.downloadedBytes
+                    // Total is completed-file bytes + current file expected (if known).
+                    let aggregateTotal = self._aggregateCompletedExpected + (state.expectedBytes ?? state.downloadedBytes)
+                    // Speed: bytes/sec over elapsed time since last sample (minimum 0.5 s window).
+                    let now = Date()
+                    let elapsed = now.timeIntervalSince(self._aggregateSpeedSample.time)
+                    if elapsed >= 0.5 {
+                        let deltaBytes = aggregateDownloaded - self._aggregateSpeedSample.bytes
+                        self.tokenSaverDownloadBytesPerSec = elapsed > 0 ? Double(deltaBytes) / elapsed : 0
+                        self._aggregateSpeedSample = (aggregateDownloaded, now)
+                    }
+                    self.tokenSaverAggregatedDownloadedBytes = aggregateDownloaded
+                    self.tokenSaverAggregatedTotalBytes = aggregateTotal
+                    self.tokenSaverModelDownloadState = state
                 }
                 let validation = self.validateTokenSaverModel()
                 guard validation.state == .installed else {
@@ -1536,6 +1605,9 @@ public struct SidebarRootView: View {
         .sheet(isPresented: $vm.showsTokenSaverModelDownload) {
             TokenSaverModelDownloadModal(
                 state: vm.tokenSaverModelDownloadState,
+                aggregatedDownloadedBytes: vm.tokenSaverAggregatedDownloadedBytes,
+                aggregatedTotalBytes: vm.tokenSaverAggregatedTotalBytes,
+                downloadBytesPerSec: vm.tokenSaverDownloadBytesPerSec,
                 onCancel: { vm.cancelTokenSaverModelDownload() },
                 onRetry: { vm.retryTokenSaverModelDownload() }
             )
@@ -2571,6 +2643,9 @@ public struct SidebarRootView: View {
 
     private struct TokenSaverModelDownloadModal: View {
         let state: TokenSaverModelDownloadState
+        let aggregatedDownloadedBytes: Int64
+        let aggregatedTotalBytes: Int64
+        let downloadBytesPerSec: Double
         let onCancel: () -> Void
         let onRetry: () -> Void
 
@@ -2648,7 +2723,10 @@ public struct SidebarRootView: View {
 
         private var progressView: some View {
             Group {
-                if let fraction = state.fractionCompleted {
+                if aggregatedTotalBytes > 0 && state.phase == .downloading {
+                    let fraction = min(Double(aggregatedDownloadedBytes) / Double(aggregatedTotalBytes), 1.0)
+                    ProgressView(value: fraction, total: 1)
+                } else if let fraction = state.fractionCompleted {
                     ProgressView(value: fraction, total: 1)
                 } else {
                     ProgressView()
@@ -2658,10 +2736,31 @@ public struct SidebarRootView: View {
         }
 
         private var progressText: String {
-            let downloaded = Self.formatBytes(state.downloadedBytes)
-            guard let expected = state.expectedBytes else { return downloaded }
-            let percent = Int(((state.fractionCompleted ?? 0) * 100).rounded())
-            return "\(downloaded) / \(Self.formatBytes(expected)) (\(percent)%)"
+            // Use aggregate bytes when a real download is in progress.
+            // Fall back to per-file display during prepare/verify/idle phases.
+            guard state.phase == .downloading, aggregatedTotalBytes > 0 else {
+                let downloaded = Self.formatBytes(state.downloadedBytes)
+                guard let expected = state.expectedBytes else { return downloaded }
+                let percent = Int(((state.fractionCompleted ?? 0) * 100).rounded())
+                return "\(downloaded) / \(Self.formatBytes(expected)) (\(percent)%)"
+            }
+            let (percent, etaSeconds) = SidebarViewModel.aggregateProgress(
+                downloadedBytes: aggregatedDownloadedBytes,
+                totalBytes: aggregatedTotalBytes,
+                bytesPerSec: downloadBytesPerSec
+            )
+            let downloaded = Self.formatBytes(aggregatedDownloadedBytes)
+            let total = Self.formatBytes(aggregatedTotalBytes)
+            let speed = downloadBytesPerSec > 0
+                ? " - \(Self.formatBytes(Int64(downloadBytesPerSec)))/s"
+                : ""
+            let eta: String
+            if let secs = etaSeconds, secs > 0 {
+                eta = " - ~\(SidebarViewModel.formatDownloadETA(secs)) left"
+            } else {
+                eta = ""
+            }
+            return "\(downloaded) of \(total) - \(percent)%\(speed)\(eta)"
         }
 
         private func infoRow(_ label: String, _ value: String) -> some View {
@@ -2691,6 +2790,7 @@ public struct SidebarRootView: View {
             }
             return String(format: value >= 10 || index == 0 ? "%.0f %@" : "%.1f %@", value, units[index])
         }
+
     }
 
     private var accountAvatar: some View {
