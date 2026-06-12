@@ -1206,12 +1206,12 @@ final class GhosttyTerminalView: NSView {
         return CGGetActiveDisplayList(0, nil, &count) == .success && count > 0
     }
 
-    private static var nativeRendererEnabled: Bool {
+    private static let nativeRendererEnabled: Bool = {
         let env = ProcessInfo.processInfo.environment
         guard env["RC2_ENABLE_GHOSTTY_IN_TESTS"] != "1" else { return true }
         guard env["XCTestConfigurationFilePath"] == nil else { return false }
         return ProcessInfo.processInfo.processName != "xctest"
-    }
+    }()
 
     private func updateFocus() {
         guard let surface = surfaceSlot.liveSurface() else { return }
