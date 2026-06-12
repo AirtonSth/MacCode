@@ -14,6 +14,7 @@ import AgentRuntime
 ///  P2 — providerLocked: system messages do NOT lock the provider
 ///  P2 — content-omitted: applyBodyBudget still blanks bodies (logic unchanged)
 ///  P3 — providerLocked false after only system messages
+///  UX-SR1-BADGE — showsTranslatedBadge: true=>true, false=>false
 @MainActor
 final class AgentAppUXGapsTests: XCTestCase {
 
@@ -264,5 +265,24 @@ final class AgentAppUXGapsTests: XCTestCase {
 
         XCTAssertFalse(vm.isStopping,
                        "isStopping must be cleared when the run reaches a terminal state")
+    }
+
+    // MARK: - UX-SR1-BADGE: showsTranslatedBadge seam
+
+    /// WHY: a humanized SR1 reply must be transparently labeled so the user knows
+    /// it was rewritten by Token Saver. The badge decision is a pure function of
+    /// the wasTranslated flag so it can be verified without any view setup.
+    func test_showsTranslatedBadge_true_whenWasSR1Translated() {
+        XCTAssertTrue(
+            AgentAppView.showsTranslatedBadge(wasSR1Translated: true),
+            "Badge must appear when the message was SR1-translated"
+        )
+    }
+
+    func test_showsTranslatedBadge_false_whenNotTranslated() {
+        XCTAssertFalse(
+            AgentAppView.showsTranslatedBadge(wasSR1Translated: false),
+            "Badge must NOT appear for normal (non-SR1) messages"
+        )
     }
 }

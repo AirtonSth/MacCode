@@ -83,6 +83,11 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     /// unchanged on any error.
     public var finalResponseTranslator: (@Sendable (_ response: String, _ provider: AgentProvider, _ threadId: AgentThreadID, _ runId: AgentRunID) async -> String)?
 
+    /// Fired (on an arbitrary executor) when a final assistant message was SR1-translated
+    /// and persisted. Callers can use the id to badge the message in the UI.
+    /// Not fired when translation is a no-op (finalResponseTranslator absent or text unchanged).
+    public var onSR1TranslatedMessageId: (@Sendable (AgentMessageID) -> Void)?
+
     public init(
         runRepo: AgentRunRepository,
         messageRepo: AgentMessageRepository,
@@ -931,6 +936,15 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                         threadId: threadId,
                         allowFinalResponseTranslation: false
                     )
+                    // Signal callers that a translated message was persisted.
+                    // activeAssistantMessageIds[runId] is set by the turnCompleted
+                    // handle above (persistAssistantIfMissing -> activeAssistantMessageIds).
+                    self.lock.lock()
+                    let translatedMsgId = self.activeAssistantMessageIds[runId]
+                    self.lock.unlock()
+                    if let mid = translatedMsgId {
+                        self.onSR1TranslatedMessageId?(mid)
+                    }
                 }
                 return
             }

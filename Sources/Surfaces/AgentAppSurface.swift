@@ -155,6 +155,11 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// an app relaunch and has a recoverable provider session. Drives the inline
     /// Continue action. Cleared when a run starts or the selected thread changes.
     @Published public private(set) var selectedThreadHasRecoverableContext: Bool = false
+    /// UX-SR1-BADGE: ids of assistant messages that were SR1-translated this session.
+    /// Populated by the coordinator's onSR1TranslatedMessageId callback; not persisted.
+    /// After reload the badge is absent for previously-translated messages (follow-up:
+    /// persist wasTranslated on AgentMessage to survive restarts).
+    @Published public private(set) var sr1TranslatedMessageIds: Set<AgentMessageID> = []
 
     public let workspaceID: WorkspaceID
     public let cwd: String
@@ -219,6 +224,11 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         self.promptHistory = promptHistoryStore?.load(workspaceID: workspaceID) ?? []
         reloadCustomModels()
         self.coordinator.addObserver(self)
+        self.coordinator.onSR1TranslatedMessageId = { [weak self] msgId in
+            Task { @MainActor [weak self] in
+                self?.sr1TranslatedMessageIds.insert(msgId)
+            }
+        }
         reloadThreads()
         loadGitBranch()
     }
@@ -2388,6 +2398,14 @@ public struct AgentAppView: View {
 
     public init(vm: AgentAppViewModel) { self.vm = vm }
 
+    /// Pure seam: whether to show the "translated from compressed output" badge.
+    /// WHY: humanized SR1 replies should be transparently labeled so the user knows
+    /// the message was rewritten by Token Saver. Tested in isolation so the badge
+    /// decision is independent of view state.
+    static func showsTranslatedBadge(wasSR1Translated: Bool) -> Bool {
+        wasSR1Translated
+    }
+
     static func shouldRenderFinalAssistantMessage(_ turn: AssistantTurnSnapshot, persistedAssistantTexts: [String] = []) -> Bool {
         guard let final = turn.finalAssistantMessage, !final.isEmpty else { return false }
         if assistantText(final, matchesAny: persistedAssistantTexts) { return false }
@@ -4327,7 +4345,19 @@ public struct AgentAppView: View {
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .accessibilityLabel("Content omitted: message body was too large to display")
                 } else {
-                    assistantProse(msg.content)
+                    let showBadge = Self.showsTranslatedBadge(
+                        wasSR1Translated: vm.sr1TranslatedMessageIds.contains(msg.id)
+                    )
+                    VStack(alignment: .leading, spacing: DS.Space.xs) {
+                        if showBadge {
+                            Text("translated from compressed output")
+                                .font(DS.Font.caption2)
+                                .foregroundColor(DS.Palette.textTertiary)
+                                .accessibilityLabel("This reply was translated from Token Saver compressed output")
+                                .accessibilityIdentifier("agent.assistantMessage.sr1Badge.\(msg.id.value.uuidString)")
+                        }
+                        assistantProse(msg.content)
+                    }
                 }
             }
         case .system:
