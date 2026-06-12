@@ -10,17 +10,26 @@ public struct DeadlineDistillRuntime: DistillRuntime {
     private let wrapped: any DistillRuntime
     private let deadline: Duration
     private let fallback: @Sendable (DistillRequest) -> String
+    /// Called when the deadline fires or the runtime throws and the deterministic
+    /// fallback is returned.  Wire this to `DistillServiceMetricsRecorder.recordFallback()`
+    /// so operators can detect a permanently-cold model via /metrics.
+    /// WHY: without this hook every deadline-exceeded response goes through the
+    /// success path, making `fallbackRequests` permanently zero even when the MLX
+    /// model never warms up (silent fail-open that metrics cannot detect).
+    private let onFallback: (@Sendable () async -> Void)?
 
     private struct DeadlineExceeded: Error {}
 
     public init(
         wrapping wrapped: any DistillRuntime,
         deadlineMilliseconds: Int,
-        fallback: @escaping @Sendable (DistillRequest) -> String = { MLXDistillRuntime.fallbackOutput(for: $0) }
+        fallback: @escaping @Sendable (DistillRequest) -> String = { MLXDistillRuntime.fallbackOutput(for: $0) },
+        onFallback: (@Sendable () async -> Void)? = nil
     ) {
         self.wrapped = wrapped
         self.deadline = .milliseconds(max(1, deadlineMilliseconds))
         self.fallback = fallback
+        self.onFallback = onFallback
     }
 
     public func distill(_ request: DistillRequest) async throws -> String {
@@ -42,6 +51,9 @@ public struct DeadlineDistillRuntime: DistillRuntime {
         } catch {
             // Deadline exceeded or the runtime threw: fail open to the deterministic
             // fallback. Never propagate — the agent turn must proceed.
+            if let onFallback {
+                await onFallback()
+            }
             return fallback(request)
         }
     }

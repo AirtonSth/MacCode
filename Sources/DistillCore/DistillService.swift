@@ -263,7 +263,10 @@ public final class DistillHTTPServer: @unchecked Sendable {
 
     private let configuration: DistillServiceConfiguration
     private let scheduler: DistillScheduler
-    private let metrics = DistillServiceMetricsRecorder()
+    /// Exposed so callers can wire `DeadlineDistillRuntime.onFallback` to
+    /// `metrics.recordFallback()` without coupling the scheduler layer to the
+    /// HTTP layer.  Read-only; the recorder itself is the mutation surface.
+    public let metrics: DistillServiceMetricsRecorder
     private let queue = DispatchQueue(label: "io.remotecode.distill.http", qos: .userInitiated)
     private let encoder = JSONEncoder()
     private let decoder = JSONDecoder()
@@ -281,6 +284,7 @@ public final class DistillHTTPServer: @unchecked Sendable {
         reversibleStore: ReversibleStoring? = nil,
         reversibleStoreMinBytes: Int = 8_192,
         startsReady: Bool = true,
+        metricsRecorder: DistillServiceMetricsRecorder? = nil,
         onSuccess: SuccessHandler? = nil
     ) {
         self.configuration = configuration
@@ -288,6 +292,7 @@ public final class DistillHTTPServer: @unchecked Sendable {
         self.reversibleStore = reversibleStore
         self.reversibleStoreMinBytes = max(1, reversibleStoreMinBytes)
         self._ready = startsReady
+        self.metrics = metricsRecorder ?? DistillServiceMetricsRecorder()
         self.onSuccess = onSuccess
     }
 

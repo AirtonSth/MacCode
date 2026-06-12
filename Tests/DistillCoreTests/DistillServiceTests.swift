@@ -398,6 +398,138 @@ final class DistillServiceTests: XCTestCase {
         return (http.statusCode, data)
     }
 
+    // MARK: - DeadlineDistillRuntime fallback counter wiring
+
+    // WHY: a permanently-cold MLX model returns the deterministic fallback on
+    // every call, but prior to the onFallback hook those responses went through
+    // the success path, so fallbackRequests stayed zero and the model's cold state
+    // was undetectable via /metrics.  This test verifies that:
+    //   (a) onFallback fires on the deadline-exceeded path (not the success path),
+    //   (b) onFallback does NOT fire when the runtime succeeds within the deadline,
+    //   (c) the shared metrics recorder passed to DistillHTTPServer reflects the
+    //       fallback count via /metrics -- proving the full production wiring.
+    func test_deadlineRuntime_onFallback_firesOnDeadlinePath_notOnSuccessPath() async throws {
+        // Actor-safe counter: counts onFallback invocations.
+        actor FallbackCounter {
+            private(set) var count = 0
+            func increment() { count += 1 }
+        }
+        let counter = FallbackCounter()
+
+        // Runtime that never completes (simulates a permanently-cold model).
+        struct InfiniteRuntime: DistillRuntime {
+            func distill(_ request: DistillRequest) async throws -> String {
+                // Block until cancelled (task group cancellation from deadline fire).
+                try await Task.sleep(for: .seconds(60))
+                return "unreachable"
+            }
+        }
+
+        let runtime = DeadlineDistillRuntime(
+            wrapping: InfiniteRuntime(),
+            // 10 ms deadline so the test completes quickly without a real sleep.
+            deadlineMilliseconds: 10,
+            onFallback: { await counter.increment() }
+        )
+
+        // (a) deadline-exceeded path: onFallback must fire, result is the fallback string.
+        let result = try await runtime.distill(
+            DistillRequest(mode: .commandOutput, input: "some output", maxOutputCharacters: 200)
+        )
+        XCTAssertFalse(result.isEmpty,
+                       "deadline fallback must return a non-empty deterministic result, not an empty string")
+        let countAfterFallback = await counter.count
+        XCTAssertEqual(countAfterFallback, 1,
+                       "onFallback must fire exactly once when the deadline fires before the runtime finishes")
+
+        // (b) success path: a fast runtime must NOT trigger onFallback.
+        struct FastRuntime: DistillRuntime {
+            func distill(_ request: DistillRequest) async throws -> String { "PASS" }
+        }
+        let fastRuntime = DeadlineDistillRuntime(
+            wrapping: FastRuntime(),
+            deadlineMilliseconds: 5_000,   // generous deadline -- fast runtime wins
+            onFallback: { await counter.increment() }
+        )
+        _ = try await fastRuntime.distill(
+            DistillRequest(mode: .commandOutput, input: "x", maxOutputCharacters: 200)
+        )
+        let countAfterSuccess = await counter.count
+        XCTAssertEqual(countAfterSuccess, 1,
+                       "onFallback must NOT fire when the runtime succeeds within the deadline")
+    }
+
+    // WHY: the full production wiring passes a shared DistillServiceMetricsRecorder
+    // to both DeadlineDistillRuntime.onFallback and DistillHTTPServer (via
+    // metricsRecorder:).  This test exercises that path end-to-end: a fallback
+    // response must appear in /metrics as fallbackRequests=1, NOT as
+    // successfulRequests=1, so operators can detect a permanently-cold model.
+    func test_httpServer_sharedMetrics_fallbackCountAppearsInMetricsEndpoint() async throws {
+        let sharedMetrics = DistillServiceMetricsRecorder()
+
+        struct InfiniteRuntime: DistillRuntime {
+            func distill(_ request: DistillRequest) async throws -> String {
+                try await Task.sleep(for: .seconds(60))
+                return "unreachable"
+            }
+        }
+
+        let configuration = try DistillServiceConfiguration(
+            authToken: "fallback-wiring-token",
+            appSupportDirectory: NSTemporaryDirectory(),
+            maxConcurrentRequests: 1
+        )
+        // Use 10 ms deadline directly (bypasses configuration's 1 s floor so the
+        // test completes quickly without sleeping for the full minimum).
+        let scheduler = DistillScheduler(
+            runtime: DeadlineDistillRuntime(
+                wrapping: InfiniteRuntime(),
+                deadlineMilliseconds: 10,
+                onFallback: { await sharedMetrics.recordFallback() }
+            ),
+            maxConcurrentRequests: 1
+        )
+        let server = DistillHTTPServer(
+            configuration: configuration,
+            scheduler: scheduler,
+            metricsRecorder: sharedMetrics
+        )
+        let ready = try await server.start()
+        defer { server.stop() }
+
+        // Submit one distill request -- the InfiniteRuntime never finishes,
+        // so DeadlineDistillRuntime fires the fallback after 10 ms.
+        let body = try JSONEncoder().encode(
+            DistillRequest(mode: .commandOutput, input: "test input", maxOutputCharacters: 200)
+        )
+        let distillResp = try await response(
+            baseURL: ready.baseURL,
+            path: "/v1/distill",
+            method: "POST",
+            token: "fallback-wiring-token",
+            body: body
+        )
+        // The request still returns 200 (fail-open), but the response carries the
+        // deterministic fallback output, not the InfiniteRuntime output.
+        XCTAssertEqual(distillResp.status, 200, "deadline fallback must still yield a 200 response (fail-open)")
+
+        // /metrics must now show fallbackRequests=1 and successfulRequests=0.
+        let metricsResp = try await response(
+            baseURL: ready.baseURL,
+            path: "/metrics",
+            token: "fallback-wiring-token"
+        )
+        XCTAssertEqual(metricsResp.status, 200)
+        let snapshot = try JSONDecoder().decode(DistillServiceMetrics.self, from: metricsResp.data)
+        XCTAssertEqual(snapshot.fallbackRequests, 1,
+                       "deadline-exceeded path must increment fallbackRequests so operators can detect a cold model; " +
+                       "prior to the wiring this counter stayed zero even when every call hit the fallback")
+        XCTAssertEqual(snapshot.failedRequests, 0,
+                       "a fail-open fallback response must not increment failedRequests; " +
+                       "it still yields a usable 200 response to the caller")
+        XCTAssertEqual(snapshot.totalRequests, 1, "one request was submitted regardless of how it resolved")
+    }
+
     // MARK: - invalidate
 
     /// Replacing a cached DistillServiceClient must call invalidate() on the old

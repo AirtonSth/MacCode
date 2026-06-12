@@ -33,12 +33,20 @@ struct RemoteCodeDistillServiceMain {
 
             let configuration = try DistillServiceConfiguration.parse(arguments: arguments)
             let baseRuntime = try await runtime(for: configuration)
+            // Shared metrics recorder: wired to both the HTTP server (which reads
+            // it for /metrics) and to DeadlineDistillRuntime.onFallback (which
+            // increments fallbackRequests on every deadline-exceeded path).
+            // WHY: without this wiring fallback responses went through the success
+            // path, so fallbackRequests stayed zero even when the model never warmed
+            // up -- a permanently-cold model was undetectable via /metrics.
+            let sharedMetrics = DistillServiceMetricsRecorder()
             // Per-call deadline + fail-open so a stalled/cold generation never blocks
             // the agent loop (N2). Warmup below pays the cold-start before we serve.
             let scheduler = DistillScheduler(
                 runtime: DeadlineDistillRuntime(
                     wrapping: baseRuntime,
-                    deadlineMilliseconds: configuration.mlxCallDeadlineMS
+                    deadlineMilliseconds: configuration.mlxCallDeadlineMS,
+                    onFallback: { await sharedMetrics.recordFallback() }
                 ),
                 maxConcurrentRequests: configuration.maxConcurrentRequests,
                 maxQueueDepth: configuration.maxQueueDepth
@@ -49,7 +57,7 @@ struct RemoteCodeDistillServiceMain {
             let savingsRepo = TokenSaverSavingsRepository(db: db)
             let reversibleStore = SidecarReversibleStore(store: ReversibleContentStore(db: db))
             let eventWriter = DistillSidecarEventWriter()
-            let server = DistillHTTPServer(configuration: configuration, scheduler: scheduler, reversibleStore: reversibleStore, startsReady: false) { request, response in
+            let server = DistillHTTPServer(configuration: configuration, scheduler: scheduler, reversibleStore: reversibleStore, startsReady: false, metricsRecorder: sharedMetrics) { request, response in
                 guard let record = DistillSavingsCalculator.record(for: request, response: response) else {
                     return
                 }

@@ -418,6 +418,60 @@ private struct TokenSaverDistillProcessEvent: Codable {
     }
 }
 
+// MARK: - Process spawner seam
+
+/// Result of spawning the sidecar process.
+/// Carries the live `Process` handle plus the read ends of stdout and stderr,
+/// so the controller can wire readability handlers without knowing how the pipes
+/// were created (real `Pipe()` vs. test-injected `FileHandle`).
+public struct DistillSpawnResult: @unchecked Sendable {
+    public let process: Process
+    public let stdoutHandle: FileHandle
+    public let stderrHandle: FileHandle
+
+    public init(process: Process, stdoutHandle: FileHandle, stderrHandle: FileHandle) {
+        self.process = process
+        self.stdoutHandle = stdoutHandle
+        self.stderrHandle = stderrHandle
+    }
+}
+
+/// Abstracts `Process()` creation so crash/EOF/stderr scenarios are exercisable
+/// in unit tests without launching the real `RemoteCodeDistillService` binary.
+/// WHY: the start() method hard-codes `Process()`, making it impossible to
+/// simulate a crash (process exits immediately), an EOF on stdout (ready event
+/// never arrives), or stderr flooding without a real binary on-disk (Rule 8).
+/// The default implementation creates real `Pipe`-backed processes; tests inject
+/// a factory that returns a pre-wired fast-exit process or a controlled pipe.
+public protocol DistillProcessSpawning: Sendable {
+    /// Create and run a process.  Must call `process.run()` before returning.
+    /// Throws if the process cannot be launched.
+    func spawn(executableURL: URL, arguments: [String]) throws -> DistillSpawnResult
+}
+
+/// Real (production) spawner: creates a `Process` with two `Pipe` instances and
+/// calls `run()`.  This is identical to the code that was previously inlined in
+/// `start()`, with no behaviour change in production.
+public struct RealDistillProcessSpawner: DistillProcessSpawning, Sendable {
+    public init() {}
+
+    public func spawn(executableURL: URL, arguments: [String]) throws -> DistillSpawnResult {
+        let process = Process()
+        let stdout = Pipe()
+        let stderr = Pipe()
+        process.executableURL = executableURL
+        process.standardOutput = stdout
+        process.standardError = stderr
+        process.arguments = arguments
+        try process.run()
+        return DistillSpawnResult(
+            process: process,
+            stdoutHandle: stdout.fileHandleForReading,
+            stderrHandle: stderr.fileHandleForReading
+        )
+    }
+}
+
 @MainActor
 public final class TokenSaverDistillServiceController {
     public typealias ExecutableURLResolver = @MainActor () -> URL?
@@ -435,6 +489,7 @@ public final class TokenSaverDistillServiceController {
 
     private let appSupportDirectory: URL
     private let executableURLResolver: ExecutableURLResolver
+    private let processSpawner: any DistillProcessSpawning
     private var process: Process?
     private var readyOutputHandle: FileHandle?
     private var readyOutputBuffer = Data()
@@ -456,11 +511,13 @@ public final class TokenSaverDistillServiceController {
     public init(
         appSupportDirectory: URL,
         executableURLResolver: @escaping ExecutableURLResolver = TokenSaverDistillServiceController.defaultExecutableURL,
-        idleTimeoutMS: Int = 300_000
+        idleTimeoutMS: Int = 300_000,
+        processSpawner: any DistillProcessSpawning = RealDistillProcessSpawner()
     ) {
         self.appSupportDirectory = appSupportDirectory
         self.executableURLResolver = executableURLResolver
         self.idleTimeoutMS = idleTimeoutMS
+        self.processSpawner = processSpawner
     }
 
     deinit {
@@ -607,13 +664,7 @@ public final class TokenSaverDistillServiceController {
         }
 
         let token = UUID().uuidString
-        let process = Process()
-        let stdout = Pipe()
-        let stderr = Pipe()
-        process.executableURL = executableURL
-        process.standardOutput = stdout
-        process.standardError = stderr
-        process.arguments = [
+        let arguments = [
             "--auth-token", token,
             "--app-support-dir", appSupportDirectory.path,
             "--host", "127.0.0.1",
@@ -627,7 +678,8 @@ public final class TokenSaverDistillServiceController {
         ]
 
         do {
-            try process.run()
+            let spawned = try processSpawner.spawn(executableURL: executableURL, arguments: arguments)
+            let process = spawned.process
             self.process = process
             self.bearerToken = token
             self.status = .starting
@@ -643,10 +695,10 @@ public final class TokenSaverDistillServiceController {
             // Drain stderr continuously so the pipe buffer never fills.
             // Without this handler the sidecar blocks on any stderr write once
             // the 64 KB kernel pipe buffer is full, producing a deadlock.
-            stderr.fileHandleForReading.readabilityHandler = { handle in
+            spawned.stderrHandle.readabilityHandler = { handle in
                 _ = handle.availableData   // discard; keeps the buffer empty
             }
-            readReadyEvent(from: stdout.fileHandleForReading, process: process)
+            readReadyEvent(from: spawned.stdoutHandle, process: process)
         } catch {
             self.status = .failed("RemoteCodeDistillService launch failed")
             self.bearerToken = nil

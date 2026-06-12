@@ -306,19 +306,41 @@ enum ProcessTerminator {
         return errno == EPERM
     }
 
-    // Returns the full process subtree rooted at `root` (children-first, root last)
-    // using libproc, enumerating once instead of recursive pgrep subprocesses.
-    private static func processTreePIDs(root: Int32) -> [Int32] {
-        directChildPIDs(of: root).flatMap(processTreePIDs(root:)) + [root]
+    // Returns the full process subtree rooted at `root` (children-first, root last).
+    // Uses the injected `childPIDProvider` so tests can supply fake process trees
+    // without spawning real processes.
+    // `internal` (not `private`) so tests can call it directly to verify provider wiring.
+    static func processTreePIDs(root: Int32) -> [Int32] {
+        childPIDProvider.directChildren(of: root).flatMap(processTreePIDs(root:)) + [root]
     }
 
-    private static func directChildPIDs(of pid: Int32) -> [Int32] {
-        let size = proc_listchildpids(pid, nil, 0)
-        guard size > 0 else { return [] }
-        var buffer = [pid_t](repeating: 0, count: Int(size))
-        let written = proc_listchildpids(pid, &buffer, size * Int32(MemoryLayout<pid_t>.size))
-        guard written > 0 else { return [] }
-        let count = min(Int(written), buffer.count)
-        return buffer.prefix(count).filter { $0 > 0 }
+    // MARK: - Child-PID provider seam
+
+    /// Abstracts the kernel lookup of direct child PIDs so termination ordering
+    /// and escalation logic can be exercised in unit tests with a fake tree,
+    /// without spawning real processes (Rule 8). The default implementation
+    /// calls `proc_listchildpids` directly (libproc, single enumeration).
+    /// `internal` so `@testable import AgentRuntime` exposes it to tests.
+    protocol ChildPIDProviding: Sendable {
+        func directChildren(of pid: Int32) -> [Int32]
     }
+
+    /// Real (production) provider backed by `proc_listchildpids`.
+    struct LibprocChildPIDProvider: ChildPIDProviding {
+        func directChildren(of pid: Int32) -> [Int32] {
+            let size = proc_listchildpids(pid, nil, 0)
+            guard size > 0 else { return [] }
+            var buffer = [pid_t](repeating: 0, count: Int(size))
+            let written = proc_listchildpids(pid, &buffer, size * Int32(MemoryLayout<pid_t>.size))
+            guard written > 0 else { return [] }
+            let count = min(Int(written), buffer.count)
+            return buffer.prefix(count).filter { $0 > 0 }
+        }
+    }
+
+    /// Injected provider; defaults to the real `proc_listchildpids` implementation.
+    /// Tests replace this with a `FakeChildPIDProvider` that returns a pre-wired tree.
+    /// Written only in tests (before concurrent access begins) and read on a
+    /// single thread from `terminateTree`.  There is no concurrent mutation in production.
+    static var childPIDProvider: any ChildPIDProviding = LibprocChildPIDProvider()
 }
