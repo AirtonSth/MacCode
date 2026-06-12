@@ -46,8 +46,8 @@ public struct DeadlineDistillRuntime: DistillRuntime {
         }
     }
 
-    public func warmup() async {
-        await wrapped.warmup()
+    public func warmup() async throws {
+        try await wrapped.warmup()
     }
 
     public func reclaimIdleMemory() {

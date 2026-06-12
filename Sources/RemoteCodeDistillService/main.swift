@@ -71,8 +71,14 @@ struct RemoteCodeDistillServiceMain {
             // Pay the model cold-start NOW, while /readyz still reports 503, so the
             // first real agent turn never awaits a cold model. Only after warmup do
             // we flip readiness and emit the ready event the controller waits for.
-            await baseRuntime.warmup()
-            server.markReady()
+            // If warmup fails, skip markReady() so /readyz stays 503 and the
+            // controller sees a degraded service rather than a falsely-ready one.
+            do {
+                try await baseRuntime.warmup()
+                server.markReady()
+            } catch {
+                FileHandle.standardError.write(Data("RemoteCodeDistillService warmup failed (service degraded, /readyz will stay 503): \(error)\n".utf8))
+            }
             let encoder = JSONEncoder()
             let payload = try encoder.encode(ready)
             FileHandle.standardOutput.write(payload)

@@ -22,7 +22,7 @@ final class DistillLivePerfTests: XCTestCase {
         let runtime = try await MLXDistillRuntime(modelDirectory: installer.modelStorageDirectory(revision: manifest.revision))
 
         // Pay cold-start before measuring (proves warmup removes the first-call cost).
-        await runtime.warmup()
+        try await runtime.warmup()
 
         // Budget: a warm distill on Apple Silicon must stay well under the per-call
         // deadline (default 20s). 18s p95 leaves headroom while catching a stall.

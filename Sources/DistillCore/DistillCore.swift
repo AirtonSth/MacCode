@@ -213,14 +213,15 @@ public protocol DistillRuntime: Sendable {
 
     /// Pay any one-time cold-start cost (model load, Metal kernel JIT) up front so
     /// the first real request never blocks on it on a live agent turn. Default no-op.
-    func warmup() async
+    /// Throws if the warmup inference fails, so the caller can mark the service degraded.
+    func warmup() async throws
 }
 
 public extension DistillRuntime {
     /// Runtimes without a reclaimable cache (deterministic/local) need do nothing.
     func reclaimIdleMemory() {}
     /// Runtimes with no cold-start cost need do nothing.
-    func warmup() async {}
+    func warmup() async throws {}
 }
 
 private enum SR1LineParser {
@@ -784,7 +785,7 @@ public struct MLXDistillRuntime: DistillRuntime {
 
     /// Pay the cold-start cost (Metal kernel JIT, first allocation) before the
     /// server accepts requests, so no live agent turn ever awaits a cold model.
-    public func warmup() async {
+    public func warmup() async throws {
         let parameters = GenerateParameters(maxTokens: 1, temperature: 0)
         let session = ChatSession(
             modelContainer,
@@ -793,7 +794,7 @@ public struct MLXDistillRuntime: DistillRuntime {
             additionalContext: ["enable_thinking": false]
         )
         await lane.acquire()
-        _ = try? await session.respond(to: "ok")
+        _ = try await session.respond(to: "ok")
         await lane.release()
         reclaimIdleMemory()
         NSLog("RemoteCodeDistillService MLX warmup complete")
