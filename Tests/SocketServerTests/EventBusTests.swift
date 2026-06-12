@@ -84,6 +84,36 @@ final class EventBusTests: XCTestCase {
         XCTAssertEqual(closed.values(), ["queue_full"])
     }
 
+    func test_subscriberSnapshotConsistencyAfterAddAndRemove() {
+        // WHY: publish iterates a cached snapshot instead of copying subscribers.values
+        // on every call; the cache must reflect every add and every remove so no event
+        // is delivered to a removed subscriber and no new subscriber is skipped.
+        let bus = EventBus()
+
+        var aReceived: [String] = []
+        var bReceived: [String] = []
+
+        let idA = bus.subscribe(since: nil) { aReceived.append($0.kind) }
+        let idB = bus.subscribe(since: nil) { bReceived.append($0.kind) }
+
+        bus.publish(kind: "e1", payload: .null)
+        // both A and B must receive e1 (snapshot includes both after two adds)
+        XCTAssertEqual(aReceived, ["e1"], "subscriber A missed event after add; snapshot not rebuilt on subscribe")
+        XCTAssertEqual(bReceived, ["e1"], "subscriber B missed event after add; snapshot not rebuilt on subscribe")
+
+        bus.unsubscribe(idA)
+        bus.publish(kind: "e2", payload: .null)
+        // A must NOT receive e2 (snapshot must have been rebuilt on unsubscribe)
+        XCTAssertEqual(aReceived, ["e1"], "removed subscriber A still received event; snapshot not rebuilt on unsubscribe")
+        XCTAssertEqual(bReceived, ["e1", "e2"], "subscriber B missed event after A was removed")
+
+        bus.unsubscribe(idB)
+        bus.publish(kind: "e3", payload: .null)
+        // neither A nor B should receive e3 (empty snapshot)
+        XCTAssertEqual(aReceived, ["e1"], "A received event after full unsubscribe")
+        XCTAssertEqual(bReceived, ["e1", "e2"], "B received event after full unsubscribe")
+    }
+
     @MainActor
     func test_dispatcher_eventsRecent_returnsBus() async {
         // publish to shared bus then query

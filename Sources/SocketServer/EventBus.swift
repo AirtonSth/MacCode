@@ -26,6 +26,9 @@ public final class EventBus: @unchecked Sendable {
     }
 
     private var subscribers: [UUID: Subscriber] = [:]
+    /// Cached flat array rebuilt only when subscribers are added or removed.
+    /// publish() reads this instead of copying subscribers.values every call.
+    private var subscribersSnapshot: [Subscriber] = []
     private var recent: [Event] = []
     private var recentBytes: Int = 0
     private let recentLimit: Int
@@ -58,7 +61,7 @@ public final class EventBus: @unchecked Sendable {
         if shouldRetainRecentEvent?(ev) ?? true {
             retainRecent(ev)
         }
-        let subs = Array(subscribers.values)
+        let subs = subscribersSnapshot
         let p = persister
         lock.unlock()
         p?(ev)
@@ -114,6 +117,7 @@ public final class EventBus: @unchecked Sendable {
         let id = UUID()
         lock.lock()
         subscribers[id] = Subscriber(filter: filter, handler: handler)
+        subscribersSnapshot = Array(subscribers.values)
         let backlog = recent.compactMap { event -> Event? in
             guard event.seq > (since ?? 0) else { return nil }
             return filter.map(event)
@@ -124,7 +128,10 @@ public final class EventBus: @unchecked Sendable {
     }
 
     public func unsubscribe(_ id: UUID) {
-        lock.lock(); subscribers.removeValue(forKey: id); lock.unlock()
+        lock.lock()
+        subscribers.removeValue(forKey: id)
+        subscribersSnapshot = Array(subscribers.values)
+        lock.unlock()
     }
 
     public func snapshot() -> (lastSeq: Int64, recent: [Event]) {
