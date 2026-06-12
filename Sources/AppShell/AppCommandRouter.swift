@@ -426,6 +426,9 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
 
     public func closeWorkspace(_ id: WorkspaceID, publishEvent: Bool = true) throws {
         try context?.apply(.closeWorkspace(id))
+        if let ctx = context {
+            try? PromptHistoryStore(db: ctx.db).delete(workspaceID: id)
+        }
         windowController?.refreshFromState()
         reconcileSurfaceVisibility()
         if publishEvent {
@@ -442,6 +445,8 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         for id in uniqueIds {
             try ctx.apply(.closeWorkspace(id))
         }
+        let store = PromptHistoryStore(db: ctx.db)
+        uniqueIds.forEach { try? store.delete(workspaceID: $0) }
         windowController?.refreshFromState()
         reconcileSurfaceVisibility()
         uniqueIds.forEach(publishWorkspaceClosed)

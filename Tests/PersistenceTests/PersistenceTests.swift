@@ -540,4 +540,32 @@ final class PersistenceTests: XCTestCase {
                        "fetching before the cursor must read the next older DB-backed terminal history page")
         XCTAssertFalse(older.hasMoreOlder)
     }
+
+    // Closing a workspace must delete its prompt history so user-typed prompts do
+    // not leak on disk indefinitely (privacy + unbounded settings-table growth).
+    func test_promptHistoryStore_deleteWorkspace_removesItsHistoryAndPreservesOthers() throws {
+        let tmp = NSTemporaryDirectory() + "RC2Test-" + UUID().uuidString
+        defer { try? FileManager.default.removeItem(atPath: tmp) }
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let store = PromptHistoryStore(db: db)
+
+        let wsA = WorkspaceID()
+        let wsB = WorkspaceID()
+
+        store.save(["cmd-a1", "cmd-a2"], workspaceID: wsA)
+        store.save(["cmd-b1"], workspaceID: wsB)
+
+        // Precondition: both workspaces have history.
+        XCTAssertEqual(store.load(workspaceID: wsA), ["cmd-a1", "cmd-a2"])
+        XCTAssertEqual(store.load(workspaceID: wsB), ["cmd-b1"])
+
+        // Simulate workspace A being closed/removed.
+        try store.delete(workspaceID: wsA)
+
+        // Post-condition: A's history is gone; B's is untouched.
+        XCTAssertTrue(store.load(workspaceID: wsA).isEmpty,
+                      "closing a workspace must purge its prompt history from the settings table")
+        XCTAssertEqual(store.load(workspaceID: wsB), ["cmd-b1"],
+                       "deleting one workspace's prompt history must not affect other workspaces")
+    }
 }
