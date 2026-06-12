@@ -116,7 +116,14 @@ public struct LayoutReducer {
             guard let current = next.window.workspaces.firstIndex(of: wid) else { throw LayoutError.workspaceNotFound }
             var order = next.window.workspaces
             order.remove(at: current)
-            order.insert(wid, at: max(0, min(position, order.count)))
+            // `position` is the target's index in the pre-remove array.  When the
+            // dragged item sits before the target (downward drag, current < position),
+            // removing it shifts every subsequent item left by one, so the target is
+            // now at `position - 1`.  Insert at `position - 1` to land just before it,
+            // matching the insertion-line that renders at the top of the target row.
+            // Upward drag (current >= position): no shift occurs; insert at `position`.
+            let insertIndex = LayoutReducer.reorderedIndex(dragged: current, target: position)
+            order.insert(wid, at: max(0, min(insertIndex, order.count)))
             next.window.workspaces = pinSorted(order, workspaces: next.workspaces)
             return next
         case let .promoteWorkspace(wid):
@@ -325,6 +332,25 @@ public struct LayoutReducer {
     }
 
     // MARK: helpers
+
+    /// Computes the insertion index into the post-remove array so that the item
+    /// lands immediately before the visual target row.
+    ///
+    /// Convention: `dragged` and `target` are indices into the same pre-remove
+    /// array.  `target` is the index of the row whose top edge shows the insertion
+    /// line (i.e. "insert before target").
+    ///
+    /// - Upward drag (dragged > target): removing `dragged` does not shift items
+    ///   before it, so `target` stays at the same index in the post-remove array.
+    ///   Return `target` unchanged.
+    /// - Downward drag (dragged < target): removing `dragged` shifts every
+    ///   subsequent item left by one, so the target row is now at `target - 1` in
+    ///   the post-remove array.  Return `target - 1` so the item lands before it.
+    /// - Same index: treated as upward (no adjustment), but callers should guard
+    ///   against no-op moves before reaching here.
+    public static func reorderedIndex(dragged: Int, target: Int) -> Int {
+        dragged < target ? target - 1 : target
+    }
 
     private func isPinned(_ id: WorkspaceID, workspaces: [WorkspaceID: Workspace]) -> Bool {
         workspaces[id]?.metadata["pinned"] == "true"

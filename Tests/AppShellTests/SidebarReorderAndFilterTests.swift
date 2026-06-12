@@ -26,30 +26,28 @@ final class SidebarReorderAndFilterTests: XCTestCase {
     // MARK: - T001: downward drag-reorder
 
     /// WHY: WorkspaceEditTests covers upward-only drag (third before first).
-    /// Downward drag was not tested.  A bug in the position calculation only
-    /// for downward moves would silently place the dragged workspace at the
-    /// wrong index, scrambling the sidebar order the user set.
-    ///
-    /// Implementation note: reorderWorkspace(dragged, before: target) inserts
-    /// dragged at target's pre-removal index.  When dragged is before target in
-    /// the list, removing dragged shifts remaining items left, so the insert
-    /// at targetIndex places dragged AFTER target (downward drag lands at end
-    /// when target is the last element).
-    func test_reorderWorkspace_downward_movesWorkspaceToEnd() throws {
+    /// Downward drag was the source of an off-by-one bug: passing the pre-removal
+    /// target index to the reducer without adjusting for the left-shift caused by
+    /// removing the dragged item first.  A downward drag that fires "before gamma"
+    /// must land ABOVE gamma, not one row below it.
+    func test_reorderWorkspace_downward_movesWorkspaceBeforeTarget() throws {
         let (ctx, router, vm) = try make()
         let a = try router.createWorkspace(name: "alpha", cwd: "/a")
         let b = try router.createWorkspace(name: "beta",  cwd: "/b")
         let c = try router.createWorkspace(name: "gamma", cwd: "/c")
         vm.reload()
 
-        // Drag alpha (index 0) "before" gamma (index 2).  After removing alpha
-        // from [a,b,c] -> [b,c], insert at position 2 -> [b,c,a].
+        // Drag alpha (index 0) "before" gamma (index 2).
+        // Reducer removes alpha from [a,b,c] -> [b,c], then inserts at
+        // reorderedIndex(dragged:0, target:2) = 1 -> [b,a,c].
+        // WHY this matters: the insertion line renders at the TOP of the target
+        // row; landing one row past it is a daily papercut for any downward drag.
         vm.reorderWorkspace(a.id, before: c.id)
 
         let order = ctx.state.window.workspaces
-        XCTAssertEqual(order, [b.id, c.id, a.id],
-                       "downward drag: alpha at index 0 reordered before gamma at index 2 must produce [beta, gamma, alpha]  -  " +
-                       "the position-based insert places the item at the pre-removal target index, after removal shifts the list")
+        XCTAssertEqual(order, [b.id, a.id, c.id],
+                       "downward drag: alpha before gamma must produce [beta, alpha, gamma]  -  " +
+                       "the insertion line is at the top of the target row so the item must land immediately before it")
     }
 
     /// WHY: Dragging the middle workspace to just before the first must produce
@@ -109,7 +107,7 @@ final class SidebarReorderAndFilterTests: XCTestCase {
 
         // Drag alpha (canonical index 0) "before" gamma (canonical index 2).
         // Reducer: remove alpha from [alpha, HIDDEN, gamma] -> [HIDDEN, gamma],
-        // insert at 2 -> [HIDDEN, gamma, alpha].
+        // insert at reorderedIndex(dragged:0, target:2) = 1 -> [HIDDEN, alpha, gamma].
         // Key invariant: the operation resolves against the canonical array,
         // not the filtered array, so HIDDEN stays at its correct canonical position.
         vm.reorderWorkspace(a.id, before: c.id)
@@ -119,10 +117,10 @@ final class SidebarReorderAndFilterTests: XCTestCase {
         // HIDDEN must still be present at some position (not dropped by the reorder).
         XCTAssertTrue(names.contains("HIDDEN"),
                       "reorder with filter active must not drop hidden workspaces from the canonical list")
-        // Alpha ends up after gamma (downward drag semantics, see T001).
-        XCTAssertTrue(names.firstIndex(of: "gamma")! < names.firstIndex(of: "alpha")!,
-                      "downward drag of alpha before gamma must place alpha after gamma in the canonical order  -  " +
-                      "the position resolves against the canonical array index of gamma")
+        // Alpha ends up before gamma (corrected downward drag semantics: insertion line is at top of target).
+        XCTAssertTrue(names.firstIndex(of: "alpha")! < names.firstIndex(of: "gamma")!,
+                      "downward drag of alpha before gamma must place alpha before gamma in the canonical order  -  " +
+                      "the insertion line is at the top of the target row so the item must land immediately before it")
         _ = b  // suppress unused warning
     }
 

@@ -137,4 +137,76 @@ final class LayoutReducerTests: XCTestCase {
         s = try r.reduce(s, .focusSurface(wid, a.id))
         XCTAssertEqual(s.workspaces[wid]!.focusedPaneID, p)
     }
+
+    // MARK: - reorderedIndex helper
+
+    /// WHY: reorderedIndex is the single index-adjustment gate for drag-reorder.
+    /// A downward drag (dragged < target) must subtract 1 because removing the
+    /// dragged item shifts all subsequent indices left; without the adjustment the
+    /// item lands one row AFTER the insertion line instead of on it.
+    func test_reorderedIndex_downwardDrag_subtractsOne() {
+        // [A,B,C,D]: drag A (0) before C (2).
+        // Remove A -> [B,C,D].  C is now at 1.  Insert before C -> index 1.
+        XCTAssertEqual(LayoutReducer.reorderedIndex(dragged: 0, target: 2), 1,
+                       "downward drag must subtract 1 from target to compensate for left-shift after removal")
+    }
+
+    /// WHY: upward drag must not adjust the index -- removing an item that sits
+    /// after the target does not shift the target.  Adjusting would land the item
+    /// one row too high.
+    func test_reorderedIndex_upwardDrag_unchanged() {
+        // [A,B,C]: drag C (2) before A (0).
+        // Remove C -> [A,B].  A is still at 0.  Insert before A -> index 0.
+        XCTAssertEqual(LayoutReducer.reorderedIndex(dragged: 2, target: 0), 0,
+                       "upward drag must leave target index unchanged  -  " +
+                       "the dragged item is after the target so removal does not shift the target")
+    }
+
+    /// WHY: dragging to the immediately adjacent slot in each direction must
+    /// produce the correct neighbour swap, not a no-op or out-of-bounds.
+    func test_reorderedIndex_adjacentDownward_subtractsOne() {
+        // [A,B]: drag A (0) before B (1) -> insertIndex = 0.
+        XCTAssertEqual(LayoutReducer.reorderedIndex(dragged: 0, target: 1), 0,
+                       "dragging one step down must produce insertIndex 0 (adjacent swap)")
+    }
+
+    func test_reorderedIndex_adjacentUpward_unchanged() {
+        // [A,B]: drag B (1) before A (0) -> insertIndex = 0.
+        XCTAssertEqual(LayoutReducer.reorderedIndex(dragged: 1, target: 0), 0,
+                       "dragging one step up must produce insertIndex 0 (adjacent swap)")
+    }
+
+    /// WHY: same-index input (before-guard caller passes dragged == target)
+    /// must return target unchanged so callers that skip the no-op guard do not crash.
+    func test_reorderedIndex_sameIndex_unchanged() {
+        XCTAssertEqual(LayoutReducer.reorderedIndex(dragged: 2, target: 2), 2,
+                       "same dragged and target index must return target unchanged  -  " +
+                       "callers guard against this but the helper must not produce a negative index")
+    }
+
+    /// WHY: end-to-end reorder via the reducer must produce the visually correct
+    /// order for a 4-item downward drag, matching the example in the todo spec:
+    /// [A,B,C,D] move A to drop-before-C -> [B,A,C,D].
+    func test_reorderWorkspace_fourItem_downwardDrag_landsBeforeTarget() throws {
+        let r = LayoutReducer()
+        var s = LayoutState()
+        s = try r.reduce(s, .createWorkspace(name: "A", cwd: "/a", initial: nil))
+        let a = s.window.selectedWorkspaceID!
+        s = try r.reduce(s, .createWorkspace(name: "B", cwd: "/b", initial: nil))
+        let b = s.window.selectedWorkspaceID!
+        s = try r.reduce(s, .createWorkspace(name: "C", cwd: "/c", initial: nil))
+        let c = s.window.selectedWorkspaceID!
+        s = try r.reduce(s, .createWorkspace(name: "D", cwd: "/d", initial: nil))
+        let d = s.window.selectedWorkspaceID!
+        // Initial order: [A, B, C, D]
+        XCTAssertEqual(s.window.workspaces, [a, b, c, d])
+
+        // Drag A (index 0) before C (index 2).  SidebarView passes targetIndex=2.
+        // reorderedIndex(dragged:0, target:2) = 1.
+        // Result: [B, A, C, D].
+        s = try r.reduce(s, .reorderWorkspace(a, position: 2))
+        XCTAssertEqual(s.window.workspaces, [b, a, c, d],
+                       "[A,B,C,D] drag A before C must produce [B,A,C,D]  -  " +
+                       "the insertion line is at the top of C so A must land immediately before C, not after it")
+    }
 }
