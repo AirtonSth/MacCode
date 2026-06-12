@@ -300,7 +300,7 @@ public final class TokenSaverAccountUsageRefresher: TokenSaverAccountUsageRefres
     }
 
     private func fetchClaudeUsage(_ request: TokenSaverAccountUsageRefreshRequest) async -> AssistantAccountUsage? {
-        if let usage = runClaudeUsageScreen(request) {
+        if let usage = await runClaudeUsageScreen(request) {
             return usage
         }
         if let result = run(
@@ -321,7 +321,7 @@ public final class TokenSaverAccountUsageRefresher: TokenSaverAccountUsageRefres
         return nil
     }
 
-    private func runClaudeUsageScreen(_ request: TokenSaverAccountUsageRefreshRequest) -> AssistantAccountUsage? {
+    private func runClaudeUsageScreen(_ request: TokenSaverAccountUsageRefreshRequest) async -> AssistantAccountUsage? {
         guard let path = ProcessLocator.resolve(request.claudeBinary) else {
             return nil
         }
@@ -362,18 +362,26 @@ public final class TokenSaverAccountUsageRefresher: TokenSaverAccountUsageRefres
         var output = Data()
         let readyDeadline = Date().addingTimeInterval(min(10, max(2, timeoutSeconds / 2)))
         while Date() < readyDeadline {
+            if Task.isCancelled {
+                terminatePTYChild(pid)
+                return nil
+            }
             _ = readAvailablePTY(masterFD, into: &output)
             let text = String(decoding: output.suffix(64_000), as: UTF8.self)
             if text.contains("❯") {
                 break
             }
-            Thread.sleep(forTimeInterval: 0.15)
+            try? await Task.sleep(nanoseconds: 150_000_000)
         }
-        Thread.sleep(forTimeInterval: 0.25)
+        try? await Task.sleep(nanoseconds: 250_000_000)
 
         writePTY(masterFD, Data("/usage\r".utf8))
         let deadline = Date().addingTimeInterval(timeoutSeconds)
         while Date() < deadline {
+            if Task.isCancelled {
+                terminatePTYChild(pid)
+                return nil
+            }
             let childOpen = readAvailablePTY(masterFD, into: &output)
             let text = String(decoding: output.suffix(256_000), as: UTF8.self)
             if let usage = AssistantAccountUsageParser.claudeUsageScreen(text) {
@@ -381,11 +389,11 @@ public final class TokenSaverAccountUsageRefresher: TokenSaverAccountUsageRefres
                 return usage
             }
             if !childOpen && !isChildRunning(pid) { break }
-            Thread.sleep(forTimeInterval: 0.15)
+            try? await Task.sleep(nanoseconds: 150_000_000)
         }
 
         writePTY(masterFD, Data("\u{1B}/exit\r".utf8))
-        Thread.sleep(forTimeInterval: 0.2)
+        try? await Task.sleep(nanoseconds: 200_000_000)
         _ = readAvailablePTY(masterFD, into: &output)
         terminatePTYChild(pid)
         let text = String(decoding: output.suffix(256_000), as: UTF8.self)
