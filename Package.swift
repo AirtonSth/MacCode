@@ -158,6 +158,11 @@ let package = Package(
             name: "AppShellTests",
             dependencies: ["AppShell", "CoreModel", "Persistence", "SocketServer", "Surfaces"],
             path: "Tests/AppShellTests"
+        ),
+        .testTarget(
+            name: "DesignSystemKitTests",
+            dependencies: ["DesignSystemKit"],
+            path: "Tests/DesignSystemKitTests"
         )
     ],
     swiftLanguageVersions: [.v5]

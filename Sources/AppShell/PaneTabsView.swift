@@ -935,12 +935,6 @@ public final class PaneTabsView: NSObject {
         }
     }
 
-    /// Testable drop-position math. The index is the count of tab
-    /// midpoints strictly left of the drop point.
-    public static func dropInsertionIndex(tabMidXs: [CGFloat], dropX: CGFloat) -> Int {
-        tabMidXs.filter { dropX > $0 }.count
-    }
-
     /// Pure half-tab drop placement. Returns the insertion index for a
     /// surface dropped onto the tab at `index`: left half -> `index`
     /// (insert before), right half -> `index + 1` (insert after).
@@ -1131,7 +1125,6 @@ public final class PaneTabsView: NSObject {
 
 @MainActor
 final class PaneTabButton: NSView {
-    static let pasteboardType = NSPasteboard.PasteboardType("io.remotecode.surface-id")
     private static weak var highlightedTab: PaneTabButton?
     private static weak var highlightedStrip: PaneTabDropStack?
     private static weak var highlightedSplitRoot: PaneRootView?
@@ -1330,7 +1323,6 @@ final class PaneTabButton: NSView {
                                       options: [.mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect],
                                       owner: self, userInfo: nil)
         addTrackingArea(tracking)
-        registerForDraggedTypes([Self.pasteboardType])
     }
 
     func setBusy(_ busy: Bool) {
@@ -1536,21 +1528,6 @@ final class PaneTabButton: NSView {
         onClose()
     }
 
-    override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
-        draggedSurface(from: sender).map { $0 == surfaceID ? [] : .move } ?? []
-    }
-
-    override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
-        guard let dragged = draggedSurface(from: sender) else { return false }
-        return onDropSurface?(dragged) ?? false
-    }
-
-    private func draggedSurface(from info: NSDraggingInfo) -> SurfaceID? {
-        guard let raw = info.draggingPasteboard.string(forType: Self.pasteboardType),
-              let uuid = UUID(uuidString: raw) else { return nil }
-        return SurfaceID(uuid)
-    }
-
     private func performManualDrop(with event: NSEvent) {
         guard let contentView = window?.contentView else { return }
         let point = contentView.convert(event.locationInWindow, from: nil)
@@ -1694,8 +1671,6 @@ final class PaneTabButton: NSView {
         }
         return nil
     }
-
-    func performSelectFromTitlebarClick() { onSelect() }
 
     @objc private func closeClicked() { onClose() }
 
@@ -1987,13 +1962,11 @@ final class PaneTabDropStack: NoDragStack {
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         configureDropFeedback()
-        registerForDraggedTypes([PaneTabButton.pasteboardType])
     }
 
     required init?(coder: NSCoder) {
         super.init(coder: coder)
         configureDropFeedback()
-        registerForDraggedTypes([PaneTabButton.pasteboardType])
     }
 
     func setAppendHighlighted(_ active: Bool) {
@@ -2018,20 +1991,6 @@ final class PaneTabDropStack: NoDragStack {
         applyChromeColors()
     }
 
-    override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
-        draggedSurface(from: sender) == nil ? [] : .move
-    }
-
-    override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
-        guard let dragged = draggedSurface(from: sender) else { return false }
-        return onDropSurface?(dragged) ?? false
-    }
-
-    private func draggedSurface(from info: NSDraggingInfo) -> SurfaceID? {
-        guard let raw = info.draggingPasteboard.string(forType: PaneTabButton.pasteboardType),
-              let uuid = UUID(uuidString: raw) else { return nil }
-        return SurfaceID(uuid)
-    }
 }
 
 class NoDragScroll: NSScrollView {
