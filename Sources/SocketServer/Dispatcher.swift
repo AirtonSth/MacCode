@@ -57,6 +57,10 @@ public protocol CommandRouting: AnyObject {
     func selectAgentThread(thread: AgentThreadID) throws
     func listAgentMessages(thread: AgentThreadID, limit: Int) throws -> [AgentMessage]
     func listAgentMessagesPage(thread: AgentThreadID, limit: Int, before: AgentMessageCursor?, after: AgentMessageCursor?) throws -> AgentMessagePage
+    /// PERF-007: returns the set of thread IDs that have at least one message, via a
+    /// single SQL query. Used by agent.thread.list to derive provider_locked for every
+    /// thread without issuing one query per thread.
+    func threadIdsWithMessages() throws -> Set<AgentThreadID>
     func getAgentMessage(id: AgentMessageID) throws -> AgentMessage?
     func listAgentQueuedMessages(thread: AgentThreadID) throws -> [AgentQueuedMessage]
     func updateAgentQueuedMessage(id: AgentQueuedMessageID, text: String, attachments: [AgentAttachment]) throws -> AgentQueuedMessage
@@ -836,7 +840,9 @@ public final class JSONRPCDispatcher {
             case "agent.thread.list":
                 let wid: WorkspaceID? = params["workspace_id"]?.stringValue.flatMap(UUID.init).map(WorkspaceID.init)
                 let threads = try router.listAgentThreads(workspace: wid)
-                return .init(id: id, result: .array(threads.map(encodeThread)))
+                // PERF-007: one batch query for all threads instead of N per-thread queries.
+                let lockedThreads = (try? router.threadIdsWithMessages()) ?? []
+                return .init(id: id, result: .array(threads.map { encodeThread($0, lockedThreads: lockedThreads) }))
             case "agent.thread.create":
                 let wid: WorkspaceID? = params["workspace_id"]?.stringValue.flatMap(UUID.init).map(WorkspaceID.init)
                 let title = params["title"]?.stringValue ?? "New thread"
@@ -1794,6 +1800,24 @@ public final class JSONRPCDispatcher {
         object["base_branch"] = thread.baseBranch.map { .string($0) } ?? .null
         object["worktree_path"] = thread.worktreePath.map { .string($0) } ?? .null
         let locked = providerLocked(thread)
+        object["providerLocked"] = .bool(locked)
+        object["provider_locked"] = .bool(locked)
+        return .object(object)
+    }
+
+    /// Batch overload used by agent.thread.list (PERF-007): caller pre-fetches
+    /// the locked set once; no additional query is issued per thread.
+    private func encodeThread(_ thread: AgentThread, lockedThreads: Set<AgentThreadID>) -> JSONValue {
+        guard case .object(var object) = encode(thread) else { return .null }
+        let display = AgentThreadTitle.display(thread.title)
+        object["displayTitle"] = .string(display)
+        object["display_title"] = .string(display)
+        object["model_selection"] = encode(thread.modelSelection)
+        object["provider_instance_id"] = thread.providerInstanceId.map { .string($0) } ?? .null
+        object["execution_mode"] = .string(thread.executionMode.rawValue)
+        object["base_branch"] = thread.baseBranch.map { .string($0) } ?? .null
+        object["worktree_path"] = thread.worktreePath.map { .string($0) } ?? .null
+        let locked = lockedThreads.contains(thread.id)
         object["providerLocked"] = .bool(locked)
         object["provider_locked"] = .bool(locked)
         return .object(object)

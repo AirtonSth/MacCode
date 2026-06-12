@@ -1123,6 +1123,11 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         return try ctx.messageRepo.listRecent(threadId: thread, limit: max(0, min(limit, 500)))
     }
 
+    public func threadIdsWithMessages() throws -> Set<AgentThreadID> {
+        guard let ctx = context else { throw LayoutError.workspaceNotFound }
+        return try ctx.messageRepo.threadIdsWithMessages()
+    }
+
     public func listAgentMessagesPage(thread: AgentThreadID, limit: Int, before: AgentMessageCursor?, after: AgentMessageCursor? = nil) throws -> AgentMessagePage {
         guard let ctx = context else { throw LayoutError.workspaceNotFound }
         return try ctx.messageRepo.listPage(threadId: thread, limit: max(0, min(limit, 500)), before: before, after: after)

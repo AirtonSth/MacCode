@@ -245,6 +245,9 @@ class FakeRouter: CommandRouting, TerminalCommandRouting {
     func listAgentMessages(thread: AgentThreadID, limit: Int) throws -> [AgentMessage] {
         Array(messageStore.filter { $0.threadId == thread }.suffix(max(0, limit)))
     }
+    func threadIdsWithMessages() throws -> Set<AgentThreadID> {
+        Set(messageStore.map(\.threadId))
+    }
     func listAgentMessagesPage(thread: AgentThreadID, limit requestedLimit: Int, before beforeCursor: AgentMessageCursor?, after afterCursor: AgentMessageCursor?) throws -> AgentMessagePage {
         let limit = max(0, min(requestedLimit, 500))
         let filtered = messageStore
