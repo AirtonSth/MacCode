@@ -244,4 +244,35 @@ final class ANSIRendererTests: XCTestCase {
         XCTAssertEqual(srgb.greenComponent, green / 255.0, accuracy: 0.01, file: file, line: line)
         XCTAssertEqual(srgb.blueComponent, blue / 255.0, accuracy: 0.01, file: file, line: line)
     }
+
+    // MARK: - OSC buffer cap tests
+
+    /// WHY: a malformed or adversarial OSC string must not grow oscBuffer beyond
+    /// oscBufferCap, preventing unbounded memory growth (OOM risk on long-running
+    /// terminal sessions receiving crafted input).
+    func test_oscBuffer_abortsToGroundAtCap() {
+        let r = ANSIRenderer(rows: 2, cols: 20)
+        // Build an OSC sequence whose payload exceeds the cap: ESC ] <cap+1 bytes> BEL
+        var oversized = Data([0x1B, 0x5D]) // ESC ]
+        oversized += Data(repeating: UInt8(ascii: "X"), count: ANSIRenderer.oscBufferCap + 1)
+        oversized += Data([0x07]) // BEL terminator
+        r.feed(oversized)
+        // After overflow the parser must be back in ground, not stuck in .osc.
+        // Verify by feeding plain text that must land in the grid correctly.
+        r.feed("A".data(using: .utf8)!)
+        XCTAssertEqual(r.grid[0][0].ch, "A",
+            "parser must return to ground after OSC overflow so subsequent text is placed")
+    }
+
+    /// WHY: legitimate short OSC sequences (e.g. title sets, <100 bytes) must
+    /// continue to be consumed and not corrupt the parser state.
+    func test_oscBuffer_shortSequenceDoesNotAffectSubsequentText() {
+        let r = ANSIRenderer(rows: 2, cols: 20)
+        // ESC ] 0 ; title BEL  (set-title, standard OSC 0)
+        let osc = "\u{1B}]0;my title\u{07}"
+        r.feed(osc.data(using: .utf8)!)
+        r.feed("B".data(using: .utf8)!)
+        XCTAssertEqual(r.grid[0][0].ch, "B",
+            "normal OSC sequence must not corrupt ground state")
+    }
 }

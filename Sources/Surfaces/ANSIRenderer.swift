@@ -86,6 +86,11 @@ public final class ANSIRenderer {
     private var csiIntermediate: UInt8 = 0
     private var oscBuffer = ""
 
+    /// Maximum bytes accepted into oscBuffer before treating the sequence as
+    /// malformed and aborting to ground. Real OSC payloads (window titles, etc.)
+    /// are at most a few hundred bytes; 65536 is far above any legitimate value.
+    static let oscBufferCap = 65_536
+
     private func emptyGrid(rows: Int? = nil, cols: Int? = nil) -> [[Cell]] {
         let rowCount = max(1, rows ?? self.rows)
         let colCount = max(1, cols ?? self.cols)
@@ -243,6 +248,12 @@ public final class ANSIRenderer {
         if b == 0x1B { // start of ST? next char must be \
             // peek state will read next byte; simple model: just return to ground on next ESC
             state = .esc
+            return
+        }
+        guard oscBuffer.count < ANSIRenderer.oscBufferCap else {
+            // Malformed or adversarially large OSC: abort without retaining the data.
+            oscBuffer = ""
+            state = .ground
             return
         }
         oscBuffer.append(Character(UnicodeScalar(b)))
