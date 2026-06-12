@@ -622,6 +622,13 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         // C5: ~/.remotecode/keybindings.json may rebind the palette.
         applyKeybindingOverride(to: paletteItem, command: "commandPalette.toggle")
         viewMenu.addItem(paletteItem)
+        // UX-MAC_APPSHELL-TOKENSAVER-KEYBOARD: keyboard-reachable Token Saver toggle
+        // (Cmd+Shift+S). Posts rc2TokenSaverToggle; SidebarViewModel observes and
+        // calls setTokenSaverEnabled(!current). Cmd+Shift+S is unused in this menu map.
+        let tokenSaverToggleItem = NSMenuItem(title: "Toggle Token Saver", action: #selector(toggleTokenSaverFromMenu), keyEquivalent: "s")
+        tokenSaverToggleItem.keyEquivalentModifierMask = [.command, .shift]
+        tokenSaverToggleItem.target = self
+        viewMenu.addItem(tokenSaverToggleItem)
         viewMenu.addItem(.separator())
         let revealDiagnostics = NSMenuItem(title: "Reveal Diagnostics in Finder", action: #selector(revealDiagnosticsInFinder), keyEquivalent: "")
         revealDiagnostics.target = self
@@ -904,6 +911,10 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
 
     @objc private func togglePalette() {
         palette?.toggle()
+    }
+
+    @objc private func toggleTokenSaverFromMenu() {
+        NotificationCenter.default.post(name: .rc2TokenSaverToggle, object: nil)
     }
 
     @objc private func showSettings() {

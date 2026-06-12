@@ -10,6 +10,9 @@ import DesignSystemKit
 
 public extension Notification.Name {
     static let rc2TokenSaverUsageChanged = Notification.Name("rc2TokenSaverUsageChanged")
+    /// Posted by AppDelegate's "Toggle Token Saver" menu item (Cmd+Shift+S).
+    /// SidebarViewModel observes this and calls setTokenSaverEnabled(!tokenSaverEnabled).
+    static let rc2TokenSaverToggle = Notification.Name("rc2TokenSaverToggle")
 }
 
 @MainActor
@@ -126,6 +129,12 @@ public final class SidebarViewModel: ObservableObject {
     @Published public private(set) var tokenSaverSavingsSummary: TokenSaverSavingsSummary = .empty
     @Published public var showsTokenSaverModelDownload = false
     @Published public private(set) var tokenSaverModelDownloadState: TokenSaverModelDownloadState = .idle
+    /// True while a background account-usage refresh (CLI probe) is in flight.
+    /// Drives the spinner in the details popover (:188).
+    @Published public private(set) var tokenSaverAccountUsageIsRefreshing: Bool = false
+    /// Timestamp of the last completed account-usage refresh, or nil when never refreshed.
+    /// Drives the "last updated" line in the details popover (:188).
+    @Published public private(set) var tokenSaverAccountUsageLastUpdated: Date? = nil
     /// Current status of the Token Saver sidecar. Updated whenever the controller
     /// posts `.rc2TokenSaverDistillStatusChanged`. Drives the status row in the
     /// details popover so a blocked/failed sidecar is never invisible (Rule 6).
@@ -141,6 +150,7 @@ public final class SidebarViewModel: ObservableObject {
     private var privateAccountObserver: NSObjectProtocol?
     private var tokenSaverUsageObserver: NSObjectProtocol?
     private var sidecarStatusObserver: NSObjectProtocol?
+    private var tokenSaverToggleObserver: NSObjectProtocol?
     private let updateChecker: AppUpdateChecking?
     private let settingsStore: SettingsStore
     private let insomniaPower: InsomniaPowerManaging
@@ -215,6 +225,14 @@ public final class SidebarViewModel: ObservableObject {
                   let controller = note.object as? TokenSaverDistillServiceController else { return }
             Task { @MainActor in viewModel.sidecarStatus = controller.status }
         }
+        self.tokenSaverToggleObserver = NotificationCenter.default.addObserver(
+            forName: .rc2TokenSaverToggle,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            guard let viewModel = self else { return }
+            Task { @MainActor in viewModel.setTokenSaverEnabled(!viewModel.tokenSaverEnabled) }
+        }
         self.updateChecker?.onAvailabilityChanged = { [weak self] availability in
             self?.updateAvailability = availability
         }
@@ -237,6 +255,9 @@ public final class SidebarViewModel: ObservableObject {
         }
         if let sidecarStatusObserver {
             NotificationCenter.default.removeObserver(sidecarStatusObserver)
+        }
+        if let tokenSaverToggleObserver {
+            NotificationCenter.default.removeObserver(tokenSaverToggleObserver)
         }
         tokenSaverModelDownloadTask?.cancel()
         powerMonitor.stop()
@@ -283,7 +304,41 @@ public final class SidebarViewModel: ObservableObject {
     }
 
     public func refreshTokenSaverAccountUsageForDetails() {
-        context?.refreshTokenSaverAccountUsage(reason: "details")
+        guard !tokenSaverAccountUsageIsRefreshing else { return }
+        guard privateAccountUser != nil else { return }
+        tokenSaverAccountUsageIsRefreshing = true
+        // Fire-and-forget: kick the refresh, then observe the usage-changed
+        // notification to detect completion.  A 90-second timeout ensures the
+        // spinner stops even when the CLI probe hangs or the notification is
+        // never posted (e.g. signed-out race).
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            var observer: NSObjectProtocol?
+            let done = await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
+                // One-shot notification observer -- resumes with true on completion.
+                observer = NotificationCenter.default.addObserver(
+                    forName: .rc2TokenSaverUsageChanged,
+                    object: nil,
+                    queue: .main
+                ) { _ in
+                    if let o = observer { NotificationCenter.default.removeObserver(o) }
+                    observer = nil
+                    continuation.resume(returning: true)
+                }
+                self.context?.refreshTokenSaverAccountUsage(reason: "details")
+                // Schedule a timeout: if no notification arrives within 90 s,
+                // resume with false so the spinner stops.
+                Task { @MainActor in
+                    try? await Task.sleep(nanoseconds: 90_000_000_000)
+                    guard let o = observer else { return }
+                    NotificationCenter.default.removeObserver(o)
+                    observer = nil
+                    continuation.resume(returning: false)
+                }
+            }
+            self.tokenSaverAccountUsageIsRefreshing = false
+            if done { self.tokenSaverAccountUsageLastUpdated = Date() }
+        }
     }
 
     public func setInsomniaEnabled(_ enabled: Bool) {
@@ -1847,6 +1902,17 @@ public struct SidebarRootView: View {
     }
 
     private var tokenSaverControl: some View {
+        // :186 -- compute model dir size once for this render pass.
+        // Only evaluated when !tokenSaverEnabled so the hot (enabled) path
+        // pays zero cost.
+        let modelDirURL: URL? = {
+            guard !vm.tokenSaverEnabled, let ctx = vm.context else { return nil }
+            return TokenSaverModelInstaller(appSupportDirectory: ctx.appSupportDirectory).distillDirectory
+        }()
+        let modelDirBytes: Int64 = modelDirURL.map { Self.modelDirSize(at: $0) } ?? 0
+        let showDeleteModel = !vm.tokenSaverEnabled && modelDirBytes > 0
+
+        return VStack(alignment: .leading, spacing: DS.Space.xs) {
         Button {
             tokenSaverAction()
         } label: {
@@ -1908,13 +1974,53 @@ public struct SidebarRootView: View {
         .accessibilityValue(tokenSaverAccessibilityValue)
         .accessibilityHint(tokenSaverHelpText)
         .accessibilityIdentifier("sidebar.tokenSaver")
+
+        // :186 -- "Delete model (N GB)" affordance when disabled + model installed.
+        // Guard: only shown when disabled so there is no risk of deleting a
+        // live/downloading model.  The distillDirectory is removed atomically
+        // so partial states (manifest + cache + model files) are all cleared.
+        if showDeleteModel {
+            Button {
+                deleteTokenSaverModel()
+            } label: {
+                HStack(spacing: DS.Space.xs) {
+                    Image(systemName: "trash")
+                        .font(.system(size: 11, weight: .regular))
+                        .foregroundColor(DS.Palette.danger)
+                    Text("Delete model (\(Self.humanDirSizeString(modelDirBytes)))")
+                        .font(DS.Font.caption)
+                        .foregroundColor(DS.Palette.danger)
+                        .lineLimit(1)
+                }
+                .padding(.horizontal, DS.Space.sm)
+                .padding(.vertical, DS.Space.xs)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Delete Token Saver model")
+            .accessibilityValue("Model size \(Self.humanDirSizeString(modelDirBytes))")
+            .accessibilityHint("Removes the downloaded model files to reclaim disk space")
+            .accessibilityIdentifier("sidebar.tokenSaver.deleteModel")
+        }
+        } // end outer VStack
     }
 
     private var tokenSaverCompactControl: some View {
-        Button {
+        let ringVals = tokenSaverActivityRingValues
+        // :195 -- build the label outside the label closure so it is
+        // available both for the rings and for the button's own a11y value.
+        let ringsLabel = Self.ringsAccessibilityLabel(
+            scope: tokenSaverLimitScopeTitle(for: .week),
+            savedTokens: tokenSaverSavedOrPotential(in: vm.tokenSaverUsageSnapshot, scope: .week),
+            savedProgress: ringVals.tokenSaverProgress,
+            claudeUsedProgress: ringVals.claudeUsedProgress,
+            codexUsedProgress: ringVals.codexUsedProgress
+        )
+        return Button {
             toggleTokenSaverDetails(refreshWhenOpening: true)
         } label: {
-            TokenSaverActivityRings(values: tokenSaverActivityRingValues)
+            TokenSaverActivityRings(values: ringVals, a11yLabel: ringsLabel)
                 .frame(width: 34, height: 34)
                 .frame(width: 48, height: 40)
                 .contentShape(Rectangle())
@@ -1954,6 +2060,26 @@ public struct SidebarRootView: View {
             vm.refreshTokenSaverAccountUsageForDetails()
         }
         showsTokenSaverDetails = willOpen
+    }
+
+    // :186 -- Removes the entire Distill directory (model files + manifest +
+    // validation cache) after an NSAlert confirmation.
+    // Guard: only called from the delete button which is only shown when
+    // !tokenSaverEnabled, so we never delete a live or downloading model.
+    private func deleteTokenSaverModel() {
+        guard !vm.tokenSaverEnabled else { return }
+        guard let ctx = vm.context else { return }
+        let installer = TokenSaverModelInstaller(appSupportDirectory: ctx.appSupportDirectory)
+        let bytes = Self.modelDirSize(at: installer.distillDirectory)
+        let sizeStr = Self.humanDirSizeString(bytes)
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Delete Token Saver model (\(sizeStr))?"
+        alert.informativeText = "This removes the downloaded model files from disk. You can download the model again when you re-enable Token Saver."
+        alert.addButton(withTitle: "Delete")
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        try? FileManager.default.removeItem(at: installer.distillDirectory)
     }
 
     private var tokenSaverPillText: String {
@@ -2041,14 +2167,18 @@ public struct SidebarRootView: View {
 
     private func tokenSaverLimitScopeTitle(for scope: TokenSaverUsageScope) -> String {
         switch scope {
-        case .currentSession: return "current session"
+        // :187 -- "currentSession" bucket sums today's UTC-day, not a live
+        // session window.  "today" is the honest label for what is shown.
+        case .currentSession: return "today"
         case .week: return "week"
         }
     }
 
     private func tokenSaverScopeTitle(_ scope: TokenSaverUsageScope) -> String {
         switch scope {
-        case .currentSession: return "Current Session"
+        // :187 -- Picker label must match the windowing: today's UTC-day bucket,
+        // not a "session" (which implies start-of-process to now).
+        case .currentSession: return "Today"
         case .week: return "Week"
         }
     }
@@ -2217,6 +2347,25 @@ public struct SidebarRootView: View {
                 .accessibilityIdentifier("sidebar.tokenSaver.toggle")
             }
 
+            // :188 -- Last-updated timestamp + in-flight spinner for the
+            // account-usage refresh (CLI probe takes ~40s).
+            HStack(spacing: DS.Space.xs) {
+                if vm.tokenSaverAccountUsageIsRefreshing {
+                    ProgressView()
+                        .controlSize(.mini)
+                        .scaleEffect(0.75)
+                        .frame(width: 12, height: 12)
+                        .accessibilityLabel("Refreshing usage data")
+                        .accessibilityIdentifier("sidebar.tokenSaver.usageRefreshSpinner")
+                }
+                Text(Self.lastUpdatedLabel(vm.tokenSaverAccountUsageLastUpdated, now: Date()))
+                    .font(DS.Font.caption2)
+                    .foregroundColor(DS.Palette.textTertiary)
+                    .lineLimit(1)
+                    .accessibilityIdentifier("sidebar.tokenSaver.lastUpdated")
+            }
+            .frame(maxWidth: .infinity, alignment: .trailing)
+
             if let label = Self.sidecarStatusLabel(vm.sidecarStatus) {
                 HStack(spacing: DS.Space.xs) {
                     Image(systemName: "exclamationmark.triangle.fill")
@@ -2308,11 +2457,19 @@ public struct SidebarRootView: View {
 
     private var tokenSaverDetailsActivityChart: some View {
         let snapshot = tokenSaverDetailsSnapshot
+        let detailsRingVals = tokenSaverActivityRingValues(for: snapshot, scope: tokenSaverDetailsScope)
+        // :195 -- build label via the seam; replaces the detached
+        // .accessibilityLabel/.accessibilityValue pair that never reached the view.
+        let detailsRingsLabel = Self.ringsAccessibilityLabel(
+            scope: tokenSaverLimitScopeTitle(for: tokenSaverDetailsScope),
+            savedTokens: tokenSaverSavedOrPotential(in: snapshot, scope: tokenSaverDetailsScope),
+            savedProgress: detailsRingVals.tokenSaverProgress,
+            claudeUsedProgress: detailsRingVals.claudeUsedProgress,
+            codexUsedProgress: detailsRingVals.codexUsedProgress
+        )
         return HStack(alignment: .center, spacing: DS.Space.lg) {
-            TokenSaverActivityRings(values: tokenSaverActivityRingValues(for: snapshot, scope: tokenSaverDetailsScope))
+            TokenSaverActivityRings(values: detailsRingVals, a11yLabel: detailsRingsLabel)
                 .frame(width: 104, height: 104)
-                .accessibilityLabel("Token Saver usage rings")
-                .accessibilityValue(tokenSaverDetailsChartAccessibilityValue(for: snapshot))
 
             VStack(alignment: .leading, spacing: DS.Space.sm) {
                 tokenSaverRingLegendRow(
@@ -2530,6 +2687,91 @@ public struct SidebarRootView: View {
         "\(Int((min(max(progress, 0), 1) * 100).rounded()))%"
     }
 
+    // MARK: - Static seams (:186 :187 :188 :195)
+
+    /// :186 -- Sums the byte sizes of all regular files under `url` (non-recursive
+    /// into sub-directories is fine; the model dir is flat).  Uses a recursive
+    /// enumerator so nested revision sub-directories are included.
+    ///
+    /// WHY pure/nonisolated: lets tests exercise the calculation with a temp-dir
+    /// fixture without any AppContext or UI setup.  Returns 0 when the directory
+    /// does not exist (model not installed).
+    nonisolated public static func modelDirSize(at url: URL) -> Int64 {
+        let fm = FileManager.default
+        guard let enumerator = fm.enumerator(
+            at: url,
+            includingPropertiesForKeys: [.fileSizeKey, .isRegularFileKey],
+            options: [.skipsHiddenFiles]
+        ) else { return 0 }
+        var total: Int64 = 0
+        for case let fileURL as URL in enumerator {
+            guard (try? fileURL.resourceValues(forKeys: [.isRegularFileKey]))?.isRegularFile == true else { continue }
+            if let size = (try? fileURL.resourceValues(forKeys: [.fileSizeKey]))?.fileSize {
+                total += Int64(size)
+            }
+        }
+        return total
+    }
+
+    /// :186 -- Human-readable size string for a byte count, matching the style
+    /// used in `TokenSaverModelDownloadModal.formatBytes`.
+    nonisolated public static func humanDirSizeString(_ bytes: Int64) -> String {
+        guard bytes > 0 else { return "0 B" }
+        let units = ["B", "KB", "MB", "GB"]
+        var value = Double(bytes)
+        var index = 0
+        while value >= 1024, index < units.count - 1 {
+            value /= 1024
+            index += 1
+        }
+        return String(format: value >= 10 || index == 0 ? "%.0f %@" : "%.1f %@", value, units[index])
+    }
+
+    /// :188 -- Human-readable "last updated" label for the account-usage
+    /// timestamp row in the details popover.
+    ///
+    /// Returns "Never" when `date` is nil.
+    /// Returns "Updated just now" when elapsed < 60 s.
+    /// Returns "Updated Xm ago" for minutes, "Updated Xh ago" for hours.
+    /// Capped at "Updated 24h+ ago" beyond 24 h so the string stays compact.
+    ///
+    /// WHY separate: the test can verify the label logic without a running VM or
+    /// wall-clock dependency -- tests pass an explicit `now`.
+    nonisolated public static func lastUpdatedLabel(_ date: Date?, now: Date) -> String {
+        guard let date else { return "Never" }
+        let elapsed = now.timeIntervalSince(date)
+        guard elapsed >= 0 else { return "Updated just now" }
+        if elapsed < 60 { return "Updated just now" }
+        let mins = Int(elapsed / 60)
+        if mins < 60 { return "Updated \(mins)m ago" }
+        let hours = mins / 60
+        if hours < 24 { return "Updated \(hours)h ago" }
+        return "Updated 24h+ ago"
+    }
+
+    /// :195 -- Accessible description of the activity rings for VoiceOver.
+    ///
+    /// WHY: `TokenSaverActivityRings` was `.accessibilityHidden(true)` so VoiceOver
+    /// reported nothing.  This seam produces a non-empty string containing the ring
+    /// values so screen readers can convey the same information as the visual rings.
+    nonisolated public static func ringsAccessibilityLabel(
+        scope: String,
+        savedTokens: Int,
+        savedProgress: Double,
+        claudeUsedProgress: Double,
+        codexUsedProgress: Double
+    ) -> String {
+        let savedPct = Int((min(max(savedProgress, 0), 1) * 100).rounded())
+        let claudePct = Int((min(max(claudeUsedProgress, 0), 1) * 100).rounded())
+        let codexPct = Int((min(max(codexUsedProgress, 0), 1) * 100).rounded())
+        let savedStr = savedTokens >= 1_000_000
+            ? String(format: "%.1fM", Double(savedTokens) / 1_000_000)
+            : savedTokens >= 1_000
+                ? String(format: "%.0fK", Double(savedTokens) / 1_000)
+                : "\(savedTokens)"
+        return "Token Saver rings, \(scope): saved \(savedStr) tokens (\(savedPct)%), Claude used \(claudePct)%, Codex used \(codexPct)%"
+    }
+
     struct TokenSaverActivityRings: View {
         struct Values: Equatable {
             let tokenSaverProgress: Double
@@ -2538,6 +2780,10 @@ public struct SidebarRootView: View {
         }
 
         let values: Values
+        /// :195 -- VoiceOver label describing ring values.  nil hides the element
+        /// (legacy behaviour when caller cannot supply values; should not occur in
+        /// production paths).
+        var a11yLabel: String? = nil
 
         var body: some View {
             GeometryReader { proxy in
@@ -2547,7 +2793,9 @@ public struct SidebarRootView: View {
                     .position(x: proxy.size.width / 2, y: proxy.size.height / 2)
             }
             .aspectRatio(1, contentMode: .fit)
-            .accessibilityHidden(true)
+            // :195 -- expose ring values to VoiceOver instead of hiding the element.
+            .accessibilityHidden(a11yLabel == nil)
+            .accessibilityLabel(a11yLabel ?? "")
         }
 
         private func scaledContent(side: CGFloat) -> some View {
