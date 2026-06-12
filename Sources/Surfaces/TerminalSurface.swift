@@ -579,6 +579,11 @@ public final class TerminalSurface: NSObject, Surface {
     private var historyWriteFailures = 0
     private var outputPartial = false
     private var outputPendingBytes = 0
+    // Raw bytes received while the renderer was suppressed (isVisible=false).
+    // Replayed into renderer.feed on didBecomeVisible so the ANSI snapshot is
+    // complete even if the surface was never rendered while hidden.
+    private var hiddenRendererBuffer = Data()
+    private var hiddenRendererBufferOverflowed = false
     private var totalOutputBytes = 0
     private var outputBytesAtLastTelemetry = 0
     private var lastOutputTelemetryAt = Date.distantPast
@@ -614,6 +619,11 @@ public final class TerminalSurface: NSObject, Surface {
     private static let outputTelemetryByteInterval = 8 * 1024 * 1024
     private static let outputTelemetryTimeInterval: TimeInterval = 60
     private nonisolated static let maxHistoryChunkBytes = 64 * 1024
+    // Maximum bytes buffered for hidden-renderer heal. Chosen large enough to
+    // cover realistic hidden bursts (build output, long completions) while
+    // bounding memory. Bytes beyond this cap are NOT fed to the renderer on
+    // reveal; the snapshot will be partial (complete=false) but never OOM.
+    private static let maxHiddenRendererBufferBytes = 4 * 1024 * 1024
 
     public var viewportSize: TerminalViewportSize {
         terminalSize
@@ -928,6 +938,22 @@ public final class TerminalSurface: NSObject, Surface {
         outputBus.emit(descriptor.id, data)
         if renderAllowedAtRead {
             renderer.feed(data)
+        } else {
+            // Surface is hidden: buffer bytes so the renderer can be healed on
+            // reveal. Cap the buffer to avoid unbounded growth during long hidden
+            // sessions; bytes beyond the cap are silently dropped (the snapshot
+            // will remain complete=false, which is already correct behavior).
+            if !hiddenRendererBufferOverflowed {
+                let remaining = Self.maxHiddenRendererBufferBytes - hiddenRendererBuffer.count
+                if remaining >= data.count {
+                    hiddenRendererBuffer.append(data)
+                } else if remaining > 0 {
+                    hiddenRendererBuffer.append(data.prefix(remaining))
+                    hiddenRendererBufferOverflowed = true
+                } else {
+                    hiddenRendererBufferOverflowed = true
+                }
+            }
         }
         if renderAllowedAtRead, renderDiagnostics().canRender {
             ghosttyView.processOutput(data)
@@ -1042,6 +1068,23 @@ public final class TerminalSurface: NSObject, Surface {
         default:
             return nil
         }
+    }
+
+    // Pure decision seam: decides what bytes (if any) to replay into the
+    // renderer when a hidden surface becomes visible again.
+    //
+    // - buffer: bytes accumulated while hidden (may be empty or overflowed-truncated)
+    // - overflowed: true when the buffer hit the cap; the renderer snapshot will
+    //   still be partial even after the replay (caller must keep complete=false)
+    //
+    // Returns the data that MUST be fed to renderer.feed on reveal, or nil when
+    // there is nothing to replay. This seam is nonisolated/static so it can be
+    // unit-tested without AppKit or a live TerminalSurface instance.
+    nonisolated static func hiddenRendererHealPlan(buffer: Data, overflowed: Bool) -> Data? {
+        guard !buffer.isEmpty else { return nil }
+        // Even when overflowed, replay whatever was buffered: partial is better
+        // than nothing; the complete=false flag already signals the gap.
+        return buffer
     }
 
     @discardableResult
@@ -1443,6 +1486,18 @@ public final class TerminalSurface: NSObject, Surface {
     public func didBecomeVisible() {
         guard !isVisible else { return }
         isVisible = true
+        // Heal the renderer BEFORE setting readerAllowsRender=true.
+        // Once readerAllowsRender flips, appendDataAsync feeds live bytes
+        // directly into renderer.feed; replaying the buffer first ensures
+        // the renderer sees bytes in chronological order with no gap and no
+        // double-feed (buffer is cleared here, live path is not yet active).
+        let healBuffer = hiddenRendererBuffer
+        let healOverflowed = hiddenRendererBufferOverflowed
+        hiddenRendererBuffer = Data()
+        hiddenRendererBufferOverflowed = false
+        if let replay = Self.hiddenRendererHealPlan(buffer: healBuffer, overflowed: healOverflowed) {
+            renderer.feed(replay)
+        }
         readerAllowsRender = true
         ghosttyView.setOcclusion(visible: true)
         let hadHiddenOutput = outputPendingBytes > 0
@@ -1471,6 +1526,10 @@ public final class TerminalSurface: NSObject, Surface {
         isVisible = false
         readerAllowsRender = false
         isDrainingHiddenBacklog = false
+        // Clear any renderer buffer from a prior hidden session so bytes from
+        // one hidden period do not bleed into the next.
+        hiddenRendererBuffer = Data()
+        hiddenRendererBufferOverflowed = false
         ghosttyView.setOcclusion(visible: false)
         scheduleParkingIfDetached()
     }
