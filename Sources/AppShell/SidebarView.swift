@@ -274,6 +274,11 @@ public final class SidebarViewModel: ObservableObject {
     /// Session-local undo stack for removed workspaces. Newest entry at end.
     /// Not persisted; cleared on app quit.
     private(set) var removedWorkspaceStack: [WorkspaceUndoEntry] = []
+    /// PERF-MAC_SIDEBAR-001 (test seam): counts how many times
+    /// `busyTooltip(for:)` issues a `threadRepo.list(workspaceId:)` DB call.
+    /// Production code never reads this; tests assert it stays bounded so
+    /// N health events * M workspaces does not produce N*M DB round-trips.
+    var threadListCallCount: Int = 0
     private var privateAccountObserver: NSObjectProtocol?
     private var tokenSaverUsageObserver: NSObjectProtocol?
     private var sidecarStatusObserver: NSObjectProtocol?
@@ -1339,6 +1344,7 @@ public final class SidebarViewModel: ObservableObject {
     public func busyTooltip(for ws: Workspace) -> String? {
         let threadTitles: [String]
         if let router, let ctx = context {
+            threadListCallCount += 1
             threadTitles = ((try? ctx.threadRepo.list(workspaceId: ws.id)) ?? [])
                 .filter { $0.status == .running }
                 .map(\.title)

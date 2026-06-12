@@ -218,6 +218,13 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
     /// empty container shows a "Restoring workspaces…" affordance instead
     /// of the bare no-workspace empty state.
     private var isRestoringLayout = true
+    /// PERF-MAC_SHELL_WINDOW-002 (test seam): incremented each time
+    /// `rebuildWorkspaceContainer` performs a full teardown/rebuild (i.e.
+    /// the layout signature changed or the controller set is empty).
+    /// The early-return / reconcile-in-place path does NOT increment.
+    /// Production code never reads this; tests assert it to catch silent
+    /// rebuild regressions that os.log alone cannot surface.
+    var rebuildCount: Int = 0
 
     public init(context: AppContext, router: AppCommandRouter, updater: AppUpdateChecking? = nil) {
         self.context = context
@@ -779,6 +786,7 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
             return
         }
         lastWorkspaceContainerSignature = signature
+        rebuildCount += 1
         let rebuildStart = DispatchTime.now()
 
         window.disableScreenUpdatesUntilFlush()
