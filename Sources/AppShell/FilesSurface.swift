@@ -1245,6 +1245,13 @@ private struct FilesSurfaceRoot: View {
     @FocusState private var newFileFieldFocused: Bool
     @State private var nameFilter = ""
 
+    // Preview HTML cache -- avoids recomputing MarkdownSurface.renderHTML / highlightedHTML
+    // on every SwiftUI body pass. Seeded immediately on .onAppear; subsequent changes are
+    // debounced by previewDebounceInterval so rapid typing does not hammer the renderer.
+    private static let previewDebounceInterval: TimeInterval = 0.2
+    @State private var cachedPreviewHTML = ""
+    @State private var previewDebounceTimer: Timer? = nil
+
     var body: some View {
         GeometryReader { proxy in
             HStack(spacing: 0) {
@@ -1329,6 +1336,32 @@ private struct FilesSurfaceRoot: View {
                   let entry = model.entries.first(where: { $0.id == id }) else { return }
             model.select(entry)
         }
+        // Seed cachedPreviewHTML immediately on first appear so the initial render
+        // is not blank. Subsequent changes go through the debounce path.
+        .onAppear {
+            cachedPreviewHTML = computePreviewHTML(markdown: isMarkdownEntry)
+        }
+        // Debounce preview recompute when the draft text changes (rapid typing path).
+        .onChange(of: model.draftText) { _ in
+            schedulePreviewRecompute(markdown: isMarkdownEntry)
+        }
+        // Immediately recompute when a different file is selected so the preview
+        // switches to the new file without a 200ms blank frame.
+        .onChange(of: model.selectedEntry) { _ in
+            previewDebounceTimer?.invalidate()
+            previewDebounceTimer = nil
+            cachedPreviewHTML = computePreviewHTML(markdown: isMarkdownEntry)
+        }
+        // Tear down any pending debounce timer when the view is removed.
+        .onDisappear {
+            previewDebounceTimer?.invalidate()
+            previewDebounceTimer = nil
+        }
+    }
+
+    // True when the currently selected entry should be rendered as Markdown HTML.
+    private var isMarkdownEntry: Bool {
+        model.selectedEntry?.kind == "markdown"
     }
 
     private var sidebar: some View {
@@ -1933,18 +1966,40 @@ private struct FilesSurfaceRoot: View {
         }
     }
 
+    // Computes the HTML string for the current source text and kind.
+    // Called once on appear and again after each debounced change.
+    private func computePreviewHTML(markdown: Bool) -> String {
+        if markdown {
+            return MarkdownSurface.renderHTML(markdown: model.draftText)
+        } else if model.selectedEntry?.kind == "html" {
+            return model.draftText
+        } else {
+            return highlightedHTML(text: model.draftText, language: model.selectedEntry?.language)
+        }
+    }
+
+    // Schedules a debounced recompute of cachedPreviewHTML.
+    // If called within previewDebounceInterval of a prior call the timer resets.
+    private func schedulePreviewRecompute(markdown: Bool) {
+        previewDebounceTimer?.invalidate()
+        previewDebounceTimer = Timer.scheduledTimer(
+            withTimeInterval: Self.previewDebounceInterval,
+            repeats: false
+        ) { _ in
+            cachedPreviewHTML = computePreviewHTML(markdown: markdown)
+            previewDebounceTimer = nil
+        }
+    }
+
     @ViewBuilder
     private func sourcePreview(markdown: Bool) -> some View {
-        let preview = markdown
-            ? MarkdownSurface.renderHTML(markdown: model.draftText)
-            : (model.selectedEntry?.kind == "html" ? model.draftText : highlightedHTML(text: model.draftText, language: model.selectedEntry?.language))
         if model.readerMode == "preview" {
-            PreviewWebView(html: preview, baseURL: model.previewURL?.deletingLastPathComponent())
+            PreviewWebView(html: cachedPreviewHTML, baseURL: model.previewURL?.deletingLastPathComponent())
         } else if model.readerMode == "split" {
             HStack(spacing: 0) {
                 editor
                 Divider().overlay(DS.Palette.line)
-                PreviewWebView(html: preview, baseURL: model.previewURL?.deletingLastPathComponent())
+                PreviewWebView(html: cachedPreviewHTML, baseURL: model.previewURL?.deletingLastPathComponent())
             }
         } else {
             editor
