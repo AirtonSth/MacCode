@@ -473,6 +473,96 @@ final class TokenSaverInstallTests: XCTestCase {
         XCTAssertEqual(store.load().providers.first { $0.provider == .claude }?.weeklyUsedPercent, 57)
     }
 
+    // MARK: - needsRehash fast-path cache
+
+    // WHY: unchanged model files must skip the SHA-256 re-hash on every app launch.
+    // The invariant: cache hit requires BOTH size AND mtime to match; any drift forces a re-hash.
+
+    func test_needsRehash_returnsTrue_whenNoCachedEntry() {
+        let current = (size: Int64(1024), mtime: Date(timeIntervalSince1970: 1_000))
+        XCTAssertTrue(
+            TokenSaverModelInstaller.needsRehash(cached: nil, current: current),
+            "no cache entry -> must re-hash (first run or cache evicted)"
+        )
+    }
+
+    func test_needsRehash_returnsTrue_whenSizeDiffers() {
+        let mtime = Date(timeIntervalSince1970: 1_000)
+        let cached = (size: Int64(1024), mtime: mtime)
+        let current = (size: Int64(2048), mtime: mtime)
+        XCTAssertTrue(
+            TokenSaverModelInstaller.needsRehash(cached: cached, current: current),
+            "size changed -> must re-hash regardless of mtime"
+        )
+    }
+
+    func test_needsRehash_returnsTrue_whenMtimeDiffers() {
+        let cached = (size: Int64(512), mtime: Date(timeIntervalSince1970: 1_000))
+        let current = (size: Int64(512), mtime: Date(timeIntervalSince1970: 2_000))
+        XCTAssertTrue(
+            TokenSaverModelInstaller.needsRehash(cached: cached, current: current),
+            "mtime changed -> must re-hash even when size is the same"
+        )
+    }
+
+    func test_needsRehash_returnsFalse_whenSizeAndMtimeBothMatch() {
+        let mtime = Date(timeIntervalSince1970: 1_783_000_000)
+        let cached = (size: Int64(4096), mtime: mtime)
+        let current = (size: Int64(4096), mtime: mtime)
+        XCTAssertFalse(
+            TokenSaverModelInstaller.needsRehash(cached: cached, current: current),
+            "size and mtime unchanged -> skip SHA-256 re-hash"
+        )
+    }
+
+    func test_validateInstalledModel_skipsRehashOnSecondCallWhenFileUnchanged() throws {
+        // Proves the cache is written after the first full hash and consulted on the next call.
+        let appSupport = tempDir()
+        let installer = TokenSaverModelInstaller(appSupportDirectory: appSupport)
+
+        let modelFile = installer.distillDirectory.appendingPathComponent("weights.bin")
+        try FileManager.default.createDirectory(at: installer.distillDirectory, withIntermediateDirectories: true)
+        try Data("mlx-weights".utf8).write(to: modelFile)
+        let checksum = try TokenSaverModelInstaller.sha256Hex(url: modelFile)
+        let manifest = TokenSaverModelManifest(
+            revision: "commit-sha",
+            files: [TokenSaverModelFile(relativePath: "weights.bin", sha256: checksum, sizeBytes: 11)]
+        )
+        try installer.writeManifest(manifest)
+
+        // First call: no cache -> full hash -> writes cache.
+        XCTAssertEqual(installer.validateInstalledModel(), .installed)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: installer.validationCacheURL.path),
+                      "validation cache must be written after the first successful full hash")
+
+        // Second call: cache hit (file unmodified) -> must still report installed without re-hash.
+        XCTAssertEqual(installer.validateInstalledModel(), .installed,
+                       "unchanged file must be accepted via the (size,mtime) fast-path on subsequent calls")
+    }
+
+    func test_validateInstalledModel_rehashesAfterFileTampered() throws {
+        // Proves a size-changing tamper is caught even when a cache entry exists.
+        let appSupport = tempDir()
+        let installer = TokenSaverModelInstaller(appSupportDirectory: appSupport)
+
+        let modelFile = installer.distillDirectory.appendingPathComponent("weights.bin")
+        try FileManager.default.createDirectory(at: installer.distillDirectory, withIntermediateDirectories: true)
+        try Data("mlx-weights".utf8).write(to: modelFile)
+        let checksum = try TokenSaverModelInstaller.sha256Hex(url: modelFile)
+        let manifest = TokenSaverModelManifest(
+            revision: "commit-sha",
+            files: [TokenSaverModelFile(relativePath: "weights.bin", sha256: checksum, sizeBytes: 11)]
+        )
+        try installer.writeManifest(manifest)
+
+        XCTAssertEqual(installer.validateInstalledModel(), .installed)
+
+        // Tamper: different content (different size -> mtime also changes on write).
+        try Data("tampered-content".utf8).write(to: modelFile)
+        XCTAssertEqual(installer.validateInstalledModel().state, .incomplete,
+                       "size change must invalidate the cache and trigger a re-hash that catches the tamper")
+    }
+
     func test_usageStoreRecordsSevenDayChartBucketsWithoutRawText() throws {
         let appSupport = tempDir()
         var calendar = Calendar(identifier: .gregorian)

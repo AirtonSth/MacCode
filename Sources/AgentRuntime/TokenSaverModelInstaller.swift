@@ -115,6 +115,27 @@ public struct TokenSaverModelValidation: Sendable, Equatable {
     public static let installed = TokenSaverModelValidation(state: .installed, reason: nil)
 }
 
+// Per-file record written to the validation cache after a successful full SHA-256 verify.
+// Invariant: a cache hit (size AND mtime both match) guarantees the file content was
+// SHA-256-verified at the time of the last write. Any change to size OR mtime invalidates
+// the cache entry and forces a full re-hash.
+// Accepted gap: a tampered file whose attacker also preserves the exact byte-count AND
+// filesystem mtime will pass the fast-path. The manifest SHA-256 remains the authority and
+// is applied on every launch whenever size or mtime drifts.
+public struct ModelValidationCacheEntry: Codable, Sendable, Equatable {
+    public let relativePath: String
+    public let expectedSHA256: String
+    public let sizeBytes: Int64
+    public let modificationDate: Date
+
+    public init(relativePath: String, expectedSHA256: String, sizeBytes: Int64, modificationDate: Date) {
+        self.relativePath = relativePath
+        self.expectedSHA256 = expectedSHA256
+        self.sizeBytes = sizeBytes
+        self.modificationDate = modificationDate
+    }
+}
+
 public final class TokenSaverModelInstaller: @unchecked Sendable {
     public let appSupportDirectory: URL
     private let fileManager: FileManager
@@ -135,6 +156,10 @@ public final class TokenSaverModelInstaller: @unchecked Sendable {
         distillDirectory.appendingPathComponent("DistillModelManifest.json")
     }
 
+    public var validationCacheURL: URL {
+        distillDirectory.appendingPathComponent("DistillValidationCache.json")
+    }
+
     public func modelStorageDirectory(revision: String) -> URL {
         distillDirectory
             .appendingPathComponent("Models", isDirectory: true)
@@ -153,6 +178,32 @@ public final class TokenSaverModelInstaller: @unchecked Sendable {
         try data.write(to: manifestURL, options: .atomic)
     }
 
+    // Returns the validation cache keyed by relativePath, or empty dict on missing/corrupt cache.
+    func loadValidationCache() -> [String: ModelValidationCacheEntry] {
+        guard let data = try? Data(contentsOf: validationCacheURL),
+              let entries = try? decoder.decode([ModelValidationCacheEntry].self, from: data) else {
+            return [:]
+        }
+        return Dictionary(entries.map { ($0.relativePath, $0) }, uniquingKeysWith: { $1 })
+    }
+
+    // Atomically writes the cache. Silently drops write errors -- the cache is advisory only.
+    func writeValidationCache(_ entries: [ModelValidationCacheEntry]) {
+        guard let data = try? encoder.encode(entries) else { return }
+        try? data.write(to: validationCacheURL, options: .atomic)
+    }
+
+    // Pure helper: returns true when a full SHA-256 re-hash is required.
+    // Re-hashes when the cache entry is absent or when either size or mtime differs.
+    // Returns false only when both size and mtime match the cached record.
+    public static func needsRehash(
+        cached: (size: Int64, mtime: Date)?,
+        current: (size: Int64, mtime: Date)
+    ) -> Bool {
+        guard let cached else { return true }
+        return cached.size != current.size || cached.mtime != current.mtime
+    }
+
     public func validateInstalledModel() -> TokenSaverModelValidation {
         guard let manifest = loadManifest() else {
             return TokenSaverModelValidation(state: .missing, reason: "manifest missing")
@@ -164,20 +215,43 @@ public final class TokenSaverModelInstaller: @unchecked Sendable {
             return TokenSaverModelValidation(state: .incomplete, reason: "manifest has no files")
         }
 
+        var cache = loadValidationCache()
+        var cacheUpdated = false
+
         for file in manifest.files {
             let url = distillDirectory.appendingPathComponent(file.relativePath)
             guard fileManager.fileExists(atPath: url.path) else {
                 return TokenSaverModelValidation(state: .incomplete, reason: "missing file \(file.relativePath)")
             }
             guard let attrs = try? fileManager.attributesOfItem(atPath: url.path),
-                  let size = attrs[.size] as? NSNumber,
-                  size.int64Value == file.sizeBytes else {
+                  let sizeNum = attrs[.size] as? NSNumber,
+                  sizeNum.int64Value == file.sizeBytes else {
                 return TokenSaverModelValidation(state: .incomplete, reason: "size mismatch \(file.relativePath)")
             }
-            guard (try? Self.sha256Hex(url: url)) == file.sha256.lowercased() else {
-                return TokenSaverModelValidation(state: .incomplete, reason: "checksum mismatch \(file.relativePath)")
+            let currentSize = sizeNum.int64Value
+            let currentMtime = (attrs[.modificationDate] as? Date) ?? .distantPast
+
+            let entry = cache[file.relativePath]
+            let cached: (size: Int64, mtime: Date)? = entry.map { ($0.sizeBytes, $0.modificationDate) }
+
+            if Self.needsRehash(cached: cached, current: (size: currentSize, mtime: currentMtime)) {
+                guard (try? Self.sha256Hex(url: url)) == file.sha256.lowercased() else {
+                    return TokenSaverModelValidation(state: .incomplete, reason: "checksum mismatch \(file.relativePath)")
+                }
+                cache[file.relativePath] = ModelValidationCacheEntry(
+                    relativePath: file.relativePath,
+                    expectedSHA256: file.sha256.lowercased(),
+                    sizeBytes: currentSize,
+                    modificationDate: currentMtime
+                )
+                cacheUpdated = true
             }
         }
+
+        if cacheUpdated {
+            writeValidationCache(Array(cache.values))
+        }
+
         return .installed
     }
 
