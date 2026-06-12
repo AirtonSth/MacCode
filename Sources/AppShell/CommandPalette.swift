@@ -50,6 +50,23 @@ private struct SettingsRepoFrecencyAdapter: PaletteFrecencyRepository {
     func set(_ key: String, _ value: String) throws { try inner.set(key, value) }
 }
 
+// MARK: - ScriptCacheEntry
+
+/// PERF-003 / UX-fix: one entry per workspace cwd in CommandPalette.scriptCache.
+/// Carries the discovered scripts, when they were cached, and the mtime of the
+/// script source files at cache time. The mtime lets us detect on-disk edits
+/// (package.json / Makefile / Package.swift) without polling, so the palette
+/// shows fresh scripts after the user saves a file rather than after a relaunch.
+struct ScriptCacheEntry {
+    let scripts: [ProjectScript]
+    let cachedAt: Date
+    /// Max mtime of script source files at discovery time. Nil when no source
+    /// file was found (e.g. cwd has neither package.json, Makefile, nor Package.swift).
+    let sourceMtime: Date?
+}
+
+// MARK: - PaletteCategory
+
 /// UX-003: lightweight grouping used for section headers in the default view.
 /// `rawValue` is the visible header label; `order` fixes section sequence.
 public enum PaletteCategory: String, CaseIterable {
@@ -106,7 +123,34 @@ public final class CommandPalette: NSObject, NSWindowDelegate, NSTableViewDataSo
     /// open keystroke on a filesystem scan. Keyed by workspace cwd; refreshed
     /// off-main and re-fed into the palette when it resolves.
     /// Internal so AppShellTests can pre-seed the cache for deterministic tests.
-    var scriptCache: [String: [ProjectScript]] = [:]
+    ///
+    /// UX-fix: entries now carry a timestamp and the source-file mtime so stale
+    /// scripts (added/removed on disk) are re-discovered without a relaunch.
+    /// TTL fallback: 5 s covers the edge case where mtime is unavailable.
+    var scriptCache: [String: ScriptCacheEntry] = [:]
+
+    /// TTL used when the source-file mtime cannot be read (defensive fallback).
+    static let scriptCacheTTL: TimeInterval = 5
+
+    /// Pure seam: returns true when the entry should be discarded and
+    /// re-discovered. Either condition is sufficient:
+    ///   1. mtime changed  - user saved changes to package.json / Makefile.
+    ///   2. TTL expired    - mtime unavailable (e.g. file deleted, FS error).
+    /// Neither condition fires on repeated lookups within the TTL window.
+    static func shouldReload(
+        cachedMtime: Date?,
+        currentMtime: Date?,
+        cachedAt: Date,
+        now: Date,
+        ttl: TimeInterval
+    ) -> Bool {
+        // Mtime-based: precise invalidation when both dates are known.
+        if let cm = cachedMtime, let nm = currentMtime {
+            return nm != cm
+        }
+        // TTL fallback: covers file-deleted / FS-error cases.
+        return now.timeIntervalSince(cachedAt) >= ttl
+    }
 
     /// UX-004: when the palette is open we observe the live agent VM so the
     /// model rows appear as soon as loadModels() resolves, without reopening.
@@ -379,19 +423,49 @@ public final class CommandPalette: NSObject, NSWindowDelegate, NSTableViewDataSo
     /// palette never blocks on `ProjectScripts.discover` (a filesystem scan).
     /// On a cache miss the cmd+k path returns immediately with no scripts and
     /// schedules an off-main discovery that re-feeds the palette on completion.
+    ///
+    /// UX-fix: if the cached entry is stale (mtime changed or TTL expired) we
+    /// treat it like a miss and kick off re-discovery. The stale scripts are
+    /// returned immediately so the palette is non-empty while discovery runs;
+    /// rebuildCommands() will refresh them once the new list arrives.
     private func cachedScripts(cwd: String) -> [ProjectScript] {
-        if let cached = scriptCache[cwd] { return cached }
         guard !cwd.isEmpty else { return [] }
+        let now = Date()
+        let currentMtime = CommandPalette.sourceMtime(cwd: cwd)
+        if let entry = scriptCache[cwd],
+           !CommandPalette.shouldReload(
+               cachedMtime: entry.sourceMtime,
+               currentMtime: currentMtime,
+               cachedAt: entry.cachedAt,
+               now: now,
+               ttl: CommandPalette.scriptCacheTTL) {
+            return entry.scripts
+        }
+        // Cache miss or stale: return whatever we have (may be empty on first
+        // open) and kick off a background re-discovery.
+        let staleScripts = scriptCache[cwd]?.scripts ?? []
         Task.detached(priority: .userInitiated) { [weak self] in
             let scripts = ProjectScripts.discover(in: cwd)
+            let mtime = CommandPalette.sourceMtime(cwd: cwd)
             await MainActor.run { [weak self] in
                 guard let self else { return }
-                self.scriptCache[cwd] = scripts
+                self.scriptCache[cwd] = ScriptCacheEntry(scripts: scripts, cachedAt: Date(), sourceMtime: mtime)
                 // Only refresh if the user is still looking at this palette.
                 if self.window.isVisible { self.rebuildCommands() }
             }
         }
-        return []
+        return staleScripts
+    }
+
+    /// Returns the most recent mtime among the script source files in cwd
+    /// (package.json, Makefile, Package.swift). Returns nil if none exist.
+    nonisolated private static func sourceMtime(cwd: String) -> Date? {
+        let sources = ["package.json", "Makefile", "Package.swift"]
+        let dates = sources.compactMap { name -> Date? in
+            let path = cwd + "/" + name
+            return (try? FileManager.default.attributesOfItem(atPath: path))?[.modificationDate] as? Date
+        }
+        return dates.max()
     }
 
     /// UX-004: refresh the open palette once the agent VM finishes loading

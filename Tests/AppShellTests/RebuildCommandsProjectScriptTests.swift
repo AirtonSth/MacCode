@@ -50,7 +50,7 @@ final class RebuildCommandsProjectScriptTests: XCTestCase {
             ProjectScript(name: "build", command: "npm run build", source: "package.json"),
             ProjectScript(name: "test", command: "npm run test", source: "package.json"),
         ]
-        palette.scriptCache[cwd] = scripts
+        palette.scriptCache[cwd] = ScriptCacheEntry(scripts: scripts, cachedAt: Date(), sourceMtime: nil)
 
         palette.rebuildCommands()
 
@@ -76,6 +76,78 @@ final class RebuildCommandsProjectScriptTests: XCTestCase {
         let scriptCmds = allIDs.filter { $0.hasPrefix("project.run.") && $0 != "project.run.more" }
         XCTAssertTrue(scriptCmds.isEmpty,
                       "when the scriptCache is empty no project.run.* commands must appear; stale script commands from a previous workspace would let the user accidentally run a script in the wrong project")
+    }
+
+    // MARK: - T4: shouldReload - pure staleness seam
+
+    /// WHY: the seam must return true when mtime changed, so a package.json
+    /// edit (new script added) causes re-discovery rather than serving a stale
+    /// list. Without this, the user edits package.json and sees the old script
+    /// list until they restart the app.
+    func test_shouldReload_returnsTrue_whenMtimeChanged() {
+        let t0 = Date(timeIntervalSinceReferenceDate: 0)
+        let t1 = Date(timeIntervalSinceReferenceDate: 1)
+        let result = CommandPalette.shouldReload(
+            cachedMtime: t0,
+            currentMtime: t1,     // mtime advanced -> file was edited
+            cachedAt: Date(),
+            now: Date(),
+            ttl: 60               // TTL is generous; mtime must win
+        )
+        XCTAssertTrue(result,
+                      "shouldReload must return true when the source-file mtime changed; failing to do so means an edited package.json never updates the palette scripts until the app is relaunched")
+    }
+
+    /// WHY: if the mtime did NOT change the cache is valid; re-discovering on
+    /// every palette open would defeat the cache and re-introduce the blocking
+    /// filesystem scan that PERF-003 was built to eliminate.
+    func test_shouldReload_returnsFalse_whenMtimeUnchanged_andWithinTTL() {
+        let mtime = Date(timeIntervalSinceReferenceDate: 0)
+        let cachedAt = Date(timeIntervalSinceReferenceDate: 0)
+        let now = Date(timeIntervalSinceReferenceDate: 2)  // 2 s later, TTL = 5 s
+        let result = CommandPalette.shouldReload(
+            cachedMtime: mtime,
+            currentMtime: mtime,  // unchanged
+            cachedAt: cachedAt,
+            now: now,
+            ttl: 5
+        )
+        XCTAssertFalse(result,
+                       "shouldReload must return false when mtime is unchanged and within TTL; returning true here would re-run a filesystem scan on every palette open, negating the cache")
+    }
+
+    /// WHY: when the mtime cannot be read (file deleted, FS error) the TTL
+    /// becomes the fallback. An expired TTL must trigger re-discovery so the
+    /// palette stays consistent even when mtime is unavailable.
+    func test_shouldReload_returnsTrue_whenMtimeNil_andTTLExpired() {
+        let cachedAt = Date(timeIntervalSinceReferenceDate: 0)
+        let now = Date(timeIntervalSinceReferenceDate: 10)  // 10 s > TTL 5 s
+        let result = CommandPalette.shouldReload(
+            cachedMtime: nil,
+            currentMtime: nil,
+            cachedAt: cachedAt,
+            now: now,
+            ttl: 5
+        )
+        XCTAssertTrue(result,
+                      "shouldReload must return true when mtime is unavailable and TTL has expired; omitting the TTL fallback would serve stale scripts forever when the source file is unreachable")
+    }
+
+    /// WHY: mtime nil but within TTL -> entry is still fresh. Returning true
+    /// here would cause a discovery scan on every lookup until the TTL window
+    /// closes, which defeats PERF-003 for projects that lack a package.json.
+    func test_shouldReload_returnsFalse_whenMtimeNil_andWithinTTL() {
+        let cachedAt = Date(timeIntervalSinceReferenceDate: 0)
+        let now = Date(timeIntervalSinceReferenceDate: 2)   // 2 s < TTL 5 s
+        let result = CommandPalette.shouldReload(
+            cachedMtime: nil,
+            currentMtime: nil,
+            cachedAt: cachedAt,
+            now: now,
+            ttl: 5
+        )
+        XCTAssertFalse(result,
+                       "shouldReload must return false when mtime is unavailable but within TTL; triggering re-discovery on every lookup degrades cmd+k open performance for projects without a package.json")
     }
 
     // MARK: - T3: scriptCache is keyed by cwd - scripts from a different workspace must not bleed in
@@ -104,9 +176,11 @@ final class RebuildCommandsProjectScriptTests: XCTestCase {
 
         let palette = CommandPalette(router: router)
         // Seed scripts only under cwdB.
-        palette.scriptCache[cwdB] = [
-            ProjectScript(name: "deploy", command: "npm run deploy", source: "package.json")
-        ]
+        palette.scriptCache[cwdB] = ScriptCacheEntry(
+            scripts: [ProjectScript(name: "deploy", command: "npm run deploy", source: "package.json")],
+            cachedAt: Date(),
+            sourceMtime: nil
+        )
         palette.rebuildCommands()
 
         let allIDs = palette.allCommandIDsForTesting
