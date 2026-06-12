@@ -90,6 +90,11 @@ public final class SidebarViewModel: ObservableObject {
         _ hasEnoughDisk: Bool
     ) -> Bool
 
+    /// Seam injected in tests so the disable-confirm prompt can be replaced
+    /// without showing a real NSAlert. Production default shows a blocking
+    /// NSAlert. Returning true means "proceed with disable".
+    public typealias TokenSaverDisableConfirmProvider = @MainActor () -> Bool
+
     public weak var context: AppContext?
     public weak var router: AppCommandRouter?
 
@@ -144,6 +149,7 @@ public final class SidebarViewModel: ObservableObject {
     private let tokenSaverModelValidationProvider: TokenSaverModelValidationProvider?
     private let tokenSaverModelDownloadHandler: TokenSaverModelDownloadHandler?
     private let tokenSaverDownloadConfirmProvider: TokenSaverDownloadConfirmProvider?
+    private let tokenSaverDisableConfirmProvider: TokenSaverDisableConfirmProvider?
     private var lastPowerState: ExternalPowerState
     private var showingInsomniaBatteryPrompt = false
     private var tokenSaverModelDownloadTask: Task<TokenSaverModelManifest, Error>?
@@ -168,7 +174,8 @@ public final class SidebarViewModel: ObservableObject {
         },
         tokenSaverModelValidationProvider: TokenSaverModelValidationProvider? = nil,
         tokenSaverModelDownloadHandler: TokenSaverModelDownloadHandler? = nil,
-        tokenSaverDownloadConfirmProvider: TokenSaverDownloadConfirmProvider? = nil
+        tokenSaverDownloadConfirmProvider: TokenSaverDownloadConfirmProvider? = nil,
+        tokenSaverDisableConfirmProvider: TokenSaverDisableConfirmProvider? = nil
     ) {
         self.context = context
         self.router = router
@@ -181,6 +188,7 @@ public final class SidebarViewModel: ObservableObject {
         self.tokenSaverModelValidationProvider = tokenSaverModelValidationProvider
         self.tokenSaverModelDownloadHandler = tokenSaverModelDownloadHandler
         self.tokenSaverDownloadConfirmProvider = tokenSaverDownloadConfirmProvider
+        self.tokenSaverDisableConfirmProvider = tokenSaverDisableConfirmProvider
         self.lastPowerState = powerMonitor.currentPowerState
         self.privateAccountObserver = NotificationCenter.default.addObserver(
             forName: .rc2PrivateAccountChanged,
@@ -311,6 +319,13 @@ public final class SidebarViewModel: ObservableObject {
     public func setTokenSaverEnabled(_ enabled: Bool) {
         guard privateAccountUser?.subscribed == true else { return }
         if !enabled {
+            let confirmed: Bool
+            if let provider = tokenSaverDisableConfirmProvider {
+                confirmed = provider()
+            } else {
+                confirmed = Self.defaultTokenSaverDisableConfirm()
+            }
+            guard confirmed else { return }
             tokenSaverEnabled = false
             settingsStore.update {
                 $0.tokenSaverEnabled = false
@@ -365,6 +380,14 @@ public final class SidebarViewModel: ObservableObject {
     }
 
     public func retryTokenSaverModelDownload() {
+        beginTokenSaverModelDownload(reason: nil)
+    }
+
+    /// Resumes a paused download. Shows the modal again and restarts the
+    /// download from the beginning (the downloader does not support HTTP range
+    /// resume, so "resume" means "start over from the paused state").
+    public func resumeTokenSaverModelDownload() {
+        showsTokenSaverModelDownload = true
         beginTokenSaverModelDownload(reason: nil)
     }
 
@@ -611,6 +634,29 @@ public final class SidebarViewModel: ObservableObject {
         }
         let response = alert.runModal()
         return hasEnoughDisk && response == .alertFirstButtonReturn
+    }
+
+    /// Pure seam: returns true when a disable-confirm alert should be shown
+    /// before stopping Token Saver. Always returns true so every disable goes
+    /// through the confirm path; extracted for testing without spinning an NSAlert.
+    ///
+    /// WHY separate: the alert blocks the main thread. Tests inject
+    /// `tokenSaverDisableConfirmProvider` to skip the alert; this seam documents
+    /// the decision boundary (always confirm) independently of the alert copy.
+    nonisolated public static func shouldConfirmTokenSaverDisable() -> Bool {
+        return true
+    }
+
+    /// Blocking NSAlert shown before Token Saver is disabled. Disabling stops
+    /// the sidecar process and uninstalls the managed distill skill.
+    public static func defaultTokenSaverDisableConfirm() -> Bool {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Disable Token Saver?"
+        alert.informativeText = "Disabling Token Saver stops the local model and uninstalls the compression skill. You can re-enable it at any time."
+        alert.addButton(withTitle: "Disable")
+        alert.addButton(withTitle: "Cancel")
+        return alert.runModal() == .alertFirstButtonReturn
     }
 
     public static func defaultInsomniaBatteryPrompt() -> InsomniaBatteryDecision {
@@ -1609,6 +1655,7 @@ public struct SidebarRootView: View {
                 aggregatedTotalBytes: vm.tokenSaverAggregatedTotalBytes,
                 downloadBytesPerSec: vm.tokenSaverDownloadBytesPerSec,
                 onCancel: { vm.cancelTokenSaverModelDownload() },
+                onResume: { vm.resumeTokenSaverModelDownload() },
                 onRetry: { vm.retryTokenSaverModelDownload() }
             )
         }
@@ -1917,16 +1964,13 @@ public struct SidebarRootView: View {
 
     private var tokenSaverHeadline: String {
         guard let user = vm.privateAccountUser else { return "Track Claude + Codex savings" }
-        let used = vm.tokenSaverUsageSnapshot.usedTokens
-        if user.subscribed {
-            if vm.tokenSaverEnabled {
-                let saved = vm.tokenSaverSavingsSummary.totalSavedTokens
-                return saved > 0 ? "Saved \(Self.formatTokenCount(saved)) tokens" : "Tracking savings per agent run"
-            }
-            return "Enable savings"
-        }
-        let potential = TokenSaverUsageStore.estimatePotentialSavings(usedTokens: used)
-        return potential > 0 ? "Save ~\(Self.formatTokenCount(potential)) tokens" : "Savings estimate ready"
+        return Self.tokenSaverCardHeadline(
+            subscribed: user.subscribed,
+            enabled: vm.tokenSaverEnabled,
+            sidecarStatus: vm.sidecarStatus,
+            savedTokens: vm.tokenSaverSavingsSummary.totalSavedTokens,
+            usedTokens: vm.tokenSaverUsageSnapshot.usedTokens
+        )
     }
 
     private var tokenSaverSubtitle: String {
@@ -2426,6 +2470,50 @@ public struct SidebarRootView: View {
         }
     }
 
+    /// Pure seam: returns the headline string for the Token Saver card. Extracted
+    /// so tests can verify the degraded-state copy without rendering any SwiftUI view.
+    ///
+    /// WHY: when the sidecar is blocked the user sees the same "Saved X tokens"
+    /// headline as when everything is healthy, giving no signal that compression
+    /// has stopped. This seam makes the degraded variant testable and explicit.
+    nonisolated public static func tokenSaverCardHeadline(
+        subscribed: Bool,
+        enabled: Bool,
+        sidecarStatus: TokenSaverDistillServiceStatus,
+        savedTokens: Int,
+        usedTokens: Int
+    ) -> String {
+        if subscribed && enabled {
+            if case .blocked = sidecarStatus {
+                return "Token Saver degraded"
+            }
+            return savedTokens > 0
+                ? "Saved \(Self.formatTokenCountPublic(savedTokens)) tokens"
+                : "Tracking savings per agent run"
+        }
+        if subscribed {
+            return "Enable savings"
+        }
+        let potential = TokenSaverUsageStore.estimatePotentialSavings(usedTokens: usedTokens)
+        return potential > 0
+            ? "Save ~\(Self.formatTokenCountPublic(potential)) tokens"
+            : "Savings estimate ready"
+    }
+
+    // Internal alias exposed for the pure seam above. Mirrors `formatTokenCount`
+    // which is private; keeping it nonisolated and public lets tests call it.
+    nonisolated public static func formatTokenCountPublic(_ value: Int) -> String {
+        if value >= 1_000_000 {
+            let whole = Double(value) / 1_000_000.0
+            return String(format: whole >= 10 ? "%.0fM" : "%.1fM", whole)
+        }
+        if value >= 1_000 {
+            let whole = Double(value) / 1_000.0
+            return String(format: whole >= 10 ? "%.0fK" : "%.1fK", whole)
+        }
+        return "\(value)"
+    }
+
     private static func formatTokenCount(_ value: Int) -> String {
         if value >= 1_000_000 {
             let whole = Double(value) / 1_000_000.0
@@ -2647,9 +2735,11 @@ public struct SidebarRootView: View {
         let aggregatedTotalBytes: Int64
         let downloadBytesPerSec: Double
         let onCancel: () -> Void
+        let onResume: () -> Void
         let onRetry: () -> Void
 
         private var isFailed: Bool { state.phase == .failed }
+        private var isPaused: Bool { state.phase == .paused }
 
         var body: some View {
             VStack(alignment: .leading, spacing: DS.Space.lg) {
@@ -2707,6 +2797,14 @@ public struct SidebarRootView: View {
                     }
                     .keyboardShortcut(.cancelAction)
                     .frame(minWidth: 88, minHeight: 44)
+                    if isPaused {
+                        Button("Resume") {
+                            onResume()
+                        }
+                        .keyboardShortcut(.defaultAction)
+                        .frame(minWidth: 88, minHeight: 44)
+                        .accessibilityIdentifier("tokenSaverDownload.resume")
+                    }
                     if isFailed {
                         Button("Retry") {
                             onRetry()
