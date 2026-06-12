@@ -121,6 +121,10 @@ public final class SidebarViewModel: ObservableObject {
     @Published public private(set) var tokenSaverSavingsSummary: TokenSaverSavingsSummary = .empty
     @Published public var showsTokenSaverModelDownload = false
     @Published public private(set) var tokenSaverModelDownloadState: TokenSaverModelDownloadState = .idle
+    /// Current status of the Token Saver sidecar. Updated whenever the controller
+    /// posts `.rc2TokenSaverDistillStatusChanged`. Drives the status row in the
+    /// details popover so a blocked/failed sidecar is never invisible (Rule 6).
+    @Published public private(set) var sidecarStatus: TokenSaverDistillServiceStatus = .notStarted
     public var draggingWorkspaceID: WorkspaceID?
     /// UX-MAC_SHELL_WINDOW-012: the row the drag is currently hovering,
     /// so the list can draw an insertion line instead of reordering live.
@@ -131,6 +135,7 @@ public final class SidebarViewModel: ObservableObject {
     private(set) var removedWorkspaceStack: [WorkspaceUndoEntry] = []
     private var privateAccountObserver: NSObjectProtocol?
     private var tokenSaverUsageObserver: NSObjectProtocol?
+    private var sidecarStatusObserver: NSObjectProtocol?
     private let updateChecker: AppUpdateChecking?
     private let settingsStore: SettingsStore
     private let insomniaPower: InsomniaPowerManaging
@@ -184,6 +189,15 @@ public final class SidebarViewModel: ObservableObject {
             guard let viewModel = self else { return }
             Task { @MainActor in viewModel.reloadTokenSaver() }
         }
+        self.sidecarStatusObserver = NotificationCenter.default.addObserver(
+            forName: .rc2TokenSaverDistillStatusChanged,
+            object: nil,
+            queue: .main
+        ) { [weak self] note in
+            guard let viewModel = self,
+                  let controller = note.object as? TokenSaverDistillServiceController else { return }
+            Task { @MainActor in viewModel.sidecarStatus = controller.status }
+        }
         self.updateChecker?.onAvailabilityChanged = { [weak self] availability in
             self?.updateAvailability = availability
         }
@@ -194,6 +208,7 @@ public final class SidebarViewModel: ObservableObject {
         reload()
         reloadInsomnia()
         reloadTokenSaver()
+        sidecarStatus = context.tokenSaverDistillServiceController.status
     }
 
     deinit {
@@ -202,6 +217,9 @@ public final class SidebarViewModel: ObservableObject {
         }
         if let tokenSaverUsageObserver {
             NotificationCenter.default.removeObserver(tokenSaverUsageObserver)
+        }
+        if let sidecarStatusObserver {
+            NotificationCenter.default.removeObserver(sidecarStatusObserver)
         }
         tokenSaverModelDownloadTask?.cancel()
         powerMonitor.stop()
@@ -2083,6 +2101,28 @@ public struct SidebarRootView: View {
                 .accessibilityIdentifier("sidebar.tokenSaver.toggle")
             }
 
+            if let label = Self.sidecarStatusLabel(vm.sidecarStatus) {
+                HStack(spacing: DS.Space.xs) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundColor(DS.Palette.warning)
+                    Text(label)
+                        .font(DS.Font.caption)
+                        .foregroundColor(DS.Palette.warning)
+                        .lineLimit(2)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .padding(.horizontal, DS.Space.sm)
+                .padding(.vertical, DS.Space.xs)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(
+                    RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
+                        .fill(DS.Palette.warning.opacity(0.10))
+                )
+                .accessibilityElement(children: .combine)
+                .accessibilityIdentifier("sidebar.tokenSaver.sidecarStatus")
+            }
+
             Picker("Usage scope", selection: tokenSaverDetailsScopeBinding) {
                 ForEach(TokenSaverUsageScope.allCases, id: \.self) { scope in
                     Text(tokenSaverScopeTitle(scope)).tag(scope)
@@ -2288,6 +2328,29 @@ public struct SidebarRootView: View {
         switch provider {
         case .claude: return "Claude"
         case .codex: return "Codex"
+        }
+    }
+
+    /// Pure seam: maps a sidecar status to a short human-readable label for the
+    /// details-popover status row. Returns nil for `.running` and `.notStarted`
+    /// (healthy / not yet started) so no banner appears. Returns a non-nil,
+    /// ASCII-only string for `.blocked`, `.failed`, and `.starting` (not healthy).
+    ///
+    /// WHY separate from `displayLabel`: this seam controls VISIBILITY. Returning
+    /// nil hides the row entirely so the popover stays clean when the sidecar
+    /// is healthy.
+    nonisolated public static func sidecarStatusLabel(
+        _ status: TokenSaverDistillServiceStatus
+    ) -> String? {
+        switch status {
+        case .blocked(let reason):
+            return reason.isEmpty ? "Sidecar blocked" : "Sidecar blocked: \(reason)"
+        case .failed(let reason):
+            return reason.isEmpty ? "Sidecar failed" : "Sidecar failed: \(reason)"
+        case .starting:
+            return "Sidecar warming up"
+        case .running, .notStarted:
+            return nil
         }
     }
 
