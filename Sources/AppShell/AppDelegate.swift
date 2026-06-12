@@ -1273,3 +1273,21 @@ extension SurfaceType {
         }
     }
 }
+
+#if DEBUG
+extension AppDelegate {
+    /// Test seam: synchronously drains the background writer queue after calling
+    /// the production CCR retention path so tests can assert pruning without timers.
+    ///
+    /// WHY: `runCCRRetention` is private and dispatches asynchronously; a test
+    /// that bypasses the delegate exercises only the API layer.  This seam drives
+    /// the full production path — same store, same queue — then blocks until the
+    /// async prune is complete, making the outcome synchronously verifiable.
+    /// The 24-hour cadence timer is never installed in these tests, so disk growth
+    /// due to an absent scheduling hook will fail this assertion.
+    func runCCRRetentionForTesting() {
+        runCCRRetention()
+        context?.flushWriterQueue()
+    }
+}
+#endif

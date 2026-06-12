@@ -98,10 +98,10 @@ public final class LocalAuthAdapter: DirectAuthProvider {
 
     public func createPairingRequest(deviceName: String, privateAccountAccessToken: String?) -> (requestId: String, code: String)? {
         guard let req = try? repo.createPairingRequest(deviceName: deviceName) else { return nil }
-        try? repo.audit(actor: "device", action: "pairing.request", detail: deviceName)
+        auditLoud(actor: "device", action: "pairing.request", detail: deviceName)
         if canAutoApprovePairing(privateAccountAccessToken: privateAccountAccessToken) {
             approvePairingRequest(req.id)
-            try? repo.audit(actor: "account", action: "pairing.auto_approve", detail: deviceName)
+            auditLoud(actor: "account", action: "pairing.auto_approve", detail: deviceName)
             return (req.id, req.code)
         }
         onPairingRequest?(PairingPrompt(requestId: req.id, code: req.code, deviceName: deviceName,
@@ -144,13 +144,13 @@ public final class LocalAuthAdapter: DirectAuthProvider {
         pendingLock.lock()
         pendingTokens[requestId] = (trust.id, token, Date())
         pendingLock.unlock()
-        try? repo.audit(actor: trust.id, action: "pairing.approve", detail: trust.displayName)
+        auditLoud(actor: trust.id, action: "pairing.approve", detail: trust.displayName)
     }
 
     /// Called from the Mac modal's Deny button.
     public func denyPairingRequest(_ requestId: String) {
         try? repo.denyPairingRequest(id: requestId)
-        try? repo.audit(actor: "user", action: "pairing.deny", detail: requestId)
+        auditLoud(actor: "user", action: "pairing.deny", detail: requestId)
     }
 
     public func pairingRequestStatus(requestId: String) -> (status: String, deviceId: String?, token: String?)? {
@@ -187,21 +187,21 @@ public final class LocalAuthAdapter: DirectAuthProvider {
         pendingLock.lock()
         pendingTokens.removeValue(forKey: requestId)
         pendingLock.unlock()
-        try? repo.audit(actor: "device", action: "pairing.cancel", detail: requestId)
+        auditLoud(actor: "device", action: "pairing.cancel", detail: requestId)
         onPairingCancelled?(requestId)
         return true
     }
 
     public func createPairingCode() -> String? {
         guard let p = try? repo.createPairingCode() else { return nil }
-        try? repo.audit(actor: "system", action: "pairing.create", detail: p.code)
+        auditLoud(actor: "system", action: "pairing.create", detail: p.code)
         return p.code
     }
 
     public func redeemPairingCode(_ code: String, deviceName: String) -> (deviceId: String, token: String)? {
         do {
             guard let p = try repo.redeemPairingCode(code, deviceName: deviceName) else { return nil }
-            try? repo.audit(actor: p.0.id, action: "pairing.redeem", detail: deviceName)
+            auditLoud(actor: p.0.id, action: "pairing.redeem", detail: deviceName)
             return (p.0.id, p.token)
         } catch {
             return nil
@@ -225,7 +225,30 @@ public final class LocalAuthAdapter: DirectAuthProvider {
 
     public func revokeDevice(_ id: String) {
         try? repo.revoke(id: id)
-        try? repo.audit(actor: "system", action: "device.revoke", detail: id)
+        auditLoud(actor: "system", action: "device.revoke", detail: id)
+    }
+
+    // MARK: - Internal audit helper
+
+    /// Write an audit row. In DEBUG builds throws loudly on failure so regressions
+    /// are caught immediately; in release builds falls back to the original silent
+    /// `try?` so a transient DB error never crashes a production user's session.
+    ///
+    /// WHY: `try? repo.audit(...)` silently swallows errors. A broken audit path
+    /// (schema regression, corrupt table) is a compliance gap that is invisible
+    /// until a post-incident review. A DEBUG assertion turns it into an immediate
+    /// test failure.
+    private func auditLoud(actor: String, action: String, detail: String?) {
+        #if DEBUG
+        do {
+            try repo.audit(actor: actor, action: action, detail: detail)
+        } catch {
+            assertionFailure("audit_log write failed in DEBUG build — action=\(action) error=\(error). " +
+                             "A silent audit failure is a compliance/regression risk; fix the underlying error.")
+        }
+        #else
+        try? repo.audit(actor: actor, action: action, detail: detail)
+        #endif
     }
 }
 
