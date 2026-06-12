@@ -450,7 +450,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 self.editingQueuedMessage = nil
                 queuedMessageDraft = ""
                 reloadQueuedMessages()
-                onQueuedMessageEvent?("agent.message.queue.updated", updated)
+                onQueuedMessageEvent?(AgentQueueEventKinds.updated, updated)
             } else {
                 queueStatusMessage = "Already processing."
                 self.editingQueuedMessage = nil
@@ -474,7 +474,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 queueStatusMessage = "Queued message will run next."
                 reloadQueuedMessages()
                 for queued in queuedMessages {
-                    onQueuedMessageEvent?("agent.message.queue.updated", queued)
+                    onQueuedMessageEvent?(AgentQueueEventKinds.updated, queued)
                 }
                 return
             }
@@ -489,9 +489,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             }
             queueStatusMessage = nil
             reloadQueuedMessages()
-            onQueuedMessageEvent?("agent.message.queue.drained", queued)
+            onQueuedMessageEvent?(AgentQueueEventKinds.drained, queued)
             for queued in queuedMessages {
-                onQueuedMessageEvent?("agent.message.queue.updated", queued)
+                onQueuedMessageEvent?(AgentQueueEventKinds.updated, queued)
             }
             _ = await startProviderRun(
                 text: queued.text,
@@ -513,7 +513,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                     queuedMessageDraft = ""
                 }
                 reloadQueuedMessages()
-                onQueuedMessageEvent?("agent.message.queue.cancelled", cancelled)
+                onQueuedMessageEvent?(AgentQueueEventKinds.cancelled, cancelled)
             } else {
                 queueStatusMessage = "Already processing."
                 reloadQueuedMessages()
@@ -557,7 +557,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             }
             reloadQueuedMessages()
             for queued in queuedMessages {
-                onQueuedMessageEvent?("agent.message.queue.updated", queued)
+                onQueuedMessageEvent?(AgentQueueEventKinds.updated, queued)
             }
         } catch {
             queueStatusMessage = "Queue reorder failed: \(error)"
@@ -1589,7 +1589,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             reloadQueuedMessages()
             // QA-MAC_AGENT-010: track queue depth for diagnostics.
             agentSurfaceLog.info("queue.enqueued thread=\(selectedThreadId.value.uuidString, privacy: .public) depth=\(self.queuedMessages.count, privacy: .public)")
-            onQueuedMessageEvent?("agent.message.queued", queued)
+            onQueuedMessageEvent?(AgentQueueEventKinds.queued, queued)
         } catch {
             queueStatusMessage = "Queue send failed: \(error)"
         }

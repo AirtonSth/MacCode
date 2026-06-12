@@ -298,15 +298,8 @@ public final class AppContext {
                 EventBus.shared.publish(kind: "agent.thread.token_usage", payload: .object(p))
             case .accountUsage(let usage):
                 self.recordTokenSaverAccountUsage(usage)
-                EventBus.shared.publish(kind: "agent.account.usage", payload: .object([
-                    "thread_id": .string(t),
-                    "provider": .string(usage.provider.rawValue),
-                    "weekly_used_percent": .number(usage.weeklyUsedPercent),
-                    "weekly_window_duration_minutes": usage.weeklyWindowDurationMinutes.map { .number(Double($0)) } ?? .null,
-                    "weekly_resets_at_ms": usage.weeklyResetsAtMs.map { .number(Double($0)) } ?? .null,
-                    "current_session_used_percent": usage.currentSessionUsedPercent.map { .number($0) } ?? .null,
-                    "current_session_resets_at_ms": usage.currentSessionResetsAtMs.map { .number(Double($0)) } ?? .null
-                ]))
+                EventBus.shared.publish(kind: "agent.account.usage",
+                    payload: .object(Self.accountUsagePayload(threadId: t, usage: usage)))
             case .contextCompaction(let summary):
                 EventBus.shared.publish(kind: "agent.context.compaction", payload: .object([
                     "thread_id": .string(t),
@@ -504,15 +497,8 @@ public final class AppContext {
                 guard let self else { return }
                 for usage in usages {
                     self.recordTokenSaverAccountUsage(usage)
-                    EventBus.shared.publish(kind: "agent.account.usage", payload: .object([
-                        "provider": .string(usage.provider.rawValue),
-                        "reason": .string(reason),
-                        "weekly_used_percent": .number(usage.weeklyUsedPercent),
-                        "weekly_window_duration_minutes": usage.weeklyWindowDurationMinutes.map { .number(Double($0)) } ?? .null,
-                        "weekly_resets_at_ms": usage.weeklyResetsAtMs.map { .number(Double($0)) } ?? .null,
-                        "current_session_used_percent": usage.currentSessionUsedPercent.map { .number($0) } ?? .null,
-                        "current_session_resets_at_ms": usage.currentSessionResetsAtMs.map { .number(Double($0)) } ?? .null
-                    ]))
+                    EventBus.shared.publish(kind: "agent.account.usage",
+                        payload: .object(Self.accountUsagePayload(reason: reason, usage: usage)))
                 }
                 self.publishTokenSaverAccountUsageRefresh(
                     state: "finished",
@@ -561,18 +547,61 @@ public final class AppContext {
         detail: String?,
         providers: [String] = []
     ) {
-        var payload: [String: JSONValue] = [
+        let payload = Self.accountUsageRefreshPayload(
+            state: state,
+            reason: reason,
+            detail: detail,
+            providers: providers,
+            refreshCount: tokenSaverAccountUsageRefreshCount
+        )
+        EventBus.shared.publish(kind: "agent.account.usage.refresh", payload: .object(payload))
+    }
+
+    /// Pure builder for the `agent.account.usage` event payload.
+    ///
+    /// WHY: the payload is constructed in two call sites (run-time event and
+    /// refresh path). Extracting the builder lets golden contract tests pin
+    /// the field names and types so silent schema drift fails a mac test.
+    /// `threadId` is present only in the run-time path; `reason` only in the
+    /// refresh path — both are optional.
+    nonisolated static func accountUsagePayload(
+        threadId: String? = nil,
+        reason: String? = nil,
+        usage: AssistantAccountUsage
+    ) -> [String: JSONValue] {
+        var p: [String: JSONValue] = [
+            "provider": .string(usage.provider.rawValue),
+            "weekly_used_percent": .number(usage.weeklyUsedPercent),
+            "weekly_window_duration_minutes": usage.weeklyWindowDurationMinutes.map { .number(Double($0)) } ?? .null,
+            "weekly_resets_at_ms": usage.weeklyResetsAtMs.map { .number(Double($0)) } ?? .null,
+            "current_session_used_percent": usage.currentSessionUsedPercent.map { .number($0) } ?? .null,
+            "current_session_resets_at_ms": usage.currentSessionResetsAtMs.map { .number(Double($0)) } ?? .null
+        ]
+        if let threadId { p["thread_id"] = .string(threadId) }
+        if let reason   { p["reason"]    = .string(reason)   }
+        return p
+    }
+
+    /// Pure builder for the `agent.account.usage.refresh` event payload.
+    ///
+    /// WHY: same extraction rationale as `accountUsagePayload` — lets a golden
+    /// test pin `state`/`reason`/`refresh_count`/`detail`/`providers` field
+    /// names independently of the private emit function.
+    nonisolated static func accountUsageRefreshPayload(
+        state: String,
+        reason: String,
+        detail: String?,
+        providers: [String],
+        refreshCount: Int
+    ) -> [String: JSONValue] {
+        var p: [String: JSONValue] = [
             "state": .string(state),
             "reason": .string(reason),
-            "refresh_count": .number(Double(tokenSaverAccountUsageRefreshCount))
+            "refresh_count": .number(Double(refreshCount))
         ]
-        if let detail {
-            payload["detail"] = .string(detail)
-        }
-        if !providers.isEmpty {
-            payload["providers"] = .array(providers.map { .string($0) })
-        }
-        EventBus.shared.publish(kind: "agent.account.usage.refresh", payload: .object(payload))
+        if let detail { p["detail"] = .string(detail) }
+        if !providers.isEmpty { p["providers"] = .array(providers.map { .string($0) }) }
+        return p
     }
 
     /// Reuse one client per live sidecar (base URL + bearer token). Rebuilds
