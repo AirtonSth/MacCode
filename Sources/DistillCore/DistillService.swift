@@ -351,7 +351,46 @@ public final class DistillHTTPServer: @unchecked Sendable {
         )
     }
 
-    private func receive(connection: NWConnection, buffer: Data) {
+    /// Maximum bytes buffered for a connection whose HTTP header has not yet been
+    /// parsed and the bearer token verified. 65536 bytes is far above any realistic
+    /// HTTP request-line + headers (typical auth request is < 2 KB), and far below
+    /// the input sizes a legitimate authed POST /v1/distill may carry (uncapped once
+    /// auth is confirmed via the Authorization header in the buffer).
+    static let preAuthBufferCap = 65_536
+
+    /// Pure seam: returns true when a connection has not yet been header-authed and
+    /// its accumulated buffer exceeds the pre-auth cap. Extracted for testability.
+    /// WHY: an unauthenticated client must not be able to OOM the distill service by
+    /// streaming arbitrary bytes before completing an HTTP request.
+    static func exceedsPreAuthCap(bufferCount: Int, headerAuthed: Bool, cap: Int = preAuthBufferCap) -> Bool {
+        !headerAuthed && bufferCount > cap
+    }
+
+    /// Returns true if the Authorization header in the (possibly partial) buffer
+    /// matches the expected bearer token. Requires the header section to be complete
+    /// (i.e. `\r\n\r\n` present). Used to lift the pre-auth cap once auth is seen.
+    private func bufferIsHeaderAuthed(_ data: Data) -> Bool {
+        guard let headerRange = data.range(of: Data("\r\n\r\n".utf8)),
+              let headerText = String(data: data[..<headerRange.lowerBound], encoding: .utf8) else {
+            return false
+        }
+        let expected = "Bearer \(configuration.authToken)"
+        return headerText
+            .split(separator: "\r\n")
+            .dropFirst()
+            .contains { line in
+                let pieces = line.split(separator: ":", maxSplits: 1)
+                guard pieces.count == 2,
+                      pieces[0].trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "authorization" else {
+                    return false
+                }
+                return pieces[1].trimmingCharacters(in: .whitespacesAndNewlines) == expected
+            }
+    }
+
+    // scanOffset tracks the last position searched for "\r\n\r\n" so each receive
+    // cycle only scans new bytes rather than re-scanning the entire buffer.
+    private func receive(connection: NWConnection, buffer: Data, scanOffset: Int = 0, headerAuthed: Bool = false) {
         connection.start(queue: queue)
         connection.receive(minimumIncompleteLength: 1, maximumLength: 1_048_576) { [weak self] data, _, isComplete, error in
             guard let self else { return }
@@ -365,18 +404,39 @@ public final class DistillHTTPServer: @unchecked Sendable {
                 nextBuffer.append(data)
             }
 
-            if self.requestIsComplete(nextBuffer) {
+            // Promote headerAuthed once the header section is fully buffered.
+            let authed = headerAuthed || self.bufferIsHeaderAuthed(nextBuffer)
+
+            // Reject pre-auth connections that exceed the buffer cap. An authed
+            // connection (large distill body) is never capped here.
+            if DistillHTTPServer.exceedsPreAuthCap(bufferCount: nextBuffer.count, headerAuthed: authed) {
+                connection.cancel()
+                return
+            }
+
+            // Advance the scan offset to avoid re-scanning bytes already checked.
+            // The separator is 4 bytes; we must not skip past a partial match at the
+            // tail of the previously-scanned window, so retreat by 3.
+            let nextScanOffset = max(0, nextBuffer.count - (data?.count ?? 0) - 3)
+
+            if self.requestIsComplete(nextBuffer, from: nextScanOffset) {
                 Task {
                     await self.handle(buffer: nextBuffer, connection: connection)
                 }
             } else {
-                self.receive(connection: connection, buffer: nextBuffer)
+                self.receive(connection: connection, buffer: nextBuffer, scanOffset: nextScanOffset, headerAuthed: authed)
             }
         }
     }
 
-    private func requestIsComplete(_ data: Data) -> Bool {
-        guard let headerRange = data.range(of: Data("\r\n\r\n".utf8)),
+    /// Returns true when `data` contains a complete HTTP request (headers + declared body).
+    /// `from` is a hint: the search for `\r\n\r\n` starts at `max(0, from - 3)` to
+    /// avoid re-scanning already-checked bytes while still catching a separator that
+    /// straddles the previous read boundary.
+    /// Internal (not private) so unit tests can exercise the scan-offset logic directly.
+    func requestIsComplete(_ data: Data, from scanOffset: Int = 0) -> Bool {
+        let searchStart = max(0, scanOffset - 3)
+        guard let headerRange = data.range(of: Data("\r\n\r\n".utf8), in: searchStart..<data.count),
               let headerText = String(data: data[..<headerRange.lowerBound], encoding: .utf8) else {
             return false
         }

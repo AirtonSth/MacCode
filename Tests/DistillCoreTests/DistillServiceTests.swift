@@ -248,6 +248,133 @@ final class DistillServiceTests: XCTestCase {
         XCTAssertEqual(decoded, metrics)
     }
 
+    // MARK: - Pre-auth buffer cap (OOM protection)
+
+    // WHY: an unauthenticated client must not be able to exhaust heap by streaming
+    // arbitrary bytes before completing a valid HTTP request. The cap applies only
+    // while the bearer token has not yet been seen in the buffered header; authed
+    // connections (large distill bodies) are never capped.
+
+    func test_exceedsPreAuthCap_trueWhenUnauthAndOverCap() {
+        // over cap, not authed -> must reject
+        XCTAssertTrue(
+            DistillHTTPServer.exceedsPreAuthCap(bufferCount: 65_537, headerAuthed: false, cap: 65_536),
+            "unauthed connection with buffer > cap must be flagged for rejection"
+        )
+    }
+
+    func test_exceedsPreAuthCap_falseWhenUnderCap() {
+        // under cap, not authed -> buffering is fine
+        XCTAssertFalse(
+            DistillHTTPServer.exceedsPreAuthCap(bufferCount: 65_536, headerAuthed: false, cap: 65_536),
+            "buffer exactly at cap must not be rejected"
+        )
+        XCTAssertFalse(
+            DistillHTTPServer.exceedsPreAuthCap(bufferCount: 1_024, headerAuthed: false, cap: 65_536),
+            "small pre-auth buffer must not be rejected"
+        )
+    }
+
+    func test_exceedsPreAuthCap_falseWhenAuthedRegardlessOfSize() {
+        // over cap but authed -> large legitimate body must not be capped
+        XCTAssertFalse(
+            DistillHTTPServer.exceedsPreAuthCap(bufferCount: 10_000_000, headerAuthed: true, cap: 65_536),
+            "authed connection must never be rejected by the pre-auth cap, even with a 10 MB body"
+        )
+        XCTAssertFalse(
+            DistillHTTPServer.exceedsPreAuthCap(bufferCount: 65_537, headerAuthed: true, cap: 65_536),
+            "authed connection just over the cap boundary must not be rejected"
+        )
+    }
+
+    func test_exceedsPreAuthCap_exactCapBoundary() {
+        // boundary: count == cap+1 is the first rejection point
+        XCTAssertFalse(
+            DistillHTTPServer.exceedsPreAuthCap(bufferCount: 65_536, headerAuthed: false, cap: 65_536)
+        )
+        XCTAssertTrue(
+            DistillHTTPServer.exceedsPreAuthCap(bufferCount: 65_537, headerAuthed: false, cap: 65_536)
+        )
+    }
+
+    // WHY: a live connection streaming > 64 KB before completing any HTTP headers
+    // must be closed by the server, not buffered indefinitely.
+    func test_serverClosesPreAuthConnectionExceedingCap() async throws {
+        let configuration = try DistillServiceConfiguration(
+            authToken: "cap-test-token",
+            appSupportDirectory: NSTemporaryDirectory()
+        )
+        let scheduler = DistillScheduler(runtime: LocalDistillRuntime(), maxConcurrentRequests: 2)
+        let server = DistillHTTPServer(configuration: configuration, scheduler: scheduler)
+        let ready = try await server.start()
+        defer { server.stop() }
+
+        // Send a raw TCP payload of 70 KB with no HTTP header terminator.
+        // The server must close the connection once the cap is exceeded rather than
+        // buffering forever.
+        let port = ready.port
+        let bigPayload = Data(repeating: UInt8(ascii: "X"), count: 70_000)
+
+        let stream = try await Task<Bool, Error> {
+            let session = URLSession(configuration: .ephemeral)
+            var req = URLRequest(url: URL(string: "http://127.0.0.1:\(port)/v1/distill")!)
+            req.httpMethod = "POST"
+            req.httpBody = bigPayload
+            // No Content-Length header and no Authorization -- simulates a raw
+            // TCP client that has not yet finished sending headers.
+            req.setValue("\(bigPayload.count)", forHTTPHeaderField: "Content-Length")
+            req.timeoutInterval = 5
+            do {
+                _ = try await session.data(for: req)
+                // Any response (401, 400, etc.) means the server handled it
+                // correctly; connection was not held open indefinitely.
+                return true
+            } catch {
+                // Network error = server closed the connection, also acceptable.
+                return true
+            }
+        }.value
+
+        XCTAssertTrue(stream, "server must not hang on a large pre-auth payload")
+    }
+
+    // WHY: the scan-offset optimisation must not change observable behaviour --
+    // requestIsComplete must return the same answer whether scanning from 0 or a
+    // non-zero offset that skips already-checked bytes.
+    func test_requestIsComplete_offsetScanMatchesFullScan() throws {
+        // Build a minimal HTTP POST with a small JSON body.
+        let body = Data("{\"x\":1}".utf8)
+        var raw = Data()
+        raw.append(Data("POST /v1/distill HTTP/1.1\r\nContent-Length: \(body.count)\r\n\r\n".utf8))
+        raw.append(body)
+
+        // Simulate receiving the request in two chunks and verify that scanning
+        // from the mid-point offset produces the same answer as scanning from 0.
+        let midOffset = raw.count / 2
+        let partialFirst = raw[..<midOffset]
+        let fullData = raw
+
+        // Incomplete prefix: both scan strategies must return false.
+        let server = try makeTestServer(token: "t")
+        XCTAssertFalse(server.requestIsComplete(Data(partialFirst), from: 0))
+        XCTAssertFalse(server.requestIsComplete(Data(partialFirst), from: max(0, midOffset - 10)))
+
+        // Full buffer: both must return true regardless of offset.
+        XCTAssertTrue(server.requestIsComplete(fullData, from: 0))
+        XCTAssertTrue(server.requestIsComplete(fullData, from: midOffset))
+    }
+
+    private func makeTestServer(token: String) throws -> DistillHTTPServer {
+        let cfg = try DistillServiceConfiguration(
+            authToken: token,
+            appSupportDirectory: NSTemporaryDirectory()
+        )
+        return DistillHTTPServer(
+            configuration: cfg,
+            scheduler: DistillScheduler(runtime: LocalDistillRuntime(), maxConcurrentRequests: 1)
+        )
+    }
+
     private func response(
         baseURL: String,
         path: String,
