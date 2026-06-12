@@ -153,6 +153,50 @@ final class HTTPServerTests: XCTestCase {
         return fd
     }
 
+    // MARK: - nextHeaderTerminatorRange unit tests
+
+    /// Terminator present in a single contiguous buffer -- found at correct index.
+    func test_nextHeaderTerminatorRange_present() {
+        let buf = Data("GET / HTTP/1.1\r\nHost: x\r\n\r\n".utf8)
+        let r = DirectHTTPServer.nextHeaderTerminatorRange(in: buf, from: 0)
+        XCTAssertNotNil(r, "terminator must be found in a complete header")
+        // The range should point at the \r\n\r\n that ends the header.
+        XCTAssertEqual(buf[r!], Data("\r\n\r\n".utf8),
+                       "range must point at the 4-byte CRLFCRLF sequence")
+    }
+
+    /// WHY: a terminator split across two appends must still be found when
+    /// the scan starts at (prevCount - 3). This is the boundary case the
+    /// overlap exists for. Without the 3-byte overlap the second half \r\n
+    /// would be scanned in isolation and the terminator would be missed.
+    func test_nextHeaderTerminatorRange_split_across_boundary() {
+        // Simulate: first read ends with "\r\n", second read starts with "\r\n".
+        var buf = Data("GET / HTTP/1.1\r\nHost: x\r\n".utf8) // ends with \r\n
+        let prevCount = buf.count
+        buf.append(Data("\r\n".utf8))                         // second read: \r\n completes terminator
+        let overlap = 3  // terminatorLength - 1
+        let searchFrom = max(0, prevCount - overlap)
+        let r = DirectHTTPServer.nextHeaderTerminatorRange(in: buf, from: searchFrom)
+        XCTAssertNotNil(r,
+            "terminator split across two reads must be found with a 3-byte overlap search")
+    }
+
+    /// Searching from beyond the terminator must return nil (correctness guard).
+    func test_nextHeaderTerminatorRange_miss_when_offset_past_terminator() {
+        let header = "GET / HTTP/1.1\r\nHost: x\r\n\r\n"
+        let buf = Data(header.utf8)
+        // Start search past the terminator position.
+        let r = DirectHTTPServer.nextHeaderTerminatorRange(in: buf, from: buf.count)
+        XCTAssertNil(r, "search past end of buffer must return nil")
+    }
+
+    /// No terminator in buffer -- must return nil.
+    func test_nextHeaderTerminatorRange_absent() {
+        let buf = Data("GET / HTTP/1.1\r\nHost: x\r\n".utf8)
+        XCTAssertNil(DirectHTTPServer.nextHeaderTerminatorRange(in: buf, from: 0),
+                     "absent terminator must return nil")
+    }
+
     private func writeAll(fd: Int32, data: Data) throws {
         try data.withUnsafeBytes { raw in
             guard let base = raw.baseAddress else { return }

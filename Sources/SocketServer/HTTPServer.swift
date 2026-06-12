@@ -144,6 +144,23 @@ public final class DirectHTTPServer: @unchecked Sendable {
         !loopbackOnly && hasAuthProvider
     }
 
+    /// Pure helper: search `buf` for the CRLFCRLF header terminator starting
+    /// at byte index `from`. The caller must pass
+    ///   from = max(0, previousBufferCount - (terminator.count - 1))
+    /// so that a terminator split across two consecutive appends is never
+    /// missed while each call only scans newly-appended bytes (plus a small
+    /// overlap). No I/O; extracted for unit-testability.
+    nonisolated static func nextHeaderTerminatorRange(
+        in buf: Data,
+        from: Int
+    ) -> Range<Data.Index>? {
+        let terminator = Data("\r\n\r\n".utf8)
+        let searchStart = buf.index(buf.startIndex, offsetBy: from)
+        let slice = buf[searchStart...]
+        guard let r = slice.range(of: terminator) else { return nil }
+        return r
+    }
+
     public let port: UInt16
     public let bindLoopbackOnly: Bool
     public let dispatcher: JSONRPCDispatcher
@@ -265,7 +282,15 @@ public final class DirectHTTPServer: @unchecked Sendable {
         }
         var buffer = Data()
         var tmp = [UInt8](repeating: 0, count: 4096)
+        // headerSearchOffset: start each scan from (prevCount - 3) so a
+        // terminator split across two reads is never missed, while avoiding
+        // re-scanning bytes already checked. The overlap is terminatorLength-1
+        // = 3 bytes; without it "\r\n" at the end of one read and "\r\n" at
+        // the start of the next would be invisible to the scanner.
+        var headerSearchOffset = 0
+        let terminatorLength = 4 // "\r\n\r\n"
         while running {
+            let prevCount = buffer.count
             let n = read(fd, &tmp, tmp.count)
             if n <= 0 { return }
             buffer.append(tmp, count: n)
@@ -273,9 +298,10 @@ public final class DirectHTTPServer: @unchecked Sendable {
                 send(fd: fd, status: 431, contentType: "text/plain", body: Data("request header too large\n".utf8))
                 return
             }
-            if buffer.range(of: Data("\r\n\r\n".utf8)) != nil { break }
+            headerSearchOffset = max(0, prevCount - (terminatorLength - 1))
+            if Self.nextHeaderTerminatorRange(in: buffer, from: headerSearchOffset) != nil { break }
         }
-        guard let headerEnd = buffer.range(of: Data("\r\n\r\n".utf8)) else { return }
+        guard let headerEnd = Self.nextHeaderTerminatorRange(in: buffer, from: 0) else { return }
         let headerData = buffer.subdata(in: buffer.startIndex..<headerEnd.lowerBound)
         guard let headerStr = String(data: headerData, encoding: .utf8) else { return }
         let lines = headerStr.split(separator: "\r\n", omittingEmptySubsequences: false)
