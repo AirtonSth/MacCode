@@ -1246,6 +1246,29 @@ final class PaneActionTests: XCTestCase {
         }) else { return [] }
         return allSubviews(of: tab).compactMap { $0 as? NSProgressIndicator }
     }
+
+    func test_closeSurfaces_batch_removesAllGivenSurfacesInOneCall() throws {
+        // Verifies that closeSurfaces(workspace:surfaces:) removes every listed
+        // surface and leaves only the unlisted one, proving the batch method
+        // applies all mutations without skipping any surface.
+        let (ctx, router) = try makeContext()
+        let ws = try router.createWorkspace(name: "batch-close", cwd: NSTemporaryDirectory())
+        guard case .pane(let pane) = ws.layout else { return XCTFail("expected single pane") }
+        let ptv = PaneTabsView(pane: pane, router: router)
+        let b = try XCTUnwrap(ptv.performAdd(.browser, title: "b"))
+        let c = try XCTUnwrap(ptv.performAdd(.browser, title: "c"))
+        guard case .pane(let p0) = ctx.state.workspaces[ws.id]!.layout else { return XCTFail() }
+        let keepID = p0.surfaces.first!.id
+        XCTAssertEqual(p0.surfaces.count, 3)
+
+        try router.closeSurfaces(workspace: ws.id, surfaces: [b.id, c.id])
+
+        guard case .pane(let p1) = ctx.state.workspaces[ws.id]!.layout else { return XCTFail() }
+        XCTAssertEqual(p1.surfaces.map(\.id), [keepID],
+                       "batch close must remove exactly the requested surfaces and leave the rest")
+        XCTAssertNil(SurfaceRegistry.shared.surface(b.id), "b must be unregistered after batch close")
+        XCTAssertNil(SurfaceRegistry.shared.surface(c.id), "c must be unregistered after batch close")
+    }
 }
 
 @MainActor

@@ -690,6 +690,32 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         publishSurfaceClosed(workspace: workspace, surface: surface)
     }
 
+    /// Close multiple surfaces in one batch, applying a single refreshFromState
+    /// and reconcileSurfaceVisibility after all mutations instead of one per surface.
+    /// Per-surface side effects (registry unregister, output-bus remove, closed-tab
+    /// buffer push, event publish) are still performed individually, in order.
+    public func closeSurfaces(workspace: WorkspaceID, surfaces: [SurfaceID]) throws {
+        guard !surfaces.isEmpty else { return }
+        let workspaceCwd = context?.state.workspaces[workspace]?.cwd ?? ""
+        for surface in surfaces {
+            let closedDescriptor = (try? locateSurface(surface))?.descriptor
+                ?? SurfaceRegistry.shared.surface(surface)?.descriptor
+            try context?.apply(.closeSurface(workspace, surface))
+            if let s = SurfaceRegistry.shared.surface(surface) {
+                s.close()
+                SurfaceRegistry.shared.unregister(surface)
+            }
+            SurfaceOutputBus.shared.remove(surfaceId: surface)
+            if let desc = closedDescriptor {
+                let entry = ClosedTabEntry(descriptor: desc, workspaceCwd: workspaceCwd)
+                closedTabBuffer.push(entry, for: workspace)
+            }
+            publishSurfaceClosed(workspace: workspace, surface: surface)
+        }
+        windowController?.refreshFromState()
+        reconcileSurfaceVisibility()
+    }
+
     /// Reopen the most-recently-closed tab in `workspace`, restoring its cwd.
     /// Returns the new descriptor, or nil when the closed-tab buffer is empty.
     @discardableResult

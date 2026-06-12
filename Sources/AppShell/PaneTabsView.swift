@@ -472,12 +472,10 @@ public final class PaneTabsView: NSObject {
         for id in ids where surfaceIsUnsaved(id) {
             if !confirmCloseUnsavedSurface(id) { return false }
         }
-        for id in ids {
-            do {
-                try router.closeSurface(workspace: wid, surface: id)
-            } catch {
-                return false
-            }
+        do {
+            try router.closeSurfaces(workspace: wid, surfaces: ids)
+        } catch {
+            return false
         }
         return true
     }
