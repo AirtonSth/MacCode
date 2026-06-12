@@ -211,6 +211,15 @@ public final class SettingsViewModel: ObservableObject {
     /// WHY: without this, remoteAccessEnabled stays true even when nothing is
     /// listening, and the user believes remote access is active when it is not.
     @Published public var remoteAccessBindFailedReason: String? = nil
+    /// All server startup failures accumulated since launch (general surfacing,
+    /// UX-MAC_SOCKET_SERVER-P1 :214). Read from AppDelegate.serverStartupFailures
+    /// on Settings open and updated on serverStartupFailureNotification.
+    /// WHY: a failed server start is otherwise invisible -- only NSLog; the user
+    /// has no way to know the socket or HTTP listener never came up.
+    /// Distinct from remoteAccessBindFailedReason (:162): that property is scoped
+    /// to the current toggle attempt and gates toggle-revert. This list is
+    /// always-visible, additive, and idempotent (read-only from AppDelegate).
+    @Published public var serverStartupFailures: [(server: String, reason: String)] = []
     @Published public var appSettings: AppSettings = AppSettings()
     /// True while this VM is mid-post for rc2RemoteAccessSettingChanged so the
     /// observer can skip the redundant self-triggered reload (L91 perf fix).
@@ -380,6 +389,24 @@ public final class SettingsViewModel: ObservableObject {
                 self.remoteAccessBindFailedReason = reason
             }
         })
+        // General startup-failure surfacing (:214): always refresh the list when
+        // any server startup failure is recorded, regardless of whether a toggle
+        // is pending. This observer is additive and does not interfere with the
+        // toggle-revert observer above (which exits early via the `guard pending`
+        // gate when no toggle is in progress).
+        // WHY: socket-server and HTTP-server failures that happen at launch (before
+        // any toggle) are invisible to the user without this second observer.
+        changeObservers.append(NotificationCenter.default.addObserver(
+            forName: AppDelegate.serverStartupFailureNotification, object: nil, queue: .main
+        ) { [weak self] notification in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                let delegate = notification.object as? AppDelegate
+                if let failures = delegate?.serverStartupFailures {
+                    self.serverStartupFailures = failures
+                }
+            }
+        })
     }
 
     deinit {
@@ -388,6 +415,15 @@ public final class SettingsViewModel: ObservableObject {
 
     public func reload() {
         remoteAccessEnabled = (try? settingsRepo.get("remote_access_enabled")) == "1"
+        // Refresh the general startup-failure list from AppDelegate on every reload
+        // (Settings open, account/remote-access notification-driven reload).
+        // Reading the shared array is idempotent and does not interfere with the
+        // toggle-revert observer (:162) which is guarded by _pendingRemoteAccessToggle.
+        // NSApp is an implicitly-unwrapped global that is nil in a unit-test
+        // process with no shared NSApplication, so bind it before use.
+        if let app = NSApp, let delegate = app.delegate as? AppDelegate {
+            serverStartupFailures = delegate.serverStartupFailures
+        }
         appSettings = settingsStore.load()
         codexPath = cliPath(key: "cli.codex.path", fallback: "codex")
         claudePath = cliPath(key: "cli.claude.path", fallback: "claude")
@@ -796,6 +832,37 @@ public struct SettingsView: View {
                 .background(DS.Palette.danger.opacity(0.10))
                 .cornerRadius(DS.Radius.card)
                 .accessibilityIdentifier("settings.writeError")
+            }
+
+            // UX-MAC_SOCKET_SERVER-P1 :214: general server startup failure banner.
+            // Shown whenever at least one server failed to start at launch or on
+            // re-configure. Distinct from remoteAccessBindFailedReason (:162) which
+            // is scoped to the current toggle attempt; this banner covers all servers
+            // (socket + HTTP) and persists until the user dismisses it.
+            if !vm.serverStartupFailures.isEmpty {
+                VStack(alignment: .leading, spacing: DS.Space.xs) {
+                    ForEach(Array(vm.serverStartupFailures.enumerated()), id: \.offset) { _, failure in
+                        HStack(spacing: DS.Space.sm) {
+                            Text("\(failure.server) failed to start: \(failure.reason)")
+                                .font(DS.Font.caption)
+                                .foregroundColor(DS.Palette.danger)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .accessibilityIdentifier("settings.serverStartupFailure.\(failure.server)")
+                        }
+                    }
+                    Button {
+                        vm.serverStartupFailures = []
+                    } label: {
+                        Text("Dismiss")
+                            .font(DS.Font.caption)
+                    }
+                    .buttonStyle(.link)
+                    .accessibilityIdentifier("settings.serverStartupFailures.dismiss")
+                }
+                .padding(DS.Space.sm)
+                .background(DS.Palette.danger.opacity(0.10))
+                .cornerRadius(DS.Radius.card)
+                .accessibilityIdentifier("settings.serverStartupFailures")
             }
 
             ScrollView {
