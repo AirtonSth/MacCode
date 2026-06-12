@@ -1,11 +1,14 @@
 import Foundation
 import AppKit
 import Security
+import os
 import CoreModel
 import Persistence
 import AgentRuntime
 import SocketServer
 import Surfaces
+
+private let appRouterLog = Logger(subsystem: "io.remotecode.appshell", category: "router")
 
 private struct AgentProviderInstanceConfig: Decodable, Equatable {
     var id: String
@@ -56,6 +59,9 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     private let providerProbeCacheTTL: TimeInterval = 30
     private var suppressedLayoutEventDepth = 0
     private var closedTabBuffer = ClosedTabRingBuffer(capacity: 10)
+    /// Descriptors that failed to reinstantiate during session restore.
+    /// Populated by `reinstantiateRestoredSurfaces`; readable by tests and diagnostics.
+    public private(set) var restoreFailedSurfaceIDs: [SurfaceID] = []
 
     public convenience init(context: AppContext) {
         self.init(context: context, sshPasswordStore: KeychainSSHPasswordStore())
@@ -232,7 +238,8 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                     idMap[desc.id] = surface.descriptor.id
                     SurfaceRegistry.shared.register(surface)
                 } catch {
-                    // skip
+                    appRouterLog.error("surface.restore.failed id=\(desc.id, privacy: .public) type=\(String(describing: desc.type), privacy: .public) error=\(String(describing: error), privacy: .public)")
+                    restoreFailedSurfaceIDs.append(desc.id)
                 }
             }
         }
