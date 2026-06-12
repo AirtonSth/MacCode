@@ -10,8 +10,23 @@ public final class ClaudeRunner: AgentProviderRunner, @unchecked Sendable {
     }
 
     public func listModels() async -> [AgentModelDescriptor] {
-        let dynamicModels = await AnthropicModelDiscovery.listModels()
-        return dynamicModels.isEmpty ? Self.listModels(installedVersion: nil) : dynamicModels
+        let result = await AnthropicModelDiscovery.listModelsResult()
+        return result.isFallback ? Self.listModels(installedVersion: nil) : result.models
+    }
+
+    /// Like `listModels` but returns a `ModelListResult` so callers can
+    /// inspect whether the static fallback was used.
+    /// `environment` and `session` are injected for testing; production
+    /// callers use the defaults.
+    public func listModelsResult(
+        environment: [String: String] = [:],
+        session: URLSession = .shared
+    ) async -> ModelListResult {
+        let result = await AnthropicModelDiscovery.listModelsResult(environment: environment, session: session)
+        if result.isFallback {
+            return ModelListResult(models: Self.listModels(installedVersion: nil), isFallback: true)
+        }
+        return result
     }
 
     public static func listModels(installedVersion: String?) -> [AgentModelDescriptor] {

@@ -117,6 +117,10 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     @Published public var providerRecoveryStatusMessage: String?
     @Published public var modelListLoading = false
     @Published public var modelListStatusMessage: String?
+    /// True when the current Claude model list is the static built-in fallback
+    /// (live discovery failed or was not attempted). The picker uses this to
+    /// show a "using built-in defaults" hint and offer a manual refresh.
+    @Published public var availableModelsAreFallback: Bool = false
     @Published public var providerSnapshotStatusMessage: String?
     @Published public var pullRequestURL: String = ""
     @Published public var pullRequestPreparing = false
@@ -844,14 +848,21 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         defer { modelListLoading = false }
         do {
             let m: [AgentModelDescriptor]
+            let isFallback: Bool
             if let modelListLoader {
                 m = try await modelListLoader(provider)
+                isFallback = false
+            } else if provider == .claude {
+                let result = await ClaudeRunner().listModelsResult()
+                m = result.models
+                isFallback = result.isFallback
             } else {
-                let runner: AgentProviderRunner = provider == .codex ? CodexRunner() : ClaudeRunner()
-                m = await runner.listModels()
+                m = await CodexRunner().listModels()
+                isFallback = false
             }
             await MainActor.run {
                 self.availableModels = m
+                self.availableModelsAreFallback = isFallback
                 self.modelListStatusMessage = m.isEmpty ? "No models returned for \(self.providerDisplayName(self.provider)). Retry from the model menu." : nil
                 // B8: a provider switch must leave a model valid for that
                 // provider — never a stale id from the other provider.
@@ -863,6 +874,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         } catch {
             await MainActor.run {
                 self.modelListStatusMessage = "Model list failed. Retry from the model menu."
+                self.availableModelsAreFallback = false
             }
         }
     }
@@ -1646,6 +1658,8 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         promptHistory.append(text)
         promptHistory = Array(promptHistory.suffix(PromptHistoryStore.limit))
         promptHistoryStore?.save(promptHistory, workspaceID: workspaceID)
+        // NOTE: call promptHistoryStore?.search(workspaceID:query:limit:) from a
+        // search field in the composer to surface filtered history to the user.
         promptHistoryCursor = nil
     }
 
@@ -4994,6 +5008,15 @@ public struct AgentAppView: View {
             }
             if !modelOptions.isEmpty || !customModels.isEmpty {
                 compactMenuSection("Model")
+                if vm.availableModelsAreFallback && vm.provider == .claude {
+                    Text("Using built-in defaults - live list unavailable")
+                        .font(DS.Font.caption)
+                        .foregroundColor(DS.Palette.textSecondary)
+                    compactMenuRow("Refresh model list", selected: false) {
+                        Task { await vm.loadModels() }
+                    }
+                    .disabled(vm.modelListLoading)
+                }
                 let visibleModelCount = showAllModelOptions ? modelOptions.count : min(3, modelOptions.count)
                 let visibleCustomModelCount = showAllModelOptions ? customModels.count : max(0, 3 - visibleModelCount)
                 let visibleModels = Array(modelOptions.prefix(visibleModelCount))

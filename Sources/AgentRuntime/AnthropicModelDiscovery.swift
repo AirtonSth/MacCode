@@ -53,6 +53,22 @@ public enum AnthropicDiscoveryRequestBuilder {
     }
 }
 
+// MARK: - Discovery result carrying source signal
+
+/// Result of a model-list attempt.
+/// `isFallback == true` means no live data was obtained and the static alias
+/// list is being used instead. The picker must surface this to the user.
+public struct ModelListResult: Sendable {
+    public let models: [AgentModelDescriptor]
+    /// True when `models` is the static built-in alias list, not a live API response.
+    public let isFallback: Bool
+
+    public init(models: [AgentModelDescriptor], isFallback: Bool) {
+        self.models = models
+        self.isFallback = isFallback
+    }
+}
+
 // MARK: - Discovery with 1-hour TTL cache
 
 public enum AnthropicModelDiscovery {
@@ -66,29 +82,57 @@ public enum AnthropicModelDiscovery {
         await _cache.reset()
     }
 
+    /// Returns live models or empty on failure. Callers that need the
+    /// fallback signal should use `listModelsResult` instead.
     public static func listModels(
         environment: [String: String] = [:],
         session: URLSession = .shared
     ) async -> [AgentModelDescriptor] {
+        await listModelsResult(environment: environment, session: session).models
+    }
+
+    /// Returns a `ModelListResult` that carries both the model list and an
+    /// `isFallback` flag. `isFallback` is true when the live fetch failed
+    /// (no credential, network error, non-200) and the static alias list was
+    /// substituted; false when live API data was obtained.
+    public static func listModelsResult(
+        environment: [String: String] = [:],
+        session: URLSession = .shared
+    ) async -> ModelListResult {
         let env = CodexRunner.processEnvironment(overrides: environment)
 
-        // Cache hit?
+        // Cache hit? Cache stores only live data, so a hit is never a fallback.
         if let cached = await _cache.entry, cached.isValid(ttl: cacheTTL) {
-            return cached.models
+            return ModelListResult(models: cached.models, isFallback: false)
         }
 
-        guard let request = AnthropicDiscoveryRequestBuilder.build(environment: env) else { return [] }
+        guard let request = AnthropicDiscoveryRequestBuilder.build(environment: env) else {
+            return ModelListResult(models: [], isFallback: true)
+        }
 
         do {
             let (data, response) = try await session.data(for: request)
             guard (response as? HTTPURLResponse)?.statusCode == 200,
-                  let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else { return [] }
+                  let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                return ModelListResult(models: [], isFallback: true)
+            }
             let models = modelDescriptors(fromListResponse: object)
             await _cache.store(ModelDiscoveryCacheEntry(models: models, fetchedAt: Date()))
-            return models
+            return ModelListResult(models: models, isFallback: false)
         } catch {
-            return []
+            return ModelListResult(models: [], isFallback: true)
         }
+    }
+
+    /// Forces a fresh live fetch by clearing the cache first, then delegates
+    /// to `listModelsResult`. Use this when the user explicitly requests a
+    /// refresh from the model picker.
+    public static func refresh(
+        environment: [String: String] = [:],
+        session: URLSession = .shared
+    ) async -> ModelListResult {
+        await _cache.reset()
+        return await listModelsResult(environment: environment, session: session)
     }
 
     public static func modelDescriptors(fromListResponse response: [String: Any]) -> [AgentModelDescriptor] {
