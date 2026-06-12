@@ -201,6 +201,23 @@ public final class DirectHTTPServer: @unchecked Sendable {
         !loopbackOnly && hasAuthProvider
     }
 
+    /// Pre-token `/v1/*` paths that must stay open even on a non-loopback bind
+    /// (the mobile client fetches these before a token exists). GAP-9.
+    nonisolated static let authExemptV1Paths: Set<String> = [
+        "/v1/discovery", "/v1/capabilities",
+        "/v1/pair", "/v1/pair/redeem", "/v1/pair/status", "/v1/pair/cancel"
+    ]
+
+    /// Pure helper: decides whether an HTTP `/v1/*` request must present a valid
+    /// bearer token. Mirrors the gate below: loopback-only binds are trusted
+    /// (open), pre-token paths are exempt, and a missing auth provider disables
+    /// the gate. Extracted so the auth decision is unit-testable without a live
+    /// socket (a loopback test client is always treated as trusted, so a real
+    /// socket cannot exercise the non-loopback gate).
+    nonisolated static func httpAuthGateRequiresToken(loopbackOnly: Bool, path: String, hasAuthProvider: Bool) -> Bool {
+        !loopbackOnly && path.hasPrefix("/v1") && !authExemptV1Paths.contains(path) && hasAuthProvider
+    }
+
     /// Pure helper: search `buf` for the CRLFCRLF header terminator starting
     /// at byte index `from`. The caller must pass
     ///   from = max(0, previousBufferCount - (terminator.count - 1))
@@ -527,8 +544,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
         // client before a token exists (mirrors /v1/discovery); gating
         // it makes every LAN connect fail with 401 → permanent
         // "Not authorized". It must be exempt like discovery.
-        if !bindLoopbackOnly, path.hasPrefix("/v1"),
-           !["/v1/discovery", "/v1/capabilities", "/v1/pair", "/v1/pair/redeem", "/v1/pair/status", "/v1/pair/cancel"].contains(path),
+        if Self.httpAuthGateRequiresToken(loopbackOnly: bindLoopbackOnly, path: path, hasAuthProvider: auth != nil),
            let auth = auth {
             let token = headers["authorization"].flatMap { $0.split(separator: " ").last.map(String.init) } ?? headers["x-rc2-token"]
             if let t = token, auth.verify(token: t) {

@@ -136,6 +136,66 @@ final class HTTPServerTests: XCTestCase {
         XCTAssertEqual(frame.count, 127)
     }
 
+    // MARK: - Auth-gate coverage (T010-T012, T006) — loopbackOnly: false
+
+    /// Minimal auth provider used only by the auth-gate tests below.
+    /// Not shared with HTTPPairingTests.FakeAuth to keep each file self-contained.
+    private final class StubAuth: DirectAuthProvider {
+        func verify(token: String) -> Bool { token == "good-token" }
+        func createPairingCode() -> String? { nil }
+        func redeemPairingCode(_ code: String, deviceName: String) -> (deviceId: String, token: String)? { nil }
+        func listDevices() -> [[String: Any]] { [] }
+        func revokeDevice(_ id: String) {}
+    }
+
+    /// WHY: the auth gate at HTTPServer.swift:530-541 is the primary security
+    /// barrier preventing unauthenticated LAN peers from invoking RPC methods,
+    /// listing devices, or receiving terminal output via /v1/ws.
+    /// Every existing test uses loopbackOnly:true which skips the gate entirely.
+    /// A regression here would allow any LAN device to run arbitrary commands
+    /// without pairing (DRIFT-3 class of defect).
+
+    @MainActor
+    // The auth gate is decided by HTTPServer.httpAuthGateRequiresToken /
+    // wsUpgradeRequiresToken. A loopback test client (127.0.0.1) is always
+    // treated as trusted, so a real socket cannot exercise the NON-loopback
+    // gate -- these tests pin the pure gate decision instead, exactly what the
+    // production gate at HTTPServer.swift:524-540 evaluates per request.
+
+    func test_httpAuthGate_rpc_requiresTokenOnNonLoopback() {
+        XCTAssertTrue(DirectHTTPServer.httpAuthGateRequiresToken(loopbackOnly: false, path: "/v1/rpc", hasAuthProvider: true),
+            "/v1/rpc on a non-loopback bind with auth configured MUST require a token (auth bypass = LAN RCE)")
+    }
+    func test_httpAuthGate_devices_requiresTokenOnNonLoopback() {
+        XCTAssertTrue(DirectHTTPServer.httpAuthGateRequiresToken(loopbackOnly: false, path: "/v1/devices", hasAuthProvider: true),
+            "/v1/devices must require a token on non-loopback; device enumeration leaks pairing state")
+    }
+    func test_httpAuthGate_loopbackIsTrustedOpen() {
+        XCTAssertFalse(DirectHTTPServer.httpAuthGateRequiresToken(loopbackOnly: true, path: "/v1/rpc", hasAuthProvider: true),
+            "loopback-only binds are trusted and must stay open (preserves the local test harness + same-machine UX)")
+    }
+    func test_httpAuthGate_preTokenPathsExempt() {
+        for p in ["/v1/discovery", "/v1/capabilities", "/v1/pair", "/v1/pair/redeem", "/v1/pair/status", "/v1/pair/cancel"] {
+            XCTAssertFalse(DirectHTTPServer.httpAuthGateRequiresToken(loopbackOnly: false, path: p, hasAuthProvider: true),
+                "\(p) is fetched before a token exists (GAP-9); gating it makes every LAN connect fail 401")
+        }
+    }
+    func test_httpAuthGate_noAuthProviderDisablesGate() {
+        XCTAssertFalse(DirectHTTPServer.httpAuthGateRequiresToken(loopbackOnly: false, path: "/v1/rpc", hasAuthProvider: false),
+            "with no auth provider configured the gate is disabled (auth not yet provisioned)")
+    }
+    func test_httpAuthGate_validTokenAccepted_invalidRejected() {
+        let auth = StubAuth()
+        XCTAssertTrue(auth.verify(token: "good-token"), "a valid bearer token must verify so a gated request proceeds (200)")
+        XCTAssertFalse(auth.verify(token: "wrong-token"), "an invalid bearer token must fail verification so the request is rejected (401)")
+    }
+    func test_wsUpgradeGate_requiresTokenOnNonLoopback() {
+        XCTAssertTrue(DirectHTTPServer.wsUpgradeRequiresToken(loopbackOnly: false, hasAuthProvider: true),
+            "the /v1/ws upgrade must require a token on a non-loopback bind; unauthenticated WS = full event-stream leak")
+        XCTAssertFalse(DirectHTTPServer.wsUpgradeRequiresToken(loopbackOnly: true, hasAuthProvider: true),
+            "loopback WS upgrade stays open (trusted)")
+    }
+
     private func connectLocalhost(port: UInt16) throws -> Int32 {
         let fd = socket(AF_INET, SOCK_STREAM, 0)
         XCTAssertGreaterThanOrEqual(fd, 0)

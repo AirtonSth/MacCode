@@ -87,24 +87,25 @@ final class HTTPPairingTests: XCTestCase {
         _ = post("\(base)/v1/pair", ["device_name": "warmup"])   // absorb first-POST body loss
     }
 
-    /// Sacrificial first case (alphabetical order). The first pairing
-    /// test in an xctest process has all its POST traffic poisoned by a
-    /// pre-existing raw-socket-server/URLSession cold-start artifact that
-    /// only clears across a test boundary (NOT product behavior: the iOS
-    /// client uses its own transport + GET-discovery-first; curl/agent-
-    /// device e2e never hit it). This case absorbs that penalty and
-    /// asserts nothing, so every real assertion below runs clean and
-    /// order-independent.
+    /// WHY: the previous warmup used a raw-socket URLSession round-trip
+    /// to absorb a cold-start body-loss artifact. The in-process
+    /// `dispatchRPC(bodyData:)` seam (HTTPServer.swift:750) bypasses the
+    /// socket entirely, so it is order-independent and never loses a body.
+    /// Verifying that a known-good request reaches the dispatcher confirms
+    /// the seam works and gives the test suite a deterministic warm path.
     @MainActor
-    func test_aaa_processWarmup_noAssertions() throws {
-        let port = UInt16.random(in: 33000...44000)
-        let s = DirectHTTPServer(port: port, loopbackOnly: true,
-                                 dispatcher: JSONRPCDispatcher(router: FakeRouter()), auth: FakeAuth())
-        try s.start(); defer { s.stop() }
-        let base = "http://127.0.0.1:\(port)"
-        waitReady(base)
-        _ = post("\(base)/v1/pair", ["device_name": "warmup"])
-        _ = post("\(base)/v1/pair/redeem", ["code": "123456", "device_name": "warmup"])
+    func test_aaa_dispatchRPCSeam_dispatchesRoundTrip() async throws {
+        let dispatcher = JSONRPCDispatcher(router: FakeRouter())
+        let s = DirectHTTPServer(port: UInt16.random(in: 33000...44000), loopbackOnly: true,
+                                 dispatcher: dispatcher, auth: FakeAuth())
+        // No start() needed: dispatchRPC(bodyData:) is a pure in-process call.
+        let body = Data("{\"jsonrpc\":\"2.0\",\"id\":\"warmup\",\"method\":\"workspace.create\",\"params\":{\"name\":\"seam\",\"cwd\":\"/tmp\"}}".utf8)
+        let respData = await s.dispatchRPC(bodyData: body)
+        let obj = (try? JSONSerialization.jsonObject(with: respData)) as? [String: Any]
+        XCTAssertEqual(obj?["id"] as? String, "warmup",
+                       "dispatchRPC seam must round-trip the request id to the dispatcher response, proving the seam reaches the router")
+        XCTAssertNil(obj?["error"],
+                     "a well-formed workspace.create request through the dispatchRPC seam must not produce an RPC error")
     }
 
     @MainActor
