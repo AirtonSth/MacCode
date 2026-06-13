@@ -7,6 +7,8 @@ public struct PairingPrompt: Sendable {
     public let requestId: String
     public let code: String
     public let deviceName: String
+    /// Stable client-provided ID used only for explicit "always allow" pairing.
+    public let clientDeviceID: String?
     /// When the pairing request was created on the server (used for countdown).
     public let createdAt: Date
     /// When the pairing request expires (createdAt + TTL).
@@ -14,12 +16,13 @@ public struct PairingPrompt: Sendable {
     /// Source IP of the device that initiated the request, if known.
     public let sourceIP: String?
 
-    public init(requestId: String, code: String, deviceName: String,
+    public init(requestId: String, code: String, deviceName: String, clientDeviceID: String? = nil,
                 createdAt: Date = Date(), expiresAt: Date = Date().addingTimeInterval(300),
                 sourceIP: String? = nil) {
         self.requestId = requestId
         self.code = code
         self.deviceName = deviceName
+        self.clientDeviceID = clientDeviceID
         self.createdAt = createdAt
         self.expiresAt = expiresAt
         self.sourceIP = sourceIP
@@ -97,16 +100,34 @@ public final class LocalAuthAdapter: DirectAuthProvider {
     }
 
     public func createPairingRequest(deviceName: String, privateAccountAccessToken: String?) -> (requestId: String, code: String)? {
-        guard let req = try? repo.createPairingRequest(deviceName: deviceName) else { return nil }
+        createPairingRequest(deviceName: deviceName, clientDeviceID: nil, privateAccountAccessToken: privateAccountAccessToken)
+    }
+
+    public func createPairingRequest(deviceName: String, clientDeviceID: String?, privateAccountAccessToken: String?) -> (requestId: String, code: String)? {
+        let normalizedClientDeviceID = clientDeviceID
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .flatMap { $0.isEmpty ? nil : $0 }
+        guard let req = try? repo.createPairingRequest(deviceName: deviceName, clientDeviceID: normalizedClientDeviceID) else { return nil }
         auditLoud(actor: "device", action: "pairing.request", detail: deviceName)
         if canAutoApprovePairing(privateAccountAccessToken: privateAccountAccessToken) {
             approvePairingRequest(req.id)
             auditLoud(actor: "account", action: "pairing.auto_approve", detail: deviceName)
             return (req.id, req.code)
         }
+        if canAlwaysAllowPairing(clientDeviceID: normalizedClientDeviceID) {
+            approvePairingRequest(req.id, alwaysAllowPairing: true)
+            auditLoud(actor: "device", action: "pairing.always_allow_auto_approve", detail: deviceName)
+            return (req.id, req.code)
+        }
         onPairingRequest?(PairingPrompt(requestId: req.id, code: req.code, deviceName: deviceName,
+                                         clientDeviceID: normalizedClientDeviceID,
                                          createdAt: req.createdAt, expiresAt: req.expiresAt))
         return (req.id, req.code)
+    }
+
+    private func canAlwaysAllowPairing(clientDeviceID: String?) -> Bool {
+        guard let clientDeviceID else { return false }
+        return ((try? repo.alwaysAllowedPairingDevice(clientDeviceID: clientDeviceID)) ?? nil) != nil
     }
 
     private func canAutoApprovePairing(privateAccountAccessToken: String?) -> Bool {
@@ -139,12 +160,12 @@ public final class LocalAuthAdapter: DirectAuthProvider {
     }
 
     /// Called from the Mac modal's Approve button.
-    public func approvePairingRequest(_ requestId: String) {
-        guard let (trust, token) = try? repo.approvePairingRequest(id: requestId) else { return }
+    public func approvePairingRequest(_ requestId: String, alwaysAllowPairing: Bool = false) {
+        guard let (trust, token) = try? repo.approvePairingRequest(id: requestId, alwaysAllowPairing: alwaysAllowPairing) else { return }
         pendingLock.lock()
         pendingTokens[requestId] = (trust.id, token, Date())
         pendingLock.unlock()
-        auditLoud(actor: trust.id, action: "pairing.approve", detail: trust.displayName)
+        auditLoud(actor: trust.id, action: alwaysAllowPairing ? "pairing.approve_always_allow" : "pairing.approve", detail: trust.displayName)
     }
 
     /// Called from the Mac modal's Deny button.
@@ -216,9 +237,11 @@ public final class LocalAuthAdapter: DirectAuthProvider {
                 "display_name": d.displayName,
                 "created_at": ISO8601DateFormatter().string(from: d.createdAt),
                 "capabilities": d.capabilities,
-                "revoked": d.revokedAt != nil
+                "revoked": d.revokedAt != nil,
+                "always_allow_pairing": d.alwaysAllowPairing
             ]
             if let ls = d.lastSeenAt { dict["last_seen_at"] = ISO8601DateFormatter().string(from: ls) }
+            if let clientDeviceID = d.clientDeviceID { dict["client_device_id"] = clientDeviceID }
             return dict
         }
     }

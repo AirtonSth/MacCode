@@ -62,6 +62,7 @@ public struct DeviceRowFormatter {
         if let ls = d.lastSeenAt {
             parts.append("seen " + relativeFormatter.localizedString(for: ls, relativeTo: now))
         }
+        if d.alwaysAllowPairing { parts.append("always allow") }
         if d.revokedAt != nil { parts.append("revoked") }
         return parts.joined(separator: " \u{00B7} ")
     }
@@ -682,6 +683,11 @@ public final class SettingsViewModel: ObservableObject {
         reload()
     }
 
+    public func setAlwaysAllowPairing(deviceID: String, enabled: Bool) {
+        try? trustRepo.setAlwaysAllowPairing(id: deviceID, enabled: enabled)
+        reload()
+    }
+
     public func connectPrivateAccount() async {
         let email = privateAccountEmail.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !email.isEmpty, !privateAccountPassword.isEmpty, !privateAccountBusy else { return }
@@ -1296,6 +1302,20 @@ public struct SettingsView: View {
                             if d.revokedAt != nil {
                                 DSPill("revoked", tone: .danger)
                             } else {
+                                if d.alwaysAllowPairing {
+                                    DSPill("always allow", tone: .success)
+                                    Button("Disable Always Allow") {
+                                        vm.setAlwaysAllowPairing(deviceID: d.id, enabled: false)
+                                    }
+                                    .buttonStyle(DSSecondaryButtonStyle())
+                                    .accessibilityIdentifier("settings.device.\(d.id).alwaysAllow")
+                                } else if d.clientDeviceID != nil {
+                                    Button("Always Allow") {
+                                        vm.setAlwaysAllowPairing(deviceID: d.id, enabled: true)
+                                    }
+                                    .buttonStyle(DSSecondaryButtonStyle())
+                                    .accessibilityIdentifier("settings.device.\(d.id).alwaysAllow")
+                                }
                                 Button("Revoke") { deviceToRevoke = d }
                                     .buttonStyle(DSSecondaryButtonStyle())
                                     .accessibilityIdentifier("settings.device.\(d.id).revoke")
@@ -1347,6 +1367,7 @@ public struct SettingsView: View {
         if let lastSeen = d.lastSeenAt {
             parts.append("seen " + Self.deviceRelativeFormatter.localizedString(for: lastSeen, relativeTo: Date()))
         }
+        if d.alwaysAllowPairing { parts.append("always allow") }
         return parts.joined(separator: " \u{00B7} ")
     }
 

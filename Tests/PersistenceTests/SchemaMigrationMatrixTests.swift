@@ -5,7 +5,7 @@ import XCTest
 ///
 /// WHY: `SchemaMigrationTransactionTests` covers transaction semantics (rollback,
 /// re-run) but starts from an empty DB. The real migration risk is a partially-
-/// deployed schema: a user on v13 who upgrades to v28 must get all 15 intermediate
+/// deployed schema: a user on v13 who upgrades to v29 must get all intermediate
 /// steps applied without data loss.  A missing ALTER or a step that fails mid-way
 /// bricks the user's DB silently.
 ///
@@ -22,7 +22,7 @@ import XCTest
 ///   v13 — agent_turn_checkpoints added (checkpoint feature birth)
 ///   v25 — token_saver_savings added
 ///   v27 — rc_reversible_content added (CCR store)
-///   v28 — head (current)  [identity: migrate from v28 is a no-op]
+///   v29 — head (current)  [identity: migrate from v29 is a no-op]
 ///
 /// Each test follows the pattern:
 ///   1. Build old-version DB in memory via `Schema.migrateSteps(db, steps.prefix(n))`.
@@ -117,6 +117,14 @@ final class SchemaMigrationMatrixTests: XCTestCase {
         XCTAssertEqual(try rowCount(db, table: "audit_log"), 1,
                        "a v2 audit_log row must survive migration to head — " +
                        "losing audit history breaks compliance and post-incident review")
+        let st = try db.prepare("SELECT client_device_id, always_allow_pairing FROM device_trust WHERE id = 'dev-v2';")
+        defer { st.reset() }
+        XCTAssertTrue(try st.step(),
+                      "v29 must add permanent trust columns to surviving v2 device_trust rows")
+        XCTAssertTrue(st.columnIsNull(0),
+                      "old paired devices have no pre-token client_device_id and must migrate as nil, not a fabricated id")
+        XCTAssertEqual(st.columnInt64(1), 0,
+                       "old paired devices must not silently become Always Allow during migration")
     }
 
     // MARK: - v13 → head

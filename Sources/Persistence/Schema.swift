@@ -9,7 +9,7 @@ public struct SchemaStep {
 }
 
 public enum Schema {
-    public static let currentVersion: Int = 28
+    public static let currentVersion: Int = 29
 
     public static let steps: [SchemaStep] = [
         SchemaStep(1, """
@@ -422,6 +422,12 @@ public enum Schema {
         ALTER TABLE token_saver_savings ADD COLUMN content_type TEXT NOT NULL DEFAULT 'unknown';
         ALTER TABLE token_saver_savings ADD COLUMN engine TEXT NOT NULL DEFAULT 'unknown';
         ALTER TABLE token_saver_savings ADD COLUMN cache_state TEXT NOT NULL DEFAULT 'unknown';
+        """),
+        SchemaStep(29, """
+        ALTER TABLE device_trust ADD COLUMN client_device_id TEXT;
+        ALTER TABLE device_trust ADD COLUMN always_allow_pairing INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE pairing_requests ADD COLUMN client_device_id TEXT;
+        CREATE INDEX IF NOT EXISTS idx_device_trust_client_allow ON device_trust(client_device_id, always_allow_pairing);
         """)
     ]
 

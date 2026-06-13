@@ -772,6 +772,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
     private var pairingSheet: NSPanel?
     private var pairingSheetTimer: Timer?
     private var pairingCountdownLabel: NSTextField?
+    private var pairingAlwaysAllowCheckbox: NSButton?
     private var pairingPromptPending: PairingPrompt?
 
     private func presentPairingPrompt(_ prompt: PairingPrompt) {
@@ -785,7 +786,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
 
         let ttl = prompt.expiresAt.timeIntervalSince(prompt.createdAt)
         let panel = NSPanel(
-            contentRect: NSRect(x: 0, y: 0, width: 400, height: 260),
+            contentRect: NSRect(x: 0, y: 0, width: 400, height: 290),
             styleMask: [.titled, .nonactivatingPanel],
             backing: .buffered,
             defer: true
@@ -794,13 +795,13 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         panel.isMovableByWindowBackground = true
         panel.level = .modalPanel
 
-        let content = NSView(frame: NSRect(x: 0, y: 0, width: 400, height: 260))
+        let content = NSView(frame: NSRect(x: 0, y: 0, width: 400, height: 290))
 
         // Device name label
         let heading = NSTextField(labelWithString: "Allow \"\(prompt.deviceName)\" to connect?")
         heading.font = NSFont.boldSystemFont(ofSize: 14)
         heading.alignment = .center
-        heading.frame = NSRect(x: 20, y: 210, width: 360, height: 20)
+        heading.frame = NSRect(x: 20, y: 240, width: 360, height: 20)
         content.addSubview(heading)
 
         // UX-P2: always show the confirmation instruction; append source IP when
@@ -815,7 +816,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         let info = NSTextField(labelWithString: infoText)
         info.alignment = .center
         info.textColor = .secondaryLabelColor
-        info.frame = NSRect(x: 20, y: 185, width: 360, height: 18)
+        info.frame = NSRect(x: 20, y: 215, width: 360, height: 18)
         content.addSubview(info)
 
         // Code display — expose digits individually for VoiceOver so the user
@@ -823,7 +824,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         let codeField = NSTextField(labelWithString: prompt.code)
         codeField.font = NSFont.monospacedDigitSystemFont(ofSize: 36, weight: .bold)
         codeField.alignment = .center
-        codeField.frame = NSRect(x: 20, y: 125, width: 360, height: 50)
+        codeField.frame = NSRect(x: 20, y: 155, width: 360, height: 50)
         codeField.setAccessibilityLabel(Self.pairingCodeAccessibilityLabel(prompt.code))
         content.addSubview(codeField)
 
@@ -835,7 +836,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         createdLabel.alignment = .center
         createdLabel.font = NSFont.systemFont(ofSize: 11)
         createdLabel.textColor = .secondaryLabelColor
-        createdLabel.frame = NSRect(x: 20, y: 105, width: 360, height: 16)
+        createdLabel.frame = NSRect(x: 20, y: 135, width: 360, height: 16)
         content.addSubview(createdLabel)
 
         // Countdown label
@@ -843,9 +844,18 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         countdown.alignment = .center
         countdown.font = NSFont.monospacedDigitSystemFont(ofSize: 13, weight: .regular)
         countdown.textColor = .secondaryLabelColor
-        countdown.frame = NSRect(x: 20, y: 75, width: 360, height: 20)
+        countdown.frame = NSRect(x: 20, y: 105, width: 360, height: 20)
         content.addSubview(countdown)
         pairingCountdownLabel = countdown
+
+        if prompt.clientDeviceID != nil {
+            let alwaysAllow = NSButton(checkboxWithTitle: "Always allow this device", target: nil, action: nil)
+            alwaysAllow.frame = NSRect(x: 20, y: 70, width: 360, height: 22)
+            alwaysAllow.toolTip = "Future pairing requests from this same device will be approved automatically until you turn this off in Settings."
+            alwaysAllow.setAccessibilityIdentifier("pairing.alwaysAllow")
+            content.addSubview(alwaysAllow)
+            pairingAlwaysAllowCheckbox = alwaysAllow
+        }
 
         // Approve button
         let approveBtn = NSButton(title: "Approve", target: self, action: #selector(pairingApprove))
@@ -886,7 +896,10 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
 
     @objc private func pairingApprove() {
         guard let prompt = pairingPromptPending else { return }
-        localAuth?.approvePairingRequest(prompt.requestId)
+        localAuth?.approvePairingRequest(
+            prompt.requestId,
+            alwaysAllowPairing: pairingAlwaysAllowCheckbox?.state == .on
+        )
         dismissPairingSheet()
     }
 
@@ -910,6 +923,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         pairingSheet?.orderOut(nil)
         pairingSheet = nil
         pairingCountdownLabel = nil
+        pairingAlwaysAllowCheckbox = nil
         pairingPromptPending = nil
     }
 

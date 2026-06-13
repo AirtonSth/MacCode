@@ -26,7 +26,9 @@ final class DevicesPanelFormatterTests: XCTestCase {
         name: String = "Sam's iPhone",
         createdAt: Date? = nil,
         lastSeenAt: Date? = nil,
-        revokedAt: Date? = nil
+        revokedAt: Date? = nil,
+        clientDeviceID: String? = nil,
+        alwaysAllowPairing: Bool = false
     ) -> DeviceTrust {
         DeviceTrust(
             id: id,
@@ -34,7 +36,9 @@ final class DevicesPanelFormatterTests: XCTestCase {
             tokenHash: "fakehash",
             createdAt: createdAt ?? Date(timeIntervalSince1970: 1_749_384_000),
             lastSeenAt: lastSeenAt,
-            revokedAt: revokedAt
+            revokedAt: revokedAt,
+            clientDeviceID: clientDeviceID,
+            alwaysAllowPairing: alwaysAllowPairing
         )
     }
 
@@ -95,6 +99,15 @@ final class DevicesPanelFormatterTests: XCTestCase {
         let sub = DeviceRowFormatter.subtitle(d, isoFormatter: iso, relativeFormatter: relative, now: now)
         XCTAssertTrue(sub.contains("revoked"),
                       "subtitle must include 'revoked' so the device state is readable without the pill UI")
+    }
+
+    /// A permanently trusted device must expose that state in text, not only via
+    /// a colored pill, so screen readers and copy/paste diagnostics preserve it.
+    func test_subtitle_alwaysAllowDevice_containsAlwaysAllowLabel() {
+        let d = makeDevice(clientDeviceID: "ios-client", alwaysAllowPairing: true)
+        let sub = DeviceRowFormatter.subtitle(d, isoFormatter: iso, relativeFormatter: relative, now: now)
+        XCTAssertTrue(sub.contains("always allow"),
+                      "subtitle must include 'always allow' so users can audit which device will auto-approve future pairing requests")
     }
 
     // MARK: - DeviceRowFormatter.isRevoked

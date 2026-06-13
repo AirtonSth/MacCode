@@ -19,6 +19,13 @@ final class AuditLogIntegrationTests: XCTestCase {
 
     // MARK: - Helpers
 
+    private final class PromptFlag: @unchecked Sendable {
+        private let lock = NSLock()
+        private var _value = false
+        func mark() { lock.lock(); _value = true; lock.unlock() }
+        var value: Bool { lock.lock(); defer { lock.unlock() }; return _value }
+    }
+
     private func makeAuth() throws -> (LocalAuthAdapter, DeviceTrustRepository) {
         let dir = NSTemporaryDirectory() + "RC2AuditIT-\(UUID().uuidString)"
         addTeardownBlock { try? FileManager.default.removeItem(atPath: dir) }
@@ -63,6 +70,43 @@ final class AuditLogIntegrationTests: XCTestCase {
         XCTAssertTrue(actions.contains("pairing.approve"),
                       "approvePairingRequest must write a 'pairing.approve' audit row — " +
                       "missing row makes explicit human approval invisible in the audit trail")
+    }
+
+    /// WHY: users without a private-account login asked for a permanent trust
+    /// choice. After one explicit Always Allow approval, a repeated pairing
+    /// request from the same stable client_device_id must mint a token without
+    /// showing another modal.
+    func test_alwaysAllowPairing_autoApprovesRepeatedClientDeviceWithoutModal() throws {
+        let (auth, repo) = try makeAuth()
+        guard let (firstReqId, _) = auth.createPairingRequest(
+            deviceName: "iPhone-always",
+            clientDeviceID: "ios-client-a",
+            privateAccountAccessToken: nil
+        ) else {
+            return XCTFail("first createPairingRequest must succeed on a fresh DB")
+        }
+        auth.approvePairingRequest(firstReqId, alwaysAllowPairing: true)
+        _ = auth.pairingRequestStatus(requestId: firstReqId)
+
+        let promptFlag = PromptFlag()
+        auth.onPairingRequest = { _ in promptFlag.mark() }
+        guard let (secondReqId, _) = auth.createPairingRequest(
+            deviceName: "iPhone-always",
+            clientDeviceID: "ios-client-a",
+            privateAccountAccessToken: nil
+        ) else {
+            return XCTFail("second createPairingRequest must succeed")
+        }
+        let status = try XCTUnwrap(auth.pairingRequestStatus(requestId: secondReqId))
+
+        XCTAssertFalse(promptFlag.value,
+                       "a permanently trusted client_device_id must not show another approve/deny modal on repeated pairing")
+        XCTAssertEqual(status.status, "approved")
+        XCTAssertNotNil(status.token,
+                        "auto-approved repeated pairing must still mint and deliver a fresh one-time token")
+        let actions = try auditActions(in: repo)
+        XCTAssertTrue(actions.contains("pairing.approve_always_allow"))
+        XCTAssertTrue(actions.contains("pairing.always_allow_auto_approve"))
     }
 
     // MARK: - denyPairingRequest writes audit row

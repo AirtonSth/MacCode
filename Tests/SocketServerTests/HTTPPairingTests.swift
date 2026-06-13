@@ -9,6 +9,7 @@ final class HTTPPairingTests: XCTestCase {
         var devices: [(String, String)] = []
         var autoApprove = true
         var lastPrivateAccountAccessToken: String?
+        var lastClientDeviceID: String?
         private var requests: [String: (code: String, status: String, token: String?, deviceId: String?)] = [:]
 
         func verify(token: String) -> Bool { token == "valid-token" }
@@ -22,6 +23,10 @@ final class HTTPPairingTests: XCTestCase {
             createPairingRequest(deviceName: deviceName, privateAccountAccessToken: nil)
         }
         func createPairingRequest(deviceName: String, privateAccountAccessToken: String?) -> (requestId: String, code: String)? {
+            createPairingRequest(deviceName: deviceName, clientDeviceID: nil, privateAccountAccessToken: privateAccountAccessToken)
+        }
+        func createPairingRequest(deviceName: String, clientDeviceID: String?, privateAccountAccessToken: String?) -> (requestId: String, code: String)? {
+            lastClientDeviceID = clientDeviceID
             lastPrivateAccountAccessToken = privateAccountAccessToken
             let id = "req-1", code = "424242"
             requests[id] = (code, "pending", nil, nil)
@@ -151,6 +156,26 @@ final class HTTPPairingTests: XCTestCase {
         XCTAssertEqual(pair?["code"] as? String, "424242")
         XCTAssertEqual(auth.lastPrivateAccountAccessToken, "ios-private-token",
                        "the Mac HTTP pairing endpoint must pass the iOS private account proof into the auth provider before deciding whether to prompt")
+    }
+
+    @MainActor
+    func test_pairRequestPassesClientDeviceIDToAuthProvider() throws {
+        let port = UInt16.random(in: 33000...44000)
+        let auth = FakeAuth()
+        let s = DirectHTTPServer(port: port, loopbackOnly: true,
+                                 dispatcher: JSONRPCDispatcher(router: FakeRouter()), auth: auth)
+        try s.start(); defer { s.stop() }
+        let base = "http://127.0.0.1:\(port)"
+        waitReady(base)
+
+        let pair = post("\(base)/v1/pair", [
+            "device_name": "phone",
+            "client_device_id": "ios-vendor-123"
+        ])
+
+        XCTAssertEqual(pair?["code"] as? String, "424242")
+        XCTAssertEqual(auth.lastClientDeviceID, "ios-vendor-123",
+                       "the Mac HTTP pairing endpoint must pass client_device_id through so explicit Always Allow approvals can recognize the same device later")
     }
 
     @MainActor

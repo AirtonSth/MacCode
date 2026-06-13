@@ -73,6 +73,53 @@ final class DeviceTrustTests: XCTestCase {
         XCTAssertNil(try repo.approvePairingRequest(id: req.id))
     }
 
+    /// WHY: "Always Allow" is meaningful only when the pre-token request carries
+    /// a stable client_device_id. Approval must persist that id with the trusted
+    /// device so a future tokenless pairing request from the same phone can be
+    /// auto-approved without a private-account login.
+    func test_approveAlwaysAllow_persistsClientDeviceIDAndAllowFlag() throws {
+        let repo = try freshRepo()
+        let req = try repo.createPairingRequest(deviceName: "iPhone", clientDeviceID: "ios-client-1")
+
+        let approved = try XCTUnwrap(try repo.approvePairingRequest(id: req.id, alwaysAllowPairing: true))
+
+        XCTAssertEqual(approved.0.clientDeviceID, "ios-client-1")
+        XCTAssertTrue(approved.0.alwaysAllowPairing,
+                      "approving with Always Allow must persist the opt-in flag; otherwise future repeated pairing still prompts")
+        let listed = try XCTUnwrap(try repo.list().first)
+        XCTAssertEqual(listed.clientDeviceID, "ios-client-1")
+        XCTAssertTrue(listed.alwaysAllowPairing)
+    }
+
+    /// WHY: if a device is explicitly trusted permanently, the auth adapter uses
+    /// this lookup to decide whether a repeated tokenless request can be approved.
+    /// Revoked rows must not qualify or a revoked phone could regain access.
+    func test_alwaysAllowedPairingDevice_ignoresRevokedRows() throws {
+        let repo = try freshRepo()
+        let req = try repo.createPairingRequest(deviceName: "iPhone", clientDeviceID: "ios-client-2")
+        let approved = try XCTUnwrap(try repo.approvePairingRequest(id: req.id, alwaysAllowPairing: true))
+        XCTAssertNotNil(try repo.alwaysAllowedPairingDevice(clientDeviceID: "ios-client-2"))
+
+        try repo.revoke(id: approved.0.id)
+
+        XCTAssertNil(try repo.alwaysAllowedPairingDevice(clientDeviceID: "ios-client-2"),
+                     "revoking a trusted device must also remove its permanent auto-approve authority")
+    }
+
+    /// WHY: Settings needs a reversible control. Turning Always Allow off must
+    /// immediately stop the lookup that auto-approves future pairing requests.
+    func test_setAlwaysAllowPairing_canDisableAndEnableForKnownClientDevice() throws {
+        let repo = try freshRepo()
+        let req = try repo.createPairingRequest(deviceName: "iPhone", clientDeviceID: "ios-client-3")
+        let approved = try XCTUnwrap(try repo.approvePairingRequest(id: req.id, alwaysAllowPairing: true))
+
+        try repo.setAlwaysAllowPairing(id: approved.0.id, enabled: false)
+        XCTAssertNil(try repo.alwaysAllowedPairingDevice(clientDeviceID: "ios-client-3"))
+
+        try repo.setAlwaysAllowPairing(id: approved.0.id, enabled: true)
+        XCTAssertNotNil(try repo.alwaysAllowedPairingDevice(clientDeviceID: "ios-client-3"))
+    }
+
     /// WHY: cancelling a pending request must report success and make the
     /// status terminal ('cancelled'), so a later /v1/pair/status returns the
     /// terminal state and the device stops polling. This is the backing

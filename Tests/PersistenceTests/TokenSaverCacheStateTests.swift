@@ -8,8 +8,8 @@ final class TokenSaverCacheStateTests: XCTestCase {
         return db
     }
 
-    func test_schemaVersionIs28() {
-        XCTAssertEqual(Schema.currentVersion, 28)
+    func test_schemaVersionIs29() {
+        XCTAssertEqual(Schema.currentVersion, 29)
     }
 
     func test_recordStoresCacheState() throws {

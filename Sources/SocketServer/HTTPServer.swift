@@ -21,6 +21,7 @@ public protocol DirectAuthProvider: AnyObject {
     /// approve/deny modal. Returns the request id + the code to display.
     func createPairingRequest(deviceName: String) -> (requestId: String, code: String)?
     func createPairingRequest(deviceName: String, privateAccountAccessToken: String?) -> (requestId: String, code: String)?
+    func createPairingRequest(deviceName: String, clientDeviceID: String?, privateAccountAccessToken: String?) -> (requestId: String, code: String)?
     /// Poll a request. `token` is non-nil exactly once, on the first
     /// poll after approval, and is never persisted server-side.
     func pairingRequestStatus(requestId: String) -> (status: String, deviceId: String?, token: String?)?
@@ -39,6 +40,9 @@ public extension DirectAuthProvider {
     func createPairingRequest(deviceName: String) -> (requestId: String, code: String)? { nil }
     func createPairingRequest(deviceName: String, privateAccountAccessToken: String?) -> (requestId: String, code: String)? {
         createPairingRequest(deviceName: deviceName)
+    }
+    func createPairingRequest(deviceName: String, clientDeviceID: String?, privateAccountAccessToken: String?) -> (requestId: String, code: String)? {
+        createPairingRequest(deviceName: deviceName, privateAccountAccessToken: privateAccountAccessToken)
     }
     func pairingRequestStatus(requestId: String) -> (status: String, deviceId: String?, token: String?)? { nil }
     func cancelPairingRequest(requestId: String) -> Bool { false }
@@ -656,7 +660,8 @@ public final class DirectHTTPServer: @unchecked Sendable {
             let obj = (try? JSONSerialization.jsonObject(with: bodyData)) as? [String: Any]
             let deviceName = (obj?["device_name"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? "Unnamed device"
             let privateAccountAccessToken = (obj?["private_account_access_token"] as? String).flatMap { $0.isEmpty ? nil : $0 }
-            guard let r = auth.createPairingRequest(deviceName: deviceName, privateAccountAccessToken: privateAccountAccessToken) else {
+            let clientDeviceID = (obj?["client_device_id"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+            guard let r = auth.createPairingRequest(deviceName: deviceName, clientDeviceID: clientDeviceID, privateAccountAccessToken: privateAccountAccessToken) else {
                 pairingThrottle.releaseOutstanding(peer: peer)
                 // CONTRACT (:23): same code here -- auth provider declined to create request.
                 sendJSON(fd: fd, status: 503, body: pairingErrorPayload(code: "pairing_disabled"), acceptEncoding: headers["accept-encoding"]); return
