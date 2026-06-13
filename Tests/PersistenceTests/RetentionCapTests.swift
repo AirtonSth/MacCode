@@ -205,4 +205,52 @@ final class RetentionCapTests: XCTestCase {
         XCTAssertEqual(otherWindow.chunks.count, 1,
                        "delete-on-close must not affect chunks belonging to other surfaces")
     }
+
+    // MARK: - QA-mac:75 scripted heavy session -> whole-DB footprint stays bounded
+
+    func test_heavySession_allRetentionCapsTogetherBoundTheDatabase() throws {
+        // WHY: the per-cap tests prove each table is bounded in isolation. This is the
+        // scripted-heavy-session integration QA-mac:75 asks for: drive ONE thread/surface
+        // far past every cap, apply all three prunes, and assert every growth table lands
+        // at/under its cap simultaneously -- i.e. a long-lived session cannot grow the DB
+        // without bound. This composition is what "would have caught" the unbounded
+        // agent_provider_event_logs / agent_stream_events / terminal_output_chunks growth.
+        let db = try makeDB()
+        let runs = AgentRunRepository(db: db)
+        let thread = try makeThread(db: db)
+        let run = try makeRun(db: db, threadId: thread.id)
+
+        // Caps chosen small but exceeded by a wide margin (heavy load relative to cap),
+        // so the assertion proves the bound regardless of how long the session runs.
+        let providerCap = 100, streamCap = 100, terminalByteCap = 1_000
+        let heavy = 250
+
+        for i in 0..<heavy { try appendEvent(runs: runs, run: run, index: i) }          // provider event logs
+        for i in 0..<heavy {                                                            // stream events
+            try runs.appendStreamEvent(runId: run.id, seq: i, kind: "k", payloadJSON: #"{"i":\#(i)}"#)
+        }
+        let surfaceID = "surface-heavy"
+        let chunkRepo = TerminalOutputRepository(db: db)
+        for i in 0..<heavy {                                                            // terminal chunks: 250 x 10B = 2500B
+            try chunkRepo.append(surfaceID: surfaceID, workspaceID: nil, chunkIndex: Int64(i), data: Data("0123456789".utf8))
+        }
+
+        // Pre-condition: everything is over budget before pruning.
+        XCTAssertGreaterThan(try runs.countProviderEventLogs(threadId: thread.id), providerCap)
+        XCTAssertGreaterThan(try runs.countStreamEvents(threadId: thread.id), streamCap)
+        XCTAssertGreaterThan(try chunkRepo.totalBytes(surfaceID: surfaceID), terminalByteCap)
+
+        // Apply every retention cap, as the coordinator does on the write path.
+        try runs.pruneProviderEventLogs(threadId: thread.id, keepLatest: providerCap)
+        try runs.pruneStreamEvents(threadId: thread.id, keepLatest: streamCap)
+        try chunkRepo.pruneByteCap(surfaceID: surfaceID, maxBytes: terminalByteCap)
+
+        // Post-condition: every growth table is bounded simultaneously.
+        XCTAssertEqual(try runs.countProviderEventLogs(threadId: thread.id), providerCap,
+                       "provider event logs must be capped at keepLatest after a heavy session")
+        XCTAssertEqual(try runs.countStreamEvents(threadId: thread.id), streamCap,
+                       "stream events must be capped at keepLatest after a heavy session")
+        XCTAssertLessThanOrEqual(try chunkRepo.totalBytes(surfaceID: surfaceID), terminalByteCap,
+                       "terminal output bytes must stay within the byte cap after a heavy session")
+    }
 }
