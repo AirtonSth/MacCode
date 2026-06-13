@@ -1,6 +1,7 @@
 import Foundation
 import AppKit
 import SwiftUI
+import CoreImage
 import CoreModel
 import Persistence
 import AgentRuntime
@@ -243,6 +244,11 @@ public final class SettingsViewModel: ObservableObject {
     @Published public var newPairingCode: String?
     @Published public var pairingCodeExpiresAt: Date?
     @Published public var pairingCodeError: String?
+    /// QR payload string for the active pairing code, or nil when no code is live.
+    /// Populated alongside `newPairingCode` so the QR view re-renders atomically.
+    /// WHY separate: the view reads it directly; keeping it Published avoids
+    /// recomputing the payload string on every TimelineView tick.
+    @Published public var pairingQRPayload: String?
     @Published public var updatingProviders: Set<AgentProvider> = []
     @Published public var providerUpdateMessages: [AgentProvider: String] = [:]
     @Published public var customModelsByProvider: [AgentProvider: [String]] = [:]
@@ -615,8 +621,24 @@ public final class SettingsViewModel: ObservableObject {
             newPairingCode = pc.code
             pairingCodeExpiresAt = Date().addingTimeInterval(600)
             pairingCodeError = nil
+            // Build the QR payload immediately after minting the code.
+            // host: prefer the persisted server_id's companion host if stored;
+            // fall back to ProcessInfo hostname which is always available on macOS.
+            // port: 18217 is the sole production HTTP listener port (AppDelegate:510).
+            // server_id: read from settingsRepo — same key AppDelegate writes on first start.
+            // WHY: encoding these alongside the code means iOS can open the TCP
+            // connection without any manual IP entry.
+            let host = ProcessInfo.processInfo.hostName
+            let serverId: String = ((try? settingsRepo.get("server_id")) ?? nil) ?? ""
+            pairingQRPayload = PairingQRPayload.buildPayload(
+                code: pc.code,
+                host: host,
+                port: 18217,
+                serverId: serverId
+            )
         } catch {
             pairingCodeError = "Could not generate a pairing code: \(error.localizedDescription)"
+            pairingQRPayload = nil
         }
     }
 
@@ -1156,6 +1178,14 @@ public struct SettingsView: View {
                             .font(DS.Font.caption)
                             .foregroundColor(expired ? DS.Palette.danger : DS.Palette.textTertiary)
                     }
+                }
+                // QR code: shown while the code is live; hidden once expired.
+                // WHY: the QR encodes the same pairing URL the user can type manually,
+                // so scanning it is strictly an ergonomic shortcut — the security
+                // boundary is unchanged (code still expires in 600 s).
+                if let payload = vm.pairingQRPayload {
+                    PairingQRView(payload: payload)
+                        .accessibilityIdentifier("settings.pairing.qr")
                 }
             } else {
                 Button("Generate pairing code") { vm.createPairingCode() }
@@ -1786,6 +1816,38 @@ public final class SettingsWindowController: NSObject {
         } else {
             window.close()
         }
+    }
+}
+
+// MARK: - PairingQRView
+
+/// Renders the pairing QR code that encodes the `remotecode://pair?...` URL.
+///
+/// WHY: CoreImage QR output is a raw CIImage at 1:1 pixel resolution; it must
+/// be scaled via NSCIImageRep before SwiftUI Image displays it at a readable
+/// size. Interpolation is disabled so pixels remain crisp.
+///
+/// Stateless: recomputes NSImage only when `payload` changes (at most once per
+/// code generation, not on every TimelineView tick).
+private struct PairingQRView: View {
+    let payload: String
+
+    var body: some View {
+        if let nsImage = makeQRImage(payload: payload) {
+            Image(nsImage: nsImage)
+                .interpolation(.none)
+                .resizable()
+                .frame(width: 128, height: 128)
+                .accessibilityLabel("Scan to pair with this Mac")
+        }
+    }
+
+    private func makeQRImage(payload: String) -> NSImage? {
+        guard let ciImage = PairingQRPayload.qrCIImage(payload: payload) else { return nil }
+        let rep = NSCIImageRep(ciImage: ciImage)
+        let nsImage = NSImage(size: NSSize(width: 128, height: 128))
+        nsImage.addRepresentation(rep)
+        return nsImage
     }
 }
 
