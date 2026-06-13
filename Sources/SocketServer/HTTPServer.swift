@@ -189,7 +189,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
     static let maxRequestHeaderBytes = 64 * 1024
     static let maxRequestBodyBytes = 2 * 1024 * 1024
     static let maxClientFramePayloadBytes = 1024 * 1024
-    static let maxWebSocketOutboundQueuedBytes = 1024 * 1024
+    public static let maxWebSocketOutboundQueuedBytes = 1024 * 1024
     static let wsHeartbeatInterval: TimeInterval = 20
 
     /// Pure helper: decides whether the `/v1/ws` upgrade must present a valid
@@ -251,12 +251,13 @@ public final class DirectHTTPServer: @unchecked Sendable {
     let wsTracker = WSConnectionTracker()
     private let heartbeatInterval: TimeInterval
     private let receiveTimeoutSeconds: Int
+    private let webSocketOutboundMaxQueuedBytes: Int
 
     private var listenFD: Int32 = -1
     private var running = false
     private var accept: Thread?
 
-    public init(port: UInt16 = 18217, loopbackOnly: Bool = true, dispatcher: JSONRPCDispatcher, auth: DirectAuthProvider? = nil, serverId: String = ProcessInfo.processInfo.globallyUniqueString, heartbeatInterval: TimeInterval = 20, clientReceiveTimeoutSeconds: Int = 20) {
+    public init(port: UInt16 = 18217, loopbackOnly: Bool = true, dispatcher: JSONRPCDispatcher, auth: DirectAuthProvider? = nil, serverId: String = ProcessInfo.processInfo.globallyUniqueString, heartbeatInterval: TimeInterval = 20, clientReceiveTimeoutSeconds: Int = 20, webSocketOutboundMaxQueuedBytes: Int = DirectHTTPServer.maxWebSocketOutboundQueuedBytes) {
         self.port = port
         self.bindLoopbackOnly = loopbackOnly
         self.dispatcher = dispatcher
@@ -264,6 +265,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
         self.serverId = serverId
         self.heartbeatInterval = heartbeatInterval
         self.receiveTimeoutSeconds = max(1, clientReceiveTimeoutSeconds)
+        self.webSocketOutboundMaxQueuedBytes = max(1, webSocketOutboundMaxQueuedBytes)
     }
 
     public func start() throws {
@@ -464,7 +466,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
             let wsFilter = EventStreamFilter.parse(headers["x-rc2-ws-filter"])
             let subIDBox = LockedSubscriberID()
             let outbound = WebSocketOutboundQueue(
-                maxQueuedBytes: Self.maxWebSocketOutboundQueuedBytes,
+                maxQueuedBytes: webSocketOutboundMaxQueuedBytes,
                 writer: { [weak self] data in
                     guard let self else { return false }
                     return self.sendWSEvent(fd: fd, data: data, compressed: wsCompressionEnabled)
@@ -528,7 +530,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
             heartbeat.setEventHandler {
                 guard Self.shouldSendHeartbeat(
                     queued: outbound.queuedByteCount,
-                    max: Self.maxWebSocketOutboundQueuedBytes
+                    max: self.webSocketOutboundMaxQueuedBytes
                 ) else { return }
                 guard let data = try? JSONSerialization.data(withJSONObject: [
                     "type": "heartbeat",

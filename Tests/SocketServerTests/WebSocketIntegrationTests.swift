@@ -11,11 +11,15 @@ import CoreModel
 @MainActor
 final class WebSocketIntegrationTests: XCTestCase {
 
-    private func startServer(heartbeatInterval: TimeInterval = DirectHTTPServer.wsHeartbeatInterval) throws -> (DirectHTTPServer, UInt16) {
+    private func startServer(
+        heartbeatInterval: TimeInterval = DirectHTTPServer.wsHeartbeatInterval,
+        webSocketOutboundMaxQueuedBytes: Int = DirectHTTPServer.maxWebSocketOutboundQueuedBytes
+    ) throws -> (DirectHTTPServer, UInt16) {
         let port = UInt16.random(in: 33000...44000)
         let server = DirectHTTPServer(port: port, loopbackOnly: true,
                                       dispatcher: JSONRPCDispatcher(router: FakeRouter()),
-                                      heartbeatInterval: heartbeatInterval)
+                                      heartbeatInterval: heartbeatInterval,
+                                      webSocketOutboundMaxQueuedBytes: webSocketOutboundMaxQueuedBytes)
         try server.start()
         return (server, port)
     }
@@ -118,6 +122,43 @@ final class WebSocketIntegrationTests: XCTestCase {
         }
         XCTAssertTrue(cleanedUp,
                       "closing a live WS task must unsubscribe from EventBus so repeated mobile reconnects do not leak subscribers")
+    }
+
+    func testSlowClientQueueFullClosesLiveWebSocketWithServerClosePayload() async throws {
+        let (server, port) = try startServer(webSocketOutboundMaxQueuedBytes: 128)
+        defer { server.stop() }
+        try await Task.sleep(nanoseconds: 80_000_000)
+
+        let task = wsTask(port: port, sinceSeq: EventBus.shared.currentSeq)
+        defer { task.cancel(with: .normalClosure, reason: nil) }
+        try await Task.sleep(nanoseconds: 150_000_000)
+
+        let kind = "test.ws.queuefull.\(UUID().uuidString)"
+        EventBus.shared.publish(kind: kind, payload: .object([
+            "blob": .string(String(repeating: "x", count: 4_096))
+        ]))
+
+        for _ in 0..<10 {
+            let message = try await receiveWithTimeout(task, seconds: 2)
+            let data: Data
+            switch message {
+            case .data(let d): data = d
+            case .string(let s): data = Data(s.utf8)
+            @unknown default: continue
+            }
+            guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { continue }
+            if obj["type"] as? String == "server_close" {
+                XCTAssertEqual(obj["reason"] as? String, "queue_full",
+                               "live WS slow-client close must carry the stable queue_full reason")
+                XCTAssertEqual(obj["action"] as? String, "reconnect_with_baseline",
+                               "client recovery must be explicit after a queue_full close")
+                let dropped = await waitUntil { server.wsTracker.slowClientDrops >= 1 }
+                XCTAssertTrue(dropped, "live queue_full close must increment slow-client diagnostics")
+                return
+            }
+        }
+
+        XCTFail("live queue_full path must send a server_close frame before shutting down the socket")
     }
 
     func testCompressionNegotiationDeliversDecodableEnvelope() async throws {
