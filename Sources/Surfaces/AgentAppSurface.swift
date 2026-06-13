@@ -160,11 +160,11 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// an app relaunch and has a recoverable provider session. Drives the inline
     /// Continue action. Cleared when a run starts or the selected thread changes.
     @Published public private(set) var selectedThreadHasRecoverableContext: Bool = false
-    /// UX-SR1-BADGE: ids of assistant messages that were SR1-translated this session.
-    /// Populated by the coordinator's onSR1TranslatedMessageId callback; not persisted.
-    /// After reload the badge is absent for previously-translated messages (follow-up:
-    /// persist wasTranslated on AgentMessage to survive restarts).
+    /// UX-SR1-BADGE: ids of assistant messages that were SR1-translated.
+    /// Populated live by the coordinator callback and rebuilt from persisted stream
+    /// events on thread open so the badge survives restarts.
     @Published public private(set) var sr1TranslatedMessageIds: Set<AgentMessageID> = []
+    @Published public private(set) var sr1OriginalTextsByMessageId: [AgentMessageID: String] = [:]
 
     public let workspaceID: WorkspaceID
     public let cwd: String
@@ -227,6 +227,10 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// view logic is deterministic. Must not be called in production code.
     public func setClockForTests(_ clock: @escaping @Sendable () -> Date) {
         self.clock = clock
+    }
+
+    public func sr1OriginalText(for id: AgentMessageID) -> String? {
+        sr1OriginalTextsByMessageId[id]
     }
 
     public init(
@@ -436,6 +440,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         for event in persistedReplay {
             timeline.apply(event)
         }
+        refreshSR1TranslationStateFromTimeline()
         // PERF: rebuild the O(1) item index once over the fully-replayed timeline so
         // subsequent item-location lookups skip the O(turns x items) linear scan.
         timelineItemIndex = TimelineItemIndex(turns: timeline.turns)
@@ -452,6 +457,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             for event in replayEvents {
                 self.timeline.apply(event)
             }
+            self.refreshSR1TranslationStateFromTimeline()
             self.timelineItemIndex = TimelineItemIndex(turns: self.timeline.turns)
         }
         rehydrateProposedPlans(threadId: id)
@@ -2113,6 +2119,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 if self.status != .running { self.status = .running }
             }
             self.timeline.apply(event)
+            self.refreshSR1TranslationStateFromTimeline()
             // UX-MAC_AGENT-009: track recoverability of the latest error so the
             // transcript can offer Retry; any other event clears the flag.
             if case let .error(_, recoverable) = event {
@@ -2314,6 +2321,19 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             updated.remove(oldest)
         }
         return updated
+    }
+
+    private func refreshSR1TranslationStateFromTimeline() {
+        var ids = Set<AgentMessageID>()
+        var originals: [AgentMessageID: String] = [:]
+        for (rawId, translation) in timeline.sr1TranslationsByMessageId {
+            guard let uuid = UUID(uuidString: rawId) else { continue }
+            let id = AgentMessageID(uuid)
+            ids.insert(id)
+            originals[id] = translation.originalText
+        }
+        sr1TranslatedMessageIds.formUnion(ids)
+        sr1OriginalTextsByMessageId.merge(originals) { _, new in new }
     }
 }
 
@@ -2804,6 +2824,12 @@ public struct AgentAppView: View {
     /// decision is independent of view state.
     static func showsTranslatedBadge(wasSR1Translated: Bool) -> Bool {
         wasSR1Translated
+    }
+
+    static func sr1BadgeLabel(hasOriginalText: Bool) -> String {
+        hasOriginalText
+            ? "translated from compressed output - View original"
+            : "translated from compressed output"
     }
 
     /// Pure seam: checkpoint revert always needs a destructive confirmation.
@@ -4809,11 +4835,28 @@ public struct AgentAppView: View {
                     )
                     VStack(alignment: .leading, spacing: DS.Space.xs) {
                         if showBadge {
-                            Text("translated from compressed output")
-                                .font(DS.Font.caption2)
-                                .foregroundColor(DS.Palette.textTertiary)
-                                .accessibilityLabel("This reply was translated from Token Saver compressed output")
-                                .accessibilityIdentifier("agent.assistantMessage.sr1Badge.\(msg.id.value.uuidString)")
+                            if let original = vm.sr1OriginalText(for: msg.id) {
+                                DisclosureGroup {
+                                    Text(original)
+                                        .font(DS.Font.caption)
+                                        .foregroundColor(DS.Palette.textSecondary)
+                                        .textSelection(.enabled)
+                                        .padding(DS.Space.sm)
+                                        .background(DS.Palette.surface, in: RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
+                                } label: {
+                                    Text(Self.sr1BadgeLabel(hasOriginalText: true))
+                                        .font(DS.Font.caption2)
+                                        .foregroundColor(DS.Palette.textTertiary)
+                                }
+                                .accessibilityLabel("This reply was translated from Token Saver compressed output. View original.")
+                                .accessibilityIdentifier("agent.assistantMessage.sr1Original.\(msg.id.value.uuidString)")
+                            } else {
+                                Text(Self.sr1BadgeLabel(hasOriginalText: false))
+                                    .font(DS.Font.caption2)
+                                    .foregroundColor(DS.Palette.textTertiary)
+                                    .accessibilityLabel("This reply was translated from Token Saver compressed output")
+                                    .accessibilityIdentifier("agent.assistantMessage.sr1Badge.\(msg.id.value.uuidString)")
+                            }
                         }
                         assistantProse(msg.content)
                     }

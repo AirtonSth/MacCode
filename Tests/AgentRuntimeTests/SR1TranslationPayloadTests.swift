@@ -1,5 +1,6 @@
 import XCTest
 @testable import AgentRuntime
+import CoreModel
 
 /// Tests for ClaudeStreamingCLIAdapter.sr1TranslationPayload.
 ///
@@ -87,6 +88,49 @@ final class SR1TranslationPayloadTests: XCTestCase {
                      "no-rewrite round-trip must not inject originalText")
         XCTAssertEqual(decoded["rewrittenText"] as? String, text)
         XCTAssertEqual(decoded["sr1Translated"] as? Bool, false)
+    }
+
+    func test_sr1TranslationEventRoundTripsAndIndexesByMessageId() throws {
+        let messageId = UUID().uuidString
+        let original = "S: tests pass. P: focused suite green."
+        let rewritten = "Focused tests passed."
+        let event = AssistantEvent.sr1Translation(AssistantSR1Translation(
+            messageId: messageId,
+            originalText: original,
+            rewrittenText: rewritten
+        ))
+
+        let data = try JSONEncoder().encode(event)
+        let decoded = try JSONDecoder().decode(AssistantEvent.self, from: data)
+        var state = AssistantTimelineState()
+        state.apply(decoded)
+
+        XCTAssertEqual(
+            state.sr1TranslationsByMessageId[messageId]?.originalText,
+            original,
+            "persisted SR1 translation events must preserve the original text for the view-original affordance"
+        )
+        XCTAssertEqual(state.sr1TranslationsByMessageId[messageId]?.rewrittenText, rewritten)
+    }
+
+    func test_sr1TranslationEventIndexesByItemIdForStreamingItems() {
+        let itemId = "item-123"
+        let original = "D inspect repo. O patch applied."
+        let rewritten = "I inspected the repo and applied the patch."
+        var state = AssistantTimelineState()
+
+        state.apply(.sr1Translation(AssistantSR1Translation(
+            itemId: itemId,
+            originalText: original,
+            rewrittenText: rewritten
+        )))
+
+        XCTAssertEqual(
+            state.sr1TranslationsByItemId[itemId]?.originalText,
+            original,
+            "streaming item translations must also keep original SR1 text in the timeline state"
+        )
+        XCTAssertEqual(state.sr1TranslationsByItemId[itemId]?.rewrittenText, rewritten)
     }
 
     // MARK: - edge cases

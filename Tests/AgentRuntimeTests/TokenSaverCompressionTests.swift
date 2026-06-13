@@ -263,6 +263,14 @@ final class TokenSaverCompressionTests: XCTestCase {
                        "the Agent App transcript must persist the human-language answer, not the SR1 compressed provider response")
         XCTAssertFalse(assistant.content.contains("SR1"))
         XCTAssertFalse(assistant.content.contains("S: tests green"))
+        let translation = try await waitForSR1Translation(
+            coordinator,
+            threadId: thread.id,
+            messageId: assistant.id.value.uuidString
+        )
+        XCTAssertEqual(translation.originalText, sr1,
+                       "persisted stream replay must retain the original SR1 text for view-original")
+        XCTAssertEqual(translation.rewrittenText, humanized)
     }
 
     func test_sr1SemanticLineWithoutHeaderIsHumanizedBeforePersistence() async throws {
@@ -639,5 +647,24 @@ final class TokenSaverCompressionTests: XCTestCase {
         }
         XCTFail("timed out waiting for assistant message")
         throw XCTSkip("assistant message did not persist")
+    }
+
+    private func waitForSR1Translation(
+        _ coordinator: AgentRunCoordinator,
+        threadId: AgentThreadID,
+        messageId: String
+    ) async throws -> AssistantSR1Translation {
+        let deadline = Date().addingTimeInterval(3)
+        while Date() < deadline {
+            for event in coordinator.latestStreamEvents(threadId: threadId) {
+                if case .sr1Translation(let translation) = event,
+                   translation.messageId == messageId {
+                    return translation
+                }
+            }
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTFail("timed out waiting for persisted SR1 translation event")
+        throw XCTSkip("SR1 translation event did not persist")
     }
 }

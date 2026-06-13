@@ -844,6 +844,18 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                     Task { [weak self] in
                         guard let self else { return }
                         let translated = await self.translateSR1Response(text, runId: runId, threadId: threadId)
+                        if translated != text {
+                            self.handle(
+                                event: .event(.sr1Translation(AssistantSR1Translation(
+                                    itemId: itemId,
+                                    originalText: text,
+                                    rewrittenText: translated
+                                ))),
+                                runId: runId,
+                                threadId: threadId,
+                                allowFinalResponseTranslation: false
+                            )
+                        }
                         let delta: AssistantEvent
                         switch target {
                         case .body:
@@ -973,6 +985,21 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                             allowFinalResponseTranslation: false
                         )
                     }
+                    self.lock.lock()
+                    let translatedMsgId = self.activeAssistantMessageIds[runId]
+                    self.lock.unlock()
+                    if let mid = translatedMsgId, translated != finalMessage {
+                        self.handle(
+                            event: .event(.sr1Translation(AssistantSR1Translation(
+                                messageId: mid.value.uuidString,
+                                originalText: finalMessage,
+                                rewrittenText: translated
+                            ))),
+                            runId: runId,
+                            threadId: threadId,
+                            allowFinalResponseTranslation: false
+                        )
+                    }
                     self.handle(
                         event: .finished(status, finalMessage: translated, providerThreadId: providerThreadId),
                         runId: runId,
@@ -982,15 +1009,12 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                     // Signal callers that a translated message was persisted.
                     // activeAssistantMessageIds[runId] is set by the turnCompleted
                     // handle above (persistAssistantIfMissing -> activeAssistantMessageIds).
-                    self.lock.lock()
-                    let translatedMsgId = self.activeAssistantMessageIds[runId]
-                    self.lock.unlock()
                     if let mid = translatedMsgId {
                         self.onSR1TranslatedMessageId?(mid)
                     }
                 }
-                return
-            }
+	                return
+	            }
             // PERF-MAC_AGENT-007: drain any buffered stream writes before the run
             // tears down, so the tail of a fast stream is durably persisted (and
             // visible to latestStreamEvents/reload) once the run finishes.

@@ -43,6 +43,20 @@ public struct AssistantItem: Codable, Sendable, Equatable, Identifiable {
     }
 }
 
+public struct AssistantSR1Translation: Codable, Sendable, Equatable {
+    public var itemId: String?
+    public var messageId: String?
+    public var originalText: String
+    public var rewrittenText: String
+
+    public init(itemId: String? = nil, messageId: String? = nil, originalText: String, rewrittenText: String) {
+        self.itemId = itemId
+        self.messageId = messageId
+        self.originalText = originalText
+        self.rewrittenText = rewrittenText
+    }
+}
+
 public enum AssistantRequestKind: String, Codable, Sendable {
     case commandExecution
     case fileRead
@@ -419,6 +433,7 @@ public enum AssistantEvent: Codable, Sendable, Equatable {
     case accountUsage(AssistantAccountUsage)
     case contextCompaction(summary: String?)
     case providerRuntime(ProviderRuntimeEvent)
+    case sr1Translation(AssistantSR1Translation)
     case error(message: String, recoverable: Bool)
 
     public var debugDescription: String {
@@ -441,6 +456,7 @@ public enum AssistantEvent: Codable, Sendable, Equatable {
         case .accountUsage(let u): return "accountUsage(\(u.provider.rawValue) \(Int(u.weeklyUsedPercent.rounded()))%)"
         case .contextCompaction: return "contextCompaction"
         case .providerRuntime(let e): return "providerRuntime(\(e.provider.rawValue) \(e.method))"
+        case .sr1Translation(let t): return "sr1Translation(\(t.itemId ?? t.messageId ?? "-"))"
         case .error(let m, _): return "error(\(m))"
         }
     }
@@ -483,6 +499,8 @@ public struct AssistantTimelineState: Codable, Sendable, Equatable {
     public var tokenUsage: AssistantTokenUsage?
     public var contextCompactionSummary: String?
     public var providerRuntimeEvents: [ProviderRuntimeEvent]
+    public var sr1TranslationsByItemId: [String: AssistantSR1Translation]
+    public var sr1TranslationsByMessageId: [String: AssistantSR1Translation]
     private var pendingItemDeltas: [String: PendingItemDelta]
 
     private struct PendingItemDelta: Codable, Sendable, Equatable {
@@ -498,6 +516,8 @@ public struct AssistantTimelineState: Codable, Sendable, Equatable {
         self.pendingUserInputs = []
         self.proposedPlans = []
         self.providerRuntimeEvents = []
+        self.sr1TranslationsByItemId = [:]
+        self.sr1TranslationsByMessageId = [:]
         self.pendingItemDeltas = [:]
     }
 
@@ -685,6 +705,13 @@ public struct AssistantTimelineState: Codable, Sendable, Equatable {
                 state: nil,
                 createdAtMs: event.receivedAtMs
             ))
+        case .sr1Translation(let translation):
+            if let itemId = translation.itemId, !itemId.isEmpty {
+                sr1TranslationsByItemId[itemId] = translation
+            }
+            if let messageId = translation.messageId, !messageId.isEmpty {
+                sr1TranslationsByMessageId[messageId] = translation
+            }
         case .error(let m, _):
             self.error = m
             recordActivity(AssistantWorkActivity(

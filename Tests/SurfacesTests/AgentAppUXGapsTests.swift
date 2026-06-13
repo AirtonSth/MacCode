@@ -285,4 +285,20 @@ final class AgentAppUXGapsTests: XCTestCase {
             "Badge must NOT appear for normal (non-SR1) messages"
         )
     }
+
+    func test_sr1BadgeLabel_exposesViewOriginalWhenOriginalTextExists() {
+        XCTAssertEqual(
+            AgentAppView.sr1BadgeLabel(hasOriginalText: true),
+            "translated from compressed output - View original",
+            "Badge text must expose the original SR1 text affordance when persisted original text is available"
+        )
+    }
+
+    func test_sr1BadgeLabel_usesPlainBadgeWithoutOriginalText() {
+        XCTAssertEqual(
+            AgentAppView.sr1BadgeLabel(hasOriginalText: false),
+            "translated from compressed output",
+            "Badge text must remain compact when older events have no original text to show"
+        )
+    }
 }

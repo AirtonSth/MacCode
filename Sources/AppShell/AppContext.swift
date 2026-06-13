@@ -333,6 +333,8 @@ public final class AppContext {
                 ]))
             case .providerRuntime(let event):
                 EventBus.shared.publish(kind: "agent.provider_runtime.event", payload: runtimeEventPayload(event, threadId: t))
+            case .sr1Translation:
+                break
             case .error:
                 EventBus.shared.publish(kind: "agent.run.error", payload: agentRunPayload(threadId: tid))
             }
