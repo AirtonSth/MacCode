@@ -514,6 +514,45 @@ func filterFileEntries<T: FileNameFilterable>(_ entries: [T], query: String) -> 
     }
 }
 
+func visibleFileEntries<T: FileNameFilterable>(
+    _ entries: [T],
+    showHidden: Bool,
+    query: String,
+    isHidden: (T) -> Bool
+) -> [T] {
+    let base = showHidden ? entries : entries.filter { !isHidden($0) }
+    return filterFileEntries(base, query: query)
+}
+
+func resolveSubmittedFilesPath(raw: String, root: String) -> String? {
+    let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmed.isEmpty else { return nil }
+    if trimmed == root || trimmed == "/" { return "" }
+    if trimmed.hasPrefix(root + "/") {
+        return String(trimmed.dropFirst(root.count + 1))
+    }
+    return trimmed.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+}
+
+func shouldGateLargeMedia(size: Int, loadAnyway: Bool, threshold: Int = LargeMediaGuardThreshold) -> Bool {
+    size > threshold && !loadAnyway
+}
+
+let LargeMediaGuardThreshold = 64 * 1024 * 1024
+
+struct BinaryMetadataRow: Equatable {
+    let label: String
+    let value: String
+}
+
+func binaryMetadataRows(relativePath: String, mime: String, size: Int) -> [BinaryMetadataRow] {
+    [
+        BinaryMetadataRow(label: "Path", value: relativePath),
+        BinaryMetadataRow(label: "MIME", value: mime),
+        BinaryMetadataRow(label: "Size", value: "\(size) bytes")
+    ]
+}
+
 // MARK: - Incremental highlight range helper (no AppKit, no MainActor; tested in IncrementalHighlightRangesTests)
 
 /// Compute the UTF-16 NSRanges (over `newText`) of lines that differ between `oldText` and
@@ -1767,13 +1806,12 @@ private struct FilesSurfaceRoot: View {
     // Dotfiles are hidden unless the user opts in via the sidebar toggle (IMP-MAC_FILES-014).
     // Name filter further narrows the visible set when the user types in the filter field.
     private var visibleEntries: [FileEntry] {
-        let base = showHidden ? model.entries : model.entries.filter { !$0.isHidden }
-        return filterFileEntries(base, query: nameFilter)
+        visibleFileEntries(model.entries, showHidden: showHidden, query: nameFilter, isHidden: \.isHidden)
     }
 
     private func visibleChildren(of directory: FileEntry) -> [FileEntry] {
         let children = model.childEntries(for: directory)
-        return showHidden ? children : children.filter { !$0.isHidden }
+        return visibleFileEntries(children, showHidden: showHidden, query: "", isHidden: \.isHidden)
     }
 
     // Recursive tree renderer (P1): each row gets a disclosure triangle when it is a directory, and
@@ -1924,15 +1962,9 @@ private struct FilesSurfaceRoot: View {
     }
 
     private func submitPath() {
-        let raw = pathInput.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !raw.isEmpty else { pathInput = displayPath; return }
-        let relative: String
-        if raw == model.root || raw == "/" {
-            relative = ""
-        } else if raw.hasPrefix(model.root + "/") {
-            relative = String(raw.dropFirst(model.root.count + 1))
-        } else {
-            relative = raw.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        guard let relative = resolveSubmittedFilesPath(raw: pathInput, root: model.root) else {
+            pathInput = displayPath
+            return
         }
         model.loadDirectory(relative)
         // On a bad path the error surfaces far away in the reader; flag the field red and restore
@@ -2398,14 +2430,14 @@ private struct FilesSurfaceRoot: View {
 /// video or huge image does not stall/spike memory by decoding/streaming it immediately. Text
 /// reads are already byte-capped; media previews load straight from disk (UX-MAC_FILES-008).
 private struct LargeMediaGuard<Content: View>: View {
-    static var threshold: Int { 64 * 1024 * 1024 }
+    static var threshold: Int { LargeMediaGuardThreshold }
     let entry: FileEntry
     let url: URL?
     @ViewBuilder let content: (URL?) -> Content
     @State private var loadAnyway = false
 
     var body: some View {
-        if entry.size > Self.threshold && !loadAnyway {
+        if shouldGateLargeMedia(size: entry.size, loadAnyway: loadAnyway, threshold: Self.threshold) {
             VStack(spacing: 12) {
                 Image(systemName: "exclamationmark.triangle")
                     .font(.system(size: 28))
@@ -2629,6 +2661,10 @@ extension FilesEmptyState where Actions == EmptyView {
 
 private struct BinaryMetadataView: View {
     let entry: FileEntry
+    private var rows: [BinaryMetadataRow] {
+        binaryMetadataRows(relativePath: entry.relativePath, mime: entry.mime, size: entry.size)
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             Label(entry.kind.capitalized, systemImage: "lock.doc")
@@ -2636,9 +2672,9 @@ private struct BinaryMetadataView: View {
             Text(entry.editabilityReason)
                 .foregroundStyle(DS.Palette.textSecondary)
             Grid(alignment: .leading, horizontalSpacing: 16, verticalSpacing: 8) {
-                GridRow { Text("Path"); Text(entry.relativePath).font(DS.Font.monoSmall) }
-                GridRow { Text("MIME"); Text(entry.mime).font(DS.Font.monoSmall) }
-                GridRow { Text("Size"); Text("\(entry.size) bytes").font(DS.Font.monoSmall) }
+                ForEach(rows, id: \.label) { row in
+                    GridRow { Text(row.label); Text(row.value).font(DS.Font.monoSmall) }
+                }
             }
             // Escape hatch to the real file for binaries RemoteCode can't render (UX-MAC_FILES-009).
             HStack(spacing: 8) {
