@@ -73,6 +73,34 @@ public struct SplitNode: Codable, Sendable, Equatable {
         }
     }
 
+    private enum CodingKeys: String, CodingKey {
+        case id
+        case orientation
+        case children
+        case ratios
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(UUID.self, forKey: .id)
+        orientation = try container.decode(SplitOrientation.self, forKey: .orientation)
+        children = try container.decode([LayoutNode].self, forKey: .children)
+        let decodedRatios = try container.decodeIfPresent([Double].self, forKey: .ratios)
+        if let decodedRatios, decodedRatios.count == children.count {
+            ratios = SplitNode.normalize(decodedRatios)
+        } else {
+            ratios = Array(repeating: 1.0 / Double(max(children.count, 1)), count: children.count)
+        }
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(id, forKey: .id)
+        try container.encode(orientation, forKey: .orientation)
+        try container.encode(children, forKey: .children)
+        try container.encode(ratios, forKey: .ratios)
+    }
+
     public static func normalize(_ rs: [Double]) -> [Double] {
         let total = rs.reduce(0, +)
         guard total > 0 else { return Array(repeating: 1.0 / Double(max(rs.count, 1)), count: rs.count) }

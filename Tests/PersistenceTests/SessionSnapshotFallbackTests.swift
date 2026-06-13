@@ -18,6 +18,66 @@ final class SessionSnapshotFallbackTests: XCTestCase {
         SessionSnapshot(layout: LayoutState())
     }
 
+    private func splitSnapshot() -> SessionSnapshot {
+        let left = PaneNode(surfaces: [SurfaceDescriptor(type: .terminal, title: "left")])
+        let right = PaneNode(surfaces: [SurfaceDescriptor(type: .browser, title: "right")])
+        let split = SplitNode(
+            id: UUID(uuidString: "11111111-2222-3333-4444-555555555555")!,
+            orientation: .horizontal,
+            children: [.pane(left), .pane(right)],
+            ratios: [0.25, 0.75]
+        )
+        let workspace = Workspace(name: "split", cwd: "/tmp", layout: .split(split))
+        let window = AppWindow(workspaces: [workspace.id], selectedWorkspaceID: workspace.id)
+        return SessionSnapshot(layout: LayoutState(window: window, workspaces: [workspace.id: workspace]))
+    }
+
+    private func snapshotDataWithMismatchedSplitRatios() throws -> Data {
+        let data = try JSONEncoder().encode(splitSnapshot())
+        var object = try JSONSerialization.jsonObject(with: data)
+        var patched = false
+
+        func patch(_ value: inout Any) {
+            if var dict = value as? [String: Any] {
+                if !patched, dict["children"] != nil, dict["ratios"] != nil {
+                    dict["ratios"] = [1.0]
+                    patched = true
+                    value = dict
+                    return
+                }
+                for key in Array(dict.keys) {
+                    var child = dict[key] as Any
+                    patch(&child)
+                    dict[key] = child
+                }
+                value = dict
+            } else if var array = value as? [Any] {
+                for index in array.indices {
+                    var child = array[index]
+                    patch(&child)
+                    array[index] = child
+                }
+                value = array
+            }
+        }
+
+        patch(&object)
+        XCTAssertTrue(patched, "test fixture must patch the encoded split ratios")
+        return try JSONSerialization.data(withJSONObject: object)
+    }
+
+    private func insertSnapshotPayload(_ data: Data, into db: SQLiteDB, version: Int = SessionSnapshot.currentVersion) throws {
+        let payload = String(data: data, encoding: .utf8) ?? "{}"
+        let st = try db.prepare("""
+            INSERT INTO session_snapshots(version, payload_json, created_at)
+            VALUES(?, ?, ?);
+        """)
+        try st.bind(1, Int64(version))
+        try st.bind(2, payload)
+        try st.bind(3, "2030-01-01T00:00:00Z")
+        _ = try st.step()
+    }
+
     // Corrupt the payload of the row with the highest id (newest).
     private func corruptNewestPayload(db: SQLiteDB) throws {
         try db.execute("""
@@ -169,6 +229,29 @@ final class SessionSnapshotFallbackTests: XCTestCase {
         XCTAssertFalse(surfaceIDs.contains(danglingID.value),
             "the dangling selectedSurfaceID must not match any surface in the pane; " +
             "if it does the test fixture is wrong")
+    }
+
+    // MARK: - Split ratio mismatch
+
+    /// WHY (T013 fixture): SplitNode.init normalizes ratios and repairs a count
+    /// mismatch, but Codable decoding used to bypass that invariant. A malformed
+    /// snapshot with 2 children and 1 ratio could leak into layout restore. The
+    /// decoder now repairs the local split node to equal ratios, preserving the
+    /// rest of the snapshot instead of dropping the whole row.
+    func test_latestDecodable_splitRatiosChildrenMismatch_normalizesRatios() throws {
+        let (repo, db) = try makeRepo()
+        try insertSnapshotPayload(try snapshotDataWithMismatchedSplitRatios(), into: db)
+
+        let result = try XCTUnwrap(repo.latest(),
+            "latest() must recover a snapshot whose split ratios are locally repairable")
+        guard case .split(let split) = result.layout.workspaces.values.first?.layout else {
+            return XCTFail("expected split layout after decoding mismatched ratio fixture")
+        }
+        XCTAssertEqual(split.children.count, 2)
+        XCTAssertEqual(split.ratios.count, split.children.count,
+                       "decoded split ratios must be repaired to match children count")
+        XCTAssertEqual(split.ratios[0], 0.5, accuracy: 0.0001)
+        XCTAssertEqual(split.ratios[1], 0.5, accuracy: 0.0001)
     }
 
     // MARK: - firstDecodable seam
