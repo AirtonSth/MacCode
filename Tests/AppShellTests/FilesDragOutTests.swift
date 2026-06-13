@@ -1,5 +1,6 @@
 import XCTest
 @testable import AppShell
+import UniformTypeIdentifiers
 
 /// Tests for the `fileOutDragInfo(absolutePath:)` pure helper introduced for P3 drag-file-out.
 ///
@@ -79,5 +80,46 @@ final class FilesDragOutTests: XCTestCase {
             "URL.path must round-trip path with spaces correctly")
         XCTAssertEqual(info.promiseFilename, "Notes Draft.md",
             "filename must preserve spaces so the receiving app shows a readable name")
+    }
+
+    func test_fileOutDragInfo_unknownExtensionFallsBackToGenericItemType() {
+        // WHY: files without an extension still need a valid promised-file type so the AppKit
+        // drag path can start instead of producing an unusable pasteboard item.
+        let info = fileOutDragInfo(absolutePath: "/Users/sam/workspace/Makefile")
+        XCTAssertEqual(info.typeIdentifier, UTType.item.identifier,
+            "extensionless paths must still advertise a generic item type")
+    }
+
+    func test_fileOutItemProviderRegistersFileAndTextPayloads() {
+        // WHY: the single sidebar drag must support both external drops (Finder reads the file
+        // representation) and internal drops (RemoteCode reads the encoded String payload).
+        let info = fileOutDragInfo(absolutePath: "/Users/sam/workspace/src/App.swift")
+        let provider = fileOutItemProvider(info: info, textPayload: "rc-test-payload")
+
+        XCTAssertEqual(provider.suggestedName, "App.swift",
+            "Finder should receive the row filename as the suggested promised-file name")
+        XCTAssertTrue(provider.hasItemConformingToTypeIdentifier(info.typeIdentifier),
+            "drag provider must expose a promised file representation for external app drops")
+        XCTAssertTrue(provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier),
+            "drag provider must also expose the source file URL for apps that accept file URLs")
+        XCTAssertTrue(provider.hasItemConformingToTypeIdentifier(UTType.utf8PlainText.identifier),
+            "drag provider must keep the internal String payload for RemoteCode drop targets")
+    }
+
+    func test_combinedDragPayloadKeepsFileTabAndMovePayloadsDecodable() {
+        // WHY: one AppKit drag source backs both internal file-tab drops and sidebar move drops.
+        // The combined text payload must let each target find the payload it understands.
+        let workspace = UUID().uuidString
+        let surface = UUID().uuidString
+        let tabPath = Data("src/App.swift".utf8).base64EncodedString()
+        let movePath = Data("src".utf8).base64EncodedString()
+        let fileTab = "rc-file-tab|\(workspace)|\(surface)|\(tabPath)"
+        let move = "rc-sidebar-move|\(workspace)|\(movePath)"
+        let combined = fileOutCombinedDragPayload(fileTabPayload: fileTab, movePayload: move)
+
+        XCTAssertEqual(fileTabDragPayloadCandidate(in: combined ?? ""), fileTab,
+            "file-tab drop targets must recover their payload from the combined drag text")
+        XCTAssertEqual(sidebarMoveDragPayloadCandidate(in: combined ?? ""), move,
+            "folder drop targets must recover their move payload from the combined drag text")
     }
 }

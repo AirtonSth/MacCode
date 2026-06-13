@@ -2,6 +2,7 @@ import Foundation
 import AppKit
 import ImageIO
 import SwiftUI
+import UniformTypeIdentifiers
 import WebKit
 import AVKit
 import CoreModel
@@ -383,6 +384,7 @@ struct FileOutDragInfo: Equatable {
     /// Equals `URL(fileURLWithPath: absolutePath).lastPathComponent`, which is the `name`
     /// field on `FileEntry` (guaranteed non-empty by the server API).
     let promiseFilename: String
+    let typeIdentifier: String
 }
 
 /// Compute the drag-out info for a single sidebar row. Pure: no AppKit, no MainActor.
@@ -390,7 +392,45 @@ struct FileOutDragInfo: Equatable {
 /// Works identically for files and directories; directories can also be dragged to Finder.
 func fileOutDragInfo(absolutePath: String) -> FileOutDragInfo {
     let url = URL(fileURLWithPath: absolutePath)
-    return FileOutDragInfo(absoluteURL: url, promiseFilename: url.lastPathComponent)
+    let type = UTType(filenameExtension: url.pathExtension) ?? .item
+    return FileOutDragInfo(absoluteURL: url, promiseFilename: url.lastPathComponent, typeIdentifier: type.identifier)
+}
+
+func fileOutCombinedDragPayload(fileTabPayload: String?, movePayload: String?) -> String? {
+    let payloads = [fileTabPayload, movePayload]
+        .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+        .filter { !$0.isEmpty }
+    return payloads.isEmpty ? nil : payloads.joined(separator: "\n")
+}
+
+private func dragPayloadCandidates(_ raw: String) -> [String] {
+    raw.split(whereSeparator: \.isNewline).map(String.init)
+}
+
+func fileTabDragPayloadCandidate(in raw: String) -> String? {
+    dragPayloadCandidates(raw).first { FileTabDragPayload.decode($0) != nil }
+}
+
+func sidebarMoveDragPayloadCandidate(in raw: String) -> String? {
+    dragPayloadCandidates(raw).first { SidebarMoveDragPayload.decode($0) != nil }
+}
+
+func fileOutItemProvider(info: FileOutDragInfo, textPayload: String?) -> NSItemProvider {
+    let provider = NSItemProvider()
+    provider.suggestedName = info.promiseFilename
+    if let textPayload {
+        provider.registerObject(textPayload as NSString, visibility: .all)
+    }
+    provider.registerObject(info.absoluteURL as NSURL, visibility: .all)
+    provider.registerFileRepresentation(
+        forTypeIdentifier: info.typeIdentifier,
+        fileOptions: [.openInPlace],
+        visibility: .all
+    ) { completion in
+        completion(info.absoluteURL, true, nil)
+        return nil
+    }
+    return provider
 }
 
 // MARK: - Pure name-filter helper (no AppKit, no MainActor; tested in FilesNameFilterTests)
@@ -562,6 +602,21 @@ private struct SidebarMoveDragModifier: ViewModifier {
     }
 }
 
+private struct FileOutDragModifier: ViewModifier {
+    let absolutePath: String
+    let fileTabPayload: String?
+    let movePayload: String?
+
+    func body(content: Content) -> some View {
+        content.onDrag {
+            fileOutItemProvider(
+                info: fileOutDragInfo(absolutePath: absolutePath),
+                textPayload: fileOutCombinedDragPayload(fileTabPayload: fileTabPayload, movePayload: movePayload)
+            )
+        }
+    }
+}
+
 private struct SidebarMoveDropModifier: ViewModifier {
     let enabled: Bool
     let workspaceID: String
@@ -569,14 +624,14 @@ private struct SidebarMoveDropModifier: ViewModifier {
     let isTargeted: (Bool) -> Void
 
     @ViewBuilder
-    func body(content: Content) -> some View {
-        if enabled {
-            content.dropDestination(for: String.self) { values, _ in
-                guard let raw = values.first,
-                      let payload = SidebarMoveDragPayload.decode(raw),
-                      payload.workspaceID == workspaceID else { return false }
-                return onDrop(payload.relativePath)
-            } isTargeted: { targeted in
+	    func body(content: Content) -> some View {
+	        if enabled {
+	            content.dropDestination(for: String.self) { values, _ in
+	                guard let raw = values.compactMap(sidebarMoveDragPayloadCandidate(in:)).first,
+	                      let payload = SidebarMoveDragPayload.decode(raw),
+	                      payload.workspaceID == workspaceID else { return false }
+	                return onDrop(payload.relativePath)
+	            } isTargeted: { targeted in
                 isTargeted(targeted)
             }
         } else {
@@ -585,7 +640,7 @@ private struct SidebarMoveDropModifier: ViewModifier {
     }
 }
 
-private extension View {
+	private extension View {
     func fileTabDragPayload(_ payload: String?) -> some View {
         modifier(FileTabDragModifier(payload: payload))
     }
@@ -594,7 +649,11 @@ private extension View {
         modifier(SidebarMoveDragModifier(payload: payload))
     }
 
-    func sidebarMoveDropDestination(
+    func fileOutDragProvider(absolutePath: String, fileTabPayload: String?, movePayload: String?) -> some View {
+        modifier(FileOutDragModifier(absolutePath: absolutePath, fileTabPayload: fileTabPayload, movePayload: movePayload))
+    }
+
+	func sidebarMoveDropDestination(
         enabled: Bool,
         workspaceID: String,
         onDrop: @escaping (String) -> Bool,
@@ -1107,11 +1166,12 @@ private final class FilesViewModel: ObservableObject {
         }
     }
 
-    func handleFileDropPayload(_ rawPayload: String, location: CGPoint, size: CGSize) -> Bool {
-        guard let payload = FileTabDragPayload.decode(rawPayload),
-              payload.workspaceID == workspaceID.value.uuidString else { return false }
-        let direction: SplitDirection = location.y >= size.height * 0.68 ? .down : .right
-        splitFileTab(path: payload.path, direction: direction)
+	    func handleFileDropPayload(_ rawPayload: String, location: CGPoint, size: CGSize) -> Bool {
+	        guard let rawPayload = fileTabDragPayloadCandidate(in: rawPayload),
+	              let payload = FileTabDragPayload.decode(rawPayload),
+	              payload.workspaceID == workspaceID.value.uuidString else { return false }
+	        let direction: SplitDirection = location.y >= size.height * 0.68 ? .down : .right
+	        splitFileTab(path: payload.path, direction: direction)
         return true
     }
 
@@ -1639,10 +1699,11 @@ private struct FilesSurfaceRoot: View {
         .listRowInsets(EdgeInsets(top: 1, leading: 0, bottom: 1, trailing: 0))
         .listRowBackground(Color.clear)
         .contextMenu { fileContextMenu(for: entry) }
-        .fileTabDragPayload(entry.dragPayload)
-        // Any entry can be dragged to move it. Directories also accept drops.
-        .sidebarMoveDragPayload(entry.moveDragPayload)
-        .sidebarMoveDropDestination(
+	        .fileTabDragPayload(entry.dragPayload)
+	        // Any entry can be dragged to move it. Directories also accept drops.
+	        .sidebarMoveDragPayload(entry.moveDragPayload)
+	        .fileOutDragProvider(absolutePath: entry.path, fileTabPayload: entry.dragPayload, movePayload: entry.moveDragPayload)
+	        .sidebarMoveDropDestination(
             enabled: entry.isDirectory,
             workspaceID: model.workspaceID.value.uuidString,
             onDrop: { relativePath in
@@ -1883,11 +1944,11 @@ private struct FilesSurfaceRoot: View {
                     previewBody
                 }
             }
-            .dropDestination(for: String.self) { values, location in
-                dropTargeted = false
-                guard let payload = values.first else { return false }
-                return model.handleFileDropPayload(payload, location: location, size: proxy.size)
-            } isTargeted: { targeted in
+	            .dropDestination(for: String.self) { values, location in
+	                dropTargeted = false
+	                guard let payload = values.compactMap(fileTabDragPayloadCandidate(in:)).first else { return false }
+	                return model.handleFileDropPayload(payload, location: location, size: proxy.size)
+	            } isTargeted: { targeted in
                 dropTargeted = targeted
             }
             // Show where a dragged file tab will land so the user isn't guessing right-vs-bottom
