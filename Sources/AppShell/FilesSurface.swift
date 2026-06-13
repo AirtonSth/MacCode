@@ -787,6 +787,43 @@ func filesRemoteUpdateDecision(
     return .conflictKeepLocal
 }
 
+struct FilesRemoteContentUpdate: Equatable {
+    let draftText: String
+    let renderedText: String
+    let pendingRemoteText: String?
+    let remoteEditConflict: Bool
+}
+
+func filesRemoteContentUpdate(
+    localDirty: Bool,
+    draftText: String,
+    renderedText: String,
+    remoteText: String,
+    lastSyncedText: String
+) -> FilesRemoteContentUpdate {
+    switch filesRemoteUpdateDecision(
+        localDirty: localDirty,
+        localText: draftText,
+        remoteText: remoteText,
+        lastSyncedText: lastSyncedText
+    ) {
+    case .apply:
+        return FilesRemoteContentUpdate(
+            draftText: remoteText,
+            renderedText: remoteText,
+            pendingRemoteText: nil,
+            remoteEditConflict: false
+        )
+    case .conflictKeepLocal:
+        return FilesRemoteContentUpdate(
+            draftText: draftText,
+            renderedText: renderedText,
+            pendingRemoteText: remoteText,
+            remoteEditConflict: true
+        )
+    }
+}
+
 struct FilesEditClosedUpdate: Equatable {
     let dirtyPaths: Set<String>
     let cachePathToRemove: String?
@@ -1353,25 +1390,22 @@ private final class FilesViewModel: ObservableObject {
         }
         if let content = payload["content"]?.stringValue {
             if remote {
-                let decision = filesRemoteUpdateDecision(
+                let update = filesRemoteContentUpdate(
                     localDirty: isDirty,
-                    localText: draftText,
+                    draftText: draftText,
+                    renderedText: renderedText,
                     remoteText: content,
                     lastSyncedText: lastSyncedText
                 )
-                switch decision {
-                case .apply:
-                    remoteEditConflict = false
-                    pendingRemoteText = nil
-                    setDraft(content)
-                    renderedText = content
-                case .conflictKeepLocal:
+                remoteEditConflict = update.remoteEditConflict
+                pendingRemoteText = update.pendingRemoteText
+                if update.remoteEditConflict {
                     // Preserve the local draft. Park the remote version so the user
                     // can load it explicitly via the conflict banner ("Load Remote").
-                    pendingRemoteText = content
-                    remoteEditConflict = true
-                    // renderedText is intentionally left unchanged -- the preview keeps
-                    // showing the local draft until the conflict is resolved.
+                    renderedText = update.renderedText
+                } else {
+                    setDraft(update.draftText)
+                    renderedText = update.renderedText
                 }
             } else if draftText != content {
                 setDraft(content)

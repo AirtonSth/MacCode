@@ -99,4 +99,48 @@ final class FilesRemoteUpdateDecisionTests: XCTestCase {
         XCTAssertEqual(decision, .conflictKeepLocal,
             "dirty + remote cleared the file: must protect local draft, not silently delete it")
     }
+
+    // MARK: - Remote content update
+
+    func test_remoteContentUpdate_cleanDraftAppliesRemoteText() {
+        // WHY: when there are no unsaved local edits, a remote patch from iOS should update both
+        // editor and preview immediately and must not show a conflict banner.
+        let update = filesRemoteContentUpdate(
+            localDirty: false,
+            draftText: "old",
+            renderedText: "old",
+            remoteText: "new from iOS",
+            lastSyncedText: "old"
+        )
+
+        XCTAssertEqual(update.draftText, "new from iOS",
+            "remote edit on a clean draft must replace the editor text")
+        XCTAssertEqual(update.renderedText, "new from iOS",
+            "remote edit on a clean draft must replace the rendered preview")
+        XCTAssertNil(update.pendingRemoteText,
+            "clean remote edits should apply immediately, not park pending text")
+        XCTAssertFalse(update.remoteEditConflict,
+            "clean remote edits must not show a conflict notice")
+    }
+
+    func test_remoteContentUpdate_dirtyDivergedDraftPreservesLocalAndParksRemote() {
+        // WHY: this is the data-loss case. A remote edit arriving while the user has a different
+        // unsaved draft must be held for explicit user action instead of clobbering local text.
+        let update = filesRemoteContentUpdate(
+            localDirty: true,
+            draftText: "local unsaved",
+            renderedText: "local preview",
+            remoteText: "remote version",
+            lastSyncedText: "base"
+        )
+
+        XCTAssertEqual(update.draftText, "local unsaved",
+            "dirty divergent remote edit must preserve the local editor draft")
+        XCTAssertEqual(update.renderedText, "local preview",
+            "dirty divergent remote edit must preserve the current preview")
+        XCTAssertEqual(update.pendingRemoteText, "remote version",
+            "remote content must be parked so Load Remote can apply it explicitly")
+        XCTAssertTrue(update.remoteEditConflict,
+            "dirty divergent remote edit must surface the conflict banner")
+    }
 }
