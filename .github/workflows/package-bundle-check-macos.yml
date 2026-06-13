@@ -1,0 +1,39 @@
+name: Packaged-bundle structural check (macOS)
+
+# QA-mac:71 -- package the app in CI (debug config) and assert the bundle is
+# structurally valid (T026): valid Info.plist, APPL package type, a real Mach-O
+# executable matching CFBundleExecutable, non-empty identifier/version, and an
+# exactly-8-byte PkgInfo (the QA-mac:70 regression class). package-app.sh runs
+# codesign --verify only for human local packaging, so this guards the structure
+# that must hold regardless of signing.
+
+on:
+  pull_request:
+    paths:
+      - 'Sources/**'
+      - 'Package.swift'
+      - 'scripts/package-app.sh'
+      - 'scripts/check-app-bundle.sh'
+      - '.github/workflows/package-bundle-check-macos.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package-and-check:
+    name: package (debug) + structural check
+    runs-on: macos-14
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Select Xcode toolchain
+        run: echo "DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer" >> "$GITHUB_ENV"
+      - name: Package debug bundle
+        env:
+          RC2_CONFIG: debug
+        run: bash scripts/package-app.sh
+      - name: Structural check (T026)
+        run: bash scripts/check-app-bundle.sh dist/RemoteCode.app
+      - name: plutil -lint Info.plist
+        run: plutil -lint dist/RemoteCode.app/Contents/Info.plist
