@@ -61,4 +61,32 @@ final class FilesRecycleTests: XCTestCase {
         XCTAssertEqual(urls.map(\.path), inputs,
             "URL order must match input order for caller index-correspondence")
     }
+
+    // MARK: - filesDeleteSelectionUpdate
+
+    func test_deleteSelectionUpdate_deletedSelectedPathClearsEditorAndDirtyPaths() {
+        let update = filesDeleteSelectionUpdate(
+            selectedPath: "src/App.swift",
+            deletedPaths: ["src/App.swift", "README.md"],
+            dirtyPaths: ["src/App.swift", "README.md", "docs/Guide.md"]
+        )
+
+        XCTAssertTrue(update.shouldClearSelectedEditor,
+            "deleting the selected file must clear the editor state before recycling")
+        XCTAssertEqual(update.dirtyPaths, ["docs/Guide.md"],
+            "all deleted paths must be removed from dirtyPaths while unrelated dirty files remain")
+    }
+
+    func test_deleteSelectionUpdate_unselectedDeleteKeepsEditor() {
+        let update = filesDeleteSelectionUpdate(
+            selectedPath: "src/App.swift",
+            deletedPaths: ["README.md"],
+            dirtyPaths: ["src/App.swift", "README.md"]
+        )
+
+        XCTAssertFalse(update.shouldClearSelectedEditor,
+            "deleting another file must not clear the currently selected editor")
+        XCTAssertEqual(update.dirtyPaths, ["src/App.swift"],
+            "dirtyPaths should clear only the deleted file")
+    }
 }

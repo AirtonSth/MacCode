@@ -868,6 +868,22 @@ func filesEditClosedUpdate(
     )
 }
 
+struct FilesDeleteSelectionUpdate: Equatable {
+    let shouldClearSelectedEditor: Bool
+    let dirtyPaths: Set<String>
+}
+
+func filesDeleteSelectionUpdate(
+    selectedPath: String?,
+    deletedPaths: [String],
+    dirtyPaths: Set<String>
+) -> FilesDeleteSelectionUpdate {
+    FilesDeleteSelectionUpdate(
+        shouldClearSelectedEditor: selectedPath.map { deletedPaths.contains($0) } ?? false,
+        dirtyPaths: dirtyPaths.subtracting(deletedPaths)
+    )
+}
+
 @MainActor
 final class FilesViewModel: ObservableObject {
     @Published var currentDirectory = ""
@@ -1235,7 +1251,12 @@ final class FilesViewModel: ObservableObject {
     func delete(_ entries: [FileEntry]) {
         let relativePaths = entries.map(\.relativePath)
         guard !relativePaths.isEmpty else { return }
-        if let selectedPath, relativePaths.contains(selectedPath) {
+        let update = filesDeleteSelectionUpdate(
+            selectedPath: selectedPath,
+            deletedPaths: relativePaths,
+            dirtyPaths: dirtyPaths
+        )
+        if update.shouldClearSelectedEditor, let selectedPath {
             closeSessionIfSelected(path: selectedPath)
             selectedEntry = nil
             setDraft("")
@@ -1243,7 +1264,7 @@ final class FilesViewModel: ObservableObject {
             isDirty = false
         }
         let urls = recycleURLs(forAbsolutePaths: entries.map(\.path))
-        dirtyPaths.subtract(relativePaths)
+        dirtyPaths = update.dirtyPaths
         NSWorkspace.shared.recycle(urls) { [weak self] _, error in
             DispatchQueue.main.async {
                 guard let self else { return }
