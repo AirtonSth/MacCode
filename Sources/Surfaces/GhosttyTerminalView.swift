@@ -2104,25 +2104,45 @@ private extension NSScreen {
 // fork exposes ghostty_surface_preedit so the engine can render the in-progress
 // composition; committed text flows through the existing typed-text path.
 extension GhosttyTerminalView: NSTextInputClient {
-    private static func plainString(from any: Any) -> String? {
+    nonisolated static func plainString(from any: Any) -> String? {
         if let s = any as? String { return s }
         if let a = any as? NSAttributedString { return a.string }
         return nil
     }
 
+    /// Pure NSTextInputClient preedit transitions, extracted so the IME / dead-key
+    /// composition contract is unit-testable without a live Ghostty surface.
+    /// `.setMarked` shows the in-progress composition; `.insert` and `.unmark` BOTH
+    /// clear it. The `.insert` clear is the dead-key fix: committing a character
+    /// (e.g. ~ then a -> a, ' then e -> e) must drop the in-progress preedit before
+    /// the character is sent, never leave the dead key rendered.
+    enum IMEPreeditInput { case setMarked(Any), insert, unmark }
+    nonisolated static func nextPreedit(for input: IMEPreeditInput) -> String {
+        switch input {
+        case .setMarked(let s): return plainString(from: s) ?? ""
+        case .insert, .unmark: return ""
+        }
+    }
+
+    nonisolated static func markedRange(forPreedit text: String) -> NSRange {
+        text.isEmpty
+            ? NSRange(location: NSNotFound, length: 0)
+            : NSRange(location: 0, length: (text as NSString).length)
+    }
+
     func insertText(_ string: Any, replacementRange: NSRange) {
-        setPreedit("")
+        setPreedit(Self.nextPreedit(for: .insert))
         guard let text = Self.plainString(from: string), !text.isEmpty,
               let surface = surfaceForInput() else { return }
         sendText(text, to: surface)
     }
 
     func setMarkedText(_ string: Any, selectedRange: NSRange, replacementRange: NSRange) {
-        setPreedit(Self.plainString(from: string) ?? "")
+        setPreedit(Self.nextPreedit(for: .setMarked(string)))
     }
 
     func unmarkText() {
-        setPreedit("")
+        setPreedit(Self.nextPreedit(for: .unmark))
     }
 
     /// Push the marked (composing) text to Ghostty so it renders the preedit
@@ -2145,11 +2165,7 @@ extension GhosttyTerminalView: NSTextInputClient {
 
     func hasMarkedText() -> Bool { !markedText.isEmpty }
 
-    func markedRange() -> NSRange {
-        markedText.isEmpty
-            ? NSRange(location: NSNotFound, length: 0)
-            : NSRange(location: 0, length: (markedText as NSString).length)
-    }
+    func markedRange() -> NSRange { Self.markedRange(forPreedit: markedText) }
 
     func selectedRange() -> NSRange { NSRange(location: NSNotFound, length: 0) }
 
