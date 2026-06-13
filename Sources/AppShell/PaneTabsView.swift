@@ -1157,8 +1157,19 @@ public final class PaneTabsView: NSObject {
     }
 
     private func adjustedPositionForSamePane(_ surface: SurfaceID, targetPosition: Int) -> Int {
-        guard let sourceIndex = pane.surfaces.firstIndex(where: { $0.id == surface }),
-              sourceIndex < targetPosition else { return targetPosition }
+        Self.adjustedSamePanePosition(
+            sourceIndex: pane.surfaces.firstIndex(where: { $0.id == surface }),
+            targetPosition: targetPosition
+        )
+    }
+
+    /// QA-cross:36 -- the same-pane reorder position rule, shared in semantics with
+    /// iOS `TabReorderPlan.plan`: a RIGHTWARD same-pane move must offset its target
+    /// by its own removal (target - 1); a LEFTWARD move (sourceIndex >= target) or a
+    /// drop with no resolvable source keeps the target. Extracted as a pure seam so
+    /// the math is unit-testable and provably matches the iOS plan() offset rule.
+    nonisolated static func adjustedSamePanePosition(sourceIndex: Int?, targetPosition: Int) -> Int {
+        guard let sourceIndex, sourceIndex < targetPosition else { return targetPosition }
         return max(0, targetPosition - 1)
     }
 
