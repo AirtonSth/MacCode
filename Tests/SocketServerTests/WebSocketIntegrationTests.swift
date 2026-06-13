@@ -95,6 +95,50 @@ final class WebSocketIntegrationTests: XCTestCase {
         XCTFail("did not receive the compressed event within the frame budget")
     }
 
+    func testFilterNegotiationDropsDiagnosticKeepsCritical() async throws {
+        let (server, port) = try startServer()
+        defer { server.stop() }
+        try await Task.sleep(nanoseconds: 80_000_000)
+
+        // Negotiate the cellular-safe filter. It drops diagnostic/metrics events
+        // (reducerRequired == false, non-critical) and keeps critical ones.
+        var req = URLRequest(url: URL(string: "ws://127.0.0.1:\(port)/v1/ws")!)
+        let baseline = EventBus.shared.currentSeq
+        req.setValue("\(baseline)", forHTTPHeaderField: "x-rc2-since-seq")
+        req.setValue("cellular-safe", forHTTPHeaderField: "x-rc2-ws-filter")
+        let task = URLSession.shared.webSocketTask(with: req)
+        task.resume()
+        try await Task.sleep(nanoseconds: 150_000_000)
+
+        // Publish a DROPPED diagnostic event first, then a KEPT critical event.
+        let droppedKind = "diagnostic.test.\(UUID().uuidString)"   // priority .diagnostic -> filtered out
+        let keptKind = "test.ws.critical.\(UUID().uuidString)"     // default -> .critical -> kept
+        EventBus.shared.publish(kind: droppedKind, payload: .object(["d": .bool(true)]))
+        EventBus.shared.publish(kind: keptKind, payload: .object(["k": .bool(true)]))
+
+        // The first non-heartbeat event must be the critical one; the diagnostic
+        // event must never appear (the negotiated filter dropped it server-side).
+        for _ in 0..<50 {
+            let message = try await task.receive()
+            let data: Data
+            switch message {
+            case .data(let d): data = d
+            case .string(let s): data = Data(s.utf8)
+            @unknown default: continue
+            }
+            guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { continue }
+            if obj["type"] as? String == "heartbeat" { continue }
+            let k = obj["kind"] as? String
+            XCTAssertNotEqual(k, droppedKind,
+                "the cellular-safe filter must drop diagnostic.* events server-side; one was delivered")
+            if k == keptKind {
+                task.cancel(with: .normalClosure, reason: nil)
+                return
+            }
+        }
+        XCTFail("did not receive the critical event the cellular-safe filter should keep")
+    }
+
     func testHandshakeThenDeliversPublishedEvent() async throws {
         let (server, port) = try startServer()
         defer { server.stop() }
