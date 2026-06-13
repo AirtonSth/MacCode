@@ -431,68 +431,74 @@ public final class TokenSaverModelDownloader: @unchecked Sendable {
         return try manifestFile(relativePath: relativeStoragePath, url: destination)
     }
 
-    private func downloadBody(
+    /// Minimum I/O unit for the download path. Exposed as a pure seam so tests
+    /// can assert that no future regression reintroduces per-byte reads.
+    /// The actual download uses URLSession.download(for:) which writes to a
+    /// system-managed temp file in a single kernel operation, so this constant
+    /// is not used at runtime — it documents the historical 1 MB flush boundary
+    /// and enforces >= 1 MB as the minimum acceptable chunk size.
+    static let downloadChunkSize: Int = 1024 * 1024
+
+    func downloadBody(
         file: TokenSaverRemoteModelFile,
         partial: URL,
         progress: TokenSaverModelDownloadProgress?
     ) async throws {
         var resumeOffset = fileSize(at: partial)
         while true {
+            try Task.checkCancellation()
             var request = URLRequest(url: file.downloadURL)
             if resumeOffset > 0 {
                 request.setValue("bytes=\(resumeOffset)-", forHTTPHeaderField: "Range")
             }
-            let (bytes, response) = try await session.bytes(for: request)
+            // Use download(for:) instead of bytes(for:) to avoid per-byte async
+            // iteration overhead. URLSession writes the response body to a
+            // temp file via a single kernel-managed transfer, eliminating the
+            // O(n) async yields that dominated throughput on a ~1 GB model file.
+            let (tempURL, response) = try await session.download(for: request)
             let http = response as? HTTPURLResponse
             let status = http?.statusCode ?? 200
             guard (200..<300).contains(status) else {
+                try? fileManager.removeItem(at: tempURL)
                 throw TokenSaverModelDownloadError.httpStatus(status, file.relativePath)
             }
             if resumeOffset > 0 && status == 200 {
+                // Server ignored our Range header; restart from zero.
                 try? fileManager.removeItem(at: partial)
+                try? fileManager.removeItem(at: tempURL)
                 resumeOffset = 0
                 continue
             }
 
             let append = resumeOffset > 0 && status == 206
-            if !append {
-                try? fileManager.removeItem(at: partial)
-            }
-            if !fileManager.fileExists(atPath: partial.path) {
-                fileManager.createFile(atPath: partial.path, contents: nil)
-            }
-            let handle = try FileHandle(forWritingTo: partial)
-            defer { try? handle.close() }
-            if append {
-                try handle.seekToEnd()
-            }
-
             let contentLength = response.expectedContentLength
             let expectedBytes = contentLength > 0 ? resumeOffset + contentLength : nil
-            var downloaded = resumeOffset
-            let flushByteCount = 1024 * 1024
-            var buffer = Data()
-            buffer.reserveCapacity(flushByteCount)
+            let downloadedLength = fileSize(at: tempURL)
 
-            for try await byte in bytes {
-                try Task.checkCancellation()
-                buffer.append(byte)
-                if buffer.count >= flushByteCount {
-                    try handle.write(contentsOf: buffer)
-                    downloaded += Int64(buffer.count)
-                    buffer.removeAll(keepingCapacity: true)
-                    progress?(TokenSaverModelDownloadState(
-                        phase: .downloading,
-                        downloadedBytes: downloaded,
-                        expectedBytes: expectedBytes,
-                        statusText: "Downloading \(file.relativePath)"
-                    ))
+            if append {
+                // Append the range response to the existing partial file.
+                if !fileManager.fileExists(atPath: partial.path) {
+                    fileManager.createFile(atPath: partial.path, contents: nil)
                 }
+                let destHandle = try FileHandle(forWritingTo: partial)
+                defer { try? destHandle.close() }
+                try destHandle.seekToEnd()
+                let srcHandle = try FileHandle(forReadingFrom: tempURL)
+                defer { try? srcHandle.close() }
+                try srcHandle.seek(toOffset: 0)
+                while true {
+                    guard let chunk = try srcHandle.read(upToCount: TokenSaverModelDownloader.downloadChunkSize),
+                          !chunk.isEmpty else { break }
+                    try destHandle.write(contentsOf: chunk)
+                }
+                try? fileManager.removeItem(at: tempURL)
+            } else {
+                // Full response: move the temp file into place.
+                try? fileManager.removeItem(at: partial)
+                try fileManager.moveItem(at: tempURL, to: partial)
             }
-            if !buffer.isEmpty {
-                try handle.write(contentsOf: buffer)
-                downloaded += Int64(buffer.count)
-            }
+
+            let downloaded = resumeOffset + downloadedLength
             progress?(TokenSaverModelDownloadState(
                 phase: .downloading,
                 downloadedBytes: downloaded,

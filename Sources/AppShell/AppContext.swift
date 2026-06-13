@@ -680,6 +680,9 @@ public final class AppContext {
             // No model service: the deterministic dedup is still a safe, non-lossy win.
             return deduped.count < prompt.count ? adopt(deduped) : prompt
         }
+        // Reset the idle-eviction timer: a real request is being dispatched so
+        // the model must not be unloaded while it is in use.
+        tokenSaverDistillServiceController.recordRequest()
 
         let request = DistillRequest(
             mode: .longText,
@@ -727,6 +730,8 @@ public final class AppContext {
             NSLog("RemoteCode Token Saver SR1 humanize fallback used (provider=\(provider.rawValue)): distill client unavailable (status=\(Self.describe(tokenSaverDistillServiceController.status)))")
             return fallback
         }
+        // Reset the idle-eviction timer: a real request is being dispatched.
+        tokenSaverDistillServiceController.recordRequest()
 
         let input = """
         TARGET_LANGUAGE: \(targetLanguage)
