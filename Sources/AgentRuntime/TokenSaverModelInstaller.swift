@@ -276,6 +276,99 @@ public final class TokenSaverModelInstaller: @unchecked Sendable {
             .replacingOccurrences(of: "/", with: "__")
             .replacingOccurrences(of: ":", with: "_")
     }
+
+    // MARK: - Aggregate download UX seams
+
+    /// Parses the Hugging Face `?blobs=true` JSON response and sums all blob
+    /// sizes. Returns nil when the data cannot be decoded as a valid blob list.
+    ///
+    /// The `?blobs=true` query parameter asks the HF API to return the actual
+    /// blob object for each sibling instead of just the filename, giving us
+    /// the precise file size before starting any download.
+    ///
+    /// Expected JSON shape (array at top level or nested under `siblings`):
+    ///   [{"rfilename":"config.json","size":1234}, ...]
+    /// or the full model response with `siblings` having a `size` field when
+    /// `?blobs=true` is appended.
+    ///
+    /// WHY static nonisolated: callers live on arbitrary actors; the parse is
+    /// pure computation with no I/O, so it can run anywhere.
+    public static func totalSizeFromBlobs(_ data: Data) -> Int64? {
+        // HF ?blobs=true response: array of objects with "size" (Int64) fields.
+        // We accept both top-level arrays and the `siblings` key of a model object.
+        struct BlobEntry: Decodable {
+            let size: Int64?
+        }
+        struct ModelWithSiblings: Decodable {
+            let siblings: [BlobEntry]
+        }
+
+        let decoder = JSONDecoder()
+
+        // Try top-level array first.
+        if let entries = try? decoder.decode([BlobEntry].self, from: data) {
+            let total = entries.compactMap(\.size).reduce(0, +)
+            return total > 0 ? total : nil
+        }
+        // Try `siblings` key (full model object with ?blobs=true).
+        if let model = try? decoder.decode(ModelWithSiblings.self, from: data) {
+            let total = model.siblings.compactMap(\.size).reduce(0, +)
+            return total > 0 ? total : nil
+        }
+        return nil
+    }
+
+    /// URL to query with `?blobs=true` to pre-fetch aggregate file sizes before
+    /// the download begins. Adding the query parameter makes HF embed blob size
+    /// in each sibling entry, eliminating per-file HEAD requests.
+    public static var approvedModelBlobsURL: URL {
+        URL(string: "\(TokenSaverModelManifest.approvedModelAPIPayloadURL.absoluteString)?blobs=true")!
+    }
+
+    /// Pure predicate: true when `free` bytes is at least `required + margin`.
+    ///
+    /// WHY a static seam: the disk-space check must be testable without real
+    /// FileManager I/O. The margin absorbs the partial-download scratch space and
+    /// the post-download manifest + cache writes.
+    ///
+    /// The margin is 200 MB — the same constant used in SidebarViewModel for the
+    /// pre-download confirm dialog, kept in sync here so both paths agree.
+    public static let diskSpaceMarginBytes: Int64 = 200_000_000
+
+    public static func hasSufficientDiskSpace(required: Int64, free: Int64) -> Bool {
+        free >= required + diskSpaceMarginBytes
+    }
+
+    /// Pure function: bytes-per-second from a (bytesDelta, secondsDelta) sample.
+    ///
+    /// Returns 0 when `secondsDelta` is not strictly positive to avoid division
+    /// by zero or negative speed from clock skew. NaN/inf cannot be returned.
+    ///
+    /// WHY separate from the caller: the SidebarViewModel speed-sample path and
+    /// any future background download coordinator must both agree on this guard;
+    /// a shared static seam prevents each caller from re-implementing the guard
+    /// differently (one guard vs three divergent guards).
+    public static func downloadSpeed(bytesDelta: Int64, secondsDelta: Double) -> Double {
+        guard secondsDelta > 0, bytesDelta >= 0 else { return 0 }
+        let speed = Double(bytesDelta) / secondsDelta
+        return speed.isFinite ? speed : 0
+    }
+
+    /// Pure function: seconds remaining given bytes left and current speed.
+    ///
+    /// Returns nil when `speed` is not strictly positive (no estimate possible)
+    /// or when `remaining` is non-positive (already done). Never returns negative
+    /// or non-finite values.
+    ///
+    /// WHY separate: ETA computation appears in the aggregate-progress callback
+    /// and in formatting helpers; a shared static seam means a single test suite
+    /// covers every caller.
+    public static func eta(remaining: Int64, speed: Double) -> Int? {
+        guard speed > 0, remaining > 0 else { return remaining <= 0 ? 0 : nil }
+        let seconds = Double(remaining) / speed
+        guard seconds.isFinite else { return nil }
+        return Int(seconds.rounded())
+    }
 }
 
 public enum TokenSaverModelDownloadError: Error, Sendable, Equatable, CustomStringConvertible {
