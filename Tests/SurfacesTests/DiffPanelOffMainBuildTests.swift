@@ -30,6 +30,23 @@ final class DiffPanelOffMainBuildTests: XCTestCase {
                       "empty rawDiff must produce zero segments so the diff view clears")
     }
 
+    /// WHY: rebuildStyledDiffAsync caps rendered text at 400K before calling
+    /// buildDiffSegments. The cap prevents TextKit stalls only if the builder
+    /// remains cheap at that boundary; this measure guard catches regressions.
+    func test_performance_buildDiffSegments_atRenderCap() {
+        let line = "+let value = try await client.request(path: \"/api/items\")\n"
+        let repeatCount = (400 * 1024 / line.utf8.count) + 1
+        let source = String(repeating: line, count: repeatCount)
+        let capped = String(source.prefix(400 * 1024))
+
+        XCTAssertEqual(capped.count, 400 * 1024,
+                       "fixture must match the diff render cap that rebuildStyledDiffAsync uses")
+
+        measure {
+            _ = DiffPanelViewModel.buildDiffSegments(capped)
+        }
+    }
+
     // MARK: - Addition lines
 
     /// WHY: added lines (+) must classify as .add so they receive the green

@@ -2838,8 +2838,7 @@ private struct CodeTextEditor: NSViewRepresentable {
             let selectedRanges = textView.selectedRanges
             let scrollOrigin = textView.enclosingScrollView?.contentView.bounds.origin
             let text = textView.string
-            let attributed = NSMutableAttributedString(string: text, attributes: codeBaseAttributes(for: currentPalette))
-            highlightCode(text, in: attributed)
+            let attributed = highlightedCodeAttributedString(text, palette: currentPalette)
             textView.textStorage?.setAttributedString(attributed)
             textView.selectedRanges = selectedRanges
             if let scrollOrigin {
@@ -3058,6 +3057,12 @@ private func codeBaseAttributes(for palette: EditorColorPalette) -> [NSAttribute
     [.font: NSFont.monospacedSystemFont(ofSize: 12, weight: .regular),
      .foregroundColor: palette.text,
      .backgroundColor: palette.background]
+}
+
+func highlightedCodeAttributedString(_ text: String, palette: EditorColorPalette) -> NSMutableAttributedString {
+    let attributed = NSMutableAttributedString(string: text, attributes: codeBaseAttributes(for: palette))
+    highlightCode(text, in: attributed)
+    return attributed
 }
 
 private func highlightCode(_ text: String, in attributed: NSMutableAttributedString) {
