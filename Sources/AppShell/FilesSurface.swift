@@ -333,6 +333,18 @@ func newFolderTargetPath(parent: String, name: String, existingNames: Set<String
     return parent.isEmpty ? candidate : "\(parent)/\(candidate)"
 }
 
+func initialFilesDirectory(stateDirectory: String, selectedPath: String?) -> String {
+    guard stateDirectory.isEmpty, let selectedPath else { return stateDirectory }
+    let parent = (selectedPath as NSString).deletingLastPathComponent
+    return parent == "." ? "" : parent
+}
+
+func newFileTargetPath(parent: String, rawName: String) -> String? {
+    let name = rawName.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !name.isEmpty else { return nil }
+    return parent.isEmpty ? name : "\(parent)/\(name)"
+}
+
 /// Validate whether moving `src` into the directory `dstDir` is safe within `workspaceRoot`.
 /// Returns `false` (reject) when:
 ///  - `src` or `dstDir` escapes `workspaceRoot`
@@ -874,12 +886,7 @@ private final class FilesViewModel: ObservableObject {
             if let state = try router?.filesStateGet(surface: surfaceID).objectValue {
                 initialSelectedPath = state["selected_path"]?.stringValue
                 let stateDirectory = state["current_directory"]?.stringValue ?? ""
-                if stateDirectory.isEmpty, let initialSelectedPath {
-                    let parent = (initialSelectedPath as NSString).deletingLastPathComponent
-                    currentDirectory = parent == "." ? "" : parent
-                } else {
-                    currentDirectory = stateDirectory
-                }
+                currentDirectory = initialFilesDirectory(stateDirectory: stateDirectory, selectedPath: initialSelectedPath)
                 readerMode = state["reader_mode"]?.stringValue ?? "source"
                 dirtyPaths = Self.dirtyPaths(from: state)
             }
@@ -1069,9 +1076,7 @@ private final class FilesViewModel: ObservableObject {
     }
 
     func createFile(named rawName: String) {
-        let name = rawName.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !name.isEmpty else { return }
-        let path = currentDirectory.isEmpty ? name : "\(currentDirectory)/\(name)"
+        guard let path = newFileTargetPath(parent: currentDirectory, rawName: rawName) else { return }
         do {
             let result = try router?.fsWorkspaceCreateFile(workspace: workspaceID, path: path, content: "")
             let created = result.flatMap(FileEntry.init(value:))

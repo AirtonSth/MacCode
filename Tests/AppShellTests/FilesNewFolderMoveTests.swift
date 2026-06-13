@@ -52,6 +52,43 @@ final class FilesNewFolderMoveTests: XCTestCase {
             "counter must skip every occupied slot, not just the first two")
     }
 
+    // MARK: - initialFilesDirectory / newFileTargetPath
+
+    func test_initialFilesDirectory_usesExplicitStateDirectoryWhenPresent() {
+        let result = initialFilesDirectory(stateDirectory: "src", selectedPath: "docs/readme.md")
+
+        XCTAssertEqual(result, "src",
+            "persisted current_directory must win over selected_path so directory restore is stable")
+    }
+
+    func test_initialFilesDirectory_derivesParentFromSelectedPathWhenDirectoryEmpty() {
+        let result = initialFilesDirectory(stateDirectory: "", selectedPath: "a/b/c.txt")
+
+        XCTAssertEqual(result, "a/b",
+            "initial restore must list the selected file's parent directory so the row can be selected")
+    }
+
+    func test_initialFilesDirectory_selectedRootFileStaysAtRoot() {
+        let result = initialFilesDirectory(stateDirectory: "", selectedPath: "README.md")
+
+        XCTAssertEqual(result, "",
+            "a selected root-level file must not restore the literal '.' pseudo-directory")
+    }
+
+    func test_newFileTargetPath_trimsNameAndJoinsCurrentDirectory() {
+        let result = newFileTargetPath(parent: "docs", rawName: " notes.md ")
+
+        XCTAssertEqual(result, "docs/notes.md",
+            "new-file creation must trim dialog input and create under the current directory")
+    }
+
+    func test_newFileTargetPath_rejectsWhitespaceOnlyName() {
+        let result = newFileTargetPath(parent: "docs", rawName: "   ")
+
+        XCTAssertNil(result,
+            "blank new-file names must not call the filesystem create RPC")
+    }
+
     // MARK: - validateMove
 
     func test_validateMove_validFileToSubdir_allowed() {
