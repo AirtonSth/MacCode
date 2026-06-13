@@ -417,10 +417,14 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
             record(event, session: session)
             emit(.event(event), session: session)
             if case .error(_, let recoverable) = event, !recoverable {
+                lock.lock()
                 session.sawError = true
+                lock.unlock()
             }
             if case .threadStarted(_, let providerThreadId) = event {
+                lock.lock()
                 session.providerThreadId = providerThreadId
+                lock.unlock()
                 emitSessionSnapshot(session: session, reason: "thread_started")
             }
             if case .turnStarted(let turnId) = event {
@@ -470,9 +474,11 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
                     lock.unlock()
                     emitSessionSnapshot(session: session, reason: "turn_completed")
                 }
+                lock.lock()
                 let status: AgentRunStatus = session.sawError ? .failed : .completed
                 session.status = status
                 let providerThreadId = session.providerThreadId
+                lock.unlock()
                 emit(.status(status), session: session)
                 emit(.finished(status, finalMessage: finalMessage, providerThreadId: providerThreadId), session: session)
                 lock.lock()
@@ -518,11 +524,12 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
         session.inFlightRunId = nil
         session.status = .cancelled
         let onEvent = session.onEvent
+        let providerThreadId = session.providerThreadId
         session.onEvent = nil
         lock.unlock()
         if shouldFinish {
             onEvent?(.status(.cancelled))
-            onEvent?(.finished(.cancelled, finalMessage: nil, providerThreadId: session.providerThreadId))
+            onEvent?(.finished(.cancelled, finalMessage: nil, providerThreadId: providerThreadId))
         }
     }
 
@@ -540,9 +547,11 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
         lock.unlock()
         emitSessionSnapshot(session: session, reason: "turn_completed")
 
+        lock.lock()
         let status: AgentRunStatus = session.sawError ? .failed : .completed
         session.status = status
         let providerThreadId = session.providerThreadId
+        lock.unlock()
         emit(.status(status), session: session)
         emit(.finished(status, finalMessage: finalMessage, providerThreadId: providerThreadId), session: session)
 
@@ -556,7 +565,9 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
     }
 
     private func terminate(session: Session, status: AgentRunStatus) {
+        lock.lock()
         session.status = status
+        lock.unlock()
         settlePendingRequests(session)
         settlePendingUserInputs(session)
         session.stdoutPipe.fileHandleForReading.readabilityHandler = nil
