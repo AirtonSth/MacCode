@@ -250,17 +250,19 @@ public final class DirectHTTPServer: @unchecked Sendable {
 
     /// Live connection-level metrics surfaced via /v1/health.
     let wsTracker = WSConnectionTracker()
+    private let heartbeatInterval: TimeInterval
 
     private var listenFD: Int32 = -1
     private var running = false
     private var accept: Thread?
 
-    public init(port: UInt16 = 18217, loopbackOnly: Bool = true, dispatcher: JSONRPCDispatcher, auth: DirectAuthProvider? = nil, serverId: String = ProcessInfo.processInfo.globallyUniqueString) {
+    public init(port: UInt16 = 18217, loopbackOnly: Bool = true, dispatcher: JSONRPCDispatcher, auth: DirectAuthProvider? = nil, serverId: String = ProcessInfo.processInfo.globallyUniqueString, heartbeatInterval: TimeInterval = 20) {
         self.port = port
         self.bindLoopbackOnly = loopbackOnly
         self.dispatcher = dispatcher
         self.auth = auth
         self.serverId = serverId
+        self.heartbeatInterval = heartbeatInterval
     }
 
     public func start() throws {
@@ -521,7 +523,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
             // honest live/stale indicator ("last synced Ns ago"). Seq-less so
             // it never collides with the ordered event stream.
             let heartbeat = DispatchSource.makeTimerSource(queue: DispatchQueue.global())
-            heartbeat.schedule(deadline: .now() + Self.wsHeartbeatInterval, repeating: Self.wsHeartbeatInterval)
+            heartbeat.schedule(deadline: .now() + heartbeatInterval, repeating: heartbeatInterval)
             heartbeat.setEventHandler {
                 guard Self.shouldSendHeartbeat(
                     queued: outbound.queuedByteCount,

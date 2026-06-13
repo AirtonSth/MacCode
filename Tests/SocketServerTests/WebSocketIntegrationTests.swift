@@ -11,10 +11,11 @@ import CoreModel
 @MainActor
 final class WebSocketIntegrationTests: XCTestCase {
 
-    private func startServer() throws -> (DirectHTTPServer, UInt16) {
+    private func startServer(heartbeatInterval: TimeInterval = DirectHTTPServer.wsHeartbeatInterval) throws -> (DirectHTTPServer, UInt16) {
         let port = UInt16.random(in: 33000...44000)
         let server = DirectHTTPServer(port: port, loopbackOnly: true,
-                                      dispatcher: JSONRPCDispatcher(router: FakeRouter()))
+                                      dispatcher: JSONRPCDispatcher(router: FakeRouter()),
+                                      heartbeatInterval: heartbeatInterval)
         try server.start()
         return (server, port)
     }
@@ -45,6 +46,78 @@ final class WebSocketIntegrationTests: XCTestCase {
         }
         XCTFail("did not receive an event of kind \(wantedKind) within the frame budget")
         return [:]
+    }
+
+    private enum TimeoutError: Error { case timedOut }
+
+    private func receiveWithTimeout(_ task: URLSessionWebSocketTask, seconds: Double = 2) async throws -> URLSessionWebSocketTask.Message {
+        try await withThrowingTaskGroup(of: URLSessionWebSocketTask.Message.self) { group in
+            group.addTask {
+                try await task.receive()
+            }
+            group.addTask {
+                try await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+                throw TimeoutError.timedOut
+            }
+            let result = try await group.next()!
+            group.cancelAll()
+            return result
+        }
+    }
+
+    private func waitUntil(timeoutSeconds: Double = 2, _ condition: @escaping () -> Bool) async -> Bool {
+        let deadline = Date().addingTimeInterval(timeoutSeconds)
+        while Date() < deadline {
+            if condition() { return true }
+            try? await Task.sleep(nanoseconds: 20_000_000)
+        }
+        return condition()
+    }
+
+    func testHeartbeatFrameFiresOverLiveWebSocket() async throws {
+        let (server, port) = try startServer(heartbeatInterval: 0.05)
+        defer { server.stop() }
+        try await Task.sleep(nanoseconds: 80_000_000)
+
+        let baseline = EventBus.shared.currentSeq
+        let task = wsTask(port: port, sinceSeq: baseline)
+        defer { task.cancel(with: .normalClosure, reason: nil) }
+
+        for _ in 0..<5 {
+            let message = try await receiveWithTimeout(task)
+            let data: Data
+            switch message {
+            case .data(let d): data = d
+            case .string(let s): data = Data(s.utf8)
+            @unknown default: continue
+            }
+            guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { continue }
+            if obj["type"] as? String == "heartbeat" {
+                XCTAssertNotNil(obj["ts"], "heartbeat frames must carry a timestamp for client freshness UI")
+                return
+            }
+        }
+        XCTFail("did not receive a heartbeat frame over the live WebSocket")
+    }
+
+    func testWebSocketCloseUnsubscribesEventBus() async throws {
+        let baselineSubscribers = EventBus.shared.subscriberCountForTests
+        let (server, port) = try startServer()
+        defer { server.stop() }
+        try await Task.sleep(nanoseconds: 80_000_000)
+
+        let task = wsTask(port: port, sinceSeq: EventBus.shared.currentSeq)
+        let subscribed = await waitUntil {
+            EventBus.shared.subscriberCountForTests > baselineSubscribers
+        }
+        XCTAssertTrue(subscribed, "WS handshake must create an EventBus subscription before this test can prove cleanup")
+
+        task.cancel(with: .normalClosure, reason: nil)
+        let cleanedUp = await waitUntil {
+            EventBus.shared.subscriberCountForTests == baselineSubscribers
+        }
+        XCTAssertTrue(cleanedUp,
+                      "closing a live WS task must unsubscribe from EventBus so repeated mobile reconnects do not leak subscribers")
     }
 
     func testCompressionNegotiationDeliversDecodableEnvelope() async throws {
