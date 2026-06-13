@@ -1,0 +1,3 @@
+runModal 26
+threadSleep 4
+semaphoreWait 4
