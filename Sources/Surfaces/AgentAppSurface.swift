@@ -185,6 +185,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     // UX-XPLAT-DELETE-UNDO: drops the transient delete snapshot when the undo
     // window lapses. Cancelled on a new delete, on undo, or on teardown.
     private var threadDeletionUndoExpiryTask: Task<Void, Never>?
+    // UX-XPLAT-REVERT-UNDO: drops the transient checkpoint-revert undo toast when
+    // the undo window lapses. Cancelled on a new revert, on undo, or on teardown.
+    private var checkpointRevertUndoExpiryTask: Task<Void, Never>?
     /// PERF: tracks thread ids whose placeholder titles have already been repaired
     /// so reloadThreads never issues a full messageRepo.list for the same thread twice.
     private var repairedThreadIds: Set<AgentThreadID> = []
@@ -657,6 +660,12 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 loadAllMessages(selectedThreadId)
                 reloadCheckpoints()
                 reloadThreads()
+                armCheckpointRevertUndo(CheckpointRevertUndoToast(
+                    threadId: selectedThreadId,
+                    cwd: cwd,
+                    checkpointTurnCount: turnCount,
+                    capturedAt: currentTime()
+                ))
             } catch {
                 checkpointStatusMessage = "Revert failed: \(error.localizedDescription)"
             }
@@ -1582,6 +1591,68 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             selectThread(restore)
         }
         return true
+    }
+
+    /// UX-XPLAT-REVERT-UNDO: transient handle to the most recent checkpoint
+    /// revert. `capturedAt` mirrors the toast arming instant (a hair after the
+    /// coordinator's own undo capture); `checkpointTurnCount` drives the copy.
+    public struct CheckpointRevertUndoToast: Equatable {
+        public let threadId: AgentThreadID
+        public let cwd: String
+        public let checkpointTurnCount: Int
+        public let capturedAt: Date
+    }
+
+    /// Seconds the undo toast stays actionable after a checkpoint revert.
+    public static let checkpointRevertUndoWindow: TimeInterval = 10
+
+    /// UX-XPLAT-REVERT-UNDO: transient handle to the most recent checkpoint
+    /// revert. Non-nil only inside the undo window; cleared on undo, on a new
+    /// revert, or when the window lapses. Drives the revert undo toast.
+    @Published public private(set) var pendingCheckpointRevertUndo: CheckpointRevertUndoToast?
+
+    /// Publish the toast as the active undo affordance and schedule its expiry.
+    /// The revert itself already happened; this only controls how long the user
+    /// can take it back. Mirrors armThreadDeletionUndo.
+    private func armCheckpointRevertUndo(_ toast: CheckpointRevertUndoToast) {
+        checkpointRevertUndoExpiryTask?.cancel()
+        pendingCheckpointRevertUndo = toast
+        let window = Self.checkpointRevertUndoWindow
+        checkpointRevertUndoExpiryTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(window * 1_000_000_000))
+            guard let self, !Task.isCancelled else { return }
+            // Only clear the toast we armed; a newer revert owns its own.
+            if let current = self.pendingCheckpointRevertUndo,
+               current.capturedAt == toast.capturedAt,
+               !CheckpointRevertUndo.isWithinUndoWindow(
+                   capturedAt: current.capturedAt,
+                   now: self.currentTime(),
+                   window: window
+               ) {
+                self.pendingCheckpointRevertUndo = nil
+            }
+        }
+    }
+
+    /// UX-XPLAT-REVERT-UNDO: ask the coordinator to reverse the most recent
+    /// checkpoint revert (files + DB), then refresh the view. The coordinator
+    /// owns its own undo window and THROWS if it has lapsed; the catch surfaces
+    /// that. The toast is dismissed immediately on tap, like thread-delete undo.
+    public func undoLastCheckpointRevert() {
+        guard let toast = pendingCheckpointRevertUndo else { return }
+        checkpointRevertUndoExpiryTask?.cancel()
+        Task { @MainActor in
+            do {
+                try coordinator.undoLastCheckpointRevert(threadId: toast.threadId, cwd: toast.cwd)
+                loadAllMessages(toast.threadId)
+                reloadCheckpoints()
+                reloadThreads()
+                checkpointStatusMessage = "Restored."
+            } catch {
+                checkpointStatusMessage = "Undo failed: \(error.localizedDescription)"
+            }
+        }
+        pendingCheckpointRevertUndo = nil
     }
 
     /// Derive the persisted thread title from the first user message.
@@ -3545,6 +3616,9 @@ public struct AgentAppView: View {
             if let undo = vm.pendingThreadDeletionUndo {
                 threadDeletionUndoBanner(undo)
             }
+            if let crToast = vm.pendingCheckpointRevertUndo {
+                checkpointRevertUndoBanner(crToast)
+            }
             if !vm.timeline.workActivities.isEmpty {
                 workLogRow
                     .padding(.horizontal, 22)
@@ -3661,6 +3735,27 @@ public struct AgentAppView: View {
         .background(DS.Palette.surfaceRaised)
         .overlay(alignment: .bottom) { Rectangle().fill(DS.Palette.line).frame(height: 1) }
         .accessibilityIdentifier("agent.thread.delete.undoBanner")
+    }
+
+    private func checkpointRevertUndoBanner(_ toast: AgentAppViewModel.CheckpointRevertUndoToast) -> some View {
+        HStack(spacing: DS.Space.sm) {
+            Image(systemName: "arrow.uturn.backward")
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundColor(DS.Palette.textSecondary)
+            Text("Reverted to checkpoint \(toast.checkpointTurnCount)")
+                .font(DS.Font.caption.weight(.semibold))
+                .foregroundColor(DS.Palette.text)
+            Spacer(minLength: 0)
+            Button("Undo") { vm.undoLastCheckpointRevert() }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .accessibilityIdentifier("agent.checkpoint.revert.undo")
+        }
+        .padding(.horizontal, DS.Space.lg).padding(.vertical, DS.Space.sm)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(DS.Palette.surfaceRaised)
+        .overlay(alignment: .bottom) { Rectangle().fill(DS.Palette.line).frame(height: 1) }
+        .accessibilityIdentifier("agent.checkpoint.revert.undoBanner")
     }
 
     private var modelLabel: String {
