@@ -47,6 +47,54 @@ final class WebSocketIntegrationTests: XCTestCase {
         return [:]
     }
 
+    func testCompressionNegotiationDeliversDecodableEnvelope() async throws {
+        let (server, port) = try startServer()
+        defer { server.stop() }
+        try await Task.sleep(nanoseconds: 80_000_000)
+
+        // Negotiate lzfse compression via the upgrade header.
+        var req = URLRequest(url: URL(string: "ws://127.0.0.1:\(port)/v1/ws")!)
+        let baseline = EventBus.shared.currentSeq
+        req.setValue("\(baseline)", forHTTPHeaderField: "x-rc2-since-seq")
+        req.setValue(PayloadCodec.lzfse.wireName, forHTTPHeaderField: "x-rc2-ws-encoding")
+        let task = URLSession.shared.webSocketTask(with: req)
+        task.resume()
+        try await Task.sleep(nanoseconds: 150_000_000)
+
+        // A large, highly-compressible payload so the envelope is strictly smaller
+        // than the raw frame (the server only sends a binary envelope when it wins).
+        let kind = "test.ws.compress.\(UUID().uuidString)"
+        let big = String(repeating: "same visible state ", count: 400)
+        EventBus.shared.publish(kind: kind, payload: .object(["blob": .string(big)]))
+
+        for _ in 0..<50 {
+            let message = try await task.receive()
+            switch message {
+            case .data(let envelope):
+                // Binary frame => the negotiated lzfse WebSocket envelope. It must
+                // decode back to the exact JSON event we published.
+                let decoded = try PayloadCodec.decodeWebSocketEnvelope(envelope)
+                guard let obj = try? JSONSerialization.jsonObject(with: decoded) as? [String: Any],
+                      obj["kind"] as? String == kind else { continue }
+                let payload = obj["payload"] as? [String: Any]
+                XCTAssertEqual(payload?["blob"] as? String, big,
+                    "a compression-negotiated client must receive a decodable lzfse envelope carrying the exact event")
+                task.cancel(with: .normalClosure, reason: nil)
+                return
+            case .string(let s):
+                // Text frame: only acceptable if it is NOT our large event (e.g. a
+                // heartbeat); our big payload must arrive compressed as a binary frame.
+                if let obj = try? JSONSerialization.jsonObject(with: Data(s.utf8)) as? [String: Any],
+                   obj["kind"] as? String == kind {
+                    XCTFail("the large negotiated-compression event must be delivered as a binary lzfse envelope, not an uncompressed text frame")
+                    return
+                }
+            @unknown default: continue
+            }
+        }
+        XCTFail("did not receive the compressed event within the frame budget")
+    }
+
     func testHandshakeThenDeliversPublishedEvent() async throws {
         let (server, port) = try startServer()
         defer { server.stop() }
