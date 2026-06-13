@@ -28,12 +28,61 @@ public final class ANSIRenderer {
                                        bold: false, italic: false, underline: false, inverse: false)
     }
 
+    // MARK: - O(1) scrollback ring buffer
+    // WHY: the old Array-backed scrollback did O(n) removeFirst at every scroll
+    // step once the 10 000-row cap was reached, causing O(n^2) behaviour under
+    // sustained output (yes / build logs). Replacing the storage with a fixed-
+    // capacity ring buffer (head-index deque) makes push O(1) regardless of fill.
+    // The public `scrollback` computed property returns a materialized [[Cell]] in
+    // insertion order so all existing readers (`scrollback + grid`, `.count`, etc.)
+    // continue to work with zero observable change in output.
+    private struct ScrollbackRing {
+        private var buf: [[Cell]]
+        private var head: Int = 0
+        private(set) var count: Int = 0
+
+        init(capacity: Int) {
+            // capacity == 0 is legal (scrollback disabled)
+            self.buf = [[Cell]](repeating: [], count: max(1, capacity))
+        }
+
+        var capacity: Int { buf.count }
+
+        // O(1) push. When full, overwrites the oldest slot (head advances).
+        mutating func push(_ row: [Cell]) {
+            if count < capacity {
+                buf[(head + count) % capacity] = row
+                count += 1
+            } else {
+                // Ring is full: overwrite the oldest slot, then advance head.
+                buf[head] = row
+                head = (head + 1) % capacity
+            }
+        }
+
+        // Returns rows in insertion order (oldest first), O(n).
+        func ordered() -> [[Cell]] {
+            guard count > 0 else { return [] }
+            var out = [[Cell]]()
+            out.reserveCapacity(count)
+            for i in 0..<count {
+                out.append(buf[(head + i) % capacity])
+            }
+            return out
+        }
+    }
+
     public private(set) var rows: Int
     public private(set) var cols: Int
     public private(set) var grid: [[Cell]]
     public private(set) var cursorRow = 0
     public private(set) var cursorCol = 0
-    public private(set) var scrollback: [[Cell]]
+    // Computed: materialises the ring in insertion order on each access.
+    // External call-sites treat this exactly like the old [[Cell]] array.
+    public var scrollback: [[Cell]] { _scrollbackRing.ordered() }
+    // Efficient count without materialising the array (used by snapshot/cursorOffset).
+    var scrollbackCount: Int { _scrollbackRing.count }
+    private var _scrollbackRing: ScrollbackRing
     public private(set) var usesAlternateScreen = false
     private let scrollbackLimit: Int
     private var savedGrid: [[Cell]]?
@@ -69,8 +118,8 @@ public final class ANSIRenderer {
         self.brightColors = palette.bright
         self.rows = rows
         self.cols = cols
-        self.scrollback = []
         self.scrollbackLimit = max(0, scrollbackLimit)
+        self._scrollbackRing = ScrollbackRing(capacity: max(1, scrollbackLimit))
         self.grid = Array(repeating: Array(repeating: Cell.empty, count: cols), count: rows)
     }
 
@@ -183,10 +232,8 @@ public final class ANSIRenderer {
     private func appendScrollback(_ row: [Cell], preserveBlank: Bool = true) {
         guard scrollbackLimit > 0 else { return }
         guard preserveBlank || row.contains(where: isVisibleContent) else { return }
-        scrollback.append(row)
-        if scrollback.count > scrollbackLimit {
-            scrollback.removeFirst(scrollback.count - scrollbackLimit)
-        }
+        // O(1): ring push handles eviction of the oldest row when at capacity.
+        _scrollbackRing.push(row)
     }
 
     private func isVisibleContent(_ cell: Cell) -> Bool {
@@ -498,7 +545,7 @@ public final class ANSIRenderer {
         let curRow = cursorRow
         let curCol = min(cursorCol, cols - 1)
         let allRows = usesAlternateScreen ? grid : scrollback + grid
-        let cursorRenderedRow = usesAlternateScreen ? curRow : scrollback.count + curRow
+        let cursorRenderedRow = usesAlternateScreen ? curRow : scrollbackCount + curRow
         for (i, row) in allRows.enumerated() {
             // Trim trailing empties to keep lines tidy.
             var endCol = row.count - 1
@@ -697,7 +744,7 @@ public final class ANSIRenderer {
     public func cursorOffset(in rendered: String) -> Int {
         let lines = rendered.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
         guard !lines.isEmpty else { return 0 }
-        let rowOffset = usesAlternateScreen ? 0 : scrollback.count
+        let rowOffset = usesAlternateScreen ? 0 : scrollbackCount
         let row = min(rowOffset + cursorRow, lines.count - 1)
         var offset = 0
         for i in 0..<row {
