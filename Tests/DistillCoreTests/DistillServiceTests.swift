@@ -297,6 +297,55 @@ final class DistillServiceTests: XCTestCase {
         )
     }
 
+    func test_declaredBodyExceedsLimit_usesContentLengthBoundary() {
+        var raw = Data()
+        raw.append(Data("POST /v1/distill HTTP/1.1\r\n".utf8))
+        raw.append(Data("Authorization: Bearer t\r\n".utf8))
+        raw.append(Data("Content-Length: 33\r\n\r\n".utf8))
+
+        XCTAssertFalse(
+            DistillHTTPServer.declaredBodyExceedsLimit(buffer: raw, cap: 33),
+            "a request exactly at the body cap must be accepted so legitimate capped client payloads work"
+        )
+        XCTAssertTrue(
+            DistillHTTPServer.declaredBodyExceedsLimit(buffer: raw, cap: 32),
+            "the service must reject declared bodies above cap before buffering them"
+        )
+    }
+
+    func test_httpServerRejectsOversizeDistillRequestBody() async throws {
+        let configuration = try DistillServiceConfiguration(
+            authToken: "body-limit-token",
+            appSupportDirectory: NSTemporaryDirectory(),
+            maxConcurrentRequests: 2
+        )
+        let scheduler = DistillScheduler(runtime: LocalDistillRuntime(), maxConcurrentRequests: 2)
+        let server = DistillHTTPServer(
+            configuration: configuration,
+            scheduler: scheduler,
+            requestBodyLimitBytes: 64
+        )
+        let ready = try await server.start()
+        defer { server.stop() }
+
+        let request = DistillRequest(mode: .commandOutput, input: String(repeating: "x", count: 128))
+        let body = try JSONEncoder().encode(request)
+        XCTAssertGreaterThan(body.count, 64, "fixture must exceed the injected service-side body cap")
+
+        let response = try await response(
+            baseURL: ready.baseURL,
+            path: "/v1/distill",
+            method: "POST",
+            token: "body-limit-token",
+            body: body
+        )
+
+        XCTAssertEqual(response.status, 413)
+        let text = String(decoding: response.data, as: UTF8.self)
+        XCTAssertTrue(text.contains("payload_too_large"),
+                      "oversize requests must fail loud with a stable error code instead of reaching the scheduler")
+    }
+
     // WHY: a live connection streaming > 64 KB before completing any HTTP headers
     // must be closed by the server, not buffered indefinitely.
     func test_serverClosesPreAuthConnectionExceedingCap() async throws {

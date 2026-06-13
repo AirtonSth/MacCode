@@ -273,6 +273,7 @@ public final class DistillHTTPServer: @unchecked Sendable {
     private let onSuccess: SuccessHandler?
     private let reversibleStore: ReversibleStoring?
     private let reversibleStoreMinBytes: Int
+    private let requestBodyLimitBytes: Int
     private var listener: NWListener?
     private var actualPort: UInt16 = 0
     private let readyLock = NSLock()
@@ -283,6 +284,7 @@ public final class DistillHTTPServer: @unchecked Sendable {
         scheduler: DistillScheduler,
         reversibleStore: ReversibleStoring? = nil,
         reversibleStoreMinBytes: Int = 8_192,
+        requestBodyLimitBytes: Int = DistillHTTPServer.maxRequestBodyBytes,
         startsReady: Bool = true,
         metricsRecorder: DistillServiceMetricsRecorder? = nil,
         onSuccess: SuccessHandler? = nil
@@ -291,6 +293,7 @@ public final class DistillHTTPServer: @unchecked Sendable {
         self.scheduler = scheduler
         self.reversibleStore = reversibleStore
         self.reversibleStoreMinBytes = max(1, reversibleStoreMinBytes)
+        self.requestBodyLimitBytes = max(1, requestBodyLimitBytes)
         self._ready = startsReady
         self.metrics = metricsRecorder ?? DistillServiceMetricsRecorder()
         self.onSuccess = onSuccess
@@ -362,6 +365,10 @@ public final class DistillHTTPServer: @unchecked Sendable {
     /// the input sizes a legitimate authed POST /v1/distill may carry (uncapped once
     /// auth is confirmed via the Authorization header in the buffer).
     static let preAuthBufferCap = 65_536
+    /// Maximum accepted HTTP body size for POST /v1/distill. The client caps the
+    /// raw input at 32 MiB; this body cap leaves JSON overhead room while rejecting
+    /// malicious or stale clients before the service buffers unbounded data.
+    public static let maxRequestBodyBytes = 36 * 1024 * 1024
 
     /// Pure seam: returns true when a connection has not yet been header-authed and
     /// its accumulated buffer exceeds the pre-auth cap. Extracted for testability.
@@ -369,6 +376,30 @@ public final class DistillHTTPServer: @unchecked Sendable {
     /// streaming arbitrary bytes before completing an HTTP request.
     static func exceedsPreAuthCap(bufferCount: Int, headerAuthed: Bool, cap: Int = preAuthBufferCap) -> Bool {
         !headerAuthed && bufferCount > cap
+    }
+
+    static func declaredContentLength(headerText: String) -> Int? {
+        headerText
+            .split(separator: "\r\n")
+            .dropFirst()
+            .compactMap { line -> Int? in
+                let pieces = line.split(separator: ":", maxSplits: 1)
+                guard pieces.count == 2,
+                      pieces[0].trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "content-length" else {
+                    return nil
+                }
+                return Int(pieces[1].trimmingCharacters(in: .whitespacesAndNewlines))
+            }
+            .first
+    }
+
+    static func declaredBodyExceedsLimit(buffer: Data, cap: Int = maxRequestBodyBytes) -> Bool {
+        guard let headerRange = buffer.range(of: Data("\r\n\r\n".utf8)),
+              let headerText = String(data: buffer[..<headerRange.lowerBound], encoding: .utf8),
+              let declaredLength = declaredContentLength(headerText: headerText) else {
+            return false
+        }
+        return declaredLength > cap
     }
 
     /// Returns true if the Authorization header in the (possibly partial) buffer
@@ -418,6 +449,14 @@ public final class DistillHTTPServer: @unchecked Sendable {
                 connection.cancel()
                 return
             }
+            if authed && DistillHTTPServer.declaredBodyExceedsLimit(buffer: nextBuffer, cap: self.requestBodyLimitBytes) {
+                self.send(
+                    status: 413,
+                    body: ErrorBody(error: "payload_too_large", message: "distill request body exceeds limit"),
+                    connection: connection
+                )
+                return
+            }
 
             // Advance the scan offset to avoid re-scanning bytes already checked.
             // The separator is 4 bytes; we must not skip past a partial match at the
@@ -445,18 +484,7 @@ public final class DistillHTTPServer: @unchecked Sendable {
               let headerText = String(data: data[..<headerRange.lowerBound], encoding: .utf8) else {
             return false
         }
-        let contentLength = headerText
-            .split(separator: "\r\n")
-            .dropFirst()
-            .compactMap { line -> Int? in
-                let pieces = line.split(separator: ":", maxSplits: 1)
-                guard pieces.count == 2,
-                      pieces[0].trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "content-length" else {
-                    return nil
-                }
-                return Int(pieces[1].trimmingCharacters(in: .whitespacesAndNewlines))
-            }
-            .first ?? 0
+        let contentLength = Self.declaredContentLength(headerText: headerText) ?? 0
         return data.count >= headerRange.upperBound + contentLength
     }
 
@@ -520,6 +548,11 @@ public final class DistillHTTPServer: @unchecked Sendable {
 
     private func handleDistill(request: HTTPRequest, connection: NWConnection) async {
         await metrics.recordRequest()
+        guard request.body.count <= requestBodyLimitBytes else {
+            await metrics.recordFailure()
+            send(status: 413, body: ErrorBody(error: "payload_too_large", message: "distill request body exceeds limit"), connection: connection)
+            return
+        }
         do {
             let distillRequest = try decoder.decode(DistillRequest.self, from: request.body)
             // Store-before-loss (N5): persist the original BEFORE the runtime can
@@ -599,6 +632,7 @@ public final class DistillHTTPServer: @unchecked Sendable {
         case 401: phrase = "Unauthorized"
         case 404: phrase = "Not Found"
         case 405: phrase = "Method Not Allowed"
+        case 413: phrase = "Payload Too Large"
         case 429: phrase = "Too Many Requests"
         case 502: phrase = "Bad Gateway"
         case 503: phrase = "Service Unavailable"
