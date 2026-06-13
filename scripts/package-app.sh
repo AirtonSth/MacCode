@@ -171,9 +171,9 @@ cat > "$STAGING_APP/Contents/Info.plist" <<EOF
 </plist>
 EOF
 
-cat > "$STAGING_APP/Contents/PkgInfo" <<EOF
-APPL????
-EOF
+# PkgInfo must be exactly the 8 bytes "APPL????" with NO trailing newline; a
+# heredoc/echo adds one (9 bytes), which some bundle validators reject (QA-mac :70).
+printf 'APPL????' > "$STAGING_APP/Contents/PkgInfo"
 
 if command -v xattr >/dev/null 2>&1; then
   xattr -cr "$STAGING_APP" || true
