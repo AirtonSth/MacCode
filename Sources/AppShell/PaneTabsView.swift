@@ -1583,8 +1583,15 @@ final class PaneTabButton: NSView {
     }
 
     private func performManualDrop(with event: NSEvent) {
-        guard let contentView = window?.contentView else { return }
-        let point = contentView.convert(event.locationInWindow, from: nil)
+        guard let sourceWindow = window else { return }
+        let screenPoint = sourceWindow.convertPoint(toScreen: event.locationInWindow)
+        let windows = NSApp.windows.filter { $0.isVisible && !$0.isMiniaturized && $0.contentView != nil }
+        let indexed = windows.map { (id: UUID(), frame: $0.frame) }
+        guard let targetId = PaneTabsView.windowTarget(forScreenPoint: screenPoint, in: indexed),
+              let index = indexed.firstIndex(where: { $0.id == targetId }),
+              let contentView = windows[index].contentView else { return }
+        let pointInWindow = windows[index].convertPoint(fromScreen: screenPoint)
+        let point = contentView.convert(pointInWindow, from: nil as NSView?)
         guard let hit = contentView.hitTest(point) else { return }
         routeManualDrop(hit: hit, contentPoint: point, in: contentView)
     }
