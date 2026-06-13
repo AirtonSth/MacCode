@@ -149,7 +149,10 @@ let package = Package(
         .testTarget(
             name: "AgentRuntimeTests",
             dependencies: ["AgentRuntime", "CoreModel", "GitTestSupport"],
-            path: "Tests/AgentRuntimeTests"
+            path: "Tests/AgentRuntimeTests",
+            resources: [
+                .copy("Fixtures")
+            ]
         ),
         .testTarget(
             name: "DistillCoreTests",
