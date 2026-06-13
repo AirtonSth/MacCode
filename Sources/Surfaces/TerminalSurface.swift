@@ -601,6 +601,51 @@ public final class TerminalSurface: NSObject, Surface {
     // readTextSnapshot cache so we do not have to reach into ANSIRenderer's
     // private contentVersion.
     private var rendererMutationCount: UInt64 = 0
+    // MARK: - Lazy mirror-renderer feeding (PERF-136)
+    // The ANSIRenderer (`renderer`) exists ONLY to produce the mirror snapshot
+    // (readTextSnapshot / saveOutput). On the VISIBLE hot path we used to feed it
+    // byte-by-byte on the main thread for every output chunk, in addition to
+    // feeding the ghostty display — a full double-emulation that dominated CPU
+    // during high-rate output (`yes`, build logs).
+    //
+    // Instead we now RECORD visible feed/resize operations into an ordered pending
+    // buffer and replay them into `renderer` only when a snapshot is actually read
+    // (ensureRendererCurrent). The renderer's state is observable ONLY via snapshot
+    // reads, and every read flushes the buffer first, so the deferral is
+    // unobservable: the replayed sequence is byte-identical to eager feeding BY
+    // CONSTRUCTION (same feed/resize ops, same order). `rendererMutationCount`
+    // still advances on every BUFFERED event so cached snapshots invalidate
+    // correctly while pending work exists.
+    enum PendingRendererEvent {
+        case bytes(Data)
+        case resize(rows: Int, cols: Int)
+    }
+    private var pendingRendererEvents: [PendingRendererEvent] = []
+    private var pendingRendererByteCount = 0
+
+    /// Replays recorded renderer events into `target` in order. This is the SAME
+    /// code path the production flush (`ensureRendererCurrent`) uses, exposed as a
+    /// pure static seam so the equivalence test drives identical logic.
+    static func replay(_ events: [PendingRendererEvent], into target: ANSIRenderer) {
+        for event in events {
+            switch event {
+            case .bytes(let data):
+                target.feed(data)
+            case .resize(let rows, let cols):
+                target.resize(rows: rows, cols: cols)
+            }
+        }
+    }
+
+    /// Flushes all pending renderer events into `renderer`, then clears the buffer.
+    /// Idempotent: a no-op when nothing is pending. MUST be called at the top of
+    /// every renderer-read site so the snapshot reflects all deferred events.
+    private func ensureRendererCurrent() {
+        guard !pendingRendererEvents.isEmpty else { return }
+        Self.replay(pendingRendererEvents, into: renderer)
+        pendingRendererEvents.removeAll(keepingCapacity: true)
+        pendingRendererByteCount = 0
+    }
     // Cached result of readTextSnapshot(). Invalidated when either the renderer
     // mutation count or the ghostty viewport text changes (see snapshotCacheValid).
     private var cachedTextSnapshot: (rendererVersion: UInt64, viewportText: String?, value: TerminalTextSnapshot)?
@@ -853,7 +898,16 @@ public final class TerminalSurface: NSObject, Surface {
     private func applyTerminalSize(_ size: TerminalViewportSize, sendToPTY: Bool, force: Bool = false) {
         guard force || size != terminalSize else { return }
         terminalSize = size
-        renderer.resize(rows: size.rows, cols: size.cols)
+        // Preserve ordering vs pending visible bytes (PERF-136): if visible feed
+        // events are queued, this resize must be applied AFTER them, otherwise the
+        // already-received bytes would be reflowed at the wrong dimensions. Record
+        // it in the same ordered buffer. When nothing is pending, apply now
+        // (current behavior, safe). gh/PTY winsize stay immediate either way.
+        if pendingRendererEvents.isEmpty {
+            renderer.resize(rows: size.rows, cols: size.cols)
+        } else {
+            pendingRendererEvents.append(.resize(rows: size.rows, cols: size.cols))
+        }
         rendererMutationCount &+= 1
         if sendToPTY, masterFD >= 0 {
             _ = rc2_set_winsize(masterFD, Int32(size.rows), Int32(size.cols))
@@ -947,8 +1001,19 @@ public final class TerminalSurface: NSObject, Surface {
         // HC-1: stream raw PTY output to the mirror in real time.
         outputBus.emit(descriptor.id, data)
         if renderAllowedAtRead {
-            renderer.feed(data)
+            // Defer the mirror-renderer feed (PERF-136): record the bytes instead
+            // of emulating them now. rendererMutationCount must still advance so a
+            // cached snapshot built before this chunk is invalidated. The replay on
+            // the next snapshot read is byte-identical to feeding here.
+            pendingRendererEvents.append(.bytes(data))
+            pendingRendererByteCount += data.count
             rendererMutationCount &+= 1
+            // Cap the pending buffer to bound memory during long visible bursts.
+            // Unlike the hidden path we FORCE-FLUSH (never drop) so the visible
+            // snapshot stays COMPLETE.
+            if pendingRendererByteCount > Self.maxHiddenRendererBufferBytes {
+                ensureRendererCurrent()
+            }
         } else {
             // Surface is hidden: buffer bytes so the renderer can be healed on
             // reveal. Cap the buffer to avoid unbounded growth during long hidden
@@ -980,8 +1045,14 @@ public final class TerminalSurface: NSObject, Surface {
         guard let data = raw.data(using: .utf8) else { return }
         enqueueHistory(data)
         recordOutputTelemetry(bytes: data.count)
-        renderer.feed(data)
+        // Route through the same ordered pending buffer (PERF-136) so an injected
+        // string stays ordered relative to any pending visible output bytes.
+        pendingRendererEvents.append(.bytes(data))
+        pendingRendererByteCount += data.count
         rendererMutationCount &+= 1
+        if pendingRendererByteCount > Self.maxHiddenRendererBufferBytes {
+            ensureRendererCurrent()
+        }
         lastOutputAt = Date()
         outputBus.emit(descriptor.id, data)
         if renderDiagnostics().canRender {
@@ -1186,6 +1257,10 @@ public final class TerminalSurface: NSObject, Surface {
     }
 
     public func readTextSnapshot() -> TerminalTextSnapshot {
+        // Flush any deferred visible feed/resize events into `renderer` FIRST
+        // (PERF-136), before the cache check, so rendererMutationCount and the
+        // renderer's actual state agree for every read site below.
+        ensureRendererCurrent()
         if !isVisible && outputPendingBytes > 0 {
             // Hidden-output fallback: only the renderer is authoritative here.
             // The viewport key in this branch is always nil (we skip ghostty read).
@@ -1588,6 +1663,10 @@ public final class TerminalSurface: NSObject, Surface {
     public func didBecomeVisible() {
         guard !isVisible else { return }
         isVisible = true
+        // Defensive (PERF-136): drain any deferred visible events before the hidden
+        // heal feeds directly into `renderer`, so the heal bytes stay ordered after
+        // them. didBecomeHidden already flushes, so this is normally a no-op.
+        ensureRendererCurrent()
         // Heal the renderer BEFORE setting readerAllowsRender=true.
         // Once readerAllowsRender flips, appendDataAsync feeds live bytes
         // directly into renderer.feed; replaying the buffer first ensures
@@ -1626,6 +1705,12 @@ public final class TerminalSurface: NSObject, Surface {
 
     public func didBecomeHidden() {
         guard isVisible else { return }
+        // Flush any deferred visible feed/resize events (PERF-136) into `renderer`
+        // BEFORE switching to the hidden path. Otherwise bytes buffered during the
+        // hidden period (hiddenRendererBuffer, fed directly into `renderer` on
+        // reveal) would land ahead of these still-pending earlier visible bytes,
+        // reordering the mirror stream.
+        ensureRendererCurrent()
         isVisible = false
         readerAllowsRender = false
         isDrainingHiddenBacklog = false
@@ -1807,6 +1892,9 @@ public final class TerminalSurface: NSObject, Surface {
     /// The caller is responsible for presenting the NSSavePanel and providing
     /// the destination URL.
     public func saveOutput(format: TerminalExportFormat, to url: URL) throws {
+        // Flush deferred renderer events (PERF-136) so the exported scrollback
+        // reflects all output, not just what was eagerly fed.
+        ensureRendererCurrent()
         let content: String
         switch format {
         case .ansi:
