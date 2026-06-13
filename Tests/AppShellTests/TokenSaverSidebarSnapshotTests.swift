@@ -21,7 +21,7 @@ final class TokenSaverSidebarSnapshotTests: XCTestCase {
         func stop() {}
     }
 
-    func test_paidTokenSaverSidebarRendersSavingsPanelOffscreen() throws {
+    func test_paidTokenSaverSidebarRendersSavingsPanelOffscreen() async throws {
         let appSupport = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
             .appendingPathComponent("RC2TokenSaverSnapshot-\(UUID().uuidString)", isDirectory: true)
         let context = try AppContext(channel: .debug, appSupportOverride: appSupport.path)
@@ -85,6 +85,11 @@ final class TokenSaverSidebarSnapshotTests: XCTestCase {
             tokenSaverModelValidationProvider: { .installed }
         )
         viewModel.reload()
+        // PERF-MAC-100: the heavy snapshot+summary load now runs off-main and
+        // coalesced. RunLoop pumping does not service Swift concurrency, so we
+        // await the deterministic reload here to guarantee the published
+        // snapshot is populated before the offscreen render + asserts below.
+        await viewModel.reloadTokenSaverAndWait()
         let root = SidebarRootView(vm: viewModel)
             .frame(width: 320, height: 860)
         let hostingView = NSHostingView(rootView: root)
@@ -137,10 +142,10 @@ final class TokenSaverSidebarSnapshotTests: XCTestCase {
     /// NSAppearance(.aqua) and two non-default widths so both regressions produce
     /// a test failure.
 
-    func test_sidebarSnapshot_lightAppearance_rendersVisibleContent() throws {
+    func test_sidebarSnapshot_lightAppearance_rendersVisibleContent() async throws {
         let appSupport = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
             .appendingPathComponent("RC2TokenSaverSnapshotLight-\(UUID().uuidString)", isDirectory: true)
-        let (vm, hostingView) = try makeOffscreenSidebar(appSupport: appSupport, width: 320)
+        let (vm, hostingView) = try await makeOffscreenSidebar(appSupport: appSupport, width: 320)
 
         NSAppearance.current = NSAppearance(named: .aqua)!
         hostingView.appearance = NSAppearance(named: .aqua)
@@ -167,10 +172,10 @@ final class TokenSaverSidebarSnapshotTests: XCTestCase {
                       "light-appearance render must not change tokenSaverEnabled state")
     }
 
-    func test_sidebarSnapshot_narrowWidth180pt_rendersWithoutCrash() throws {
+    func test_sidebarSnapshot_narrowWidth180pt_rendersWithoutCrash() async throws {
         let appSupport = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
             .appendingPathComponent("RC2TokenSaverSnapshotNarrow-\(UUID().uuidString)", isDirectory: true)
-        let (_, hostingView) = try makeOffscreenSidebar(appSupport: appSupport, width: 180)
+        let (_, hostingView) = try await makeOffscreenSidebar(appSupport: appSupport, width: 180)
 
         RunLoop.main.run(until: Date().addingTimeInterval(0.2))
 
@@ -191,10 +196,10 @@ final class TokenSaverSidebarSnapshotTests: XCTestCase {
                              "zero count means the layout truncation removed all UI at minimum width")
     }
 
-    func test_sidebarSnapshot_wideWidth560pt_rendersWithoutCrash() throws {
+    func test_sidebarSnapshot_wideWidth560pt_rendersWithoutCrash() async throws {
         let appSupport = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
             .appendingPathComponent("RC2TokenSaverSnapshotWide-\(UUID().uuidString)", isDirectory: true)
-        let (_, hostingView) = try makeOffscreenSidebar(appSupport: appSupport, width: 560)
+        let (_, hostingView) = try await makeOffscreenSidebar(appSupport: appSupport, width: 560)
 
         RunLoop.main.run(until: Date().addingTimeInterval(0.2))
 
@@ -222,7 +227,7 @@ final class TokenSaverSidebarSnapshotTests: XCTestCase {
     private func makeOffscreenSidebar(
         appSupport: URL,
         width: CGFloat
-    ) throws -> (vm: SidebarViewModel, hostingView: NSView) {
+    ) async throws -> (vm: SidebarViewModel, hostingView: NSView) {
         let context = try AppContext(channel: .debug, appSupportOverride: appSupport.path)
         let router = AppCommandRouter(context: context)
         context.router = router
@@ -247,6 +252,10 @@ final class TokenSaverSidebarSnapshotTests: XCTestCase {
             tokenSaverModelValidationProvider: { .installed }
         )
         vm.reload()
+        // PERF-MAC-100: deterministically populate the off-main snapshot+summary
+        // before building the offscreen render (RunLoop pumping does not service
+        // Swift concurrency).
+        await vm.reloadTokenSaverAndWait()
 
         let height: CGFloat = 860
         let root = SidebarRootView(vm: vm).frame(width: width, height: height)

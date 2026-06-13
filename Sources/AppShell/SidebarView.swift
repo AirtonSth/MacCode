@@ -281,6 +281,11 @@ public final class SidebarViewModel: ObservableObject {
     var threadListCallCount: Int = 0
     private var privateAccountObserver: NSObjectProtocol?
     private var tokenSaverUsageObserver: NSObjectProtocol?
+    /// PERF-MAC-100: in-flight background reload of the heavy Token Saver
+    /// usage snapshot + savings summary. A new notification cancels the prior
+    /// task so a burst of per-provider `.rc2TokenSaverUsageChanged` events
+    /// coalesces into a single off-main read instead of N main-thread reads.
+    private var tokenSaverHeavyReloadTask: Task<Void, Never>?
     private var sidecarStatusObserver: NSObjectProtocol?
     private var tokenSaverToggleObserver: NSObjectProtocol?
     private let updateChecker: AppUpdateChecking?
@@ -424,18 +429,73 @@ public final class SidebarViewModel: ObservableObject {
         applyInsomniaPower()
     }
 
+    /// PERF-MAC-100: fire-and-forget reload used by the notification path.
+    ///
+    /// The cheap `tokenSaverEnabled` flag is read synchronously on the main
+    /// actor (UI + InsomniaSidebarTests assert it synchronously). The heavy
+    /// work -- a JSON file read (`TokenSaverUsageStore.load()`) and a SQL
+    /// aggregate (`tokenSaverSavingsRepo.summary()`) -- runs OFF the main
+    /// thread and is coalesced: a fresh notification cancels the prior task,
+    /// so a per-provider burst collapses to a single background read.
     private func reloadTokenSaver() {
         let settings = settingsStore.load()
         tokenSaverEnabled = settings.tokenSaverEnabled
-        if let context {
-            tokenSaverUsageSnapshot = TokenSaverUsageStore(
-                appSupportDirectory: context.appSupportDirectory
-            ).load()
-            tokenSaverSavingsSummary = (try? context.tokenSaverSavingsRepo.summary()) ?? .empty
-        } else {
+        guard let context else {
+            tokenSaverHeavyReloadTask?.cancel()
+            tokenSaverHeavyReloadTask = nil
             tokenSaverUsageSnapshot = .empty()
             tokenSaverSavingsSummary = .empty
+            return
         }
+        let appSupport = context.appSupportDirectory
+        let repo = context.tokenSaverSavingsRepo
+        tokenSaverHeavyReloadTask?.cancel()
+        tokenSaverHeavyReloadTask = Task { [weak self] in
+            let result = await Self.loadTokenSaverHeavy(appSupportDirectory: appSupport, repo: repo)
+            guard !Task.isCancelled else { return }
+            await MainActor.run { [weak self] in
+                guard let self, !Task.isCancelled else { return }
+                self.tokenSaverUsageSnapshot = result.snapshot
+                self.tokenSaverSavingsSummary = result.summary
+            }
+        }
+    }
+
+    /// PERF-MAC-100: deterministic reload for tests and any caller that must
+    /// observe a populated snapshot immediately after `await`. Reads the cheap
+    /// enabled flag synchronously, then awaits the same off-main heavy load
+    /// INLINE (not registered in `tokenSaverHeavyReloadTask`, so a later
+    /// notification cannot cancel it) before assigning the published values.
+    func reloadTokenSaverAndWait() async {
+        let settings = settingsStore.load()
+        tokenSaverEnabled = settings.tokenSaverEnabled
+        guard let context else {
+            tokenSaverHeavyReloadTask?.cancel()
+            tokenSaverHeavyReloadTask = nil
+            tokenSaverUsageSnapshot = .empty()
+            tokenSaverSavingsSummary = .empty
+            return
+        }
+        let result = await Self.loadTokenSaverHeavy(
+            appSupportDirectory: context.appSupportDirectory,
+            repo: context.tokenSaverSavingsRepo
+        )
+        tokenSaverUsageSnapshot = result.snapshot
+        tokenSaverSavingsSummary = result.summary
+    }
+
+    /// Runs the heavy Token Saver reads off the main actor. `repo` is
+    /// `@unchecked Sendable` and `TokenSaverUsageStore(...).load()` only reads
+    /// a file, so both are safe to call on a background executor.
+    private static func loadTokenSaverHeavy(
+        appSupportDirectory: URL,
+        repo: TokenSaverSavingsRepository
+    ) async -> (snapshot: TokenSaverUsageSnapshot, summary: TokenSaverSavingsSummary) {
+        await Task.detached {
+            let snapshot = TokenSaverUsageStore(appSupportDirectory: appSupportDirectory).load()
+            let summary = (try? repo.summary()) ?? .empty
+            return (snapshot, summary)
+        }.value
     }
 
     public func refreshTokenSaverAccountUsageForDetails() {
