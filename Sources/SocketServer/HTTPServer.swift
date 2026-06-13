@@ -350,9 +350,15 @@ public final class DirectHTTPServer: @unchecked Sendable {
 
     private func handle(fd: Int32, peer: String) {
         var subID: UUID?
+        // PERF-114: when the /v1/rpc handler hands the fd off to an async
+        // Task, that Task owns the fd lifecycle (send + close). The defer
+        // must NOT also close it, or we double-close. handedOff gates that.
+        var handedOff = false
         defer {
-            if let s = subID { EventBus.shared.unsubscribe(s) }
-            close(fd)
+            if !handedOff {
+                if let s = subID { EventBus.shared.unsubscribe(s) }
+                close(fd)
+            }
         }
         // Apply a receive timeout so a slow/stuck client cannot block this
         // handler thread forever. On timeout, read() returns -1 with errno
@@ -616,8 +622,24 @@ public final class DirectHTTPServer: @unchecked Sendable {
             // GAP-1: the authenticated JSON-RPC surface the mobile client
             // uses for every feature call. Routes to the same dispatcher
             // the Unix socket uses, hopping to the main actor.
-            let respData = dispatchRPCSync(bodyData)
-            send(fd: fd, status: 200, contentType: "application/json", body: respData, acceptEncoding: headers["accept-encoding"])
+            //
+            // PERF-114: dispatch on the pure-async seam in a detached Task
+            // instead of parking this global-pool worker (and one of the
+            // bounded gate slots) for the full RPC duration. The Task owns
+            // the fd from here on (send + close); we set handedOff so the
+            // defer skips its close, then RETURN so the read loop / defer
+            // never touch the fd again. Only Sendable values are captured by
+            // value (fd: Int32, bodyData: Data, ae: String?); subID is nil
+            // on this path and is intentionally not touched by the Task.
+            handedOff = true
+            let ae = headers["accept-encoding"]
+            Task { [weak self] in
+                guard let self else { close(fd); return }
+                let respData = await self.dispatchRPC(bodyData: bodyData)
+                self.send(fd: fd, status: 200, contentType: "application/json", body: respData, acceptEncoding: ae)
+                close(fd)
+            }
+            return
         case ("POST", "/v1/pair"):
             // Device-initiated request → Mac shows an approve/deny modal.
             // Returns immediately; the device polls /v1/pair/status. The
@@ -757,21 +779,13 @@ public final class DirectHTTPServer: @unchecked Sendable {
         }
     }
 
-    /// PERF-001: cap how many pool threads may be parked on the
-    /// main-actor hop at once. A burst of concurrent RPCs (iOS foreground
-    /// firing list/status/get) would otherwise grow the global pool with
-    /// N semaphore-blocked workers all queued behind the serial main actor.
-    /// Bounding the gate keeps thread-pool growth and head-of-line blocking
-    /// in check; main-actor dispatch is already serial so throughput is
-    /// unchanged.
-    private static let rpcHopGate = DispatchSemaphore(value: 8)
-
     /// QA-003: pure async request/response seam — decode → dispatch →
     /// encode with no semaphore and no socket. Lets framing, compression,
     /// and auth-gating be unit-tested deterministically by feeding body
     /// bytes and awaiting the response bytes, instead of driving a real
-    /// socket and a real main runloop. The socket path (`dispatchRPCSync`)
-    /// is a thin synchronous bridge over this.
+    /// socket and a real main runloop. PERF-114: the /v1/rpc HTTP handler
+    /// now drives this directly from a detached Task, so no global-pool
+    /// worker is parked for the RPC's duration.
     public func dispatchRPC(bodyData: Data) async -> Data {
         let encoder = JSONEncoder()
         let decoder = JSONDecoder()
@@ -781,26 +795,6 @@ public final class DirectHTTPServer: @unchecked Sendable {
         }
         let resp = await dispatcher.dispatch(req)
         return (try? encoder.encode(resp)) ?? Data("{}".utf8)
-    }
-
-    /// Decode + dispatch one JSON-RPC request on the main actor and
-    /// return the encoded response bytes. Mirrors UnixSocketServer's
-    /// hop pattern so synchronous AppKit/SwiftUI calls stay on main.
-    private func dispatchRPCSync(_ bodyData: Data) -> Data {
-        Self.rpcHopGate.wait()
-        defer { Self.rpcHopGate.signal() }
-        let semaphore = DispatchSemaphore(value: 0)
-        final class Slot: @unchecked Sendable { var value: Data? }
-        let slot = Slot()
-        DispatchQueue.main.async {
-            let task = Task { @MainActor in
-                slot.value = await self.dispatchRPC(bodyData: bodyData)
-                semaphore.signal()
-            }
-            _ = task
-        }
-        semaphore.wait()
-        return slot.value ?? (try? JSONEncoder().encode(JSONRPCResponse(id: nil, error: .internalError))) ?? Data("{}".utf8)
     }
 
     private func send(fd: Int32, status: Int, contentType: String, body: Data, acceptEncoding: String? = nil, additionalHeaders: [String: String] = [:]) {
