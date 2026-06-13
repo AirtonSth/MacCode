@@ -2642,6 +2642,12 @@ public struct AgentAppView: View {
     @State private var timelineDropTargeted = false
     @State private var timelineScrollScheduler = TimelineScrollScheduler()
     @State private var composerEditorHeight: CGFloat = PromptComposerEditor.minHeight
+    // macos:32: caret-anchored suggestion popup state. selection nil == nothing
+    // highlighted; dismissed == user pressed Esc for the current token. caretRect
+    // is in the editor's own coordinate space (origin top-left in SwiftUI overlay).
+    @State private var suggestionSelectedIndex: Int? = nil
+    @State private var suggestionPopupDismissed = false
+    @State private var composerCaretRect: CGRect = .zero
     @AppStorage("agent.threadRail.intent.v1") private var threadRailIntentRaw = AdaptiveSidebarIntent.auto.rawValue
     @AppStorage("agent.planSidebar.intent.v1") private var planSidebarIntentRaw = AdaptiveSidebarIntent.auto.rawValue
     @State private var showThreadRail = true
@@ -5145,16 +5151,47 @@ public struct AgentAppView: View {
                 onSend: { Task { await vm.send() } },
                 onPreviousHistory: { vm.recallPreviousPrompt() },
                 onNextHistory: { vm.recallNextPrompt() },
-                onTextEdited: { vm.promptWasEdited() },
+                onTextEdited: {
+                    vm.promptWasEdited()
+                    // macos:32: a real keystroke that changes the token re-opens a
+                    // popup the user had dismissed for the previous token.
+                    suggestionPopupDismissed = false
+                },
                 onFileDrop: { paths in vm.insertDroppedFilePaths(paths) },
-                onCursorMoved: { offset in vm.composerCursorOffset = offset }
+                onCursorMoved: { offset in vm.composerCursorOffset = offset },
+                onCaretRectChanged: { rect in composerCaretRect = rect },
+                popupIsOpen: {
+                    ComposerSuggestionNavigation.isOpen(
+                        count: vm.composerSuggestions.count,
+                        dismissed: suggestionPopupDismissed
+                    )
+                },
+                onPopupNavUp: {
+                    suggestionSelectedIndex = ComposerSuggestionNavigation.moveUp(
+                        selected: suggestionSelectedIndex,
+                        count: vm.composerSuggestions.count
+                    )
+                },
+                onPopupNavDown: {
+                    suggestionSelectedIndex = ComposerSuggestionNavigation.moveDown(
+                        selected: suggestionSelectedIndex,
+                        count: vm.composerSuggestions.count
+                    )
+                },
+                onPopupApply: { applyHighlightedSuggestion() },
+                onPopupDismiss: { suggestionPopupDismissed = true }
             )
             .frame(height: composerEditorHeight)
             .padding(.horizontal, DS.Space.lg)
             .padding(.top, DS.Space.sm)
             .padding(.bottom, DS.Space.xs)
             .accessibilityIdentifier("agent.composer.input")
-            composerSuggestions
+            .overlay(alignment: .topLeading) { suggestionPopup }
+            // macos:32: reset selection + un-dismiss whenever the suggestion set
+            // changes identity/count (new token, or token edited into a new list).
+            .onChange(of: vm.composerSuggestions.map(\.id)) { _ in
+                suggestionSelectedIndex = ComposerSuggestionNavigation.reset()
+            }
             composerToolbar
         }
         .background(DS.Palette.surface)
@@ -5246,37 +5283,81 @@ public struct AgentAppView: View {
         .accessibilityIdentifier("agent.attach")
     }
 
-    @ViewBuilder
-    private var composerSuggestions: some View {
+    // macos:32: applies the currently highlighted suggestion (or the first when
+    // nothing is highlighted yet, e.g. user pressed Return right after typing the
+    // token without arrowing). Reads vm state live, then resets popup state.
+    private func applyHighlightedSuggestion() {
         let suggestions = vm.composerSuggestions
-        if !suggestions.isEmpty {
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: DS.Space.sm) {
-                    ForEach(suggestions) { suggestion in
-                        Button { vm.applyComposerSuggestion(suggestion) } label: {
-                            HStack(spacing: DS.Space.xs) {
-                                Image(systemName: suggestion.kind == .skill ? "puzzlepiece.extension" : "command")
-                                    .font(.system(size: 10, weight: .semibold))
-                                Text(suggestion.title)
-                                    .font(DS.Font.caption.weight(.medium))
-                                    .lineLimit(1)
-                            }
-                            .foregroundColor(DS.Palette.text)
-                            .padding(.horizontal, DS.Space.sm)
-                            .padding(.vertical, DS.Space.xs)
-                            .background(DS.Palette.surfaceRaised)
-                            .clipShape(Capsule())
-                            .overlay(Capsule().strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline))
+        guard !suggestions.isEmpty else { return }
+        let index = suggestionSelectedIndex ?? 0
+        guard suggestions.indices.contains(index) else { return }
+        vm.applyComposerSuggestion(suggestions[index])
+        suggestionSelectedIndex = ComposerSuggestionNavigation.reset()
+        suggestionPopupDismissed = true
+    }
+
+    // macos:32: caret-anchored, keyboard-navigable suggestion popup. Replaces the
+    // former horizontal chip row. Anchored to the caret rect, positioned ABOVE the
+    // caret when there is room, else below.
+    @ViewBuilder
+    private var suggestionPopup: some View {
+        let suggestions = vm.composerSuggestions
+        if ComposerSuggestionNavigation.isOpen(count: suggestions.count, dismissed: suggestionPopupDismissed) {
+            let rowHeight: CGFloat = 30
+            let popupHeight = min(CGFloat(suggestions.count), 6) * rowHeight
+            let placeAbove = composerCaretRect.minY >= popupHeight + 6
+            let yOffset = placeAbove
+                ? composerCaretRect.minY - popupHeight - 4
+                : composerCaretRect.maxY + 4
+            VStack(spacing: 0) {
+                ScrollView(.vertical, showsIndicators: suggestions.count > 6) {
+                    VStack(spacing: 0) {
+                        ForEach(Array(suggestions.enumerated()), id: \.element.id) { index, suggestion in
+                            suggestionRow(suggestion, highlighted: index == suggestionSelectedIndex)
+                                .frame(height: rowHeight)
                         }
-                        .buttonStyle(.plain)
-                        .help(suggestion.subtitle)
-                        .accessibilityIdentifier("agent.suggestion.\(suggestion.insertText.trimmingCharacters(in: .whitespaces))")
                     }
                 }
-                .padding(.horizontal, DS.Space.lg)
-                .padding(.bottom, DS.Space.xs)
+                .frame(height: popupHeight)
             }
+            .frame(width: 280)
+            .background(DS.Palette.surfaceRaised)
+            .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
+                .strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline))
+            .shadow(color: Color.black.opacity(0.18), radius: 8, y: 2)
+            .offset(x: max(0, composerCaretRect.minX), y: yOffset)
+            .accessibilityIdentifier("agent.suggestion.popup")
+            .allowsHitTesting(true)
         }
+    }
+
+    private func suggestionRow(_ suggestion: AgentComposerSuggestion, highlighted: Bool) -> some View {
+        Button { vm.applyComposerSuggestion(suggestion); suggestionPopupDismissed = true } label: {
+            HStack(spacing: DS.Space.sm) {
+                Image(systemName: suggestion.kind == .skill ? "puzzlepiece.extension" : "command")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundColor(highlighted ? DS.Palette.accent : DS.Palette.textSecondary)
+                    .frame(width: 16)
+                VStack(alignment: .leading, spacing: 0) {
+                    Text(suggestion.title)
+                        .font(DS.Font.caption.weight(.medium))
+                        .foregroundColor(DS.Palette.text)
+                        .lineLimit(1)
+                    Text(suggestion.subtitle)
+                        .font(DS.Font.caption2)
+                        .foregroundColor(DS.Palette.textTertiary)
+                        .lineLimit(1)
+                }
+                Spacer(minLength: 0)
+            }
+            .padding(.horizontal, DS.Space.sm)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(highlighted ? DS.Palette.accent.opacity(0.14) : Color.clear)
+        }
+        .buttonStyle(.plain)
+        .help(suggestion.subtitle)
+        .accessibilityIdentifier("agent.suggestion.\(suggestion.insertText.trimmingCharacters(in: .whitespaces))")
     }
 
     private var permissionMenu: some View {
@@ -6316,6 +6397,75 @@ enum PromptComposerKeyAction: Equatable {
         let wantsNewline = modifiers.contains(.shift) || modifiers.contains(.option)
         return wantsNewline ? .insertNewline : .send
     }
+
+    // macos:32: resolves a keystroke given whether the caret-anchored suggestion
+    // popup is open. When the popup is CLOSED this ALWAYS defers to the existing
+    // 2-arg `action(keyCode:modifiers:)` via `.passthrough`, so send/history
+    // behavior is byte-for-byte identical to today. When the popup is OPEN, the
+    // navigation keys (up/down/Return/Esc, with no disqualifying modifiers) are
+    // intercepted; everything else still passes through. The existing 2-arg fn
+    // is left UNCHANGED.
+    static func resolve(keyCode: UInt16, modifiers: NSEvent.ModifierFlags, popupOpen: Bool) -> ComposerKeyResolution {
+        let passthrough = ComposerKeyResolution.passthrough(action(keyCode: keyCode, modifiers: modifiers))
+        guard popupOpen else { return passthrough }
+        let hasHardModifier = !modifiers.intersection([.command, .control, .option]).isEmpty
+        switch keyCode {
+        case 126 where !hasHardModifier && !modifiers.contains(.shift):
+            return .navUp
+        case 125 where !hasHardModifier && !modifiers.contains(.shift):
+            return .navDown
+        case 36, 76:
+            // Plain Return applies the selection; Shift/Option-Return must still
+            // insert a newline (passthrough), so the user can compose multiline
+            // prompts while the popup is visible.
+            if modifiers.contains(.shift) || modifiers.contains(.option) { return passthrough }
+            return .applySelected
+        case 53:
+            return .dismissPopup
+        default:
+            return passthrough
+        }
+    }
+}
+
+// macos:32: outcome of a keystroke when the suggestion popup may be open.
+enum ComposerKeyResolution: Equatable {
+    case navUp
+    case navDown
+    case applySelected
+    case dismissPopup
+    case passthrough(PromptComposerKeyAction)
+}
+
+// macos:32: pure, value-type navigation logic for the caret-anchored suggestion
+// popup. Holds NO view state and is unit-testable in isolation. `selectedIndex`
+// is the highlighted row (nil == nothing highlighted yet).
+struct ComposerSuggestionNavigation: Equatable {
+    var selectedIndex: Int?
+
+    static func reset() -> Int? { nil }
+
+    // Down: from nil -> 0; otherwise advance with wrap-around. count==0 -> nil.
+    static func moveDown(selected: Int?, count: Int) -> Int? {
+        guard count > 0 else { return nil }
+        guard let current = selected else { return 0 }
+        let clamped = max(0, min(current, count - 1))
+        return (clamped + 1) % count
+    }
+
+    // Up: from nil -> last row; otherwise retreat with wrap-around. count==0 -> nil.
+    static func moveUp(selected: Int?, count: Int) -> Int? {
+        guard count > 0 else { return nil }
+        guard let current = selected else { return count - 1 }
+        let clamped = max(0, min(current, count - 1))
+        return (clamped - 1 + count) % count
+    }
+
+    // The popup is open iff there is at least one suggestion and the user has
+    // not dismissed it (Esc) for the current token.
+    static func isOpen(count: Int, dismissed: Bool) -> Bool {
+        count > 0 && !dismissed
+    }
 }
 
 private final class PromptComposerTextView: NSTextView {
@@ -6323,22 +6473,48 @@ private final class PromptComposerTextView: NSTextView {
     var onPreviousHistory: (() -> Bool)?
     var onNextHistory: (() -> Bool)?
     var onFileDrop: (([String]) -> Void)?
+    // macos:32: suggestion-popup hooks. `popupIsOpen` is read at keyDown time so
+    // the closures never capture a stale suggestion snapshot.
+    var popupIsOpen: (() -> Bool)?
+    var onPopupNavUp: (() -> Void)?
+    var onPopupNavDown: (() -> Void)?
+    var onPopupApply: (() -> Void)?
+    var onPopupDismiss: (() -> Void)?
     var placeholderString: String = "" {
         didSet { needsDisplay = true }
     }
 
     override func keyDown(with event: NSEvent) {
-        switch PromptComposerKeyAction.action(for: event) {
-        case .send:
-            onSend?()
-        case .insertNewline:
-            insertNewlineIgnoringFieldEditor(self)
-        case .previousHistory:
-            if onPreviousHistory?() != true { super.keyDown(with: event) }
-        case .nextHistory:
-            if onNextHistory?() != true { super.keyDown(with: event) }
-        case .ignore:
-            super.keyDown(with: event)
+        let open = popupIsOpen?() ?? false
+        let resolution = PromptComposerKeyAction.resolve(
+            keyCode: event.keyCode,
+            modifiers: event.modifierFlags,
+            popupOpen: open
+        )
+        switch resolution {
+        case .navUp:
+            onPopupNavUp?()
+        case .navDown:
+            onPopupNavDown?()
+        case .applySelected:
+            onPopupApply?()
+        case .dismissPopup:
+            onPopupDismiss?()
+        case .passthrough(let action):
+            // Identical to today's behavior when the popup is closed (and for any
+            // non-navigation key while it is open).
+            switch action {
+            case .send:
+                onSend?()
+            case .insertNewline:
+                insertNewlineIgnoringFieldEditor(self)
+            case .previousHistory:
+                if onPreviousHistory?() != true { super.keyDown(with: event) }
+            case .nextHistory:
+                if onNextHistory?() != true { super.keyDown(with: event) }
+            case .ignore:
+                super.keyDown(with: event)
+            }
         }
     }
 
@@ -6396,6 +6572,15 @@ private struct PromptComposerEditor: NSViewRepresentable {
     // UX-XPLAT-009: reports the UTF-16 offset of the insertion point so
     // suggestion anchoring uses the cursor position, not text.endIndex.
     let onCursorMoved: (Int) -> Void
+    // macos:32: reports the caret rect (in the text view's own coordinate space)
+    // so the suggestion popup can anchor to the insertion point.
+    let onCaretRectChanged: (CGRect) -> Void
+    // macos:32: popup wiring. `popupIsOpen` is queried lazily at keyDown time.
+    let popupIsOpen: () -> Bool
+    let onPopupNavUp: () -> Void
+    let onPopupNavDown: () -> Void
+    let onPopupApply: () -> Void
+    let onPopupDismiss: () -> Void
 
     func makeNSView(context: Context) -> NSScrollView {
         let scroll = FilePathDropScrollView()
@@ -6428,6 +6613,11 @@ private struct PromptComposerEditor: NSViewRepresentable {
         textView.onPreviousHistory = onPreviousHistory
         textView.onNextHistory = onNextHistory
         textView.onFileDrop = onFileDrop
+        textView.popupIsOpen = popupIsOpen
+        textView.onPopupNavUp = onPopupNavUp
+        textView.onPopupNavDown = onPopupNavDown
+        textView.onPopupApply = onPopupApply
+        textView.onPopupDismiss = onPopupDismiss
         textView.placeholderString = placeholder
         // QA-MAC_AGENT-001: stable identifier on the AppKit text view so
         // XCUITest can address the composer input directly.
@@ -6447,6 +6637,11 @@ private struct PromptComposerEditor: NSViewRepresentable {
         textView.onPreviousHistory = onPreviousHistory
         textView.onNextHistory = onNextHistory
         textView.onFileDrop = onFileDrop
+        textView.popupIsOpen = popupIsOpen
+        textView.onPopupNavUp = onPopupNavUp
+        textView.onPopupNavDown = onPopupNavDown
+        textView.onPopupApply = onPopupApply
+        textView.onPopupDismiss = onPopupDismiss
         textView.isEditable = isEnabled
         textView.placeholderString = placeholder
         if textView.string != text {
@@ -6464,7 +6659,13 @@ private struct PromptComposerEditor: NSViewRepresentable {
     }
 
     func makeCoordinator() -> Coordinator {
-        Coordinator(text: $text, height: $height, onTextEdited: onTextEdited, onCursorMoved: onCursorMoved)
+        Coordinator(
+            text: $text,
+            height: $height,
+            onTextEdited: onTextEdited,
+            onCursorMoved: onCursorMoved,
+            onCaretRectChanged: onCaretRectChanged
+        )
     }
 
     final class Coordinator: NSObject, NSTextViewDelegate {
@@ -6472,6 +6673,7 @@ private struct PromptComposerEditor: NSViewRepresentable {
         @Binding var height: CGFloat
         let onTextEdited: () -> Void
         let onCursorMoved: (Int) -> Void
+        let onCaretRectChanged: (CGRect) -> Void
         weak var textView: PromptComposerTextView?
         var appliedFocusTick: Int?
         private var externallyAppliedText: String?
@@ -6480,12 +6682,14 @@ private struct PromptComposerEditor: NSViewRepresentable {
             text: Binding<String>,
             height: Binding<CGFloat>,
             onTextEdited: @escaping () -> Void,
-            onCursorMoved: @escaping (Int) -> Void
+            onCursorMoved: @escaping (Int) -> Void,
+            onCaretRectChanged: @escaping (CGRect) -> Void
         ) {
             _text = text
             _height = height
             self.onTextEdited = onTextEdited
             self.onCursorMoved = onCursorMoved
+            self.onCaretRectChanged = onCaretRectChanged
         }
 
         func textDidChange(_ notification: Notification) {
@@ -6511,6 +6715,41 @@ private struct PromptComposerEditor: NSViewRepresentable {
         private func reportCursor(for textView: NSTextView) {
             let offset = textView.selectedRange().location
             onCursorMoved(offset)
+            onCaretRectChanged(caretRect(for: textView, insertionUTF16: offset))
+        }
+
+        // macos:32: insertion-point rect in the text view's own coordinate space.
+        // The zero-length glyph rect can be degenerate (empty doc, caret at end of
+        // a line); fall back to the glyph BEFORE the caret, then to the text
+        // container origin, so the popup always has a sane anchor.
+        private func caretRect(for textView: NSTextView, insertionUTF16: Int) -> CGRect {
+            guard let layoutManager = textView.layoutManager,
+                  let container = textView.textContainer else {
+                return CGRect(origin: textView.textContainerOrigin, size: .zero)
+            }
+            let origin = textView.textContainerOrigin
+            let length = (textView.string as NSString).length
+            let location = max(0, min(insertionUTF16, length))
+            let glyphRange = layoutManager.glyphRange(
+                forCharacterRange: NSRange(location: location, length: 0),
+                actualCharacterRange: nil
+            )
+            var rect = layoutManager.boundingRect(forGlyphRange: glyphRange, in: container)
+            if rect.isEmpty, location > 0 {
+                let priorGlyphs = layoutManager.glyphRange(
+                    forCharacterRange: NSRange(location: location - 1, length: 1),
+                    actualCharacterRange: nil
+                )
+                let prior = layoutManager.boundingRect(forGlyphRange: priorGlyphs, in: container)
+                if !prior.isEmpty {
+                    // Anchor at the trailing edge of the preceding glyph.
+                    rect = CGRect(x: prior.maxX, y: prior.minY, width: 0, height: prior.height)
+                }
+            }
+            if rect.isEmpty {
+                rect = CGRect(x: 0, y: 0, width: 0, height: textView.font?.pointSize ?? 13)
+            }
+            return rect.offsetBy(dx: origin.x, dy: origin.y)
         }
 
         func applyExternalText(_ value: String, to textView: NSTextView) {
