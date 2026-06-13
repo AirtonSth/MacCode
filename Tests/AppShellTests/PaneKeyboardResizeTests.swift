@@ -213,6 +213,32 @@ final class PaneKeyboardResizeTests: XCTestCase {
 
     // MARK: - performKeyboardPaneResize: routes to paneResize reducer
 
+    func test_keyboardShortcut_ctrlOptionArrows_mapToDirections() {
+        XCTAssertEqual(
+            PaneKeyboardResizeKey.direction(keyCode: 123, modifiers: [.control, .option]),
+            .left,
+            "Ctrl+Opt+Left must dispatch a pane-resize left command"
+        )
+        XCTAssertEqual(PaneKeyboardResizeKey.direction(keyCode: 124, modifiers: [.control, .option]), .right)
+        XCTAssertEqual(PaneKeyboardResizeKey.direction(keyCode: 125, modifiers: [.control, .option]), .down)
+        XCTAssertEqual(PaneKeyboardResizeKey.direction(keyCode: 126, modifiers: [.control, .option]), .up)
+    }
+
+    func test_keyboardShortcut_ignoresArrowsWithoutExactCtrlOption() {
+        XCTAssertNil(
+            PaneKeyboardResizeKey.direction(keyCode: 124, modifiers: [.control]),
+            "arrow without Option must remain available to the focused surface"
+        )
+        XCTAssertNil(
+            PaneKeyboardResizeKey.direction(keyCode: 124, modifiers: [.control, .option, .command]),
+            "Ctrl+Opt+Cmd+Arrow must not accidentally resize panes when the user invokes another chord"
+        )
+        XCTAssertNil(
+            PaneKeyboardResizeKey.direction(keyCode: 36, modifiers: [.control, .option]),
+            "Ctrl+Opt+non-arrow must not resize panes"
+        )
+    }
+
     // WHY: the seam must thread the computed ratios through the router so the
     // RatioSplitView re-renders and iOS/macOS state stays in sync.
     @MainActor

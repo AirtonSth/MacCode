@@ -11,6 +11,11 @@ import os
 /// diagnosable and the PERF-002 rebuild cost is measurable.
 private let shellLog = Logger(subsystem: "io.remotecode.appshell", category: "shell")
 
+@MainActor
+protocol PaneKeyboardResizeHandling: AnyObject {
+    func resizeFocusedPane(_ direction: SplitDirection) -> Bool
+}
+
 final class InteractiveTitlebarWindow: NSWindow {
     /// QA-MAC_SHELL_WINDOW-005: the interactive titlebar band height. The
     /// tab strip / header lives in the top `titlebarBandHeight` points of
@@ -22,6 +27,12 @@ final class InteractiveTitlebarWindow: NSWindow {
     private var lastTitlebarClick: (time: TimeInterval, point: NSPoint)?
 
     override func sendEvent(_ event: NSEvent) {
+        if event.type == .keyDown,
+           let direction = PaneKeyboardResizeKey.direction(keyCode: event.keyCode, modifiers: event.modifierFlags),
+           let handler = delegate as? PaneKeyboardResizeHandling,
+           handler.resizeFocusedPane(direction) {
+            return
+        }
         if event.type == .leftMouseDown, dispatchTitlebarDoubleClick(event) {
             return
         }
@@ -144,6 +155,22 @@ final class InteractiveTitlebarWindow: NSWindow {
     }
 }
 
+enum PaneKeyboardResizeKey {
+    private static let requiredModifiers: NSEvent.ModifierFlags = [.control, .option]
+    private static let relevantModifiers: NSEvent.ModifierFlags = [.control, .option, .command, .shift]
+
+    nonisolated static func direction(keyCode: UInt16, modifiers: NSEvent.ModifierFlags) -> SplitDirection? {
+        guard modifiers.intersection(relevantModifiers) == requiredModifiers else { return nil }
+        switch keyCode {
+        case 123: return .left
+        case 124: return .right
+        case 125: return .down
+        case 126: return .up
+        default: return nil
+        }
+    }
+}
+
 private extension NSRect {
     func isNearlyEqual(to other: NSRect) -> Bool {
         abs(origin.x - other.origin.x) < 2 &&
@@ -162,7 +189,7 @@ public extension Notification.Name {
 }
 
 @MainActor
-public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitViewDelegate {
+public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitViewDelegate, PaneKeyboardResizeHandling {
     public let window: NSWindow
     public weak var context: AppContext?
     public weak var router: AppCommandRouter?
@@ -694,6 +721,19 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
         let splitType = selectedSurface?.type ?? .terminal
         let splitTitle = PaneTabsView.surfaceChoices.first(where: { $0.1 == splitType })?.0 ?? "Terminal"
         return controller.performSplit(direction, type: splitType, title: splitTitle) != nil
+    }
+
+    @discardableResult
+    public func resizeFocusedPane(_ direction: SplitDirection) -> Bool {
+        guard let ctx = context,
+              let wid = ctx.state.window.selectedWorkspaceID,
+              let ws = ctx.state.workspaces[wid],
+              !detachedWorkspaceIDs.contains(wid) else { return false }
+        let focusedPaneID = ws.focusedPaneID ?? ws.layout.paneIDs().first
+        guard let focusedPaneID,
+              let controller = paneControllers.first(where: { $0.pane.id == focusedPaneID })
+                ?? paneControllers.first else { return false }
+        return controller.performKeyboardPaneResize(direction: direction)
     }
 
     public func repairSelectedTerminalFocus(reason: String) {
@@ -1394,7 +1434,7 @@ private final class OrphanWindowAttachHandler: NSObject {
 }
 
 @MainActor
-private final class WorkspaceWindowController: NSObject, NSWindowDelegate {
+private final class WorkspaceWindowController: NSObject, NSWindowDelegate, PaneKeyboardResizeHandling {
     let window: NSWindow
     private let workspaceID: WorkspaceID
     private weak var context: AppContext?
@@ -1479,6 +1519,16 @@ private final class WorkspaceWindowController: NSObject, NSWindowDelegate {
     func repairSelectedTerminalFocus(reason: String) {
         guard protectedFocusedView() == nil else { return }
         router?.repairSelectedTerminalFocus(workspace: workspaceID, reason: reason)
+    }
+
+    @discardableResult
+    func resizeFocusedPane(_ direction: SplitDirection) -> Bool {
+        guard let ws = context?.state.workspaces[workspaceID] else { return false }
+        let focusedPaneID = ws.focusedPaneID ?? ws.layout.paneIDs().first
+        guard let focusedPaneID,
+              let controller = paneControllers.first(where: { $0.pane.id == focusedPaneID })
+                ?? paneControllers.first else { return false }
+        return controller.performKeyboardPaneResize(direction: direction)
     }
 
     private func protectedFocusedView() -> NSView? {
