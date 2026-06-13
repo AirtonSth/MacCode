@@ -23,6 +23,9 @@ public final class SQLiteDB {
     fileprivate var handle: OpaquePointer?
     public let path: String
     private let queue = DispatchQueue(label: "RemoteCode.SQLiteDB")
+    // Marks `queue` so cachedStatement() can detect when it is running inside a
+    // `performSync` block (and may therefore safely reuse a shared cached stmt).
+    private static let queueKey = DispatchSpecificKey<UInt8>()
 
     // MARK: - Prepared-statement cache
     //
@@ -46,20 +49,41 @@ public final class SQLiteDB {
     // Caller is responsible for serialisation (either via `performSync` or a
     // single-writer context); see `prepare` for the thread-safety rationale.
     fileprivate func cachedStatement(sql: String) throws -> SQLiteStatement {
-        if let cached = stmtCache[sql] {
-            // Reset: rewinds the VM + wipes bindings before each reuse.
-            sqlite3_reset(cached)
-            sqlite3_clear_bindings(cached)
-            return SQLiteStatement(handle: cached, db: self, owned: false)
+        // The cache hands out a SHARED sqlite3_stmt (owned: false). Sharing one
+        // statement is only safe when the whole reset->bind->step sequence is
+        // serialised -- i.e. when we are running ON `queue` (a `performSync`
+        // caller). Off the queue (the bare `prepare()` repo call sites, reached
+        // from the main/socket/coordinator threads -- QA-mac:72 T007) two threads
+        // would share one handle and one thread's sqlite3_reset/clear_bindings
+        // would wipe another's in-flight state, losing writes. So:
+        //   - on the serial queue  -> use/grow the cache (fast, serialised, safe)
+        //   - off the serial queue -> compile a FRESH OWNED statement per call.
+        // SQLITE_OPEN_FULLMUTEX serialises every use of the shared connection, so
+        // independent per-call statements prepare/bind/step/finalize safely from
+        // many threads. This is the pre-cache concurrency contract the original
+        // `prepare` actually provided (it compiled a fresh statement each call).
+        let onSerialQueue = DispatchQueue.getSpecific(key: Self.queueKey) != nil
+        if onSerialQueue {
+            if let cached = stmtCache[sql] {
+                // Reset: rewinds the VM + wipes bindings before each reuse.
+                sqlite3_reset(cached)
+                sqlite3_clear_bindings(cached)
+                return SQLiteStatement(handle: cached, db: self, owned: false)
+            }
+            let stmt = try compileStatement(sql)
+            stmtCache[sql] = stmt
+            return SQLiteStatement(handle: stmt, db: self, owned: false)
         }
+        return SQLiteStatement(handle: try compileStatement(sql), db: self, owned: true)
+    }
+
+    private func compileStatement(_ sql: String) throws -> OpaquePointer {
         var stmt: OpaquePointer?
         let rc = sqlite3_prepare_v2(handle, sql, -1, &stmt, nil)
         if rc != SQLITE_OK {
-            let msg = String(cString: sqlite3_errmsg(handle))
-            throw SQLiteError.prepare(msg)
+            throw SQLiteError.prepare(String(cString: sqlite3_errmsg(handle)))
         }
-        stmtCache[sql] = stmt!
-        return SQLiteStatement(handle: stmt!, db: self, owned: false)
+        return stmt!
     }
 
     public init(path: String) throws {
@@ -77,6 +101,7 @@ public final class SQLiteDB {
             throw SQLiteError.open(msg)
         }
         self.handle = h
+        queue.setSpecific(key: Self.queueKey, value: 1)
         try execute("PRAGMA journal_mode=WAL;")
         try execute("PRAGMA foreign_keys=ON;")
         try execute("PRAGMA synchronous=NORMAL;")
