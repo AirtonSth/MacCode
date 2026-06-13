@@ -6613,6 +6613,9 @@ public final class AgentAppSurface: NSObject, Surface {
     /// EventBus subscription so socket-driven thread mutations refresh
     /// this already-open surface (wired by AppCommandRouter, like Feed).
     public var subscriptionToken: AnyHashable?
+    /// Called once by close() to release the EventBus subscription.
+    /// Set by AppCommandRouter immediately after subscribe (mirrors Feed pattern).
+    public var onClose: (() -> Void)?
 
     public init(workspaceID: WorkspaceID, cwd: String, coordinator: AgentRunCoordinator, threadRepo: AgentThreadRepository, messageRepo: AgentMessageRepository, queuedMessageRepo: AgentQueuedMessageRepository? = nil, pendingCallbackRepo: ProviderPendingCallbackRepository? = nil, proposedPlanRepo: AgentProposedPlanRepository? = nil, checkpointRepo: AgentTurnCheckpointRepository? = nil, promptHistoryStore: PromptHistoryStore? = nil, customModelStore: AgentCustomModelStore? = nil, planNotesStore: PlanNotesStore? = nil, title: String = "Agent App") {
         self.descriptor = SurfaceDescriptor(type: .agentApp, title: title, iconName: "sparkle", metadata: ["workspace": workspaceID.value.uuidString, "cwd": cwd])
@@ -6637,7 +6640,7 @@ public final class AgentAppSurface: NSObject, Surface {
         view.window?.makeFirstResponder(view)
     }
     public func unfocus() {}
-    public func close() {}
+    public func close() { onClose?(); onClose = nil }
     public func sendText(_ text: String) {
         viewModel.prompt = (viewModel.prompt.isEmpty ? text : viewModel.prompt + "\n" + text)
     }

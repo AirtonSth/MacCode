@@ -188,6 +188,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                             }
                         }
                         agent.subscriptionToken = AnyHashable(token)
+                        agent.onClose = { EventBus.shared.unsubscribe(token) }
                         agent.viewModel.providerSnapshotLoader = { [weak self] in
                             await self?.listAgentProviderSnapshots() ?? []
                         }
@@ -432,9 +433,23 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     }
 
     public func closeWorkspace(_ id: WorkspaceID, publishEvent: Bool = true) throws {
+        // Collect surface IDs before the layout is mutated so we can purge their
+        // terminal history after the workspace is removed. Guard: only surfaces that
+        // belong to this workspace are collected; live surfaces in other workspaces
+        // are never touched.
+        var surfaceIDsToDelete: [String] = []
+        if let ws = context?.state.workspaces[id] {
+            forEachSurface(in: ws.layout) { desc in
+                surfaceIDsToDelete.append(desc.id.value.uuidString)
+            }
+        }
         try context?.apply(.closeWorkspace(id))
         if let ctx = context {
             try? PromptHistoryStore(db: ctx.db).delete(workspaceID: id)
+            let repo = ctx.terminalOutputRepo
+            for sid in surfaceIDsToDelete {
+                try? repo.delete(surfaceID: sid)
+            }
         }
         windowController?.refreshFromState()
         reconcileSurfaceVisibility()
@@ -449,11 +464,24 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         let uniqueIds = ids.filter { seen.insert($0).inserted }
         guard !uniqueIds.isEmpty else { return }
         guard uniqueIds.allSatisfy({ ctx.state.workspaces[$0] != nil }) else { throw LayoutError.workspaceNotFound }
+        // Collect surface IDs before the layout is mutated.
+        var surfaceIDsToDelete: [String] = []
+        for id in uniqueIds {
+            if let ws = ctx.state.workspaces[id] {
+                forEachSurface(in: ws.layout) { desc in
+                    surfaceIDsToDelete.append(desc.id.value.uuidString)
+                }
+            }
+        }
         for id in uniqueIds {
             try ctx.apply(.closeWorkspace(id))
         }
         let store = PromptHistoryStore(db: ctx.db)
         uniqueIds.forEach { try? store.delete(workspaceID: $0) }
+        let repo = ctx.terminalOutputRepo
+        for sid in surfaceIDsToDelete {
+            try? repo.delete(surfaceID: sid)
+        }
         windowController?.refreshFromState()
         reconcileSurfaceVisibility()
         uniqueIds.forEach(publishWorkspaceClosed)
@@ -693,6 +721,10 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             SurfaceRegistry.shared.unregister(surface)
         }
         SurfaceOutputBus.shared.remove(surfaceId: surface)
+        // Guard: surface is no longer in the layout (apply(.closeSurface) succeeded),
+        // so it is genuinely removed. Delete its persisted terminal history now; rows
+        // have no other owner once the surface is gone.
+        try? context?.terminalOutputRepo.delete(surfaceID: surface.value.uuidString)
         if let desc = closedDescriptor {
             let entry = ClosedTabEntry(descriptor: desc, workspaceCwd: workspaceCwdForReopen)
             closedTabBuffer.push(entry, for: workspace)
@@ -718,6 +750,8 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 SurfaceRegistry.shared.unregister(surface)
             }
             SurfaceOutputBus.shared.remove(surfaceId: surface)
+            // Guard: surface removed from layout; delete its persisted terminal history.
+            try? context?.terminalOutputRepo.delete(surfaceID: surface.value.uuidString)
             if let desc = closedDescriptor {
                 let entry = ClosedTabEntry(descriptor: desc, workspaceCwd: workspaceCwd)
                 closedTabBuffer.push(entry, for: workspace)
@@ -2460,6 +2494,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                     }
                 }
                 agent.subscriptionToken = AnyHashable(token)
+                agent.onClose = { EventBus.shared.unsubscribe(token) }
                 agent.viewModel.providerSnapshotLoader = { [weak self] in
                     await self?.listAgentProviderSnapshots() ?? []
                 }
