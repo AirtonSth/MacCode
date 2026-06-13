@@ -208,6 +208,43 @@ final class ClaudeCLIAdapterSessionPruneTests: XCTestCase {
         }
         XCTFail("timed out waiting for threads to finish")
     }
+
+    // MARK: - QA-mac:74 map-cardinality stress
+
+    func test_adapterMapsStayBoundedUnderManyThreads() async throws {
+        // WHY: run far more threads through the adapter than the cap and assert the
+        // sessions/events maps never exceed it. Eviction (pruneEligible) makes map
+        // cardinality N-INDEPENDENT -- no matter how many threads complete, only `cap`
+        // most-recent non-rolled-back sessions are retained. Pins the Perf #5 unbounded-
+        // growth fix, driven through the same fake-runner sendTurn path as the cap tests.
+        let cap = 10
+        let total = 80
+        let adapter = ClaudeCLIAdapter(
+            runner: ScriptedClaudeRunnerForPrune(),
+            maxReadableEvents: 5_000,
+            maxSessions: cap
+        )
+        var ids: [AgentThreadID] = []
+        for i in 0..<total {
+            let t = AgentThreadID()
+            ids.append(t)
+            _ = try await adapter.sendTurn(
+                AgentRunRequest(threadId: t, provider: .claude, model: "m", cwd: NSTemporaryDirectory(), prompt: "p\(i)"),
+                onEvent: { _ in }
+            )
+            // The just-finished thread is the newest, so it is never the one evicted.
+            try await waitUntilFinished(adapter: adapter, threadIds: [t])
+            XCTAssertLessThanOrEqual(adapter.listSessions().count, cap,
+                "the sessions map must never exceed maxSessions, even mid-stream after \(i + 1) finished threads")
+        }
+
+        XCTAssertEqual(adapter.listSessions().count, cap,
+            "after \(total) finished threads with cap \(cap), exactly \(cap) most-recent sessions are retained -- map growth is bounded, not proportional to thread count")
+        XCTAssertFalse(adapter.hasSession(threadId: ids[0]),
+            "the very first thread must have been evicted long ago -- the maps do not grow with session count")
+        XCTAssertTrue(adapter.hasSession(threadId: ids[total - 1]),
+            "the most-recent thread must be retained")
+    }
 }
 
 // MARK: - Test doubles
