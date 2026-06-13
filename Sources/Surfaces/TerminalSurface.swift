@@ -595,6 +595,15 @@ public final class TerminalSurface: NSObject, Surface {
     private var busyStateProbeUntil = Date.distantPast
     private var lastPublishedBusyState = false
     private var didBeepForDeadInput = false
+    // MARK: - readTextSnapshot cache
+    // Tracks how many times TerminalSurface has mutated the ANSIRenderer (via
+    // renderer.feed / renderer.resize). Used as the renderer-side key for the
+    // readTextSnapshot cache so we do not have to reach into ANSIRenderer's
+    // private contentVersion.
+    private var rendererMutationCount: UInt64 = 0
+    // Cached result of readTextSnapshot(). Invalidated when either the renderer
+    // mutation count or the ghostty viewport text changes (see snapshotCacheValid).
+    private var cachedTextSnapshot: (rendererVersion: UInt64, viewportText: String?, value: TerminalTextSnapshot)?
     private var parkingWindow: NSWindow?
     private var parkingConstraints: [NSLayoutConstraint] = []
     private var needsHistoryReplay = false
@@ -845,6 +854,7 @@ public final class TerminalSurface: NSObject, Surface {
         guard force || size != terminalSize else { return }
         terminalSize = size
         renderer.resize(rows: size.rows, cols: size.cols)
+        rendererMutationCount &+= 1
         if sendToPTY, masterFD >= 0 {
             _ = rc2_set_winsize(masterFD, Int32(size.rows), Int32(size.cols))
         }
@@ -938,6 +948,7 @@ public final class TerminalSurface: NSObject, Surface {
         outputBus.emit(descriptor.id, data)
         if renderAllowedAtRead {
             renderer.feed(data)
+            rendererMutationCount &+= 1
         } else {
             // Surface is hidden: buffer bytes so the renderer can be healed on
             // reveal. Cap the buffer to avoid unbounded growth during long hidden
@@ -970,6 +981,7 @@ public final class TerminalSurface: NSObject, Surface {
         enqueueHistory(data)
         recordOutputTelemetry(bytes: data.count)
         renderer.feed(data)
+        rendererMutationCount &+= 1
         lastOutputAt = Date()
         outputBus.emit(descriptor.id, data)
         if renderDiagnostics().canRender {
@@ -1175,7 +1187,18 @@ public final class TerminalSurface: NSObject, Surface {
 
     public func readTextSnapshot() -> TerminalTextSnapshot {
         if !isVisible && outputPendingBytes > 0 {
-            return TerminalTextSnapshot(
+            // Hidden-output fallback: only the renderer is authoritative here.
+            // The viewport key in this branch is always nil (we skip ghostty read).
+            if let cached = cachedTextSnapshot,
+               Self.snapshotCacheValid(
+                   rendererVersion: rendererMutationCount,
+                   cachedVersion: cached.rendererVersion,
+                   viewportText: nil,
+                   cachedViewportText: cached.viewportText
+               ) {
+                return cached.value
+            }
+            let snap = TerminalTextSnapshot(
                 text: renderer.snapshot().string,
                 ansiText: renderer.ansiSnapshot(includeScrollback: true),
                 complete: false,
@@ -1187,9 +1210,25 @@ public final class TerminalSurface: NSObject, Surface {
                 cols: terminalSize.cols,
                 renderDiagnostics: renderDiagnostics()
             )
+            cachedTextSnapshot = (rendererMutationCount, nil, snap)
+            return snap
+        }
+        // Read the ghostty viewport text first (cheap when there is no pending
+        // output — just reads the existing rendered frame). We need the value
+        // before the cache check because it is the viewport-side cache key.
+        let currentViewportText = ghosttyView.readViewportText()
+        if let cached = cachedTextSnapshot,
+           Self.snapshotCacheValid(
+               rendererVersion: rendererMutationCount,
+               cachedVersion: cached.rendererVersion,
+               viewportText: currentViewportText,
+               cachedViewportText: cached.viewportText
+           ) {
+            return cached.value
         }
         let diagnostics = renderDiagnostics()
-        if let text = ghosttyView.readViewportText() {
+        let snap: TerminalTextSnapshot
+        if let text = currentViewportText {
             let rendererText = renderer.snapshot().string
             let complete = diagnostics.canRender && Self.readTextComplete(
                 outputPartial: outputPartial,
@@ -1203,7 +1242,7 @@ public final class TerminalSurface: NSObject, Surface {
                 renderBlockedReason: diagnostics.blockedReason
             )
             if Self.shouldPreferRendererSnapshotForReadText(viewportText: text, rendererText: rendererText) {
-                return TerminalTextSnapshot(
+                snap = TerminalTextSnapshot(
                     text: rendererText,
                     ansiText: renderer.ansiSnapshot(includeScrollback: true),
                     complete: complete,
@@ -1215,36 +1254,73 @@ public final class TerminalSurface: NSObject, Surface {
                     cols: terminalSize.cols,
                     renderDiagnostics: diagnostics
                 )
+            } else {
+                snap = TerminalTextSnapshot(
+                    text: text,
+                    ansiText: renderer.ansiSnapshot(matchingVisibleText: text),
+                    complete: complete,
+                    source: "ghostty_viewport",
+                    timestamp: Date(),
+                    partialReason: partialReason,
+                    pendingBytes: outputPendingBytes,
+                    rows: terminalSize.rows,
+                    cols: terminalSize.cols,
+                    renderDiagnostics: diagnostics
+                )
             }
-            return TerminalTextSnapshot(
-                text: text,
-                ansiText: renderer.ansiSnapshot(matchingVisibleText: text),
-                complete: complete,
-                source: "ghostty_viewport",
+        } else {
+            snap = TerminalTextSnapshot(
+                text: renderer.snapshot().string,
+                ansiText: renderer.ansiSnapshot(includeScrollback: true),
+                complete: false,
+                source: "ansi_fallback",
                 timestamp: Date(),
-                partialReason: partialReason,
+                partialReason: "ghostty_unavailable",
                 pendingBytes: outputPendingBytes,
                 rows: terminalSize.rows,
                 cols: terminalSize.cols,
                 renderDiagnostics: diagnostics
             )
         }
-        return TerminalTextSnapshot(
-            text: renderer.snapshot().string,
-            ansiText: renderer.ansiSnapshot(includeScrollback: true),
-            complete: false,
-            source: "ansi_fallback",
-            timestamp: Date(),
-            partialReason: "ghostty_unavailable",
-            pendingBytes: outputPendingBytes,
-            rows: terminalSize.rows,
-            cols: terminalSize.cols,
-            renderDiagnostics: diagnostics
-        )
+        cachedTextSnapshot = (rendererMutationCount, currentViewportText, snap)
+        return snap
     }
 
     static func readTextComplete(outputPartial: Bool, outputPendingBytes: Int, historyWriteFailures: Int) -> Bool {
         !outputPartial && outputPendingBytes == 0 && historyWriteFailures == 0
+    }
+
+    /// Pure cache-validity decision for `readTextSnapshot()`.
+    ///
+    /// Returns `true` only when BOTH the renderer AND the ghostty viewport text
+    /// are unchanged since the snapshot was last built, so the cached value can
+    /// be returned without rebuilding.
+    ///
+    /// Design rationale:
+    /// - `rendererVersion` tracks every `renderer.feed()` / `renderer.resize()`
+    ///   call inside TerminalSurface, giving us a cheap per-mutation signal
+    ///   without touching ANSIRenderer's private `contentVersion`.
+    /// - `viewportText` is the full string returned by `ghosttyView.readViewportText()`
+    ///   on the last build. Viewport text changes independently of the renderer
+    ///   (e.g. Ghostty scrolls or repaints while the ANSIRenderer version is
+    ///   unchanged), so a renderer-version-only key would return stale viewport
+    ///   text. Storing the full string and checking equality is O(n) in text
+    ///   length but is only paid on actual `readTextSnapshot()` calls — not on
+    ///   every byte of output.
+    /// - A `nil` viewportText means "ghostty returned nil on the last build"
+    ///   (surface not ready / no live surface). Cache is valid only when the
+    ///   current ghostty text is also nil — the moment ghostty becomes available
+    ///   the viewport key diverges and the cache is rebuilt.
+    ///
+    /// Staleness guarantee: if either signal changes, this returns `false` and
+    /// the caller must rebuild. It never returns `true` for a stale result.
+    nonisolated static func snapshotCacheValid(
+        rendererVersion: UInt64,
+        cachedVersion: UInt64,
+        viewportText: String?,
+        cachedViewportText: String?
+    ) -> Bool {
+        rendererVersion == cachedVersion && viewportText == cachedViewportText
     }
 
     static func readTextPartialReason(outputPartial: Bool, outputPendingBytes: Int, historyWriteFailures: Int, renderBlockedReason: String? = nil) -> String? {
@@ -1523,6 +1599,7 @@ public final class TerminalSurface: NSObject, Surface {
         hiddenRendererBufferOverflowed = false
         if let replay = Self.hiddenRendererHealPlan(buffer: healBuffer, overflowed: healOverflowed) {
             renderer.feed(replay)
+            rendererMutationCount &+= 1
         }
         readerAllowsRender = true
         ghosttyView.setOcclusion(visible: true)
