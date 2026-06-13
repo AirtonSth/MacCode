@@ -3142,8 +3142,8 @@ private func terminalHealthJSON(_ health: TerminalRuntimeHealth) -> JSONValue {
     ])
 }
 
-private func terminalSnapshotJSON(_ snapshot: TerminalTextSnapshot) -> JSONValue {
-    .object([
+func terminalSnapshotJSON(_ snapshot: TerminalTextSnapshot) -> JSONValue {
+    var fields: [String: JSONValue] = [
         "text": .string(snapshot.text),
         "ansi_text": snapshot.ansiText.map { .string($0) } ?? .null,
         "complete": .bool(snapshot.complete),
@@ -3155,7 +3155,14 @@ private func terminalSnapshotJSON(_ snapshot: TerminalTextSnapshot) -> JSONValue
         "rows": .number(Double(snapshot.rows)),
         "cols": .number(Double(snapshot.cols)),
         "render_diagnostics": snapshot.renderDiagnostics.map(terminalRenderDiagnosticsJSON) ?? .null
-    ])
+    ]
+    // Emit `ansi_palette` ONLY for a custom theme. A nil palette (default
+    // theme) omits the key entirely so the payload is byte-identical to
+    // before this seam existed (back-compat).
+    if let palette = snapshot.ansiPalette {
+        fields["ansi_palette"] = .array(palette.map { .string($0) })
+    }
+    return .object(fields)
 }
 
 private func terminalRenderDiagnosticsJSON(_ diagnostics: TerminalRenderDiagnostics) -> JSONValue {

@@ -57,4 +57,40 @@ public enum ANSIPaletteMapper {
         }
         return (basic, bright)
     }
+
+    // MARK: - Wire encoding (mirror palette serialization)
+
+    /// Encode a single NSColor as a lowercase `#rrggbb` hex string from its
+    /// sRGB channels. Pure; no AppKit runloop needed.
+    static func hex(_ color: NSColor) -> String {
+        let c = color.usingColorSpace(.sRGB) ?? color
+        let r = Int((c.redComponent * 255.0).rounded())
+        let g = Int((c.greenComponent * 255.0).rounded())
+        let b = Int((c.blueComponent * 255.0).rounded())
+        func clamp(_ v: Int) -> Int { max(0, min(255, v)) }
+        return String(format: "#%02x%02x%02x", clamp(r), clamp(g), clamp(b))
+    }
+
+    /// The default 16-entry palette (basic 0-7 then bright 8-15) as `#rrggbb`.
+    /// Used as the omission baseline: a resolved palette equal to this is the
+    /// built-in default, so the wire payload omits `ansi_palette` entirely.
+    public static let defaultPaletteHex: [String] =
+        (defaultBasic + defaultBright).map(hex)
+
+    /// Resolve `theme` into a complete 16-entry `#rrggbb` palette and return it
+    /// ONLY when it differs from the built-in default. Returns `nil` for a nil
+    /// theme or for a theme whose resolved 16 colors equal the default palette,
+    /// so default themes serialize no `ansi_palette` (back-compat: a nil here
+    /// renders byte-identical to before this seam existed).
+    ///
+    /// WHY: the iOS mirror keeps its own hardcoded default palette. Sending the
+    /// default would be redundant bytes and would force iOS down the
+    /// custom-palette path for users who never changed their theme. We only
+    /// transmit a palette when it is genuinely custom.
+    public static func customPaletteHex(from theme: ANSIThemeColors?) -> [String]? {
+        guard let theme else { return nil }
+        let (basic, bright) = palette(from: theme)
+        let resolved = (basic + bright).map(hex)
+        return resolved == defaultPaletteHex ? nil : resolved
+    }
 }

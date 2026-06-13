@@ -1273,7 +1273,7 @@ public final class TerminalSurface: NSObject, Surface {
                ) {
                 return cached.value
             }
-            let snap = TerminalTextSnapshot(
+            var snap = TerminalTextSnapshot(
                 text: renderer.snapshot().string,
                 ansiText: renderer.ansiSnapshot(includeScrollback: true),
                 complete: false,
@@ -1285,6 +1285,7 @@ public final class TerminalSurface: NSObject, Surface {
                 cols: terminalSize.cols,
                 renderDiagnostics: renderDiagnostics()
             )
+            snap.ansiPalette = resolvedCustomPaletteHex()
             cachedTextSnapshot = (rendererMutationCount, nil, snap)
             return snap
         }
@@ -1302,7 +1303,7 @@ public final class TerminalSurface: NSObject, Surface {
             return cached.value
         }
         let diagnostics = renderDiagnostics()
-        let snap: TerminalTextSnapshot
+        var snap: TerminalTextSnapshot
         if let text = currentViewportText {
             let rendererText = renderer.snapshot().string
             let complete = diagnostics.canRender && Self.readTextComplete(
@@ -1357,8 +1358,17 @@ public final class TerminalSurface: NSObject, Surface {
                 renderDiagnostics: diagnostics
             )
         }
+        snap.ansiPalette = resolvedCustomPaletteHex()
         cachedTextSnapshot = (rendererMutationCount, currentViewportText, snap)
         return snap
+    }
+
+    /// Resolve the active Ghostty theme's 16-entry ANSI palette as `#rrggbb`
+    /// hex strings, or `nil` when the theme is the built-in default (so the
+    /// snapshot omits `ansi_palette` and iOS uses its own default). Pure beyond
+    /// the Ghostty config read.
+    private func resolvedCustomPaletteHex() -> [String]? {
+        ANSIPaletteMapper.customPaletteHex(from: GhosttyTerminalView.resolvedANSIThemeColors())
     }
 
     static func readTextComplete(outputPartial: Bool, outputPendingBytes: Int, historyWriteFailures: Int) -> Bool {

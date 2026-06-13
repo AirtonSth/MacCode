@@ -35,6 +35,12 @@ public struct TerminalRuntimeHealth: Sendable, Equatable {
 public struct TerminalTextSnapshot: Sendable, Equatable {
     public var text: String
     public var ansiText: String? = nil
+    /// Resolved 16-entry ANSI palette (indices 0-15) as `#rrggbb` hex strings,
+    /// populated ONLY when the active Ghostty theme differs from the built-in
+    /// default palette. `nil` means "default palette" -- iOS renders with its
+    /// own hardcoded default, so a nil here is byte-identical to before this
+    /// field existed (back-compat). Serialized as `ansi_palette` only when set.
+    public var ansiPalette: [String]? = nil
     public var complete: Bool
     public var source: String
     public var timestamp: Date
