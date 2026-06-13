@@ -137,4 +137,33 @@ final class LifecycleLogRotationTests: XCTestCase {
             "lifecycle.log.1 must NOT exist when the log has not reached the rotation cap - premature rotation discards forensic data"
         )
     }
+
+    func test_recorder_diskUsageStaysBoundedUnderSustainedWrites() throws {
+        // QA-mac:82(c) log-size budget. Without rotation a long-lived process would
+        // grow lifecycle.log without bound. Write far past a small cap and assert the
+        // on-disk footprint stays bounded: (1) the LIVE log never exceeds cap + one
+        // max line, and (2) only ONE backup generation is ever kept (no .2/.3), so
+        // total disk usage is bounded by ~2x cap regardless of how many events arrive.
+        let cap = 256
+        let (recorder, dir) = makeRecorder(cap: cap)
+        let logURL = dir.appendingPathComponent("lifecycle.log")
+
+        // ~80 records of a fixed-width event; each line is well under the cap, so
+        // this forces many rotations (total bytes >> cap).
+        for i in 0..<80 { recorder.record("sustained_event_\(String(format: "%03d", i))") }
+
+        let liveSize = (try FileManager.default.attributesOfItem(atPath: logURL.path)[.size] as? Int) ?? -1
+        XCTAssertGreaterThanOrEqual(liveSize, 0, "live lifecycle.log must exist after sustained writes")
+        // Rotation fires BEFORE an append once size >= cap, so the live file can hold
+        // at most (cap - 1) carried bytes plus one freshly written line.
+        let maxLineBytes = 512
+        XCTAssertLessThanOrEqual(
+            liveSize, cap + maxLineBytes,
+            "live lifecycle.log must stay bounded by the rotation cap (+ one line); an unbounded live log defeats the disk budget")
+
+        // Only one backup generation is retained: .1 may exist, .2 must never.
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: dir.appendingPathComponent("lifecycle.log.2").path),
+            "only a single .1 backup generation may be kept; a second generation would let disk usage grow unbounded")
+    }
 }
