@@ -178,6 +178,28 @@ final class AgentAppQueuedMessageAndHelperTests: XCTestCase {
                        "forceQueuedMessageNow while running must surface a confirmation message")
     }
 
+    func test_reorderQueuedMessage_persistsPositionsAndReloadsInNewOrder() throws {
+        // WHY: drag reordering is not just a transient UI sort. The DB positions
+        // decide what runs next after a reload or app restart, so every message
+        // must be upserted with a contiguous position after onMove.
+        let (vm, repo) = try makeVM(withQueue: true)
+        let queuedRepo = try XCTUnwrap(repo)
+        vm.createThread(title: "t")
+        let threadId = try XCTUnwrap(vm.selectedThreadId)
+        try queuedRepo.upsert(AgentQueuedMessage(threadId: threadId, text: "first", position: 1))
+        try queuedRepo.upsert(AgentQueuedMessage(threadId: threadId, text: "second", position: 2))
+        try queuedRepo.upsert(AgentQueuedMessage(threadId: threadId, text: "third", position: 3))
+        vm.reloadQueuedMessages()
+
+        vm.reorderQueuedMessage(from: IndexSet(integer: 0), to: 3)
+
+        let reloaded = try queuedRepo.list(threadId: threadId)
+        XCTAssertEqual(reloaded.map(\.text), ["second", "third", "first"],
+                       "dragging the first queued message to the end must persist the new DB order")
+        XCTAssertEqual(reloaded.map(\.position), [1, 2, 3],
+                       "persisted queue positions must be rewritten contiguously after reorder so future enqueues and reloads stay deterministic")
+    }
+
     // MARK: - T019-T021: lastErrorRecoverable state machine
 
     func test_lastErrorRecoverable_setTrueOnRecoverableError() async throws {

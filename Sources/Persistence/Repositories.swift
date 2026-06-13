@@ -467,7 +467,7 @@ public final class AgentQueuedMessageRepository {
         let st = try db.prepare("""
             INSERT INTO agent_queued_messages(id, thread_id, text, attachments_json, interaction_mode, position, created_at, updated_at)
             VALUES(?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(id) DO UPDATE SET text=excluded.text, attachments_json=excluded.attachments_json, interaction_mode=excluded.interaction_mode, updated_at=excluded.updated_at;
+            ON CONFLICT(id) DO UPDATE SET text=excluded.text, attachments_json=excluded.attachments_json, interaction_mode=excluded.interaction_mode, position=excluded.position, updated_at=excluded.updated_at;
         """)
         try st.bind(1, message.id.value.uuidString)
         try st.bind(2, message.threadId.value.uuidString)
