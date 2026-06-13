@@ -67,6 +67,11 @@ public final class PaneTabsView: NSObject {
     // UX-P3: holds the surface ID shown in a missing-surface placeholder so
     // the "Close Tab" recovery button can route through closeSurface.
     private var pendingMissingSurfaceID: SurfaceID?
+    // PERF: cache for files-tab dirty state resolved asynchronously.
+    // Key present => state known (true=dirty). Key absent => unknown (async resolve pending or not yet triggered).
+    // Staleness window: up to one event-loop turn after tab construction before the async RPC result arrives
+    // and updates the button; subsequent updates arrive via files.state.updated events (no polling needed).
+    private var dirtyStateCache: [SurfaceID: Bool] = [:]
 
     public init(pane: PaneNode, router: AppCommandRouter?, showsWorkspaceControls: Bool = true, splitContext: PaneSplitContext? = nil, workspaceID: WorkspaceID? = nil) {
         self.pane = pane
@@ -554,21 +559,58 @@ public final class PaneTabsView: NSObject {
         return pane.surfaces[pane.surfaces.index(after: index)...].map(\.id)
     }
 
+    /// PERF: pure seam for the synchronous dirty-state decision.
+    /// Returns the known dirty state without issuing any RPC.
+    /// - isDirty: the descriptor's isDirty flag (always trusted).
+    /// - metadataDirtyCount: the descriptor's "dirty_count" metadata string, or nil when absent.
+    /// - cachedDirty: last async-resolved value for this surface, or nil when unknown.
+    /// WHY: sync RPC x tabs x rebuilds = main-thread stall on every tab operation;
+    /// extracting this seam lets callers (and tests) reason about the decision without
+    /// triggering IO. nil return means "state unknown -- trigger async resolve".
+    nonisolated static func dirtyStateForTab(isDirty: Bool, metadataDirtyCount: String?, cachedDirty: Bool?) -> Bool? {
+        if isDirty { return true }
+        if let raw = metadataDirtyCount { return (Int(raw) ?? 0) > 0 }
+        return cachedDirty // nil => unknown; caller must async-resolve
+    }
+
     private func surfaceIsUnsaved(_ id: SurfaceID) -> Bool {
-        if let desc = pane.surfaces.first(where: { $0.id == id }) {
-            if desc.isDirty { return true }
-            // PERF-MAC_SHELL_WINDOW-006: trust the dirty_count streamed via
-            // `files.state.updated` when present (even "0") instead of a
-            // synchronous per-tab RPC. Only when the descriptor carries no
-            // dirty_count at all (state unknown) do we fall back to the RPC.
-            if let raw = desc.metadata["dirty_count"] {
-                return (Int(raw) ?? 0) > 0
+        guard let desc = pane.surfaces.first(where: { $0.id == id }) else { return false }
+        // Fast path: pure decision from descriptor flags + cache. No RPC.
+        if let known = Self.dirtyStateForTab(
+            isDirty: desc.isDirty,
+            metadataDirtyCount: desc.metadata["dirty_count"],
+            cachedDirty: dirtyStateCache[id]
+        ) { return known }
+        // State unknown (files tab, no dirty_count metadata, no cached value).
+        // Return false now; trigger async resolve to update cache + button.
+        guard desc.type == .files else { return false }
+        scheduleAsyncDirtyResolve(id)
+        return false
+    }
+
+    /// Fires the RPC off the main thread, caches the result, and patches the
+    /// tab button on the MainActor. Safe to call from init context: the Task
+    /// captures only [weak self] so it cannot extend PaneTabsView lifetime.
+    private func scheduleAsyncDirtyResolve(_ id: SurfaceID) {
+        guard let router else { return }
+        Task { [weak self] in
+            let isDirty: Bool
+            do {
+                let state = try router.filesStateGet(surface: id).objectValue
+                if case .array(let values) = state?["dirty_paths"] ?? .array([]) {
+                    isDirty = values.contains { $0.stringValue != nil }
+                } else {
+                    isDirty = false
+                }
+            } catch {
+                isDirty = false
             }
-            guard desc.type == .files else { return false }
+            await MainActor.run { [weak self] in
+                guard let self else { return }
+                self.dirtyStateCache[id] = isDirty
+                self.tabButtons[id]?.setDirty(isDirty)
+            }
         }
-        guard let state = try? router?.filesStateGet(surface: id).objectValue,
-              case .array(let values) = state["dirty_paths"] ?? .array([]) else { return false }
-        return values.contains { $0.stringValue != nil }
     }
 
     private func confirmCloseUnsavedSurface(_ id: SurfaceID) -> Bool {
@@ -588,10 +630,11 @@ public final class PaneTabsView: NSObject {
               let raw = payload["surface_id"]?.stringValue,
               let uuid = UUID(uuidString: raw) else { return }
         let surfaceID = SurfaceID(uuid)
-        guard let tab = tabButtons[surfaceID],
-              let state = payload["state"]?.objectValue,
+        guard let state = payload["state"]?.objectValue,
               case .array(let values) = state["dirty_paths"] ?? .array([]) else { return }
-        tab.setDirty(values.contains { $0.stringValue != nil })
+        let isDirty = values.contains { $0.stringValue != nil }
+        dirtyStateCache[surfaceID] = isDirty
+        tabButtons[surfaceID]?.setDirty(isDirty)
     }
 
     func refreshBusyStates() {
