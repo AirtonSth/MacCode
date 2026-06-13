@@ -50,6 +50,164 @@ public struct PrivatePushDeliveryResult: Codable, Equatable, Sendable {
     public let shouldDropSubscription: Bool
 }
 
+// MARK: - Live Activity push content-state contract (host <-> iOS)
+//
+// CONTRACT PIN: an APNs Live Activity push carries a `content-state` dictionary
+// that the iOS ActivityKit runtime decodes DIRECTLY into the on-device
+// `RemoteCodeActivityAttributes.ContentState` via that struct's synthesized
+// `Codable`. The keys below MUST therefore match that struct's stored-property
+// names exactly (title, statusLine, preview, phase, activeThreadCount,
+// updatedAt, runStartDate?, workspaceId?, threadId?). `phase` is the raw
+// ThreadLiveActivityPhase string ("running" / "completed" / "failed"). This is
+// the single schema both platforms agree on; the older chatId/chatTitle/
+// elapsedSeconds shape (T025) is retired in favour of this one.
+public struct PrivateLiveActivityContentState: Codable, Equatable, Sendable {
+    public let title: String
+    public let statusLine: String
+    public let preview: String
+    /// "running" | "completed" | "failed" -- the ThreadLiveActivityPhase raw value.
+    public let phase: String
+    public let activeThreadCount: Int
+    /// Seconds since 1970 (UNIX epoch) so JS/native backends and the iOS decode
+    /// agree on a single absolute time base regardless of JSONEncoder defaults.
+    public let updatedAt: Double
+    /// Run start (seconds since 1970) when a single thread is active; nil otherwise.
+    public let runStartDate: Double?
+    public let workspaceId: String?
+    public let threadId: String?
+
+    public init(
+        title: String,
+        statusLine: String,
+        preview: String,
+        phase: String,
+        activeThreadCount: Int,
+        updatedAt: Double,
+        runStartDate: Double? = nil,
+        workspaceId: String? = nil,
+        threadId: String? = nil
+    ) {
+        self.title = title
+        self.statusLine = statusLine
+        self.preview = preview
+        self.phase = phase
+        self.activeThreadCount = activeThreadCount
+        self.updatedAt = updatedAt
+        self.runStartDate = runStartDate
+        self.workspaceId = workspaceId
+        self.threadId = threadId
+    }
+}
+
+/// Host-side equivalent of the iOS `ThreadLiveActivitySnapshot`: the minimal,
+/// pure input the host has at a run-lifecycle boundary, from which the
+/// Live Activity push payload (`PrivateLiveActivityContentState`) is built.
+public struct PrivateLiveActivitySnapshot: Equatable, Sendable {
+    public let title: String
+    public let statusLine: String
+    public let preview: String
+    public let phase: String
+    public let activeThreadCount: Int
+    public let updatedAt: Date
+    public let runStartDate: Date?
+    public let workspaceId: String?
+    public let threadId: String?
+
+    public init(
+        title: String,
+        statusLine: String,
+        preview: String,
+        phase: String,
+        activeThreadCount: Int,
+        updatedAt: Date,
+        runStartDate: Date? = nil,
+        workspaceId: String? = nil,
+        threadId: String? = nil
+    ) {
+        self.title = title
+        self.statusLine = statusLine
+        self.preview = preview
+        self.phase = phase
+        self.activeThreadCount = activeThreadCount
+        self.updatedAt = updatedAt
+        self.runStartDate = runStartDate
+        self.workspaceId = workspaceId
+        self.threadId = threadId
+    }
+
+    /// Pure payload builder (the host-side seam unit-tested in isolation):
+    /// projects this snapshot into the wire content-state both platforms decode.
+    public func contentState() -> PrivateLiveActivityContentState {
+        PrivateLiveActivityContentState(
+            title: title,
+            statusLine: statusLine,
+            preview: preview,
+            phase: phase,
+            activeThreadCount: activeThreadCount,
+            updatedAt: updatedAt.timeIntervalSince1970,
+            runStartDate: runStartDate?.timeIntervalSince1970,
+            workspaceId: workspaceId,
+            threadId: threadId
+        )
+    }
+
+    /// Maps a terminal `AgentRunStatus` to a running/terminal Live Activity
+    /// snapshot, reusing the same English copy the alert path ships. Returns nil
+    /// for non-terminal phases (pending/running) so only real lifecycle ends
+    /// fire a terminal Live Activity push.
+    public static func terminal(
+        threadId: String,
+        title: String?,
+        phase: AgentRunStatus,
+        now: Date = Date()
+    ) -> PrivateLiveActivitySnapshot? {
+        let normalizedTitle = title?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let displayTitle = (normalizedTitle?.isEmpty == false) ? normalizedTitle! : "Thread"
+        let mappedPhase: String
+        let statusLine: String
+        let previewSuffix: String
+        switch phase {
+        case .completed:
+            mappedPhase = "completed"
+            statusLine = "Finished"
+            previewSuffix = "response is ready."
+        case .cancelled:
+            mappedPhase = "failed"
+            statusLine = "Stopped"
+            previewSuffix = "was stopped."
+        case .interrupted:
+            mappedPhase = "failed"
+            statusLine = "Interrupted"
+            previewSuffix = "was interrupted."
+        case .failed:
+            mappedPhase = "failed"
+            statusLine = "Failed"
+            previewSuffix = "ended with an error."
+        case .pending, .running:
+            return nil
+        }
+        return PrivateLiveActivitySnapshot(
+            title: displayTitle,
+            statusLine: statusLine,
+            preview: "\(displayTitle) \(previewSuffix)",
+            phase: mappedPhase,
+            activeThreadCount: 0,
+            updatedAt: now,
+            workspaceId: nil,
+            threadId: threadId
+        )
+    }
+}
+
+/// Idempotency-key namespace for Live Activity pushes, parallel to the
+/// `thread.<id>.<outcome>` keys the alert path uses. Kept distinct so a Live
+/// Activity update and an alert for the same run never collide on the backend.
+public enum PrivateLiveActivityEvent: String, Sendable {
+    case start
+    case update
+    case end
+}
+
 public protocol PrivateAccountAPI: Sendable {
     func login(email: String, password: String) async throws -> PrivateAccountSession
     func currentUser(accessToken: String) async throws -> PrivateAccountUser
@@ -58,6 +216,7 @@ public protocol PrivateAccountAPI: Sendable {
     func billingOverview(accessToken: String) async throws -> PrivateBillingOverview
     func createPortal(accessToken: String) async throws -> URL
     func deliverAlert(accessToken: String, title: String, body: String, pushToken: String, pushTokenType: String, idempotencyKey: String) async throws -> PrivatePushDeliveryResult
+    func deliverLiveActivity(accessToken: String, event: String, contentState: PrivateLiveActivityContentState, liveActivityToken: String, pushToken: String, pushTokenType: String, idempotencyKey: String) async throws -> PrivatePushDeliveryResult
 }
 
 public enum PrivateAccountAPIError: Error, Equatable {
@@ -121,6 +280,37 @@ public final class URLSessionPrivateAccountAPI: PrivateAccountAPI, @unchecked Se
             method: "POST",
             accessToken: accessToken,
             body: Body(body: body, pushToken: pushToken, pushTokenType: pushTokenType, title: title),
+            idempotencyKey: idempotencyKey
+        )
+    }
+
+    public func deliverLiveActivity(
+        accessToken: String,
+        event: String,
+        contentState: PrivateLiveActivityContentState,
+        liveActivityToken: String,
+        pushToken: String,
+        pushTokenType: String,
+        idempotencyKey: String
+    ) async throws -> PrivatePushDeliveryResult {
+        struct Body: Encodable {
+            let contentState: PrivateLiveActivityContentState
+            let event: String
+            let liveActivityToken: String
+            let pushToken: String
+            let pushTokenType: String
+        }
+        return try await request(
+            path: "/v1/private/push-notification/deliver",
+            method: "POST",
+            accessToken: accessToken,
+            body: Body(
+                contentState: contentState,
+                event: event,
+                liveActivityToken: liveActivityToken,
+                pushToken: pushToken,
+                pushTokenType: pushTokenType
+            ),
             idempotencyKey: idempotencyKey
         )
     }
@@ -275,6 +465,40 @@ public final class PrivateNotificationBridge: @unchecked Sendable {
             }
         } catch {
             Self.log.error("Private push delivery failed: \(String(describing: error), privacy: .public)")
+            return
+        }
+    }
+
+    /// Delivers a Live Activity content-state push for a run-lifecycle boundary,
+    /// mirroring `deliver(_:)`. Requires the paired iOS device to have registered
+    /// a `liveActivityToken` (start-token) via `privatePushTokenUpdate`; without
+    /// one there is no activity to address, so the push is skipped. The
+    /// `idempotencyKey` namespaces the event (start/update/end) so a Live Activity
+    /// push never collides with the alert for the same run.
+    public func deliverLiveActivity(
+        snapshot: PrivateLiveActivitySnapshot,
+        event: PrivateLiveActivityEvent,
+        idempotencyKey: String
+    ) async {
+        guard let session = accountStore.load(), session.user.subscribed,
+              let target = pushTargetStore.load(),
+              let liveActivityToken = target.liveActivityToken,
+              !liveActivityToken.isEmpty else { return }
+        do {
+            let result = try await api.deliverLiveActivity(
+                accessToken: session.accessToken,
+                event: event.rawValue,
+                contentState: snapshot.contentState(),
+                liveActivityToken: liveActivityToken,
+                pushToken: target.pushToken,
+                pushTokenType: target.pushTokenType,
+                idempotencyKey: idempotencyKey
+            )
+            if result.shouldDropSubscription {
+                pushTargetStore.clear()
+            }
+        } catch {
+            Self.log.error("Private live-activity delivery failed: \(String(describing: error), privacy: .public)")
             return
         }
     }

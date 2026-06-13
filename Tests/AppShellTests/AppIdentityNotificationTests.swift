@@ -309,6 +309,115 @@ final class AppIdentityNotificationTests: XCTestCase {
                        "terminal outcome notifications must be sent to the private backend with the paired iOS push target")
     }
 
+    func testLiveActivitySnapshotContentStateMatchesOnDeviceSchemaKeys() throws {
+        let updated = Date(timeIntervalSince1970: 1_800)
+        let started = Date(timeIntervalSince1970: 1_500)
+        let snapshot = PrivateLiveActivitySnapshot(
+            title: "Release prep",
+            statusLine: "1 active thread",
+            preview: "Release prep",
+            phase: "running",
+            activeThreadCount: 1,
+            updatedAt: updated,
+            runStartDate: started,
+            workspaceId: "ws-1",
+            threadId: "t-1"
+        )
+
+        let state = snapshot.contentState()
+        XCTAssertEqual(state.title, "Release prep")
+        XCTAssertEqual(state.phase, "running")
+        XCTAssertEqual(state.activeThreadCount, 1)
+        XCTAssertEqual(state.updatedAt, 1_800)
+        XCTAssertEqual(state.runStartDate, 1_500)
+
+        // The wire content-state is decoded by iOS ActivityKit directly into
+        // RemoteCodeActivityAttributes.ContentState, so the JSON keys MUST be
+        // exactly that struct's stored-property names. A rename on either side
+        // breaks Live Activity push decode -- this pins the contract.
+        let json = try JSONSerialization.jsonObject(with: try JSONEncoder().encode(state)) as? [String: Any]
+        XCTAssertEqual(Set((json ?? [:]).keys),
+                       ["title", "statusLine", "preview", "phase", "activeThreadCount", "updatedAt", "runStartDate", "workspaceId", "threadId"],
+                       "Live Activity push content-state keys must match the on-device ContentState schema both platforms decode")
+    }
+
+    func testLiveActivityTerminalSnapshotMapsRunOutcomeAndSkipsNonTerminalPhases() {
+        XCTAssertNil(PrivateLiveActivitySnapshot.terminal(threadId: "t1", title: "Build fix", phase: .running),
+                     "only real run-lifecycle ends fire a terminal Live Activity push")
+
+        let completed = PrivateLiveActivitySnapshot.terminal(threadId: "t1", title: "Build fix", phase: .completed)
+        XCTAssertEqual(completed?.phase, "completed")
+        XCTAssertEqual(completed?.statusLine, "Finished")
+        XCTAssertEqual(completed?.activeThreadCount, 0)
+        XCTAssertEqual(completed?.preview, "Build fix response is ready.")
+
+        let cancelled = PrivateLiveActivitySnapshot.terminal(threadId: "t1", title: "Build fix", phase: .cancelled)
+        XCTAssertEqual(cancelled?.phase, "failed",
+                       "the on-device ContentState only models running/completed/failed; cancelled maps to failed")
+    }
+
+    func testPrivateNotificationBridgeSendsLiveActivityThroughBackendWhenTokenPaired() async throws {
+        let dir = NSTemporaryDirectory() + "RC2LiveActivity-" + UUID().uuidString
+        let ctx = try AppContext(channel: .debug, appSupportOverride: dir)
+        let accountStore = PrivateAccountSessionStore(repo: ctx.settingsRepo)
+        let targetStore = PrivatePushTargetStore(repo: ctx.settingsRepo)
+        let api = RecordingPrivateAccountAPI()
+        accountStore.save(api.session)
+        targetStore.save(pushToken: "apns-token", pushTokenType: "apns", liveActivityToken: "activity-token", deviceId: "device-1")
+        let bridge = PrivateNotificationBridge(accountStore: accountStore, pushTargetStore: targetStore, api: api)
+
+        let snapshot = try XCTUnwrap(PrivateLiveActivitySnapshot.terminal(threadId: "thread-1", title: "Build fix", phase: .completed))
+        await bridge.deliverLiveActivity(snapshot: snapshot, event: .end, idempotencyKey: "activity.thread-1.end.completed")
+
+        XCTAssertEqual(api.liveActivityRequests.count, 1)
+        let req = try XCTUnwrap(api.liveActivityRequests.first)
+        XCTAssertEqual(req.accessToken, "access-token")
+        XCTAssertEqual(req.liveActivityToken, "activity-token")
+        XCTAssertEqual(req.pushToken, "apns-token")
+        XCTAssertEqual(req.event, "end")
+        XCTAssertEqual(req.idempotencyKey, "activity.thread-1.end.completed",
+                       "Live Activity idempotency keys must be namespaced so they never collide with the alert for the same run")
+        XCTAssertEqual(req.contentState.phase, "completed")
+        XCTAssertEqual(req.contentState.statusLine, "Finished")
+    }
+
+    func testPrivateNotificationBridgeSkipsLiveActivityWhenNoStartTokenPaired() async throws {
+        let dir = NSTemporaryDirectory() + "RC2LiveActivityNoTok-" + UUID().uuidString
+        let ctx = try AppContext(channel: .debug, appSupportOverride: dir)
+        let accountStore = PrivateAccountSessionStore(repo: ctx.settingsRepo)
+        let targetStore = PrivatePushTargetStore(repo: ctx.settingsRepo)
+        let api = RecordingPrivateAccountAPI()
+        accountStore.save(api.session)
+        // No liveActivityToken: there is no activity to address, so the push
+        // must be skipped rather than sent with an empty token.
+        targetStore.save(pushToken: "apns-token", pushTokenType: "apns", liveActivityToken: nil, deviceId: "device-1")
+        let bridge = PrivateNotificationBridge(accountStore: accountStore, pushTargetStore: targetStore, api: api)
+
+        let snapshot = try XCTUnwrap(PrivateLiveActivitySnapshot.terminal(threadId: "thread-1", title: "Build fix", phase: .completed))
+        await bridge.deliverLiveActivity(snapshot: snapshot, event: .end, idempotencyKey: "activity.thread-1.end.completed")
+
+        XCTAssertTrue(api.liveActivityRequests.isEmpty,
+                      "a Live Activity push with no paired start token must be skipped, not sent against a nil activity")
+    }
+
+    func testPrivateNotificationBridgeClearsTargetWhenLiveActivityBackendDropsSubscription() async throws {
+        let dir = NSTemporaryDirectory() + "RC2LiveActivityDrop-" + UUID().uuidString
+        let ctx = try AppContext(channel: .debug, appSupportOverride: dir)
+        let accountStore = PrivateAccountSessionStore(repo: ctx.settingsRepo)
+        let targetStore = PrivatePushTargetStore(repo: ctx.settingsRepo)
+        let api = RecordingPrivateAccountAPI()
+        api.liveActivityResult = PrivatePushDeliveryResult(delivered: false, errorCode: "apns/Unregistered", shouldDropSubscription: true)
+        accountStore.save(api.session)
+        targetStore.save(pushToken: "apns-token", pushTokenType: "apns", liveActivityToken: "activity-token", deviceId: "device-1")
+        let bridge = PrivateNotificationBridge(accountStore: accountStore, pushTargetStore: targetStore, api: api)
+
+        let snapshot = try XCTUnwrap(PrivateLiveActivitySnapshot.terminal(threadId: "thread-1", title: "Build fix", phase: .completed))
+        await bridge.deliverLiveActivity(snapshot: snapshot, event: .end, idempotencyKey: "activity.thread-1.end.completed")
+
+        XCTAssertNil(targetStore.load(),
+                     "a backend token-drop response on the Live Activity path must clear the stale push target, mirroring the alert path")
+    }
+
     func testStreamingErrorsDoNotEmitTerminalRunNotificationsBeforeFinish() async throws {
         let dir = NSTemporaryDirectory() + "RC2Notify-" + UUID().uuidString
         let ctx = try AppContext(channel: .debug, appSupportOverride: dir)
@@ -558,6 +667,8 @@ private final class RecordingPrivateAccountAPI: PrivateAccountAPI, @unchecked Se
     )
     var loginRequests: [[String: String]] = []
     var alertRequests: [(accessToken: String, title: String, body: String, pushToken: String, pushTokenType: String, idempotencyKey: String)] = []
+    var liveActivityRequests: [(accessToken: String, event: String, contentState: PrivateLiveActivityContentState, liveActivityToken: String, pushToken: String, pushTokenType: String, idempotencyKey: String)] = []
+    var liveActivityResult = PrivatePushDeliveryResult(delivered: true, errorCode: nil, shouldDropSubscription: false)
     var billingOverviewRequests: [String] = []
     var portalRequests: [String] = []
     var refreshRequests: [String] = []
@@ -620,5 +731,10 @@ private final class RecordingPrivateAccountAPI: PrivateAccountAPI, @unchecked Se
     func deliverAlert(accessToken: String, title: String, body: String, pushToken: String, pushTokenType: String, idempotencyKey: String) async throws -> PrivatePushDeliveryResult {
         alertRequests.append((accessToken, title, body, pushToken, pushTokenType, idempotencyKey))
         return PrivatePushDeliveryResult(delivered: true, errorCode: nil, shouldDropSubscription: false)
+    }
+
+    func deliverLiveActivity(accessToken: String, event: String, contentState: PrivateLiveActivityContentState, liveActivityToken: String, pushToken: String, pushTokenType: String, idempotencyKey: String) async throws -> PrivatePushDeliveryResult {
+        liveActivityRequests.append((accessToken, event, contentState, liveActivityToken, pushToken, pushTokenType, idempotencyKey))
+        return liveActivityResult
     }
 }

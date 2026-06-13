@@ -189,9 +189,35 @@ public final class AppContext {
             }
             return .object(payload)
         }
-        coordinator.onRunStarted = { tid, _ in
+        coordinator.onRunStarted = { [weak self] tid, _ in
             EventBus.shared.publish(kind: "agent.run.started",
                                     payload: agentRunPayload(threadId: tid))
+            // Fire a "running" Live Activity push so the paired iOS card starts
+            // (or refreshes) the moment a run begins, mirroring the alert path on
+            // completion. Skips silently when no live-activity token is paired.
+            guard let self else { return }
+            let title = (try? self.threadRepo.get(id: tid)?.title)?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let displayTitle = (title?.isEmpty == false) ? title! : "Thread"
+            let runStart = try? self.coordinator.runStartedAt(threadId: tid)
+            let snapshot = PrivateLiveActivitySnapshot(
+                title: displayTitle,
+                statusLine: "1 active thread",
+                preview: displayTitle,
+                phase: "running",
+                activeThreadCount: 1,
+                updatedAt: Date(),
+                runStartDate: runStart,
+                workspaceId: (try? self.threadRepo.get(id: tid)?.workspaceId)?.value.uuidString,
+                threadId: tid.value.uuidString
+            )
+            Task {
+                await self.privateNotificationBridge.deliverLiveActivity(
+                    snapshot: snapshot,
+                    event: .start,
+                    idempotencyKey: "activity.\(tid.value.uuidString).start"
+                )
+            }
         }
         coordinator.onMessageAppended = { message in
             EventBus.shared.publish(kind: "agent.message.appended", payload: messageJSON(message))
@@ -332,6 +358,22 @@ public final class AppContext {
                 SystemNotifier.shared.post(content)
                 Task {
                     await self.privateNotificationBridge.deliver(content)
+                }
+            }
+            // Terminal Live Activity push: end the paired iOS card with the run
+            // outcome (mid-session terminal update) so it stops showing a frozen
+            // "running" state. Non-terminal phases produce no snapshot.
+            if let endSnapshot = PrivateLiveActivitySnapshot.terminal(
+                threadId: tid.value.uuidString,
+                title: try? self.threadRepo.get(id: tid)?.title,
+                phase: status
+            ) {
+                Task {
+                    await self.privateNotificationBridge.deliverLiveActivity(
+                        snapshot: endSnapshot,
+                        event: .end,
+                        idempotencyKey: "activity.\(tid.value.uuidString).end.\(endSnapshot.phase)"
+                    )
                 }
             }
         }
