@@ -787,6 +787,29 @@ func filesRemoteUpdateDecision(
     return .conflictKeepLocal
 }
 
+struct FilesEditClosedUpdate: Equatable {
+    let dirtyPaths: Set<String>
+    let cachePathToRemove: String?
+    let shouldClearActiveSession: Bool
+}
+
+func filesEditClosedUpdate(
+    currentSessionID: String?,
+    currentDirtyPaths: Set<String>,
+    closedSessionID: String,
+    path: String?
+) -> FilesEditClosedUpdate {
+    var dirtyPaths = currentDirtyPaths
+    if let path {
+        dirtyPaths.remove(path)
+    }
+    return FilesEditClosedUpdate(
+        dirtyPaths: dirtyPaths,
+        cachePathToRemove: path,
+        shouldClearActiveSession: currentSessionID == closedSessionID
+    )
+}
+
 @MainActor
 private final class FilesViewModel: ObservableObject {
     @Published var currentDirectory = ""
@@ -1268,11 +1291,17 @@ private final class FilesViewModel: ObservableObject {
             // session the host no longer has (QA-MAC_FILES-007).
             guard payload["surface_id"]?.stringValue == surfaceID.value.uuidString,
                   let closedID = payload["session_id"]?.stringValue else { return }
-            if let path = payload["path"]?.stringValue {
-                dirtyPaths.remove(path)
+            let update = filesEditClosedUpdate(
+                currentSessionID: sessionID,
+                currentDirtyPaths: dirtyPaths,
+                closedSessionID: closedID,
+                path: payload["path"]?.stringValue
+            )
+            dirtyPaths = update.dirtyPaths
+            if let path = update.cachePathToRemove {
                 sessionCache.removeValue(forKey: path)
             }
-            if sessionID == closedID {
+            if update.shouldClearActiveSession {
                 sessionID = nil
                 sessionPath = nil
                 isDirty = false
