@@ -1,0 +1,40 @@
+name: Token Saver MLX live (Apple Silicon)
+
+# QA-mac:113 -- scheduled Apple-Silicon lane for the opt-in live MLX suites.
+# The job intentionally downloads/runs the approved model and asserts a memory
+# ceiling so the prior 21GB-growth class regresses loudly.
+
+on:
+  schedule:
+    - cron: '9 11 * * 1'
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'Sources/DistillCore/**'
+      - 'Sources/AgentRuntime/TokenSaverModel*.swift'
+      - 'Tests/DistillCoreTests/DistillLiveModelTests.swift'
+      - 'Tests/DistillCoreTests/DistillLivePerfTests.swift'
+      - 'Tests/DistillCoreTests/MLXHotPathSafetyTests.swift'
+      - '.github/workflows/token-saver-mlx-live-macos.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  mlx-live:
+    name: live MLX model/perf/RSS gate
+    runs-on: macos-14-xlarge
+    timeout-minutes: 90
+    env:
+      DEVELOPER_DIR: /Applications/Xcode.app/Contents/Developer
+      REMOTE_CODE_TOKEN_SAVER_LIVE_MODEL_TEST: '1'
+      REMOTE_CODE_TOKEN_SAVER_LIVE_MODEL_DIR: ${{ runner.temp }}/RemoteCodeTokenSaverLiveModel
+      REMOTE_CODE_TOKEN_SAVER_RSS_CEILING_GB: '21'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Require Apple Silicon runner
+        run: |
+          test "$(uname -m)" = "arm64"
+      - name: Run live MLX suites
+        run: swift test --filter 'DistillLiveModelTests|DistillLivePerfTests|MLXHotPathSafetyTests'
