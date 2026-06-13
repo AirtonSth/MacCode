@@ -201,6 +201,19 @@ public enum DistillError: Error, Sendable, Equatable {
     case emptyInput
     case queueFull
     case invalidOutput
+
+    /// The HTTP status + stable error code the distill service returns for this
+    /// error. Extracted as a pure seam (QA-mac:54) so the saturation wire contract
+    /// is testable without the MLX runtime: a bounded-worker overflow MUST surface
+    /// as 429 `queue_full`, which the managed CLI then fail-opens on (non-200 ->
+    /// echo stdin), so distill saturation never blocks an agent turn.
+    public var httpMapping: (status: Int, code: String) {
+        switch self {
+        case .emptyInput:   return (400, "empty_input")
+        case .queueFull:    return (429, "queue_full")
+        case .invalidOutput: return (502, "invalid_output")
+        }
+    }
 }
 
 public protocol DistillRuntime: Sendable {

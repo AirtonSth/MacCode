@@ -39,6 +39,38 @@ final class ManagedDistillCLITests: XCTestCase {
         XCTAssertEqual(out, raw)
     }
 
+    // MARK: - QA-mac:54 saturation -> 429 -> CLI fail-open chain
+
+    func test_distillErrorHttpMappingSeam() {
+        // The wire contract: a bounded-worker overflow is 429 queue_full; the other
+        // errors keep their distinct codes so the CLI fail-opens only on the right ones.
+        XCTAssertEqual(DistillError.queueFull.httpMapping.status, 429)
+        XCTAssertEqual(DistillError.queueFull.httpMapping.code, "queue_full")
+        XCTAssertEqual(DistillError.emptyInput.httpMapping.status, 400)
+        XCTAssertEqual(DistillError.invalidOutput.httpMapping.status, 502)
+    }
+
+    func test_saturationQueueFullChainsToCLIFailOpen() async {
+        // End-to-end saturation contract across the 3 already-tested links:
+        //   (1) a saturated DistillScheduler throws DistillError.queueFull
+        //   (2) that maps to HTTP 429 queue_full (httpMapping seam, routed through
+        //       DistillService)
+        //   (3) the managed CLI, seeing a non-200, FAILS OPEN -- echoes stdin
+        //       verbatim, exit 0 -- so distill saturation never blocks an agent turn.
+        let saturation = DistillError.queueFull
+        let mapping = saturation.httpMapping
+        XCTAssertEqual(mapping.status, 429, "scheduler saturation must surface as 429 over the wire")
+
+        let raw = Data("the agent tool output that must survive saturation".utf8)
+        // Transport stands in for the saturated service returning exactly the mapped status.
+        let cli = ManagedDistillCLI(arguments: [], stdin: raw, state: state) { _ in
+            (Data(#"{"error":"\#(mapping.code)","message":"bounded distill worker is full"}"#.utf8), mapping.status)
+        }
+        let (out, code) = await cli.run()
+        XCTAssertEqual(code, 0, "a saturated (429) distill service must fail-open, exit 0 -- never block the agent")
+        XCTAssertEqual(out, raw, "fail-open must echo the agent's tool output verbatim under saturation, losing nothing")
+    }
+
     func test_compress_emptyOutput_failsOpen() async {
         let resp = DistillResponse(requestID: UUID(), output: "   ", inputCharacters: 5)
         let data = try! JSONEncoder().encode(resp)

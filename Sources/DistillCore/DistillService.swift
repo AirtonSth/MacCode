@@ -541,14 +541,16 @@ public final class DistillHTTPServer: @unchecked Sendable {
             send(status: 200, body: response, connection: connection)
         } catch let error as DistillError {
             await metrics.recordFailure()
+            // Status + code come from the pure DistillError.httpMapping seam (tested);
+            // the human messages stay here.
+            let message: String
             switch error {
-            case .emptyInput:
-                send(status: 400, body: ErrorBody(error: "empty_input", message: "input is empty"), connection: connection)
-            case .queueFull:
-                send(status: 429, body: ErrorBody(error: "queue_full", message: "bounded distill worker is full"), connection: connection)
-            case .invalidOutput:
-                send(status: 502, body: ErrorBody(error: "invalid_output", message: "runtime returned empty output"), connection: connection)
+            case .emptyInput:    message = "input is empty"
+            case .queueFull:     message = "bounded distill worker is full"
+            case .invalidOutput: message = "runtime returned empty output"
             }
+            let mapping = error.httpMapping
+            send(status: mapping.status, body: ErrorBody(error: mapping.code, message: message), connection: connection)
         } catch {
             await metrics.recordFailure()
             send(status: 400, body: ErrorBody(error: "bad_request", message: "invalid distill request"), connection: connection)
