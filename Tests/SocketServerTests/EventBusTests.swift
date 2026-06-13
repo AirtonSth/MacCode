@@ -124,6 +124,66 @@ final class EventBusTests: XCTestCase {
         guard case .array(let evs) = o["events"]! else { return XCTFail() }
         XCTAssertFalse(evs.isEmpty)
     }
+
+    // MARK: - PERF-MAC_SOCKET-:110 subscribe(since:) backlog delta slice
+
+    func test_subscribe_sinceNonZero_receivesOnlyDelta() {
+        // WHY: a reconnecting client passes its last-seen seq; the server must
+        // replay only events AFTER that seq (delta), not the full retained backlog.
+        // Delivering the full backlog on every reconnect wastes ~4 MiB of cellular
+        // traffic and causes the iOS reducer to double-apply mutations.
+        let bus = EventBus()
+        bus.publish(kind: "ev.a", payload: .null) // seq 1
+        bus.publish(kind: "ev.b", payload: .null) // seq 2
+        bus.publish(kind: "ev.c", payload: .null) // seq 3
+        bus.publish(kind: "ev.d", payload: .null) // seq 4
+
+        var received: [Int64] = []
+        _ = bus.subscribe(since: 3, filter: .full) { received.append($0.seq) }
+
+        XCTAssertEqual(received, [4],
+            "subscribe(since:3) must deliver only seq 4 (events with seq > 3) -- " +
+            "replaying seqs 1-3 forces the client to re-apply already-applied mutations")
+    }
+
+    func test_subscribe_sinceZero_receivesFullBacklog() {
+        // WHY: a fresh first-connect client passes since=0 (or server defaults to 0
+        // when no header is present); it must receive the complete retained backlog
+        // so the mirror starts from the correct initial state.
+        let bus = EventBus()
+        bus.publish(kind: "ev.a", payload: .null) // seq 1
+        bus.publish(kind: "ev.b", payload: .null) // seq 2
+        bus.publish(kind: "ev.c", payload: .null) // seq 3
+
+        var received: [Int64] = []
+        _ = bus.subscribe(since: 0, filter: .full) { received.append($0.seq) }
+
+        XCTAssertEqual(received, [1, 2, 3],
+            "subscribe(since:0) must deliver the full backlog -- " +
+            "a fresh client with no prior state needs every event to build its mirror")
+    }
+
+    func test_subscribe_sinceAtLastEvent_receivesNoBacklog() {
+        // WHY: when the client's last-seen seq equals the bus's highest seq there
+        // is no delta; the server must not send any backlog frame (zero bytes saved
+        // equals zero bytes wasted on cellular).
+        let bus = EventBus()
+        bus.publish(kind: "ev.a", payload: .null) // seq 1
+        bus.publish(kind: "ev.b", payload: .null) // seq 2
+
+        var received: [Int64] = []
+        _ = bus.subscribe(since: 2, filter: .full) { received.append($0.seq) }
+
+        XCTAssertTrue(received.isEmpty,
+            "subscribe(since:2) on a bus whose last seq is 2 must deliver no backlog -- " +
+            "the client is already fully caught up; any delivery would be a duplicate")
+
+        // live events after subscribe must still arrive
+        bus.publish(kind: "ev.c", payload: .null) // seq 3
+        XCTAssertEqual(received, [3],
+            "live event seq 3 must arrive after an empty backlog -- " +
+            "the subscriber must not be silently dropped when its since-seq equals lastSeq")
+    }
 }
 
 private final class LockedStrings {

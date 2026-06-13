@@ -489,7 +489,16 @@ public final class DirectHTTPServer: @unchecked Sendable {
                                                 filter: wsFilter) { data in
                 _ = outbound.enqueue(data)
             }
-            let id = EventBus.shared.subscribe(since: 0, filter: wsFilter) { ev in
+            // PERF-MAC_SOCKET-:110 -- honor the client's last-seen seq so a
+            // reconnect receives only the delta (events after that seq), not the
+            // full retained backlog (~4 MiB on a busy session).
+            // Slice boundary: EventBus.subscribe delivers event.seq > since, so
+            // the first event the client receives is the first it has NOT yet seen.
+            // A missing or non-numeric header falls back to 0 (full backlog) so
+            // first-connect and legacy clients continue to work correctly.
+            let wsSinceSeq = headers["x-rc2-since-seq"]
+                .flatMap { Int64($0.trimmingCharacters(in: .whitespaces)) } ?? 0
+            let id = EventBus.shared.subscribe(since: wsSinceSeq, filter: wsFilter) { ev in
                 let obj: [String: Any] = [
                     "seq": ev.seq,
                     "kind": ev.kind,

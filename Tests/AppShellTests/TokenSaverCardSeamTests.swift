@@ -1,12 +1,48 @@
 import XCTest
 import Foundation
+import AgentRuntime
 @testable import AppShell
 
-// WHY: four UX items (186/187/188/195) each have a pure static seam on
-// SidebarRootView.  These tests guard the business logic of each seam so
-// regressions surface immediately without any UI render or AppContext spin-up.
+// WHY: four UX items (186/187/188/195) + PERF-MAC_SIDEBAR-:101 each have a
+// pure static seam on SidebarRootView.  These tests guard the business logic
+// of each seam so regressions surface immediately without any UI render or
+// AppContext spin-up.
 
 final class TokenSaverCardSeamTests: XCTestCase {
+
+    // MARK: - PERF-MAC_SIDEBAR-:101 detailsSnapshotCacheValid
+
+    func test_detailsSnapshotCacheValid_sevenDaysPeriod_returnsTrue() {
+        // WHY: when the published snapshot already carries .sevenDays the popover
+        // does not need to read usage.json from disk; returning true here is the
+        // gate that prevents up to 3 disk I/Os per render frame.
+        let snap = TokenSaverUsageSnapshot(period: .sevenDays, providers: [])
+        XCTAssertTrue(
+            SidebarRootView.detailsSnapshotCacheValid(publishedSnapshot: snap),
+            "sevenDays snapshot must be considered cache-valid so no disk read fires per frame"
+        )
+    }
+
+    func test_detailsSnapshotCacheValid_todayPeriod_returnsFalse() {
+        // WHY: a snapshot with period .today was loaded for the main sidebar card,
+        // not the details popover; cache-invalid means the popover will read the
+        // sevenDays file exactly once (then cache it) instead of on every body pass.
+        let snap = TokenSaverUsageSnapshot(period: .today, providers: [])
+        XCTAssertFalse(
+            SidebarRootView.detailsSnapshotCacheValid(publishedSnapshot: snap),
+            "today snapshot must not be cache-valid -- the details popover needs sevenDays data"
+        )
+    }
+
+    func test_detailsSnapshotCacheValid_thirtyDaysPeriod_returnsFalse() {
+        // WHY: .thirtyDays is also not the period the details popover expects;
+        // any period other than .sevenDays must trigger the (cached) disk read.
+        let snap = TokenSaverUsageSnapshot(period: .thirtyDays, providers: [])
+        XCTAssertFalse(
+            SidebarRootView.detailsSnapshotCacheValid(publishedSnapshot: snap),
+            "thirtyDays snapshot must not be cache-valid -- only .sevenDays matches the details popover contract"
+        )
+    }
 
     // MARK: - :186 modelDirSize
 

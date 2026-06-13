@@ -1733,6 +1733,14 @@ public struct SidebarRootView: View {
     /// the top or bottom of the workspace list. Stored so we can invalidate it
     /// when the drag leaves the edge zone or the drop completes.
     @State private var dragScrollTimer: Timer? = nil
+    /// PERF-MAC_SIDEBAR-:101 -- Cache the disk-loaded details snapshot so the
+    /// fallback `TokenSaverUsageStore.load()` call runs at most once per
+    /// `vm.tokenSaverUsageSnapshot` change, not on every SwiftUI body pass.
+    /// `_detailsSnapshotCacheKey` stores the published snapshot that was current
+    /// when `_detailsSnapshotCache` was populated; a referential inequality check
+    /// (Equatable) invalidates the cache when the store signals new data.
+    @State private var _detailsSnapshotCache: TokenSaverUsageSnapshot? = nil
+    @State private var _detailsSnapshotCacheKey: TokenSaverUsageSnapshot? = nil
     private let onOpenSettings: () -> Void
     private let onOpenAccount: () -> Void
     private let keyMapper = SidebarKeyIntentMapper()
@@ -2704,11 +2712,34 @@ public struct SidebarRootView: View {
     }
 
     private var tokenSaverDetailsSnapshot: TokenSaverUsageSnapshot {
-        if vm.tokenSaverUsageSnapshot.period == .sevenDays {
+        // PERF-MAC_SIDEBAR-:101 -- fast path: published snapshot already has the
+        // period we need; return it directly without a disk read.
+        if Self.detailsSnapshotCacheValid(publishedSnapshot: vm.tokenSaverUsageSnapshot) {
             return vm.tokenSaverUsageSnapshot
         }
+        // Slow path: fallback disk read, but only when the published snapshot
+        // changed since the last call (cache miss). Invalidation is by value
+        // equality: a new write to usage.json bumps vm.tokenSaverUsageSnapshot,
+        // which is Equatable, so the cache stays coherent without a file watcher.
+        let key = vm.tokenSaverUsageSnapshot
+        if let cached = _detailsSnapshotCache, _detailsSnapshotCacheKey == key {
+            return cached
+        }
         guard let context = vm.context else { return .empty() }
-        return TokenSaverUsageStore(appSupportDirectory: context.appSupportDirectory).load()
+        let loaded = TokenSaverUsageStore(appSupportDirectory: context.appSupportDirectory).load()
+        _detailsSnapshotCache = loaded
+        _detailsSnapshotCacheKey = key
+        return loaded
+    }
+
+    /// Pure predicate: returns true when `publishedSnapshot` already carries the
+    /// period required by the details popover, making a disk read unnecessary.
+    /// Extracted as a static seam so tests can verify the hit/miss boundary
+    /// without an AppContext or SwiftUI render cycle.
+    /// WHY: the predicate is the only logic that determines whether a disk read
+    /// fires per frame; testing it in isolation proves the cache-valid contract.
+    static func detailsSnapshotCacheValid(publishedSnapshot: TokenSaverUsageSnapshot) -> Bool {
+        publishedSnapshot.period == .sevenDays
     }
 
     private var tokenSaverDetailsSavedOrPotential: Int {
