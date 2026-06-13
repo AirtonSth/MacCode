@@ -1255,6 +1255,32 @@ public final class TerminalSurface: NSObject, Surface {
         return nil
     }
 
+    /// The reason a history flush is requested.
+    ///
+    /// This is a pure, nonisolated enum used by `flushShouldWait(reason:)` so
+    /// the wait-vs-async decision can be unit-tested without AppKit or a live
+    /// TerminalSurface instance.
+    enum FlushReason {
+        /// The user closed a tab (or the surface is being torn down mid-session).
+        /// A slow disk must not stall the main thread — flush asynchronously.
+        case tabClose
+        /// The app is about to terminate (applicationWillTerminate).
+        /// Data must not be lost on quit — flush synchronously as a barrier.
+        case appTermination
+    }
+
+    /// Returns whether a history flush for `reason` must block (wait: true) or
+    /// can run asynchronously (wait: false).
+    ///
+    /// This seam is `nonisolated static` so it is testable without AppKit,
+    /// @MainActor, or a live surface.
+    nonisolated static func flushShouldWait(reason: FlushReason) -> Bool {
+        switch reason {
+        case .tabClose:       return false   // async: no UI stall on tab close
+        case .appTermination: return true    // sync barrier: no history loss on quit
+        }
+    }
+
     private func publishRuntimeHealth() {
         SurfaceRuntimeBus.shared.emit(descriptor.id, runtimeHealth())
     }
@@ -1563,7 +1589,11 @@ public final class TerminalSurface: NSObject, Surface {
         isClosing = true
         removeRestartBanner()
         closeParkingWindowIfNeeded()
-        flushHistory(wait: true)
+        // Async flush: pendingHistoryData is captured by value inside the
+        // DispatchWorkItem, so the bytes survive surface teardown. The
+        // historyQueue retains the work item until it completes — no data loss.
+        // App-quit uses flushPersistedHistory() (wait: true) as the barrier.
+        flushHistory(wait: Self.flushShouldWait(reason: .tabClose))
         readSource?.cancel()
         readSource = nil
         inputPump?.stop(reason: .processExited)
