@@ -116,6 +116,39 @@ final class TokenSaverProcessSpawnerTests: XCTestCase {
         XCTAssertGreaterThan(stderrData.count, 0, "stderr handle must deliver data written by the process")
     }
 
+    // QA-mac:53 -- real stderr-backpressure proof (T007). The small-amount test
+    // above never fills the 64 KB kernel pipe buffer, so it cannot detect a missing
+    // drain. Here the child floods stderr with ~256 KB (4x the buffer) and ONLY
+    // THEN writes its ready marker to stdout. With the controller's continuous
+    // stderr drain active the child completes and the marker arrives; WITHOUT a
+    // drain the child would block on the stderr write at ~64 KB and never reach the
+    // stdout write -- the deadlock this guards against.
+    func testStderrFloodDoesNotDeadlockWhenDrained() throws {
+        // 256 KiB of stderr, then the ready marker on stdout, then exit.
+        let command = "i=0; while [ $i -lt 4096 ]; do printf '%064d\\n' $i >&2; i=$((i+1)); done; printf 'READY\\n'; exit 0"
+        let spawner = ShellSpawner(command: command)
+        let result = try spawner.spawn(executableURL: URL(fileURLWithPath: "/bin/sh"), arguments: [])
+
+        // Mirror the controller's drain exactly: discard stderr continuously so the
+        // pipe buffer never fills (TokenSaverDistillServiceController.swift:698-700).
+        result.stderrHandle.readabilityHandler = { handle in
+            _ = handle.availableData
+        }
+
+        // If the drain works, the child reaches the stdout write and exits, so this
+        // read returns "READY" and terminates at EOF. If stderr backed up, the child
+        // would be blocked before the stdout write and this would never see READY.
+        let stdout = result.stdoutHandle.readDataToEndOfFile()
+        result.stderrHandle.readabilityHandler = nil
+        result.process.waitUntilExit()
+
+        let text = String(decoding: stdout, as: UTF8.self)
+        XCTAssertTrue(text.contains("READY"),
+            "the child must reach its post-flood stdout write -- proving the controller's stderr drain prevents a >64KB backpressure deadlock")
+        XCTAssertEqual(result.process.terminationStatus, 0,
+            "the flooding child must exit cleanly once stderr is drained, not hang")
+    }
+
     // MARK: - ThrowingSpawner drives the catch path in start()
 
     // WHY: the catch block in start() sets status = .failed when spawn() throws.
