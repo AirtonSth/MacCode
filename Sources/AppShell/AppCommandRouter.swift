@@ -3056,11 +3056,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         if case .array(let values) = state["dirty_paths"] ?? .array([]) {
             dirtyPaths = values.compactMap(\.stringValue)
         }
-        if dirty {
-            if !dirtyPaths.contains(path) { dirtyPaths.append(path) }
-        } else {
-            dirtyPaths.removeAll { $0 == path }
-        }
+        dirtyPaths = filesDirtyPathsAfterMutation(existing: dirtyPaths, path: path, dirty: dirty)
         state["dirty_paths"] = .array(dirtyPaths.map { .string($0) })
         state["revision"] = .number(Double((state["revision"]?.intValue ?? 0) + 1))
         state["updated_at"] = .number(Date().timeIntervalSince1970)
@@ -3166,6 +3162,16 @@ func terminalSnapshotJSON(_ snapshot: TerminalTextSnapshot) -> JSONValue {
         fields["ansi_palette"] = .array(palette.map { .string($0) })
     }
     return .object(fields)
+}
+
+func filesDirtyPathsAfterMutation(existing: [String], path: String, dirty: Bool) -> [String] {
+    var next = existing
+    if dirty {
+        if !next.contains(path) { next.append(path) }
+    } else {
+        next.removeAll { $0 == path }
+    }
+    return next
 }
 
 private func terminalRenderDiagnosticsJSON(_ diagnostics: TerminalRenderDiagnostics) -> JSONValue {
