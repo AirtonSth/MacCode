@@ -15,21 +15,34 @@ private let lifecycleRecorderLog = Logger(subsystem: "io.remotecode.app", catego
 private var lifecycleSignalLogFD: Int32 = -1
 private var lifecycleSignalMarkerPath: UnsafeMutablePointer<CChar>?
 
-private func lifecycleSignalHandler(_ signo: Int32) {
-    let message: StaticString
+/// The (async-signal-safe) log line written for a terminating signal. Pure;
+/// extracted so the signal->message mapping is unit-testable (QA-mac:48).
+func lifecycleSignalMessage(for signo: Int32) -> StaticString {
     switch signo {
-    case SIGTERM: message = "signal=SIGTERM terminating\n"
-    case SIGINT: message = "signal=SIGINT terminating\n"
-    default: message = "signal=other terminating\n"
+    case SIGTERM: return "signal=SIGTERM terminating\n"
+    case SIGINT: return "signal=SIGINT terminating\n"
+    default: return "signal=other terminating\n"
     }
-    if lifecycleSignalLogFD >= 0 {
-        message.withUTF8Buffer { buf in
-            _ = write(lifecycleSignalLogFD, buf.baseAddress, buf.count)
+}
+
+/// The signal handler's side effects: append the marker line to the open log fd
+/// and unlink the run marker. Async-signal-safe (only write/unlink, no Swift
+/// allocation). Extracted WITHOUT the re-raise so the write+unlink mechanics are
+/// unit-testable in-process (QA-mac:48); the real handler below performs these
+/// then re-raises with the default disposition so the signal still terminates.
+func lifecycleSignalRecord(fd: Int32, markerPath: UnsafeMutablePointer<CChar>?, signo: Int32) {
+    if fd >= 0 {
+        lifecycleSignalMessage(for: signo).withUTF8Buffer { buf in
+            _ = write(fd, buf.baseAddress, buf.count)
         }
     }
-    if let path = lifecycleSignalMarkerPath {
+    if let path = markerPath {
         unlink(path)
     }
+}
+
+private func lifecycleSignalHandler(_ signo: Int32) {
+    lifecycleSignalRecord(fd: lifecycleSignalLogFD, markerPath: lifecycleSignalMarkerPath, signo: signo)
     signal(signo, SIG_DFL)
     raise(signo)
 }

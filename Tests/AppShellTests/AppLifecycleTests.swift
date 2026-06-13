@@ -95,6 +95,54 @@ final class AppLifecycleRecorderTests: XCTestCase {
             "hoisting the ISO8601DateFormatter must not change the timestamp format -- log consumers depend on this exact ISO8601 layout"
         )
     }
+
+    // MARK: - QA-mac:48 signal-handler write+unlink mechanics
+
+    func test_signalMessage_mapsKnownSignals() {
+        XCTAssertEqual("\(lifecycleSignalMessage(for: SIGTERM))", "signal=SIGTERM terminating\n",
+            "SIGTERM must log a SIGTERM line so a crash analysis can tell a clean terminate from a hard kill")
+        XCTAssertEqual("\(lifecycleSignalMessage(for: SIGINT))", "signal=SIGINT terminating\n",
+            "SIGINT must log a SIGINT line")
+        XCTAssertEqual("\(lifecycleSignalMessage(for: SIGSEGV))", "signal=other terminating\n",
+            "an unmapped signal must still log a generic terminating line, never nothing")
+    }
+
+    func test_signalRecord_writesLineAndUnlinksMarker() throws {
+        // The real sigaction handler routes through lifecycleSignalRecord before it
+        // re-raises (which the OS-default disposition handles). This exercises the
+        // write+unlink mechanics in-process: a SIGTERM must append its line to the
+        // log fd AND remove the run marker, so the next launch sees an orderly-exit
+        // trail rather than a surviving marker (which would read as a hard kill).
+        let dir = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("RC2Signal-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let logURL = dir.appendingPathComponent("lifecycle.log")
+        let markerURL = dir.appendingPathComponent("running.marker")
+        FileManager.default.createFile(atPath: logURL.path, contents: Data())
+        try Data("present".utf8).write(to: markerURL)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: markerURL.path), "precondition: marker present")
+
+        let fd = open(logURL.path, O_WRONLY | O_APPEND)
+        XCTAssertGreaterThanOrEqual(fd, 0, "must open the log fd")
+        let markerPath = strdup(markerURL.path)
+        defer { free(markerPath); if fd >= 0 { close(fd) } }
+
+        lifecycleSignalRecord(fd: fd, markerPath: markerPath, signo: SIGTERM)
+
+        let logged = (try? String(contentsOf: logURL, encoding: .utf8)) ?? ""
+        XCTAssertTrue(logged.contains("signal=SIGTERM terminating"),
+            "the signal handler must append the SIGTERM line to the live log fd")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: markerURL.path),
+            "the signal handler must unlink the run marker so a clean SIGTERM is not misread as a hard kill")
+    }
+
+    func test_signalRecord_negativeFdAndNilMarkerAreSafeNoops() {
+        // Defensive: before installSignalHandlers (fd = -1, marker = nil) the handler
+        // must not crash if a signal somehow fires.
+        lifecycleSignalRecord(fd: -1, markerPath: nil, signo: SIGINT)
+    }
 }
 
 final class AppLifecycleTests: XCTestCase {
