@@ -1,0 +1,29 @@
+name: Provider binary smoke (macOS)
+
+# QA-mac:112 -- gated real-binary lane. Public runners usually skip because
+# claude/codex are absent; self-hosted or developer runners fail fast when a
+# provider CLI release removes command/flag surfaces RemoteCode hardcodes.
+
+on:
+  schedule:
+    - cron: '41 10 * * 1'
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'Sources/AgentRuntime/**'
+      - 'Tests/AgentRuntimeTests/**'
+      - 'scripts/provider-binary-smoke.sh'
+      - '.github/workflows/provider-binary-smoke-macos.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  provider-binary-smoke:
+    name: binary-present provider CLI smoke
+    runs-on: macos-14
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Smoke installed provider binaries
+        run: scripts/provider-binary-smoke.sh
