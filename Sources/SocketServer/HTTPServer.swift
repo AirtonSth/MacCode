@@ -187,11 +187,6 @@ public final class DirectHTTPServer: @unchecked Sendable {
     static let maxClientFramePayloadBytes = 1024 * 1024
     static let maxWebSocketOutboundQueuedBytes = 1024 * 1024
     static let wsHeartbeatInterval: TimeInterval = 20
-    /// Receive timeout applied to every accepted client fd before the read
-    /// loop starts. Prevents a slow/stuck client from blocking the handler
-    /// thread indefinitely. `read()` will return -1 / EAGAIN after this many
-    /// seconds of silence, and the existing `n <= 0` guard closes the fd.
-    static let clientReceiveTimeoutSeconds: Int = 20
 
     /// Pure helper: decides whether the `/v1/ws` upgrade must present a valid
     /// bearer token. Mirrors the HTTP `/v1/*` auth gate: loopback-only binds are
@@ -251,18 +246,20 @@ public final class DirectHTTPServer: @unchecked Sendable {
     /// Live connection-level metrics surfaced via /v1/health.
     let wsTracker = WSConnectionTracker()
     private let heartbeatInterval: TimeInterval
+    private let receiveTimeoutSeconds: Int
 
     private var listenFD: Int32 = -1
     private var running = false
     private var accept: Thread?
 
-    public init(port: UInt16 = 18217, loopbackOnly: Bool = true, dispatcher: JSONRPCDispatcher, auth: DirectAuthProvider? = nil, serverId: String = ProcessInfo.processInfo.globallyUniqueString, heartbeatInterval: TimeInterval = 20) {
+    public init(port: UInt16 = 18217, loopbackOnly: Bool = true, dispatcher: JSONRPCDispatcher, auth: DirectAuthProvider? = nil, serverId: String = ProcessInfo.processInfo.globallyUniqueString, heartbeatInterval: TimeInterval = 20, clientReceiveTimeoutSeconds: Int = 20) {
         self.port = port
         self.bindLoopbackOnly = loopbackOnly
         self.dispatcher = dispatcher
         self.auth = auth
         self.serverId = serverId
         self.heartbeatInterval = heartbeatInterval
+        self.receiveTimeoutSeconds = max(1, clientReceiveTimeoutSeconds)
     }
 
     public func start() throws {
@@ -366,7 +363,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
         // handler thread forever. On timeout, read() returns -1 with errno
         // EAGAIN/EWOULDBLOCK; the `n <= 0` guard below treats that as a
         // closed/failed connection and exits, which is the correct outcome.
-        var rcvTimeout = timeval(tv_sec: Self.clientReceiveTimeoutSeconds, tv_usec: 0)
+        var rcvTimeout = timeval(tv_sec: receiveTimeoutSeconds, tv_usec: 0)
         setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &rcvTimeout, socklen_t(MemoryLayout<timeval>.size))
         var buffer = Data()
         var tmp = [UInt8](repeating: 0, count: 4096)

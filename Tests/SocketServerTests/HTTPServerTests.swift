@@ -128,6 +128,42 @@ final class HTTPServerTests: XCTestCase {
         )
     }
 
+    @MainActor
+    func test_partialHeaderSlowLorisConnectionTimesOutAndCloses() throws {
+        let port = UInt16.random(in: 33000...44000)
+        let dispatcher = JSONRPCDispatcher(router: FakeRouter())
+        let s = DirectHTTPServer(
+            port: port,
+            loopbackOnly: true,
+            dispatcher: dispatcher,
+            clientReceiveTimeoutSeconds: 1
+        )
+        try s.start()
+        defer { s.stop() }
+        Thread.sleep(forTimeInterval: 0.05)
+
+        let fd = try connectLocalhost(port: port)
+        defer { Darwin.close(fd) }
+        var clientTimeout = timeval(tv_sec: 3, tv_usec: 0)
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &clientTimeout, socklen_t(MemoryLayout<timeval>.size))
+
+        let partial = """
+        GET /v1/ws HTTP/1.1\r
+        Host: 127.0.0.1:\(port)\r
+        """
+        try writeAll(fd: fd, data: Data(partial.utf8))
+
+        var byte = UInt8(0)
+        let start = Date()
+        let n = Darwin.read(fd, &byte, 1)
+        let elapsed = Date().timeIntervalSince(start)
+
+        XCTAssertLessThan(elapsed, 2.5,
+                          "partial-header clients must be reclaimed by the server timeout, not by the test client's longer timeout")
+        XCTAssertTrue(n == 0 || (n < 0 && errno == ECONNRESET),
+                      "server must close/reset a slow-loris partial-header connection; read result=\(n), errno=\(errno)")
+    }
+
     func test_webSocketPongFrameClampsOversizedPingPayload() {
         let frame = DirectHTTPServer.pongFrame(payload: Data(repeating: 0x41, count: 300))
 
