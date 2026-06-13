@@ -22,6 +22,7 @@ final class SettingsStoreTests: XCTestCase {
         XCTAssertFalse(d.insomniaAllowSystemSleepWhenDisplayClosed)
         XCTAssertTrue(d.insomniaAllowScreenSaverAfter45MinutesOfInactivity)
         XCTAssertFalse(d.tokenSaverEnabled)
+        XCTAssertEqual(d.terminalFontSize, 0)
     }
 
     func test_saveThenLoadRoundTrips() throws {
@@ -34,7 +35,8 @@ final class SettingsStoreTests: XCTestCase {
             insomniaAllowDisplaySleep: false,
             insomniaAllowSystemSleepWhenDisplayClosed: true,
             insomniaAllowScreenSaverAfter45MinutesOfInactivity: false,
-            tokenSaverEnabled: true
+            tokenSaverEnabled: true,
+            terminalFontSize: 16
         ))
         let r = s.load()
         XCTAssertTrue(r.diffWordWrap && r.diffIgnoreWhitespace)
@@ -44,6 +46,7 @@ final class SettingsStoreTests: XCTestCase {
         XCTAssertTrue(r.insomniaAllowSystemSleepWhenDisplayClosed)
         XCTAssertFalse(r.insomniaAllowScreenSaverAfter45MinutesOfInactivity)
         XCTAssertTrue(r.tokenSaverEnabled)
+        XCTAssertEqual(r.terminalFontSize, 16, "terminalFontSize must round-trip so new terminals keep the chosen base font")
     }
 
     func test_updatePreservesOtherFields() throws {
@@ -68,6 +71,7 @@ final class SettingsStoreTests: XCTestCase {
         XCTAssertFalse(r.insomniaAllowSystemSleepWhenDisplayClosed)
         XCTAssertTrue(r.insomniaAllowScreenSaverAfter45MinutesOfInactivity)
         XCTAssertFalse(r.tokenSaverEnabled)
+        XCTAssertEqual(r.terminalFontSize, 0, "older settings blobs must default terminal font size to Ghostty default")
     }
 
     func test_corruptBlobDegradesToDefaults() throws {

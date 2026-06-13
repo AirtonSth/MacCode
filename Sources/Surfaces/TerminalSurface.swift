@@ -705,6 +705,8 @@ public final class TerminalSurface: NSObject, Surface {
         launch: Launch,
         restoredSurfaceID: SurfaceID? = nil,
         historyRepo: TerminalOutputRepository? = nil,
+        settingsRepo: (any SettingsWriteRepository)? = nil,
+        terminalFontSize: Double = TerminalFontSizeSetting.defaultSize,
         outputBus: SurfaceOutputBus = .shared
     ) throws {
         self.historyRepo = historyRepo
@@ -760,6 +762,9 @@ public final class TerminalSurface: NSObject, Surface {
         )
         let terminalView = GhosttyTerminalView(frame: initialFrame)
         terminalView.translatesAutoresizingMaskIntoConstraints = false
+        terminalView.fontZoomStore = settingsRepo
+        terminalView.fontZoomWorkspaceID = workspaceID.value.uuidString
+        terminalView.baseFontSize = TerminalFontSizeSetting.normalized(terminalFontSize)
         terminalView.setAccessibilityIdentifier("surface.terminal.view.\(descriptor.id.value.uuidString)")
         self.ghosttyView = terminalView
         let container = TerminalDropContainerView(frame: initialFrame)

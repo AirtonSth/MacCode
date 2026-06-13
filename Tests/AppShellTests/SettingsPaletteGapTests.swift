@@ -245,7 +245,7 @@ final class SettingsPaletteGapTests: XCTestCase {
             "insomniaEnabled", "insomniaAllowDisplaySleep",
             "insomniaAllowSystemSleepWhenDisplayClosed",
             "insomniaAllowScreenSaverAfter45MinutesOfInactivity",
-            "tokenSaverEnabled", "sessionLearnEnabled", "historyCompactionEnabled",
+            "tokenSaverEnabled", "terminalFontSize", "sessionLearnEnabled", "historyCompactionEnabled",
         ]
         XCTAssertEqual(
             Set(AppSettingsKeys.userTunableKeys), expected,

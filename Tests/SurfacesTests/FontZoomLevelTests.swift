@@ -99,3 +99,31 @@ final class FontZoomLevelTests: XCTestCase {
         _ = tooHigh // silence unused-result warning
     }
 }
+
+final class TerminalFontSizeSettingTests: XCTestCase {
+
+    func test_normalized_zeroMeansGhosttyDefault() {
+        XCTAssertEqual(TerminalFontSizeSetting.normalized(0), 0,
+                       "0 must keep Ghostty's configured default instead of forcing an app font size")
+    }
+
+    func test_normalized_clampsToLegibleRange() {
+        XCTAssertEqual(TerminalFontSizeSetting.normalized(1), TerminalFontSizeSetting.minSize,
+                       "too-small stored sizes must clamp up so text remains legible")
+        XCTAssertEqual(TerminalFontSizeSetting.normalized(200), TerminalFontSizeSetting.maxSize,
+                       "too-large stored sizes must clamp down so the terminal grid remains usable")
+    }
+
+    func test_normalized_rejectsNonFiniteValues() {
+        XCTAssertEqual(TerminalFontSizeSetting.normalized(.nan), 0,
+                       "a corrupt NaN setting must fall back to Ghostty default")
+        XCTAssertEqual(TerminalFontSizeSetting.normalized(.infinity), 0,
+                       "a corrupt infinite setting must fall back to Ghostty default")
+    }
+
+    func test_displayLabelMatchesPersistedChoice() {
+        XCTAssertEqual(TerminalFontSizeSetting.displayLabel(0), "Ghostty default")
+        XCTAssertEqual(TerminalFontSizeSetting.displayLabel(15.6), "16 pt",
+                       "settings UI must show the exact normalized size new terminals will receive")
+    }
+}

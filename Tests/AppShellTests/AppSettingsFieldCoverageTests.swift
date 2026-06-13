@@ -33,6 +33,7 @@ final class AppSettingsFieldCoverageTests: XCTestCase {
             "insomniaAllowSystemSleepWhenDisplayClosed",
             "insomniaAllowScreenSaverAfter45MinutesOfInactivity",
             "tokenSaverEnabled",
+            "terminalFontSize",
             "sessionLearnEnabled",
             "historyCompactionEnabled",
         ]
@@ -96,6 +97,13 @@ final class AppSettingsFieldCoverageTests: XCTestCase {
         XCTAssertFalse(SettingsStore(db: ctx.db).load().tokenSaverEnabled,
                        "setTokenSaverEnabled must persist the value")
 
+        // Terminal base font
+        vm.setTerminalFontSize(16)
+        XCTAssertEqual(vm.appSettings.terminalFontSize, 16,
+                       "setTerminalFontSize must update appSettings immediately")
+        XCTAssertEqual(SettingsStore(db: ctx.db).load().terminalFontSize, 16,
+                       "setTerminalFontSize must persist so new terminal surfaces use the selected base size")
+
         // Insomnia enabled flag
         vm.setInsomniaEnabled(true)
         XCTAssertTrue(vm.appSettings.insomniaEnabled)
@@ -126,6 +134,7 @@ final class AppSettingsFieldCoverageTests: XCTestCase {
         let store = SettingsStore(db: ctx.db)
         store.save(AppSettings(
             sidebarSort: "manual",
+            terminalFontSize: 18,
             sessionLearnEnabled: true,
             historyCompactionEnabled: true
         ))
@@ -139,5 +148,7 @@ final class AppSettingsFieldCoverageTests: XCTestCase {
                       "reload() must restore sessionLearnEnabled from the persisted store")
         XCTAssertTrue(vm.appSettings.historyCompactionEnabled,
                       "reload() must restore historyCompactionEnabled from the persisted store")
+        XCTAssertEqual(vm.appSettings.terminalFontSize, 18,
+                       "reload() must restore terminalFontSize from the persisted store")
     }
 }

@@ -160,6 +160,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     /// selectedSurfaceID per pane.
     public func reinstantiateRestoredSurfaces() {
         guard let ctx = context else { return }
+        let terminalFontSize = SettingsStore(db: ctx.db).load().terminalFontSize
         var idMap: [SurfaceID: SurfaceID] = [:]
         for (wid, ws) in ctx.state.workspaces {
             forEachSurface(in: ws.layout) { desc in
@@ -169,12 +170,12 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                     let surface: Surface
                     switch desc.type {
                     case .terminal:
-                        surface = try TerminalSurface(workspaceID: wid, title: title, launch: .shell(cwd: cwd), restoredSurfaceID: desc.id, historyRepo: ctx.terminalOutputRepo)
+                        surface = try TerminalSurface(workspaceID: wid, title: title, launch: .shell(cwd: cwd), restoredSurfaceID: desc.id, historyRepo: ctx.terminalOutputRepo, settingsRepo: ctx.settingsRepo, terminalFontSize: terminalFontSize)
                     case .ssh:
                         if let profile = sshProfile(from: desc) {
-                            surface = try TerminalSurface(workspaceID: wid, title: title, launch: .ssh(profile: profile, cwd: cwd), restoredSurfaceID: desc.id, historyRepo: ctx.terminalOutputRepo)
+                            surface = try TerminalSurface(workspaceID: wid, title: title, launch: .ssh(profile: profile, cwd: cwd), restoredSurfaceID: desc.id, historyRepo: ctx.terminalOutputRepo, settingsRepo: ctx.settingsRepo, terminalFontSize: terminalFontSize)
                         } else {
-                            surface = try SSHSurface(workspaceID: wid, cwd: cwd, title: title, router: self)
+                            surface = try SSHSurface(workspaceID: wid, cwd: cwd, title: title, router: self, settingsRepo: ctx.settingsRepo, terminalFontSize: terminalFontSize)
                         }
                     case .browser:
                         surface = configureBrowserSurface(BrowserSurface(workspaceID: wid, initialURL: restoredBrowserURL(from: desc), title: title))
@@ -2469,19 +2470,20 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     private func makeSurface(type: SurfaceType, title: String?, workspace: WorkspaceID, cwd: String) -> SurfaceDescriptor {
         let baseTitle = title ?? defaultTitle(for: type)
         let descriptor = SurfaceDescriptor(type: type, title: baseTitle, iconName: type.rawValue, metadata: ["workspace": workspace.value.uuidString, "cwd": cwd])
+        let terminalFontSize = context.map { SettingsStore(db: $0.db).load().terminalFontSize } ?? 0
         // build concrete surface object now and register
         do {
             let surface: Surface
             switch type {
             case .terminal:
-                let terminal = try TerminalSurface(workspaceID: workspace, title: baseTitle, launch: .shell(cwd: cwd), historyRepo: context?.terminalOutputRepo)
+                let terminal = try TerminalSurface(workspaceID: workspace, title: baseTitle, launch: .shell(cwd: cwd), historyRepo: context?.terminalOutputRepo, settingsRepo: context?.settingsRepo, terminalFontSize: terminalFontSize)
                 terminal.onRestartRequested = { [weak self, weak terminal] in
                     guard let self, let terminal else { return }
                     self.restartSurface(terminal.descriptor.id)
                 }
                 surface = terminal
             case .ssh:
-                surface = try SSHSurface(workspaceID: workspace, cwd: cwd, title: baseTitle, router: self)
+                surface = try SSHSurface(workspaceID: workspace, cwd: cwd, title: baseTitle, router: self, settingsRepo: context?.settingsRepo, terminalFontSize: terminalFontSize)
             case .browser:
                 surface = configureBrowserSurface(BrowserSurface(workspaceID: workspace, initialURL: nil, title: baseTitle))
             case .agentApp:
@@ -2591,7 +2593,8 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
 
     private func makeSSHSurface(profile: SSHHostProfile, title: String?, workspace: WorkspaceID, cwd: String) throws -> SurfaceDescriptor {
         let baseTitle = title ?? profile.label
-        let surface = try SSHSurface(workspaceID: workspace, cwd: cwd, title: baseTitle, router: self)
+        let terminalFontSize = context.map { SettingsStore(db: $0.db).load().terminalFontSize } ?? 0
+        let surface = try SSHSurface(workspaceID: workspace, cwd: cwd, title: baseTitle, router: self, settingsRepo: context?.settingsRepo, terminalFontSize: terminalFontSize)
         surface.connectForRouter(profile)
         SurfaceRegistry.shared.register(surface)
         return surface.descriptor

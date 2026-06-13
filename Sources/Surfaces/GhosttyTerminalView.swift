@@ -254,6 +254,25 @@ enum FontZoomLevel {
     }
 }
 
+/// Base terminal font-size preference. `0` preserves Ghostty's configured default.
+public enum TerminalFontSizeSetting {
+    public static let defaultSize: Double = 0
+    public static let minSize: Double = 8
+    public static let maxSize: Double = 32
+
+    public nonisolated static func normalized(_ size: Double) -> Double {
+        guard size.isFinite else { return defaultSize }
+        guard size > defaultSize else { return defaultSize }
+        return min(maxSize, max(minSize, size.rounded()))
+    }
+
+    public nonisolated static func displayLabel(_ size: Double) -> String {
+        let normalized = normalized(size)
+        guard normalized != defaultSize else { return "Ghostty default" }
+        return "\(Int(normalized)) pt"
+    }
+}
+
 /// Pure helper that formats a human-readable scrollback position label.
 ///
 /// Rules (matches common terminal conventions):
@@ -644,6 +663,8 @@ final class GhosttyTerminalView: NSView {
     /// KV key suffix that scopes zoom persistence to the workspace.
     /// Set to the workspace UUID string before the surface is first shown.
     var fontZoomWorkspaceID: String?
+    /// Base font size passed to Ghostty at surface creation. 0 = Ghostty default.
+    var baseFontSize: Double = TerminalFontSizeSetting.defaultSize
 
     private let surfaceSlot = GhosttySurfaceSlot()
     private let ioContext = RemoteCodeGhosttyIOContext()
@@ -1199,7 +1220,7 @@ final class GhosttyTerminalView: NSView {
         ))
         config.userdata = Unmanaged.passUnretained(self).toOpaque()
         config.scale_factor = Double(window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 1)
-        config.font_size = 0
+        config.font_size = Float(baseFontSize)
         config.context = GHOSTTY_SURFACE_CONTEXT_WINDOW
         config.io_mode = GHOSTTY_SURFACE_IO_MANUAL
         config.io_write_cb = ghosttyTerminalIOWriteCallback

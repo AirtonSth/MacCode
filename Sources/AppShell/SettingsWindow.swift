@@ -7,6 +7,7 @@ import Persistence
 import AgentRuntime
 import SocketServer
 import DesignSystemKit
+import Surfaces
 import UserNotifications
 import os
 
@@ -31,6 +32,7 @@ public struct AppSettingsKeys {
         "insomniaAllowSystemSleepWhenDisplayClosed",
         "insomniaAllowScreenSaverAfter45MinutesOfInactivity",
         "tokenSaverEnabled",
+        "terminalFontSize",
         "sessionLearnEnabled",
         "historyCompactionEnabled",
     ]
@@ -542,6 +544,12 @@ public final class SettingsViewModel: ObservableObject {
         settingsStore.update { $0.tokenSaverEnabled = on }
     }
 
+    public func setTerminalFontSize(_ size: Double) {
+        let normalized = TerminalFontSizeSetting.normalized(size)
+        appSettings.terminalFontSize = normalized
+        settingsStore.update { $0.terminalFontSize = normalized }
+    }
+
     public func setSessionLearnEnabled(_ on: Bool) {
         appSettings.sessionLearnEnabled = on
         settingsStore.update { $0.sessionLearnEnabled = on }
@@ -919,6 +927,7 @@ public struct SettingsView: View {
                 VStack(alignment: .leading, spacing: DS.Space.lg) {
                     remoteAccessSection
                     diffDefaultsSection
+                    terminalSection
                     sidebarSection
                     insomniaSection
                     tokenSaverSection
@@ -1023,6 +1032,31 @@ public struct SettingsView: View {
                 .frame(width: 140)
                 .accessibilityIdentifier("settings.sidebar.sortOrder.picker")
             }
+        }
+        .dsPanel(padding: DS.Space.lg)
+    }
+
+    private var terminalSection: some View {
+        VStack(alignment: .leading, spacing: DS.Space.md) {
+            DSSectionHeaderG("Terminal")
+            settingRow("Font size") {
+                Picker("", selection: Binding(
+                    get: { TerminalFontSizeSetting.normalized(vm.appSettings.terminalFontSize) },
+                    set: { vm.setTerminalFontSize($0) }
+                )) {
+                    Text("Ghostty default").tag(TerminalFontSizeSetting.defaultSize)
+                    ForEach(Array(Int(TerminalFontSizeSetting.minSize)...Int(TerminalFontSizeSetting.maxSize)), id: \.self) { size in
+                        let value = Double(size)
+                        Text(TerminalFontSizeSetting.displayLabel(value)).tag(value)
+                    }
+                }
+                .labelsHidden()
+                .frame(width: 160)
+                .accessibilityIdentifier("settings.terminal.fontSize.picker")
+            }
+            Text("New terminals use this base size; workspace zoom remains separate.")
+                .font(DS.Font.caption)
+                .foregroundColor(DS.Palette.textTertiary)
         }
         .dsPanel(padding: DS.Space.lg)
     }

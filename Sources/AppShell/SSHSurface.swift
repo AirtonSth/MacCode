@@ -2,6 +2,7 @@ import AppKit
 import SwiftUI
 import CoreModel
 import DesignSystemKit
+import Persistence
 import SocketServer
 import Surfaces
 import os
@@ -21,6 +22,8 @@ final class SSHSurface: NSObject, SSHTransferSurface {
     private let workspaceID: WorkspaceID
     private let cwd: String
     private weak var router: AppCommandRouter?
+    private let settingsRepo: (any SettingsWriteRepository)?
+    private let terminalFontSize: Double
     private let terminalContainer = NSView()
     private let hostResizeHandle = DSResizeHandleView(axis: .vertical)
     private let transferDivider = DSResizeHandleView(axis: .vertical)
@@ -53,10 +56,12 @@ final class SSHSurface: NSObject, SSHTransferSurface {
 
     var sshTransferProfile: SSHHostProfile? { viewModel.selectedHost }
 
-    init(workspaceID: WorkspaceID, cwd: String, title: String, router: AppCommandRouter?) throws {
+    init(workspaceID: WorkspaceID, cwd: String, title: String, router: AppCommandRouter?, settingsRepo: (any SettingsWriteRepository)? = nil, terminalFontSize: Double = TerminalFontSizeSetting.defaultSize) throws {
         self.workspaceID = workspaceID
         self.cwd = cwd
         self.router = router
+        self.settingsRepo = settingsRepo
+        self.terminalFontSize = terminalFontSize
         self.descriptor = SurfaceDescriptor(
             type: .ssh,
             title: title,
@@ -352,7 +357,7 @@ final class SSHSurface: NSObject, SSHTransferSurface {
             stopSessionAliveTimer()
             terminal?.close()
             viewModel.sessionDead = false
-            let next = try TerminalSurface(workspaceID: workspaceID, title: saved.label, launch: .ssh(profile: saved, cwd: cwd))
+            let next = try TerminalSurface(workspaceID: workspaceID, title: saved.label, launch: .ssh(profile: saved, cwd: cwd), settingsRepo: settingsRepo, terminalFontSize: terminalFontSize)
             terminal = next
             descriptor.metadata = next.descriptor.metadata
             descriptor.metadata["ssh_status"] = "connected"
