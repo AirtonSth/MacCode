@@ -108,7 +108,7 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
         try write(["type": "rc_interrupt"], to: session)
     }
 
-    public func respondToRequest(threadId: AgentThreadID, requestId: String, response: AgentProviderRequestResponse) throws {
+    public func respondToRequest(threadId: AgentThreadID, requestId: String, response: AgentProviderRequestResponse) async throws {
         lock.lock()
         guard let session = sessions[threadId] else {
             lock.unlock()
@@ -166,30 +166,11 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
         terminate(session)
     }
 
-    public func recoverSession(_ request: AgentRunRequest, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) throws {
+    public func recoverSession(_ request: AgentRunRequest, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) async throws {
         guard request.providerThreadId?.isEmpty == false else {
             throw AgentProviderAdapterError.unsupported("Claude Agent SDK recovery requires providerThreadId")
         }
-        // Drive the async session provisioning on the cooperative pool while blocking
-        // this (non-async) caller via a semaphore — no Thread.sleep, no pinned pool thread.
-        let sem = DispatchSemaphore(value: 0)
-        var outcome: Result<Session, Error>?
-        Task { [weak self] in
-            guard let self else {
-                outcome = .failure(AgentProviderAdapterError.sessionNotFound(request.threadId))
-                sem.signal()
-                return
-            }
-            do {
-                let s = try await self.sessionForAsync(request, provisioningCallback: nil)
-                outcome = .success(s)
-            } catch {
-                outcome = .failure(error)
-            }
-            sem.signal()
-        }
-        sem.wait()
-        let session = try outcome!.get()
+        let session = try await sessionForAsync(request, provisioningCallback: nil)
         lock.lock()
         session.onEvent = onEvent
         session.status = .completed
@@ -208,7 +189,7 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
         return sessions[threadId] != nil
     }
 
-    public func readThread(threadId: AgentThreadID) throws -> [AssistantEvent] {
+    public func readThread(threadId: AgentThreadID) async throws -> [AssistantEvent] {
         lock.lock(); defer { lock.unlock() }
         if let session = sessions[threadId] {
             return session.events
@@ -219,7 +200,7 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
         throw AgentProviderAdapterError.sessionNotFound(threadId)
     }
 
-    public func rollbackThread(threadId: AgentThreadID, toTurnId: String) throws {
+    public func rollbackThread(threadId: AgentThreadID, toTurnId: String) async throws {
         lock.lock()
         guard let session = sessions[threadId] else {
             lock.unlock()

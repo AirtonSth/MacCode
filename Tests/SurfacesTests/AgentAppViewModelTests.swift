@@ -579,7 +579,7 @@ final class AgentAppViewModelTests: XCTestCase {
                        "stale provider questions must not reappear as actionable Agent App cards after restart/reload")
     }
 
-    func test_failedPendingCallbackResponsesBecomeStaleAndNonActionable() throws {
+    func test_failedPendingCallbackResponsesBecomeStaleAndNonActionable() async throws {
         let tmp = NSTemporaryDirectory() + "rc2-vm-agent-callback-fail-" + UUID().uuidString
         let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
         let threadRepo = AgentThreadRepository(db: db)
@@ -612,6 +612,9 @@ final class AgentAppViewModelTests: XCTestCase {
 
         vm.respondToPendingRequest(vm.openPendingRequests[0], response: .approve)
         vm.answerPendingUserInput(vm.openPendingUserInputs[0], answer: "Run")
+        // respondToPendingRequest now drives the (async) coordinator.respondToRequest
+        // off the main run loop; let that @MainActor task drain before asserting.
+        try await Task.sleep(nanoseconds: 50_000_000)
 
         XCTAssertEqual(vm.timeline.pendingRequests.first?.state, .stale,
                        "failed provider approval responses must be retained as stale diagnostics")
@@ -672,7 +675,7 @@ final class AgentAppViewModelTests: XCTestCase {
                       "secret free-text questions use the same draft/submit path but must be distinguishable for masked rendering")
     }
 
-    func test_approveForSessionPromotesThreadPermissionToFullAccess() throws {
+    func test_approveForSessionPromotesThreadPermissionToFullAccess() async throws {
         let adapter = CapturingProviderAdapter(provider: .codex)
         let (vm, repo) = try makeVM(adapter: adapter)
         vm.createThread(title: "approval")
@@ -688,6 +691,9 @@ final class AgentAppViewModelTests: XCTestCase {
         vm.timeline.apply(.requestOpened(request))
 
         vm.respondToPendingRequest(request, response: .approveForSession)
+        // respondToPendingRequest now drives the (async) coordinator.respondToRequest
+        // off the main run loop; let that @MainActor task drain before asserting.
+        try await Task.sleep(nanoseconds: 50_000_000)
 
         XCTAssertEqual(adapter.lastRequestResponse?.response, .approveForSession,
                        "Approve Session must still send the provider session-scoped decision so the current run stops asking")
@@ -697,7 +703,7 @@ final class AgentAppViewModelTests: XCTestCase {
                        "Approve Session must persist Full Access so later messages in the same thread auto-approve")
     }
 
-    func test_selectThreadReplaysProviderReadThreadSnapshotWhenAvailable() throws {
+    func test_selectThreadReplaysProviderReadThreadSnapshotWhenAvailable() async throws {
         let adapter = CapturingProviderAdapter(provider: .codex, readEvents: [
             .threadStarted(threadId: "provider-thread-1", providerThreadId: "provider-thread-1"),
             .turnStarted(turnId: "provider-turn-1"),
@@ -716,13 +722,21 @@ final class AgentAppViewModelTests: XCTestCase {
 
         vm.createThread(title: "recover")
 
+        // PERF: selectThread now opens instantly from persisted events and replays
+        // the provider readThread snapshot one main-actor hop later (the freeze
+        // fix). The provider snapshot still REPLACES the stale local rows; we just
+        // drain that one hop before asserting the final, identical timeline state.
+        await waitAsync("provider snapshot replayed") {
+            vm.timeline.turns.map(\.turnId) == ["provider-turn-1"]
+        }
+
         XCTAssertEqual(vm.timeline.providerThreadId, "provider-thread-1")
         XCTAssertEqual(vm.timeline.turns.map(\.turnId), ["provider-turn-1"])
         XCTAssertEqual(vm.timeline.latestAssistantMessage, "Recovered from provider snapshot",
                        "selecting a thread with a live provider session must reload the provider snapshot instead of relying only on stale local stream rows")
     }
 
-    func test_restartedAgentAppRehydratesCodexThreadFromProviderSnapshotAfterLocalEventLoss() throws {
+    func test_restartedAgentAppRehydratesCodexThreadFromProviderSnapshotAfterLocalEventLoss() async throws {
         let tmp = NSTemporaryDirectory() + "rc2-vm-agent-provider-snapshot-restart-" + UUID().uuidString
         let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
         let workspaceID = WorkspaceID()
@@ -768,6 +782,13 @@ final class AgentAppViewModelTests: XCTestCase {
 
         XCTAssertEqual(vm.selectedThreadId, thread.id,
                        "after app restart, Agent App must reopen the persisted Codex thread")
+        // PERF: the provider snapshot replay on auto-reopen is now deferred one
+        // main-actor hop behind the instant local open (the freeze fix). Drain it
+        // before asserting that the provider snapshot still REPLACED the stale
+        // local final-message rows -- final timeline state is unchanged.
+        await waitAsync("restart provider snapshot replayed") {
+            vm.timeline.turns.map(\.turnId) == ["provider-turn-after-restart"]
+        }
         XCTAssertEqual(vm.timeline.providerThreadId, "provider-thread-after-restart")
         XCTAssertEqual(vm.timeline.turns.map(\.turnId), ["provider-turn-after-restart"])
         XCTAssertEqual(vm.timeline.latestAssistantMessage, "Recovered provider state after restart",
@@ -1931,7 +1952,7 @@ final class AgentAppViewModelTests: XCTestCase {
                       "/status must surface the run configuration")
     }
 
-    func test_slashUnknown_returnsFalseSoProviderCanHandleIt() throws {
+    func test_slashUnknown_returnsFalseSoProviderCanHandleIt() async throws {
         let (vm, _) = try makeVM()
         vm.createThread(title: "t")
         XCTAssertFalse(vm.handleSlashCommand("/wat"),
@@ -2961,13 +2982,13 @@ final class AgentAppViewModelTests: XCTestCase {
             checkpointRepo: checkpointRepo,
             providerAdapters: [.codex: restartedAdapter]
         )
-        _ = try restartedCoordinator.revertThreadToCheckpoint(threadId: threadId, checkpointTurnCount: 1, cwd: repoDir)
+        _ = try await restartedCoordinator.revertThreadToCheckpoint(threadId: threadId, checkpointTurnCount: 1, cwd: repoDir)
 
         XCTAssertEqual(try String(contentsOfFile: repoDir + "/tracked.txt"), "RC_AGENT_APP_CHECKPOINT_ONE\n",
                        "checkpoint revert after app restart must restore the workspace to the selected real Codex turn")
         XCTAssertFalse(FileManager.default.fileExists(atPath: repoDir + "/new.txt"),
                        "checkpoint revert must remove files introduced after the selected real Codex turn")
-        let readback = try restartedCoordinator.readThread(threadId: threadId)
+        let readback = try await restartedCoordinator.readThread(threadId: threadId)
         let readbackText = readback.map { String(describing: $0) }.joined(separator: "\n")
         XCTAssertTrue(readbackText.contains("RC_AGENT_APP_CHECKPOINT_ONE"))
         XCTAssertFalse(readbackText.contains("RC_AGENT_APP_CHECKPOINT_TWO"),
@@ -3174,7 +3195,7 @@ private final class FailingCallbackRunner: AgentProviderRunner, @unchecked Senda
         AgentRunHandle(runId: request.runId, process: nil) {}
     }
 
-    func respondToRequest(threadId: AgentThreadID, requestId: String, response: AgentProviderRequestResponse) throws {
+    func respondToRequest(threadId: AgentThreadID, requestId: String, response: AgentProviderRequestResponse) async throws {
         throw AgentProviderAdapterError.unsupported("dead approval callback")
     }
 
@@ -3351,7 +3372,7 @@ private final class CapturingProviderAdapter: AgentProviderAdapter, @unchecked S
         AgentRunHandle(runId: request.runId, process: nil) {}
     }
     func interruptTurn(threadId: AgentThreadID) throws {}
-    func respondToRequest(threadId: AgentThreadID, requestId: String, response: AgentProviderRequestResponse) throws {
+    func respondToRequest(threadId: AgentThreadID, requestId: String, response: AgentProviderRequestResponse) async throws {
         lock.lock()
         _lastRequestResponse = (threadId, requestId, response)
         lock.unlock()
@@ -3362,11 +3383,11 @@ private final class CapturingProviderAdapter: AgentProviderAdapter, @unchecked S
         lock.unlock()
     }
     func stopSession(threadId: AgentThreadID) throws {}
-    func recoverSession(_ request: AgentRunRequest, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) throws {}
+    func recoverSession(_ request: AgentRunRequest, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) async throws {}
     func listSessions() -> [AgentProviderSessionSummary] { [] }
     func hasSession(threadId: AgentThreadID) -> Bool { true }
-    func readThread(threadId: AgentThreadID) throws -> [AssistantEvent] { readEvents }
-    func rollbackThread(threadId: AgentThreadID, toTurnId: String) throws {}
+    func readThread(threadId: AgentThreadID) async throws -> [AssistantEvent] { readEvents }
+    func rollbackThread(threadId: AgentThreadID, toTurnId: String) async throws {}
     func stopAll() {}
     func streamEvents(threadId: AgentThreadID, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) throws {}
 }

@@ -186,7 +186,7 @@ final class FakeRunnerTests: XCTestCase {
         XCTFail("non-git completed run must still record an explicit missing checkpoint")
     }
 
-    func test_revertThreadToCheckpointRestoresWorkspaceAndRollsBackProvider() throws {
+    func test_revertThreadToCheckpointRestoresWorkspaceAndRollsBackProvider() async throws {
         let appSupport = NSTemporaryDirectory() + "rc2-checkpoint-revert-db-" + UUID().uuidString
         let repoDir = try mkTmpRepo(prefix: "rc2-checkpoint-revert-repo-")
         defer {
@@ -245,7 +245,7 @@ final class FakeRunnerTests: XCTestCase {
                                               checkpointRepo: checkpointRepo,
                                               providerAdapters: [.codex: adapter])
 
-        _ = try coordinator.revertThreadToCheckpoint(threadId: thread.id, checkpointTurnCount: 1, cwd: repoDir)
+        _ = try await coordinator.revertThreadToCheckpoint(threadId: thread.id, checkpointTurnCount: 1, cwd: repoDir)
 
         XCTAssertEqual(try String(contentsOfFile: repoDir + "/README.md", encoding: .utf8), turnOneBody)
         XCTAssertFalse(FileManager.default.fileExists(atPath: repoDir + "/later.txt"),
@@ -257,7 +257,7 @@ final class FakeRunnerTests: XCTestCase {
                        "local assistant messages after the target checkpoint must be pruned when their checkpoint trace is known")
     }
 
-    func test_revertThreadToCheckpointRecoversPersistedProviderSessionBeforeRollback() throws {
+    func test_revertThreadToCheckpointRecoversPersistedProviderSessionBeforeRollback() async throws {
         let appSupport = NSTemporaryDirectory() + "rc2-checkpoint-recover-revert-db-" + UUID().uuidString
         let repoDir = try mkTmpRepo(prefix: "rc2-checkpoint-recover-revert-repo-")
         defer {
@@ -316,7 +316,7 @@ final class FakeRunnerTests: XCTestCase {
                                               checkpointRepo: checkpointRepo,
                                               providerAdapters: [.codex: adapter])
 
-        _ = try coordinator.revertThreadToCheckpoint(threadId: thread.id, checkpointTurnCount: 1, cwd: repoDir)
+        _ = try await coordinator.revertThreadToCheckpoint(threadId: thread.id, checkpointTurnCount: 1, cwd: repoDir)
 
         XCTAssertEqual(adapter.lastProviderThreadId, "codex-thread-recovered",
                        "checkpoint revert after app restart must recover the persisted provider session before calling rollback")
@@ -324,7 +324,7 @@ final class FakeRunnerTests: XCTestCase {
         XCTAssertEqual(try String(contentsOfFile: repoDir + "/README.md", encoding: .utf8), targetBody)
     }
 
-    func test_revertThreadToCheckpointPreflightsSnapshotsBeforeProviderRollback() throws {
+    func test_revertThreadToCheckpointPreflightsSnapshotsBeforeProviderRollback() async throws {
         let appSupport = NSTemporaryDirectory() + "rc2-checkpoint-corrupt-revert-db-" + UUID().uuidString
         let repoDir = try mkTmpRepo(prefix: "rc2-checkpoint-corrupt-revert-repo-")
         defer {
@@ -358,7 +358,12 @@ final class FakeRunnerTests: XCTestCase {
                                               checkpointRepo: checkpointRepo,
                                               providerAdapters: [.codex: adapter])
 
-        XCTAssertThrowsError(try coordinator.revertThreadToCheckpoint(threadId: thread.id, checkpointTurnCount: 1, cwd: repoDir))
+        do {
+            _ = try await coordinator.revertThreadToCheckpoint(threadId: thread.id, checkpointTurnCount: 1, cwd: repoDir)
+            XCTFail("checkpoint revert must throw when local snapshots are not restorable")
+        } catch {
+            // expected
+        }
         XCTAssertNil(adapter.lastRollback,
                      "checkpoint revert must prove local snapshots are restorable before rolling back the provider conversation")
     }
@@ -510,7 +515,7 @@ final class FakeRunnerTests: XCTestCase {
             return ids == ["approval-runtime-1"]
         }
 
-        try coordinator.respondToRequest(threadId: thread.id, requestId: "approval-runtime-1", response: .approveForSession)
+        try await coordinator.respondToRequest(threadId: thread.id, requestId: "approval-runtime-1", response: .approveForSession)
 
         try await waitUntil("resolved approval id removed from runtime payload") {
             guard let session = try? sessionRepo.get(threadId: thread.id),
@@ -1066,7 +1071,7 @@ final class FakeRunnerTests: XCTestCase {
                                               threadRepo: threadRepo,
                                               providerAdapters: [.codex: adapter])
 
-        try coordinator.respondToRequest(threadId: thread.id, requestId: "approval-1", response: .approveForSession)
+        try await coordinator.respondToRequest(threadId: thread.id, requestId: "approval-1", response: .approveForSession)
         try coordinator.respondToUserInput(threadId: thread.id, requestId: "question-1", text: "Run")
 
         XCTAssertEqual(adapter.lastRequestResponse?.0, thread.id)
@@ -1077,7 +1082,7 @@ final class FakeRunnerTests: XCTestCase {
         XCTAssertEqual(adapter.lastUserInputResponse?.2, "Run")
     }
 
-    func test_coordinatorRoutesReadAndRollbackThroughProviderAdapter() throws {
+    func test_coordinatorRoutesReadAndRollbackThroughProviderAdapter() async throws {
         let tmp = NSTemporaryDirectory() + "rc2-provider-adapter-read-rollback-" + UUID().uuidString
         let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
         let threadRepo = AgentThreadRepository(db: db)
@@ -1091,8 +1096,9 @@ final class FakeRunnerTests: XCTestCase {
                                               threadRepo: threadRepo,
                                               providerAdapters: [.codex: adapter])
 
-        XCTAssertEqual(try coordinator.readThread(threadId: thread.id), [.turnStarted(turnId: "turn-1")])
-        try coordinator.rollbackThread(threadId: thread.id, toTurnId: "turn-1")
+        let readTurn1 = try await coordinator.readThread(threadId: thread.id)
+        XCTAssertEqual(readTurn1, [.turnStarted(turnId: "turn-1")])
+        try await coordinator.rollbackThread(threadId: thread.id, toTurnId: "turn-1")
 
         XCTAssertEqual(adapter.lastRollback?.0, thread.id)
         XCTAssertEqual(adapter.lastRollback?.1, "turn-1")
@@ -1165,7 +1171,7 @@ final class FakeRunnerTests: XCTestCase {
                        "Claude recovery must use persisted resume state after provider stopAll instead of starting a disconnected thread")
     }
 
-    func test_claudeCallbacksReadAndRollbackRouteThroughProviderAdapter() throws {
+    func test_claudeCallbacksReadAndRollbackRouteThroughProviderAdapter() async throws {
         let tmp = NSTemporaryDirectory() + "rc2-claude-callback-read-rollback-" + UUID().uuidString
         let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
         let threadRepo = AgentThreadRepository(db: db)
@@ -1180,10 +1186,11 @@ final class FakeRunnerTests: XCTestCase {
                                               threadRepo: threadRepo,
                                               providerAdapters: [.claude: adapter])
 
-        try coordinator.respondToRequest(threadId: thread.id, requestId: "approval-1", response: .approveForSession)
+        try await coordinator.respondToRequest(threadId: thread.id, requestId: "approval-1", response: .approveForSession)
         try coordinator.respondToUserInput(threadId: thread.id, requestId: "question-1", text: "Run")
-        XCTAssertEqual(try coordinator.readThread(threadId: thread.id), [.turnStarted(turnId: "claude-turn-1")])
-        try coordinator.rollbackThread(threadId: thread.id, toTurnId: "claude-turn-1")
+        let readClaudeTurn1 = try await coordinator.readThread(threadId: thread.id)
+        XCTAssertEqual(readClaudeTurn1, [.turnStarted(turnId: "claude-turn-1")])
+        try await coordinator.rollbackThread(threadId: thread.id, toTurnId: "claude-turn-1")
 
         XCTAssertEqual(adapter.lastRequestResponse?.2, .approveForSession,
                        "Claude approval responses must route through the provider adapter")
@@ -1289,12 +1296,14 @@ final class FakeRunnerTests: XCTestCase {
                                                        providerThreadId: providerThreadId)) { _ in }
         try await waitForReadableTurn(adapter: adapter, threadId: threadId, turnId: "turn-two")
 
-        XCTAssertEqual(try adapter.readThread(threadId: threadId).compactMap(\.completedTurnId), ["turn-one", "turn-two"],
+        let cliReadTurns = try await adapter.readThread(threadId: threadId).compactMap(\.completedTurnId)
+        XCTAssertEqual(cliReadTurns, ["turn-one", "turn-two"],
                        "Claude CLI sessions must expose readable turn history for Agent App reload instead of leaving readThread unsupported")
 
-        try adapter.rollbackThread(threadId: threadId, toTurnId: "turn-one")
+        try await adapter.rollbackThread(threadId: threadId, toTurnId: "turn-one")
 
-        XCTAssertEqual(try adapter.readThread(threadId: threadId).compactMap(\.completedTurnId), ["turn-one"],
+        let cliRolledBackTurns = try await adapter.readThread(threadId: threadId).compactMap(\.completedTurnId)
+        XCTAssertEqual(cliRolledBackTurns, ["turn-one"],
                        "Claude local rollback must trim the readable snapshot so checkpoint/revert UI does not show abandoned later turns")
     }
 
@@ -1314,7 +1323,7 @@ final class FakeRunnerTests: XCTestCase {
             try await waitForReadableTurn(adapter: adapter, threadId: threadId, turnId: "turn-\(prompt)")
         }
 
-        let readable = try adapter.readThread(threadId: threadId)
+        let readable = try await adapter.readThread(threadId: threadId)
         XCTAssertLessThanOrEqual(readable.count, 4,
                                  "Claude CLI readable snapshots must be bounded so long-running sessions do not retain every provider event in memory")
         XCTAssertTrue(readable.contains { $0.completedTurnId == "turn-three" },
@@ -1360,7 +1369,7 @@ final class FakeRunnerTests: XCTestCase {
     private func waitForReadableTurn(adapter: ClaudeCLIAdapter, threadId: AgentThreadID, turnId: String) async throws {
         let deadline = Date().addingTimeInterval(3)
         while Date() < deadline {
-            if ((try? adapter.readThread(threadId: threadId)) ?? []).contains(where: { $0.completedTurnId == turnId }) {
+            if ((try? await adapter.readThread(threadId: threadId)) ?? []).contains(where: { $0.completedTurnId == turnId }) {
                 return
             }
             try? await Task.sleep(nanoseconds: 20_000_000)
@@ -1564,7 +1573,7 @@ private final class SpyProviderAdapter: AgentProviderAdapter, @unchecked Sendabl
         _interruptTurnCallCount += 1
         lock.unlock()
     }
-    func respondToRequest(threadId: AgentThreadID, requestId: String, response: AgentProviderRequestResponse) throws {
+    func respondToRequest(threadId: AgentThreadID, requestId: String, response: AgentProviderRequestResponse) async throws {
         lock.lock()
         _lastRequestResponse = (threadId, requestId, response)
         lock.unlock()
@@ -1580,7 +1589,7 @@ private final class SpyProviderAdapter: AgentProviderAdapter, @unchecked Sendabl
         sessionSummaries.removeAll { $0.threadId == threadId }
         lock.unlock()
     }
-    func recoverSession(_ request: AgentRunRequest, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) throws {
+    func recoverSession(_ request: AgentRunRequest, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) async throws {
         lock.lock()
         _lastProviderThreadId = request.providerThreadId
         _lastRecoveredExtraArgs = request.extraArgs
@@ -1595,8 +1604,8 @@ private final class SpyProviderAdapter: AgentProviderAdapter, @unchecked Sendabl
         lock.lock(); defer { lock.unlock() }
         return sessionSummaries.contains { $0.threadId == threadId }
     }
-    func readThread(threadId: AgentThreadID) throws -> [AssistantEvent] { readEvents }
-    func rollbackThread(threadId: AgentThreadID, toTurnId: String) throws {
+    func readThread(threadId: AgentThreadID) async throws -> [AssistantEvent] { readEvents }
+    func rollbackThread(threadId: AgentThreadID, toTurnId: String) async throws {
         lock.lock()
         _lastRollback = (threadId, toTurnId)
         lock.unlock()
@@ -1624,14 +1633,14 @@ private final class FailingProviderAdapter: AgentProviderAdapter, @unchecked Sen
         throw AgentProviderAdapterError.unsupported("simulated provider startup failure")
     }
     func interruptTurn(threadId: AgentThreadID) throws {}
-    func respondToRequest(threadId: AgentThreadID, requestId: String, response: AgentProviderRequestResponse) throws {}
+    func respondToRequest(threadId: AgentThreadID, requestId: String, response: AgentProviderRequestResponse) async throws {}
     func respondToUserInput(threadId: AgentThreadID, requestId: String, text: String) throws {}
     func stopSession(threadId: AgentThreadID) throws {}
-    func recoverSession(_ request: AgentRunRequest, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) throws {}
+    func recoverSession(_ request: AgentRunRequest, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) async throws {}
     func listSessions() -> [AgentProviderSessionSummary] { [] }
     func hasSession(threadId: AgentThreadID) -> Bool { false }
-    func readThread(threadId: AgentThreadID) throws -> [AssistantEvent] { [] }
-    func rollbackThread(threadId: AgentThreadID, toTurnId: String) throws {}
+    func readThread(threadId: AgentThreadID) async throws -> [AssistantEvent] { [] }
+    func rollbackThread(threadId: AgentThreadID, toTurnId: String) async throws {}
     func stopAll() {}
     func streamEvents(threadId: AgentThreadID, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) throws {}
 }
@@ -1666,7 +1675,7 @@ private final class PendingUserInputAdapter: AgentProviderAdapter, @unchecked Se
     }
 
     func interruptTurn(threadId: AgentThreadID) throws {}
-    func respondToRequest(threadId: AgentThreadID, requestId: String, response: AgentProviderRequestResponse) throws {}
+    func respondToRequest(threadId: AgentThreadID, requestId: String, response: AgentProviderRequestResponse) async throws {}
     func respondToUserInput(threadId: AgentThreadID, requestId: String, text: String) throws {
         lock.lock()
         let callback = callbacks[threadId]
@@ -1674,11 +1683,11 @@ private final class PendingUserInputAdapter: AgentProviderAdapter, @unchecked Se
         callback?(.event(.userInputResolved(requestId: requestId, answer: text)))
     }
     func stopSession(threadId: AgentThreadID) throws {}
-    func recoverSession(_ request: AgentRunRequest, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) throws {}
+    func recoverSession(_ request: AgentRunRequest, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) async throws {}
     func listSessions() -> [AgentProviderSessionSummary] { [] }
     func hasSession(threadId: AgentThreadID) -> Bool { false }
-    func readThread(threadId: AgentThreadID) throws -> [AssistantEvent] { [] }
-    func rollbackThread(threadId: AgentThreadID, toTurnId: String) throws {}
+    func readThread(threadId: AgentThreadID) async throws -> [AssistantEvent] { [] }
+    func rollbackThread(threadId: AgentThreadID, toTurnId: String) async throws {}
     func stopAll() {}
     func streamEvents(threadId: AgentThreadID, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) throws {}
 }
@@ -1714,7 +1723,7 @@ private final class PendingApprovalAdapter: AgentProviderAdapter, @unchecked Sen
     }
 
     func interruptTurn(threadId: AgentThreadID) throws {}
-    func respondToRequest(threadId: AgentThreadID, requestId: String, response: AgentProviderRequestResponse) throws {
+    func respondToRequest(threadId: AgentThreadID, requestId: String, response: AgentProviderRequestResponse) async throws {
         lock.lock()
         let callback = callbacks[threadId]
         lock.unlock()
@@ -1722,11 +1731,11 @@ private final class PendingApprovalAdapter: AgentProviderAdapter, @unchecked Sen
     }
     func respondToUserInput(threadId: AgentThreadID, requestId: String, text: String) throws {}
     func stopSession(threadId: AgentThreadID) throws {}
-    func recoverSession(_ request: AgentRunRequest, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) throws {}
+    func recoverSession(_ request: AgentRunRequest, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) async throws {}
     func listSessions() -> [AgentProviderSessionSummary] { [] }
     func hasSession(threadId: AgentThreadID) -> Bool { false }
-    func readThread(threadId: AgentThreadID) throws -> [AssistantEvent] { [] }
-    func rollbackThread(threadId: AgentThreadID, toTurnId: String) throws {}
+    func readThread(threadId: AgentThreadID) async throws -> [AssistantEvent] { [] }
+    func rollbackThread(threadId: AgentThreadID, toTurnId: String) async throws {}
     func stopAll() {}
     func streamEvents(threadId: AgentThreadID, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) throws {}
 }
@@ -1773,14 +1782,14 @@ private final class ClaudeSessionSnapshotAdapter: AgentProviderAdapter, @uncheck
     }
 
     func interruptTurn(threadId: AgentThreadID) throws {}
-    func respondToRequest(threadId: AgentThreadID, requestId: String, response: AgentProviderRequestResponse) throws {}
+    func respondToRequest(threadId: AgentThreadID, requestId: String, response: AgentProviderRequestResponse) async throws {}
     func respondToUserInput(threadId: AgentThreadID, requestId: String, text: String) throws {}
     func stopSession(threadId: AgentThreadID) throws {}
-    func recoverSession(_ request: AgentRunRequest, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) throws {}
+    func recoverSession(_ request: AgentRunRequest, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) async throws {}
     func listSessions() -> [AgentProviderSessionSummary] { [] }
     func hasSession(threadId: AgentThreadID) -> Bool { false }
-    func readThread(threadId: AgentThreadID) throws -> [AssistantEvent] { [] }
-    func rollbackThread(threadId: AgentThreadID, toTurnId: String) throws {}
+    func readThread(threadId: AgentThreadID) async throws -> [AssistantEvent] { [] }
+    func rollbackThread(threadId: AgentThreadID, toTurnId: String) async throws {}
     func stopAll() {}
     func streamEvents(threadId: AgentThreadID, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) throws {}
 }

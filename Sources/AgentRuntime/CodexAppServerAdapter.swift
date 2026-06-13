@@ -196,7 +196,7 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         }
     }
 
-    public func respondToRequest(threadId: AgentThreadID, requestId: String, response: AgentProviderRequestResponse) throws {
+    public func respondToRequest(threadId: AgentThreadID, requestId: String, response: AgentProviderRequestResponse) async throws {
         guard let pending = removePendingApproval(threadId: threadId, requestId: requestId) else {
             throw AgentProviderAdapterError.sessionNotFound(threadId)
         }
@@ -221,7 +221,7 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         ], threadId: threadId)
         if response == .approveForSession {
             setSessionPermissionMode(threadId: threadId, permissionMode: .fullAccess)
-            try promoteSessionPermission(threadId: threadId, to: .fullAccess)
+            try await promoteSessionPermission(threadId: threadId, to: .fullAccess)
         }
         pending.continuation.resume(returning: ["decision": Self.codexDecision(response)])
     }
@@ -256,29 +256,14 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         session.client.stop()
     }
 
-    public func recoverSession(_ request: AgentRunRequest, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) throws {
+    public func recoverSession(_ request: AgentRunRequest, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) async throws {
         guard request.providerThreadId?.isEmpty == false else {
             throw AgentProviderAdapterError.unsupported("Codex app-server recovery requires providerThreadId")
         }
         let client = try clientFor(request: request, onEvent: onEvent)
-        let semaphore = DispatchSemaphore(value: 0)
-        let box = LockedResult<CodexAppServerThreadOpenResult>()
-        Task {
-            do {
-                _ = try await client.initialize(clientName: "remotecode", clientTitle: "RemoteCode", clientVersion: "0.0.0")
-                let opened = try await client.openThread(for: request)
-                box.set(.success(opened))
-            } catch {
-                box.set(.failure(error))
-            }
-            semaphore.signal()
-        }
-        guard semaphore.wait(timeout: .now() + openTimeout) == .success else {
-            client.stop()
-            throw AgentProviderAdapterError.unsupported("Codex app-server session recovery timed out")
-        }
         do {
-            let opened = try box.get().get()
+            _ = try await client.initialize(clientName: "remotecode", clientTitle: "RemoteCode", clientVersion: "0.0.0")
+            let opened = try await client.openThread(for: request)
             recordSession(threadId: request.threadId, client: client, providerThreadId: opened.providerThreadId, interactionMode: request.interactionMode, onEvent: onEvent, permissionMode: request.permissionMode)
             if let activeTurnId = Self.recoveryActiveTurnId(from: request.extraArgs) {
                 setActiveTurn(threadId: request.threadId, turnId: activeTurnId)
@@ -302,35 +287,21 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         return sessions[threadId] != nil
     }
 
-    public func readThread(threadId: AgentThreadID) throws -> [AssistantEvent] {
+    public func readThread(threadId: AgentThreadID) async throws -> [AssistantEvent] {
         guard let snapshot = sessionSnapshot(threadId: threadId) else {
             throw AgentProviderAdapterError.sessionNotFound(threadId)
         }
-        let semaphore = DispatchSemaphore(value: 0)
-        let box = LockedResult<CodexAppServerClient.JSONObject>()
-        Task {
-            do {
-                let response = try await snapshot.client.readThread(providerThreadId: snapshot.providerThreadId, includeTurns: true)
-                box.set(.success(response))
-            } catch {
-                box.set(.failure(error))
-            }
-            semaphore.signal()
-        }
-        guard semaphore.wait(timeout: .now() + openTimeout) == .success else {
-            throw AgentProviderAdapterError.unsupported("Codex app-server thread/read timed out")
-        }
-        let response = try box.get().get()
+        let response = try await snapshot.client.readThread(providerThreadId: snapshot.providerThreadId, includeTurns: true)
         mergeCompletedTurnIds(threadId: threadId, turnIds: Self.turnIds(fromThreadReadResponse: response))
         return Self.events(fromThreadReadResponse: response, providerThreadId: snapshot.providerThreadId)
     }
 
-    public func rollbackThread(threadId: AgentThreadID, toTurnId: String) throws {
+    public func rollbackThread(threadId: AgentThreadID, toTurnId: String) async throws {
         guard var snapshot = sessionSnapshot(threadId: threadId) else {
             throw AgentProviderAdapterError.sessionNotFound(threadId)
         }
         if snapshot.completedTurnIds.firstIndex(of: toTurnId) == nil {
-            _ = try? readThread(threadId: threadId)
+            _ = try? await readThread(threadId: threadId)
             if let refreshed = sessionSnapshot(threadId: threadId) {
                 snapshot = refreshed
             }
@@ -342,21 +313,7 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         guard numTurns > 0 else { return }
         let client = snapshot.client
         let providerThreadId = snapshot.providerThreadId
-        let semaphore = DispatchSemaphore(value: 0)
-        let box = LockedResult<CodexAppServerClient.JSONObject>()
-        Task {
-            do {
-                let response = try await client.rollbackThread(providerThreadId: providerThreadId, numTurns: numTurns)
-                box.set(.success(response))
-            } catch {
-                box.set(.failure(error))
-            }
-            semaphore.signal()
-        }
-        guard semaphore.wait(timeout: .now() + rollbackTimeout) == .success else {
-            throw AgentProviderAdapterError.unsupported("Codex app-server thread/rollback timed out")
-        }
-        _ = try box.get().get()
+        _ = try await client.rollbackThread(providerThreadId: providerThreadId, numTurns: numTurns)
     }
 
     public func stopAll() {
@@ -447,25 +404,11 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         }
     }
 
-    private func promoteSessionPermission(threadId: AgentThreadID, to mode: AgentPermissionMode) throws {
+    private func promoteSessionPermission(threadId: AgentThreadID, to mode: AgentPermissionMode) async throws {
         guard let snapshot = sessionSnapshot(threadId: threadId) else {
             throw AgentProviderAdapterError.sessionNotFound(threadId)
         }
-        let semaphore = DispatchSemaphore(value: 0)
-        let box = LockedResult<Void>()
-        Task {
-            do {
-                try await snapshot.client.updateThreadSettings(providerThreadId: snapshot.providerThreadId, permissionMode: mode)
-                box.set(.success(()))
-            } catch {
-                box.set(.failure(error))
-            }
-            semaphore.signal()
-        }
-        guard semaphore.wait(timeout: .now() + openTimeout) == .success else {
-            throw AgentProviderAdapterError.unsupported("Codex app-server thread/settings/update timed out")
-        }
-        try box.get().get()
+        try await snapshot.client.updateThreadSettings(providerThreadId: snapshot.providerThreadId, permissionMode: mode)
     }
 
     private func awaitUserInput(method: String, payload: [String: Any], threadId: AgentThreadID) async throws -> Any? {
@@ -1981,24 +1924,5 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
 private extension String {
     var nilIfEmpty: String? {
         isEmpty ? nil : self
-    }
-}
-
-private final class LockedResult<Value>: @unchecked Sendable {
-    private let lock = NSLock()
-    private var result: Result<Value, Error>?
-
-    func set(_ result: Result<Value, Error>) {
-        lock.lock()
-        self.result = result
-        lock.unlock()
-    }
-
-    func get() throws -> Result<Value, Error> {
-        lock.lock(); defer { lock.unlock() }
-        guard let result else {
-            throw AgentProviderAdapterError.unsupported("Codex app-server thread/read returned no result")
-        }
-        return result
     }
 }

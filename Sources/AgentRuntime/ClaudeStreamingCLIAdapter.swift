@@ -165,7 +165,7 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
         return data
     }
 
-    public func respondToRequest(threadId: AgentThreadID, requestId: String, response: AgentProviderRequestResponse) throws {
+    public func respondToRequest(threadId: AgentThreadID, requestId: String, response: AgentProviderRequestResponse) async throws {
         lock.lock()
         guard let session = sessions[threadId] else {
             lock.unlock()
@@ -209,7 +209,7 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
         terminate(session: session, status: .cancelled)
     }
 
-    public func recoverSession(_ request: AgentRunRequest, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) throws {
+    public func recoverSession(_ request: AgentRunRequest, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) async throws {
         guard request.providerThreadId?.isEmpty == false else {
             throw AgentProviderAdapterError.unsupported("Claude streaming recovery requires providerThreadId")
         }
@@ -246,7 +246,7 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
         return sessions[threadId] != nil
     }
 
-    public func readThread(threadId: AgentThreadID) throws -> [AssistantEvent] {
+    public func readThread(threadId: AgentThreadID) async throws -> [AssistantEvent] {
         lock.lock()
         let session = sessions[threadId]
         lock.unlock()
@@ -256,7 +256,7 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
         return session.events
     }
 
-    public func rollbackThread(threadId: AgentThreadID, toTurnId: String) throws {
+    public func rollbackThread(threadId: AgentThreadID, toTurnId: String) async throws {
         lock.lock()
         guard let session = sessions[threadId] else {
             lock.unlock()

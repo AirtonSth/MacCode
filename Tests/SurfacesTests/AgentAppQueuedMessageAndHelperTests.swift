@@ -261,6 +261,15 @@ final class AgentAppQueuedMessageAndHelperTests: XCTestCase {
         // lastErrorRecoverable = false explicitly.
         vm.respondToPendingRequest(fakeRequest, response: .approve)
 
+        // respondToPendingRequest now resolves off the main run loop (coordinator
+        // .respondToRequest is async since the codex semaphore bridge was removed),
+        // so the failure path clears the recoverable flag one hop later. Drain until
+        // it does; a real regression that left the flag recoverable would never
+        // clear it and this loop would time out, still failing the assert.
+        let recoverableDeadline = Date().addingTimeInterval(2)
+        while vm.lastErrorRecoverable && Date() < recoverableDeadline {
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
         XCTAssertFalse(vm.lastErrorRecoverable,
                        "a response-path failure must not offer Retry (it is not a prompt failure — the user must restart the turn manually)")
     }

@@ -61,7 +61,8 @@ final class ClaudeStreamingCLIAdapterTests: XCTestCase {
         XCTAssertEqual(try String(contentsOf: counter, encoding: .utf8), "2",
                        "Claude streaming adapter must keep one process alive and feed the second turn over stdin")
         XCTAssertEqual(adapter.listSessions().first?.providerThreadId, "claude-stream-session-1")
-        XCTAssertEqual(try adapter.readThread(threadId: threadId).compactMap(Self.completedTurnId).count, 2,
+        let streamingReadTurns = try await adapter.readThread(threadId: threadId).compactMap(Self.completedTurnId)
+        XCTAssertEqual(streamingReadTurns.count, 2,
                        "readThread must expose both completed turns from the durable streaming session")
         try adapter.stopSession(threadId: threadId)
     }
@@ -192,7 +193,7 @@ final class ClaudeStreamingCLIAdapterTests: XCTestCase {
             try await waitForFinish(in: sink, expected: "ROLLBACK_REPLY_\(index)")
         }
 
-        let completedBefore = try adapter.readThread(threadId: threadId).compactMap(Self.completedTurnId)
+        let completedBefore = try await adapter.readThread(threadId: threadId).compactMap(Self.completedTurnId)
         XCTAssertEqual(completedBefore.count, 2)
         let restoredTurnId = try XCTUnwrap(completedBefore.first)
 
@@ -200,9 +201,9 @@ final class ClaudeStreamingCLIAdapterTests: XCTestCase {
         try adapter.streamEvents(threadId: threadId) { event in
             Task { await rollbackSink.record(event) }
         }
-        try adapter.rollbackThread(threadId: threadId, toTurnId: restoredTurnId)
+        try await adapter.rollbackThread(threadId: threadId, toTurnId: restoredTurnId)
 
-        let readable = try adapter.readThread(threadId: threadId)
+        let readable = try await adapter.readThread(threadId: threadId)
         XCTAssertEqual(readable.compactMap(Self.completedTurnId), [restoredTurnId],
                        "Claude streaming rollback must prune abandoned later turns from readable history")
         XCTAssertFalse(readable.contains {
@@ -249,7 +250,7 @@ final class ClaudeStreamingCLIAdapterTests: XCTestCase {
         let adapter = ClaudeStreamingCLIAdapter(binaryNameOverride: script.path)
         let threadId = AgentThreadID()
         let providerThreadId = "claude-stream-session-recovered"
-        try adapter.recoverSession(AgentRunRequest(
+        try await adapter.recoverSession(AgentRunRequest(
             threadId: threadId,
             provider: .claude,
             model: "claude-haiku-4-5-20251001",
@@ -311,7 +312,7 @@ final class ClaudeStreamingCLIAdapterTests: XCTestCase {
 
         let adapter = ClaudeStreamingCLIAdapter(binaryNameOverride: script.path)
         let threadId = AgentThreadID()
-        try adapter.recoverSession(AgentRunRequest(
+        try await adapter.recoverSession(AgentRunRequest(
             threadId: threadId,
             provider: .claude,
             model: "claude-haiku-4-5-20251001",
@@ -321,7 +322,7 @@ final class ClaudeStreamingCLIAdapterTests: XCTestCase {
             environment: ["HOME": home.path]
         )) { _ in }
 
-        let readable = try adapter.readThread(threadId: threadId)
+        let readable = try await adapter.readThread(threadId: threadId)
         XCTAssertTrue(readable.contains {
             if case .itemDelta(_, let body, _, _) = $0 { return body == "TRANSCRIPT_BEFORE_RESTART" }
             return false
@@ -567,7 +568,7 @@ final class ClaudeStreamingCLIAdapterTests: XCTestCase {
         try adapter.respondToUserInput(threadId: threadId, requestId: "ask-1", text: "blue")
         try await waitForFinish(in: sink, expected: "ANSWERED_blue")
 
-        let readable = try adapter.readThread(threadId: threadId)
+        let readable = try await adapter.readThread(threadId: threadId)
         XCTAssertTrue(readable.contains {
             if case .userInputResolved(let requestId, let answer) = $0 {
                 return requestId == "ask-1" && answer == "blue"
@@ -618,7 +619,7 @@ final class ClaudeStreamingCLIAdapterTests: XCTestCase {
         }
 
         try await waitForRequest(in: sink, requestId: "perm-1")
-        try adapter.respondToRequest(threadId: threadId, requestId: "perm-1", response: .approveForSession)
+        try await adapter.respondToRequest(threadId: threadId, requestId: "perm-1", response: .approveForSession)
         try await waitForRequestResolution(in: sink, requestId: "perm-1", state: .approved)
         try await waitForFinish(in: sink, expected: "PERMISSION_approveForSession")
 
@@ -752,7 +753,7 @@ final class ClaudeStreamingCLIAdapterTests: XCTestCase {
             try await waitForFinish(in: sink, expected: "RETENTION_REPLY_\(index + 1)")
         }
 
-        let readable = try adapter.readThread(threadId: threadId)
+        let readable = try await adapter.readThread(threadId: threadId)
         XCTAssertLessThanOrEqual(readable.count, 5,
                                  "Claude streaming readable snapshots must be bounded so long sessions do not retain every stream-json event in memory")
         XCTAssertTrue(readable.contains {
@@ -844,7 +845,8 @@ final class ClaudeStreamingCLIAdapterTests: XCTestCase {
         XCTAssertTrue(commands.contains(#""attachments":[{"#) && commands.contains(#""path":"#) && commands.contains("note.txt"),
                       "Claude SDK bridge must send structured attachment metadata to the SDK bridge instead of flattening attachments into the prompt")
         XCTAssertEqual(adapter.listSessions().first?.providerThreadId, "sdk-session-1")
-        XCTAssertEqual(try adapter.readThread(threadId: threadId).compactMap(Self.completedTurnId).count, 2)
+        let sdkReadTurns = try await adapter.readThread(threadId: threadId).compactMap(Self.completedTurnId)
+        XCTAssertEqual(sdkReadTurns.count, 2)
         try adapter.stopSession(threadId: threadId)
     }
 
@@ -1009,8 +1011,9 @@ final class ClaudeStreamingCLIAdapterTests: XCTestCase {
         }
         try await waitForFinish(in: second, expected: "SDK_ROLLBACK_2")
 
-        try adapter.rollbackThread(threadId: threadId, toTurnId: "sdk-turn-1")
-        XCTAssertEqual(try adapter.readThread(threadId: threadId).compactMap(Self.completedTurnId), ["sdk-turn-1"],
+        try await adapter.rollbackThread(threadId: threadId, toTurnId: "sdk-turn-1")
+        let sdkRolledBackTurns = try await adapter.readThread(threadId: threadId).compactMap(Self.completedTurnId)
+        XCTAssertEqual(sdkRolledBackTurns, ["sdk-turn-1"],
                        "SDK rollback should prune local readable history to the restored provider turn")
 
         let third = EventSink()
@@ -1083,7 +1086,7 @@ final class ClaudeStreamingCLIAdapterTests: XCTestCase {
         }
 
         try await waitForRequest(in: sink, requestId: "sdk-perm-1")
-        try adapter.respondToRequest(threadId: threadId, requestId: "sdk-perm-1", response: .approveForSession)
+        try await adapter.respondToRequest(threadId: threadId, requestId: "sdk-perm-1", response: .approveForSession)
         try await waitForRequestResolution(in: sink, requestId: "sdk-perm-1", state: .approved)
         try await waitForFinish(in: sink, expected: "SDK_PERMISSION_OK")
 
@@ -1288,7 +1291,7 @@ final class ClaudeStreamingCLIAdapterTests: XCTestCase {
                        "turning partial snapshots back on can reproduce Anthropic 400 errors for thinking/redacted_thinking continuations")
     }
 
-    func test_agentSDKPackageSpecRefreshesStalePinnedCache() throws {
+    func test_agentSDKPackageSpecRefreshesStalePinnedCache() async throws {
         let tmp = URL(fileURLWithPath: NSTemporaryDirectory())
             .appendingPathComponent("rc2-claude-sdk-version-\(UUID().uuidString)", isDirectory: true)
         let packageJSON = tmp.appendingPathComponent("node_modules/@anthropic-ai/claude-agent-sdk/package.json")

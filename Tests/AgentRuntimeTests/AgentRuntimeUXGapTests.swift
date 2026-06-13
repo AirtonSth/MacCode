@@ -35,12 +35,12 @@ final class AgentRuntimeUXGapTests: XCTestCase {
 
     /// respondToRequest on the one-shot/CLI path must explain the mode
     /// constraint instead of leaking the internal Swift method name.
-    func test_claudeCLIAdapter_respondToRequest_humanCopy() {
+    func test_claudeCLIAdapter_respondToRequest_humanCopy() async throws {
         let runner = FakeProviderRunner(provider: .claude)
         let adapter = ClaudeCLIAdapter(runner: runner)
         let tid = AgentThreadID()
         do {
-            try adapter.respondToRequest(threadId: tid, requestId: "r1", response: .approve)
+            try await adapter.respondToRequest(threadId: tid, requestId: "r1", response: .approve)
             XCTFail("Expected throw")
         } catch let e as AgentProviderAdapterError {
             let desc = e.description
@@ -78,11 +78,11 @@ final class AgentRuntimeUXGapTests: XCTestCase {
 
     /// OneShotProviderAdapter (used for all one-shot runners) must give the
     /// same human-readable copy on respondToRequest.
-    func test_oneShotProviderAdapter_respondToRequest_humanCopy() {
+    func test_oneShotProviderAdapter_respondToRequest_humanCopy() async throws {
         let adapter = OneShotProviderAdapter(runner: FakeProviderRunner())
         let tid = AgentThreadID()
         do {
-            try adapter.respondToRequest(threadId: tid, requestId: "r1", response: .approve)
+            try await adapter.respondToRequest(threadId: tid, requestId: "r1", response: .approve)
             XCTFail("Expected throw")
         } catch let e as AgentProviderAdapterError {
             let desc = e.description

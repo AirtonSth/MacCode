@@ -193,7 +193,7 @@ final class PersistenceRestoreTests: XCTestCase {
         XCTAssertEqual(visible.userInputs.first?.state, .stale)
     }
 
-    func test_failedProviderCallbackResponseMarksStoredCallbackStale() throws {
+    func test_failedProviderCallbackResponseMarksStoredCallbackStale() async throws {
         let dir = NSTemporaryDirectory() + "RC2CallbackFailure-" + UUID().uuidString
         let ctx = try AppContext(channel: .debug, appSupportOverride: dir)
         let router = AppCommandRouter(context: ctx)
@@ -215,7 +215,10 @@ final class PersistenceRestoreTests: XCTestCase {
             createdAtMs: 2
         ))
 
-        XCTAssertThrowsError(try router.respondAgentRequest(thread: thread.id, requestId: "approval-1", response: .approve))
+        do {
+            try await router.respondAgentRequest(thread: thread.id, requestId: "approval-1", response: .approve)
+            XCTFail("respondAgentRequest must throw when the provider session is gone")
+        } catch {}
         XCTAssertThrowsError(try router.respondAgentUserInput(thread: thread.id, requestId: "question-1", text: "Run"))
 
         let approval = try XCTUnwrap(try ctx.providerPendingCallbackRepo.get(threadId: thread.id, requestId: "approval-1", kind: .approval))
@@ -229,7 +232,7 @@ final class PersistenceRestoreTests: XCTestCase {
         XCTAssertEqual(visible.userInputs.first?.state, .stale)
     }
 
-    func test_approveForSessionFromRemoteClientPromotesThreadToFullAccessAndMirrorsEvent() throws {
+    func test_approveForSessionFromRemoteClientPromotesThreadToFullAccessAndMirrorsEvent() async throws {
         let dir = NSTemporaryDirectory() + "RC2Persist-" + UUID().uuidString
         let ctx = try AppContext(channel: .debug, appSupportOverride: dir)
         let router = AppCommandRouter(context: ctx)
@@ -246,7 +249,7 @@ final class PersistenceRestoreTests: XCTestCase {
         }
         defer { EventBus.shared.unsubscribe(token) }
 
-        try router.respondAgentRequest(thread: thread.id, requestId: "approval-1", response: .approveForSession)
+        try await router.respondAgentRequest(thread: thread.id, requestId: "approval-1", response: .approveForSession)
 
         XCTAssertEqual(adapter.lastRequestResponse?.response, .approveForSession,
                        "the iOS RPC path must still send the session-scoped approval to the live provider adapter")
@@ -326,7 +329,7 @@ private final class ApprovalCaptureAdapter: AgentProviderAdapter, @unchecked Sen
         AgentRunHandle(runId: request.runId, process: nil) {}
     }
     func interruptTurn(threadId: AgentThreadID) throws {}
-    func respondToRequest(threadId: AgentThreadID, requestId: String, response: AgentProviderRequestResponse) throws {
+    func respondToRequest(threadId: AgentThreadID, requestId: String, response: AgentProviderRequestResponse) async throws {
         lock.lock()
         _lastRequestResponse = (threadId, requestId, response)
         lock.unlock()
@@ -337,11 +340,11 @@ private final class ApprovalCaptureAdapter: AgentProviderAdapter, @unchecked Sen
         lock.unlock()
     }
     func stopSession(threadId: AgentThreadID) throws {}
-    func recoverSession(_ request: AgentRunRequest, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) throws {}
+    func recoverSession(_ request: AgentRunRequest, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) async throws {}
     func listSessions() -> [AgentProviderSessionSummary] { [] }
     func hasSession(threadId: AgentThreadID) -> Bool { true }
-    func readThread(threadId: AgentThreadID) throws -> [AssistantEvent] { [] }
-    func rollbackThread(threadId: AgentThreadID, toTurnId: String) throws {}
+    func readThread(threadId: AgentThreadID) async throws -> [AssistantEvent] { [] }
+    func rollbackThread(threadId: AgentThreadID, toTurnId: String) async throws {}
     func stopAll() {}
     func streamEvents(threadId: AgentThreadID, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) throws {}
 }

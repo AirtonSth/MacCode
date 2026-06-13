@@ -53,7 +53,7 @@ public final class ClaudeCLIAdapter: AgentProviderAdapter, @unchecked Sendable {
         handle.cancel()
     }
 
-    public func respondToRequest(threadId: AgentThreadID, requestId: String, response: AgentProviderRequestResponse) throws {
+    public func respondToRequest(threadId: AgentThreadID, requestId: String, response: AgentProviderRequestResponse) async throws {
         throw AgentProviderAdapterError.unsupported("Approvals are not available in one-shot CLI mode. Use supervised or streaming mode to approve tool requests.")
     }
 
@@ -71,7 +71,7 @@ public final class ClaudeCLIAdapter: AgentProviderAdapter, @unchecked Sendable {
         lock.unlock()
     }
 
-    public func recoverSession(_ request: AgentRunRequest, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) throws {
+    public func recoverSession(_ request: AgentRunRequest, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) async throws {
         throw AgentProviderAdapterError.unsupported("Claude CLI session recovery requires Claude SDK session support")
     }
 
@@ -85,7 +85,7 @@ public final class ClaudeCLIAdapter: AgentProviderAdapter, @unchecked Sendable {
         return sessions[threadId] != nil
     }
 
-    public func readThread(threadId: AgentThreadID) throws -> [AssistantEvent] {
+    public func readThread(threadId: AgentThreadID) async throws -> [AssistantEvent] {
         lock.lock(); defer { lock.unlock() }
         guard sessions[threadId] != nil || events[threadId] != nil else {
             throw AgentProviderAdapterError.sessionNotFound(threadId)
@@ -93,7 +93,7 @@ public final class ClaudeCLIAdapter: AgentProviderAdapter, @unchecked Sendable {
         return events[threadId] ?? []
     }
 
-    public func rollbackThread(threadId: AgentThreadID, toTurnId: String) throws {
+    public func rollbackThread(threadId: AgentThreadID, toTurnId: String) async throws {
         lock.lock(); defer { lock.unlock() }
         guard var stream = events[threadId] else {
             throw AgentProviderAdapterError.sessionNotFound(threadId)

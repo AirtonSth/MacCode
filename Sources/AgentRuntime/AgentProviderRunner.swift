@@ -103,14 +103,14 @@ public protocol AgentProviderAdapter: AnyObject {
     func startSession(_ request: AgentRunRequest, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) async throws -> AgentRunHandle
     func sendTurn(_ request: AgentRunRequest, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) async throws -> AgentRunHandle
     func interruptTurn(threadId: AgentThreadID) throws
-    func respondToRequest(threadId: AgentThreadID, requestId: String, response: AgentProviderRequestResponse) throws
+    func respondToRequest(threadId: AgentThreadID, requestId: String, response: AgentProviderRequestResponse) async throws
     func respondToUserInput(threadId: AgentThreadID, requestId: String, text: String) throws
     func stopSession(threadId: AgentThreadID) throws
-    func recoverSession(_ request: AgentRunRequest, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) throws
+    func recoverSession(_ request: AgentRunRequest, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) async throws
     func listSessions() -> [AgentProviderSessionSummary]
     func hasSession(threadId: AgentThreadID) -> Bool
-    func readThread(threadId: AgentThreadID) throws -> [AssistantEvent]
-    func rollbackThread(threadId: AgentThreadID, toTurnId: String) throws
+    func readThread(threadId: AgentThreadID) async throws -> [AssistantEvent]
+    func rollbackThread(threadId: AgentThreadID, toTurnId: String) async throws
     func stopAll()
     func streamEvents(threadId: AgentThreadID, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) throws
 }
@@ -157,7 +157,7 @@ public final class OneShotProviderAdapter: AgentProviderAdapter, @unchecked Send
         handle.cancel()
     }
 
-    public func respondToRequest(threadId: AgentThreadID, requestId: String, response: AgentProviderRequestResponse) throws {
+    public func respondToRequest(threadId: AgentThreadID, requestId: String, response: AgentProviderRequestResponse) async throws {
         throw AgentProviderAdapterError.unsupported("Approvals are not available in one-shot CLI mode. Use supervised or streaming mode to approve tool requests.")
     }
 
@@ -173,7 +173,7 @@ public final class OneShotProviderAdapter: AgentProviderAdapter, @unchecked Send
         lock.unlock()
     }
 
-    public func recoverSession(_ request: AgentRunRequest, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) throws {
+    public func recoverSession(_ request: AgentRunRequest, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) async throws {
         guard request.providerThreadId?.isEmpty == false else {
             throw AgentProviderAdapterError.unsupported("recoverSession requires providerThreadId")
         }
@@ -192,11 +192,11 @@ public final class OneShotProviderAdapter: AgentProviderAdapter, @unchecked Send
         return sessions[threadId] != nil
     }
 
-    public func readThread(threadId: AgentThreadID) throws -> [AssistantEvent] {
+    public func readThread(threadId: AgentThreadID) async throws -> [AssistantEvent] {
         throw AgentProviderAdapterError.unsupported("readThread")
     }
 
-    public func rollbackThread(threadId: AgentThreadID, toTurnId: String) throws {
+    public func rollbackThread(threadId: AgentThreadID, toTurnId: String) async throws {
         throw AgentProviderAdapterError.unsupported("rollbackThread")
     }
 

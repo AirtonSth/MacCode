@@ -1488,7 +1488,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         try? ctx.commandReceiptRepo.record(method: method, clientRequestId: clientRequestId, resultJSON: json)
     }
 
-    public func respondAgentRequest(thread: AgentThreadID, requestId: String, response: AgentProviderRequestResponse) throws {
+    public func respondAgentRequest(thread: AgentThreadID, requestId: String, response: AgentProviderRequestResponse) async throws {
         guard let ctx = context else { throw LayoutError.workspaceNotFound }
         let state: AssistantRequestState = {
             switch response {
@@ -1498,7 +1498,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             }
         }()
         do {
-            try ctx.coordinator.respondToRequest(threadId: thread, requestId: requestId, response: response)
+            try await ctx.coordinator.respondToRequest(threadId: thread, requestId: requestId, response: response)
             try? ctx.providerPendingCallbackRepo.resolve(threadId: thread, requestId: requestId, kind: .approval, state: state)
             EventBus.shared.publish(kind: "agent.request.resolved", payload: .object([
                 "thread_id": .string(thread.value.uuidString),
@@ -1583,14 +1583,14 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         return AssistantPendingCallbacksSnapshot(requests: requests, userInputs: userInputs)
     }
 
-    public func readAgentThreadEvents(thread: AgentThreadID) throws -> [AssistantEvent] {
+    public func readAgentThreadEvents(thread: AgentThreadID) async throws -> [AssistantEvent] {
         guard let ctx = context else { throw LayoutError.workspaceNotFound }
-        return try ctx.coordinator.readThread(threadId: thread)
+        return try await ctx.coordinator.readThread(threadId: thread)
     }
 
-    public func rollbackAgentThread(thread: AgentThreadID, toTurnId: String) throws {
+    public func rollbackAgentThread(thread: AgentThreadID, toTurnId: String) async throws {
         guard let ctx = context else { throw LayoutError.workspaceNotFound }
-        try ctx.coordinator.rollbackThread(threadId: thread, toTurnId: toTurnId)
+        try await ctx.coordinator.rollbackThread(threadId: thread, toTurnId: toTurnId)
     }
 
     public func listAgentThreadCheckpoints(thread: AgentThreadID) throws -> [AgentTurnCheckpointSummary] {
@@ -1609,11 +1609,11 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         return checkpoint.diffPatch ?? checkpoint.fileDiffs.map(\.patch).joined(separator: "\n")
     }
 
-    public func revertAgentThreadToCheckpoint(thread: AgentThreadID, checkpointTurnCount: Int) throws -> AgentTurnCheckpointSummary {
+    public func revertAgentThreadToCheckpoint(thread: AgentThreadID, checkpointTurnCount: Int) async throws -> AgentTurnCheckpointSummary {
         guard let ctx = context else { throw LayoutError.workspaceNotFound }
         guard let agentThread = try ctx.threadRepo.get(id: thread),
               let workspaceId = agentThread.workspaceId else { throw LayoutError.workspaceNotFound }
-        return try ctx.coordinator.revertThreadToCheckpoint(
+        return try await ctx.coordinator.revertThreadToCheckpoint(
             threadId: thread,
             checkpointTurnCount: checkpointTurnCount,
             cwd: try workspaceCwd(workspaceId)

@@ -390,7 +390,7 @@ class FakeRouter: CommandRouting, TerminalCommandRouting {
     func recordCommandReceipt(method: String, clientRequestId: String, result: JSONValue) {
         commandReceipts["\(method):\(clientRequestId)"] = result
     }
-    func respondAgentRequest(thread: AgentThreadID, requestId: String, response: AgentProviderRequestResponse) throws {
+    func respondAgentRequest(thread: AgentThreadID, requestId: String, response: AgentProviderRequestResponse) async throws {
         respondAgentRequestCallCount += 1
         lastAgentRequestResponse = (thread, requestId, response)
         agentRequestResponses.append((thread, requestId, response))
@@ -403,10 +403,10 @@ class FakeRouter: CommandRouting, TerminalCommandRouting {
     func listAgentPendingCallbacks(thread: AgentThreadID) throws -> AssistantPendingCallbacksSnapshot {
         pendingCallbackSnapshot
     }
-    func readAgentThreadEvents(thread: AgentThreadID) throws -> [AssistantEvent] {
+    func readAgentThreadEvents(thread: AgentThreadID) async throws -> [AssistantEvent] {
         readAgentEvents
     }
-    func rollbackAgentThread(thread: AgentThreadID, toTurnId: String) throws {
+    func rollbackAgentThread(thread: AgentThreadID, toTurnId: String) async throws {
         rollbackCallCount += 1
         lastRollback = (thread, toTurnId)
     }
@@ -420,7 +420,7 @@ class FakeRouter: CommandRouting, TerminalCommandRouting {
         if let path { return checkpoint.fileDiffs.first(where: { $0.path == path })?.patch ?? "" }
         return checkpoint.diffPatch ?? checkpoint.fileDiffs.map(\.patch).joined(separator: "\n")
     }
-    func revertAgentThreadToCheckpoint(thread: AgentThreadID, checkpointTurnCount: Int) throws -> AgentTurnCheckpointSummary {
+    func revertAgentThreadToCheckpoint(thread: AgentThreadID, checkpointTurnCount: Int) async throws -> AgentTurnCheckpointSummary {
         checkpointRevertCallCount += 1
         lastCheckpointRevert = (thread, checkpointTurnCount)
         return AgentTurnCheckpointSummary(

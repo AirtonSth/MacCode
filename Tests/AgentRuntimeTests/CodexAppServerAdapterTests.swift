@@ -156,7 +156,7 @@ final class CodexAppServerAdapterTests: XCTestCase {
         client.notificationHandler?("turn/completed", ["threadId": "codex-thread-1", "turnId": "turn-beta"])
         client.notificationHandler?("turn/completed", ["threadId": "codex-thread-1", "turnId": "turn-gamma"])
 
-        try adapter.rollbackThread(threadId: threadId, toTurnId: "turn-alpha")
+        try await adapter.rollbackThread(threadId: threadId, toTurnId: "turn-alpha")
 
         let deadline = Date().addingTimeInterval(3)
         while Date() < deadline {
@@ -192,7 +192,7 @@ final class CodexAppServerAdapterTests: XCTestCase {
         }
         let threadId = AgentThreadID()
 
-        try adapter.recoverSession(AgentRunRequest(
+        try await adapter.recoverSession(AgentRunRequest(
             threadId: threadId,
             provider: .codex,
             model: "gpt-5.5",
@@ -205,11 +205,11 @@ final class CodexAppServerAdapterTests: XCTestCase {
         XCTAssertEqual(client.openedRequests.first?.providerThreadId, "codex-thread-recovered")
         XCTAssertTrue(client.startedTurns.isEmpty, "Recovery for read/rollback must not start a new provider turn")
 
-        let events = try adapter.readThread(threadId: threadId)
+        let events = try await adapter.readThread(threadId: threadId)
         XCTAssertTrue(events.contains { if case .turnCompleted(let turnId, _) = $0 { return turnId == "turn-beta" } else { return false } })
         XCTAssertEqual(client.readCalls.first?.providerThreadId, "codex-thread-recovered")
 
-        try adapter.rollbackThread(threadId: threadId, toTurnId: "turn-alpha")
+        try await adapter.rollbackThread(threadId: threadId, toTurnId: "turn-alpha")
         let deadline = Date().addingTimeInterval(3)
         while Date() < deadline {
             if !client.rolledBackTurns.isEmpty { break }
@@ -227,7 +227,7 @@ final class CodexAppServerAdapterTests: XCTestCase {
         }
         let threadId = AgentThreadID()
 
-        try adapter.recoverSession(AgentRunRequest(
+        try await adapter.recoverSession(AgentRunRequest(
             threadId: threadId,
             provider: .codex,
             model: "gpt-5.5",
@@ -281,7 +281,7 @@ final class CodexAppServerAdapterTests: XCTestCase {
         XCTAssertEqual(request.kind, .commandExecution)
         XCTAssertEqual(request.detail, "swift test")
 
-        try adapter.respondToRequest(threadId: threadId, requestId: request.id, response: .approveForSession)
+        try await adapter.respondToRequest(threadId: threadId, requestId: request.id, response: .approveForSession)
         let rawResponse = try await responseTask.value
         let response = try XCTUnwrap(rawResponse as? [String: Any])
         XCTAssertEqual(response["decision"] as? String, "acceptForSession")
@@ -389,7 +389,7 @@ final class CodexAppServerAdapterTests: XCTestCase {
         Reason: Verify reload recovery
         """, "rich provider approval payloads must stay readable instead of collapsing to raw JSON")
 
-        try adapter.respondToRequest(threadId: threadId, requestId: request.id, response: .decline(nil))
+        try await adapter.respondToRequest(threadId: threadId, requestId: request.id, response: .decline(nil))
         let rawResponse = try await responseTask.value
         let response = try XCTUnwrap(rawResponse as? [String: Any])
         XCTAssertEqual(response["decision"] as? String, "decline")
@@ -431,7 +431,7 @@ final class CodexAppServerAdapterTests: XCTestCase {
         XCTAssertTrue(request.detail?.contains("/repo/Secrets.swift") == true,
                       "Codex app-server file-read approvals should use the same actionable approval UI as command and file-change approvals")
 
-        try adapter.respondToRequest(threadId: threadId, requestId: request.id, response: .decline(nil))
+        try await adapter.respondToRequest(threadId: threadId, requestId: request.id, response: .decline(nil))
         let rawResponse = try await responseTask.value
         let response = try XCTUnwrap(rawResponse as? [String: Any])
         XCTAssertEqual(response["decision"] as? String, "decline")
@@ -790,7 +790,7 @@ final class CodexAppServerAdapterTests: XCTestCase {
             prompt: "read"
         )) { _ in }
 
-        let events = try adapter.readThread(threadId: threadId)
+        let events = try await adapter.readThread(threadId: threadId)
 
         XCTAssertEqual(client.readCalls.first?.providerThreadId, "codex-thread-1")
         XCTAssertTrue(events.contains { if case .threadStarted(let threadId, let providerThreadId) = $0 { return threadId == "codex-thread-1" && providerThreadId == "codex-thread-1" } else { return false } })
@@ -889,7 +889,7 @@ final class CodexAppServerAdapterTests: XCTestCase {
             prompt: "read aliases"
         )) { _ in }
 
-        let events = try adapter.readThread(threadId: threadId)
+        let events = try await adapter.readThread(threadId: threadId)
 
         XCTAssertTrue(events.contains { if case .itemStarted(let item) = $0 { return item.id == "web-1" && item.type == .webSearch && item.summary == "RemoteCode" } else { return false } })
         XCTAssertTrue(events.contains { if case .itemDelta(let itemId, _, let output, _) = $0 { return itemId == "web-1" && output == "Search result summary" } else { return false } },
@@ -1282,7 +1282,7 @@ final class CodexAppServerAdapterTests: XCTestCase {
             prompt: "read plan"
         )) { _ in }
 
-        let events = try adapter.readThread(threadId: threadId)
+        let events = try await adapter.readThread(threadId: threadId)
         let proposedPlan = try XCTUnwrap(events.compactMap { event -> AssistantProposedPlan? in
             if case .proposedPlan(let plan) = event { return plan }
             return nil
@@ -1728,7 +1728,7 @@ final class CodexAppServerAdapterTests: XCTestCase {
             prompt: "read telemetry"
         )) { _ in }
 
-        let events = try adapter.readThread(threadId: threadId)
+        let events = try await adapter.readThread(threadId: threadId)
         XCTAssertTrue(events.contains { if case .tokenUsage(let usage) = $0 { return usage.totalTokens == 12 && usage.contextWindow == 100 } else { return false } })
         XCTAssertTrue(events.contains { if case .contextCompaction(let summary) = $0 { return summary == "Snapshot compacted" } else { return false } })
     }

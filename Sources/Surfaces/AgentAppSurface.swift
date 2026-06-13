@@ -189,6 +189,12 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// so reloadThreads never issues a full messageRepo.list for the same thread twice.
     private var repairedThreadIds: Set<AgentThreadID> = []
 
+    // Monotonic ticket for user callback actions (approval responses, user-input
+    // answers). respondToPendingRequest resolves async; this seq lets its failure
+    // path detect a newer callback action and avoid clobbering the more-recent
+    // visible error, restoring the pre-async most-recent-action-wins ordering.
+    private var callbackActionSeq: UInt64 = 0
+
     // PERF-MAC_AGENT-009: cache thread->workspace membership so didChangeStatus
     // does not issue a DB read per status event of every thread. Populated on
     // every reloadThreads() call; threads from other workspaces arrive via the
@@ -415,18 +421,36 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         loadAllMessages(id)
         timeline = AssistantTimelineState()
         let persistedEvents = coordinator.latestStreamEvents(threadId: id)
-        let replayEvents = Self.chooseReplayEvents(
-            persisted: persistedEvents,
-            snapshot: providerThreadSnapshotEvents(threadId: id).map {
-                mergePersistedContextTelemetry(snapshot: $0, persisted: persistedEvents)
-            }
-        )
-        for event in replayEvents {
+        // PERF: the provider-thread snapshot read (coordinator.readThread) used to
+        // block thread-open for up to a provider round-trip (codex app-server),
+        // freezing the UI on every open/switch. Open instantly from persisted
+        // events (snapshot: nil), then fetch the provider snapshot off the main
+        // run loop and recompute the SAME full replay (chooseReplayEvents over
+        // persisted + snapshot, identical merge + order) and re-apply it. Final
+        // timeline state is identical to the pre-async path; only the provider
+        // snapshot portion is now deferred instead of blocking.
+        let persistedReplay = Self.chooseReplayEvents(persisted: persistedEvents, snapshot: nil)
+        for event in persistedReplay {
             timeline.apply(event)
         }
         // PERF: rebuild the O(1) item index once over the fully-replayed timeline so
         // subsequent item-location lookups skip the O(turns x items) linear scan.
         timelineItemIndex = TimelineItemIndex(turns: timeline.turns)
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            let snapshot = await self.providerThreadSnapshotEvents(threadId: id)
+            // Drop the result if the user switched threads while we were reading.
+            guard self.selectedThreadId == id, let snapshot else { return }
+            let replayEvents = Self.chooseReplayEvents(
+                persisted: persistedEvents,
+                snapshot: self.mergePersistedContextTelemetry(snapshot: snapshot, persisted: persistedEvents)
+            )
+            self.timeline = AssistantTimelineState()
+            for event in replayEvents {
+                self.timeline.apply(event)
+            }
+            self.timelineItemIndex = TimelineItemIndex(turns: self.timeline.turns)
+        }
         rehydrateProposedPlans(threadId: id)
         rehydratePendingCallbacks(threadId: id)
         reloadCheckpoints()
@@ -623,22 +647,24 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
 
     public func revertSelectedCheckpoint() {
         guard let selectedThreadId, let turnCount = selectedCheckpointTurnCount else { return }
-        do {
-            _ = try coordinator.revertThreadToCheckpoint(threadId: selectedThreadId, checkpointTurnCount: turnCount, cwd: cwd)
-            // PERF-MAC_AGENT-006/012: revert deleted assistant rows — drop both caches.
-            lastPersistedAssistantContentByThread.removeValue(forKey: selectedThreadId)
-            lastPersistedFinalIdByThread.removeValue(forKey: selectedThreadId)
-            checkpointStatusMessage = "Reverted to checkpoint \(turnCount)."
-            loadAllMessages(selectedThreadId)
-            reloadCheckpoints()
-            reloadThreads()
-        } catch {
-            checkpointStatusMessage = "Revert failed: \(error.localizedDescription)"
+        Task { @MainActor in
+            do {
+                _ = try await coordinator.revertThreadToCheckpoint(threadId: selectedThreadId, checkpointTurnCount: turnCount, cwd: cwd)
+                // PERF-MAC_AGENT-006/012: revert deleted assistant rows — drop both caches.
+                lastPersistedAssistantContentByThread.removeValue(forKey: selectedThreadId)
+                lastPersistedFinalIdByThread.removeValue(forKey: selectedThreadId)
+                checkpointStatusMessage = "Reverted to checkpoint \(turnCount)."
+                loadAllMessages(selectedThreadId)
+                reloadCheckpoints()
+                reloadThreads()
+            } catch {
+                checkpointStatusMessage = "Revert failed: \(error.localizedDescription)"
+            }
         }
     }
 
-    private func providerThreadSnapshotEvents(threadId: AgentThreadID) -> [AssistantEvent]? {
-        guard let events = try? coordinator.readThread(threadId: threadId), !events.isEmpty else {
+    private func providerThreadSnapshotEvents(threadId: AgentThreadID) async -> [AssistantEvent]? {
+        guard let events = try? await coordinator.readThread(threadId: threadId), !events.isEmpty else {
             return nil
         }
         return events
@@ -845,27 +871,51 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         case .decline: state = .declined
         case .cancel: state = .cancelled
         }
-        do {
-            try coordinator.respondToRequest(threadId: threadId, requestId: request.id, response: response)
-            timeline.apply(.requestResolved(requestId: request.id, state: state))
-            // QA-MAC_AGENT-010: record approval outcomes for diagnostics.
-            agentSurfaceLog.info("approval.resolved thread=\(threadId.value.uuidString, privacy: .public) request=\(request.id, privacy: .public) state=\(state.rawValue, privacy: .public)")
-            if response == .approveForSession {
-                setPermissionMode(.fullAccess)
+        // coordinator.respondToRequest is now async (its codex app-server
+        // permission-promotion no longer blocks the caller on a semaphore).
+        // respondToPendingRequest stays a synchronous SwiftUI action; drive the
+        // resolution off the main run loop, preserving the same success/failure
+        // side-effects, ordering, and the trailing timeline tick.
+        //
+        // The async hop means a later, synchronous callback action (e.g.
+        // answerPendingUserInput) can run BEFORE this Task resolves. To preserve
+        // the pre-async "most-recent callback action's error is the visible one"
+        // ordering, stamp this action and refuse to clobber timeline.error if a
+        // newer callback action has been issued in the meantime.
+        callbackActionSeq &+= 1
+        let issuedSeq = callbackActionSeq
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                try await self.coordinator.respondToRequest(threadId: threadId, requestId: request.id, response: response)
+                self.timeline.apply(.requestResolved(requestId: request.id, state: state))
+                // QA-MAC_AGENT-010: record approval outcomes for diagnostics.
+                agentSurfaceLog.info("approval.resolved thread=\(threadId.value.uuidString, privacy: .public) request=\(request.id, privacy: .public) state=\(state.rawValue, privacy: .public)")
+                if response == .approveForSession {
+                    self.setPermissionMode(.fullAccess)
+                }
+            } catch {
+                // Always retain the stale diagnostic + clear the dead button, but
+                // only surface this error message if it is still the most recent
+                // callback action (no newer action stomped it via a sync write).
+                if issuedSeq == self.callbackActionSeq {
+                    self.timeline.apply(.error(message: "Provider request response failed: \(error)", recoverable: true))
+                    self.lastErrorRecoverable = false
+                }
+                self.timeline.apply(.requestResolved(requestId: request.id, state: .stale))
             }
-        } catch {
-            timeline.apply(.error(message: "Provider request response failed: \(error)", recoverable: true))
-            timeline.apply(.requestResolved(requestId: request.id, state: .stale))
-            // Response-failure, not a prompt failure — no prompt Retry offered.
-            lastErrorRecoverable = false
+            self.scheduleTimelineUpdateTick()
         }
-        scheduleTimelineUpdateTick()
     }
 
     public func answerPendingUserInput(_ request: AssistantUserInputRequest, answer: String) {
         guard let threadId = selectedThreadId else { return }
         let trimmed = answer.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
+        // Newest callback action -- see respondToPendingRequest: bumping this seq
+        // stops an in-flight async approval failure from overwriting this (more
+        // recent) user-input error, preserving most-recent-action-wins ordering.
+        callbackActionSeq &+= 1
         userInputSelections[request.id] = nil
         userInputDrafts[request.id] = nil
         do {

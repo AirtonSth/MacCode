@@ -71,14 +71,14 @@ public protocol CommandRouting: AnyObject {
     func saveAgentPlan(thread: AgentThreadID, planId: String, planMarkdown: String?, relativePath: String?) throws -> (path: String, relativePath: String)
     func commandReceipt(method: String, clientRequestId: String) -> JSONValue?
     func recordCommandReceipt(method: String, clientRequestId: String, result: JSONValue)
-    func respondAgentRequest(thread: AgentThreadID, requestId: String, response: AgentProviderRequestResponse) throws
+    func respondAgentRequest(thread: AgentThreadID, requestId: String, response: AgentProviderRequestResponse) async throws
     func respondAgentUserInput(thread: AgentThreadID, requestId: String, text: String) throws
     func listAgentPendingCallbacks(thread: AgentThreadID) throws -> AssistantPendingCallbacksSnapshot
-    func readAgentThreadEvents(thread: AgentThreadID) throws -> [AssistantEvent]
-    func rollbackAgentThread(thread: AgentThreadID, toTurnId: String) throws
+    func readAgentThreadEvents(thread: AgentThreadID) async throws -> [AssistantEvent]
+    func rollbackAgentThread(thread: AgentThreadID, toTurnId: String) async throws
     func listAgentThreadCheckpoints(thread: AgentThreadID) throws -> [AgentTurnCheckpointSummary]
     func agentCheckpointDiff(thread: AgentThreadID, checkpointTurnCount: Int, path: String?) throws -> String
-    func revertAgentThreadToCheckpoint(thread: AgentThreadID, checkpointTurnCount: Int) throws -> AgentTurnCheckpointSummary
+    func revertAgentThreadToCheckpoint(thread: AgentThreadID, checkpointTurnCount: Int) async throws -> AgentTurnCheckpointSummary
     func stopAgentRun(thread: AgentThreadID) throws
     func deleteAgentThread(thread: AgentThreadID) throws
     func deleteAgentThreads(_ threads: [AgentThreadID]) throws
@@ -1078,7 +1078,7 @@ public final class JSONRPCDispatcher {
                 case "cancel": response = .cancel
                 default: throw JSONRPCError.invalidParams
                 }
-                try router.respondAgentRequest(thread: tid, requestId: requestId, response: response)
+                try await router.respondAgentRequest(thread: tid, requestId: requestId, response: response)
                 let result: JSONValue = .bool(true)
                 recordCommandReceipt(method: req.method, clientRequestId: receiptKey, result: result)
                 return .init(id: id, result: result)
@@ -1099,7 +1099,7 @@ public final class JSONRPCDispatcher {
                 return .init(id: id, result: encode(try router.listAgentPendingCallbacks(thread: tid)))
             case "agent.thread.read":
                 guard let tid = params["thread_id"]?.stringValue.flatMap(UUID.init).map(AgentThreadID.init) else { throw JSONRPCError.invalidParams }
-                return .init(id: id, result: encode(try router.readAgentThreadEvents(thread: tid)))
+                return .init(id: id, result: encode(try await router.readAgentThreadEvents(thread: tid)))
             case "agent.thread.rollback":
                 guard let tid = params["thread_id"]?.stringValue.flatMap(UUID.init).map(AgentThreadID.init),
                       let turnId = params["turn_id"]?.stringValue else { throw JSONRPCError.invalidParams }
@@ -1107,7 +1107,7 @@ public final class JSONRPCDispatcher {
                 if let (_, cached) = commandReceipt(method: req.method, params: params) {
                     return .init(id: id, result: cached)
                 }
-                try router.rollbackAgentThread(thread: tid, toTurnId: turnId)
+                try await router.rollbackAgentThread(thread: tid, toTurnId: turnId)
                 let result: JSONValue = .bool(true)
                 recordCommandReceipt(method: req.method, clientRequestId: receiptKey, result: result)
                 return .init(id: id, result: result)
@@ -1130,7 +1130,7 @@ public final class JSONRPCDispatcher {
                 if let (_, cached) = commandReceipt(method: req.method, params: params) {
                     return .init(id: id, result: cached)
                 }
-                let checkpoint = try router.revertAgentThreadToCheckpoint(thread: tid, checkpointTurnCount: turnCount)
+                let checkpoint = try await router.revertAgentThreadToCheckpoint(thread: tid, checkpointTurnCount: turnCount)
                 EventBus.shared.publish(kind: "agent.checkpoint.reverted", payload: .object([
                     "thread_id": .string(tid.value.uuidString),
                     "turn_count": .number(Double(checkpoint.checkpointTurnCount)),

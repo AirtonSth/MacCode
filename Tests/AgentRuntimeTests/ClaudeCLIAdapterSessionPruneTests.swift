@@ -139,7 +139,7 @@ final class ClaudeCLIAdapterSessionPruneTests: XCTestCase {
         try await waitUntilFinished(adapter: adapter, threadIds: [t1])
 
         // Roll back t1 - marks it rollback-reachable.
-        try adapter.rollbackThread(threadId: t1, toTurnId: "turn-p")
+        try await adapter.rollbackThread(threadId: t1, toTurnId: "turn-p")
 
         // Run t2 and t3 to push map over cap.
         for threadId in [t2, t3] {
@@ -154,7 +154,7 @@ final class ClaudeCLIAdapterSessionPruneTests: XCTestCase {
         XCTAssertTrue(adapter.hasSession(threadId: t1),
                       "a rolled-back thread must not be evicted even when the session cap is exceeded")
         // t1 events must still be readable.
-        let events = try adapter.readThread(threadId: t1)
+        let events = try await adapter.readThread(threadId: t1)
         XCTAssertFalse(events.isEmpty,
                        "rolled-back thread events must remain readable after the pruner runs")
     }

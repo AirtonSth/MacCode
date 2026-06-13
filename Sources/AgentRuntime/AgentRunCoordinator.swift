@@ -324,17 +324,31 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                 // Keep the pending stop so handle registration cancels the run.
             }
         }
-        if let adapter = try? adapterForThread(threadId) {
-            do {
-                try recoverAdapterSessionIfNeeded(threadId: threadId, adapter: adapter)
-                if adapter.hasSession(threadId: threadId) {
-                    try adapter.interruptTurn(threadId: threadId)
-                    markStopRequested(threadId: threadId, runId: nil)
-                    return
+        if let adapter = try? adapterForThread(threadId), !adapter.hasSession(threadId: threadId) {
+            // recoverAdapterSessionIfNeeded is now async (its provider-session
+            // recovery no longer blocks the caller on a semaphore). stopRun must
+            // stay synchronous for its many non-async callers, so drive the
+            // best-effort recover-then-interrupt off the calling thread. The
+            // synchronous pendingThreadStops fall-through below remains the stop
+            // guarantee; the interrupt here is best-effort exactly as before.
+            //
+            // Only attempted when there is NO live session: a session that exists
+            // without a registered handle is the one-shot-before-handle race, and
+            // its interrupt would throw sessionNotFound. That case must fall
+            // through to the synchronous pendingThreadStops insertion below so
+            // handle registration cancels the run -- it must NOT early-return.
+            Task { [weak self] in
+                guard let self else { return }
+                do {
+                    try await self.recoverAdapterSessionIfNeeded(threadId: threadId, adapter: adapter)
+                    if adapter.hasSession(threadId: threadId) {
+                        try adapter.interruptTurn(threadId: threadId)
+                        self.markStopRequested(threadId: threadId, runId: nil)
+                    }
+                } catch {
+                    // Pending cancellation (recorded synchronously below) covers this;
+                    // startRun will fail loudly if recovered state is insufficient.
                 }
-            } catch {
-                // Fall through to pending cancellation; startRun will fail loudly
-                // if the recovered state is not sufficient to continue.
             }
         }
         guard let thread = try? threadRepo.get(id: threadId),
@@ -436,9 +450,9 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         onRunFinished?(request.threadId, runId, .failed)
     }
 
-    public func respondToRequest(threadId: AgentThreadID, requestId: String, response: AgentProviderRequestResponse) throws {
+    public func respondToRequest(threadId: AgentThreadID, requestId: String, response: AgentProviderRequestResponse) async throws {
         let adapter = try adapterForThread(threadId)
-        try adapter.respondToRequest(threadId: threadId, requestId: requestId, response: response)
+        try await adapter.respondToRequest(threadId: threadId, requestId: requestId, response: response)
     }
 
     public func respondToUserInput(threadId: AgentThreadID, requestId: String, text: String) throws {
@@ -446,20 +460,20 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         try adapter.respondToUserInput(threadId: threadId, requestId: requestId, text: text)
     }
 
-    public func readThread(threadId: AgentThreadID) throws -> [AssistantEvent] {
+    public func readThread(threadId: AgentThreadID) async throws -> [AssistantEvent] {
         let adapter = try adapterForThread(threadId)
-        try recoverAdapterSessionIfNeeded(threadId: threadId, adapter: adapter)
-        return try adapter.readThread(threadId: threadId)
+        try await recoverAdapterSessionIfNeeded(threadId: threadId, adapter: adapter)
+        return try await adapter.readThread(threadId: threadId)
     }
 
-    public func rollbackThread(threadId: AgentThreadID, toTurnId: String) throws {
+    public func rollbackThread(threadId: AgentThreadID, toTurnId: String) async throws {
         let adapter = try adapterForThread(threadId)
-        try recoverAdapterSessionIfNeeded(threadId: threadId, adapter: adapter)
-        try adapter.rollbackThread(threadId: threadId, toTurnId: toTurnId)
+        try await recoverAdapterSessionIfNeeded(threadId: threadId, adapter: adapter)
+        try await adapter.rollbackThread(threadId: threadId, toTurnId: toTurnId)
     }
 
     @discardableResult
-    public func revertThreadToCheckpoint(threadId: AgentThreadID, checkpointTurnCount: Int, cwd: String) throws -> AgentTurnCheckpointSummary {
+    public func revertThreadToCheckpoint(threadId: AgentThreadID, checkpointTurnCount: Int, cwd: String) async throws -> AgentTurnCheckpointSummary {
         guard let checkpointRepo else {
             throw AgentProviderAdapterError.unsupported("checkpoint repository is unavailable")
         }
@@ -478,7 +492,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
 
         let newer = try checkpointRepo.listAfter(threadId: threadId, checkpointTurnCount: checkpointTurnCount)
         try validateRestorableSnapshots(in: checkpoint, newerCheckpoints: newer, cwd: cwd)
-        try rollbackThread(threadId: threadId, toTurnId: checkpoint.turnId)
+        try await rollbackThread(threadId: threadId, toTurnId: checkpoint.turnId)
         try restoreWorkspace(to: checkpoint, newerCheckpoints: newer, cwd: cwd)
         try messageRepo.delete(ids: newer.compactMap(\.assistantMessageId))
         try checkpointRepo.deleteAfter(threadId: threadId, checkpointTurnCount: checkpointTurnCount)
@@ -585,7 +599,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         return adapterType
     }
 
-    private func recoverAdapterSessionIfNeeded(threadId: AgentThreadID, adapter: AgentProviderAdapter) throws {
+    private func recoverAdapterSessionIfNeeded(threadId: AgentThreadID, adapter: AgentProviderAdapter) async throws {
         guard !adapter.hasSession(threadId: threadId) else { return }
         guard let thread = try threadRepo.get(id: threadId) else {
             throw AgentProviderAdapterError.sessionNotFound(threadId)
@@ -618,7 +632,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             environment: ["REMOTE_CODE_AGENT_PROVIDER": thread.provider.rawValue],
             extraArgs: activeTurnId.map { ["remotecode.recovery.activeTurnId=\($0)"] } ?? []
         )
-        try adapter.recoverSession(request) { _ in }
+        try await adapter.recoverSession(request) { _ in }
     }
 
     private func providerBinaryIdentity(_ provider: AgentProvider, adapter: AgentProviderAdapter) -> String? {
