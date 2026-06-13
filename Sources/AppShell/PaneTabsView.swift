@@ -1924,6 +1924,14 @@ final class PaneRootView: NoDragView {
         super.setFrameSize(newSize)
         needsUpdateConstraints = true
         needsLayout = true
+        // PERF-MAC_SHELL_WINDOW-MED-129: during a live divider drag the parent
+        // RatioSplitView fires setFrameSize on every mouse-moved tick. Forcing
+        // a synchronous AutoLayout subtree solve per tick causes hundreds of
+        // redundant solves per second (jank). When a drag is active, mark the
+        // subtree dirty and defer — AppKit coalesces the solve at the next frame
+        // boundary. On drag-end RatioSplitView clears the flag and forces one
+        // final solve so the layout always converges to the correct final frame.
+        guard !RatioSplitView.dividerDragActive else { return }
         updateConstraintsForSubtreeIfNeeded()
         layoutSubtreeIfNeeded()
     }

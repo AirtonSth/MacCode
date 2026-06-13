@@ -781,6 +781,17 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
             // place via PaneTabsView.reconcile(to:) (diffTabs seam) instead
             // of tearing the container down -- this is what removes the
             // resize-end strip flash on focus/rename/color changes.
+            // PERF-MAC_SHELL_WINDOW-MED-126: ratios are also excluded from the
+            // structural signature. When only ratios changed (divider mouse-up),
+            // apply them in place on the live RatioSplitView tree instead of
+            // re-parenting surfaces.
+            if let ctx = context,
+               let wid = ctx.state.window.selectedWorkspaceID,
+               !detachedWorkspaceIDs.contains(wid),
+               let ws = ctx.state.workspaces[wid],
+               let rootView = workspaceContent.subviews.first {
+                applyRatiosInPlace(view: rootView, node: ws.layout)
+            }
             reconcilePaneControllersInPlace()
             shellLog.debug("rebuildWorkspaceContainer reconciled in place (structure unchanged)")
             return
@@ -860,13 +871,54 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
             // focus/rename does NOT trigger a full teardown; those are
             // applied in place by PaneTabsView.reconcile(to:) (driven by
             // the diffTabs seam). Only an id-set/order change rebuilds.
+            // Ratios are intentionally excluded: a ratio-only change is
+            // applied in place by applyRatiosInPlace (PERF-MAC_SHELL_WINDOW-MED-126)
+            // and must NOT trigger a teardown/rebuild.
             let surfaces = p.surfaces.map { $0.id.value.uuidString }.joined(separator: ",")
             parts.append("pane(\(p.id.value.uuidString);[\(surfaces)])")
         case .split(let s):
-            parts.append("split(\(s.orientation);\(s.ratios.map { String(format: "%.3f", $0) }.joined(separator: ",")){")
+            // Ratios excluded from structural signature: ratio-only changes are
+            // applied in place without a rebuild (PERF-MAC_SHELL_WINDOW-MED-126).
+            parts.append("split(\(s.orientation);\(s.id.uuidString){")
             for child in s.children { appendLayoutSignature(child, into: &parts) }
             parts.append("}")
         }
+    }
+
+    // PERF-MAC_SHELL_WINDOW-MED-126: pure seam — given two layout trees with
+    // the same structure (same split ids / child count / orientation / pane ids),
+    // returns true when they differ only in split ratios. This is the boundary
+    // condition that gates the in-place apply: if this returns false, a genuine
+    // structural change has occurred and a full rebuild is required.
+    static func ratiosOnlyChanged(old: LayoutNode, new: LayoutNode) -> Bool {
+        switch (old, new) {
+        case (.pane(let op), .pane(let np)):
+            // Panes have no ratios; if ids / surface ids match, nothing changed.
+            return op.id == np.id
+                && op.surfaces.map(\.id) == np.surfaces.map(\.id)
+        case (.split(let os), .split(let ns)):
+            guard os.id == ns.id,
+                  os.orientation == ns.orientation,
+                  os.children.count == ns.children.count else { return false }
+            return zip(os.children, ns.children).allSatisfy { ratiosOnlyChanged(old: $0, new: $1) }
+        default:
+            return false
+        }
+    }
+
+    // PERF-MAC_SHELL_WINDOW-MED-126: walk the live RatioSplitView tree rooted
+    // at `view` and apply new ratios from `node` in place. Called only when
+    // ratiosOnlyChanged confirmed a ratio-only update — no views are added,
+    // removed, or re-parented.
+    private func applyRatiosInPlace(view: NSView, node: LayoutNode) {
+        if case .split(let s) = node, let split = view as? RatioSplitView {
+            split.ratios = s.ratios.map { CGFloat($0) }
+            split.relayoutNow()
+            for (child, childNode) in zip(split.subviews, s.children) {
+                applyRatiosInPlace(view: child, node: childNode)
+            }
+        }
+        // .pane nodes have no ratios; leaf NSViews (PaneRootView) are left as-is.
     }
 
     private func attachRootLayoutView(_ layoutView: NSView) {
@@ -1552,6 +1604,13 @@ final class RatioSplitView: NSView {
     private var dividerLayers: [CALayer] = []
     private var dividerGripLayers: [CALayer] = []
 
+    // PERF-MAC_SHELL_WINDOW-MED-129: class-level flag indicating a divider drag
+    // is in progress on ANY RatioSplitView. PaneRootView reads this to skip the
+    // synchronous AutoLayout subtree solve on every setFrameSize tick — hundreds
+    // of solves per drag second are replaced by a single solve on drag-end.
+    // Thread-bound to @MainActor (all AppKit events are main-thread).
+    static var dividerDragActive: Bool = false
+
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         wantsLayer = true
@@ -1603,6 +1662,9 @@ final class RatioSplitView: NSView {
         dragDividerIndex = index
         dragStartPoint = point
         dragStartRatios = normalizedRatios(for: subviews.count)
+        // PERF-MAC_SHELL_WINDOW-MED-129: suppress per-tick AutoLayout solves
+        // in PaneRootView.setFrameSize for the duration of this drag.
+        RatioSplitView.dividerDragActive = true
         window?.makeFirstResponder(self)
     }
 
@@ -1619,6 +1681,14 @@ final class RatioSplitView: NSView {
 
     override func mouseUp(with event: NSEvent) {
         if dragDividerIndex != nil {
+            // PERF-MAC_SHELL_WINDOW-MED-129: drag ended — clear the suppression
+            // flag and force one final synchronous layout solve so every pane
+            // settles to its exact final frame before the commit fires.
+            RatioSplitView.dividerDragActive = false
+            for sv in subviews {
+                sv.needsLayout = true
+                sv.layoutSubtreeIfNeeded()
+            }
             onRatiosChanged?(ratios)
         }
         dragDividerIndex = nil
@@ -1648,7 +1718,14 @@ final class RatioSplitView: NSView {
     /// onRatiosChanged is NOT fired -- the original layout is kept.
     func cancelDividerDrag() {
         ratios = RatioSplitView.ratiosOnCancel(dragStart: dragStartRatios)
+        // PERF-MAC_SHELL_WINDOW-MED-129: clear suppression and settle layout
+        // to the restored ratios before returning.
+        RatioSplitView.dividerDragActive = false
         layoutByRatios()
+        for sv in subviews {
+            sv.needsLayout = true
+            sv.layoutSubtreeIfNeeded()
+        }
         dragDividerIndex = nil
         dragStartPoint = nil
         dragStartRatios = []
