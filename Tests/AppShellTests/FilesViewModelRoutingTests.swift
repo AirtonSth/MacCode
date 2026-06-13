@@ -15,6 +15,7 @@ final class FilesViewModelRoutingTests: XCTestCase {
         var contents: [String: String] = [:]
         var operations: [String] = []
         var sessionPathByID: [String: String] = [:]
+        var onApplyPatch: ((String) -> Void)?
 
         func filesEditClose(sessionID: String) throws -> JSONValue {
             operations.append("close:\(sessionID)")
@@ -110,11 +111,17 @@ final class FilesViewModelRoutingTests: XCTestCase {
 
         func filesEditApplyPatch(sessionID: String, baseDraftRevision: Int, rangeLocation: Int, rangeLength: Int, replacement: String, deviceID: String?) throws -> JSONValue {
             let path = sessionPathByID[sessionID] ?? ""
+            operations.append("patch:\(path):\(replacement)")
+            onApplyPatch?(path)
+            let current = contents[path] ?? ""
+            let ns = current as NSString
+            contents[path] = ns.replacingCharacters(in: NSRange(location: rangeLocation, length: rangeLength), with: replacement)
             return .object([
                 "session_id": .string(sessionID),
                 "path": .string(path),
                 "draft_revision": .number(Double(baseDraftRevision + 1)),
-                "dirty": .bool(true)
+                "dirty": .bool(true),
+                "content": .string(contents[path] ?? "")
             ])
         }
 
@@ -246,5 +253,34 @@ final class FilesViewModelRoutingTests: XCTestCase {
             "reselecting a dirty file must restore the cached local draft")
         XCTAssertFalse(router.operations.contains("open:a.txt"),
             "dirty cached sessions must not reopen from host and lose local draft state")
+    }
+
+    func test_reentrantEditorChangeDuringPatchCoalescesToSecondPatch() {
+        let router = FakeFilesRouter()
+        router.listings[""] = [FakeFilesRouter.fileEntry("a.txt")]
+        router.contents["a.txt"] = ""
+        let model = makeModel(router: router)
+        defer { model.close() }
+        model.loadDirectory("")
+        model.loadFile(model.entries[0])
+
+        var didReenter = false
+        router.onApplyPatch = { [weak model] path in
+            guard path == "a.txt", !didReenter else { return }
+            didReenter = true
+            model?.draftText = "ab"
+            model?.editorChanged("ab")
+        }
+
+        model.draftText = "a"
+        model.editorChanged("a")
+        RunLoop.current.run(until: Date().addingTimeInterval(0.4))
+
+        XCTAssertEqual(router.operations.filter { $0.hasPrefix("patch:a.txt") }.count, 2,
+            "typing again during an in-flight patch must be coalesced into exactly one follow-up patch")
+        XCTAssertEqual(model.draftText, "ab",
+            "the final draft should include the reentrant edit")
+        XCTAssertEqual(router.contents["a.txt"], "ab",
+            "the host content should receive the follow-up patch after the first patch finishes")
     }
 }
