@@ -182,6 +182,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     private var promptHistoryCursor: Int?
     private var terminalRunIds = Set<AgentRunID>()
     private var timelineUpdateTickTask: Task<Void, Never>?
+    // UX-XPLAT-DELETE-UNDO: drops the transient delete snapshot when the undo
+    // window lapses. Cancelled on a new delete, on undo, or on teardown.
+    private var threadDeletionUndoExpiryTask: Task<Void, Never>?
     /// PERF: tracks thread ids whose placeholder titles have already been repaired
     /// so reloadThreads never issues a full messageRepo.list for the same thread twice.
     private var repairedThreadIds: Set<AgentThreadID> = []
@@ -1372,7 +1375,61 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         reloadThreads()
     }
 
+    // UX-XPLAT-DELETE-UNDO: thread deletion stays IMMEDIATE and final (the
+    // delete*Thread contract is unchanged). On top of it we keep a transient
+    // in-memory snapshot of the just-deleted thread(s) + their messages for a
+    // short window so the user can undo an accidental delete. After the window
+    // the snapshot is dropped and the delete is permanent. This is purely
+    // additive: nothing defers the actual DELETE.
+    public struct ThreadDeletionUndo {
+        /// One deleted thread captured before it was removed from the store.
+        public struct ThreadSnapshot: Sendable, Equatable {
+            public let thread: AgentThread
+            public let messages: [AgentMessage]
+        }
+
+        /// All threads removed by a single delete action, the instant captured,
+        /// and which (if any) thread was selected at delete time so undo can
+        /// restore selection too. `count` drives the toast copy.
+        public var snapshots: [ThreadSnapshot]
+        public var capturedAt: Date
+        public var previouslySelectedThreadId: AgentThreadID?
+
+        public var count: Int { snapshots.count }
+
+        /// Pure: is an undo still allowed `window` seconds after capture?
+        /// WHY: an accidental delete must be recoverable, but only briefly —
+        /// after the window the snapshot is dropped and the delete is final.
+        public static func isWithinUndoWindow(
+            capturedAt: Date,
+            now: Date,
+            window: TimeInterval
+        ) -> Bool {
+            now.timeIntervalSince(capturedAt) < window
+        }
+
+        /// Pure: FK-safe restore order for one snapshot. agent_messages has a
+        /// `thread_id REFERENCES agent_threads(id) ON DELETE CASCADE` foreign
+        /// key with `foreign_keys=ON`, so the parent thread row MUST be
+        /// re-inserted before any message, and messages re-append oldest→newest
+        /// to preserve their original order.
+        public static func restorePlan(
+            for snapshot: ThreadSnapshot
+        ) -> (thread: AgentThread, messagesInAppendOrder: [AgentMessage]) {
+            (snapshot.thread, snapshot.messages.sorted { $0.createdAt < $1.createdAt })
+        }
+    }
+
+    /// Seconds the undo toast stays actionable after a thread delete.
+    public static let threadDeletionUndoWindow: TimeInterval = 10
+
+    /// UX-XPLAT-DELETE-UNDO: transient snapshot of the most recent thread
+    /// delete. Non-nil only inside the undo window; cleared on undo, on a new
+    /// delete, or when the window lapses. Drives the undo toast.
+    @Published public private(set) var pendingThreadDeletionUndo: ThreadDeletionUndo?
+
     public func deleteThread(_ id: AgentThreadID) {
+        let undo = captureThreadDeletionUndo(ids: [id])
         try? threadRepo.delete(id: id)
         if selectedThreadId == id {
             selectedThreadId = nil
@@ -1381,10 +1438,12 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         resetTimelineUpdateTick()
         }
         reloadThreads()
+        armThreadDeletionUndo(undo)
     }
 
     public func deleteThreads(_ ids: Set<AgentThreadID>) {
         guard !ids.isEmpty else { return }
+        let undo = captureThreadDeletionUndo(ids: Array(ids))
         try? threadRepo.delete(ids: Array(ids))
         if let selectedThreadId, ids.contains(selectedThreadId) {
             self.selectedThreadId = nil
@@ -1393,6 +1452,86 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         resetTimelineUpdateTick()
         }
         reloadThreads()
+        armThreadDeletionUndo(undo)
+    }
+
+    /// Snapshot the threads (+ their messages) about to be deleted, BEFORE the
+    /// store removes them. Returns nil if nothing could be captured so the undo
+    /// toast never appears for a no-op.
+    private func captureThreadDeletionUndo(ids: [AgentThreadID]) -> ThreadDeletionUndo? {
+        var snapshots: [ThreadDeletionUndo.ThreadSnapshot] = []
+        for id in ids {
+            guard let thread = try? threadRepo.get(id: id) else { continue }
+            let messages = (try? messageRepo.list(threadId: id)) ?? []
+            snapshots.append(.init(thread: thread, messages: messages))
+        }
+        guard !snapshots.isEmpty else { return nil }
+        return ThreadDeletionUndo(
+            snapshots: snapshots,
+            capturedAt: currentTime(),
+            previouslySelectedThreadId: selectedThreadId
+        )
+    }
+
+    /// Publish the snapshot as the active undo affordance and schedule its
+    /// expiry. The delete itself already happened; this only controls how long
+    /// the user can take it back.
+    private func armThreadDeletionUndo(_ undo: ThreadDeletionUndo?) {
+        threadDeletionUndoExpiryTask?.cancel()
+        guard let undo else {
+            pendingThreadDeletionUndo = nil
+            return
+        }
+        pendingThreadDeletionUndo = undo
+        let window = Self.threadDeletionUndoWindow
+        threadDeletionUndoExpiryTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(window * 1_000_000_000))
+            guard let self, !Task.isCancelled else { return }
+            // Only clear the snapshot we armed; a newer delete owns its own.
+            if let current = self.pendingThreadDeletionUndo,
+               current.capturedAt == undo.capturedAt,
+               !ThreadDeletionUndo.isWithinUndoWindow(
+                   capturedAt: current.capturedAt,
+                   now: self.currentTime(),
+                   window: window
+               ) {
+                self.pendingThreadDeletionUndo = nil
+            }
+        }
+    }
+
+    /// UX-XPLAT-DELETE-UNDO: restore the most recently deleted thread(s) from
+    /// the transient snapshot, provided the undo window has not lapsed. Returns
+    /// true if a restore happened. FK-safe: re-inserts the thread row first,
+    /// then re-appends its messages.
+    @discardableResult
+    public func undoLastThreadDeletion() -> Bool {
+        guard let undo = pendingThreadDeletionUndo,
+              ThreadDeletionUndo.isWithinUndoWindow(
+                  capturedAt: undo.capturedAt,
+                  now: currentTime(),
+                  window: Self.threadDeletionUndoWindow
+              ) else {
+            // Window lapsed (or nothing to undo): drop the stale snapshot.
+            pendingThreadDeletionUndo = nil
+            threadDeletionUndoExpiryTask?.cancel()
+            return false
+        }
+        for snapshot in undo.snapshots {
+            let plan = ThreadDeletionUndo.restorePlan(for: snapshot)
+            try? threadRepo.upsert(plan.thread)
+            for message in plan.messagesInAppendOrder {
+                try? messageRepo.append(message)
+            }
+        }
+        pendingThreadDeletionUndo = nil
+        threadDeletionUndoExpiryTask?.cancel()
+        reloadThreads()
+        if let restore = undo.previouslySelectedThreadId,
+           threads.contains(where: { $0.id == restore }) {
+            selectThread(restore)
+        }
+        return true
     }
 
     /// Derive the persisted thread title from the first user message.
@@ -3347,6 +3486,9 @@ public struct AgentAppView: View {
             if vm.permissionMode == .fullAccess {
                 fullAccessBanner
             }
+            if let undo = vm.pendingThreadDeletionUndo {
+                threadDeletionUndoBanner(undo)
+            }
             if !vm.timeline.workActivities.isEmpty {
                 workLogRow
                     .padding(.horizontal, 22)
@@ -3440,6 +3582,29 @@ public struct AgentAppView: View {
         .background(DS.Palette.danger.opacity(0.12))
         .overlay(alignment: .bottom) { Rectangle().fill(DS.Palette.danger.opacity(0.3)).frame(height: 1) }
         .accessibilityIdentifier("agent.fullAccessBanner")
+    }
+
+    // UX-XPLAT-DELETE-UNDO: transient toast offering to restore a just-deleted
+    // thread. The delete already happened; Undo re-inserts the snapshot.
+    private func threadDeletionUndoBanner(_ undo: AgentAppViewModel.ThreadDeletionUndo) -> some View {
+        HStack(spacing: DS.Space.sm) {
+            Image(systemName: "trash")
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundColor(DS.Palette.textSecondary)
+            Text(undo.count > 1 ? "\(undo.count) threads deleted" : "Thread deleted")
+                .font(DS.Font.caption.weight(.semibold))
+                .foregroundColor(DS.Palette.text)
+            Spacer(minLength: 0)
+            Button("Undo") { vm.undoLastThreadDeletion() }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .accessibilityIdentifier("agent.thread.delete.undo")
+        }
+        .padding(.horizontal, DS.Space.lg).padding(.vertical, DS.Space.sm)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(DS.Palette.surfaceRaised)
+        .overlay(alignment: .bottom) { Rectangle().fill(DS.Palette.line).frame(height: 1) }
+        .accessibilityIdentifier("agent.thread.delete.undoBanner")
     }
 
     private var modelLabel: String {
