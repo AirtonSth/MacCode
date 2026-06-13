@@ -131,4 +131,46 @@ final class FileTreeStoreTests: XCTestCase {
         XCTAssertTrue(didForce)
         XCTAssertEqual(lister.calls, ["src", "src"], "force must bypass the cache and refetch")
     }
+
+    func test_cachedItem_findsSeededRootWithoutListingChildren() {
+        let lister = FakeLister([:])
+        let store = FileTreeStore<StubItem>(lister: lister.list)
+        store.setRoots([StubItem("src", isDirectory: true)])
+
+        let cached = store.cachedItem(relativePath: "src")
+
+        XCTAssertEqual(cached?.relativePath, "src",
+            "sidebar move-drop must resolve top-level drag sources from the already-rendered roots")
+        XCTAssertEqual(lister.calls, [],
+            "cached lookup must not list directories; it is used during drag/drop hit handling")
+    }
+
+    func test_cachedItem_findsExpandedSubtreeChild() {
+        let lister = FakeLister([
+            "src": [StubItem("src/app.swift", isDirectory: false), StubItem("src/ui", isDirectory: true)]
+        ])
+        let store = FileTreeStore<StubItem>(lister: lister.list)
+        store.setRoots([StubItem("src", isDirectory: true)])
+
+        _ = store.children(at: "src")
+        let cached = store.cachedItem(relativePath: "src/app.swift")
+
+        XCTAssertEqual(cached?.relativePath, "src/app.swift",
+            "moving a file from an expanded subdirectory must find the cached source row")
+        XCTAssertEqual(lister.calls, ["src"],
+            "the subtree should be fetched once by expansion and then reused by drag/drop lookup")
+    }
+
+    func test_cachedItem_doesNotFetchUncachedSubtree() {
+        let lister = FakeLister(["src": [StubItem("src/app.swift", isDirectory: false)]])
+        let store = FileTreeStore<StubItem>(lister: lister.list)
+        store.setRoots([StubItem("src", isDirectory: true)])
+
+        let cached = store.cachedItem(relativePath: "src/app.swift")
+
+        XCTAssertNil(cached,
+            "cached lookup must not perform surprise IO for collapsed subtrees during drop handling")
+        XCTAssertEqual(lister.calls, [],
+            "uncached subtree lookup must stay read-only so failed drops do not trigger hidden listings")
+    }
 }

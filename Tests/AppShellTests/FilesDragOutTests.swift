@@ -1,5 +1,6 @@
 import XCTest
 @testable import AppShell
+import CoreModel
 import UniformTypeIdentifiers
 
 /// Tests for the `fileOutDragInfo(absolutePath:)` pure helper introduced for P3 drag-file-out.
@@ -121,5 +122,37 @@ final class FilesDragOutTests: XCTestCase {
             "file-tab drop targets must recover their payload from the combined drag text")
         XCTAssertEqual(sidebarMoveDragPayloadCandidate(in: combined ?? ""), move,
             "folder drop targets must recover their move payload from the combined drag text")
+    }
+
+    func test_fileTabDragPayload_roundTripsWorkspaceSurfaceAndPath() {
+        // WHY: dropping a file row into the editor area opens/splits the exact file from the source
+        // surface. The encoded string is the only contract between the drag source and drop target.
+        let workspace = WorkspaceID()
+        let surface = SurfaceID()
+
+        let encoded = FileTabDragPayload.encode(
+            workspaceID: workspace,
+            sourceSurfaceID: surface,
+            path: "src/Feature Tests/App View.swift"
+        )
+        let decoded = FileTabDragPayload.decode(encoded)
+
+        XCTAssertEqual(decoded?.workspaceID, workspace.value.uuidString,
+            "file-tab payload must preserve the source workspace id")
+        XCTAssertEqual(decoded?.sourceSurfaceID, surface.value.uuidString,
+            "file-tab payload must preserve the source surface id")
+        XCTAssertEqual(decoded?.path, "src/Feature Tests/App View.swift",
+            "file-tab payload must preserve nested paths with spaces exactly")
+    }
+
+    func test_fileTabDragPayload_rejectsMalformedValues() {
+        // WHY: drop targets receive arbitrary pasteboard text. Malformed tab payloads must fail
+        // closed so the Files surface does not split/open a garbage path.
+        XCTAssertNil(FileTabDragPayload.decode("src/App.swift"),
+            "plain text must not be treated as an internal file-tab drag")
+        XCTAssertNil(FileTabDragPayload.decode("rc-file-tab|workspace|surface|not-base64"),
+            "invalid base64 path must be rejected")
+        XCTAssertNil(FileTabDragPayload.decode("rc-file-tab|workspace|surface|"),
+            "empty paths must be rejected")
     }
 }

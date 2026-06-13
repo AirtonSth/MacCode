@@ -55,7 +55,7 @@ final class FilesSurface: NSObject, Surface {
     func snapshot() -> [String: String] { ["selected_path": model.selectedPath ?? ""] }
 }
 
-private struct FileTabDragPayload {
+struct FileTabDragPayload {
     static let prefix = "rc-file-tab|"
     let workspaceID: String
     let sourceSurfaceID: String
@@ -255,6 +255,15 @@ final class FileTreeStore<Item: FileTreeItem> {
     /// yields `[]` without caching, so the row can retry instead of sticking as empty.
     func children(at path: String) -> [Item] {
         (try? fetch(path, force: false)) ?? []
+    }
+
+    func cachedItem(relativePath: String) -> Item? {
+        if let root = roots.first(where: { $0.item.relativePath == relativePath }) {
+            return root.item
+        }
+        return childCache.values.lazy
+            .flatMap { $0 }
+            .first(where: { $0.relativePath == relativePath })
     }
 
     private func fetch(_ path: String, force: Bool) throws -> [Item] {
@@ -929,6 +938,7 @@ private final class FilesViewModel: ObservableObject {
     /// subtree children, so move-drop works even when the dragged item is in an expanded subdir.
     func allKnownEntry(relativePath: String) -> FileEntry? {
         entries.first(where: { $0.relativePath == relativePath })
+            ?? treeStore.cachedItem(relativePath: relativePath)
     }
 
     func isExpanded(_ directory: FileEntry) -> Bool {
