@@ -106,6 +106,23 @@ final class DirectAccessConfigTests: XCTestCase {
             "version value must come from the argument, not a hardcoded constant")
     }
 
+    func test_bonjourTXTRecord_carriesBundleVersionWithoutDrift() {
+        // QA-mac:82(b) version-drift guard. Feeding the live AppVersion.short
+        // (CFBundleShortVersionString, or the 'unknown' fallback under SPM) must
+        // surface in the TXT 'version' field byte-for-byte. Together with
+        // test_bonjourTXTRecord_threadsServerIdAndVersionThrough (builder uses its
+        // argument, not a constant) and AppVersionResolutionTests (short == bundle),
+        // this pins the full bundle -> AppVersion.short -> TXT chain: the advertised
+        // discovery version can never silently drift from the actual build.
+        let advertised = AppVersion.short
+        let txt = AppDelegate.bonjourTXTRecord(serverId: "SID", version: advertised)
+        XCTAssertEqual(txt["version"], Data(advertised.utf8),
+            "the Bonjour TXT version field must carry the live bundle short version " +
+            "byte-for-byte; any transform here would drift discovery metadata from the build")
+        XCTAssertFalse(advertised.isEmpty,
+            "advertised version must be non-empty so iOS version negotiation has a value")
+    }
+
     // MARK: - T019 / GAP-5: auth provider strong-retention regression
 
     @MainActor
