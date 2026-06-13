@@ -72,6 +72,14 @@ public final class EventBus: @unchecked Sendable {
         self.clock = clock
     }
 
+    /// The highest seq published so far. A reconnecting client (or a test) can
+    /// subscribe with `since: currentSeq` / the `x-rc2-since-seq` header to receive
+    /// only future events, skipping the retained backlog deterministically.
+    public var currentSeq: Int64 {
+        lock.lock(); defer { lock.unlock() }
+        return lastSeq
+    }
+
     public func publish(kind: String, payload: JSONValue) {
         lock.lock()
         lastSeq += 1
