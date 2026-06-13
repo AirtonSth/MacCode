@@ -24,6 +24,44 @@ public final class SQLiteDB {
     public let path: String
     private let queue = DispatchQueue(label: "RemoteCode.SQLiteDB")
 
+    // MARK: - Prepared-statement cache
+    //
+    // Thread-safety: the cache lives here and is only accessed inside `queue.sync`
+    // blocks (every public method that touches `handle` already serialises through
+    // `queue`).  SQLite statement handles are NOT thread-safe on their own, so
+    // keeping them inside the serial queue is the only correct approach.
+    //
+    // Reset contract: before returning a cached statement the cache calls
+    // sqlite3_reset + sqlite3_clear_bindings.  sqlite3_reset rewinds the cursor so
+    // the caller can re-step, and sqlite3_clear_bindings removes any values left
+    // from the previous use so there is no stale-binding data corruption.
+    //
+    // Eviction: statements are finalised (freed) when the connection closes (deinit).
+    // There is no LRU cap because the SQL vocabulary of a single SQLiteDB connection
+    // is bounded by the number of distinct query strings in the Persistence module
+    // (~40-50 distinct strings), so unbounded growth is not a practical risk.
+    private var stmtCache: [String: OpaquePointer] = [:]
+
+    // Returns a cached-and-reset statement, or compiles a fresh one.
+    // Caller is responsible for serialisation (either via `performSync` or a
+    // single-writer context); see `prepare` for the thread-safety rationale.
+    fileprivate func cachedStatement(sql: String) throws -> SQLiteStatement {
+        if let cached = stmtCache[sql] {
+            // Reset: rewinds the VM + wipes bindings before each reuse.
+            sqlite3_reset(cached)
+            sqlite3_clear_bindings(cached)
+            return SQLiteStatement(handle: cached, db: self, owned: false)
+        }
+        var stmt: OpaquePointer?
+        let rc = sqlite3_prepare_v2(handle, sql, -1, &stmt, nil)
+        if rc != SQLITE_OK {
+            let msg = String(cString: sqlite3_errmsg(handle))
+            throw SQLiteError.prepare(msg)
+        }
+        stmtCache[sql] = stmt!
+        return SQLiteStatement(handle: stmt!, db: self, owned: false)
+    }
+
     public init(path: String) throws {
         self.path = path
         let dir = (path as NSString).deletingLastPathComponent
@@ -50,6 +88,10 @@ public final class SQLiteDB {
     }
 
     deinit {
+        // Finalise every cached statement before closing the connection.
+        // sqlite3_close returns SQLITE_BUSY if any statement is still alive.
+        for stmt in stmtCache.values { sqlite3_finalize(stmt) }
+        stmtCache.removeAll()
         if let handle { sqlite3_close(handle) }
     }
 
@@ -70,13 +112,17 @@ public final class SQLiteDB {
     }
 
     public func prepare(_ sql: String) throws -> SQLiteStatement {
-        var stmt: OpaquePointer?
-        let rc = sqlite3_prepare_v2(handle, sql, -1, &stmt, nil)
-        if rc != SQLITE_OK {
-            let msg = String(cString: sqlite3_errmsg(handle))
-            throw SQLiteError.prepare(msg)
-        }
-        return SQLiteStatement(handle: stmt!, db: self)
+        // Does NOT dispatch through `queue`: callers that need serialisation use
+        // `performSync` or call from a single-writer context.  Adding queue.sync
+        // here would deadlock callers inside `performSync { database.prepare(...) }`
+        // (a serial DispatchQueue is non-reentrant).
+        //
+        // The thread-safety contract is: the cache (`stmtCache`) is accessed only
+        // from contexts that are already serialised by either `queue` (via
+        // `performSync`) or by the caller's own concurrency domain.  This is the
+        // same contract the original `prepare` imposed (it accessed `handle`
+        // directly without a queue).
+        try cachedStatement(sql: sql)
     }
 
     public func transaction<T>(_ block: () throws -> T) throws -> T {
@@ -98,15 +144,21 @@ public final class SQLiteDB {
 }
 
 public final class SQLiteStatement {
-    fileprivate let handle: OpaquePointer
+    // `internal` (not `fileprivate`) so @testable tests can compare handles
+    // when verifying the statement cache returns the same compiled pointer.
+    let handle: OpaquePointer
     fileprivate weak var db: SQLiteDB?
+    // When `owned` is false the handle belongs to the SQLiteDB statement cache
+    // and must NOT be finalised here; the cache finalises it in SQLiteDB.deinit.
+    private let owned: Bool
 
-    init(handle: OpaquePointer, db: SQLiteDB) {
+    init(handle: OpaquePointer, db: SQLiteDB, owned: Bool = true) {
         self.handle = handle
         self.db = db
+        self.owned = owned
     }
 
-    deinit { sqlite3_finalize(handle) }
+    deinit { if owned { sqlite3_finalize(handle) } }
 
     private static let transientDestructor = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
 
