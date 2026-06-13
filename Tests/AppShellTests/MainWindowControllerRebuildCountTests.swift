@@ -42,6 +42,24 @@ final class MainWindowControllerRebuildCountTests: XCTestCase {
         RunLoop.main.run(until: Date().addingTimeInterval(0.05))
     }
 
+    private func makeDescriptor(_ index: Int) -> SurfaceDescriptor {
+        SurfaceDescriptor(
+            type: .browser,
+            title: "wide-tab-\(index)",
+            iconName: "browser",
+            metadata: ["test": "wide-layout"]
+        )
+    }
+
+    private func surfaceCount(in node: LayoutNode) -> Int {
+        switch node {
+        case .pane(let pane):
+            return pane.surfaces.count
+        case .split(let split):
+            return split.children.reduce(0) { $0 + surfaceCount(in: $1) }
+        }
+    }
+
     override func tearDown() {
         // Close all surfaces and windows created during the test.
         let surfaces = SurfaceRegistry.shared.all()
@@ -279,5 +297,60 @@ final class MainWindowControllerRebuildCountTests: XCTestCase {
             "closeSurface changes the structural signature (surface id set shrinks) and must " +
             "trigger a full rebuild (rebuildCount must increment) even when the focus fast path " +
             "is active. If this does not increment, the structural-change rebuild gate is broken.")
+    }
+
+    // MARK: - PERF #3/#4: wide layout rebuild budget
+
+    func test_wideLayoutSixPanesFortyTabs_rebuildsWithinBudget() throws {
+        let dir = NSTemporaryDirectory() + "RC2WideLayout-\(UUID().uuidString)"
+        let ctx = try AppContext(channel: .debug, appSupportOverride: dir)
+        let router = AppCommandRouter(context: ctx)
+        ctx.router = router
+
+        try ctx.apply(.createWorkspace(name: "wide", cwd: dir, initial: nil))
+        let workspaceID = try XCTUnwrap(ctx.state.window.selectedWorkspaceID)
+        try ctx.apply(.addSurface(workspaceID, paneID: nil, descriptor: makeDescriptor(0)))
+
+        for index in 1..<6 {
+            let targetPane = try XCTUnwrap(ctx.state.workspaces[workspaceID]?.layout.paneIDs().last)
+            try ctx.apply(.splitPane(
+                workspaceID,
+                paneID: targetPane,
+                direction: index.isMultiple(of: 2) ? .down : .right,
+                newSurface: makeDescriptor(index)
+            ))
+        }
+
+        let paneIDs = try XCTUnwrap(ctx.state.workspaces[workspaceID]?.layout.paneIDs())
+        XCTAssertEqual(paneIDs.count, 6, "wide-layout benchmark fixture must have exactly 6 panes")
+        for index in 6..<39 {
+            try ctx.apply(.addSurface(workspaceID, paneID: paneIDs[index % paneIDs.count], descriptor: makeDescriptor(index)))
+        }
+
+        let wc = MainWindowController(context: ctx, router: router)
+        router.windowController = wc
+        retainedControllers.append(wc)
+        wc.refreshFromState()
+        drainMainQueue()
+        let countBeforeMeasuredRebuild = wc.rebuildCount
+
+        try ctx.apply(.addSurface(workspaceID, paneID: paneIDs[0], descriptor: makeDescriptor(39)))
+
+        let start = DispatchTime.now()
+        wc.refreshFromState()
+        drainMainQueue()
+        let elapsedMs = Double(DispatchTime.now().uptimeNanoseconds - start.uptimeNanoseconds) / 1_000_000
+        let budgetMs = 750.0
+        let wideLayout = try XCTUnwrap(ctx.state.workspaces[workspaceID]?.layout)
+
+        print("WideLayoutRebuildBenchmark panes=6 tabs=40 elapsedMs=\(Int(elapsedMs)) budgetMs=\(Int(budgetMs))")
+        XCTAssertEqual(wideLayout.paneIDs().count, 6,
+                       "wide-layout rebuild must preserve all 6 panes")
+        XCTAssertEqual(surfaceCount(in: wideLayout), 40,
+                       "wide-layout rebuild must preserve all 40 tabs")
+        XCTAssertGreaterThan(wc.rebuildCount, countBeforeMeasuredRebuild,
+                             "adding the 40th tab changes the structural signature and must trigger one full rebuild")
+        XCTAssertLessThanOrEqual(elapsedMs, budgetMs,
+                                 "6-pane/40-tab structural rebuild must stay under the CI budget to catch O(N) sync-RPC/DB regressions")
     }
 }
