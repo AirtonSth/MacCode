@@ -5,6 +5,7 @@ import Persistence
 import AgentRuntime
 import SocketServer
 import Surfaces
+import AppLifecycleSupport
 import UserNotifications
 import os
 

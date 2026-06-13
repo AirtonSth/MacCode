@@ -1,5 +1,6 @@
 import AppKit
 import XCTest
+@testable import AppLifecycleSupport
 @testable import AppShell
 
 final class AppLifecycleRecorderTests: XCTestCase {

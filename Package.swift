@@ -9,6 +9,7 @@ let package = Package(
     products: [
         .executable(name: "RemoteCode", targets: ["AppShell"]),
         .executable(name: "RemoteCodeDistillService", targets: ["RemoteCodeDistillService"]),
+        .executable(name: "LifecycleSignalProbe", targets: ["LifecycleSignalProbe"]),
         .executable(name: "rc2", targets: ["RC2CLI"]),
         .library(name: "CoreModel", targets: ["CoreModel"]),
         .library(name: "Persistence", targets: ["Persistence"]),
@@ -16,6 +17,7 @@ let package = Package(
         .library(name: "DistillCore", targets: ["DistillCore"]),
         .library(name: "SocketServer", targets: ["SocketServer"]),
         .library(name: "Surfaces", targets: ["Surfaces"]),
+        .library(name: "AppLifecycleSupport", targets: ["AppLifecycleSupport"]),
         .library(name: "DesignSystemKit", targets: ["DesignSystemKit"])
     ],
     dependencies: [
@@ -72,6 +74,11 @@ let package = Package(
             dependencies: ["DistillCore", "AgentRuntime", "Persistence"],
             path: "Sources/RemoteCodeDistillService"
         ),
+        .executableTarget(
+            name: "LifecycleSignalProbe",
+            dependencies: ["AppLifecycleSupport"],
+            path: "Tests/LifecycleSignalProbe"
+        ),
         .target(
             name: "SocketServer",
             dependencies: ["CoreModel", "Persistence", "AgentRuntime"],
@@ -80,6 +87,10 @@ let package = Package(
         .target(
             name: "DesignSystemKit",
             path: "Sources/DesignSystemKit"
+        ),
+        .target(
+            name: "AppLifecycleSupport",
+            path: "Sources/AppLifecycleSupport"
         ),
         .target(
             name: "Surfaces",
@@ -107,6 +118,7 @@ let package = Package(
                 "DistillCore",
                 "SocketServer",
                 "Surfaces",
+                "AppLifecycleSupport",
                 "DesignSystemKit",
                 .product(name: "Sparkle", package: "Sparkle")
             ],
@@ -156,7 +168,7 @@ let package = Package(
         ),
         .testTarget(
             name: "AppShellTests",
-            dependencies: ["AppShell", "CoreModel", "Persistence", "SocketServer", "Surfaces"],
+            dependencies: ["AppShell", "AppLifecycleSupport", "CoreModel", "Persistence", "SocketServer", "Surfaces"],
             path: "Tests/AppShellTests"
         ),
         .testTarget(

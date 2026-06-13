@@ -1,4 +1,5 @@
 import XCTest
+@testable import AppLifecycleSupport
 @testable import AppShell
 
 /// Tests for lifecycle.log size-capped rotation.
