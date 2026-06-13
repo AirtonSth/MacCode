@@ -101,7 +101,7 @@ private struct SidebarMoveDragPayload {
     }
 }
 
-private struct FileEntry: Identifiable, Equatable {
+struct FileEntry: Identifiable, Equatable {
     let id: String
     let name: String
     let path: String
@@ -276,6 +276,27 @@ final class FileTreeStore<Item: FileTreeItem> {
 
 extension FileEntry: FileTreeItem {}
 extension FileEntry: FileNameFilterable {}
+
+@MainActor
+protocol FilesSurfaceRouting: AnyObject {
+    func filesEditClose(sessionID: String) throws -> JSONValue
+    func filesStateGet(surface: SurfaceID) throws -> JSONValue
+    func fsWorkspaceList(workspace: WorkspaceID, path: String?) throws -> JSONValue
+    func filesStateUpdate(surface: SurfaceID, patch: [String: JSONValue], baseRevision: Int?, deviceID: String?) throws -> JSONValue
+    func filesEditOpen(surface: SurfaceID, path: String) throws -> JSONValue
+    func fsWorkspaceRead(workspace: WorkspaceID, path: String, maxBytes: Int?) throws -> JSONValue
+    func filesEditSave(sessionID: String) throws -> JSONValue
+    func filesEditDiscard(sessionID: String) throws -> JSONValue
+    func fsWorkspaceCreateFile(workspace: WorkspaceID, path: String, content: String) throws -> JSONValue
+    func fsWorkspaceCreateDirectory(workspace: WorkspaceID, path: String) throws -> JSONValue
+    func fsWorkspaceMoveItem(workspace: WorkspaceID, sourcePath: String, destinationDirectoryPath: String) throws -> JSONValue
+    func fsWorkspaceRename(workspace: WorkspaceID, path: String, newName: String) throws -> JSONValue
+    func filesOpenTab(workspace: WorkspaceID, sourceSurface: SurfaceID?, paneID: PaneID?, path: String) throws -> SurfaceDescriptor
+    func filesSplitTab(workspace: WorkspaceID, sourceSurface: SurfaceID?, paneID: PaneID?, direction: SplitDirection, path: String) throws -> SurfaceDescriptor
+    func filesEditApplyPatch(sessionID: String, baseDraftRevision: Int, rangeLocation: Int, rangeLength: Int, replacement: String, deviceID: String?) throws -> JSONValue
+}
+
+extension AppCommandRouter: FilesSurfaceRouting {}
 
 // MARK: - Pure per-extension icon helper (no AppKit, no MainActor; tested in FileExtensionIconTests)
 
@@ -848,7 +869,7 @@ func filesEditClosedUpdate(
 }
 
 @MainActor
-private final class FilesViewModel: ObservableObject {
+final class FilesViewModel: ObservableObject {
     @Published var currentDirectory = ""
     @Published var entries: [FileEntry] = []
     @Published var selectedEntry: FileEntry?
@@ -881,7 +902,7 @@ private final class FilesViewModel: ObservableObject {
     let surfaceID: SurfaceID
     let workspaceID: WorkspaceID
     let root: String
-    weak var router: AppCommandRouter?
+    weak var router: (any FilesSurfaceRouting)?
     private var sessionID: String?
     private var draftRevision = 0
     private var lastSyncedText = ""
@@ -913,7 +934,7 @@ private final class FilesViewModel: ObservableObject {
     var selectedPath: String? { selectedEntry?.relativePath }
     var visibleText: String { draftText.isEmpty ? renderedText : draftText }
 
-    init(surfaceID: SurfaceID, workspaceID: WorkspaceID, root: String, router: AppCommandRouter) {
+    init(surfaceID: SurfaceID, workspaceID: WorkspaceID, root: String, router: any FilesSurfaceRouting) {
         self.surfaceID = surfaceID
         self.workspaceID = workspaceID
         self.root = root
