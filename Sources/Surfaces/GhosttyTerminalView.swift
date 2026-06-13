@@ -647,6 +647,13 @@ final class GhosttyTerminalView: NSView {
 
     private let surfaceSlot = GhosttySurfaceSlot()
     private let ioContext = RemoteCodeGhosttyIOContext()
+    /// Retained reference that pins ioContext for the Ghostty IO-thread lifetime.
+    /// Set once in setup(), released in deinit after ghostty_surface_free returns
+    /// so the raw userdata pointer passed to Ghostty can never dangle.
+    private var ioContextRetain: Unmanaged<RemoteCodeGhosttyIOContext>?
+    /// True while the IO-context retain is held; false after deinit releases it.
+    /// Exposed for lifecycle tests only — do not use in production code paths.
+    var ioContextIsPinned: Bool { ioContextRetain != nil }
     private var pendingOutput = Data()
     private var outputFlushScheduled = false
     private var lastPixelSize = NSSize(width: 0, height: 0)
@@ -742,16 +749,30 @@ final class GhosttyTerminalView: NSView {
         // come out of here once -- no double-free is possible.
         let surfaceToFree: ghostty_surface_t? = surfaceSlot.removeForClose()
         surfaceSlot.markClosed()
+        // Capture ioContextRetain for release after ghostty_surface_free returns.
+        // Ghostty's IO thread may call io_write_cb at any time up to and including
+        // during ghostty_surface_free; releasing before the free completes would
+        // leave a dangling userdata pointer on the IO thread (use-after-free).
+        let pinnedContext = ioContextRetain
         // ghostty_surface_free must be called on the main thread.
         // Capture only the value-type pointer; never capture self in a deinit closure.
         if let ptr = surfaceToFree {
             if Thread.isMainThread {
                 ghostty_surface_free(ptr)
+                // Safe to release now: ghostty_surface_free has returned, so
+                // Ghostty will not dereference io_write_userdata again.
+                pinnedContext?.release()
             } else {
                 DispatchQueue.main.async {
                     ghostty_surface_free(ptr)
+                    // Same guarantee: release only after free completes.
+                    pinnedContext?.release()
                 }
             }
+        } else {
+            // No surface was ever created (or it was already freed by closeSurface).
+            // Ghostty has no live reference to io_write_userdata, so release is safe.
+            pinnedContext?.release()
         }
     }
 
@@ -784,10 +805,11 @@ final class GhosttyTerminalView: NSView {
         // Ghostty's IO thread may invoke io_write_cb (which dereferences this
         // ioContext via its raw userdata pointer) at any time, including around
         // surface free / view dealloc with no quiescence guarantee. Pin the tiny
-        // context for the process lifetime so that pointer can never dangle into
-        // freed memory (use-after-free on a ghostty thread). The weak `view`
-        // inside it goes nil on dealloc, so the callback safely no-ops.
-        _ = Unmanaged.passRetained(ioContext)
+        // context until ghostty_surface_free returns so that pointer can never
+        // dangle into freed memory (use-after-free on a ghostty thread). The weak
+        // `view` inside it goes nil on dealloc, so the callback safely no-ops.
+        // The retained ref is released in deinit after ghostty_surface_free returns.
+        ioContextRetain = Unmanaged.passRetained(ioContext)
         // Accept both file-URL drops (paths) and plain-text drops (literal text).
         // Plain .string is added here so dragging a selection from another app or
         // from a text editor inserts the text into the terminal rather than being
