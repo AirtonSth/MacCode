@@ -622,8 +622,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         guard let selectedThreadId, let turnCount = selectedCheckpointTurnCount else { return }
         do {
             _ = try coordinator.revertThreadToCheckpoint(threadId: selectedThreadId, checkpointTurnCount: turnCount, cwd: cwd)
-            // PERF-MAC_AGENT-006: revert deleted assistant rows — drop the cache.
+            // PERF-MAC_AGENT-006/012: revert deleted assistant rows — drop both caches.
             lastPersistedAssistantContentByThread.removeValue(forKey: selectedThreadId)
+            lastPersistedFinalIdByThread.removeValue(forKey: selectedThreadId)
             checkpointStatusMessage = "Reverted to checkpoint \(turnCount)."
             loadAllMessages(selectedThreadId)
             reloadCheckpoints()
@@ -1780,16 +1781,58 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     // skip the O(history) reload when re-deduping the same completed answer.
     private var lastPersistedAssistantContentByThread: [AgentThreadID: String] = [:]
 
+    // PERF-MAC_AGENT-012: ID of the last final message this surface appended per
+    // thread. Non-nil = this session already wrote a final to DB; a subsequent
+    // completion with new text can skip the O(history) messageRepo.list and just
+    // append. Nil = first completion in this session → reload once to guard
+    // against a prior session having written the same final already.
+    private var lastPersistedFinalIdByThread: [AgentThreadID: AgentMessageID] = [:]
+
+    // Pure decision seam: returns true when a full DB reload is needed before
+    // deciding whether to append. False = session ID-memo proves last persist is
+    // known; the incoming text differs (content memo already ruled out identity),
+    // so a direct append is safe without consulting the full message list.
+    //
+    // nonisolated + static: callable from tests without a surface instance and
+    // without main-actor hops.
+    nonisolated static func shouldReloadForFinal(
+        lastPersistedId: AgentMessageID?,
+        lastPersistedKey: String?,
+        incomingKey: String
+    ) -> Bool {
+        // Content equality is checked by the caller before reaching this point;
+        // if we are here incomingKey != lastPersistedKey (new text).
+        // If we have persisted before (id != nil) we already know DB state for
+        // this thread from this session: the last final's id is recorded and its
+        // content was different from incomingKey. A new final can be safely
+        // appended. Reload only when id is nil (no session history — must check
+        // DB for a pre-existing row written by a prior session/path).
+        return lastPersistedId == nil
+    }
+
     private func persistFinalAssistantIfMissing(_ text: String, threadId: AgentThreadID) {
         let text = AssistantTimelineState.cappedText(text)
+        // Fast path: same text already persisted this session — nothing to do.
         if lastPersistedAssistantContentByThread[threadId] == text { return }
-        let existing = (try? messageRepo.list(threadId: threadId)) ?? []
-        guard !existing.contains(where: { $0.role == .assistant && $0.content == text }) else {
-            lastPersistedAssistantContentByThread[threadId] = text
-            return
+        // PERF-MAC_AGENT-012: if we have a session ID for this thread the DB
+        // state is known — skip O(history) list and append directly.
+        // Reload only on first completion in a session (id == nil) to guard
+        // against a prior session/path having already written this exact text.
+        if Self.shouldReloadForFinal(
+            lastPersistedId: lastPersistedFinalIdByThread[threadId],
+            lastPersistedKey: lastPersistedAssistantContentByThread[threadId],
+            incomingKey: text
+        ) {
+            let existing = (try? messageRepo.list(threadId: threadId)) ?? []
+            guard !existing.contains(where: { $0.role == .assistant && $0.content == text }) else {
+                lastPersistedAssistantContentByThread[threadId] = text
+                return
+            }
         }
-        try? messageRepo.append(AgentMessage(threadId: threadId, role: .assistant, content: text))
+        let msg = AgentMessage(threadId: threadId, role: .assistant, content: text)
+        try? messageRepo.append(msg)
         lastPersistedAssistantContentByThread[threadId] = text
+        lastPersistedFinalIdByThread[threadId] = msg.id
     }
 
     // MARK: AgentRunObserver
