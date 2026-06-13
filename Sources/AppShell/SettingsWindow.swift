@@ -343,7 +343,12 @@ public final class SettingsViewModel: ObservableObject {
         // capture self. Called on the calling thread (MainActor for all callers).
         self.settingsStore.onWriteError = { [weak self] error in
             Task { @MainActor [weak self] in
-                self?.settingsWriteError = "Settings could not be saved: \(error.localizedDescription). The change will revert on next launch."
+                self?.recordSettingsWriteError(error)
+            }
+        }
+        self.customModelStore.onWriteError = { [weak self] error in
+            Task { @MainActor [weak self] in
+                self?.recordSettingsWriteError(error)
             }
         }
         // Keep separate Settings/Account window instances in sync: when either
@@ -387,13 +392,17 @@ public final class SettingsViewModel: ObservableObject {
                 self._pendingRemoteAccessToggle = false
                 // Read the HTTP server failure reason, if any.
                 let delegate = notification.object as? AppDelegate
-                let reason = delegate?.serverStartupFailures
-                    .last(where: { $0.server == "HTTP server" })?.reason ?? "Listener failed to bind"
-                // Revert the stored preference so it matches the actual listener state.
-                try? self.settingsRepo.set("remote_access_enabled", "0")
-                self.remoteAccessEnabled = false
-                self.remoteAccessBindFailedReason = reason
-            }
+	                let reason = delegate?.serverStartupFailures
+	                    .last(where: { $0.server == "HTTP server" })?.reason ?? "Listener failed to bind"
+	                // Revert the stored preference so it matches the actual listener state.
+	                do {
+	                    try self.settingsRepo.set("remote_access_enabled", "0")
+	                } catch {
+	                    self.recordSettingsWriteError(error)
+	                }
+	                self.remoteAccessEnabled = false
+	                self.remoteAccessBindFailedReason = reason
+	            }
         })
         // General startup-failure surfacing (:214): always refresh the list when
         // any server startup failure is recorded, regardless of whether a toggle
@@ -463,7 +472,13 @@ public final class SettingsViewModel: ObservableObject {
         // Clear any previous bind-fail state; a new toggle attempt supersedes it.
         remoteAccessBindFailedReason = nil
         remoteAccessEnabled = on
-        try? settingsRepo.set("remote_access_enabled", on ? "1" : "0")
+        do {
+            try settingsRepo.set("remote_access_enabled", on ? "1" : "0")
+        } catch {
+            remoteAccessEnabled = !on
+            recordSettingsWriteError(error)
+            return
+        }
         // Arm the pending-toggle flag before posting so the serverStartupFailure
         // observer can attribute the upcoming bind result to this specific toggle.
         // Only arm when turning on; turning off cannot produce a bind error.
@@ -770,7 +785,12 @@ public final class SettingsViewModel: ObservableObject {
 
     private func saveCLIPath(key: String, provider: AgentProvider, path: String) {
         let trimmed = path.trimmingCharacters(in: .whitespacesAndNewlines)
-        try? settingsRepo.set(key, trimmed)
+        do {
+            try settingsRepo.set(key, trimmed)
+        } catch {
+            recordSettingsWriteError(error)
+            return
+        }
         switch provider {
         case .codex:
             context.coordinator.replaceProviderAdapter(.codex, adapter: CodexAppServerAdapter(binaryNameOverride: trimmed.isEmpty ? nil : trimmed))
@@ -781,6 +801,14 @@ public final class SettingsViewModel: ObservableObject {
                 context.coordinator.replaceProviderAdapter(.claude, adapter: ClaudeAgentSDKBridgeAdapter())
             }
         }
+    }
+
+    private func recordSettingsWriteError(_ error: Error) {
+        settingsWriteError = Self.settingsWriteErrorMessage(error)
+    }
+
+    static func settingsWriteErrorMessage(_ error: Error) -> String {
+        "Settings could not be saved: \(error.localizedDescription). The change will revert on next launch."
     }
 }
 

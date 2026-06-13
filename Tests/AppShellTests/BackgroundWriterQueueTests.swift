@@ -124,6 +124,28 @@ final class BackgroundWriterQueueTests: XCTestCase {
                         "snapshot must be written by backgroundWriterQueue after scheduleSnapshotSave+flush so the main thread was never blocked by JSONEncoder.encode")
     }
 
+    @MainActor
+    func test_recordPersistenceWriteErrorPublishesMessage() throws {
+        let dir = NSTemporaryDirectory() + "RC2SnapWriteError-\(UUID().uuidString)"
+        let ctx = try AppContext(channel: .debug, appSupportOverride: dir)
+        var delivered: String?
+        ctx.onPersistenceWriteError = { delivered = $0 }
+
+        ctx.recordPersistenceWriteError(NSError(
+            domain: "test",
+            code: 28,
+            userInfo: [NSLocalizedDescriptionKey: "no space left on device"]
+        ), operation: "Session layout")
+
+        XCTAssertEqual(
+            ctx.persistenceWriteErrorMessage,
+            "Session layout could not be saved: no space left on device.",
+            "snapshot write failures must be retained for UI/error surfaces instead of being swallowed"
+        )
+        XCTAssertEqual(delivered, ctx.persistenceWriteErrorMessage,
+            "snapshot write failures must notify the non-blocking error funnel")
+    }
+
     /// The persister closure body (the actual DB write) must execute on a
     /// thread that is NOT the main thread. This validates that the writer queue
     /// is genuinely a background queue, not DispatchQueue.main in disguise.

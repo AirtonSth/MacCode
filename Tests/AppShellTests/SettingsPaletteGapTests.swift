@@ -26,6 +26,22 @@ final class SettingsPaletteGapTests: XCTestCase {
         return try AppContext(channel: .debug, appSupportOverride: dir)
     }
 
+    // MARK: - P2-Settings-5: write failures surface user-visible copy
+
+    func test_settingsWriteErrorMessage_includesFailureReason() {
+        let message = SettingsViewModel.settingsWriteErrorMessage(NSError(
+            domain: "test",
+            code: 12,
+            userInfo: [NSLocalizedDescriptionKey: "database is read-only"]
+        ))
+
+        XCTAssertEqual(
+            message,
+            "Settings could not be saved: database is read-only. The change will revert on next launch.",
+            "settings writes must fail loud with actionable copy instead of disappearing behind try?"
+        )
+    }
+
     // MARK: - P1-Settings-2: custom model clear no longer strands subsequent keystrokes
 
     /// WHY: When a user clears a custom-model text field (value becomes ""),

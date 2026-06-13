@@ -1,11 +1,12 @@
 import XCTest
 @testable import Persistence
+import CoreModel
 
 // MARK: - Test double
 
 /// Simulates a SettingsRepository whose set() always throws.
 /// Pure value — no SQLiteDB, no MainActor, no I/O.
-private final class FailingSettingsRepository: SettingsWriteRepository {
+private final class FailingSettingsRepository: SettingsKeyValueRepository {
     enum Err: Error { case injected }
 
     private var store: [String: String] = [:]
@@ -16,6 +17,11 @@ private final class FailingSettingsRepository: SettingsWriteRepository {
     func set(_ key: String, _ value: String) throws {
         if shouldFail { throw Err.injected }
         store[key] = value
+    }
+
+    func delete(key: String) throws {
+        if shouldFail { throw Err.injected }
+        store.removeValue(forKey: key)
     }
 }
 
@@ -87,5 +93,33 @@ final class SettingsStoreWriteErrorTests: XCTestCase {
 
         XCTAssertNotNil(capturedError,
             "update() internally calls save(); write failures must propagate to the funnel")
+    }
+
+    func test_promptHistoryFailingWrite_invokesOnWriteError() {
+        let repo = FailingSettingsRepository()
+        let store = PromptHistoryStore(repo: repo)
+        var capturedError: Error?
+        store.onWriteError = { capturedError = $0 }
+
+        repo.shouldFail = true
+        store.save(["build then test"], workspaceID: WorkspaceID())
+
+        XCTAssertNotNil(capturedError,
+            "PromptHistoryStore.save must route persistence failures to onWriteError so typed prompts are not lost silently")
+        XCTAssertTrue(capturedError is FailingSettingsRepository.Err)
+    }
+
+    func test_customModelFailingWrite_invokesOnWriteError() {
+        let repo = FailingSettingsRepository()
+        let store = AgentCustomModelStore(repo: repo)
+        var capturedError: Error?
+        store.onWriteError = { capturedError = $0 }
+
+        repo.shouldFail = true
+        store.add("custom-model", provider: .claude)
+
+        XCTAssertNotNil(capturedError,
+            "AgentCustomModelStore must route write failures to onWriteError so Settings custom-model edits are not lost silently")
+        XCTAssertTrue(capturedError is FailingSettingsRepository.Err)
     }
 }

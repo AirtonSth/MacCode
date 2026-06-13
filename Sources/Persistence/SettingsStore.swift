@@ -107,6 +107,12 @@ public protocol SettingsWriteRepository {
 
 extension SettingsRepository: SettingsWriteRepository {}
 
+protocol SettingsKeyValueRepository: SettingsWriteRepository {
+    func delete(key: String) throws
+}
+
+extension SettingsRepository: SettingsKeyValueRepository {}
+
 public final class SettingsStore {
     private let repo: any SettingsWriteRepository
     private let key = "app_settings"
@@ -150,8 +156,9 @@ public final class SettingsStore {
 }
 
 public final class AgentCustomModelStore {
-    private let repo: SettingsRepository
+    private let repo: any SettingsWriteRepository
     private let keyPrefix = "agent.custom_models."
+    public var onWriteError: ((Error) -> Void)?
 
     public init(repo: SettingsRepository) {
         self.repo = repo
@@ -159,6 +166,10 @@ public final class AgentCustomModelStore {
 
     public init(db: SQLiteDB) {
         self.repo = SettingsRepository(db: db)
+    }
+
+    init(repo: any SettingsWriteRepository) {
+        self.repo = repo
     }
 
     public func list(provider: AgentProvider) -> [String] {
@@ -200,7 +211,11 @@ public final class AgentCustomModelStore {
     private func save(_ models: [String], provider: AgentProvider) {
         guard let data = try? JSONEncoder().encode(normalized(models)),
               let raw = String(data: data, encoding: .utf8) else { return }
-        try? repo.set(keyPrefix + provider.rawValue, raw)
+        do {
+            try repo.set(keyPrefix + provider.rawValue, raw)
+        } catch {
+            onWriteError?(error)
+        }
     }
 
     private func normalized(_ values: [String]) -> [String] {

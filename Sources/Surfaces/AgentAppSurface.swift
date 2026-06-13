@@ -260,6 +260,11 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         self.customModelStore = customModelStore
         self.planNotesStore = planNotesStore
         self.promptHistory = promptHistoryStore?.load(workspaceID: workspaceID) ?? []
+        self.promptHistoryStore?.onWriteError = { [weak self] error in
+            Task { @MainActor [weak self] in
+                self?.statusMessage = Self.promptHistoryWriteErrorMessage(error)
+            }
+        }
         reloadCustomModels()
         self.coordinator.addObserver(self)
         self.coordinator.onSR1TranslatedMessageId = { [weak self] msgId in
@@ -1986,6 +1991,10 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         // NOTE: call promptHistoryStore?.search(workspaceID:query:limit:) from a
         // search field in the composer to surface filtered history to the user.
         promptHistoryCursor = nil
+    }
+
+    nonisolated static func promptHistoryWriteErrorMessage(_ error: Error) -> String {
+        "Prompt history could not be saved: \(error.localizedDescription)."
     }
 
     /// UX-MAC_AGENT-009: re-send the last prompt after a recoverable error

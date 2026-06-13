@@ -301,4 +301,18 @@ final class AgentAppUXGapsTests: XCTestCase {
             "Badge text must remain compact when older events have no original text to show"
         )
     }
+
+    func test_promptHistoryWriteErrorMessage_isUserVisible() {
+        let message = AgentAppViewModel.promptHistoryWriteErrorMessage(NSError(
+            domain: "test",
+            code: 7,
+            userInfo: [NSLocalizedDescriptionKey: "disk full"]
+        ))
+
+        XCTAssertEqual(
+            message,
+            "Prompt history could not be saved: disk full.",
+            "Prompt-history write failures must produce user-visible status copy instead of being swallowed"
+        )
+    }
 }

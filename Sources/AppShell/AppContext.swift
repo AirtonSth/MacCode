@@ -32,6 +32,8 @@ public final class AppContext {
     public let tokenSaverDistillServiceController: TokenSaverDistillServiceController
     public private(set) var managedDistillSkillInstallResults: [AgentSkillInstallResult] = []
     public private(set) var tokenSaverAccountUsageRefreshCount = 0
+    public private(set) var persistenceWriteErrorMessage: String?
+    public var onPersistenceWriteError: ((String) -> Void)?
 
     public let reducer = LayoutReducer()
     public var state = LayoutState()
@@ -1160,8 +1162,14 @@ public final class AppContext {
             guard let self else { return }
             let snap = SessionSnapshot(layout: self.state)
             let repo = self.snapshotRepo
-            self.backgroundWriterQueue.async {
-                _ = try? repo.save(snap)
+            self.backgroundWriterQueue.async { [weak self] in
+                do {
+                    try repo.save(snap)
+                } catch {
+                    Task { @MainActor [weak self] in
+                        self?.recordPersistenceWriteError(error, operation: "Session layout")
+                    }
+                }
             }
         }
         pendingSave = work
@@ -1172,7 +1180,21 @@ public final class AppContext {
         pendingSave?.cancel()
         pendingSave = nil
         let snap = SessionSnapshot(layout: state)
-        _ = try? snapshotRepo.save(snap)
+        do {
+            try snapshotRepo.save(snap)
+        } catch {
+            recordPersistenceWriteError(error, operation: "Session layout")
+        }
+    }
+
+    func recordPersistenceWriteError(_ error: Error, operation: String) {
+        let message = Self.persistenceWriteErrorMessage(operation: operation, error: error)
+        persistenceWriteErrorMessage = message
+        onPersistenceWriteError?(message)
+    }
+
+    static func persistenceWriteErrorMessage(operation: String, error: Error) -> String {
+        "\(operation) could not be saved: \(error.localizedDescription)."
     }
 
     /// Drain backgroundWriterQueue synchronously. Use in tests that call

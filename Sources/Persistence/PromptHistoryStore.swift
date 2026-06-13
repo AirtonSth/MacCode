@@ -4,10 +4,15 @@ import CoreModel
 public final class PromptHistoryStore {
     public static let limit = 200
 
-    private let repo: SettingsRepository
+    private let repo: any SettingsKeyValueRepository
+    public var onWriteError: ((Error) -> Void)?
 
     public init(db: SQLiteDB) {
         self.repo = SettingsRepository(db: db)
+    }
+
+    init(repo: any SettingsKeyValueRepository) {
+        self.repo = repo
     }
 
     public func load(workspaceID: WorkspaceID) -> [String] {
@@ -23,7 +28,11 @@ public final class PromptHistoryStore {
         let capped = Array(history.suffix(Self.limit))
         guard let data = try? JSONEncoder().encode(capped),
               let json = String(data: data, encoding: .utf8) else { return }
-        try? repo.set(key(for: workspaceID), json)
+        do {
+            try repo.set(key(for: workspaceID), json)
+        } catch {
+            onWriteError?(error)
+        }
     }
 
     /// Return up to `limit` history entries for `workspaceID` whose text
