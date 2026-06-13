@@ -1,0 +1,27 @@
+name: macOS Agent perf guards
+
+# QA-mac:77 -- CI gate for thread-open replay. The focused test builds a
+# 5,000-event persisted stream and asserts selectThread replay stays bounded.
+
+on:
+  pull_request:
+    paths:
+      - 'Sources/Surfaces/AgentAppSurface.swift'
+      - 'Tests/SurfacesTests/AgentAppPerfBundleTests.swift'
+      - '.github/workflows/macos-agent-perf-guards.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  agent-perf:
+    name: 5k replay budget
+    runs-on: macos-14
+    env:
+      DEVELOPER_DIR: /Applications/Xcode.app/Contents/Developer
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Run thread-open replay benchmark
+        run: swift test --filter AgentAppPerfBundleTests/test_threadOpenReplayFiveThousandEventsStaysWithinBudget

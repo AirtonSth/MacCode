@@ -28,7 +28,7 @@ final class AgentAppPerfBundleTests: XCTestCase {
 
     // MARK: - Helpers
 
-    private func makeVM() throws -> (AgentAppViewModel, AgentThreadRepository) {
+    private func makeVM(provider: AgentProviderRunner? = nil) throws -> (AgentAppViewModel, AgentThreadRepository) {
         let tmp = NSTemporaryDirectory() + "rc2-perf-bundle-" + UUID().uuidString
         let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
         let threadRepo = AgentThreadRepository(db: db)
@@ -37,7 +37,7 @@ final class AgentAppPerfBundleTests: XCTestCase {
         let coord = AgentRunCoordinator(
             runRepo: runRepo, messageRepo: messageRepo, threadRepo: threadRepo,
             providers: [
-                .codex: FakeProviderRunner(provider: .codex),
+                .codex: provider ?? FakeProviderRunner(provider: .codex),
                 .claude: FakeProviderRunner(provider: .claude)
             ]
         )
@@ -133,6 +133,34 @@ final class AgentAppPerfBundleTests: XCTestCase {
                        "events for non-selected threads must not pollute the current timeline")
     }
 
+    // MARK: - PERF #1: 5,000-event thread-open replay benchmark
+
+    func test_threadOpenReplayFiveThousandEventsStaysWithinBudget() async throws {
+        let runner = ReplayBenchmarkRunner(turns: 1_000)
+        let (vm, _) = try makeVM(provider: runner)
+        vm.createThread(title: "5k replay")
+        let threadId = try XCTUnwrap(vm.selectedThreadId)
+
+        vm.prompt = "generate replay benchmark"
+        await vm.send()
+        await waitAsync("5,000-event run completes", timeout: 30) {
+            vm.status == .completed && vm.timeline.latestAssistantMessage == "REPLAY_999"
+        }
+
+        let start = DispatchTime.now()
+        vm.selectThread(threadId)
+        let elapsedMs = Double(DispatchTime.now().uptimeNanoseconds - start.uptimeNanoseconds) / 1_000_000
+        let budgetMs = 2_000.0
+
+        print("ThreadOpenReplayBenchmark events=5000 turns=1000 elapsedMs=\(Int(elapsedMs)) budgetMs=\(Int(budgetMs))")
+        XCTAssertEqual(vm.timeline.turns.count, 1_000,
+                       "thread-open replay must restore every persisted turn from the 5,000-event run")
+        XCTAssertEqual(vm.timeline.latestAssistantMessage, "REPLAY_999",
+                       "thread-open replay must preserve the newest assistant message after rebuilding the timeline")
+        XCTAssertLessThanOrEqual(elapsedMs, budgetMs,
+                                 "opening a 5,000-event thread must stay under the CI replay budget to catch O(n^2) regressions")
+    }
+
     // MARK: - Fix B: transcriptSignature static helper
 
     /// buildTranscriptSignature is deterministic: the same messages + turns
@@ -215,7 +243,7 @@ final class AgentAppPerfBundleTests: XCTestCase {
     /// must contain the new thread's id mapped to the correct workspace.
     /// This proves the cache is populated before any status events arrive.
     func test_threadWorkspaceCache_populatedAfterReloadThreads() async throws {
-        let (vm, threadRepo) = try makeVM()
+        let (vm, _) = try makeVM()
         vm.createThread(title: "cached")
         let tid = try XCTUnwrap(vm.selectedThreadId)
 
@@ -333,5 +361,43 @@ final class AgentAppPerfBundleTests: XCTestCase {
                 XCTFail("unexpected event type at index \(idx)")
             }
         }
+    }
+}
+
+private final class ReplayBenchmarkRunner: AgentProviderRunner, @unchecked Sendable {
+    let provider: AgentProvider = .codex
+    private let turns: Int
+
+    init(turns: Int) {
+        self.turns = turns
+    }
+
+    func listModels() async -> [AgentModelDescriptor] { [] }
+
+    func startRun(_ request: AgentRunRequest, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) async throws -> AgentRunHandle {
+        let turns = self.turns
+        Task.detached {
+            let providerThreadId = request.providerThreadId ?? UUID().uuidString
+            let startedAt = Int64(Date().timeIntervalSince1970 * 1000)
+            onEvent(.status(.running))
+            onEvent(.event(.threadStarted(threadId: providerThreadId, providerThreadId: providerThreadId)))
+            for index in 0..<turns {
+                let turnId = "replay-turn-\(index)"
+                let itemId = "replay-item-\(index)"
+                onEvent(.event(.turnStarted(turnId: turnId)))
+                onEvent(.event(.itemStarted(item: AssistantItem(
+                    id: itemId,
+                    turnId: turnId,
+                    type: .assistantMessage,
+                    startedAtMs: startedAt + Int64(index)
+                ))))
+                onEvent(.event(.itemDelta(itemId: itemId, bodyAppend: "REPLAY_\(index)", outputAppend: nil, summary: nil)))
+                onEvent(.event(.itemCompleted(itemId: itemId, finalState: .completed)))
+                onEvent(.event(.turnCompleted(turnId: turnId, finalMessage: "REPLAY_\(index)")))
+            }
+            onEvent(.status(.completed))
+            onEvent(.finished(.completed, finalMessage: "REPLAY_\(max(turns - 1, 0))", providerThreadId: providerThreadId))
+        }
+        return AgentRunHandle(runId: request.runId, process: nil) {}
     }
 }
