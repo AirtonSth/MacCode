@@ -14,6 +14,7 @@ final class FilesViewModelRoutingTests: XCTestCase {
         var listings: [String: [JSONValue]] = [:]
         var contents: [String: String] = [:]
         var operations: [String] = []
+        var sessionPathByID: [String: String] = [:]
 
         func filesEditClose(sessionID: String) throws -> JSONValue {
             operations.append("close:\(sessionID)")
@@ -42,6 +43,7 @@ final class FilesViewModelRoutingTests: XCTestCase {
 
         func filesEditOpen(surface: SurfaceID, path: String) throws -> JSONValue {
             operations.append("open:\(path)")
+            sessionPathByID["session-\(path)"] = path
             return .object([
                 "surface_id": .string(surface.value.uuidString),
                 "path": .string(path),
@@ -107,7 +109,13 @@ final class FilesViewModelRoutingTests: XCTestCase {
         }
 
         func filesEditApplyPatch(sessionID: String, baseDraftRevision: Int, rangeLocation: Int, rangeLength: Int, replacement: String, deviceID: String?) throws -> JSONValue {
-            .object(["session_id": .string(sessionID), "dirty": .bool(true)])
+            let path = sessionPathByID[sessionID] ?? ""
+            return .object([
+                "session_id": .string(sessionID),
+                "path": .string(path),
+                "draft_revision": .number(Double(baseDraftRevision + 1)),
+                "dirty": .bool(true)
+            ])
         }
 
         private func parentPath(for path: String) -> String {
@@ -210,5 +218,33 @@ final class FilesViewModelRoutingTests: XCTestCase {
             "renamed open file should be reselected")
         XCTAssertTrue(router.operations.contains("open:new.txt"),
             "renamed open file should open a fresh edit session")
+    }
+
+    func test_dirtySessionCacheRestoresDraftWithoutReopeningHostSession() {
+        let router = FakeFilesRouter()
+        router.listings[""] = [
+            FakeFilesRouter.fileEntry("a.txt"),
+            FakeFilesRouter.fileEntry("b.txt")
+        ]
+        router.contents["a.txt"] = "clean a"
+        router.contents["b.txt"] = "clean b"
+        let model = makeModel(router: router)
+        defer { model.close() }
+
+        model.loadDirectory("")
+        let a = model.entries[0]
+        let b = model.entries[1]
+        model.loadFile(a)
+        model.draftText = "dirty a"
+        model.editorChanged("dirty a")
+        RunLoop.current.run(until: Date().addingTimeInterval(0.2))
+        model.loadFile(b)
+        router.operations.removeAll()
+        model.loadFile(a)
+
+        XCTAssertEqual(model.draftText, "dirty a",
+            "reselecting a dirty file must restore the cached local draft")
+        XCTAssertFalse(router.operations.contains("open:a.txt"),
+            "dirty cached sessions must not reopen from host and lose local draft state")
     }
 }
