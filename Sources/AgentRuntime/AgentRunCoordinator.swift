@@ -46,6 +46,12 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     // PERF-MAC_AGENT-006: last assistant text persisted per thread, to dedup the
     // turnCompleted/finished pair without reloading the whole thread history.
     private var lastPersistedAssistantContent: [AgentThreadID: String] = [:]
+    // UX-MAC-CHECKPOINT-REVERT-UNDO: transient snapshot of the most recent
+    // checkpoint revert, captured pre-destruction. Non-nil only inside the undo
+    // window; cleared on a successful undo. Lock-guarded like other coord state.
+    private var lastCheckpointRevertUndo: CheckpointRevertUndo?
+    /// Seconds a checkpoint revert stays reversible after it runs.
+    public static let checkpointRevertUndoWindow: TimeInterval = 10
     private let lock = NSLock()
     private var observerRefs: [WeakAgentRunObserver] = []
     public var observer: AgentRunObserver? {
@@ -492,6 +498,13 @@ public final class AgentRunCoordinator: @unchecked Sendable {
 
         let newer = try checkpointRepo.listAfter(threadId: threadId, checkpointTurnCount: checkpointTurnCount)
         try validateRestorableSnapshots(in: checkpoint, newerCheckpoints: newer, cwd: cwd)
+        // UX-MAC-CHECKPOINT-REVERT-UNDO: capture the forward state the revert is
+        // about to DESTROY — pre-revert on-disk bytes for every affected path and
+        // the message rows about to be deleted — BEFORE restoreWorkspace + the
+        // deletes run. This must happen here (post-validate, pre-mutation) or it
+        // would snapshot the reverted state. Pure read + store; revert behavior
+        // below is unchanged.
+        captureCheckpointRevertUndo(threadId: threadId, target: checkpoint, newer: newer, cwd: cwd)
         try await rollbackThread(threadId: threadId, toTurnId: checkpoint.turnId)
         try restoreWorkspace(to: checkpoint, newerCheckpoints: newer, cwd: cwd)
         try messageRepo.delete(ids: newer.compactMap(\.assistantMessageId))
@@ -1565,6 +1578,91 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
             try data.write(to: url, options: .atomic)
         }
+    }
+
+    /// UX-MAC-CHECKPOINT-REVERT-UNDO: snapshot the forward state a revert is
+    /// about to destroy. Reads the CURRENT on-disk bytes for every affected path
+    /// (nil = absent) and fetches the to-be-deleted message rows, then stores it
+    /// under `lock`. Best-effort: a read failure for a single path records it as
+    /// absent rather than aborting the revert.
+    private func captureCheckpointRevertUndo(
+        threadId: AgentThreadID,
+        target: AgentTurnCheckpointSummary,
+        newer: [AgentTurnCheckpointSummary],
+        cwd: String
+    ) {
+        let paths = CheckpointRevertUndo.affectedPaths(target: target, newer: newer)
+        let forwardFiles: [CheckpointRevertUndo.CapturedFile] = paths.sorted().map { path in
+            guard let url = safeWorkspaceURL(cwd: cwd, relativePath: path),
+                  FileManager.default.fileExists(atPath: url.path),
+                  let data = try? Data(contentsOf: url) else {
+                return CheckpointRevertUndo.CapturedFile(path: path, contentsBase64: nil)
+            }
+            return CheckpointRevertUndo.CapturedFile(path: path, contentsBase64: data.base64EncodedString())
+        }
+        let deletedMessages: [AgentMessage] = newer
+            .compactMap(\.assistantMessageId)
+            .compactMap { try? messageRepo.get(id: $0) }
+        let undo = CheckpointRevertUndo(
+            threadId: threadId,
+            checkpointTurnCount: target.checkpointTurnCount,
+            capturedAt: Date(),
+            forwardFiles: forwardFiles,
+            deletedCheckpoints: newer,
+            deletedMessages: deletedMessages
+        )
+        lock.lock(); lastCheckpointRevertUndo = undo; lock.unlock()
+    }
+
+    /// UX-MAC-CHECKPOINT-REVERT-UNDO: reverse the most recent checkpoint revert,
+    /// provided the undo window has not lapsed. Restores files (writing back
+    /// captured bytes, or removing files that were absent pre-revert) and
+    /// re-inserts the deleted checkpoint + message rows FK-safe (checkpoints
+    /// before messages; both reference the still-existing thread). Throws if no
+    /// matching undo exists or the window lapsed; on those paths nothing is
+    /// mutated. Provider state is intentionally left as rolled-back — the DB and
+    /// files move forward while the provider conversation stays at the target
+    /// turn; this desync is the same best-effort stance as the thread-delete
+    /// undo and is NOT reconciled here.
+    public func undoLastCheckpointRevert(threadId: AgentThreadID, cwd: String, now: Date = Date()) throws {
+        lock.lock()
+        let stored = lastCheckpointRevertUndo
+        lock.unlock()
+        guard let undo = stored, undo.threadId == threadId else {
+            throw AgentProviderAdapterError.unsupported("no checkpoint revert to undo for this thread")
+        }
+        guard CheckpointRevertUndo.isWithinUndoWindow(
+            capturedAt: undo.capturedAt,
+            now: now,
+            window: Self.checkpointRevertUndoWindow
+        ) else {
+            throw AgentProviderAdapterError.unsupported("checkpoint revert undo window has lapsed")
+        }
+        // (a) FILES: write back pre-revert bytes, or remove files that were absent.
+        for file in undo.forwardFiles {
+            guard let url = safeWorkspaceURL(cwd: cwd, relativePath: file.path) else {
+                throw AgentProviderAdapterError.unsupported("checkpoint path escapes workspace: \(file.path)")
+            }
+            if let encoded = file.contentsBase64 {
+                guard let data = Data(base64Encoded: encoded) else {
+                    throw AgentProviderAdapterError.unsupported("captured snapshot is corrupt: \(file.path)")
+                }
+                try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+                try data.write(to: url, options: .atomic)
+            } else if FileManager.default.fileExists(atPath: url.path) {
+                try FileManager.default.removeItem(at: url)
+            }
+        }
+        // (b) DB FK-safe: re-insert checkpoints first, then messages. agent_messages
+        // and the checkpoint rows both reference agent_threads(id); the thread row
+        // still exists, so the only ordering constraint is parent-before-child.
+        for checkpoint in undo.deletedCheckpoints {
+            try checkpointRepo?.upsert(checkpoint)
+        }
+        for message in undo.deletedMessages {
+            try messageRepo.append(message)
+        }
+        lock.lock(); lastCheckpointRevertUndo = nil; lock.unlock()
     }
 
     private func validateRestorableSnapshots(in checkpoint: AgentTurnCheckpointSummary, newerCheckpoints: [AgentTurnCheckpointSummary], cwd: String) throws {
