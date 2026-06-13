@@ -68,6 +68,7 @@ final class SplitLayoutRuntimeTests: XCTestCase {
         _ = try router.splitPane(workspace: ws.id, paneID: pid,
                                  direction: .right, surfaceType: .agentApp, title: "Agent App")
 
+        drainMainQueue()   // flush the coalesced refreshFromState before inspecting the view tree
         wc.window.contentView?.layoutSubtreeIfNeeded()
         let split = try XCTUnwrap(findSplit(wc.window.contentView!), "RatioSplitView must exist")
         split.layoutSubtreeIfNeeded()
@@ -89,6 +90,7 @@ final class SplitLayoutRuntimeTests: XCTestCase {
         _ = try router.splitPane(workspace: ws.id, paneID: pid,
                                  direction: .down, surfaceType: .agentApp, title: "Agent App")
 
+        drainMainQueue()   // flush the coalesced refreshFromState before inspecting the view tree
         wc.window.contentView?.layoutSubtreeIfNeeded()
         let split = try XCTUnwrap(findSplit(wc.window.contentView!))
         split.layoutSubtreeIfNeeded()
