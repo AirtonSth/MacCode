@@ -425,7 +425,10 @@ public final class JSONRPCDispatcher {
                 return .init(id: id, result: .bool(true))
             case "ssh.host.list":
                 let workspace = try workspaceID(from: params)
-                return .init(id: id, result: encode(try router.sshHostList(workspace: workspace)))
+                let listed = try router.sshHostList(workspace: workspace).map { host -> SSHHostProfile in
+                    var h = host; h.password = nil; return h
+                }
+                return .init(id: id, result: encode(listed))
             case "ssh.host.upsert":
                 let workspace = try workspaceID(from: params)
                 let profile = try sshProfile(from: params)
