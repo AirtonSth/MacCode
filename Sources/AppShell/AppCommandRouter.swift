@@ -807,17 +807,18 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
            }),
            ws.focusedPaneID == paneID,
            ws.layout.find(paneID: paneID)?.selectedSurfaceID == surface {
+            // Already the focused surface in the focused pane -- no state mutation needed.
             windowController?.focusSurface(surface)
             publishSurfaceFocused(workspace: workspace, surface: surface)
             return
         }
         try context?.apply(.focusSurface(workspace, surface))
-        // Rebuild the pane so the newly selected tab's surface actually
-        // becomes the visible content (the custom tab strip has no
-        // built-in content switching like NSTabView did).
-        windowController?.refreshFromState()
+        // PERF-MAC_SHELL_WINDOW-125: focus/tab selection changes only the
+        // selected-surface and focused-pane fields -- the structural signature
+        // (pane id set, surface id set, order) is unchanged. Use the in-place
+        // fast path instead of a full teardown/rebuild.
         reconcileSurfaceVisibility()
-        windowController?.focusSurface(surface)
+        windowController?.applyFocusChangeInPlace(surfaceToFocus: surface)
         publishSurfaceFocused(workspace: workspace, surface: surface)
     }
 
@@ -825,8 +826,10 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     /// pane the focused one so Cmd+W/Cmd+D act on the pane the user is typing in.
     public func focusPane(workspace: WorkspaceID, pane: PaneID) throws {
         try context?.apply(.focusPane(workspace, pane))
-        windowController?.refreshFromState()
+        // PERF-MAC_SHELL_WINDOW-125: pane focus changes only focusedPaneID --
+        // structural signature unchanged. Reconcile in place (no rebuild).
         reconcileSurfaceVisibility()
+        windowController?.applyFocusChangeInPlace(surfaceToFocus: nil)
     }
 
     public func repairSelectedTerminalFocus(reason: String) {

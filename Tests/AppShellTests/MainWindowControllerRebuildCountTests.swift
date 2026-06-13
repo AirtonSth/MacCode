@@ -163,4 +163,121 @@ final class MainWindowControllerRebuildCountTests: XCTestCase {
             "path must be taken; a rebuild here would cause the pane-header flash reported as " +
             "the resize-end jank in PERF-MAC_SHELL_WINDOW-002")
     }
+
+    // MARK: - PERF-MAC_SHELL_WINDOW-125: focus/tab-select does not rebuild
+
+    /// WHY: selecting a tab (focusSurface) changes only selectedSurfaceID and
+    /// focusedPaneID in the layout -- the structural signature (pane id set,
+    /// surface id set, order) is unchanged. applyFocusChangeInPlace must be
+    /// taken instead of refreshFromState, so rebuildCount must NOT increment.
+    /// If it increments, every tab click tears down the container (hundreds of
+    /// allocations per click, jank visible on tab strip).
+    func test_rebuildCount_doesNotIncrement_forFocusSurface() throws {
+        let (ctx, router, wc) = try makeController(prefix: "focusSurface")
+        let ws = try router.createWorkspace(name: "ws", cwd: NSTemporaryDirectory())
+        // Add a second surface so we have something to switch between.
+        let _ = try router.createSurface(workspace: ws.id, type: .browser, paneID: nil, title: "Tab2")
+        wc.refreshFromState()
+        drainMainQueue()
+
+        guard let wid = ctx.state.window.selectedWorkspaceID,
+              let freshWS = ctx.state.workspaces[wid],
+              let firstSurfaceID = freshWS.layout.find(paneID: freshWS.layout.paneIDs()[0])?.surfaces.first?.id,
+              let secondSurfaceID = freshWS.layout.find(paneID: freshWS.layout.paneIDs()[0])?.surfaces.last?.id,
+              firstSurfaceID != secondSurfaceID else {
+            XCTFail("Expected workspace with two surfaces in the same pane")
+            return
+        }
+
+        // Select first surface to ensure a known selected state.
+        try router.focusSurface(workspace: wid, surface: firstSurfaceID)
+        drainMainQueue()
+        let countBefore = wc.rebuildCount
+
+        // Select second surface -- focus-only change, structural signature unchanged.
+        try router.focusSurface(workspace: wid, surface: secondSurfaceID)
+        drainMainQueue()
+
+        XCTAssertEqual(wc.rebuildCount, countBefore,
+            "focusSurface (tab selection) must NOT increment rebuildCount: selecting a tab " +
+            "changes only selectedSurfaceID, not the structural signature. " +
+            "applyFocusChangeInPlace must reconcile in place (PERF-MAC_SHELL_WINDOW-125). " +
+            "If this fails, every tab click performs a full container teardown/rebuild.")
+    }
+
+    /// WHY: clicking a pane to focus it (focusPane) changes only focusedPaneID --
+    /// the structural signature is unchanged. applyFocusChangeInPlace must be
+    /// taken; rebuildCount must NOT increment.
+    /// If it increments, every pane focus click (e.g. clicking into a terminal
+    /// after working in a browser pane) causes a full container rebuild.
+    func test_rebuildCount_doesNotIncrement_forFocusPane() throws {
+        let (ctx, router, wc) = try makeController(prefix: "focusPane")
+        let ws = try router.createWorkspace(name: "ws2", cwd: NSTemporaryDirectory())
+        // Split to get two panes.
+        guard let paneID = ctx.state.workspaces[ws.id]?.layout.paneIDs().first else {
+            XCTFail("Expected at least one pane after createWorkspace")
+            return
+        }
+        let _ = try router.splitPane(workspace: ws.id, paneID: paneID, direction: .right, surfaceType: .browser, title: "Split")
+        wc.refreshFromState()
+        drainMainQueue()
+
+        guard let wid = ctx.state.window.selectedWorkspaceID,
+              let freshWS = ctx.state.workspaces[wid] else {
+            XCTFail("Workspace not found after split")
+            return
+        }
+        let paneIDs = freshWS.layout.paneIDs()
+        guard paneIDs.count >= 2 else {
+            XCTFail("Expected two panes after split, got \(paneIDs.count)")
+            return
+        }
+
+        // Focus pane 0 as baseline.
+        try router.focusPane(workspace: wid, pane: paneIDs[0])
+        drainMainQueue()
+        let countBefore = wc.rebuildCount
+
+        // Focus pane 1 -- pane-focus-only change, structural signature unchanged.
+        try router.focusPane(workspace: wid, pane: paneIDs[1])
+        drainMainQueue()
+
+        XCTAssertEqual(wc.rebuildCount, countBefore,
+            "focusPane (pane-focus click) must NOT increment rebuildCount: only focusedPaneID " +
+            "changes, not the structural signature. applyFocusChangeInPlace must reconcile in " +
+            "place (PERF-MAC_SHELL_WINDOW-125). If this fails, every pane-content click " +
+            "performs a full container teardown/rebuild.")
+    }
+
+    /// WHY: structural changes (addSurface / closeSurface) alter the surface id
+    /// set and MUST still trigger a full rebuild even after the focus-only fast
+    /// path is in place. Verifies the seam boundary -- a close must increment.
+    func test_rebuildCount_increments_forStructuralChange_afterFocusFastPath() throws {
+        let (ctx, router, wc) = try makeController(prefix: "structural")
+        let ws = try router.createWorkspace(name: "ws3", cwd: NSTemporaryDirectory())
+        let tab2 = try router.createSurface(workspace: ws.id, type: .browser, paneID: nil, title: "Tab2")
+        wc.refreshFromState()
+        drainMainQueue()
+
+        guard let wid = ctx.state.window.selectedWorkspaceID,
+              let freshWS = ctx.state.workspaces[wid],
+              let firstSurfaceID = freshWS.layout.find(paneID: freshWS.layout.paneIDs()[0])?.surfaces.first?.id else {
+            XCTFail("Setup failed")
+            return
+        }
+
+        // Do a focus-only change first (exercises the fast path).
+        try router.focusSurface(workspace: wid, surface: firstSurfaceID)
+        drainMainQueue()
+        let countAfterFocus = wc.rebuildCount
+
+        // Now close a surface -- structural change; must rebuild.
+        try router.closeSurface(workspace: wid, surface: tab2.id)
+        drainMainQueue()
+
+        XCTAssertGreaterThan(wc.rebuildCount, countAfterFocus,
+            "closeSurface changes the structural signature (surface id set shrinks) and must " +
+            "trigger a full rebuild (rebuildCount must increment) even when the focus fast path " +
+            "is active. If this does not increment, the structural-change rebuild gate is broken.")
+    }
 }

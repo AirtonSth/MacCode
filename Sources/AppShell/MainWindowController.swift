@@ -622,6 +622,40 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
         }
     }
 
+    /// PERF-MAC_SHELL_WINDOW-125: focus-only fast path.
+    ///
+    /// When a tab selection or pane-focus change arrives, only the focused
+    /// surface / pane highlight changed -- the structural layout (pane id set,
+    /// surface id set, order) is unchanged. A full refreshFromState teardown is
+    /// not needed; instead:
+    ///   1. reconcilePaneControllersInPlace() patches each live strip's tab
+    ///      highlight and scroll position in place.
+    ///   2. focusSurface(_:) gives the surface first-responder focus.
+    ///
+    /// Fallback: when paneControllers is empty (first focus before any rebuild,
+    /// initial mount) the RatioSplitView has not been created yet, so we must
+    /// fall back to refreshFromState() to produce the initial container.
+    ///
+    /// Signature boundary: this method is only correct when the STRUCTURAL
+    /// signature (workspace id, pane id set + order, surface id set + order)
+    /// has NOT changed.  Callers (focusSurface/focusPane in AppCommandRouter)
+    /// must only reach here after apply(.focusSurface) / apply(.focusPane)
+    /// mutations -- mutations that, by contract, never alter the structural
+    /// signature.
+    public func applyFocusChangeInPlace(surfaceToFocus: SurfaceID?) {
+        if paneControllers.isEmpty {
+            // Container not yet built (initial mount / first focus before any
+            // rebuild). Fall back to full refresh so RatioSplitView is created.
+            refreshFromState()
+            return
+        }
+        reconcilePaneControllersInPlace()
+        if let sid = surfaceToFocus {
+            focusSurface(sid)
+        }
+        shellLog.debug("applyFocusChangeInPlace surface=\(surfaceToFocus.map { $0.value.uuidString } ?? "nil", privacy: .public)")
+    }
+
     /// UX-MAC_SHELL_WINDOW-003: close the focused pane's selected surface
     /// (with its unsaved-changes confirm). Returns false when there is no
     /// surface to close so ⌘W can fall back to closing the window.
