@@ -155,4 +155,40 @@ final class FilesDragOutTests: XCTestCase {
         XCTAssertNil(FileTabDragPayload.decode("rc-file-tab|workspace|surface|"),
             "empty paths must be rejected")
     }
+
+    func test_fileTabDropPath_acceptsOnlySameWorkspacePayload() {
+        // WHY: the editor drop target must not open a file from another workspace when pasteboard
+        // text from a different Files surface is dropped onto this one.
+        let workspace = WorkspaceID()
+        let foreignWorkspace = WorkspaceID()
+        let surface = SurfaceID()
+        let sameWorkspacePayload = FileTabDragPayload.encode(
+            workspaceID: workspace,
+            sourceSurfaceID: surface,
+            path: "src/App.swift"
+        )
+        let foreignPayload = FileTabDragPayload.encode(
+            workspaceID: foreignWorkspace,
+            sourceSurfaceID: surface,
+            path: "secrets.txt"
+        )
+
+        XCTAssertEqual(fileTabDropPath(rawPayload: sameWorkspacePayload, workspaceID: workspace), "src/App.swift",
+            "same-workspace file-tab drops should open the encoded file path")
+        XCTAssertNil(fileTabDropPath(rawPayload: foreignPayload, workspaceID: workspace),
+            "foreign-workspace file-tab drops must be rejected before split/open")
+    }
+
+    func test_fileDropSplitDirection_usesLowerBandForDownSplit() {
+        // WHY: a drop near the bottom of the editor creates a vertical split; everywhere above that
+        // threshold creates a side-by-side split. The 68% boundary is the shared UI contract.
+        let size = CGSize(width: 1_000, height: 1_000)
+
+        XCTAssertEqual(fileDropSplitDirection(location: CGPoint(x: 500, y: 679), size: size), .right,
+            "drops above the lower 32% band should split to the right")
+        XCTAssertEqual(fileDropSplitDirection(location: CGPoint(x: 500, y: 680), size: size), .down,
+            "drops at the 68% boundary should split downward")
+        XCTAssertEqual(fileDropSplitDirection(location: CGPoint(x: 500, y: 681), size: size), .down,
+            "drops below the boundary should split downward")
+    }
 }

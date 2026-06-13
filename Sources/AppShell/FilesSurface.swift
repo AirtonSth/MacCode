@@ -424,6 +424,17 @@ func sidebarMoveDragPayloadCandidate(in raw: String) -> String? {
     dragPayloadCandidates(raw).first { SidebarMoveDragPayload.decode($0) != nil }
 }
 
+func fileTabDropPath(rawPayload: String, workspaceID: WorkspaceID) -> String? {
+    guard let rawPayload = fileTabDragPayloadCandidate(in: rawPayload),
+          let payload = FileTabDragPayload.decode(rawPayload),
+          payload.workspaceID == workspaceID.value.uuidString else { return nil }
+    return payload.path
+}
+
+func fileDropSplitDirection(location: CGPoint, size: CGSize) -> SplitDirection {
+    location.y >= size.height * 0.68 ? .down : .right
+}
+
 func fileOutItemProvider(info: FileOutDragInfo, textPayload: String?) -> NSItemProvider {
     let provider = NSItemProvider()
     provider.suggestedName = info.promiseFilename
@@ -1177,13 +1188,10 @@ private final class FilesViewModel: ObservableObject {
     }
 
 	    func handleFileDropPayload(_ rawPayload: String, location: CGPoint, size: CGSize) -> Bool {
-	        guard let rawPayload = fileTabDragPayloadCandidate(in: rawPayload),
-	              let payload = FileTabDragPayload.decode(rawPayload),
-	              payload.workspaceID == workspaceID.value.uuidString else { return false }
-	        let direction: SplitDirection = location.y >= size.height * 0.68 ? .down : .right
-	        splitFileTab(path: payload.path, direction: direction)
-        return true
-    }
+	        guard let path = fileTabDropPath(rawPayload: rawPayload, workspaceID: workspaceID) else { return false }
+	        splitFileTab(path: path, direction: fileDropSplitDirection(location: location, size: size))
+	        return true
+	    }
 
     func insertText(_ text: String) {
         draftText += text
