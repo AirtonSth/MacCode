@@ -1532,10 +1532,10 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         }
     }
 
-    public func respondAgentUserInput(thread: AgentThreadID, requestId: String, text: String) throws {
+    public func respondAgentUserInput(thread: AgentThreadID, requestId: String, text: String) async throws {
         guard let ctx = context else { throw LayoutError.workspaceNotFound }
         do {
-            try ctx.coordinator.respondToUserInput(threadId: thread, requestId: requestId, text: text)
+            try await ctx.coordinator.respondToUserInput(threadId: thread, requestId: requestId, text: text)
             try? ctx.providerPendingCallbackRepo.resolve(threadId: thread, requestId: requestId, kind: .userInput, state: .resolved)
             EventBus.shared.publish(kind: "agent.user_input.resolved", payload: .object([
                 "thread_id": .string(thread.value.uuidString),
@@ -1947,6 +1947,15 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         // (streaming CLI, SDK-bridge tool-exec env, session) uses for the agent's bash tools
         // that spawn `cmd | distill`. Set unconditionally — even with no instance config.
         env["REMOTE_CODE_AGENT_PROVIDER"] = provider.rawValue
+        if provider == .claude,
+           let context,
+           SettingsStore(db: context.db).load().tokenSaverEnabled {
+            env["RC_TOKEN_SAVER_POST_TOOL_USE"] = "1"
+            env["REMOTE_CODE_DISTILL_STATE_PATH"] = context.appSupportDirectory
+                .appendingPathComponent("Distill", isDirectory: true)
+                .appendingPathComponent("DistillCLIState.json")
+                .path
+        }
         return env
     }
 

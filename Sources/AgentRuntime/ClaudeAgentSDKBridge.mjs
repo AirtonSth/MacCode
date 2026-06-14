@@ -32,9 +32,168 @@ const SUPPORTED_IMAGE_MIME_TYPES = new Set([
   'image/gif',
   'image/webp',
 ]);
+const TOKEN_SAVER_MIN_BYTES = 2048;
+const TOKEN_SAVER_MIN_LINES = 30;
+const TOKEN_SAVER_STORE_MIN_BYTES = 2048;
+const TOKEN_SAVER_HOOK_TIMEOUT_MS = 1000;
+const TOKEN_SAVER_EXCLUDED_TOOLS = new Set(['read', 'edit', 'write', 'multiedit', 'notebookedit']);
+const TOKEN_SAVER_PROFILES = new Map([
+  ['grep', 'conservative'],
+  ['glob', 'conservative'],
+  ['bash', 'moderate'],
+  ['webfetch', 'aggressive'],
+]);
 
 function emit(object) {
   process.stdout.write(JSON.stringify(object) + '\n');
+}
+
+function normalizeToolName(toolName) {
+  return String(toolName || '').trim().replace(/[-_]/g, '').toLowerCase();
+}
+
+function lineCount(text) {
+  return String(text || '').split('\n').length;
+}
+
+function extractToolOutputText(value) {
+  if (value == null) return '';
+  if (typeof value === 'string') return value;
+  if (Array.isArray(value)) {
+    return value.map(extractToolOutputText).filter(Boolean).join('\n');
+  }
+  if (typeof value !== 'object') return String(value);
+  if (Array.isArray(value.content)) return extractToolOutputText(value.content);
+  for (const key of ['text', 'output', 'stdout', 'stderr', 'result']) {
+    if (typeof value[key] === 'string') return value[key];
+  }
+  return '';
+}
+
+function replaceToolOutputText(value, text) {
+  if (typeof value === 'string') return text;
+  if (Array.isArray(value)) return [{ type: 'text', text }];
+  if (value && typeof value === 'object') {
+    if (Array.isArray(value.content)) return { ...value, content: [{ type: 'text', text }] };
+    for (const key of ['text', 'output', 'stdout', 'stderr', 'result']) {
+      if (typeof value[key] === 'string') return { ...value, [key]: text };
+    }
+  }
+  return text;
+}
+
+function tokenSaverToolDecision(toolName, output) {
+  const normalized = normalizeToolName(toolName);
+  const profile = TOKEN_SAVER_PROFILES.get(normalized) || 'passthrough';
+  let skipReason = null;
+  if (TOKEN_SAVER_EXCLUDED_TOOLS.has(normalized)) skipReason = 'excluded_tool';
+  else if (profile === 'passthrough') skipReason = 'not_allowlisted';
+  else if (Buffer.byteLength(output || '', 'utf8') <= TOKEN_SAVER_MIN_BYTES && lineCount(output) <= TOKEN_SAVER_MIN_LINES) skipReason = 'below_threshold';
+  return { profile, shouldCompress: skipReason == null, skipReason };
+}
+
+function tokenSaverContractQuestion(toolName, toolInput, profile) {
+  const args = summarizeToolInput(toolInput);
+  const suffix = args ? ` Context: ${args}.` : '';
+  if (profile === 'conservative') {
+    return `Compress search output without dropping any match line. Preserve paths, line numbers, matched text, and quoted strings verbatim; only collapse duplicate/context noise.${suffix}`;
+  }
+  if (profile === 'moderate') {
+    return `Compress command output. Preserve exit codes, failing test names, errors, warnings, assertions, numbers, paths, and quoted strings verbatim; collapse repeated progress noise.${suffix}`;
+  }
+  if (profile === 'aggressive') {
+    return `Compress fetched web content for the current task. Preserve URLs, titles, code, API signatures, numbers, and quoted strings verbatim; keep retrieve-worthy details explicit.${suffix}`;
+  }
+  return `Pass through tool output unchanged.${suffix}`;
+}
+
+function summarizeToolInput(toolInput) {
+  if (!toolInput || typeof toolInput !== 'object') return '';
+  const parts = [];
+  for (const key of ['command', 'pattern', 'path', 'glob', 'url']) {
+    if (typeof toolInput[key] === 'string' && toolInput[key].trim()) parts.push(`${key}=${toolInput[key].trim()}`);
+  }
+  return parts.join(' | ').slice(0, 500);
+}
+
+function loadTokenSaverState() {
+  const override = current.env.REMOTE_CODE_DISTILL_STATE_PATH;
+  const candidates = override ? [override] : [];
+  for (const candidate of candidates) {
+    try {
+      const parsed = JSON.parse(fs.readFileSync(candidate, 'utf8'));
+      if (parsed.base_url && parsed.auth_token) {
+        return { baseURL: String(parsed.base_url), authToken: String(parsed.auth_token) };
+      }
+    } catch (_) {
+      // fail open
+    }
+  }
+  return null;
+}
+
+async function postTokenSaverDistill(state, body) {
+  if (typeof fetch !== 'function') return null;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), TOKEN_SAVER_HOOK_TIMEOUT_MS);
+  try {
+    const response = await fetch(`${state.baseURL}/v1/distill`, {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${state.authToken}`,
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    });
+    if (!response.ok) return null;
+    const decoded = await response.json();
+    return typeof decoded.output === 'string' ? decoded.output : null;
+  } catch (_) {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function tokenSaverPostToolUse(input) {
+  if (current.env.RC_TOKEN_SAVER_POST_TOOL_USE !== '1') return {};
+  if (!input || input.hook_event_name !== 'PostToolUse') return {};
+  const rawOutput = extractToolOutputText(input.tool_response);
+  const decision = tokenSaverToolDecision(input.tool_name, rawOutput);
+  if (!decision.shouldCompress) return {};
+  const state = loadTokenSaverState();
+  if (!state) return {};
+  const output = await postTokenSaverDistill(state, {
+    mode: 'commandOutput',
+    priority: 1,
+    input: rawOutput,
+    question: tokenSaverContractQuestion(input.tool_name, input.tool_input, decision.profile),
+    provider: current.env.REMOTE_CODE_AGENT_PROVIDER || 'claude',
+    recordSavings: true,
+    runMode: 'optimize',
+    maxOutputCharacters: Math.max(512, Math.min(rawOutput.length, 12000)),
+    cacheState: 'tool_output_hooked',
+    reversibleStoreMinBytes: TOKEN_SAVER_STORE_MIN_BYTES,
+  });
+  if (!output || output.length >= rawOutput.length) return {};
+  return {
+    continue: true,
+    hookSpecificOutput: {
+      hookEventName: 'PostToolUse',
+      updatedMCPToolOutput: replaceToolOutputText(input.tool_response, output),
+    },
+  };
+}
+
+function tokenSaverHooks() {
+  return {
+    PostToolUse: [{
+      matcher: '*',
+      timeout: Math.ceil(TOKEN_SAVER_HOOK_TIMEOUT_MS / 1000),
+      hooks: [tokenSaverPostToolUse],
+    }],
+  };
 }
 
 function bridgeUserInputRequest(request) {
@@ -163,6 +322,7 @@ function ensureQuery() {
       settingSources: ['user', 'project'],
       allowDangerouslySkipPermissions: current.permissionMode === 'bypassPermissions',
       env: current.env,
+      hooks: tokenSaverHooks(),
       // Partial assistant snapshots can contain evolving thinking blocks. Replaying
       // those snapshots into the next Anthropic request can trip the API's
       // "thinking blocks must remain unchanged" validation.

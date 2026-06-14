@@ -593,11 +593,6 @@ public final class CodexAppServerClient: @unchecked Sendable {
     }
 
     private static func developerInstructions(for mode: AgentInteractionMode) -> String {
-        switch mode {
-        case .default:
-            return "Implement clear user requests, keep changes scoped, preserve unrelated local work, verify before reporting completion, and ask before ambiguous or risky edits."
-        case .plan:
-            return "Analyze the request and produce a concrete plan only. Do not edit files, run destructive commands, or implement changes until the user explicitly approves the plan."
-        }
+        AgentProviderInstructionText.developerInstructions(for: mode)
     }
 }

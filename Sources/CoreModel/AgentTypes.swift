@@ -246,23 +246,35 @@ public struct AgentRunRequest: Codable, Sendable, Equatable {
     }
 
     public var providerPrompt: String {
-        switch interactionMode {
+        AgentProviderInstructionText.providerPrompt(for: interactionMode, prompt: prompt)
+    }
+}
+
+public enum AgentProviderInstructionText {
+    public static func providerPrompt(for mode: AgentInteractionMode, prompt: String) -> String {
+        """
+        \(providerPreamble(for: mode))
+
+        User request:
+        \(prompt)
+        """
+    }
+
+    public static func developerInstructions(for mode: AgentInteractionMode) -> String {
+        switch mode {
         case .default:
-            return """
-            You are in default mode inside the RemoteCode Agent App. Implement the user's request when it is clear, keep changes scoped to that request, preserve unrelated local work, and verify the result before reporting completion. If the request is ambiguous or risky, ask a concise clarification before changing files.
-
-            User request:
-            \(prompt)
-            """
+            return "Implement clear requests; keep scope; preserve unrelated work; verify; ask before ambiguous/risky edits."
         case .plan:
-            return """
-            You are in plan mode. Analyze the request and produce a concrete plan only. Do not edit files, run destructive commands, or implement changes until the user explicitly approves the plan.
+            return "Plan only. Do not edit, run destructive commands, or implement until user approval."
+        }
+    }
 
-            If the provider exposes an ExitPlanMode or proposed-plan tool, call it exactly once with the final plan, then stop and wait for the user. Do not continue into implementation after emitting the plan.
-
-            User request:
-            \(prompt)
-            """
+    public static func providerPreamble(for mode: AgentInteractionMode) -> String {
+        switch mode {
+        case .default:
+            return "Default mode. Implement clear requests; keep scope; preserve unrelated work; verify; ask before ambiguous/risky edits."
+        case .plan:
+            return "Plan mode. Produce a concrete plan only. Do not edit files, run destructive commands, or implement until approved. If available, call ExitPlanMode once with the final plan, then wait."
         }
     }
 }

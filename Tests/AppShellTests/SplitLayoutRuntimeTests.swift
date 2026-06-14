@@ -53,8 +53,8 @@ final class SplitLayoutRuntimeTests: XCTestCase {
         return workspace
     }
 
-    private func drainMainQueue() {
-        RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+    private func drainMainQueue(seconds: TimeInterval = 0.05) {
+        RunLoop.main.run(until: Date().addingTimeInterval(seconds))
     }
 
     func test_horizontalSplit_panesAreEqualWidthAtRuntime() throws {
@@ -145,6 +145,7 @@ final class SplitLayoutRuntimeTests: XCTestCase {
         let split = try XCTUnwrap(findRootSplit(first.window.contentView!))
         split.setPosition(360, ofDividerAt: 0)
         split.layoutSubtreeIfNeeded()
+        drainMainQueue(seconds: 0.35)
 
         let second = MainWindowController(context: ctx, router: router)
         Self.retainedWindowControllers.append(second)

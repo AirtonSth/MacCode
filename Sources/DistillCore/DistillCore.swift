@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 import HuggingFace
 import MLX
 import MLXHuggingFace
@@ -23,6 +24,63 @@ public enum DistillPriority: Int, Codable, Sendable, Comparable {
     }
 }
 
+public enum CommandOutputIntent: String, Codable, Sendable, Equatable {
+    case cwdAndFiles
+    case cwdOnly
+    case tokenVerdict
+    case pathsOnly
+    case existsMissing
+    case statusCode
+    case jsonOnly
+}
+
+public struct CommandOutputIntentDecision: Equatable, Sendable {
+    public let intent: CommandOutputIntent
+    public let confidence: Double
+
+    public init(intent: CommandOutputIntent, confidence: Double) {
+        self.intent = intent
+        self.confidence = confidence
+    }
+
+    fileprivate func isConfident(minimumConfidence: Double) -> Bool {
+        confidence.isFinite && confidence >= minimumConfidence
+    }
+}
+
+public typealias CommandOutputIntentClassifier = @Sendable (String) -> CommandOutputIntentDecision?
+
+public enum DistillRunMode: String, Codable, Sendable, Equatable {
+    case audit
+    case optimize
+    case simulate
+}
+
+public struct DistillAuditReport: Codable, Sendable, Equatable {
+    public let runMode: DistillRunMode
+    public let candidateOutputCharacters: Int
+    public let candidateOutputTokens: Int
+    public let wouldSaveTokens: Int
+    public let accepted: Bool
+    public let wallClockMilliseconds: Int
+
+    public init(
+        runMode: DistillRunMode,
+        candidateOutputCharacters: Int,
+        candidateOutputTokens: Int,
+        wouldSaveTokens: Int,
+        accepted: Bool,
+        wallClockMilliseconds: Int
+    ) {
+        self.runMode = runMode
+        self.candidateOutputCharacters = max(0, candidateOutputCharacters)
+        self.candidateOutputTokens = max(0, candidateOutputTokens)
+        self.wouldSaveTokens = max(0, wouldSaveTokens)
+        self.accepted = accepted
+        self.wallClockMilliseconds = max(0, wallClockMilliseconds)
+    }
+}
+
 public struct DistillRequest: Codable, Sendable, Equatable, Identifiable {
     public let id: UUID
     public let mode: DistillMode
@@ -31,6 +89,11 @@ public struct DistillRequest: Codable, Sendable, Equatable, Identifiable {
     public let question: String?
     public let provider: String?
     public let recordSavings: Bool?
+    public let runMode: DistillRunMode?
+    public let cacheState: String?
+    public let rerankQuery: String?
+    public let topK: Int?
+    public let encoderLane: String?
     public let maxOutputCharacters: Int
 
     public init(
@@ -41,6 +104,11 @@ public struct DistillRequest: Codable, Sendable, Equatable, Identifiable {
         question: String? = nil,
         provider: String? = nil,
         recordSavings: Bool = false,
+        runMode: DistillRunMode = .optimize,
+        cacheState: String? = nil,
+        rerankQuery: String? = nil,
+        topK: Int? = nil,
+        encoderLane: String? = nil,
         maxOutputCharacters: Int = 4_000
     ) {
         self.id = id
@@ -50,7 +118,16 @@ public struct DistillRequest: Codable, Sendable, Equatable, Identifiable {
         self.question = question?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
         self.provider = provider?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
         self.recordSavings = recordSavings
+        self.runMode = runMode
+        self.cacheState = cacheState?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
+        self.rerankQuery = rerankQuery?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
+        self.topK = topK.map { max(1, $0) }
+        self.encoderLane = encoderLane?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
         self.maxOutputCharacters = max(128, maxOutputCharacters)
+    }
+
+    public var effectiveRunMode: DistillRunMode {
+        runMode ?? .optimize
     }
 }
 
@@ -66,6 +143,8 @@ public struct DistillResponse: Codable, Sendable, Equatable {
     /// (small/lossless). Optional + synthesized Codable => decode tolerates older
     /// payloads that omit the key (version-skew safe).
     public let originalHandle: String?
+    public let runMode: DistillRunMode?
+    public let auditReport: DistillAuditReport?
 
     public init(
         requestID: UUID,
@@ -73,7 +152,9 @@ public struct DistillResponse: Codable, Sendable, Equatable {
         inputCharacters: Int,
         inputTokens: Int = 0,
         outputTokens: Int = 0,
-        originalHandle: String? = nil
+        originalHandle: String? = nil,
+        runMode: DistillRunMode = .optimize,
+        auditReport: DistillAuditReport? = nil
     ) {
         self.requestID = requestID
         self.output = output
@@ -82,11 +163,29 @@ public struct DistillResponse: Codable, Sendable, Equatable {
         self.inputTokens = max(0, inputTokens)
         self.outputTokens = max(0, outputTokens)
         self.originalHandle = originalHandle
+        self.runMode = runMode
+        self.auditReport = auditReport
     }
 
     /// Tokens removed by compression. Never negative: a longer "compressed"
     /// output (rare model misbehavior) reports zero savings, not negative.
     public var savedTokens: Int { max(inputTokens - outputTokens, 0) }
+
+    /// I2.4: fail-open copy that serves `input` verbatim (no savings, no handle). Used when
+    /// a LOSSY substitution could not be backed by a reversible store, so the dropped bytes
+    /// would otherwise be unrecoverable.
+    public func verbatimFallback(input: String) -> DistillResponse {
+        DistillResponse(
+            requestID: requestID,
+            output: input,
+            inputCharacters: input.count,
+            inputTokens: inputTokens,
+            outputTokens: inputTokens,
+            originalHandle: nil,
+            runMode: runMode ?? .optimize,
+            auditReport: auditReport
+        )
+    }
 
     /// Copy carrying the CCR handle to the stored original.
     public func withOriginalHandle(_ handle: String?) -> DistillResponse {
@@ -96,8 +195,133 @@ public struct DistillResponse: Codable, Sendable, Equatable {
             inputCharacters: inputCharacters,
             inputTokens: inputTokens,
             outputTokens: outputTokens,
-            originalHandle: handle
+            originalHandle: handle,
+            runMode: runMode ?? .optimize,
+            auditReport: auditReport
         )
+    }
+}
+
+public struct DistillRankChunk: Codable, Sendable, Equatable {
+    public let id: String
+    public let text: String
+    public let contentType: DistillContentType
+    public let position: Int
+
+    private enum CodingKeys: String, CodingKey {
+        case id
+        case text
+        case contentType
+        case position
+    }
+
+    public init(id: String, text: String, contentType: DistillContentType = .prose, position: Int = 0) {
+        self.id = id
+        self.text = text
+        self.contentType = contentType
+        self.position = max(0, position)
+    }
+
+    public init(from decoder: Swift.Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.id = try container.decode(String.self, forKey: .id)
+        self.text = try container.decode(String.self, forKey: .text)
+        self.contentType = try container.decodeIfPresent(DistillContentType.self, forKey: .contentType) ?? .prose
+        self.position = max(0, try container.decodeIfPresent(Int.self, forKey: .position) ?? 0)
+    }
+}
+
+public struct DistillRankRequest: Codable, Sendable, Equatable {
+    public let query: String
+    public let chunks: [DistillRankChunk]
+    public let toolArguments: String?
+    public let topK: Int?
+    public let encoderLane: String?
+
+    public init(
+        query: String,
+        chunks: [DistillRankChunk],
+        toolArguments: String? = nil,
+        topK: Int? = nil,
+        encoderLane: String? = nil
+    ) {
+        self.query = query
+        self.chunks = chunks
+        self.toolArguments = toolArguments?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
+        self.topK = topK.map { max(1, $0) }
+        self.encoderLane = encoderLane?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
+    }
+}
+
+public struct DistillRankedChunk: Codable, Sendable, Equatable {
+    public let id: String
+    public let text: String
+    public let contentType: DistillContentType
+    public let position: Int
+    public let bm25Score: Double
+    public let embeddingScore: Double?
+    public let finalScore: Double
+
+    public init(
+        id: String,
+        text: String,
+        contentType: DistillContentType,
+        position: Int,
+        bm25Score: Double,
+        embeddingScore: Double?,
+        finalScore: Double
+    ) {
+        self.id = id
+        self.text = text
+        self.contentType = contentType
+        self.position = position
+        self.bm25Score = bm25Score
+        self.embeddingScore = embeddingScore
+        self.finalScore = finalScore
+    }
+}
+
+public struct DistillRankResponse: Codable, Sendable, Equatable {
+    public let query: String
+    public let encoderLane: String?
+    public let results: [DistillRankedChunk]
+
+    public init(query: String, encoderLane: String? = nil, results: [DistillRankedChunk]) {
+        self.query = query
+        self.encoderLane = encoderLane
+        self.results = results
+    }
+}
+
+public struct DistillEmbedRequest: Codable, Sendable, Equatable {
+    public let inputs: [String]
+    public let encoderLane: String?
+
+    public init(inputs: [String], encoderLane: String? = nil) {
+        self.inputs = inputs
+        self.encoderLane = encoderLane?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
+    }
+}
+
+public struct DistillEmbedResponse: Codable, Sendable, Equatable {
+    public let available: Bool
+    public let encoderLane: String?
+    public let dimensions: Int
+    public let embeddings: [[Double]]
+    public let message: String?
+
+    public init(
+        available: Bool,
+        encoderLane: String? = nil,
+        dimensions: Int = 0,
+        embeddings: [[Double]] = [],
+        message: String? = nil
+    ) {
+        self.available = available
+        self.encoderLane = encoderLane
+        self.dimensions = max(0, dimensions)
+        self.embeddings = embeddings
+        self.message = message
     }
 }
 
@@ -143,6 +367,7 @@ public struct DistillSavingsRecord: Sendable, Equatable {
 public enum DistillSavingsCalculator {
     public static func record(for request: DistillRequest, response: DistillResponse, defaultProvider: String = "unknown") -> DistillSavingsRecord? {
         guard request.recordSavings == true else { return nil }
+        guard request.effectiveRunMode == .optimize else { return nil }
         let provider = request.provider?
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .nilIfEmpty ?? defaultProvider
@@ -159,7 +384,7 @@ public enum DistillSavingsCalculator {
                 inputTokens: response.inputTokens,
                 outputTokens: response.outputTokens,
                 savedTokens: response.savedTokens,
-                cacheState: "tool_output_oneshot"
+                cacheState: request.cacheState ?? "tool_output_oneshot"
             )
         case .sr1Humanize:
             // The agent emitted the compressed SR1 response instead of the full
@@ -183,7 +408,7 @@ public enum DistillSavingsCalculator {
                 inputTokens: response.inputTokens,
                 outputTokens: response.outputTokens,
                 savedTokens: response.savedTokens,
-                cacheState: request.mode == .longText ? "prompt" : "watch"
+                cacheState: request.cacheState ?? (request.mode == .longText ? "prompt" : "watch")
             )
         }
     }
@@ -235,6 +460,40 @@ public extension DistillRuntime {
     func reclaimIdleMemory() {}
     /// Runtimes with no cold-start cost need do nothing.
     func warmup() async throws {}
+}
+
+public struct DistillResultCacheKey: Hashable, Sendable, Equatable {
+    /// Bump when any crusher, prompt template, or literal-preservation rule changes.
+    public static let pipelineVersion = "distill-pipeline-v1"
+
+    public let mode: DistillMode
+    public let inputSHA256: String
+    public let questionSHA256: String?
+    public let maxOutputCharacters: Int
+    public let modelRevision: String
+    public let pipelineVersion: String
+
+    public init(
+        request: DistillRequest,
+        modelRevision: String = DistillApprovedModel.id,
+        pipelineVersion: String = Self.pipelineVersion
+    ) {
+        self.mode = request.mode
+        self.inputSHA256 = Self.sha256Hex(request.input)
+        self.questionSHA256 = request.question.map(Self.sha256Hex)
+        self.maxOutputCharacters = request.maxOutputCharacters
+        self.modelRevision = modelRevision
+        self.pipelineVersion = pipelineVersion
+    }
+
+    private static func sha256Hex(_ value: String) -> String {
+        SHA256.hash(data: Data(value.utf8)).map { String(format: "%02x", $0) }.joined()
+    }
+}
+
+private struct DistillResultCacheEntry: Sendable {
+    let output: String
+    let insertedAt: Date
 }
 
 private enum SR1LineParser {
@@ -424,13 +683,26 @@ public actor DistillScheduler {
     private let runtime: any DistillRuntime
     private let maxConcurrentRequests: Int
     private let maxQueueDepth: Int
+    private let resultCacheTTLSeconds: TimeInterval
+    private let resultCacheCapacity: Int
     private var activeRequests = 0
     private var waiters: [CheckedContinuation<Void, Error>] = []
+    private var resultCache: [DistillResultCacheKey: DistillResultCacheEntry] = [:]
+    private var resultCacheHits = 0
+    private var resultCacheMisses = 0
 
-    public init(runtime: any DistillRuntime, maxConcurrentRequests: Int = 8, maxQueueDepth: Int = 0) {
+    public init(
+        runtime: any DistillRuntime,
+        maxConcurrentRequests: Int = 8,
+        maxQueueDepth: Int = 0,
+        resultCacheTTLSeconds: TimeInterval = 1_800,
+        resultCacheCapacity: Int = 128
+    ) {
         self.runtime = runtime
         self.maxConcurrentRequests = max(1, maxConcurrentRequests)
         self.maxQueueDepth = max(0, maxQueueDepth)
+        self.resultCacheTTLSeconds = max(0, resultCacheTTLSeconds)
+        self.resultCacheCapacity = max(0, resultCacheCapacity)
     }
 
     public var activeRequestCount: Int {
@@ -441,9 +713,32 @@ public actor DistillScheduler {
         waiters.count
     }
 
+    public var resultCacheCount: Int {
+        resultCache.count
+    }
+
+    public var resultCacheHitCount: Int {
+        resultCacheHits
+    }
+
+    public var resultCacheMissCount: Int {
+        resultCacheMisses
+    }
+
     public func submit(_ request: DistillRequest) async throws -> DistillResponse {
         let trimmed = request.input.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { throw DistillError.emptyInput }
+        if request.effectiveRunMode != .optimize {
+            return try await audit(request)
+        }
+        let cacheKey = DistillResultCacheKey(request: request)
+        if let cached = cachedOutput(for: cacheKey) {
+            resultCacheHits += 1
+            return response(for: request, output: cached)
+        }
+        if resultCacheTTLSeconds > 0, resultCacheCapacity > 0 {
+            resultCacheMisses += 1
+        }
 
         try await acquireSlot()
         defer { releaseSlot() }
@@ -453,13 +748,77 @@ public actor DistillScheduler {
         guard !output.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw DistillError.invalidOutput
         }
+        storeCachedOutput(output, for: cacheKey)
+        return response(for: request, output: output)
+    }
+
+    private func audit(_ request: DistillRequest) async throws -> DistillResponse {
+        try await acquireSlot()
+        defer { releaseSlot() }
+
+        let started = Date()
+        let raw = try await runtime.distill(request)
+        let candidate = String(raw.prefix(request.maxOutputCharacters))
+        let inputTokens = TokenEstimator.estimate(request.input)
+        let candidateTokens = candidate.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            ? inputTokens
+            : TokenEstimator.estimate(candidate)
+        let wouldSaveTokens = max(inputTokens - candidateTokens, 0)
+        let elapsedMs = Int(Date().timeIntervalSince(started) * 1_000)
+        let report = DistillAuditReport(
+            runMode: request.effectiveRunMode,
+            candidateOutputCharacters: candidate.count,
+            candidateOutputTokens: candidateTokens,
+            wouldSaveTokens: wouldSaveTokens,
+            accepted: !candidate.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && candidate.count < request.input.count,
+            wallClockMilliseconds: elapsedMs
+        )
         return DistillResponse(
+            requestID: request.id,
+            output: request.input,
+            inputCharacters: request.input.count,
+            inputTokens: inputTokens,
+            outputTokens: inputTokens,
+            runMode: request.effectiveRunMode,
+            auditReport: report
+        )
+    }
+
+    private func response(for request: DistillRequest, output: String) -> DistillResponse {
+        DistillResponse(
             requestID: request.id,
             output: output,
             inputCharacters: request.input.count,
             inputTokens: TokenEstimator.estimate(request.input),
-            outputTokens: TokenEstimator.estimate(output)
+            outputTokens: TokenEstimator.estimate(output),
+            runMode: request.effectiveRunMode
         )
+    }
+
+    private func cachedOutput(for key: DistillResultCacheKey) -> String? {
+        guard resultCacheTTLSeconds > 0,
+              let entry = resultCache[key] else {
+            return nil
+        }
+        if Date().timeIntervalSince(entry.insertedAt) > resultCacheTTLSeconds {
+            resultCache.removeValue(forKey: key)
+            return nil
+        }
+        return entry.output
+    }
+
+    private func storeCachedOutput(_ output: String, for key: DistillResultCacheKey) {
+        guard resultCacheCapacity > 0,
+              !RetrieveHandleSanitizer.containsHandle(output) else {
+            return
+        }
+        let now = Date()
+        resultCache[key] = DistillResultCacheEntry(output: output, insertedAt: now)
+        guard resultCache.count > resultCacheCapacity,
+              let oldest = resultCache.min(by: { $0.value.insertedAt < $1.value.insertedAt })?.key else {
+            return
+        }
+        resultCache.removeValue(forKey: oldest)
     }
 
     private func acquireSlot() async throws {
@@ -492,6 +851,7 @@ public actor DistillScheduler {
 
 public struct LocalDistillRuntime: DistillRuntime {
     static let contentRouter = DistillContentRouter()
+    public static let commandOutputIntentConfidenceThreshold = 0.82
 
     public init() {}
 
@@ -501,7 +861,7 @@ public struct LocalDistillRuntime: DistillRuntime {
         // summarization. Skipped for .commandOutput (it must answer the contract
         // question, not blind-minify) and .sr1Humanize (a translation task).
         if request.mode == .longText || request.mode == .watchSummary,
-           let routed = Self.contentRouter.route(request.input) {
+           let routed = Self.contentRouter.route(request.input, options: Self.routerOptions(for: request)) {
             return routed.output
         }
         if request.mode == .commandOutput {
@@ -529,44 +889,34 @@ public struct LocalDistillRuntime: DistillRuntime {
         return lines.isEmpty ? "\(prefix) no content" : lines.map { "\(prefix) \($0)" }.joined(separator: "\n")
     }
 
+    static func routerOptions(for request: DistillRequest) -> DistillRouterOptions {
+        DistillRouterOptions(
+            allowElementDropping: false,
+            contextPressure: DistillRouterOptions.pressure(
+                inputCharacters: request.input.count,
+                outputBudgetCharacters: request.maxOutputCharacters
+            ),
+            query: request.question
+        )
+    }
+
     static func commandOutputFallback(input: String, question explicitQuestion: String?, maxOutputCharacters: Int) -> String {
         let parsed = splitLegacyCommandPayload(input)
         let question = (explicitQuestion?.nilIfEmpty ?? parsed.question ?? "Compress command output. Return only the useful signal.")
             .trimmingCharacters(in: .whitespacesAndNewlines)
         let source = parsed.output.trimmingCharacters(in: .whitespacesAndNewlines)
-        let lowerQuestion = question.lowercased()
-        guard !source.isEmpty else {
-            if lowerQuestion.contains("none") { return "NONE" }
-            return "distill: Insufficient information to output anything."
+        if let extracted = commandOutputExtraction(source: source, question: question) {
+            return boundedCommandOutput(extracted, maxOutputCharacters: maxOutputCharacters)
         }
 
         let sourceLines = source
             .split(whereSeparator: \.isNewline)
             .map { String($0).trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
+        guard !sourceLines.isEmpty else { return "NONE" }
 
         let output: String
-        if lowerQuestion.contains("cwd=") && lowerQuestion.contains("files=") {
-            let cwd = sourceLines.first ?? source
-            let files = sourceLines.dropFirst()
-            output = "CWD=\(cwd); FILES=\(files.isEmpty ? "EMPTY" : files.joined(separator: ", "))"
-        } else if lowerQuestion.contains("cwd") && lowerQuestion.contains("only") {
-            output = sourceLines.first ?? source
-        } else if lowerQuestion.contains("filename") || lowerQuestion.contains("file path") || lowerQuestion.contains("paths only") || lowerQuestion.contains("keep paths only") {
-            var pathLines = sourceLines
-            if lowerQuestion.contains("html") && lowerQuestion.contains("file") {
-                pathLines = pathLines.filter { $0.lowercased().contains(".html") }
-            }
-            output = pathLines.isEmpty ? "NONE" : pathLines.joined(separator: "\n")
-        } else if lowerQuestion.contains("exists") && lowerQuestion.contains("missing") {
-            output = source.lowercased().contains("code=0") || source.lowercased().contains("exists_code=0") ? "EXISTS" : "MISSING"
-        } else if lowerQuestion.contains("pass") || lowerQuestion.contains("fail") {
-            output = passFailSummary(source: source, sourceLines: sourceLines, lowerQuestion: lowerQuestion)
-        } else if lowerQuestion.contains("status code") {
-            output = httpStatusSummary(sourceLines: sourceLines)
-        } else if lowerQuestion.contains("json") {
-            output = firstLikelyJSON(from: source) ?? "distill: Insufficient information to output anything."
-        } else if sourceLines.count <= 12 {
+        if sourceLines.count <= 12 {
             output = sourceLines.joined(separator: "\n")
         } else {
             let head = sourceLines.prefix(6)
@@ -574,10 +924,80 @@ public struct LocalDistillRuntime: DistillRuntime {
             output = (head + ["... \(sourceLines.count - 10) lines omitted ..."] + tail).joined(separator: "\n")
         }
 
-        return String(output.prefix(maxOutputCharacters))
+        return boundedCommandOutput(output, maxOutputCharacters: maxOutputCharacters)
     }
 
-    private static func splitLegacyCommandPayload(_ input: String) -> (question: String?, output: String) {
+    static func commandOutputExtraction(
+        source rawSource: String,
+        question: String,
+        intent explicitIntent: CommandOutputIntent? = nil
+    ) -> String? {
+        let source = rawSource.trimmingCharacters(in: .whitespacesAndNewlines)
+        let lowerQuestion = question.lowercased()
+        let intent = explicitIntent ?? heuristicCommandOutputIntent(question)
+        guard !source.isEmpty else {
+            return lowerQuestion.contains("none") ? "NONE" : nil
+        }
+
+        let sourceLines = source
+            .split(whereSeparator: \.isNewline)
+            .map { String($0).trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+
+        if intent == .cwdAndFiles {
+            let cwd = sourceLines.first ?? source
+            let files = sourceLines.dropFirst()
+            return "CWD=\(cwd); FILES=\(files.isEmpty ? "EMPTY" : files.joined(separator: ", "))"
+        } else if intent == .cwdOnly {
+            return sourceLines.first ?? source
+        } else if intent == .pathsOnly {
+            let paths = pathLines(from: sourceLines, htmlOnly: lowerQuestion.contains("html") && lowerQuestion.contains("file"))
+            return paths.isEmpty ? "NONE" : paths.joined(separator: "\n")
+        } else if intent == .existsMissing {
+            return existsMissingSummary(source: source)
+        } else if intent == .tokenVerdict {
+            return passFailSummary(source: source, sourceLines: sourceLines, lowerQuestion: lowerQuestion)
+        } else if intent == .statusCode {
+            return httpStatusSummary(sourceLines: sourceLines)
+        } else if intent == .jsonOnly {
+            return firstLikelyJSON(from: source)
+        }
+        return nil
+    }
+
+    static func commandOutputIntent(
+        question: String,
+        classifier: CommandOutputIntentClassifier? = nil,
+        confidenceThreshold: Double = commandOutputIntentConfidenceThreshold
+    ) -> CommandOutputIntent? {
+        if let decision = classifier?(question),
+           decision.isConfident(minimumConfidence: confidenceThreshold) {
+            return decision.intent
+        }
+        return heuristicCommandOutputIntent(question)
+    }
+
+    private static func heuristicCommandOutputIntent(_ question: String) -> CommandOutputIntent? {
+        let lowerQuestion = question.lowercased()
+        if lowerQuestion.contains("cwd=") && lowerQuestion.contains("files=") { return .cwdAndFiles }
+        if lowerQuestion.contains("cwd") && lowerQuestion.contains("only") { return .cwdOnly }
+        if (lowerQuestion.contains("pass") || lowerQuestion.contains("fail")) &&
+            (lowerQuestion.contains("only") || lowerQuestion.contains("return") || lowerQuestion.contains("did ")) {
+            return .tokenVerdict
+        }
+        if lowerQuestion.contains("filename") ||
+            lowerQuestion.contains("file path") ||
+            lowerQuestion.contains("paths only") ||
+            lowerQuestion.contains("keep paths only") {
+            return .pathsOnly
+        }
+        if lowerQuestion.contains("exists") && lowerQuestion.contains("missing") { return .existsMissing }
+        if lowerQuestion.contains("status code") { return .statusCode }
+        if lowerQuestion.contains("json") && lowerQuestion.contains("only") { return .jsonOnly }
+        return nil
+    }
+
+    static func splitLegacyCommandPayload(_ input: String) -> (question: String?, output: String) {
         guard let promptRange = input.range(of: "PROMPT:\n"),
               let inputRange = input.range(of: "\n\nINPUT:\n"),
               promptRange.upperBound <= inputRange.lowerBound else {
@@ -590,33 +1010,31 @@ public struct LocalDistillRuntime: DistillRuntime {
         return (question, output)
     }
 
-    private static func passFailSummary(source: String, sourceLines: [String], lowerQuestion: String) -> String {
+    private static func passFailSummary(source: String, sourceLines: [String], lowerQuestion: String) -> String? {
         let lowerSource = source.lowercased()
         let badLines = sourceLines.filter { line in
             let lowerLine = line.lowercased()
-            if lowerLine.contains("0 failures") || lowerLine.contains("no failures") {
+            if hasRegexMatch(#"\b0\s+failures?\b|\bno\s+failures?\b"#, in: lowerLine) {
                 return false
             }
-            return lowerLine.contains("fail") ||
-                lowerLine.contains("failed") ||
-                lowerLine.contains("error") ||
-                lowerLine.contains("crashloop") ||
-                lowerLine.contains("nonzero") ||
-                lowerLine.contains("exit 1")
+            return hasRegexMatch(#"\b(fail(?:ed|ure|ures)?|error|errors|crashloop|nonzero)\b|\bexit\s+[1-9][0-9]*\b|\bcode\s*=\s*[1-9][0-9]*\b"#, in: lowerLine)
         }
         if !badLines.isEmpty {
-            return "FAIL " + badLines.prefix(3).joined(separator: "; ")
+            let shown = badLines.prefix(3)
+            let hiddenCount = badLines.count - shown.count
+            let suffix = hiddenCount > 0 ? "; +\(hiddenCount) more" : ""
+            return "FAIL " + shown.joined(separator: "; ") + suffix
         }
         if lowerSource.contains("http/1.1 200") || lowerSource.contains("http/2 200") || lowerSource.contains(" 200 ") {
             return "PASS HTTP 200"
         }
-        if lowerSource.contains("passed") || lowerSource.contains("pass") || lowerSource.contains("0 failures") || lowerSource.contains("exit 0") || lowerSource.contains("exists_code=0") {
+        if hasRegexMatch(#"\b([0-9]+\s+passed|passed|pass)\b|\b0\s+failures?\b|\bexit\s+0\b|\b(?:exists_)?code\s*=\s*0\b"#, in: lowerSource) {
             return "PASS"
         }
         if lowerQuestion.contains("if code 0") {
-            return lowerSource.contains("code=0") || lowerSource.contains("exists_code=0") ? "EXISTS" : "MISSING"
+            return existsMissingSummary(source: source)
         }
-        return "distill: Insufficient information to output anything."
+        return nil
     }
 
     private static func httpStatusSummary(sourceLines: [String]) -> String {
@@ -628,8 +1046,64 @@ public struct LocalDistillRuntime: DistillRuntime {
 
     private static func firstLikelyJSON(from source: String) -> String? {
         let trimmed = source.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard trimmed.first == "{" || trimmed.first == "[" else { return nil }
-        return trimmed
+        if isValidJSON(trimmed) { return trimmed }
+        let lines = trimmed
+            .split(whereSeparator: \.isNewline)
+            .map { String($0).trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        guard lines.count > 1, lines.allSatisfy(isValidJSON) else { return nil }
+        return lines.joined(separator: "\n")
+    }
+
+    private static func existsMissingSummary(source: String) -> String? {
+        let lowerSource = source.lowercased()
+        guard hasRegexMatch(#"\b(?:exists_)?code\s*=\s*-?[0-9]+\b"#, in: lowerSource) else {
+            return nil
+        }
+        return hasRegexMatch(#"\b(?:exists_)?code\s*=\s*0\b"#, in: lowerSource) ? "EXISTS" : "MISSING"
+    }
+
+    private static func pathLines(from sourceLines: [String], htmlOnly: Bool) -> [String] {
+        sourceLines.compactMap { line in
+            let path = line.trimmingCharacters(in: CharacterSet(charactersIn: "`\"' "))
+            guard looksLikePath(path) else { return nil }
+            if htmlOnly, !path.lowercased().contains(".html") { return nil }
+            return path
+        }
+    }
+
+    private static func looksLikePath(_ line: String) -> Bool {
+        guard !line.isEmpty,
+              !line.contains("\u{0}"),
+              !line.contains("://"),
+              line.range(of: #"\s{2,}"#, options: .regularExpression) == nil else {
+            return false
+        }
+        return line.hasPrefix("/") ||
+            line.hasPrefix("./") ||
+            line.hasPrefix("../") ||
+            line.contains("/") ||
+            line.range(of: #"\.[A-Za-z0-9]{1,8}$"#, options: .regularExpression) != nil
+    }
+
+    private static func isValidJSON(_ text: String) -> Bool {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.first == "{" || trimmed.first == "[" else { return false }
+        guard let data = trimmed.data(using: .utf8) else { return false }
+        return (try? JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed])) != nil
+    }
+
+    private static func hasRegexMatch(_ pattern: String, in text: String) -> Bool {
+        text.range(of: pattern, options: [.regularExpression, .caseInsensitive]) != nil
+    }
+
+    static func boundedCommandOutput(_ output: String, maxOutputCharacters: Int) -> String {
+        guard output.count > maxOutputCharacters else { return output }
+        let suffix = "\n... truncated to \(maxOutputCharacters) chars ..."
+        guard maxOutputCharacters > suffix.count else {
+            return String(suffix.prefix(maxOutputCharacters))
+        }
+        return String(output.prefix(maxOutputCharacters - suffix.count)) + suffix
     }
 
     static func humanizeSR1Fallback(_ input: String, maxOutputCharacters: Int) -> String {
@@ -813,6 +1287,17 @@ public struct MLXDistillRuntime: DistillRuntime {
         NSLog("RemoteCodeDistillService MLX warmup complete")
     }
 
+    static func routerOptions(for request: DistillRequest) -> DistillRouterOptions {
+        DistillRouterOptions(
+            allowElementDropping: false,
+            contextPressure: DistillRouterOptions.pressure(
+                inputCharacters: request.input.count,
+                outputBudgetCharacters: request.maxOutputCharacters
+            ),
+            query: request.question
+        )
+    }
+
     public func distill(_ request: DistillRequest) async throws -> String {
         if let deterministic = Self.deterministicCommandOutput(for: request) {
             return deterministic
@@ -823,7 +1308,7 @@ public struct MLXDistillRuntime: DistillRuntime {
         // Covers the .longText prompt-compression path. .commandOutput is excluded
         // (honors its contract question above) and .sr1Humanize is a translation.
         if request.mode == .longText || request.mode == .watchSummary,
-           let routed = Self.contentRouter.route(request.input) {
+           let routed = Self.contentRouter.route(request.input, options: Self.routerOptions(for: request)) {
             return routed.output
         }
 
@@ -847,10 +1332,11 @@ public struct MLXDistillRuntime: DistillRuntime {
         // Clear prior KV history so this independent distill call cannot
         // observe responses from previous, unrelated requests.
         await session.clear()
+        let protected = Self.requestByProtectingTagsAndMarkers(request)
         await lane.acquire()
         let raw: String
         do {
-            raw = try await session.respond(to: Self.prompt(for: request))
+            raw = try await session.respond(to: Self.prompt(for: protected.request))
         } catch {
             await lane.release()
             throw error
@@ -860,10 +1346,35 @@ public struct MLXDistillRuntime: DistillRuntime {
         let normalizedOutput = request.mode == .commandOutput
             ? Self.collapseDuplicatedCommandOutput(output)
             : output
-        guard Self.isUsefulOutput(normalizedOutput, mode: request.mode) else {
+        let restoredOutput = protected.payload.restore(in: normalizedOutput)
+        guard Self.isUsefulOutput(restoredOutput, mode: request.mode) else {
             return Self.fallbackOutput(for: request)
         }
-        return Self.guardLossyProseOutput(normalizedOutput, request: request)
+        return Self.guardLossyProseOutput(restoredOutput, request: request)
+    }
+
+    static func requestByProtectingTagsAndMarkers(_ request: DistillRequest) -> (request: DistillRequest, payload: ProtectedTagPayload) {
+        switch request.mode {
+        case .longText, .watchSummary:
+            let payload = TagAndMarkerProtector.protect(request.input)
+            guard !payload.isEmpty else { return (request, payload) }
+            return (
+                DistillRequest(
+                    id: request.id,
+                    mode: request.mode,
+                    priority: request.priority,
+                    input: payload.text,
+                    question: request.question,
+                    provider: request.provider,
+                    recordSavings: request.recordSavings ?? false,
+                    runMode: request.effectiveRunMode,
+                    maxOutputCharacters: request.maxOutputCharacters
+                ),
+                payload
+            )
+        case .commandOutput, .sr1Humanize:
+            return (request, ProtectedTagPayload(text: request.input, replacements: [:]))
+        }
     }
 
     /// N5 guard for the lossy prose modes (.longText/.watchSummary): if the model's
@@ -874,31 +1385,28 @@ public struct MLXDistillRuntime: DistillRuntime {
     static func guardLossyProseOutput(_ output: String, request: DistillRequest) -> String {
         switch request.mode {
         case .longText, .watchSummary:
-            return LiteralPreservation.guarded(original: request.input, compressed: output).output
+            let literalGuarded = LiteralPreservation.guarded(original: request.input, compressed: output)
+            guard literalGuarded.droppedLiteral == nil else { return literalGuarded.output }
+            return FaithfulnessGate.validate(original: request.input, compressed: literalGuarded.output).accepted
+                ? literalGuarded.output
+                : request.input
         case .commandOutput, .sr1Humanize:
             return output
         }
     }
 
-    static func deterministicCommandOutput(for request: DistillRequest) -> String? {
+    static func deterministicCommandOutput(
+        for request: DistillRequest,
+        classifier: CommandOutputIntentClassifier? = nil
+    ) -> String? {
         guard request.mode == .commandOutput else { return nil }
-        let contract = (request.question?.nilIfEmpty ?? request.input).lowercased()
-        let asksForCwdAndFiles = contract.contains("cwd=") && contract.contains("files=")
-        let asksForCwdOnly = contract.contains("cwd") && contract.contains("only")
-        let asksForTokenVerdict = (contract.contains("pass") || contract.contains("fail")) && contract.contains("only")
-        let asksForPathsOnly = contract.contains("filename") ||
-            contract.contains("file path") ||
-            contract.contains("paths only") ||
-            contract.contains("keep paths only")
-        let asksForRawJSON = contract.contains("json") && contract.contains("only")
-        guard asksForCwdAndFiles || asksForCwdOnly || asksForTokenVerdict || asksForPathsOnly || asksForRawJSON else {
+        let parsed = LocalDistillRuntime.splitLegacyCommandPayload(request.input)
+        let question = request.question?.nilIfEmpty ?? parsed.question ?? request.input
+        guard let intent = LocalDistillRuntime.commandOutputIntent(question: question, classifier: classifier),
+              let output = LocalDistillRuntime.commandOutputExtraction(source: parsed.output, question: question, intent: intent) else {
             return nil
         }
-        return LocalDistillRuntime.commandOutputFallback(
-            input: request.input,
-            question: request.question,
-            maxOutputCharacters: request.maxOutputCharacters
-        )
+        return LocalDistillRuntime.boundedCommandOutput(output, maxOutputCharacters: request.maxOutputCharacters)
     }
 
     private static func systemInstructions(for mode: DistillMode) -> String {
@@ -993,8 +1501,21 @@ public struct MLXDistillRuntime: DistillRuntime {
         min(512, max(32, request.maxOutputCharacters / 4))
     }
 
-    private static func fitInput(_ input: String, maxCharacters: Int = 24_000) -> String {
+    static func fitInput(_ input: String, maxCharacters: Int = 24_000) -> String {
         guard input.count > maxCharacters else { return input }
+        var maxKeep = max(8, min(120, maxCharacters / 120))
+        while maxKeep >= 8 {
+            let keepLast = max(2, min(8, maxKeep / 4))
+            let scored = DistillImportanceScorer.compact(input, maxKeep: maxKeep, keepLast: keepLast)
+            if scored.droppedLines > 0, scored.compacted.count <= maxCharacters {
+                return scored.compacted
+            }
+            maxKeep = (maxKeep * 3) / 4
+        }
+        return headTailFitInput(input, maxCharacters: maxCharacters)
+    }
+
+    private static func headTailFitInput(_ input: String, maxCharacters: Int) -> String {
         let half = max(0, maxCharacters / 2 - 50)
         let head = input.prefix(half)
         let tail = input.suffix(half)

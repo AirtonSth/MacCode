@@ -59,6 +59,7 @@ final class TokenSaverInstallTests: XCTestCase {
         private let lock = NSLock()
         private var _phases: [TokenSaverModelDownloadPhase] = []
         private var _rangeHeaders: [String?] = []
+        private var _authorizationHeaders: [String?] = []
 
         func appendPhase(_ phase: TokenSaverModelDownloadPhase) {
             lock.lock()
@@ -72,6 +73,12 @@ final class TokenSaverInstallTests: XCTestCase {
             lock.unlock()
         }
 
+        func appendAuthorizationHeader(_ header: String?) {
+            lock.lock()
+            _authorizationHeaders.append(header)
+            lock.unlock()
+        }
+
         var phases: [TokenSaverModelDownloadPhase] {
             lock.lock()
             defer { lock.unlock() }
@@ -82,6 +89,12 @@ final class TokenSaverInstallTests: XCTestCase {
             lock.lock()
             defer { lock.unlock() }
             return _rangeHeaders
+        }
+
+        var authorizationHeaders: [String?] {
+            lock.lock()
+            defer { lock.unlock() }
+            return _authorizationHeaders
         }
     }
 
@@ -102,6 +115,85 @@ final class TokenSaverInstallTests: XCTestCase {
         let config = URLSessionConfiguration.ephemeral
         config.protocolClasses = [URLProtocolStub.self]
         return URLSession(configuration: config)
+    }
+
+    private func writeTinyTokenSaverModel(
+        installer: TokenSaverModelInstaller,
+        revision: String = "unit-rev-test"
+    ) throws -> TokenSaverModelManifest {
+        let fileURL = installer.modelStorageDirectory(revision: revision)
+            .appendingPathComponent("model.safetensors")
+        try FileManager.default.createDirectory(
+            at: fileURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        let data = Data("mlx-unit-weights".utf8)
+        try data.write(to: fileURL)
+        let relativePath = [
+            "Models",
+            TokenSaverModelInstaller.safePathComponent(installer.approvedModel.id),
+            revision,
+            "model.safetensors"
+        ].joined(separator: "/")
+        let manifest = TokenSaverModelManifest(
+            modelID: installer.approvedModel.id,
+            modelURL: installer.approvedModel.url,
+            revision: revision,
+            runtime: installer.approvedModel.runtime,
+            files: [
+                TokenSaverModelFile(
+                    relativePath: relativePath,
+                    sha256: try TokenSaverModelInstaller.sha256Hex(url: fileURL),
+                    sizeBytes: Int64(data.count)
+                )
+            ]
+        )
+        try installer.writeManifest(manifest)
+        return manifest
+    }
+
+    private func writeTinyRequiredModels(installer: TokenSaverModelInstaller) throws {
+        var manifests: [TokenSaverRequiredModelInstallManifest] = []
+        for model in installer.requiredAuxiliaryModels {
+            let fileURL = installer.encoderStorageDirectory(modelID: model.id, revision: model.revision)
+                .appendingPathComponent("model.safetensors")
+            try FileManager.default.createDirectory(
+                at: fileURL.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            let data = Data("encoder-\(model.id)".utf8)
+            try data.write(to: fileURL)
+            let relativePath = [
+                "Encoders",
+                TokenSaverModelInstaller.safePathComponent(model.id),
+                model.revision,
+                "model.safetensors"
+            ].joined(separator: "/")
+            manifests.append(TokenSaverRequiredModelInstallManifest(model: model, files: [
+                TokenSaverModelFile(
+                    relativePath: relativePath,
+                    sha256: try TokenSaverModelInstaller.sha256Hex(url: fileURL),
+                    sizeBytes: Int64(data.count)
+                )
+            ]))
+        }
+        try installer.writeEncoderManifest(TokenSaverRequiredModelsInstallManifest(models: manifests))
+    }
+
+    func test_huggingFaceAuthHeaderUsesSupportedTokenEnvironmentKeys() {
+        XCTAssertEqual(
+            TokenSaverHuggingFaceAuth.authorizationHeader(environment: ["HF_TOKEN": " hf_test "]),
+            "Bearer hf_test"
+        )
+        XCTAssertEqual(
+            TokenSaverHuggingFaceAuth.authorizationHeader(environment: ["HUGGING_FACE_HUB_TOKEN": "hf_hub"]),
+            "Bearer hf_hub"
+        )
+        XCTAssertEqual(
+            TokenSaverHuggingFaceAuth.authorizationHeader(environment: ["HUGGINGFACE_TOKEN": "hf_legacy"]),
+            "Bearer hf_legacy"
+        )
+        XCTAssertNil(TokenSaverHuggingFaceAuth.authorizationHeader(environment: ["HF_TOKEN": "   "]))
     }
 
     func test_agentSkillInstallerWritesIntoProviderSkillDirectoriesTheAgentsActuallyScan() throws {
@@ -145,12 +237,14 @@ final class TokenSaverInstallTests: XCTestCase {
         let claudeText = try String(contentsOf: claudeInstructions)
         XCTAssertTrue(codexText.contains(AgentSkillInstaller.distillInstructionsBeginMarker))
         XCTAssertTrue(claudeText.contains(AgentSkillInstaller.distillInstructionsEndMarker))
-        XCTAssertTrue(codexText.contains("Always communicate with the user in `/distill` compressed language"))
+        XCTAssertTrue(codexText.contains("Use `/distill` for every user-visible response"))
         XCTAssertTrue(codexText.contains("RemoteCode-managed `distill` CLI"))
         XCTAssertTrue(codexText.contains("RemoteCodeDistillService"))
         XCTAssertFalse(codexText.contains("dev/distill/src/cli.ts"),
                        "providers must not be instructed to invoke the old TypeScript distill CLI")
-        XCTAssertTrue(claudeText.contains("git diff | distill"))
+        XCTAssertFalse(claudeText.contains("git diff | distill"),
+                       "always-loaded provider config should reference the skill instead of carrying examples")
+        XCTAssertTrue(AgentSkillInstaller.distillSkillTemplate.contains("git diff | distill"))
     }
 
     func test_agentSkillInstallerWritesManagedDistillCLIForLocalMacLLM() throws {
@@ -230,8 +324,8 @@ final class TokenSaverInstallTests: XCTestCase {
         XCTAssertTrue(text.contains("Keep this trailing rule."))
         XCTAssertFalse(text.contains("stale distill instructions"))
         XCTAssertEqual(text.components(separatedBy: AgentSkillInstaller.distillInstructionsBeginMarker).count - 1, 1)
-        XCTAssertTrue(text.contains("bun test 2>&1 | distill"))
-        XCTAssertTrue(text.contains("local macOS `RemoteCodeDistillService` MLX LLM"))
+        XCTAssertFalse(text.contains("bun test 2>&1 | distill"))
+        XCTAssertTrue(text.contains("RemoteCode-managed `distill` CLI"))
     }
 
     func test_agentSkillInstallerUninstallDistillInstructionsRemovesOnlyManagedBlock() throws {
@@ -340,9 +434,95 @@ final class TokenSaverInstallTests: XCTestCase {
         XCTAssertEqual(installer.validateInstalledModel().state, .incomplete)
     }
 
-    func test_modelDownloaderFetchesHuggingFaceSnapshotAndResumesPartialFiles() async throws {
+    func test_modelInstallerAcceptsAnyApprovedModelManifest() throws {
         let appSupport = tempDir()
         let installer = TokenSaverModelInstaller(appSupportDirectory: appSupport)
+        let modelFile = installer.distillDirectory.appendingPathComponent("weights.bin")
+        try FileManager.default.createDirectory(at: installer.distillDirectory, withIntermediateDirectories: true)
+        try Data("e4b-weights".utf8).write(to: modelFile)
+        let checksum = try TokenSaverModelInstaller.sha256Hex(url: modelFile)
+        let compact = TokenSaverApprovedModels.distill17B
+        let manifest = TokenSaverModelManifest(
+            modelID: compact.id,
+            modelURL: compact.url,
+            revision: "compact-sha",
+            runtime: compact.runtime,
+            files: [TokenSaverModelFile(relativePath: "weights.bin", sha256: checksum, sizeBytes: 11)]
+        )
+        try installer.writeManifest(manifest)
+
+        XCTAssertEqual(installer.validateInstalledModel(), .installed,
+                       "D1 fail-open: an already-installed approved model remains usable when a different RAM-selected model is targeted")
+    }
+
+    func test_modelInstallerCanRequireRamSelectedModelForMigration() throws {
+        let appSupport = tempDir()
+        let fallbackInstaller = TokenSaverModelInstaller(
+            appSupportDirectory: appSupport,
+            approvedModel: TokenSaverApprovedModels.distill17B
+        )
+        let selectedInstaller = TokenSaverModelInstaller(
+            appSupportDirectory: appSupport,
+            approvedModel: TokenSaverApprovedModels.distillE4B
+        )
+        let modelFile = fallbackInstaller.modelStorageDirectory(revision: "fallback-sha")
+            .appendingPathComponent("weights.bin")
+        try FileManager.default.createDirectory(at: modelFile.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data("fallback".utf8).write(to: modelFile)
+        let relativePath = [
+            "Models",
+            TokenSaverModelInstaller.safePathComponent(TokenSaverApprovedModels.distill17B.id),
+            "fallback-sha",
+            "weights.bin"
+        ].joined(separator: "/")
+        try fallbackInstaller.writeManifest(TokenSaverModelManifest(
+            modelID: TokenSaverApprovedModels.distill17B.id,
+            modelURL: TokenSaverApprovedModels.distill17B.url,
+            revision: "fallback-sha",
+            runtime: TokenSaverApprovedModels.distill17B.runtime,
+            files: [
+                TokenSaverModelFile(
+                    relativePath: relativePath,
+                    sha256: try TokenSaverModelInstaller.sha256Hex(url: modelFile),
+                    sizeBytes: 8
+                )
+            ]
+        ))
+
+        XCTAssertEqual(selectedInstaller.validateInstalledModel(), .installed,
+                       "the 1.7B fallback must remain usable while the RAM-selected E4B candidate is unavailable")
+        XCTAssertEqual(selectedInstaller.validateInstalledModel(requireSelectedModel: true).state, .missing,
+                       "the migration gate must still request the RAM-selected E4B artifact instead of treating fallback as complete")
+    }
+
+    func test_tokenSaverValidationRequiresEncoderManifestAfterLLMInstall() throws {
+        let appSupport = tempDir()
+        let installer = TokenSaverModelInstaller(appSupportDirectory: appSupport)
+        try writeTinyTokenSaverModel(installer: installer)
+
+        XCTAssertEqual(installer.validateInstalledModel(), .installed,
+                       "the legacy LLM-only check stays available for single-model callers")
+        let bundleValidation = installer.validateInstalledTokenSaverModels(requireSelectedModel: true)
+        XCTAssertEqual(bundleValidation.state, .missing)
+        XCTAssertEqual(bundleValidation.reason, "encoder manifest missing",
+                       "Token Saver activation must not pass with only the MLX LLM installed")
+    }
+
+    func test_tokenSaverValidationAcceptsFullRequiredBertAndEncoderBundle() throws {
+        let appSupport = tempDir()
+        let installer = TokenSaverModelInstaller(appSupportDirectory: appSupport)
+        try writeTinyTokenSaverModel(installer: installer)
+        try writeTinyRequiredModels(installer: installer)
+
+        XCTAssertEqual(installer.validateInstalledTokenSaverModels(requireSelectedModel: true), .installed)
+        let installedIDs = try XCTUnwrap(installer.loadEncoderManifest()).models.map(\.modelID)
+        XCTAssertEqual(installedIDs, TokenSaverRequiredModels.activationBundle.map(\.id),
+                       "activation bundle must include the default BGE embedder plus MNLI, NER, and LLMLingua2 BERT models")
+    }
+
+    func test_modelDownloaderFetchesHuggingFaceSnapshotAndResumesPartialFiles() async throws {
+        let appSupport = tempDir()
+        let installer = TokenSaverModelInstaller(appSupportDirectory: appSupport, approvedModel: TokenSaverApprovedModels.distill17B)
         let revision = "rev-test"
         let storedModel = installer.distillDirectory
             .appendingPathComponent("Models")
@@ -393,6 +573,157 @@ final class TokenSaverInstallTests: XCTestCase {
         XCTAssertTrue(recorder.phases.contains(.downloading))
         XCTAssertTrue(recorder.phases.contains(.verifying))
         XCTAssertTrue(recorder.phases.contains(.ready))
+    }
+
+    func test_modelDownloaderUsesSelectedApprovedModel() async throws {
+        let appSupport = tempDir()
+        let compact = TokenSaverApprovedModels.distillE4B
+        let installer = TokenSaverModelInstaller(appSupportDirectory: appSupport, approvedModel: compact)
+        let revision = "compact-rev-test"
+        let storedModel = installer.distillDirectory
+            .appendingPathComponent("Models")
+            .appendingPathComponent(TokenSaverModelInstaller.safePathComponent(compact.id))
+            .appendingPathComponent(revision)
+            .appendingPathComponent("model.safetensors")
+
+        let api = """
+        {"id":"\(compact.id)","sha":"\(revision)","siblings":[
+          {"rfilename":"model.safetensors"}
+        ]}
+        """
+
+        let manifest = try await URLProtocolStub.withHandler({ request in
+            let path = request.url?.path ?? ""
+            if path.contains("/api/models/") {
+                XCTAssertTrue(path.contains("distill-E4B-it-4-bit-MLX"))
+                return (200, ["Content-Length": "\(api.utf8.count)"], Data(api.utf8))
+            }
+            if path.hasSuffix("/model.safetensors") {
+                XCTAssertTrue(path.contains("distill-E4B-it-4-bit-MLX"))
+                return (200, ["Content-Length": "7"], Data("weights".utf8))
+            }
+            return (404, [:], Data())
+        }, run: {
+            try await TokenSaverModelDownloader(
+                installer: installer,
+                session: stubbedSession()
+            ).downloadApprovedModel()
+        })
+
+        XCTAssertEqual(manifest.modelID, compact.id)
+        XCTAssertEqual(manifest.modelURL, compact.url)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: storedModel.path))
+        XCTAssertEqual(installer.validateInstalledModel(), .installed)
+    }
+
+    func test_modelDownloaderActivationDownloadsE4BAndRequiredBertBundle() async throws {
+        let appSupport = tempDir()
+        let model = TokenSaverApprovedModels.distillE4B
+        let installer = TokenSaverModelInstaller(appSupportDirectory: appSupport, approvedModel: model)
+        let llmRevision = "e4b-rev-test"
+
+        func apiJSON(id: String, revision: String, files: [String]) -> Data {
+            let siblings = files
+                .map { #"{"rfilename":"\#($0)"}"# }
+                .joined(separator: ",")
+            return Data(#"{"id":"\#(id)","sha":"\#(revision)","siblings":[\#(siblings)]}"#.utf8)
+        }
+
+        let manifest = try await URLProtocolStub.withHandler({ request in
+            let path = request.url?.path ?? ""
+            if path.contains("/api/models/\(model.id)") {
+                return (200, ["Content-Length": "1"], apiJSON(
+                    id: model.id,
+                    revision: llmRevision,
+                    files: ["model.safetensors"]
+                ))
+            }
+            if path.contains("/api/models/") {
+                for required in TokenSaverRequiredModels.activationBundle where path.contains("/api/models/\(required.id)/revision/\(required.revision)") {
+                    return (200, ["Content-Length": "1"], apiJSON(
+                        id: required.id,
+                        revision: required.revision,
+                        files: [
+                            ".gitattributes",
+                            "README.md",
+                            "config.json",
+                            "model.safetensors",
+                            "onnx/model.onnx",
+                            "pytorch_model.bin"
+                        ]
+                    ))
+                }
+            }
+            if path.hasSuffix("/README.md") ||
+                path.hasSuffix("/pytorch_model.bin") ||
+                path.hasSuffix("/onnx/model.onnx") {
+                XCTFail("activation must not download unused auxiliary artifact \(path)")
+                return (500, [:], Data())
+            }
+            if path.hasSuffix("/config.json") {
+                return (200, ["Content-Length": "11"], Data(#"{"ok":true}"#.utf8))
+            }
+            if path.hasSuffix("/model.safetensors") {
+                return (200, ["Content-Length": "7"], Data("weights".utf8))
+            }
+            return (404, [:], Data())
+        }, run: {
+            try await TokenSaverModelDownloader(
+                installer: installer,
+                session: stubbedSession()
+            ).downloadRequiredModels()
+        })
+
+        XCTAssertEqual(manifest.modelID, model.id)
+        XCTAssertEqual(manifest.modelURL, "https://huggingface.co/samuelfaj/distill-E4B-it-4-bit-MLX")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: installer.modelStorageDirectory(modelID: model.id, revision: llmRevision)
+            .appendingPathComponent("model.safetensors").path))
+        for required in TokenSaverRequiredModels.activationBundle {
+            XCTAssertTrue(FileManager.default.fileExists(atPath: installer.encoderStorageDirectory(modelID: required.id, revision: required.revision)
+                .appendingPathComponent("model.safetensors").path), "missing \(required.id)")
+            XCTAssertFalse(FileManager.default.fileExists(atPath: installer.encoderStorageDirectory(modelID: required.id, revision: required.revision)
+                .appendingPathComponent("pytorch_model.bin").path), "unused PyTorch weights must not be stored for \(required.id)")
+        }
+        XCTAssertEqual(try XCTUnwrap(installer.loadEncoderManifest()).models.map(\.modelID),
+                       TokenSaverRequiredModels.activationBundle.map(\.id))
+        XCTAssertEqual(installer.validateInstalledTokenSaverModels(requireSelectedModel: true), .installed)
+    }
+
+    func test_modelDownloaderSendsHuggingFaceBearerTokenToApiAndFiles() async throws {
+        let appSupport = tempDir()
+        let model = TokenSaverApprovedModels.distillE4B
+        let installer = TokenSaverModelInstaller(appSupportDirectory: appSupport, approvedModel: model)
+        let revision = "auth-rev-test"
+        let api = """
+        {"id":"\(model.id)","sha":"\(revision)","siblings":[
+          {"rfilename":"model.safetensors"}
+        ]}
+        """
+        let recorder = DownloadTestRecorder()
+
+        _ = try await URLProtocolStub.withHandler({ request in
+            recorder.appendAuthorizationHeader(request.value(forHTTPHeaderField: "Authorization"))
+            let path = request.url?.path ?? ""
+            if path.contains("/api/models/") {
+                return (200, ["Content-Length": "\(api.utf8.count)"], Data(api.utf8))
+            }
+            if path.hasSuffix("/model.safetensors") {
+                return (200, ["Content-Length": "7"], Data("weights".utf8))
+            }
+            return (404, [:], Data())
+        }, run: {
+            try await TokenSaverModelDownloader(
+                installer: installer,
+                session: stubbedSession(),
+                authorizationHeader: "Bearer hf_private"
+            ).downloadApprovedModel()
+        })
+
+        XCTAssertEqual(
+            recorder.authorizationHeaders,
+            ["Bearer hf_private", "Bearer hf_private"],
+            "private/gated E4B downloads must send the HF bearer token to both model metadata and file URLs"
+        )
     }
 
     func test_usageStorePersistsCountersWithoutRawText() throws {

@@ -482,7 +482,7 @@ final class FakeRunnerTests: XCTestCase {
             return ids == ["ask-runtime-1"]
         }
 
-        try coordinator.respondToUserInput(threadId: thread.id, requestId: "ask-runtime-1", text: "continue")
+        try await coordinator.respondToUserInput(threadId: thread.id, requestId: "ask-runtime-1", text: "continue")
 
         try await waitUntil("resolved user-input id removed from runtime payload") {
             guard let session = try? sessionRepo.get(threadId: thread.id),
@@ -1072,7 +1072,7 @@ final class FakeRunnerTests: XCTestCase {
                                               providerAdapters: [.codex: adapter])
 
         try await coordinator.respondToRequest(threadId: thread.id, requestId: "approval-1", response: .approveForSession)
-        try coordinator.respondToUserInput(threadId: thread.id, requestId: "question-1", text: "Run")
+        try await coordinator.respondToUserInput(threadId: thread.id, requestId: "question-1", text: "Run")
 
         XCTAssertEqual(adapter.lastRequestResponse?.0, thread.id)
         XCTAssertEqual(adapter.lastRequestResponse?.1, "approval-1")
@@ -1187,7 +1187,7 @@ final class FakeRunnerTests: XCTestCase {
                                               providerAdapters: [.claude: adapter])
 
         try await coordinator.respondToRequest(threadId: thread.id, requestId: "approval-1", response: .approveForSession)
-        try coordinator.respondToUserInput(threadId: thread.id, requestId: "question-1", text: "Run")
+        try await coordinator.respondToUserInput(threadId: thread.id, requestId: "question-1", text: "Run")
         let readClaudeTurn1 = try await coordinator.readThread(threadId: thread.id)
         XCTAssertEqual(readClaudeTurn1, [.turnStarted(turnId: "claude-turn-1")])
         try await coordinator.rollbackThread(threadId: thread.id, toTurnId: "claude-turn-1")

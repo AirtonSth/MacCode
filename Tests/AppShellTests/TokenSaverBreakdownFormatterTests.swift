@@ -121,4 +121,41 @@ final class TokenSaverBreakdownFormatterTests: XCTestCase {
         XCTAssertEqual(rows[0].savedTokens, 4200)
         XCTAssertEqual(rows[0].runs, 7)
     }
+
+    /// Direct CLI savings are recorded outside Claude/Codex, but the visible
+    /// details rows must still reconcile to the headline saved-token total.
+    func testOtherSavingsRowReconcilesUnattributedSavingsForActiveSubscribers() {
+        let s = TokenSaverSavingsSummary(
+            providers: [
+                TokenSaverProviderSavings(provider: "claude", savedTokens: 60, inputTokens: 100, outputTokens: 40, runs: 1),
+                TokenSaverProviderSavings(provider: "codex", savedTokens: 0, inputTokens: 0, outputTokens: 0, runs: 0),
+                TokenSaverProviderSavings(provider: "unknown", savedTokens: 22_770, inputTokens: 27_000, outputTokens: 4_230, runs: 9),
+            ],
+            daily: []
+        )
+
+        let row = TokenSaverSavingsDisplay.otherSavingsRow(from: s, subscribed: true, enabled: true)
+
+        XCTAssertEqual(row?.savedTokens, 22_770)
+        XCTAssertEqual(row?.runs, 9)
+        XCTAssertEqual(
+            60 + 0 + (row?.savedTokens ?? 0),
+            s.totalSavedTokens,
+            "Claude + Codex + CLI/other must equal the headline saved-token total"
+        )
+    }
+
+    /// The reconciling row is for measured savings only. Unpaid/disabled states
+    /// show potential savings, so an unattributed measured row would be misleading.
+    func testOtherSavingsRowHiddenOutsideActivePaidState() {
+        let s = TokenSaverSavingsSummary(
+            providers: [
+                TokenSaverProviderSavings(provider: "unknown", savedTokens: 100, inputTokens: 200, outputTokens: 100, runs: 1),
+            ],
+            daily: []
+        )
+
+        XCTAssertNil(TokenSaverSavingsDisplay.otherSavingsRow(from: s, subscribed: false, enabled: true))
+        XCTAssertNil(TokenSaverSavingsDisplay.otherSavingsRow(from: s, subscribed: true, enabled: false))
+    }
 }

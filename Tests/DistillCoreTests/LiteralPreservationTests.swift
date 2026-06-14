@@ -20,7 +20,7 @@ final class LiteralPreservationTests: XCTestCase {
         let lossyDroppingLine = "There was a fatal error during rendering." // drops App/Main.swift:88
         let result = LiteralPreservation.guarded(original: original, compressed: lossyDroppingLine)
         XCTAssertEqual(result.output, original, "dropping a pinned literal => reject, keep original (N5)")
-        XCTAssertEqual(result.droppedLiteral, "App/Main.swift:88")
+        XCTAssertTrue(result.droppedLiteral?.contains("App/Main.swift:88") == true)
     }
 
     func test_guardAcceptsLossyOutputThatKeepsLiterals() {
@@ -51,5 +51,28 @@ final class LiteralPreservationTests: XCTestCase {
         // A summary that loses the actual edit must be rejected.
         let result = LiteralPreservation.guarded(original: diff, compressed: "Changed the timeout value.")
         XCTAssertEqual(result.output, diff)
+    }
+
+    func test_tagsAndRetrieveMarkersArePinned() {
+        let original = "Do not drop <policy mode=\"strict\">safe</policy> or [[rc:deadbeef]]."
+        let pins = LiteralPreservation.pinnedLiterals(in: original)
+
+        XCTAssertTrue(pins.contains("<policy mode=\"strict\">"))
+        XCTAssertTrue(pins.contains("</policy>"))
+        XCTAssertTrue(pins.contains("[[rc:deadbeef]]"))
+
+        let result = LiteralPreservation.guarded(original: original, compressed: "Do not drop safe.")
+        XCTAssertEqual(result.output, original)
+    }
+
+    func test_extendedPinsForProsePruningLane() {
+        let original = "Commit abc1234 fixed `retryLimit` in version 1.2.3 on port 8080.\nERROR: keep this whole line."
+        let pins = LiteralPreservation.pinnedLiterals(in: original)
+
+        XCTAssertTrue(pins.contains("abc1234"))
+        XCTAssertTrue(pins.contains("`retryLimit`"))
+        XCTAssertTrue(pins.contains("1.2.3"))
+        XCTAssertTrue(pins.contains("port 8080"))
+        XCTAssertTrue(pins.contains("ERROR: keep this whole line."))
     }
 }

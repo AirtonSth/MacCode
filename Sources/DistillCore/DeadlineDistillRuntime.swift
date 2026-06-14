@@ -20,6 +20,22 @@ public struct DeadlineDistillRuntime: DistillRuntime {
 
     private struct DeadlineExceeded: Error {}
 
+    private final class OneShot: @unchecked Sendable {
+        private let lock = NSLock()
+        private var fired = false
+
+        func fire(_ body: () -> Void) {
+            lock.lock()
+            guard !fired else {
+                lock.unlock()
+                return
+            }
+            fired = true
+            lock.unlock()
+            body()
+        }
+    }
+
     public init(
         wrapping wrapped: any DistillRuntime,
         deadlineMilliseconds: Int,
@@ -36,17 +52,24 @@ public struct DeadlineDistillRuntime: DistillRuntime {
         let wrapped = self.wrapped
         let deadline = self.deadline
         do {
-            return try await withThrowingTaskGroup(of: String.self) { group in
-                group.addTask { try await wrapped.distill(request) }
-                group.addTask {
-                    try await Task.sleep(for: deadline)
-                    throw DeadlineExceeded()
+            return try await withCheckedThrowingContinuation { continuation in
+                let oneShot = OneShot()
+                let runtimeTask = Task {
+                    do {
+                        let output = try await wrapped.distill(request)
+                        oneShot.fire { continuation.resume(returning: output) }
+                    } catch {
+                        oneShot.fire { continuation.resume(throwing: error) }
+                    }
                 }
-                // First child to finish wins; cancel the loser (the sleep, or the
-                // in-flight generation if the deadline fired first).
-                let result = try await group.next()!
-                group.cancelAll()
-                return result
+                Task {
+                    try? await Task.sleep(for: deadline)
+                    guard !Task.isCancelled else { return }
+                    oneShot.fire {
+                        runtimeTask.cancel()
+                        continuation.resume(throwing: DeadlineExceeded())
+                    }
+                }
             }
         } catch {
             // Deadline exceeded or the runtime threw: fail open to the deterministic

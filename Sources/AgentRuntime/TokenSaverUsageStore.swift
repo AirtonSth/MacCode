@@ -11,6 +11,8 @@ public struct TokenSaverProviderUsage: Codable, Sendable, Equatable {
     public let provider: AgentProvider
     public var actualProviderTokens: Int
     public var estimatedRawTokens: Int
+    public var actualProviderBilledTokenUnits: Double
+    public var estimatedRawBilledTokenUnits: Double
     public var eligibleRuns: Int
     public var currentSessionTokens: Int
     public var currentSessionLimitTokens: Int
@@ -24,6 +26,8 @@ public struct TokenSaverProviderUsage: Codable, Sendable, Equatable {
         provider: AgentProvider,
         actualProviderTokens: Int = 0,
         estimatedRawTokens: Int = 0,
+        actualProviderBilledTokenUnits: Double? = nil,
+        estimatedRawBilledTokenUnits: Double? = nil,
         eligibleRuns: Int = 0,
         currentSessionTokens: Int = 0,
         currentSessionLimitTokens: Int = 0,
@@ -36,6 +40,11 @@ public struct TokenSaverProviderUsage: Codable, Sendable, Equatable {
         self.provider = provider
         self.actualProviderTokens = max(0, actualProviderTokens)
         self.estimatedRawTokens = max(0, estimatedRawTokens)
+        self.actualProviderBilledTokenUnits = max(0, actualProviderBilledTokenUnits ?? Double(max(0, actualProviderTokens)))
+        self.estimatedRawBilledTokenUnits = max(
+            self.actualProviderBilledTokenUnits,
+            estimatedRawBilledTokenUnits ?? Double(max(0, estimatedRawTokens))
+        )
         self.eligibleRuns = max(0, eligibleRuns)
         self.currentSessionTokens = max(0, currentSessionTokens)
         self.currentSessionLimitTokens = max(0, currentSessionLimitTokens)
@@ -50,6 +59,8 @@ public struct TokenSaverProviderUsage: Codable, Sendable, Equatable {
         case provider
         case actualProviderTokens
         case estimatedRawTokens
+        case actualProviderBilledTokenUnits
+        case estimatedRawBilledTokenUnits
         case eligibleRuns
         case currentSessionTokens
         case currentSessionLimitTokens
@@ -65,6 +76,14 @@ public struct TokenSaverProviderUsage: Codable, Sendable, Equatable {
         provider = try container.decode(AgentProvider.self, forKey: .provider)
         actualProviderTokens = max(0, try container.decodeIfPresent(Int.self, forKey: .actualProviderTokens) ?? 0)
         estimatedRawTokens = max(0, try container.decodeIfPresent(Int.self, forKey: .estimatedRawTokens) ?? 0)
+        actualProviderBilledTokenUnits = max(
+            0,
+            try container.decodeIfPresent(Double.self, forKey: .actualProviderBilledTokenUnits) ?? Double(actualProviderTokens)
+        )
+        estimatedRawBilledTokenUnits = max(
+            actualProviderBilledTokenUnits,
+            try container.decodeIfPresent(Double.self, forKey: .estimatedRawBilledTokenUnits) ?? Double(estimatedRawTokens)
+        )
         eligibleRuns = max(0, try container.decodeIfPresent(Int.self, forKey: .eligibleRuns) ?? 0)
         currentSessionTokens = max(0, try container.decodeIfPresent(Int.self, forKey: .currentSessionTokens) ?? 0)
         currentSessionLimitTokens = max(0, try container.decodeIfPresent(Int.self, forKey: .currentSessionLimitTokens) ?? 0)
@@ -77,6 +96,10 @@ public struct TokenSaverProviderUsage: Codable, Sendable, Equatable {
 
     public var measuredSavedTokens: Int {
         max(estimatedRawTokens - actualProviderTokens, 0)
+    }
+
+    public var measuredSavedBilledTokenUnits: Double {
+        max(estimatedRawBilledTokenUnits - actualProviderBilledTokenUnits, 0)
     }
 
     public var weeklyRemainingPercent: Double? {
@@ -209,6 +232,8 @@ public final class TokenSaverUsageStore: @unchecked Sendable {
         provider: AgentProvider,
         actualProviderTokens: Int,
         estimatedRawTokens: Int,
+        actualProviderBilledTokenUnits: Double? = nil,
+        estimatedRawBilledTokenUnits: Double? = nil,
         eligibleRuns: Int = 1,
         currentSessionTokens: Int = 0,
         currentSessionLimitTokens: Int? = nil,
@@ -222,6 +247,8 @@ public final class TokenSaverUsageStore: @unchecked Sendable {
             provider: provider,
             actualProviderTokens: actualProviderTokens,
             estimatedRawTokens: max(estimatedRawTokens, actualProviderTokens),
+            actualProviderBilledTokenUnits: actualProviderBilledTokenUnits,
+            estimatedRawBilledTokenUnits: estimatedRawBilledTokenUnits,
             eligibleRuns: eligibleRuns,
             currentSessionTokens: currentSessionTokens,
             currentSessionLimitTokens: currentSessionLimitTokens ?? 0
@@ -232,6 +259,8 @@ public final class TokenSaverUsageStore: @unchecked Sendable {
                 provider: provider,
                 actualProviderTokens: current.actualProviderTokens + delta.actualProviderTokens,
                 estimatedRawTokens: current.estimatedRawTokens + delta.estimatedRawTokens,
+                actualProviderBilledTokenUnits: current.actualProviderBilledTokenUnits + delta.actualProviderBilledTokenUnits,
+                estimatedRawBilledTokenUnits: current.estimatedRawBilledTokenUnits + delta.estimatedRawBilledTokenUnits,
                 eligibleRuns: current.eligibleRuns + delta.eligibleRuns,
                 currentSessionTokens: max(current.currentSessionTokens, delta.currentSessionTokens),
                 currentSessionLimitTokens: max(current.currentSessionLimitTokens, delta.currentSessionLimitTokens),
@@ -274,6 +303,8 @@ public final class TokenSaverUsageStore: @unchecked Sendable {
                 provider: provider,
                 actualProviderTokens: current.actualProviderTokens,
                 estimatedRawTokens: current.estimatedRawTokens,
+                actualProviderBilledTokenUnits: current.actualProviderBilledTokenUnits,
+                estimatedRawBilledTokenUnits: current.estimatedRawBilledTokenUnits,
                 eligibleRuns: current.eligibleRuns,
                 currentSessionTokens: current.currentSessionTokens,
                 currentSessionLimitTokens: current.currentSessionLimitTokens,

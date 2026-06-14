@@ -242,11 +242,10 @@ public final class DeviceTrustRepository {
     /// unchanged. Never escapes this type.
     private struct PairingConflict: Error {}
 
-    public func redeemPairingCode(_ code: String, deviceName: String) throws -> (DeviceTrust, token: String)? {
+    public func redeemPairingCode(_ code: String, deviceName: String, now: Date = Date()) throws -> (DeviceTrust, token: String)? {
         let deviceId = UUID().uuidString
         let token = DeviceTrustRepository.generateToken()
         let hash = DeviceTrustRepository.hash(token)
-        let now = Date()
         let now_s = iso.string(from: now)
 
         do {

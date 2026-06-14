@@ -219,6 +219,95 @@ final class TokenSaverSidebarSnapshotTests: XCTestCase {
                              "near-zero means elements did not expand to fill the extra width")
     }
 
+    func test_tokenSaverDetailsPopoverRendersOtherSavingsReconciliation() async throws {
+        let appSupport = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+            .appendingPathComponent("RC2TokenSaverDetailsOther-\(UUID().uuidString)", isDirectory: true)
+        let context = try AppContext(channel: .debug, appSupportOverride: appSupport.path)
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        SettingsStore(db: context.db).save(AppSettings(tokenSaverEnabled: true))
+        PrivateAccountSessionStore(repo: context.settingsRepo).save(PrivateAccountSession(
+            accessToken: "token",
+            refreshToken: "refresh",
+            user: PrivateAccountUser(
+                daysRemaing: nil,
+                daysRemaining: 30,
+                email: "paid@example.com",
+                id: "paid-user",
+                subscribed: true
+            )
+        ))
+        for _ in 0..<9 {
+            try context.tokenSaverSavingsRepo.record(
+                provider: "unknown",
+                mode: "command-output",
+                inputTokens: 3_000,
+                outputTokens: 470
+            )
+        }
+
+        let vm = SidebarViewModel(
+            context: context,
+            router: router,
+            insomniaPower: FakeInsomniaPowerManager(),
+            powerMonitor: FakeExternalPowerMonitor(),
+            tokenSaverModelValidationProvider: { .installed }
+        )
+        vm.reload()
+        await vm.reloadTokenSaverAndWait()
+
+        let other = try XCTUnwrap(TokenSaverSavingsDisplay.otherSavingsRow(
+            from: vm.tokenSaverSavingsSummary,
+            subscribed: true,
+            enabled: true
+        ))
+        XCTAssertEqual(vm.tokenSaverSavingsSummary.totalSavedTokens, 22_770)
+        XCTAssertEqual(other.savedTokens, 22_770)
+        XCTAssertEqual(other.runs, 9)
+        XCTAssertEqual(
+            (vm.tokenSaverSavingsSummary.savings(for: "claude")?.savedTokens ?? 0) +
+            (vm.tokenSaverSavingsSummary.savings(for: "codex")?.savedTokens ?? 0) +
+            other.savedTokens,
+            vm.tokenSaverSavingsSummary.totalSavedTokens,
+            "details rows must reconcile to the headline total when direct CLI rows are unattributed"
+        )
+
+        let details = SidebarRootView(vm: vm)
+            .tokenSaverDetailsPopoverForTesting
+            .frame(width: 350, height: 460)
+        let hosting = NSHostingView(rootView: details)
+        hosting.frame = NSRect(x: 0, y: 0, width: 350, height: 460)
+        hosting.wantsLayer = true
+        let window = NSWindow(
+            contentRect: hosting.bounds,
+            styleMask: [.borderless],
+            backing: .buffered,
+            defer: false
+        )
+        window.contentView = hosting
+        window.layoutIfNeeded()
+        hosting.layoutSubtreeIfNeeded()
+        RunLoop.main.run(until: Date().addingTimeInterval(0.2))
+
+        guard let bitmap = hosting.bitmapImageRepForCachingDisplay(in: hosting.bounds) else {
+            return XCTFail("Token Saver details reconciliation snapshot must create a bitmap")
+        }
+        hosting.cacheDisplay(in: hosting.bounds, to: bitmap)
+        guard let png = bitmap.representation(using: .png, properties: [:]) else {
+            return XCTFail("Token Saver details reconciliation snapshot must encode as PNG")
+        }
+        let artifactPath = ProcessInfo.processInfo.environment["REMOTE_CODE_TOKEN_SAVER_DETAILS_ARTIFACT"]
+        let artifactURL = URL(fileURLWithPath: artifactPath ?? NSTemporaryDirectory() + "remote-code-token-saver-details-proof.png")
+        try FileManager.default.createDirectory(at: artifactURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try png.write(to: artifactURL)
+
+        XCTAssertGreaterThan(png.count, 6_000,
+                             "details popover proof image must not be empty; a tiny file means the reconciliation UI did not render")
+        XCTAssertGreaterThan(nonTransparentSampleCount(in: bitmap), 500,
+                             "details popover must render visible pixels for the reconciliation rows")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: artifactURL.path))
+    }
+
     // MARK: - Shared offscreen fixture factory
 
     /// Builds a fully populated SidebarViewModel + offscreen hosting view at `width`.

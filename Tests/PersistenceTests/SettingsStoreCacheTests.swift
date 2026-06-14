@@ -6,17 +6,36 @@ import XCTest
 /// Tracks how many times get() was called so tests can assert decode count.
 /// Pure value — no SQLiteDB, no I/O.
 private final class CountingSettingsRepository: SettingsWriteRepository {
+    private let lock = NSLock()
     private var store: [String: String] = [:]
-    private(set) var getCallCount = 0
-    var shouldFailSet = false
+    private var _getCallCount = 0
+    private var _shouldFailSet = false
+
+    var getCallCount: Int {
+        lock.lock(); defer { lock.unlock() }
+        return _getCallCount
+    }
+
+    var shouldFailSet: Bool {
+        get {
+            lock.lock(); defer { lock.unlock() }
+            return _shouldFailSet
+        }
+        set {
+            lock.lock(); defer { lock.unlock() }
+            _shouldFailSet = newValue
+        }
+    }
 
     func get(_ key: String) throws -> String? {
-        getCallCount += 1
+        lock.lock(); defer { lock.unlock() }
+        _getCallCount += 1
         return store[key]
     }
 
     func set(_ key: String, _ value: String) throws {
-        if shouldFailSet { throw CountingErr.injected }
+        lock.lock(); defer { lock.unlock() }
+        if _shouldFailSet { throw CountingErr.injected }
         store[key] = value
     }
 

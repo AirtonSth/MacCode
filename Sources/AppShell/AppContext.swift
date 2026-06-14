@@ -51,14 +51,17 @@ public final class AppContext {
     private struct PendingUsage {
         var provider: AgentProvider
         var totalTokens: Int
+        var billedTokenUnits: Double
         var eligibleRuns: Int
         var currentSessionTokens: Int
         var currentSessionLimitTokens: Int?
     }
     private var pendingUsageByRun: [AgentRunID: PendingUsage] = [:]
+    private var sessionLearnInputTokensByRun: [AgentRunID: Int] = [:]
     private var pendingUsageFlushTask: Task<Void, Never>?
     private var cachedDistillClientKey: String?
     private var cachedDistillClient: DistillServiceClient?
+    private var tokenSaverPromptSkipSet: [DistillResultCacheKey: Date] = [:]
     /// Test seam: when set, used instead of resolving a client from the live
     /// sidecar status. Production code never sets this.
     var distillClientOverrideForTesting: DistillServiceClient?
@@ -75,6 +78,7 @@ public final class AppContext {
     // rarely nets out positive once MLX latency is counted (NetPositiveGate floor, G3).
     private static let tokenSaverMinCompressChars = 2_000
     private static let tokenSaverDistillStartupPolls = 300
+    private static let tokenSaverPromptSkipSetTTL: TimeInterval = 1_800
     private static let tokenSaverUsageNotificationMinimumInterval: TimeInterval = 2
     /// Debounce window for coalescing per-token usage writes into one disk write.
     private static let tokenSaverUsageDebounceInterval: TimeInterval = 0.75
@@ -131,6 +135,10 @@ public final class AppContext {
         self.coordinator.promptCompressor = { [weak self] prompt, provider, threadId in
             guard let self else { return prompt }
             return await self.tokenSaverCompress(prompt: prompt, provider: provider, threadId: threadId)
+        }
+        self.coordinator.followUpPromptCompressor = { [weak self] prompt, provider, threadId in
+            guard let self else { return prompt }
+            return await self.tokenSaverCompress(prompt: prompt, provider: provider, threadId: threadId, cacheState: "prompt_followup")
         }
         self.coordinator.finalResponseTranslator = { [weak self] response, provider, threadId, runId in
             guard let self else { return response }
@@ -491,7 +499,7 @@ public final class AppContext {
         let settings = SettingsStore(db: db).load()
         let session = PrivateAccountSessionStore(repo: settingsRepo).load()
         let modelValidation = TokenSaverModelInstaller(appSupportDirectory: appSupportDirectory)
-            .validateInstalledModel()
+            .validateInstalledTokenSaverModels()
         tokenSaverDistillServiceController.startIfEligible(
             session: session,
             settings: settings,
@@ -689,7 +697,7 @@ public final class AppContext {
         return max(0, Date().timeIntervalSince(runtime.updatedAt))
     }
 
-    func tokenSaverCompress(prompt: String, provider: AgentProvider, threadId: AgentThreadID) async -> String {
+    func tokenSaverCompress(prompt: String, provider: AgentProvider, threadId: AgentThreadID, cacheState: String = "prompt") async -> String {
         guard SettingsStore(db: db).load().tokenSaverEnabled else { return prompt }
         // NetPositiveGate (G3): there is no app-side cached prefix to preserve (resume sends
         // the full wrapped prompt), so this is a numeric decision — compress the new-turn
@@ -699,16 +707,43 @@ public final class AppContext {
         guard gate.shouldCompress(inputCharacters: prompt.count, secondsSinceLastTurn: secondsSinceLastTurn) else {
             return prompt
         }
+        let skipKey = DistillResultCacheKey(request: DistillRequest(
+            mode: .longText,
+            priority: .interactive,
+            input: prompt,
+            maxOutputCharacters: max(512, prompt.count)
+        ))
+        if tokenSaverPromptSkipSetContains(skipKey) {
+            return prompt
+        }
+        let diffWindowed = tokenSaverDiffPromptCandidate(prompt)
         // Non-lossy dedup pre-pass (P4): collapse exact-duplicate large blocks within the
         // prompt to a model-readable "identical to block above" pointer. The model keeps
         // full information (content once + a pointer it understands), so this is safe to
         // send AND a win even if the model compression step is unavailable.
-        let deduped = DistillBlockDeduper.dedupe(prompt).output
+        let dedupeProbe = DistillBlockDeduper.dedupe(prompt)
+        let deduped: String
+        if dedupeProbe.nearDedupedBlocks > 0, prompt.utf8.count >= 8_192,
+           let handle = try? ReversibleContentStore(db: db).store(prompt) {
+            deduped = DistillBlockDeduper
+                .dedupe(prompt, originalHandleMarker: ReversibleContentStore.marker(for: handle))
+                .output
+        } else {
+            deduped = dedupeProbe.output
+        }
+        let deterministicCandidate = [diffWindowed, deduped]
+            .compactMap { $0 }
+            .filter { $0.count < prompt.count }
+            .min { $0.count < $1.count }
+            ?? prompt
 
         // Adopt `candidate` only if it beats the ORIGINAL prompt; record honest end-to-end
-        // savings (original -> final), tagged cache_state=prompt.
+        // savings (original -> final), tagged with the caller's cache_state.
         func adopt(_ candidate: String) -> String {
-            guard candidate.count < prompt.count else { return prompt }
+            guard candidate.count < prompt.count else {
+                self.tokenSaverPromptSkipSet[skipKey] = Date()
+                return prompt
+            }
             let inputTokens = TokenEstimator.estimate(prompt)
             let outputTokens = TokenEstimator.estimate(candidate)
             recordTokenSaverSidecarSavings(
@@ -717,14 +752,14 @@ public final class AppContext {
                 inputTokens: inputTokens,
                 outputTokens: outputTokens,
                 savedTokens: max(inputTokens - outputTokens, 0),
-                cacheState: "prompt"
+                cacheState: cacheState
             )
             return candidate
         }
 
         guard let client = currentDistillClient() else {
-            // No model service: the deterministic dedup is still a safe, non-lossy win.
-            return deduped.count < prompt.count ? adopt(deduped) : prompt
+            // No model service: deterministic pre-passes still fail open and can save tokens.
+            return deterministicCandidate.count < prompt.count ? adopt(deterministicCandidate) : prompt
         }
         // Reset the idle-eviction timer: a real request is being dispatched so
         // the model must not be unloaded while it is in use.
@@ -733,28 +768,62 @@ public final class AppContext {
         let request = DistillRequest(
             mode: .longText,
             priority: .interactive,
-            input: deduped,
-            maxOutputCharacters: max(512, deduped.count)
+            input: deterministicCandidate,
+            maxOutputCharacters: max(512, deterministicCandidate.count)
         )
         do {
             let response = try await client.distill(request)
-            let modelOutput = response.output.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? deduped : response.output
-            // Pick the smaller of {model output, deduped}, then adopt only if it beats the original.
-            let best = modelOutput.count < deduped.count ? modelOutput : deduped
+            let modelOutput = response.output.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? deterministicCandidate : response.output
+            let literalSafeModelOutput = LiteralPreservation.guarded(original: prompt, compressed: modelOutput).droppedLiteral == nil
+                ? modelOutput
+                : deterministicCandidate
+            // Pick the smaller of {model output, deterministic pre-pass}, then adopt only if it beats the original.
+            let best = literalSafeModelOutput.count < deterministicCandidate.count ? literalSafeModelOutput : deterministicCandidate
             return adopt(best)
         } catch {
             NSLog("RemoteCode Token Saver compression skipped (provider=\(provider.rawValue)): \(error)")
-            // Fail-open to the deterministic dedup if it helped, else the original.
-            return deduped.count < prompt.count ? adopt(deduped) : prompt
+            // Fail-open to the deterministic pre-pass if it helped, else the original.
+            return deterministicCandidate.count < prompt.count ? adopt(deterministicCandidate) : prompt
         }
+    }
+
+    private func tokenSaverDiffPromptCandidate(_ prompt: String) -> String? {
+        guard DiffCrusher.looksLikeDiff(prompt),
+              let windowed = DiffCrusher.window(prompt) else {
+            return nil
+        }
+        do {
+            let handle = try ReversibleContentStore(db: db).store(prompt)
+            let marker = ReversibleContentStore.marker(for: handle)
+            let candidate = """
+            \(windowed)
+
+            \(marker) full original diff available via rc_retrieve(\(handle)).
+            """
+            return candidate.count < prompt.count ? candidate : nil
+        } catch {
+            NSLog("RemoteCode Token Saver diff prompt windowing skipped: \(error)")
+            return nil
+        }
+    }
+
+    private func tokenSaverPromptSkipSetContains(_ key: DistillResultCacheKey) -> Bool {
+        guard let insertedAt = tokenSaverPromptSkipSet[key] else { return false }
+        if Date().timeIntervalSince(insertedAt) > Self.tokenSaverPromptSkipSetTTL {
+            tokenSaverPromptSkipSet.removeValue(forKey: key)
+            return false
+        }
+        return true
     }
 
     /// P5 SessionLearn: on a failed run, mine a deterministic correction rule from the
     /// run's error into the managed instructions region (FIFO-capped, appended at the file
     /// bottom so the upper instruction prefix stays byte-stable). Off by default; best-effort.
     func recordSessionLearnFromRun(runId: AgentRunID, status: AgentRunStatus) {
+        let inputTokens = sessionLearnInputTokensByRun[runId] ?? 0
+        sessionLearnInputTokensByRun.removeValue(forKey: runId)
         guard SettingsStore(db: db).load().sessionLearnEnabled else { return }
-        guard SessionLearnRegion.shouldMine(runFailed: status == .failed, inputTokens: 0) else { return }
+        guard SessionLearnRegion.shouldMine(runFailed: status == .failed, inputTokens: inputTokens) else { return }
         guard let run = try? runRepo.get(id: runId) else { return }
         let error = (run.errorMessage ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         guard !error.isEmpty else { return }
@@ -942,6 +1011,7 @@ public final class AppContext {
               let run = try? runRepo.get(id: runId) else {
             return
         }
+        sessionLearnInputTokensByRun[runId, default: 0] += max(0, usage.inputTokens)
         let settings = SettingsStore(db: db).load()
         // Record only the real provider-billed token count. Savings are now
         // measured at the local sidecar call sites (`| distill` command-output
@@ -954,6 +1024,7 @@ public final class AppContext {
         // and app-quit paths force an immediate flush so no tokens are ever lost.
         if var pending = pendingUsageByRun[runId] {
             pending.totalTokens += usage.totalTokens
+            pending.billedTokenUnits += usage.billedTotalTokenUnits
             pending.eligibleRuns += eligibleRuns
             pending.currentSessionTokens = max(pending.currentSessionTokens, usage.totalTokens)
             if let window = usage.contextWindow {
@@ -964,6 +1035,7 @@ public final class AppContext {
             pendingUsageByRun[runId] = PendingUsage(
                 provider: run.provider,
                 totalTokens: usage.totalTokens,
+                billedTokenUnits: usage.billedTotalTokenUnits,
                 eligibleRuns: eligibleRuns,
                 currentSessionTokens: usage.totalTokens,
                 currentSessionLimitTokens: usage.contextWindow
@@ -1018,6 +1090,8 @@ public final class AppContext {
                         provider: pending.provider,
                         actualProviderTokens: pending.totalTokens,
                         estimatedRawTokens: pending.totalTokens,
+                        actualProviderBilledTokenUnits: pending.billedTokenUnits,
+                        estimatedRawBilledTokenUnits: pending.billedTokenUnits,
                         eligibleRuns: pending.eligibleRuns,
                         currentSessionTokens: pending.currentSessionTokens,
                         currentSessionLimitTokens: pending.currentSessionLimitTokens

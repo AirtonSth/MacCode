@@ -105,6 +105,7 @@ public protocol AgentProviderAdapter: AnyObject {
     func interruptTurn(threadId: AgentThreadID) throws
     func respondToRequest(threadId: AgentThreadID, requestId: String, response: AgentProviderRequestResponse) async throws
     func respondToUserInput(threadId: AgentThreadID, requestId: String, text: String) throws
+    func respondToUserInput(threadId: AgentThreadID, requestId: String, verbatimText: String, outboundText: String) throws
     func stopSession(threadId: AgentThreadID) throws
     func recoverSession(_ request: AgentRunRequest, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) async throws
     func listSessions() -> [AgentProviderSessionSummary]
@@ -113,6 +114,12 @@ public protocol AgentProviderAdapter: AnyObject {
     func rollbackThread(threadId: AgentThreadID, toTurnId: String) async throws
     func stopAll()
     func streamEvents(threadId: AgentThreadID, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) throws
+}
+
+public extension AgentProviderAdapter {
+    func respondToUserInput(threadId: AgentThreadID, requestId: String, verbatimText: String, outboundText: String) throws {
+        try respondToUserInput(threadId: threadId, requestId: requestId, text: verbatimText)
+    }
 }
 
 public final class OneShotProviderAdapter: AgentProviderAdapter, @unchecked Sendable {

@@ -180,7 +180,7 @@ public final class ClaudeCLIAdapter: AgentProviderAdapter, @unchecked Sendable {
         cap: Int
     ) -> [AgentThreadID] {
         let eligible = finishedOrder.filter { !rolledBackThreadIds.contains($0) }
-        let excess = eligible.count - cap
+        let excess = finishedOrder.count - cap
         guard excess > 0 else { return [] }
         return Array(eligible.prefix(excess))
     }

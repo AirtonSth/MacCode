@@ -82,6 +82,19 @@ public struct TokenSaverSavingsSummary: Sendable, Equatable {
         providers.first { $0.provider == provider }
     }
 
+    /// Saved tokens attributed to providers NOT in `known` (e.g. direct `distill` CLI
+    /// usage recorded as "unknown"). The Token Saver card shows only Claude + Codex
+    /// rows; without surfacing this, the headline total (which sums ALL providers) would
+    /// not reconcile with the visible rows — exactly the "Saved 23K but Claude/Codex 0"
+    /// confusion. So: total == sum(known rows) + this.
+    public func savedTokens(forProvidersOtherThan known: Set<String>) -> Int {
+        providers.filter { !known.contains($0.provider) }.reduce(0) { $0 + $1.savedTokens }
+    }
+
+    public func runs(forProvidersOtherThan known: Set<String>) -> Int {
+        providers.filter { !known.contains($0.provider) }.reduce(0) { $0 + $1.runs }
+    }
+
     public static let empty = TokenSaverSavingsSummary(providers: [], daily: [], modes: [])
 }
 

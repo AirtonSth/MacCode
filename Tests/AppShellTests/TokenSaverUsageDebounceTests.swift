@@ -170,4 +170,43 @@ final class TokenSaverUsageDebounceTests: XCTestCase {
         XCTAssertEqual(codex?.actualProviderTokens, 250,
                        "run-end flush must not lose tokens that were buffered inside the debounce window")
     }
+
+    func test_providerUsageFlushPersistsCacheWeightedBillingUnits() throws {
+        let appSupport = NSTemporaryDirectory() + "RC2UsageBilling-" + UUID().uuidString
+        let context = try AppContext(channel: .debug, appSupportOverride: appSupport)
+        SettingsStore(db: context.db).update { $0.tokenSaverEnabled = true }
+
+        let thread = AgentThread(title: "t", provider: .claude, model: "m")
+        try context.threadRepo.upsert(thread)
+        let run = AgentRun(threadId: thread.id, provider: .claude, model: "m",
+                           status: .running, startedAt: Date())
+        try context.runRepo.upsert(run)
+
+        context.coordinator.onAssistantEvent?(
+            .tokenUsage(AssistantTokenUsage(
+                inputTokens: 1_600,
+                outputTokens: 40,
+                totalTokens: 1_640,
+                uncachedInputTokens: 1_000,
+                cacheCreationInputTokens: 400,
+                cacheReadInputTokens: 200
+            )),
+            thread.id,
+            run.id
+        )
+        context.flushPendingTokenSaverUsage(runId: run.id)
+
+        let deadline = Date().addingTimeInterval(2)
+        var snapshot = TokenSaverUsageStore(appSupportDirectory: context.appSupportDirectory).load()
+        while (snapshot.providers.first(where: { $0.provider == .claude })?.actualProviderTokens ?? 0) == 0,
+              Date() < deadline {
+            Thread.sleep(forTimeInterval: 0.02)
+            snapshot = TokenSaverUsageStore(appSupportDirectory: context.appSupportDirectory).load()
+        }
+
+        let claude = snapshot.providers.first { $0.provider == .claude }
+        XCTAssertEqual(claude?.actualProviderTokens, 1_640)
+        XCTAssertEqual(claude?.actualProviderBilledTokenUnits ?? 0, 1_560, accuracy: 0.001)
+        XCTAssertEqual(claude?.estimatedRawBilledTokenUnits ?? 0, 1_560, accuracy: 0.001)
+    }
 }

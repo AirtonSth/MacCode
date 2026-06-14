@@ -649,7 +649,7 @@ final class AgentAppViewModelTests: XCTestCase {
                        "multi-select questions must submit one final answer atomically instead of resuming once per selected option")
     }
 
-    func test_freeTextUserInputDraftCanAnswerProviderQuestion() throws {
+    func test_freeTextUserInputDraftCanAnswerProviderQuestion() async throws {
         let adapter = CapturingProviderAdapter(provider: .codex)
         let (vm, _) = try makeVM(adapter: adapter)
         vm.createThread(title: "free text input")
@@ -665,6 +665,9 @@ final class AgentAppViewModelTests: XCTestCase {
 
         vm.userInputDrafts[request.id] = "release/next"
         vm.answerPendingUserInput(request, answer: vm.userInputDrafts[request.id] ?? "")
+        await waitAsync("free-text provider response reaches adapter") {
+            adapter.lastUserInputResponse?.requestId == "question-1"
+        }
 
         XCTAssertEqual(adapter.lastUserInputResponse?.requestId, "question-1")
         XCTAssertEqual(adapter.lastUserInputResponse?.text, "release/next",
@@ -1810,8 +1813,10 @@ final class AgentAppViewModelTests: XCTestCase {
         await vm.send()
         vm.prompt = "inspect before editing"
         await vm.send()
-        await waitAsync("plan mode reaches runner") {
-            runner.interactionModes.contains(.plan)
+        await waitAsync("plan mode reaches runner and completes") {
+            runner.interactionModes.contains(.plan) &&
+            runner.prompts.last == "inspect before editing" &&
+            vm.status == .completed
         }
 
         vm.prompt = "/default"
@@ -1820,7 +1825,8 @@ final class AgentAppViewModelTests: XCTestCase {
         await vm.send()
 
         await waitAsync("default mode reaches runner") {
-            runner.interactionModes.last == .default
+            runner.interactionModes.last == .default &&
+            runner.prompts.last == "now implement"
         }
         XCTAssertEqual(runner.prompts.last, "now implement",
                        "/default must restore provider runtime behavior without sending a local command as user prompt")

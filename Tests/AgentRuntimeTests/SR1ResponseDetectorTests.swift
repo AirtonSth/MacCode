@@ -49,6 +49,44 @@ final class SR1ResponseDetectorTests: XCTestCase {
                       "three colon-delimited lines with distinct prefixes must exceed the threshold")
     }
 
+    func test_isSR1_classifierConfidentTrueOverridesHeuristicFalse() {
+        let text = "compressed answer with nonstandard labels that the heuristic cannot prove"
+        let classifier: SR1ResponseClassifier = { _ in
+            SR1ClassifierDecision(isSR1: true, confidence: 0.93)
+        }
+
+        XCTAssertTrue(SR1ResponseDetector.isSR1(text, classifier: classifier),
+                      "a confident classifier decision must catch SR1 that prefix heuristics miss")
+    }
+
+    func test_isSR1_classifierConfidentFalseOverridesHeuristicTrue() {
+        let text = "D: Doctor recommends rest and fluids."
+        let classifier: SR1ResponseClassifier = { _ in
+            SR1ClassifierDecision(isSR1: false, confidence: 0.91)
+        }
+
+        XCTAssertFalse(SR1ResponseDetector.isSR1(text, classifier: classifier),
+                       "a confident classifier rejection must prevent prefix false-positive buffer holds")
+    }
+
+    func test_isSR1_classifierLowConfidenceFallsBackToHeuristic() {
+        let text = "D: deploy the service"
+        let classifier: SR1ResponseClassifier = { _ in
+            SR1ClassifierDecision(isSR1: false, confidence: 0.20)
+        }
+
+        XCTAssertTrue(SR1ResponseDetector.isSR1(text, classifier: classifier),
+                      "low-confidence classifier output must fail open to the existing heuristic")
+    }
+
+    func test_isSR1_classifierNilDecisionFallsBackToHeuristic() {
+        let text = "D: deploy the service"
+        let classifier: SR1ResponseClassifier = { _ in nil }
+
+        XCTAssertTrue(SR1ResponseDetector.isSR1(text, classifier: classifier),
+                      "missing classifier output must preserve current SR1 detection behavior")
+    }
+
     // MARK: - isSR1: false positives that must NOT be detected
 
     func test_isSR1_normalEnglishParagraph_returnsFalse() {

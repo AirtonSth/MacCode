@@ -52,6 +52,10 @@ final class InsomniaSidebarTests: XCTestCase {
         }
     }
 
+    private final class DownloadProbe {
+        var started = false
+    }
+
     private func make(
         dir: String = NSTemporaryDirectory() + "RC2Insomnia-" + UUID().uuidString,
         seedSettings: AppSettings? = nil,
@@ -59,7 +63,9 @@ final class InsomniaSidebarTests: XCTestCase {
         powerMonitor: ExternalPowerMonitoring = FakeExternalPowerMonitor(),
         insomniaBatteryPrompt: @escaping SidebarViewModel.InsomniaBatteryPrompt = { .keepEnabled },
         tokenSaverModelValidationProvider: SidebarViewModel.TokenSaverModelValidationProvider? = nil,
-        tokenSaverModelDownloadHandler: SidebarViewModel.TokenSaverModelDownloadHandler? = nil
+        tokenSaverModelDownloadHandler: SidebarViewModel.TokenSaverModelDownloadHandler? = nil,
+        tokenSaverDownloadConfirmProvider: SidebarViewModel.TokenSaverDownloadConfirmProvider? = { _, _ in true },
+        operationErrorPresenter: @escaping SidebarViewModel.OperationErrorPresenter = { _, _ in }
     ) throws -> (AppContext, AppCommandRouter, SidebarViewModel, FakeInsomniaPowerManager) {
         let ctx = try AppContext(channel: .debug, appSupportOverride: dir)
         let router = AppCommandRouter(context: ctx)
@@ -74,7 +80,9 @@ final class InsomniaSidebarTests: XCTestCase {
             powerMonitor: powerMonitor,
             insomniaBatteryPrompt: insomniaBatteryPrompt,
             tokenSaverModelValidationProvider: tokenSaverModelValidationProvider,
-            tokenSaverModelDownloadHandler: tokenSaverModelDownloadHandler
+            tokenSaverModelDownloadHandler: tokenSaverModelDownloadHandler,
+            tokenSaverDownloadConfirmProvider: tokenSaverDownloadConfirmProvider,
+            operationErrorPresenter: operationErrorPresenter
         )
         return (ctx, router, vm, power)
     }
@@ -105,12 +113,15 @@ final class InsomniaSidebarTests: XCTestCase {
         try data.write(to: fileURL)
         let relativePath = [
             "Models",
-            TokenSaverModelInstaller.safePathComponent(TokenSaverModelManifest.approvedModelID),
+            TokenSaverModelInstaller.safePathComponent(installer.approvedModel.id),
             revision,
             "model.safetensors"
         ].joined(separator: "/")
         let manifest = TokenSaverModelManifest(
+            modelID: installer.approvedModel.id,
+            modelURL: installer.approvedModel.url,
             revision: revision,
+            runtime: installer.approvedModel.runtime,
             files: [
                 TokenSaverModelFile(
                     relativePath: relativePath,
@@ -121,6 +132,34 @@ final class InsomniaSidebarTests: XCTestCase {
         )
         try installer.writeManifest(manifest)
         return manifest
+    }
+
+    private func writeTinyRequiredModels(installer: TokenSaverModelInstaller) throws {
+        var manifests: [TokenSaverRequiredModelInstallManifest] = []
+        for model in installer.requiredAuxiliaryModels {
+            let fileURL = installer.encoderStorageDirectory(modelID: model.id, revision: model.revision)
+                .appendingPathComponent("model.safetensors")
+            try FileManager.default.createDirectory(
+                at: fileURL.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            let data = Data("encoder-ui-\(model.id)".utf8)
+            try data.write(to: fileURL)
+            let relativePath = [
+                "Encoders",
+                TokenSaverModelInstaller.safePathComponent(model.id),
+                model.revision,
+                "model.safetensors"
+            ].joined(separator: "/")
+            manifests.append(TokenSaverRequiredModelInstallManifest(model: model, files: [
+                TokenSaverModelFile(
+                    relativePath: relativePath,
+                    sha256: try TokenSaverModelInstaller.sha256Hex(url: fileURL),
+                    sizeBytes: Int64(data.count)
+                )
+            ]))
+        }
+        try installer.writeEncoderManifest(TokenSaverRequiredModelsInstallManifest(models: manifests))
     }
 
     private func savePrivateSession(in ctx: AppContext, subscribed: Bool) {
@@ -221,6 +260,38 @@ final class InsomniaSidebarTests: XCTestCase {
         XCTAssertEqual(vm.tokenSaverModelDownloadState.errorMessage, "manifest missing")
     }
 
+    func test_tokenSaverPaidEnableOpensDownloadWhenEncoderBundleMissing() throws {
+        let dir = NSTemporaryDirectory() + "RC2TokenSaverEncoderMissing-" + UUID().uuidString
+        let installer = TokenSaverModelInstaller(appSupportDirectory: URL(fileURLWithPath: dir, isDirectory: true))
+        _ = try writeTinyTokenSaverModel(installer: installer)
+        let waitingDownload: SidebarViewModel.TokenSaverModelDownloadHandler = { progress in
+            progress(TokenSaverModelDownloadState(
+                phase: .downloading,
+                downloadedBytes: 0,
+                expectedBytes: 10,
+                statusText: "Waiting"
+            ))
+            try await Task.sleep(nanoseconds: 5_000_000_000)
+            throw CancellationError()
+        }
+        let (ctx, _, vm, _) = try make(
+            dir: dir,
+            seedSettings: AppSettings(tokenSaverEnabled: false),
+            tokenSaverModelDownloadHandler: waitingDownload
+        )
+        savePrivateSession(in: ctx, subscribed: true)
+        vm.reload()
+
+        vm.setTokenSaverEnabled(true)
+
+        XCTAssertFalse(vm.tokenSaverEnabled,
+                       "paid Token Saver must not persist enabled with only the selected MLX LLM installed")
+        XCTAssertTrue(vm.showsTokenSaverModelDownload,
+                      "missing BERT/encoder models must open the same activation download path")
+        XCTAssertEqual(vm.tokenSaverModelDownloadState.errorMessage, "encoder manifest missing")
+        vm.cancelTokenSaverModelDownload()
+    }
+
     func test_tokenSaverPaidEnableDownloadsMissingModelThenPersists() async throws {
         let dir = NSTemporaryDirectory() + "RC2TokenSaverDownload-" + UUID().uuidString
         let installer = TokenSaverModelInstaller(appSupportDirectory: URL(fileURLWithPath: dir, isDirectory: true))
@@ -238,13 +309,14 @@ final class InsomniaSidebarTests: XCTestCase {
                 statusText: "Verifying downloaded model"
             ))
             let manifest = try self.writeTinyTokenSaverModel(installer: installer)
+            try self.writeTinyRequiredModels(installer: installer)
             progress(.ready)
             return manifest
         }
         let (ctx, _, vm, _) = try make(
             dir: dir,
             seedSettings: AppSettings(tokenSaverEnabled: false),
-            tokenSaverModelValidationProvider: { installer.validateInstalledModel() },
+            tokenSaverModelValidationProvider: { installer.validateInstalledTokenSaverModels() },
             tokenSaverModelDownloadHandler: handler
         )
         savePrivateSession(in: ctx, subscribed: true)
@@ -257,9 +329,53 @@ final class InsomniaSidebarTests: XCTestCase {
                       "paid Token Saver enablement should complete only after the clicked download writes and verifies the approved model manifest")
         XCTAssertFalse(vm.showsTokenSaverModelDownload)
         XCTAssertEqual(vm.tokenSaverModelDownloadState.phase, .ready)
-        XCTAssertEqual(installer.validateInstalledModel(), .installed)
+        XCTAssertEqual(installer.validateInstalledTokenSaverModels(), .installed)
         XCTAssertTrue(SettingsStore(db: ctx.db).load().tokenSaverEnabled,
                       "verified first-use model download must persist Token Saver on for future launches")
+    }
+
+    func test_tokenSaverEnableKeepsFallbackRunningWhileSelectedModelDownloads() async throws {
+        guard TokenSaverApprovedModels.selected() == TokenSaverApprovedModels.distillE4B else {
+            throw XCTSkip("E4B migration path requires a >=16 GiB host; selector unit tests cover the lower-memory branch")
+        }
+        let dir = NSTemporaryDirectory() + "RC2TokenSaverFallbackMigration-" + UUID().uuidString
+        let fallbackInstaller = TokenSaverModelInstaller(
+            appSupportDirectory: URL(fileURLWithPath: dir, isDirectory: true),
+            approvedModel: TokenSaverApprovedModels.distill17B
+        )
+        _ = try writeTinyTokenSaverModel(installer: fallbackInstaller, revision: "fallback-ui-rev")
+        try writeTinyRequiredModels(installer: fallbackInstaller)
+
+        let probe = DownloadProbe()
+        let handler: SidebarViewModel.TokenSaverModelDownloadHandler = { progress in
+            probe.started = true
+            progress(TokenSaverModelDownloadState(
+                phase: .downloading,
+                downloadedBytes: 0,
+                expectedBytes: 10,
+                statusText: "Downloading selected model"
+            ))
+            try await Task.sleep(nanoseconds: 5_000_000_000)
+            throw CancellationError()
+        }
+        let (ctx, _, vm, _) = try make(
+            dir: dir,
+            seedSettings: AppSettings(tokenSaverEnabled: false),
+            tokenSaverModelDownloadHandler: handler
+        )
+        savePrivateSession(in: ctx, subscribed: true)
+        vm.reload()
+
+        vm.setTokenSaverEnabled(true)
+        let started = await waitUntil { probe.started }
+
+        XCTAssertTrue(started)
+        XCTAssertTrue(vm.tokenSaverEnabled,
+                      "a >=16 GiB Mac with an installed 1.7B fallback must keep Token Saver enabled while E4B downloads")
+        XCTAssertTrue(SettingsStore(db: ctx.db).load().tokenSaverEnabled)
+        XCTAssertTrue(vm.showsTokenSaverModelDownload,
+                      "migration must still surface the selected-model download instead of silently staying on fallback")
+        vm.cancelTokenSaverModelDownload()
     }
 
     func test_tokenSaverModelDownloadProgressFractionIsSafeForSwiftUIProgressView() throws {

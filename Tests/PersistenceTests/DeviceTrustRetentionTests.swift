@@ -70,7 +70,7 @@ final class DeviceTrustRetentionTests: XCTestCase {
         let t0   = Date(timeIntervalSince1970: 1_000_000)
         let iso  = ISO8601DateFormatter()
         let code = try repo.createPairingCode(ttlSeconds: 60, at: t0)
-        let (device, token) = try XCTUnwrap(try repo.redeemPairingCode(code.code, deviceName: "phone"))
+        let (device, token) = try XCTUnwrap(try repo.redeemPairingCode(code.code, deviceName: "phone", now: t0))
 
         // First verify at t0 — prev is nil, so last_seen is written.
         _ = try XCTUnwrap(try repo.verify(token: token, threshold: 60, now: t0))

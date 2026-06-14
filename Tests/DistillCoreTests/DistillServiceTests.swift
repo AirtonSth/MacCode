@@ -1,4 +1,5 @@
 import XCTest
+import CoreModel
 @testable import DistillCore
 
 final class DistillServiceTests: XCTestCase {
@@ -14,6 +15,34 @@ final class DistillServiceTests: XCTestCase {
         func allRecords() -> [DistillSavingsRecord] {
             records
         }
+    }
+
+    private struct FixedStatsProvider: DistillStatsProviding {
+        let snapshot: DistillStatsSnapshot
+
+        func statsSnapshot() throws -> DistillStatsSnapshot {
+            snapshot
+        }
+    }
+
+    func test_metricsDecodeLegacyPayloadDefaultsAdditiveFields() throws {
+        let json = """
+        {
+          "active_requests": 1,
+          "total_requests": 10,
+          "successful_requests": 9,
+          "failed_requests": 1,
+          "max_concurrent_requests": 8
+        }
+        """.data(using: .utf8)!
+
+        let metrics = try JSONDecoder().decode(DistillServiceMetrics.self, from: json)
+
+        XCTAssertEqual(metrics.fallbackRequests, 0)
+        XCTAssertEqual(metrics.cacheDriftWarnings, 0)
+        XCTAssertEqual(metrics.encoderLaneInvocations, 0)
+        XCTAssertEqual(metrics.resolvedWithoutLLMRate, 0)
+        XCTAssertEqual(metrics.gateP95Millis, 0)
     }
 
     func test_mlxRuntimeRequiresRealLocalModelFiles() async {
@@ -56,6 +85,16 @@ final class DistillServiceTests: XCTestCase {
                 .unsupportedModel(modelID: "other/model", modelURL: "https://example.invalid/model")
             )
         }
+
+        let compact = TokenSaverApprovedModels.distillE4B
+        let accepted = try DistillServiceConfiguration(
+            authToken: "token",
+            appSupportDirectory: "/tmp/remote-code",
+            runtime: compact.runtime,
+            modelID: compact.id,
+            modelURL: compact.url
+        )
+        XCTAssertEqual(accepted.modelID, compact.id)
     }
 
     func test_httpServerRequiresBearerTokenAndServesDistillRequests() async throws {
@@ -108,6 +147,131 @@ final class DistillServiceTests: XCTestCase {
         XCTAssertEqual(snapshot.totalRequests, 1)
         XCTAssertEqual(snapshot.successfulRequests, 1)
         XCTAssertEqual(snapshot.failedRequests, 0)
+    }
+
+    func test_httpStatsEndpointReturnsSavingsLedgerSnapshot() async throws {
+        let configuration = try DistillServiceConfiguration(
+            authToken: "stats-token",
+            appSupportDirectory: NSTemporaryDirectory(),
+            maxConcurrentRequests: 1
+        )
+        let stats = DistillStatsSnapshot(
+            totalSavedTokens: 321,
+            totalRuns: 4,
+            providers: [DistillStatsProviderSavings(provider: "codex", savedTokens: 321, inputTokens: 900, outputTokens: 579, runs: 4)],
+            modes: [DistillStatsModeSavings(provider: "codex", mode: "prompt", savedTokens: 321, runs: 4)]
+        )
+        let server = DistillHTTPServer(
+            configuration: configuration,
+            scheduler: DistillScheduler(runtime: LocalDistillRuntime(), maxConcurrentRequests: 1),
+            statsProvider: FixedStatsProvider(snapshot: stats)
+        )
+        let ready = try await server.start()
+        defer { server.stop() }
+
+        let unauthorized = try await response(baseURL: ready.baseURL, path: "/v1/stats")
+        XCTAssertEqual(unauthorized.status, 401, "stats exposes savings data and must require the bearer token")
+
+        let authorized = try await response(baseURL: ready.baseURL, path: "/v1/stats", token: "stats-token")
+        XCTAssertEqual(authorized.status, 200)
+        let decoded = try JSONDecoder().decode(DistillStatsSnapshot.self, from: authorized.data)
+        XCTAssertEqual(decoded, stats)
+    }
+
+    func test_httpRankAndEmbedExposeEncoderPrimitivesWithoutOverloadingDistill() async throws {
+        let configuration = try DistillServiceConfiguration(
+            authToken: "encoder-token",
+            appSupportDirectory: NSTemporaryDirectory(),
+            maxConcurrentRequests: 1
+        )
+        let server = DistillHTTPServer(
+            configuration: configuration,
+            scheduler: DistillScheduler(runtime: LocalDistillRuntime(), maxConcurrentRequests: 1)
+        )
+        let ready = try await server.start()
+        defer { server.stop() }
+
+        let unauthorized = try await response(
+            baseURL: ready.baseURL,
+            path: "/v1/rank",
+            method: "POST",
+            body: try JSONEncoder().encode(DistillRankRequest(query: "auth failure", chunks: []))
+        )
+        XCTAssertEqual(unauthorized.status, 401, "encoder primitives expose prompt material and must require the bearer token")
+
+        let rankRequest = DistillRankRequest(
+            query: "auth failure",
+            chunks: [
+                DistillRankChunk(id: "noise", text: "render layout completed", contentType: .prose, position: 0),
+                DistillRankChunk(id: "hit", text: "auth failure caused login error", contentType: .buildOutput, position: 1)
+            ],
+            toolArguments: "login",
+            topK: 1,
+            encoderLane: "colbert-shadow"
+        )
+        let ranked = try await response(
+            baseURL: ready.baseURL,
+            path: "/v1/rank",
+            method: "POST",
+            token: "encoder-token",
+            body: try JSONEncoder().encode(rankRequest)
+        )
+        XCTAssertEqual(ranked.status, 200)
+        let rankResponse = try JSONDecoder().decode(DistillRankResponse.self, from: ranked.data)
+        XCTAssertEqual(rankResponse.encoderLane, "colbert-shadow")
+        XCTAssertEqual(rankResponse.results.map(\.id), ["hit"],
+                       "rank endpoint must expose deterministic BM25/content-type ranking while real encoder lanes remain optional")
+
+        let embedded = try await response(
+            baseURL: ready.baseURL,
+            path: "/v1/embed",
+            method: "POST",
+            token: "encoder-token",
+            body: try JSONEncoder().encode(DistillEmbedRequest(inputs: ["auth failure"], encoderLane: "modernbert"))
+        )
+        XCTAssertEqual(embedded.status, 200)
+        let embedResponse = try JSONDecoder().decode(DistillEmbedResponse.self, from: embedded.data)
+        XCTAssertFalse(embedResponse.available, "absent encoder runtime must fail open instead of returning fake vectors")
+        XCTAssertEqual(embedResponse.encoderLane, "modernbert")
+        XCTAssertEqual(embedResponse.embeddings, [])
+    }
+
+    func test_rankChunkDecodesLegacyPayloadWithDefaultContentType() throws {
+        let data = Data(#"{"id":"auth","text":"authentication failed","position":1}"#.utf8)
+        let chunk = try JSONDecoder().decode(DistillRankChunk.self, from: data)
+
+        XCTAssertEqual(chunk.contentType, .prose,
+                       "rank wire clients that omit additive contentType must keep the default prose ranking semantics")
+        XCTAssertEqual(chunk.position, 1)
+    }
+
+    func test_clientRankAndEmbedUseDedicatedEndpoints() async throws {
+        let configuration = try DistillServiceConfiguration(
+            authToken: "client-encoder-token",
+            appSupportDirectory: NSTemporaryDirectory(),
+            maxConcurrentRequests: 1
+        )
+        let server = DistillHTTPServer(
+            configuration: configuration,
+            scheduler: DistillScheduler(runtime: LocalDistillRuntime(), maxConcurrentRequests: 1)
+        )
+        let ready = try await server.start()
+        defer { server.stop() }
+
+        let client = try XCTUnwrap(DistillServiceClient(ready: ready, authToken: "client-encoder-token"))
+        let rank = try await client.rank(DistillRankRequest(
+            query: "database panic",
+            chunks: [
+                DistillRankChunk(id: "a", text: "database panic in migration", contentType: .buildOutput, position: 0),
+                DistillRankChunk(id: "b", text: "all tests passed", contentType: .testReport, position: 1)
+            ],
+            topK: 1
+        ))
+        XCTAssertEqual(rank.results.first?.id, "a")
+
+        let embed = try await client.embed(DistillEmbedRequest(inputs: ["database panic"], encoderLane: "modernbert"))
+        XCTAssertFalse(embed.available)
+        XCTAssertEqual(embed.embeddings.count, 0)
     }
 
     func test_httpServerSuccessHookReceivesCommandOutputSavingsRecord() async throws {
@@ -195,6 +359,8 @@ final class DistillServiceTests: XCTestCase {
         // baseline: all counters start at zero
         let empty = await recorder.snapshot(activeRequests: 0, maxConcurrentRequests: 8)
         XCTAssertEqual(empty.fallbackRequests, 0)
+        XCTAssertEqual(empty.resultCacheHits, 0)
+        XCTAssertEqual(empty.resultCacheMisses, 0)
         XCTAssertEqual(empty.totalRequests, 0)
         XCTAssertEqual(empty.successfulRequests, 0)
         XCTAssertEqual(empty.failedRequests, 0)
@@ -237,15 +403,184 @@ final class DistillServiceTests: XCTestCase {
             successfulRequests: 2,
             failedRequests: 0,
             fallbackRequests: 1,
+            resultCacheHits: 4,
+            resultCacheMisses: 5,
+            systemPromptHash: "abc123",
+            cacheDriftWarnings: 2,
+            encoderLaneInvocations: 6,
+            encoderLaneAccepts: 3,
+            encoderLaneFallbacks: 2,
+            encoderLaneFailures: 1,
+            encoderLaneDeadlineTimeouts: 1,
+            pipeHitRate: 0.25,
             maxConcurrentRequests: 8
         )
         let data = try JSONEncoder().encode(metrics)
         let dict = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
         XCTAssertEqual(dict["fallback_requests"] as? Int, 1,
                        "fallback_requests must appear under its snake_case JSON key")
+        XCTAssertEqual(dict["result_cache_hits"] as? Int, 4,
+                       "cache-hit telemetry must appear under its snake_case JSON key")
+        XCTAssertEqual(dict["result_cache_misses"] as? Int, 5,
+                       "cache-miss telemetry must appear under its snake_case JSON key")
+        XCTAssertEqual(dict["volatile_token_warnings"] as? Int, 0,
+                       "B6 warn-only cache-aligner telemetry must serialize under its snake_case JSON key")
+        XCTAssertEqual(dict["system_prompt_hash"] as? String, "abc123",
+                       "B6 cache-drift telemetry must expose the current prompt-contract hash")
+        XCTAssertEqual(dict["cache_drift_warnings"] as? Int, 2,
+                       "B6 cache-drift warnings must serialize under their snake_case JSON key")
+        XCTAssertEqual(dict["encoder_lane_invocations"] as? Int, 6)
+        XCTAssertEqual(dict["encoder_lane_accepts"] as? Int, 3)
+        XCTAssertEqual(dict["encoder_lane_fallbacks"] as? Int, 2)
+        XCTAssertEqual(dict["encoder_lane_failures"] as? Int, 1)
+        XCTAssertEqual(dict["encoder_lane_deadline_timeouts"] as? Int, 1)
+        XCTAssertEqual(dict["pipe_hit_rate"] as? Double, 0.25)
         // decode round-trip
         let decoded = try JSONDecoder().decode(DistillServiceMetrics.self, from: data)
         XCTAssertEqual(decoded, metrics)
+    }
+
+    func test_httpMetricsExposeVolatileTokenWarningsWithoutBlockingRequest() async throws {
+        let configuration = try DistillServiceConfiguration(
+            authToken: "volatile-metrics-token",
+            appSupportDirectory: NSTemporaryDirectory(),
+            maxConcurrentRequests: 2
+        )
+        let scheduler = DistillScheduler(runtime: LocalDistillRuntime(), maxConcurrentRequests: 2)
+        let server = DistillHTTPServer(configuration: configuration, scheduler: scheduler)
+        let ready = try await server.start()
+        defer { server.stop() }
+
+        let request = DistillRequest(
+            mode: .commandOutput,
+            input: "build id 7f8d2d3e-1234-4cde-8f90-abcdefabcdef at 2026-06-13T21:00:01Z",
+            question: "Did token eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjMifQ.signature appear?",
+            maxOutputCharacters: 200
+        )
+        let distillResponse = try await response(
+            baseURL: ready.baseURL,
+            path: "/v1/distill",
+            method: "POST",
+            token: "volatile-metrics-token",
+            body: JSONEncoder().encode(request)
+        )
+        XCTAssertEqual(distillResponse.status, 200, "B6 is warn-only: volatile tokens must not block compression")
+
+        let metrics = try await response(
+            baseURL: ready.baseURL,
+            path: "/metrics",
+            token: "volatile-metrics-token"
+        )
+        let snapshot = try JSONDecoder().decode(DistillServiceMetrics.self, from: metrics.data)
+        XCTAssertEqual(snapshot.volatileTokenWarnings, 3)
+    }
+
+    func test_httpMetricsExposeCacheDriftPromptHashWithoutBlockingRequest() async throws {
+        let configuration = try DistillServiceConfiguration(
+            authToken: "cache-drift-token",
+            appSupportDirectory: NSTemporaryDirectory(),
+            maxConcurrentRequests: 2
+        )
+        let scheduler = DistillScheduler(runtime: LocalDistillRuntime(), maxConcurrentRequests: 2)
+        let server = DistillHTTPServer(configuration: configuration, scheduler: scheduler)
+        let ready = try await server.start()
+        defer { server.stop() }
+
+        let first = DistillRequest(
+            mode: .commandOutput,
+            input: "build passed",
+            question: "Did it pass?",
+            maxOutputCharacters: 200
+        )
+        let second = DistillRequest(
+            mode: .commandOutput,
+            input: "build failed",
+            question: "Did it pass?",
+            maxOutputCharacters: 200
+        )
+        let changed = DistillRequest(
+            mode: .commandOutput,
+            input: "build failed",
+            question: "Did it fail?",
+            maxOutputCharacters: 200
+        )
+
+        for request in [first, second, changed] {
+            let distillResponse = try await response(
+                baseURL: ready.baseURL,
+                path: "/v1/distill",
+                method: "POST",
+                token: "cache-drift-token",
+                body: JSONEncoder().encode(request)
+            )
+            XCTAssertEqual(distillResponse.status, 200, "B6 cache-drift telemetry is warn-only and must not block distill")
+        }
+
+        let metrics = try await response(
+            baseURL: ready.baseURL,
+            path: "/metrics",
+            token: "cache-drift-token"
+        )
+        let snapshot = try JSONDecoder().decode(DistillServiceMetrics.self, from: metrics.data)
+        XCTAssertEqual(snapshot.cacheDriftWarnings, 1)
+        XCTAssertEqual(snapshot.systemPromptHash, CacheAlignerPromptContract.systemPromptHash(for: changed))
+    }
+
+    func test_httpMetricsExposeResultCacheHitAndMissCounts() async throws {
+        let configuration = try DistillServiceConfiguration(
+            authToken: "cache-metrics-token",
+            appSupportDirectory: NSTemporaryDirectory(),
+            maxConcurrentRequests: 2
+        )
+        let scheduler = DistillScheduler(runtime: LocalDistillRuntime(), maxConcurrentRequests: 2)
+        let server = DistillHTTPServer(configuration: configuration, scheduler: scheduler)
+        let ready = try await server.start()
+        defer { server.stop() }
+
+        let first = DistillRequest(
+            id: UUID(uuidString: "33333333-3333-3333-3333-333333333333")!,
+            mode: .commandOutput,
+            input: "build passed\n0 failures",
+            question: "Did the build pass? Return PASS or FAIL only.",
+            maxOutputCharacters: 200
+        )
+        let second = DistillRequest(
+            id: UUID(uuidString: "44444444-4444-4444-4444-444444444444")!,
+            mode: .commandOutput,
+            input: first.input,
+            question: first.question,
+            maxOutputCharacters: first.maxOutputCharacters
+        )
+
+        let firstResponse = try await response(
+            baseURL: ready.baseURL,
+            path: "/v1/distill",
+            method: "POST",
+            token: "cache-metrics-token",
+            body: JSONEncoder().encode(first)
+        )
+        XCTAssertEqual(firstResponse.status, 200)
+        let secondResponse = try await response(
+            baseURL: ready.baseURL,
+            path: "/v1/distill",
+            method: "POST",
+            token: "cache-metrics-token",
+            body: JSONEncoder().encode(second)
+        )
+        XCTAssertEqual(secondResponse.status, 200)
+
+        let metrics = try await response(
+            baseURL: ready.baseURL,
+            path: "/metrics",
+            token: "cache-metrics-token"
+        )
+        let snapshot = try JSONDecoder().decode(DistillServiceMetrics.self, from: metrics.data)
+        XCTAssertEqual(snapshot.totalRequests, 2)
+        XCTAssertEqual(snapshot.successfulRequests, 2)
+        XCTAssertEqual(snapshot.resultCacheMisses, 1,
+                       "first identical request must be counted as a cache miss")
+        XCTAssertEqual(snapshot.resultCacheHits, 1,
+                       "second identical request must be counted as a cache hit")
     }
 
     // MARK: - Pre-auth buffer cap (OOM protection)

@@ -61,7 +61,14 @@ final class DistillTransportBudgetTests: XCTestCase {
     // it can fall back to raw when the optimizer is unavailable.
     func testOriginalRequestInputIsPreservedAfterCapping() {
         let original = String(repeating: "X", count: DistillServiceClient.stdinByteCap + 4_096)
-        let request = DistillRequest(mode: .commandOutput, input: original)
+        let request = DistillRequest(
+            mode: .commandOutput,
+            input: original,
+            cacheState: "tool_output_hooked",
+            rerankQuery: "panic root cause",
+            topK: 3,
+            encoderLane: "colbert-shadow"
+        )
 
         let wire = DistillServiceClient.cappedForWire(request)
 
@@ -75,6 +82,10 @@ final class DistillTransportBudgetTests: XCTestCase {
         XCTAssertEqual(wire.id, request.id)
         XCTAssertEqual(wire.mode, request.mode)
         XCTAssertEqual(wire.priority, request.priority)
+        XCTAssertEqual(wire.cacheState, request.cacheState)
+        XCTAssertEqual(wire.rerankQuery, request.rerankQuery)
+        XCTAssertEqual(wire.topK, request.topK)
+        XCTAssertEqual(wire.encoderLane, request.encoderLane)
         XCTAssertEqual(wire.maxOutputCharacters, request.maxOutputCharacters)
     }
 

@@ -5,7 +5,7 @@ import XCTest
 ///
 /// WHY: `SchemaMigrationTransactionTests` covers transaction semantics (rollback,
 /// re-run) but starts from an empty DB. The real migration risk is a partially-
-/// deployed schema: a user on v13 who upgrades to v29 must get all intermediate
+/// deployed schema: a user on v13 who upgrades to head must get all intermediate
 /// steps applied without data loss.  A missing ALTER or a step that fails mid-way
 /// bricks the user's DB silently.
 ///
@@ -22,7 +22,9 @@ import XCTest
 ///   v13 — agent_turn_checkpoints added (checkpoint feature birth)
 ///   v25 — token_saver_savings added
 ///   v27 — rc_reversible_content added (CCR store)
-///   v29 — head (current)  [identity: migrate from v29 is a no-op]
+///   v30 — token_saver_encoder_manifests added
+///   v31 — shared_memory_blocks added
+///   head — current  [identity: migrate from head is a no-op]
 ///
 /// Each test follows the pattern:
 ///   1. Build old-version DB in memory via `Schema.migrateSteps(db, steps.prefix(n))`.
@@ -231,6 +233,41 @@ final class SchemaMigrationMatrixTests: XCTestCase {
         XCTAssertEqual(try rowCount(db, table: "rc_reversible_content"), 1,
                        "a v27 CCR block must survive migration to head — " +
                        "losing it destroys the recovery path for every compressed message referencing that handle")
+    }
+
+    // MARK: - v30 → head
+
+    /// WHY: F8 pins encoder manifest storage to its own schema bump. A later
+    /// migration must not collide with or recreate that table because the
+    /// manifest is the hard license/runtime gate for optional encoder lanes.
+    func test_v30_to_head_encoderManifestSurvives() throws {
+        let steps = Schema.steps
+        let db = try migrateFromVersion(n: 30)
+
+        try db.execute("""
+            INSERT INTO token_saver_encoder_manifests
+                (role, model_id, source_url, revision, runtime, license, max_seq_len, chunk_policy, manifest_json, installed_at)
+            VALUES
+                ('reranker', 'example/model', 'https://example.invalid/model', 'abc123', 'coreml', 'Apache-2.0', 8192, 'sliding-window', '{}', '2026-01-01T00:00:00Z');
+        """)
+
+        try Schema.migrateSteps(db, steps)
+
+        XCTAssertEqual(try maxVersion(db), Schema.currentVersion,
+                       "migrating from v30 to head must reach currentVersion")
+        XCTAssertEqual(try rowCount(db, table: "token_saver_encoder_manifests"), 1,
+                       "a v30 encoder manifest row must survive migration to head")
+    }
+
+    func test_tokenSaverSchemaStepsHaveExplicitStorageOrder() {
+        let byVersion = Dictionary(uniqueKeysWithValues: Schema.steps.map { ($0.version, $0.sql) })
+
+        XCTAssertTrue(byVersion[27]?.contains("rc_reversible_content") == true)
+        XCTAssertTrue(byVersion[28]?.contains("ALTER TABLE token_saver_savings ADD COLUMN cache_state") == true)
+        XCTAssertTrue(byVersion[29]?.contains("always_allow_pairing") == true,
+                      "v29 is already consumed by pairing and must not be reused by Token Saver storage")
+        XCTAssertTrue(byVersion[30]?.contains("token_saver_encoder_manifests") == true)
+        XCTAssertTrue(byVersion[31]?.contains("shared_memory_blocks") == true)
     }
 
     // MARK: - head → head (idempotent re-run)

@@ -1144,7 +1144,12 @@ final class ClaudeStreamingCLIAdapterTests: XCTestCase {
         }
 
         try await waitForUserInput(in: sink, requestId: "sdk-input-1")
-        try adapter.respondToUserInput(threadId: threadId, requestId: "sdk-input-1", text: "blue")
+        try adapter.respondToUserInput(
+            threadId: threadId,
+            requestId: "sdk-input-1",
+            verbatimText: "blue",
+            outboundText: "COMPRESSED-blue"
+        )
         try await waitForUserInputResolution(in: sink, requestId: "sdk-input-1")
         try await waitForFinish(in: sink, expected: "SDK_INPUT_blue")
 
@@ -1153,6 +1158,8 @@ final class ClaudeStreamingCLIAdapterTests: XCTestCase {
                       "SDK bridge adapter must answer native SDK elicitation through the callback response channel")
         XCTAssertTrue(commands.contains(#""text":"blue""#),
                       "SDK native user-input callbacks must preserve the answer text")
+        XCTAssertFalse(commands.contains("COMPRESSED-blue"),
+                       "SDK native user-input callbacks are structured answers and must not use compressed outbound text")
         XCTAssertEqual(commands.components(separatedBy: "\"type\":\"rc_turn\"").count - 1, 1,
                        "SDK native user-input callbacks should not start a second provider turn")
         try adapter.stopSession(threadId: threadId)
@@ -1289,6 +1296,24 @@ final class ClaudeStreamingCLIAdapterTests: XCTestCase {
                       "Claude SDK partial assistant snapshots must stay disabled so thinking blocks are not replayed in a mutated form on the next provider request")
         XCTAssertFalse(source.contains("includePartialMessages: true"),
                        "turning partial snapshots back on can reproduce Anthropic 400 errors for thinking/redacted_thinking continuations")
+    }
+
+    func test_agentSDKBridgeSourceWiresPostToolUseTokenSaverHook() throws {
+        let packageRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let bridge = packageRoot.appendingPathComponent("Sources/AgentRuntime/ClaudeAgentSDKBridge.mjs")
+        let source = try String(contentsOf: bridge, encoding: .utf8)
+
+        XCTAssertTrue(source.contains("hooks: tokenSaverHooks()"),
+                      "I2: SDK query options must register the PostToolUse hook so tool_result bytes can be replaced before provider context replay")
+        XCTAssertTrue(source.contains("updatedMCPToolOutput"),
+                      "I2: PostToolUse must use the SDK replacement field, not only additionalContext, otherwise raw tool output still reaches the next request")
+        XCTAssertTrue(source.contains("RC_TOKEN_SAVER_POST_TOOL_USE"),
+                      "I2: hook must stay opt-in/default-off until Token Saver enables it")
+        XCTAssertTrue(source.contains("TOKEN_SAVER_STORE_MIN_BYTES = 2048"),
+                      "I2: hooked tool output lane lowers reversible store floor from 8192 to 2048 bytes")
     }
 
     func test_agentSDKPackageSpecRefreshesStalePinnedCache() async throws {

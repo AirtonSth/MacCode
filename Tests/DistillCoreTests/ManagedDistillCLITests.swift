@@ -106,6 +106,60 @@ final class ManagedDistillCLITests: XCTestCase {
         XCTAssertEqual(code, 1, "retrieve has no stdin to preserve => loud non-zero on miss")
     }
 
+    func test_statsSubcommandFetchesStatsWithoutCompressingPipedInput() async {
+        let raw = Data("transcript or stats input must not become a compression prompt".utf8)
+        let snapshot = DistillStatsSnapshot(
+            totalSavedTokens: 150,
+            totalRuns: 3,
+            providers: [DistillStatsProviderSavings(provider: "claude", savedTokens: 150, inputTokens: 500, outputTokens: 350, runs: 3)],
+            modes: [DistillStatsModeSavings(provider: "claude", mode: "command-output", savedTokens: 150, runs: 3)]
+        )
+        let encoded = try! JSONEncoder().encode(snapshot)
+        let cli = ManagedDistillCLI(arguments: ["stats"], stdin: raw, state: state) { request in
+            XCTAssertEqual(request.url?.path, "/v1/stats")
+            XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer t")
+            return (encoded, 200)
+        }
+
+        let (out, code) = await cli.run()
+
+        XCTAssertEqual(code, 0)
+        let text = String(decoding: out, as: UTF8.self)
+        XCTAssertTrue(text.contains("saved_tokens=150"))
+        XCTAssertTrue(text.contains("provider claude: saved=150"))
+        XCTAssertNotEqual(out, raw, "stats must not fail-open as command-output compression")
+    }
+
+    func test_dslLearnThreadConsumesTranscriptWithoutCompression() async {
+        let raw = Data("S start\nD patch\nP pass\n".utf8)
+        let cli = ManagedDistillCLI(arguments: ["dsl", "learn-thread", "--stdin"], stdin: raw, state: state) { _ in
+            XCTFail("dsl learn-thread must not call /v1/distill")
+            return nil
+        }
+
+        let (out, code) = await cli.run()
+
+        XCTAssertEqual(code, 0)
+        let text = String(decoding: out, as: UTF8.self)
+        XCTAssertTrue(text.contains("accepted \(raw.count) bytes"))
+    }
+
+    func test_reservedRankAndWrapSubcommandsDoNotCompressPipedInput() async {
+        let raw = Data("rank or wrap input must not become a compression prompt".utf8)
+        for subcommand in ["rank", "wrap"] {
+            let cli = ManagedDistillCLI(arguments: [subcommand], stdin: raw, state: state) { _ in
+                XCTFail("reserved \(subcommand) must not call /v1/distill")
+                return nil
+            }
+
+            let (out, code) = await cli.run()
+
+            XCTAssertEqual(code, 1)
+            XCTAssertNotEqual(out, raw)
+            XCTAssertTrue(String(decoding: out, as: UTF8.self).contains("reserved subcommand"))
+        }
+    }
+
     // MARK: - stdin cap (WHY: oversized stdin must not OOM the CLI)
 
     func test_exceedsStdinCap_pureSeam_rejectsAboveCap() {

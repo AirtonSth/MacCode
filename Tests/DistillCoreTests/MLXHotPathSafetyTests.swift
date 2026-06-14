@@ -9,6 +9,14 @@ final class MLXHotPathSafetyTests: XCTestCase {
             return "SLOW"
         }
     }
+    private struct NonCooperativeRuntime: DistillRuntime {
+        let sleepSeconds: TimeInterval
+
+        func distill(_ request: DistillRequest) async throws -> String {
+            Thread.sleep(forTimeInterval: sleepSeconds)
+            return "LATE"
+        }
+    }
     private struct ThrowingRuntime: DistillRuntime {
         struct Boom: Error {}
         func distill(_ request: DistillRequest) async throws -> String { throw Boom() }
@@ -29,6 +37,22 @@ final class MLXHotPathSafetyTests: XCTestCase {
         )
         let output = try await runtime.distill(req())
         XCTAssertEqual(output, "FALLBACK", "a stalled generation past the deadline must fail open, never block/throw")
+    }
+
+    func test_nonCooperativeRuntimeDeadlineReturnsWithoutWaitingForCancelledChild() async throws {
+        let runtime = DeadlineDistillRuntime(
+            wrapping: NonCooperativeRuntime(sleepSeconds: 0.8),
+            deadlineMilliseconds: 25,
+            fallback: { _ in "FALLBACK" }
+        )
+
+        let started = Date()
+        let output = try await runtime.distill(req())
+        let elapsed = Date().timeIntervalSince(started)
+
+        XCTAssertEqual(output, "FALLBACK")
+        XCTAssertLessThan(elapsed, 0.25,
+                          "deadline fallback must return at the wall-clock deadline even when the wrapped runtime ignores cancellation")
     }
 
     func test_runtimeThrow_failsOpenToFallback() async throws {

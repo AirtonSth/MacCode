@@ -22,7 +22,7 @@ final class CodexRunnerArgsTests: XCTestCase {
         XCTAssertFalse(a.contains("resume"), "a first run must not be a resume")
         XCTAssertFalse(a.contains("--model"), "empty model → account default (no -m)")
         XCTAssertTrue(a.contains("--json") && a.contains("--skip-git-repo-check"))
-        XCTAssertTrue(a.last?.contains("You are in default mode inside the RemoteCode Agent App") == true,
+        XCTAssertTrue(a.last?.contains("Default mode.") == true,
                       "Default Mode semantics must reach Codex, not only local UI state")
         XCTAssertTrue(a.last?.contains("do it") == true, "prompt is the final positional arg payload")
     }
@@ -194,7 +194,7 @@ final class CodexRunnerArgsTests: XCTestCase {
                                       model: "", cwd: "/tmp", prompt: "inspect first",
                                       interactionMode: .plan)
         let args = CodexRunner.buildArgs(request)
-        XCTAssertTrue(args.last?.contains("You are in plan mode") == true,
+        XCTAssertTrue(args.last?.contains("Plan mode.") == true,
                       "plan mode must reach Codex as provider instructions, not only toggle local UI")
         XCTAssertTrue(args.last?.contains("Do not edit files") == true)
         XCTAssertTrue(args.last?.contains("inspect first") == true)
@@ -202,9 +202,9 @@ final class CodexRunnerArgsTests: XCTestCase {
 
     func test_defaultModeWrapsPromptWithProviderInstructions() {
         let args = CodexRunner.buildArgs(req())
-        XCTAssertTrue(args.last?.contains("You are in default mode inside the RemoteCode Agent App") == true)
-        XCTAssertTrue(args.last?.contains("preserve unrelated local work") == true)
-        XCTAssertTrue(args.last?.contains("verify the result") == true)
+        XCTAssertTrue(args.last?.contains("Default mode.") == true)
+        XCTAssertTrue(args.last?.contains("preserve unrelated work") == true)
+        XCTAssertTrue(args.last?.contains("verify") == true)
         XCTAssertTrue(args.last?.contains("do it") == true)
     }
 

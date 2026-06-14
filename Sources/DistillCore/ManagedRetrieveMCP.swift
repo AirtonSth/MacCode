@@ -1,8 +1,8 @@
 import Foundation
 
-/// Retrieve-only MCP server core (P3-T5): a native tool surface so Claude/Codex can fetch
+/// Retrieve/search-only MCP server core (P3-T5): a native tool surface so Claude/Codex can fetch
 /// the byte-exact original behind a `[[rc:HANDLE]]` marker without shelling out. It exposes
-/// exactly one tool, `rc_retrieve`. It is RETRIEVE-ONLY by design — there is no compress
+/// read-only tools, `rc_retrieve` and `rc_search`. It is RETRIEVE-ONLY by design — there is no compress
 /// tool, because compressing via an MCP round-trip would send raw output through the model
 /// and pay for the tokens twice.
 ///
@@ -10,12 +10,19 @@ import Foundation
 /// lives in the executable; this type is the pure, testable message handler.
 public struct ManagedRetrieveMCP: Sendable {
     public typealias RetrieveFn = @Sendable (_ handle: String) async -> String?
+    public typealias SearchFn = @Sendable (_ query: String, _ topK: Int) async -> [CCRSearchResult]
 
     public static let toolName = "rc_retrieve"
+    public static let searchToolName = "rc_search"
     private let retrieve: RetrieveFn
+    private let search: SearchFn
 
-    public init(retrieve: @escaping RetrieveFn) {
+    public init(
+        retrieve: @escaping RetrieveFn,
+        search: @escaping SearchFn = { _, _ in [] }
+    ) {
         self.retrieve = retrieve
+        self.search = search
     }
 
     /// Handle one JSON-RPC request line. Returns the response line, or nil for notifications
@@ -52,12 +59,35 @@ public struct ManagedRetrieveMCP: Sendable {
                         "properties": ["handle": ["type": "string", "description": "The handle from a [[rc:HANDLE]] marker."]],
                         "required": ["handle"],
                     ],
+                ], [
+                    "name": Self.searchToolName,
+                    "description": "Search stored RemoteCode Token Saver originals by query and return read-only retrieve handles.",
+                    "inputSchema": [
+                        "type": "object",
+                        "properties": [
+                            "query": ["type": "string", "description": "Search query."],
+                            "topK": ["type": "integer", "description": "Maximum result count."],
+                        ],
+                        "required": ["query"],
+                    ],
                 ]],
             ])
         case "tools/call":
             let params = msg["params"] as? [String: Any]
             let args = params?["arguments"] as? [String: Any]
-            guard (params?["name"] as? String) == Self.toolName, let handleArg = args?["handle"] as? String else {
+            let name = params?["name"] as? String
+            if name == Self.searchToolName {
+                guard let query = args?["query"] as? String else {
+                    return errorReply(id: id, code: -32602, message: "missing query")
+                }
+                let topK = args?["topK"] as? Int ?? 5
+                let results = await search(query, max(1, min(20, topK)))
+                return reply(id: id, result: [
+                    "content": [["type": "text", "text": encodeJSON(results) ?? "[]"]],
+                    "isError": false,
+                ])
+            }
+            guard name == Self.toolName, let handleArg = args?["handle"] as? String else {
                 return errorReply(id: id, code: -32602, message: "unknown tool or missing handle")
             }
             let original = await retrieve(handleArg)
@@ -84,5 +114,10 @@ public struct ManagedRetrieveMCP: Sendable {
             return nil
         }
         return text // single line (no embedded newlines from JSONSerialization default)
+    }
+
+    private func encodeJSON<T: Encodable>(_ value: T) -> String? {
+        guard let data = try? JSONEncoder().encode(value) else { return nil }
+        return String(data: data, encoding: .utf8)
     }
 }

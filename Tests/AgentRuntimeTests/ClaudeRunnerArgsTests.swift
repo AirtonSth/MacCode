@@ -50,7 +50,7 @@ final class ClaudeRunnerArgsTests: XCTestCase {
         let a = ClaudeRunner.buildArgs(req())
         let m = a.firstIndex(of: "--model")!
         XCTAssertEqual(a[a.index(after: m)], "claude-opus-4-7")
-        XCTAssertTrue(a.last?.contains("You are in default mode inside the RemoteCode Agent App") == true,
+        XCTAssertTrue(a.last?.contains("Default mode.") == true,
                       "the prompt must be the final positional arg with default-mode provider instructions")
         XCTAssertTrue(a.last?.contains("hello world") == true)
     }
@@ -156,21 +156,21 @@ final class ClaudeRunnerArgsTests: XCTestCase {
         let mode = args[args.index(after: args.firstIndex(of: "--permission-mode")!)]
         XCTAssertEqual(mode, "plan",
                        "Claude plan mode must use the provider-level permission mode, not only local prompt wrapping")
-        XCTAssertTrue(args.last?.contains("You are in plan mode") == true,
+        XCTAssertTrue(args.last?.contains("Plan mode.") == true,
                       "plan mode must reach Claude as provider instructions, not only toggle local UI")
         XCTAssertTrue(args.last?.contains("Do not edit files") == true)
         XCTAssertTrue(args.last?.contains("ExitPlanMode") == true,
                       "Claude plan mode must tell provider-native planning tools to emit one final plan artifact")
-        XCTAssertTrue(args.last?.contains("stop and wait for the user") == true,
+        XCTAssertTrue(args.last?.contains("then wait") == true,
                       "after a plan artifact, Claude must not continue into implementation inside the same run")
         XCTAssertTrue(args.last?.contains("inspect first") == true)
     }
 
     func test_defaultModeWrapsPromptWithProviderInstructions() {
         let args = ClaudeRunner.buildArgs(req())
-        XCTAssertTrue(args.last?.contains("You are in default mode inside the RemoteCode Agent App") == true)
-        XCTAssertTrue(args.last?.contains("preserve unrelated local work") == true)
-        XCTAssertTrue(args.last?.contains("verify the result") == true)
+        XCTAssertTrue(args.last?.contains("Default mode.") == true)
+        XCTAssertTrue(args.last?.contains("preserve unrelated work") == true)
+        XCTAssertTrue(args.last?.contains("verify") == true)
         XCTAssertTrue(args.last?.contains("hello world") == true)
     }
 

@@ -187,6 +187,48 @@ public struct AssistantTokenUsage: Codable, Sendable, Equatable {
         self.cacheCreationInputTokens = cacheCreationInputTokens
         self.cacheReadInputTokens = cacheReadInputTokens
     }
+
+    public var billedInputTokenUnits: Double {
+        let uncached = uncachedInputTokens ?? max(0, inputTokens - (cacheCreationInputTokens ?? 0) - (cacheReadInputTokens ?? 0))
+        let creation = cacheCreationInputTokens ?? 0
+        let read = cacheReadInputTokens ?? 0
+        return TokenBillingWeights.default.inputUnits(
+            uncached: uncached,
+            cacheCreation: creation,
+            cacheRead: read
+        )
+    }
+
+    public var billedTotalTokenUnits: Double {
+        billedInputTokenUnits + (Double(max(0, outputTokens)) * TokenBillingWeights.default.output)
+    }
+}
+
+public struct TokenBillingWeights: Codable, Sendable, Equatable {
+    public let uncachedInput: Double
+    public let cacheCreationInput: Double
+    public let cacheReadInput: Double
+    public let output: Double
+
+    public init(
+        uncachedInput: Double = 1.0,
+        cacheCreationInput: Double = 1.25,
+        cacheReadInput: Double = 0.1,
+        output: Double = 1.0
+    ) {
+        self.uncachedInput = max(0, uncachedInput)
+        self.cacheCreationInput = max(0, cacheCreationInput)
+        self.cacheReadInput = max(0, cacheReadInput)
+        self.output = max(0, output)
+    }
+
+    public static let `default` = TokenBillingWeights()
+
+    public func inputUnits(uncached: Int, cacheCreation: Int, cacheRead: Int) -> Double {
+        (Double(max(0, uncached)) * uncachedInput)
+            + (Double(max(0, cacheCreation)) * cacheCreationInput)
+            + (Double(max(0, cacheRead)) * cacheReadInput)
+    }
 }
 
 public struct AssistantAccountUsage: Codable, Sendable, Equatable {

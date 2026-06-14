@@ -79,6 +79,10 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     /// user message. Must be fail-open — return the input unchanged on any
     /// error or when Token Saver is disabled.
     public var promptCompressor: (@Sendable (_ prompt: String, _ provider: AgentProvider, _ threadId: AgentThreadID) async -> String)?
+    /// Token Saver hook for free-form follow-up answers. Defaults to
+    /// `promptCompressor` when nil, but app shells can provide a separate hook
+    /// to tag telemetry as `prompt_followup`.
+    public var followUpPromptCompressor: (@Sendable (_ prompt: String, _ provider: AgentProvider, _ threadId: AgentThreadID) async -> String)?
     /// P3: optionally compact large tool output in a persisted stream-event payload before it
     /// is written (CCR-backed, structure-preserving). nil => payloads stored verbatim.
     public var streamPayloadCompactor: (@Sendable (_ payloadJSON: String) -> String)?
@@ -461,9 +465,17 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         try await adapter.respondToRequest(threadId: threadId, requestId: requestId, response: response)
     }
 
-    public func respondToUserInput(threadId: AgentThreadID, requestId: String, text: String) throws {
+    public func respondToUserInput(threadId: AgentThreadID, requestId: String, text: String) async throws {
         let adapter = try adapterForThread(threadId)
-        try adapter.respondToUserInput(threadId: threadId, requestId: requestId, text: text)
+        let outboundText: String
+        if let followUpPromptCompressor {
+            outboundText = await followUpPromptCompressor(text, adapter.provider, threadId)
+        } else if let promptCompressor {
+            outboundText = await promptCompressor(text, adapter.provider, threadId)
+        } else {
+            outboundText = text
+        }
+        try adapter.respondToUserInput(threadId: threadId, requestId: requestId, verbatimText: text, outboundText: outboundText)
     }
 
     public func readThread(threadId: AgentThreadID) async throws -> [AssistantEvent] {
@@ -767,7 +779,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
 
     @discardableResult
     private func persistAssistantIfMissing(_ text: String, threadId: AgentThreadID, runId: AgentRunID) -> AgentMessage? {
-        let text = AssistantTimelineState.cappedText(text)
+        let text = AssistantTimelineState.cappedText(sanitizeFinalAssistantText(text))
         guard !text.isEmpty else { return nil }
         // PERF-MAC_AGENT-006: the common duplicate is the same turn's final
         // message arriving via both `turnCompleted` and `finished`. Skip the
@@ -811,6 +823,21 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         return message
     }
 
+    private func sanitizeFinalAssistantText(_ text: String) -> String {
+        RetrieveHandleSanitizer.strip(text)
+    }
+
+    private func sanitizeFinalAssistantText(_ text: String?) -> String? {
+        text.map(sanitizeFinalAssistantText)
+    }
+
+    private func sanitizeFinalAssistantEvent(_ ev: AssistantEvent) -> AssistantEvent {
+        if case .turnCompleted(let turnId, let finalMessage) = ev {
+            return .turnCompleted(turnId: turnId, finalMessage: sanitizeFinalAssistantText(finalMessage))
+        }
+        return ev
+    }
+
     private func handle(
         event: AgentRunEvent,
         runId: AgentRunID,
@@ -818,7 +845,8 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         allowFinalResponseTranslation: Bool = true
     ) {
         switch event {
-        case .event(let ev):
+        case .event(let rawEvent):
+            let ev = sanitizeFinalAssistantEvent(rawEvent)
             if allowFinalResponseTranslation,
                case .turnCompleted(let turnId, let finalMessage) = ev,
                let finalMessage,
@@ -969,7 +997,8 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             for observer in observersSnapshot() {
                 observer.runCoordinator(self, didChangeStatus: st, runId: runId, threadId: threadId)
             }
-        case .finished(let status, let finalMessage, let providerThreadId):
+        case .finished(let status, let rawFinalMessage, let providerThreadId):
+            let finalMessage = sanitizeFinalAssistantText(rawFinalMessage)
             if allowFinalResponseTranslation,
                status == .completed,
                let finalMessage,
@@ -1360,7 +1389,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             return (try? threadRepo.get(id: threadId)?.provider) ?? .codex
         }()
         let translated = await finalResponseTranslator(response, provider, threadId, runId)
-        let trimmed = translated.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmed = sanitizeFinalAssistantText(translated).trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.isEmpty ? response : trimmed
     }
 

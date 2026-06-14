@@ -938,19 +938,22 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         callbackActionSeq &+= 1
         userInputSelections[request.id] = nil
         userInputDrafts[request.id] = nil
-        do {
-            try coordinator.respondToUserInput(threadId: threadId, requestId: request.id, text: trimmed)
-            timeline.apply(.userInputResolved(requestId: request.id, answer: trimmed))
-        } catch {
-            timeline.apply(.error(message: "Provider user-input response failed: \(error)", recoverable: true))
-            if let idx = timeline.pendingUserInputs.firstIndex(where: { $0.id == request.id }) {
-                timeline.pendingUserInputs[idx].state = .stale
-                timeline.pendingUserInputs[idx].resolvedAtMs = Int64(Date().timeIntervalSince1970 * 1000)
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                try await self.coordinator.respondToUserInput(threadId: threadId, requestId: request.id, text: trimmed)
+                self.timeline.apply(.userInputResolved(requestId: request.id, answer: trimmed))
+            } catch {
+                self.timeline.apply(.error(message: "Provider user-input response failed: \(error)", recoverable: true))
+                if let idx = self.timeline.pendingUserInputs.firstIndex(where: { $0.id == request.id }) {
+                    self.timeline.pendingUserInputs[idx].state = .stale
+                    self.timeline.pendingUserInputs[idx].resolvedAtMs = Int64(Date().timeIntervalSince1970 * 1000)
+                }
+                // Response-failure, not a prompt failure — no prompt Retry offered.
+                self.lastErrorRecoverable = false
             }
-            // Response-failure, not a prompt failure — no prompt Retry offered.
-            lastErrorRecoverable = false
+            self.scheduleTimelineUpdateTick()
         }
-        scheduleTimelineUpdateTick()
     }
 
     public func toggleUserInputOption(_ option: String, for request: AssistantUserInputRequest) {

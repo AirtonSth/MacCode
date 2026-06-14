@@ -29,4 +29,17 @@ final class NetPositiveGateTests: XCTestCase {
         XCTAssertEqual(gate.decide(inputCharacters: 2_000, secondsSinceLastTurn: 300), .compress)
         XCTAssertEqual(gate.decide(inputCharacters: 2_000, secondsSinceLastTurn: 299.9), .skipWarmResume)
     }
+
+    func test_billedSavingsMustRemainPositiveAfterRetrieveDebit() {
+        XCTAssertTrue(gate.acceptsBilledSavings(
+            originalBilledTokenUnits: 1_000,
+            compressedBilledTokenUnits: 600,
+            retrieveDebitUnits: 100
+        ))
+        XCTAssertFalse(gate.acceptsBilledSavings(
+            originalBilledTokenUnits: 1_000,
+            compressedBilledTokenUnits: 950,
+            retrieveDebitUnits: 100
+        ), "M2: retrieve/reinjection debit can turn token savings into net-negative billed cost")
+    }
 }

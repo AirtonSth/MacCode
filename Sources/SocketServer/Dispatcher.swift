@@ -72,7 +72,7 @@ public protocol CommandRouting: AnyObject {
     func commandReceipt(method: String, clientRequestId: String) -> JSONValue?
     func recordCommandReceipt(method: String, clientRequestId: String, result: JSONValue)
     func respondAgentRequest(thread: AgentThreadID, requestId: String, response: AgentProviderRequestResponse) async throws
-    func respondAgentUserInput(thread: AgentThreadID, requestId: String, text: String) throws
+    func respondAgentUserInput(thread: AgentThreadID, requestId: String, text: String) async throws
     func listAgentPendingCallbacks(thread: AgentThreadID) throws -> AssistantPendingCallbacksSnapshot
     func readAgentThreadEvents(thread: AgentThreadID) async throws -> [AssistantEvent]
     func rollbackAgentThread(thread: AgentThreadID, toTurnId: String) async throws
@@ -1090,7 +1090,7 @@ public final class JSONRPCDispatcher {
                 if let (_, cached) = commandReceipt(method: req.method, params: params) {
                     return .init(id: id, result: cached)
                 }
-                try router.respondAgentUserInput(thread: tid, requestId: requestId, text: text)
+                try await router.respondAgentUserInput(thread: tid, requestId: requestId, text: text)
                 let result: JSONValue = .bool(true)
                 recordCommandReceipt(method: req.method, clientRequestId: receiptKey, result: result)
                 return .init(id: id, result: result)

@@ -2,6 +2,7 @@ import XCTest
 @testable import AppShell
 @testable import CoreModel
 @testable import AgentRuntime
+@testable import Persistence
 @testable import SocketServer
 @testable import Surfaces
 
@@ -563,6 +564,49 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
         XCTAssertNil(request.environment["CLAUDE_CONFIG_DIR"],
                      "Claude provider isolation should follow Claude Code's HOME-based state model")
         XCTAssertEqual(request.environment["REMOTE_CODE_INSTANCE"], "personal")
+    }
+
+    func test_tokenSaverEnabledAddsClaudeSDKPostToolUseHookEnvironment() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let workspaceDir = root.appendingPathComponent("workspace", isDirectory: true)
+        try FileManager.default.createDirectory(at: workspaceDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        defer { closeAndUnregisterAllSurfaces() }
+
+        let support = root.appendingPathComponent("support", isDirectory: true)
+        let ctx = try AppContext(channel: .debug, appSupportOverride: support.path)
+        SettingsStore(db: ctx.db).update { $0.tokenSaverEnabled = true }
+        let router = AppCommandRouter(context: ctx)
+        ctx.router = router
+
+        let capture = RequestCaptureRunner(provider: .claude)
+        ctx.coordinator.replaceProvider(.claude, runner: capture)
+        let workspace = try router.createWorkspace(name: "claude-token-saver-hook", cwd: workspaceDir.path)
+        let thread = try router.createAgentThread(
+            workspace: workspace.id,
+            title: "claude token saver hook",
+            provider: .claude,
+            model: "claude-opus-4-7",
+            permissionMode: .supervised,
+            reasoningEffort: .medium
+        )
+
+        _ = try await router.sendAgentMessage(
+            thread: thread.id,
+            text: "check post tool hook env",
+            provider: nil,
+            model: nil,
+            permissionMode: nil,
+            reasoningEffort: nil
+        )
+
+        let request = try XCTUnwrap(capture.lastRequest)
+        XCTAssertEqual(request.environment["RC_TOKEN_SAVER_POST_TOOL_USE"], "1")
+        XCTAssertEqual(
+            request.environment["REMOTE_CODE_DISTILL_STATE_PATH"],
+            support.appendingPathComponent("Distill", isDirectory: true).appendingPathComponent("DistillCLIState.json").path,
+            "Claude SDK PostToolUse hook must read the same bearer-protected sidecar state as the managed distill CLI"
+        )
     }
 
     func test_stopAgentRunCancelsCoordinatorThreadRun() async throws {

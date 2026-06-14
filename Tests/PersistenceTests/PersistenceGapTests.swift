@@ -31,41 +31,41 @@ final class PersistenceGapTests: XCTestCase {
 
     // MARK: - T015: PromptHistoryStore hard cap and overflow trim
 
-    /// WHY: the 20-entry cap is the single piece of policy keeping the settings
-    /// table from growing unboundedly. If save() or load() lets more than 20
+    /// WHY: the PromptHistoryStore.limit cap is the single piece of policy keeping the settings
+    /// table from growing unboundedly. If save() or load() lets more than that many
     /// entries through, long-running apps accumulate unbounded JSON.
     func test_T015_promptHistory_cap_saveTrimsToBoundary() throws {
         let db = try makeDB()
         let store = PromptHistoryStore(db: db)
         let wid = WorkspaceID(UUID())
 
-        // Save 25 entries; only the last 20 must survive.
-        let entries = (0..<25).map { "prompt-\($0)" }
+        // Save more than the cap; only the newest capped slice must survive.
+        let entries = (0..<(PromptHistoryStore.limit + 5)).map { "prompt-\($0)" }
         store.save(entries, workspaceID: wid)
 
         let loaded = store.load(workspaceID: wid)
-        XCTAssertEqual(loaded.count, 20,
-            "save must cap history at 20 so the settings row cannot grow unboundedly")
-        XCTAssertEqual(loaded, Array(entries.suffix(20)),
-            "the retained entries must be the newest 20, not the oldest 20")
+        XCTAssertEqual(loaded.count, PromptHistoryStore.limit,
+            "save must cap history at PromptHistoryStore.limit so the settings row cannot grow unboundedly")
+        XCTAssertEqual(loaded, Array(entries.suffix(PromptHistoryStore.limit)),
+            "the retained entries must be the newest prompts, not the oldest prompts")
     }
 
     func test_T015_promptHistory_cap_loadTrimsLegacyOversizedBlob() throws {
-        // A blob written by a buggy or future build with 30 entries must be
-        // trimmed to 20 on load so the app never operates on an oversized buffer.
+        // A blob written by a buggy or future build over the cap must be
+        // trimmed on load so the app never operates on an oversized buffer.
         let db = try makeDB()
         let store = PromptHistoryStore(db: db)
         let wid = WorkspaceID(UUID())
 
-        let thirtyEntries = (0..<30).map { "p\($0)" }
-        let json = (try? JSONEncoder().encode(thirtyEntries))
+        let oversized = (0..<(PromptHistoryStore.limit + 10)).map { "p\($0)" }
+        let json = (try? JSONEncoder().encode(oversized))
             .flatMap { String(data: $0, encoding: .utf8) }!
         try SettingsRepository(db: db).set("agent_prompt_history.\(wid.value.uuidString)", json)
 
         let loaded = store.load(workspaceID: wid)
-        XCTAssertEqual(loaded.count, 20,
-            "load must apply suffix(20) so an oversized legacy blob is trimmed on first access")
-        XCTAssertEqual(loaded, Array(thirtyEntries.suffix(20)),
+        XCTAssertEqual(loaded.count, PromptHistoryStore.limit,
+            "load must apply suffix(PromptHistoryStore.limit) so an oversized legacy blob is trimmed on first access")
+        XCTAssertEqual(loaded, Array(oversized.suffix(PromptHistoryStore.limit)),
             "trimmed load must keep the newest entries, matching save semantics")
     }
 

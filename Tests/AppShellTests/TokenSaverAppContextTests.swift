@@ -18,6 +18,25 @@ final class TokenSaverAppContextTests: XCTestCase {
         }
     }
 
+    private actor CountingEchoRuntime: DistillRuntime {
+        private var count = 0
+
+        func distill(_ request: DistillRequest) async throws -> String {
+            count += 1
+            return request.input
+        }
+
+        var callCount: Int { count }
+    }
+
+    private struct FixedOutputRuntime: DistillRuntime {
+        let output: String
+
+        func distill(_ request: DistillRequest) async throws -> String {
+            output
+        }
+    }
+
     private actor FakeTokenSaverAccountUsageRefresher: TokenSaverAccountUsageRefreshing {
         let response: [AssistantAccountUsage]
         private(set) var requests: [TokenSaverAccountUsageRefreshRequest] = []
@@ -125,7 +144,7 @@ final class TokenSaverAppContextTests: XCTestCase {
         XCTAssertTrue(skillText.contains("P=proof"))
         let codexConfigText = try String(contentsOf: configURLs.codex)
         let claudeConfigText = try String(contentsOf: configURLs.claude)
-        XCTAssertTrue(codexConfigText.contains("Use `/distill` every time"))
+        XCTAssertTrue(codexConfigText.contains("Use `/distill` for every user-visible response"))
         XCTAssertTrue(codexConfigText.contains("RemoteCode-managed `distill` CLI"))
         XCTAssertTrue(claudeConfigText.contains("RemoteCodeDistillService"))
         XCTAssertFalse(codexConfigText.contains("dev/distill/src/cli.ts"))
@@ -187,7 +206,9 @@ final class TokenSaverAppContextTests: XCTestCase {
         process.standardInput = stdin
         process.standardOutput = stdout
         process.standardError = stderr
-        process.environment = CodexRunner.processEnvironment(overrides: [:])
+        process.environment = CodexRunner.processEnvironment(overrides: [
+            "REMOTE_CODE_DISTILL_STATE_PATH": stateURL.path
+        ])
 
         try process.run()
         stdin.fileHandleForWriting.write(Data("unit tests passed\nno failures\n".utf8))
@@ -442,6 +463,65 @@ final class TokenSaverAppContextTests: XCTestCase {
         XCTAssertGreaterThan(summary.averageSavedPerRun, 0, "the per-run average (média) must be computable from real data")
     }
 
+    func test_tokenSaverFollowUpCompressionRecordsPromptFollowupCacheState() async throws {
+        let appSupport = NSTemporaryDirectory() + "RC2TokenSaverFollowupLedger-" + UUID().uuidString
+        let context = try AppContext(channel: .debug, appSupportOverride: appSupport)
+        SettingsStore(db: context.db).update { $0.tokenSaverEnabled = true }
+
+        let configuration = try DistillServiceConfiguration(
+            authToken: "followup-token",
+            appSupportDirectory: appSupport
+        )
+        let scheduler = DistillScheduler(runtime: LocalDistillRuntime(), maxConcurrentRequests: 4)
+        let server = DistillHTTPServer(configuration: configuration, scheduler: scheduler)
+        let ready = try await server.start()
+        defer { server.stop() }
+        context.distillClientOverrideForTesting = DistillServiceClient(ready: ready, authToken: "followup-token")
+
+        let prompt = (1...40)
+            .map { "follow-up verbose prose segment \($0) with repeated diagnostic context and remediation detail" }
+            .joined(separator: "\n")
+
+        let compressed = await context.tokenSaverCompress(
+            prompt: prompt,
+            provider: .claude,
+            threadId: AgentThreadID(),
+            cacheState: "prompt_followup"
+        )
+
+        XCTAssertLessThan(compressed.count, prompt.count)
+        let stmt = try context.db.prepare("SELECT cache_state FROM token_saver_savings LIMIT 1;")
+        XCTAssertTrue(try stmt.step())
+        XCTAssertEqual(stmt.columnText(0), "prompt_followup")
+    }
+
+    func test_tokenSaverCompressionRejectsModelOutputThatDropsPinnedLiteral() async throws {
+        let appSupport = NSTemporaryDirectory() + "RC2TokenSaverLiteralGuard-" + UUID().uuidString
+        let context = try AppContext(channel: .debug, appSupportOverride: appSupport)
+        SettingsStore(db: context.db).update { $0.tokenSaverEnabled = true }
+
+        let configuration = try DistillServiceConfiguration(
+            authToken: "literal-token",
+            appSupportDirectory: appSupport
+        )
+        let scheduler = DistillScheduler(runtime: FixedOutputRuntime(output: "Short summary without the exact file reference."), maxConcurrentRequests: 2)
+        let server = DistillHTTPServer(configuration: configuration, scheduler: scheduler)
+        let ready = try await server.start()
+        defer { server.stop() }
+        context.distillClientOverrideForTesting = DistillServiceClient(ready: ready, authToken: "literal-token")
+
+        let prompt = (1...35)
+            .map { "diagnostic \($0): failure remains at /tmp/Foo.swift:4242 with verbose context and identifier build-\($0)" }
+            .joined(separator: "\n")
+
+        let compressed = await context.tokenSaverCompress(prompt: prompt, provider: .claude, threadId: AgentThreadID())
+
+        XCTAssertEqual(compressed, prompt,
+                       "dropping a pinned file:line literal must reject model compression and fail open")
+        XCTAssertEqual(try context.tokenSaverSavingsRepo.summary().totalRuns, 0,
+                       "rejected lossy output must not fabricate savings")
+    }
+
     func test_tokenSaverGateSkipsBelowFloorPrompt() async throws {
         let appSupport = NSTemporaryDirectory() + "RC2GateFloor-" + UUID().uuidString
         let context = try AppContext(channel: .debug, appSupportOverride: appSupport)
@@ -453,6 +533,43 @@ final class TokenSaverAppContextTests: XCTestCase {
         XCTAssertLessThan(small.count, 2_000)
         let out = await context.tokenSaverCompress(prompt: small, provider: .claude, threadId: AgentThreadID())
         XCTAssertEqual(out, small, "below floor => returned verbatim, no compression")
+    }
+
+    func test_tokenSaverSkipSetAvoidsRepeatingKnownNoWinPrompt() async throws {
+        let appSupport = NSTemporaryDirectory() + "RC2PromptSkipSet-" + UUID().uuidString
+        let context = try AppContext(channel: .debug, appSupportOverride: appSupport)
+        SettingsStore(db: context.db).update { $0.tokenSaverEnabled = true }
+
+        let configuration = try DistillServiceConfiguration(
+            authToken: "skip-set-token",
+            appSupportDirectory: appSupport
+        )
+        let runtime = CountingEchoRuntime()
+        let scheduler = DistillScheduler(
+            runtime: runtime,
+            maxConcurrentRequests: 2,
+            resultCacheCapacity: 0
+        )
+        let server = DistillHTTPServer(configuration: configuration, scheduler: scheduler)
+        let ready = try await server.start()
+        defer { server.stop() }
+        context.distillClientOverrideForTesting = DistillServiceClient(ready: ready, authToken: "skip-set-token")
+
+        let prompt = (1...45)
+            .map { "unique non-compressible instruction line \($0) with path /tmp/file-\($0).swift and code \($0)" }
+            .joined(separator: "\n")
+        XCTAssertGreaterThan(prompt.count, 2_000)
+
+        let first = await context.tokenSaverCompress(prompt: prompt, provider: .claude, threadId: AgentThreadID())
+        let second = await context.tokenSaverCompress(prompt: prompt, provider: .claude, threadId: AgentThreadID())
+
+        XCTAssertEqual(first, prompt)
+        XCTAssertEqual(second, prompt)
+        let callCount = await runtime.callCount
+        XCTAssertEqual(callCount, 1,
+                       "a known no-win prompt should be remembered locally instead of paying the sidecar again")
+        XCTAssertEqual(try context.tokenSaverSavingsRepo.summary().totalRuns, 0,
+                       "no-win skip-set entries must not fabricate savings rows")
     }
 
     func test_tokenSaverDedupsRepeatedBlockEvenWithoutModelService() async throws {
@@ -472,6 +589,65 @@ final class TokenSaverAppContextTests: XCTestCase {
         XCTAssertTrue(out.contains("⟪identical to block #"), "model-readable dedup pointer present (non-lossy)")
         XCTAssertTrue(out.contains(block), "the first occurrence stays inline — no information lost")
         XCTAssertEqual(try context.tokenSaverSavingsRepo.summary().totalRuns, 1, "the dedup saving is recorded")
+    }
+
+    func test_tokenSaverNearDedupsVolatileOnlyBlocksWithCCRHandleWithoutModelService() async throws {
+        let appSupport = NSTemporaryDirectory() + "RC2NearDedup-" + UUID().uuidString
+        let context = try AppContext(channel: .debug, appSupportOverride: appSupport)
+        SettingsStore(db: context.db).update { $0.tokenSaverEnabled = true }
+
+        let stableTail = String(repeating: " stable auth diagnostic payload", count: 180)
+        let first = """
+        2026-06-13T10:20:30Z pid=1234 crashed at 0x0000000abcdef123
+        ERROR auth failed in LoginView.swift:88\(stableTail)
+        """
+        let second = """
+        2026-06-13T10:20:31Z pid=5678 crashed at 0x0000000abcdef999
+        ERROR auth failed in LoginView.swift:88\(stableTail)
+        """
+        let prompt = "Task intro.\n\n\(first)\n\n\(second)\n\nEnd."
+        XCTAssertGreaterThan(prompt.utf8.count, 8_192)
+
+        let out = await context.tokenSaverCompress(prompt: prompt, provider: .claude, threadId: AgentThreadID())
+
+        XCTAssertLessThan(out.count, prompt.count)
+        XCTAssertTrue(out.contains("same as block #1 above except"))
+        XCTAssertTrue(out.contains("pid=1234"))
+        XCTAssertTrue(out.contains("pid=5678"))
+        let markerRange = try XCTUnwrap(out.range(of: #"\[\[rc:[0-9a-f]+\]\]"#, options: .regularExpression))
+        let marker = String(out[markerRange])
+        XCTAssertEqual(try ReversibleContentStore(db: context.db).retrieveText(marker), prompt,
+                       "large near-dup prompt must retain a byte-exact CCR recovery handle")
+    }
+
+    func test_tokenSaverDiffPromptUsesCCRBackedWindowWithoutModelService() async throws {
+        let appSupport = NSTemporaryDirectory() + "RC2DiffWindow-" + UUID().uuidString
+        let context = try AppContext(channel: .debug, appSupportOverride: appSupport)
+        SettingsStore(db: context.db).update { $0.tokenSaverEnabled = true }
+
+        var lines = ["Review this patch:", "diff --git a/Sources/App.swift b/Sources/App.swift", "@@ -1,90 +1,90 @@"]
+        for i in 0..<36 {
+            lines.append(" context before \(i) with verbose unchanged implementation detail that should not be re-injected into the provider prompt")
+        }
+        lines.append("-let retryLimit = 2")
+        lines.append("+let retryLimit = 4")
+        for i in 0..<36 {
+            lines.append(" context after \(i) with verbose unchanged implementation detail that should not be re-injected into the provider prompt")
+        }
+        let prompt = lines.joined(separator: "\n")
+        XCTAssertGreaterThan(prompt.count, 2_000)
+
+        let out = await context.tokenSaverCompress(prompt: prompt, provider: .claude, threadId: AgentThreadID())
+
+        XCTAssertLessThan(out.count, prompt.count, "diff prompt re-injection should send the windowed diff, not the full patch")
+        XCTAssertTrue(out.contains("-let retryLimit = 2"))
+        XCTAssertTrue(out.contains("+let retryLimit = 4"))
+        XCTAssertTrue(out.contains("unchanged lines"), "unchanged diff context must collapse to an explicit marker")
+        let markerRange = try XCTUnwrap(out.range(of: #"\[\[rc:[0-9a-f]+\]\]"#, options: .regularExpression))
+        let marker = String(out[markerRange])
+        XCTAssertEqual(try ReversibleContentStore(db: context.db).retrieveText(marker), prompt,
+                       "the full original prompt/diff must be recoverable byte-exact from the CCR marker")
+        XCTAssertEqual(try context.tokenSaverSavingsRepo.summary().totalRuns, 1, "deterministic diff windowing savings are recorded")
     }
 
     func test_sessionLearnMinesFailedRunIntoRegionWhenEnabled() throws {
@@ -512,6 +688,37 @@ final class TokenSaverAppContextTests: XCTestCase {
         SettingsStore(db: context.db).update { $0.sessionLearnEnabled = true }
         context.recordSessionLearnFromRun(runId: run.id, status: .completed)
         XCTAssertEqual(try SessionLearnRegion(fileURL: learnFile).rules().count, 0)
+    }
+
+    func test_sessionLearnUsesParsedInputTokensForExpensiveRunGate() throws {
+        let appSupport = NSTemporaryDirectory() + "RC2SessionLearnTokens-" + UUID().uuidString
+        let context = try AppContext(channel: .debug, appSupportOverride: appSupport)
+        SettingsStore(db: context.db).update { $0.sessionLearnEnabled = true }
+        let learnFile = URL(fileURLWithPath: appSupport).appendingPathComponent("AGENTS.md")
+        context.sessionLearnInstructionFilesOverrideForTesting = [learnFile]
+
+        let thread = AgentThread(title: "t", provider: .claude, model: "m")
+        try context.threadRepo.upsert(thread)
+        let run = AgentRun(
+            threadId: thread.id,
+            provider: .claude,
+            model: "m",
+            status: .completed,
+            errorMessage: "near context limit: replayed redundant tool output"
+        )
+        try context.runRepo.upsert(run)
+
+        context.coordinator.onAssistantEvent?(
+            .tokenUsage(AssistantTokenUsage(inputTokens: 80_000, outputTokens: 10, totalTokens: 80_010)),
+            thread.id,
+            run.id
+        )
+        context.recordSessionLearnFromRun(runId: run.id, status: .completed)
+
+        let rules = try SessionLearnRegion(fileURL: learnFile).rules()
+        XCTAssertEqual(rules.count, 1,
+                       "expensive successful runs must use parsed provider input tokens instead of the old hardcoded zero")
+        XCTAssertTrue(rules[0].contains("replayed redundant tool output"))
     }
 
     func test_tokenSaverHumanizesSR1FinalResponseThroughDistillClientInUserLanguage() async throws {
@@ -819,7 +1026,7 @@ final class TokenSaverAppContextTests: XCTestCase {
         let executable = appSupport.appendingPathComponent("FakeRemoteCodeDistillService")
         let script = """
         #!/bin/sh
-        printf '%s\\n' '{"event":"ready","base_url":"http://127.0.0.1:18181","host":"127.0.0.1","port":18181,"pid":12345,"protocol":1,"runtime":"mlx","model_id":"samuelfaj/distill-1.7B-4bit-MLX","max_concurrent_requests":8,"max_queue_depth":64}'
+        printf '%s\\n' '{"event":"ready","base_url":"http://127.0.0.1:18181","host":"127.0.0.1","port":18181,"pid":12345,"protocol":1,"runtime":"mlx","model_id":"\(DistillApprovedModel.id)","max_concurrent_requests":8,"max_queue_depth":64}'
         exec 1>/dev/null
         sleep 20
         """
@@ -882,7 +1089,7 @@ final class TokenSaverAppContextTests: XCTestCase {
         let executable = appSupport.appendingPathComponent("FakeRemoteCodeDistillService")
         let script = """
         #!/bin/sh
-        printf '%s\\n' '{"event":"ready","base_url":"http://127.0.0.1:18182","host":"127.0.0.1","port":18182,"pid":12346,"protocol":1,"runtime":"mlx","model_id":"samuelfaj/distill-1.7B-4bit-MLX","max_concurrent_requests":8,"max_queue_depth":64}'
+        printf '%s\\n' '{"event":"ready","base_url":"http://127.0.0.1:18182","host":"127.0.0.1","port":18182,"pid":12346,"protocol":1,"runtime":"mlx","model_id":"\(DistillApprovedModel.id)","max_concurrent_requests":8,"max_queue_depth":64}'
         sleep 20
         """
         try Data(script.utf8).write(to: executable)
@@ -975,7 +1182,7 @@ final class TokenSaverAppContextTests: XCTestCase {
         let executable = appSupport.appendingPathComponent("FakeRemoteCodeDistillService")
         let script = """
         #!/bin/sh
-        printf '%s\\n' '{"event":"ready","base_url":"http://127.0.0.1:18183","host":"127.0.0.1","port":18183,"pid":12347,"protocol":1,"runtime":"mlx","model_id":"samuelfaj/distill-1.7B-4bit-MLX","max_concurrent_requests":8,"max_queue_depth":64}'
+        printf '%s\\n' '{"event":"ready","base_url":"http://127.0.0.1:18183","host":"127.0.0.1","port":18183,"pid":12347,"protocol":1,"runtime":"mlx","model_id":"\(DistillApprovedModel.id)","max_concurrent_requests":8,"max_queue_depth":64}'
         sleep 0.1
         printf '%s\\n' '{"event":"savings_recorded","provider":"codex","mode":"command-output","input_tokens":30,"output_tokens":10,"saved_tokens":20}'
         sleep 20

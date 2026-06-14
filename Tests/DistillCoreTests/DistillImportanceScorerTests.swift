@@ -29,4 +29,22 @@ final class DistillImportanceScorerTests: XCTestCase {
         XCTAssertTrue(r.compacted.contains("noise line 60"), "the last line (most recent) is kept")
         XCTAssertTrue(r.compacted.contains("noise line 55"), "the tail window is kept")
     }
+
+    func test_fitInputUsesImportanceScorerBeforeBlindHeadTailTruncation() {
+        var lines = (1...220).map { "INFO routine setup line \($0)" }
+        lines[120] = "ERROR payment flow failed at Sources/Billing/Checkout.swift:37 expected 2 got 1"
+        lines[219] = "FINAL STATUS failed"
+        let text = lines.joined(separator: "\n")
+
+        let fitted = MLXDistillRuntime.fitInput(text, maxCharacters: 1_200)
+
+        XCTAssertLessThanOrEqual(fitted.count, 1_200)
+        XCTAssertTrue(
+            fitted.contains("ERROR payment flow failed at Sources/Billing/Checkout.swift:37 expected 2 got 1"),
+            "middle load-bearing error lines must survive fitting"
+        )
+        XCTAssertTrue(fitted.contains("FINAL STATUS failed"), "tail status must survive fitting")
+        XCTAssertTrue(fitted.contains("lines elided"), "low-signal middle bulk should be collapsed before model prompt construction")
+        XCTAssertFalse(fitted.contains("chars truncated"), "scored fitting should avoid blind head/tail truncation when it fits")
+    }
 }

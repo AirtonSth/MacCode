@@ -19,11 +19,14 @@ public enum DistillImportanceScorer {
         guard lines.count > maxKeep else { return Result(compacted: text, droppedLines: 0) }
 
         let lastStart = max(0, lines.count - keepLast)
-        // Indices to keep: high score OR within the last-N tail.
+        // Indices to keep: floor lines (error/fatal/file:line) and the last-N tail are
+        // kept UNCONDITIONALLY (I6.2) — they are exempt from the maxKeep budget so a
+        // burst of error lines can never push a real error out. Everything else competes
+        // for the remaining budget by score.
         var keep = Set<Int>()
         var scored: [(index: Int, score: Int)] = []
         for (i, line) in lines.enumerated() {
-            if i >= lastStart { keep.insert(i) }
+            if i >= lastStart || isFloorLine(line) { keep.insert(i) }
             scored.append((i, score(line, index: i, total: lines.count)))
         }
         // Fill remaining budget with the top-scoring non-tail lines.
@@ -53,14 +56,28 @@ public enum DistillImportanceScorer {
     private static func score(_ line: String, index: Int, total: Int) -> Int {
         let lower = line.lowercased()
         var s = 0
-        if lower.contains("error") || lower.contains("exception") || lower.contains("fatal")
-            || lower.contains("panic") || lower.contains("traceback") || lower.contains(" fail") {
-            s += 10
-        }
+        if isFloorLine(line) { s += 10 }
         if lower.contains("warn") { s += 4 }
         if line.range(of: #"[\w./~-]+\.[A-Za-z0-9]+:\d+"#, options: .regularExpression) != nil { s += 8 } // file:line
         if line.range(of: #"(^|\s)(/|\./|~/)[\w./-]+"#, options: .regularExpression) != nil { s += 3 }     // a path
         if index < 3 { s += 2 } // a little weight to the head (command echo / first lines)
         return s
+    }
+
+    /// A line that must never be silently dropped (I6.2): error/exception/fatal/panic/
+    /// traceback/fail lines and any `file:line` reference, including Python (`File "x",
+    /// line N`) and JS (`at fn (file:line)`) stack frames (I6.3).
+    static func isFloorLine(_ line: String) -> Bool {
+        let lower = line.lowercased()
+        if lower.contains("error") || lower.contains("exception") || lower.contains("fatal")
+            || lower.contains("panic") || lower.contains("traceback") || lower.contains(" fail")
+            || lower.hasPrefix("fail") {
+            return true
+        }
+        // file.ext:line  |  Python: File "...", line N  |  JS: at ... (file:line)
+        if line.range(of: #"[\w./~-]+\.[A-Za-z0-9]+:\d+"#, options: .regularExpression) != nil { return true }
+        if line.range(of: #"File "[^"]+", line \d+"#, options: .regularExpression) != nil { return true }
+        if line.range(of: #"^\s*at .+\(.+:\d+(?::\d+)?\)"#, options: .regularExpression) != nil { return true }
+        return false
     }
 }

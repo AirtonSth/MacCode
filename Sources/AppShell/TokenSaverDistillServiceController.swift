@@ -1,4 +1,5 @@
 import AgentRuntime
+import CoreModel
 import DistillCore
 import Foundation
 import Persistence
@@ -664,14 +665,18 @@ public final class TokenSaverDistillServiceController {
         }
 
         let token = UUID().uuidString
+        let manifest = TokenSaverModelInstaller(appSupportDirectory: appSupportDirectory).loadManifest()
+        let model = manifest.flatMap {
+            TokenSaverApprovedModels.approved(id: $0.modelID, url: $0.modelURL, runtime: $0.runtime)
+        } ?? TokenSaverApprovedModels.defaultModel
         let arguments = [
             "--auth-token", token,
             "--app-support-dir", appSupportDirectory.path,
             "--host", "127.0.0.1",
             "--port", "0",
-            "--runtime", DistillApprovedModel.runtime,
-            "--model-id", DistillApprovedModel.id,
-            "--model-url", DistillApprovedModel.url,
+            "--runtime", model.runtime,
+            "--model-id", model.id,
+            "--model-url", model.url,
             "--max-concurrent-requests", "8",
             "--max-queue-depth", "64",
             "--idle-timeout-ms", "300000"

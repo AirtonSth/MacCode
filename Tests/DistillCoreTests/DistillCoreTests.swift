@@ -23,6 +23,24 @@ final class DistillCoreTests: XCTestCase {
         }
     }
 
+    private actor CountingRuntime: DistillRuntime {
+        private var count = 0
+        let outputBuilder: @Sendable (Int, DistillRequest) -> String
+
+        init(outputBuilder: @escaping @Sendable (Int, DistillRequest) -> String = { count, request in
+            "S cached-\(count) \(request.input)"
+        }) {
+            self.outputBuilder = outputBuilder
+        }
+
+        func distill(_ request: DistillRequest) async throws -> String {
+            count += 1
+            return outputBuilder(count, request)
+        }
+
+        var callCount: Int { count }
+    }
+
     /// Blocks every `distill` until released and counts `reclaimIdleMemory` calls, so a
     /// test can prove the scheduler reclaims GPU memory exactly when it drains to idle.
     private final class ReclaimTrackingRuntime: DistillRuntime, @unchecked Sendable {
@@ -156,6 +174,103 @@ final class DistillCoreTests: XCTestCase {
         XCTAssertEqual(queued, 0)
     }
 
+    func test_schedulerCachesAcceptedOutputByFullFingerprint() async throws {
+        let runtime = CountingRuntime()
+        let scheduler = DistillScheduler(runtime: runtime, maxConcurrentRequests: 1, resultCacheTTLSeconds: 60, resultCacheCapacity: 8)
+        let first = DistillRequest(
+            id: UUID(uuidString: "11111111-1111-1111-1111-111111111111")!,
+            mode: .longText,
+            input: "same large payload",
+            question: "compress",
+            maxOutputCharacters: 400
+        )
+        let second = DistillRequest(
+            id: UUID(uuidString: "22222222-2222-2222-2222-222222222222")!,
+            mode: .longText,
+            input: "same large payload",
+            question: "compress",
+            maxOutputCharacters: 400
+        )
+
+        let firstResponse = try await scheduler.submit(first)
+        let secondResponse = try await scheduler.submit(second)
+
+        XCTAssertEqual(firstResponse.output, "S cached-1 same large payload")
+        XCTAssertEqual(secondResponse.output, firstResponse.output,
+                       "identical mode/input/question/output budget must reuse the accepted result instead of paying the runtime again")
+        XCTAssertEqual(secondResponse.requestID, second.id,
+                       "a cache hit must still be wrapped as a response to the current request")
+        let callCount = await runtime.callCount
+        let cacheCount = await scheduler.resultCacheCount
+        XCTAssertEqual(callCount, 1)
+        XCTAssertEqual(cacheCount, 1)
+    }
+
+    func test_schedulerResultCacheKeyIncludesQuestionAndOutputBudget() async throws {
+        let runtime = CountingRuntime()
+        let scheduler = DistillScheduler(runtime: runtime, maxConcurrentRequests: 1, resultCacheTTLSeconds: 60, resultCacheCapacity: 8)
+
+        _ = try await scheduler.submit(DistillRequest(mode: .commandOutput, input: "alpha\nbeta", question: "Keep alpha only.", maxOutputCharacters: 400))
+        _ = try await scheduler.submit(DistillRequest(mode: .commandOutput, input: "alpha\nbeta", question: "Keep beta only.", maxOutputCharacters: 400))
+        _ = try await scheduler.submit(DistillRequest(mode: .commandOutput, input: "alpha\nbeta", question: "Keep alpha only.", maxOutputCharacters: 200))
+
+        let callCount = await runtime.callCount
+        let cacheCount = await scheduler.resultCacheCount
+        XCTAssertEqual(callCount, 3,
+                       "question and maxOutputCharacters are part of the fingerprint so stale answers cannot cross contracts")
+        XCTAssertEqual(cacheCount, 3)
+    }
+
+    func test_resultCacheKeyIncludesModeModelRevisionAndPipelineVersion() {
+        let base = DistillRequest(
+            mode: .commandOutput,
+            input: "alpha\nbeta",
+            question: "Keep alpha only.",
+            maxOutputCharacters: 400
+        )
+        let differentMode = DistillRequest(
+            mode: .longText,
+            input: "alpha\nbeta",
+            question: "Keep alpha only.",
+            maxOutputCharacters: 400
+        )
+
+        let key = DistillResultCacheKey(request: base, modelRevision: "model-a", pipelineVersion: "pipeline-v1")
+        XCTAssertNotEqual(
+            key,
+            DistillResultCacheKey(request: differentMode, modelRevision: "model-a", pipelineVersion: "pipeline-v1"),
+            "mode is part of the cache key so command-output and prose contracts cannot share answers"
+        )
+        XCTAssertNotEqual(
+            key,
+            DistillResultCacheKey(request: base, modelRevision: "model-b", pipelineVersion: "pipeline-v1"),
+            "model revision is part of the cache key so model bumps invalidate stale hits"
+        )
+        XCTAssertNotEqual(
+            key,
+            DistillResultCacheKey(request: base, modelRevision: "model-a", pipelineVersion: "pipeline-v2"),
+            "pipelineVersion is part of the cache key so crusher or literal-preservation changes invalidate stale hits"
+        )
+    }
+
+    func test_schedulerDoesNotCacheOutputsWithUnvalidatedRetrieveHandles() async throws {
+        let runtime = CountingRuntime { count, _ in
+            "S handle-output-\(count) [[rc:abc123]]"
+        }
+        let scheduler = DistillScheduler(runtime: runtime, maxConcurrentRequests: 1, resultCacheTTLSeconds: 60, resultCacheCapacity: 8)
+        let request = DistillRequest(mode: .longText, input: "payload with lossy handle source", maxOutputCharacters: 400)
+
+        let first = try await scheduler.submit(request)
+        let second = try await scheduler.submit(request)
+
+        XCTAssertNotEqual(first.output, second.output,
+                          "outputs with retrieve handles must not be served from cache without a live handle validation path")
+        let callCount = await runtime.callCount
+        let cacheCount = await scheduler.resultCacheCount
+        XCTAssertEqual(callCount, 2)
+        XCTAssertEqual(cacheCount, 0)
+    }
+
     func test_commandOutputRuntimeReturnsOnlyRequestedFormat() async throws {
         let scheduler = DistillScheduler(runtime: LocalDistillRuntime(), maxConcurrentRequests: 2)
         let response = try await scheduler.submit(DistillRequest(
@@ -232,6 +347,97 @@ final class DistillCoreTests: XCTestCase {
         XCTAssertEqual(MLXDistillRuntime.deterministicCommandOutput(for: cwdAndFiles), "CWD=/tmp; FILES=index.html, notes.txt")
     }
 
+    func test_mlxRuntimeDoesNotBypassPassFailWithoutEvidence() throws {
+        let request = DistillRequest(
+            mode: .commandOutput,
+            input: "bypass token unchanged\npassphrase accepted\nSources/error_handler.swift",
+            question: "Did tests pass? Return PASS or FAIL only.",
+            maxOutputCharacters: 200
+        )
+
+        XCTAssertNil(MLXDistillRuntime.deterministicCommandOutput(for: request),
+                     "substring matches like bypass/passphrase/error_handler must not bypass the model as PASS/FAIL evidence")
+        XCTAssertFalse(LocalDistillRuntime.commandOutputFallback(
+            input: request.input,
+            question: request.question,
+            maxOutputCharacters: 200
+        ).contains("Insufficient information"))
+    }
+
+    func test_mlxRuntimeDoesNotBypassJSONOnlyWithNoise() throws {
+        let request = DistillRequest(
+            mode: .commandOutput,
+            input: "{\"ok\":true}\nwarning: extra stderr",
+            question: "Return JSON only.",
+            maxOutputCharacters: 200
+        )
+
+        XCTAssertNil(MLXDistillRuntime.deterministicCommandOutput(for: request),
+                     "JSON-only deterministic bypass must require parseable JSON or JSONL, not JSON plus noise")
+    }
+
+    func test_mlxRuntimeDoesNotBypassExistsMissingWithoutCodeToken() throws {
+        let request = DistillRequest(
+            mode: .commandOutput,
+            input: "file is present",
+            question: "Return EXISTS or MISSING.",
+            maxOutputCharacters: 200
+        )
+
+        XCTAssertNil(MLXDistillRuntime.deterministicCommandOutput(for: request),
+                     "EXISTS/MISSING deterministic bypass must require an explicit code= token")
+    }
+
+    func test_mlxRuntimeCommandOutputClassifierCanExpandKnownContracts() throws {
+        let request = DistillRequest(
+            mode: .commandOutput,
+            input: "foo.html\nbar.txt\n",
+            question: "Extract relevant artifacts.",
+            maxOutputCharacters: 200
+        )
+        let classifier: CommandOutputIntentClassifier = { _ in
+            CommandOutputIntentDecision(intent: .pathsOnly, confidence: 0.94)
+        }
+
+        XCTAssertEqual(
+            MLXDistillRuntime.deterministicCommandOutput(for: request, classifier: classifier),
+            "foo.html\nbar.txt",
+            "a confident encoder classifier can route to a self-validating deterministic extractor"
+        )
+    }
+
+    func test_mlxRuntimeCommandOutputClassifierLowConfidenceFallsBackToHeuristic() throws {
+        let request = DistillRequest(
+            mode: .commandOutput,
+            input: "foo.html\nbar.txt\n",
+            question: "Extract relevant artifacts.",
+            maxOutputCharacters: 200
+        )
+        let classifier: CommandOutputIntentClassifier = { _ in
+            CommandOutputIntentDecision(intent: .pathsOnly, confidence: 0.20)
+        }
+
+        XCTAssertNil(
+            MLXDistillRuntime.deterministicCommandOutput(for: request, classifier: classifier),
+            "low-confidence classifier output must not bypass MLX when the heuristic has no known contract"
+        )
+    }
+
+    func test_commandOutputFailingNamesReportsHiddenCount() async throws {
+        let scheduler = DistillScheduler(runtime: LocalDistillRuntime(), maxConcurrentRequests: 2)
+        let response = try await scheduler.submit(DistillRequest(
+            mode: .commandOutput,
+            input: "TestA failed\nTestB error\nTestC failed\nTestD failed",
+            question: "Did tests pass? Return PASS or FAIL, followed by failing test names if any.",
+            maxOutputCharacters: 300
+        ))
+
+        XCTAssertTrue(response.output.hasPrefix("FAIL "))
+        XCTAssertTrue(response.output.contains("TestA failed"))
+        XCTAssertTrue(response.output.contains("+1 more"),
+                      "deterministic failing-name output must disclose when additional failures were omitted")
+    }
+
     func test_commandOutputSavingsUseEstimatedTokensNotCharacterLength() {
         let request = DistillRequest(
             mode: .commandOutput,
@@ -288,6 +494,28 @@ final class DistillCoreTests: XCTestCase {
         XCTAssertEqual(record?.inputTokens, 7648)
         XCTAssertEqual(record?.outputTokens, 99)
         XCTAssertEqual(record?.savedTokens, 7549, "saved tokens must equal the published token delta, not the character delta")
+    }
+
+    func test_commandOutputSavingsCanUseHookedToolCacheState() {
+        let request = DistillRequest(
+            mode: .commandOutput,
+            input: String(repeating: "line\n", count: 100),
+            provider: "claude",
+            recordSavings: true,
+            cacheState: "tool_output_hooked"
+        )
+        let response = DistillResponse(
+            requestID: request.id,
+            output: "summary",
+            inputCharacters: request.input.count,
+            inputTokens: 100,
+            outputTokens: 10
+        )
+
+        let record = DistillSavingsCalculator.record(for: request, response: response)
+
+        XCTAssertEqual(record?.cacheState, "tool_output_hooked",
+                       "I2: SDK PostToolUse compression must be measurable separately from one-shot pipe savings")
     }
 
     func test_sr1HumanizeSavingsUseEstimatedTokensOfHumanVersusSR1() {

@@ -134,6 +134,10 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
     }
 
     public func respondToUserInput(threadId: AgentThreadID, requestId: String, text: String) throws {
+        try respondToUserInput(threadId: threadId, requestId: requestId, verbatimText: text, outboundText: text)
+    }
+
+    public func respondToUserInput(threadId: AgentThreadID, requestId: String, verbatimText: String, outboundText: String) throws {
         lock.lock()
         guard let session = sessions[threadId] else {
             lock.unlock()
@@ -145,12 +149,12 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
         }
         let usesBridgeCallback = session.bridgeUserInputIds.remove(requestId) != nil
         lock.unlock()
-        let resolved = AssistantEvent.userInputResolved(requestId: requestId, answer: text)
+        let resolved = AssistantEvent.userInputResolved(requestId: requestId, answer: verbatimText)
         record(resolved, session: session)
         if usesBridgeCallback {
-            try write(["type": "user_input_response", "request_id": requestId, "text": text], to: session)
+            try write(["type": "user_input_response", "request_id": requestId, "text": verbatimText], to: session)
         } else {
-            try write(["type": "rc_turn", "prompt": text], to: session)
+            try write(["type": "rc_turn", "prompt": outboundText], to: session)
         }
         emit(.event(resolved), session: session)
     }

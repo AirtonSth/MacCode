@@ -51,7 +51,7 @@ public enum AgentSkillUninstallResult: String, Sendable, Equatable {
 public final class AgentSkillInstaller: @unchecked Sendable {
     public static let distillSkillID = "distill"
     public static let distillSourceURL = "https://github.com/samuelfaj/distill/blob/main/skills/distill/SKILL.md"
-    public static let distillLocalVersion = "2"
+    public static let distillLocalVersion = "4"
     public static let distillInstructionsBeginMarker = "<!-- distill skill: begin -->"
     public static let distillInstructionsEndMarker = "<!-- distill skill: end -->"
     public static let distillCLIBeginMarker = "# RemoteCode managed distill CLI: begin"
@@ -94,42 +94,32 @@ public final class AgentSkillInstaller: @unchecked Sendable {
     - Do not output a rewritten/compressed version of the latest user prompt unless the user explicitly asks to compress text.
     - Emit `Dict:` early when aliases or prefixes matter.
 
+    Command-output policy:
+    - For non-interactive, non-TUI shell/tool commands with output above ~30 lines or ~2KB, pipe through the RemoteCode-managed `distill` CLI with an explicit extraction prompt.
+    - Never call Node, tsx, npm, bun, or a source-checkout CLI for `distill`.
+    - Skip the pipe only when exact raw output is required, output is interactive/TUI, or the local RemoteCode service is unavailable; report that fallback.
+    - If a summary includes `[[rc:<handle>]]`, recover exact bytes with `distill retrieve <handle>`.
+    - Wait for `distill` before continuing.
+
+    Examples:
+    - `bun test 2>&1 | distill "Did tests pass? Return PASS or FAIL, followed by failing test names if any."`
+    - `git diff | distill "What changed? Return only files changed and one-line summary for each."`
+    - `terraform plan 2>&1 | distill "Is this safe? Return SAFE, REVIEW, or UNSAFE, followed by risky changes."`
+
     Source reference:
     - https://github.com/samuelfaj/distill/blob/main/skills/distill/SKILL.md
     """
 
     public static let distillAgentInstructionsTemplate = """
     <!-- distill skill: begin -->
-    CRITICAL: Always communicate with the user in `/distill` compressed language in English: Military English + AR-0/AR-1, short command lines, explicit constraints, explicit pass criteria, and no filler. Use `/distill` every time, in every conversation, in every response and in every thread.
-    Do not return a rewritten/compressed copy of the user's prompt. Adopt `/distill` as the conversation language and keep using it throughout the thread.
-    Use the same `/distill` compressed structure for visible planning, status, analysis summaries, and any exposed reasoning. Keep hidden chain-of-thought private; never reveal it.
+    CRITICAL: Use `/distill` for every user-visible response: English Military English + AR-0/AR-1, short command lines, explicit constraints, explicit pass criteria, no filler.
     Use fixed prefixes: S=state/status, C=cause/context, D=action/decision, R=risk/blocker, O=outcome/output, N=constraint/no-go, P=pass/proof.
-    Every thread must use DSL/Dict when it helps compression. Start with `Dict:` when meanings are not already shared.
-    Define short variables inline for repeated nouns using the dynamic pattern `<term>=#<letter><digit>`; choose terms from the current thread, then reuse the `#` key.
-    There is no fixed variable list. The model must pick terms that repeat or are likely to repeat.
-    Inline variables are thread-local by default. Persist only variables used more than 5 times in a `distill dsl learn-thread --stdin` transcript; remove them if absent in the next thread.
-    Variable keys are `#` plus letter+digit. Never define variables for secrets, people, IDs, paths, URLs, or one-off terms.
-    Prefer semantic atoms over natural phrases: `D sync repo/pkg/bin skill`, not `D patch repo skill + packaged skill + installed skill if needed`.
-    Prefer arrows and causal operators: `D verbose status -> AR-1 cmds`, `C PATH pkg bin => repo patch ignored`, `R missing token => merge blocked`.
-    Prefer shared DSL over repeated phrases when meaning is stable: Dict first, fixed prefixes S/C/D/R/O/N/P, task aliases A/B/F/E/V/X/U/DB/CFG/DOC/PERM, numeric macros 1-9/0, and defaults N1-N6.
-    Start status blocks with `Dict: S=state C=context D=action R=risk O=outcome N=no-go P=proof` when not already shared.
-    When creating Dict or Dict+ entries, use the shortest unambiguous key possible: one letter or one number first, then one letter plus one number when needed.
-    Create Dict/Dict+ only for terms that repeat or are likely to repeat. Do not grow DSL for rare, ambiguous, sensitive, or temporary terms.
-    Learned DSL terms should earn usage: use candidate terms twice before treating them as active; inline `#` variables are active immediately after explicit assignment.
-    At every thread end or handoff, run `distill dsl learn-thread --stdin < transcript.txt>` when transcript export is available.
-    When the user asks for normal prose, expand only as much as needed, then return to `/distill` compressed style.
-    For every non-interactive, non-TUI shell/tool command, pipe output through the RemoteCode-managed `distill` CLI with an explicit prompt. This CLI is installed by RemoteCode and proxies to the local macOS `RemoteCodeDistillService` MLX LLM.
-    Never invoke Node, tsx, npm, bun, or a source-checkout CLI for `distill`.
-    If the managed `distill` CLI reports that the local RemoteCode service is unavailable, continue with raw output and report that Token Saver local LLM was unavailable.
-    Skip `| distill` only when exact raw output is required, when the local service is unavailable, or when `distill` would break an interactive/TUI workflow.
-    Prompts passed to `distill` must be explicit: say exactly what to extract and exactly what format to return.
-    Examples:
-    bun test 2>&1 | distill "Did tests pass? Return PASS or FAIL, followed by failing test names if any."
-    git diff | distill "What changed? Return only files changed and one-line summary for each."
-    terraform plan 2>&1 | distill "Is this safe? Return SAFE, REVIEW, or UNSAFE, followed by risky changes."
-    Hard rule: ALWAYS pipe the output of build, test, lint, install, git, grep, find, cat, and curl commands through `distill` whenever the raw output exceeds ~30 lines or ~2KB. Only the distilled result needs to enter the conversation; the raw bytes are wasted tokens.
-    The distilled result may append a `[[rc:<handle>]]` marker. If you later need an exact detail the summary dropped (a precise line, error string, number, or path), recover the byte-exact original with `distill retrieve <handle>`. You MAY retrieve at any time; nothing is lost.
-    Wait for `distill` to finish before continuing.
+    Use Dict/inline `#` variables only when they reduce repetition. Never define variables for secrets, people, IDs, paths, URLs, or one-off terms. Keep hidden chain-of-thought private.
+    Do not return a rewritten/compressed copy of the user's prompt unless explicitly asked to compress text.
+    For long non-interactive command output, ALWAYS pipe build, test, lint, install, git, grep, find, cat, and curl output through the RemoteCode-managed `distill` CLI when output exceeds ~30 lines or ~2KB. Use explicit extraction prompts.
+    Skip `| distill` only for exact raw output, interactive/TUI output, or unavailable local RemoteCodeDistillService; report the fallback. Never invoke Node, tsx, npm, bun, or a source-checkout CLI for `distill`.
+    If a summary includes `[[rc:<handle>]]`, recover exact bytes with `distill retrieve <handle>`. Wait for `distill` before continuing.
+    Details and examples live in the managed `distill` SKILL.md.
     <!-- distill skill: end -->
     """
 

@@ -45,4 +45,17 @@ public struct NetPositiveGate: Sendable, Equatable {
     public func shouldCompress(inputCharacters: Int, secondsSinceLastTurn: Double?) -> Bool {
         decide(inputCharacters: inputCharacters, secondsSinceLastTurn: secondsSinceLastTurn) == .compress
     }
+
+    public func acceptsBilledSavings(
+        originalBilledTokenUnits: Double,
+        compressedBilledTokenUnits: Double,
+        retrieveDebitUnits: Double = 0,
+        localOverheadUnits: Double = 0
+    ) -> Bool {
+        let net = originalBilledTokenUnits
+            - compressedBilledTokenUnits
+            - max(0, retrieveDebitUnits)
+            - max(0, localOverheadUnits)
+        return net > 0
+    }
 }

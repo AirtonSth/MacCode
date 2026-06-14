@@ -210,7 +210,7 @@ final class CodexAppServerClientTests: XCTestCase {
         let settings = try XCTUnwrap(collaboration["settings"] as? [String: Any])
         XCTAssertEqual(settings["model"] as? String, "gpt-5.5")
         XCTAssertEqual(settings["reasoning_effort"] as? String, "high")
-        XCTAssertTrue((settings["developer_instructions"] as? String)?.contains("plan only") == true,
+        XCTAssertTrue((settings["developer_instructions"] as? String)?.contains("Plan only") == true,
                       "Plan mode must travel as app-server collaborationMode, not only as prompt text")
     }
 

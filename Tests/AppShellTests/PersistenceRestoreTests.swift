@@ -219,7 +219,10 @@ final class PersistenceRestoreTests: XCTestCase {
             try await router.respondAgentRequest(thread: thread.id, requestId: "approval-1", response: .approve)
             XCTFail("respondAgentRequest must throw when the provider session is gone")
         } catch {}
-        XCTAssertThrowsError(try router.respondAgentUserInput(thread: thread.id, requestId: "question-1", text: "Run"))
+        do {
+            try await router.respondAgentUserInput(thread: thread.id, requestId: "question-1", text: "Run")
+            XCTFail("respondAgentUserInput must throw when the provider session is gone")
+        } catch {}
 
         let approval = try XCTUnwrap(try ctx.providerPendingCallbackRepo.get(threadId: thread.id, requestId: "approval-1", kind: .approval))
         let question = try XCTUnwrap(try ctx.providerPendingCallbackRepo.get(threadId: thread.id, requestId: "question-1", kind: .userInput))
@@ -261,7 +264,7 @@ final class PersistenceRestoreTests: XCTestCase {
         }, "Approve Session from iOS must emit a thread update so connected devices render Full Access")
     }
 
-    func test_remoteUserInputResponseResolvesStoredCallbackAndMirrorsEvent() throws {
+    func test_remoteUserInputResponseResolvesStoredCallbackAndMirrorsEvent() async throws {
         let dir = NSTemporaryDirectory() + "RC2UserInput-" + UUID().uuidString
         let ctx = try AppContext(channel: .debug, appSupportOverride: dir)
         let router = AppCommandRouter(context: ctx)
@@ -285,7 +288,7 @@ final class PersistenceRestoreTests: XCTestCase {
         }
         defer { EventBus.shared.unsubscribe(token) }
 
-        try router.respondAgentUserInput(thread: thread.id, requestId: "question-1", text: "Run")
+        try await router.respondAgentUserInput(thread: thread.id, requestId: "question-1", text: "Run")
 
         XCTAssertEqual(adapter.lastUserInputResponse?.text, "Run",
                        "the iOS RPC path must still send the answer to the live provider adapter")

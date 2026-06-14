@@ -39,14 +39,17 @@ final class PreparedStatementCacheTests: XCTestCase {
         let db = try makeDB()
         let sql = "SELECT id, val FROM t WHERE id = ?;"
 
-        let st1 = try db.prepare(sql)
-        let ptr1 = st1.handle
+        let (ptr1, ptr2) = try db.performSync { database in
+            let st1 = try database.prepare(sql)
+            let ptr1 = st1.handle
 
-        let st2 = try db.prepare(sql)
-        let ptr2 = st2.handle
+            let st2 = try database.prepare(sql)
+            let ptr2 = st2.handle
+            return (ptr1, ptr2)
+        }
 
         XCTAssertEqual(ptr1, ptr2,
-            "CACHE-HIT: same SQL must return the same OpaquePointer (no redundant sqlite3_prepare_v2 on hot path)")
+            "CACHE-HIT: same SQL must reuse the same OpaquePointer inside performSync, where reset/bind/step are serialised")
     }
 
     // MARK: - CACHE-MISS: different SQL compiles a distinct statement

@@ -9,10 +9,19 @@ import Foundation
 /// agent depends on.
 public enum LiteralPreservation {
     private static let patterns: [String] = [
-        #"[\w./~-]+\.[A-Za-z0-9]+:\d+"#,                                  // file.ext:line
+        #"[\w./~-]+\.[A-Za-z0-9]+:\d+"#,                                  // file.ext:line (also covers JS `at fn (a.js:1:2)`)
+        #"File "[^"\n]+", line \d+"#,                                      // Python traceback frame
+        #"/(?:[A-Za-z0-9._~+-]+/)+[A-Za-z0-9._~+-]+"#,                     // absolute path (I8.5: load-bearing, anti-hallucination)
         #"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b"#, // UUID
+        #"\b[0-9a-f]{7,11}\b"#,                                             // short git SHA
         #"\b[0-9a-f]{12,}\b"#,                                            // hex hash / sha (>=12)
         #"\b\d{4,}\b"#,                                                   // long numbers (ids, counts, codes)
+        #"`[^`\n]{1,120}`"#,                                               // quoted identifiers / commands
+        #"\bv?\d+\.\d+(?:\.\d+){0,2}(?:[-+][A-Za-z0-9.-]+)?\b"#,          // versions
+        #"\b(?:exit(?:\s+code)?|code|port)\s*[:=]?\s*\d{1,5}\b"#,         // small but load-bearing codes/ports
+        #"\b[A-Z]{1,2}\d{3,5}\b"#,                                        // compiler/lint codes (I10.6): TS2345, E501, E0382
+        #"\[\[rc:[0-9a-fA-F]+\]\]"#,                                      // recoverable content marker
+        #"</?[A-Za-z][A-Za-z0-9:_-]*(?:\s+[^<>]*?)?>"#,                   // XML/HTML-style tags
     ]
 
     /// Distinct load-bearing literals found in `text`.
@@ -30,6 +39,11 @@ public enum LiteralPreservation {
         // Diff change lines (the actual edit) must survive verbatim.
         for line in text.split(separator: "\n", omittingEmptySubsequences: true) {
             if (line.hasPrefix("+") || line.hasPrefix("-")) && !line.hasPrefix("+++") && !line.hasPrefix("---") {
+                let trimmed = line.trimmingCharacters(in: .whitespaces)
+                if trimmed.count > 1 { found.insert(String(trimmed)) }
+            }
+            let lower = line.lowercased()
+            if lower.range(of: #"\b(error|panic|fatal|exception)\b"#, options: .regularExpression) != nil {
                 let trimmed = line.trimmingCharacters(in: .whitespaces)
                 if trimmed.count > 1 { found.insert(String(trimmed)) }
             }

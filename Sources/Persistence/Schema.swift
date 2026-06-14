@@ -9,7 +9,7 @@ public struct SchemaStep {
 }
 
 public enum Schema {
-    public static let currentVersion: Int = 29
+    public static let currentVersion: Int = 31
 
     public static let steps: [SchemaStep] = [
         SchemaStep(1, """
@@ -428,6 +428,39 @@ public enum Schema {
         ALTER TABLE device_trust ADD COLUMN always_allow_pairing INTEGER NOT NULL DEFAULT 0;
         ALTER TABLE pairing_requests ADD COLUMN client_device_id TEXT;
         CREATE INDEX IF NOT EXISTS idx_device_trust_client_allow ON device_trust(client_device_id, always_allow_pairing);
+        """),
+        SchemaStep(30, """
+        CREATE TABLE IF NOT EXISTS token_saver_encoder_manifests (
+            role TEXT NOT NULL,
+            model_id TEXT NOT NULL,
+            source_url TEXT NOT NULL,
+            revision TEXT NOT NULL,
+            runtime TEXT NOT NULL,
+            license TEXT NOT NULL,
+            max_seq_len INTEGER NOT NULL,
+            chunk_policy TEXT NOT NULL,
+            manifest_json TEXT NOT NULL,
+            installed_at TEXT NOT NULL,
+            PRIMARY KEY(role, model_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_token_saver_encoder_manifests_role ON token_saver_encoder_manifests(role);
+        """),
+        SchemaStep(31, """
+        CREATE TABLE IF NOT EXISTS shared_memory_blocks (
+            id TEXT PRIMARY KEY,
+            content_hash TEXT NOT NULL,
+            reversible_handle TEXT NOT NULL,
+            preview TEXT NOT NULL DEFAULT '',
+            byte_count INTEGER NOT NULL,
+            token_count_estimate INTEGER NOT NULL DEFAULT 0,
+            ref_count INTEGER NOT NULL DEFAULT 0,
+            metadata_json TEXT NOT NULL DEFAULT '{}',
+            created_at_ms INTEGER NOT NULL,
+            last_access_ms INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_shared_memory_blocks_hash ON shared_memory_blocks(content_hash);
+        CREATE INDEX IF NOT EXISTS idx_shared_memory_blocks_handle ON shared_memory_blocks(reversible_handle);
+        CREATE INDEX IF NOT EXISTS idx_shared_memory_blocks_access ON shared_memory_blocks(last_access_ms);
         """)
     ]
 

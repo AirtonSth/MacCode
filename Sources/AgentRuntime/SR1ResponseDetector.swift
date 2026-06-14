@@ -1,8 +1,25 @@
 import Foundation
 
+public struct SR1ClassifierDecision: Equatable, Sendable {
+    public let isSR1: Bool
+    public let confidence: Double
+
+    public init(isSR1: Bool, confidence: Double) {
+        self.isSR1 = isSR1
+        self.confidence = confidence
+    }
+
+    fileprivate func isConfident(minimumConfidence: Double) -> Bool {
+        confidence.isFinite && confidence >= minimumConfidence
+    }
+}
+
+public typealias SR1ResponseClassifier = @Sendable (String) -> SR1ClassifierDecision?
+
 public enum SR1ResponseDetector {
     private static let semanticPrefixes = Set("SCDRONP")
     private static let variableKeyPattern = #"#[A-Za-z][0-9]+"#
+    public static let classifierConfidenceThreshold = 0.82
 
     public static func parseSemanticLine(_ line: String) -> (prefix: Character, content: String)? {
         let trimmed = line.trimmingCharacters(in: .whitespaces)
@@ -70,10 +87,23 @@ public enum SR1ResponseDetector {
         return allowSpaceDelimitedOutcome || isDelimitedSemanticLine(trimmed)
     }
 
-    public static func isSR1(_ text: String) -> Bool {
+    public static func isSR1(
+        _ text: String,
+        classifier: SR1ResponseClassifier? = nil,
+        confidenceThreshold: Double = classifierConfidenceThreshold
+    ) -> Bool {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard trimmed.count >= 6 else { return false }
 
+        if let decision = classifier?(trimmed),
+           decision.isConfident(minimumConfidence: confidenceThreshold) {
+            return decision.isSR1
+        }
+
+        return heuristicIsSR1(trimmed)
+    }
+
+    private static func heuristicIsSR1(_ trimmed: String) -> Bool {
         let lines = trimmed
             .split(whereSeparator: \.isNewline)
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
@@ -87,6 +117,9 @@ public enum SR1ResponseDetector {
             lower.hasPrefix("dict:") ||
             lower.contains("\ndict:")
         let inlineSegments = parseSemanticSegments(trimmed)
+        if hasExplicitMarker, inlineSegments.count >= 1 {
+            return true
+        }
         if inlineSegments.count >= 2, startsWithSemanticMarker(trimmed) {
             return true
         }

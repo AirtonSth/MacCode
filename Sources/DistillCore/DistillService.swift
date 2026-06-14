@@ -1,5 +1,6 @@
 import Foundation
 import Network
+import CoreModel
 
 /// Abstraction over the CCR reversible store, injected into the HTTP layer so
 /// DistillCore stays free of a Persistence dependency. The sidecar's main()
@@ -11,10 +12,90 @@ public protocol ReversibleStoring: Sendable {
     func retrieveOriginal(_ handle: String) throws -> Data?
 }
 
+public struct DistillStatsProviderSavings: Codable, Sendable, Equatable {
+    public let provider: String
+    public let savedTokens: Int
+    public let inputTokens: Int
+    public let outputTokens: Int
+    public let runs: Int
+
+    public init(provider: String, savedTokens: Int, inputTokens: Int, outputTokens: Int, runs: Int) {
+        self.provider = provider
+        self.savedTokens = savedTokens
+        self.inputTokens = inputTokens
+        self.outputTokens = outputTokens
+        self.runs = runs
+    }
+
+    public enum CodingKeys: String, CodingKey {
+        case provider
+        case savedTokens = "saved_tokens"
+        case inputTokens = "input_tokens"
+        case outputTokens = "output_tokens"
+        case runs
+    }
+}
+
+public struct DistillStatsModeSavings: Codable, Sendable, Equatable {
+    public let provider: String
+    public let mode: String
+    public let savedTokens: Int
+    public let runs: Int
+
+    public init(provider: String, mode: String, savedTokens: Int, runs: Int) {
+        self.provider = provider
+        self.mode = mode
+        self.savedTokens = savedTokens
+        self.runs = runs
+    }
+
+    public enum CodingKeys: String, CodingKey {
+        case provider
+        case mode
+        case savedTokens = "saved_tokens"
+        case runs
+    }
+}
+
+public struct DistillStatsSnapshot: Codable, Sendable, Equatable {
+    public let totalSavedTokens: Int
+    public let totalRuns: Int
+    public let providers: [DistillStatsProviderSavings]
+    public let modes: [DistillStatsModeSavings]
+
+    public init(
+        totalSavedTokens: Int = 0,
+        totalRuns: Int = 0,
+        providers: [DistillStatsProviderSavings] = [],
+        modes: [DistillStatsModeSavings] = []
+    ) {
+        self.totalSavedTokens = totalSavedTokens
+        self.totalRuns = totalRuns
+        self.providers = providers
+        self.modes = modes
+    }
+
+    public enum CodingKeys: String, CodingKey {
+        case totalSavedTokens = "total_saved_tokens"
+        case totalRuns = "total_runs"
+        case providers
+        case modes
+    }
+}
+
+public protocol DistillStatsProviding: Sendable {
+    func statsSnapshot() throws -> DistillStatsSnapshot
+}
+
 public enum DistillApprovedModel {
-    public static let id = "samuelfaj/distill-1.7B-4bit-MLX"
-    public static let url = "https://huggingface.co/samuelfaj/distill-1.7B-4bit-MLX"
-    public static let runtime = "mlx"
+    public static let id = TokenSaverApprovedModels.defaultModel.id
+    public static let url = TokenSaverApprovedModels.defaultModel.url
+    public static let runtime = TokenSaverApprovedModels.defaultModel.runtime
+    public static let all = TokenSaverApprovedModels.all
+
+    public static func isApproved(modelID: String, modelURL: String, runtime: String) -> Bool {
+        TokenSaverApprovedModels.approved(id: modelID, url: modelURL, runtime: runtime) != nil
+    }
 }
 
 public enum DistillServiceError: Error, Sendable, Equatable, CustomStringConvertible {
@@ -86,7 +167,7 @@ public struct DistillServiceConfiguration: Sendable, Equatable {
         guard runtime == DistillApprovedModel.runtime else {
             throw DistillServiceError.unsupportedRuntime(runtime)
         }
-        guard modelID == DistillApprovedModel.id, modelURL == DistillApprovedModel.url else {
+        guard DistillApprovedModel.isApproved(modelID: modelID, modelURL: modelURL, runtime: runtime) else {
             throw DistillServiceError.unsupportedModel(modelID: modelID, modelURL: modelURL)
         }
 
@@ -179,6 +260,25 @@ public struct DistillServiceMetrics: Codable, Sendable, Equatable {
     public let successfulRequests: Int
     public let failedRequests: Int
     public let fallbackRequests: Int
+    public let resultCacheHits: Int
+    public let resultCacheMisses: Int
+    public let volatileTokenWarnings: Int
+    public let systemPromptHash: String?
+    public let cacheDriftWarnings: Int
+    public let encoderLaneInvocations: Int
+    public let encoderLaneAccepts: Int
+    public let encoderLaneFallbacks: Int
+    public let encoderLaneFailures: Int
+    public let encoderLaneDeadlineTimeouts: Int
+    public let pipeHitRate: Double
+    /// C5: share of routed requests answered WITHOUT the MLX LLM, and average
+    /// wall-clock of the encoder stage vs the LLM stage (BERT-first payoff).
+    public let resolvedWithoutLLMRate: Double
+    public let encoderAvgMillis: Double
+    public let llmAvgMillis: Double
+    /// M6: end-to-end gate/hook latency percentiles (incl. GPU contention).
+    public let gateP50Millis: Int
+    public let gateP95Millis: Int
     public let maxConcurrentRequests: Int
 
     public enum CodingKeys: String, CodingKey {
@@ -187,7 +287,99 @@ public struct DistillServiceMetrics: Codable, Sendable, Equatable {
         case successfulRequests = "successful_requests"
         case failedRequests = "failed_requests"
         case fallbackRequests = "fallback_requests"
+        case resultCacheHits = "result_cache_hits"
+        case resultCacheMisses = "result_cache_misses"
+        case volatileTokenWarnings = "volatile_token_warnings"
+        case systemPromptHash = "system_prompt_hash"
+        case cacheDriftWarnings = "cache_drift_warnings"
+        case encoderLaneInvocations = "encoder_lane_invocations"
+        case encoderLaneAccepts = "encoder_lane_accepts"
+        case encoderLaneFallbacks = "encoder_lane_fallbacks"
+        case encoderLaneFailures = "encoder_lane_failures"
+        case encoderLaneDeadlineTimeouts = "encoder_lane_deadline_timeouts"
+        case pipeHitRate = "pipe_hit_rate"
+        case resolvedWithoutLLMRate = "resolved_without_llm_rate"
+        case encoderAvgMillis = "encoder_avg_millis"
+        case llmAvgMillis = "llm_avg_millis"
+        case gateP50Millis = "gate_p50_millis"
+        case gateP95Millis = "gate_p95_millis"
         case maxConcurrentRequests = "max_concurrent_requests"
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.init(
+            activeRequests: try container.decode(Int.self, forKey: .activeRequests),
+            totalRequests: try container.decode(Int.self, forKey: .totalRequests),
+            successfulRequests: try container.decode(Int.self, forKey: .successfulRequests),
+            failedRequests: try container.decode(Int.self, forKey: .failedRequests),
+            fallbackRequests: try container.decodeIfPresent(Int.self, forKey: .fallbackRequests) ?? 0,
+            resultCacheHits: try container.decodeIfPresent(Int.self, forKey: .resultCacheHits) ?? 0,
+            resultCacheMisses: try container.decodeIfPresent(Int.self, forKey: .resultCacheMisses) ?? 0,
+            volatileTokenWarnings: try container.decodeIfPresent(Int.self, forKey: .volatileTokenWarnings) ?? 0,
+            systemPromptHash: try container.decodeIfPresent(String.self, forKey: .systemPromptHash),
+            cacheDriftWarnings: try container.decodeIfPresent(Int.self, forKey: .cacheDriftWarnings) ?? 0,
+            encoderLaneInvocations: try container.decodeIfPresent(Int.self, forKey: .encoderLaneInvocations) ?? 0,
+            encoderLaneAccepts: try container.decodeIfPresent(Int.self, forKey: .encoderLaneAccepts) ?? 0,
+            encoderLaneFallbacks: try container.decodeIfPresent(Int.self, forKey: .encoderLaneFallbacks) ?? 0,
+            encoderLaneFailures: try container.decodeIfPresent(Int.self, forKey: .encoderLaneFailures) ?? 0,
+            encoderLaneDeadlineTimeouts: try container.decodeIfPresent(Int.self, forKey: .encoderLaneDeadlineTimeouts) ?? 0,
+            pipeHitRate: try container.decodeIfPresent(Double.self, forKey: .pipeHitRate) ?? 0,
+            resolvedWithoutLLMRate: try container.decodeIfPresent(Double.self, forKey: .resolvedWithoutLLMRate) ?? 0,
+            encoderAvgMillis: try container.decodeIfPresent(Double.self, forKey: .encoderAvgMillis) ?? 0,
+            llmAvgMillis: try container.decodeIfPresent(Double.self, forKey: .llmAvgMillis) ?? 0,
+            gateP50Millis: try container.decodeIfPresent(Int.self, forKey: .gateP50Millis) ?? 0,
+            gateP95Millis: try container.decodeIfPresent(Int.self, forKey: .gateP95Millis) ?? 0,
+            maxConcurrentRequests: try container.decode(Int.self, forKey: .maxConcurrentRequests)
+        )
+    }
+
+    public init(
+        activeRequests: Int,
+        totalRequests: Int,
+        successfulRequests: Int,
+        failedRequests: Int,
+        fallbackRequests: Int,
+        resultCacheHits: Int = 0,
+        resultCacheMisses: Int = 0,
+        volatileTokenWarnings: Int = 0,
+        systemPromptHash: String? = nil,
+        cacheDriftWarnings: Int = 0,
+        encoderLaneInvocations: Int = 0,
+        encoderLaneAccepts: Int = 0,
+        encoderLaneFallbacks: Int = 0,
+        encoderLaneFailures: Int = 0,
+        encoderLaneDeadlineTimeouts: Int = 0,
+        pipeHitRate: Double = 0,
+        resolvedWithoutLLMRate: Double = 0,
+        encoderAvgMillis: Double = 0,
+        llmAvgMillis: Double = 0,
+        gateP50Millis: Int = 0,
+        gateP95Millis: Int = 0,
+        maxConcurrentRequests: Int
+    ) {
+        self.activeRequests = activeRequests
+        self.totalRequests = totalRequests
+        self.successfulRequests = successfulRequests
+        self.failedRequests = failedRequests
+        self.fallbackRequests = fallbackRequests
+        self.resultCacheHits = resultCacheHits
+        self.resultCacheMisses = resultCacheMisses
+        self.volatileTokenWarnings = volatileTokenWarnings
+        self.systemPromptHash = systemPromptHash
+        self.cacheDriftWarnings = max(0, cacheDriftWarnings)
+        self.encoderLaneInvocations = max(0, encoderLaneInvocations)
+        self.encoderLaneAccepts = max(0, encoderLaneAccepts)
+        self.encoderLaneFallbacks = max(0, encoderLaneFallbacks)
+        self.encoderLaneFailures = max(0, encoderLaneFailures)
+        self.encoderLaneDeadlineTimeouts = max(0, encoderLaneDeadlineTimeouts)
+        self.pipeHitRate = min(1, max(0, pipeHitRate.isFinite ? pipeHitRate : 0))
+        self.resolvedWithoutLLMRate = min(1, max(0, resolvedWithoutLLMRate.isFinite ? resolvedWithoutLLMRate : 0))
+        self.encoderAvgMillis = max(0, encoderAvgMillis.isFinite ? encoderAvgMillis : 0)
+        self.llmAvgMillis = max(0, llmAvgMillis.isFinite ? llmAvgMillis : 0)
+        self.gateP50Millis = max(0, gateP50Millis)
+        self.gateP95Millis = max(0, gateP95Millis)
+        self.maxConcurrentRequests = maxConcurrentRequests
     }
 }
 
@@ -196,8 +388,29 @@ public actor DistillServiceMetricsRecorder {
     private var successfulRequests = 0
     private var failedRequests = 0
     private var fallbackRequests = 0
+    private var volatileTokenWarnings = 0
+    private var systemPromptHash: String?
+    private var cacheDriftWarnings = 0
+    private var routeLedger = TokenSaverRouteLedger()
+    private var encoderMetrics = EncoderLaneMetricsSnapshot(invocations: 0, accepts: 0, fallbacks: 0, failures: 0)
+    private var gateLatency = LatencyPercentileTracker()
 
     public init() {}
+
+    /// M6: record end-to-end gate/hook latency for the p50/p95 percentiles.
+    public func recordLatency(milliseconds: Int) {
+        gateLatency.record(milliseconds: milliseconds)
+    }
+
+    /// C5: record a per-lane routing outcome (stage + wall-clock) for the BERT-first ledger.
+    public func recordRoute(_ event: TokenSaverRouteTelemetryEvent) {
+        routeLedger.record(event)
+    }
+
+    /// M5: capture the encoder lane's cumulative counters for /metrics.
+    public func recordEncoderMetrics(_ snapshot: EncoderLaneMetricsSnapshot) {
+        encoderMetrics = snapshot
+    }
 
     public func recordRequest() {
         totalRequests += 1
@@ -215,13 +428,46 @@ public actor DistillServiceMetricsRecorder {
         fallbackRequests += 1
     }
 
-    public func snapshot(activeRequests: Int, maxConcurrentRequests: Int) -> DistillServiceMetrics {
+    public func recordVolatileTokenWarnings(_ count: Int) {
+        volatileTokenWarnings += max(0, count)
+    }
+
+    public func recordSystemPromptHash(_ hash: String) {
+        let trimmed = hash.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        if let previous = systemPromptHash, previous != trimmed {
+            cacheDriftWarnings += 1
+        }
+        systemPromptHash = trimmed
+    }
+
+    public func snapshot(
+        activeRequests: Int,
+        maxConcurrentRequests: Int,
+        resultCacheHits: Int = 0,
+        resultCacheMisses: Int = 0
+    ) -> DistillServiceMetrics {
         DistillServiceMetrics(
             activeRequests: activeRequests,
             totalRequests: totalRequests,
             successfulRequests: successfulRequests,
             failedRequests: failedRequests,
             fallbackRequests: fallbackRequests,
+            resultCacheHits: resultCacheHits,
+            resultCacheMisses: resultCacheMisses,
+            volatileTokenWarnings: volatileTokenWarnings,
+            systemPromptHash: systemPromptHash,
+            cacheDriftWarnings: cacheDriftWarnings,
+            encoderLaneInvocations: encoderMetrics.invocations,
+            encoderLaneAccepts: encoderMetrics.accepts,
+            encoderLaneFallbacks: encoderMetrics.fallbacks,
+            encoderLaneFailures: encoderMetrics.failures,
+            encoderLaneDeadlineTimeouts: encoderMetrics.deadlineTimeouts,
+            resolvedWithoutLLMRate: routeLedger.resolvedWithoutLLMRate,
+            encoderAvgMillis: routeLedger.averageLatencyMillis(stage: .encoderBERT),
+            llmAvgMillis: routeLedger.averageLatencyMillis(stage: .llmMLX),
+            gateP50Millis: gateLatency.p50,
+            gateP95Millis: gateLatency.p95,
             maxConcurrentRequests: maxConcurrentRequests
         )
     }
@@ -272,6 +518,7 @@ public final class DistillHTTPServer: @unchecked Sendable {
     private let decoder = JSONDecoder()
     private let onSuccess: SuccessHandler?
     private let reversibleStore: ReversibleStoring?
+    private let statsProvider: DistillStatsProviding?
     private let reversibleStoreMinBytes: Int
     private let requestBodyLimitBytes: Int
     private var listener: NWListener?
@@ -283,6 +530,7 @@ public final class DistillHTTPServer: @unchecked Sendable {
         configuration: DistillServiceConfiguration,
         scheduler: DistillScheduler,
         reversibleStore: ReversibleStoring? = nil,
+        statsProvider: DistillStatsProviding? = nil,
         reversibleStoreMinBytes: Int = 8_192,
         requestBodyLimitBytes: Int = DistillHTTPServer.maxRequestBodyBytes,
         startsReady: Bool = true,
@@ -292,6 +540,7 @@ public final class DistillHTTPServer: @unchecked Sendable {
         self.configuration = configuration
         self.scheduler = scheduler
         self.reversibleStore = reversibleStore
+        self.statsProvider = statsProvider
         self.reversibleStoreMinBytes = max(1, reversibleStoreMinBytes)
         self.requestBodyLimitBytes = max(1, requestBodyLimitBytes)
         self._ready = startsReady
@@ -513,19 +762,40 @@ public final class DistillHTTPServer: @unchecked Sendable {
             }
         case ("GET", "/metrics"):
             let active = await scheduler.activeRequestCount
+            let cacheHits = await scheduler.resultCacheHitCount
+            let cacheMisses = await scheduler.resultCacheMissCount
             let snapshot = await metrics.snapshot(
                 activeRequests: active,
-                maxConcurrentRequests: configuration.maxConcurrentRequests
+                maxConcurrentRequests: configuration.maxConcurrentRequests,
+                resultCacheHits: cacheHits,
+                resultCacheMisses: cacheMisses
             )
             send(status: 200, body: snapshot, connection: connection)
+        case ("GET", "/v1/stats"):
+            handleStats(connection: connection)
         case ("POST", "/v1/distill"):
             await handleDistill(request: request, connection: connection)
+        case ("POST", "/v1/rank"):
+            handleRank(request: request, connection: connection)
+        case ("POST", "/v1/embed"):
+            handleEmbed(request: request, connection: connection)
         case (_, "/v1/distill"):
+            send(status: 405, body: ErrorBody(error: "method_not_allowed", message: "use POST"), connection: connection)
+        case (_, "/v1/rank"), (_, "/v1/embed"):
             send(status: 405, body: ErrorBody(error: "method_not_allowed", message: "use POST"), connection: connection)
         case ("GET", let path) where path.hasPrefix("/v1/retrieve/"):
             handleRetrieve(path: path, connection: connection)
         default:
             send(status: 404, body: ErrorBody(error: "not_found", message: request.path), connection: connection)
+        }
+    }
+
+    private func handleStats(connection: NWConnection) {
+        do {
+            let snapshot = try statsProvider?.statsSnapshot() ?? DistillStatsSnapshot()
+            send(status: 200, body: snapshot, connection: connection)
+        } catch {
+            send(status: 500, body: ErrorBody(error: "stats_unavailable", message: "\(error)"), connection: connection)
         }
     }
 
@@ -555,18 +825,36 @@ public final class DistillHTTPServer: @unchecked Sendable {
         }
         do {
             let distillRequest = try decoder.decode(DistillRequest.self, from: request.body)
+            let volatileScan = CacheAlignerVolatileTokenDetector.scan(
+                [distillRequest.input, distillRequest.question ?? ""].joined(separator: "\n")
+            )
+            if volatileScan.warningCount > 0 {
+                await metrics.recordVolatileTokenWarnings(volatileScan.warningCount)
+            }
+            await metrics.recordSystemPromptHash(CacheAlignerPromptContract.systemPromptHash(for: distillRequest))
             // Store-before-loss (N5): persist the original BEFORE the runtime can
             // truncate (fitInput >24k) or lossily compress it, so it is always
             // recoverable via /v1/retrieve. Only inputs large enough to be worth
             // recovering are stored. Failure to store never blocks the response.
             var originalHandle: String?
-            if let reversibleStore {
+            var storeFailedForLargeInput = false
+            if distillRequest.effectiveRunMode == .optimize, let reversibleStore {
                 let bytes = Data(distillRequest.input.utf8)
                 if bytes.count >= reversibleStoreMinBytes {
-                    originalHandle = try? reversibleStore.storeOriginal(bytes)
+                    // I2.4: surface the failure instead of swallowing it with `try?`, so a
+                    // lossy substitution is never served without a recoverable original.
+                    do {
+                        originalHandle = try reversibleStore.storeOriginal(bytes)
+                    } catch {
+                        storeFailedForLargeInput = true
+                    }
                 }
             }
-            let response = try await scheduler.submit(distillRequest).withOriginalHandle(originalHandle)
+            let compressed = try await scheduler.submit(distillRequest).withOriginalHandle(originalHandle)
+            // I2.4: never substitute a LOSSY output whose original could not be stored.
+            let response = (storeFailedForLargeInput && compressed.output != distillRequest.input)
+                ? compressed.verbatimFallback(input: distillRequest.input)
+                : compressed
             if let onSuccess {
                 await onSuccess(distillRequest, response)
             }
@@ -587,6 +875,62 @@ public final class DistillHTTPServer: @unchecked Sendable {
         } catch {
             await metrics.recordFailure()
             send(status: 400, body: ErrorBody(error: "bad_request", message: "invalid distill request"), connection: connection)
+        }
+    }
+
+    private func handleRank(request: HTTPRequest, connection: NWConnection) {
+        guard request.body.count <= requestBodyLimitBytes else {
+            send(status: 413, body: ErrorBody(error: "payload_too_large", message: "rank request body exceeds limit"), connection: connection)
+            return
+        }
+        do {
+            let rankRequest = try decoder.decode(DistillRankRequest.self, from: request.body)
+            let chunks = rankRequest.chunks.enumerated().map { offset, chunk in
+                QueryAwareChunk(
+                    id: chunk.id,
+                    text: chunk.text,
+                    contentType: chunk.contentType,
+                    position: chunk.position == 0 ? offset : chunk.position
+                )
+            }
+            let ranked = QueryAwareChunkRanker()
+                .rank(chunks: chunks, query: rankRequest.query, toolArguments: rankRequest.toolArguments)
+                .prefix(max(1, rankRequest.topK ?? chunks.count))
+                .map { ranked in
+                    DistillRankedChunk(
+                        id: ranked.chunk.id,
+                        text: ranked.chunk.text,
+                        contentType: ranked.chunk.contentType,
+                        position: ranked.chunk.position,
+                        bm25Score: ranked.bm25Score,
+                        embeddingScore: ranked.embeddingScore,
+                        finalScore: ranked.finalScore
+                    )
+                }
+            send(status: 200, body: DistillRankResponse(query: rankRequest.query, encoderLane: rankRequest.encoderLane, results: Array(ranked)), connection: connection)
+        } catch {
+            send(status: 400, body: ErrorBody(error: "bad_request", message: "invalid rank request"), connection: connection)
+        }
+    }
+
+    private func handleEmbed(request: HTTPRequest, connection: NWConnection) {
+        guard request.body.count <= requestBodyLimitBytes else {
+            send(status: 413, body: ErrorBody(error: "payload_too_large", message: "embed request body exceeds limit"), connection: connection)
+            return
+        }
+        do {
+            let embedRequest = try decoder.decode(DistillEmbedRequest.self, from: request.body)
+            send(
+                status: 200,
+                body: DistillEmbedResponse(
+                    available: false,
+                    encoderLane: embedRequest.encoderLane,
+                    message: "encoder lane unavailable; no synthetic embeddings returned"
+                ),
+                connection: connection
+            )
+        } catch {
+            send(status: 400, body: ErrorBody(error: "bad_request", message: "invalid embed request"), connection: connection)
         }
     }
 

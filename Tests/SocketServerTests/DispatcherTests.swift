@@ -395,7 +395,7 @@ class FakeRouter: CommandRouting, TerminalCommandRouting {
         lastAgentRequestResponse = (thread, requestId, response)
         agentRequestResponses.append((thread, requestId, response))
     }
-    func respondAgentUserInput(thread: AgentThreadID, requestId: String, text: String) throws {
+    func respondAgentUserInput(thread: AgentThreadID, requestId: String, text: String) async throws {
         respondAgentUserInputCallCount += 1
         lastAgentUserInputResponse = (thread, requestId, text)
         agentUserInputResponses.append((thread, requestId, text))

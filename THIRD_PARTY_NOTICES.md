@@ -1,18 +1,55 @@
-# Third-Party Notices
+# Third Party Notices
 
-RemoteCode 2 is implemented in-house, but its design takes inspiration from two open-source projects. No source code from either project is currently copied into this repository; this file exists so that when we adapt patterns, attribution is already in place.
+This file lists third-party model artifacts that RemoteCode may download on demand for Token Saver. The app does not vendor these weights in the source tree.
 
-## cmux
+## Token Saver MLX Models
 
-- Repository: https://github.com/manaflow-ai/cmux
-- License: GPL-3.0-or-later **or** commercial (dual-licensed). Copyright (c) 2024-present Manaflow, Inc.
-- Use in RemoteCode 2: behavioral reference only. We study the cmux Swift code under `~/dev/remotecode2/.references/cmux/` for window/workspace/pane/surface architecture, terminal/browser surfaces, socket/CLI shapes, session restore, and notifications. **No cmux source is currently copied into RemoteCode 2.** If we later choose to adopt cmux code, a license decision must be recorded in `project/09-risks-decisions.html` and this file must list the affected files.
+### samuelfaj/distill-1.7B-4bit-MLX
 
-## T3 Code
+- Source: https://huggingface.co/samuelfaj/distill-1.7B-4bit-MLX
+- Runtime: MLX
+- License metadata: Apache-2.0
+- Hugging Face API revision observed on 2026-06-13: `af905e680e12ab4630b78c8c7c8fc69eb1ddf288`
+- Base model metadata: `samuelfaj/distill-1.7B-MLX`
+- Use: fallback Token Saver distill/compression model below 16 GiB unified memory or when higher-tier migration fails.
 
-- Repository: https://github.com/pingdotgg/t3code
-- License: MIT. Copyright (c) 2026 T3 Tools Inc.
-- Use in RemoteCode 2: behavioral and UX reference. We study the T3 Code web UI under `~/dev/remotecode2/.references/t3code/` for the Agent App surface (sidebar, header, branch toolbar, composer, timeline, diff panel, command palette, terminal drawer, keybindings).
-- MIT requires preservation of the license and copyright notice. When we directly adapt text or logic from a T3 Code file, we will reproduce the notice here. As of 2026-05-14, no T3 Code source is copied; the Swift UI structure was informed by the public file names only.
+### samuelfaj/distill-E4B-it-4-bit-MLX
 
-If you adapt code from these projects, update this file in the same change.
+- Source: https://huggingface.co/samuelfaj/distill-E4B-it-4-bit-MLX
+- Runtime: MLX
+- License metadata: blocked; Hugging Face API returned HTTP 401 without authentication on 2026-06-14.
+- Hugging Face API revision observed on 2026-06-14: unavailable without authentication.
+- Base model metadata: unavailable without authentication.
+- Use: selected Token Saver distill/compression model on hosts with at least 16 GiB unified memory after download, checksum validation, warmup, and perf gates pass.
+
+## Token Saver Encoder Models (optional, BERT-family via MLXEmbedders)
+
+These run real embedding inference for the encoder lane (cosine / near-dup / query-rerank / embedding-prototype zero-shot). License + pinned commit SHA verified against the Hugging Face model API on 2026-06-14. Only permissive licenses {Apache-2.0, MIT, BSD-3-Clause} pass the structural hard-gate (`TokenSaverEncoderManifest.approvedLicenses`); the download gate additionally requires an immutable 40-hex commit SHA.
+
+### BAAI/bge-small-en-v1.5  (default embedder)
+
+- Source: https://huggingface.co/BAAI/bge-small-en-v1.5
+- Runtime: MLXEmbedders (MLX) · Role: embedder · max_seq_len 512
+- License metadata: MIT
+- Pinned revision: `5c38ec7c405ec4b44b94cc5a9bb96e735b38267a`
+
+### TaylorAI/bge-micro-v2  (tiny / CI live-inference proof)
+
+- Source: https://huggingface.co/TaylorAI/bge-micro-v2
+- Runtime: MLXEmbedders (MLX) · Role: embedder · max_seq_len 512
+- License metadata: MIT
+- Pinned revision: `3edf6d7de0faa426b09780416fe61009f26ae589`
+
+### sentence-transformers/all-MiniLM-L6-v2  (alternate embedder)
+
+- Source: https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2
+- Runtime: MLXEmbedders (MLX) · Role: embedder · max_seq_len 512
+- License metadata: Apache-2.0
+- Pinned revision: `1110a243fdf4706b3f48f1d95db1a4f5529b4d41`
+
+> Provenance (V12): these are off-the-shelf public encoders used as-is — no weights retrained, no code copied from the `headroom` repo; the encoder lane is a clean Swift port of the *ideas*. The previously-listed `answerdotai/answerai-colbert-small-v1` and `nomic-ai/modernbert-embed-base` manifests keep the `pin-required-before-download` placeholder revision and are therefore NOT download-approved until a SHA is pinned and their arch is supported by the embedder backend (ModernBERT/ColBERT are not loadable by the vendored `Bert`/`NomicBert`).
+
+## Verification Notes
+
+- License metadata for the public 1.7B fallback was read from the Hugging Face model API on 2026-06-13.
+- The planned `samuelfaj/distill-E4B-it-4-bit-MLX` endpoint returned HTTP 401 during unauthenticated verification on 2026-06-14. It stays in the approved runtime selector because `plan/todo.html` requires it, but release/default-on still requires authenticated license + artifact proof.

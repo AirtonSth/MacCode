@@ -36,9 +36,13 @@ final class UnixSocketListenerEventTests: XCTestCase {
 
     @MainActor
     func testStart_publishesListenerEvent_boundTrue() throws {
-        let socketURL = FileManager.default.temporaryDirectory
-            .appendingPathComponent("rc2-listener-ok-\(UUID().uuidString).sock")
-        defer { try? FileManager.default.removeItem(at: socketURL) }
+        let shortID = UUID().uuidString.prefix(8)
+        let socketURL = URL(fileURLWithPath: "/tmp/rc2-ok-\(shortID).sock")
+        defer {
+            if FileManager.default.fileExists(atPath: socketURL.path) {
+                try? FileManager.default.removeItem(at: socketURL)
+            }
+        }
 
         let startSeq = EventBus.shared.snapshot().lastSeq
         var received: [EventBus.Event] = []

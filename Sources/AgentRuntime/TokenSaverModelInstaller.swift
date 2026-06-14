@@ -1,5 +1,6 @@
 import CryptoKit
 import Foundation
+import CoreModel
 
 public enum TokenSaverModelInstallState: String, Codable, Sendable, Equatable {
     case missing
@@ -70,9 +71,9 @@ public struct TokenSaverModelFile: Codable, Sendable, Equatable {
 }
 
 public struct TokenSaverModelManifest: Codable, Sendable, Equatable {
-    public static let approvedModelID = "samuelfaj/distill-1.7B-4bit-MLX"
-    public static let approvedModelURL = "https://huggingface.co/samuelfaj/distill-1.7B-4bit-MLX"
-    public static let approvedRuntime = "mlx"
+    public static let approvedModelID = TokenSaverApprovedModels.defaultModel.id
+    public static let approvedModelURL = TokenSaverApprovedModels.defaultModel.url
+    public static let approvedRuntime = TokenSaverApprovedModels.defaultModel.runtime
 
     public let modelID: String
     public let modelURL: String
@@ -95,11 +96,69 @@ public struct TokenSaverModelManifest: Codable, Sendable, Equatable {
     }
 
     public var isApprovedModel: Bool {
-        modelID == Self.approvedModelID && modelURL == Self.approvedModelURL && runtime == Self.approvedRuntime
+        TokenSaverApprovedModels.approved(id: modelID, url: modelURL, runtime: runtime) != nil
     }
 
     public static var approvedModelAPIPayloadURL: URL {
-        URL(string: "https://huggingface.co/api/models/\(approvedModelID)")!
+        TokenSaverApprovedModels.defaultModel.apiPayloadURL
+    }
+
+    public static func approvedModelAPIPayloadURL(for model: TokenSaverApprovedModel) -> URL {
+        model.apiPayloadURL
+    }
+}
+
+public struct TokenSaverRequiredModelInstallManifest: Codable, Sendable, Equatable {
+    public let modelID: String
+    public let modelURL: String
+    public let revision: String
+    public let runtime: String
+    public let role: String
+    public let files: [TokenSaverModelFile]
+
+    public init(
+        modelID: String,
+        modelURL: String,
+        revision: String,
+        runtime: String,
+        role: String,
+        files: [TokenSaverModelFile]
+    ) {
+        self.modelID = modelID
+        self.modelURL = modelURL
+        self.revision = revision
+        self.runtime = runtime
+        self.role = role
+        self.files = files
+    }
+
+    public init(model: TokenSaverRequiredModel, files: [TokenSaverModelFile]) {
+        self.init(
+            modelID: model.id,
+            modelURL: model.url,
+            revision: model.revision,
+            runtime: model.runtime,
+            role: model.role,
+            files: files
+        )
+    }
+
+    public func matches(_ required: TokenSaverRequiredModel) -> Bool {
+        modelID == required.id &&
+            modelURL == required.url &&
+            revision == required.revision &&
+            runtime == required.runtime &&
+            role == required.role
+    }
+}
+
+public struct TokenSaverRequiredModelsInstallManifest: Codable, Sendable, Equatable {
+    public let schemaVersion: Int
+    public let models: [TokenSaverRequiredModelInstallManifest]
+
+    public init(schemaVersion: Int = 1, models: [TokenSaverRequiredModelInstallManifest]) {
+        self.schemaVersion = schemaVersion
+        self.models = models
     }
 }
 
@@ -138,12 +197,21 @@ public struct ModelValidationCacheEntry: Codable, Sendable, Equatable {
 
 public final class TokenSaverModelInstaller: @unchecked Sendable {
     public let appSupportDirectory: URL
+    public let approvedModel: TokenSaverApprovedModel
+    public let requiredAuxiliaryModels: [TokenSaverRequiredModel]
     private let fileManager: FileManager
     private let decoder = JSONDecoder()
     private let encoder = JSONEncoder()
 
-    public init(appSupportDirectory: URL, fileManager: FileManager = .default) {
+    public init(
+        appSupportDirectory: URL,
+        fileManager: FileManager = .default,
+        approvedModel: TokenSaverApprovedModel = TokenSaverApprovedModels.selected(),
+        requiredAuxiliaryModels: [TokenSaverRequiredModel] = TokenSaverRequiredModels.activationBundle
+    ) {
         self.appSupportDirectory = appSupportDirectory
+        self.approvedModel = approvedModel
+        self.requiredAuxiliaryModels = requiredAuxiliaryModels
         self.fileManager = fileManager
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
     }
@@ -156,14 +224,29 @@ public final class TokenSaverModelInstaller: @unchecked Sendable {
         distillDirectory.appendingPathComponent("DistillModelManifest.json")
     }
 
+    public var encoderManifestURL: URL {
+        distillDirectory.appendingPathComponent("DistillEncoderManifest.json")
+    }
+
     public var validationCacheURL: URL {
         distillDirectory.appendingPathComponent("DistillValidationCache.json")
     }
 
     public func modelStorageDirectory(revision: String) -> URL {
+        modelStorageDirectory(modelID: approvedModel.id, revision: revision)
+    }
+
+    public func modelStorageDirectory(modelID: String, revision: String) -> URL {
         distillDirectory
             .appendingPathComponent("Models", isDirectory: true)
-            .appendingPathComponent(Self.safePathComponent(TokenSaverModelManifest.approvedModelID), isDirectory: true)
+            .appendingPathComponent(Self.safePathComponent(modelID), isDirectory: true)
+            .appendingPathComponent(revision, isDirectory: true)
+    }
+
+    public func encoderStorageDirectory(modelID: String, revision: String) -> URL {
+        distillDirectory
+            .appendingPathComponent("Encoders", isDirectory: true)
+            .appendingPathComponent(Self.safePathComponent(modelID), isDirectory: true)
             .appendingPathComponent(revision, isDirectory: true)
     }
 
@@ -172,10 +255,21 @@ public final class TokenSaverModelInstaller: @unchecked Sendable {
         return try? decoder.decode(TokenSaverModelManifest.self, from: data)
     }
 
+    public func loadEncoderManifest() -> TokenSaverRequiredModelsInstallManifest? {
+        guard let data = try? Data(contentsOf: encoderManifestURL) else { return nil }
+        return try? decoder.decode(TokenSaverRequiredModelsInstallManifest.self, from: data)
+    }
+
     public func writeManifest(_ manifest: TokenSaverModelManifest) throws {
         try fileManager.createDirectory(at: distillDirectory, withIntermediateDirectories: true)
         let data = try encoder.encode(manifest)
         try data.write(to: manifestURL, options: .atomic)
+    }
+
+    public func writeEncoderManifest(_ manifest: TokenSaverRequiredModelsInstallManifest) throws {
+        try fileManager.createDirectory(at: distillDirectory, withIntermediateDirectories: true)
+        let data = try encoder.encode(manifest)
+        try data.write(to: encoderManifestURL, options: .atomic)
     }
 
     // Returns the validation cache keyed by relativePath, or empty dict on missing/corrupt cache.
@@ -204,21 +298,71 @@ public final class TokenSaverModelInstaller: @unchecked Sendable {
         return cached.size != current.size || cached.mtime != current.mtime
     }
 
-    public func validateInstalledModel() -> TokenSaverModelValidation {
+    public func validateInstalledModel(requireSelectedModel: Bool = false) -> TokenSaverModelValidation {
         guard let manifest = loadManifest() else {
             return TokenSaverModelValidation(state: .missing, reason: "manifest missing")
         }
         guard manifest.isApprovedModel else {
             return TokenSaverModelValidation(state: .incomplete, reason: "manifest does not reference approved MLX model")
         }
+        if requireSelectedModel, manifest.modelID != approvedModel.id {
+            return TokenSaverModelValidation(
+                state: .missing,
+                reason: "selected model \(approvedModel.id) not installed; installed \(manifest.modelID)"
+            )
+        }
         guard !manifest.files.isEmpty else {
             return TokenSaverModelValidation(state: .incomplete, reason: "manifest has no files")
+        }
+
+        return validateFiles(manifest.files, emptyReason: "manifest has no files")
+    }
+
+    public func validateInstalledTokenSaverModels(requireSelectedModel: Bool = false) -> TokenSaverModelValidation {
+        let llmValidation = validateInstalledModel(requireSelectedModel: requireSelectedModel)
+        guard llmValidation.state == .installed else { return llmValidation }
+        return validateInstalledEncoderModels()
+    }
+
+    public func validateInstalledEncoderModels() -> TokenSaverModelValidation {
+        guard !requiredAuxiliaryModels.isEmpty else { return .installed }
+        guard let manifest = loadEncoderManifest() else {
+            return TokenSaverModelValidation(state: .missing, reason: "encoder manifest missing")
+        }
+        guard manifest.schemaVersion == 1 else {
+            return TokenSaverModelValidation(state: .incomplete, reason: "unsupported encoder manifest schema")
+        }
+
+        let installedByID = Dictionary(manifest.models.map { ($0.modelID, $0) }, uniquingKeysWith: { $1 })
+        var files: [TokenSaverModelFile] = []
+        for required in requiredAuxiliaryModels {
+            guard let installed = installedByID[required.id] else {
+                return TokenSaverModelValidation(state: .missing, reason: "required encoder model \(required.id) missing")
+            }
+            guard installed.matches(required) else {
+                return TokenSaverModelValidation(state: .incomplete, reason: "required encoder model \(required.id) metadata mismatch")
+            }
+            guard !installed.files.isEmpty else {
+                return TokenSaverModelValidation(state: .incomplete, reason: "required encoder model \(required.id) has no files")
+            }
+            files.append(contentsOf: installed.files)
+        }
+
+        return validateFiles(files, emptyReason: "encoder manifest has no files")
+    }
+
+    private func validateFiles(
+        _ files: [TokenSaverModelFile],
+        emptyReason: String
+    ) -> TokenSaverModelValidation {
+        guard !files.isEmpty else {
+            return TokenSaverModelValidation(state: .incomplete, reason: emptyReason)
         }
 
         var cache = loadValidationCache()
         var cacheUpdated = false
 
-        for file in manifest.files {
+        for file in files {
             let url = distillDirectory.appendingPathComponent(file.relativePath)
             guard fileManager.fileExists(atPath: url.path) else {
                 return TokenSaverModelValidation(state: .incomplete, reason: "missing file \(file.relativePath)")
@@ -416,6 +560,19 @@ public struct TokenSaverRemoteModelSnapshot: Sendable, Equatable {
 
 public typealias TokenSaverModelDownloadProgress = @Sendable (TokenSaverModelDownloadState) -> Void
 
+public enum TokenSaverHuggingFaceAuth {
+    public static func authorizationHeader(environment: [String: String] = ProcessInfo.processInfo.environment) -> String? {
+        for key in ["HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "HUGGINGFACE_TOKEN"] {
+            guard let token = environment[key]?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !token.isEmpty else {
+                continue
+            }
+            return "Bearer \(token)"
+        }
+        return nil
+    }
+}
+
 public final class TokenSaverModelDownloader: @unchecked Sendable {
     private struct HuggingFaceModelResponse: Decodable {
         struct Sibling: Decodable {
@@ -427,23 +584,113 @@ public final class TokenSaverModelDownloader: @unchecked Sendable {
         let siblings: [Sibling]
     }
 
+    private struct RemoteModelSource: Sendable {
+        enum ArtifactKind: Sendable, Equatable {
+            case llm
+            case auxiliary
+        }
+
+        let id: String
+        let url: String
+        let apiPayloadURL: URL
+        let expectedRevision: String?
+        let artifactKind: ArtifactKind
+    }
+
     private let installer: TokenSaverModelInstaller
     private let session: URLSession
     private let fileManager: FileManager
+    private let authorizationHeader: String?
     private let decoder = JSONDecoder()
 
     public init(
         installer: TokenSaverModelInstaller,
         session: URLSession = .shared,
-        fileManager: FileManager = .default
+        fileManager: FileManager = .default,
+        authorizationHeader: String? = TokenSaverHuggingFaceAuth.authorizationHeader()
     ) {
         self.installer = installer
         self.session = session
         self.fileManager = fileManager
+        let trimmedAuthorization = authorizationHeader?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        self.authorizationHeader = trimmedAuthorization.isEmpty ? nil : trimmedAuthorization
     }
 
     public func downloadApprovedModel(
         progress: TokenSaverModelDownloadProgress? = nil
+    ) async throws -> TokenSaverModelManifest {
+        try await downloadApprovedModel(progress: progress, emitReady: true)
+    }
+
+    public func downloadRequiredModels(
+        progress: TokenSaverModelDownloadProgress? = nil
+    ) async throws -> TokenSaverModelManifest {
+        let manifest = try await downloadApprovedModel(progress: progress, emitReady: false)
+        _ = try await downloadRequiredEncoderModels(progress: progress)
+        let validation = installer.validateInstalledTokenSaverModels(requireSelectedModel: true)
+        guard validation.state == .installed else {
+            throw TokenSaverModelDownloadError.validationFailed(validation.reason)
+        }
+        progress?(.ready)
+        return manifest
+    }
+
+    public func downloadRequiredEncoderModels(
+        progress: TokenSaverModelDownloadProgress? = nil
+    ) async throws -> TokenSaverRequiredModelsInstallManifest {
+        guard !installer.requiredAuxiliaryModels.isEmpty else {
+            let manifest = TokenSaverRequiredModelsInstallManifest(models: [])
+            try installer.writeEncoderManifest(manifest)
+            return manifest
+        }
+
+        var installedModels: [TokenSaverRequiredModelInstallManifest] = []
+        for (modelIndex, model) in installer.requiredAuxiliaryModels.enumerated() {
+            guard model.hasImmutableRevision else {
+                throw TokenSaverModelDownloadError.invalidModelResponse
+            }
+            progress?(TokenSaverModelDownloadState(
+                phase: .preparing,
+                statusText: "Fetching \(model.id) manifest (\(modelIndex + 1)/\(installer.requiredAuxiliaryModels.count))"
+            ))
+            let snapshot = try await fetchRequiredModelSnapshot(model)
+            guard !snapshot.files.isEmpty else { throw TokenSaverModelDownloadError.noModelFiles }
+
+            var manifestFiles: [TokenSaverModelFile] = []
+            for (fileIndex, file) in snapshot.files.enumerated() {
+                try Task.checkCancellation()
+                progress?(TokenSaverModelDownloadState(
+                    phase: .downloading,
+                    statusText: "Downloading \(model.id)/\(file.relativePath) (\(fileIndex + 1)/\(snapshot.files.count))"
+                ))
+                let localFile = try await downloadFile(
+                    file,
+                    modelID: model.id,
+                    revision: snapshot.revision,
+                    storageRoot: "Encoders",
+                    progress: progress
+                )
+                manifestFiles.append(localFile)
+            }
+            installedModels.append(TokenSaverRequiredModelInstallManifest(model: model, files: manifestFiles))
+        }
+
+        progress?(TokenSaverModelDownloadState(
+            phase: .verifying,
+            statusText: "Verifying downloaded encoder models"
+        ))
+        let manifest = TokenSaverRequiredModelsInstallManifest(models: installedModels)
+        try installer.writeEncoderManifest(manifest)
+        let validation = installer.validateInstalledEncoderModels()
+        guard validation.state == .installed else {
+            throw TokenSaverModelDownloadError.validationFailed(validation.reason)
+        }
+        return manifest
+    }
+
+    private func downloadApprovedModel(
+        progress: TokenSaverModelDownloadProgress?,
+        emitReady: Bool
     ) async throws -> TokenSaverModelManifest {
         progress?(TokenSaverModelDownloadState(
             phase: .preparing,
@@ -461,7 +708,9 @@ public final class TokenSaverModelDownloader: @unchecked Sendable {
             ))
             let localFile = try await downloadFile(
                 file,
+                modelID: installer.approvedModel.id,
                 revision: snapshot.revision,
+                storageRoot: "Models",
                 progress: progress
             )
             manifestFiles.append(localFile)
@@ -471,44 +720,84 @@ public final class TokenSaverModelDownloader: @unchecked Sendable {
             phase: .verifying,
             statusText: "Verifying downloaded model"
         ))
-        let manifest = TokenSaverModelManifest(revision: snapshot.revision, files: manifestFiles)
+        let manifest = TokenSaverModelManifest(
+            modelID: installer.approvedModel.id,
+            modelURL: installer.approvedModel.url,
+            revision: snapshot.revision,
+            runtime: installer.approvedModel.runtime,
+            files: manifestFiles
+        )
         try installer.writeManifest(manifest)
         let validation = installer.validateInstalledModel()
         guard validation.state == .installed else {
             throw TokenSaverModelDownloadError.validationFailed(validation.reason)
         }
-        progress?(.ready)
+        if emitReady {
+            progress?(.ready)
+        }
         return manifest
     }
 
     public func fetchApprovedModelSnapshot() async throws -> TokenSaverRemoteModelSnapshot {
-        let (data, response) = try await session.data(from: TokenSaverModelManifest.approvedModelAPIPayloadURL)
+        try await fetchModelSnapshot(RemoteModelSource(
+            id: installer.approvedModel.id,
+            url: installer.approvedModel.url,
+            apiPayloadURL: TokenSaverModelManifest.approvedModelAPIPayloadURL(for: installer.approvedModel),
+            expectedRevision: nil,
+            artifactKind: .llm
+        ))
+    }
+
+    public func fetchRequiredModelSnapshot(_ model: TokenSaverRequiredModel) async throws -> TokenSaverRemoteModelSnapshot {
+        try await fetchModelSnapshot(RemoteModelSource(
+            id: model.id,
+            url: model.url,
+            apiPayloadURL: model.apiPayloadURL,
+            expectedRevision: model.revision,
+            artifactKind: .auxiliary
+        ))
+    }
+
+    private func fetchModelSnapshot(_ source: RemoteModelSource) async throws -> TokenSaverRemoteModelSnapshot {
+        let request = authorizedRequest(url: source.apiPayloadURL)
+        let (data, response) = try await session.data(for: request)
         if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
             throw TokenSaverModelDownloadError.httpStatus(http.statusCode, "api/models")
         }
         let decoded = try decoder.decode(HuggingFaceModelResponse.self, from: data)
-        guard decoded.id == TokenSaverModelManifest.approvedModelID else {
+        guard decoded.id == source.id else {
+            throw TokenSaverModelDownloadError.invalidModelResponse
+        }
+        let revision = source.expectedRevision ?? decoded.sha
+        if let expectedRevision = source.expectedRevision, decoded.sha != expectedRevision {
             throw TokenSaverModelDownloadError.invalidModelResponse
         }
         let files = try decoded.siblings
             .map(\.rfilename)
-            .filter(Self.shouldDownloadFile)
+            .filter { Self.shouldDownloadFile($0, artifactKind: source.artifactKind) }
             .sorted()
             .map { path in
                 TokenSaverRemoteModelFile(
                     relativePath: path,
-                    downloadURL: try Self.downloadURL(revision: decoded.sha, relativePath: path)
+                    downloadURL: try Self.downloadURL(modelURL: source.url, revision: revision, relativePath: path)
                 )
             }
-        return TokenSaverRemoteModelSnapshot(revision: decoded.sha, files: files)
+        return TokenSaverRemoteModelSnapshot(revision: revision, files: files)
     }
 
     private func downloadFile(
         _ file: TokenSaverRemoteModelFile,
+        modelID: String,
         revision: String,
+        storageRoot: String,
         progress: TokenSaverModelDownloadProgress?
     ) async throws -> TokenSaverModelFile {
-        let relativeStoragePath = Self.localRelativePath(revision: revision, remotePath: file.relativePath)
+        let relativeStoragePath = Self.localRelativePath(
+            storageRoot: storageRoot,
+            modelID: modelID,
+            revision: revision,
+            remotePath: file.relativePath
+        )
         let destination = installer.distillDirectory.appendingPathComponent(relativeStoragePath)
         if fileManager.fileExists(atPath: destination.path) {
             return try manifestFile(relativePath: relativeStoragePath, url: destination)
@@ -540,7 +829,7 @@ public final class TokenSaverModelDownloader: @unchecked Sendable {
         var resumeOffset = fileSize(at: partial)
         while true {
             try Task.checkCancellation()
-            var request = URLRequest(url: file.downloadURL)
+            var request = authorizedRequest(url: file.downloadURL)
             if resumeOffset > 0 {
                 request.setValue("bytes=\(resumeOffset)-", forHTTPHeaderField: "Range")
             }
@@ -617,24 +906,51 @@ public final class TokenSaverModelDownloader: @unchecked Sendable {
         return max(0, size.int64Value)
     }
 
-    private static func shouldDownloadFile(_ path: String) -> Bool {
-        !path.hasPrefix(".")
+    private func authorizedRequest(url: URL) -> URLRequest {
+        var request = URLRequest(url: url)
+        if let authorizationHeader {
+            request.setValue(authorizationHeader, forHTTPHeaderField: "Authorization")
+        }
+        return request
     }
 
-    private static func downloadURL(revision: String, relativePath: String) throws -> URL {
+    private static func shouldDownloadFile(_ path: String, artifactKind: RemoteModelSource.ArtifactKind) -> Bool {
+        guard !path.hasPrefix(".") else { return false }
+        guard artifactKind == .auxiliary else { return true }
+
+        let lower = path.lowercased()
+        let name = URL(fileURLWithPath: lower).lastPathComponent
+        if lower.hasPrefix("onnx/") {
+            return false
+        }
+        if ["pytorch_model.bin", "tf_model.h5", "flax_model.msgpack", "rust_model.ot"].contains(name) {
+            return false
+        }
+        return lower.hasSuffix(".safetensors") ||
+            lower.hasSuffix(".json") ||
+            lower.hasSuffix(".txt") ||
+            lower.hasSuffix(".model")
+    }
+
+    private static func downloadURL(modelURL: String, revision: String, relativePath: String) throws -> URL {
         var allowed = CharacterSet.urlPathAllowed
         allowed.remove(charactersIn: "#?")
         guard let encodedPath = relativePath.addingPercentEncoding(withAllowedCharacters: allowed),
-              let url = URL(string: "\(TokenSaverModelManifest.approvedModelURL)/resolve/\(revision)/\(encodedPath)") else {
+              let url = URL(string: "\(modelURL)/resolve/\(revision)/\(encodedPath)") else {
             throw TokenSaverModelDownloadError.invalidDownloadURL(relativePath)
         }
         return url
     }
 
-    private static func localRelativePath(revision: String, remotePath: String) -> String {
+    private static func localRelativePath(
+        storageRoot: String,
+        modelID: String,
+        revision: String,
+        remotePath: String
+    ) -> String {
         [
-            "Models",
-            TokenSaverModelInstaller.safePathComponent(TokenSaverModelManifest.approvedModelID),
+            storageRoot,
+            TokenSaverModelInstaller.safePathComponent(modelID),
             revision,
             remotePath
         ].joined(separator: "/")

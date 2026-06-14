@@ -227,13 +227,17 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
     }
 
     public func respondToUserInput(threadId: AgentThreadID, requestId: String, text: String) throws {
+        try respondToUserInput(threadId: threadId, requestId: requestId, verbatimText: text, outboundText: text)
+    }
+
+    public func respondToUserInput(threadId: AgentThreadID, requestId: String, verbatimText: String, outboundText: String) throws {
         guard let pending = removePendingUserInput(threadId: threadId, requestId: requestId) else {
             throw AgentProviderAdapterError.sessionNotFound(threadId)
         }
         let answers = Self.codexAnswers(
             questionIds: pending.questionIds,
             multiSelectQuestionIds: pending.multiSelectQuestionIds,
-            text: text
+            text: verbatimText
         )
         var payload: [String: Any] = [
             "requestId": requestId,
@@ -243,7 +247,7 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         if let itemId = pending.itemId { payload["itemId"] = itemId }
         emit([
             runtimeEvent(method: "item/tool/requestUserInput/answered", payload: payload),
-            .userInputResolved(requestId: requestId, answer: text)
+            .userInputResolved(requestId: requestId, answer: verbatimText)
         ], threadId: threadId)
         pending.continuation.resume(returning: ["answers": answers])
     }

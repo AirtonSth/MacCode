@@ -142,10 +142,53 @@ private final class RecordingObserver: AgentRunObserver {
     func runCoordinator(_ c: AgentRunCoordinator, didChangeStatus status: AgentRunStatus, runId: AgentRunID, threadId: AgentThreadID) {}
 }
 
+private final class UserInputCapturingAdapter: AgentProviderAdapter, @unchecked Sendable {
+    let provider: AgentProvider
+    private let lock = NSLock()
+    private(set) var capturedUserInput: (threadId: AgentThreadID, requestId: String, verbatimText: String, outboundText: String)?
+
+    init(provider: AgentProvider = .claude) {
+        self.provider = provider
+    }
+
+    func listModels() async -> [AgentModelDescriptor] { [] }
+    func startSession(_ request: AgentRunRequest, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) async throws -> AgentRunHandle {
+        try await sendTurn(request, onEvent: onEvent)
+    }
+    func sendTurn(_ request: AgentRunRequest, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) async throws -> AgentRunHandle {
+        AgentRunHandle(runId: request.runId, process: nil) {}
+    }
+    func interruptTurn(threadId: AgentThreadID) throws {}
+    func respondToRequest(threadId: AgentThreadID, requestId: String, response: AgentProviderRequestResponse) async throws {}
+    func respondToUserInput(threadId: AgentThreadID, requestId: String, text: String) throws {
+        try respondToUserInput(threadId: threadId, requestId: requestId, verbatimText: text, outboundText: text)
+    }
+    func respondToUserInput(threadId: AgentThreadID, requestId: String, verbatimText: String, outboundText: String) throws {
+        lock.lock()
+        capturedUserInput = (threadId, requestId, verbatimText, outboundText)
+        lock.unlock()
+    }
+    func stopSession(threadId: AgentThreadID) throws {}
+    func recoverSession(_ request: AgentRunRequest, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) async throws {}
+    func listSessions() -> [AgentProviderSessionSummary] { [] }
+    func hasSession(threadId: AgentThreadID) -> Bool { true }
+    func readThread(threadId: AgentThreadID) async throws -> [AssistantEvent] { [] }
+    func rollbackThread(threadId: AgentThreadID, toTurnId: String) async throws {}
+    func stopAll() {}
+    func streamEvents(threadId: AgentThreadID, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) throws {}
+}
+
 private extension AssistantEvent {
     var bodyAppendForTest: String? {
         if case .itemDelta(_, let bodyAppend, _, _) = self {
             return bodyAppend
+        }
+        return nil
+    }
+
+    var turnCompletedFinalMessageForTest: String? {
+        if case .turnCompleted(_, let finalMessage) = self {
+            return finalMessage
         }
         return nil
     }
@@ -190,6 +233,40 @@ final class TokenSaverCompressionTests: XCTestCase {
         let messages = (try? messageRepo.list(threadId: thread.id)) ?? []
         XCTAssertEqual(messages.first(where: { $0.role == .user })?.content, original,
                        "the displayed user message must remain the original, uncompressed text")
+    }
+
+    func test_followUpCompressorTransformsOutboundButPreservesVerbatimAnswer() async throws {
+        let tmp = NSTemporaryDirectory() + "rc2-ts-followup-compress-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let thread = AgentThread(title: "follow-up", provider: .claude, model: "fake-model")
+        try threadRepo.upsert(thread)
+        let adapter = UserInputCapturingAdapter(provider: .claude)
+        let coordinator = AgentRunCoordinator(
+            runRepo: runRepo,
+            messageRepo: messageRepo,
+            threadRepo: threadRepo,
+            providerAdapters: [.claude: adapter]
+        )
+        coordinator.promptCompressor = { _, _, _ in
+            XCTFail("free-form follow-up answers should use followUpPromptCompressor when present")
+            return "WRONG"
+        }
+        coordinator.followUpPromptCompressor = { prompt, provider, threadId in
+            XCTAssertEqual(provider, .claude)
+            XCTAssertEqual(threadId, thread.id)
+            return "COMPRESSED::" + prompt
+        }
+
+        let original = "Here is a long follow-up stack trace at /tmp/Foo.swift:42 with error code 17"
+        try await coordinator.respondToUserInput(threadId: thread.id, requestId: "free-form-1", text: original)
+
+        XCTAssertEqual(adapter.capturedUserInput?.verbatimText, original,
+                       "UI/history must preserve the exact user answer")
+        XCTAssertEqual(adapter.capturedUserInput?.outboundText, "COMPRESSED::" + original,
+                       "free-form follow-up dispatch must use the compressed outbound text")
     }
 
     func test_noCompressorSendsOriginalUnchanged() async throws {
@@ -271,6 +348,73 @@ final class TokenSaverCompressionTests: XCTestCase {
         XCTAssertEqual(translation.originalText, sr1,
                        "persisted stream replay must retain the original SR1 text for view-original")
         XCTAssertEqual(translation.rewrittenText, humanized)
+    }
+
+    func test_finalAssistantHandleMarkerIsStrippedBeforePersistenceAndTurnCompletedDisplay() async throws {
+        let tmp = NSTemporaryDirectory() + "rc2-ts-final-handle-strip-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let final = "Build passed. Full raw output available.\n[[rc:deadbeef]]"
+        let runner = ScriptedFinalRunner(provider: .codex, finalMessage: final)
+        let thread = AgentThread(title: "final handle", provider: .codex, model: "fake-model")
+        try threadRepo.upsert(thread)
+        let coordinator = AgentRunCoordinator(
+            runRepo: runRepo, messageRepo: messageRepo, threadRepo: threadRepo,
+            providers: [.codex: runner]
+        )
+        let observer = RecordingObserver()
+        coordinator.addObserver(observer)
+
+        _ = try await coordinator.startRun(AgentRunRequest(
+            threadId: thread.id,
+            provider: .codex,
+            model: "fake-model",
+            cwd: tmp,
+            prompt: "Summarize the build output."
+        ))
+        let assistant = try await waitForAssistantMessage(messageRepo, threadId: thread.id)
+
+        XCTAssertEqual(assistant.content, "Build passed. Full raw output available.",
+                       "final assistant persistence must strip retrieve handles so transcript text stays human-facing")
+        XCTAssertFalse(assistant.content.contains("[[rc:"))
+        let turnCompleted = observer.recordedEvents.compactMap(\.turnCompletedFinalMessageForTest).last
+        XCTAssertEqual(turnCompleted, assistant.content,
+                       "turnCompleted display payload must match the sanitized persisted assistant text")
+    }
+
+    func test_finalResponseTranslatorOutputHandleMarkerIsStrippedBeforePersistence() async throws {
+        let tmp = NSTemporaryDirectory() + "rc2-ts-translated-handle-strip-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let sr1 = "S: build pass. P: unit tests green."
+        let runner = ScriptedFinalRunner(provider: .claude, finalMessage: sr1)
+        let thread = AgentThread(title: "translated handle", provider: .claude, model: "fake-model")
+        try threadRepo.upsert(thread)
+        let coordinator = AgentRunCoordinator(
+            runRepo: runRepo, messageRepo: messageRepo, threadRepo: threadRepo,
+            providers: [.claude: runner]
+        )
+
+        coordinator.finalResponseTranslator = { _, _, _, _ in
+            "Build passed. Raw log retained.\n[[rc:cafebabe]]"
+        }
+
+        _ = try await coordinator.startRun(AgentRunRequest(
+            threadId: thread.id,
+            provider: .claude,
+            model: "fake-model",
+            cwd: tmp,
+            prompt: "Explain the build result."
+        ))
+        let assistant = try await waitForAssistantMessage(messageRepo, threadId: thread.id)
+
+        XCTAssertEqual(assistant.content, "Build passed. Raw log retained.",
+                       "translated final text must be sanitized before it reaches transcript persistence")
+        XCTAssertFalse(assistant.content.contains("[[rc:"))
     }
 
     func test_sr1SemanticLineWithoutHeaderIsHumanizedBeforePersistence() async throws {
@@ -453,6 +597,13 @@ final class TokenSaverCompressionTests: XCTestCase {
                        "raw SR1 provider text must not reach the live timeline")
         XCTAssertFalse(liveBodies.contains("S received."))
 
+        while Date() < deadline,
+              !coordinator.latestStreamEvents(threadId: thread.id)
+                .compactMap(\.bodyAppendForTest)
+                .joined(separator: "\n")
+                .contains(expected) {
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
         let persistedBodies = coordinator.latestStreamEvents(threadId: thread.id)
             .compactMap(\.bodyAppendForTest)
             .joined(separator: "\n")

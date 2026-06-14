@@ -141,18 +141,25 @@ final class ClaudeCLIAdapterSessionPruneTests: XCTestCase {
         // Roll back t1 - marks it rollback-reachable.
         try await adapter.rollbackThread(threadId: t1, toTurnId: "turn-p")
 
-        // Run t2 and t3 to push map over cap.
-        for threadId in [t2, t3] {
-            _ = try await adapter.sendTurn(
-                AgentRunRequest(threadId: threadId, provider: .claude, model: "m", cwd: NSTemporaryDirectory(), prompt: "p"),
-                onEvent: { _ in }
-            )
-        }
-        try await waitUntilFinished(adapter: adapter, threadIds: [t2, t3])
+        _ = try await adapter.sendTurn(
+            AgentRunRequest(threadId: t2, provider: .claude, model: "m", cwd: NSTemporaryDirectory(), prompt: "p"),
+            onEvent: { _ in }
+        )
+        try await waitUntilFinished(adapter: adapter, threadIds: [t2])
+
+        // t3 pushes the finished-session map over cap. t1 is exempt, so t2 is
+        // the oldest non-rolled-back session and may be evicted.
+        _ = try await adapter.sendTurn(
+            AgentRunRequest(threadId: t3, provider: .claude, model: "m", cwd: NSTemporaryDirectory(), prompt: "p"),
+            onEvent: { _ in }
+        )
+        try await waitUntilFinished(adapter: adapter, threadIds: [t3])
 
         // t1 must survive because it was rolled back.
         XCTAssertTrue(adapter.hasSession(threadId: t1),
                       "a rolled-back thread must not be evicted even when the session cap is exceeded")
+        XCTAssertTrue(adapter.hasSession(threadId: t3),
+                      "the newest non-rolled-back thread should remain after the cap pruner runs")
         // t1 events must still be readable.
         let events = try await adapter.readThread(threadId: t1)
         XCTAssertFalse(events.isEmpty,

@@ -64,6 +64,18 @@ final class PaneActionTests: XCTestCase {
         return (ctx, router)
     }
 
+    private func drainMainQueue(seconds: TimeInterval = 0.05) {
+        RunLoop.main.run(until: Date().addingTimeInterval(seconds))
+    }
+
+    private func waitUntil(_ message: String, timeout: TimeInterval = 1, condition: () -> Bool) {
+        let deadline = Date().addingTimeInterval(timeout)
+        while !condition(), Date() < deadline {
+            drainMainQueue(seconds: 0.02)
+        }
+        XCTAssertTrue(condition(), message)
+    }
+
     private func makePaneWithTabCount(_ count: Int, name: String) throws -> (AppContext, AppCommandRouter, WorkspaceID, PaneNode) {
         let (ctx, router) = try makeContext()
         let ws = try router.createWorkspace(name: name, cwd: NSTemporaryDirectory())
@@ -290,6 +302,9 @@ final class PaneActionTests: XCTestCase {
         let host = try router.sshHostUpsert(SSHHostProfile(label: "Example SSH", destination: "example.invalid"), workspace: ws.id)
 
         surface.openNewConnectionForTesting(host)
+        waitUntil("first SSH open-new-connection must finish its async connect phase", timeout: 8) {
+            surface.snapshot()["ssh_status"] == "connected"
+        }
 
         var updated = try XCTUnwrap(ctx.state.workspaces[ws.id])
         let paneID = try XCTUnwrap(updated.layout.paneIDs().first)
@@ -312,6 +327,9 @@ final class PaneActionTests: XCTestCase {
                        "the new SSH tab should become the selected tab so it is visible immediately")
         let newSurfaceID = try XCTUnwrap(pane.surfaces.last?.id)
         let newSurface = try XCTUnwrap(SurfaceRegistry.shared.surface(newSurfaceID) as? SSHSurface)
+        waitUntil("new SSH tab must finish its async connect phase", timeout: 8) {
+            newSurface.snapshot()["ssh_status"] == "connected"
+        }
         XCTAssertEqual(newSurface.view.subviews.count, 5,
                        "new active SSH connections must open the full SSH tab chrome with hosts, terminal, and transfer sidebar")
         XCTAssertEqual(newSurface.sshTransferProfile?.id, host.id,
@@ -382,6 +400,7 @@ final class PaneActionTests: XCTestCase {
         try ctx.apply(.addSurface(workspaceID, paneID: nil, descriptor: descriptor))
         let controller = MainWindowController(context: ctx, router: router)
         router.windowController = controller
+        drainMainQueue()
         controller.window.contentView?.layoutSubtreeIfNeeded()
         let rootBefore = try XCTUnwrap(allSubviews(of: controller.window.contentView ?? NSView()).first { $0 is PaneRootView })
 
@@ -875,6 +894,7 @@ final class PaneActionTests: XCTestCase {
         let (ctx, router) = try makeContext()
         _ = try router.createWorkspace(name: "visible", cwd: NSTemporaryDirectory())
         let controller = MainWindowController(context: ctx, router: router)
+        drainMainQueue()
         controller.window.contentView?.layoutSubtreeIfNeeded()
 
         let content = try XCTUnwrap(controller.window.contentView)

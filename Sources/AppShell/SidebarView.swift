@@ -55,11 +55,10 @@ public final class SidebarViewModel: ObservableObject {
         case confirm
     }
 
-    /// Estimated model size used for disk-space checks and the confirm dialog
-    /// copy. Derived from the approved 1.7B 4-bit MLX model; no network call
-    /// is made -- the manifest is not available before the download begins.
-    /// Source: samuelfaj/distill-1.7B-4bit-MLX HuggingFace repo (~1.1 GB).
-    public static let approvedModelEstimatedBytes: Int64 = 1_100_000_000
+    /// Estimated full Token Saver bundle size used for disk-space checks and
+    /// the confirm dialog copy. Covers the selected approved MLX LLM plus the
+    /// required BERT/encoder models downloaded during activation.
+    public static let approvedModelEstimatedBytes: Int64 = 3_800_000_000
 
     /// Safety margin added to the estimated model size before comparing with
     /// free disk space. Covers the partial download file and manifest write.
@@ -81,7 +80,7 @@ public final class SidebarViewModel: ObservableObject {
         freeDiskBytes < modelBytes + downloadDiskMarginBytes ? .insufficientDisk : .confirm
     }
 
-    /// Human-readable size string for `approvedModelEstimatedBytes`, e.g. "1.1 GB".
+    /// Human-readable size string for `approvedModelEstimatedBytes`, e.g. "3.8 GB".
     nonisolated public static func humanModelSizeString() -> String {
         ByteCountFormatter.string(fromByteCount: approvedModelEstimatedBytes, countStyle: .file)
     }
@@ -97,6 +96,7 @@ public final class SidebarViewModel: ObservableObject {
     /// without showing a real NSAlert. Production default shows a blocking
     /// NSAlert. Returning true means "proceed with disable".
     public typealias TokenSaverDisableConfirmProvider = @MainActor () -> Bool
+    public typealias OperationErrorPresenter = @MainActor (_ message: String, _ detail: String) -> Void
 
     // MARK: - WorkspacePrompting seam (:95)
 
@@ -220,6 +220,7 @@ public final class SidebarViewModel: ObservableObject {
     /// after `self` is available in `init`). Tests replace this with a fake that
     /// returns a pre-determined decision without spinning AppKit modals.
     public var workspacePrompter: (any WorkspacePrompting)?
+    private let operationErrorPresenter: OperationErrorPresenter
 
     public weak var context: AppContext?
     public weak var router: AppCommandRouter?
@@ -322,7 +323,8 @@ public final class SidebarViewModel: ObservableObject {
         tokenSaverModelValidationProvider: TokenSaverModelValidationProvider? = nil,
         tokenSaverModelDownloadHandler: TokenSaverModelDownloadHandler? = nil,
         tokenSaverDownloadConfirmProvider: TokenSaverDownloadConfirmProvider? = nil,
-        tokenSaverDisableConfirmProvider: TokenSaverDisableConfirmProvider? = nil
+        tokenSaverDisableConfirmProvider: TokenSaverDisableConfirmProvider? = nil,
+        operationErrorPresenter: @escaping OperationErrorPresenter = SidebarViewModel.defaultOperationErrorPresenter
     ) {
         self.context = context
         self.router = router
@@ -336,6 +338,7 @@ public final class SidebarViewModel: ObservableObject {
         self.tokenSaverModelDownloadHandler = tokenSaverModelDownloadHandler
         self.tokenSaverDownloadConfirmProvider = tokenSaverDownloadConfirmProvider
         self.tokenSaverDisableConfirmProvider = tokenSaverDisableConfirmProvider
+        self.operationErrorPresenter = operationErrorPresenter
         self.lastPowerState = powerMonitor.currentPowerState
         self.privateAccountObserver = NotificationCenter.default.addObserver(
             forName: .rc2PrivateAccountChanged,
@@ -584,8 +587,28 @@ public final class SidebarViewModel: ObservableObject {
             context?.reconcileManagedDistillSkills(tokenSaverEnabled: false)
             return
         }
-        let validation = validateTokenSaverModel()
-        guard validation.state == .installed else {
+        let selectedValidation = validateTokenSaverModel(requireSelectedModel: true)
+        if selectedValidation.state == .installed {
+            tokenSaverEnabled = true
+            settingsStore.update {
+                $0.tokenSaverEnabled = true
+            }
+            refreshTokenSaverDistillService(modelValidation: selectedValidation)
+            return
+        }
+
+        let installedFallbackValidation = validateTokenSaverModel(requireSelectedModel: false)
+        if installedFallbackValidation.state == .installed {
+            tokenSaverEnabled = true
+            settingsStore.update {
+                $0.tokenSaverEnabled = true
+            }
+            refreshTokenSaverDistillService(modelValidation: installedFallbackValidation)
+            beginTokenSaverModelDownload(reason: selectedValidation.reason)
+            return
+        }
+
+        guard selectedValidation.state == .installed else {
             // Model is not present: require confirmation before starting the
             // multi-GB download. Skip the prompt only when the model is already
             // installed (no download needed).
@@ -603,14 +626,9 @@ public final class SidebarViewModel: ObservableObject {
                 confirmed = Self.defaultTokenSaverDownloadConfirm(sizeString: sizeString, hasEnoughDisk: hasEnoughDisk)
             }
             guard confirmed else { return }
-            beginTokenSaverModelDownload(reason: validation.reason)
+            beginTokenSaverModelDownload(reason: selectedValidation.reason)
             return
         }
-        tokenSaverEnabled = true
-        settingsStore.update {
-            $0.tokenSaverEnabled = true
-        }
-        refreshTokenSaverDistillService(modelValidation: validation)
     }
 
     public func dismissTokenSaverModelDownload() {
@@ -728,14 +746,15 @@ public final class SidebarViewModel: ObservableObject {
         refreshTokenSaverDistillService(modelValidation: .installed)
     }
 
-    private func validateTokenSaverModel() -> TokenSaverModelValidation {
+    private func validateTokenSaverModel(requireSelectedModel: Bool = false) -> TokenSaverModelValidation {
         if let tokenSaverModelValidationProvider {
             return tokenSaverModelValidationProvider()
         }
         guard let context else {
             return TokenSaverModelValidation(state: .missing, reason: "app support unavailable")
         }
-        return TokenSaverModelInstaller(appSupportDirectory: context.appSupportDirectory).validateInstalledModel()
+        return TokenSaverModelInstaller(appSupportDirectory: context.appSupportDirectory)
+            .validateInstalledTokenSaverModels(requireSelectedModel: requireSelectedModel)
     }
 
     private func beginTokenSaverModelDownload(reason: String?) {
@@ -827,7 +846,7 @@ public final class SidebarViewModel: ObservableObject {
         let downloader = TokenSaverModelDownloader(
             installer: TokenSaverModelInstaller(appSupportDirectory: context.appSupportDirectory)
         )
-        return try await downloader.downloadApprovedModel { state in
+        return try await downloader.downloadRequiredModels { state in
             Task { @MainActor in
                 progress(state)
             }
@@ -1508,7 +1527,7 @@ public final class SidebarViewModel: ObservableObject {
 
     // MARK: Error surfacing
 
-    private func showOperationError(_ message: String, detail: String) {
+    public static func defaultOperationErrorPresenter(message: String, detail: String) {
         let alert = NSAlert()
         alert.alertStyle = .critical
         alert.messageText = message
@@ -1520,6 +1539,10 @@ public final class SidebarViewModel: ObservableObject {
         } else {
             alert.runModal()
         }
+    }
+
+    private func showOperationError(_ message: String, detail: String) {
+        operationErrorPresenter(message, detail)
     }
 
     // MARK: Keyboard navigation
@@ -1765,6 +1788,24 @@ public struct TokenSaverBreakdownFormatter {
         return byMode
             .map { mode, totals in TokenSaverBreakdownRow(mode: mode, savedTokens: totals.saved, runs: totals.runs) }
             .sorted { $0.savedTokens > $1.savedTokens }
+    }
+}
+
+public enum TokenSaverSavingsDisplay {
+    public static let managedProviderIDs: Set<String> = ["claude", "codex"]
+
+    public static func otherSavingsRow(
+        from summary: TokenSaverSavingsSummary,
+        subscribed: Bool,
+        enabled: Bool
+    ) -> (savedTokens: Int, runs: Int)? {
+        guard subscribed && enabled else { return nil }
+        let savedTokens = summary.savedTokens(forProvidersOtherThan: managedProviderIDs)
+        guard savedTokens > 0 else { return nil }
+        return (
+            savedTokens: savedTokens,
+            runs: summary.runs(forProvidersOtherThan: managedProviderIDs)
+        )
     }
 }
 
@@ -2678,6 +2719,13 @@ public struct SidebarRootView: View {
             VStack(alignment: .leading, spacing: DS.Space.sm) {
                 tokenSaverProviderRow(provider: .claude)
                 tokenSaverProviderRow(provider: .codex)
+                if let other = TokenSaverSavingsDisplay.otherSavingsRow(
+                    from: vm.tokenSaverSavingsSummary,
+                    subscribed: vm.privateAccountUser?.subscribed == true,
+                    enabled: vm.tokenSaverEnabled
+                ) {
+                    tokenSaverOtherSavingsRow(saved: other.savedTokens, runs: other.runs)
+                }
             }
 
             let breakdownRows = TokenSaverBreakdownFormatter().rows(from: vm.tokenSaverSavingsSummary)
@@ -2727,6 +2775,10 @@ public struct SidebarRootView: View {
         .frame(width: 350, alignment: .leading)
         .background(DS.Palette.surface)
         .accessibilityIdentifier("sidebar.tokenSaver.details")
+    }
+
+    var tokenSaverDetailsPopoverForTesting: some View {
+        tokenSaverDetailsPopover
     }
 
     private var tokenSaverDetailsActivityChart: some View {
@@ -2841,6 +2893,36 @@ public struct SidebarRootView: View {
         }
         .padding(.vertical, 1)
         .accessibilityElement(children: .combine)
+    }
+
+    /// Reconciling row for savings not attributed to Claude/Codex — direct `distill`
+    /// CLI usage (provider "unknown"). Keeps the visible rows summing to the headline.
+    private func tokenSaverOtherSavingsRow(saved: Int, runs: Int) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            HStack(alignment: .firstTextBaseline, spacing: DS.Space.sm) {
+                Text("CLI & other")
+                    .font(DS.Font.captionStrong)
+                    .foregroundColor(DS.Palette.text)
+                    .lineLimit(1)
+                Spacer(minLength: 0)
+            }
+            HStack(alignment: .firstTextBaseline, spacing: DS.Space.sm) {
+                Text(runs == 1 ? "1 direct distill run" : "\(runs) direct distill runs")
+                    .font(DS.Font.caption)
+                    .foregroundColor(DS.Palette.textSecondary)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.82)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                Text("Saved " + Self.formatTokenCount(saved))
+                    .font(DS.Font.caption)
+                    .foregroundColor(DS.Palette.success)
+                    .monospacedDigit()
+                    .lineLimit(1)
+            }
+        }
+        .padding(.vertical, 1)
+        .accessibilityElement(children: .combine)
+        .accessibilityIdentifier("sidebar.tokenSaver.otherSavings")
     }
 
     private func tokenSaverRingLegendRow(color: Color, label: String, value: String) -> some View {
@@ -3335,7 +3417,7 @@ public struct SidebarRootView: View {
                         Text("Download Token Saver model")
                             .font(DS.Font.title3)
                             .foregroundColor(DS.Palette.text)
-                        Text(TokenSaverModelManifest.approvedModelID)
+                        Text(TokenSaverApprovedModels.selected().id)
                             .font(DS.Font.monoSmall)
                             .foregroundColor(DS.Palette.textSecondary)
                             .textSelection(.enabled)
@@ -3344,7 +3426,7 @@ public struct SidebarRootView: View {
                 }
 
                 VStack(alignment: .leading, spacing: DS.Space.sm) {
-                    infoRow("Source", "huggingface.co/samuelfaj/distill-1.7B-4bit-MLX")
+                    infoRow("Source", TokenSaverApprovedModels.selected().url.replacingOccurrences(of: "https://", with: ""))
                     infoRow("Status", state.statusText)
                     infoRow("Progress", progressText)
                     if let errorMessage = state.errorMessage, !errorMessage.isEmpty {

@@ -121,4 +121,32 @@ final class TokenSaverSavingsRepositoryTests: XCTestCase {
         XCTAssertEqual(summary.daily.count, 2, "two distinct UTC days must produce two daily buckets")
         XCTAssertEqual(summary.daily.map(\.savedTokens).reduce(0, +), summary.totalSavedTokens)
     }
+
+    /// The Token Saver card bug: direct `distill` CLI usage is recorded as provider
+    /// "unknown", so the headline total counted it but the per-provider (Claude/Codex)
+    /// rows showed 0 — the numbers didn't reconcile. This proves the displayed rows
+    /// (Claude + Codex + "CLI & other") sum exactly to the headline total.
+    func test_displayedSavingsReconcileWithHeadlineTotal() throws {
+        let db = try makeDB()
+        let repo = TokenSaverSavingsRepository(db: db, retentionDays: 7)
+        let now = Date(timeIntervalSince1970: 1_000_000_000)
+        // 9 command-output runs from the direct CLI → provider "unknown" (the screenshot).
+        for _ in 0..<9 {
+            _ = try repo.record(provider: "unknown", mode: "command-output", inputTokens: 3000, outputTokens: 470, at: now)
+        }
+        _ = try repo.record(provider: "claude", mode: "longText", inputTokens: 100, outputTokens: 40, at: now)
+
+        let s = try repo.summary(now: now)
+        let claude = s.savings(for: "claude")?.savedTokens ?? 0
+        let codex = s.savings(for: "codex")?.savedTokens ?? 0
+        let other = s.savedTokens(forProvidersOtherThan: ["claude", "codex"])
+
+        XCTAssertEqual(codex, 0)
+        XCTAssertGreaterThan(other, 0, "the unknown/CLI savings must be surfaced, not hidden")
+        XCTAssertEqual(other, 9 * (3000 - 470))
+        // The invariant the UI now upholds: visible rows sum to the headline total.
+        XCTAssertEqual(claude + codex + other, s.totalSavedTokens,
+                       "Claude + Codex + 'CLI & other' must equal the headline 'Saved N'")
+        XCTAssertEqual(s.runs(forProvidersOtherThan: ["claude", "codex"]), 9)
+    }
 }

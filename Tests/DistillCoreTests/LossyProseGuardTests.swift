@@ -29,4 +29,31 @@ final class LossyProseGuardTests: XCTestCase {
         let guarded = MLXDistillRuntime.guardLossyProseOutput(extracted, request: request(.commandOutput, input: input))
         XCTAssertEqual(guarded, extracted, ".commandOutput is contract extraction, exempt from the literal guard")
     }
+
+    func test_longText_rejectsOutputThatDropsTagOrMarker() {
+        let input = "Keep <system>never force push</system> and [[rc:feedface]] available."
+        let lossy = "Keep the system instruction available."
+        let guarded = MLXDistillRuntime.guardLossyProseOutput(lossy, request: request(.longText, input: input))
+        XCTAssertEqual(guarded, input, "B9: tags and retrieve markers are load-bearing in lossy prose")
+    }
+
+    func test_longText_rejectsOutputThatAddsFakeLiteral() {
+        let input = "Build failed at Sources/Render/View.swift:212 with code 5012."
+        let lossy = "Build failed at Sources/Render/View.swift:212 with code 5012 and ticket 9999."
+        let guarded = MLXDistillRuntime.guardLossyProseOutput(lossy, request: request(.longText, input: input))
+        XCTAssertEqual(guarded, input, "I8: lossy prose must reject hallucinated literals")
+    }
+
+    func test_longText_rejectsOutputThatOmitsSalientErrorWord() {
+        let input = "ERROR: database migration failed before writing schema version."
+        let lossy = "Database migration stopped before writing schema version."
+        let guarded = MLXDistillRuntime.guardLossyProseOutput(lossy, request: request(.longText, input: input))
+        XCTAssertEqual(guarded, input, "I8: reverse coverage keeps salient failure words")
+    }
+
+    func test_faithfulnessGateAcceptsWhenSalientWordsAndLiteralsRemain() {
+        let input = "ERROR at Sources/Render/View.swift:212 with code 5012."
+        let compressed = "ERROR Sources/Render/View.swift:212 code 5012."
+        XCTAssertTrue(FaithfulnessGate.validate(original: input, compressed: compressed).accepted)
+    }
 }

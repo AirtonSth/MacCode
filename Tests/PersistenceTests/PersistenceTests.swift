@@ -264,7 +264,7 @@ final class PersistenceTests: XCTestCase {
                        "checkpoint file summaries must survive as structured data, not only as display text")
     }
 
-    func test_turnCheckpointCorruptionFailsLoudInsteadOfDroppingSnapshotData() throws {
+    func test_turnCheckpointCorruptionReportsSkippedRowsWithoutDroppingHealthyData() throws {
         let tmp = NSTemporaryDirectory() + "RC2TurnCheckpointCorrupt-" + UUID().uuidString
         defer { try? FileManager.default.removeItem(atPath: tmp) }
         let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
@@ -283,10 +283,12 @@ final class PersistenceTests: XCTestCase {
         ))
         try db.execute("UPDATE agent_turn_checkpoints SET file_snapshots_json = '{broken json' WHERE turn_id = 'turn-corrupt';")
 
-        XCTAssertThrowsError(try AgentTurnCheckpointRepository(db: db).list(threadId: thread.id),
-                             "corrupt checkpoint snapshot JSON must fail loud instead of silently producing an empty restore set") { error in
-            XCTAssertTrue(String(describing: error).contains("Corrupt agent checkpoint"))
-        }
+        let result = try AgentTurnCheckpointRepository(db: db).listTolerant(threadId: thread.id)
+        XCTAssertEqual(result.healthy.count, 0)
+        XCTAssertEqual(result.corruptCount, 1,
+                       "corrupt checkpoint snapshot JSON must be counted so restore diagnostics fail loud without hiding other healthy checkpoints")
+        XCTAssertEqual(try AgentTurnCheckpointRepository(db: db).list(threadId: thread.id), [],
+                       "legacy list() should skip corrupt rows while listTolerant reports the skipped-row count")
     }
 
     func test_commandReceipt_roundtripsAcrossBootstrapRestart() throws {

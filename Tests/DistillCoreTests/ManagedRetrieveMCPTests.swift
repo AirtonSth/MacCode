@@ -21,8 +21,8 @@ final class ManagedRetrieveMCPTests: XCTestCase {
     func test_toolsListExposesRetrieveOnly() async throws {
         let obj = try parse(await server().handle(#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#))
         let tools = try XCTUnwrap((obj["result"] as? [String: Any])?["tools"] as? [[String: Any]])
-        XCTAssertEqual(tools.count, 1, "retrieve-only: exactly one tool, no compress tool")
-        XCTAssertEqual(tools[0]["name"] as? String, "rc_retrieve")
+        XCTAssertEqual(Set(tools.compactMap { $0["name"] as? String }), ["rc_retrieve", "rc_search"])
+        XCTAssertFalse(tools.contains { ($0["name"] as? String) == "rc_compress" }, "read-only MCP: no compress tool")
     }
 
     func test_toolsCallReturnsOriginal() async throws {
@@ -44,7 +44,22 @@ final class ManagedRetrieveMCPTests: XCTestCase {
     func test_wrongToolIsRejected() async throws {
         let obj = try parse(await server().handle(
             #"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"rc_compress","arguments":{}}}"#))
-        XCTAssertNotNil(obj["error"], "only rc_retrieve is exposed; no compress tool")
+        XCTAssertNotNil(obj["error"], "only read-only retrieve/search tools are exposed; no compress tool")
+    }
+
+    func test_searchToolReturnsReadOnlyHandles() async throws {
+        let index = CCRSearchIndex(records: [
+            CCRSearchRecord(handle: "h1", text: "INFO ok"),
+            CCRSearchRecord(handle: "h2", text: "ERROR payment failed at Sources/Billing.swift:12")
+        ])
+        let srv = ManagedRetrieveMCP(retrieve: { _ in nil }, search: { query, topK in index.search(query, topK: topK) })
+        let obj = try parse(await srv.handle(
+            #"{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"rc_search","arguments":{"query":"payment error","topK":1}}}"#))
+        let result = try XCTUnwrap(obj["result"] as? [String: Any])
+        let content = try XCTUnwrap(result["content"] as? [[String: Any]])
+        let text = try XCTUnwrap(content[0]["text"] as? String)
+        XCTAssertTrue(text.contains(#""handle":"h2""#))
+        XCTAssertFalse(text.contains("ERROR payment failed at Sources/Billing.swift:12\"}"), "search returns excerpts/handles, not full originals")
     }
 
     func test_notificationGetsNoResponse() async {

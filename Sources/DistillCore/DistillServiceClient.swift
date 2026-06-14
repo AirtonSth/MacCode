@@ -123,6 +123,14 @@ public final class DistillServiceClient: @unchecked Sendable {
         }
     }
 
+    public func rank(_ request: DistillRankRequest) async throws -> DistillRankResponse {
+        try await post(path: "v1/rank", body: request, responseType: DistillRankResponse.self)
+    }
+
+    public func embed(_ request: DistillEmbedRequest) async throws -> DistillEmbedResponse {
+        try await post(path: "v1/embed", body: request, responseType: DistillEmbedResponse.self)
+    }
+
     /// Release the underlying URLSession, allowing in-flight requests to
     /// complete before the session is torn down. Call this before discarding
     /// a client so the OS can reclaim socket/thread resources promptly.
@@ -161,6 +169,11 @@ public final class DistillServiceClient: @unchecked Sendable {
             question: request.question,
             provider: request.provider,
             recordSavings: request.recordSavings ?? false,
+            runMode: request.effectiveRunMode,
+            cacheState: request.cacheState,
+            rerankQuery: request.rerankQuery,
+            topK: request.topK,
+            encoderLane: request.encoderLane,
             maxOutputCharacters: request.maxOutputCharacters
         )
     }
@@ -223,5 +236,45 @@ public final class DistillServiceClient: @unchecked Sendable {
             i = prev
         }
         return String(s[start..<s.endIndex])
+    }
+
+    private func post<Request: Encodable, Response: Decodable>(
+        path: String,
+        body: Request,
+        responseType: Response.Type
+    ) async throws -> Response {
+        var httpRequest = URLRequest(url: baseURL.appendingPathComponent(path))
+        httpRequest.httpMethod = "POST"
+        httpRequest.setValue("Bearer \(authToken)", forHTTPHeaderField: "Authorization")
+        httpRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        httpRequest.timeoutInterval = Self.requestTimeoutSeconds
+        do {
+            httpRequest.httpBody = try encoder.encode(body)
+        } catch {
+            throw DistillClientError.transport("encode request: \(error)")
+        }
+
+        let data: Data
+        let response: URLResponse
+        do {
+            (data, response) = try await session.data(for: httpRequest)
+        } catch let urlError as URLError where urlError.code == .timedOut {
+            throw DistillClientError.timedOut(Self.requestTimeoutSeconds)
+        } catch {
+            throw DistillClientError.transport(String(describing: error))
+        }
+
+        guard let http = response as? HTTPURLResponse else {
+            throw DistillClientError.transport("non-http response")
+        }
+        guard http.statusCode == 200 else {
+            let body = String(decoding: data, as: UTF8.self)
+            throw DistillClientError.badStatus(http.statusCode, body)
+        }
+        do {
+            return try decoder.decode(Response.self, from: data)
+        } catch {
+            throw DistillClientError.decode(String(describing: error))
+        }
     }
 }

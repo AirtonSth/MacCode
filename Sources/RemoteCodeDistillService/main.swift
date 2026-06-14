@@ -56,8 +56,9 @@ struct RemoteCodeDistillServiceMain {
             let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: configuration.appSupportDirectory).run()
             let savingsRepo = TokenSaverSavingsRepository(db: db)
             let reversibleStore = SidecarReversibleStore(store: ReversibleContentStore(db: db))
+            let statsProvider = SidecarDistillStatsProvider(repository: savingsRepo)
             let eventWriter = DistillSidecarEventWriter()
-            let server = DistillHTTPServer(configuration: configuration, scheduler: scheduler, reversibleStore: reversibleStore, startsReady: false, metricsRecorder: sharedMetrics) { request, response in
+            let server = DistillHTTPServer(configuration: configuration, scheduler: scheduler, reversibleStore: reversibleStore, statsProvider: statsProvider, startsReady: false, metricsRecorder: sharedMetrics) { request, response in
                 guard let record = DistillSavingsCalculator.record(for: request, response: response) else {
                     return
                 }
@@ -195,11 +196,11 @@ struct RemoteCodeDistillServiceMain {
 
         let appSupport = URL(fileURLWithPath: configuration.appSupportDirectory, isDirectory: true)
         let installer = TokenSaverModelInstaller(appSupportDirectory: appSupport)
-        let validation = installer.validateInstalledModel()
+        let validation = installer.validateInstalledTokenSaverModels()
         guard validation.state == .installed, let manifest = installer.loadManifest() else {
             throw DistillServiceError.modelValidationFailed(validation.reason)
         }
-        return try await MLXDistillRuntime(modelDirectory: installer.modelStorageDirectory(revision: manifest.revision))
+        return try await MLXDistillRuntime(modelDirectory: installer.modelStorageDirectory(modelID: manifest.modelID, revision: manifest.revision))
     }
 
     private static let helpText = """
@@ -213,8 +214,8 @@ struct RemoteCodeDistillServiceMain {
       --host 127.0.0.1
       --port 0
       --runtime mlx
-      --model-id samuelfaj/distill-1.7B-4bit-MLX
-      --model-url https://huggingface.co/samuelfaj/distill-1.7B-4bit-MLX
+      --model-id \(DistillApprovedModel.id)
+      --model-url \(DistillApprovedModel.url)
       --max-concurrent-requests 8
       --max-queue-depth 64
       --idle-timeout-ms 300000
@@ -227,6 +228,35 @@ private struct SidecarReversibleStore: ReversibleStoring {
     let store: ReversibleContentStore
     func storeOriginal(_ data: Data) throws -> String { try store.store(data) }
     func retrieveOriginal(_ handle: String) throws -> Data? { try store.retrieve(handle) }
+}
+
+private struct SidecarDistillStatsProvider: DistillStatsProviding {
+    let repository: TokenSaverSavingsRepository
+
+    func statsSnapshot() throws -> DistillStatsSnapshot {
+        let summary = try repository.summary()
+        return DistillStatsSnapshot(
+            totalSavedTokens: summary.totalSavedTokens,
+            totalRuns: summary.totalRuns,
+            providers: summary.providers.map {
+                DistillStatsProviderSavings(
+                    provider: $0.provider,
+                    savedTokens: $0.savedTokens,
+                    inputTokens: $0.inputTokens,
+                    outputTokens: $0.outputTokens,
+                    runs: $0.runs
+                )
+            },
+            modes: summary.modes.map {
+                DistillStatsModeSavings(
+                    provider: $0.provider,
+                    mode: $0.mode,
+                    savedTokens: $0.savedTokens,
+                    runs: $0.runs
+                )
+            }
+        )
+    }
 }
 
 private final class DistillSidecarEventWriter: @unchecked Sendable {

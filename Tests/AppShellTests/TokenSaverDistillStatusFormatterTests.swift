@@ -62,6 +62,16 @@ final class TokenSaverDistillStatusFormatterTests: XCTestCase {
           "total_requests": \(total),
           "successful_requests": \(success),
           "failed_requests": \(failed),
+          "fallback_requests": 0,
+          "result_cache_hits": 0,
+          "result_cache_misses": 0,
+          "volatile_token_warnings": 0,
+          "encoder_lane_invocations": 0,
+          "encoder_lane_accepts": 0,
+          "encoder_lane_fallbacks": 0,
+          "encoder_lane_failures": 0,
+          "encoder_lane_deadline_timeouts": 0,
+          "pipe_hit_rate": 0,
           "max_concurrent_requests": \(max)
         }
         """.data(using: .utf8)!

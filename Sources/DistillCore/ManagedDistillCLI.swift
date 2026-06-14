@@ -64,8 +64,39 @@ public struct ManagedDistillCLI: Sendable {
         if arguments.first == "retrieve" {
             return await retrieve(handle: arguments.dropFirst().first ?? "")
         }
+        if arguments.first == "stats" {
+            return await stats()
+        }
+        if arguments.first == "dsl" {
+            return dsl(arguments: Array(arguments.dropFirst()))
+        }
+        if let command = arguments.first, Self.reservedSubcommands.contains(command) {
+            return unsupportedReservedSubcommand(command)
+        }
         let prompt = arguments.joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines)
         return await compress(prompt: prompt)
+    }
+
+    private static let reservedSubcommands: Set<String> = [
+        "rank",
+        "wrap"
+    ]
+
+    private func unsupportedReservedSubcommand(_ command: String) -> (Data, Int32) {
+        let message = "distill \(command): reserved subcommand is not implemented by this managed CLI\n"
+        return (Data(message.utf8), 1)
+    }
+
+    private func dsl(arguments: [String]) -> (Data, Int32) {
+        guard arguments.first == "learn-thread",
+              arguments.dropFirst().contains("--stdin") else {
+            return (Data("distill dsl: reserved subcommand is not implemented by this managed CLI\n".utf8), 1)
+        }
+        guard !stdin.isEmpty else {
+            return (Data("distill dsl learn-thread: no transcript on stdin\n".utf8), 1)
+        }
+        let message = "distill dsl learn-thread: accepted \(stdin.count) bytes\n"
+        return (Data(message.utf8), 0)
     }
 
     // MARK: - compress (fail-open)
@@ -133,5 +164,32 @@ public struct ManagedDistillCLI: Sendable {
             return (Data("distill retrieve: original unavailable\n".utf8), 1)
         }
         return (Data(original.utf8), 0)
+    }
+
+    private func stats() async -> (Data, Int32) {
+        guard let state, let url = URL(string: state.baseURL + "/v1/stats") else {
+            return (Data("distill stats: service unavailable\n".utf8), 1)
+        }
+        var urlRequest = URLRequest(url: url)
+        urlRequest.setValue("Bearer \(state.authToken)", forHTTPHeaderField: "Authorization")
+        guard let (data, status) = await transport(urlRequest), status == 200,
+              let snapshot = try? JSONDecoder().decode(DistillStatsSnapshot.self, from: data) else {
+            return (Data("distill stats: stats unavailable\n".utf8), 1)
+        }
+        return (Data(Self.formatStats(snapshot).utf8), 0)
+    }
+
+    static func formatStats(_ snapshot: DistillStatsSnapshot) -> String {
+        var lines = [
+            "saved_tokens=\(snapshot.totalSavedTokens)",
+            "runs=\(snapshot.totalRuns)"
+        ]
+        for provider in snapshot.providers {
+            lines.append("provider \(provider.provider): saved=\(provider.savedTokens) input=\(provider.inputTokens) output=\(provider.outputTokens) runs=\(provider.runs)")
+        }
+        for mode in snapshot.modes {
+            lines.append("mode \(mode.provider)/\(mode.mode): saved=\(mode.savedTokens) runs=\(mode.runs)")
+        }
+        return lines.joined(separator: "\n") + "\n"
     }
 }
