@@ -188,10 +188,20 @@ public struct DistillContentRouter: Sendable {
             // Build/search output often contains repeated progress or match rows.
             // Reuse the reversible line-run compressor before falling through.
             candidate = LogCollapser.collapse(input).map { DistillRouteResult(output: $0, contentType: type, lossless: true) }
-        case .sourceCode, .html:
-            // No safe deterministic crusher for these yet; fall through to the
-            // lane ML / passthrough chain without rewriting semantics.
-            candidate = nil
+        case .sourceCode:
+            if options.allowElementDropping, let handle = options.reversibleHandle {
+                candidate = SourceCodeSkeletonizer.skeletonize(input, droppedHandle: handle)
+                    .map { DistillRouteResult(output: $0, contentType: .sourceCode, lossless: false) }
+            } else {
+                candidate = nil
+            }
+        case .html:
+            if options.allowElementDropping, let handle = options.reversibleHandle {
+                candidate = HTMLStructuralCompressor.compress(input, droppedHandle: handle)
+                    .map { DistillRouteResult(output: $0, contentType: .html, lossless: false) }
+            } else {
+                candidate = nil
+            }
         case .mixed:
             candidate = nil
         case .prose:

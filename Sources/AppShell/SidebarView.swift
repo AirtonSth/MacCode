@@ -58,11 +58,11 @@ public final class SidebarViewModel: ObservableObject {
     /// Estimated full Token Saver bundle size used for disk-space checks and
     /// the confirm dialog copy. Covers the selected approved MLX LLM plus the
     /// required BERT/encoder models downloaded during activation.
-    public static let approvedModelEstimatedBytes: Int64 = 3_800_000_000
+    nonisolated public static let approvedModelEstimatedBytes: Int64 = 3_800_000_000
 
     /// Safety margin added to the estimated model size before comparing with
     /// free disk space. Covers the partial download file and manifest write.
-    public static let downloadDiskMarginBytes: Int64 = 200_000_000
+    nonisolated public static let downloadDiskMarginBytes: Int64 = 200_000_000
 
     /// Pure seam: decides whether a multi-GB download may proceed based solely
     /// on arithmetic over byte counts.  No I/O, no UI.

@@ -60,7 +60,7 @@ final class SourceCodeSkeletonizerTests: XCTestCase {
         )
     }
 
-    func test_routerStillFallsThroughForSourceCodeWithoutStoreBackedSkeletonizer() {
+    func test_routerFallsThroughForSourceCodeWithoutStoreBackedSkeletonizer() {
         let source = """
         import Foundation
         func run() -> String {
@@ -71,5 +71,37 @@ final class SourceCodeSkeletonizerTests: XCTestCase {
         let router = DistillContentRouter()
         XCTAssertEqual(router.classify(source), .sourceCode)
         XCTAssertNil(router.route(source))
+    }
+
+    func test_routerUsesStoreBackedSkeletonizerForLargeSourceCode() throws {
+        let body = (0..<50)
+            .map { "        let value\($0) = input + \($0)" }
+            .joined(separator: "\n")
+        let source = """
+        import Foundation
+
+        struct Renderer {
+            public func render(input: Int) -> String {
+        \(body)
+                return String(value49)
+            }
+        }
+        """
+
+        let router = DistillContentRouter()
+        let result = try XCTUnwrap(
+            router.route(
+                source,
+                options: .init(allowElementDropping: true, reversibleHandle: "code123")
+            ),
+            "B13 CodeCompressor must be reachable from the native router when a reversible store handle is available"
+        )
+
+        XCTAssertEqual(result.contentType, .sourceCode)
+        XCTAssertFalse(result.lossless)
+        XCTAssertTrue(result.output.contains("public func render(input: Int) -> String {"))
+        XCTAssertTrue(result.output.contains("[[rc:code123]]"))
+        XCTAssertFalse(result.output.contains("let value49 = input + 49"))
+        XCTAssertLessThan(result.output.count, source.count)
     }
 }
