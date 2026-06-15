@@ -2557,6 +2557,18 @@ public struct SidebarRootView: View {
         return "\(prefix) \(Self.formatTokenCount(tokenSaverSavedOrPotential(in: snapshot, scope: scope)))"
     }
 
+    /// The Token Saver legend headline advertises the lifetime grand total saved
+    /// across every provider (Claude + Codex + direct CLI), independent of the
+    /// selected scope. Non-subscribed users still see the scoped potential pitch.
+    private func tokenSaverLifetimeSavingsSummary(
+        for snapshot: TokenSaverUsageSnapshot
+    ) -> String {
+        guard vm.privateAccountUser?.subscribed == true && vm.tokenSaverEnabled else {
+            return tokenSaverSavingsSummary(for: snapshot, scope: tokenSaverDetailsScope)
+        }
+        return "Saved \(Self.formatTokenCount(vm.tokenSaverSavingsSummary.totalSavedTokens))"
+    }
+
     private func tokenSaverUsedLimitProgress(
         for usage: TokenSaverProviderUsage,
         provider: AgentProvider,
@@ -2728,49 +2740,6 @@ public struct SidebarRootView: View {
                     tokenSaverOtherSavingsRow(saved: other.savedTokens, runs: other.runs)
                 }
             }
-
-            let breakdownRows = TokenSaverBreakdownFormatter().rows(from: vm.tokenSaverSavingsSummary)
-            if !breakdownRows.isEmpty {
-                Divider()
-
-                VStack(alignment: .leading, spacing: DS.Space.xs) {
-                    HStack(alignment: .firstTextBaseline, spacing: DS.Space.sm) {
-                        Text("By mode")
-                            .font(DS.Font.captionStrong)
-                            .foregroundColor(DS.Palette.textSecondary)
-                        Spacer(minLength: 0)
-                        let avg = vm.tokenSaverSavingsSummary.averageSavedPerRun
-                        if avg > 0 {
-                            Text("~\(Self.formatTokenCount(avg)) avg/run")
-                                .font(DS.Font.caption)
-                                .foregroundColor(DS.Palette.textTertiary)
-                                .monospacedDigit()
-                                .accessibilityIdentifier("sidebar.tokenSaver.avgPerRun")
-                        }
-                    }
-                    ForEach(breakdownRows, id: \.mode) { row in
-                        HStack(alignment: .firstTextBaseline, spacing: DS.Space.sm) {
-                            Text(row.mode)
-                                .font(DS.Font.caption)
-                                .foregroundColor(DS.Palette.text)
-                                .lineLimit(1)
-                            Spacer(minLength: 0)
-                            Text("\(Self.formatTokenCount(row.savedTokens)) saved")
-                                .font(DS.Font.caption)
-                                .foregroundColor(DS.Palette.success)
-                                .monospacedDigit()
-                                .lineLimit(1)
-                            Text("\(row.runs) run\(row.runs == 1 ? "" : "s")")
-                                .font(DS.Font.caption2)
-                                .foregroundColor(DS.Palette.textTertiary)
-                                .monospacedDigit()
-                                .lineLimit(1)
-                        }
-                        .accessibilityElement(children: .combine)
-                        .accessibilityIdentifier("sidebar.tokenSaver.breakdown.\(row.mode)")
-                    }
-                }
-            }
         }
         .padding(DS.Space.md)
         .frame(width: 350, alignment: .leading)
@@ -2802,7 +2771,7 @@ public struct SidebarRootView: View {
                 tokenSaverRingLegendRow(
                     color: DS.Palette.success,
                     label: "Token Saver",
-                    value: tokenSaverSavingsSummary(for: snapshot, scope: tokenSaverDetailsScope)
+                    value: tokenSaverLifetimeSavingsSummary(for: snapshot)
                 )
                 tokenSaverRingLegendRow(
                     color: tokenSaverProviderColor(.claude),
