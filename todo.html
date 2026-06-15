@@ -1,0 +1,205 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>TODO — Suporte ao modelo E4B no Token Saver</title>
+<style>
+  :root{
+    --bg:#0d1117; --panel:#161b22; --border:#30363d; --text:#e6edf3; --muted:#9da7b3;
+    --accent:#3b82f6; --green:#3fb950; --red:#f85149; --amber:#d29922; --code:#0b0f14;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--text);font:15px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;}
+  .wrap{max-width:920px;margin:0 auto;padding:40px 24px 80px;}
+  h1{font-size:26px;margin:0 0 4px;}
+  h2{font-size:19px;margin:36px 0 12px;padding-bottom:6px;border-bottom:1px solid var(--border);}
+  h3{font-size:15px;margin:22px 0 8px;color:var(--muted);text-transform:uppercase;letter-spacing:.04em;}
+  p{margin:10px 0;}
+  code{background:var(--code);padding:1px 6px;border-radius:4px;font-family:"SF Mono",ui-monospace,Menlo,monospace;font-size:13px;color:#a5d6ff;}
+  pre{background:var(--code);border:1px solid var(--border);border-radius:8px;padding:14px 16px;overflow-x:auto;font-family:"SF Mono",ui-monospace,Menlo,monospace;font-size:12.5px;line-height:1.5;color:#c9d1d9;}
+  .meta{color:var(--muted);font-size:13px;margin-bottom:24px;}
+  .tag{display:inline-block;font-size:11px;font-weight:600;padding:2px 9px;border-radius:999px;vertical-align:middle;}
+  .tag.todo{background:rgba(210,153,34,.15);color:var(--amber);border:1px solid rgba(210,153,34,.4);}
+  .tag.done{background:rgba(63,185,80,.15);color:var(--green);border:1px solid rgba(63,185,80,.4);}
+  .tag.block{background:rgba(248,81,73,.15);color:var(--red);border:1px solid rgba(248,81,73,.4);}
+  .card{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:18px 20px;margin:14px 0;}
+  table{border-collapse:collapse;width:100%;margin:14px 0;font-size:13.5px;}
+  th,td{text-align:left;padding:8px 10px;border:1px solid var(--border);vertical-align:top;}
+  th{background:var(--panel);color:var(--muted);font-weight:600;}
+  ul,ol{margin:10px 0;padding-left:22px;}
+  li{margin:6px 0;}
+  .ok{color:var(--green);font-weight:600;}
+  .bad{color:var(--red);font-weight:600;}
+  .warn{color:var(--amber);font-weight:600;}
+  .step{border-left:3px solid var(--accent);padding:4px 0 4px 16px;margin:16px 0;}
+  .small{font-size:12.5px;color:var(--muted);}
+  a{color:var(--accent);}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <h1>TODO — Fazer o modelo <code>distill-E4B</code> (Gemma 3n) funcionar no Token Saver</h1>
+  <div class="meta">
+    Criado: 2026-06-15 · Branch: <code>june-09</code> · Status: <span class="tag block">BLOQUEADO POR LIB DE TERCEIROS</span><br>
+    Estado atual em produção: Token Saver funcionando 100% com o modelo <code>distill-1.7B-4bit-MLX</code> (qwen3).
+    Este documento descreve o que falta para suportar TAMBÉM o <code>distill-E4B-it-4-bit-MLX</code> (Gemma 3n).
+  </div>
+
+  <div class="card">
+    <strong>Resumo executivo.</strong> O E4B <span class="bad">não carrega</span> porque a biblioteca
+    <code>mlx-swift-lm 3.31.3</code> (a mais recente) tem um <em>loader</em> Gemma 3n incompleto, incompatível
+    com o layout de quantização deste checkpoint (gerado pelo <code>mlx_lm</code> Python). Não é um bug único:
+    é uma <span class="bad">cascata</span> de incompatibilidades. O único conserto real é
+    <strong>corrigir/forkar o loader Gemma 3n do mlx-swift-lm</strong> — trabalho grande e sensível a
+    correção numérica. Enquanto isso, o 1.7B (qwen3) atende perfeitamente e é ~2–3× mais rápido.
+  </div>
+
+  <h2>1. Contexto</h2>
+  <ul>
+    <li>O Token Saver roda um modelo MLX local (sidecar <code>RemoteCodeDistillService</code>) para comprimir prompts/saídas.</li>
+    <li>Modelos aprovados ficam em <code>Sources/CoreModel/TokenSaverApprovedModel.swift</code> (<code>TokenSaverApprovedModels.all</code>).</li>
+    <li>Hoje <code>all</code> contém só o <code>distill17B</code>. O <code>distillE4B</code> existe como constante mas foi
+        <strong>removido de <code>all</code></strong> justamente porque não carrega.</li>
+    <li>O E4B é maior (4B efetivos vs 1.7B) → potencialmente melhor qualidade de compressão, porém ~2–3× mais lento por chamada.</li>
+  </ul>
+
+  <h2>2. Por que o E4B não funciona (causa-raiz comprovada)</h2>
+  <p>
+    O E4B é <code>model_type: gemma4</code> / <code>Gemma4ForConditionalGeneration</code> (Gemma 3n):
+    42 camadas, <code>hidden_size=2560</code>, <code>hidden_size_per_layer_input=256</code>, <code>num_kv_shared_layers=18</code>.
+    O <code>LLMModelFactory</code> mapeia <code>gemma4</code> →
+    <code>.build/checkouts/mlx-swift-lm/Libraries/MLXLLM/Models/Gemma4Text.swift</code>, que falha ao carregar os pesos quantizados.
+  </p>
+  <p>O checkpoint foi quantizado pelo <code>mlx_lm</code> (Python). O loader Swift diverge dele em <strong>vários</strong> pontos
+     (cada correção revelou o próximo erro — uma cascata):</p>
+
+  <table>
+    <tr><th>#</th><th>Incompatibilidade</th><th>Detalhe técnico</th><th>Status</th></tr>
+    <tr>
+      <td>1</td>
+      <td><code>per_layer_model_projection</code> quantizado, mas a lib o constrói como float</td>
+      <td>A lib usa <code>private class ScaledLinear: Module</code> (Gemma4Text.swift:163) com <code>let weight: MLXArray</code> cru — <strong>não é quantizável</strong>. Checkpoint: <code>[10752, 320]</code> (4-bit empacotado, 2560/8). Lib espera float <code>[10752, 2560]</code> → <code>mismatchedSize</code>.</td>
+      <td><span class="warn">corrigível via dequant</span></td>
+    </tr>
+    <tr>
+      <td>2</td>
+      <td>Camadas KV-shared (24–41) sem <code>k_proj</code>/<code>v_proj</code>/<code>k_norm</code></td>
+      <td>Como <code>42 − 18 = 24</code>, as camadas 24+ compartilham KV; o checkpoint <strong>não tem</strong> esses pesos. Mas a lib cria <code>k_proj</code>/<code>v_proj</code>/<code>k_norm</code> para TODAS as camadas (Gemma4Text.swift:253/255/260, incondicional) → <code>keyNotFound layers.24.self_attn.k_proj.weight</code>. (No forward, camadas shared usam <code>sharedKV</code> e nunca chamam esses módulos.)</td>
+      <td><span class="warn">contornável com placeholders</span></td>
+    </tr>
+    <tr>
+      <td>3</td>
+      <td>Enumeração de pesos depende do <code>model.safetensors.index.json</code></td>
+      <td>O loader Swift usa o <code>weight_map</code> do index. Sem um index correto, chaves "somem" (ex.: <code>keyNotFound model.norm.weight</code> mesmo existindo no arquivo).</td>
+      <td><span class="warn">contornável regerando o index</span></td>
+    </tr>
+    <tr>
+      <td>4+</td>
+      <td><code>embed_tokens</code> / <code>embed_tokens_per_layer</code> (e possivelmente mais)</td>
+      <td>Após corrigir 1–3, surgiu <code>keyNotFound embed_tokens.weight</code> (Embedding quantizada custom). Provavelmente há mais por trás (<code>embed_tokens_per_layer</code> é enorme: 262144×10752). <strong>A cascata indica desalinhamento estrutural amplo, não 2–3 pontos.</strong></td>
+      <td><span class="bad">não resolvido</span></td>
+    </tr>
+  </table>
+
+  <p class="small">
+    Fatos adicionais: <code>3.31.3</code> é a versão <strong>mais recente</strong> do mlx-swift-lm (não há upgrade).
+    Re-quantizar do zero <strong>não</strong> ajuda — o <code>mlx_lm</code> (Python) produz exatamente o layout que a lib Swift não lê.
+  </p>
+
+  <h2>3. O que já foi tentado <span class="tag done">FEITO</span></h2>
+  <div class="card">
+    <p>Abordagem "quant compatível" via cirurgia no checkpoint local (sem re-download / sem HF):
+       script <code>convert_e4b.py</code> (guardado em <code>/tmp/convert_e4b.py</code> na sessão; recriar a partir da descrição abaixo).</p>
+    <ol>
+      <li><span class="ok">✓</span> Dequantizar <code>per_layer_model_projection</code> → bf16 com <code>mx.dequantize</code> (inverso exato; a lib aplica o mesmo <code>scalar</code> nos dois caminhos, então o forward seria numericamente idêntico). Remover <code>scales</code>/<code>biases</code> e a entrada do dict <code>quantization</code> no <code>config.json</code>.</li>
+      <li><span class="ok">✓</span> Injetar placeholders nas camadas 24–41: <code>k_proj</code>/<code>v_proj</code> = zeros <code>[1024, 2560]</code>, <code>k_norm</code> = ones <code>[512]</code> (formas tiradas da camada 23 real). São carregados mas <strong>nunca usados</strong> no runtime (forward usa <code>sharedKV</code>).</li>
+      <li><span class="ok">✓</span> Regerar <code>model.safetensors.index.json</code> (<code>weight_map</code> de todas as chaves → arquivo único) e o manifesto (<code>DistillModelManifest.json</code>) com SHAs novos.</li>
+    </ol>
+    <p><strong>Resultado:</strong> corrigiu os erros 1, 2 e 3 <em>sequencialmente</em>, mas cada correção revelou a próxima
+       (<code>per_layer_model_projection</code> → <code>k_proj</code> → <code>norm</code> → <code>embed_tokens</code> → …).
+       <span class="bad">Parado no erro 4.</span></p>
+    <p><strong>Por que parei:</strong> (a) é aberto — não se sabe quantos mismatches faltam; (b) é arriscado — mesmo que carregue,
+       a correção do forward do Gemma 3n (PLE/altup/KV-share) nessa versão da lib não está validada e poderia gerar
+       <span class="bad">compressão silenciosamente errada</span>, corrompendo o contexto do agente (pior que "saved 0").</p>
+  </div>
+
+  <h2>4. O que precisa ser feito <span class="tag todo">TODO</span></h2>
+
+  <h3>Opção A (recomendada para suportar E4B) — Forkar e corrigir o mlx-swift-lm</h3>
+  <div class="step">
+    <p>É o único conserto <em>correto</em>: alinhar o loader Gemma 3n da lib ao formato do checkpoint do <code>mlx_lm</code>.</p>
+    <ol>
+      <li>Forkar <code>github.com/ml-explore/mlx-swift-lm</code> e apontar o <code>Package.swift</code> para o fork
+          (<code>.package(url: "&lt;fork&gt;", ...)</code>), pinando o revision.</li>
+      <li>Em <code>Libraries/MLXLLM/Models/Gemma4Text.swift</code>:
+        <ul>
+          <li><strong>Tornar <code>ScaledLinear</code> quantization-aware</strong> (suportar <code>weight</code> empacotado + <code>scales</code> + <code>biases</code> + <code>group_size</code>/<code>bits</code>, usando <code>quantizedMatmul</code>), respeitando o dict <code>quantization</code> por-módulo do config.</li>
+          <li><strong>Não criar <code>k_proj</code>/<code>v_proj</code>/<code>k_norm</code> para camadas KV-shared</strong> (índice ≥ <code>numHiddenLayers − numKvSharedLayers</code>), ou torná-los opcionais e não exigir os pesos.</li>
+          <li>Conferir <code>embed_tokens</code> e <code>embed_tokens_per_layer</code>: garantir que o caminho de quantização da lib bata com o do checkpoint.</li>
+          <li>Validar PLE (per-layer embeddings), altup e laurel para esta variante (config mostra <code>laurel_rank=None</code>, <code>altup_num_inputs=None</code> — confirmar se o forward está correto).</li>
+        </ul>
+      </li>
+      <li><strong>VALIDAÇÃO NUMÉRICA OBRIGATÓRIA</strong> antes de enviar: comparar a saída do E4B carregado pela lib Swift
+          contra a referência do <code>mlx_lm</code> (Python) no MESMO prompt. Devem bater (tolerância pequena).
+          Sem isso, há risco de compressão silenciosamente errada.</li>
+      <li>Reativar o E4B: re-adicionar <code>distillE4B</code> a <code>TokenSaverApprovedModels.all</code> e decidir a política de seleção
+          (ver <strong>Decisão de produto</strong> abaixo). Adicionar um teste vivo (espelhar <code>Distill17BModelLoadTests</code>) que
+          carrega + gera com o E4B.</li>
+    </ol>
+    <p class="small">Esforço: alto. Risco: médio-alto (correção numérica + manutenção de fork). Recompensa: qualidade possivelmente maior, custo de latência ~2–3×.</p>
+  </div>
+
+  <h3>Opção B — Esperar/atualizar o suporte upstream</h3>
+  <div class="step">
+    <p>Acompanhar o mlx-swift-lm; quando o suporte a Gemma 3n quantizado amadurecer, bumpar a dependência e testar o E4B com o teste vivo. Sem fork.</p>
+  </div>
+
+  <h3>Opção C — Re-quantização compatível a partir do modelo full-precision</h3>
+  <div class="step">
+    <p>Requer o fine-tune <code>distill-E4B</code> em precisão cheia + conta HF. Re-quantizar com um predicado que produza
+       EXATAMENTE o que a lib Swift espera (deixar módulos custom sem quantizar, manter k/v em todas as camadas).
+       <span class="warn">Na prática, depende de saber todas as expectativas da lib</span> — então só vale junto com o entendimento da Opção A.</p>
+  </div>
+
+  <h2>5. Decisão de produto (resolver antes de ativar o E4B)</h2>
+  <div class="card">
+    <p><code>TokenSaverApprovedModels.selected()</code> escolhe o modelo de maior <code>minimumMemoryBytes</code> que a máquina suporta.
+       O E4B tem limite de 16 GB. Em máquinas ≥16 GB, ativar o E4B em <code>all</code> faria dele o <strong>default</strong>,
+       deixando cada turno do agente ~2–3× mais lento.</p>
+    <p><strong>Decidir:</strong> o E4B deve ser (a) opt-in explícito do usuário, (b) default só acima de algum limite de RAM, ou
+       (c) nunca default (apenas selecionável manualmente). Para um "Token Saver" focado em eficiência, opt-in é o mais seguro.</p>
+  </div>
+
+  <h2>6. Critérios de pronto (Definition of Done)</h2>
+  <ul>
+    <li>Sidecar carrega o E4B sem <code>MLX runtime failed</code> / <code>keyNotFound</code> / <code>mismatchedSize</code> (log mostra <code>MLX warmup complete</code>).</li>
+    <li><code>/v1/distill</code> com <code>mode: longText</code> retorna <code>routeStage: "llm_mlx"</code> e saída <strong>sã</strong> (não-lixo), validada contra a referência <code>mlx_lm</code>.</li>
+    <li>Savings reais gravados por provedor + engine (<code>longText (model)</code>) em tempo real.</li>
+    <li>Teste vivo do E4B passa (gated por env, como o do 1.7B).</li>
+    <li>Política de seleção decidida e implementada; <code>swift build</code> + suíte de testes verdes.</li>
+    <li>App re-empacotado (<code>scripts/package-app.sh</code>) e relançado.</li>
+  </ul>
+
+  <h2>7. Arquivos / referências</h2>
+  <ul>
+    <li><code>Sources/CoreModel/TokenSaverApprovedModel.swift</code> — lista de modelos aprovados / seleção.</li>
+    <li><code>.build/checkouts/mlx-swift-lm/Libraries/MLXLLM/Models/Gemma4Text.swift</code> — loader Gemma 3n (onde estão os bugs).</li>
+    <li><code>Sources/DistillCore/DistillCore.swift</code> — <code>MLXDistillRuntime</code> (carrega o modelo) + <code>EncoderFirstRuntime</code> (lane BERT).</li>
+    <li><code>Sources/RemoteCodeDistillService/main.swift</code> — bootstrap do sidecar + validação do modelo.</li>
+    <li><code>Tests/DistillCoreTests/Distill17BModelLoadTests.swift</code> — modelo de teste vivo a espelhar para o E4B.</li>
+    <li>Conversor (cirurgia de checkpoint, parcial): <code>/tmp/convert_e4b.py</code> (recriar conforme a Seção 3).</li>
+  </ul>
+
+  <h2>8. Recomendação</h2>
+  <div class="card">
+    <p><span class="ok">Manter o 1.7B (qwen3)</span> como modelo do Token Saver: funciona perfeitamente, grava savings em tempo real
+       nos dois provedores (Claude + Codex) com as 3 técnicas (determinístico + BERT + modelo), e é mais rápido.
+       Tratar o E4B como melhoria futura via <strong>Opção A</strong> (fork) somente se a qualidade extra justificar o custo
+       de latência e a manutenção do fork — e <strong>nunca</strong> enviar um E4B que apenas "carrega" sem validação numérica da saída.</p>
+  </div>
+
+</div>
+</body>
+</html>

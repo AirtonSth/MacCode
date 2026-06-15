@@ -1979,6 +1979,7 @@ public struct SidebarRootView: View {
                 }
                 .frame(maxHeight: .infinity)
                 .focusable()
+                .focusEffectDisabled()
                 .onKeyPress(phases: .down) { press in
                     handleKeyPress(press)
                 }
