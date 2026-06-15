@@ -5,9 +5,17 @@ cd "$(dirname "$0")/.."
 LINES="${RC2_MEMORY_SMOKE_LINES:-12000}"
 MAX_RSS_KB="${RC2_MEMORY_SMOKE_MAX_RSS_KB:-900000}"
 APP_NAME="RemoteCode"
+export RC2_CHANNEL="${RC2_CHANNEL:-stable}"
+case "$RC2_CHANNEL" in
+  stable) SOCKET_PATH="/tmp/RemoteCode.sock" ;;
+  canary) SOCKET_PATH="/tmp/RemoteCodeCanary.sock" ;;
+  debug) SOCKET_PATH="/tmp/RemoteCodeDebug.sock" ;;
+  *) echo "unsupported RC2_CHANNEL=$RC2_CHANNEL" >&2; exit 1 ;;
+esac
+export SOCKET_PATH
 ./script/build_and_run.sh --verify >/dev/null
 for _ in {1..40}; do
-  if .build/debug/rc2 --json ping 2>/dev/null | grep -q '"pong"'; then
+  if PING_JSON="$(.build/debug/rc2 --json ping 2>/dev/null)" && grep -q '"pong"' <<<"$PING_JSON"; then
     break
   fi
   sleep 0.25
@@ -34,7 +42,8 @@ import json, socket, sys
 sid=sys.argv[1]
 req={"jsonrpc":"2.0","id":1,"method":"surface.read_history","params":{"id":sid,"max_bytes":65536}}
 s=socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-s.connect("/tmp/RemoteCodeDebug.sock")
+import os
+s.connect(os.environ["SOCKET_PATH"])
 s.sendall((json.dumps(req)+"\n").encode())
 data=b""
 while not data.endswith(b"\n"):

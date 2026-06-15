@@ -728,8 +728,11 @@ public final class DistillHTTPServer: @unchecked Sendable {
     /// straddles the previous read boundary.
     /// Internal (not private) so unit tests can exercise the scan-offset logic directly.
     func requestIsComplete(_ data: Data, from scanOffset: Int = 0) -> Bool {
+        let separator = Data("\r\n\r\n".utf8)
         let searchStart = max(0, scanOffset - 3)
-        guard let headerRange = data.range(of: Data("\r\n\r\n".utf8), in: searchStart..<data.count),
+        let headerRange = data.range(of: separator, in: searchStart..<data.count)
+            ?? data.range(of: separator)
+        guard let headerRange,
               let headerText = String(data: data[..<headerRange.lowerBound], encoding: .utf8) else {
             return false
         }

@@ -33,7 +33,11 @@ public final class EventBus: @unchecked Sendable {
     private var recentBytes: Int = 0
     private let recentLimit: Int
     private let recentByteLimit: Int
-    private let encoder = JSONEncoder()
+    private let encoder: JSONEncoder = {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        return encoder
+    }()
     /// One-encode-per-event cache keyed by seq. Entries are evicted when the
     /// corresponding event is removed from the recent ring, bounding memory to
     /// at most recentLimit entries.

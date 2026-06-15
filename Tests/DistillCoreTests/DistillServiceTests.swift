@@ -748,6 +748,21 @@ final class DistillServiceTests: XCTestCase {
         XCTAssertTrue(server.requestIsComplete(fullData, from: midOffset))
     }
 
+    func test_requestIsComplete_bodyContinuationOffsetStillFindsHeader() throws {
+        let body = Data(String(repeating: "x", count: 70_000).utf8)
+        var raw = Data()
+        raw.append(Data("POST /v1/distill HTTP/1.1\r\nContent-Length: \(body.count)\r\n\r\n".utf8))
+        raw.append(body)
+
+        let server = try makeTestServer(token: "t")
+        let offsetAfterHeader = raw.count - body.count + 32_000
+
+        XCTAssertTrue(
+            server.requestIsComplete(raw, from: offsetAfterHeader),
+            "large authed bodies can arrive after the header delimiter was already scanned; completion must still detect the buffered header"
+        )
+    }
+
     private func makeTestServer(token: String) throws -> DistillHTTPServer {
         let cfg = try DistillServiceConfiguration(
             authToken: token,
