@@ -49,6 +49,10 @@ public struct DeadlineDistillRuntime: DistillRuntime {
     }
 
     public func distill(_ request: DistillRequest) async throws -> String {
+        try await distillStaged(request).output
+    }
+
+    public func distillStaged(_ request: DistillRequest) async throws -> DistillStageResult {
         let wrapped = self.wrapped
         let deadline = self.deadline
         do {
@@ -56,8 +60,8 @@ public struct DeadlineDistillRuntime: DistillRuntime {
                 let oneShot = OneShot()
                 let runtimeTask = Task {
                     do {
-                        let output = try await wrapped.distill(request)
-                        oneShot.fire { continuation.resume(returning: output) }
+                        let staged = try await wrapped.distillStaged(request)
+                        oneShot.fire { continuation.resume(returning: staged) }
                     } catch {
                         oneShot.fire { continuation.resume(throwing: error) }
                     }
@@ -77,7 +81,7 @@ public struct DeadlineDistillRuntime: DistillRuntime {
             if let onFallback {
                 await onFallback()
             }
-            return fallback(request)
+            return DistillStageResult(output: fallback(request), stage: .deterministic)
         }
     }
 

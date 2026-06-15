@@ -29,6 +29,41 @@ import Testing
 @Suite("TokenSaverDistillLaunchPlanner — stderr drain companion")
 struct TokenSaverStderrDrainTests {
 
+    // MARK: - Failure reason diagnostics
+
+    /// Why it matters: a sidecar crash loop must show the real stderr cause
+    /// instead of a generic "exited; restarting" banner that hides model-load
+    /// incompatibilities.
+    @Test("failure reason includes last actionable stderr line")
+    func failureReasonIncludesLastActionableStderrLine() {
+        let stderr = """
+        RemoteCodeDistillService MLX memory bounded: cacheLimit=128MB memoryLimit=6144MB
+        RemoteCodeDistillService failed: mismatchedSize(path: [\"language_model\"], expectedShape: [10752, 2560], actualShape: [10752, 320])
+        """
+        let reason = TokenSaverDistillFailureReasonFormatter.appendDiagnostic(
+            to: "RemoteCodeDistillService exited; restarting",
+            stderrLine: stderr
+        )
+
+        #expect(reason.contains("RemoteCodeDistillService exited; restarting"))
+        #expect(reason.contains("mismatchedSize"))
+        #expect(!reason.contains("MLX memory bounded"))
+    }
+
+    /// Why it matters: the app should strip the repeated executable prefix and
+    /// keep the UI banner short enough to stay readable.
+    @Test("stderr diagnostic strips service prefix and truncates long lines")
+    func stderrDiagnosticStripsPrefixAndTruncates() {
+        let longTail = String(repeating: "x", count: 400)
+        let diagnostic = TokenSaverDistillFailureReasonFormatter.sanitizedDiagnostic(
+            from: "RemoteCodeDistillService failed: \(longTail)"
+        )
+
+        #expect(diagnostic?.hasPrefix("RemoteCodeDistillService failed:") == false)
+        #expect((diagnostic?.count ?? 0) <= 223)
+        #expect(diagnostic?.hasSuffix("...") == true)
+    }
+
     // MARK: - LaunchPlanner (testable seam)
 
     /// Why it matters: planner is the sole guard that prevents `start()` (and

@@ -51,4 +51,3 @@ final class DiffPanelErrorBannerTests: XCTestCase {
         XCTAssertNil(vm.lastError)
     }
 }
-

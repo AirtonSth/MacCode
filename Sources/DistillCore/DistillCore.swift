@@ -129,6 +129,33 @@ public struct DistillRequest: Codable, Sendable, Equatable, Identifiable {
     public var effectiveRunMode: DistillRunMode {
         runMode ?? .optimize
     }
+
+    private enum CodingKeys: String, CodingKey {
+        case id, mode, priority, input, question, provider
+        case recordSavings, runMode, cacheState, rerankQuery, topK, encoderLane, maxOutputCharacters
+    }
+
+    /// Tolerant decoder: identical to the synthesized one EXCEPT a wire client may omit
+    /// `id` (a fresh UUID is synthesized). WHY: a hand-built JSON body that merely omitted
+    /// `id` previously 400'd, and the caller (the Claude PostToolUse hook) failed open
+    /// silently — recording ZERO savings. All other fields keep their original required /
+    /// optional semantics so decode behavior is otherwise unchanged.
+    public init(from decoder: Swift.Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.id = try c.decodeIfPresent(UUID.self, forKey: .id) ?? UUID()
+        self.mode = try c.decode(DistillMode.self, forKey: .mode)
+        self.priority = try c.decode(DistillPriority.self, forKey: .priority)
+        self.input = try c.decode(String.self, forKey: .input)
+        self.question = try c.decodeIfPresent(String.self, forKey: .question)
+        self.provider = try c.decodeIfPresent(String.self, forKey: .provider)
+        self.recordSavings = try c.decodeIfPresent(Bool.self, forKey: .recordSavings)
+        self.runMode = try c.decodeIfPresent(DistillRunMode.self, forKey: .runMode)
+        self.cacheState = try c.decodeIfPresent(String.self, forKey: .cacheState)
+        self.rerankQuery = try c.decodeIfPresent(String.self, forKey: .rerankQuery)
+        self.topK = try c.decodeIfPresent(Int.self, forKey: .topK)
+        self.encoderLane = try c.decodeIfPresent(String.self, forKey: .encoderLane)
+        self.maxOutputCharacters = try c.decode(Int.self, forKey: .maxOutputCharacters)
+    }
 }
 
 public struct DistillResponse: Codable, Sendable, Equatable {
@@ -145,6 +172,10 @@ public struct DistillResponse: Codable, Sendable, Equatable {
     public let originalHandle: String?
     public let runMode: DistillRunMode?
     public let auditReport: DistillAuditReport?
+    /// Which engine produced this output (deterministic router / BERT encoder lane /
+    /// MLX LLM). Lets Token Saver attribute saved tokens per technique. Optional +
+    /// synthesized Codable => decode tolerates payloads from older sidecars.
+    public let routeStage: TokenSaverRouteStage?
 
     public init(
         requestID: UUID,
@@ -154,7 +185,8 @@ public struct DistillResponse: Codable, Sendable, Equatable {
         outputTokens: Int = 0,
         originalHandle: String? = nil,
         runMode: DistillRunMode = .optimize,
-        auditReport: DistillAuditReport? = nil
+        auditReport: DistillAuditReport? = nil,
+        routeStage: TokenSaverRouteStage? = nil
     ) {
         self.requestID = requestID
         self.output = output
@@ -165,6 +197,7 @@ public struct DistillResponse: Codable, Sendable, Equatable {
         self.originalHandle = originalHandle
         self.runMode = runMode
         self.auditReport = auditReport
+        self.routeStage = routeStage
     }
 
     /// Tokens removed by compression. Never negative: a longer "compressed"
@@ -173,7 +206,9 @@ public struct DistillResponse: Codable, Sendable, Equatable {
 
     /// I2.4: fail-open copy that serves `input` verbatim (no savings, no handle). Used when
     /// a LOSSY substitution could not be backed by a reversible store, so the dropped bytes
-    /// would otherwise be unrecoverable.
+    /// would otherwise be unrecoverable. Engine attribution is set to `.verbatim`: no engine
+    /// compression was actually served, so the per-technique breakdown and route ledger must
+    /// not credit a zero-saving run to the model/BERT/deterministic engine that was bypassed.
     public func verbatimFallback(input: String) -> DistillResponse {
         DistillResponse(
             requestID: requestID,
@@ -183,7 +218,8 @@ public struct DistillResponse: Codable, Sendable, Equatable {
             outputTokens: inputTokens,
             originalHandle: nil,
             runMode: runMode ?? .optimize,
-            auditReport: auditReport
+            auditReport: auditReport,
+            routeStage: .verbatim
         )
     }
 
@@ -197,8 +233,22 @@ public struct DistillResponse: Codable, Sendable, Equatable {
             outputTokens: outputTokens,
             originalHandle: handle,
             runMode: runMode ?? .optimize,
-            auditReport: auditReport
+            auditReport: auditReport,
+            routeStage: routeStage
         )
+    }
+}
+
+/// Output of a runtime distill call plus which engine produced it. Lets the
+/// scheduler attribute saved tokens and route telemetry per technique without
+/// changing the legacy `distill(_:) -> String` contract.
+public struct DistillStageResult: Sendable {
+    public let output: String
+    public let stage: TokenSaverRouteStage?
+
+    public init(output: String, stage: TokenSaverRouteStage?) {
+        self.output = output
+        self.stage = stage
     }
 }
 
@@ -345,6 +395,9 @@ public enum TokenEstimator {
 
 public struct DistillSavingsRecord: Sendable, Equatable {
     public let provider: String
+    /// Saved-tokens mode, already folded with the producing engine where known
+    /// (e.g. "command-output (bert)") so the Token Saver breakdown shows savings per
+    /// technique. `routeStage` carries the raw engine for callers that want it.
     public let mode: String
     public let inputTokens: Int
     public let outputTokens: Int
@@ -353,14 +406,18 @@ public struct DistillSavingsRecord: Sendable, Equatable {
     /// never re-sent (char-delta is honest/cache-neutral); `prompt` is cache-relevant;
     /// `sr1_humanize`/`watch` are response-side. Lets the headline keep only honest rows.
     public let cacheState: String
+    /// The engine that produced this saving (deterministic / BERT / MLX), raw. `mode`
+    /// already folds it in for display; kept here for telemetry/tests.
+    public let routeStage: TokenSaverRouteStage?
 
-    public init(provider: String, mode: String, inputTokens: Int, outputTokens: Int, savedTokens: Int, cacheState: String = "unknown") {
+    public init(provider: String, mode: String, inputTokens: Int, outputTokens: Int, savedTokens: Int, cacheState: String = "unknown", routeStage: TokenSaverRouteStage? = nil) {
         self.provider = provider
         self.mode = mode
         self.inputTokens = max(0, inputTokens)
         self.outputTokens = max(0, outputTokens)
         self.savedTokens = max(0, savedTokens)
         self.cacheState = cacheState
+        self.routeStage = routeStage
     }
 }
 
@@ -380,11 +437,12 @@ public enum DistillSavingsCalculator {
             // already carries those estimates from the scheduler.
             return DistillSavingsRecord(
                 provider: provider,
-                mode: "command-output",
+                mode: TokenSaverEngineLabel.mode(base: "command-output", stage: response.routeStage),
                 inputTokens: response.inputTokens,
                 outputTokens: response.outputTokens,
                 savedTokens: response.savedTokens,
-                cacheState: request.cacheState ?? "tool_output_oneshot"
+                cacheState: request.cacheState ?? "tool_output_oneshot",
+                routeStage: response.routeStage
             )
         case .sr1Humanize:
             // The agent emitted the compressed SR1 response instead of the full
@@ -404,11 +462,12 @@ public enum DistillSavingsCalculator {
         case .longText, .watchSummary:
             return DistillSavingsRecord(
                 provider: provider,
-                mode: request.mode.rawValue,
+                mode: TokenSaverEngineLabel.mode(base: request.mode.rawValue, stage: response.routeStage),
                 inputTokens: response.inputTokens,
                 outputTokens: response.outputTokens,
                 savedTokens: response.savedTokens,
-                cacheState: request.cacheState ?? (request.mode == .longText ? "prompt" : "watch")
+                cacheState: request.cacheState ?? (request.mode == .longText ? "prompt" : "watch"),
+                routeStage: response.routeStage
             )
         }
     }
@@ -444,6 +503,12 @@ public enum DistillError: Error, Sendable, Equatable {
 public protocol DistillRuntime: Sendable {
     func distill(_ request: DistillRequest) async throws -> String
 
+    /// Like `distill`, but also reports which engine produced the output so Token
+    /// Saver can attribute saved tokens per technique (deterministic / BERT / MLX).
+    /// Default impl runs `distill` and reports an unknown engine (`nil`), so existing
+    /// runtimes keep working unchanged; engine-aware runtimes override this.
+    func distillStaged(_ request: DistillRequest) async throws -> DistillStageResult
+
     /// Called by the scheduler when no requests remain in flight. Runtimes that hold
     /// a GPU buffer cache (MLX) return it to the OS here so a long-lived warm server
     /// idles near its model's resident size instead of accumulating across requests.
@@ -456,10 +521,39 @@ public protocol DistillRuntime: Sendable {
 }
 
 public extension DistillRuntime {
+    /// Default: run the legacy text path and report an unknown engine.
+    func distillStaged(_ request: DistillRequest) async throws -> DistillStageResult {
+        DistillStageResult(output: try await distill(request), stage: nil)
+    }
     /// Runtimes without a reclaimable cache (deterministic/local) need do nothing.
     func reclaimIdleMemory() {}
     /// Runtimes with no cold-start cost need do nothing.
     func warmup() async throws {}
+}
+
+/// Maps a distill mode to its Token Saver routing lane (for route telemetry).
+public func tokenSaverLane(for mode: DistillMode) -> TokenSaverLane {
+    switch mode {
+    case .commandOutput: return .commandOutput
+    case .longText: return .longText
+    case .watchSummary: return .watchSummary
+    case .sr1Humanize: return .sr1Humanize
+    }
+}
+
+/// Human-readable, breakdown-stable mode label that folds the producing engine
+/// into the saved-tokens `mode` so the Token Saver UI shows savings per technique
+/// (e.g. "command-output (bert)" vs "command-output (model)").
+public enum TokenSaverEngineLabel {
+    public static func mode(base: String, stage: TokenSaverRouteStage?) -> String {
+        guard let stage else { return base }
+        switch stage {
+        case .deterministic: return "\(base) (deterministic)"
+        case .encoderBERT: return "\(base) (bert)"
+        case .llmMLX: return "\(base) (model)"
+        case .verbatim: return base
+        }
+    }
 }
 
 public struct DistillResultCacheKey: Hashable, Sendable, Equatable {
@@ -493,6 +587,7 @@ public struct DistillResultCacheKey: Hashable, Sendable, Equatable {
 
 private struct DistillResultCacheEntry: Sendable {
     let output: String
+    let stage: TokenSaverRouteStage?
     let insertedAt: Date
 }
 
@@ -690,19 +785,25 @@ public actor DistillScheduler {
     private var resultCache: [DistillResultCacheKey: DistillResultCacheEntry] = [:]
     private var resultCacheHits = 0
     private var resultCacheMisses = 0
+    /// C5: per-request engine routing telemetry sink (deterministic / BERT / MLX +
+    /// wall-clock). nil in unit/library use; the sidecar wires it to the metrics
+    /// recorder so the BERT-first payoff is observable in /metrics.
+    private let routeRecorder: (@Sendable (TokenSaverRouteTelemetryEvent) async -> Void)?
 
     public init(
         runtime: any DistillRuntime,
         maxConcurrentRequests: Int = 8,
         maxQueueDepth: Int = 0,
         resultCacheTTLSeconds: TimeInterval = 1_800,
-        resultCacheCapacity: Int = 128
+        resultCacheCapacity: Int = 128,
+        routeRecorder: (@Sendable (TokenSaverRouteTelemetryEvent) async -> Void)? = nil
     ) {
         self.runtime = runtime
         self.maxConcurrentRequests = max(1, maxConcurrentRequests)
         self.maxQueueDepth = max(0, maxQueueDepth)
         self.resultCacheTTLSeconds = max(0, resultCacheTTLSeconds)
         self.resultCacheCapacity = max(0, resultCacheCapacity)
+        self.routeRecorder = routeRecorder
     }
 
     public var activeRequestCount: Int {
@@ -732,9 +833,9 @@ public actor DistillScheduler {
             return try await audit(request)
         }
         let cacheKey = DistillResultCacheKey(request: request)
-        if let cached = cachedOutput(for: cacheKey) {
+        if let cached = cachedEntry(for: cacheKey) {
             resultCacheHits += 1
-            return response(for: request, output: cached)
+            return response(for: request, output: cached.output, stage: cached.stage)
         }
         if resultCacheTTLSeconds > 0, resultCacheCapacity > 0 {
             resultCacheMisses += 1
@@ -743,13 +844,22 @@ public actor DistillScheduler {
         try await acquireSlot()
         defer { releaseSlot() }
 
-        let raw = try await runtime.distill(request)
-        let output = String(raw.prefix(request.maxOutputCharacters))
+        let started = Date()
+        let staged = try await runtime.distillStaged(request)
+        let elapsedMs = Int(Date().timeIntervalSince(started) * 1_000)
+        let output = String(staged.output.prefix(request.maxOutputCharacters))
         guard !output.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw DistillError.invalidOutput
         }
-        storeCachedOutput(output, for: cacheKey)
-        return response(for: request, output: output)
+        if let routeRecorder {
+            await routeRecorder(TokenSaverRouteTelemetryEvent(
+                lane: tokenSaverLane(for: request.mode),
+                stage: staged.stage ?? .llmMLX,
+                wallClockMilliseconds: elapsedMs
+            ))
+        }
+        storeCachedOutput(output, stage: staged.stage, for: cacheKey)
+        return response(for: request, output: output, stage: staged.stage)
     }
 
     private func audit(_ request: DistillRequest) async throws -> DistillResponse {
@@ -784,18 +894,19 @@ public actor DistillScheduler {
         )
     }
 
-    private func response(for request: DistillRequest, output: String) -> DistillResponse {
+    private func response(for request: DistillRequest, output: String, stage: TokenSaverRouteStage?) -> DistillResponse {
         DistillResponse(
             requestID: request.id,
             output: output,
             inputCharacters: request.input.count,
             inputTokens: TokenEstimator.estimate(request.input),
             outputTokens: TokenEstimator.estimate(output),
-            runMode: request.effectiveRunMode
+            runMode: request.effectiveRunMode,
+            routeStage: stage
         )
     }
 
-    private func cachedOutput(for key: DistillResultCacheKey) -> String? {
+    private func cachedEntry(for key: DistillResultCacheKey) -> DistillResultCacheEntry? {
         guard resultCacheTTLSeconds > 0,
               let entry = resultCache[key] else {
             return nil
@@ -804,16 +915,16 @@ public actor DistillScheduler {
             resultCache.removeValue(forKey: key)
             return nil
         }
-        return entry.output
+        return entry
     }
 
-    private func storeCachedOutput(_ output: String, for key: DistillResultCacheKey) {
+    private func storeCachedOutput(_ output: String, stage: TokenSaverRouteStage?, for key: DistillResultCacheKey) {
         guard resultCacheCapacity > 0,
               !RetrieveHandleSanitizer.containsHandle(output) else {
             return
         }
         let now = Date()
-        resultCache[key] = DistillResultCacheEntry(output: output, insertedAt: now)
+        resultCache[key] = DistillResultCacheEntry(output: output, stage: stage, insertedAt: now)
         guard resultCache.count > resultCacheCapacity,
               let oldest = resultCache.min(by: { $0.value.insertedAt < $1.value.insertedAt })?.key else {
             return
@@ -856,16 +967,26 @@ public struct LocalDistillRuntime: DistillRuntime {
     public init() {}
 
     public func distill(_ request: DistillRequest) async throws -> String {
+        try await distillStaged(request).output
+    }
+
+    public func distillStaged(_ request: DistillRequest) async throws -> DistillStageResult {
+        // Every LocalDistillRuntime path is deterministic (no model), so the engine
+        // attribution is uniformly `.deterministic`.
+        DistillStageResult(output: try await Self.deterministicOutput(request), stage: .deterministic)
+    }
+
+    private static func deterministicOutput(_ request: DistillRequest) async throws -> String {
         // Deterministic content routing (G4): lossless structural compression of
         // JSON/log payloads on the pure "compress this" modes, before any heuristic
         // summarization. Skipped for .commandOutput (it must answer the contract
         // question, not blind-minify) and .sr1Humanize (a translation task).
         if request.mode == .longText || request.mode == .watchSummary,
-           let routed = Self.contentRouter.route(request.input, options: Self.routerOptions(for: request)) {
+           let routed = contentRouter.route(request.input, options: routerOptions(for: request)) {
             return routed.output
         }
         if request.mode == .commandOutput {
-            return Self.commandOutputFallback(
+            return commandOutputFallback(
                 input: request.input,
                 question: request.question,
                 maxOutputCharacters: request.maxOutputCharacters
@@ -884,7 +1005,7 @@ public struct LocalDistillRuntime: DistillRuntime {
         case .watchSummary:
             prefix = "D"
         case .sr1Humanize:
-            return Self.humanizeSR1Fallback(request.input, maxOutputCharacters: request.maxOutputCharacters)
+            return humanizeSR1Fallback(request.input, maxOutputCharacters: request.maxOutputCharacters)
         }
         return lines.isEmpty ? "\(prefix) no content" : lines.map { "\(prefix) \($0)" }.joined(separator: "\n")
     }
@@ -1299,8 +1420,12 @@ public struct MLXDistillRuntime: DistillRuntime {
     }
 
     public func distill(_ request: DistillRequest) async throws -> String {
+        try await distillStaged(request).output
+    }
+
+    public func distillStaged(_ request: DistillRequest) async throws -> DistillStageResult {
         if let deterministic = Self.deterministicCommandOutput(for: request) {
-            return deterministic
+            return DistillStageResult(output: deterministic, stage: .deterministic)
         }
 
         // Deterministic content routing (G4): lossless structural compression of
@@ -1309,9 +1434,14 @@ public struct MLXDistillRuntime: DistillRuntime {
         // (honors its contract question above) and .sr1Humanize is a translation.
         if request.mode == .longText || request.mode == .watchSummary,
            let routed = Self.contentRouter.route(request.input, options: Self.routerOptions(for: request)) {
-            return routed.output
+            return DistillStageResult(output: routed.output, stage: .deterministic)
         }
 
+        let raw = try await mlxGeneratedOutput(request)
+        return DistillStageResult(output: raw, stage: .llmMLX)
+    }
+
+    private func mlxGeneratedOutput(_ request: DistillRequest) async throws -> String {
         let instructions = Self.systemInstructions(for: request.mode)
         let maxTokens = Self.maxTokens(for: request)
         let cacheKey = ChatSessionCacheKey(instructions: instructions, maxTokens: maxTokens)

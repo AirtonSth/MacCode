@@ -5,8 +5,10 @@ final class DistillInstructionsTemplateTests: XCTestCase {
     func test_instructionsCarryHardPipeHeuristicAndRetrieveNote() {
         let t = AgentSkillInstaller.distillAgentInstructionsTemplate
         // P1-T7: hard pipe heuristic so agents auto-capture large tool output (G5).
-        XCTAssertTrue(t.contains("ALWAYS pipe build, test"), "hard pipe heuristic present")
-        XCTAssertTrue(t.contains("~30 lines or ~2KB"), "concrete size threshold present")
+        // Strengthened per "err toward more savings": default-pipe with a low threshold.
+        XCTAssertTrue(t.contains("by DEFAULT pipe EVERY"), "default-pipe heuristic present")
+        XCTAssertTrue(t.contains("~10 lines or ~1KB"), "lowered concrete size threshold present")
+        XCTAssertTrue(t.lowercased().contains("bias to compress"), "explicit bias-to-compress directive present")
         // Retrieve half of the reversibility story (G2/N5).
         XCTAssertTrue(t.contains("distill retrieve <handle>"), "retrieve command documented")
         XCTAssertTrue(t.contains("[[rc:<handle>]]"), "handle marker documented so the agent knows how to recover originals")

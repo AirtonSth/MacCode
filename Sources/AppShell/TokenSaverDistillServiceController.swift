@@ -215,6 +215,37 @@ public enum TokenSaverDistillSupervisor {
     }
 }
 
+public enum TokenSaverDistillFailureReasonFormatter {
+    private static let serviceFailurePrefix = "RemoteCodeDistillService failed:"
+    private static let maxDiagnosticCharacters = 220
+
+    public static func appendDiagnostic(to reason: String, stderrLine: String?) -> String {
+        guard let diagnostic = sanitizedDiagnostic(from: stderrLine) else { return reason }
+        guard !reason.contains(diagnostic) else { return reason }
+        return "\(reason): \(diagnostic)"
+    }
+
+    public static func sanitizedDiagnostic(from stderrLine: String?) -> String? {
+        guard let stderrLine else { return nil }
+        let candidates = stderrLine
+            .split(whereSeparator: \.isNewline)
+            .map { String($0).trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+            .filter { !$0.contains("MLX memory bounded") }
+        guard var diagnostic = candidates.last else { return nil }
+        if diagnostic.hasPrefix(serviceFailurePrefix) {
+            diagnostic = String(diagnostic.dropFirst(serviceFailurePrefix.count))
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        guard !diagnostic.isEmpty else { return nil }
+        if diagnostic.count > maxDiagnosticCharacters {
+            let cutoff = diagnostic.index(diagnostic.startIndex, offsetBy: maxDiagnosticCharacters)
+            diagnostic = String(diagnostic[..<cutoff]) + "..."
+        }
+        return diagnostic
+    }
+}
+
 /// Pure idle-unload decision helper. No side effects; fully testable without MainActor.
 ///
 /// - Parameters:
@@ -493,7 +524,11 @@ public final class TokenSaverDistillServiceController {
     private let processSpawner: any DistillProcessSpawning
     private var process: Process?
     private var readyOutputHandle: FileHandle?
+    private var stderrOutputHandle: FileHandle?
     private var readyOutputBuffer = Data()
+    private var stderrOutputBuffer = Data()
+    private var lastStderrLine: String?
+    private static let maxCapturedStderrBytes = 8192
     /// Set while `stop()` is tearing down so the termination handler does not
     /// misinterpret an intentional terminate() as a crash and auto-restart.
     private var isStopping = false
@@ -559,7 +594,11 @@ public final class TokenSaverDistillServiceController {
         restartAttempts = 0
         readyOutputHandle?.readabilityHandler = nil
         readyOutputHandle = nil
+        stderrOutputHandle?.readabilityHandler = nil
+        stderrOutputHandle = nil
         readyOutputBuffer.removeAll(keepingCapacity: false)
+        stderrOutputBuffer.removeAll(keepingCapacity: false)
+        lastStderrLine = nil
         removeCLIState()
         if let process {
             process.terminationHandler = nil
@@ -585,6 +624,11 @@ public final class TokenSaverDistillServiceController {
         // Tear down the dead process' I/O handles so a relaunch starts clean.
         readyOutputHandle?.readabilityHandler = nil
         readyOutputHandle = nil
+        stderrOutputHandle?.readabilityHandler = nil
+        if let data = stderrOutputHandle?.readDataToEndOfFile(), !data.isEmpty {
+            captureStderrData(data)
+        }
+        stderrOutputHandle = nil
         readyOutputBuffer.removeAll(keepingCapacity: false)
         removeCLIState()
         process = nil
@@ -601,10 +645,15 @@ public final class TokenSaverDistillServiceController {
             event: event,
             restartAttempts: restartAttempts
         )
-        status = decision.nextStatus
+        status = statusWithLastStderr(decision.nextStatus)
         if decision.shouldRestart {
             scheduleRestart()
         }
+    }
+
+    private func statusWithLastStderr(_ nextStatus: TokenSaverDistillServiceStatus) -> TokenSaverDistillServiceStatus {
+        guard case .failed(let reason) = nextStatus else { return nextStatus }
+        return .failed(TokenSaverDistillFailureReasonFormatter.appendDiagnostic(to: reason, stderrLine: lastStderrLine))
     }
 
     private func scheduleRestart() {
@@ -665,6 +714,10 @@ public final class TokenSaverDistillServiceController {
         }
 
         let token = UUID().uuidString
+        stderrOutputHandle?.readabilityHandler = nil
+        stderrOutputHandle = nil
+        stderrOutputBuffer.removeAll(keepingCapacity: false)
+        lastStderrLine = nil
         let manifest = TokenSaverModelInstaller(appSupportDirectory: appSupportDirectory).loadManifest()
         let model = manifest.flatMap {
             TokenSaverApprovedModels.approved(id: $0.modelID, url: $0.modelURL, runtime: $0.runtime)
@@ -700,8 +753,13 @@ public final class TokenSaverDistillServiceController {
             // Drain stderr continuously so the pipe buffer never fills.
             // Without this handler the sidecar blocks on any stderr write once
             // the 64 KB kernel pipe buffer is full, producing a deadlock.
-            spawned.stderrHandle.readabilityHandler = { handle in
-                _ = handle.availableData   // discard; keeps the buffer empty
+            self.stderrOutputHandle = spawned.stderrHandle
+            spawned.stderrHandle.readabilityHandler = { [weak self] handle in
+                let data = handle.availableData   // drains; keeps the buffer empty
+                guard !data.isEmpty else { return }
+                Task { @MainActor [weak self] in
+                    self?.captureStderrData(data)
+                }
             }
             readReadyEvent(from: spawned.stdoutHandle, process: process)
         } catch {
@@ -772,6 +830,16 @@ public final class TokenSaverDistillServiceController {
             return
         }
         NotificationCenter.default.post(name: .rc2TokenSaverUsageChanged, object: nil)
+    }
+
+    private func captureStderrData(_ data: Data) {
+        guard !data.isEmpty else { return }
+        stderrOutputBuffer.append(data)
+        if stderrOutputBuffer.count > Self.maxCapturedStderrBytes {
+            stderrOutputBuffer = stderrOutputBuffer.suffix(Self.maxCapturedStderrBytes)
+        }
+        guard let text = String(data: stderrOutputBuffer, encoding: .utf8) else { return }
+        lastStderrLine = TokenSaverDistillFailureReasonFormatter.sanitizedDiagnostic(from: text)
     }
 
     private var cliStateURL: URL {

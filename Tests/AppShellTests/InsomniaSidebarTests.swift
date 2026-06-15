@@ -335,8 +335,12 @@ final class InsomniaSidebarTests: XCTestCase {
     }
 
     func test_tokenSaverEnableKeepsFallbackRunningWhileSelectedModelDownloads() async throws {
-        guard TokenSaverApprovedModels.selected() == TokenSaverApprovedModels.distillE4B else {
-            throw XCTSkip("E4B migration path requires a >=16 GiB host; selector unit tests cover the lower-memory branch")
+        // This exercises the dual-model migration UX (a smaller fallback installed while a
+        // larger selected model downloads). It is dormant while the approved set has a
+        // single runnable model (E4B is excluded until mlx-swift-lm can load gemma4); it
+        // reactivates automatically when a second approved model returns.
+        guard TokenSaverApprovedModels.selected() != TokenSaverApprovedModels.fallbackModel else {
+            throw XCTSkip("dual-model migration path requires >=2 approved models; only 1.7B is runnable today")
         }
         let dir = NSTemporaryDirectory() + "RC2TokenSaverFallbackMigration-" + UUID().uuidString
         let fallbackInstaller = TokenSaverModelInstaller(

@@ -42,6 +42,10 @@ final class MainWindowControllerRebuildCountTests: XCTestCase {
         RunLoop.main.run(until: Date().addingTimeInterval(0.05))
     }
 
+    private func allSubviews(of view: NSView) -> [NSView] {
+        view.subviews + view.subviews.flatMap { allSubviews(of: $0) }
+    }
+
     private func makeDescriptor(_ index: Int) -> SurfaceDescriptor {
         SurfaceDescriptor(
             type: .browser,
@@ -221,6 +225,47 @@ final class MainWindowControllerRebuildCountTests: XCTestCase {
             "changes only selectedSurfaceID, not the structural signature. " +
             "applyFocusChangeInPlace must reconcile in place (PERF-MAC_SHELL_WINDOW-125). " +
             "If this fails, every tab click performs a full container teardown/rebuild.")
+    }
+
+    /// WHY: the same fast path that prevents a full rebuild must still replace
+    /// the visible content view. Otherwise a clicked tab looks selected while
+    /// the pane keeps rendering the old tab's surface.
+    func test_focusSurfaceUpdatesVisibleContentWithoutFullRebuild() throws {
+        let (ctx, router, wc) = try makeController(prefix: "focusSurfaceContent")
+        let ws = try router.createWorkspace(name: "ws-content", cwd: NSTemporaryDirectory())
+        let _ = try router.createSurface(workspace: ws.id, type: .browser, paneID: nil, title: "Tab2")
+        wc.refreshFromState()
+        drainMainQueue()
+
+        guard let wid = ctx.state.window.selectedWorkspaceID,
+              let freshWS = ctx.state.workspaces[wid],
+              let pane = freshWS.layout.find(paneID: freshWS.layout.paneIDs()[0]),
+              let firstSurfaceID = pane.surfaces.first?.id,
+              let secondSurfaceID = pane.surfaces.last?.id,
+              firstSurfaceID != secondSurfaceID,
+              let firstView = SurfaceRegistry.shared.surface(firstSurfaceID)?.view,
+              let secondView = SurfaceRegistry.shared.surface(secondSurfaceID)?.view,
+              let contentView = wc.window.contentView else {
+            XCTFail("Expected workspace with two registered surfaces in the same pane")
+            return
+        }
+
+        try router.focusSurface(workspace: wid, surface: firstSurfaceID)
+        drainMainQueue()
+        XCTAssertTrue(allSubviews(of: contentView).contains { $0 === firstView },
+                      "known starting point: the first selected tab's surface is mounted before switching")
+        let countBefore = wc.rebuildCount
+
+        try router.focusSurface(workspace: wid, surface: secondSurfaceID)
+        drainMainQueue()
+        let liveSubviews = allSubviews(of: contentView)
+
+        XCTAssertEqual(wc.rebuildCount, countBefore,
+                       "tab selection must stay on the in-place reconcile path, not hide the bug behind a full rebuild")
+        XCTAssertFalse(liveSubviews.contains { $0 === firstView },
+                       "the previously selected tab's surface must be removed from the content area")
+        XCTAssertTrue(liveSubviews.contains { $0 === secondView },
+                      "the newly selected tab's surface must be mounted so selected chrome and visible content match")
     }
 
     /// WHY: clicking a pane to focus it (focusPane) changes only focusedPaneID --

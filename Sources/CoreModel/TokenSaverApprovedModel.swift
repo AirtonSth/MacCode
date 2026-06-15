@@ -26,6 +26,15 @@ public enum TokenSaverApprovedModels {
         minimumMemoryBytes: 0
     )
 
+    /// Gemma 3n (`gemma4` / `Gemma4ForConditionalGeneration`). DELIBERATELY EXCLUDED from
+    /// `all`: the vendored mlx-swift-lm cannot load this architecture (it throws
+    /// `mismatchedSize`/`keyNotFound` on the per-layer projection weights at load time), so
+    /// the sidecar silently fell back to the deterministic runtime — the "distill model"
+    /// technique never ran and Token Saver under-counted. Re-add to `all` only once
+    /// mlx-swift-lm gains Gemma 3n support AND a live load+generate test passes. Kept as a
+    /// constant for tests and future re-enable. NOTE: an already-downloaded E4B copy is not
+    /// auto-deleted on migration to 1.7B (model revisions are never GC'd here); a user who
+    /// wants the disk back uses the existing "Delete model" action in the Token Saver UI.
     public static let distillE4B = TokenSaverApprovedModel(
         id: "samuelfaj/distill-E4B-it-4-bit-MLX",
         url: "https://huggingface.co/samuelfaj/distill-E4B-it-4-bit-MLX",
@@ -33,9 +42,12 @@ public enum TokenSaverApprovedModels {
         minimumMemoryBytes: 16 * 1_024 * 1_024 * 1_024
     )
 
+    /// Only models the current runtime can ACTUALLY load belong here. `selected()` and
+    /// `approved()` both derive from this list, so an excluded model is never auto-selected
+    /// and an installed copy of it reports "not approved" → the app migrates to a model that
+    /// works (1.7B / qwen3, verified to load + generate).
     public static let all: [TokenSaverApprovedModel] = [
         distill17B,
-        distillE4B,
     ]
 
     public static let fallbackModel = distill17B

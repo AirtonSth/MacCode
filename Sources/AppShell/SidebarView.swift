@@ -3715,7 +3715,6 @@ public struct SidebarRootView: View {
                             RoundedRectangle(cornerRadius: 1.5, style: .continuous)
                         )
                         .padding(.vertical, 5)
-                        .padding(.leading, DS.Space.sm)
                 }
             }
             .contentShape(Rectangle())

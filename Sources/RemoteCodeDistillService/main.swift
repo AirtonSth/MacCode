@@ -32,7 +32,11 @@ struct RemoteCodeDistillServiceMain {
             }
 
             let configuration = try DistillServiceConfiguration.parse(arguments: arguments)
-            let baseRuntime = try await runtime(for: configuration)
+            let runtimeResolution = try await runtime(for: configuration)
+            let baseRuntime = runtimeResolution.runtime
+            if let fallbackReason = runtimeResolution.fallbackReason {
+                FileHandle.standardError.write(Data("RemoteCodeDistillService MLX runtime failed; using deterministic fallback: \(fallbackReason)\n".utf8))
+            }
             // Shared metrics recorder: wired to both the HTTP server (which reads
             // it for /metrics) and to DeadlineDistillRuntime.onFallback (which
             // increments fallbackRequests on every deadline-exceeded path).
@@ -40,16 +44,27 @@ struct RemoteCodeDistillServiceMain {
             // path, so fallbackRequests stayed zero even when the model never warmed
             // up -- a permanently-cold model was undetectable via /metrics.
             let sharedMetrics = DistillServiceMetricsRecorder()
+            // BERT-first lane (C3): a real encoder extracts the relevant lines of large
+            // command output before the LLM is touched — and runs even when the LLM failed
+            // to load (deterministic fallback above), so the BERT technique always
+            // contributes. nil embedder => behaves exactly like the base runtime.
+            let encoderRuntime = EncoderFirstRuntime(
+                wrapping: baseRuntime,
+                encoderLane: EncoderFirstRuntime.makeEncoderLane()
+            )
             // Per-call deadline + fail-open so a stalled/cold generation never blocks
             // the agent loop (N2). Warmup below pays the cold-start before we serve.
             let scheduler = DistillScheduler(
                 runtime: DeadlineDistillRuntime(
-                    wrapping: baseRuntime,
+                    wrapping: encoderRuntime,
                     deadlineMilliseconds: configuration.mlxCallDeadlineMS,
                     onFallback: { await sharedMetrics.recordFallback() }
                 ),
                 maxConcurrentRequests: configuration.maxConcurrentRequests,
-                maxQueueDepth: configuration.maxQueueDepth
+                maxQueueDepth: configuration.maxQueueDepth,
+                // C5: feed per-request engine routing (deterministic / BERT / MLX) into the
+                // metrics recorder so the BERT-first payoff is observable in /metrics.
+                routeRecorder: { event in await sharedMetrics.recordRoute(event) }
             )
             // One DB connection shared by the savings ledger and the CCR store so
             // /v1/retrieve reads exactly what store-before-loss wrote (DB-path parity).
@@ -83,7 +98,8 @@ struct RemoteCodeDistillServiceMain {
             // If warmup fails, skip markReady() so /readyz stays 503 and the
             // controller sees a degraded service rather than a falsely-ready one.
             do {
-                try await baseRuntime.warmup()
+                // Warm both the encoder lane and the base runtime before readiness.
+                try await encoderRuntime.warmup()
                 server.markReady()
             } catch {
                 FileHandle.standardError.write(Data("RemoteCodeDistillService warmup failed (service degraded, /readyz will stay 503): \(error)\n".utf8))
@@ -189,9 +205,14 @@ struct RemoteCodeDistillServiceMain {
         return nil
     }
 
-    private static func runtime(for configuration: DistillServiceConfiguration) async throws -> any DistillRuntime {
+    private struct RuntimeResolution {
+        let runtime: any DistillRuntime
+        let fallbackReason: String?
+    }
+
+    private static func runtime(for configuration: DistillServiceConfiguration) async throws -> RuntimeResolution {
         if ProcessInfo.processInfo.environment["REMOTE_CODE_DISTILL_ALLOW_TEST_RUNTIME"] == "1" {
-            return LocalDistillRuntime()
+            return RuntimeResolution(runtime: LocalDistillRuntime(), fallbackReason: nil)
         }
 
         let appSupport = URL(fileURLWithPath: configuration.appSupportDirectory, isDirectory: true)
@@ -200,7 +221,14 @@ struct RemoteCodeDistillServiceMain {
         guard validation.state == .installed, let manifest = installer.loadManifest() else {
             throw DistillServiceError.modelValidationFailed(validation.reason)
         }
-        return try await MLXDistillRuntime(modelDirectory: installer.modelStorageDirectory(modelID: manifest.modelID, revision: manifest.revision))
+        do {
+            return RuntimeResolution(
+                runtime: try await MLXDistillRuntime(modelDirectory: installer.modelStorageDirectory(modelID: manifest.modelID, revision: manifest.revision)),
+                fallbackReason: nil
+            )
+        } catch {
+            return RuntimeResolution(runtime: LocalDistillRuntime(), fallbackReason: String(describing: error))
+        }
     }
 
     private static let helpText = """

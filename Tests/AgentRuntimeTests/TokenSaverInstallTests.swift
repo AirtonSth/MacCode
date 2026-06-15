@@ -577,7 +577,7 @@ final class TokenSaverInstallTests: XCTestCase {
 
     func test_modelDownloaderUsesSelectedApprovedModel() async throws {
         let appSupport = tempDir()
-        let compact = TokenSaverApprovedModels.distillE4B
+        let compact = TokenSaverApprovedModels.distill17B
         let installer = TokenSaverModelInstaller(appSupportDirectory: appSupport, approvedModel: compact)
         let revision = "compact-rev-test"
         let storedModel = installer.distillDirectory
@@ -595,11 +595,11 @@ final class TokenSaverInstallTests: XCTestCase {
         let manifest = try await URLProtocolStub.withHandler({ request in
             let path = request.url?.path ?? ""
             if path.contains("/api/models/") {
-                XCTAssertTrue(path.contains("distill-E4B-it-4-bit-MLX"))
+                XCTAssertTrue(path.contains("distill-1.7B-4bit-MLX"))
                 return (200, ["Content-Length": "\(api.utf8.count)"], Data(api.utf8))
             }
             if path.hasSuffix("/model.safetensors") {
-                XCTAssertTrue(path.contains("distill-E4B-it-4-bit-MLX"))
+                XCTAssertTrue(path.contains("distill-1.7B-4bit-MLX"))
                 return (200, ["Content-Length": "7"], Data("weights".utf8))
             }
             return (404, [:], Data())
@@ -616,11 +616,11 @@ final class TokenSaverInstallTests: XCTestCase {
         XCTAssertEqual(installer.validateInstalledModel(), .installed)
     }
 
-    func test_modelDownloaderActivationDownloadsE4BAndRequiredBertBundle() async throws {
+    func test_modelDownloaderActivationDownloadsSelectedModelAndRequiredBertBundle() async throws {
         let appSupport = tempDir()
-        let model = TokenSaverApprovedModels.distillE4B
+        let model = TokenSaverApprovedModels.distill17B
         let installer = TokenSaverModelInstaller(appSupportDirectory: appSupport, approvedModel: model)
-        let llmRevision = "e4b-rev-test"
+        let llmRevision = "selected-rev-test"
 
         func apiJSON(id: String, revision: String, files: [String]) -> Data {
             let siblings = files
@@ -675,7 +675,7 @@ final class TokenSaverInstallTests: XCTestCase {
         })
 
         XCTAssertEqual(manifest.modelID, model.id)
-        XCTAssertEqual(manifest.modelURL, "https://huggingface.co/samuelfaj/distill-E4B-it-4-bit-MLX")
+        XCTAssertEqual(manifest.modelURL, "https://huggingface.co/samuelfaj/distill-1.7B-4bit-MLX")
         XCTAssertTrue(FileManager.default.fileExists(atPath: installer.modelStorageDirectory(modelID: model.id, revision: llmRevision)
             .appendingPathComponent("model.safetensors").path))
         for required in TokenSaverRequiredModels.activationBundle {
@@ -691,7 +691,7 @@ final class TokenSaverInstallTests: XCTestCase {
 
     func test_modelDownloaderSendsHuggingFaceBearerTokenToApiAndFiles() async throws {
         let appSupport = tempDir()
-        let model = TokenSaverApprovedModels.distillE4B
+        let model = TokenSaverApprovedModels.distill17B
         let installer = TokenSaverModelInstaller(appSupportDirectory: appSupport, approvedModel: model)
         let revision = "auth-rev-test"
         let api = """

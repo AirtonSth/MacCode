@@ -463,6 +463,41 @@ final class TokenSaverAppContextTests: XCTestCase {
         XCTAssertGreaterThan(summary.averageSavedPerRun, 0, "the per-run average (média) must be computable from real data")
     }
 
+    func test_tokenSaverCompressionAutoSavesForCodexNotJustClaude() async throws {
+        // The "Codex Saved 0" complaint: prompt compression is provider-agnostic. The same
+        // automatic compress path that records Claude savings must record Codex savings —
+        // attributed to codex, engine-tagged — WITHOUT the agent voluntarily piping anything.
+        let appSupport = NSTemporaryDirectory() + "RC2TokenSaverCodexAuto-" + UUID().uuidString
+        let context = try AppContext(channel: .debug, appSupportOverride: appSupport)
+        SettingsStore(db: context.db).update { $0.tokenSaverEnabled = true }
+
+        let configuration = try DistillServiceConfiguration(authToken: "codex-token", appSupportDirectory: appSupport)
+        let scheduler = DistillScheduler(runtime: LocalDistillRuntime(), maxConcurrentRequests: 4)
+        let server = DistillHTTPServer(configuration: configuration, scheduler: scheduler)
+        let ready = try await server.start()
+        defer { server.stop() }
+        context.distillClientOverrideForTesting = DistillServiceClient(ready: ready, authToken: "codex-token")
+
+        let bigPrompt = (1...40)
+            .map { "line \($0): a verbose codex instruction line that the distiller will compress away" }
+            .joined(separator: "\n")
+        XCTAssertGreaterThan(bigPrompt.count, 2_000)
+
+        let compressed = await context.tokenSaverCompress(prompt: bigPrompt, provider: .codex, threadId: AgentThreadID())
+        XCTAssertLessThan(compressed.count, bigPrompt.count, "Codex prompts must auto-compress, exactly like Claude")
+
+        let summary = try context.tokenSaverSavingsRepo.summary()
+        let codex = try XCTUnwrap(summary.savings(for: "codex"),
+                                  "a codex-attributed savings row must be persisted — proving Codex is no longer 'Saved 0'")
+        XCTAssertGreaterThan(codex.savedTokens, 0, "Codex must actually save tokens automatically")
+        XCTAssertEqual(codex.runs, 1)
+        // The engine that produced the win must be folded into the mode for the breakdown.
+        let codexMode = try XCTUnwrap(summary.modes.first { $0.provider == "codex" })
+        XCTAssertTrue(codexMode.mode.contains("(deterministic)") || codexMode.mode.contains("(model)"),
+                      "codex savings must be engine-attributed, got mode=\(codexMode.mode)")
+        XCTAssertNil(summary.savings(for: "claude"), "this run was codex-only; no claude row should exist")
+    }
+
     func test_tokenSaverFollowUpCompressionRecordsPromptFollowupCacheState() async throws {
         let appSupport = NSTemporaryDirectory() + "RC2TokenSaverFollowupLedger-" + UUID().uuidString
         let context = try AppContext(channel: .debug, appSupportOverride: appSupport)

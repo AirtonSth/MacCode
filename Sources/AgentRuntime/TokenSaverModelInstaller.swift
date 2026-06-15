@@ -574,6 +574,116 @@ public enum TokenSaverHuggingFaceAuth {
 }
 
 public final class TokenSaverModelDownloader: @unchecked Sendable {
+    private final class DownloadSessionDelegate: NSObject, URLSessionDownloadDelegate, @unchecked Sendable {
+        private let lock = NSLock()
+        private let relativePath: String
+        private let resumeOffset: Int64
+        private let stagingDirectory: URL
+        private let fileManager: FileManager
+        private let progress: TokenSaverModelDownloadProgress?
+        private var continuation: CheckedContinuation<(URL, URLResponse), Error>?
+        private var task: URLSessionDownloadTask?
+        private var result: Result<(URL, URLResponse), Error>?
+
+        init(
+            relativePath: String,
+            resumeOffset: Int64,
+            stagingDirectory: URL,
+            fileManager: FileManager,
+            progress: TokenSaverModelDownloadProgress?
+        ) {
+            self.relativePath = relativePath
+            self.resumeOffset = resumeOffset
+            self.stagingDirectory = stagingDirectory
+            self.fileManager = fileManager
+            self.progress = progress
+        }
+
+        func start(task: URLSessionDownloadTask, continuation: CheckedContinuation<(URL, URLResponse), Error>) {
+            lock.lock()
+            self.task = task
+            self.continuation = continuation
+            lock.unlock()
+            task.resume()
+        }
+
+        func cancel() {
+            lock.lock()
+            let task = self.task
+            self.task = nil
+            lock.unlock()
+            task?.cancel()
+        }
+
+        func urlSession(
+            _ session: URLSession,
+            downloadTask: URLSessionDownloadTask,
+            didWriteData bytesWritten: Int64,
+            totalBytesWritten: Int64,
+            totalBytesExpectedToWrite: Int64
+        ) {
+            guard let progress else { return }
+            progress(TokenSaverModelDownloader.currentFileDownloadProgressState(
+                relativePath: relativePath,
+                resumeOffset: resumeOffset,
+                totalBytesWritten: totalBytesWritten,
+                totalBytesExpectedToWrite: totalBytesExpectedToWrite
+            ))
+        }
+
+        func urlSession(
+            _ session: URLSession,
+            downloadTask: URLSessionDownloadTask,
+            didFinishDownloadingTo location: URL
+        ) {
+            let stagedURL = stagingDirectory
+                .appendingPathComponent(".download-\(UUID().uuidString)", isDirectory: false)
+            do {
+                try? fileManager.removeItem(at: stagedURL)
+                try fileManager.moveItem(at: location, to: stagedURL)
+                guard let response = downloadTask.response else {
+                    throw URLError(.badServerResponse)
+                }
+                setResult(.success((stagedURL, response)))
+            } catch {
+                setResult(.failure(error))
+            }
+        }
+
+        func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+            if let error {
+                complete(.failure(error))
+                return
+            }
+            lock.lock()
+            let result = self.result
+            lock.unlock()
+            complete(result ?? .failure(URLError(.badServerResponse)))
+        }
+
+        private func setResult(_ result: Result<(URL, URLResponse), Error>) {
+            lock.lock()
+            self.result = result
+            lock.unlock()
+        }
+
+        private func complete(_ result: Result<(URL, URLResponse), Error>) {
+            lock.lock()
+            let continuation = self.continuation
+            self.continuation = nil
+            self.task = nil
+            lock.unlock()
+
+            guard let continuation else { return }
+            switch result {
+            case .success(let value):
+                continuation.resume(returning: value)
+            case .failure(let error):
+                continuation.resume(throwing: error)
+            }
+        }
+    }
+
     private struct HuggingFaceModelResponse: Decodable {
         struct Sibling: Decodable {
             let rfilename: String
@@ -815,11 +925,29 @@ public final class TokenSaverModelDownloader: @unchecked Sendable {
 
     /// Minimum I/O unit for the download path. Exposed as a pure seam so tests
     /// can assert that no future regression reintroduces per-byte reads.
-    /// The actual download uses URLSession.download(for:) which writes to a
-    /// system-managed temp file in a single kernel operation, so this constant
-    /// is not used at runtime — it documents the historical 1 MB flush boundary
-    /// and enforces >= 1 MB as the minimum acceptable chunk size.
+    /// The actual download uses URLSessionDownloadTask, which writes to a
+    /// system-managed temp file and reports coarse delegate progress. This
+    /// constant documents the historical 1 MB flush boundary used only when
+    /// appending a resumed partial response.
     static let downloadChunkSize: Int = 1024 * 1024
+
+    static func currentFileDownloadProgressState(
+        relativePath: String,
+        resumeOffset: Int64,
+        totalBytesWritten: Int64,
+        totalBytesExpectedToWrite: Int64
+    ) -> TokenSaverModelDownloadState {
+        let downloaded = resumeOffset + max(0, totalBytesWritten)
+        let expected = totalBytesExpectedToWrite > 0
+            ? resumeOffset + totalBytesExpectedToWrite
+            : nil
+        return TokenSaverModelDownloadState(
+            phase: .downloading,
+            downloadedBytes: downloaded,
+            expectedBytes: expected,
+            statusText: "Downloading \(relativePath)"
+        )
+    }
 
     func downloadBody(
         file: TokenSaverRemoteModelFile,
@@ -833,11 +961,16 @@ public final class TokenSaverModelDownloader: @unchecked Sendable {
             if resumeOffset > 0 {
                 request.setValue("bytes=\(resumeOffset)-", forHTTPHeaderField: "Range")
             }
-            // Use download(for:) instead of bytes(for:) to avoid per-byte async
-            // iteration overhead. URLSession writes the response body to a
-            // temp file via a single kernel-managed transfer, eliminating the
-            // O(n) async yields that dominated throughput on a ~1 GB model file.
-            let (tempURL, response) = try await session.download(for: request)
+            // Use a download task instead of bytes(for:) to avoid per-byte async
+            // iteration overhead. A delegate reports live current-file bytes
+            // while URLSession still writes to a temp file.
+            let (tempURL, response) = try await downloadTempFile(
+                request: request,
+                file: file,
+                resumeOffset: resumeOffset,
+                stagingDirectory: partial.deletingLastPathComponent(),
+                progress: progress
+            )
             let http = response as? HTTPURLResponse
             let status = http?.statusCode ?? 200
             guard (200..<300).contains(status) else {
@@ -888,6 +1021,37 @@ public final class TokenSaverModelDownloader: @unchecked Sendable {
                 statusText: "Downloaded \(file.relativePath)"
             ))
             return
+        }
+    }
+
+    private func downloadTempFile(
+        request: URLRequest,
+        file: TokenSaverRemoteModelFile,
+        resumeOffset: Int64,
+        stagingDirectory: URL,
+        progress: TokenSaverModelDownloadProgress?
+    ) async throws -> (URL, URLResponse) {
+        let delegate = DownloadSessionDelegate(
+            relativePath: file.relativePath,
+            resumeOffset: resumeOffset,
+            stagingDirectory: stagingDirectory,
+            fileManager: fileManager,
+            progress: progress
+        )
+        let progressSession = URLSession(
+            configuration: session.configuration,
+            delegate: delegate,
+            delegateQueue: nil
+        )
+        defer { progressSession.finishTasksAndInvalidate() }
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<(URL, URLResponse), Error>) in
+                let task = progressSession.downloadTask(with: request)
+                delegate.start(task: task, continuation: continuation)
+            }
+        } onCancel: {
+            delegate.cancel()
+            progressSession.invalidateAndCancel()
         }
     }
 

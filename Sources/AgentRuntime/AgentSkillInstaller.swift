@@ -51,7 +51,7 @@ public enum AgentSkillUninstallResult: String, Sendable, Equatable {
 public final class AgentSkillInstaller: @unchecked Sendable {
     public static let distillSkillID = "distill"
     public static let distillSourceURL = "https://github.com/samuelfaj/distill/blob/main/skills/distill/SKILL.md"
-    public static let distillLocalVersion = "4"
+    public static let distillLocalVersion = "5"
     public static let distillInstructionsBeginMarker = "<!-- distill skill: begin -->"
     public static let distillInstructionsEndMarker = "<!-- distill skill: end -->"
     public static let distillCLIBeginMarker = "# RemoteCode managed distill CLI: begin"
@@ -94,10 +94,11 @@ public final class AgentSkillInstaller: @unchecked Sendable {
     - Do not output a rewritten/compressed version of the latest user prompt unless the user explicitly asks to compress text.
     - Emit `Dict:` early when aliases or prefixes matter.
 
-    Command-output policy:
-    - For non-interactive, non-TUI shell/tool commands with output above ~30 lines or ~2KB, pipe through the RemoteCode-managed `distill` CLI with an explicit extraction prompt.
+    Command-output policy (Token Saver — bias to compress; over-compressing is preferred to under-compressing):
+    - DEFAULT to piping EVERY non-interactive, non-TUI shell/tool command through the RemoteCode-managed `distill` CLI whenever its output is more than ~10 lines or ~1KB. This applies to build, test, lint, install, git, grep, rg, find, ls, cat, head, tail, curl, sed, awk, docker, kubectl, terraform, and any other command that emits bulk text.
+    - Treat piping as the norm, not the exception: if you are unsure whether output will be large, pipe it. Always pass an explicit extraction prompt so the distilled result still answers the task.
     - Never call Node, tsx, npm, bun, or a source-checkout CLI for `distill`.
-    - Skip the pipe only when exact raw output is required, output is interactive/TUI, or the local RemoteCode service is unavailable; report that fallback.
+    - Skip the pipe ONLY when you genuinely need the exact bytes (e.g. applying a patch, copying a hash/token verbatim), the output is interactive/TUI, or the local RemoteCode service is unavailable; state that you skipped and why.
     - If a summary includes `[[rc:<handle>]]`, recover exact bytes with `distill retrieve <handle>`.
     - Wait for `distill` before continuing.
 
@@ -116,8 +117,8 @@ public final class AgentSkillInstaller: @unchecked Sendable {
     Use fixed prefixes: S=state/status, C=cause/context, D=action/decision, R=risk/blocker, O=outcome/output, N=constraint/no-go, P=pass/proof.
     Use Dict/inline `#` variables only when they reduce repetition. Never define variables for secrets, people, IDs, paths, URLs, or one-off terms. Keep hidden chain-of-thought private.
     Do not return a rewritten/compressed copy of the user's prompt unless explicitly asked to compress text.
-    For long non-interactive command output, ALWAYS pipe build, test, lint, install, git, grep, find, cat, and curl output through the RemoteCode-managed `distill` CLI when output exceeds ~30 lines or ~2KB. Use explicit extraction prompts.
-    Skip `| distill` only for exact raw output, interactive/TUI output, or unavailable local RemoteCodeDistillService; report the fallback. Never invoke Node, tsx, npm, bun, or a source-checkout CLI for `distill`.
+    Token Saver — bias to compress (over-compressing beats under-compressing): by DEFAULT pipe EVERY non-interactive, non-TUI command whose output exceeds ~10 lines or ~1KB through the RemoteCode-managed `distill` CLI with an explicit extraction prompt (build/test/lint/git/grep/find/ls/cat/curl/docker/kubectl/etc). If unsure it will be large, pipe it.
+    Skip `| distill` ONLY when you need exact bytes (patches, hashes/tokens), output is interactive/TUI, or the local RemoteCodeDistillService is unavailable; state the skip. Never invoke Node, tsx, npm, bun, or a source-checkout CLI for `distill`.
     If a summary includes `[[rc:<handle>]]`, recover exact bytes with `distill retrieve <handle>`. Wait for `distill` before continuing.
     Details and examples live in the managed `distill` SKILL.md.
     <!-- distill skill: end -->

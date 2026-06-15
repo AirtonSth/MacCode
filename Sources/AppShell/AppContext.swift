@@ -738,8 +738,10 @@ public final class AppContext {
             ?? prompt
 
         // Adopt `candidate` only if it beats the ORIGINAL prompt; record honest end-to-end
-        // savings (original -> final), tagged with the caller's cache_state.
-        func adopt(_ candidate: String) -> String {
+        // savings (original -> final), tagged with the caller's cache_state AND the engine
+        // that produced the win (deterministic pre-pass vs the model) so the Token Saver
+        // breakdown attributes per technique.
+        func adopt(_ candidate: String, stage: TokenSaverRouteStage) -> String {
             guard candidate.count < prompt.count else {
                 self.tokenSaverPromptSkipSet[skipKey] = Date()
                 return prompt
@@ -752,14 +754,15 @@ public final class AppContext {
                 inputTokens: inputTokens,
                 outputTokens: outputTokens,
                 savedTokens: max(inputTokens - outputTokens, 0),
-                cacheState: cacheState
+                cacheState: cacheState,
+                routeStage: stage
             )
             return candidate
         }
 
         guard let client = currentDistillClient() else {
             // No model service: deterministic pre-passes still fail open and can save tokens.
-            return deterministicCandidate.count < prompt.count ? adopt(deterministicCandidate) : prompt
+            return deterministicCandidate.count < prompt.count ? adopt(deterministicCandidate, stage: .deterministic) : prompt
         }
         // Reset the idle-eviction timer: a real request is being dispatched so
         // the model must not be unloaded while it is in use.
@@ -778,12 +781,16 @@ public final class AppContext {
                 ? modelOutput
                 : deterministicCandidate
             // Pick the smaller of {model output, deterministic pre-pass}, then adopt only if it beats the original.
-            let best = literalSafeModelOutput.count < deterministicCandidate.count ? literalSafeModelOutput : deterministicCandidate
-            return adopt(best)
+            let modelWon = literalSafeModelOutput.count < deterministicCandidate.count
+            let best = modelWon ? literalSafeModelOutput : deterministicCandidate
+            // Attribute to the engine that actually produced the adopted text: the
+            // sidecar's reported route when the model output won, else the deterministic pre-pass.
+            let stage: TokenSaverRouteStage = modelWon ? (response.routeStage ?? .llmMLX) : .deterministic
+            return adopt(best, stage: stage)
         } catch {
             NSLog("RemoteCode Token Saver compression skipped (provider=\(provider.rawValue)): \(error)")
             // Fail-open to the deterministic pre-pass if it helped, else the original.
-            return deterministicCandidate.count < prompt.count ? adopt(deterministicCandidate) : prompt
+            return deterministicCandidate.count < prompt.count ? adopt(deterministicCandidate, stage: .deterministic) : prompt
         }
     }
 
@@ -1134,13 +1141,14 @@ public final class AppContext {
         inputTokens: Int,
         outputTokens: Int,
         savedTokens: Int,
-        cacheState: String = "unknown"
+        cacheState: String = "unknown",
+        routeStage: TokenSaverRouteStage? = nil
     ) {
         guard SettingsStore(db: db).load().tokenSaverEnabled else { return }
         do {
             _ = try tokenSaverSavingsRepo.record(
                 provider: provider.rawValue,
-                mode: mode,
+                mode: TokenSaverEngineLabel.mode(base: mode, stage: routeStage),
                 inputTokens: inputTokens,
                 outputTokens: outputTokens,
                 savedTokens: savedTokens,

@@ -42,7 +42,6 @@ final class FakeNotificationCenterClient: NotificationCenterClient, @unchecked S
         fatalError("notificationSettings() must not be called in tests without a real UNCenter")
     }
 }
-
 // MARK: - SystemNotifierClientSeamTests
 
 /// WHY (QA :96): SystemNotifier called UNUserNotificationCenter.current() directly.
@@ -129,4 +128,3 @@ final class SystemNotifierClientSeamTests: XCTestCase {
             "notification posting is unaffected when no client is injected")
     }
 }
-

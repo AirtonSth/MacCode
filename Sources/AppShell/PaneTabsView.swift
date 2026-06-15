@@ -23,7 +23,7 @@ public struct PaneSplitContext {
 @MainActor
 public final class PaneTabsView: NSObject {
     public let view: NSView
-    public let pane: PaneNode
+    public private(set) var pane: PaneNode
     public weak var router: AppCommandRouter?
     private let splitContext: PaneSplitContext?
     private let workspaceIDOverride: WorkspaceID?
@@ -119,63 +119,7 @@ public final class PaneTabsView: NSObject {
         contentArea.layer?.backgroundColor = DS.NS.bg.cgColor
         contentArea.layer?.masksToBounds = true
         contentArea.isHidden = paneMinimized
-        if let selID = selectedID, let surface = SurfaceRegistry.shared.surface(selID) {
-            let sv = surface.view
-            sv.translatesAutoresizingMaskIntoConstraints = false
-            contentArea.addSubview(sv)
-            NSLayoutConstraint.activate([
-                sv.topAnchor.constraint(equalTo: contentArea.topAnchor),
-                sv.bottomAnchor.constraint(equalTo: contentArea.bottomAnchor),
-                sv.leadingAnchor.constraint(equalTo: contentArea.leadingAnchor),
-                sv.trailingAnchor.constraint(equalTo: contentArea.trailingAnchor)
-            ])
-        } else {
-            if pane.surfaces.isEmpty {
-                let label = NSTextField(labelWithString: "Empty pane \u{2014} use + to add a surface")
-                label.textColor = DS.NS.textTertiary
-                label.font = NSFont.systemFont(ofSize: 12)
-                label.translatesAutoresizingMaskIntoConstraints = false
-                contentArea.addSubview(label)
-                NSLayoutConstraint.activate([
-                    label.centerXAnchor.constraint(equalTo: contentArea.centerXAnchor),
-                    label.centerYAnchor.constraint(equalTo: contentArea.centerYAnchor)
-                ])
-            } else {
-                // UX-P3: surface registered in the pane model but not in
-                // SurfaceRegistry (e.g. session-restore failure). Show
-                // user-readable copy and a recovery action.
-                let label = NSTextField(labelWithString: "This tab could not be loaded")
-                label.textColor = DS.NS.textTertiary
-                label.font = NSFont.systemFont(ofSize: 13)
-                label.translatesAutoresizingMaskIntoConstraints = false
-
-                let hint = NSTextField(labelWithString: "The surface is unavailable. Close the tab to continue.")
-                hint.textColor = DS.NS.textTertiary
-                hint.font = NSFont.systemFont(ofSize: 11)
-                hint.translatesAutoresizingMaskIntoConstraints = false
-
-                let closeBtn = NSButton(title: "Close Tab", target: nil, action: nil)
-                closeBtn.bezelStyle = .rounded
-                closeBtn.controlSize = .small
-                closeBtn.translatesAutoresizingMaskIntoConstraints = false
-                if let failedID = selectedID {
-                    pendingMissingSurfaceID = failedID
-                    closeBtn.target = self
-                    closeBtn.action = #selector(closeMissingSurface(_:))
-                }
-
-                let stack = NSStackView(views: [label, hint, closeBtn])
-                stack.orientation = .vertical
-                stack.alignment = .centerX
-                stack.spacing = DS.Space.sm
-                stack.translatesAutoresizingMaskIntoConstraints = false
-                contentArea.addSubview(stack)
-                NSLayoutConstraint.activate([
-                    stack.centerXAnchor.constraint(equalTo: contentArea.centerXAnchor),
-                    stack.centerYAnchor.constraint(equalTo: contentArea.centerYAnchor)
-                ])
-            }
-        }
+        installSelectedContent(selectedID: selectedID, in: pane)
 
         // Chrome-style flat "+" that sits right after the last tab.
         // Clicking it pops the surface-type menu under the button.
@@ -308,6 +252,78 @@ public final class PaneTabsView: NSObject {
         tabScrollView.scrollDocumentViewToVisible(tab)
     }
 
+    @discardableResult
+    private func installSelectedContent(selectedID: SurfaceID?, in pane: PaneNode) -> Bool {
+        let selectedView = selectedID.flatMap { SurfaceRegistry.shared.surface($0)?.view }
+        if let selectedView,
+           contentArea.subviews.count == 1,
+           contentArea.subviews.first === selectedView {
+            return false
+        }
+
+        for subview in contentArea.subviews {
+            subview.removeFromSuperview()
+        }
+        pendingMissingSurfaceID = nil
+
+        if let selectedView {
+            selectedView.removeFromSuperview()
+            selectedView.translatesAutoresizingMaskIntoConstraints = false
+            contentArea.addSubview(selectedView)
+            NSLayoutConstraint.activate([
+                selectedView.topAnchor.constraint(equalTo: contentArea.topAnchor),
+                selectedView.bottomAnchor.constraint(equalTo: contentArea.bottomAnchor),
+                selectedView.leadingAnchor.constraint(equalTo: contentArea.leadingAnchor),
+                selectedView.trailingAnchor.constraint(equalTo: contentArea.trailingAnchor)
+            ])
+        } else if pane.surfaces.isEmpty {
+            let label = NSTextField(labelWithString: "Empty pane \u{2014} use + to add a surface")
+            label.textColor = DS.NS.textTertiary
+            label.font = NSFont.systemFont(ofSize: 12)
+            label.translatesAutoresizingMaskIntoConstraints = false
+            contentArea.addSubview(label)
+            NSLayoutConstraint.activate([
+                label.centerXAnchor.constraint(equalTo: contentArea.centerXAnchor),
+                label.centerYAnchor.constraint(equalTo: contentArea.centerYAnchor)
+            ])
+        } else {
+            // UX-P3: surface registered in the pane model but not in
+            // SurfaceRegistry (e.g. session-restore failure). Show
+            // user-readable copy and a recovery action.
+            let label = NSTextField(labelWithString: "This tab could not be loaded")
+            label.textColor = DS.NS.textTertiary
+            label.font = NSFont.systemFont(ofSize: 13)
+            label.translatesAutoresizingMaskIntoConstraints = false
+
+            let hint = NSTextField(labelWithString: "The surface is unavailable. Close the tab to continue.")
+            hint.textColor = DS.NS.textTertiary
+            hint.font = NSFont.systemFont(ofSize: 11)
+            hint.translatesAutoresizingMaskIntoConstraints = false
+
+            let closeBtn = NSButton(title: "Close Tab", target: nil, action: nil)
+            closeBtn.bezelStyle = .rounded
+            closeBtn.controlSize = .small
+            closeBtn.translatesAutoresizingMaskIntoConstraints = false
+            if let failedID = selectedID {
+                pendingMissingSurfaceID = failedID
+                closeBtn.target = self
+                closeBtn.action = #selector(closeMissingSurface(_:))
+            }
+
+            let stack = NSStackView(views: [label, hint, closeBtn])
+            stack.orientation = .vertical
+            stack.alignment = .centerX
+            stack.spacing = DS.Space.sm
+            stack.translatesAutoresizingMaskIntoConstraints = false
+            contentArea.addSubview(stack)
+            NSLayoutConstraint.activate([
+                stack.centerXAnchor.constraint(equalTo: contentArea.centerXAnchor),
+                stack.centerYAnchor.constraint(equalTo: contentArea.centerYAnchor)
+            ])
+        }
+        return true
+    }
+
     /// Test seam: the live button bound to `id` (nil if none), so the
     /// reconcile's in-place patching can be asserted without a window.
     func tabButtonForTesting(_ id: SurfaceID) -> PaneTabButton? { tabButtons[id] }
@@ -367,6 +383,7 @@ public final class PaneTabsView: NSObject {
     /// change), so the caller can skip a container teardown entirely.
     @discardableResult
     public func reconcile(to pane: PaneNode) -> Bool {
+        self.pane = pane
         let newIDs = pane.surfaces.map(\.id)
         let diff = Self.diffTabs(old: currentSurfaceIDs, new: newIDs)
         let selectedID = pane.selectedSurfaceID ?? pane.surfaces.first?.id
@@ -392,6 +409,7 @@ public final class PaneTabsView: NSObject {
                 insertIndex += 1
             }
             currentSelectedID = selectedID
+            installSelectedContent(selectedID: selectedID, in: pane)
             DispatchQueue.main.async { [weak self] in self?.scrollSelectedTabIntoView(selectedID) }
             return false
         }
@@ -412,6 +430,7 @@ public final class PaneTabsView: NSObject {
         // the user's manual scroll position.
         if selectedID != currentSelectedID {
             currentSelectedID = selectedID
+            installSelectedContent(selectedID: selectedID, in: pane)
             DispatchQueue.main.async { [weak self] in self?.scrollSelectedTabIntoView(selectedID) }
         }
         return true

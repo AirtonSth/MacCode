@@ -86,7 +86,10 @@ final class DistillServiceTests: XCTestCase {
             )
         }
 
-        let compact = TokenSaverApprovedModels.distillE4B
+        // Use the currently-approved, runnable model (1.7B). E4B is intentionally no
+        // longer approved (the vendored mlx-swift-lm can't load gemma4), so a config that
+        // names it must now be REJECTED — asserted below.
+        let compact = TokenSaverApprovedModels.distill17B
         let accepted = try DistillServiceConfiguration(
             authToken: "token",
             appSupportDirectory: "/tmp/remote-code",
@@ -95,6 +98,17 @@ final class DistillServiceTests: XCTestCase {
             modelURL: compact.url
         )
         XCTAssertEqual(accepted.modelID, compact.id)
+
+        // The excluded E4B model must be rejected by the configuration gate so the sidecar
+        // can never be launched pointing at a model that fails to load.
+        let e4b = TokenSaverApprovedModels.distillE4B
+        XCTAssertThrowsError(try DistillServiceConfiguration(
+            authToken: "token",
+            appSupportDirectory: "/tmp/remote-code",
+            runtime: e4b.runtime,
+            modelID: e4b.id,
+            modelURL: e4b.url
+        ), "E4B is no longer approved and must not pass the configuration gate")
     }
 
     func test_httpServerRequiresBearerTokenAndServesDistillRequests() async throws {
@@ -310,7 +324,10 @@ final class DistillServiceTests: XCTestCase {
         let records = await recorder.allRecords()
         let record = try XCTUnwrap(records.first)
         XCTAssertEqual(record.provider, "codex")
-        XCTAssertEqual(record.mode, "command-output")
+        // Mode folds in the producing engine (deterministic test runtime) so the Token
+        // Saver breakdown can attribute savings per technique.
+        XCTAssertEqual(record.mode, "command-output (deterministic)")
+        XCTAssertEqual(record.routeStage, .deterministic)
         XCTAssertEqual(record.inputTokens, TokenEstimator.estimate(request.input),
                        "command-output savings record estimated tokens of the raw input, not its character length")
         XCTAssertEqual(record.outputTokens, TokenEstimator.estimate("alpha.html\nbeta.html"),

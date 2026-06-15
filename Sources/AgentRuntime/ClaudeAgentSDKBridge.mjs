@@ -1,6 +1,7 @@
 import { createSdkMcpServer, query, tool } from '@anthropic-ai/claude-agent-sdk';
 import { z } from 'zod';
 import { execFile, execFileSync } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -165,6 +166,10 @@ async function tokenSaverPostToolUse(input) {
   const state = loadTokenSaverState();
   if (!state) return {};
   const output = await postTokenSaverDistill(state, {
+    // The sidecar's DistillRequest requires a UUID `id`; without it the POST is
+    // rejected 400 and this hook fails open silently — recording zero Token Saver
+    // savings for Claude. Always send one so tool-output distillation is counted.
+    id: randomUUID(),
     mode: 'commandOutput',
     priority: 1,
     input: rawOutput,
@@ -450,9 +455,39 @@ function userInputResult(command) {
   }
 }
 
+let pendingCommandText = '';
+
+function recoverableCommandJSONError(error) {
+  const message = String(error?.message || error);
+  return message.includes('Unterminated string in JSON')
+    || message.includes('Unexpected end of JSON input')
+    || message.includes('Unexpected end of JSON');
+}
+
+function parseCommandLine(line) {
+  const text = pendingCommandText ? `${pendingCommandText}\\n${line}` : line;
+  try {
+    const command = JSON.parse(text);
+    pendingCommandText = '';
+    return command;
+  } catch (error) {
+    if (recoverableCommandJSONError(error)) {
+      pendingCommandText = text;
+      return null;
+    }
+    pendingCommandText = '';
+    emit({
+      type: 'error',
+      error: { message: `Invalid Claude SDK bridge command JSON: ${String(error?.message || error)}` },
+    });
+    return null;
+  }
+}
+
 for await (const line of rl) {
-  if (!line.trim()) continue;
-  const command = JSON.parse(line);
+  if (!line.trim() && !pendingCommandText) continue;
+  const command = parseCommandLine(line);
+  if (!command) continue;
   if (command.type === 'rc_configure') {
     current = {
       cwd: command.cwd || current.cwd,
@@ -493,4 +528,11 @@ for await (const line of rl) {
     if (activeQuery?.close) activeQuery.close();
     process.exit(0);
   }
+}
+
+if (pendingCommandText) {
+  emit({
+    type: 'error',
+    error: { message: 'Invalid Claude SDK bridge command JSON: input ended before the JSON command was complete' },
+  });
 }

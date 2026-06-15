@@ -48,7 +48,10 @@ final class CLIProviderAttributionTests: XCTestCase {
         let records = await capture.records
         let record = try XCTUnwrap(records.first, "the CLI run must produce a savings record")
         XCTAssertEqual(record.provider, "claude", "REMOTE_CODE_AGENT_PROVIDER=claude => savings attributed to claude, NOT unknown")
-        XCTAssertEqual(record.mode, "command-output")
+        // The mode now folds in the producing engine so the Token Saver breakdown shows
+        // savings per technique; the deterministic test runtime tags it accordingly.
+        XCTAssertEqual(record.mode, "command-output (deterministic)")
+        XCTAssertEqual(record.routeStage, .deterministic)
         XCTAssertGreaterThan(record.savedTokens, 0, "and the saving is recorded")
     }
 

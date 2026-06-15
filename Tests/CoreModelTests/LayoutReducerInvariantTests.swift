@@ -139,7 +139,7 @@ final class LayoutReducerInvariantTests: XCTestCase {
     // MARK: - (b) No empty pane inside any split
 
     /// WHY: closing the LAST surface in one pane of a 2-pane split collapses
-    /// the split. If collapse fails, the split would contain an empty child pane  - 
+    /// the split. If collapse fails, the split would contain an empty child pane  -
     /// a pane the user cannot see or close, corrupting the layout.
     func test_noEmptyPaneInsideSplit_afterLastSurfaceClosed() throws {
         var s = try r.reduce(LayoutState(), .createWorkspace(name: "ws", cwd: "/tmp", initial: nil))

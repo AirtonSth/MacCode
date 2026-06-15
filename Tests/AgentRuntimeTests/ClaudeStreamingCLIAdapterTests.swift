@@ -1316,6 +1316,84 @@ final class ClaudeStreamingCLIAdapterTests: XCTestCase {
                       "I2: hooked tool output lane lowers reversible store floor from 8192 to 2048 bytes")
     }
 
+    func test_agentSDKBridgeRecoversRawNewlineSplitPromptCommand() throws {
+        guard let node = ProcessLocator.resolve("node") else {
+            throw XCTSkip("node not available")
+        }
+        let packageRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let tmp = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("rc2-claude-sdk-bridge-raw-newline-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
+
+        let bridge = tmp.appendingPathComponent("ClaudeAgentSDKBridge.mjs")
+        try FileManager.default.copyItem(
+            at: packageRoot.appendingPathComponent("Sources/AgentRuntime/ClaudeAgentSDKBridge.mjs"),
+            to: bridge
+        )
+
+        let sdkModule = tmp.appendingPathComponent("node_modules/@anthropic-ai/claude-agent-sdk", isDirectory: true)
+        try FileManager.default.createDirectory(at: sdkModule, withIntermediateDirectories: true)
+        try #"{"type":"module","main":"index.js"}"#.write(to: sdkModule.appendingPathComponent("package.json"), atomically: true, encoding: .utf8)
+        try """
+        export function createSdkMcpServer() {
+          return { instance: { server: {} } };
+        }
+        export function tool(name, description, schema, handler) {
+          return { name, description, schema, handler };
+        }
+        export function query({ prompt }) {
+          return (async function*() {
+            const iterator = prompt[Symbol.asyncIterator]();
+            const next = await iterator.next();
+            if (next.done) return;
+            const text = next.value?.message?.content?.[0]?.text || '';
+            const marker = text.includes('line one\\n\\nline three') ? 'BRIDGE_RAW_NEWLINE_OK' : 'BRIDGE_RAW_NEWLINE_MISSING';
+            yield { type: 'system', subtype: 'init', session_id: 'fake-sdk-session' };
+            yield { type: 'assistant', message: { id: 'fake-turn', content: [{ type: 'text', text: marker }] }, session_id: 'fake-sdk-session' };
+            yield { type: 'result', subtype: 'success', is_error: false, result: marker, session_id: 'fake-sdk-session' };
+          })();
+        }
+        """.write(to: sdkModule.appendingPathComponent("index.js"), atomically: true, encoding: .utf8)
+
+        let zodModule = tmp.appendingPathComponent("node_modules/zod", isDirectory: true)
+        try FileManager.default.createDirectory(at: zodModule, withIntermediateDirectories: true)
+        try #"{"type":"module","main":"index.js"}"#.write(to: zodModule.appendingPathComponent("package.json"), atomically: true, encoding: .utf8)
+        try "export const z = {};\n".write(to: zodModule.appendingPathComponent("index.js"), atomically: true, encoding: .utf8)
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: node)
+        process.arguments = [bridge.path]
+        process.currentDirectoryURL = tmp
+        let stdin = Pipe()
+        let stdout = Pipe()
+        let stderr = Pipe()
+        process.standardInput = stdin
+        process.standardOutput = stdout
+        process.standardError = stderr
+        try process.run()
+
+        let splitCommand = """
+        {"type":"rc_turn","prompt":"line one
+
+        line three","session_id":"split-session"}
+        """
+        stdin.fileHandleForWriting.write(Data(splitCommand.utf8))
+        stdin.fileHandleForWriting.closeFile()
+
+        let out = String(decoding: stdout.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+        let err = String(decoding: stderr.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+        process.waitUntilExit()
+
+        XCTAssertEqual(process.terminationStatus, 0, "raw newline prompt command must not crash the bridge; stderr: \(err)")
+        XCTAssertTrue(out.contains("BRIDGE_RAW_NEWLINE_OK"),
+                      "bridge must recover a prompt JSON command split by a raw newline inside the prompt string")
+        XCTAssertFalse(err.contains("SyntaxError: Unterminated string"),
+                       "the bridge must not leak the JSON.parse stack shown in the Agent App screenshot")
+    }
+
     func test_agentSDKPackageSpecRefreshesStalePinnedCache() async throws {
         let tmp = URL(fileURLWithPath: NSTemporaryDirectory())
             .appendingPathComponent("rc2-claude-sdk-version-\(UUID().uuidString)", isDirectory: true)

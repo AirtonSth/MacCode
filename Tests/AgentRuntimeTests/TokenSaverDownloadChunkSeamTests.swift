@@ -107,19 +107,81 @@ final class TokenSaverDownloadChunkSeamTests: XCTestCase {
         let session = URLSession(configuration: config)
 
         let downloader = TokenSaverModelDownloader(installer: installer, session: session)
-        var phases: [TokenSaverModelDownloadPhase] = []
+        let recorder = DownloadProgressRecorder()
         try await downloader.downloadBody(file: file, partial: partial) { state in
-            phases.append(state.phase)
+            recorder.append(state)
         }
 
         XCTAssertTrue(
-            phases.contains(.downloading),
+            recorder.phases.contains(.downloading),
             "progress callback must fire with .downloading phase after a successful chunked download"
+        )
+    }
+
+    func test_downloadBodyReportsCurrentFileWriteProgress() async throws {
+        // WHY: large model downloads spend minutes inside URLSession's temp-file
+        // transfer. The modal must show bytes for the active file instead of
+        // looking frozen on the previous small file's 100% progress.
+        let appSupport = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("ChunkSeam-live-progress-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: appSupport) }
+        let installer = TokenSaverModelInstaller(appSupportDirectory: appSupport)
+
+        let file = TokenSaverRemoteModelFile(
+            relativePath: "model.safetensors",
+            downloadURL: URL(string: "https://example.invalid/model.safetensors")!
+        )
+        let partial = installer.distillDirectory
+            .appendingPathComponent("model.safetensors.partial")
+        try FileManager.default.createDirectory(
+            at: installer.distillDirectory,
+            withIntermediateDirectories: true
+        )
+
+        let config = URLSessionConfiguration.ephemeral
+        config.protocolClasses = [ChunkedResponseProtocolStub.self]
+        let session = URLSession(configuration: config)
+
+        let downloader = TokenSaverModelDownloader(installer: installer, session: session)
+        let recorder = DownloadProgressRecorder()
+        try await downloader.downloadBody(file: file, partial: partial) { state in
+            recorder.append(state)
+        }
+
+        XCTAssertTrue(
+            recorder.states.contains {
+                $0.phase == .downloading &&
+                    $0.statusText == "Downloading model.safetensors" &&
+                    $0.downloadedBytes > 0 &&
+                    $0.expectedBytes == 10
+            },
+            "downloadBody must emit live write progress for the active large file before the final downloaded callback"
         )
     }
 }
 
 // MARK: - Stubs
+
+private final class DownloadProgressRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var recordedStates: [TokenSaverModelDownloadState] = []
+
+    func append(_ state: TokenSaverModelDownloadState) {
+        lock.lock()
+        recordedStates.append(state)
+        lock.unlock()
+    }
+
+    var states: [TokenSaverModelDownloadState] {
+        lock.lock()
+        defer { lock.unlock() }
+        return recordedStates
+    }
+
+    var phases: [TokenSaverModelDownloadPhase] {
+        states.map(\.phase)
+    }
+}
 
 /// Returns a 200 response with body "fresh" for any request.
 private final class FullResponseProtocolStub: URLProtocol {
@@ -140,4 +202,36 @@ private final class FullResponseProtocolStub: URLProtocol {
     }
 
     override func stopLoading() {}
+}
+
+/// Returns a 200 response in two chunks so download progress has an active file
+/// write to report before completion.
+private final class ChunkedResponseProtocolStub: URLProtocol {
+    private var stopped = false
+
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        let response = HTTPURLResponse(
+            url: request.url!,
+            statusCode: 200,
+            httpVersion: "HTTP/1.1",
+            headerFields: ["Content-Length": "10"]
+        )!
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        DispatchQueue.global().asyncAfter(deadline: .now() + 0.05) { [weak self] in
+            guard let self, !self.stopped else { return }
+            self.client?.urlProtocol(self, didLoad: Data("first".utf8))
+            DispatchQueue.global().asyncAfter(deadline: .now() + 0.05) { [weak self] in
+                guard let self, !self.stopped else { return }
+                self.client?.urlProtocol(self, didLoad: Data("chunk".utf8))
+                self.client?.urlProtocolDidFinishLoading(self)
+            }
+        }
+    }
+
+    override func stopLoading() {
+        stopped = true
+    }
 }
