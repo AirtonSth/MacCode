@@ -1377,6 +1377,9 @@ public struct MLXDistillRuntime: DistillRuntime {
         MLX.Memory.memoryLimit = Self.gpuMemoryLimitBytes
         MLX.Memory.cacheLimit = Self.gpuCacheLimitBytes
         NSLog("RemoteCodeDistillService MLX memory bounded: cacheLimit=\(Self.gpuCacheLimitBytes / 1_048_576)MB memoryLimit=\(Self.gpuMemoryLimitBytes / 1_048_576)MB")
+        // Install the patched gemma4 model so LLMModelFactory can load KV-shared / fully-quantized
+        // Gemma 4 checkpoints (e.g. distill-E4B). Idempotent; no effect on non-Gemma-4 models.
+        await RCGemma4ModelOverride.register()
         self.modelContainer = try await LLMModelFactory.shared.loadContainer(
             from: modelDirectory,
             using: #huggingFaceTokenizerLoader()
@@ -1406,6 +1409,28 @@ public struct MLXDistillRuntime: DistillRuntime {
         await lane.release()
         reclaimIdleMemory()
         NSLog("RemoteCodeDistillService MLX warmup complete")
+    }
+
+    /// Test seam: raw model generation bypassing the deterministic content router and the
+    /// distill faithfulness/literal guards, so the coherence of the loaded model can be asserted
+    /// directly (a model that loads but is numerically broken emits junk here).
+    func generateRawForTesting(instructions: String, prompt: String, maxTokens: Int) async throws -> String {
+        let session = ChatSession(
+            modelContainer,
+            instructions: instructions,
+            generateParameters: GenerateParameters(maxTokens: maxTokens, temperature: 0),
+            additionalContext: ["enable_thinking": false]
+        )
+        await lane.acquire()
+        let raw: String
+        do {
+            raw = try await session.respond(to: prompt)
+        } catch {
+            await lane.release()
+            throw error
+        }
+        await lane.release()
+        return Self.cleanOutput(raw)
     }
 
     static func routerOptions(for request: DistillRequest) -> DistillRouterOptions {

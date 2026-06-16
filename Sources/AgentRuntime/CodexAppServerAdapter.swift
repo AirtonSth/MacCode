@@ -32,6 +32,13 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         var onEvent: (@Sendable (AgentRunEvent) -> Void)?
         var interactionMode: AgentInteractionMode
         var finalAssistantMessage: String
+        // The assistant item the `finalAssistantMessage` buffer currently belongs
+        // to. A turn can emit many assistant-message items (short preamble notes
+        // before tool calls, then the actual answer); the final answer is the LAST
+        // one, not the concatenation of every preamble. Tracking the item id lets
+        // `appendFinalMessage` reset the buffer when a new item starts while still
+        // accumulating multiple streamed deltas of the same item.
+        var finalAssistantMessageItemId: String?
         var completedTurnIds: [String]
         var pendingApprovals: [String: PendingApproval]
         var pendingUserInputs: [String: PendingUserInput]
@@ -595,7 +602,7 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
             if let body = Self.body(for: item, type: rawType), !body.isEmpty,
                itemType != .assistantMessage || !alreadyStreamed {
                 if itemType == .assistantMessage {
-                    appendFinalMessage(threadId: threadId, delta: body)
+                    appendFinalMessage(threadId: threadId, itemId: itemId, delta: body)
                 }
                 events.append(.itemDelta(
                     itemId: itemId,
@@ -610,7 +617,7 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
             let turnId = string(payload, "turnId") ?? string(payload, "turn_id") ?? activeTurnId(threadId: threadId) ?? ""
             ensureAssistantItem(threadId: threadId, turnId: turnId, itemId: itemId, now: now, events: &events)
             let delta = string(payload, "delta") ?? string(payload, "text") ?? ""
-            appendFinalMessage(threadId: threadId, delta: delta)
+            appendFinalMessage(threadId: threadId, itemId: itemId, delta: delta)
             markStreamedItem(threadId: threadId, turnId: turnId, itemId: itemId)
             events.append(.itemDelta(itemId: itemId, bodyAppend: delta, outputAppend: nil, summary: nil))
         case "command/exec/outputDelta", "command.exec.outputDelta":
@@ -1013,6 +1020,7 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
             onEvent: onEvent,
             interactionMode: interactionMode,
             finalAssistantMessage: "",
+            finalAssistantMessageItemId: nil,
             completedTurnIds: [],
             pendingApprovals: [:],
             pendingUserInputs: [:],
@@ -1070,9 +1078,19 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         lock.unlock()
     }
 
-    private func appendFinalMessage(threadId: AgentThreadID, delta: String) {
+    private func appendFinalMessage(threadId: AgentThreadID, itemId: String, delta: String) {
         lock.lock()
-        sessions[threadId]?.finalAssistantMessage += delta
+        // A turn may emit several assistant-message items (preamble notes, then the
+        // final answer). Keep only the latest item's text: reset the buffer when a
+        // new item begins, but still concatenate multiple streamed deltas that share
+        // the same item id. Otherwise the persisted/final answer becomes the whole
+        // narration of the turn instead of the last message.
+        if sessions[threadId]?.finalAssistantMessageItemId != itemId {
+            sessions[threadId]?.finalAssistantMessage = delta
+            sessions[threadId]?.finalAssistantMessageItemId = itemId
+        } else {
+            sessions[threadId]?.finalAssistantMessage += delta
+        }
         lock.unlock()
     }
 
@@ -1096,6 +1114,7 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         // (rollback window) and emittedProposedPlanIds (proposed-plan dedup)
         // are intentionally retained.
         sessions[threadId]?.finalAssistantMessage = ""
+        sessions[threadId]?.finalAssistantMessageItemId = nil
         sessions[threadId]?.startedItemIds.removeAll(keepingCapacity: false)
         sessions[threadId]?.streamedItemIds.removeAll(keepingCapacity: false)
         sessions[threadId]?.proposedPlanBuffers.removeAll(keepingCapacity: false)

@@ -114,6 +114,13 @@ public final class ClaudeRunner: AgentProviderRunner, @unchecked Sendable {
             }
         }
         args.append(contentsOf: ["--tools", ""])
+        // Token Saver parity with the SDK bridge: when the host signals Token Saver is on (and the
+        // managed `distill` CLI therefore exists), append the canonical distill instructions so the
+        // streaming CLI also pipes `| distill` and speaks distill language. `--append-system-prompt`
+        // adds to the CLI's default prompt, so it stays additive. Absent when Token Saver is off.
+        if request.environment["RC_TOKEN_SAVER_DISTILL_HINT"] == "1" {
+            args.append(contentsOf: ["--append-system-prompt", AgentSkillInstaller.distillAgentInstructionsBody])
+        }
         args.append(contentsOf: request.extraArgs)
         return args
     }

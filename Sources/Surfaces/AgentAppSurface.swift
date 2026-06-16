@@ -2979,9 +2979,16 @@ public struct AgentAppView: View {
         guard turn.finished else { return [] }
         let assistantItems = renderableItems.filter { $0.type == .assistantMessage }
         guard !assistantItems.isEmpty else { return [] }
-        if turn.finalAssistantMessage != nil,
+        if let final = turn.finalAssistantMessage,
            !shouldRenderFinalAssistantMessage(turn, persistedAssistantTexts: persistedAssistantTexts) {
-            return Set(assistantItems.map(\.id))
+            // The final answer is the LAST assistant item that the final text
+            // covers — not every assistant item in the turn. A turn can emit many
+            // preamble messages ("State:/Action:/…") before the real answer; those
+            // must collapse into the Worked disclosure, leaving only the last
+            // message as the visible answer. When the last item has already been
+            // hidden because it duplicates the persisted answer, no item matches and
+            // every preamble correctly demotes to the work log.
+            return Set([assistantItems.last { assistantText($0.body, matches: final) }?.id].compactMap { $0 })
         }
         if turn.finalAssistantMessage == nil, let final = assistantItems.last {
             return [final.id]

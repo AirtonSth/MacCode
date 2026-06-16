@@ -124,6 +124,17 @@ public final class AgentSkillInstaller: @unchecked Sendable {
     <!-- distill skill: end -->
     """
 
+    /// The distill agent instructions with the begin/end HTML markers stripped. The markers
+    /// only matter for the in-place upsert/removal inside CLAUDE.md/AGENTS.md; this marker-free
+    /// body is what gets injected as an authoritative system prompt (Claude SDK bridge), where
+    /// the surrounding CLAUDE.md is easily buried. Single source of truth with the installed text.
+    public static var distillAgentInstructionsBody: String {
+        distillAgentInstructionsTemplate
+            .replacingOccurrences(of: distillInstructionsBeginMarker, with: "")
+            .replacingOccurrences(of: distillInstructionsEndMarker, with: "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
     private let claudeSkillsRoot: URL
     private let codexSkillsRoot: URL
     private let claudeInstructionsURL: URL

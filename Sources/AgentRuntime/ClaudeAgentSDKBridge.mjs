@@ -24,6 +24,7 @@ let current = {
   sessionId: undefined,
   env: process.env,
   settings: undefined,
+  systemPrompt: undefined,
 };
 const pendingPermissions = new Map();
 const pendingUserInputs = new Map();
@@ -376,6 +377,11 @@ function ensureQuery() {
       resumeSessionAt: current.resumeSessionAt,
       sessionId: current.resume ? undefined : current.sessionId,
       permissionMode: current.permissionMode,
+      // Token Saver distill instructions (pipe `| distill` + speak distill language), the
+      // analog of Codex's per-turn developer_instructions. The host sends this only when
+      // Token Saver is on; when undefined the SDK keeps its default (empty) custom prompt, so
+      // this is purely additive and never introduces the claude_code preset.
+      systemPrompt: current.systemPrompt,
       tools: { type: 'preset', preset: 'claude_code' },
       mcpServers,
       settings: current.settings,
@@ -591,6 +597,7 @@ for await (const line of rl) {
       sessionId: command.session_id || undefined,
       env: { ...process.env, ...(command.environment || {}) },
       settings: command.settings || undefined,
+      systemPrompt: command.system_prompt || undefined,
     };
   } else if (command.type === 'rc_turn') {
     pushPrompt(command.prompt || '', command.attachments || []);

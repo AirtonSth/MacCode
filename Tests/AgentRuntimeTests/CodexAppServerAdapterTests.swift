@@ -1067,6 +1067,105 @@ final class CodexAppServerAdapterTests: XCTestCase {
                        "item/completed must not replay the full assistant text after deltas already streamed it")
     }
 
+    func test_adapterFinalMessageIsLastAgentMessageItemNotConcatenationOfPreambles() async throws {
+        // A single turn can emit several assistant-message items: short preamble
+        // notes ("State:/Action:") before tool calls, then the real answer. The
+        // final answer must be the LAST message only, NOT the concatenation of
+        // every preamble — otherwise the answer bubble (and the persisted, reload-
+        // surviving message) shows the whole narration of the turn.
+        let client = MockCodexAppServerClient(autoComplete: false)
+        let adapter = CodexAppServerAdapter { _, notificationHandler, _ in
+            client.notificationHandler = notificationHandler
+            return client
+        }
+        let threadId = AgentThreadID()
+        let sink = EventSink()
+
+        _ = try await adapter.sendTurn(AgentRunRequest(
+            threadId: threadId,
+            provider: .codex,
+            model: "gpt-5.5",
+            cwd: "/tmp/remotecode-app-server-adapter",
+            prompt: "do work"
+        )) { event in
+            Task { await sink.record(event) }
+        }
+
+        for (itemId, text) in [("msg-1", "Reading the config."), ("msg-2", "Running the tests."), ("msg-3", "All checks passed.")] {
+            client.notificationHandler?("item/agentMessage/delta", [
+                "threadId": "codex-thread-1",
+                "turnId": "turn-preambles-1",
+                "itemId": itemId,
+                "delta": text
+            ])
+        }
+        client.notificationHandler?("turn/completed", [
+            "threadId": "codex-thread-1",
+            "turnId": "turn-preambles-1"
+        ])
+
+        try await Task.sleep(nanoseconds: 50_000_000)
+        let events = await sink.snapshot()
+        let final = events.compactMap { event -> String? in
+            if case .turnCompleted(_, let final) = event { return final }
+            return nil
+        }.first
+
+        XCTAssertEqual(final, "All checks passed.",
+                       "the final answer must be the last assistant message item, not every preamble concatenated")
+        XCTAssertNotEqual(final, "Reading the config.Running the tests.All checks passed.",
+                       "preamble messages from earlier in the turn must not leak into the final answer")
+    }
+
+    func test_adapterAccumulatesMultipleDeltasOfSameAgentMessageItem() async throws {
+        // Per-item reset must NOT break intra-item streaming: multiple deltas that
+        // share one item id are still concatenated into that item's full text.
+        let client = MockCodexAppServerClient(autoComplete: false)
+        let adapter = CodexAppServerAdapter { _, notificationHandler, _ in
+            client.notificationHandler = notificationHandler
+            return client
+        }
+        let threadId = AgentThreadID()
+        let sink = EventSink()
+
+        _ = try await adapter.sendTurn(AgentRunRequest(
+            threadId: threadId,
+            provider: .codex,
+            model: "gpt-5.5",
+            cwd: "/tmp/remotecode-app-server-adapter",
+            prompt: "count"
+        )) { event in
+            Task { await sink.record(event) }
+        }
+
+        client.notificationHandler?("item/agentMessage/delta", [
+            "threadId": "codex-thread-1",
+            "turnId": "turn-same-item-1",
+            "itemId": "msg-1",
+            "delta": "1 2 3"
+        ])
+        client.notificationHandler?("item/agentMessage/delta", [
+            "threadId": "codex-thread-1",
+            "turnId": "turn-same-item-1",
+            "itemId": "msg-1",
+            "delta": " 4 5"
+        ])
+        client.notificationHandler?("turn/completed", [
+            "threadId": "codex-thread-1",
+            "turnId": "turn-same-item-1"
+        ])
+
+        try await Task.sleep(nanoseconds: 50_000_000)
+        let events = await sink.snapshot()
+        let final = events.compactMap { event -> String? in
+            if case .turnCompleted(_, let final) = event { return final }
+            return nil
+        }.first
+
+        XCTAssertEqual(final, "1 2 3 4 5",
+                       "streamed deltas that share one assistant item id must accumulate into that item's full text")
+    }
+
     func test_adapterTreatsSnakeCaseAgentMessageCompletionAsFinalAssistantResponse() async throws {
         let client = MockCodexAppServerClient(autoComplete: false)
         let adapter = CodexAppServerAdapter { _, notificationHandler, _ in

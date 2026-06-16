@@ -2,9 +2,11 @@ import DistillCore
 import Foundation
 import XCTest
 
-/// Empirical gate for the 1.7B model swap: prove `samuelfaj/distill-1.7B-4bit-MLX`
-/// (qwen3 arch) actually LOADS in MLXDistillRuntime and GENERATES — unlike the E4B
-/// (gemma4) model, which fails to load with the vendored mlx-swift-lm.
+/// Empirical gate for the 1.7B fallback model: prove `samuelfaj/distill-1.7B-4bit-MLX`
+/// (qwen3 arch) actually LOADS in MLXDistillRuntime and GENERATES. This is the model
+/// selected on hosts below E4B's 16 GiB memory floor, and it must keep working after the
+/// `RCGemma4ModelOverride` registration was added to `MLXDistillRuntime.init` (that override
+/// only affects the `gemma4` type and must not perturb the qwen3 load path).
 ///
 ///   REMOTE_CODE_TOKEN_SAVER_17B_DIR=<model dir> \
 ///     DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \

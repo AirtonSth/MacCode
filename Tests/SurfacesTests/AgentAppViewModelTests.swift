@@ -1255,6 +1255,67 @@ final class AgentAppViewModelTests: XCTestCase {
                        "everything that is not the final answer, including assistant drafts, must move into the Worked disclosure")
     }
 
+    func test_completedTurnWithLastMessageFinalDemotesEarlierPreamblesToWorkLog() {
+        // A Codex turn emits several preamble messages before the real answer. Only
+        // the LAST assistant message is the answer; the earlier preambles must
+        // collapse into the Worked disclosure instead of stacking up as the visible
+        // final answer (the bug this fix addresses).
+        let turn = AssistantTurnSnapshot(
+            turnId: "turn-1",
+            items: [
+                AssistantItem(id: "msg-1", turnId: "turn-1", type: .assistantMessage, state: .completed, body: "Let me read the config first.", startedAtMs: 1_000, finishedAtMs: 2_000),
+                AssistantItem(id: "msg-2", turnId: "turn-1", type: .assistantMessage, state: .completed, body: "Now running the test suite.", startedAtMs: 2_000, finishedAtMs: 3_000),
+                AssistantItem(id: "msg-3", turnId: "turn-1", type: .assistantMessage, state: .completed, body: "All checks passed and the build is green.", startedAtMs: 3_000, finishedAtMs: 4_000)
+            ],
+            finalAssistantMessage: "All checks passed and the build is green.",
+            finished: true
+        )
+        let renderable = AgentAppView.renderableItems(in: turn)
+
+        XCTAssertEqual(AgentAppView.completedVisibleAssistantItems(in: turn, renderableItems: renderable).map(\.id), ["msg-3"],
+                       "only the last assistant message must remain the visible answer when a turn emits multiple preamble messages")
+        XCTAssertEqual(AgentAppView.completedWorkItems(in: turn, renderableItems: renderable).map(\.id), ["msg-1", "msg-2"],
+                       "earlier preamble assistant messages must collapse into the Worked disclosure, not show as the final answer")
+    }
+
+    func test_persistedLastMessageRendersOnceWhilePreamblesStayInWorkLog() {
+        // After the run finishes, the durable persisted answer is the LAST message
+        // only. The timeline shows the preambles in the Worked disclosure and the
+        // persisted bubble shows the answer — the answer must render exactly once,
+        // never duplicated between the persisted row and the timeline.
+        let threadId = AgentThreadID()
+        let persisted = AgentMessage(
+            threadId: threadId,
+            role: .assistant,
+            content: "All checks passed and the build is green."
+        )
+        let turn = AssistantTurnSnapshot(
+            turnId: "turn-1",
+            items: [
+                AssistantItem(id: "msg-1", turnId: "turn-1", type: .assistantMessage, state: .completed, body: "Let me read the config first.", startedAtMs: 1),
+                AssistantItem(id: "msg-2", turnId: "turn-1", type: .assistantMessage, state: .completed, body: "Now running the test suite.", startedAtMs: 2),
+                AssistantItem(id: "msg-3", turnId: "turn-1", type: .assistantMessage, state: .completed, body: "All checks passed and the build is green.", startedAtMs: 3)
+            ],
+            finalAssistantMessage: "All checks passed and the build is green.",
+            finished: true
+        )
+
+        XCTAssertTrue(
+            AgentAppView.hiddenPersistedAssistantMessageIDs(messages: [persisted], timelineTurns: [turn]).isEmpty,
+            "the persisted last message must stay visible: the timeline now shows only the preambles, never the answer, so there is nothing to dedup against"
+        )
+
+        // Once the persisted answer has filtered the matching last item out of the
+        // renderable set, NO timeline item is the final answer, so every preamble
+        // demotes to the work log and the persisted bubble is the sole answer.
+        // (Before the fix this returned all preamble items, double-rendering them.)
+        let renderableWithPersisted = AgentAppView.renderableItems(in: turn, persistedAssistantTexts: ["All checks passed and the build is green."])
+        XCTAssertTrue(
+            AgentAppView.completedFinalAssistantItemIDs(in: turn, renderableItems: renderableWithPersisted, persistedAssistantTexts: ["All checks passed and the build is green."]).isEmpty,
+            "no preamble may be promoted to the visible final answer once the real answer is shown by the persisted bubble"
+        )
+    }
+
     func test_turnViewRendersFinalWhenAssistantItemBodyIsOnlyPartial() {
         let turn = AssistantTurnSnapshot(
             turnId: "turn-1",

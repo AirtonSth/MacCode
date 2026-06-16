@@ -46,6 +46,25 @@ final class ClaudeRunnerArgsTests: XCTestCase {
                      "resumed Claude streaming sessions must not also request a new session id")
     }
 
+    func test_streamingTokenSaverHintAppendsDistillSystemPrompt() {
+        let on = AgentRunRequest(threadId: AgentThreadID(), provider: .claude,
+                                 model: "claude-opus-4-7", cwd: "/tmp", prompt: "hi",
+                                 environment: ["RC_TOKEN_SAVER_DISTILL_HINT": "1"])
+        let a = ClaudeRunner.buildStreamingArgs(on)
+        guard let idx = a.firstIndex(of: "--append-system-prompt") else {
+            return XCTFail("Token Saver on must append distill instructions to the streaming CLI system prompt so Claude pipes `| distill` and speaks distill language")
+        }
+        XCTAssertEqual(a[a.index(after: idx)], AgentSkillInstaller.distillAgentInstructionsBody,
+                       "appended system prompt must be the canonical distill instructions, not an ad-hoc string")
+        XCTAssertTrue(AgentSkillInstaller.distillAgentInstructionsBody.contains("| distill"),
+                      "the injected body must carry the `| distill` piping rule")
+
+        let off = AgentRunRequest(threadId: AgentThreadID(), provider: .claude,
+                                  model: "claude-opus-4-7", cwd: "/tmp", prompt: "hi")
+        XCTAssertNil(ClaudeRunner.buildStreamingArgs(off).firstIndex(of: "--append-system-prompt"),
+                     "no Token Saver hint (CLI uninstalled) must leave the streaming system prompt untouched")
+    }
+
     func test_modelAndPromptPlacement() {
         let a = ClaudeRunner.buildArgs(req())
         let m = a.firstIndex(of: "--model")!

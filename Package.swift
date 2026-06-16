@@ -158,7 +158,11 @@ let package = Package(
         ),
         .testTarget(
             name: "DistillCoreTests",
-            dependencies: ["DistillCore", "AgentRuntime"],
+            dependencies: [
+                "DistillCore",
+                "AgentRuntime",
+                .product(name: "MLXLLM", package: "mlx-swift-lm")
+            ],
             path: "Tests/DistillCoreTests"
         ),
         .testTarget(

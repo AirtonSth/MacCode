@@ -850,6 +850,64 @@ final class ClaudeStreamingCLIAdapterTests: XCTestCase {
         try adapter.stopSession(threadId: threadId)
     }
 
+    func test_agentSDKBridgeAdapterSendsDistillSystemPromptOnlyWhenTokenSaverHintSet() async throws {
+        guard ProcessLocator.resolve("node") != nil else { throw XCTSkip("node not available") }
+        let tmp = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("rc2-claude-sdk-distill-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
+        let bridge = tmp.appendingPathComponent("fake-sdk-bridge.mjs")
+        try """
+        import fs from 'node:fs';
+        import readline from 'node:readline';
+        const log = process.argv[2];
+        const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
+        function write(obj) { process.stdout.write(JSON.stringify(obj) + '\\n'); }
+        for await (const line of rl) {
+          if (!line.trim()) continue;
+          const cmd = JSON.parse(line);
+          if (cmd.type === 'rc_configure') {
+            fs.appendFileSync(log, JSON.stringify(cmd) + '\\n');
+            write({ type: 'system', subtype: 'init', session_id: 'distill-session' });
+          } else if (cmd.type === 'rc_turn') {
+            write({ type: 'result', subtype: 'success', is_error: false, result: 'OK', session_id: 'distill-session' });
+          } else if (cmd.type === 'rc_close') {
+            process.exit(0);
+          }
+        }
+        """.write(to: bridge, atomically: true, encoding: .utf8)
+
+        func configureCommand(tokenSaverOn: Bool) async throws -> String {
+            let adapter = ClaudeAgentSDKBridgeAdapter(bridgeScriptPath: bridge.path)
+            let log = tmp.appendingPathComponent("cfg-\(tokenSaverOn).jsonl")
+            FileManager.default.createFile(atPath: log.path, contents: Data())
+            let sink = EventSink()
+            _ = try await adapter.sendTurn(AgentRunRequest(
+                threadId: AgentThreadID(),
+                provider: .claude,
+                model: "claude-haiku-4-5-20251001",
+                cwd: tmp.path,
+                prompt: "hi",
+                environment: tokenSaverOn ? ["RC_TOKEN_SAVER_DISTILL_HINT": "1"] : [:],
+                extraArgs: [log.path]
+            )) { event in Task { await sink.record(event) } }
+            try await waitForFinish(in: sink, expected: "OK")
+            try? adapter.stopSession(threadId: adapter.listSessions().first!.threadId)
+            return try String(contentsOf: log, encoding: .utf8)
+        }
+
+        let on = try await configureCommand(tokenSaverOn: true)
+        XCTAssertTrue(on.contains("\"system_prompt\""),
+                      "Token Saver on must send the distill system prompt on rc_configure")
+        XCTAssertTrue(on.contains("pipe EVERY non-interactive"),
+                      "the system prompt must carry the canonical `| distill` piping rule")
+        XCTAssertTrue(on.contains("S=state"),
+                      "the system prompt must carry the distill-language prefixes so user-visible replies use distill language")
+
+        let off = try await configureCommand(tokenSaverOn: false)
+        XCTAssertFalse(off.contains("\"system_prompt\""),
+                       "no Token Saver hint (managed distill CLI uninstalled) must leave the SDK system prompt at its empty default")
+    }
+
     func test_agentSDKBridgeAdapterFinalizesAssistantTextWhenBridgeExitsWithoutResult() async throws {
         let tmp = URL(fileURLWithPath: NSTemporaryDirectory())
             .appendingPathComponent("rc2-claude-sdk-finalize-\(UUID().uuidString)", isDirectory: true)
@@ -1314,6 +1372,24 @@ final class ClaudeStreamingCLIAdapterTests: XCTestCase {
                       "I2: hook must stay opt-in/default-off until Token Saver enables it")
         XCTAssertTrue(source.contains("TOKEN_SAVER_STORE_MIN_BYTES = 2048"),
                       "I2: hooked tool output lane lowers reversible store floor from 8192 to 2048 bytes")
+    }
+
+    // The SDK bridge has no developer_instructions channel like Codex, so the Token Saver
+    // distill rules (pipe `| distill` + speak distill language) must ride in the SDK
+    // `systemPrompt`. The host sends it as `system_prompt` on rc_configure; the bridge relays
+    // it into the query options. Locks both ends of that wiring.
+    func test_agentSDKBridgeSourceWiresTokenSaverSystemPrompt() throws {
+        let packageRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let bridge = packageRoot.appendingPathComponent("Sources/AgentRuntime/ClaudeAgentSDKBridge.mjs")
+        let source = try String(contentsOf: bridge, encoding: .utf8)
+
+        XCTAssertTrue(source.contains("systemPrompt: current.systemPrompt"),
+                      "SDK query options must pass the host-provided distill system prompt so Claude pipes `| distill` and speaks distill language")
+        XCTAssertTrue(source.contains("systemPrompt: command.system_prompt || undefined"),
+                      "rc_configure must relay the host `system_prompt` into session state (undefined keeps the SDK default empty prompt when Token Saver is off)")
     }
 
     // Token Saver must distill EVERY tool (no 4-tool allowlist) once output passes

@@ -86,9 +86,8 @@ final class DistillServiceTests: XCTestCase {
             )
         }
 
-        // Use the currently-approved, runnable model (1.7B). E4B is intentionally no
-        // longer approved (the vendored mlx-swift-lm can't load gemma4), so a config that
-        // names it must now be REJECTED — asserted below.
+        // Both approved distill models must pass the configuration gate so the sidecar can be
+        // launched pointing at either one. The qwen3 1.7B fallback:
         let compact = TokenSaverApprovedModels.distill17B
         let accepted = try DistillServiceConfiguration(
             authToken: "token",
@@ -99,16 +98,17 @@ final class DistillServiceTests: XCTestCase {
         )
         XCTAssertEqual(accepted.modelID, compact.id)
 
-        // The excluded E4B model must be rejected by the configuration gate so the sidecar
-        // can never be launched pointing at a model that fails to load.
+        // ...and the gemma4 E4B model, now loadable via RCGemma4ModelOverride and therefore
+        // approved, must also be accepted (it was rejected while excluded from `all`).
         let e4b = TokenSaverApprovedModels.distillE4B
-        XCTAssertThrowsError(try DistillServiceConfiguration(
+        let acceptedE4B = try DistillServiceConfiguration(
             authToken: "token",
             appSupportDirectory: "/tmp/remote-code",
             runtime: e4b.runtime,
             modelID: e4b.id,
             modelURL: e4b.url
-        ), "E4B is no longer approved and must not pass the configuration gate")
+        )
+        XCTAssertEqual(acceptedE4B.modelID, e4b.id)
     }
 
     func test_httpServerRequiresBearerTokenAndServesDistillRequests() async throws {
