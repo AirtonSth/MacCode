@@ -23,6 +23,16 @@ struct RemoteCodeDistillServiceMain {
             await runMCP()
             return
         }
+        // RTK-style transparent command wrappers: invoked via a symlink whose basename is a
+        // wrapped command (e.g. ~/.remote-code/bin/rg), or explicitly as `… wrap <cmd> <args>`.
+        if CommandWrapPolicy.isWrapped(programName) {
+            await runWrap(command: programName, arguments: Array(rawArgs.dropFirst()))
+            return
+        }
+        if rawArgs.dropFirst().first == "wrap", rawArgs.count >= 3 {
+            await runWrap(command: rawArgs[2], arguments: Array(rawArgs.dropFirst(3)))
+            return
+        }
 
         do {
             let arguments = Array(CommandLine.arguments.dropFirst())
@@ -142,6 +152,44 @@ struct RemoteCodeDistillServiceMain {
         let (out, code) = await cli.run()
         FileHandle.standardOutput.write(out)
         Darwin.exit(code)
+    }
+
+    /// Transparent command-wrapper mode (RTK port). Runs the real command, and when this wrapper
+    /// is the terminal command feeding the agent, compresses its stdout via the resident sidecar
+    /// (reversible — a `[[rc:<handle>]]` marker lets the agent recover the exact bytes). Always
+    /// exits with the REAL command's status. Fail-open throughout: any failure passes the raw
+    /// output through unchanged so a command's output is never lost or corrupted.
+    private static func runWrap(command: String, arguments: [String]) async {
+        let session = createConfiguredURLSession()
+        let exitCode = await CommandWrapRunner.run(command: command, args: arguments) { captured, query, storeFloorBytes in
+            let env = ProcessInfo.processInfo.environment
+            let provider = env["REMOTE_CODE_AGENT_PROVIDER"]?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let maxChars = Int(env["REMOTE_CODE_DISTILL_MAX_OUTPUT_CHARS"] ?? "") ?? 4_000
+            // Per-command extraction query: nil (no question → deterministic router) for
+            // search/listings; a neutral extractive query for cat/sed so the service routes to its
+            // BERT lane (verbatim line selection) instead of the misfiring intent extractor.
+            let cli = ManagedDistillCLI(
+                arguments: query.map { [$0] } ?? [],
+                stdin: captured,
+                state: loadCLIState(),
+                provider: (provider?.isEmpty == false) ? provider : nil,
+                maxOutputCharacters: maxChars,
+                reversibleStoreMinBytes: storeFloorBytes
+            ) { request in
+                do {
+                    let (data, response) = try await session.data(for: request)
+                    return (data, (response as? HTTPURLResponse)?.statusCode ?? 0)
+                } catch {
+                    return nil
+                }
+            }
+            let (out, code) = await cli.run()
+            // compress() is fail-open: code 0 carries either the compressed text (+handle) or, on
+            // any sidecar failure, the raw bytes verbatim. A non-zero code is the oversize-input
+            // rejection — fall back to the captured bytes rather than emitting that error.
+            return code == 0 ? out : nil
+        }
+        Darwin.exit(exitCode)
     }
 
     /// Retrieve-only MCP server (P3-T5): newline-delimited JSON-RPC 2.0 over stdio. Exposes

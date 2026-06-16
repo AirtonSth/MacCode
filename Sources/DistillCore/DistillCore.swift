@@ -95,6 +95,11 @@ public struct DistillRequest: Codable, Sendable, Equatable, Identifiable {
     public let topK: Int?
     public let encoderLane: String?
     public let maxOutputCharacters: Int
+    /// Per-request override for the store-before-loss floor: inputs at least this many bytes
+    /// have their byte-exact original stored so a lossy compression stays recoverable via
+    /// `/v1/retrieve`. nil uses the server default. The Claude PostToolUse hook and the RTK
+    /// command wrappers send a low value so their compressed output always carries a handle.
+    public let reversibleStoreMinBytes: Int?
 
     public init(
         id: UUID = UUID(),
@@ -109,7 +114,8 @@ public struct DistillRequest: Codable, Sendable, Equatable, Identifiable {
         rerankQuery: String? = nil,
         topK: Int? = nil,
         encoderLane: String? = nil,
-        maxOutputCharacters: Int = 4_000
+        maxOutputCharacters: Int = 4_000,
+        reversibleStoreMinBytes: Int? = nil
     ) {
         self.id = id
         self.mode = mode
@@ -124,6 +130,7 @@ public struct DistillRequest: Codable, Sendable, Equatable, Identifiable {
         self.topK = topK.map { max(1, $0) }
         self.encoderLane = encoderLane?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
         self.maxOutputCharacters = max(128, maxOutputCharacters)
+        self.reversibleStoreMinBytes = reversibleStoreMinBytes.map { max(1, $0) }
     }
 
     public var effectiveRunMode: DistillRunMode {
@@ -133,6 +140,7 @@ public struct DistillRequest: Codable, Sendable, Equatable, Identifiable {
     private enum CodingKeys: String, CodingKey {
         case id, mode, priority, input, question, provider
         case recordSavings, runMode, cacheState, rerankQuery, topK, encoderLane, maxOutputCharacters
+        case reversibleStoreMinBytes
     }
 
     /// Tolerant decoder: identical to the synthesized one EXCEPT a wire client may omit
@@ -155,6 +163,7 @@ public struct DistillRequest: Codable, Sendable, Equatable, Identifiable {
         self.topK = try c.decodeIfPresent(Int.self, forKey: .topK)
         self.encoderLane = try c.decodeIfPresent(String.self, forKey: .encoderLane)
         self.maxOutputCharacters = try c.decode(Int.self, forKey: .maxOutputCharacters)
+        self.reversibleStoreMinBytes = try c.decodeIfPresent(Int.self, forKey: .reversibleStoreMinBytes).map { max(1, $0) }
     }
 }
 
@@ -1556,7 +1565,12 @@ public struct MLXDistillRuntime: DistillRuntime {
     ) -> String? {
         guard request.mode == .commandOutput else { return nil }
         let parsed = LocalDistillRuntime.splitLegacyCommandPayload(request.input)
-        let question = request.question?.nilIfEmpty ?? parsed.question ?? request.input
+        // Intent extraction needs a REAL question to know what to extract. Falling back to the
+        // input ITSELF as the question makes the classifier misfire on data keywords — a source
+        // file with "FAIL"/"error" comments returns a bogus PASS/FAIL line, markdown returns
+        // "PASS" — replacing the whole output with a 4-byte token. With no question, skip intent
+        // extraction entirely and let the content router / BERT / LLM handle the content.
+        guard let question = (request.question?.nilIfEmpty ?? parsed.question) else { return nil }
         guard let intent = LocalDistillRuntime.commandOutputIntent(question: question, classifier: classifier),
               let output = LocalDistillRuntime.commandOutputExtraction(source: parsed.output, question: question, intent: intent) else {
             return nil

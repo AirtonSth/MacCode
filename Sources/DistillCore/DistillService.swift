@@ -843,7 +843,11 @@ public final class DistillHTTPServer: @unchecked Sendable {
             var storeFailedForLargeInput = false
             if distillRequest.effectiveRunMode == .optimize, let reversibleStore {
                 let bytes = Data(distillRequest.input.utf8)
-                if bytes.count >= reversibleStoreMinBytes {
+                // A request may LOWER the store floor (never raise it above the server cap) so
+                // the Claude hook / RTK wrappers can guarantee a recovery handle for smaller
+                // outputs than the global default would otherwise store.
+                let effectiveStoreMin = min(reversibleStoreMinBytes, distillRequest.reversibleStoreMinBytes ?? reversibleStoreMinBytes)
+                if bytes.count >= effectiveStoreMin {
                     // I2.4: surface the failure instead of swallowing it with `try?`, so a
                     // lossy substitution is never served without a recoverable original.
                     do {

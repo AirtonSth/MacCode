@@ -411,6 +411,30 @@ final class TokenSaverInstallTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: codexSkill.path))
     }
 
+    func test_modelArtifactsPresent_detectsDownloadedWeightsIndependentOfActiveManifest() throws {
+        let appSupport = tempDir()
+        let installer = TokenSaverModelInstaller(appSupportDirectory: appSupport)
+        let e4b = TokenSaverApprovedModels.distillE4B
+
+        XCTAssertFalse(installer.modelArtifactsPresent(model: e4b), "no weights on disk yet")
+
+        // Simulate the E4B model fully downloaded under its own revision dir, even though no
+        // manifest activates it (the exact 'downloaded but not active' state that pinned 1.7B).
+        let revDir = installer.distillDirectory
+            .appendingPathComponent("Models", isDirectory: true)
+            .appendingPathComponent(TokenSaverModelInstaller.safePathComponent(e4b.id), isDirectory: true)
+            .appendingPathComponent("rev-sha", isDirectory: true)
+        try FileManager.default.createDirectory(at: revDir, withIntermediateDirectories: true)
+        try Data("safetensors".utf8).write(to: revDir.appendingPathComponent("model.safetensors"))
+        try Data("{}".utf8).write(to: revDir.appendingPathComponent("config.json"))
+
+        XCTAssertTrue(installer.modelArtifactsPresent(model: e4b),
+                      "weights present on disk must be detected so startup can activate the preferred model")
+        // Missing config.json => not a usable model dir.
+        try FileManager.default.removeItem(at: revDir.appendingPathComponent("config.json"))
+        XCTAssertFalse(installer.modelArtifactsPresent(model: e4b), "a revision without config.json is not activatable")
+    }
+
     func test_modelInstallerRequiresApprovedManifestAndChecksums() throws {
         let appSupport = tempDir()
         let installer = TokenSaverModelInstaller(appSupportDirectory: appSupport)

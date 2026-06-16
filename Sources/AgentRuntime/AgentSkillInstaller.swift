@@ -276,6 +276,74 @@ public final class AgentSkillInstaller: @unchecked Sendable {
         return .notPresent
     }
 
+    /// Install the RTK-style transparent command wrappers: a symlink per wrapped command in the
+    /// managed bin dir (`~/.remote-code/bin`, which is PREPENDED to the agent PATH but not on the
+    /// user's interactive shell PATH — so only agents get wrappers) pointing at the
+    /// RemoteCodeDistillService binary, which detects its basename and enters wrap mode. A wrapper
+    /// is installed ONLY when the real command exists on the system, so a missing command (e.g.
+    /// `rg` not installed) is never shadowed by a wrapper that would then fail. Returns the
+    /// commands wrapped. Best-effort symmetry with `installDistillCLI`.
+    @discardableResult
+    public func installCommandWrappers(serviceBinaryURL: URL? = nil) throws -> [String] {
+        try fileManager.createDirectory(at: cliBinDirectory, withIntermediateDirectories: true)
+        guard let binary = serviceBinaryURL ?? Self.resolveServiceBinary(fileManager: fileManager) else {
+            throw AgentSkillCLIError.serviceBinaryUnavailable
+        }
+        let searchDirectories = systemCommandSearchDirectories()
+        var installed: [String] = []
+        for command in WrappedCommandCatalog.commands {
+            guard commandExistsOnSystem(command, searchDirectories: searchDirectories) else { continue }
+            let link = cliBinDirectory.appendingPathComponent(command)
+            if let dest = try? fileManager.destinationOfSymbolicLink(atPath: link.path) {
+                if dest == binary.path { installed.append(command); continue }
+                try? fileManager.removeItem(at: link) // replace a stale managed symlink
+            } else if fileManager.fileExists(atPath: link.path) {
+                // A real (non-symlink) file we did not create — never clobber it.
+                continue
+            }
+            try fileManager.createSymbolicLink(at: link, withDestinationURL: binary)
+            installed.append(command)
+        }
+        return installed
+    }
+
+    /// Remove the command-wrapper symlinks — but only those still pointing at our service binary,
+    /// so a user's own command on the managed path (unexpected) is never deleted.
+    @discardableResult
+    public func uninstallCommandWrappers() throws -> [String] {
+        let binaryPath = Self.resolveServiceBinary(fileManager: fileManager)?.path
+        var removed: [String] = []
+        for command in WrappedCommandCatalog.commands {
+            let link = cliBinDirectory.appendingPathComponent(command)
+            guard let dest = try? fileManager.destinationOfSymbolicLink(atPath: link.path) else { continue }
+            guard dest == binaryPath || (dest as NSString).lastPathComponent == "RemoteCodeDistillService" else { continue }
+            try fileManager.removeItem(at: link)
+            removed.append(command)
+        }
+        return removed
+    }
+
+    /// Agent command search path (the same dirs the agent's shell sees) minus the managed bin
+    /// dir, so "does the real command exist?" never resolves to one of our own wrapper symlinks.
+    private func systemCommandSearchDirectories() -> [String] {
+        let home = fileManager.homeDirectoryForCurrentUser.path
+        let managed = cliBinDirectory.path
+        let joined = ProcessLocator.expandedPath(
+            environmentPath: ProcessInfo.processInfo.environment["PATH"],
+            homeDirectory: home
+        )
+        return joined.split(separator: ":").map(String.init).filter { !$0.isEmpty && $0 != managed }
+    }
+
+    private func commandExistsOnSystem(_ command: String, searchDirectories: [String]) -> Bool {
+        for dir in searchDirectories {
+            if fileManager.isExecutableFile(atPath: (dir as NSString).appendingPathComponent(command)) {
+                return true
+            }
+        }
+        return false
+    }
+
     private func claudeSettingsURL() -> URL {
         claudeInstructionsURL.deletingLastPathComponent().appendingPathComponent("settings.json")
     }

@@ -51,4 +51,58 @@ final class ManagedDistillCLIInstallTests: XCTestCase {
         let result = try installer.uninstallDistillCLI()
         XCTAssertEqual(result, .removed, "legacy Python CLI is cleaned up on uninstall (migration)")
     }
+
+    // MARK: - RTK transparent command wrappers
+
+    private func fakeServiceBinary(in home: URL) throws -> URL {
+        let binary = home.appendingPathComponent("fake/RemoteCodeDistillService")
+        try FileManager.default.createDirectory(at: binary.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data("binary".utf8).write(to: binary)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: binary.path)
+        return binary
+    }
+
+    func test_installCommandWrappers_symlinksExistingCommandsToServiceBinary() throws {
+        let home = tempHome(); defer { try? FileManager.default.removeItem(at: home) }
+        let binary = try fakeServiceBinary(in: home)
+        let installer = AgentSkillInstaller(homeDirectory: home)
+
+        let installed = try installer.installCommandWrappers(serviceBinaryURL: binary)
+        // cat and ls exist on every macOS system, so they must be wrapped and point at our binary.
+        XCTAssertTrue(installed.contains("cat") && installed.contains("ls"))
+        for command in ["cat", "ls"] {
+            let link = home.appendingPathComponent(".remote-code/bin/\(command)")
+            XCTAssertEqual(try FileManager.default.destinationOfSymbolicLink(atPath: link.path), binary.path)
+        }
+        // Idempotent: a second install keeps the same links, no throw.
+        XCTAssertEqual(Set(try installer.installCommandWrappers(serviceBinaryURL: binary)), Set(installed))
+
+        let removed = try installer.uninstallCommandWrappers()
+        XCTAssertTrue(removed.contains("cat") && removed.contains("ls"))
+        XCTAssertNil(try? FileManager.default.destinationOfSymbolicLink(atPath: home.appendingPathComponent(".remote-code/bin/cat").path))
+    }
+
+    func test_installCommandWrappers_neverShadowsAMissingCommand() throws {
+        let home = tempHome(); defer { try? FileManager.default.removeItem(at: home) }
+        let binary = try fakeServiceBinary(in: home)
+        let installer = AgentSkillInstaller(homeDirectory: home)
+        let installed = try installer.installCommandWrappers(serviceBinaryURL: binary)
+        // Only commands that actually resolve on the system are wrapped; a wrapper is never
+        // created for an absent command (which would then fail with "command not found").
+        for command in installed {
+            XCTAssertTrue(FileManager.default.fileExists(atPath: home.appendingPathComponent(".remote-code/bin/\(command)").path))
+        }
+    }
+
+    func test_uninstallCommandWrappers_leavesAUserOwnedFileUntouched() throws {
+        let home = tempHome(); defer { try? FileManager.default.removeItem(at: home) }
+        let binDir = home.appendingPathComponent(".remote-code/bin", isDirectory: true)
+        try FileManager.default.createDirectory(at: binDir, withIntermediateDirectories: true)
+        // A real (non-symlink) file the user placed at our managed path for `cat`.
+        let userFile = binDir.appendingPathComponent("cat")
+        try Data("not ours".utf8).write(to: userFile)
+        let installer = AgentSkillInstaller(homeDirectory: home)
+        _ = try installer.uninstallCommandWrappers()
+        XCTAssertTrue(FileManager.default.fileExists(atPath: userFile.path), "a non-symlink we did not create must never be removed")
+    }
 }

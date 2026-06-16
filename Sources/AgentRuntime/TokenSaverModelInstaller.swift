@@ -243,6 +243,23 @@ public final class TokenSaverModelInstaller: @unchecked Sendable {
             .appendingPathComponent(revision, isDirectory: true)
     }
 
+    /// True when a model's weights are already on disk (some revision dir holds a `*.safetensors`
+    /// plus `config.json`), independent of which model the ACTIVE manifest references. Lets startup
+    /// ACTIVATE an already-downloaded preferred model without ever starting a multi-GB download
+    /// (that stays toggle/UI-driven). Defaults to the memory-selected model (e.g. E4B on ≥16 GB).
+    public func modelArtifactsPresent(model: TokenSaverApprovedModel = TokenSaverApprovedModels.selected()) -> Bool {
+        let base = distillDirectory
+            .appendingPathComponent("Models", isDirectory: true)
+            .appendingPathComponent(Self.safePathComponent(model.id), isDirectory: true)
+        guard let revisions = try? fileManager.contentsOfDirectory(at: base, includingPropertiesForKeys: nil) else {
+            return false
+        }
+        return revisions.contains { revisionDir in
+            let files = (try? fileManager.contentsOfDirectory(atPath: revisionDir.path)) ?? []
+            return files.contains { $0.hasSuffix(".safetensors") } && files.contains("config.json")
+        }
+    }
+
     public func encoderStorageDirectory(modelID: String, revision: String) -> URL {
         distillDirectory
             .appendingPathComponent("Encoders", isDirectory: true)

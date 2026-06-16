@@ -482,6 +482,7 @@ public final class AppContext {
                 try installer.installDistillInstructions(for: .codex)
                 try installer.installDistillInstructions(for: .claude)
                 _ = try installer.installDistillCLI(appSupportDirectory: appSupportDirectory)
+                try? installer.installCommandWrappers() // RTK transparent wrappers (best-effort; needs the bundled binary)
                 try? installer.installRetrieveMCP() // retrieve-only MCP (best-effort; needs the bundled binary)
                 managedDistillSkillInstallResults = [codex, claude]
                 managedDistillSkillInstallError = nil
@@ -491,6 +492,7 @@ public final class AppContext {
                 _ = try installer.uninstallDistillInstructions(for: .codex)
                 _ = try installer.uninstallDistillInstructions(for: .claude)
                 _ = try installer.uninstallDistillCLI()
+                _ = try? installer.uninstallCommandWrappers()
                 try? installer.uninstallRetrieveMCP()
                 managedDistillSkillInstallResults = []
                 managedDistillSkillInstallError = nil
@@ -505,13 +507,50 @@ public final class AppContext {
     private func startTokenSaverDistillServiceIfEligible() {
         let settings = SettingsStore(db: db).load()
         let session = PrivateAccountSessionStore(repo: settingsRepo).load()
-        let modelValidation = TokenSaverModelInstaller(appSupportDirectory: appSupportDirectory)
-            .validateInstalledTokenSaverModels()
+        let installer = TokenSaverModelInstaller(appSupportDirectory: appSupportDirectory)
+        let modelValidation = installer.validateInstalledTokenSaverModels()
         tokenSaverDistillServiceController.startIfEligible(
             session: session,
             settings: settings,
             modelValidation: modelValidation
         )
+        activatePreferredTokenSaverModelIfDownloaded(settings: settings, session: session)
+    }
+
+    /// The eligibility check above accepts ANY installed approved model, so a machine that already
+    /// holds the higher-tier SELECTED model (e.g. the E4B model on ≥16 GB) but whose active
+    /// manifest still points at a smaller fallback (e.g. the 1.7B) keeps running the fallback —
+    /// the startup path never upgrades. When the selected model's weights are ALREADY on disk,
+    /// activate it (write its manifest) and restart the sidecar so it actually loads it (`start()`
+    /// no-ops while the sidecar is running). A not-yet-downloaded model is left alone: that
+    /// multi-GB download stays toggle/UI-driven so launch never starts one silently.
+    private func activatePreferredTokenSaverModelIfDownloaded(settings: AppSettings, session: PrivateAccountSession?) {
+        let installer = TokenSaverModelInstaller(appSupportDirectory: appSupportDirectory)
+        guard settings.tokenSaverEnabled,
+              installer.validateInstalledModel(requireSelectedModel: true).state != .installed,  // selected not active
+              installer.validateInstalledModel(requireSelectedModel: false).state == .installed,  // a fallback IS active
+              installer.modelArtifactsPresent() else {                                           // selected already downloaded
+            return
+        }
+        let appSupport = appSupportDirectory
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            let installer = TokenSaverModelInstaller(appSupportDirectory: appSupport)
+            do {
+                // Writes the selected model's manifest; the already-present files are skipped via
+                // their cached checksums, so this does not re-download multiple GB.
+                _ = try await TokenSaverModelDownloader(installer: installer).downloadRequiredModels { _ in }
+                self.tokenSaverDistillServiceController.stop()
+                self.tokenSaverDistillServiceController.startIfEligible(
+                    session: session,
+                    settings: settings,
+                    modelValidation: installer.validateInstalledTokenSaverModels()
+                )
+                NSLog("RemoteCode Token Saver: activated preferred model \(TokenSaverApprovedModels.selected().id)")
+            } catch {
+                NSLog("RemoteCode Token Saver preferred-model activation failed: \(error)")
+            }
+        }
     }
 
     private func recordTokenSaverAccountUsage(_ usage: AssistantAccountUsage) {

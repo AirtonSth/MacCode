@@ -42,6 +42,9 @@ public struct ManagedDistillCLI: Sendable {
     public let state: State?
     public let provider: String?
     public let maxOutputCharacters: Int
+    /// Per-request reversible-store floor (nil = server default). The RTK command wrappers set
+    /// a low value so compressed output always carries a `[[rc:<handle>]]` recovery marker.
+    public let reversibleStoreMinBytes: Int?
     public let transport: Transport
 
     public init(
@@ -50,6 +53,7 @@ public struct ManagedDistillCLI: Sendable {
         state: State?,
         provider: String? = nil,
         maxOutputCharacters: Int = 4_000,
+        reversibleStoreMinBytes: Int? = nil,
         transport: @escaping Transport
     ) {
         self.arguments = arguments
@@ -57,6 +61,7 @@ public struct ManagedDistillCLI: Sendable {
         self.state = state
         self.provider = provider
         self.maxOutputCharacters = max(128, maxOutputCharacters)
+        self.reversibleStoreMinBytes = reversibleStoreMinBytes
         self.transport = transport
     }
 
@@ -127,7 +132,8 @@ public struct ManagedDistillCLI: Sendable {
             question: prompt.isEmpty ? nil : prompt,
             provider: provider,
             recordSavings: true,
-            maxOutputCharacters: maxOutputCharacters
+            maxOutputCharacters: maxOutputCharacters,
+            reversibleStoreMinBytes: reversibleStoreMinBytes
         )
         guard let body = try? JSONEncoder().encode(request) else { return failOpen() }
 

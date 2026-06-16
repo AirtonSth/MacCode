@@ -39,6 +39,34 @@ final class ManagedDistillCLITests: XCTestCase {
         XCTAssertEqual(out, raw)
     }
 
+    func test_compress_sendsPerRequestReversibleStoreMinBytes() async {
+        var captured: DistillRequest?
+        let resp = DistillResponse(requestID: UUID(), output: "x", inputCharacters: 2_000, originalHandle: "h")
+        let data = try! JSONEncoder().encode(resp)
+        let cli = ManagedDistillCLI(
+            arguments: [],
+            stdin: Data(String(repeating: "line of command output\n", count: 50).utf8),
+            state: state,
+            reversibleStoreMinBytes: 256
+        ) { request in
+            captured = try? JSONDecoder().decode(DistillRequest.self, from: request.httpBody ?? Data())
+            return (data, 200)
+        }
+        _ = await cli.run()
+        XCTAssertEqual(captured?.reversibleStoreMinBytes, 256,
+                       "the wrap path lowers the store floor so compressed output always carries a recovery handle")
+    }
+
+    func test_distillRequest_reversibleStoreMinBytes_roundTripsAndOmissionDecodesNil() throws {
+        // Round-trip the field itself (encoder + tolerant decoder).
+        let encoded = try JSONEncoder().encode(DistillRequest(mode: .commandOutput, input: "x", reversibleStoreMinBytes: 2048))
+        XCTAssertEqual(try JSONDecoder().decode(DistillRequest.self, from: encoded).reversibleStoreMinBytes, 2048)
+        // A wire body (as the Claude hook / wrappers hand-build) that omits the key decodes to
+        // nil — version-skew safe. `priority` is an Int on the wire, matching the hook's payload.
+        let omitted = #"{"mode":"commandOutput","priority":1,"input":"x","maxOutputCharacters":4000}"#
+        XCTAssertNil(try JSONDecoder().decode(DistillRequest.self, from: Data(omitted.utf8)).reversibleStoreMinBytes)
+    }
+
     // MARK: - QA-mac:54 saturation -> 429 -> CLI fail-open chain
 
     func test_distillErrorHttpMappingSeam() {
