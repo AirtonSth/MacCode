@@ -1316,6 +1316,35 @@ final class ClaudeStreamingCLIAdapterTests: XCTestCase {
                       "I2: hooked tool output lane lowers reversible store floor from 8192 to 2048 bytes")
     }
 
+    // Token Saver must distill EVERY tool (no 4-tool allowlist) once output passes
+    // the stated policy threshold (>~1KB OR >~10 lines), excluding only the
+    // exact-byte file tools. Locks the policy values + the no-allowlist behavior.
+    func test_agentSDKBridgeTokenSaverCompressesAllToolsAbovePolicyThreshold() throws {
+        let packageRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let bridge = packageRoot.appendingPathComponent("Sources/AgentRuntime/ClaudeAgentSDKBridge.mjs")
+        let source = try String(contentsOf: bridge, encoding: .utf8)
+
+        XCTAssertTrue(source.contains("TOKEN_SAVER_MIN_BYTES = 1024"),
+                      "threshold must match the distill policy (~1KB), not the prior 2048 that skipped 1-2KB output")
+        XCTAssertTrue(source.contains("TOKEN_SAVER_MIN_LINES = 10"),
+                      "threshold must match the distill policy (~10 lines), not the prior 30 that skipped 10-30 line output")
+        XCTAssertTrue(source.contains("TOKEN_SAVER_DEFAULT_PROFILE"),
+                      "unlisted tools must fall back to a compressing default profile, not passthrough")
+        XCTAssertTrue(source.contains("TOKEN_SAVER_PROFILES.get(normalized) || TOKEN_SAVER_DEFAULT_PROFILE"),
+                      "the decision must default every tool to compression instead of a 4-tool allowlist")
+        XCTAssertFalse(source.contains("'not_allowlisted'"),
+                       "there must be no allowlist gate — every non-excluded tool compresses")
+        // The AND guard is correct De Morgan ("skip only when BOTH dimensions are
+        // small"); it must remain AND so output compresses when EITHER threshold trips.
+        XCTAssertTrue(source.contains("<= TOKEN_SAVER_MIN_BYTES && lineCount(output) <= TOKEN_SAVER_MIN_LINES"),
+                      "skip guard must stay AND so a >1KB OR >10-line output is compressed")
+        XCTAssertTrue(source.contains("TOKEN_SAVER_EXCLUDED_TOOLS = new Set(['read', 'edit', 'write', 'multiedit', 'notebookedit'])"),
+                      "only exact-byte file tools are exempt (compressing them would break verbatim edits)")
+    }
+
     func test_agentSDKBridgeRecoversRawNewlineSplitPromptCommand() throws {
         guard let node = ProcessLocator.resolve("node") else {
             throw XCTSkip("node not available")
@@ -1392,6 +1421,71 @@ final class ClaudeStreamingCLIAdapterTests: XCTestCase {
                       "bridge must recover a prompt JSON command split by a raw newline inside the prompt string")
         XCTAssertFalse(err.contains("SyntaxError: Unterminated string"),
                        "the bridge must not leak the JSON.parse stack shown in the Agent App screenshot")
+    }
+
+    // The Claude AskUserQuestion tool reaches the bridge through the SDK
+    // `canUseTool` callback even in bypassPermissions/full-access mode. The
+    // screenshot bug showed it rendered as a "Provider approval" card with raw
+    // JSON and Approve/Approve Session buttons. The bridge must instead route it as
+    // a structured `user_input_request` (no approval), and return the user's choice
+    // to the model as the canUseTool `{ behavior: 'allow', updatedInput: { answers } }`
+    // permission result.
+    func test_agentSDKBridgeRoutesAskUserQuestionAsStructuredUserInput() throws {
+        guard let node = ProcessLocator.resolve("node") else { throw XCTSkip("node not available") }
+        let session = try AskUserQuestionBridgeSession(node: node, packageRoot: AskUserQuestionBridgeSession.packageRoot())
+
+        try session.send(["type": "rc_configure", "permission_mode": "full_access", "session_id": "fake-aq"])
+        try session.send(["type": "rc_turn", "prompt": "decide the path"])
+
+        XCTAssertTrue(session.waitFor("\"type\":\"user_input_request\""),
+                      "AskUserQuestion must surface as a user_input_request card, not block silently")
+        try session.send(["type": "user_input_response", "request_id": "ask-real-1", "text": #"{"Which path?":"Run"}"#])
+        let sawResult = session.waitFor("ASK_RESULT:")
+        let err = session.finish()
+        let out = session.output
+
+        XCTAssertTrue(sawResult, "the bridge must resolve the AskUserQuestion canUseTool promise once answered; stderr: \(err)")
+        XCTAssertTrue(out.contains("\"type\":\"user_input_request\""),
+                      "Bug 1/2: AskUserQuestion must render as a structured question card")
+        XCTAssertFalse(out.contains("\"type\":\"permission_request\""),
+                       "Bug 3: AskUserQuestion in full access must NOT request tool approval (no Approve/Approve Session)")
+        XCTAssertTrue(out.contains("\"ask_user_question\":true"),
+                      "the user_input_request must be tagged so the UI renders the structured AskUserQuestion picker")
+        XCTAssertTrue(out.contains("Which path?") && out.contains("Plan") && out.contains("Run"),
+                      "Bug 1: the question text and option labels must be carried through, not raw-JSON-only")
+        // The canUseTool result returned to the model must allow the tool and carry
+        // the answer keyed by question text. The result is JSON nested inside the
+        // assistant message text, so the inner quotes are escaped in raw stdout.
+        XCTAssertTrue(out.contains(#"\"behavior\":\"allow\""#),
+                      "answering AskUserQuestion must allow the tool to proceed")
+        XCTAssertTrue(out.contains(#"\"answers\":{\"Which path?\":\"Run\"}"#),
+                      "the user's selection must be returned to the model in updatedInput.answers, keyed by question text")
+        XCTAssertEqual(session.process.terminationStatus, 0, "bridge must exit cleanly; stderr: \(err)")
+    }
+
+    // Interrupting while an AskUserQuestion is pending must NOT leave the SDK
+    // async generator awaiting an answer forever — the bridge denies the pending
+    // canUseTool so the turn can unwind.
+    func test_agentSDKBridgeInterruptDeniesPendingAskUserQuestion() throws {
+        guard let node = ProcessLocator.resolve("node") else { throw XCTSkip("node not available") }
+        let session = try AskUserQuestionBridgeSession(node: node, packageRoot: AskUserQuestionBridgeSession.packageRoot())
+
+        try session.send(["type": "rc_configure", "permission_mode": "full_access", "session_id": "fake-aq"])
+        try session.send(["type": "rc_turn", "prompt": "decide the path"])
+        XCTAssertTrue(session.waitFor("\"type\":\"user_input_request\""),
+                      "the question must be pending before we interrupt")
+        try session.send(["type": "rc_interrupt"])
+        let resolved = session.waitFor("ASK_RESULT:")
+        let err = session.finish()
+        let out = session.output
+
+        XCTAssertTrue(resolved,
+                      "interrupt must settle the pending AskUserQuestion canUseTool promise instead of hanging; stderr: \(err)")
+        XCTAssertTrue(out.contains(#"\"behavior\":\"deny\""#),
+                      "an interrupted AskUserQuestion must be denied so the tool does not silently proceed")
+        XCTAssertTrue(out.contains(#"\"interrupt\":true"#),
+                      "the deny must interrupt the turn rather than just rejecting one tool call")
+        XCTAssertEqual(session.process.terminationStatus, 0, "bridge must exit cleanly after interrupt; stderr: \(err)")
     }
 
     func test_agentSDKPackageSpecRefreshesStalePinnedCache() async throws {
@@ -1530,4 +1624,115 @@ private actor EventSink {
     private var events: [AgentRunEvent] = []
     func record(_ event: AgentRunEvent) { events.append(event) }
     func snapshot() -> [AgentRunEvent] { events }
+}
+
+/// Thread-safe accumulator for draining a child process's stdout off the main
+/// thread while the test polls for markers.
+private final class LockedString: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage = ""
+    func append(_ text: String) { lock.lock(); storage += text; lock.unlock() }
+    var value: String { lock.lock(); defer { lock.unlock() }; return storage }
+}
+
+/// Runs the real ClaudeAgentSDKBridge.mjs node process with a fake
+/// `@anthropic-ai/claude-agent-sdk` whose `query()` drives the bridge's
+/// `canUseTool` callback for AskUserQuestion and echoes the returned permission
+/// result as an `ASK_RESULT:<json>` assistant message. Lets tests assert the
+/// AskUserQuestion routing + answer/cancel round-trip end to end.
+private final class AskUserQuestionBridgeSession {
+    let process: Process
+    private let stdin: Pipe
+    private let buffer = LockedString()
+    private let stderrPipe = Pipe()
+    private let reader: Thread
+
+    init(node: String, packageRoot: URL) throws {
+        let tmp = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("rc2-claude-sdk-bridge-ask-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
+        let bridge = tmp.appendingPathComponent("ClaudeAgentSDKBridge.mjs")
+        try FileManager.default.copyItem(
+            at: packageRoot.appendingPathComponent("Sources/AgentRuntime/ClaudeAgentSDKBridge.mjs"),
+            to: bridge
+        )
+        let sdkModule = tmp.appendingPathComponent("node_modules/@anthropic-ai/claude-agent-sdk", isDirectory: true)
+        try FileManager.default.createDirectory(at: sdkModule, withIntermediateDirectories: true)
+        try #"{"type":"module","main":"index.js"}"#.write(to: sdkModule.appendingPathComponent("package.json"), atomically: true, encoding: .utf8)
+        try """
+        export function createSdkMcpServer() { return { instance: { server: {} } }; }
+        export function tool(name, description, schema, handler) { return { name, description, schema, handler }; }
+        export function query({ prompt, options }) {
+          return (async function*() {
+            yield { type: 'system', subtype: 'init', session_id: 'fake-aq' };
+            const iterator = prompt[Symbol.asyncIterator]();
+            await iterator.next();
+            const input = { questions: [{ question: 'Which path?', header: 'Path', options: [{ label: 'Plan', description: 'Plan first' }, { label: 'Run', description: 'Run now' }], multiSelect: false }] };
+            const result = await options.canUseTool('AskUserQuestion', input, { toolUseID: 'ask-real-1' });
+            yield { type: 'assistant', message: { id: 'aq-turn', content: [{ type: 'text', text: 'ASK_RESULT:' + JSON.stringify(result) }] }, session_id: 'fake-aq' };
+            yield { type: 'result', subtype: 'success', is_error: false, result: 'done', session_id: 'fake-aq' };
+          })();
+        }
+        """.write(to: sdkModule.appendingPathComponent("index.js"), atomically: true, encoding: .utf8)
+        let zodModule = tmp.appendingPathComponent("node_modules/zod", isDirectory: true)
+        try FileManager.default.createDirectory(at: zodModule, withIntermediateDirectories: true)
+        try #"{"type":"module","main":"index.js"}"#.write(to: zodModule.appendingPathComponent("package.json"), atomically: true, encoding: .utf8)
+        try "export const z = {};\n".write(to: zodModule.appendingPathComponent("index.js"), atomically: true, encoding: .utf8)
+
+        process = Process()
+        process.executableURL = URL(fileURLWithPath: node)
+        process.arguments = [bridge.path]
+        process.currentDirectoryURL = tmp
+        stdin = Pipe()
+        let stdout = Pipe()
+        process.standardInput = stdin
+        process.standardOutput = stdout
+        process.standardError = stderrPipe
+        let buffer = self.buffer
+        let readerHandle = stdout.fileHandleForReading
+        reader = Thread {
+            while true {
+                let chunk = readerHandle.availableData
+                if chunk.isEmpty { break }
+                buffer.append(String(decoding: chunk, as: UTF8.self))
+            }
+        }
+        reader.stackSize = 1 << 20
+        reader.start()
+        try process.run()
+    }
+
+    func send(_ object: [String: Any]) throws {
+        let data = try JSONSerialization.data(withJSONObject: object)
+        stdin.fileHandleForWriting.write(data)
+        stdin.fileHandleForWriting.write(Data("\n".utf8))
+    }
+
+    @discardableResult
+    func waitFor(_ marker: String, timeout: TimeInterval = 8) -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if buffer.value.contains(marker) { return true }
+            Thread.sleep(forTimeInterval: 0.02)
+        }
+        return false
+    }
+
+    var output: String { buffer.value }
+
+    /// Closes stdin, waits for exit, returns stderr text.
+    func finish() -> String {
+        try? send(["type": "rc_close"])
+        stdin.fileHandleForWriting.closeFile()
+        process.waitUntilExit()
+        reader.cancel()
+        return String(decoding: stderrPipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+    }
+
+    static func packageRoot(file: StaticString = #filePath) -> URL {
+        URL(fileURLWithPath: "\(file)")
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+    }
 }

@@ -167,6 +167,55 @@ final class AssistantTimelineTests: XCTestCase {
                                  "the memory-ceiling backstop still bounds turns")
     }
 
+    // Structured AskUserQuestion requests are persisted (callback snapshot) and
+    // restored across app restarts — the questions/options/per-question multiSelect
+    // must survive the Codable round-trip, and legacy rows without `questions` must
+    // still decode (version-skew safe).
+    func test_structuredUserInputRequestCodableRoundTrip() throws {
+        let request = AssistantUserInputRequest(
+            id: "ask-1",
+            turnId: "turn-1",
+            prompt: "Framework: pick one",
+            questions: [
+                AssistantUserInputQuestion(
+                    id: "0",
+                    prompt: "Pick the framework?",
+                    header: "Framework",
+                    options: [
+                        AssistantUserInputOption(label: "SwiftUI", detail: "Declarative"),
+                        AssistantUserInputOption(label: "AppKit", detail: "Imperative"),
+                    ],
+                    allowsMultipleSelection: false
+                ),
+                AssistantUserInputQuestion(
+                    id: "1",
+                    prompt: "Targets?",
+                    header: "Targets",
+                    options: [AssistantUserInputOption(label: "macOS")],
+                    allowsMultipleSelection: true
+                ),
+            ],
+            createdAtMs: 1
+        )
+        let data = try JSONEncoder().encode(request)
+        let decoded = try JSONDecoder().decode(AssistantUserInputRequest.self, from: data)
+        XCTAssertEqual(decoded.questions.count, 2,
+                       "structured questions must survive persistence so a restored card still renders")
+        XCTAssertEqual(decoded.questions.map(\.id), ["0", "1"],
+                       "position-stable question ids must round-trip so duplicate prompts stay distinct")
+        XCTAssertEqual(decoded.questions.first?.options.map(\.label), ["SwiftUI", "AppKit"])
+        XCTAssertEqual(decoded.questions.first?.options.first?.detail, "Declarative")
+        XCTAssertEqual(decoded.questions.last?.allowsMultipleSelection, true)
+        XCTAssertTrue(decoded.isStructured)
+
+        // Legacy / version-skew payload with no `questions` key decodes to a plain
+        // free-text request, not a decode failure.
+        let legacy = #"{"id":"q","turnId":"t","prompt":"Branch?","createdAtMs":1}"#
+        let legacyDecoded = try JSONDecoder().decode(AssistantUserInputRequest.self, from: Data(legacy.utf8))
+        XCTAssertTrue(legacyDecoded.questions.isEmpty)
+        XCTAssertFalse(legacyDecoded.isStructured)
+    }
+
     func test_timelineTracksApprovalsUserInputPlansAndTokenUsage() {
         var s = AssistantTimelineState()
         s.apply(.requestOpened(AssistantPendingRequest(

@@ -138,6 +138,58 @@ final class ClaudeParserCLITests: XCTestCase {
                        "Claude AskUserQuestion must become actionable RemoteCode user-input state instead of a dead generic tool row")
     }
 
+    // Real Claude AskUserQuestion schema: a `questions` array, each with its own
+    // `question`, `header`, structured `options` (label+description), and
+    // `multiSelect`. The previous parser only read a singular `question`/`options`
+    // shape that the tool never emits, so the card degraded to an unanswerable
+    // "Input required" box (screenshot bug). This proves the real shape becomes a
+    // structured, human-readable question instead.
+    func test_askUserQuestionRealSchema_becomesStructuredQuestions() {
+        let evs = collect([
+            #"{"type":"system","subtype":"init","session_id":"s5b"}"#,
+            #"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"ask-real","name":"AskUserQuestion","input":{"questions":[{"question":"Which auth method should we use?","header":"Auth","options":[{"label":"OAuth","description":"Delegated OAuth 2.0"},{"label":"API key","description":"Static shared key"}],"multiSelect":false}]}}]}}"#,
+            #"{"type":"result","subtype":"success","result":"waiting"}"#
+        ])
+
+        let request = evs.compactMap { event -> AssistantUserInputRequest? in
+            if case .userInputRequested(let request) = event { return request }
+            return nil
+        }.first
+
+        XCTAssertEqual(request?.id, "ask-real")
+        XCTAssertNotEqual(request?.prompt, "Input required",
+                          "the real AskUserQuestion schema must not degrade to a placeholder prompt the user cannot act on")
+        XCTAssertEqual(request?.questions.count, 1,
+                       "the structured `questions` array must drive a human-readable question card")
+        XCTAssertEqual(request?.questions.first?.prompt, "Which auth method should we use?")
+        XCTAssertEqual(request?.questions.first?.header, "Auth")
+        XCTAssertEqual(request?.questions.first?.options.map(\.label), ["OAuth", "API key"],
+                       "option labels must be extracted so the user sees real choices instead of raw JSON")
+        XCTAssertEqual(request?.questions.first?.options.map(\.detail), ["Delegated OAuth 2.0", "Static shared key"],
+                       "option descriptions explain trade-offs and must survive parsing")
+        XCTAssertEqual(request?.questions.first?.allowsMultipleSelection, false)
+    }
+
+    func test_askUserQuestionRealSchema_multiQuestionMultiSelect() {
+        let evs = collect([
+            #"{"type":"system","subtype":"init","session_id":"s5c"}"#,
+            #"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"ask-multi","name":"AskUserQuestion","input":{"questions":[{"question":"Pick the framework?","header":"Framework","options":[{"label":"SwiftUI","description":"Declarative"},{"label":"AppKit","description":"Imperative"}],"multiSelect":false},{"question":"Which targets to support?","header":"Targets","options":[{"label":"macOS","description":""},{"label":"iPadOS","description":""}],"multiSelect":true}]}}]}}"#,
+            #"{"type":"result","subtype":"success","result":"waiting"}"#
+        ])
+
+        let request = evs.compactMap { event -> AssistantUserInputRequest? in
+            if case .userInputRequested(let request) = event { return request }
+            return nil
+        }.first
+
+        XCTAssertEqual(request?.questions.count, 2,
+                       "every question in the array must render, not just the first")
+        XCTAssertEqual(request?.questions.last?.prompt, "Which targets to support?")
+        XCTAssertEqual(request?.questions.last?.allowsMultipleSelection, true,
+                       "per-question multiSelect must be preserved so checkbox vs radio rendering is correct")
+        XCTAssertEqual(request?.questions.last?.options.map(\.label), ["macOS", "iPadOS"])
+    }
+
     func test_exitPlanModeTool_becomesStructuredProposedPlan() {
         let evs = collect([
             #"{"type":"system","subtype":"init","session_id":"s6"}"#,

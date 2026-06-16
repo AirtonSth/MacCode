@@ -99,6 +99,52 @@ public struct AssistantPendingRequest: Codable, Sendable, Equatable, Identifiabl
     }
 }
 
+/// One selectable choice inside a structured AskUserQuestion question.
+public struct AssistantUserInputOption: Codable, Sendable, Equatable, Identifiable {
+    public var label: String
+    public var detail: String?
+    public var id: String { label }
+
+    public init(label: String, detail: String? = nil) {
+        self.label = label
+        self.detail = detail
+    }
+}
+
+/// A single question inside a structured AskUserQuestion request. `id` is a
+/// position-stable identity (set per request so duplicate prompt text cannot
+/// collide in SwiftUI identity or per-question UI state); `prompt` is the question
+/// text the provider expects back as the `answers` map key. Defaults to `prompt`
+/// when no explicit id is supplied (e.g. older payloads / direct construction).
+public struct AssistantUserInputQuestion: Codable, Sendable, Equatable, Identifiable {
+    public var id: String
+    public var prompt: String
+    public var header: String?
+    public var options: [AssistantUserInputOption]
+    public var allowsMultipleSelection: Bool
+
+    public init(id: String? = nil, prompt: String, header: String? = nil, options: [AssistantUserInputOption] = [], allowsMultipleSelection: Bool = false) {
+        self.id = id ?? prompt
+        self.prompt = prompt
+        self.header = header
+        self.options = options
+        self.allowsMultipleSelection = allowsMultipleSelection
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id, prompt, header, options, allowsMultipleSelection
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        prompt = try c.decode(String.self, forKey: .prompt)
+        id = try c.decodeIfPresent(String.self, forKey: .id) ?? prompt
+        header = try c.decodeIfPresent(String.self, forKey: .header)
+        options = try c.decodeIfPresent([AssistantUserInputOption].self, forKey: .options) ?? []
+        allowsMultipleSelection = try c.decodeIfPresent(Bool.self, forKey: .allowsMultipleSelection) ?? false
+    }
+}
+
 public struct AssistantUserInputRequest: Codable, Sendable, Equatable, Identifiable {
     public let id: String
     public let turnId: String?
@@ -106,18 +152,28 @@ public struct AssistantUserInputRequest: Codable, Sendable, Equatable, Identifia
     public var options: [String]
     public var allowsMultipleSelection: Bool
     public var isSecret: Bool
+    /// Structured multi-question payload for the Claude AskUserQuestion tool.
+    /// Empty for plain free-text / single-list elicitations, which keep using
+    /// `prompt` + `options`.
+    public var questions: [AssistantUserInputQuestion]
+    /// True when this request must render as the structured AskUserQuestion picker
+    /// rather than the legacy `prompt` + flat-`options` card. Single-question
+    /// structured requests intentionally also mirror `options`/`allowsMultipleSelection`
+    /// for the work log + legacy consumers, so branch on this, not on `options`.
+    public var isStructured: Bool { !questions.isEmpty }
     public var answer: String?
     public var state: AssistantRequestState
     public var createdAtMs: Int64
     public var resolvedAtMs: Int64?
 
-    public init(id: String, turnId: String?, prompt: String, options: [String] = [], allowsMultipleSelection: Bool = false, isSecret: Bool = false, answer: String? = nil, state: AssistantRequestState = .pending, createdAtMs: Int64, resolvedAtMs: Int64? = nil) {
+    public init(id: String, turnId: String?, prompt: String, options: [String] = [], allowsMultipleSelection: Bool = false, isSecret: Bool = false, questions: [AssistantUserInputQuestion] = [], answer: String? = nil, state: AssistantRequestState = .pending, createdAtMs: Int64, resolvedAtMs: Int64? = nil) {
         self.id = id
         self.turnId = turnId
         self.prompt = prompt
         self.options = options
         self.allowsMultipleSelection = allowsMultipleSelection
         self.isSecret = isSecret
+        self.questions = questions
         self.answer = answer
         self.state = state
         self.createdAtMs = createdAtMs
@@ -125,7 +181,7 @@ public struct AssistantUserInputRequest: Codable, Sendable, Equatable, Identifia
     }
 
     private enum CodingKeys: String, CodingKey {
-        case id, turnId, prompt, options, allowsMultipleSelection, isSecret, answer, state, createdAtMs, resolvedAtMs
+        case id, turnId, prompt, options, allowsMultipleSelection, isSecret, questions, answer, state, createdAtMs, resolvedAtMs
     }
 
     public init(from decoder: Decoder) throws {
@@ -136,6 +192,7 @@ public struct AssistantUserInputRequest: Codable, Sendable, Equatable, Identifia
         options = try c.decodeIfPresent([String].self, forKey: .options) ?? []
         allowsMultipleSelection = try c.decodeIfPresent(Bool.self, forKey: .allowsMultipleSelection) ?? false
         isSecret = try c.decodeIfPresent(Bool.self, forKey: .isSecret) ?? false
+        questions = try c.decodeIfPresent([AssistantUserInputQuestion].self, forKey: .questions) ?? []
         answer = try c.decodeIfPresent(String.self, forKey: .answer)
         state = try c.decodeIfPresent(AssistantRequestState.self, forKey: .state) ?? .pending
         createdAtMs = try c.decodeIfPresent(Int64.self, forKey: .createdAtMs) ?? 0

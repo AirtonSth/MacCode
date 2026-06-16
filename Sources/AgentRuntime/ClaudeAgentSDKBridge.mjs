@@ -27,17 +27,30 @@ let current = {
 };
 const pendingPermissions = new Map();
 const pendingUserInputs = new Map();
+// AskUserQuestion arrives through canUseTool (even in bypassPermissions). We hold
+// the canUseTool resolver here, surface the questions as a user_input_request, and
+// resolve with { behavior: 'allow', updatedInput: { answers } } once answered.
+const pendingAskUserQuestions = new Map();
 const SUPPORTED_IMAGE_MIME_TYPES = new Set([
   'image/jpeg',
   'image/png',
   'image/gif',
   'image/webp',
 ]);
-const TOKEN_SAVER_MIN_BYTES = 2048;
-const TOKEN_SAVER_MIN_LINES = 30;
+// Compress tool output once it exceeds ~1KB OR ~10 lines, matching the distill
+// policy the agent is told to follow (compress >~1KB or >~10 lines). The skip
+// guard below uses AND so output is compressed when EITHER threshold is exceeded.
+const TOKEN_SAVER_MIN_BYTES = 1024;
+const TOKEN_SAVER_MIN_LINES = 10;
 const TOKEN_SAVER_STORE_MIN_BYTES = 2048;
 const TOKEN_SAVER_HOOK_TIMEOUT_MS = 1000;
+// Exact-byte tools are the ONLY carve-out: distilling file content / edit echoes
+// would break the agent's verbatim edits (the distill policy itself says "skip
+// when you need the exact bytes"). Every OTHER tool is compressed (no allowlist).
 const TOKEN_SAVER_EXCLUDED_TOOLS = new Set(['read', 'edit', 'write', 'multiedit', 'notebookedit']);
+// Per-tool compression contracts. Tools not listed here fall back to
+// TOKEN_SAVER_DEFAULT_PROFILE — i.e. EVERY non-excluded tool is distilled.
+const TOKEN_SAVER_DEFAULT_PROFILE = 'moderate';
 const TOKEN_SAVER_PROFILES = new Map([
   ['grep', 'conservative'],
   ['glob', 'conservative'],
@@ -85,10 +98,11 @@ function replaceToolOutputText(value, text) {
 
 function tokenSaverToolDecision(toolName, output) {
   const normalized = normalizeToolName(toolName);
-  const profile = TOKEN_SAVER_PROFILES.get(normalized) || 'passthrough';
+  // Every tool compresses (no allowlist); only the exact-byte tools and
+  // sub-threshold output are skipped.
+  const profile = TOKEN_SAVER_PROFILES.get(normalized) || TOKEN_SAVER_DEFAULT_PROFILE;
   let skipReason = null;
   if (TOKEN_SAVER_EXCLUDED_TOOLS.has(normalized)) skipReason = 'excluded_tool';
-  else if (profile === 'passthrough') skipReason = 'not_allowlisted';
   else if (Buffer.byteLength(output || '', 'utf8') <= TOKEN_SAVER_MIN_BYTES && lineCount(output) <= TOKEN_SAVER_MIN_LINES) skipReason = 'below_threshold';
   return { profile, shouldCompress: skipReason == null, skipReason };
 }
@@ -105,7 +119,9 @@ function tokenSaverContractQuestion(toolName, toolInput, profile) {
   if (profile === 'aggressive') {
     return `Compress fetched web content for the current task. Preserve URLs, titles, code, API signatures, numbers, and quoted strings verbatim; keep retrieve-worthy details explicit.${suffix}`;
   }
-  return `Pass through tool output unchanged.${suffix}`;
+  // Default contract for any other tool: compress conservatively without dropping
+  // anything the agent might need verbatim.
+  return `Compress this tool output for the current task. Preserve errors, warnings, exit codes, identifiers, numbers, paths, and quoted strings verbatim; collapse only repeated or noise lines.${suffix}`;
 }
 
 function summarizeToolInput(toolInput) {
@@ -218,6 +234,49 @@ function bridgeUserInputRequest(request) {
 
 function isExitPlanMode(toolName) {
   return String(toolName || '').replace(/[_-]/g, '').toLowerCase() === 'exitplanmode';
+}
+
+function isAskUserQuestion(toolName) {
+  return normalizeToolName(toolName) === 'askuserquestion';
+}
+
+// Human-readable summary for the work log / accessibility. The host renders the
+// structured `questions`, but a plain prompt keeps non-structured consumers sane.
+function askUserQuestionPrompt(input) {
+  const questions = (input && Array.isArray(input.questions)) ? input.questions : [];
+  if (questions.length === 1) return questions[0].question || 'Claude needs your input';
+  if (questions.length > 1) {
+    return questions
+      .map((q) => (q && q.header ? `${q.header}: ${q.question || ''}` : (q && q.question) || ''))
+      .join('\n');
+  }
+  return 'Claude needs your input';
+}
+
+// Map the host's answer back into the canUseTool PermissionResult the SDK expects.
+// Answers are keyed by question text; multi-select answers are comma-joined. A
+// non-JSON answer is treated as a freeform `response` (the SDK's "Other" path).
+// Cancellation is not handled here — it flows through drainPendingCallbacks on
+// interrupt/close, which denies the pending tool.
+function askUserQuestionResult(command, input) {
+  const updatedInput = { ...(input || {}) };
+  if (command.answers && typeof command.answers === 'object') {
+    updatedInput.answers = command.answers;
+  } else if (typeof command.text === 'string' && command.text.trim()) {
+    try {
+      const parsed = JSON.parse(command.text);
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        updatedInput.answers = parsed;
+      } else {
+        updatedInput.response = command.text;
+      }
+    } catch {
+      updatedInput.response = command.text;
+    }
+  } else {
+    updatedInput.answers = {};
+  }
+  return { behavior: 'allow', updatedInput, toolUseID: command.request_id };
 }
 
 function emitPlanToolUse(toolName, input, toolUseID) {
@@ -344,6 +403,23 @@ function ensureQuery() {
             toolUseID: requestId,
           };
         }
+        // AskUserQuestion is an interactive question, not a permission gate: route
+        // it as a structured user_input_request (never an Approve/Decline card) and
+        // return the user's choice as the canUseTool result. This also keeps it
+        // working in bypassPermissions/full-access mode, where the SDK still calls
+        // canUseTool for AskUserQuestion.
+        if (isAskUserQuestion(toolName)) {
+          emit({
+            type: 'user_input_request',
+            request_id: requestId,
+            ask_user_question: true,
+            prompt: askUserQuestionPrompt(input),
+            questions: (input && input.questions) || [],
+          });
+          return await new Promise((resolve) => {
+            pendingAskUserQuestions.set(requestId, { resolve, input: input || {} });
+          });
+        }
         emit({
           type: 'permission_request',
           request_id: requestId,
@@ -426,6 +502,23 @@ function e2eUserInputMcpServers() {
   return {
     remotecode_user_input_e2e: sdkServer,
   };
+}
+
+// Resolve every in-flight callback promise (deny / cancel) so an interrupt or
+// close cannot leave the SDK async generator awaiting a host answer forever.
+function drainPendingCallbacks() {
+  for (const [id, ask] of pendingAskUserQuestions) {
+    ask.resolve({ behavior: 'deny', message: 'cancelled', interrupt: true, toolUseID: id });
+  }
+  pendingAskUserQuestions.clear();
+  for (const [id, resolve] of pendingPermissions) {
+    resolve({ behavior: 'deny', message: 'cancelled', interrupt: true, toolUseID: id });
+  }
+  pendingPermissions.clear();
+  for (const [, resolve] of pendingUserInputs) {
+    resolve({ action: 'cancel' });
+  }
+  pendingUserInputs.clear();
 }
 
 function permissionResult(command) {
@@ -517,14 +610,24 @@ for await (const line of rl) {
       resolver(permissionResult(command));
     }
   } else if (command.type === 'user_input_response') {
-    const resolver = pendingUserInputs.get(command.request_id);
-    if (resolver) {
-      pendingUserInputs.delete(command.request_id);
-      resolver(userInputResult(command));
+    const ask = pendingAskUserQuestions.get(command.request_id);
+    if (ask) {
+      pendingAskUserQuestions.delete(command.request_id);
+      ask.resolve(askUserQuestionResult(command, ask.input));
+    } else {
+      const resolver = pendingUserInputs.get(command.request_id);
+      if (resolver) {
+        pendingUserInputs.delete(command.request_id);
+        resolver(userInputResult(command));
+      }
     }
   } else if (command.type === 'rc_interrupt') {
     if (activeQuery?.interrupt) await activeQuery.interrupt();
+    // Settle any in-flight callback promises so the SDK generator cannot hang
+    // awaiting an answer/permission the user just interrupted.
+    drainPendingCallbacks();
   } else if (command.type === 'rc_close') {
+    drainPendingCallbacks();
     if (activeQuery?.close) activeQuery.close();
     process.exit(0);
   }

@@ -166,6 +166,47 @@ final class TokenSaverAppContextTests: XCTestCase {
                      "disabling Token Saver must remove the PATH symlink too")
     }
 
+    func test_distillInstallStatusMappingDistinguishesFailedFromOff() {
+        // A reconcile failure must surface as .failed (visible), never collapse into
+        // .inactive which looks identical to "Token Saver off".
+        XCTAssertEqual(
+            DistillInstallStatus.from(error: "no service binary", enabled: true, installedCount: 0),
+            .failed("no service binary"),
+            "an install failure must be visible, not swallowed as inactive")
+        XCTAssertEqual(
+            DistillInstallStatus.from(error: "no service binary", enabled: false, installedCount: 0),
+            .failed("no service binary"),
+            "a recorded error wins even if the toggle reads off")
+        XCTAssertEqual(
+            DistillInstallStatus.from(error: nil, enabled: true, installedCount: 2),
+            .installed)
+        XCTAssertEqual(
+            DistillInstallStatus.from(error: nil, enabled: true, installedCount: 0),
+            .inactive,
+            "enabled but nothing installed yet is inactive, not a false 'installed'")
+        XCTAssertEqual(
+            DistillInstallStatus.from(error: nil, enabled: false, installedCount: 0),
+            .inactive)
+    }
+
+    func test_reconcileClearsInstallErrorOnSuccessAndOff() throws {
+        let appSupport = NSTemporaryDirectory() + "RC2DistillInstallStatus-" + UUID().uuidString
+        let home = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+            .appendingPathComponent("RC2DistillInstallStatusHome-" + UUID().uuidString, isDirectory: true)
+        let context = try AppContext(channel: .debug, appSupportOverride: appSupport)
+        context.agentSkillsHomeOverrideForTesting = home
+
+        context.reconcileManagedDistillSkills(tokenSaverEnabled: true)
+        XCTAssertEqual(context.managedDistillSkillInstallResults.count, 2)
+        XCTAssertNil(context.managedDistillSkillInstallError,
+                     "a clean install must leave no error so the UI shows installed, not failed")
+
+        context.reconcileManagedDistillSkills(tokenSaverEnabled: false)
+        XCTAssertTrue(context.managedDistillSkillInstallResults.isEmpty)
+        XCTAssertNil(context.managedDistillSkillInstallError,
+                     "turning Token Saver off is not a failure — the error must clear")
+    }
+
     func test_managedDistillCLIUsesLocalMacDistillService() async throws {
         let appSupportURL = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
             .appendingPathComponent("RC2ManagedDistillCLI-\(UUID().uuidString)", isDirectory: true)

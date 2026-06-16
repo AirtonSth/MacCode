@@ -649,6 +649,122 @@ final class AgentAppViewModelTests: XCTestCase {
                        "multi-select questions must submit one final answer atomically instead of resuming once per selected option")
     }
 
+    // Claude AskUserQuestion screenshot bug: the card showed raw JSON / an empty
+    // "Input required" box. A structured request must collect each question's choice
+    // and submit ONE answer map keyed by question text (the shape the Claude SDK
+    // expects), then clear the card so it does not linger on screen.
+    func test_submitAskUserQuestionBuildsAnswersKeyedByQuestionText() async throws {
+        let adapter = CapturingProviderAdapter(provider: .codex)
+        let (vm, _) = try makeVM(adapter: adapter)
+        vm.createThread(title: "ask user question")
+        let request = AssistantUserInputRequest(
+            id: "ask-1",
+            turnId: "turn-1",
+            prompt: "Framework: Pick the framework?\nTargets: Which targets?",
+            questions: [
+                AssistantUserInputQuestion(
+                    prompt: "Pick the framework?",
+                    header: "Framework",
+                    options: [
+                        AssistantUserInputOption(label: "SwiftUI", detail: "Declarative"),
+                        AssistantUserInputOption(label: "AppKit", detail: "Imperative"),
+                    ],
+                    allowsMultipleSelection: false
+                ),
+                AssistantUserInputQuestion(
+                    prompt: "Which targets?",
+                    header: "Targets",
+                    options: [
+                        AssistantUserInputOption(label: "macOS"),
+                        AssistantUserInputOption(label: "iPadOS"),
+                    ],
+                    allowsMultipleSelection: true
+                ),
+            ],
+            createdAtMs: 1
+        )
+        vm.timeline.apply(.userInputRequested(request))
+
+        XCTAssertFalse(vm.askUserQuestionIsComplete(request),
+                       "submit must stay disabled until every question is answered")
+        vm.selectAskUserQuestionOption("SwiftUI", question: request.questions[0], request: request)
+        XCTAssertFalse(vm.askUserQuestionIsComplete(request),
+                       "one answered question is not enough — all are required")
+        vm.selectAskUserQuestionOption("macOS", question: request.questions[1], request: request)
+        vm.selectAskUserQuestionOption("iPadOS", question: request.questions[1], request: request)
+        XCTAssertTrue(vm.askUserQuestionIsComplete(request))
+
+        vm.submitAskUserQuestion(request)
+        await waitAsync("structured answer reaches adapter") {
+            adapter.lastUserInputResponse?.requestId == "ask-1"
+        }
+
+        let text = try XCTUnwrap(adapter.lastUserInputResponse?.text)
+        let answers = try XCTUnwrap(try JSONSerialization.jsonObject(with: Data(text.utf8)) as? [String: String])
+        XCTAssertEqual(answers["Pick the framework?"], "SwiftUI",
+                       "single-select answers must be keyed by the question text the Claude SDK expects")
+        XCTAssertEqual(answers["Which targets?"], "iPadOS, macOS",
+                       "multi-select answers must be one deterministically-ordered, comma-joined string")
+        await waitAsync("structured question card clears") { vm.openPendingUserInputs.isEmpty }
+        XCTAssertEqual(vm.openPendingUserInputs, [],
+                       "answering a structured question must clear the card instead of leaving a stuck Input-required box")
+    }
+
+    func test_askUserQuestionOtherFreeformOverridesSelection() throws {
+        let (vm, _) = try makeVM()
+        vm.createThread(title: "ask other")
+        let question = AssistantUserInputQuestion(
+            prompt: "Which database?",
+            header: "DB",
+            options: [AssistantUserInputOption(label: "Postgres"), AssistantUserInputOption(label: "MySQL")],
+            allowsMultipleSelection: false
+        )
+        let request = AssistantUserInputRequest(
+            id: "ask-2", turnId: "turn-2", prompt: "Which database?",
+            questions: [question], createdAtMs: 1
+        )
+        vm.timeline.apply(.userInputRequested(request))
+
+        vm.userInputDrafts[vm.askUserQuestionKey(request, question)] = "SQLite"
+        XCTAssertTrue(vm.askUserQuestionIsComplete(request),
+                      "a freeform Other answer must satisfy the question even with no option selected")
+        XCTAssertEqual(vm.askUserQuestionAnswer(for: question, in: request), "SQLite",
+                       "Other freeform text must be usable as the answer (the SDK auto-provides an Other option)")
+    }
+
+    func test_askUserQuestionOptionAndOtherAreMutuallyExclusive() throws {
+        let (vm, _) = try makeVM()
+        vm.createThread(title: "ask exclusive")
+        let question = AssistantUserInputQuestion(
+            prompt: "Which database?",
+            header: "DB",
+            options: [AssistantUserInputOption(label: "Postgres"), AssistantUserInputOption(label: "MySQL")],
+            allowsMultipleSelection: false
+        )
+        let request = AssistantUserInputRequest(
+            id: "ask-3", turnId: "turn-3", prompt: "Which database?",
+            questions: [question], createdAtMs: 1
+        )
+        vm.timeline.apply(.userInputRequested(request))
+
+        // Typing Other clears any prior option selection.
+        vm.selectAskUserQuestionOption("Postgres", question: question, request: request)
+        vm.setAskUserQuestionOther("SQLite", question: question, request: request)
+        XCTAssertEqual(vm.askUserQuestionAnswer(for: question, in: request), "SQLite")
+        XCTAssertFalse(vm.askUserQuestionOptionIsSelected("Postgres", question: question, request: request),
+                       "typing an Other answer must clear a stale option selection")
+
+        // Re-selecting an option clears the Other draft — so toggling it back off
+        // cannot resurrect stale Other text and falsely satisfy the question.
+        vm.selectAskUserQuestionOption("MySQL", question: question, request: request)
+        XCTAssertEqual(vm.askUserQuestionAnswer(for: question, in: request), "MySQL",
+                       "selecting an option must supersede and clear the Other draft")
+        vm.selectAskUserQuestionOption("MySQL", question: question, request: request) // toggle off (single-select)
+        XCTAssertNil(vm.askUserQuestionAnswer(for: question, in: request),
+                     "deselecting the last option must leave the question unanswered, not fall back to stale Other text")
+        XCTAssertFalse(vm.askUserQuestionIsComplete(request))
+    }
+
     func test_freeTextUserInputDraftCanAnswerProviderQuestion() async throws {
         let adapter = CapturingProviderAdapter(provider: .codex)
         let (vm, _) = try makeVM(adapter: adapter)

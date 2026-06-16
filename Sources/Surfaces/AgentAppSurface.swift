@@ -970,6 +970,84 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             .joined(separator: "\n")
     }
 
+    // MARK: Structured AskUserQuestion cards
+    //
+    // A structured request carries one or more questions, each with its own
+    // options and single/multi-select mode. Selections and the per-question "Other"
+    // freeform draft are keyed by (request, question) so multiple questions on one
+    // card stay independent. Submitting builds one `{question text: answer}` map and
+    // resolves the provider callback once — the Claude SDK expects answers keyed by
+    // the question text, with multi-select answers comma-joined.
+    public func askUserQuestionKey(_ request: AssistantUserInputRequest, _ question: AssistantUserInputQuestion) -> String {
+        "\(request.id)\u{1}\(question.id)"
+    }
+
+    public func askUserQuestionOptionIsSelected(_ option: String, question: AssistantUserInputQuestion, request: AssistantUserInputRequest) -> Bool {
+        userInputSelections[askUserQuestionKey(request, question)]?.contains(option) == true
+    }
+
+    public func selectAskUserQuestionOption(_ option: String, question: AssistantUserInputQuestion, request: AssistantUserInputRequest) {
+        let key = askUserQuestionKey(request, question)
+        var selection = userInputSelections[key] ?? []
+        if question.allowsMultipleSelection {
+            if selection.contains(option) { selection.remove(option) } else { selection.insert(option) }
+        } else {
+            selection = selection.contains(option) ? [] : [option]
+        }
+        userInputSelections[key] = selection
+        // Options and the freeform "Other" field are mutually exclusive: interacting
+        // with options always drops any "Other" text so a stale draft can't survive a
+        // toggle-off and make the question look answered with old text.
+        userInputDrafts[key] = nil
+    }
+
+    /// Sets the per-question freeform "Other" text. Non-empty text supersedes any
+    /// option selection for that question (the inverse of selectAskUserQuestionOption).
+    public func setAskUserQuestionOther(_ text: String, question: AssistantUserInputQuestion, request: AssistantUserInputRequest) {
+        let key = askUserQuestionKey(request, question)
+        userInputDrafts[key] = text
+        if !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            userInputSelections[key] = nil
+        }
+    }
+
+    /// The answer for one question: a non-empty freeform "Other" draft wins,
+    /// otherwise the selected option label(s) (comma-joined for multi-select).
+    /// `nil` when the question is unanswered.
+    public func askUserQuestionAnswer(for question: AssistantUserInputQuestion, in request: AssistantUserInputRequest) -> String? {
+        let key = askUserQuestionKey(request, question)
+        let draft = (userInputDrafts[key] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        if !draft.isEmpty { return draft }
+        let labels = Set(question.options.map(\.label))
+        let selected = (userInputSelections[key] ?? [])
+            .filter { labels.contains($0) }
+            .sorted()
+        guard !selected.isEmpty else { return nil }
+        return selected.joined(separator: ", ")
+    }
+
+    public func askUserQuestionIsComplete(_ request: AssistantUserInputRequest) -> Bool {
+        !request.questions.isEmpty && request.questions.allSatisfy { askUserQuestionAnswer(for: $0, in: request) != nil }
+    }
+
+    public func submitAskUserQuestion(_ request: AssistantUserInputRequest) {
+        guard askUserQuestionIsComplete(request) else { return }
+        var answers: [String: String] = [:]
+        for question in request.questions {
+            if let answer = askUserQuestionAnswer(for: question, in: request) {
+                answers[question.prompt] = answer
+            }
+        }
+        guard let data = try? JSONSerialization.data(withJSONObject: answers, options: [.sortedKeys]),
+              let json = String(data: data, encoding: .utf8) else { return }
+        for question in request.questions {
+            let key = askUserQuestionKey(request, question)
+            userInputSelections[key] = nil
+            userInputDrafts[key] = nil
+        }
+        answerPendingUserInput(request, answer: json)
+    }
+
     public func loadModels() async {
         modelListLoading = true
         modelListStatusMessage = "Loading models..."
@@ -4371,6 +4449,22 @@ public struct AgentAppView: View {
                     .foregroundColor(DS.Palette.textSecondary)
                 Spacer(minLength: 0)
             }
+            if request.isStructured {
+                askUserQuestionContent(request, stale: stale)
+            } else {
+                legacyUserInputContent(request, stale: stale)
+            }
+        }
+        .padding(DS.Space.md)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(DS.Palette.surfaceRaised)
+        .clipShape(RoundedRectangle(cornerRadius: DS.Radius.panel, style: .continuous))
+        .accessibilityIdentifier("agent.pendingUserInput.\(request.id)")
+    }
+
+    @ViewBuilder
+    private func legacyUserInputContent(_ request: AssistantUserInputRequest, stale: Bool) -> some View {
+        VStack(alignment: .leading, spacing: DS.Space.sm) {
             Text(request.prompt)
                 .font(DS.Font.bodyDense.weight(.semibold))
                 .foregroundColor(DS.Palette.text)
@@ -4428,11 +4522,83 @@ public struct AgentAppView: View {
                 .controlSize(.small)
             }
         }
-        .padding(DS.Space.md)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(DS.Palette.surfaceRaised)
-        .clipShape(RoundedRectangle(cornerRadius: DS.Radius.panel, style: .continuous))
-        .accessibilityIdentifier("agent.pendingUserInput.\(request.id)")
+    }
+
+    // Structured Claude AskUserQuestion: render each question with its header,
+    // prompt, selectable options (radio for single-select, checkbox for
+    // multi-select) plus an "Other" freeform field, then submit all answers at once.
+    @ViewBuilder
+    private func askUserQuestionContent(_ request: AssistantUserInputRequest, stale: Bool) -> some View {
+        if stale {
+            Text("Restart the turn to continue.")
+                .font(DS.Font.caption)
+                .foregroundColor(DS.Palette.warning)
+        } else {
+            VStack(alignment: .leading, spacing: DS.Space.md) {
+                ForEach(request.questions) { question in
+                    VStack(alignment: .leading, spacing: DS.Space.xs) {
+                        if let header = question.header, !header.isEmpty {
+                            Text(header.uppercased())
+                                .font(DS.Font.caption2.weight(.semibold))
+                                .foregroundColor(DS.Palette.accent)
+                                .padding(.horizontal, DS.Space.xs)
+                                .padding(.vertical, 1)
+                                .background(DS.Palette.accent.opacity(0.13))
+                                .clipShape(Capsule())
+                        }
+                        Text(question.prompt)
+                            .font(DS.Font.bodyDense.weight(.semibold))
+                            .foregroundColor(DS.Palette.text)
+                        // Index-keyed so duplicate option labels can't share SwiftUI identity.
+                        ForEach(Array(question.options.enumerated()), id: \.offset) { _, option in
+                            askUserQuestionOptionButton(option, question: question, request: request)
+                        }
+                        let draftBinding = Binding(
+                            get: { vm.userInputDrafts[vm.askUserQuestionKey(request, question)] ?? "" },
+                            set: { vm.setAskUserQuestionOther($0, question: question, request: request) }
+                        )
+                        TextField("Other…", text: draftBinding)
+                            .textFieldStyle(.roundedBorder)
+                            .controlSize(.small)
+                    }
+                }
+                Button("Submit") { vm.submitAskUserQuestion(request) }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+                    .disabled(!vm.askUserQuestionIsComplete(request))
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func askUserQuestionOptionButton(_ option: AssistantUserInputOption, question: AssistantUserInputQuestion, request: AssistantUserInputRequest) -> some View {
+        let selected = vm.askUserQuestionOptionIsSelected(option.label, question: question, request: request)
+        let symbol: String = question.allowsMultipleSelection
+            ? (selected ? "checkmark.square.fill" : "square")
+            : (selected ? "largecircle.fill.circle" : "circle")
+        Button {
+            vm.selectAskUserQuestionOption(option.label, question: question, request: request)
+        } label: {
+            HStack(alignment: .top, spacing: DS.Space.sm) {
+                Image(systemName: symbol)
+                    .font(.system(size: 12))
+                    .foregroundColor(selected ? DS.Palette.accent : DS.Palette.textTertiary)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(option.label)
+                        .font(DS.Font.bodyDense)
+                        .foregroundColor(DS.Palette.text)
+                    if let detail = option.detail, !detail.isEmpty {
+                        Text(detail)
+                            .font(DS.Font.caption)
+                            .foregroundColor(DS.Palette.textSecondary)
+                    }
+                }
+                Spacer(minLength: 0)
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityIdentifier("agent.askOption.\(request.id).\(question.id).\(option.label)")
     }
 
     private func scheduleTimelineScrollToBottom(_ proxy: ScrollViewProxy, force: Bool = false) {

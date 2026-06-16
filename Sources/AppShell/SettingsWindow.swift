@@ -195,6 +195,22 @@ public enum RemoteAccessStatus: Equatable {
     }
 }
 
+/// Surfaced status of the managed `distill` skill install (mirrors AppContext's
+/// last reconcile) so a failure is visible in Settings instead of NSLog-only.
+public enum DistillInstallStatus: Equatable {
+    case inactive
+    case installed
+    case failed(String)
+
+    /// A reconcile error wins (so a failure is never hidden as "off"); otherwise
+    /// `installed` only when Token Saver is on AND the install produced results.
+    public static func from(error: String?, enabled: Bool, installedCount: Int) -> DistillInstallStatus {
+        if let error { return .failed(error) }
+        if enabled && installedCount > 0 { return .installed }
+        return .inactive
+    }
+}
+
 @MainActor
 public final class SettingsViewModel: ObservableObject {
     public let settingsRepo: SettingsRepository
@@ -224,6 +240,10 @@ public final class SettingsViewModel: ObservableObject {
     /// to the current toggle attempt and gates toggle-revert. This list is
     /// always-visible, additive, and idempotent (read-only from AppDelegate).
     @Published public var serverStartupFailures: [(server: String, reason: String)] = []
+    /// Managed-distill skill install status, surfaced so an install failure is
+    /// visible instead of NSLog-only (mirrors serverStartupFailures). Refreshed from
+    /// AppContext on every reload (Settings open / notifications) and after a retry.
+    @Published public var distillInstallStatus: DistillInstallStatus = .inactive
     @Published public var appSettings: AppSettings = AppSettings()
     /// True while this VM is mid-post for rc2RemoteAccessSettingChanged so the
     /// observer can skip the redundant self-triggered reload (L91 perf fix).
@@ -443,6 +463,7 @@ public final class SettingsViewModel: ObservableObject {
             serverStartupFailures = delegate.serverStartupFailures
         }
         appSettings = settingsStore.load()
+        refreshDistillInstallStatus()
         codexPath = cliPath(key: "cli.codex.path", fallback: "codex")
         claudePath = cliPath(key: "cli.claude.path", fallback: "claude")
         committedCodexPath = codexPath
@@ -543,6 +564,23 @@ public final class SettingsViewModel: ObservableObject {
     public func setTokenSaverEnabled(_ on: Bool) {
         appSettings.tokenSaverEnabled = on
         settingsStore.update { $0.tokenSaverEnabled = on }
+    }
+
+    /// Mirrors AppContext's last managed-distill reconcile into a published status
+    /// so the Settings UI can show installed / failed / inactive distinctly.
+    public func refreshDistillInstallStatus() {
+        distillInstallStatus = DistillInstallStatus.from(
+            error: context.managedDistillSkillInstallError,
+            enabled: appSettings.tokenSaverEnabled,
+            installedCount: context.managedDistillSkillInstallResults.count
+        )
+    }
+
+    /// Re-run the managed-distill install (idempotent) and refresh the surfaced
+    /// status — the recovery action shown next to an install failure.
+    public func retryDistillInstall() {
+        context.reconcileManagedDistillSkills(tokenSaverEnabled: appSettings.tokenSaverEnabled)
+        refreshDistillInstallStatus()
     }
 
     public func setTerminalFontSize(_ size: Double) {
@@ -1125,8 +1163,41 @@ public struct SettingsView: View {
             Text("Compresses large tool output using the local MLX model so fewer tokens reach the remote provider. Activating from the sidebar is the primary path; this toggle reflects the persisted value.")
                 .font(DS.Font.caption)
                 .foregroundColor(DS.Palette.textTertiary)
+            distillInstallStatusRow
         }
         .dsPanel(padding: DS.Space.lg)
+    }
+
+    @ViewBuilder
+    private var distillInstallStatusRow: some View {
+        switch vm.distillInstallStatus {
+        case .inactive:
+            EmptyView()
+        case .installed:
+            HStack(spacing: DS.Space.sm) {
+                Image(systemName: "checkmark.seal.fill")
+                    .foregroundColor(DS.Palette.success)
+                Text("Distill skill installed for Claude + Codex")
+                    .font(DS.Font.caption)
+                    .foregroundColor(DS.Palette.textSecondary)
+            }
+            .accessibilityIdentifier("settings.tokenSaver.distillInstall.ok")
+        case .failed(let reason):
+            HStack(alignment: .top, spacing: DS.Space.sm) {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .foregroundColor(DS.Palette.danger)
+                VStack(alignment: .leading, spacing: DS.Space.xs) {
+                    Text("Distill skill install failed: \(reason)")
+                        .font(DS.Font.caption)
+                        .foregroundColor(DS.Palette.danger)
+                        .textSelection(.enabled)
+                    Button("Retry install") { vm.retryDistillInstall() }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                }
+            }
+            .accessibilityIdentifier("settings.tokenSaver.distillInstall.failed")
+        }
     }
 
     // todo/macos-app.md :142 - Keybindings editor pane (list parsed bindings +

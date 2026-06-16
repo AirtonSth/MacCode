@@ -535,6 +535,18 @@ public final class ClaudeParser {
         guard let id = stringValue(obj["request_id"]) ?? stringValue(obj["id"]) ?? stringValue(obj["elicitation_id"]) else {
             return nil
         }
+        // Claude AskUserQuestion routed through the SDK bridge canUseTool path:
+        // a structured `questions` array. Render it as a multi-question card rather
+        // than a permission/approval row.
+        let structuredQuestions = userInputQuestions(obj["questions"])
+        if !structuredQuestions.isEmpty {
+            return structuredUserInputRequest(
+                id: id,
+                turnId: stringValue(obj["turn_id"]) ?? currentTurnId ?? id,
+                questions: structuredQuestions,
+                now: now
+            )
+        }
         let schema = obj["requested_schema"] as? [String: Any]
         let prompt = stringValue(obj["prompt"])
             ?? stringValue(obj["question"])
@@ -593,21 +605,7 @@ public final class ClaudeParser {
         guard let tool = name?.lowercased() else { return [] }
         let input = input ?? [:]
         if tool == "askuserquestion" || tool == "ask_user_question" || tool == "ask_user" {
-            let prompt = stringValue(input["question"])
-                ?? stringValue(input["prompt"])
-                ?? stringValue(input["message"])
-                ?? "Input required"
-            return [.userInputRequested(AssistantUserInputRequest(
-                id: toolId,
-                turnId: turnId,
-                prompt: prompt,
-                options: optionValues(input["options"] ?? input["choices"]),
-                allowsMultipleSelection: boolValue(input["allows_multiple_selection"])
-                    ?? boolValue(input["allowsMultipleSelection"])
-                    ?? boolValue(input["multi_select"])
-                    ?? false,
-                createdAtMs: now
-            ))]
+            return [.userInputRequested(askUserQuestionRequest(toolId: toolId, input: input, turnId: turnId, now: now))]
         }
         if tool == "exitplanmode" || tool == "exit_plan_mode" {
             let markdown = stringValue(input["plan"])
@@ -728,6 +726,101 @@ public final class ClaudeParser {
         text
             .replacingOccurrences(of: "\\s+", with: "", options: .regularExpression)
             .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    // Claude's AskUserQuestion tool sends a `questions` array, each entry with its
+    // own `question`, `header`, structured `options` (label + description), and
+    // `multiSelect`. Parse that real shape into the structured user-input model so
+    // the card renders human-readable choices instead of raw JSON / an empty
+    // "Input required" box. Falls back to the legacy singular `question`/`options`
+    // shape so older synthetic payloads keep working.
+    private func askUserQuestionRequest(toolId: String, input: [String: Any], turnId: String, now: Int64) -> AssistantUserInputRequest {
+        let questions = userInputQuestions(input["questions"])
+        if !questions.isEmpty {
+            return structuredUserInputRequest(id: toolId, turnId: turnId, questions: questions, now: now)
+        }
+        let prompt = stringValue(input["question"])
+            ?? stringValue(input["prompt"])
+            ?? stringValue(input["message"])
+            ?? "Input required"
+        return AssistantUserInputRequest(
+            id: toolId,
+            turnId: turnId,
+            prompt: prompt,
+            options: optionValues(input["options"] ?? input["choices"]),
+            allowsMultipleSelection: boolValue(input["allows_multiple_selection"])
+                ?? boolValue(input["allowsMultipleSelection"])
+                ?? boolValue(input["multi_select"])
+                ?? false,
+            createdAtMs: now
+        )
+    }
+
+    private func structuredUserInputRequest(id: String, turnId: String, questions: [AssistantUserInputQuestion], now: Int64) -> AssistantUserInputRequest {
+        // `prompt` is a plain-text summary used by the work log / accessibility; the
+        // UI renders the structured `questions`. Mirror a single question's flat
+        // options/multi-select so legacy single-list consumers keep working.
+        let prompt: String
+        if questions.count == 1 {
+            prompt = questions[0].prompt
+        } else {
+            prompt = questions.map { question in
+                if let header = question.header, !header.isEmpty { return "\(header): \(question.prompt)" }
+                return question.prompt
+            }.joined(separator: "\n")
+        }
+        return AssistantUserInputRequest(
+            id: id,
+            turnId: turnId,
+            prompt: prompt,
+            options: questions.count == 1 ? questions[0].options.map(\.label) : [],
+            allowsMultipleSelection: questions.count == 1 ? questions[0].allowsMultipleSelection : false,
+            questions: questions,
+            createdAtMs: now
+        )
+    }
+
+    private func userInputQuestions(_ value: Any?) -> [AssistantUserInputQuestion] {
+        guard let array = value as? [[String: Any]] else { return [] }
+        // Position-stable ids: AskUserQuestion may (rarely) repeat prompt text, and
+        // an id == prompt would collide in SwiftUI identity / per-question UI state.
+        return array.enumerated().compactMap { (index, raw) -> AssistantUserInputQuestion? in
+            guard let prompt = (stringValue(raw["question"])
+                ?? stringValue(raw["prompt"])
+                ?? stringValue(raw["text"])
+                ?? stringValue(raw["title"])),
+                  !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+            return AssistantUserInputQuestion(
+                id: "\(index)",
+                prompt: prompt,
+                header: stringValue(raw["header"]).flatMap { $0.isEmpty ? nil : $0 },
+                options: userInputOptions(raw["options"] ?? raw["choices"]),
+                allowsMultipleSelection: boolValue(raw["multiSelect"])
+                    ?? boolValue(raw["multi_select"])
+                    ?? boolValue(raw["allows_multiple_selection"])
+                    ?? boolValue(raw["allowsMultipleSelection"])
+                    ?? false
+            )
+        }
+    }
+
+    private func userInputOptions(_ value: Any?) -> [AssistantUserInputOption] {
+        if let strings = value as? [String] {
+            return strings.map { AssistantUserInputOption(label: $0) }
+        }
+        if let raw = value as? [[String: Any]] {
+            return raw.compactMap { option in
+                guard let label = stringValue(option["label"])
+                    ?? stringValue(option["value"])
+                    ?? stringValue(option["text"])
+                    ?? stringValue(option["title"]) else { return nil }
+                return AssistantUserInputOption(
+                    label: label,
+                    detail: stringValue(option["description"]).flatMap { $0.isEmpty ? nil : $0 }
+                )
+            }
+        }
+        return []
     }
 
     private func optionValues(_ value: Any?) -> [String] {

@@ -31,6 +31,10 @@ public final class AppContext {
     public let privateNotificationBridge: PrivateNotificationBridge
     public let tokenSaverDistillServiceController: TokenSaverDistillServiceController
     public private(set) var managedDistillSkillInstallResults: [AgentSkillInstallResult] = []
+    /// Last managed-distill reconcile error (nil when off or installed cleanly). Lets
+    /// the UI distinguish "Token Saver off" from "install failed" instead of both
+    /// looking like an empty result set.
+    public private(set) var managedDistillSkillInstallError: String?
     public private(set) var tokenSaverAccountUsageRefreshCount = 0
     public private(set) var persistenceWriteErrorMessage: String?
     public var onPersistenceWriteError: ((String) -> Void)?
@@ -480,6 +484,7 @@ public final class AppContext {
                 _ = try installer.installDistillCLI(appSupportDirectory: appSupportDirectory)
                 try? installer.installRetrieveMCP() // retrieve-only MCP (best-effort; needs the bundled binary)
                 managedDistillSkillInstallResults = [codex, claude]
+                managedDistillSkillInstallError = nil
             } else {
                 _ = try installer.uninstallDistillSkill(for: .codex)
                 _ = try installer.uninstallDistillSkill(for: .claude)
@@ -488,10 +493,12 @@ public final class AppContext {
                 _ = try installer.uninstallDistillCLI()
                 try? installer.uninstallRetrieveMCP()
                 managedDistillSkillInstallResults = []
+                managedDistillSkillInstallError = nil
             }
         } catch {
             NSLog("RemoteCode managed Distill skill reconcile failed: \(error)")
             managedDistillSkillInstallResults = []
+            managedDistillSkillInstallError = (error as NSError).localizedDescription
         }
     }
 
