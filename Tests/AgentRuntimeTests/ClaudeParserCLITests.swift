@@ -389,4 +389,40 @@ final class ClaudeParserCLITests: XCTestCase {
                        "Claude whole-message replay can repeat the completed answer before result; the parser must not create two visible answer items")
         XCTAssertEqual(finalMessage(evs), final)
     }
+
+    // REGRESSION (Agent App CPU ramp on long Claude runs): `claude --output-format
+    // stream-json` emits WHOLE assistant messages and never sends message_start, so
+    // the dedup accumulators (assembledAssistantBody + emitted bodies) reset only at
+    // the final `result`. The old dedup re-ran the \s+ normalize regex over the
+    // ENTIRE growing assembledAssistantBody and linearly over every prior emitted
+    // body on each block => O(n^2) per run, ramping CPU as the run accumulated text.
+    // Feed many DISTINCT blocks with NO `result` (state never resets) and assert the
+    // dedup normalization work grows linearly, not quadratically, with block count.
+    func test_cliWholeAssistantBlocksDedupCostStaysLinearAcrossALongRun() {
+        let p = ClaudeParser()
+        let blocks = 1_500
+        var emittedAssistantDeltas = 0
+        ClaudeParser.assistantTextNormalizationsForTesting = 0
+        for i in 0..<blocks {
+            // Distinct, non-duplicate text so nothing is suppressed — worst case:
+            // every block is recorded and compared against all accumulated state.
+            let line = #"{"type":"assistant","message":{"content":[{"type":"text","text":"block \#(i) unique payload number \#(i)"}]}}"#
+            for event in p.parseLine(line) {
+                if case .itemDelta(_, let body?, _, _) = event, body.hasPrefix("block ") {
+                    emittedAssistantDeltas += 1
+                }
+            }
+        }
+        let normalizations = ClaudeParser.assistantTextNormalizationsForTesting
+
+        // Per-block dedup cost must be O(1) in accumulated text. The old code did
+        // ~O(prior blocks) normalize passes per block (~1.1M total here); the fix
+        // does a small constant per block (~8 * blocks).
+        XCTAssertLessThanOrEqual(normalizations, blocks * 16,
+            "per-block dedup normalization must not scale with accumulated assistant text (was O(n^2)/run, the long-run CPU ramp)")
+        // Intent: the bound must not be met by dropping real content — every distinct
+        // block must still render exactly once.
+        XCTAssertEqual(emittedAssistantDeltas, blocks,
+            "distinct assistant blocks must each render once; dedup must suppress only true duplicates")
+    }
 }

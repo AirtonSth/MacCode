@@ -24,7 +24,20 @@ public final class ClaudeParser {
     private var indexToToolInputJSON: [Int: String] = [:]
     private var indexToAssistantBody: [Int: String] = [:]
     private var assembledAssistantBody: String = ""
-    private var emittedAssistantBodies: [String] = []
+    // PERF: whole-message assistant-text dedup (parseLine case "assistant") used to
+    // compare each new block against the ENTIRE growing `assembledAssistantBody` and
+    // linearly scan `emittedAssistantBodies` — re-running the `\s+` normalize regex
+    // each time. In --output-format stream-json the CLI never sends message_start, so
+    // these reset only at `result`/finalize and grew for the whole run => O(n^2) CPU
+    // ramp. The normalized/compact forms of the assembled body are now maintained
+    // incrementally, and emitted bodies are deduped via Sets, so per-block cost is
+    // O(block length), not O(accumulated assistant text). Semantics are unchanged:
+    // a block is suppressed iff its whitespace-normalized OR whitespace-stripped form
+    // matches the assembled body or any prior emitted body.
+    private var assembledAssistantBodyNormalized: String = ""
+    private var assembledAssistantBodyCompact: String = ""
+    private var emittedAssistantBodyNormalizedKeys: Set<String> = []
+    private var emittedAssistantBodyCompactKeys: Set<String> = []
 
     public func parseLine(_ line: String) -> [AssistantEvent] {
         let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -87,8 +100,7 @@ public final class ClaudeParser {
                 let msg = obj["message"] as? [String: Any]
                 let id = (msg?["id"] as? String) ?? UUID().uuidString
                 currentTurnId = id
-                assembledAssistantBody = ""
-                emittedAssistantBodies = []
+                resetAssistantBodyDedupState()
                 indexToAssistantBody = [:]
                 out.append(.turnStarted(turnId: id))
             }
@@ -124,6 +136,10 @@ public final class ClaudeParser {
             switch dtype {
             case "text_delta":
                 let text = delta["text"] as? String
+                // API-delta path only; the assembled normalized/compact dedup forms
+                // are intentionally NOT updated here — they are read solely by the
+                // whole-message `assistant` path (assembledAssistantBodyMatches), and
+                // a single CLI invocation uses one shape, never both.
                 if let text { assembledAssistantBody += text }
                 if let text, indexToType[index] == .assistantMessage {
                     indexToAssistantBody[index, default: ""] += text
@@ -151,7 +167,7 @@ public final class ClaudeParser {
                    let emitted = indexToAssistantBody[index],
                    !emitted.isEmpty,
                    !hasEmittedAssistantBody(emitted) {
-                    emittedAssistantBodies.append(emitted)
+                    recordEmittedAssistantBody(emitted)
                 }
                 out.append(.itemCompleted(itemId: itemId, finalState: .completed))
                 if indexToType[index] == .tool {
@@ -186,9 +202,9 @@ public final class ClaudeParser {
                 case "text":
                     let text = block["text"] as? String ?? ""
                     if text.isEmpty { break }
-                    if assistantText(assembledAssistantBody, equals: text) || hasEmittedAssistantBody(text) { break }
-                    emittedAssistantBodies.append(text)
-                    assembledAssistantBody += (assembledAssistantBody.isEmpty ? "" : "\n") + text
+                    if assembledAssistantBodyMatches(text) || hasEmittedAssistantBody(text) { break }
+                    recordEmittedAssistantBody(text)
+                    appendAssembledAssistantBody(text)
                     out.append(.itemStarted(item: AssistantItem(id: itemId, turnId: turnId, type: .assistantMessage, state: .streaming, summary: nil, body: "", startedAtMs: now)))
                     out.append(.itemDelta(itemId: itemId, bodyAppend: text, outputAppend: nil, summary: nil))
                     out.append(.itemCompleted(itemId: itemId, finalState: .completed))
@@ -239,8 +255,7 @@ public final class ClaudeParser {
             if let tid = currentTurnId {
                 out.append(.turnCompleted(turnId: tid, finalMessage: final))
                 currentTurnId = nil
-                assembledAssistantBody = ""
-                emittedAssistantBodies = []
+                resetAssistantBodyDedupState()
                 indexToAssistantBody = [:]
             }
         case "error":
@@ -705,25 +720,90 @@ public final class ClaudeParser {
         return String(data: data, encoding: .utf8)
     }
 
-    private func assistantText(_ lhs: String, equals rhs: String) -> Bool {
-        let left = normalizedAssistantText(lhs)
-        let right = normalizedAssistantText(rhs)
-        guard !left.isEmpty, !right.isEmpty else { return false }
-        return left == right || compactAssistantText(lhs) == compactAssistantText(rhs)
+    /// True iff `text` duplicates an already-emitted assistant body, by
+    /// whitespace-normalized OR whitespace-stripped equality. O(1): membership in
+    /// the pre-normalized key sets, equivalent to the old linear scan of
+    /// `emittedAssistantBodies` with per-element `assistantText` comparison.
+    private func hasEmittedAssistantBody(_ text: String) -> Bool {
+        let normalized = normalizedAssistantText(text)
+        guard !normalized.isEmpty else { return false }
+        if emittedAssistantBodyNormalizedKeys.contains(normalized) { return true }
+        let compact = compactAssistantText(text)
+        return !compact.isEmpty && emittedAssistantBodyCompactKeys.contains(compact)
     }
 
-    private func hasEmittedAssistantBody(_ text: String) -> Bool {
-        emittedAssistantBodies.contains { assistantText($0, equals: text) }
+    /// Records an emitted assistant body for future dedup, keyed by its normalized
+    /// and compact forms (computed once at record time instead of re-normalized on
+    /// every later comparison). Mirrors the old `emittedAssistantBodies.append`,
+    /// which only mattered for bodies with a non-empty normalized form.
+    private func recordEmittedAssistantBody(_ text: String) {
+        let normalized = normalizedAssistantText(text)
+        guard !normalized.isEmpty else { return }
+        emittedAssistantBodyNormalizedKeys.insert(normalized)
+        let compact = compactAssistantText(text)
+        if !compact.isEmpty { emittedAssistantBodyCompactKeys.insert(compact) }
     }
+
+    /// True iff `text` duplicates the whole accumulated assembled body (normalized OR
+    /// compact equality). Uses the incrementally-maintained forms, so it does not
+    /// re-normalize the growing body on every block. Equivalent to the old
+    /// `assistantText(assembledAssistantBody, equals: text)`.
+    private func assembledAssistantBodyMatches(_ text: String) -> Bool {
+        guard !assembledAssistantBodyNormalized.isEmpty else { return false }
+        let normalized = normalizedAssistantText(text)
+        guard !normalized.isEmpty else { return false }
+        if assembledAssistantBodyNormalized == normalized { return true }
+        return assembledAssistantBodyCompact == compactAssistantText(text)
+    }
+
+    /// Appends a whole-message assistant text block to the assembled body and keeps
+    /// the normalized/compact projections in sync. Blocks are joined by "\n", so the
+    /// normalized form equals each block's normalized text joined by a single space
+    /// (empty-normalized blocks contribute nothing, matching a trim of the raw body),
+    /// and the compact form is the concatenation of each block's compact text.
+    private func appendAssembledAssistantBody(_ text: String) {
+        assembledAssistantBody += (assembledAssistantBody.isEmpty ? "" : "\n") + text
+        let normalized = normalizedAssistantText(text)
+        if !normalized.isEmpty {
+            assembledAssistantBodyNormalized += assembledAssistantBodyNormalized.isEmpty ? normalized : " " + normalized
+        }
+        assembledAssistantBodyCompact += compactAssistantText(text)
+    }
+
+    /// Clears the per-run assistant-text dedup accumulators. Called at every reset
+    /// point (message_start, result, finalize) so a new turn starts from scratch.
+    private func resetAssistantBodyDedupState() {
+        assembledAssistantBody = ""
+        assembledAssistantBodyNormalized = ""
+        assembledAssistantBodyCompact = ""
+        emittedAssistantBodyNormalizedKeys = []
+        emittedAssistantBodyCompactKeys = []
+    }
+
+    #if DEBUG
+    /// Test-only observability: counts `\s+` normalization passes run by the
+    /// whole-message assistant-text dedup. A perf test asserts this stays O(blocks)
+    /// across a long run instead of O(blocks^2) — the regression where dedup
+    /// re-normalized the entire growing assembled body and every prior emitted body
+    /// on each block, ramping CPU on long Claude runs. DEBUG-only so release builds
+    /// carry no shared-mutable write on the parse path. Never read by production.
+    nonisolated(unsafe) static var assistantTextNormalizationsForTesting = 0
+    #endif
 
     private func normalizedAssistantText(_ text: String) -> String {
-        text
+        #if DEBUG
+        Self.assistantTextNormalizationsForTesting &+= 1
+        #endif
+        return text
             .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
             .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     private func compactAssistantText(_ text: String) -> String {
-        text
+        #if DEBUG
+        Self.assistantTextNormalizationsForTesting &+= 1
+        #endif
+        return text
             .replacingOccurrences(of: "\\s+", with: "", options: .regularExpression)
             .trimmingCharacters(in: .whitespacesAndNewlines)
     }
@@ -875,8 +955,7 @@ public final class ClaudeParser {
         guard let tid = currentTurnId else { return [] }
         let final = assembledAssistantBody.isEmpty ? nil : assembledAssistantBody
         currentTurnId = nil
-        assembledAssistantBody = ""
-        emittedAssistantBodies = []
+        resetAssistantBodyDedupState()
         indexToAssistantBody = [:]
         return [.turnCompleted(turnId: tid, finalMessage: final)]
     }

@@ -420,4 +420,72 @@ final class AssistantTimelineTests: XCTestCase {
         XCTAssertTrue(s.workActivities.last?.title.contains("42% swift test") == true,
                       "work log must expose current percent progress for long-running provider tools")
     }
+
+    // REGRESSION (Agent App CPU ramp / freeze on long runs): every streamed
+    // itemDelta calls mutateItem, which located the target item with a scan over
+    // EVERY turn*item. The streaming item is appended last, so each token re-scanned
+    // the whole accumulated timeline => O(items^2) per session on the main actor.
+    // CPU ramped with transcript size and froze long workflows; pressing Stop ended
+    // the delta stream and relieved it instantly. This asserts per-delta lookup cost
+    // stays bounded regardless of how many items have accumulated — it FAILS on the
+    // old whole-timeline scan and PASSES once the lookup targets the active item.
+    func test_streamingDeltasToActiveItemStayBoundedRegardlessOfAccumulatedItems() {
+        var s = AssistantTimelineState()
+        s.apply(.turnStarted(turnId: "run"))
+
+        // A long workflow piles up hundreds/thousands of completed items before the
+        // final answer streams. The active (streaming) item is started LAST.
+        let priorItems = 3_000
+        for i in 0..<priorItems {
+            let id = "item-\(i)"
+            s.apply(.itemStarted(item: AssistantItem(id: id, turnId: "run", type: .tool, startedAtMs: Int64(i))))
+            s.apply(.itemCompleted(itemId: id, finalState: .completed))
+        }
+        let activeId = "answer"
+        s.apply(.itemStarted(item: AssistantItem(id: activeId, turnId: "run", type: .assistantMessage, startedAtMs: Int64(priorItems))))
+
+        // Measure ONLY the streaming deltas (setup scans are excluded by the reset).
+        AssistantTimelineState.itemLookupComparisonsForTesting = 0
+        let deltas = 2_000
+        for i in 0..<deltas {
+            s.apply(.itemDelta(itemId: activeId, bodyAppend: "tok\(i) ", outputAppend: nil, summary: nil))
+        }
+        let comparisons = AssistantTimelineState.itemLookupComparisonsForTesting
+
+        // Bound: per-delta lookup must be O(1) in the accumulated item count. The old
+        // forward scan costs ~deltas*(priorItems+1) (~6M here); the fix costs ~deltas.
+        XCTAssertLessThanOrEqual(comparisons, deltas * 3,
+                                 "per-delta item lookup must not scale with accumulated timeline size (was O(items^2)/session, the long-run CPU ramp)")
+
+        // Intent: the deltas actually landed on the active item, and no earlier item
+        // was touched — the bound must not be met by skipping/misrouting work.
+        XCTAssertEqual(s.turns.count, 1)
+        XCTAssertEqual(s.turns[0].items.count, priorItems + 1)
+        XCTAssertEqual(s.turns[0].items.last?.id, activeId)
+        XCTAssertTrue(s.turns[0].items.last?.body.hasPrefix("tok0 ") == true)
+        XCTAssertTrue(s.turns[0].items.last?.body.hasSuffix("tok\(deltas - 1) ") == true)
+        XCTAssertEqual(s.turns[0].items.first?.body, "",
+                       "an accumulated earlier item must not be mutated by the active item's deltas")
+    }
+
+    // Lookup correctness: the active-item fast path must still resolve a delta to its
+    // OWN item even when newer items have started after it (e.g. trailing tool output
+    // arriving after the next item began). Guards the newest-first lookup change.
+    func test_itemDeltaResolvesToItsOwnItemEvenAfterNewerItemsStarted() {
+        var s = AssistantTimelineState()
+        s.apply(.turnStarted(turnId: "t"))
+        s.apply(.itemStarted(item: AssistantItem(id: "a", turnId: "t", type: .tool, startedAtMs: 1)))
+        s.apply(.itemStarted(item: AssistantItem(id: "b", turnId: "t", type: .tool, startedAtMs: 2)))
+        s.apply(.itemStarted(item: AssistantItem(id: "c", turnId: "t", type: .assistantMessage, startedAtMs: 3)))
+
+        s.apply(.itemDelta(itemId: "a", bodyAppend: "A-body", outputAppend: nil, summary: nil))
+        s.apply(.itemDelta(itemId: "c", bodyAppend: "C-body", outputAppend: nil, summary: nil))
+
+        let items = s.turns[0].items
+        XCTAssertEqual(items.first(where: { $0.id == "a" })?.body, "A-body",
+                       "a delta must mutate its own item even when newer items exist, not just the most-recent item")
+        XCTAssertEqual(items.first(where: { $0.id == "c" })?.body, "C-body")
+        XCTAssertEqual(items.first(where: { $0.id == "b" })?.body, "",
+                       "an unrelated item must never be mutated by another item's delta")
+    }
 }

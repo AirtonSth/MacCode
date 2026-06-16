@@ -848,10 +848,23 @@ public struct AssistantTimelineState: Codable, Sendable, Equatable {
 
     @discardableResult
     private mutating func mutateItem(_ iid: String, _ mut: (inout AssistantItem) -> Void) -> Bool {
-        for ti in turns.indices {
-            for ii in turns[ti].items.indices where turns[ti].items[ii].id == iid {
-                mut(&turns[ti].items[ii])
-                return true
+        // Streaming itemDeltas target the most-recently-started item, which is the
+        // last appended item in the last turn. Iterate newest-first so the per-delta
+        // lookup is O(1) for the active item instead of O(total accumulated items):
+        // the old oldest-first scan walked every prior turn*item on every token, so
+        // CPU ramped with the transcript and froze long runs (relieved only by Stop).
+        // Item ids are unique (itemStarted merges duplicates within a turn and
+        // provider item ids are globally unique), so newest-first resolves the same
+        // item a full scan would.
+        for ti in turns.indices.reversed() {
+            for ii in turns[ti].items.indices.reversed() {
+                #if DEBUG
+                Self.itemLookupComparisonsForTesting &+= 1
+                #endif
+                if turns[ti].items[ii].id == iid {
+                    mut(&turns[ti].items[ii])
+                    return true
+                }
             }
         }
         return false
@@ -871,9 +884,17 @@ public struct AssistantTimelineState: Codable, Sendable, Equatable {
     }
 
     private func item(withId iid: String) -> AssistantItem? {
-        for turn in turns {
-            if let item = turn.items.first(where: { $0.id == iid }) {
-                return item
+        // Newest-first for the same reason as mutateItem: lookups during a live run
+        // target the active (last) item, so this stays O(1) instead of scanning the
+        // whole accumulated timeline on every itemProgress/itemCompleted event.
+        for ti in turns.indices.reversed() {
+            for ii in turns[ti].items.indices.reversed() {
+                #if DEBUG
+                Self.itemLookupComparisonsForTesting &+= 1
+                #endif
+                if turns[ti].items[ii].id == iid {
+                    return turns[ti].items[ii]
+                }
             }
         }
         return nil
@@ -928,4 +949,15 @@ public struct AssistantTimelineState: Codable, Sendable, Equatable {
         guard value.count > limit else { return value }
         return String(value.suffix(limit))
     }
+
+    #if DEBUG
+    /// Test-only observability for the id->item lookup scan length used by
+    /// `mutateItem`/`item(withId:)`. A perf unit test resets this and asserts that
+    /// streaming deltas to the active (most-recently-started) item do NOT re-scan
+    /// the whole accumulated timeline — the O(items^2)-per-session regression that
+    /// froze long Agent App runs and was relieved instantly by Stop. DEBUG-only so
+    /// release builds carry no shared-mutable write on the streaming path (apply()
+    /// runs on both the UI main actor and the runner's background thread).
+    nonisolated(unsafe) static var itemLookupComparisonsForTesting = 0
+    #endif
 }
