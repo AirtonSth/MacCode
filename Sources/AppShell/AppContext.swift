@@ -771,10 +771,6 @@ public final class AppContext {
             // No model service: deterministic pre-passes still fail open and can save tokens.
             return deterministicCandidate.count < prompt.count ? adopt(deterministicCandidate, stage: .deterministic) : prompt
         }
-        // Reset the idle-eviction timer: a real request is being dispatched so
-        // the model must not be unloaded while it is in use.
-        tokenSaverDistillServiceController.recordRequest()
-
         let request = DistillRequest(
             mode: .longText,
             priority: .interactive,
@@ -859,8 +855,6 @@ public final class AppContext {
             NSLog("RemoteCode Token Saver SR1 humanize fallback used (provider=\(provider.rawValue)): distill client unavailable (status=\(Self.describe(tokenSaverDistillServiceController.status)))")
             return fallback
         }
-        // Reset the idle-eviction timer: a real request is being dispatched.
-        tokenSaverDistillServiceController.recordRequest()
 
         let input = """
         TARGET_LANGUAGE: \(targetLanguage)

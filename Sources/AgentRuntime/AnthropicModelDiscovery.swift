@@ -163,7 +163,7 @@ public enum AnthropicModelDiscovery {
             label: label,
             provider: .claude,
             supportsReasoning: supportsReasoning,
-            supportedReasoningEfforts: supportsReasoning ? AgentReasoningEffort.supportedCases : [],
+            supportedReasoningEfforts: supportsReasoning ? AgentReasoningEffort.claudeSupportedCases : [],
             supportsCustomModel: true,
             contextWindowTokens: 200_000
         )

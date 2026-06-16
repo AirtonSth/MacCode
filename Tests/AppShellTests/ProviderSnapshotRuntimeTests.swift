@@ -284,8 +284,8 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
 
         XCTAssertEqual(claude.models.map(\.id), ["opus", "sonnet", "haiku"],
                        "provider snapshots must use versionless Claude Code model aliases when the dynamic Anthropic Models API is unavailable")
-        XCTAssertEqual(claude.models.first?.supportedReasoningEfforts, AgentReasoningEffort.supportedCases,
-                       "alias fallback models must preserve thinking controls on macOS and iOS")
+        XCTAssertEqual(claude.models.first?.supportedReasoningEfforts, AgentReasoningEffort.claudeSupportedCases,
+                       "alias fallback Claude models must preserve the full Claude effort picker (incl. Max + Ultracode) on macOS and iOS")
     }
 
     func test_agentSurfaceRefreshesCurrentProviderModelsOnStartup() async throws {

@@ -246,22 +246,6 @@ public enum TokenSaverDistillFailureReasonFormatter {
     }
 }
 
-/// Pure idle-unload decision helper. No side effects; fully testable without MainActor.
-///
-/// - Parameters:
-///   - lastRequestAt: timestamp of the most recent request, or nil if no request has occurred.
-///   - idleTimeoutMS: idle window in milliseconds. <= 0 disables the feature (always returns false).
-///   - now: current time (injected for deterministic tests).
-/// - Returns: true when the model should be unloaded due to idleness.
-public enum TokenSaverIdlePolicy {
-    public static func shouldUnload(lastRequestAt: Date?, idleTimeoutMS: Int, now: Date) -> Bool {
-        guard idleTimeoutMS > 0 else { return false }
-        guard let last = lastRequestAt else { return false }
-        let elapsed = now.timeIntervalSince(last) * 1000
-        return elapsed >= Double(idleTimeoutMS)
-    }
-}
-
 /// Cached sha256 result keyed on (size, mtime) for a single model file.
 ///
 /// The entry is considered valid only when both the file size and modification
@@ -537,12 +521,15 @@ public final class TokenSaverDistillServiceController {
     private var restartAttempts = 0
     private var restartTask: Task<Void, Never>?
 
-    /// Milliseconds of inactivity after which the sidecar is unloaded to free
-    /// ~1.1 GB RAM. 0 or negative disables the feature. Defaults to 5 minutes.
+    /// Idle window (ms) forwarded to the sidecar so the SERVER reclaims the
+    /// model's GPU memory when its request queue drains. The controller itself
+    /// keeps the sidecar resident while Token Saver is enabled: terminal
+    /// `cmd | distill` talks straight to the sidecar socket and cannot autostart
+    /// it, so killing the process on idle silently broke `| distill` (it failed
+    /// open with zero recorded savings — the "saved stuck at 36k" symptom). The
+    /// heavy MLX memory is already returned per request-drain, so staying
+    /// resident only holds the ~1.1 GB process baseline.
     public let idleTimeoutMS: Int
-    /// Timestamp of the most recent request routed through the sidecar.
-    public private(set) var lastRequestAt: Date?
-    private var idleCheckTask: Task<Void, Never>?
 
     public init(
         appSupportDirectory: URL,
@@ -586,9 +573,6 @@ public final class TokenSaverDistillServiceController {
 
     public func stop() {
         isStopping = true
-        idleCheckTask?.cancel()
-        idleCheckTask = nil
-        lastRequestAt = nil
         restartTask?.cancel()
         restartTask = nil
         restartAttempts = 0
@@ -674,33 +658,6 @@ public final class TokenSaverDistillServiceController {
         }
     }
 
-    /// Call when a request is dispatched through the sidecar so the idle timer resets.
-    public func recordRequest() {
-        lastRequestAt = Date()
-    }
-
-    /// Schedules a periodic check that unloads the sidecar when idle.
-    /// Coalesces: only one check task runs at a time.
-    private func scheduleIdleCheck() {
-        guard idleTimeoutMS > 0, idleCheckTask == nil else { return }
-        let intervalNS = UInt64(max(idleTimeoutMS, 10_000)) * 1_000_000
-        idleCheckTask = Task { @MainActor [weak self] in
-            while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: intervalNS)
-                guard !Task.isCancelled, let self else { return }
-                if TokenSaverIdlePolicy.shouldUnload(
-                    lastRequestAt: self.lastRequestAt,
-                    idleTimeoutMS: self.idleTimeoutMS,
-                    now: Date()
-                ) {
-                    self.idleCheckTask = nil
-                    self.stop()
-                    return
-                }
-            }
-        }
-    }
-
     private func start() {
         if let process, process.isRunning {
             return
@@ -732,7 +689,7 @@ public final class TokenSaverDistillServiceController {
             "--model-url", model.url,
             "--max-concurrent-requests", "8",
             "--max-queue-depth", "64",
-            "--idle-timeout-ms", "300000"
+            "--idle-timeout-ms", String(idleTimeoutMS)
         ]
 
         do {
@@ -816,15 +773,22 @@ public final class TokenSaverDistillServiceController {
                 // Healthy startup clears the restart-attempt counter so the next
                 // crash gets a fresh backoff budget.
                 restartAttempts = 0
-                lastRequestAt = Date()
                 status = .running(ready)
-                scheduleIdleCheck()
             } else {
                 status = .failed("RemoteCodeDistillService ready event invalid")
             }
             return
         }
 
+        handleRunningOutputLine(lineData)
+    }
+
+    /// Handles a sidecar stdout line once the service is running. Split out from
+    /// `handleOutputLine` (which also handles the `.starting` ready event) so the
+    /// savings-event → UI-refresh wiring is unit-testable without spawning a real
+    /// process. A `savings_recorded` event means real distill traffic happened
+    /// (CLI or app), so the Token Saver card must re-read the ledger.
+    func handleRunningOutputLine(_ lineData: Data) {
         guard let event = try? JSONDecoder().decode(TokenSaverDistillProcessEvent.self, from: lineData),
               event.event == "savings_recorded" else {
             return

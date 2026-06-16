@@ -12,9 +12,21 @@ public enum AgentReasoningEffort: String, Codable, Sendable, CaseIterable {
     case medium
     case high
     case xhigh
+    case max
+    case ultracode
 
     public static var supportedCases: [AgentReasoningEffort] {
         [.low, .medium, .high, .xhigh]
+    }
+
+    /// Claude Code's effort picker exposes two levels beyond the Codex picker:
+    /// `max` and `ultracode`. Both are kept out of `supportedCases` because
+    /// Codex models fall back to that list and the `codex` CLI rejects them.
+    /// `ultracode` is not a `--effort` flag value (the CLI rejects it); it is
+    /// the `ultracode` settings key, meaning "xhigh effort + standing dynamic
+    /// workflow orchestration". The runner translates it accordingly.
+    public static var claudeSupportedCases: [AgentReasoningEffort] {
+        [.low, .medium, .high, .xhigh, .max, .ultracode]
     }
 
     /// Human label for menus. `xhigh` is shown as "Extra High" to match
@@ -26,6 +38,8 @@ public enum AgentReasoningEffort: String, Codable, Sendable, CaseIterable {
         case .medium: return "Medium"
         case .high: return "High"
         case .xhigh: return "Extra High"
+        case .max: return "Max"
+        case .ultracode: return "Ultracode"
         }
     }
 }
@@ -260,13 +274,23 @@ public enum AgentProviderInstructionText {
         """
     }
 
-    public static func developerInstructions(for mode: AgentInteractionMode) -> String {
+    /// Reinforces the Token Saver `| distill` rule in the channel RemoteCode controls every
+    /// turn. Codex (app-server) has no automatic tool-output compression hook — that is
+    /// Claude-SDK-only — so its developer_instructions are the only reliable place to make it
+    /// pipe command output. The caller gates this on Token Saver being enabled: the managed
+    /// `distill` CLI exists only then, so instructing the pipe while disabled would fail with
+    /// command-not-found and drop the command's output.
+    public static let tokenSaverDistillInstruction = "Token Saver is ON: pipe every non-interactive command whose output exceeds ~10 lines or ~1KB through the managed `distill` CLI with an extraction prompt, e.g. `git diff | distill \"summarize changes\"`. Skip only for exact bytes, interactive/TUI, or when distill is unavailable."
+
+    public static func developerInstructions(for mode: AgentInteractionMode, tokenSaverEnabled: Bool = false) -> String {
+        let base: String
         switch mode {
         case .default:
-            return "Implement clear requests; keep scope; preserve unrelated work; verify; ask before ambiguous/risky edits."
+            base = "Implement clear requests; keep scope; preserve unrelated work; verify; ask before ambiguous/risky edits."
         case .plan:
-            return "Plan only. Do not edit, run destructive commands, or implement until user approval."
+            base = "Plan only. Do not edit, run destructive commands, or implement until user approval."
         }
+        return tokenSaverEnabled ? base + " " + tokenSaverDistillInstruction : base
     }
 
     public static func providerPreamble(for mode: AgentInteractionMode) -> String {

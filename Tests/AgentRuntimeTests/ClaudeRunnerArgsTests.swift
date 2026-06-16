@@ -77,8 +77,8 @@ final class ClaudeRunnerArgsTests: XCTestCase {
 
         XCTAssertEqual(models.first?.id, "opus",
                        "Claude fallback model options must use Claude Code's latest-model alias instead of a hardcoded dated model id")
-        XCTAssertEqual(opus?.supportedReasoningEfforts, AgentReasoningEffort.supportedCases,
-                       "Claude thinking-capable models must advertise the legal effort picker values")
+        XCTAssertEqual(opus?.supportedReasoningEfforts, AgentReasoningEffort.claudeSupportedCases,
+                       "Claude thinking-capable models must advertise the legal effort picker values, including Max")
         XCTAssertFalse(opus?.supportsServiceTier == true,
                        "Claude models must not expose Codex-only fast service-tier controls")
         XCTAssertTrue(opus?.supportsCustomModel == true)
@@ -106,7 +106,7 @@ final class ClaudeRunnerArgsTests: XCTestCase {
         ])
         XCTAssertEqual(models.map(\.id), ["claude-opus-4-8", "claude-sonnet-4-6"],
                        "Claude model discovery must accept the Anthropic Models API response instead of relying on bundled model IDs")
-        XCTAssertEqual(models.first?.supportedReasoningEfforts, AgentReasoningEffort.supportedCases)
+        XCTAssertEqual(models.first?.supportedReasoningEfforts, AgentReasoningEffort.claudeSupportedCases)
         XCTAssertTrue(models.allSatisfy(\.supportsCustomModel))
     }
 
@@ -135,7 +135,61 @@ final class ClaudeRunnerArgsTests: XCTestCase {
         XCTAssertEqual(eff(.medium), "medium")
         XCTAssertEqual(eff(.high), "high")
         XCTAssertEqual(eff(.xhigh), "xhigh", "Extra High must use Claude's native xhigh effort flag")
+        XCTAssertEqual(eff(.max), "max", "Max must use Claude's native max effort flag")
+        XCTAssertEqual(eff(.ultracode), "xhigh",
+                       "Ultracode is not a --effort value (the CLI rejects it); it maps to xhigh effort")
         XCTAssertEqual(eff(nil), "medium", "no effort → a sane default, never omitted")
+    }
+
+    private func ultracodeReq(_ effort: AgentReasoningEffort) -> AgentRunRequest {
+        AgentRunRequest(threadId: AgentThreadID(), provider: .claude,
+                        model: "opus", cwd: "/tmp", prompt: "build it",
+                        permissionMode: .supervised, reasoningEffort: effort)
+    }
+
+    private func settingsValue(_ args: [String]) -> String? {
+        guard let i = args.firstIndex(of: "--settings"), args.indices.contains(args.index(after: i)) else {
+            return nil
+        }
+        return args[args.index(after: i)]
+    }
+
+    func test_ultracodeEnablesEffortAndWorkflowsViaSettings() {
+        let args = ClaudeRunner.buildArgs(ultracodeReq(.ultracode))
+        XCTAssertEqual(args[args.index(after: args.firstIndex(of: "--effort")!)], "xhigh",
+                       "Ultracode runs at xhigh effort")
+        let settings = settingsValue(args)
+        XCTAssertNotNil(settings, "Ultracode must inject --settings so the spawned session opts into ultracode")
+        XCTAssertTrue(settings?.contains("\"ultracode\":true") == true,
+                      "Ultracode must set the ultracode settings key the CLI documents for per-session activation")
+        XCTAssertTrue(settings?.contains("\"enableWorkflows\":true") == true,
+                      "the Workflow tool only appears when enableWorkflows is true, so ultracode must force it on")
+    }
+
+    func test_streamingUltracodeEnablesEffortAndWorkflowsViaSettings() {
+        let args = ClaudeRunner.buildStreamingArgs(ultracodeReq(.ultracode))
+        XCTAssertEqual(args[args.index(after: args.firstIndex(of: "--effort")!)], "xhigh")
+        let settings = settingsValue(args)
+        XCTAssertTrue(settings?.contains("\"ultracode\":true") == true)
+        XCTAssertTrue(settings?.contains("\"enableWorkflows\":true") == true,
+                      "durable streaming sessions must also opt into ultracode workflow orchestration")
+    }
+
+    func test_nonUltracodeEffortsNeverInjectSettings() {
+        for effort in [AgentReasoningEffort.low, .medium, .high, .xhigh, .max] {
+            XCTAssertNil(settingsValue(ClaudeRunner.buildArgs(ultracodeReq(effort))),
+                         "\(effort) is a plain effort level and must not pollute the run with ultracode --settings")
+            XCTAssertNil(settingsValue(ClaudeRunner.buildStreamingArgs(ultracodeReq(effort))),
+                         "\(effort) streaming runs must not inject ultracode --settings")
+        }
+    }
+
+    func test_ultracodeIsOfferedToClaudeButNotCodexPicker() {
+        XCTAssertTrue(AgentReasoningEffort.claudeSupportedCases.contains(.ultracode),
+                      "Claude reasoning models must offer Ultracode in the effort picker")
+        XCTAssertFalse(AgentReasoningEffort.supportedCases.contains(.ultracode),
+                       "Codex falls back to supportedCases and the codex CLI has no ultracode; it must stay Claude-only")
+        XCTAssertEqual(AgentReasoningEffort.ultracode.displayName, "Ultracode")
     }
 
     func test_xhighEffortDoesNotRewritePromptWithThinkingHack() {

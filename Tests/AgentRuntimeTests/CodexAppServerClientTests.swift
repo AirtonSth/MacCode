@@ -287,6 +287,60 @@ final class CodexAppServerClientTests: XCTestCase {
         XCTAssertEqual((params["sandboxPolicy"] as? [String: Any])?["type"] as? String, "dangerFullAccess")
     }
 
+    func test_startTurnInjectsDistillRuleIntoDeveloperInstructionsWhenTokenSaverHintPresent() async throws {
+        let script = try makeFakeAppServerPeer()
+        let client = try CodexAppServerClient(
+            binary: script,
+            arguments: [],
+            cwd: FileManager.default.temporaryDirectory.path
+        )
+        defer { client.stop() }
+        _ = try await client.initialize()
+
+        // WHY: Codex has no automatic tool-output compression (Claude-SDK-only). The Token Saver
+        // env hint (set by providerEnvironment when enabled) is the signal that makes Codex's
+        // per-turn developer_instructions instruct `| distill`; without it Codex never compresses
+        // command output, so Token Saver savings for Codex stay flat.
+        let withHint = try await client.startTurn(
+            providerThreadId: "thread-app-server-1",
+            for: AgentRunRequest(
+                threadId: AgentThreadID(),
+                provider: .codex,
+                model: "gpt-5.5",
+                cwd: "/tmp/remotecode-app-server-test",
+                prompt: "explore",
+                environment: ["RC_TOKEN_SAVER_DISTILL_HINT": "1"]
+            )
+        )
+        XCTAssertTrue(
+            (try collaborationSettings(from: withHint)["developer_instructions"] as? String)?.contains("| distill") == true,
+            "the Token Saver env hint must drive Codex developer_instructions to pipe `| distill`"
+        )
+
+        // No hint => Token Saver off => the managed distill CLI is uninstalled, so Codex must NOT
+        // be told to pipe through a binary that no longer exists.
+        let withoutHint = try await client.startTurn(
+            providerThreadId: "thread-app-server-1",
+            for: AgentRunRequest(
+                threadId: AgentThreadID(),
+                provider: .codex,
+                model: "gpt-5.5",
+                cwd: "/tmp/remotecode-app-server-test",
+                prompt: "explore"
+            )
+        )
+        XCTAssertFalse(
+            (try collaborationSettings(from: withoutHint)["developer_instructions"] as? String)?.contains("distill") == true,
+            "without the Token Saver hint Codex must not be instructed to pipe through the uninstalled distill CLI"
+        )
+    }
+
+    private func collaborationSettings(from response: [String: Any]) throws -> [String: Any] {
+        let params = try XCTUnwrap(response["lastParams"] as? [String: Any])
+        let collaboration = try XCTUnwrap(params["collaborationMode"] as? [String: Any])
+        return try XCTUnwrap(collaboration["settings"] as? [String: Any])
+    }
+
     private func makeFakeAppServerPeer() throws -> String {
         let dir = FileManager.default.temporaryDirectory
             .appendingPathComponent("remotecode-codex-app-server-tests-\(UUID().uuidString)", isDirectory: true)

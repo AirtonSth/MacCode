@@ -11,7 +11,6 @@ on:
 
 permissions:
   contents: write
-  pages: write
   id-token: write
 
 jobs:
@@ -21,6 +20,12 @@ jobs:
     env:
       ASSET_NAME: stable-macos-arm64-RemoteCode.dmg
       GHOSTTYKIT_ASSET: GhosttyKit.xcframework.tar.gz
+      AWS_REGION: us-east-1
+      AWS_RELEASE_UPLOAD_ROLE_ARN: ${{ secrets.AWS_RELEASE_UPLOAD_ROLE_ARN }}
+      S3_BUCKET: remotecode.io
+      S3_DOWNLOAD_PREFIX: downloads/macos
+      S3_DOWNLOAD_BASE_URL: https://remotecode.io/downloads/macos
+      CLOUDFRONT_DISTRIBUTION_ID: ${{ secrets.REMOTECODE_IO_CLOUDFRONT_DISTRIBUTION_ID }}
       CODESIGN_P12_BASE64: ${{ secrets.MACOS_DEVELOPER_ID_P12_BASE64 || secrets.MACOS_CERTIFICATE }}
       CODESIGN_P12_PASSWORD: ${{ secrets.MACOS_DEVELOPER_ID_P12_PASSWORD || secrets.MACOS_CERTIFICATE_PWD }}
       EXPECTED_CODESIGN_IDENTITY: ${{ secrets.MACOS_DEVELOPER_IDENTITY || secrets.ELECTROBUN_DEVELOPER_ID }}
@@ -104,7 +109,7 @@ jobs:
           RC2_DMG_NAME: ${{ env.ASSET_NAME }}
           RC2_REQUIRE_SPARKLE_KEY: "1"
           RC2_SPARKLE_PUBLIC_ED_KEY: ${{ secrets.SPARKLE_PUBLIC_ED_KEY }}
-          RC2_SPARKLE_FEED_URL: https://github.com/${{ github.repository }}/releases/latest/download/appcast.xml
+          RC2_SPARKLE_FEED_URL: ${{ env.S3_DOWNLOAD_BASE_URL }}/appcast.xml
         run: |
           test "$(uname -m)" = "arm64"
           scripts/package-dmg.sh
@@ -127,6 +132,28 @@ jobs:
           trap 'hdiutil detach "$MOUNT"; rmdir "$MOUNT"' EXIT
           codesign --verify --deep --strict --verbose=4 "$MOUNT/RemoteCode.app"
           spctl --assess --type execute --verbose=4 "$MOUNT/RemoteCode.app"
+
+      - name: Verify S3 release upload configuration
+        run: |
+          if [ -z "$AWS_RELEASE_UPLOAD_ROLE_ARN" ]; then
+            echo "Missing AWS_RELEASE_UPLOAD_ROLE_ARN secret"
+            exit 1
+          fi
+
+      - name: Configure AWS credentials for S3 release upload
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: ${{ env.AWS_RELEASE_UPLOAD_ROLE_ARN }}
+
+      - name: Upload DMG to S3
+        run: |
+          aws s3 cp "dist/$ASSET_NAME" "s3://$S3_BUCKET/$S3_DOWNLOAD_PREFIX/${{ steps.release.outputs.tag }}/$ASSET_NAME" \
+            --content-type "application/x-apple-diskimage" \
+            --cache-control "public, max-age=31536000, immutable"
+          aws s3 cp "dist/$ASSET_NAME" "s3://$S3_BUCKET/$S3_DOWNLOAD_PREFIX/latest/$ASSET_NAME" \
+            --content-type "application/x-apple-diskimage" \
+            --cache-control "no-cache, max-age=0"
 
       - name: Upload DMG to release
         env:
@@ -153,14 +180,15 @@ jobs:
           KEY_FILE="$RUNNER_TEMP/sparkle_ed_private_key"
           printf '%s' "$SPARKLE_PRIVATE_KEY" > "$KEY_FILE"
           SIGNATURE="$("$SIGN_UPDATE" --ed-key-file "$KEY_FILE" "dist/$ASSET_NAME")"
-          DMG_URL="https://github.com/$GITHUB_REPOSITORY/releases/download/${{ steps.release.outputs.tag }}/$ASSET_NAME"
+          APPCAST_URL="$S3_DOWNLOAD_BASE_URL/appcast.xml"
+          DMG_URL="$S3_DOWNLOAD_BASE_URL/${{ steps.release.outputs.tag }}/$ASSET_NAME"
           mkdir -p dist/pages
           cat > dist/pages/appcast.xml <<EOF
           <?xml version="1.0" encoding="utf-8"?>
           <rss version="2.0" xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle">
             <channel>
               <title>RemoteCode Updates</title>
-              <link>https://github.com/${{ github.repository }}/releases/latest/download/appcast.xml</link>
+              <link>$APPCAST_URL</link>
               <description>RemoteCode macOS updates</description>
               <item>
                 <title>RemoteCode ${{ steps.release.outputs.version }}</title>
@@ -175,6 +203,12 @@ jobs:
           grep -F "sparkle:edSignature" dist/pages/appcast.xml
           grep -F "$ASSET_NAME" dist/pages/appcast.xml
 
+      - name: Upload Sparkle appcast to S3
+        run: |
+          aws s3 cp "dist/pages/appcast.xml" "s3://$S3_BUCKET/$S3_DOWNLOAD_PREFIX/appcast.xml" \
+            --content-type "application/xml; charset=utf-8" \
+            --cache-control "no-cache, max-age=0"
+
       - name: Upload Sparkle appcast to release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -183,13 +217,9 @@ jobs:
             --repo "$GITHUB_REPOSITORY" \
             --clobber
 
-      - name: Configure GitHub Pages
-        uses: actions/configure-pages@v5
-
-      - name: Upload Sparkle appcast pages artifact
-        uses: actions/upload-pages-artifact@v3
-        with:
-          path: dist/pages
-
-      - name: Deploy Sparkle appcast to GitHub Pages
-        uses: actions/deploy-pages@v4
+      - name: Invalidate release downloads on CloudFront
+        if: ${{ env.CLOUDFRONT_DISTRIBUTION_ID != '' }}
+        run: |
+          aws cloudfront create-invalidation \
+            --distribution-id "$CLOUDFRONT_DISTRIBUTION_ID" \
+            --paths "/$S3_DOWNLOAD_PREFIX/appcast.xml" "/$S3_DOWNLOAD_PREFIX/latest/$ASSET_NAME"

@@ -583,7 +583,14 @@ public final class CodexAppServerClient: @unchecked Sendable {
             "settings": [
                 "model": model ?? "gpt-5.5",
                 "reasoning_effort": appServerReasoningEffort(for: request.reasoningEffort).rawValue,
-                "developer_instructions": developerInstructions(for: request.interactionMode)
+                "developer_instructions": developerInstructions(
+                    for: request.interactionMode,
+                    // Codex (app-server) has no automatic tool-output compression hook — that is
+                    // Claude-SDK-only — so the Token Saver `| distill` rule must ride in the
+                    // developer_instructions it reads every turn. providerEnvironment sets this
+                    // hint iff Token Saver is enabled (and thus the managed `distill` CLI exists).
+                    tokenSaverEnabled: request.environment["RC_TOKEN_SAVER_DISTILL_HINT"] == "1"
+                )
             ]
         ]
     }
@@ -592,7 +599,7 @@ public final class CodexAppServerClient: @unchecked Sendable {
         effort == .minimal ? .low : (effort ?? .medium)
     }
 
-    private static func developerInstructions(for mode: AgentInteractionMode) -> String {
-        AgentProviderInstructionText.developerInstructions(for: mode)
+    private static func developerInstructions(for mode: AgentInteractionMode, tokenSaverEnabled: Bool) -> String {
+        AgentProviderInstructionText.developerInstructions(for: mode, tokenSaverEnabled: tokenSaverEnabled)
     }
 }

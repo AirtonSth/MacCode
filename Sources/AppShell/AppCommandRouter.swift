@@ -1947,14 +1947,22 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         // (streaming CLI, SDK-bridge tool-exec env, session) uses for the agent's bash tools
         // that spawn `cmd | distill`. Set unconditionally — even with no instance config.
         env["REMOTE_CODE_AGENT_PROVIDER"] = provider.rawValue
-        if provider == .claude,
-           let context,
-           SettingsStore(db: context.db).load().tokenSaverEnabled {
-            env["RC_TOKEN_SAVER_POST_TOOL_USE"] = "1"
-            env["REMOTE_CODE_DISTILL_STATE_PATH"] = context.appSupportDirectory
-                .appendingPathComponent("Distill", isDirectory: true)
-                .appendingPathComponent("DistillCLIState.json")
-                .path
+        if let context, SettingsStore(db: context.db).load().tokenSaverEnabled {
+            // Token Saver is on, so the managed `distill` CLI is installed (reconcileManagedDistillSkills).
+            // Signal the agent to pipe large command output through it. Codex (app-server) has no
+            // automatic tool-output compression hook (Claude-only), so its developer_instructions read
+            // this hint to instruct `| distill` per turn. Never set it when disabled: the CLI is
+            // uninstalled then and a `cmd | distill` pipe would fail with command-not-found.
+            env["RC_TOKEN_SAVER_DISTILL_HINT"] = "1"
+            if provider == .claude {
+                // Claude additionally auto-compresses tool output via the SDK-bridge PostToolUse hook,
+                // which talks straight to the sidecar over HTTP using this state file.
+                env["RC_TOKEN_SAVER_POST_TOOL_USE"] = "1"
+                env["REMOTE_CODE_DISTILL_STATE_PATH"] = context.appSupportDirectory
+                    .appendingPathComponent("Distill", isDirectory: true)
+                    .appendingPathComponent("DistillCLIState.json")
+                    .path
+            }
         }
         return env
     }

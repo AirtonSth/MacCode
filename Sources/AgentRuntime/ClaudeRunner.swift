@@ -33,6 +33,33 @@ public final class ClaudeRunner: AgentProviderRunner, @unchecked Sendable {
         AnthropicModelDiscovery.latestAliasModels()
     }
 
+    /// `ultracode` is not a `--effort` flag value — the CLI rejects it
+    /// ("Unknown --effort value"). It is the `ultracode` settings key meaning
+    /// "xhigh effort + standing dynamic-workflow orchestration", so it maps to
+    /// `--effort xhigh` plus the settings payload below. Every other level maps
+    /// one-to-one; `nil`/`medium` default to medium so the flag is never omitted.
+    static func effortArgs(_ effort: AgentReasoningEffort?) -> [String] {
+        switch effort {
+        case .some(.minimal), .some(.low): return ["--effort", "low"]
+        case .some(.high): return ["--effort", "high"]
+        case .some(.xhigh): return ["--effort", "xhigh"]
+        case .some(.max): return ["--effort", "max"]
+        case .some(.ultracode): return ["--effort", "xhigh"]
+        case .some(.medium), .none: return ["--effort", "medium"]
+        }
+    }
+
+    /// Ultracode requires `enableWorkflows: true` for the Workflow tool to be
+    /// exposed; `ultracode: true` alone bumps effort to xhigh but leaves the
+    /// orchestration tool absent. Both keys are forced on for the spawned
+    /// session via `--settings` (which merges over the user's settings files).
+    /// Non-ultracode efforts pass no `--settings` so normal runs stay untouched.
+    static let ultracodeSettingsJSON = #"{"ultracode":true,"enableWorkflows":true}"#
+
+    static func ultracodeSettingsArgs(_ effort: AgentReasoningEffort?) -> [String] {
+        effort == .ultracode ? ["--settings", ultracodeSettingsJSON] : []
+    }
+
     /// Builds the `claude` CLI argv. Pure + static so the exact flag
     /// combination is regression-tested without spawning a process.
     /// `--print --output-format stream-json` MUST be accompanied by
@@ -41,12 +68,8 @@ public final class ClaudeRunner: AgentProviderRunner, @unchecked Sendable {
         var args: [String] = ["--print", "--output-format", "stream-json", "--verbose"]
         args.append(contentsOf: ["--model", request.model])
         let prompt = request.providerPrompt
-        switch request.reasoningEffort {
-        case .some(.minimal), .some(.low): args.append(contentsOf: ["--effort", "low"])
-        case .some(.high): args.append(contentsOf: ["--effort", "high"])
-        case .some(.xhigh): args.append(contentsOf: ["--effort", "xhigh"])
-        case .some(.medium), .none: args.append(contentsOf: ["--effort", "medium"])
-        }
+        args.append(contentsOf: effortArgs(request.reasoningEffort))
+        args.append(contentsOf: ultracodeSettingsArgs(request.reasoningEffort))
         // Resume the prior session so the model keeps full context.
         if let ptid = request.providerThreadId, !ptid.isEmpty {
             args.append(contentsOf: ["--resume", ptid])
@@ -74,12 +97,8 @@ public final class ClaudeRunner: AgentProviderRunner, @unchecked Sendable {
             "--replay-user-messages"
         ]
         args.append(contentsOf: ["--model", request.model])
-        switch request.reasoningEffort {
-        case .some(.minimal), .some(.low): args.append(contentsOf: ["--effort", "low"])
-        case .some(.high): args.append(contentsOf: ["--effort", "high"])
-        case .some(.xhigh): args.append(contentsOf: ["--effort", "xhigh"])
-        case .some(.medium), .none: args.append(contentsOf: ["--effort", "medium"])
-        }
+        args.append(contentsOf: effortArgs(request.reasoningEffort))
+        args.append(contentsOf: ultracodeSettingsArgs(request.reasoningEffort))
         if let ptid = request.providerThreadId, !ptid.isEmpty {
             args.append(contentsOf: ["--resume", ptid])
         } else {
