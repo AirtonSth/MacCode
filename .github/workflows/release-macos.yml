@@ -16,7 +16,7 @@ permissions:
 jobs:
   stable-macos-arm64-dmg:
     name: stable-macos-arm64-RemoteCode.dmg
-    runs-on: macos-14
+    runs-on: macos-15
     env:
       ASSET_NAME: stable-macos-arm64-RemoteCode.dmg
       GHOSTTYKIT_ASSET: GhosttyKit.xcframework.tar.gz
@@ -33,6 +33,11 @@ jobs:
       NOTARY_TEAM_ID: ${{ secrets.APPLE_TEAM_ID || secrets.ELECTROBUN_TEAMID }}
       NOTARY_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD || secrets.ELECTROBUN_APPLEIDPASS }}
     steps:
+      - name: Select Xcode with Swift 6.1+
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+
       - name: Checkout release tag
         uses: actions/checkout@v4
         with:
