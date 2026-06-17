@@ -4785,6 +4785,24 @@ public struct AgentAppView: View {
             .frame(maxWidth: .infinity, alignment: .leading)
     }
 
+    // UX-MAC_AGENT-018: one-click "Copy message" for agent replies, mirroring the
+    // user-message copy affordance. Copies the displayed text (for a translated
+    // reply that is the human-readable translation, i.e. exactly what's on screen).
+    @ViewBuilder
+    private func assistantCopyBar(text: String, identifierSuffix: String) -> some View {
+        HStack(spacing: DS.Space.xs) {
+            Button { copyToPasteboard(text) } label: {
+                Image(systemName: "doc.on.doc").font(.system(size: 10))
+            }
+            .buttonStyle(.plain)
+            .foregroundColor(DS.Palette.textTertiary)
+            .accessibilityLabel("Copy message")
+            .accessibilityIdentifier("agent.assistantMessage.copy.\(identifierSuffix)")
+            .help("Copy message")
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
     private func runningHiddenTranscriptRow(
         _ count: Int,
         revealed: Bool,
@@ -5079,6 +5097,7 @@ public struct AgentAppView: View {
                             }
                         }
                         assistantProse(msg.content)
+                        assistantCopyBar(text: msg.content, identifierSuffix: msg.id.value.uuidString)
                     }
                 }
             }
@@ -5142,7 +5161,10 @@ public struct AgentAppView: View {
             // already rendered it (prevents the answer showing twice).
             if let final = turn.finalAssistantMessage,
                Self.shouldRenderFinalAssistantMessage(turn, persistedAssistantTexts: persistedAssistantTexts) {
-                assistantProse(final)
+                VStack(alignment: .leading, spacing: DS.Space.xs) {
+                    assistantProse(final)
+                    assistantCopyBar(text: final, identifierSuffix: turn.turnId)
+                }
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
