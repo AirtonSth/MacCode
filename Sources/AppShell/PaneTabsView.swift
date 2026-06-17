@@ -1543,6 +1543,15 @@ final class PaneTabButton: NSView {
     // treat clicks here as a window drag and the tab/close never fire.
     override var mouseDownCanMoveWindow: Bool { false }
 
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        guard let hit = super.hitTest(point) else { return nil }
+        if hit === self { return self }
+        if let button = enclosingView(from: hit, as: NSButton.self) { return button }
+        return self
+    }
+
     // PERF-MAC_SHELL_WINDOW-005: if this tab is torn out of its window
     // mid-drag (e.g. window closed during a drag), the static drag-feedback
     // refs would otherwise leak a ghost/highlight until the next clear.

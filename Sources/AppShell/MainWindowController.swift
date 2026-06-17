@@ -670,6 +670,7 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
     /// mutations -- mutations that, by contract, never alter the structural
     /// signature.
     public func applyFocusChangeInPlace(surfaceToFocus: SurfaceID?) {
+        applyDetachedFocusChangeInPlace(surfaceToFocus: surfaceToFocus)
         if paneControllers.isEmpty {
             // Container not yet built (initial mount / first focus before any
             // rebuild). Fall back to full refresh so RatioSplitView is created.
@@ -681,6 +682,18 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
             focusSurface(sid)
         }
         shellLog.debug("applyFocusChangeInPlace surface=\(surfaceToFocus.map { $0.value.uuidString } ?? "nil", privacy: .public)")
+    }
+
+    private func applyDetachedFocusChangeInPlace(surfaceToFocus: SurfaceID?) {
+        guard let surfaceToFocus,
+              let ctx = context,
+              let workspaceID = ctx.state.workspaces.first(where: { _, workspace in
+                  workspace.layout.paneIDs().contains { paneID in
+                      workspace.layout.find(paneID: paneID)?.surfaces.contains { $0.id == surfaceToFocus } == true
+                  }
+              })?.key,
+              let controller = workspaceWindows[workspaceID] else { return }
+        controller.applyFocusChangeInPlace(surfaceToFocus: surfaceToFocus)
     }
 
     /// UX-MAC_SHELL_WINDOW-003: close the focused pane's selected surface
@@ -1513,6 +1526,24 @@ private final class WorkspaceWindowController: NSObject, NSWindowDelegate, PaneK
     func refreshSurfaceRuntimeState() {
         for controller in paneControllers {
             controller.refreshBusyStates()
+        }
+    }
+
+    func applyFocusChangeInPlace(surfaceToFocus: SurfaceID?) {
+        guard let ws = context?.state.workspaces[workspaceID] else {
+            closeFromOwner()
+            return
+        }
+        if paneControllers.isEmpty {
+            refreshFromState()
+            return
+        }
+        for controller in paneControllers {
+            guard let freshPane = ws.layout.find(paneID: controller.pane.id) else { continue }
+            controller.reconcile(to: freshPane)
+        }
+        if let surfaceToFocus, let surface = SurfaceRegistry.shared.surface(surfaceToFocus) {
+            surface.focus()
         }
     }
 

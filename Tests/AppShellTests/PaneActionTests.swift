@@ -1056,6 +1056,48 @@ final class PaneActionTests: XCTestCase {
                      "the new workspace window should not include the main sidebar split view")
     }
 
+    func test_focusSurfaceReconcilesDetachedWorkspaceWindowTabs() throws {
+        let (ctx, router) = try makeContext()
+        let detached = try router.createWorkspace(name: "detached-focus", cwd: NSTemporaryDirectory())
+        guard case .pane(let initialPane) = detached.layout,
+              let firstSurfaceID = initialPane.surfaces.first?.id else {
+            return XCTFail("expected a single-pane workspace with a default surface")
+        }
+        let second = try router.createSurface(
+            workspace: detached.id,
+            type: .terminal,
+            paneID: initialPane.id,
+            title: "terminal-proof"
+        )
+        try router.focusSurface(workspace: detached.id, surface: second.id)
+        _ = try router.createWorkspace(name: "main-focus", cwd: NSTemporaryDirectory())
+        let controller = MainWindowController(context: ctx, router: router)
+        router.windowController = controller
+
+        controller.openWorkspaceInNewWindow(detached.id)
+        defer { controller.workspaceWindow(for: detached.id)?.orderOut(nil) }
+        let detachedWindow = try XCTUnwrap(controller.workspaceWindow(for: detached.id))
+        detachedWindow.contentView?.layoutSubtreeIfNeeded()
+
+        try router.focusSurface(workspace: detached.id, surface: firstSurfaceID)
+        drainMainQueue()
+
+        let content = try XCTUnwrap(detachedWindow.contentView)
+        let firstTab = try XCTUnwrap(tabButton(in: content, surfaceID: firstSurfaceID))
+        let secondTab = try XCTUnwrap(tabButton(in: content, surfaceID: second.id))
+        let firstSurfaceView = try XCTUnwrap(SurfaceRegistry.shared.surface(firstSurfaceID)?.view)
+        let secondSurfaceView = try XCTUnwrap(SurfaceRegistry.shared.surface(second.id)?.view)
+
+        XCTAssertTrue(firstTab.selectedForTesting,
+                      "a tab click in a detached workspace routes through focusSurface; the detached window must repaint the newly selected tab after that single click")
+        XCTAssertFalse(secondTab.selectedForTesting,
+                       "the previously selected detached-window tab must clear its selected state without requiring a second click")
+        XCTAssertTrue(firstSurfaceView.isDescendant(of: content),
+                      "the detached workspace window must mount the newly selected surface content after one tab click")
+        XCTAssertFalse(secondSurfaceView.isDescendant(of: content),
+                       "the previously selected surface content must be removed from the detached workspace window after one tab click")
+    }
+
     func test_backButtonFromWorkspaceWindowReturnsToMainSidebarWithoutClosingAppWindow() throws {
         let (ctx, router) = try makeContext()
         let detached = try router.createWorkspace(name: "detached-back", cwd: NSTemporaryDirectory())
@@ -1258,6 +1300,12 @@ final class PaneActionTests: XCTestCase {
             current = candidate.superview
         }
         return true
+    }
+
+    private func tabButton(in view: NSView, surfaceID: SurfaceID) -> PaneTabButton? {
+        allSubviews(of: view)
+            .compactMap { $0 as? PaneTabButton }
+            .first { $0.surfaceIDForTesting == surfaceID }
     }
 
     private func tabProgressIndicators(in controller: MainWindowController, surfaceID: SurfaceID) -> [NSProgressIndicator] {
