@@ -27,36 +27,8 @@ final class AgentProviderInstructionTextTests: XCTestCase {
         XCTAssertTrue(planInstructions.contains("Do not edit"))
     }
 
-    /// Regression for the Codex `| distill` bug. Codex (app-server) has NO automatic
-    /// tool-output compression — the PostToolUse distill hook is Claude-SDK-only. Codex's
-    /// single reliable per-turn channel for the Token Saver rule is `developer_instructions`.
-    /// Without the rule here Codex almost never pipes, so large command output is never
-    /// compressed and Token Saver records ~no command-output savings for Codex. Conversely the
-    /// rule must NOT appear when Token Saver is off: the managed `distill` CLI is uninstalled
-    /// then, so a `cmd | distill` pipe would fail with command-not-found and drop the output.
-    func test_developerInstructionsCarryDistillRule_onlyWhenTokenSaverEnabled() {
-        for mode in [AgentInteractionMode.default, .plan] {
-            let on = AgentProviderInstructionText.developerInstructions(for: mode, tokenSaverEnabled: true)
-            let off = AgentProviderInstructionText.developerInstructions(for: mode, tokenSaverEnabled: false)
-
-            XCTAssertTrue(on.contains("| distill"),
-                          "\(mode) developer_instructions must instruct piping through distill when Token Saver is on")
-            XCTAssertFalse(off.contains("distill"),
-                           "\(mode) developer_instructions must not mention distill when Token Saver is off (CLI is uninstalled)")
-            XCTAssertTrue(off.count < on.count, "the distill rule is additive over the unchanged base instructions")
-            XCTAssertLessThanOrEqual(on.count, 420,
-                                     "developer_instructions are sent every Codex turn; keep the distill rule tight")
-        }
-    }
-
-    /// The default (off) call site used by every existing turn must be byte-identical to the
-    /// pre-fix text so non-Token-Saver runs are untouched.
-    func test_developerInstructionsDefaultArgMatchesTokenSaverDisabled() {
-        for mode in [AgentInteractionMode.default, .plan] {
-            XCTAssertEqual(
-                AgentProviderInstructionText.developerInstructions(for: mode),
-                AgentProviderInstructionText.developerInstructions(for: mode, tokenSaverEnabled: false)
-            )
-        }
-    }
+    // The Token Saver distill spec is no longer composed in CoreModel — it now rides on top of
+    // this base inside CodexAppServerClient (which owns the full distill body). The on/off
+    // behavior is verified end-to-end there: see CodexAppServerClientTests
+    // test_tokenSaverHint_drivesFullDistillSpecInDeveloperInstructions.
 }

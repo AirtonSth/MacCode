@@ -48,5 +48,39 @@ final class ProviderEnvironmentAttributionTests: XCTestCase {
             "1",
             "Codex relies on this hint to enable `| distill` in its developer_instructions when Token Saver is on"
         )
+        // The merge must also carry Claude's PostToolUse compression env end-to-end.
+        XCTAssertEqual(
+            router.providerEnvironment(provider: .claude, instanceId: nil)["RC_TOKEN_SAVER_POST_TOOL_USE"],
+            "1",
+            "Claude's SDK-bridge PostToolUse compression hook is driven by this env from providerEnvironment"
+        )
+    }
+
+    /// The Token Saver env is built in ONE place (AppContext.tokenSaverAgentEnvironment) and shared
+    /// by both the normal run path (providerEnvironment) and the recovered-session path (the
+    /// coordinator rebuilds its own request env, bypassing providerEnvironment). Before this was
+    /// shared, recovered sessions silently dropped the distill hint and stopped piping/speaking
+    /// distill on resume even with Token Saver on. Codex must get the distill hint only; Claude
+    /// additionally gets the PostToolUse compression vars.
+    @MainActor
+    func test_tokenSaverAgentEnvironment_isSharedAndProviderScoped() throws {
+        let appSupport = NSTemporaryDirectory() + "RC2TSEnv-" + UUID().uuidString
+        let ctx = try AppContext(channel: .debug, appSupportOverride: appSupport)
+
+        // Off: empty for both providers (managed distill CLI is uninstalled).
+        XCTAssertTrue(ctx.tokenSaverAgentEnvironment(provider: .codex).isEmpty)
+        XCTAssertTrue(ctx.tokenSaverAgentEnvironment(provider: .claude).isEmpty)
+
+        SettingsStore(db: ctx.db).update { $0.tokenSaverEnabled = true }
+
+        let codex = ctx.tokenSaverAgentEnvironment(provider: .codex)
+        XCTAssertEqual(codex["RC_TOKEN_SAVER_DISTILL_HINT"], "1")
+        XCTAssertNil(codex["RC_TOKEN_SAVER_POST_TOOL_USE"],
+                     "PostToolUse auto-compression is Claude-SDK-only; Codex must not carry it")
+
+        let claude = ctx.tokenSaverAgentEnvironment(provider: .claude)
+        XCTAssertEqual(claude["RC_TOKEN_SAVER_DISTILL_HINT"], "1")
+        XCTAssertEqual(claude["RC_TOKEN_SAVER_POST_TOOL_USE"], "1")
+        XCTAssertNotNil(claude["REMOTE_CODE_DISTILL_STATE_PATH"])
     }
 }

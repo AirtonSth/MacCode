@@ -148,6 +148,11 @@ public final class AppContext {
             guard let self else { return response }
             return await self.tokenSaverHumanizeSR1Response(response, provider: provider, threadId: threadId, runId: runId)
         }
+        // Recovered sessions rebuild their own request env in the coordinator, bypassing
+        // providerEnvironment; feed them the same Token Saver env so distill survives resume.
+        self.coordinator.recoveryEnvironmentProvider = { [weak self] provider in
+            await self?.tokenSaverAgentEnvironment(provider: provider) ?? [:]
+        }
         // P3 (opt-in, default OFF): compact large tool output in persisted stream events,
         // CCR-backed and structure-preserving, so replay still decodes. Our-storage saving.
         if SettingsStore(db: db).load().historyCompactionEnabled {
@@ -464,6 +469,29 @@ public final class AppContext {
     static var isRunningUnitTests: Bool {
         ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil ||
             NSClassFromString("XCTestCase") != nil
+    }
+
+    /// Token Saver environment vars for an agent run: the `| distill` hint (both providers) and
+    /// Claude's PostToolUse compression state path. Single source for both the normal run path
+    /// (`AppCommandRouter.providerEnvironment`) and the recovered-session path (the coordinator
+    /// rebuilds its own request env, bypassing providerEnvironment). Empty when Token Saver is off:
+    /// the managed `distill` CLI is uninstalled then, so a `cmd | distill` pipe would fail.
+    func tokenSaverAgentEnvironment(provider: AgentProvider) -> [String: String] {
+        guard SettingsStore(db: db).load().tokenSaverEnabled else { return [:] }
+        // Signal the agent to pipe large command output through the managed `distill` CLI. Codex
+        // (app-server) reads this in its per-turn developer_instructions; the Claude SDK bridge
+        // reads it to inject the distill systemPrompt.
+        var env = ["RC_TOKEN_SAVER_DISTILL_HINT": "1"]
+        if provider == .claude {
+            // Claude additionally auto-compresses tool output via the SDK-bridge PostToolUse hook,
+            // which talks straight to the sidecar over HTTP using this state file.
+            env["RC_TOKEN_SAVER_POST_TOOL_USE"] = "1"
+            env["REMOTE_CODE_DISTILL_STATE_PATH"] = appSupportDirectory
+                .appendingPathComponent("Distill", isDirectory: true)
+                .appendingPathComponent("DistillCLIState.json")
+                .path
+        }
+        return env
     }
 
     public func reconcileManagedDistillSkills(tokenSaverEnabled: Bool) {
@@ -892,6 +920,7 @@ public final class AppContext {
         let fallback = Self.fallbackHumanizeSR1(response, targetLanguage: targetLanguage)
         guard let client = await currentDistillClientWaitingForStartup() else {
             NSLog("RemoteCode Token Saver SR1 humanize fallback used (provider=\(provider.rawValue)): distill client unavailable (status=\(Self.describe(tokenSaverDistillServiceController.status)))")
+            recordTokenSaverSR1HumanizeSavings(sr1: response, humanized: fallback, provider: provider)
             return fallback
         }
 
@@ -924,6 +953,7 @@ public final class AppContext {
             return humanized
         } catch {
             NSLog("RemoteCode Token Saver SR1 humanize fallback used (provider=\(provider.rawValue)): \(error)")
+            recordTokenSaverSR1HumanizeSavings(sr1: response, humanized: fallback, provider: provider)
             return fallback
         }
     }

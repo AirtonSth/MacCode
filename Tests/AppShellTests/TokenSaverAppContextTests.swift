@@ -958,6 +958,38 @@ final class TokenSaverAppContextTests: XCTestCase {
                        "every successful local sidecar humanization call must update Token Saver reports")
     }
 
+    func test_tokenSaverHumanizedSR1FallbackRecordsEstimatedTokensWhenSidecarUnavailable() async throws {
+        let appSupport = NSTemporaryDirectory() + "RC2TokenSaverSR1FallbackSavings-" + UUID().uuidString
+        let context = try AppContext(channel: .debug, appSupportOverride: appSupport)
+        SettingsStore(db: context.db).update { $0.tokenSaverEnabled = true }
+
+        let thread = AgentThread(title: "sr1 fallback", provider: .claude, model: "fake-model")
+        try context.threadRepo.upsert(thread)
+        try context.messageRepo.append(AgentMessage(
+            threadId: thread.id,
+            role: .user,
+            content: "Please answer in English using the compact Token Saver language."
+        ))
+
+        let sr1 = """
+        S ok.
+        O /tmp/index.html created.
+        P tests passed.
+        """
+
+        let humanized = await context.tokenSaverHumanizeSR1Response(sr1, provider: .claude, threadId: thread.id)
+
+        XCTAssertNotEqual(humanized, sr1)
+        let summary = try context.tokenSaverSavingsRepo.summary()
+        let claude = try XCTUnwrap(summary.savings(for: "claude"),
+                                   "fallback SR1 expansion still saves output tokens and must be visible in the report")
+        XCTAssertEqual(claude.inputTokens, TokenEstimator.estimate(humanized))
+        XCTAssertEqual(claude.outputTokens, TokenEstimator.estimate(sr1))
+        XCTAssertEqual(claude.savedTokens, max(TokenEstimator.estimate(humanized) - TokenEstimator.estimate(sr1), 0))
+        XCTAssertEqual(claude.runs, 1)
+        XCTAssertEqual(summary.modes.first?.mode, "sr1-humanize")
+    }
+
     func test_tokenSaverUsageForDistillSkillRunDoesNotRecordSavingsWithoutSidecarCall() throws {
         let appSupport = NSTemporaryDirectory() + "RC2TokenSaverDistillSkillSavings-" + UUID().uuidString
         let context = try AppContext(channel: .debug, appSupportOverride: appSupport)

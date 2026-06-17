@@ -1,6 +1,12 @@
 import XCTest
 @testable import DistillCore
 
+private actor DistillCompressorSavingsBox {
+    private var records: [DistillSavingsRecord] = []
+    func append(_ record: DistillSavingsRecord) { records.append(record) }
+    func snapshot() -> [DistillSavingsRecord] { records }
+}
+
 final class DistillCompressorTests: XCTestCase {
     func test_libraryCompressUsesStableInProcessAPI() async throws {
         let input = """
@@ -18,6 +24,34 @@ final class DistillCompressorTests: XCTestCase {
         XCTAssertNil(response.auditReport)
     }
 
+    func test_libraryCompressRecordsSavingsWhenReportWriterIsInjected() async throws {
+        let input = """
+        {
+          "status": "ok",
+          "items": [1, 2, 3, 4, 5],
+          "message": "verbose payload that should be structurally compressed"
+        }
+        """
+        let records = DistillCompressorSavingsBox()
+        let compressor = DistillCompressor(
+            runtime: LocalDistillRuntime(),
+            savingsRecorder: { record in await records.append(record) }
+        )
+
+        let response = try await compressor.compress(input, mode: .longText, provider: "codex")
+        let captured = await records.snapshot()
+
+        let record = try XCTUnwrap(captured.first, "library compression must expose a savings record to the report writer")
+        XCTAssertEqual(captured.count, 1)
+        XCTAssertEqual(record.provider, "codex")
+        XCTAssertEqual(record.mode, "longText (deterministic)",
+                       "the report row must include the compression engine that produced the saving")
+        XCTAssertEqual(record.inputTokens, response.inputTokens)
+        XCTAssertEqual(record.outputTokens, response.outputTokens)
+        XCTAssertEqual(record.savedTokens, response.savedTokens)
+        XCTAssertGreaterThan(record.savedTokens, 0)
+    }
+
     func test_libraryCompressSupportsSimulateWithoutReplacingRawInput() async throws {
         let input = String(repeating: "verbose line\n", count: 80)
         let compressor = DistillCompressor(runtime: LocalDistillRuntime())
@@ -27,6 +61,25 @@ final class DistillCompressorTests: XCTestCase {
         XCTAssertEqual(response.output, input)
         XCTAssertEqual(response.runMode, .simulate)
         XCTAssertNotNil(response.auditReport)
+    }
+
+    func test_libraryCompressDoesNotRecordSavingsForSimulationRuns() async throws {
+        let records = DistillCompressorSavingsBox()
+        let compressor = DistillCompressor(
+            runtime: LocalDistillRuntime(),
+            savingsRecorder: { record in await records.append(record) }
+        )
+
+        _ = try await compressor.compress(
+            String(repeating: "verbose line\n", count: 80),
+            mode: .longText,
+            provider: "claude",
+            runMode: .simulate
+        )
+
+        let captured = await records.snapshot()
+        XCTAssertTrue(captured.isEmpty,
+                      "simulation/audit compression must not inflate the real Token Saver report")
     }
 
     func test_deployPolicyAllowsLibraryAndRetrieveOnlyMCP() {

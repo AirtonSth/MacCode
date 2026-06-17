@@ -266,6 +266,15 @@ final class FileTreeStore<Item: FileTreeItem> {
             .first(where: { $0.relativePath == relativePath })
     }
 
+    func cachedItem(id: String) -> Item? {
+        if let root = roots.first(where: { $0.item.id == id }) {
+            return root.item
+        }
+        return childCache.values.lazy
+            .flatMap { $0 }
+            .first(where: { $0.id == id })
+    }
+
     private func fetch(_ path: String, force: Bool) throws -> [Item] {
         if !force, let cached = childCache[path] { return cached }
         let fetched = try lister(path)
@@ -1095,6 +1104,11 @@ final class FilesViewModel: ObservableObject {
             ?? treeStore.cachedItem(relativePath: relativePath)
     }
 
+    func entryForSelectionID(_ id: String) -> FileEntry? {
+        entries.first(where: { $0.id == id })
+            ?? treeStore.cachedItem(id: id)
+    }
+
     func isExpanded(_ directory: FileEntry) -> Bool {
         expandedPaths.contains(directory.relativePath)
     }
@@ -1120,6 +1134,11 @@ final class FilesViewModel: ObservableObject {
             return
         }
         loadFile(entry)
+    }
+
+    func selectIfNeeded(_ entry: FileEntry) {
+        guard selectedEntry?.id != entry.id else { return }
+        select(entry)
     }
 
     func loadFile(_ entry: FileEntry) {
@@ -1684,8 +1703,8 @@ private struct FilesSurfaceRoot: View {
         .onChange(of: selectedFileIDs) { ids in
             guard ids.count == 1,
                   let id = ids.first,
-                  let entry = model.entries.first(where: { $0.id == id }) else { return }
-            model.select(entry)
+                  let entry = model.entryForSelectionID(id) else { return }
+            model.selectIfNeeded(entry)
         }
         // Seed cachedPreviewHTML immediately on first appear so the initial render
         // is not blank. Subsequent changes go through the debounce path.
@@ -1860,6 +1879,10 @@ private struct FilesSurfaceRoot: View {
                             .accessibilityIdentifier("files.moveDropIndicator.\(entry.relativePath)")
                     }
                 }
+                .onTapGesture {
+                    selectedFileIDs = [entry.id]
+                    model.selectIfNeeded(entry)
+                }
         }
         .tag(entry.id)
         .listRowInsets(EdgeInsets(top: 1, leading: 0, bottom: 1, trailing: 0))
@@ -1979,7 +2002,7 @@ private struct FilesSurfaceRoot: View {
     }
 
     private var selectedEntries: [FileEntry] {
-        model.entries.filter { selectedFileIDs.contains($0.id) }
+        selectedFileIDs.compactMap(model.entryForSelectionID)
     }
 
     private var deleteTitle: String {

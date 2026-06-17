@@ -188,6 +188,49 @@ final class FilesViewModelRoutingTests: XCTestCase {
             "initial state must open the selected editable file session")
     }
 
+    func test_entryForSelectionIDFindsExpandedNestedFile() {
+        let router = FakeFilesRouter()
+        router.listings[""] = [FakeFilesRouter.fileEntry("src", isDirectory: true)]
+        router.listings["src"] = [FakeFilesRouter.fileEntry("src/App.swift")]
+        let model = makeModel(router: router)
+        defer { model.close() }
+
+        model.loadDirectory("")
+        model.toggleExpand(model.entries[0])
+
+        let selected = model.entryForSelectionID("/workspace/src/App.swift")
+
+        XCTAssertEqual(selected?.relativePath, "src/App.swift",
+            "clicking a file inside an expanded folder must resolve the cached row by List selection id so the file opens")
+        guard let selected else {
+            return XCTFail("expanded nested file selection must resolve before opening")
+        }
+        model.select(selected)
+        XCTAssertEqual(model.selectedPath, "src/App.swift",
+            "clicking a cached nested file row must open the selected file, not leave the reader empty")
+        XCTAssertTrue(router.operations.contains("open:src/App.swift"),
+            "clicking a cached nested file row must call filesEditOpen for the target path")
+    }
+
+    func test_selectIfNeededDoesNotReopenAlreadySelectedFile() {
+        let router = FakeFilesRouter()
+        router.listings[""] = [FakeFilesRouter.fileEntry("README.md")]
+        let model = makeModel(router: router)
+        defer { model.close() }
+
+        model.loadDirectory("")
+        let entry = model.entries[0]
+        model.select(entry)
+        let openCount = router.operations.filter { $0 == "open:README.md" }.count
+
+        model.selectIfNeeded(entry)
+
+        XCTAssertEqual(openCount, 1,
+            "the first click should open the file exactly once")
+        XCTAssertEqual(router.operations.filter { $0 == "open:README.md" }.count, 1,
+            "tap handling and List selection changes can both fire, but the same selected file must not reopen a second edit session")
+    }
+
     func test_createFileTrimsNameCreatesUnderCurrentDirectoryAndOpensIt() {
         let router = FakeFilesRouter()
         router.listings["docs"] = []

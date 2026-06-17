@@ -3021,15 +3021,7 @@ public struct SidebarRootView: View {
     }
 
     private static func formatTokenCount(_ value: Int) -> String {
-        if value >= 1_000_000 {
-            let whole = Double(value) / 1_000_000.0
-            return String(format: whole >= 10 ? "%.0fM" : "%.1fM", whole)
-        }
-        if value >= 1_000 {
-            let whole = Double(value) / 1_000.0
-            return String(format: whole >= 10 ? "%.0fK" : "%.1fK", whole)
-        }
-        return "\(value)"
+        formatTokenCountPublic(value)
     }
 
     private static func formatPercent(_ progress: Double) -> String {

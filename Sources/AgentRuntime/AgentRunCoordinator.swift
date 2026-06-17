@@ -93,6 +93,13 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     /// unchanged on any error.
     public var finalResponseTranslator: (@Sendable (_ response: String, _ provider: AgentProvider, _ threadId: AgentThreadID, _ runId: AgentRunID) async -> String)?
 
+    /// Token Saver hook for RECOVERED sessions. The coordinator rebuilds the run request for a
+    /// resumed session itself (`recoverAdapterSessionIfNeeded`), bypassing the app shell's
+    /// `providerEnvironment`. Without this the recovered run loses `RC_TOKEN_SAVER_DISTILL_HINT`
+    /// and silently stops piping `| distill` / speaking distill even with Token Saver on. Returns
+    /// the Token Saver env vars to merge for the given provider; nil/empty => pre-fix behavior.
+    public var recoveryEnvironmentProvider: (@Sendable (_ provider: AgentProvider) async -> [String: String])?
+
     /// Fired (on an arbitrary executor) when a final assistant message was SR1-translated
     /// and persisted. Callers can use the id to badge the message in the UI.
     /// Not fired when translation is a no-op (finalResponseTranslator absent or text unchanged).
@@ -640,6 +647,11 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             throw AgentProviderAdapterError.unsupported("Provider session recovery requires cwd")
         }
         let activeTurnId = ProviderSessionRuntimePayload.decode(session.runtimePayloadJSON).activeTurnId
+        // Recovered sessions are rebuilt here, bypassing the app shell's providerEnvironment, so
+        // re-derive the Token Saver env or distill silently turns off on resume. Always keep the
+        // provider tag so `| distill` savings attribute to claude/codex (not "unknown").
+        var environment = await recoveryEnvironmentProvider?(thread.provider) ?? [:]
+        environment["REMOTE_CODE_AGENT_PROVIDER"] = thread.provider.rawValue
         let request = AgentRunRequest(
             threadId: threadId,
             provider: thread.provider,
@@ -652,9 +664,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             reasoningEffort: thread.reasoningEffort,
             serviceTier: session.serviceTier,
             interactionMode: .default,
-            // Tag the recovered session's environment with the provider so `| distill`
-            // tool calls attribute Token Saver savings correctly (not "unknown").
-            environment: ["REMOTE_CODE_AGENT_PROVIDER": thread.provider.rawValue],
+            environment: environment,
             extraArgs: activeTurnId.map { ["remotecode.recovery.activeTurnId=\($0)"] } ?? []
         )
         try await adapter.recoverSession(request) { _ in }

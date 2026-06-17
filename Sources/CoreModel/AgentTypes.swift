@@ -274,23 +274,16 @@ public enum AgentProviderInstructionText {
         """
     }
 
-    /// Reinforces the Token Saver `| distill` rule in the channel RemoteCode controls every
-    /// turn. Codex (app-server) has no automatic tool-output compression hook — that is
-    /// Claude-SDK-only — so its developer_instructions are the only reliable place to make it
-    /// pipe command output. The caller gates this on Token Saver being enabled: the managed
-    /// `distill` CLI exists only then, so instructing the pipe while disabled would fail with
-    /// command-not-found and drop the command's output.
-    public static let tokenSaverDistillInstruction = "Token Saver is ON: pipe every non-interactive command whose output exceeds ~10 lines or ~1KB through the managed `distill` CLI with an extraction prompt, e.g. `git diff | distill \"summarize changes\"`. Skip only for exact bytes, interactive/TUI, or when distill is unavailable."
-
-    public static func developerInstructions(for mode: AgentInteractionMode, tokenSaverEnabled: Bool = false) -> String {
-        let base: String
+    /// The base mode instruction Codex receives every turn as `developer_instructions`. The Token
+    /// Saver distill spec is composed on top of this in `CodexAppServerClient` (it owns the full
+    /// distill body, which lives in the AgentRuntime layer); this stays a focused, mode-only base.
+    public static func developerInstructions(for mode: AgentInteractionMode) -> String {
         switch mode {
         case .default:
-            base = "Implement clear requests; keep scope; preserve unrelated work; verify; ask before ambiguous/risky edits."
+            return "Implement clear requests; keep scope; preserve unrelated work; verify; ask before ambiguous/risky edits."
         case .plan:
-            base = "Plan only. Do not edit, run destructive commands, or implement until user approval."
+            return "Plan only. Do not edit, run destructive commands, or implement until user approval."
         }
-        return tokenSaverEnabled ? base + " " + tokenSaverDistillInstruction : base
     }
 
     public static func providerPreamble(for mode: AgentInteractionMode) -> String {

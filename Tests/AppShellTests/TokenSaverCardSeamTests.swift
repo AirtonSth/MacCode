@@ -192,6 +192,24 @@ final class TokenSaverCardSeamTests: XCTestCase {
                       "Rings label must include the saved token count formatted as K: \(label)")
     }
 
+    func test_formatTokenCountPublic_switchesToMillionsAtOneMillion() {
+        // WHY: million-scale totals must read as "M", not as four-digit "K"
+        // (e.g. 1909K). Sub-million provider rows stay in K so they remain
+        // legible; the threshold is exactly 1M.
+        let claude = 99_000
+        let codex = 480_000
+        let other = 776_000
+
+        XCTAssertEqual(SidebarRootView.formatTokenCountPublic(claude), "99K")
+        XCTAssertEqual(SidebarRootView.formatTokenCountPublic(codex), "480K")
+        XCTAssertEqual(SidebarRootView.formatTokenCountPublic(other), "776K")
+        // 1,355,000 crosses the 1M threshold -> one-decimal M headline.
+        XCTAssertEqual(SidebarRootView.formatTokenCountPublic(claude + codex + other), "1.4M")
+        // Boundary: exactly 1M switches to M; 999,999 stays in K.
+        XCTAssertEqual(SidebarRootView.formatTokenCountPublic(1_000_000), "1.0M")
+        XCTAssertEqual(SidebarRootView.formatTokenCountPublic(999_999), "1000K")
+    }
+
     func test_ringsAccessibilityLabel_containsClaudePercent() {
         // WHY: Claude usage ring must be readable by VoiceOver, not just visible.
         let label = SidebarRootView.ringsAccessibilityLabel(

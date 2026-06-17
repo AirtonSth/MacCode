@@ -287,7 +287,7 @@ final class CodexAppServerClientTests: XCTestCase {
         XCTAssertEqual((params["sandboxPolicy"] as? [String: Any])?["type"] as? String, "dangerFullAccess")
     }
 
-    func test_startTurnInjectsDistillRuleIntoDeveloperInstructionsWhenTokenSaverHintPresent() async throws {
+    func test_tokenSaverHint_drivesFullDistillSpecInDeveloperInstructions() async throws {
         let script = try makeFakeAppServerPeer()
         let client = try CodexAppServerClient(
             binary: script,
@@ -312,9 +312,17 @@ final class CodexAppServerClientTests: XCTestCase {
                 environment: ["RC_TOKEN_SAVER_DISTILL_HINT": "1"]
             )
         )
+        let hintInstructions = try XCTUnwrap(collaborationSettings(from: withHint)["developer_instructions"] as? String)
         XCTAssertTrue(
-            (try collaborationSettings(from: withHint)["developer_instructions"] as? String)?.contains("| distill") == true,
+            hintInstructions.contains("| distill"),
             "the Token Saver env hint must drive Codex developer_instructions to pipe `| distill`"
+        )
+        // Parity with Claude's per-session systemPrompt: Codex must also receive the full distill
+        // LANGUAGE spec per turn, not just the pipe rule — otherwise it depends solely on the
+        // easily-buried ~/.codex/AGENTS.md to speak distill. "AR-0/AR-1" is unique to the full body.
+        XCTAssertTrue(
+            hintInstructions.contains("AR-0/AR-1"),
+            "Codex developer_instructions must carry the full distill language spec when Token Saver is on, not only the pipe rule"
         )
 
         // No hint => Token Saver off => the managed distill CLI is uninstalled, so Codex must NOT

@@ -2,17 +2,20 @@ import Foundation
 
 public struct DistillCompressor: Sendable {
     private let scheduler: DistillScheduler
+    private let savingsRecorder: (@Sendable (DistillSavingsRecord) async -> Void)?
 
     public init(
         runtime: any DistillRuntime = LocalDistillRuntime(),
         maxConcurrentRequests: Int = 2,
-        maxQueueDepth: Int = 0
+        maxQueueDepth: Int = 0,
+        savingsRecorder: (@Sendable (DistillSavingsRecord) async -> Void)? = nil
     ) {
         self.scheduler = DistillScheduler(
             runtime: runtime,
             maxConcurrentRequests: maxConcurrentRequests,
             maxQueueDepth: maxQueueDepth
         )
+        self.savingsRecorder = savingsRecorder
     }
 
     public func compress(
@@ -29,11 +32,16 @@ public struct DistillCompressor: Sendable {
             input: input,
             question: question,
             provider: provider,
-            recordSavings: false,
+            recordSavings: savingsRecorder != nil,
             runMode: runMode,
             maxOutputCharacters: maxOutputCharacters
         )
-        return try await scheduler.submit(request)
+        let response = try await scheduler.submit(request)
+        if let savingsRecorder,
+           let record = DistillSavingsCalculator.record(for: request, response: response) {
+            await savingsRecorder(record)
+        }
+        return response
     }
 }
 
