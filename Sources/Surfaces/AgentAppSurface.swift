@@ -3236,7 +3236,14 @@ public struct AgentAppView: View {
     }
 
     static let userMessagePreviewCharacterLimit = 1_200
-    static let runningTranscriptContextSlack: TimeInterval = 2
+    nonisolated static let runningTranscriptContextSlack: TimeInterval = 2
+    // PERF-MAC_AGENT-023: idle/completed threads render their transcript in an
+    // eager (non-Lazy) VStack, so a very long thread re-builds and re-lays-out the
+    // whole history on every routine invalidation (focus, hover, scroll, the
+    // one-shot completion tick) — pathologically slow on huge threads. Bound the
+    // idle render to a recent tail, mirroring the running-state window; the older
+    // slice stays one tap away via the existing "earlier transcript items" reveal.
+    nonisolated static let idleTranscriptWindowCount = 30
     static let liveTurnRenderableItemLimit = 48
     static let liveTurnBodyCharacterLimit = 2_000
     static let liveTurnOutputCharacterLimit = 1_500
@@ -3337,15 +3344,38 @@ public struct AgentAppView: View {
     }
 
     private var visibleTranscriptEntries: [TranscriptEntry] {
-        let entries = transcriptEntries
-        guard vm.status == .running,
-              let startedAt = vm.runStartedAt,
-              entries.count > 2 else {
-            return entries
+        Self.visibleTranscriptWindow(
+            entries: transcriptEntries,
+            status: vm.status,
+            runStartedAt: vm.runStartedAt
+        )
+    }
+
+    /// Pure seam: which transcript entries the eager VStack renders.
+    ///
+    /// - Running: the time-cutoff live window (entries at/after `runStartedAt`
+    ///   minus `runningSlack`), with a 2-entry floor — unchanged behavior.
+    /// - Idle/completed: the most recent `idleWindowCount` entries when the thread
+    ///   is longer than that, so a huge thread no longer re-renders in full on
+    ///   every invalidation. The pre-window slice is surfaced by the existing
+    ///   `hiddenTranscriptSlice` + reveal row, so no history is dropped.
+    nonisolated static func visibleTranscriptWindow(
+        entries: [TranscriptEntry],
+        status: AgentRunStatus,
+        runStartedAt: Date?,
+        idleWindowCount: Int = idleTranscriptWindowCount,
+        runningSlack: TimeInterval = runningTranscriptContextSlack
+    ) -> [TranscriptEntry] {
+        if status == .running {
+            // Running path is unchanged: the time-cutoff live window, with the
+            // existing 2-entry floor and the "return all" fallbacks preserved.
+            guard let startedAt = runStartedAt, entries.count > 2 else { return entries }
+            let cutoff = startedAt.addingTimeInterval(-runningSlack).timeIntervalSince1970
+            let liveEntries = entries.filter { $0.sortTime >= cutoff }
+            return liveEntries.isEmpty ? Array(entries.suffix(2)) : liveEntries
         }
-        let cutoff = startedAt.addingTimeInterval(-Self.runningTranscriptContextSlack).timeIntervalSince1970
-        let liveEntries = entries.filter { $0.sortTime >= cutoff }
-        return liveEntries.isEmpty ? Array(entries.suffix(2)) : liveEntries
+        guard entries.count > idleWindowCount else { return entries }
+        return Array(entries.suffix(idleWindowCount))
     }
 
     /// Cheap identity signature: changes only when a message/turn is added,
@@ -4142,6 +4172,11 @@ public struct AgentAppView: View {
             .onChange(of: vm.runStartedAt) { newValue in
                 if newValue != nil { transcriptHistoryRevealed = false }
             }
+            // PERF-MAC_AGENT-023: also collapse on thread switch. Idle threads now
+            // bound their render to a recent tail (visibleTranscriptWindow), so a
+            // revealed flag carried into a different long thread would eagerly
+            // render its whole history with no user action — reintroducing the hang.
+            .onChange(of: vm.selectedThreadId) { _ in transcriptHistoryRevealed = false }
         }
     }
 
