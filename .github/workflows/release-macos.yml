@@ -150,11 +150,14 @@ jobs:
         id: s3
         run: |
           if [ -z "$AWS_RELEASE_UPLOAD_ROLE_ARN" ]; then
-            echo "enabled=false" >> "$GITHUB_OUTPUT"
-            echo "AWS_RELEASE_UPLOAD_ROLE_ARN secret is missing; skipping S3 release upload"
-          else
-            echo "enabled=true" >> "$GITHUB_OUTPUT"
+            echo "AWS_RELEASE_UPLOAD_ROLE_ARN secret is required for public macOS downloads"
+            exit 1
           fi
+          if [ -z "$CLOUDFRONT_DISTRIBUTION_ID" ]; then
+            echo "REMOTECODE_IO_CLOUDFRONT_DISTRIBUTION_ID secret is required for release download invalidation"
+            exit 1
+          fi
+          echo "enabled=true" >> "$GITHUB_OUTPUT"
 
       - name: Configure AWS credentials for S3 release upload
         if: ${{ steps.s3.outputs.enabled == 'true' }}
@@ -168,9 +171,11 @@ jobs:
         run: |
           aws s3 cp "dist/$ASSET_NAME" "s3://$S3_BUCKET/$S3_DOWNLOAD_PREFIX/${{ steps.release.outputs.tag }}/$ASSET_NAME" \
             --content-type "application/x-apple-diskimage" \
+            --acl public-read \
             --cache-control "public, max-age=31536000, immutable"
           aws s3 cp "dist/$ASSET_NAME" "s3://$S3_BUCKET/$S3_DOWNLOAD_PREFIX/latest/$ASSET_NAME" \
             --content-type "application/x-apple-diskimage" \
+            --acl public-read \
             --cache-control "no-cache, max-age=0"
 
       - name: Generate Sparkle appcast
@@ -218,6 +223,7 @@ jobs:
         run: |
           aws s3 cp "dist/pages/appcast.xml" "s3://$S3_BUCKET/$S3_DOWNLOAD_PREFIX/appcast.xml" \
             --content-type "application/xml; charset=utf-8" \
+            --acl public-read \
             --cache-control "no-cache, max-age=0"
 
       - name: Upload Sparkle appcast to release
@@ -233,4 +239,4 @@ jobs:
         run: |
           aws cloudfront create-invalidation \
             --distribution-id "$CLOUDFRONT_DISTRIBUTION_ID" \
-            --paths "/$S3_DOWNLOAD_PREFIX/appcast.xml" "/$S3_DOWNLOAD_PREFIX/latest/$ASSET_NAME"
+            --paths "/$S3_DOWNLOAD_PREFIX/appcast.xml" "/$S3_DOWNLOAD_PREFIX/latest/$ASSET_NAME" "/$S3_DOWNLOAD_PREFIX/${{ steps.release.outputs.tag }}/$ASSET_NAME"
