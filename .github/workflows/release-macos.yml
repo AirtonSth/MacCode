@@ -138,28 +138,6 @@ jobs:
           codesign --verify --deep --strict --verbose=4 "$MOUNT/RemoteCode.app"
           spctl --assess --type execute --verbose=4 "$MOUNT/RemoteCode.app"
 
-      - name: Verify S3 release upload configuration
-        run: |
-          if [ -z "$AWS_RELEASE_UPLOAD_ROLE_ARN" ]; then
-            echo "Missing AWS_RELEASE_UPLOAD_ROLE_ARN secret"
-            exit 1
-          fi
-
-      - name: Configure AWS credentials for S3 release upload
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          aws-region: ${{ env.AWS_REGION }}
-          role-to-assume: ${{ env.AWS_RELEASE_UPLOAD_ROLE_ARN }}
-
-      - name: Upload DMG to S3
-        run: |
-          aws s3 cp "dist/$ASSET_NAME" "s3://$S3_BUCKET/$S3_DOWNLOAD_PREFIX/${{ steps.release.outputs.tag }}/$ASSET_NAME" \
-            --content-type "application/x-apple-diskimage" \
-            --cache-control "public, max-age=31536000, immutable"
-          aws s3 cp "dist/$ASSET_NAME" "s3://$S3_BUCKET/$S3_DOWNLOAD_PREFIX/latest/$ASSET_NAME" \
-            --content-type "application/x-apple-diskimage" \
-            --cache-control "no-cache, max-age=0"
-
       - name: Upload DMG to release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -167,6 +145,33 @@ jobs:
           gh release upload "${{ steps.release.outputs.tag }}" "dist/$ASSET_NAME" \
             --repo "$GITHUB_REPOSITORY" \
             --clobber
+
+      - name: Check S3 release upload configuration
+        id: s3
+        run: |
+          if [ -z "$AWS_RELEASE_UPLOAD_ROLE_ARN" ]; then
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "AWS_RELEASE_UPLOAD_ROLE_ARN secret is missing; skipping S3 release upload"
+          else
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Configure AWS credentials for S3 release upload
+        if: ${{ steps.s3.outputs.enabled == 'true' }}
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: ${{ env.AWS_RELEASE_UPLOAD_ROLE_ARN }}
+
+      - name: Upload DMG to S3
+        if: ${{ steps.s3.outputs.enabled == 'true' }}
+        run: |
+          aws s3 cp "dist/$ASSET_NAME" "s3://$S3_BUCKET/$S3_DOWNLOAD_PREFIX/${{ steps.release.outputs.tag }}/$ASSET_NAME" \
+            --content-type "application/x-apple-diskimage" \
+            --cache-control "public, max-age=31536000, immutable"
+          aws s3 cp "dist/$ASSET_NAME" "s3://$S3_BUCKET/$S3_DOWNLOAD_PREFIX/latest/$ASSET_NAME" \
+            --content-type "application/x-apple-diskimage" \
+            --cache-control "no-cache, max-age=0"
 
       - name: Generate Sparkle appcast
         env:
@@ -209,6 +214,7 @@ jobs:
           grep -F "$ASSET_NAME" dist/pages/appcast.xml
 
       - name: Upload Sparkle appcast to S3
+        if: ${{ steps.s3.outputs.enabled == 'true' }}
         run: |
           aws s3 cp "dist/pages/appcast.xml" "s3://$S3_BUCKET/$S3_DOWNLOAD_PREFIX/appcast.xml" \
             --content-type "application/xml; charset=utf-8" \
@@ -223,7 +229,7 @@ jobs:
             --clobber
 
       - name: Invalidate release downloads on CloudFront
-        if: ${{ env.CLOUDFRONT_DISTRIBUTION_ID != '' }}
+        if: ${{ steps.s3.outputs.enabled == 'true' && env.CLOUDFRONT_DISTRIBUTION_ID != '' }}
         run: |
           aws cloudfront create-invalidation \
             --distribution-id "$CLOUDFRONT_DISTRIBUTION_ID" \
