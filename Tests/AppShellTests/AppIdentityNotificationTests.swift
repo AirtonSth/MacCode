@@ -82,6 +82,8 @@ final class AppIdentityNotificationTests: XCTestCase {
                       "the release workflow must generate the appcast that Sparkle polls")
         XCTAssertTrue(workflow.contains("aws-actions/configure-aws-credentials@v4"),
                       "release CI must assume the AWS role before publishing public artifacts to the private frontend bucket")
+        XCTAssertFalse(workflow.contains("--acl public-read"),
+                       "release uploads must rely on CloudFront OAC instead of public ACLs because the frontend bucket blocks public ACLs")
         XCTAssertTrue(workflow.contains("s3://$S3_BUCKET/$S3_DOWNLOAD_PREFIX/${{ steps.release.outputs.tag }}/$ASSET_NAME"),
                       "the notarized DMG must be copied to a versioned S3 key so Sparkle does not depend on private GitHub release URLs")
         XCTAssertTrue(workflow.contains("s3://$S3_BUCKET/$S3_DOWNLOAD_PREFIX/appcast.xml"),
