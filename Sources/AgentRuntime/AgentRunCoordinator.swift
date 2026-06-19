@@ -446,6 +446,32 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         onRunFinished?(threadId, stoppedRunId, .cancelled)
     }
 
+    /// F9: drop a deleted thread's residual per-thread coordinator state (the
+    /// auto-continuation streak counter and its generation token). These are the
+    /// only per-thread maps not already evicted at run finish/stop, so without this
+    /// they accumulate one Int entry per thread that ever ran for the life of the
+    /// process. Safe to call on delete: a deleted thread can never auto-continue —
+    /// any scheduled continuation fails its validity check once the token is gone
+    /// and the thread row no longer reports `.completed`.
+    public func forgetThread(_ threadId: AgentThreadID) {
+        lock.lock()
+        autoContinuationCounts.removeValue(forKey: threadId)
+        autoContinuationTokens.removeValue(forKey: threadId)
+        lock.unlock()
+    }
+
+    #if DEBUG
+    // Test-only seam for the F9 per-thread eviction: seed and observe the
+    // auto-continuation bookkeeping without driving a full stalled autonomous run.
+    func seedAutoContinuationStateForTesting(_ threadId: AgentThreadID) {
+        lock.lock(); autoContinuationCounts[threadId] = 1; autoContinuationTokens[threadId] = 1; lock.unlock()
+    }
+    var autoContinuationThreadIdsForTesting: Set<AgentThreadID> {
+        lock.lock(); defer { lock.unlock() }
+        return Set(autoContinuationCounts.keys).union(autoContinuationTokens.keys)
+    }
+    #endif
+
     // MARK: - Background-await auto-continuation (UX-MAC_AGENT-BG-AWAIT)
 
     private func resetAutoContinuationStreak(_ threadId: AgentThreadID) {

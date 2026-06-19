@@ -5,7 +5,7 @@ import SwiftUI
 @testable import Surfaces
 import CoreModel
 import Persistence
-import AgentRuntime
+@testable import AgentRuntime
 
 /// Behavioural coverage for thread rename/delete in the agent app view
 /// model. Proves the sidebar contract: rename trims + persists, deleting
@@ -3416,6 +3416,39 @@ final class AgentAppViewModelTests: XCTestCase {
                       "switching threads must reset SR1 translation state (F6: no cross-thread accumulation)")
         XCTAssertTrue(vm.sr1OriginalTextsByMessageId.isEmpty,
                       "switching threads must also drop the retained original texts")
+    }
+
+    // F9: deleting a thread must evict its per-thread VM caches and the coordinator's
+    // per-thread auto-continuation bookkeeping, which previously leaked one entry per
+    // deleted thread for the life of the surface.
+    @MainActor
+    func test_deleteThread_evictsPerThreadVMCachesAndCoordinatorState() throws {
+        let (vm, threadRepo) = try makeVM()
+        let a = AgentThread(title: "A", provider: .claude, model: "m")
+        let b = AgentThread(title: "B", provider: .claude, model: "m")
+        try threadRepo.upsert(a)
+        try threadRepo.upsert(b)
+        vm.reloadThreads()
+
+        // Populate a per-thread VM cache: type a draft on A, then switch away so it
+        // is stashed in composerDraftsByThread[A].
+        vm.selectThread(a.id)
+        vm.prompt = "unsent draft for A"
+        vm.selectThread(b.id)
+        // Seed the coordinator's per-thread auto-continuation state for A.
+        vm.coordinator.seedAutoContinuationStateForTesting(a.id)
+
+        XCTAssertTrue(vm.threadCacheResidueForTesting.contains(a.id),
+                      "precondition: A is present in a per-thread VM cache")
+        XCTAssertTrue(vm.coordinator.autoContinuationThreadIdsForTesting.contains(a.id),
+                      "precondition: A is present in coordinator auto-continuation state")
+
+        vm.deleteThread(a.id)
+
+        XCTAssertFalse(vm.threadCacheResidueForTesting.contains(a.id),
+                       "deleting a thread must leave no residue in any per-thread VM cache (F9)")
+        XCTAssertFalse(vm.coordinator.autoContinuationThreadIdsForTesting.contains(a.id),
+                       "deleting a thread must drop its coordinator auto-continuation state (F9)")
     }
 }
 

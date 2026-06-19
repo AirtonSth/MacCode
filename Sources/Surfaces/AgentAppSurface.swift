@@ -1616,6 +1616,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     public func deleteThread(_ id: AgentThreadID) {
         let undo = captureThreadDeletionUndo(ids: [id])
         try? threadRepo.delete(id: id)
+        evictThreadCaches([id])
         if selectedThreadId == id {
             selectedThreadId = nil
         messages = []
@@ -1630,6 +1631,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         guard !ids.isEmpty else { return }
         let undo = captureThreadDeletionUndo(ids: Array(ids))
         try? threadRepo.delete(ids: Array(ids))
+        evictThreadCaches(ids)
         if let selectedThreadId, ids.contains(selectedThreadId) {
             self.selectedThreadId = nil
         messages = []
@@ -1639,6 +1641,36 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         reloadThreads()
         armThreadDeletionUndo(undo)
     }
+
+    /// F9: drop deleted threads' per-thread caches so they don't leak for the life
+    /// of the surface (composer drafts, the streaming dedup caches, workspace
+    /// membership, the repaired-title marker), plus the coordinator's per-thread
+    /// auto-continuation bookkeeping. The thread's persistent state is captured for
+    /// undo separately; these transient caches rebuild on demand if a delete is
+    /// undone.
+    private func evictThreadCaches(_ ids: some Sequence<AgentThreadID>) {
+        for id in ids {
+            repairedThreadIds.remove(id)
+            threadWorkspaceCache.removeValue(forKey: id)
+            composerDraftsByThread.removeValue(forKey: id)
+            lastPersistedAssistantContentByThread.removeValue(forKey: id)
+            lastPersistedFinalIdByThread.removeValue(forKey: id)
+            coordinator.forgetThread(id)
+        }
+    }
+
+    #if DEBUG
+    /// Test-only: the set of thread ids still present in ANY per-thread VM cache,
+    /// so a test can prove `evictThreadCaches` leaves no residue after a delete.
+    var threadCacheResidueForTesting: Set<AgentThreadID> {
+        var ids = repairedThreadIds
+        ids.formUnion(threadWorkspaceCache.keys)
+        ids.formUnion(composerDraftsByThread.keys)
+        ids.formUnion(lastPersistedAssistantContentByThread.keys)
+        ids.formUnion(lastPersistedFinalIdByThread.keys)
+        return ids
+    }
+    #endif
 
     /// Snapshot the threads (+ their messages) about to be deleted, BEFORE the
     /// store removes them. Returns nil if nothing could be captured so the undo
