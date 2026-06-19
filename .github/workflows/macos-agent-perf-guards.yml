@@ -21,6 +21,7 @@ jobs:
     runs-on: macos-15
     env:
       GHOSTTYKIT_ASSET: GhosttyKit.xcframework.tar.gz
+      RC2_WIDE_LAYOUT_REBUILD_BUDGET_MS: 3000
     steps:
       - name: Select Xcode with Swift 6.1+
         uses: maxim-lobanov/setup-xcode@v1

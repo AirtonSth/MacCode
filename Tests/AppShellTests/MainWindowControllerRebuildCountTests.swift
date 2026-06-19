@@ -385,7 +385,8 @@ final class MainWindowControllerRebuildCountTests: XCTestCase {
         wc.refreshFromState()
         drainMainQueue()
         let elapsedMs = Double(DispatchTime.now().uptimeNanoseconds - start.uptimeNanoseconds) / 1_000_000
-        let budgetMs = 750.0
+        let budgetMs = ProcessInfo.processInfo.environment["RC2_WIDE_LAYOUT_REBUILD_BUDGET_MS"]
+            .flatMap(Double.init) ?? 750.0
         let wideLayout = try XCTUnwrap(ctx.state.workspaces[workspaceID]?.layout)
 
         print("WideLayoutRebuildBenchmark panes=6 tabs=40 elapsedMs=\(Int(elapsedMs)) budgetMs=\(Int(budgetMs))")
