@@ -62,6 +62,26 @@ struct TimelineItemIndex: Sendable, Equatable {
     }
 }
 
+/// F1: the composer's live text on its OWN ObservableObject. A keystroke publishes
+/// to this object (observed by the composer subtree) and NOT to AgentAppViewModel —
+/// which owns the transcript (messages/timeline) and whose `body` would otherwise
+/// re-evaluate the whole transcript on every keypress on a long thread.
+@MainActor
+public final class AgentComposerState: ObservableObject {
+    @Published public var prompt: String = ""
+}
+
+/// F1: scopes @ObservedObject observation to the composer subtree. A change to the
+/// composer text re-renders only this wrapper (and the `composer` it rebuilds),
+/// WITHOUT invalidating the enclosing AgentAppView body that owns the transcript.
+/// View-model-driven changes still reach the composer because AgentAppView re-creates
+/// this wrapper (with a fresh `content`) whenever the view model publishes.
+private struct ComposerReactiveScope<Content: View>: View {
+    @ObservedObject var composerState: AgentComposerState
+    @ViewBuilder var content: () -> Content
+    var body: some View { content() }
+}
+
 @MainActor
 public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     @Published public var threads: [AgentThread] = []
@@ -72,7 +92,15 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     @Published public var userInputSelections: [String: Set<String>] = [:]
     @Published public var userInputDrafts: [String: String] = [:]
     @Published public var focusTick: Int = 0
-    @Published public var prompt: String = ""
+    /// F1: composer text lives on `composerState` so keystrokes don't republish the
+    /// transcript-bearing view model. This proxy keeps every existing `vm.prompt`
+    /// read/write working unchanged; because it is a computed (non-@Published)
+    /// property, mutating it fires `composerState.objectWillChange`, NOT this VM's.
+    public let composerState = AgentComposerState()
+    public var prompt: String {
+        get { composerState.prompt }
+        set { composerState.prompt = newValue }
+    }
     // UX-XPLAT-009: UTF-16 cursor offset reported by PromptComposerEditor so
     // suggestions anchor at the actual insertion point, not text.endIndex.
     // nil means "not yet reported by the editor" -- suggestions fall back to
@@ -4045,7 +4073,10 @@ public struct AgentAppView: View {
             backgroundAwaitBanner
             pendingCallbackRows
             queuedMessagesSection
-            composer
+            // F1: render the composer inside a scope that observes only the composer
+            // text, so a keystroke re-renders the composer subtree and NOT this body
+            // (which builds the whole transcript).
+            ComposerReactiveScope(composerState: vm.composerState) { composer }
         }
         .background(DS.Palette.bg)
         // C6: Esc interrupts an in-flight run (remotecode.io parity).
@@ -5863,7 +5894,7 @@ public struct AgentAppView: View {
                     .padding(.top, DS.Space.md)
             }
             PromptComposerEditor(
-                text: $vm.prompt,
+                text: Binding(get: { vm.prompt }, set: { vm.prompt = $0 }),
                 height: $composerEditorHeight,
                 focusTick: vm.focusTick,
                 placeholder: "Ask \(vm.provider.rawValue.capitalized) for changes…",

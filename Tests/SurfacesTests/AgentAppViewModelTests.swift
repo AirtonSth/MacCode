@@ -1,6 +1,7 @@
 import XCTest
 import AppKit
 import MachO
+import Combine
 import SwiftUI
 @testable import Surfaces
 import CoreModel
@@ -3533,6 +3534,29 @@ final class AgentAppViewModelTests: XCTestCase {
                           "a persisted-message change must invalidate the cache (it changes the answer/worklog split)")
         XCTAssertNotEqual(base, AgentAppView.finishedTurnRenderSignature(turn: turn, assistantTextsKey: "m1|x", plansKey: "1|p"),
                           "a proposed-plan change must invalidate the cache")
+    }
+
+    // F1: a composer keystroke must publish the composer state ONLY, never the
+    // transcript-bearing view model — otherwise the whole transcript subtree
+    // re-evaluates on every keypress on a long thread (the reported lag).
+    @MainActor
+    func test_promptChange_publishesComposerStateNotViewModel() throws {
+        let (vm, _) = try makeVM()
+        var vmEmissions = 0
+        var composerEmissions = 0
+        let vmSub = vm.objectWillChange.sink { _ in vmEmissions += 1 }
+        let composerSub = vm.composerState.objectWillChange.sink { _ in composerEmissions += 1 }
+        defer { vmSub.cancel(); composerSub.cancel() }
+
+        // Simulate two keystrokes via the same proxy the composer binding writes to.
+        vm.prompt = "h"
+        vm.prompt = "hi"
+
+        XCTAssertEqual(vmEmissions, 0,
+                       "typing must NOT republish AgentAppViewModel — that would re-evaluate the whole transcript body per keystroke (F1)")
+        XCTAssertGreaterThanOrEqual(composerEmissions, 2,
+                                    "each composer text change must publish the composer state so the composer subtree updates")
+        XCTAssertEqual(vm.prompt, "hi", "the prompt proxy still reads/writes the composer text")
     }
 }
 
