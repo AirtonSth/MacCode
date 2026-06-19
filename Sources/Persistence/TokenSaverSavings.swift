@@ -19,13 +19,33 @@ public struct TokenSaverProviderSavings: Sendable, Equatable {
     }
 }
 
-/// One UTC day bucket of saved tokens, for the 7-day history chart.
+/// One calendar-day bucket of saved tokens, for the 7-day history chart.
 public struct TokenSaverDailySavings: Sendable, Equatable {
     public let dayStartMs: Int64
     public let savedTokens: Int
     public let runs: Int
 
     public init(dayStartMs: Int64, savedTokens: Int, runs: Int) {
+        self.dayStartMs = dayStartMs
+        self.savedTokens = savedTokens
+        self.runs = runs
+    }
+}
+
+/// One (provider, calendar-day) bucket of saved tokens from the retained event
+/// rows. This is the only structure with BOTH a provider and a time dimension,
+/// so it is what lets the details popover show per-provider savings for the same
+/// window (Today / Week) as the headline. Summing every provider's buckets for a
+/// day reproduces the collapsed `TokenSaverDailySavings` for that day exactly, so
+/// the per-provider rows reconcile with the windowed headline by construction.
+public struct TokenSaverProviderDailySavings: Sendable, Equatable {
+    public let provider: String
+    public let dayStartMs: Int64
+    public let savedTokens: Int
+    public let runs: Int
+
+    public init(provider: String, dayStartMs: Int64, savedTokens: Int, runs: Int) {
+        self.provider = provider
         self.dayStartMs = dayStartMs
         self.savedTokens = savedTokens
         self.runs = runs
@@ -57,15 +77,21 @@ public struct TokenSaverSavingsSummary: Sendable, Equatable {
     public let daily: [TokenSaverDailySavings]
     /// Per-(provider, mode) breakdown from the permanent accumulator.
     public let modes: [TokenSaverModeSavings]
+    /// Per-(provider, calendar-day) buckets over the retained report window. The
+    /// collapsed `daily` is the sum of these across providers, so the windowed
+    /// per-provider rows in the UI reconcile with the windowed headline.
+    public let dailyByProvider: [TokenSaverProviderDailySavings]
 
     public init(
         providers: [TokenSaverProviderSavings],
         daily: [TokenSaverDailySavings],
-        modes: [TokenSaverModeSavings] = []
+        modes: [TokenSaverModeSavings] = [],
+        dailyByProvider: [TokenSaverProviderDailySavings] = []
     ) {
         self.providers = providers
         self.daily = daily
         self.modes = modes
+        self.dailyByProvider = dailyByProvider
     }
 
     public var totalSavedTokens: Int { providers.reduce(0) { $0 + $1.savedTokens } }
@@ -106,11 +132,13 @@ public struct TokenSaverSavingsSummary: Sendable, Equatable {
 public final class TokenSaverSavingsRepository: @unchecked Sendable {
     private let db: SQLiteDB
     private let retentionDays: Int
+    private let calendar: Calendar
     private static let isoFormatter = ISO8601DateFormatter()
 
-    public init(db: SQLiteDB, retentionDays: Int = 7) {
+    public init(db: SQLiteDB, retentionDays: Int = 7, calendar: Calendar = .current) {
         self.db = db
         self.retentionDays = max(7, retentionDays)
+        self.calendar = calendar
     }
 
     private var retentionMs: Int64 { Int64(retentionDays) * 86_400_000 }
@@ -242,25 +270,56 @@ public final class TokenSaverSavingsRepository: @unchecked Sendable {
                 ))
             }
 
-            var daily: [TokenSaverDailySavings] = []
+            // Bucket the retained event rows by (provider, calendar-day). The
+            // collapsed daily total is derived from the same buckets so the
+            // per-provider windowed rows always sum to the windowed headline.
+            var providerDayBuckets: [String: [Int64: (savedTokens: Int, runs: Int)]] = [:]
             let perDay = try database.prepare("""
-                SELECT (created_at_ms / 86400000) * 86400000 AS day,
-                       COALESCE(SUM(saved_tokens), 0),
-                       COUNT(*)
+                SELECT provider,
+                       created_at_ms,
+                       COALESCE(saved_tokens, 0)
                 FROM token_saver_savings
                 WHERE created_at_ms >= ?
-                GROUP BY day
-                ORDER BY day;
+                ORDER BY created_at_ms;
             """)
             defer { perDay.reset() }
             try perDay.bind(1, cutoff)
             while try perDay.step() {
-                daily.append(TokenSaverDailySavings(
-                    dayStartMs: perDay.columnInt64(0),
-                    savedTokens: Int(perDay.columnInt64(1)),
-                    runs: Int(perDay.columnInt64(2))
-                ))
+                let provider = perDay.columnText(0) ?? "unknown"
+                let createdAtMs = perDay.columnInt64(1)
+                let savedTokens = Int(perDay.columnInt64(2))
+                let dayStartMs = self.dayStartMs(for: Date(timeIntervalSince1970: Double(createdAtMs) / 1000.0))
+                var byDay = providerDayBuckets[provider] ?? [:]
+                let current = byDay[dayStartMs] ?? (savedTokens: 0, runs: 0)
+                byDay[dayStartMs] = (
+                    savedTokens: current.savedTokens + savedTokens,
+                    runs: current.runs + 1
+                )
+                providerDayBuckets[provider] = byDay
             }
+            var dailyByProvider: [TokenSaverProviderDailySavings] = []
+            var collapsed: [Int64: (savedTokens: Int, runs: Int)] = [:]
+            for (provider, byDay) in providerDayBuckets {
+                for (dayStartMs, totals) in byDay {
+                    dailyByProvider.append(TokenSaverProviderDailySavings(
+                        provider: provider,
+                        dayStartMs: dayStartMs,
+                        savedTokens: totals.savedTokens,
+                        runs: totals.runs
+                    ))
+                    let current = collapsed[dayStartMs] ?? (savedTokens: 0, runs: 0)
+                    collapsed[dayStartMs] = (
+                        savedTokens: current.savedTokens + totals.savedTokens,
+                        runs: current.runs + totals.runs
+                    )
+                }
+            }
+            dailyByProvider.sort {
+                $0.dayStartMs != $1.dayStartMs ? $0.dayStartMs < $1.dayStartMs : $0.provider < $1.provider
+            }
+            let daily = collapsed
+                .map { TokenSaverDailySavings(dayStartMs: $0.key, savedTokens: $0.value.savedTokens, runs: $0.value.runs) }
+                .sorted { $0.dayStartMs < $1.dayStartMs }
 
             var modes: [TokenSaverModeSavings] = []
             let perMode = try database.prepare("""
@@ -280,7 +339,11 @@ public final class TokenSaverSavingsRepository: @unchecked Sendable {
                 ))
             }
 
-            return TokenSaverSavingsSummary(providers: providers, daily: daily, modes: modes)
+            return TokenSaverSavingsSummary(providers: providers, daily: daily, modes: modes, dailyByProvider: dailyByProvider)
         }
+    }
+
+    private func dayStartMs(for date: Date) -> Int64 {
+        Int64(calendar.startOfDay(for: date).timeIntervalSince1970 * 1000)
     }
 }

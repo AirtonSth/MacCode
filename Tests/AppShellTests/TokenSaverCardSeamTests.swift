@@ -1,6 +1,7 @@
 import XCTest
 import Foundation
 import AgentRuntime
+import Persistence
 @testable import AppShell
 
 // WHY: four UX items (186/187/188/195) + PERF-MAC_SIDEBAR-:101 each have a
@@ -86,7 +87,7 @@ final class TokenSaverCardSeamTests: XCTestCase {
     // MARK: - :187 scope label matches summing window
 
     func test_scopeLabel_today_notCurrentSession() {
-        // WHY: the "currentSession" bucket sums today's UTC-day; labelling it
+        // WHY: the "currentSession" bucket sums today's calendar day; labelling it
         // "Current Session" is a lie.  The seam-driven label is tested through
         // the public tokenSaverScopeTitle logic which now returns "Today".
         // We validate via lastUpdatedLabel as a proxy for the rule that
@@ -236,6 +237,23 @@ final class TokenSaverCardSeamTests: XCTestCase {
                       "Rings label must include codex used percent: \(label)")
     }
 
+    func test_ringsAccessibilityLabel_namesProvidedTarget() {
+        // WHY: Daily and Week use different saved-token targets, so VoiceOver
+        // must name the target passed by the current tab.
+        let label = SidebarRootView.ringsAccessibilityLabel(
+            scope: "week",
+            savedTokens: 10_000_000,
+            savedProgress: 1,
+            savedGoalTokens: 10_000_000,
+            claudeUsedProgress: 0.4,
+            codexUsedProgress: 0.2
+        )
+        XCTAssertTrue(label.contains("10M target"),
+                      "Rings label must name the fixed target: \(label)")
+        XCTAssertFalse(label.contains("provider spend"),
+                       "Rings label must not describe the old denominator: \(label)")
+    }
+
     func test_ringsAccessibilityLabel_zeroValues_stillNonEmpty() {
         // WHY: even a zero-state ring must produce a label; "nothing saved yet"
         // is valid information for a screen reader.
@@ -247,6 +265,232 @@ final class TokenSaverCardSeamTests: XCTestCase {
             codexUsedProgress: 0
         )
         XCTAssertFalse(label.isEmpty)
+    }
+
+    // MARK: - Token Saver saved-token targets
+
+    func test_tokenSaverSavingsGoalTokens_dailyIs2M_weekIs10M() {
+        // WHY: Product rule: Daily fills at 2M; Week fills at 10M.
+        XCTAssertEqual(SidebarRootView.tokenSaverSavingsGoalTokens(isDailyScope: true), 2_000_000)
+        XCTAssertEqual(SidebarRootView.tokenSaverSavingsGoalTokens(isDailyScope: false), 10_000_000)
+    }
+
+    func test_savingsToGoalProgress_dailyTwoMillionSaved_returnsFull() {
+        // WHY: Daily target is 2M saved tokens.
+        XCTAssertEqual(
+            SidebarRootView.savingsToGoalProgress(savedTokens: 2_000_000, goalTokens: 2_000_000),
+            1
+        )
+    }
+
+    func test_savingsToGoalProgress_weekFiveMillionSaved_returnsHalf() {
+        // WHY: Week target is 10M, so 5M saved should show a half ring.
+        XCTAssertEqual(
+            SidebarRootView.savingsToGoalProgress(savedTokens: 5_000_000, goalTokens: 10_000_000),
+            0.5,
+            accuracy: 0.000_001
+        )
+    }
+
+    func test_savingsToGoalProgress_moreThanGoal_clampsToFull() {
+        // WHY: the ring cannot render beyond 100%; savings above the tab target stay full.
+        XCTAssertEqual(
+            SidebarRootView.savingsToGoalProgress(savedTokens: 12_000_000, goalTokens: 10_000_000),
+            1
+        )
+    }
+
+    func test_savingsToGoalProgress_zeroSaved_returnsEmpty() {
+        // WHY: no measured savings must not show a filled impact ring.
+        XCTAssertEqual(
+            SidebarRootView.savingsToGoalProgress(savedTokens: 0, goalTokens: 2_000_000),
+            0
+        )
+    }
+
+    func test_savingsToGoalProgress_customGoalProtectsDivideByZero() {
+        // WHY: tests may pass custom goals; zero or negative goals should never
+        // crash or produce NaN.
+        XCTAssertEqual(
+            SidebarRootView.savingsToGoalProgress(savedTokens: 1, goalTokens: 0),
+            1
+        )
+    }
+
+    func test_tokenSaverTodaySavedTokens_atOneSecondAfterMidnight_ignoresYesterday() throws {
+        // WHY: when the calendar day turns to 00:00:01, Daily must reset even
+        // though yesterday's savings still belong in the Week window.
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = try XCTUnwrap(TimeZone(secondsFromGMT: 0))
+        let yesterday = try XCTUnwrap(DateComponents(
+            calendar: calendar,
+            timeZone: calendar.timeZone,
+            year: 2026,
+            month: 6,
+            day: 17,
+            hour: 23,
+            minute: 59,
+            second: 59
+        ).date)
+        let oneSecondAfterMidnight = try XCTUnwrap(DateComponents(
+            calendar: calendar,
+            timeZone: calendar.timeZone,
+            year: 2026,
+            month: 6,
+            day: 18,
+            hour: 0,
+            minute: 0,
+            second: 1
+        ).date)
+        let daily = [
+            TokenSaverDailySavings(
+                dayStartMs: SidebarRootView.tokenSaverDayStartMs(now: yesterday, calendar: calendar),
+                savedTokens: 8_000_000,
+                runs: 1
+            )
+        ]
+
+        XCTAssertEqual(
+            SidebarRootView.tokenSaverTodaySavedTokens(
+                daily: daily,
+                now: oneSecondAfterMidnight,
+                calendar: calendar
+            ),
+            0
+        )
+        XCTAssertEqual(
+            SidebarRootView.tokenSaverReportWindowSavedTokens(daily: daily),
+            8_000_000,
+            "Week must keep yesterday's saved tokens after Daily resets at midnight"
+        )
+    }
+
+    func test_tokenSaverNextDailyResetDate_schedulesOneSecondAfterMidnight() throws {
+        // WHY: an already-open Daily tab needs a state tick at 00:00:01 so the
+        // visible saved count clears without waiting for unrelated UI activity.
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = try XCTUnwrap(TimeZone(secondsFromGMT: 0))
+        let beforeMidnight = try XCTUnwrap(DateComponents(
+            calendar: calendar,
+            timeZone: calendar.timeZone,
+            year: 2026,
+            month: 6,
+            day: 17,
+            hour: 23,
+            minute: 59,
+            second: 59
+        ).date)
+        let expectedReset = try XCTUnwrap(DateComponents(
+            calendar: calendar,
+            timeZone: calendar.timeZone,
+            year: 2026,
+            month: 6,
+            day: 18,
+            hour: 0,
+            minute: 0,
+            second: 1
+        ).date)
+
+        XCTAssertEqual(
+            SidebarRootView.tokenSaverNextDailyResetDate(after: beforeMidnight, calendar: calendar),
+            expectedReset
+        )
+    }
+
+    // MARK: - Per-provider scoped savings (window-consistent reconciliation)
+
+    func test_tokenSaverPerProviderWindowing_today_isStrictSubsetOfWeek() throws {
+        // WHY: a provider row on the Today tab must show only today's calendar-day
+        // savings, while the Week tab sums every retained day for that provider.
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = try XCTUnwrap(TimeZone(secondsFromGMT: 0))
+        let today = try XCTUnwrap(DateComponents(
+            calendar: calendar, timeZone: calendar.timeZone,
+            year: 2026, month: 6, day: 18, hour: 12
+        ).date)
+        let yesterday = try XCTUnwrap(DateComponents(
+            calendar: calendar, timeZone: calendar.timeZone,
+            year: 2026, month: 6, day: 17, hour: 12
+        ).date)
+        let todayMs = SidebarRootView.tokenSaverDayStartMs(now: today, calendar: calendar)
+        let yestMs = SidebarRootView.tokenSaverDayStartMs(now: yesterday, calendar: calendar)
+        let dailyByProvider = [
+            TokenSaverProviderDailySavings(provider: "claude", dayStartMs: todayMs, savedTokens: 600, runs: 1),
+            TokenSaverProviderDailySavings(provider: "claude", dayStartMs: yestMs, savedTokens: 400, runs: 1),
+            TokenSaverProviderDailySavings(provider: "codex", dayStartMs: yestMs, savedTokens: 500, runs: 1)
+        ]
+
+        // Claude: today = 600 only; week = 600 + 400.
+        XCTAssertEqual(
+            SidebarRootView.tokenSaverTodaySaved(forProvider: "claude", dailyByProvider: dailyByProvider, now: today, calendar: calendar),
+            600
+        )
+        XCTAssertEqual(
+            SidebarRootView.tokenSaverWindowSaved(forProvider: "claude", dailyByProvider: dailyByProvider),
+            1000
+        )
+        // Codex only has a yesterday bucket, so Today = 0, Week = 500.
+        XCTAssertEqual(
+            SidebarRootView.tokenSaverTodaySaved(forProvider: "codex", dailyByProvider: dailyByProvider, now: today, calendar: calendar),
+            0,
+            "Codex saved nothing today, so the Today row must be 0 even though Week is 500"
+        )
+        XCTAssertEqual(
+            SidebarRootView.tokenSaverWindowSaved(forProvider: "codex", dailyByProvider: dailyByProvider),
+            500
+        )
+    }
+
+    func test_scopedProviderRows_reconcileWithGreenHeadline_todayAndWeek() throws {
+        // WHY: the bug the user hit — the green headline and the Claude/Codex/CLI
+        // rows described different windows. This proves that for EACH scope the
+        // visible rows sum exactly to the scope's green headline (the collapsed
+        // daily the headline reads).
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = try XCTUnwrap(TimeZone(secondsFromGMT: 0))
+        let today = try XCTUnwrap(DateComponents(
+            calendar: calendar, timeZone: calendar.timeZone,
+            year: 2026, month: 6, day: 18, hour: 12
+        ).date)
+        let yesterday = try XCTUnwrap(DateComponents(
+            calendar: calendar, timeZone: calendar.timeZone,
+            year: 2026, month: 6, day: 17, hour: 12
+        ).date)
+        let todayMs = SidebarRootView.tokenSaverDayStartMs(now: today, calendar: calendar)
+        let yestMs = SidebarRootView.tokenSaverDayStartMs(now: yesterday, calendar: calendar)
+        let dailyByProvider = [
+            TokenSaverProviderDailySavings(provider: "claude", dayStartMs: todayMs, savedTokens: 600, runs: 1),
+            TokenSaverProviderDailySavings(provider: "codex", dayStartMs: todayMs, savedTokens: 500, runs: 1),
+            TokenSaverProviderDailySavings(provider: "unknown", dayStartMs: todayMs, savedTokens: 2530, runs: 9),
+            TokenSaverProviderDailySavings(provider: "claude", dayStartMs: yestMs, savedTokens: 400, runs: 1)
+        ]
+        // Collapsed daily exactly as the repository derives it (green headline reads this).
+        let daily = [
+            TokenSaverDailySavings(dayStartMs: yestMs, savedTokens: 400, runs: 1),
+            TokenSaverDailySavings(dayStartMs: todayMs, savedTokens: 3630, runs: 11)
+        ]
+        let known: Set<String> = ["claude", "codex"]
+
+        // TODAY
+        let claudeToday = SidebarRootView.tokenSaverTodaySaved(forProvider: "claude", dailyByProvider: dailyByProvider, now: today, calendar: calendar)
+        let codexToday = SidebarRootView.tokenSaverTodaySaved(forProvider: "codex", dailyByProvider: dailyByProvider, now: today, calendar: calendar)
+        let otherToday = SidebarRootView.tokenSaverTodaySaved(forProvidersOtherThan: known, dailyByProvider: dailyByProvider, now: today, calendar: calendar)
+        let greenToday = SidebarRootView.tokenSaverTodaySavedTokens(daily: daily, now: today, calendar: calendar)
+        XCTAssertEqual(otherToday.savedTokens, 2530)
+        XCTAssertEqual(otherToday.runs, 9)
+        XCTAssertEqual(greenToday, 3630)
+        XCTAssertEqual(claudeToday + codexToday + otherToday.savedTokens, greenToday,
+                       "Today: Claude + Codex + CLI rows must equal the Today green headline")
+
+        // WEEK
+        let claudeWeek = SidebarRootView.tokenSaverWindowSaved(forProvider: "claude", dailyByProvider: dailyByProvider)
+        let codexWeek = SidebarRootView.tokenSaverWindowSaved(forProvider: "codex", dailyByProvider: dailyByProvider)
+        let otherWeek = SidebarRootView.tokenSaverWindowSaved(forProvidersOtherThan: known, dailyByProvider: dailyByProvider)
+        let greenWeek = SidebarRootView.tokenSaverReportWindowSavedTokens(daily: daily)
+        XCTAssertEqual(claudeWeek, 1000)
+        XCTAssertEqual(greenWeek, 4030)
+        XCTAssertEqual(claudeWeek + codexWeek + otherWeek.savedTokens, greenWeek,
+                       "Week: Claude + Codex + CLI rows must equal the Week green headline")
     }
 
     // MARK: - helpers

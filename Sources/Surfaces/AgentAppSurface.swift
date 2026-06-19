@@ -816,6 +816,32 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// B7: count of threads with an in-flight run, for the rail header.
     public var activeThreadCount: Int { threads.filter { $0.status == .running }.count }
 
+    /// Chrome should spin only for work the coordinator/repository still sees
+    /// as running. A stale local status must not keep tab/sidebar chrome busy.
+    public var hasRunningWorkForChrome: Bool {
+        let activeThreadIds = coordinator.activeThreadIdsSnapshot()
+        if let selectedThreadId, activeThreadIds.contains(selectedThreadId) { return true }
+        return threads.contains { $0.status == .running || activeThreadIds.contains($0.id) }
+    }
+
+    /// UX-MAC_AGENT-BG-AWAIT: the most recent final answer for the selected
+    /// thread, used to detect a background-await stall for the status badge /
+    /// Continue affordance. Prefers the live timeline's last turn, falling back to
+    /// the last persisted assistant message after a reload.
+    public var latestFinalAssistantMessage: String? {
+        if let final = timeline.turns.last?.finalAssistantMessage, !final.isEmpty { return final }
+        return messages.last(where: { $0.role == .assistant })?.content
+    }
+
+    /// UX-MAC_AGENT-BG-AWAIT: true when the selected thread finished while the
+    /// agent was still waiting on a background job it launched (e.g. "Standing by
+    /// for the demo recording to complete."). Surfaced as an "awaiting" badge plus
+    /// a Continue button instead of a misleading green "completed".
+    public var isAwaitingBackgroundWork: Bool {
+        status == .completed
+            && BackgroundAwaitContinuation.isAwaitingBackgroundWork(latestFinalAssistantMessage)
+    }
+
     /// P2: threads visible in the rail after applying the search query.
     /// Empty query returns all threads (no filtering).
     public var filteredThreads: [AgentThread] {
@@ -1926,6 +1952,15 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         _ = await startProviderRun(text: text, attached: attachments, recordHistory: false, interactionMode: interactionMode)
     }
 
+    /// UX-MAC_AGENT-BG-AWAIT: manually resume a thread that stalled awaiting a
+    /// background job (the supervised-mode counterpart of the autonomous auto-nudge
+    /// the coordinator runs for full-access threads).
+    public func continueAfterBackgroundWait() async {
+        guard isAwaitingBackgroundWork else { return }
+        prompt = BackgroundAwaitContinuation.continuationPrompt
+        await send()
+    }
+
     private var selectedThreadCanQueuePrompt: Bool {
         guard let selectedThreadId else { return false }
         if status == .running { return true }
@@ -2201,23 +2236,36 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     private func flushStreamEvents() {
         let pending = streamEventBatch.drain()
         guard !pending.isEmpty else { return }
+        var nextTimeline = timeline
+        var nextCurrentRunId = currentRunId
+        var nextStatus = status
+        var nextLastErrorRecoverable = lastErrorRecoverable
+        var appliedEvent = false
         for (event, run, threadId) in pending {
             guard threadId == self.selectedThreadId else { continue }
+            appliedEvent = true
             if !self.terminalRunIds.contains(run) {
-                self.currentRunId = run
+                nextCurrentRunId = run
                 self.runThreads[run] = threadId
-                if self.status != .running { self.status = .running }
+                if nextStatus != .running { nextStatus = .running }
             }
-            self.timeline.apply(event)
-            self.refreshSR1TranslationStateFromTimeline()
+            nextTimeline.apply(event)
             // UX-MAC_AGENT-009: track recoverability of the latest error so the
             // transcript can offer Retry; any other event clears the flag.
             if case let .error(_, recoverable) = event {
-                self.lastErrorRecoverable = recoverable
+                nextLastErrorRecoverable = recoverable
             } else {
-                self.lastErrorRecoverable = false
+                nextLastErrorRecoverable = false
             }
         }
+        guard appliedEvent else { return }
+        if self.currentRunId != nextCurrentRunId { self.currentRunId = nextCurrentRunId }
+        if self.status != nextStatus { self.status = nextStatus }
+        if self.lastErrorRecoverable != nextLastErrorRecoverable {
+            self.lastErrorRecoverable = nextLastErrorRecoverable
+        }
+        self.timeline = nextTimeline
+        self.refreshSR1TranslationStateFromTimeline()
         self.scheduleTimelineUpdateTick()
     }
 
@@ -2414,16 +2462,20 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     }
 
     private func refreshSR1TranslationStateFromTimeline() {
-        var ids = Set<AgentMessageID>()
-        var originals: [AgentMessageID: String] = [:]
+        var ids = sr1TranslatedMessageIds
+        var originals = sr1OriginalTextsByMessageId
         for (rawId, translation) in timeline.sr1TranslationsByMessageId {
             guard let uuid = UUID(uuidString: rawId) else { continue }
             let id = AgentMessageID(uuid)
             ids.insert(id)
             originals[id] = translation.originalText
         }
-        sr1TranslatedMessageIds.formUnion(ids)
-        sr1OriginalTextsByMessageId.merge(originals) { _, new in new }
+        if ids != sr1TranslatedMessageIds {
+            sr1TranslatedMessageIds = ids
+        }
+        if originals != sr1OriginalTextsByMessageId {
+            sr1OriginalTextsByMessageId = originals
+        }
     }
 }
 
@@ -3710,7 +3762,9 @@ public struct AgentAppView: View {
                 Divider()
                 Button("Rename…") { renameText = t.title; renamingThreadId = t.id }
                 Menu("Color") {
-                    Button("None") { vm.setThreadColor(t.id, "") }
+                    Button { vm.setThreadColor(t.id, "") } label: {
+                        TabColorMenuLabel.none
+                    }
                     ForEach(TabColor.allCases, id: \.self) { c in
                         Button { vm.setThreadColor(t.id, c.rawValue) } label: {
                             TabColorMenuLabel(c)
@@ -3779,6 +3833,7 @@ public struct AgentAppView: View {
                     .background(DS.Palette.bg)
             }
             timeline
+            backgroundAwaitBanner
             pendingCallbackRows
             queuedMessagesSection
             composer
@@ -3830,7 +3885,8 @@ public struct AgentAppView: View {
                 .foregroundColor(DS.Palette.textTertiary)
                 .lineLimit(1).truncationMode(.middle)
             Spacer(minLength: 0)
-            DSPill(vm.status.rawValue, tone: statusTone(vm.status))
+            DSPill(vm.isAwaitingBackgroundWork ? "awaiting" : vm.status.rawValue,
+                   tone: vm.isAwaitingBackgroundWork ? .warning : statusTone(vm.status))
             DSIconButton("list.bullet.rectangle", help: "Toggle plan") {
                 planSidebarIntent = vm.showPlanSidebar ? .forcedHidden : .forcedVisible
                 vm.showPlanSidebar.toggle()
@@ -4190,6 +4246,40 @@ public struct AgentAppView: View {
         if !expandedRequestPreviews.isEmpty { expandedRequestPreviews.formIntersection(liveRequestIds) }
         let liveTurnIds = Set(vm.timeline.turns.map(\.turnId))
         if !expandedCompletedWorkTurns.isEmpty { expandedCompletedWorkTurns.formIntersection(liveTurnIds) }
+    }
+
+    // UX-MAC_AGENT-BG-AWAIT: when a thread ends while the agent is still waiting on
+    // a background job it launched, the run reads "awaiting" (not a green
+    // "completed"); this banner lets the user resume it. Full-access threads are
+    // also auto-nudged by the coordinator, so this is mainly the supervised path.
+    @ViewBuilder
+    private var backgroundAwaitBanner: some View {
+        if vm.isAwaitingBackgroundWork {
+            HStack(spacing: DS.Space.sm) {
+                Image(systemName: "hourglass")
+                    .font(.system(size: 12))
+                    .foregroundColor(DS.Palette.warning)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Agent is waiting on a background task")
+                        .font(DS.Font.caption.weight(.semibold))
+                        .foregroundColor(DS.Palette.textSecondary)
+                    Text("The run ended while standing by. Resume it to check the task and finish.")
+                        .font(DS.Font.caption2)
+                        .foregroundColor(DS.Palette.textTertiary)
+                }
+                Spacer(minLength: 0)
+                Button("Continue") {
+                    Task { await vm.continueAfterBackgroundWait() }
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+            }
+            .padding(.horizontal, 22)
+            .padding(.vertical, DS.Space.sm)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(DS.Palette.bg)
+            .accessibilityIdentifier("agent.backgroundAwaitBanner")
+        }
     }
 
     @ViewBuilder
@@ -7531,7 +7621,7 @@ public final class AgentAppSurface: NSObject, Surface {
     }
 
     // A3: drives the tab/workspace spinner.
-    public var isBusy: Bool { viewModel.status == .running || viewModel.activeThreadCount > 0 }
+    public var isBusy: Bool { viewModel.hasRunningWorkForChrome }
 }
 
 // Pure keyboard-navigation helper for the thread rail.
@@ -7551,19 +7641,73 @@ enum AgentThreadRailKeyboardNav {
 }
 
 private struct TabColorMenuLabel: View {
-    let color: TabColor
+    let title: String
+    let swatchImage: NSImage
 
     init(_ color: TabColor) {
-        self.color = color
+        self.title = color.label
+        self.swatchImage = Self.swatchImage(hex: color.hex)
+    }
+
+    private init(title: String, swatchImage: NSImage) {
+        self.title = title
+        self.swatchImage = swatchImage
+    }
+
+    static var none: TabColorMenuLabel {
+        TabColorMenuLabel(title: "None", swatchImage: noneSwatchImage())
     }
 
     var body: some View {
         Label {
-            Text(color.label)
+            Text(title)
         } icon: {
-            RoundedRectangle(cornerRadius: 2, style: .continuous)
-                .fill(Color(hex: color.hex))
-                .frame(width: 12, height: 12)
+            Image(nsImage: swatchImage)
+                .renderingMode(.original)
         }
+    }
+
+    private static func swatchImage(hex: UInt32) -> NSImage {
+        menuImage { rect in
+            let path = NSBezierPath(
+                roundedRect: rect.insetBy(dx: 2, dy: 2),
+                xRadius: 3,
+                yRadius: 3
+            )
+            NSColor(hex: hex).setFill()
+            path.fill()
+            DS.NS.lineStrong.withAlphaComponent(0.75).setStroke()
+            path.lineWidth = 1
+            path.stroke()
+        }
+    }
+
+    private static func noneSwatchImage() -> NSImage {
+        menuImage { rect in
+            let box = NSBezierPath(
+                roundedRect: rect.insetBy(dx: 2, dy: 2),
+                xRadius: 3,
+                yRadius: 3
+            )
+            DS.NS.textTertiary.withAlphaComponent(0.9).setStroke()
+            box.lineWidth = 1
+            box.stroke()
+
+            let slash = NSBezierPath()
+            slash.move(to: NSPoint(x: rect.minX + 4, y: rect.minY + 4))
+            slash.line(to: NSPoint(x: rect.maxX - 4, y: rect.maxY - 4))
+            slash.lineWidth = 1.25
+            slash.stroke()
+        }
+    }
+
+    private static func menuImage(draw: @escaping (NSRect) -> Void) -> NSImage {
+        let size = NSSize(width: 14, height: 14)
+        let image = NSImage(size: size, flipped: false) { rect in
+            draw(rect)
+            return true
+        }
+        image.isTemplate = false
+        return image
     }
 }

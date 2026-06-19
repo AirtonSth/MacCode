@@ -1231,17 +1231,13 @@ public final class AppContext {
     }
 
     private func recordTokenSaverSR1HumanizeSavings(sr1: String, humanized: String, provider: AgentProvider) {
-        // Honest token accounting: the agent emitted compressed SR1 instead of
-        // the full human answer, so savings = estimate(human) - estimate(SR1).
-        let inputTokens = TokenEstimator.estimate(humanized)
-        let outputTokens = TokenEstimator.estimate(sr1)
-        let savedTokens = max(inputTokens - outputTokens, 0)
+        let estimate = TokenSaverSR1SavingsEstimator.estimate(sr1: sr1, humanized: humanized)
         recordTokenSaverSidecarSavings(
             provider: provider,
             mode: "sr1-humanize",
-            inputTokens: inputTokens,
-            outputTokens: outputTokens,
-            savedTokens: savedTokens
+            inputTokens: estimate.inputTokens,
+            outputTokens: estimate.outputTokens,
+            savedTokens: estimate.savedTokens
         )
     }
 

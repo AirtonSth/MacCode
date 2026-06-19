@@ -525,9 +525,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
             // "idle but healthy" from "silently dead socket" and surface an
             // honest live/stale indicator ("last synced Ns ago"). Seq-less so
             // it never collides with the ordered event stream.
-            let heartbeat = DispatchSource.makeTimerSource(queue: DispatchQueue.global())
-            heartbeat.schedule(deadline: .now() + heartbeatInterval, repeating: heartbeatInterval)
-            heartbeat.setEventHandler {
+            let enqueueHeartbeat = {
                 guard Self.shouldSendHeartbeat(
                     queued: outbound.queuedByteCount,
                     max: self.webSocketOutboundMaxQueuedBytes
@@ -538,6 +536,12 @@ public final class DirectHTTPServer: @unchecked Sendable {
                 ]) else { return }
                 _ = outbound.enqueue(data)
             }
+            // Send one frame immediately so iOS can mark the socket live before
+            // the server-side receive timeout races the first periodic heartbeat.
+            enqueueHeartbeat()
+            let heartbeat = DispatchSource.makeTimerSource(queue: DispatchQueue.global())
+            heartbeat.schedule(deadline: .now() + heartbeatInterval, repeating: heartbeatInterval)
+            heartbeat.setEventHandler(handler: enqueueHeartbeat)
             heartbeat.resume()
             // METRICS: track active client count for /v1/health.
             wsTracker.clientConnected()

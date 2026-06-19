@@ -48,6 +48,30 @@ final class AgentAppViewModelTests: XCTestCase {
         return (vm, threadRepo)
     }
 
+    func test_isAwaitingBackgroundWork_flagsCompletedStallButNotNormalCompletion() throws {
+        // UX-MAC_AGENT-BG-AWAIT: a run that ends while the agent is still waiting on
+        // a background job it launched must read "awaiting", not a green "completed".
+        let (vm, _) = try makeVM()
+        vm.status = .completed
+
+        vm.timeline.apply(.turnStarted(turnId: "t1"))
+        vm.timeline.apply(.turnCompleted(turnId: "t1", finalMessage: "Standing by for the demo recording to complete."))
+        XCTAssertTrue(vm.isAwaitingBackgroundWork,
+                      "a completed run whose final message is a background-await stall must surface as awaiting, so the user knows the task is not actually finished")
+
+        vm.timeline.apply(.turnStarted(turnId: "t2"))
+        vm.timeline.apply(.turnCompleted(turnId: "t2", finalMessage: "All four steps are done; the build is green and the PR is open."))
+        XCTAssertFalse(vm.isAwaitingBackgroundWork,
+                       "a completed run with a real final answer must not be flagged as awaiting")
+
+        // A running thread is never 'awaiting a background task', even mid-narration.
+        vm.timeline.apply(.turnStarted(turnId: "t3"))
+        vm.timeline.apply(.turnCompleted(turnId: "t3", finalMessage: "Standing by for the demo recording to complete."))
+        vm.status = .running
+        XCTAssertFalse(vm.isAwaitingBackgroundWork,
+                       "a running thread must not surface the awaiting badge")
+    }
+
     func test_renameThread_trimsUpdatesAndPersists() throws {
         let (vm, repo) = try makeVM()
         vm.createThread(title: "first")
@@ -2223,6 +2247,20 @@ final class AgentAppViewModelTests: XCTestCase {
         var t = try repo.get(id: busy)!; t.status = .running; try repo.upsert(t)
         vm.reloadThreads()
         XCTAssertEqual(vm.activeThreadCount, 1, "only running threads are 'active'")
+    }
+
+    func test_chromeBusy_ignoresStaleLocalRunningStatusWithoutRunningWork() throws {
+        let (vm, repo) = try makeVM()
+        vm.createThread(title: "completed")
+        let id = try XCTUnwrap(vm.selectedThreadId)
+        var thread = try XCTUnwrap(repo.get(id: id))
+        thread.status = .completed
+        try repo.upsert(thread)
+        vm.reloadThreads()
+        vm.status = .running
+
+        XCTAssertFalse(vm.hasRunningWorkForChrome,
+                       "tab/sidebar spinners must reflect actual running work, not a stale local status after the selected thread completed")
     }
 
     func test_loadModels_keepsModelValidForProvider() async throws {

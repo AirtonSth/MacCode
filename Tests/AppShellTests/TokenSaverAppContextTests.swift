@@ -909,7 +909,7 @@ final class TokenSaverAppContextTests: XCTestCase {
         XCTAssertTrue(humanized.contains("Acao: load /distill rules, inspect /tmp, then create Snake HTML game"))
     }
 
-    func test_tokenSaverHumanizedSR1ResponseRecordsEstimatedTokensOfHumanVersusSR1() async throws {
+    func test_tokenSaverHumanizedSR1ResponseRecordsHumanMinusSR1LengthTimesThree() async throws {
         let appSupport = NSTemporaryDirectory() + "RC2TokenSaverSR1OutputSavings-" + UUID().uuidString
         let context = try AppContext(channel: .debug, appSupportOverride: appSupport)
         SettingsStore(db: context.db).update { $0.tokenSaverEnabled = true }
@@ -943,22 +943,22 @@ final class TokenSaverAppContextTests: XCTestCase {
 
         let summary = try context.tokenSaverSavingsRepo.summary()
         let codex = try XCTUnwrap(summary.savings(for: "codex"))
-        let perInput = TokenEstimator.estimate(humanized)
-        let perOutput = TokenEstimator.estimate(sr1)
+        let perInput = humanized.count * 3
+        let perOutput = sr1.count * 3
         let expectedInput = perInput * 2
         let expectedOutput = perOutput * 2
         let expectedSaved = max(perInput - perOutput, 0) * 2
         XCTAssertEqual(codex.inputTokens, expectedInput,
-                       "SR1 humanization savings use the estimated tokens of the avoided human answer as the baseline")
+                       "SR1 humanization savings must include the avoided human-language transcript expansion")
         XCTAssertEqual(codex.outputTokens, expectedOutput,
-                       "SR1 humanization savings use the estimated tokens of the emitted compressed SR1 response")
+                       "SR1 humanization savings must scale the emitted compressed SR1 response with the same factor")
         XCTAssertEqual(codex.savedTokens, expectedSaved,
-                       "saved = estimate(human) - estimate(SR1) for every sidecar call")
+                       "saved = scaled human length - scaled SR1 length for every sidecar call")
         XCTAssertEqual(codex.runs, 2,
                        "every successful local sidecar humanization call must update Token Saver reports")
     }
 
-    func test_tokenSaverHumanizedSR1FallbackRecordsEstimatedTokensWhenSidecarUnavailable() async throws {
+    func test_tokenSaverHumanizedSR1FallbackRecordsHumanMinusSR1LengthTimesThreeWhenSidecarUnavailable() async throws {
         let appSupport = NSTemporaryDirectory() + "RC2TokenSaverSR1FallbackSavings-" + UUID().uuidString
         let context = try AppContext(channel: .debug, appSupportOverride: appSupport)
         SettingsStore(db: context.db).update { $0.tokenSaverEnabled = true }
@@ -983,9 +983,9 @@ final class TokenSaverAppContextTests: XCTestCase {
         let summary = try context.tokenSaverSavingsRepo.summary()
         let claude = try XCTUnwrap(summary.savings(for: "claude"),
                                    "fallback SR1 expansion still saves output tokens and must be visible in the report")
-        XCTAssertEqual(claude.inputTokens, TokenEstimator.estimate(humanized))
-        XCTAssertEqual(claude.outputTokens, TokenEstimator.estimate(sr1))
-        XCTAssertEqual(claude.savedTokens, max(TokenEstimator.estimate(humanized) - TokenEstimator.estimate(sr1), 0))
+        XCTAssertEqual(claude.inputTokens, humanized.count * 3)
+        XCTAssertEqual(claude.outputTokens, sr1.count * 3)
+        XCTAssertEqual(claude.savedTokens, max((humanized.count - sr1.count) * 3, 0))
         XCTAssertEqual(claude.runs, 1)
         XCTAssertEqual(summary.modes.first?.mode, "sr1-humanize")
     }

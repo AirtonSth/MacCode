@@ -13,12 +13,14 @@ final class WebSocketIntegrationTests: XCTestCase {
 
     private func startServer(
         heartbeatInterval: TimeInterval = DirectHTTPServer.wsHeartbeatInterval,
+        clientReceiveTimeoutSeconds: Int = 20,
         webSocketOutboundMaxQueuedBytes: Int = DirectHTTPServer.maxWebSocketOutboundQueuedBytes
     ) throws -> (DirectHTTPServer, UInt16) {
         let port = UInt16.random(in: 33000...44000)
         let server = DirectHTTPServer(port: port, loopbackOnly: true,
                                       dispatcher: JSONRPCDispatcher(router: FakeRouter()),
                                       heartbeatInterval: heartbeatInterval,
+                                      clientReceiveTimeoutSeconds: clientReceiveTimeoutSeconds,
                                       webSocketOutboundMaxQueuedBytes: webSocketOutboundMaxQueuedBytes)
         try server.start()
         return (server, port)
@@ -102,6 +104,29 @@ final class WebSocketIntegrationTests: XCTestCase {
             }
         }
         XCTFail("did not receive a heartbeat frame over the live WebSocket")
+    }
+
+    func testWebSocketSendsImmediateFrameBeforeReceiveTimeout() async throws {
+        let (server, port) = try startServer(heartbeatInterval: 5,
+                                             clientReceiveTimeoutSeconds: 1)
+        defer { server.stop() }
+        try await Task.sleep(nanoseconds: 80_000_000)
+
+        let task = wsTask(port: port, sinceSeq: EventBus.shared.currentSeq)
+        defer { task.cancel(with: .normalClosure, reason: nil) }
+
+        let message = try await receiveWithTimeout(task, seconds: 0.5)
+        let data: Data
+        switch message {
+        case .data(let d): data = d
+        case .string(let s): data = Data(s.utf8)
+        @unknown default:
+            XCTFail("unexpected websocket message type")
+            return
+        }
+        let obj = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        XCTAssertEqual(obj["type"] as? String, "heartbeat",
+                       "iOS marks the connection live only after the first frame; the host must not wait for the periodic heartbeat and race the socket receive timeout.")
     }
 
     func testWebSocketCloseUnsubscribesEventBus() async throws {

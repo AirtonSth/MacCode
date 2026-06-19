@@ -1818,6 +1818,7 @@ public struct SidebarRootView: View {
     @ObservedObject var vm: SidebarViewModel
     @State private var showsInsomniaOptions = false
     @State private var showsTokenSaverDetails = false
+    @State private var tokenSaverNow = Date()
     @AppStorage("sidebar.tokenSaver.detailsScope") private var tokenSaverDetailsScopeRaw: String = TokenSaverUsageScope.week.rawValue
     private var tokenSaverDetailsScope: TokenSaverUsageScope {
         TokenSaverUsageScope(rawValue: tokenSaverDetailsScopeRaw) ?? .week
@@ -2029,6 +2030,22 @@ public struct SidebarRootView: View {
                 onResume: { vm.resumeTokenSaverModelDownload() },
                 onRetry: { vm.retryTokenSaverModelDownload() }
             )
+        }
+        .task {
+            await tokenSaverDailyRolloverClock()
+        }
+    }
+
+    @MainActor
+    private func tokenSaverDailyRolloverClock() async {
+        tokenSaverNow = Date()
+        while !Task.isCancelled {
+            let resetDate = Self.tokenSaverNextDailyResetDate(after: Date())
+            let delay = max(resetDate.timeIntervalSinceNow, 0.1)
+            let nanoseconds = UInt64(min(delay, 86_500) * 1_000_000_000)
+            try? await Task.sleep(nanoseconds: nanoseconds)
+            guard !Task.isCancelled else { break }
+            tokenSaverNow = Date()
         }
     }
 
@@ -2327,9 +2344,10 @@ public struct SidebarRootView: View {
         // :195 -- build the label outside the label closure so it is
         // available both for the rings and for the button's own a11y value.
         let ringsLabel = Self.ringsAccessibilityLabel(
-            scope: tokenSaverLimitScopeTitle(for: .week),
-            savedTokens: tokenSaverSavedOrPotential(in: vm.tokenSaverUsageSnapshot, scope: .week),
+            scope: tokenSaverLimitScopeTitle(for: tokenSaverDetailsScope),
+            savedTokens: tokenSaverSavedOrPotential(in: vm.tokenSaverUsageSnapshot, scope: tokenSaverDetailsScope),
             savedProgress: ringVals.tokenSaverProgress,
+            savedGoalTokens: tokenSaverSavingsGoalTokens(for: tokenSaverDetailsScope),
             claudeUsedProgress: ringVals.claudeUsedProgress,
             codexUsedProgress: ringVals.codexUsedProgress
         )
@@ -2453,7 +2471,9 @@ public struct SidebarRootView: View {
     }
 
     private var tokenSaverActivityRingValues: TokenSaverActivityRings.Values {
-        tokenSaverActivityRingValues(for: vm.tokenSaverUsageSnapshot, scope: .week)
+        // Follow the persisted Today/Week scope so the compact sidebar ring matches
+        // the details popover ring exactly, instead of being pinned to .week.
+        tokenSaverActivityRingValues(for: vm.tokenSaverUsageSnapshot, scope: tokenSaverDetailsScope)
     }
 
     private func tokenSaverActivityRingValues(
@@ -2471,19 +2491,20 @@ public struct SidebarRootView: View {
 
     private var tokenSaverActivityAccessibilityValue: String {
         let snapshot = vm.tokenSaverUsageSnapshot
-        let claude = tokenSaverProviderUsage(.claude, in: snapshot)
-        let codex = tokenSaverProviderUsage(.codex, in: snapshot)
-        return [
-            tokenSaverSavingsSummary(for: snapshot, scope: .week),
-            "\(tokenSaverLimitScopeTitle(for: .week))",
-            "Claude Code used \(tokenSaverUsedLimitText(for: claude, provider: .claude, scope: .week))",
-            "Codex used \(tokenSaverUsedLimitText(for: codex, provider: .codex, scope: .week))"
-        ].joined(separator: ", ")
+        let ringVals = tokenSaverActivityRingValues(for: snapshot, scope: tokenSaverDetailsScope)
+        return Self.ringsAccessibilityLabel(
+            scope: tokenSaverLimitScopeTitle(for: tokenSaverDetailsScope),
+            savedTokens: tokenSaverSavedOrPotential(in: snapshot, scope: tokenSaverDetailsScope),
+            savedProgress: ringVals.tokenSaverProgress,
+            savedGoalTokens: tokenSaverSavingsGoalTokens(for: tokenSaverDetailsScope),
+            claudeUsedProgress: ringVals.claudeUsedProgress,
+            codexUsedProgress: ringVals.codexUsedProgress
+        )
     }
 
     private func tokenSaverLimitScopeTitle(for scope: TokenSaverUsageScope) -> String {
         switch scope {
-        // :187 -- "currentSession" bucket sums today's UTC-day, not a live
+        // :187 -- "currentSession" bucket sums today's calendar day, not a live
         // session window.  "today" is the honest label for what is shown.
         case .currentSession: return "today"
         case .week: return "week"
@@ -2492,7 +2513,7 @@ public struct SidebarRootView: View {
 
     private func tokenSaverScopeTitle(_ scope: TokenSaverUsageScope) -> String {
         switch scope {
-        // :187 -- Picker label must match the windowing: today's UTC-day bucket,
+        // :187 -- Picker label must match the windowing: today's calendar-day bucket,
         // not a "session" (which implies start-of-process to now).
         case .currentSession: return "Today"
         case .week: return "Week"
@@ -2520,8 +2541,10 @@ public struct SidebarRootView: View {
         scope: TokenSaverUsageScope
     ) -> Double {
         let saved = tokenSaverSavedOrPotential(in: snapshot, scope: scope)
-        let used = tokenSaverScopeUsedTokens(in: snapshot, scope: scope)
-        return tokenSaverRingProgress(numerator: saved, denominator: max(used + saved, 1))
+        return Self.savingsToGoalProgress(
+            savedTokens: saved,
+            goalTokens: tokenSaverSavingsGoalTokens(for: scope)
+        )
     }
 
     private func tokenSaverSavedOrPotential(
@@ -2536,17 +2559,55 @@ public struct SidebarRootView: View {
         )
     }
 
-    /// Saved-token totals from the DB ledger. Week shows the accumulated total
-    /// the user has saved; Current Session uses today's retained report bucket.
+    /// Saved-token totals from the DB ledger. Week shows the retained report
+    /// window; Today uses the current calendar-day bucket.
     private func tokenSaverMeasuredSaved(scope: TokenSaverUsageScope) -> Int {
         let summary = vm.tokenSaverSavingsSummary
         switch scope {
         case .week:
-            return summary.totalSavedTokens
+            return Self.tokenSaverReportWindowSavedTokens(daily: summary.daily)
         case .currentSession:
-            let todayStartMs = Int64(Date().timeIntervalSince1970 * 1000) / 86_400_000 * 86_400_000
-            return summary.daily.filter { $0.dayStartMs >= todayStartMs }.reduce(0) { $0 + $1.savedTokens }
+            return Self.tokenSaverTodaySavedTokens(daily: summary.daily, now: tokenSaverNow)
         }
+    }
+
+    /// Measured saved tokens for one provider in the selected scope, read from the
+    /// per-(provider, day) buckets so the row matches the windowed green headline.
+    private func tokenSaverScopedProviderSaved(_ provider: AgentProvider) -> Int {
+        let summary = vm.tokenSaverSavingsSummary
+        switch tokenSaverDetailsScope {
+        case .week:
+            return Self.tokenSaverWindowSaved(forProvider: provider.rawValue, dailyByProvider: summary.dailyByProvider)
+        case .currentSession:
+            return Self.tokenSaverTodaySaved(forProvider: provider.rawValue, dailyByProvider: summary.dailyByProvider, now: tokenSaverNow)
+        }
+    }
+
+    /// Measured saved tokens + runs for the "CLI & other" reconciling row in the
+    /// selected scope. Returns nil when not measuring or when nothing was saved.
+    private func tokenSaverScopedOtherSavings() -> (savedTokens: Int, runs: Int)? {
+        guard vm.privateAccountUser?.subscribed == true && vm.tokenSaverEnabled else { return nil }
+        let summary = vm.tokenSaverSavingsSummary
+        let result: (savedTokens: Int, runs: Int)
+        switch tokenSaverDetailsScope {
+        case .week:
+            result = Self.tokenSaverWindowSaved(
+                forProvidersOtherThan: TokenSaverSavingsDisplay.managedProviderIDs,
+                dailyByProvider: summary.dailyByProvider
+            )
+        case .currentSession:
+            result = Self.tokenSaverTodaySaved(
+                forProvidersOtherThan: TokenSaverSavingsDisplay.managedProviderIDs,
+                dailyByProvider: summary.dailyByProvider,
+                now: tokenSaverNow
+            )
+        }
+        guard result.savedTokens > 0 else { return nil }
+        return result
+    }
+
+    private func tokenSaverSavingsGoalTokens(for scope: TokenSaverUsageScope) -> Int {
+        Self.tokenSaverSavingsGoalTokens(isDailyScope: scope == .currentSession)
     }
 
     private func tokenSaverSavingsSummary(
@@ -2555,18 +2616,6 @@ public struct SidebarRootView: View {
     ) -> String {
         let prefix = vm.privateAccountUser?.subscribed == true && vm.tokenSaverEnabled ? "Saved" : "Could save"
         return "\(prefix) \(Self.formatTokenCount(tokenSaverSavedOrPotential(in: snapshot, scope: scope)))"
-    }
-
-    /// The Token Saver legend headline advertises the lifetime grand total saved
-    /// across every provider (Claude + Codex + direct CLI), independent of the
-    /// selected scope. Non-subscribed users still see the scoped potential pitch.
-    private func tokenSaverLifetimeSavingsSummary(
-        for snapshot: TokenSaverUsageSnapshot
-    ) -> String {
-        guard vm.privateAccountUser?.subscribed == true && vm.tokenSaverEnabled else {
-            return tokenSaverSavingsSummary(for: snapshot, scope: tokenSaverDetailsScope)
-        }
-        return "Saved \(Self.formatTokenCount(vm.tokenSaverSavingsSummary.totalSavedTokens))"
     }
 
     private func tokenSaverUsedLimitProgress(
@@ -2732,11 +2781,7 @@ public struct SidebarRootView: View {
             VStack(alignment: .leading, spacing: DS.Space.sm) {
                 tokenSaverProviderRow(provider: .claude)
                 tokenSaverProviderRow(provider: .codex)
-                if let other = TokenSaverSavingsDisplay.otherSavingsRow(
-                    from: vm.tokenSaverSavingsSummary,
-                    subscribed: vm.privateAccountUser?.subscribed == true,
-                    enabled: vm.tokenSaverEnabled
-                ) {
+                if let other = tokenSaverScopedOtherSavings() {
                     tokenSaverOtherSavingsRow(saved: other.savedTokens, runs: other.runs)
                 }
             }
@@ -2760,6 +2805,7 @@ public struct SidebarRootView: View {
             scope: tokenSaverLimitScopeTitle(for: tokenSaverDetailsScope),
             savedTokens: tokenSaverSavedOrPotential(in: snapshot, scope: tokenSaverDetailsScope),
             savedProgress: detailsRingVals.tokenSaverProgress,
+            savedGoalTokens: tokenSaverSavingsGoalTokens(for: tokenSaverDetailsScope),
             claudeUsedProgress: detailsRingVals.claudeUsedProgress,
             codexUsedProgress: detailsRingVals.codexUsedProgress
         )
@@ -2771,7 +2817,7 @@ public struct SidebarRootView: View {
                 tokenSaverRingLegendRow(
                     color: DS.Palette.success,
                     label: "Token Saver",
-                    value: tokenSaverLifetimeSavingsSummary(for: snapshot)
+                    value: tokenSaverSavingsSummary(for: snapshot, scope: tokenSaverDetailsScope)
                 )
                 tokenSaverRingLegendRow(
                     color: tokenSaverProviderColor(.claude),
@@ -2832,7 +2878,7 @@ public struct SidebarRootView: View {
         let snapshot = tokenSaverDetailsSnapshot
         let usage = tokenSaverProviderUsage(provider, in: snapshot)
         let value = vm.privateAccountUser?.subscribed == true && vm.tokenSaverEnabled
-            ? (vm.tokenSaverSavingsSummary.savings(for: provider.rawValue)?.savedTokens ?? 0)
+            ? tokenSaverScopedProviderSaved(provider)
             : TokenSaverUsageStore.estimatePotentialSavings(usedTokens: usage.actualProviderTokens)
         return VStack(alignment: .leading, spacing: 3) {
             HStack(alignment: .firstTextBaseline, spacing: DS.Space.sm) {
@@ -3024,6 +3070,113 @@ public struct SidebarRootView: View {
         formatTokenCountPublic(value)
     }
 
+    nonisolated public static func tokenSaverSavingsGoalTokens(isDailyScope: Bool) -> Int {
+        isDailyScope ? 2_000_000 : 10_000_000
+    }
+
+    /// Ring progress for the Token Saver impact ring. Daily uses a 2M target;
+    /// Week uses a 10M target. The caller passes the target for the current tab.
+    nonisolated public static func savingsToGoalProgress(
+        savedTokens: Int,
+        goalTokens: Int
+    ) -> Double {
+        let saved = max(savedTokens, 0)
+        let goal = max(goalTokens, 1)
+        guard saved > 0 else { return 0 }
+        return min(Double(saved) / Double(goal), 1)
+    }
+
+    nonisolated public static func tokenSaverDayStartMs(
+        now: Date,
+        calendar: Calendar = .current
+    ) -> Int64 {
+        Int64(calendar.startOfDay(for: now).timeIntervalSince1970 * 1000)
+    }
+
+    nonisolated public static func tokenSaverNextDailyResetDate(
+        after date: Date,
+        calendar: Calendar = .current
+    ) -> Date {
+        let dayStart = calendar.startOfDay(for: date)
+        let currentReset = dayStart.addingTimeInterval(1)
+        if date < currentReset { return currentReset }
+        let nextDayStart = calendar.date(byAdding: .day, value: 1, to: dayStart)
+            ?? date.addingTimeInterval(86_400)
+        return nextDayStart.addingTimeInterval(1)
+    }
+
+    nonisolated public static func tokenSaverTodaySavedTokens(
+        daily: [TokenSaverDailySavings],
+        now: Date,
+        calendar: Calendar = .current
+    ) -> Int {
+        let todayStartMs = tokenSaverDayStartMs(now: now, calendar: calendar)
+        return daily
+            .filter { $0.dayStartMs == todayStartMs }
+            .reduce(0) { $0 + $1.savedTokens }
+    }
+
+    nonisolated public static func tokenSaverReportWindowSavedTokens(
+        daily: [TokenSaverDailySavings]
+    ) -> Int {
+        daily.reduce(0) { $0 + $1.savedTokens }
+    }
+
+    /// Saved tokens for ONE provider on today's calendar day. Mirrors
+    /// `tokenSaverTodaySavedTokens` but reads the per-(provider, day) buckets so a
+    /// provider row matches the Today headline window.
+    nonisolated public static func tokenSaverTodaySaved(
+        forProvider provider: String,
+        dailyByProvider: [TokenSaverProviderDailySavings],
+        now: Date,
+        calendar: Calendar = .current
+    ) -> Int {
+        let todayStartMs = tokenSaverDayStartMs(now: now, calendar: calendar)
+        return dailyByProvider
+            .filter { $0.provider == provider && $0.dayStartMs == todayStartMs }
+            .reduce(0) { $0 + $1.savedTokens }
+    }
+
+    /// Saved tokens for ONE provider across the whole retained report window
+    /// (the Week scope), from the per-(provider, day) buckets.
+    nonisolated public static func tokenSaverWindowSaved(
+        forProvider provider: String,
+        dailyByProvider: [TokenSaverProviderDailySavings]
+    ) -> Int {
+        dailyByProvider
+            .filter { $0.provider == provider }
+            .reduce(0) { $0 + $1.savedTokens }
+    }
+
+    /// Today's saved tokens + run count for every provider NOT in `known` (the
+    /// "CLI & other" reconciling row), windowed to today.
+    nonisolated public static func tokenSaverTodaySaved(
+        forProvidersOtherThan known: Set<String>,
+        dailyByProvider: [TokenSaverProviderDailySavings],
+        now: Date,
+        calendar: Calendar = .current
+    ) -> (savedTokens: Int, runs: Int) {
+        let todayStartMs = tokenSaverDayStartMs(now: now, calendar: calendar)
+        let rows = dailyByProvider.filter { !known.contains($0.provider) && $0.dayStartMs == todayStartMs }
+        return (
+            savedTokens: rows.reduce(0) { $0 + $1.savedTokens },
+            runs: rows.reduce(0) { $0 + $1.runs }
+        )
+    }
+
+    /// Report-window saved tokens + run count for every provider NOT in `known`
+    /// (the "CLI & other" reconciling row), windowed to the Week scope.
+    nonisolated public static func tokenSaverWindowSaved(
+        forProvidersOtherThan known: Set<String>,
+        dailyByProvider: [TokenSaverProviderDailySavings]
+    ) -> (savedTokens: Int, runs: Int) {
+        let rows = dailyByProvider.filter { !known.contains($0.provider) }
+        return (
+            savedTokens: rows.reduce(0) { $0 + $1.savedTokens },
+            runs: rows.reduce(0) { $0 + $1.runs }
+        )
+    }
+
     private static func formatPercent(_ progress: Double) -> String {
         "\(Int((min(max(progress, 0), 1) * 100).rounded()))%"
     }
@@ -3137,6 +3290,7 @@ public struct SidebarRootView: View {
         scope: String,
         savedTokens: Int,
         savedProgress: Double,
+        savedGoalTokens: Int = 10_000_000,
         claudeUsedProgress: Double,
         codexUsedProgress: Double
     ) -> String {
@@ -3148,7 +3302,8 @@ public struct SidebarRootView: View {
             : savedTokens >= 1_000
                 ? String(format: "%.0fK", Double(savedTokens) / 1_000)
                 : "\(savedTokens)"
-        return "Token Saver rings, \(scope): saved \(savedStr) tokens (\(savedPct)%), Claude used \(claudePct)%, Codex used \(codexPct)%"
+        let goalStr = formatTokenCountPublic(max(savedGoalTokens, 1))
+        return "Token Saver rings, \(scope): saved \(savedStr) tokens toward \(goalStr) target (\(savedPct)%), Claude used \(claudePct)%, Codex used \(codexPct)%"
     }
 
     struct TokenSaverActivityRings: View {
@@ -3735,7 +3890,9 @@ public struct SidebarRootView: View {
                 Button("Rename\u{2026}") { vm.renameWorkspace(ws) }
                 Button("Edit description\u{2026}") { vm.editDescription(ws) }
                 Menu("Color") {
-                    Button("None") { vm.setWorkspaceColor(ws, "") }
+                    Button { vm.setWorkspaceColor(ws, "") } label: {
+                        TabColorMenuLabel.none
+                    }
                     ForEach(TabColor.allCases, id: \.self) { c in
                         Button { vm.setWorkspaceColor(ws, c.rawValue) } label: {
                             TabColorMenuLabel(c)
@@ -3750,20 +3907,74 @@ public struct SidebarRootView: View {
 }
 
 private struct TabColorMenuLabel: View {
-    let color: TabColor
+    let title: String
+    let swatchImage: NSImage
 
     init(_ color: TabColor) {
-        self.color = color
+        self.title = color.label
+        self.swatchImage = Self.swatchImage(hex: color.hex)
+    }
+
+    private init(title: String, swatchImage: NSImage) {
+        self.title = title
+        self.swatchImage = swatchImage
+    }
+
+    static var none: TabColorMenuLabel {
+        TabColorMenuLabel(title: "None", swatchImage: noneSwatchImage())
     }
 
     var body: some View {
         Label {
-            Text(color.label)
+            Text(title)
         } icon: {
-            RoundedRectangle(cornerRadius: 2, style: .continuous)
-                .fill(Color(hex: color.hex))
-                .frame(width: 12, height: 12)
+            Image(nsImage: swatchImage)
+                .renderingMode(.original)
         }
+    }
+
+    private static func swatchImage(hex: UInt32) -> NSImage {
+        menuImage { rect in
+            let path = NSBezierPath(
+                roundedRect: rect.insetBy(dx: 2, dy: 2),
+                xRadius: 3,
+                yRadius: 3
+            )
+            NSColor(hex: hex).setFill()
+            path.fill()
+            DS.NS.lineStrong.withAlphaComponent(0.75).setStroke()
+            path.lineWidth = 1
+            path.stroke()
+        }
+    }
+
+    private static func noneSwatchImage() -> NSImage {
+        menuImage { rect in
+            let box = NSBezierPath(
+                roundedRect: rect.insetBy(dx: 2, dy: 2),
+                xRadius: 3,
+                yRadius: 3
+            )
+            DS.NS.textTertiary.withAlphaComponent(0.9).setStroke()
+            box.lineWidth = 1
+            box.stroke()
+
+            let slash = NSBezierPath()
+            slash.move(to: NSPoint(x: rect.minX + 4, y: rect.minY + 4))
+            slash.line(to: NSPoint(x: rect.maxX - 4, y: rect.maxY - 4))
+            slash.lineWidth = 1.25
+            slash.stroke()
+        }
+    }
+
+    private static func menuImage(draw: @escaping (NSRect) -> Void) -> NSImage {
+        let size = NSSize(width: 14, height: 14)
+        let image = NSImage(size: size, flipped: false) { rect in
+            draw(rect)
+            return true
+        }
+        image.isTemplate = false
+        return image
     }
 }
 

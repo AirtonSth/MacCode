@@ -24,7 +24,8 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     private var providers: [AgentProvider: AgentProviderAdapter]
     private var active: [AgentRunID: AgentRunHandle] = [:]
     private var activeThreads: [AgentThreadID: AgentRunID] = [:]
-    private var activeRunMetadata: [AgentRunID: (provider: AgentProvider, providerInstanceId: String?, model: String, cwd: String, serviceTier: AgentServiceTier, runtimeMode: AgentPermissionMode, interactionMode: AgentInteractionMode, adapterKey: String, binaryIdentity: String?)] = [:]
+    private typealias RunMetadata = (provider: AgentProvider, providerInstanceId: String?, model: String, cwd: String, serviceTier: AgentServiceTier, runtimeMode: AgentPermissionMode, interactionMode: AgentInteractionMode, adapterKey: String, binaryIdentity: String?)
+    private var activeRunMetadata: [AgentRunID: RunMetadata] = [:]
     private var activeTurnIds: [AgentRunID: String] = [:]
     private var activeAssistantMessageIds: [AgentRunID: AgentMessageID] = [:]
     private var activeProviderTextItemTypes: [AgentRunID: [String: AssistantItemType]] = [:]
@@ -43,6 +44,13 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     // flushes (see shouldFlushStreamBatch). All touched under `lock`.
     private var pendingStreamWrites: [AgentThreadID: StreamWriteBatch] = [:]
     private var lastStreamFlushMs: [AgentThreadID: Int64] = [:]
+    // UX-MAC_AGENT-BG-AWAIT: per-thread consecutive auto-continuation count and a
+    // monotonic token used to cancel a scheduled continuation when the thread is
+    // stopped or a fresh run starts. Both touched under `lock`. See
+    // BackgroundAwaitContinuation: a full-access run that stalls awaiting a
+    // background job it launched is auto-nudged (bounded) so it actually finishes.
+    private var autoContinuationCounts: [AgentThreadID: Int] = [:]
+    private var autoContinuationTokens: [AgentThreadID: Int] = [:]
     // PERF-MAC_AGENT-006: last assistant text persisted per thread, to dedup the
     // turnCompleted/finished pair without reloading the whole thread history.
     private var lastPersistedAssistantContent: [AgentThreadID: String] = [:]
@@ -86,6 +94,10 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     /// P3: optionally compact large tool output in a persisted stream-event payload before it
     /// is written (CCR-backed, structure-preserving). nil => payloads stored verbatim.
     public var streamPayloadCompactor: (@Sendable (_ payloadJSON: String) -> String)?
+    /// UX-MAC_AGENT-BG-AWAIT: delay before a full-access run that stalled awaiting a
+    /// background job is auto-nudged to resume. Gives the background job time to make
+    /// progress before the agent polls it. Injectable so tests drive it to ~0.
+    public var backgroundAwaitContinuationDelay: TimeInterval = 45
 
     /// Token Saver /distill hook: async transform applied to provider text
     /// detected as SR1 compressed language. The returned value is what gets
@@ -197,7 +209,12 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     }
 
     @discardableResult
-    public func startRun(_ request: AgentRunRequest) async throws -> AgentRunID {
+    public func startRun(_ request: AgentRunRequest, isAutoContinuation: Bool = false) async throws -> AgentRunID {
+        // A user-initiated run ends any background-await auto-continuation streak;
+        // the auto-nudge path passes `isAutoContinuation: true` to preserve the bound.
+        if !isAutoContinuation {
+            resetAutoContinuationStreak(request.threadId)
+        }
         let recoveryContext = request.providerThreadId == nil ? try recoverableResumeContext(for: request) : nil
         let resumeCursor = request.providerThreadId ?? recoveryContext?.resumeCursor
         // Token Saver: compress only the text sent to the provider; the
@@ -418,11 +435,100 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         // PERF-MAC_AGENT-008: thread closed -> evict the dedup cache entry so
         // cancelled threads do not retain their final-answer text indefinitely.
         lastPersistedAssistantContent.removeValue(forKey: threadId)
+        // UX-MAC_AGENT-BG-AWAIT: a stop ends the streak and invalidates the token,
+        // so any scheduled auto-continuation for this thread aborts when it fires.
+        autoContinuationCounts.removeValue(forKey: threadId)
+        autoContinuationTokens[threadId] = (autoContinuationTokens[threadId] ?? 0) + 1
         lock.unlock()
         for observer in observersSnapshot() {
             observer.runCoordinator(self, didChangeStatus: .cancelled, runId: stoppedRunId, threadId: threadId)
         }
         onRunFinished?(threadId, stoppedRunId, .cancelled)
+    }
+
+    // MARK: - Background-await auto-continuation (UX-MAC_AGENT-BG-AWAIT)
+
+    private func resetAutoContinuationStreak(_ threadId: AgentThreadID) {
+        lock.lock(); autoContinuationCounts[threadId] = 0; lock.unlock()
+    }
+
+    /// Decide, at run finish, whether a full-access run stalled awaiting a
+    /// background job and should be auto-nudged to resume; if so, schedule a
+    /// bounded re-invocation after `backgroundAwaitContinuationDelay`.
+    private func maybeScheduleBackgroundAwaitContinuation(
+        threadId: AgentThreadID,
+        status: AgentRunStatus,
+        finalMessage: String?,
+        runMetadata: RunMetadata?,
+        resumeCursor: String?
+    ) {
+        let isAutonomous = (runMetadata?.runtimeMode ?? (try? threadRepo.get(id: threadId))?.permissionMode) == .fullAccess
+        lock.lock()
+        let prior = autoContinuationCounts[threadId] ?? 0
+        lock.unlock()
+        guard BackgroundAwaitContinuation.shouldAutoContinue(
+            status: status,
+            finalMessage: finalMessage,
+            isAutonomous: isAutonomous,
+            priorAutoContinuations: prior
+        ) else {
+            // A completed run that did NOT stall (real progress, or non-autonomous)
+            // clears the streak so a later genuine stall gets the full budget.
+            if status == .completed { resetAutoContinuationStreak(threadId) }
+            return
+        }
+        guard let runMetadata else { return }
+        lock.lock()
+        autoContinuationCounts[threadId] = prior + 1
+        let token = (autoContinuationTokens[threadId] ?? 0) + 1
+        autoContinuationTokens[threadId] = token
+        lock.unlock()
+        let attempt = prior + 1
+        let delay = backgroundAwaitContinuationDelay
+        let request = backgroundAwaitContinuationRequest(threadId: threadId, runMetadata: runMetadata, resumeCursor: resumeCursor)
+        agentRunLog.info("run.autoContinue.scheduled thread=\(threadId.value.uuidString, privacy: .public) attempt=\(attempt, privacy: .public)")
+        Task { [weak self] in
+            guard let self else { return }
+            if delay > 0 {
+                try? await Task.sleep(nanoseconds: UInt64((delay * 1_000_000_000).rounded()))
+            }
+            guard self.backgroundAwaitContinuationStillValid(threadId: threadId, token: token) else { return }
+            _ = try? await self.startRun(request, isAutoContinuation: true)
+        }
+    }
+
+    /// True iff the scheduled continuation is still the latest one for the thread
+    /// (token unchanged), the thread is idle (no live run), no stop is pending, and
+    /// the user has not already driven the thread to a non-completed state.
+    private func backgroundAwaitContinuationStillValid(threadId: AgentThreadID, token: Int) -> Bool {
+        lock.lock()
+        let ok = autoContinuationTokens[threadId] == token
+            && activeThreads[threadId] == nil
+            && !pendingThreadStops.contains(threadId)
+        lock.unlock()
+        guard ok else { return false }
+        return (try? threadRepo.get(id: threadId))?.status == .completed
+    }
+
+    private func backgroundAwaitContinuationRequest(
+        threadId: AgentThreadID,
+        runMetadata: RunMetadata,
+        resumeCursor: String?
+    ) -> AgentRunRequest {
+        let prompt = BackgroundAwaitContinuation.continuationPrompt
+        return AgentRunRequest(
+            threadId: threadId,
+            provider: runMetadata.provider,
+            providerInstanceId: runMetadata.providerInstanceId,
+            model: runMetadata.model,
+            cwd: runMetadata.cwd,
+            prompt: prompt,
+            userMessageContent: prompt,
+            providerThreadId: resumeCursor,
+            permissionMode: runMetadata.runtimeMode,
+            serviceTier: runMetadata.serviceTier,
+            interactionMode: runMetadata.interactionMode
+        )
     }
 
     private func markStartFailure(_ error: Error, request: AgentRunRequest, runId: AgentRunID, adapterKey: String, binaryIdentity: String?) {
@@ -1141,6 +1247,17 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                     assistantMessageId: assistantMessageId
                 )
             }
+            // UX-MAC_AGENT-BG-AWAIT: a full-access run that ends still awaiting a
+            // background job it launched is auto-nudged (bounded) so it actually
+            // finishes instead of silently sitting at "completed". Decided before
+            // the run metadata is evicted below.
+            maybeScheduleBackgroundAwaitContinuation(
+                threadId: threadId,
+                status: status,
+                finalMessage: finalMessage,
+                runMetadata: runMetadata,
+                resumeCursor: resumeCursor
+            )
             lock.lock()
             active.removeValue(forKey: runId)
             activeThreads.removeValue(forKey: threadId)

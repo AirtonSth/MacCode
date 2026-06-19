@@ -1,4 +1,5 @@
 import XCTest
+import Combine
 @testable import Surfaces
 import CoreModel
 import Persistence
@@ -131,6 +132,74 @@ final class AgentAppPerfBundleTests: XCTestCase {
                        "delivering an event for a non-selected thread must not change the selection")
         XCTAssertEqual(vm.timeline.turns.count, initialTurnCount,
                        "events for non-selected threads must not pollute the current timeline")
+    }
+
+    /// One provider token burst must publish one bounded UI invalidation burst, not
+    /// one SwiftUI invalidation per token. The app already batches stream events
+    /// into one main-actor hop; this guards the missing second half of that contract:
+    /// applying the batch must mutate `@Published` state in bulk so a long run keeps
+    /// typing/scrolling responsive instead of forcing hundreds of view rebuilds.
+    func test_streamEventBatch_publishesBoundedViewInvalidationsForTokenBurst() async throws {
+        let (vm, _) = try makeVM()
+        vm.createThread(title: "stream invalidation")
+        let tid = try XCTUnwrap(vm.selectedThreadId)
+        let runId = AgentRunID()
+        var publishCount = 0
+        let cancellable = vm.objectWillChange.sink { publishCount += 1 }
+
+        let turnId = "burst-turn"
+        let itemId = "burst-answer"
+        vm.runCoordinator(vm.coordinator, didReceive: .turnStarted(turnId: turnId),
+                          run: runId, threadId: tid)
+        vm.runCoordinator(vm.coordinator,
+                          didReceive: .itemStarted(item: AssistantItem(
+                              id: itemId, turnId: turnId, type: .assistantMessage,
+                              startedAtMs: Int64(Date().timeIntervalSince1970 * 1000))),
+                          run: runId, threadId: tid)
+        for i in 0..<200 {
+            vm.runCoordinator(vm.coordinator,
+                              didReceive: .itemDelta(itemId: itemId, bodyAppend: "tok\(i) ", outputAppend: nil, summary: nil),
+                              run: runId, threadId: tid)
+        }
+
+        await Task.yield()
+        try? await Task.sleep(nanoseconds: 50_000_000)
+        cancellable.cancel()
+
+        XCTAssertEqual(vm.timeline.turns.first?.items.first?.body.hasSuffix("tok199 "), true,
+                       "the bounded publish assertion must still prove every token delta was applied to the visible timeline")
+        XCTAssertLessThanOrEqual(publishCount, 10,
+                                 "one batched provider token burst must not publish one SwiftUI invalidation per token; that was the long-run typing/scrolling slowdown")
+    }
+
+    /// SR1 translation badges must still update after stream events are applied in
+    /// bulk. This protects the user-visible "View original" affordance while the
+    /// stream flush avoids publishing empty/no-op badge state on every token.
+    func test_streamEventBatch_updatesSR1TranslationBadgeStateAfterBulkTimelineApply() async throws {
+        let (vm, _) = try makeVM()
+        vm.createThread(title: "sr1 translation")
+        let tid = try XCTUnwrap(vm.selectedThreadId)
+        let runId = AgentRunID()
+        let messageId = AgentMessageID()
+        let original = "S=state D=patch P=tests"
+
+        vm.runCoordinator(
+            vm.coordinator,
+            didReceive: .sr1Translation(AssistantSR1Translation(
+                messageId: messageId.value.uuidString,
+                originalText: original,
+                rewrittenText: "State, patch, tests."
+            )),
+            run: runId,
+            threadId: tid
+        )
+
+        await Task.yield()
+
+        XCTAssertTrue(vm.sr1TranslatedMessageIds.contains(messageId),
+                      "batched stream flush must still mark SR1-translated messages so the transcript shows the translation badge")
+        XCTAssertEqual(vm.sr1OriginalText(for: messageId), original,
+                       "batched stream flush must preserve the original compressed text for the View original disclosure")
     }
 
     // MARK: - PERF #1: 5,000-event thread-open replay benchmark

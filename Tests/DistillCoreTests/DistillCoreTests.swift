@@ -518,7 +518,7 @@ final class DistillCoreTests: XCTestCase {
                        "I2: SDK PostToolUse compression must be measurable separately from one-shot pipe savings")
     }
 
-    func test_sr1HumanizeSavingsUseEstimatedTokensOfHumanVersusSR1() {
+    func test_sr1HumanizeSavingsUseHumanMinusSR1LengthTimesThree() {
         let sr1 = "S ok.\nO done."
         let request = DistillRequest(
             mode: .sr1Humanize,
@@ -545,11 +545,11 @@ final class DistillCoreTests: XCTestCase {
 
         XCTAssertEqual(record?.provider, "codex")
         XCTAssertEqual(record?.mode, "sr1-humanize")
-        XCTAssertEqual(record?.inputTokens, TokenEstimator.estimate(human),
-                       "the avoided human answer is measured in estimated tokens")
-        XCTAssertEqual(record?.outputTokens, TokenEstimator.estimate(sr1),
-                       "the emitted SR1 response is measured in estimated tokens")
-        XCTAssertEqual(record?.savedTokens, max(TokenEstimator.estimate(human) - TokenEstimator.estimate(sr1), 0))
+        XCTAssertEqual(record?.inputTokens, human.count * 3,
+                       "SR1 accounting must include the avoided human-language transcript expansion, not only tokenizer-estimated display text")
+        XCTAssertEqual(record?.outputTokens, sr1.count * 3,
+                       "the emitted SR1 response is scaled with the same transcript expansion factor")
+        XCTAssertEqual(record?.savedTokens, max((human.count - sr1.count) * 3, 0))
     }
 
     func test_mlxCommandOutputCollapsesDuplicatedModelBlocks() throws {

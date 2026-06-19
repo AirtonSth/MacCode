@@ -402,6 +402,20 @@ public enum TokenEstimator {
     }
 }
 
+public enum TokenSaverSR1SavingsEstimator {
+    private static let transcriptExpansionFactor = 3
+
+    public static func estimate(sr1: String, humanized: String) -> (inputTokens: Int, outputTokens: Int, savedTokens: Int) {
+        let inputTokens = max(0, humanized.count * transcriptExpansionFactor)
+        let outputTokens = max(0, sr1.count * transcriptExpansionFactor)
+        return (
+            inputTokens: inputTokens,
+            outputTokens: outputTokens,
+            savedTokens: max(inputTokens - outputTokens, 0)
+        )
+    }
+}
+
 public struct DistillSavingsRecord: Sendable, Equatable {
     public let provider: String
     /// Saved-tokens mode, already folded with the producing engine where known
@@ -455,17 +469,16 @@ public enum DistillSavingsCalculator {
             )
         case .sr1Humanize:
             // The agent emitted the compressed SR1 response instead of the full
-            // human-language answer; savings = estimate(human text the agent
-            // avoided) - estimate(SR1 text it actually produced).
+            // human-language answer; use the SR1 transcript-expansion estimator
+            // so short semantic prefixes still get credit for the avoided prose.
             let sr1 = sr1ResponseSource(from: request.input)
-            let input = TokenEstimator.estimate(response.output)
-            let output = TokenEstimator.estimate(sr1)
+            let estimate = TokenSaverSR1SavingsEstimator.estimate(sr1: sr1, humanized: response.output)
             return DistillSavingsRecord(
                 provider: provider,
                 mode: "sr1-humanize",
-                inputTokens: input,
-                outputTokens: output,
-                savedTokens: max(input - output, 0),
+                inputTokens: estimate.inputTokens,
+                outputTokens: estimate.outputTokens,
+                savedTokens: estimate.savedTokens,
                 cacheState: "sr1_humanize"
             )
         case .longText, .watchSummary:
