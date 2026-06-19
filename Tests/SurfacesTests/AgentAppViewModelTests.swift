@@ -3558,6 +3558,35 @@ final class AgentAppViewModelTests: XCTestCase {
                                     "each composer text change must publish the composer state so the composer subtree updates")
         XCTAssertEqual(vm.prompt, "hi", "the prompt proxy still reads/writes the composer text")
     }
+
+    // F5: the single-pass cap+budget that replaced `map(cap) + applyBodyBudget` on the
+    // thread-open path must be byte-for-byte equivalent to the prior two-pass version.
+    func test_cappedRowsWithinBudget_matchesMapThenBudgetComposition() {
+        let base = Date(timeIntervalSinceReferenceDate: 700_000_000)
+        func msg(_ i: Int, _ content: String) -> AgentMessage {
+            AgentMessage(threadId: AgentThreadID(), role: .user, content: content, createdAt: base.addingTimeInterval(Double(i)))
+        }
+        func reference(_ rows: [AgentMessage], budget: Int) -> (rows: [AgentMessage], blanked: Int) {
+            AgentAppViewModel.applyBodyBudget(rows.map { var m = $0; m.content = AssistantTimelineState.cappedText($0.content); return m }, budget: budget)
+        }
+
+        // Under budget: caps each body, blanks nothing.
+        let small = (0..<5).map { msg($0, "row-\($0)") }
+        let fused = AgentAppViewModel.cappedRowsWithinBudget(small, budget: 1_000_000)
+        let ref = reference(small, budget: 1_000_000)
+        XCTAssertEqual(fused.blanked, 0)
+        XCTAssertEqual(fused.rows.map(\.content), ref.rows.map(\.content),
+                       "single-pass cap+budget must equal map(cap)+applyBodyBudget under budget")
+
+        // Over budget: blanks the oldest bodies, identically.
+        let big = (0..<4).map { msg($0, String(repeating: "x", count: 10)) }
+        let fusedBig = AgentAppViewModel.cappedRowsWithinBudget(big, budget: 25)
+        let refBig = reference(big, budget: 25)
+        XCTAssertGreaterThan(fusedBig.blanked, 0, "a pathological thread must blank oldest bodies")
+        XCTAssertEqual(fusedBig.blanked, refBig.blanked)
+        XCTAssertEqual(fusedBig.rows.map(\.content), refBig.rows.map(\.content),
+                       "single-pass cap+budget must equal map(cap)+applyBodyBudget over budget (oldest blanked)")
+    }
 }
 
 private final class SlowStartRunner: AgentProviderRunner, @unchecked Sendable {

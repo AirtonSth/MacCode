@@ -805,11 +805,19 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     nonisolated static let fullLoadBodyBudgetBytes = 24 * 1024 * 1024  // ~24 MB of transcript text
 
     private func loadAllMessages(_ id: AgentThreadID) {
-        let all = ((try? messageRepo.list(threadId: id)) ?? []).map(Self.displayMessage)
-        let (rows, blanked) = Self.applyBodyBudget(all)
+        // F5: this read intentionally stays on the main actor. SQLiteDB serialises the
+        // C connection (FULLMUTEX), but its Swift statement cache is only safe when all
+        // access shares ONE concurrency domain (see SQLite.prepare) — this app keeps
+        // that domain on the main actor, so dispatching this read to a background queue
+        // would race the statement cache against concurrent main-actor DB access. The
+        // full (unpaged) load is deliberate for scroll stability (see above); the work
+        // that scaled with thread length was the per-row cost, cut by the utf8 fast path
+        // (F11) and the single-pass cap+budget below.
+        let raw = (try? messageRepo.list(threadId: id)) ?? []
+        let (rows, blanked) = Self.cappedRowsWithinBudget(raw)
         if blanked > 0 {
             // Fail loud: a thread big enough to trip the budget loses its oldest bodies.
-            NSLog("[AgentApp] full-load body budget tripped: blanked \(blanked)/\(all.count) oldest message bodies to stay under \(Self.fullLoadBodyBudgetBytes) bytes")
+            NSLog("[AgentApp] full-load body budget tripped: blanked \(blanked)/\(raw.count) oldest message bodies to stay under \(Self.fullLoadBodyBudgetBytes) bytes")
         }
         messages = rows
     }
@@ -837,10 +845,34 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         return (result, blanked)
     }
 
-    private static func displayMessage(_ message: AgentMessage) -> AgentMessage {
-        var m = message
-        m.content = AssistantTimelineState.cappedText(m.content)
-        return m
+    /// F5: cap each message body AND enforce the memory budget in a SINGLE pass over
+    /// the rows (the common, under-budget case does no second pass), instead of mapping
+    /// a cap over all rows and then summing them again. Output is identical to
+    /// `applyBodyBudget(raw.map { cappedText($0.content) })`.
+    nonisolated static func cappedRowsWithinBudget(_ raw: [AgentMessage], budget: Int = fullLoadBodyBudgetBytes) -> (rows: [AgentMessage], blanked: Int) {
+        var rows: [AgentMessage] = []
+        rows.reserveCapacity(raw.count)
+        var total = 0
+        for message in raw {
+            var capped = message
+            capped.content = AssistantTimelineState.cappedText(message.content)
+            total += capped.content.utf8.count
+            rows.append(capped)
+        }
+        guard total > budget else { return (rows, 0) }
+        var running = total
+        var blanked = 0
+        var i = 0
+        while running > budget && i < rows.count {
+            let bytes = rows[i].content.utf8.count
+            if bytes > 0 {
+                rows[i].content = ""
+                running -= bytes
+                blanked += 1
+            }
+            i += 1
+        }
+        return (rows, blanked)
     }
 
     private func suppressPersistedFinalDuplicatedByTimeline() {
