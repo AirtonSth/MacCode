@@ -3381,6 +3381,62 @@ public struct AgentAppView: View {
         max(0, totalCount - visibleCount)
     }
 
+    /// Canonical transcript ordering: ascending by `sortTime`, then by `id` for a
+    /// total order (deterministic regardless of sort stability). Message and turn
+    /// ids carry distinct prefixes, so two entries never tie on (sortTime, id).
+    nonisolated static func transcriptEntryOrdersBefore(_ lhs: TranscriptEntry, _ rhs: TranscriptEntry) -> Bool {
+        if lhs.sortTime == rhs.sortTime { return lhs.id < rhs.id }
+        return lhs.sortTime < rhs.sortTime
+    }
+
+    /// F7: build the merged transcript in O(N) by merging two already-ordered
+    /// sequences instead of re-sorting the whole thread (O(N log N)) on every
+    /// structural change (turn/item/message add) during a run. `messages` are
+    /// append-only in createdAt order and `turns` in start order, so each side is
+    /// already in canonical order. The message side is verified in O(N); if a
+    /// thread ever violates the invariant (e.g. exact-timestamp ties out of id
+    /// order) we fall back to a full sort, so the output is ALWAYS identical to the
+    /// canonical ordering — only the path that produces it gets cheaper.
+    nonisolated static func mergeTranscriptEntries(messages: [AgentMessage],
+                                                  turns: [AssistantTurnSnapshot]) -> [TranscriptEntry] {
+        let messageEntries = messages.map(TranscriptEntry.message)
+        // Turns are few; sort defensively so the merge precondition always holds.
+        let turnEntries = turns.map(TranscriptEntry.turn).sorted(by: transcriptEntryOrdersBefore)
+        guard isOrderedByTranscriptOrder(messageEntries) else {
+            return (messageEntries + turnEntries).sorted(by: transcriptEntryOrdersBefore)
+        }
+        return mergeOrderedTranscriptEntries(messageEntries, turnEntries)
+    }
+
+    /// True when `entries` is already in canonical transcript order (no adjacent
+    /// inversion). O(N), no allocation.
+    nonisolated static func isOrderedByTranscriptOrder(_ entries: [TranscriptEntry]) -> Bool {
+        guard entries.count > 1 else { return true }
+        for i in 1..<entries.count where transcriptEntryOrdersBefore(entries[i], entries[i - 1]) {
+            return false
+        }
+        return true
+    }
+
+    /// Standard 2-way merge of two canonically-ordered sequences. Equivalent to
+    /// `(a + b).sorted(by: transcriptEntryOrdersBefore)` because there are no
+    /// cross-side (sortTime, id) ties (distinct id prefixes) and each input is sorted.
+    nonisolated static func mergeOrderedTranscriptEntries(_ a: [TranscriptEntry], _ b: [TranscriptEntry]) -> [TranscriptEntry] {
+        var result: [TranscriptEntry] = []
+        result.reserveCapacity(a.count + b.count)
+        var i = 0, j = 0
+        while i < a.count && j < b.count {
+            if transcriptEntryOrdersBefore(b[j], a[i]) {
+                result.append(b[j]); j += 1
+            } else {
+                result.append(a[i]); i += 1
+            }
+        }
+        if i < a.count { result.append(contentsOf: a[i...]) }
+        if j < b.count { result.append(contentsOf: b[j...]) }
+        return result
+    }
+
     // PERF-MAC_AGENT-001: the merged+sorted transcript is read from `body`, so
     // it recomputed (O(n log n)) on every @Published change — every streaming
     // delta and every keystroke. Memoize it, re-sorting only when the message
@@ -3396,11 +3452,7 @@ public struct AgentAppView: View {
         if transcriptCache.signature == signature {
             return transcriptCache.entries
         }
-        let merged = (vm.messages.map(TranscriptEntry.message) + vm.timeline.turns.map(TranscriptEntry.turn))
-            .sorted { lhs, rhs in
-                if lhs.sortTime == rhs.sortTime { return lhs.id < rhs.id }
-                return lhs.sortTime < rhs.sortTime
-            }
+        let merged = Self.mergeTranscriptEntries(messages: vm.messages, turns: vm.timeline.turns)
         transcriptCache.signature = signature
         transcriptCache.entries = merged
         return merged
