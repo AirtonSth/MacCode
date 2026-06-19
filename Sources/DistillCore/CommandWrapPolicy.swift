@@ -66,11 +66,86 @@ public enum CommandWrapPolicy {
         if name == "sed", args.contains(where: Self.isSedInPlaceFlag) {
             return "sed_in_place"
         }
+        if requiresReadOnlySubcommand(name), !isAllowedReadOnlyInvocation(command: name, args: args) {
+            return "mutating_subcommand"
+        }
         return nil
     }
 
     static func isSedInPlaceFlag(_ arg: String) -> Bool {
         arg.hasPrefix("-i") || arg == "--in-place" || arg.hasPrefix("--in-place=")
+    }
+
+    private static func requiresReadOnlySubcommand(_ command: String) -> Bool {
+        ["git", "gh", "glab", "swift", "xcodebuild"].contains(command)
+    }
+
+    static func isAllowedReadOnlyInvocation(command: String, args: [String]) -> Bool {
+        let normalized = args
+            .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
+        guard !normalized.isEmpty || command == "xcodebuild" else { return false }
+
+        switch command {
+        case "git":
+            guard let subcommand = normalized.first(where: { !$0.hasPrefix("-") }) else { return false }
+            if [
+                "diff", "show", "log", "status", "grep",
+                "ls-files", "rev-parse", "describe"
+            ].contains(subcommand) {
+                return true
+            }
+            if subcommand == "branch" {
+                let rest = Array(normalized.drop { $0 != subcommand }.dropFirst())
+                return rest.isEmpty || rest.allSatisfy { ["--list", "-a", "-r", "--show-current", "-v", "-vv"].contains($0) }
+            }
+            if subcommand == "remote" {
+                let rest = Array(normalized.drop { $0 != subcommand }.dropFirst())
+                return rest.isEmpty || rest == ["-v"] || rest.first == "show" || rest.first == "get-url"
+            }
+            if subcommand == "tag" {
+                return normalized.contains("-l") || normalized.contains("--list")
+            }
+            if subcommand == "stash" {
+                return normalized.dropFirst().first == "show" || normalized.dropFirst().first == "list"
+            }
+            return false
+        case "gh":
+            return hasAllowedNestedCommand(normalized, allowed: [
+                ["pr", "diff"], ["pr", "view"], ["pr", "status"], ["pr", "checks"], ["pr", "list"],
+                ["run", "view"], ["run", "list"], ["run", "watch"],
+                ["repo", "view"], ["issue", "view"], ["issue", "list"]
+            ])
+        case "glab":
+            return hasAllowedNestedCommand(normalized, allowed: [
+                ["mr", "diff"], ["mr", "view"], ["mr", "list"], ["mr", "status"],
+                ["pipeline", "view"], ["pipeline", "list"], ["pipeline", "status"],
+                ["ci", "view"], ["job", "trace"], ["issue", "view"], ["issue", "list"]
+            ])
+        case "swift":
+            if normalized.first == "test" || normalized.first == "build" { return true }
+            if normalized.count >= 2, normalized[0] == "package" {
+                return ["describe", "dump-package", "show-dependencies"].contains(normalized[1])
+            }
+            return false
+        case "xcodebuild":
+            return normalized.isEmpty ||
+                normalized.contains("test") ||
+                normalized.contains("build") ||
+                normalized.contains("-list") ||
+                normalized.contains("-showbuildsettings") ||
+                normalized.contains("-showsdks") ||
+                normalized.contains("-version")
+        default:
+            return true
+        }
+    }
+
+    private static func hasAllowedNestedCommand(_ args: [String], allowed: [[String]]) -> Bool {
+        let positional = args.filter { !$0.hasPrefix("-") }
+        return allowed.contains { prefix in
+            positional.count >= prefix.count && Array(positional.prefix(prefix.count)) == prefix
+        }
     }
 
     // MARK: - compression decision (pure)

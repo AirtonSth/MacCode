@@ -43,6 +43,30 @@ final class DistillServiceTests: XCTestCase {
         XCTAssertEqual(metrics.encoderLaneInvocations, 0)
         XCTAssertEqual(metrics.resolvedWithoutLLMRate, 0)
         XCTAssertEqual(metrics.gateP95Millis, 0)
+        XCTAssertEqual(metrics.toolOutputEligible, 0)
+        XCTAssertEqual(metrics.toolOutputCompressed, 0)
+        XCTAssertEqual(metrics.toolOutputSkippedOverCap, 0)
+        XCTAssertEqual(metrics.toolOutputSkippedNoService, 0)
+        XCTAssertEqual(metrics.toolOutputSkippedNotTerminal, 0)
+    }
+
+    func test_metricsRecorderReportsToolOutputHitRateAndBypassCounters() async {
+        let recorder = DistillServiceMetricsRecorder()
+
+        await recorder.recordToolOutputEligible()
+        await recorder.recordToolOutputCompressed()
+        await recorder.recordToolOutputSkipped(.overCap)
+        await recorder.recordToolOutputSkipped(.noService)
+        await recorder.recordToolOutputSkipped(.notTerminal)
+
+        let snapshot = await recorder.snapshot(activeRequests: 0, maxConcurrentRequests: 2)
+
+        XCTAssertEqual(snapshot.toolOutputEligible, 1)
+        XCTAssertEqual(snapshot.toolOutputCompressed, 1)
+        XCTAssertEqual(snapshot.toolOutputSkippedOverCap, 1)
+        XCTAssertEqual(snapshot.toolOutputSkippedNoService, 1)
+        XCTAssertEqual(snapshot.toolOutputSkippedNotTerminal, 1)
+        XCTAssertEqual(snapshot.pipeHitRate, 1.0)
     }
 
     func test_mlxRuntimeRequiresRealLocalModelFiles() async {
@@ -161,6 +185,42 @@ final class DistillServiceTests: XCTestCase {
         XCTAssertEqual(snapshot.totalRequests, 1)
         XCTAssertEqual(snapshot.successfulRequests, 1)
         XCTAssertEqual(snapshot.failedRequests, 0)
+        XCTAssertEqual(snapshot.toolOutputEligible, 1)
+        XCTAssertEqual(snapshot.toolOutputCompressed, 1)
+        XCTAssertEqual(snapshot.pipeHitRate, 1.0)
+    }
+
+    func test_httpCompressAliasServesLocalCompressionWithoutProviderProxying() async throws {
+        let configuration = try DistillServiceConfiguration(
+            authToken: "compress-token",
+            appSupportDirectory: NSTemporaryDirectory(),
+            maxConcurrentRequests: 1
+        )
+        let server = DistillHTTPServer(
+            configuration: configuration,
+            scheduler: DistillScheduler(runtime: LocalDistillRuntime(), maxConcurrentRequests: 1)
+        )
+        let ready = try await server.start()
+        defer { server.stop() }
+
+        let request = DistillRequest(
+            id: UUID(uuidString: "22222222-2222-2222-2222-222222222222")!,
+            mode: .commandOutput,
+            input: "HTTP/1.1 provider body must not appear here\nbuild passed\n0 failures",
+            question: "Did the build pass? Return PASS or FAIL only.",
+            maxOutputCharacters: 200
+        )
+        let response = try await response(
+            baseURL: ready.baseURL,
+            path: "/v1/compress",
+            method: "POST",
+            token: "compress-token",
+            body: try JSONEncoder().encode(request)
+        )
+
+        XCTAssertEqual(response.status, 200)
+        let decoded = try JSONDecoder().decode(DistillResponse.self, from: response.data)
+        XCTAssertEqual(decoded.output, "PASS")
     }
 
     func test_httpStatsEndpointReturnsSavingsLedgerSnapshot() async throws {

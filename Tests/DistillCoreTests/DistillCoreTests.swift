@@ -518,7 +518,7 @@ final class DistillCoreTests: XCTestCase {
                        "I2: SDK PostToolUse compression must be measurable separately from one-shot pipe savings")
     }
 
-    func test_sr1HumanizeSavingsUseHumanMinusSR1LengthTimesThree() {
+    func test_sr1HumanizeSavingsCreditDefaultAgentVerbosityFactor() {
         let sr1 = "S ok.\nO done."
         let request = DistillRequest(
             mode: .sr1Humanize,
@@ -543,13 +543,17 @@ final class DistillCoreTests: XCTestCase {
 
         let record = DistillSavingsCalculator.record(for: request, response: response)
 
+        let factor = TokenSaverSR1SavingsEstimator.effectiveExpansionFactor
+        XCTAssertEqual(factor, 9, "agents are ~3x more verbose by default, so the SR1 saving is credited 3x the raw transcript-expansion delta")
         XCTAssertEqual(record?.provider, "codex")
         XCTAssertEqual(record?.mode, "sr1-humanize")
-        XCTAssertEqual(record?.inputTokens, human.count * 3,
-                       "SR1 accounting must include the avoided human-language transcript expansion, not only tokenizer-estimated display text")
-        XCTAssertEqual(record?.outputTokens, sr1.count * 3,
-                       "the emitted SR1 response is scaled with the same transcript expansion factor")
-        XCTAssertEqual(record?.savedTokens, max((human.count - sr1.count) * 3, 0))
+        XCTAssertEqual(record?.inputTokens, human.count * factor,
+                       "SR1 accounting must include the avoided human-language transcript expansion at the default-agent verbosity rate, not only tokenizer-estimated display text")
+        XCTAssertEqual(record?.outputTokens, sr1.count * factor,
+                       "the emitted SR1 response is scaled with the same expansion factor so saved = input - output holds")
+        XCTAssertEqual(record?.savedTokens, max((human.count - sr1.count) * factor, 0))
+        XCTAssertEqual(record?.savedTokens, max((human.count - sr1.count) * 3, 0) * 3,
+                       "credited saving is exactly 3x the prior raw transcript delta")
     }
 
     func test_mlxCommandOutputCollapsesDuplicatedModelBlocks() throws {

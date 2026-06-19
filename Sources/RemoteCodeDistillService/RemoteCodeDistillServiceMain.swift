@@ -198,18 +198,43 @@ struct RemoteCodeDistillServiceMain {
     private static func runMCP() async {
         let state = loadCLIState()
         let session = createConfiguredURLSession()
-        let server = ManagedRetrieveMCP { handle in
-            guard let state, let url = URL(string: state.baseURL + "/v1/retrieve/\(handle)") else { return nil }
-            var request = URLRequest(url: url)
-            request.setValue("Bearer \(state.authToken)", forHTTPHeaderField: "Authorization")
-            guard let (data, response) = try? await session.data(for: request),
-                  (response as? HTTPURLResponse)?.statusCode == 200,
-                  let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  (obj["found"] as? Bool) == true else {
-                return nil
+        let server = ManagedRetrieveMCP(
+            retrieve: { handle in
+                guard let state, let url = URL(string: state.baseURL + "/v1/retrieve/\(handle)") else { return nil }
+                var request = URLRequest(url: url)
+                request.setValue("Bearer \(state.authToken)", forHTTPHeaderField: "Authorization")
+                guard let (data, response) = try? await session.data(for: request),
+                      (response as? HTTPURLResponse)?.statusCode == 200,
+                      let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                      (obj["found"] as? Bool) == true else {
+                    return nil
+                }
+                return obj["original"] as? String
+            },
+            stats: {
+                guard let state, let url = URL(string: state.baseURL + "/v1/stats") else { return nil }
+                var request = URLRequest(url: url)
+                request.setValue("Bearer \(state.authToken)", forHTTPHeaderField: "Authorization")
+                guard let (data, response) = try? await session.data(for: request),
+                      (response as? HTTPURLResponse)?.statusCode == 200 else {
+                    return nil
+                }
+                return try? JSONDecoder().decode(DistillStatsSnapshot.self, from: data)
+            },
+            compress: { distillRequest in
+                guard let state, let url = URL(string: state.baseURL + "/v1/distill") else { return nil }
+                var request = URLRequest(url: url)
+                request.httpMethod = "POST"
+                request.setValue("Bearer \(state.authToken)", forHTTPHeaderField: "Authorization")
+                request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+                request.httpBody = try? JSONEncoder().encode(distillRequest)
+                guard let (data, response) = try? await session.data(for: request),
+                      (response as? HTTPURLResponse)?.statusCode == 200 else {
+                    return nil
+                }
+                return try? JSONDecoder().decode(DistillResponse.self, from: data)
             }
-            return obj["original"] as? String
-        }
+        )
         while let line = readLine(strippingNewline: true) {
             if let response = await server.handle(line) {
                 FileHandle.standardOutput.write(Data((response + "\n").utf8))

@@ -1951,9 +1951,26 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             // Token Saver env (distill hint + Claude-only PostToolUse state). Shared with the
             // session-recovery path so a resumed run keeps piping/speaking distill; see
             // AppContext.tokenSaverAgentEnvironment. Empty when Token Saver is off.
-            env.merge(context.tokenSaverAgentEnvironment(provider: provider)) { _, new in new }
+            let tokenSaverEnv = context.tokenSaverAgentEnvironment(provider: provider)
+            env.merge(tokenSaverEnv) { _, new in new }
+            if !tokenSaverEnv.isEmpty {
+                env["PATH"] = Self.providerPathWithManagedWrappers(
+                    currentPath: env["PATH"] ?? ProcessInfo.processInfo.environment["PATH"] ?? "",
+                    managedBin: AgentSkillInstaller.defaultManagedCLIBinDirectory().path
+                )
+            }
         }
         return env
+    }
+
+    static func providerPathWithManagedWrappers(currentPath: String, managedBin: String) -> String {
+        let trimmed = managedBin.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return currentPath }
+        let parts = currentPath
+            .split(separator: ":", omittingEmptySubsequences: false)
+            .map(String.init)
+            .filter { $0 != trimmed }
+        return ([trimmed] + parts).joined(separator: ":")
     }
 
     private func configuredProviderBinary(_ provider: AgentProvider) -> String? {

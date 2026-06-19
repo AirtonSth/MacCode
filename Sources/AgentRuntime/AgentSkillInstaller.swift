@@ -87,10 +87,10 @@ public final class AgentSkillInstaller: @unchecked Sendable {
     - No filler.
     - No cryptic code.
     - No long prose unless the user asks for explanation.
-    - Keep hidden chain-of-thought private.
+    - Write surfaced reasoning/thinking in distill structure (semantic S/C/D/R/O/N/P lines), not prose; keep secrets out of it.
 
     Thread behavior:
-    - Use distill structure for status updates, plans, summaries, reviews, and final answers.
+    - Use distill structure for reasoning, thinking, status updates, plans, summaries, reviews, and final answers.
     - Do not output a rewritten/compressed version of the latest user prompt unless the user explicitly asks to compress text.
     - Emit `Dict:` early when aliases or prefixes matter.
 
@@ -113,9 +113,9 @@ public final class AgentSkillInstaller: @unchecked Sendable {
 
     public static let distillAgentInstructionsTemplate = """
     <!-- distill skill: begin -->
-    CRITICAL: Use `/distill` for every user-visible response: English Military English + AR-0/AR-1, short command lines, explicit constraints, explicit pass criteria, no filler.
+    CRITICAL: Use `/distill` for every user-visible response and your reasoning/thinking: English Military English + AR-0/AR-1, short command lines, explicit constraints, explicit pass criteria, no filler.
     Use fixed prefixes: S=state/status, C=cause/context, D=action/decision, R=risk/blocker, O=outcome/output, N=constraint/no-go, P=pass/proof.
-    Use Dict/inline `#` variables only when they reduce repetition. Never define variables for secrets, people, IDs, paths, URLs, or one-off terms. Keep hidden chain-of-thought private.
+    Use Dict/inline `#` variables only when they reduce repetition. Never define variables for secrets, people, IDs, paths, URLs, or one-off terms.
     Do not return a rewritten/compressed copy of the user's prompt unless explicitly asked to compress text.
     Token Saver — bias to compress (over-compressing beats under-compressing): by DEFAULT pipe EVERY non-interactive, non-TUI command whose output exceeds ~10 lines or ~1KB through the RemoteCode-managed `distill` CLI with an explicit extraction prompt (build/test/lint/git/grep/find/ls/cat/curl/docker/kubectl/etc). If unsure it will be large, pipe it.
     Skip `| distill` ONLY when you need exact bytes (patches, hashes/tokens), output is interactive/TUI, or the local RemoteCodeDistillService is unavailable; state the skip. Never invoke Node, tsx, npm, bun, or a source-checkout CLI for `distill`.

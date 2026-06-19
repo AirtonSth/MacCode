@@ -5,10 +5,14 @@ final class CommandWrapPolicyTests: XCTestCase {
     private let noEnv: [String: String] = [:]
 
     func test_isWrapped_coversReadSearchFamilyByBasename() {
-        for c in ["rg", "grep", "find", "ls", "cat", "sed", "/bin/cat", "/opt/homebrew/bin/rg"] {
+        for c in [
+            "rg", "grep", "find", "ls", "cat", "sed",
+            "git", "gh", "glab", "swift", "xcodebuild",
+            "/bin/cat", "/opt/homebrew/bin/rg", "/usr/bin/git"
+        ] {
             XCTAssertTrue(CommandWrapPolicy.isWrapped(c), "\(c) must be wrapped")
         }
-        for c in ["git", "echo", "node", "python3", "rm", "mv"] {
+        for c in ["echo", "node", "python3", "rm", "mv"] {
             XCTAssertFalse(CommandWrapPolicy.isWrapped(c), "\(c) must NOT be wrapped")
         }
     }
@@ -21,6 +25,29 @@ final class CommandWrapPolicyTests: XCTestCase {
                      "a read-only sed slice is eligible for compression")
         XCTAssertEqual(CommandWrapPolicy.passthroughReason(command: "rg", args: ["x"], environment: ["REMOTE_CODE_WRAP_DISABLE": "1"]), "disabled")
         XCTAssertNil(CommandWrapPolicy.passthroughReason(command: "rg", args: ["x"], environment: noEnv))
+    }
+
+    func test_passthroughReason_allowsReadOnlySubcommandsAndRejectsMutatingOnes() {
+        XCTAssertNil(CommandWrapPolicy.passthroughReason(command: "git", args: ["diff"], environment: noEnv))
+        XCTAssertNil(CommandWrapPolicy.passthroughReason(command: "git", args: ["show", "--stat"], environment: noEnv))
+        XCTAssertNil(CommandWrapPolicy.passthroughReason(command: "git", args: ["branch", "--show-current"], environment: noEnv))
+        XCTAssertNil(CommandWrapPolicy.passthroughReason(command: "git", args: ["remote", "-v"], environment: noEnv))
+        XCTAssertEqual(
+            CommandWrapPolicy.passthroughReason(command: "git", args: ["push"], environment: noEnv),
+            "mutating_subcommand",
+            "git push must keep raw inherited streams and exact behavior"
+        )
+        XCTAssertEqual(CommandWrapPolicy.passthroughReason(command: "git", args: ["branch", "-D", "feature"], environment: noEnv), "mutating_subcommand")
+        XCTAssertEqual(CommandWrapPolicy.passthroughReason(command: "git", args: ["remote", "add", "origin", "url"], environment: noEnv), "mutating_subcommand")
+
+        XCTAssertNil(CommandWrapPolicy.passthroughReason(command: "gh", args: ["pr", "diff", "12"], environment: noEnv))
+        XCTAssertEqual(CommandWrapPolicy.passthroughReason(command: "gh", args: ["pr", "merge", "12"], environment: noEnv), "mutating_subcommand")
+        XCTAssertNil(CommandWrapPolicy.passthroughReason(command: "glab", args: ["mr", "diff", "12"], environment: noEnv))
+        XCTAssertEqual(CommandWrapPolicy.passthroughReason(command: "glab", args: ["mr", "merge", "12"], environment: noEnv), "mutating_subcommand")
+
+        XCTAssertNil(CommandWrapPolicy.passthroughReason(command: "swift", args: ["test"], environment: noEnv))
+        XCTAssertNil(CommandWrapPolicy.passthroughReason(command: "xcodebuild", args: ["test"], environment: noEnv))
+        XCTAssertEqual(CommandWrapPolicy.passthroughReason(command: "swift", args: ["package", "reset"], environment: noEnv), "mutating_subcommand")
     }
 
     func test_shouldCompress_thresholdsAndEnvOverrides() {

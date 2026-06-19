@@ -15,11 +15,8 @@ import Foundation
 public struct ManagedDistillCLI: Sendable {
     public typealias Transport = @Sendable (URLRequest) async -> (data: Data, status: Int)?
 
-    /// Hard cap on stdin bytes. Inputs above this are rejected with a non-zero exit so a
-    /// runaway pipe cannot buffer an arbitrarily large blob into memory.
-    /// 512 KB is well above any realistic single distill request (token-output blobs,
-    /// large git diffs, verbose test logs). Raise only if legitimate inputs are measured
-    /// to exceed this value.
+    /// Per-request stdin chunk size. Inputs above this are split into multiple bounded
+    /// distill calls; if any chunk fails, the CLI emits the original stdin verbatim.
     public static let stdinCapBytes: Int = 512 * 1_024
 
     /// Pure seam: returns true when `byteCount` exceeds `cap`. Extracted so tests can
@@ -111,17 +108,12 @@ public struct ManagedDistillCLI: Sendable {
         // sees an error in place of its tool output.
         func failOpen() -> (Data, Int32) { (stdin, 0) }
 
-        // Reject oversized stdin before any allocation. A blob this large would almost
-        // certainly time out or be refused by the service anyway; rejecting early prevents
-        // OOM and gives the caller an actionable error.
-        if ManagedDistillCLI.exceedsStdinCap(byteCount: stdin.count, cap: ManagedDistillCLI.stdinCapBytes) {
-            let msg = "distill: stdin exceeds \(ManagedDistillCLI.stdinCapBytes / 1_024) KB cap (\(stdin.count) bytes); truncate input before piping\n"
-            return (Data(msg.utf8), 1)
-        }
-
         let input = String(decoding: stdin, as: UTF8.self)
         guard !input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             return (Data(), 0) // nothing piped → nothing to compress or lose
+        }
+        if ManagedDistillCLI.exceedsStdinCap(byteCount: stdin.count, cap: ManagedDistillCLI.stdinCapBytes) {
+            return await compressChunks(input: input, prompt: prompt)
         }
         guard let state, let url = URL(string: state.baseURL + "/v1/distill") else { return failOpen() }
 
@@ -153,6 +145,82 @@ public struct ManagedDistillCLI: Sendable {
             out += "\n[[rc:\(handle)]]"
         }
         return (Data((out + "\n").utf8), 0)
+    }
+
+    private func compressChunks(input: String, prompt: String) async -> (Data, Int32) {
+        func failOpen() -> (Data, Int32) { (stdin, 0) }
+        guard let state, let url = URL(string: state.baseURL + "/v1/distill") else { return failOpen() }
+        let chunks = Self.utf8Chunks(input, maxBytes: Self.stdinCapBytes)
+        guard chunks.count > 1 else { return failOpen() }
+
+        var emitted: [String] = []
+        emitted.reserveCapacity(chunks.count)
+        for (offset, chunk) in chunks.enumerated() {
+            let question = Self.chunkQuestion(prompt: prompt, index: offset + 1, count: chunks.count)
+            let request = DistillRequest(
+                mode: .commandOutput,
+                priority: .agent,
+                input: chunk,
+                question: question,
+                provider: provider,
+                recordSavings: true,
+                maxOutputCharacters: maxOutputCharacters,
+                reversibleStoreMinBytes: reversibleStoreMinBytes
+            )
+            guard let body = try? JSONEncoder().encode(request) else { return failOpen() }
+            var urlRequest = URLRequest(url: url)
+            urlRequest.httpMethod = "POST"
+            urlRequest.setValue("Bearer \(state.authToken)", forHTTPHeaderField: "Authorization")
+            urlRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            urlRequest.httpBody = body
+
+            guard let (data, status) = await transport(urlRequest), status == 200,
+                  let response = try? JSONDecoder().decode(DistillResponse.self, from: data),
+                  !response.output.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                return failOpen()
+            }
+            var out = response.output
+            if let handle = response.originalHandle, !handle.isEmpty {
+                out += "\n[[rc:\(handle)]]"
+            }
+            emitted.append(out)
+        }
+        return (Data((emitted.joined(separator: "\n\n") + "\n").utf8), 0)
+    }
+
+    static func utf8Chunks(_ input: String, maxBytes: Int) -> [String] {
+        guard input.utf8.count > maxBytes, maxBytes > 0 else { return [input] }
+        var chunks: [String] = []
+        var current = ""
+        var currentBytes = 0
+        for character in input {
+            let text = String(character)
+            let bytes = text.utf8.count
+            if currentBytes > 0, currentBytes + bytes > maxBytes {
+                chunks.append(current)
+                current = ""
+                currentBytes = 0
+            }
+            if bytes > maxBytes {
+                if !current.isEmpty {
+                    chunks.append(current)
+                    current = ""
+                    currentBytes = 0
+                }
+                chunks.append(text)
+            } else {
+                current.append(character)
+                currentBytes += bytes
+            }
+        }
+        if !current.isEmpty { chunks.append(current) }
+        return chunks
+    }
+
+    private static func chunkQuestion(prompt: String, index: Int, count: Int) -> String? {
+        let trimmed = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        let suffix = "Chunk \(index)/\(count): preserve local errors, paths, identifiers, numbers, and retrieve-worthy details."
+        return trimmed.isEmpty ? suffix : "\(trimmed)\n\(suffix)"
     }
 
     // MARK: - retrieve (no stdin to preserve → exit 1 on miss)

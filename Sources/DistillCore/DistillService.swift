@@ -87,6 +87,12 @@ public protocol DistillStatsProviding: Sendable {
     func statsSnapshot() throws -> DistillStatsSnapshot
 }
 
+public enum ToolOutputTelemetrySkipReason: String, Sendable, Equatable {
+    case overCap = "over_cap"
+    case noService = "no_service"
+    case notTerminal = "not_terminal"
+}
+
 public enum DistillApprovedModel {
     public static let id = TokenSaverApprovedModels.defaultModel.id
     public static let url = TokenSaverApprovedModels.defaultModel.url
@@ -260,6 +266,11 @@ public struct DistillServiceMetrics: Codable, Sendable, Equatable {
     public let successfulRequests: Int
     public let failedRequests: Int
     public let fallbackRequests: Int
+    public let toolOutputEligible: Int
+    public let toolOutputCompressed: Int
+    public let toolOutputSkippedOverCap: Int
+    public let toolOutputSkippedNoService: Int
+    public let toolOutputSkippedNotTerminal: Int
     public let resultCacheHits: Int
     public let resultCacheMisses: Int
     public let volatileTokenWarnings: Int
@@ -287,6 +298,11 @@ public struct DistillServiceMetrics: Codable, Sendable, Equatable {
         case successfulRequests = "successful_requests"
         case failedRequests = "failed_requests"
         case fallbackRequests = "fallback_requests"
+        case toolOutputEligible = "tool_output_eligible"
+        case toolOutputCompressed = "tool_output_compressed"
+        case toolOutputSkippedOverCap = "tool_output_skipped_over_cap"
+        case toolOutputSkippedNoService = "tool_output_skipped_no_service"
+        case toolOutputSkippedNotTerminal = "tool_output_skipped_not_terminal"
         case resultCacheHits = "result_cache_hits"
         case resultCacheMisses = "result_cache_misses"
         case volatileTokenWarnings = "volatile_token_warnings"
@@ -314,6 +330,11 @@ public struct DistillServiceMetrics: Codable, Sendable, Equatable {
             successfulRequests: try container.decode(Int.self, forKey: .successfulRequests),
             failedRequests: try container.decode(Int.self, forKey: .failedRequests),
             fallbackRequests: try container.decodeIfPresent(Int.self, forKey: .fallbackRequests) ?? 0,
+            toolOutputEligible: try container.decodeIfPresent(Int.self, forKey: .toolOutputEligible) ?? 0,
+            toolOutputCompressed: try container.decodeIfPresent(Int.self, forKey: .toolOutputCompressed) ?? 0,
+            toolOutputSkippedOverCap: try container.decodeIfPresent(Int.self, forKey: .toolOutputSkippedOverCap) ?? 0,
+            toolOutputSkippedNoService: try container.decodeIfPresent(Int.self, forKey: .toolOutputSkippedNoService) ?? 0,
+            toolOutputSkippedNotTerminal: try container.decodeIfPresent(Int.self, forKey: .toolOutputSkippedNotTerminal) ?? 0,
             resultCacheHits: try container.decodeIfPresent(Int.self, forKey: .resultCacheHits) ?? 0,
             resultCacheMisses: try container.decodeIfPresent(Int.self, forKey: .resultCacheMisses) ?? 0,
             volatileTokenWarnings: try container.decodeIfPresent(Int.self, forKey: .volatileTokenWarnings) ?? 0,
@@ -340,6 +361,11 @@ public struct DistillServiceMetrics: Codable, Sendable, Equatable {
         successfulRequests: Int,
         failedRequests: Int,
         fallbackRequests: Int,
+        toolOutputEligible: Int = 0,
+        toolOutputCompressed: Int = 0,
+        toolOutputSkippedOverCap: Int = 0,
+        toolOutputSkippedNoService: Int = 0,
+        toolOutputSkippedNotTerminal: Int = 0,
         resultCacheHits: Int = 0,
         resultCacheMisses: Int = 0,
         volatileTokenWarnings: Int = 0,
@@ -363,6 +389,11 @@ public struct DistillServiceMetrics: Codable, Sendable, Equatable {
         self.successfulRequests = successfulRequests
         self.failedRequests = failedRequests
         self.fallbackRequests = fallbackRequests
+        self.toolOutputEligible = max(0, toolOutputEligible)
+        self.toolOutputCompressed = max(0, toolOutputCompressed)
+        self.toolOutputSkippedOverCap = max(0, toolOutputSkippedOverCap)
+        self.toolOutputSkippedNoService = max(0, toolOutputSkippedNoService)
+        self.toolOutputSkippedNotTerminal = max(0, toolOutputSkippedNotTerminal)
         self.resultCacheHits = resultCacheHits
         self.resultCacheMisses = resultCacheMisses
         self.volatileTokenWarnings = volatileTokenWarnings
@@ -388,6 +419,11 @@ public actor DistillServiceMetricsRecorder {
     private var successfulRequests = 0
     private var failedRequests = 0
     private var fallbackRequests = 0
+    private var toolOutputEligible = 0
+    private var toolOutputCompressed = 0
+    private var toolOutputSkippedOverCap = 0
+    private var toolOutputSkippedNoService = 0
+    private var toolOutputSkippedNotTerminal = 0
     private var volatileTokenWarnings = 0
     private var systemPromptHash: String?
     private var cacheDriftWarnings = 0
@@ -428,6 +464,25 @@ public actor DistillServiceMetricsRecorder {
         fallbackRequests += 1
     }
 
+    public func recordToolOutputEligible() {
+        toolOutputEligible += 1
+    }
+
+    public func recordToolOutputCompressed() {
+        toolOutputCompressed += 1
+    }
+
+    public func recordToolOutputSkipped(_ reason: ToolOutputTelemetrySkipReason) {
+        switch reason {
+        case .overCap:
+            toolOutputSkippedOverCap += 1
+        case .noService:
+            toolOutputSkippedNoService += 1
+        case .notTerminal:
+            toolOutputSkippedNotTerminal += 1
+        }
+    }
+
     public func recordVolatileTokenWarnings(_ count: Int) {
         volatileTokenWarnings += max(0, count)
     }
@@ -453,6 +508,11 @@ public actor DistillServiceMetricsRecorder {
             successfulRequests: successfulRequests,
             failedRequests: failedRequests,
             fallbackRequests: fallbackRequests,
+            toolOutputEligible: toolOutputEligible,
+            toolOutputCompressed: toolOutputCompressed,
+            toolOutputSkippedOverCap: toolOutputSkippedOverCap,
+            toolOutputSkippedNoService: toolOutputSkippedNoService,
+            toolOutputSkippedNotTerminal: toolOutputSkippedNotTerminal,
             resultCacheHits: resultCacheHits,
             resultCacheMisses: resultCacheMisses,
             volatileTokenWarnings: volatileTokenWarnings,
@@ -463,6 +523,7 @@ public actor DistillServiceMetricsRecorder {
             encoderLaneFallbacks: encoderMetrics.fallbacks,
             encoderLaneFailures: encoderMetrics.failures,
             encoderLaneDeadlineTimeouts: encoderMetrics.deadlineTimeouts,
+            pipeHitRate: toolOutputEligible == 0 ? 0 : Double(toolOutputCompressed) / Double(toolOutputEligible),
             resolvedWithoutLLMRate: routeLedger.resolvedWithoutLLMRate,
             encoderAvgMillis: routeLedger.averageLatencyMillis(stage: .encoderBERT),
             llmAvgMillis: routeLedger.averageLatencyMillis(stage: .llmMLX),
@@ -776,13 +837,13 @@ public final class DistillHTTPServer: @unchecked Sendable {
             send(status: 200, body: snapshot, connection: connection)
         case ("GET", "/v1/stats"):
             handleStats(connection: connection)
-        case ("POST", "/v1/distill"):
+        case ("POST", "/v1/distill"), ("POST", "/v1/compress"):
             await handleDistill(request: request, connection: connection)
         case ("POST", "/v1/rank"):
             handleRank(request: request, connection: connection)
         case ("POST", "/v1/embed"):
             handleEmbed(request: request, connection: connection)
-        case (_, "/v1/distill"):
+        case (_, "/v1/distill"), (_, "/v1/compress"):
             send(status: 405, body: ErrorBody(error: "method_not_allowed", message: "use POST"), connection: connection)
         case (_, "/v1/rank"), (_, "/v1/embed"):
             send(status: 405, body: ErrorBody(error: "method_not_allowed", message: "use POST"), connection: connection)
@@ -828,6 +889,9 @@ public final class DistillHTTPServer: @unchecked Sendable {
         }
         do {
             let distillRequest = try decoder.decode(DistillRequest.self, from: request.body)
+            if distillRequest.mode == .commandOutput {
+                await metrics.recordToolOutputEligible()
+            }
             let volatileScan = CacheAlignerVolatileTokenDetector.scan(
                 [distillRequest.input, distillRequest.question ?? ""].joined(separator: "\n")
             )
@@ -862,6 +926,9 @@ public final class DistillHTTPServer: @unchecked Sendable {
             let response = (storeFailedForLargeInput && compressed.output != distillRequest.input)
                 ? compressed.verbatimFallback(input: distillRequest.input)
                 : compressed
+            if distillRequest.mode == .commandOutput, response.output != distillRequest.input {
+                await metrics.recordToolOutputCompressed()
+            }
             if let onSuccess {
                 await onSuccess(distillRequest, response)
             }

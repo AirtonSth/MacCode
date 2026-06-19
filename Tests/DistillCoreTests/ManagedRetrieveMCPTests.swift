@@ -3,7 +3,21 @@ import XCTest
 
 final class ManagedRetrieveMCPTests: XCTestCase {
     private func server(_ map: [String: String] = [:]) -> ManagedRetrieveMCP {
-        ManagedRetrieveMCP { handle in map[handle] }
+        ManagedRetrieveMCP(
+            retrieve: { handle in map[handle] },
+            stats: { DistillStatsSnapshot(totalSavedTokens: 120, totalRuns: 3) },
+            compress: { request in
+                DistillResponse(
+                    requestID: request.id,
+                    output: "compressed",
+                    inputCharacters: request.input.count,
+                    inputTokens: 100,
+                    outputTokens: 10,
+                    originalHandle: "mcp-h",
+                    routeStage: .deterministic
+                )
+            }
+        )
     }
     private func parse(_ s: String?) throws -> [String: Any] {
         let data = try XCTUnwrap(s?.data(using: .utf8))
@@ -18,11 +32,10 @@ final class ManagedRetrieveMCPTests: XCTestCase {
         XCTAssertNotNil(result["capabilities"])
     }
 
-    func test_toolsListExposesRetrieveOnly() async throws {
+    func test_toolsListExposesRetrieveSearchStatsAndNetPositiveCompress() async throws {
         let obj = try parse(await server().handle(#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#))
         let tools = try XCTUnwrap((obj["result"] as? [String: Any])?["tools"] as? [[String: Any]])
-        XCTAssertEqual(Set(tools.compactMap { $0["name"] as? String }), ["rc_retrieve", "rc_search"])
-        XCTAssertFalse(tools.contains { ($0["name"] as? String) == "rc_compress" }, "read-only MCP: no compress tool")
+        XCTAssertEqual(Set(tools.compactMap { $0["name"] as? String }), ["rc_retrieve", "rc_search", "rc_stats", "rc_compress"])
     }
 
     func test_toolsCallReturnsOriginal() async throws {
@@ -43,8 +56,8 @@ final class ManagedRetrieveMCPTests: XCTestCase {
 
     func test_wrongToolIsRejected() async throws {
         let obj = try parse(await server().handle(
-            #"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"rc_compress","arguments":{}}}"#))
-        XCTAssertNotNil(obj["error"], "only read-only retrieve/search tools are exposed; no compress tool")
+            #"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"rc_delete","arguments":{}}}"#))
+        XCTAssertNotNil(obj["error"], "only retrieve/search/stats/net-positive compress tools are exposed")
     }
 
     func test_searchToolReturnsReadOnlyHandles() async throws {
@@ -60,6 +73,37 @@ final class ManagedRetrieveMCPTests: XCTestCase {
         let text = try XCTUnwrap(content[0]["text"] as? String)
         XCTAssertTrue(text.contains(#""handle":"h2""#))
         XCTAssertFalse(text.contains("ERROR payment failed at Sources/Billing.swift:12\"}"), "search returns excerpts/handles, not full originals")
+    }
+
+    func test_statsToolReturnsSavingsSnapshot() async throws {
+        let obj = try parse(await server().handle(
+            #"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"rc_stats","arguments":{}}}"#))
+        let result = try XCTUnwrap(obj["result"] as? [String: Any])
+        let content = try XCTUnwrap(result["content"] as? [[String: Any]])
+        let text = try XCTUnwrap(content[0]["text"] as? String)
+        XCTAssertTrue(text.contains(#""total_saved_tokens":120"#))
+        XCTAssertEqual(result["isError"] as? Bool, false)
+    }
+
+    func test_compressToolRunsOnlyWhenNetPositiveAndReturnsRetrieveHandle() async throws {
+        let obj = try parse(await server().handle(
+            #"{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"rc_compress","arguments":{"input":"large output","question":"keep errors","estimatedInputTokens":1000,"toolRoundTripTokens":40}}}"#))
+        let result = try XCTUnwrap(obj["result"] as? [String: Any])
+        let content = try XCTUnwrap(result["content"] as? [[String: Any]])
+        let text = try XCTUnwrap(content[0]["text"] as? String)
+        XCTAssertTrue(text.contains("compressed"))
+        XCTAssertTrue(text.contains("[[rc:mcp-h]]"))
+        XCTAssertEqual(result["isError"] as? Bool, false)
+    }
+
+    func test_compressToolSkipsWhenRoundTripWouldCostMoreThanSavings() async throws {
+        let obj = try parse(await server().handle(
+            #"{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"rc_compress","arguments":{"input":"small","question":"keep errors","estimatedInputTokens":20,"toolRoundTripTokens":200}}}"#))
+        let result = try XCTUnwrap(obj["result"] as? [String: Any])
+        let content = try XCTUnwrap(result["content"] as? [[String: Any]])
+        let text = try XCTUnwrap(content[0]["text"] as? String)
+        XCTAssertTrue(text.contains("skipped"))
+        XCTAssertEqual(result["isError"] as? Bool, false)
     }
 
     func test_notificationGetsNoResponse() async {
@@ -106,5 +150,7 @@ final class ManagedRetrieveMCPTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(lines.count, 2, "init + tools/list each return a line; got: \(out)")
         XCTAssertTrue(out.contains("\"serverInfo\""), "initialize answered")
         XCTAssertTrue(out.contains("rc_retrieve"), "tools/list exposes rc_retrieve")
+        XCTAssertTrue(out.contains("rc_stats"), "tools/list exposes rc_stats")
+        XCTAssertTrue(out.contains("rc_compress"), "tools/list exposes gated rc_compress")
     }
 }

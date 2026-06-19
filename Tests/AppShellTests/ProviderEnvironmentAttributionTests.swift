@@ -1,6 +1,7 @@
 import XCTest
 import CoreModel
 import Persistence
+import AgentRuntime
 @testable import AppShell
 
 /// Regression for the Token Saver savings-attribution bug: command-output savings from the
@@ -82,5 +83,24 @@ final class ProviderEnvironmentAttributionTests: XCTestCase {
         XCTAssertEqual(claude["RC_TOKEN_SAVER_DISTILL_HINT"], "1")
         XCTAssertEqual(claude["RC_TOKEN_SAVER_POST_TOOL_USE"], "1")
         XCTAssertNotNil(claude["REMOTE_CODE_DISTILL_STATE_PATH"])
+    }
+
+    /// Transparent command wrappers only help Codex/Claude provider shells if the managed bin
+    /// directory wins PATH lookup inside the provider process. The user's interactive shell may
+    /// still resolve Homebrew `rg`; providerEnvironment must make the provider shell resolve
+    /// `~/.remote-code/bin/rg` first when Token Saver is enabled.
+    @MainActor
+    func test_providerEnvironmentPrependsManagedWrapperBinToProviderPathWhenTokenSaverEnabled() throws {
+        let appSupport = NSTemporaryDirectory() + "RC2TSEnvPath-" + UUID().uuidString
+        let ctx = try AppContext(channel: .debug, appSupportOverride: appSupport)
+        let router = AppCommandRouter(context: ctx)
+        SettingsStore(db: ctx.db).update { $0.tokenSaverEnabled = true }
+
+        let managedBin = AgentSkillInstaller.defaultManagedCLIBinDirectory().path
+        let codexPath = try XCTUnwrap(router.providerEnvironment(provider: .codex, instanceId: nil)["PATH"])
+        let claudePath = try XCTUnwrap(router.providerEnvironment(provider: .claude, instanceId: nil)["PATH"])
+
+        XCTAssertTrue(codexPath.hasPrefix(managedBin + ":"), "Codex provider shell must resolve wrapped commands through managed bin first")
+        XCTAssertTrue(claudePath.hasPrefix(managedBin + ":"), "Claude provider shell must resolve wrapped commands through managed bin first")
     }
 }

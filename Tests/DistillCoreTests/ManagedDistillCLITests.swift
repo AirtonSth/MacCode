@@ -2,6 +2,27 @@ import XCTest
 @testable import DistillCore
 
 final class ManagedDistillCLITests: XCTestCase {
+    private actor RequestRecorder {
+        private var values: [DistillRequest] = []
+
+        func append(_ request: DistillRequest) {
+            values.append(request)
+        }
+
+        func all() -> [DistillRequest] {
+            values
+        }
+    }
+
+    private actor CallCounter {
+        private var value = 0
+
+        func increment() -> Int {
+            value += 1
+            return value
+        }
+    }
+
     private let state = ManagedDistillCLI.State(baseURL: "http://127.0.0.1:9", authToken: "t")
 
     func test_compress_success_emitsOutputAndHandleMarker() async {
@@ -40,7 +61,7 @@ final class ManagedDistillCLITests: XCTestCase {
     }
 
     func test_compress_sendsPerRequestReversibleStoreMinBytes() async {
-        var captured: DistillRequest?
+        let recorder = RequestRecorder()
         let resp = DistillResponse(requestID: UUID(), output: "x", inputCharacters: 2_000, originalHandle: "h")
         let data = try! JSONEncoder().encode(resp)
         let cli = ManagedDistillCLI(
@@ -49,10 +70,13 @@ final class ManagedDistillCLITests: XCTestCase {
             state: state,
             reversibleStoreMinBytes: 256
         ) { request in
-            captured = try? JSONDecoder().decode(DistillRequest.self, from: request.httpBody ?? Data())
+            if let decoded = try? JSONDecoder().decode(DistillRequest.self, from: request.httpBody ?? Data()) {
+                await recorder.append(decoded)
+            }
             return (data, 200)
         }
         _ = await cli.run()
+        let captured = await recorder.all().first
         XCTAssertEqual(captured?.reversibleStoreMinBytes, 256,
                        "the wrap path lowers the store floor so compressed output always carries a recovery handle")
     }
@@ -190,7 +214,7 @@ final class ManagedDistillCLITests: XCTestCase {
 
     // MARK: - stdin cap (WHY: oversized stdin must not OOM the CLI)
 
-    func test_exceedsStdinCap_pureSeam_rejectsAboveCap() {
+    func test_exceedsStdinCap_pureSeam_flagsAboveCapForChunking() {
         // Inputs above the cap must be flagged so the reject path fires before any
         // String/JSONEncoder allocation. Business rule: cap + 1 byte is over limit.
         XCTAssertTrue(
@@ -214,15 +238,54 @@ final class ManagedDistillCLITests: XCTestCase {
         )
     }
 
-    func test_compress_overCapStdin_rejectsNonZero() async {
-        // An oversized stdin must exit non-zero (not fail-open) so the caller gets an
-        // actionable error rather than silently discarded data or an OOM crash.
-        let overCap = Data(repeating: UInt8(ascii: "x"), count: ManagedDistillCLI.stdinCapBytes + 1)
-        let cli = ManagedDistillCLI(arguments: ["summarize"], stdin: overCap, state: state) { _ in nil }
+    func test_compress_oneMegabyteInputChunksInsteadOfRejecting() async throws {
+        // A 1 MB test log is a normal agent artifact. Token Saver must split it into
+        // bounded service calls, emit compressed chunks plus retrieve handles, and keep
+        // exit 0 so the shell pipeline remains usable.
+        let oneMB = Data(repeating: UInt8(ascii: "x"), count: 1_024 * 1_024)
+        let response = DistillResponse(
+            requestID: UUID(),
+            output: "chunk summary",
+            inputCharacters: ManagedDistillCLI.stdinCapBytes,
+            inputTokens: 1_000,
+            outputTokens: 10,
+            originalHandle: "h"
+        )
+        let encoded = try JSONEncoder().encode(response)
+        let recorder = RequestRecorder()
+        let cli = ManagedDistillCLI(arguments: ["summarize"], stdin: oneMB, state: state) { request in
+            if let body = request.httpBody,
+               let decoded = try? JSONDecoder().decode(DistillRequest.self, from: body) {
+                await recorder.append(decoded)
+            }
+            return (encoded, 200)
+        }
+
         let (out, code) = await cli.run()
-        XCTAssertEqual(code, 1, "over-cap stdin must exit non-zero")
-        let msg = String(decoding: out, as: UTF8.self)
-        XCTAssertTrue(msg.contains("cap"), "error message must mention the cap so the caller knows what to fix")
+        let decodedRequests = await recorder.all()
+
+        XCTAssertEqual(code, 0)
+        XCTAssertGreaterThan(decodedRequests.count, 1, "over-cap input must be split into multiple bounded requests")
+        XCTAssertTrue(decodedRequests.allSatisfy { $0.input.utf8.count <= ManagedDistillCLI.stdinCapBytes })
+        let text = String(decoding: out, as: UTF8.self)
+        XCTAssertTrue(text.contains("chunk summary"))
+        XCTAssertTrue(text.contains("[[rc:h]]"), "each lossy chunk must remain retrievable")
+        XCTAssertNotEqual(out, oneMB, "successful chunked compression should not fall back to raw output")
+    }
+
+    func test_compress_overCapChunkFailureFailsOpenToExactRawInput() async {
+        // If any chunk cannot be compressed, the whole CLI must return the exact raw
+        // input. Partial lossy summaries would hide missing bytes.
+        let oneMB = Data(repeating: UInt8(ascii: "z"), count: 1_024 * 1_024)
+        let calls = CallCounter()
+        let cli = ManagedDistillCLI(arguments: ["summarize"], stdin: oneMB, state: state) { _ in
+            await calls.increment() == 1 ? nil : (Data(), 500)
+        }
+
+        let (out, code) = await cli.run()
+
+        XCTAssertEqual(code, 0)
+        XCTAssertEqual(out, oneMB, "chunk failure must fail open to byte-exact stdin")
     }
 
     func test_compress_atCapStdin_proceedsNormally_failsOpenOnTransportFailure() async {

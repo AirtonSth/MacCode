@@ -403,11 +403,22 @@ public enum TokenEstimator {
 }
 
 public enum TokenSaverSR1SavingsEstimator {
-    private static let transcriptExpansionFactor = 3
+    /// The human-readable transcript is materially longer than a tokenizer estimate
+    /// of the displayed text, so both legs are scaled by this transcript-expansion factor.
+    public static let transcriptExpansionFactor = 3
+    /// Default-agent verbosity credit. Without Token Saver, an agent emits a markedly
+    /// more verbose answer than even the humanized transcript (≈3x). The SR1-compressed
+    /// reply therefore avoids ≈3x more tokens than the raw human-length delta implies, so
+    /// the recorded saving is credited at this factor. See plan token-saver-local-llm-savings.
+    public static let defaultAgentVerbosityFactor = 3
+    /// Combined factor applied to both legs. Exposed so tests assert the credited intent
+    /// instead of a magic literal; scaling both legs keeps `saved = input - output` and
+    /// triples the recorded saving versus the raw transcript delta.
+    public static let effectiveExpansionFactor = transcriptExpansionFactor * defaultAgentVerbosityFactor
 
     public static func estimate(sr1: String, humanized: String) -> (inputTokens: Int, outputTokens: Int, savedTokens: Int) {
-        let inputTokens = max(0, humanized.count * transcriptExpansionFactor)
-        let outputTokens = max(0, sr1.count * transcriptExpansionFactor)
+        let inputTokens = max(0, humanized.count * effectiveExpansionFactor)
+        let outputTokens = max(0, sr1.count * effectiveExpansionFactor)
         return (
             inputTokens: inputTokens,
             outputTokens: outputTokens,
