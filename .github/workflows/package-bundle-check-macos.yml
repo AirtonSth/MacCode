@@ -24,11 +24,31 @@ jobs:
   package-and-check:
     name: package (debug) + structural check
     runs-on: macos-14
+    env:
+      GHOSTTYKIT_ASSET: GhosttyKit.xcframework.tar.gz
     steps:
+      - name: Select Xcode with Swift 6.1+
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+
       - name: Checkout
         uses: actions/checkout@v4
-      - name: Select Xcode toolchain
-        run: echo "DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer" >> "$GITHUB_ENV"
+        with:
+          lfs: false
+
+      - name: Restore GhosttyKit vendor artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern "$GHOSTTYKIT_ASSET" \
+            --dir "$RUNNER_TEMP"
+          rm -rf Vendor/GhosttyKit.xcframework
+          tar -xzf "$RUNNER_TEMP/$GHOSTTYKIT_ASSET" -C .
+          test -f Vendor/GhosttyKit.xcframework/macos-arm64_x86_64/libGhosttyKit.a
+
       - name: Package debug bundle
         env:
           RC2_CONFIG: debug
