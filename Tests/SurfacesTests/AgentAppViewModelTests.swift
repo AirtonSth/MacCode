@@ -3383,6 +3383,40 @@ final class AgentAppViewModelTests: XCTestCase {
         XCTAssertTrue(vm.availableModels.contains { $0.id == vm.model },
                       "the default model must be one the picker actually offers")
     }
+
+    // F6: the SR1 translation maps were additive-only and never cleared on a thread
+    // switch, so they accumulated the union of every translated message (and its full
+    // original text) across every thread visited for the whole session.
+    @MainActor
+    func test_sr1TranslationMaps_resetOnThreadSwitchButSurviveReselect() async throws {
+        let (vm, threadRepo) = try makeVM()
+        let a = AgentThread(title: "A", provider: .claude, model: "m")
+        let b = AgentThread(title: "B", provider: .claude, model: "m")
+        try threadRepo.upsert(a)
+        try threadRepo.upsert(b)
+        vm.reloadThreads()
+
+        vm.selectThread(a.id)
+        let msgId = AgentMessageID(UUID())
+        vm.coordinator.onSR1TranslatedMessageId?(msgId)   // live badge -> Task { @MainActor }
+        for _ in 0..<200 where !vm.sr1TranslatedMessageIds.contains(msgId) {
+            try await Task.sleep(nanoseconds: 2_000_000)
+        }
+        XCTAssertTrue(vm.sr1TranslatedMessageIds.contains(msgId),
+                      "a live SR1 translation must mark the message on the current thread")
+
+        // Re-selecting the SAME thread must NOT wipe live translation state.
+        vm.selectThread(a.id)
+        XCTAssertTrue(vm.sr1TranslatedMessageIds.contains(msgId),
+                      "re-selecting the same thread must keep its SR1 translation badges")
+
+        // Switching to a DIFFERENT thread (no translations) must clear the maps.
+        vm.selectThread(b.id)
+        XCTAssertTrue(vm.sr1TranslatedMessageIds.isEmpty,
+                      "switching threads must reset SR1 translation state (F6: no cross-thread accumulation)")
+        XCTAssertTrue(vm.sr1OriginalTextsByMessageId.isEmpty,
+                      "switching threads must also drop the retained original texts")
+    }
 }
 
 private final class SlowStartRunner: AgentProviderRunner, @unchecked Sendable {

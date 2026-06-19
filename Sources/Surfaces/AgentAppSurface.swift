@@ -389,6 +389,13 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             }
             selectedThreadId = id
             prompt = composerDraftsByThread[id] ?? ""
+            // F6: the SR1 translation maps are per-thread state. Reset them on a
+            // thread switch so they don't accumulate the union of every translated
+            // message (and its full original text) across every thread visited this
+            // session. refreshSR1TranslationStateFromTimeline() below rebuilds them
+            // from the opened thread's replayed timeline.
+            sr1TranslatedMessageIds = []
+            sr1OriginalTextsByMessageId = [:]
         } else {
             selectedThreadId = id
         }
