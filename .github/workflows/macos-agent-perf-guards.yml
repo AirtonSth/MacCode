@@ -18,7 +18,7 @@ permissions:
 jobs:
   agent-perf:
     name: replay + wide-layout budgets
-    runs-on: macos-14
+    runs-on: macos-15
     env:
       GHOSTTYKIT_ASSET: GhosttyKit.xcframework.tar.gz
     steps:
@@ -26,6 +26,9 @@ jobs:
         uses: maxim-lobanov/setup-xcode@v1
         with:
           xcode-version: latest-stable
+
+      - name: Export selected Xcode developer dir
+        run: echo "DEVELOPER_DIR=$(xcode-select -p)" >> "$GITHUB_ENV"
 
       - name: Checkout
         uses: actions/checkout@v4
