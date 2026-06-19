@@ -3370,6 +3370,16 @@ public struct AgentAppView: View {
         return allItems.filter { !visibleIDs.contains($0.id) }
     }
 
+    /// Count-only path for collapsed history. The reveal row needs only this
+    /// number; building the hidden prefix on every composer keystroke scans a
+    /// huge completed thread even though the rows are not visible.
+    nonisolated static func hiddenTranscriptCount(
+        totalCount: Int,
+        visibleCount: Int
+    ) -> Int {
+        max(0, totalCount - visibleCount)
+    }
+
     // PERF-MAC_AGENT-001: the merged+sorted transcript is read from `body`, so
     // it recomputed (O(n log n)) on every @Published change — every streaming
     // delta and every keystroke. Memoize it, re-sorting only when the message
@@ -4098,10 +4108,15 @@ public struct AgentAppView: View {
                         // while rows streamed in/out, so use an eager stack for the small
                         // visible window and keep full history in the model.
                         VStack(alignment: .leading, spacing: 32) {
-                            let entries = visibleTranscriptEntries
-                            let hiddenEntries = Self.hiddenTranscriptSlice(
-                                allItems: transcriptEntries,
-                                visibleWindow: entries
+                            let allEntries = transcriptEntries
+                            let entries = Self.visibleTranscriptWindow(
+                                entries: allEntries,
+                                status: vm.status,
+                                runStartedAt: vm.runStartedAt
+                            )
+                            let hiddenCount = Self.hiddenTranscriptCount(
+                                totalCount: allEntries.count,
+                                visibleCount: entries.count
                             )
                             TimelineScrollFollower(
                                 slack: Self.timelineBottomRevealSlack,
@@ -4114,14 +4129,18 @@ public struct AgentAppView: View {
                             // Full thread is loaded up front (no infinite-scroll paging),
                             // so there are no top/bottom history sentinels and no per-row
                             // body hydrate/evict.
-                            if !hiddenEntries.isEmpty {
+                            if hiddenCount > 0 {
                                 runningHiddenTranscriptRow(
-                                    hiddenEntries.count,
+                                    hiddenCount,
                                     revealed: transcriptHistoryRevealed,
                                     onReveal: { transcriptHistoryRevealed = true }
                                 )
                             }
                             if transcriptHistoryRevealed {
+                                let hiddenEntries = Self.hiddenTranscriptSlice(
+                                    allItems: allEntries,
+                                    visibleWindow: entries
+                                )
                                 ForEach(hiddenEntries) { entry in
                                     switch entry {
                                     case .message(let message):
