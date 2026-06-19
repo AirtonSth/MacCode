@@ -446,10 +446,17 @@ public struct ProviderRuntimeEvent: Codable, Sendable, Equatable, Identifiable {
     public static func fromJSONLine(_ line: String, provider: AgentProvider, source: String, receivedAtMs: Int64 = Int64(Date().timeIntervalSince1970 * 1000)) -> ProviderRuntimeEvent? {
         let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty, let data = trimmed.data(using: .utf8),
-              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let method = obj["type"] as? String else { return nil }
-        let payloadData = (try? JSONSerialization.data(withJSONObject: obj, options: [.sortedKeys])) ?? data
-        let payload = String(data: payloadData, encoding: .utf8) ?? trimmed
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+        return fromJSONObject(obj, provider: provider, source: source, receivedAtMs: receivedAtMs)
+    }
+
+    /// F12: dict-accepting variant so a caller that has already decoded the line
+    /// (e.g. ClaudeStreamingCLIAdapter.handleLine) does not pay a second
+    /// JSONSerialization decode of the same line just to build the runtime event.
+    public static func fromJSONObject(_ obj: [String: Any], provider: AgentProvider, source: String, receivedAtMs: Int64 = Int64(Date().timeIntervalSince1970 * 1000)) -> ProviderRuntimeEvent? {
+        guard let method = obj["type"] as? String else { return nil }
+        let payload = (try? JSONSerialization.data(withJSONObject: obj, options: [.sortedKeys]))
+            .flatMap { String(data: $0, encoding: .utf8) } ?? ""
         let nested = obj["item"] as? [String: Any]
         let message = obj["message"] as? [String: Any]
         return ProviderRuntimeEvent(
