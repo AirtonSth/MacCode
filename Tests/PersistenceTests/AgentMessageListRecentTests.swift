@@ -72,4 +72,30 @@ final class AgentMessageListRecentTests: XCTestCase {
         XCTAssertTrue(recent.isEmpty,
             "listRecent(limit:0) must return an empty array; max(0, limit) guard must hold")
     }
+
+    // F13: placeholder-title repair only needs the earliest user message. This must
+    // return exactly what `list().first(where: { $0.role == .user })` returned, so
+    // the LIMIT 1 query is behavior-equivalent without loading the whole thread.
+    func test_firstUserMessage_returnsEarliestUserRowSkippingAssistants() throws {
+        let (repo, tid) = try makeRepo()
+        let base = Date(timeIntervalSinceReferenceDate: 700_000_000)
+        try repo.append(AgentMessage(threadId: tid, role: .assistant, content: "a0", createdAt: base))
+        try repo.append(AgentMessage(threadId: tid, role: .user, content: "first-user", createdAt: base.addingTimeInterval(1)))
+        try repo.append(AgentMessage(threadId: tid, role: .user, content: "second-user", createdAt: base.addingTimeInterval(2)))
+
+        let first = try repo.firstUserMessage(threadId: tid)
+        let viaList = try repo.list(threadId: tid).first(where: { $0.role == .user })
+        XCTAssertEqual(first?.content, "first-user",
+            "firstUserMessage must return the earliest USER row, skipping assistant rows")
+        XCTAssertEqual(first?.content, viaList?.content,
+            "firstUserMessage(LIMIT 1) must match the full-scan first(where:) it replaces")
+        XCTAssertEqual(first?.role, .user)
+    }
+
+    func test_firstUserMessage_nilWhenNoUserMessages() throws {
+        let (repo, tid) = try makeRepo()
+        try repo.append(AgentMessage(threadId: tid, role: .assistant, content: "only-assistant", createdAt: Date()))
+        XCTAssertNil(try repo.firstUserMessage(threadId: tid),
+            "a thread with no user message must return nil so title repair skips it (and marks it visited)")
+    }
 }

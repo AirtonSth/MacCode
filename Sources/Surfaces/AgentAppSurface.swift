@@ -351,8 +351,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             // Mark as visited regardless of whether a user message exists — a thread
             // with no user messages won't get a better title on the next call either.
             repairedThreadIds.insert(threads[index].id)
-            guard let firstUserMessage = ((try? messageRepo.list(threadId: threads[index].id)) ?? [])
-                .first(where: { $0.role == .user }) else { continue }
+            // F13: fetch only the earliest user message (LIMIT 1) instead of loading
+            // the whole thread history + content blobs on the main actor per thread.
+            guard let firstUserMessage = try? messageRepo.firstUserMessage(threadId: threads[index].id) else { continue }
             var thread = threads[index]
             thread.title = AgentThreadTitle.titleFromFirstMessage(firstUserMessage.content)
             thread.updatedAt = Date()

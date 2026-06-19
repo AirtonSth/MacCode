@@ -349,6 +349,16 @@ public final class AgentMessageRepository {
         return (try st.step()) ? message(from: st) : nil
     }
 
+    /// F13: the earliest user message for a thread, fetched directly (LIMIT 1)
+    /// instead of materializing the whole message history. Backs placeholder-title
+    /// repair, which only needs the first user message's text and otherwise loaded
+    /// every message + content blob per placeholder thread on the main actor.
+    public func firstUserMessage(threadId: AgentThreadID) throws -> AgentMessage? {
+        let st = try db.prepare("SELECT id, thread_id, role, content, created_at FROM agent_messages WHERE thread_id = ? AND role = 'user' ORDER BY created_at ASC, rowid ASC LIMIT 1;")
+        try st.bind(1, threadId.value.uuidString)
+        return (try st.step()) ? message(from: st) : nil
+    }
+
     public func listPage(threadId: AgentThreadID, limit requestedLimit: Int, before cursor: AgentMessageCursor?) throws -> AgentMessagePage {
         try listPage(threadId: threadId, limit: requestedLimit, before: cursor, after: nil)
     }
