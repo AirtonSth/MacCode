@@ -3119,7 +3119,7 @@ public struct AgentAppView: View {
     // of flooding the transcript with identical "Ran …" lines. A lone tool call renders
     // inline as before. Non-tool items (assistant text, reasoning, plan, errors) always
     // break a run, so the answer prose is never swallowed into a group.
-    enum TurnRenderBlock: Identifiable {
+    enum TurnRenderBlock: Identifiable, Equatable {
         case item(AssistantItem)
         case toolGroup(id: String, items: [AssistantItem])
 
@@ -3164,6 +3164,48 @@ public struct AgentAppView: View {
         }
         flushRun()
         return blocks
+    }
+
+    /// F2: the per-turn data `turnView` needs, computed once instead of re-deriving
+    /// `renderableItems` / `completedFinalAssistantItemIDs` (twice) / block grouping /
+    /// plan filtering on every SwiftUI body pass. Pure value so it can be memoized for
+    /// immutable (finished) turns and unit-tested against the prior inline logic.
+    struct TurnRenderInputs: Equatable {
+        var turnPlans: [AssistantProposedPlan]
+        var visibleBlocks: [TurnRenderBlock]
+        var completedWorkBlocks: [TurnRenderBlock]
+        var hiddenLiveItemCount: Int
+        var shouldRenderFinal: Bool
+    }
+
+    static func computeTurnRenderInputs(turn: AssistantTurnSnapshot,
+                                        persistedAssistantTexts: [String],
+                                        proposedPlans allPlans: [AssistantProposedPlan],
+                                        running: Bool) -> TurnRenderInputs {
+        let turnPlans = allPlans.filter {
+            $0.turnId == turn.turnId && !$0.markdown.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
+        let renderable = renderableItems(in: turn, persistedAssistantTexts: persistedAssistantTexts)
+            .filter { !($0.type == .plan && !turnPlans.isEmpty) }
+        let runningTurn = !turn.finished && running
+        let visibleRenderable = visibleLiveTurnItems(renderable, running: runningTurn)
+        let hiddenLiveItemCount = renderable.count - visibleRenderable.count
+        // Derive the final-answer item ids ONCE and split renderable items into the
+        // visible answer vs the "Worked" log, instead of computing finalIDs twice.
+        let finalIDs = turn.finished
+            ? completedFinalAssistantItemIDs(in: turn, renderableItems: renderable, persistedAssistantTexts: persistedAssistantTexts)
+            : []
+        let workItems = turn.finished ? renderable.filter { !finalIDs.contains($0.id) } : []
+        let visibleAssistant = turn.finished ? renderable.filter { finalIDs.contains($0.id) } : []
+        let visibleBlocks = turnRenderBlocks(turn.finished ? visibleAssistant : visibleRenderable)
+        let completedWorkBlocks = turnRenderBlocks(workItems)
+        let shouldRenderFinal = turn.finalAssistantMessage != nil
+            && shouldRenderFinalAssistantMessage(turn, persistedAssistantTexts: persistedAssistantTexts)
+        return TurnRenderInputs(turnPlans: turnPlans,
+                                visibleBlocks: visibleBlocks,
+                                completedWorkBlocks: completedWorkBlocks,
+                                hiddenLiveItemCount: hiddenLiveItemCount,
+                                shouldRenderFinal: shouldRenderFinal)
     }
 
     /// Collapsed-group header text: count-aware verb + noun, e.g. "Ran 4 commands",
@@ -3592,6 +3634,71 @@ public struct AgentAppView: View {
         var texts: [String] = []
     }
     private let assistantTextsCache = AssistantTextsCache()
+
+    // F2: per-turn render data, memoized for FINISHED turns (immutable content) so a
+    // long completed thread no longer re-derives renderableItems / final-id splitting /
+    // block grouping / plan filtering for every visible turn on every body pass. Keyed
+    // per turnId; an entry is replaced when its signature changes. Running turns are
+    // never cached (their content changes each delta) — they compute fresh.
+    private final class TurnRenderCache {
+        var entries: [String: (signature: String, value: TurnRenderInputs)] = [:]
+    }
+    private let turnRenderCache = TurnRenderCache()
+    #if DEBUG
+    // Test-only: counts how many times the uncached per-turn computation ran, so a
+    // unit test can prove finished turns are served from cache across body passes.
+    static nonisolated(unsafe) var turnRenderComputeCountForTesting = 0
+    #endif
+
+    /// F2: the memoized entry point used by `turnView`. Finished turns are immutable,
+    /// so their inputs are cached against a signature that also folds in the external
+    /// dependencies (persisted assistant texts + proposed plans). Running/unfinished
+    /// turns are computed fresh every pass.
+    private func turnRenderInputs(for turn: AssistantTurnSnapshot) -> TurnRenderInputs {
+        let running = vm.status == .running
+        guard turn.finished else {
+            return computeTurnRenderInputsCounted(turn: turn, running: running)
+        }
+        let plansKey = "\(vm.timeline.proposedPlans.count)|\(vm.timeline.proposedPlans.last?.id ?? "-")"
+        let signature = Self.finishedTurnRenderSignature(turn: turn, assistantTextsKey: assistantTextsKey, plansKey: plansKey)
+        if let cached = turnRenderCache.entries[turn.turnId], cached.signature == signature {
+            return cached.value
+        }
+        let value = computeTurnRenderInputsCounted(turn: turn, running: running)
+        // Bound the cache: a hard cap keeps it from growing with total finished turns
+        // over a very long session (entries rebuild on demand if cleared).
+        if turnRenderCache.entries.count > 1_024 { turnRenderCache.entries.removeAll(keepingCapacity: true) }
+        turnRenderCache.entries[turn.turnId] = (signature, value)
+        return value
+    }
+
+    /// Signature for a FINISHED turn's render data. A finished turn's items are
+    /// immutable, so (turnId, items.count) is a stable content key; the persisted
+    /// assistant texts and proposed plans are external dependencies that change the
+    /// answer-vs-worklog split and the plan rows, so they fold into the key too.
+    nonisolated static func finishedTurnRenderSignature(turn: AssistantTurnSnapshot,
+                                                        assistantTextsKey: String,
+                                                        plansKey: String) -> String {
+        "\(turn.turnId)|i\(turn.items.count)|\(assistantTextsKey)|pl\(plansKey)"
+    }
+
+    private func computeTurnRenderInputsCounted(turn: AssistantTurnSnapshot, running: Bool) -> TurnRenderInputs {
+        #if DEBUG
+        Self.turnRenderComputeCountForTesting &+= 1
+        #endif
+        return Self.computeTurnRenderInputs(
+            turn: turn,
+            persistedAssistantTexts: persistedAssistantTexts,
+            proposedPlans: vm.timeline.proposedPlans,
+            running: running
+        )
+    }
+
+    /// The message-only key that backs `persistedAssistantTexts`'s memo; reused as the
+    /// persisted-texts component of the finished-turn render signature.
+    private var assistantTextsKey: String {
+        "\(vm.messages.count)|\(vm.messages.last?.id.value.uuidString ?? "-")"
+    }
 
     private final class HiddenPersistedAssistantMessageCache {
         var key: String?
@@ -5315,31 +5422,18 @@ public struct AgentAppView: View {
 
     @ViewBuilder
     private func turnView(_ turn: AssistantTurnSnapshot) -> some View {
-        let turnPlans = proposedPlans(for: turn)
-        let renderableItems = Self.renderableItems(in: turn, persistedAssistantTexts: persistedAssistantTexts)
-            .filter { !($0.type == .plan && !turnPlans.isEmpty) }
-        let runningTurn = !turn.finished && vm.status == .running
-        let visibleRenderableItems = Self.visibleLiveTurnItems(renderableItems, running: runningTurn)
-        let hiddenLiveItemCount = renderableItems.count - visibleRenderableItems.count
-        let workItems = turn.finished ? Self.completedWorkItems(
-            in: turn,
-            renderableItems: renderableItems,
-            persistedAssistantTexts: persistedAssistantTexts
-        ) : []
-        let visibleAssistantItems = turn.finished ? Self.completedVisibleAssistantItems(
-            in: turn,
-            renderableItems: renderableItems,
-            persistedAssistantTexts: persistedAssistantTexts
-        ) : []
-        let blocks = Self.turnRenderBlocks(turn.finished ? visibleAssistantItems : visibleRenderableItems)
-        let completedWorkBlocks = Self.turnRenderBlocks(workItems)
+        // F2: all the per-turn derivation (renderableItems, final-id split, block
+        // grouping, plan filtering) is computed once here and memoized for finished
+        // turns, instead of re-running on every body pass.
+        let inputs = turnRenderInputs(for: turn)
+        let blocks = inputs.visibleBlocks
         VStack(alignment: .leading, spacing: DS.Space.xl) {
-            if turn.finished, !completedWorkBlocks.isEmpty {
-                completedWorkDisclosure(turn: turn, blocks: completedWorkBlocks)
+            if turn.finished, !inputs.completedWorkBlocks.isEmpty {
+                completedWorkDisclosure(turn: turn, blocks: inputs.completedWorkBlocks)
             }
             if !turn.finished {
-                if hiddenLiveItemCount > 0 {
-                    hiddenLiveTurnItemsRow(hiddenLiveItemCount)
+                if inputs.hiddenLiveItemCount > 0 {
+                    hiddenLiveTurnItemsRow(inputs.hiddenLiveItemCount)
                 }
                 ForEach(blocks) { block in
                     switch block {
@@ -5348,7 +5442,7 @@ public struct AgentAppView: View {
                     }
                 }
             }
-            ForEach(turnPlans) { plan in
+            ForEach(inputs.turnPlans) { plan in
                 proposedPlanRow(plan)
             }
             if turn.finished {
@@ -5361,8 +5455,7 @@ public struct AgentAppView: View {
             }
             // Only show the turn's final text if no assistant-message item
             // already rendered it (prevents the answer showing twice).
-            if let final = turn.finalAssistantMessage,
-               Self.shouldRenderFinalAssistantMessage(turn, persistedAssistantTexts: persistedAssistantTexts) {
+            if let final = turn.finalAssistantMessage, inputs.shouldRenderFinal {
                 VStack(alignment: .leading, spacing: DS.Space.xs) {
                     assistantProse(final)
                     assistantCopyBar(text: final, identifierSuffix: turn.turnId)
@@ -5417,11 +5510,6 @@ public struct AgentAppView: View {
         .frame(maxWidth: .infinity, alignment: .leading)
     }
 
-    private func proposedPlans(for turn: AssistantTurnSnapshot) -> [AssistantProposedPlan] {
-        vm.timeline.proposedPlans.filter {
-            $0.turnId == turn.turnId && !$0.markdown.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        }
-    }
 
     @ViewBuilder
     private func itemRow(_ item: AssistantItem) -> some View {

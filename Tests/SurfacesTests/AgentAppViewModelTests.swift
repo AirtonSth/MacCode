@@ -3450,6 +3450,90 @@ final class AgentAppViewModelTests: XCTestCase {
         XCTAssertFalse(vm.coordinator.autoContinuationThreadIdsForTesting.contains(a.id),
                        "deleting a thread must drop its coordinator auto-continuation state (F9)")
     }
+
+    // F2: computeTurnRenderInputs is the single per-turn derivation that replaced the
+    // re-run-every-body-pass logic in turnView. It must produce EXACTLY what the prior
+    // composition of the (independently tested) helpers produced.
+    func test_computeTurnRenderInputs_matchesPriorHelperComposition() {
+        let turn = AssistantTurnSnapshot(
+            turnId: "turn-1",
+            items: [
+                AssistantItem(id: "msg-1", turnId: "turn-1", type: .assistantMessage, state: .completed, body: "Let me read the config first.", startedAtMs: 1_000, finishedAtMs: 2_000),
+                AssistantItem(id: "tool", turnId: "turn-1", type: .commandExecution, state: .completed, summary: "swift test", output: "PASS", startedAtMs: 2_000, finishedAtMs: 4_000),
+                AssistantItem(id: "msg-3", turnId: "turn-1", type: .assistantMessage, state: .completed, body: "All checks passed.", startedAtMs: 4_000, finishedAtMs: 5_000)
+            ],
+            finalAssistantMessage: "All checks passed.",
+            finished: true
+        )
+        let inputs = AgentAppView.computeTurnRenderInputs(
+            turn: turn, persistedAssistantTexts: [], proposedPlans: [], running: false)
+
+        let renderable = AgentAppView.renderableItems(in: turn)
+        let expectedVisible = AgentAppView.turnRenderBlocks(
+            AgentAppView.completedVisibleAssistantItems(in: turn, renderableItems: renderable))
+        let expectedWork = AgentAppView.turnRenderBlocks(
+            AgentAppView.completedWorkItems(in: turn, renderableItems: renderable))
+
+        XCTAssertEqual(inputs.visibleBlocks, expectedVisible,
+                       "visible blocks must match turnRenderBlocks(completedVisibleAssistantItems)")
+        XCTAssertEqual(inputs.completedWorkBlocks, expectedWork,
+                       "work blocks must match turnRenderBlocks(completedWorkItems) — the finalIDs split is computed once but identically")
+        XCTAssertEqual(inputs.shouldRenderFinal,
+                       AgentAppView.shouldRenderFinalAssistantMessage(turn, persistedAssistantTexts: []),
+                       "shouldRenderFinal must match the helper — here the last item already renders the answer, so the separate final block is suppressed (no double answer)")
+        XCTAssertFalse(inputs.shouldRenderFinal,
+                       "when the final text equals the last visible assistant item, the separate final block must not render")
+        XCTAssertEqual(inputs.hiddenLiveItemCount, 0, "finished turns hide nothing as live overflow")
+    }
+
+    func test_computeTurnRenderInputs_runningTurnKeepsLiveItemsAndNoFinal() {
+        let turn = AssistantTurnSnapshot(
+            turnId: "live",
+            items: [AssistantItem(id: "t", turnId: "live", type: .tool, state: .streaming, startedAtMs: 1_000)],
+            finished: false
+        )
+        let inputs = AgentAppView.computeTurnRenderInputs(
+            turn: turn, persistedAssistantTexts: [], proposedPlans: [], running: true)
+        XCTAssertEqual(inputs.visibleBlocks.count, 1, "a running turn shows its live item")
+        XCTAssertTrue(inputs.completedWorkBlocks.isEmpty, "a running turn has no completed work disclosure")
+        XCTAssertFalse(inputs.shouldRenderFinal, "a running turn has no final answer yet")
+    }
+
+    func test_computeTurnRenderInputs_filtersPlanItemsWhenPlanCardPresent() {
+        let turn = AssistantTurnSnapshot(
+            turnId: "turn-p",
+            items: [AssistantItem(id: "plan", turnId: "turn-p", type: .plan, state: .completed, body: "1. step", startedAtMs: 1_000, finishedAtMs: 2_000)],
+            finished: true
+        )
+        let plan = AssistantProposedPlan(id: "plan-1", turnId: "turn-p", markdown: "1. step")
+        let inputs = AgentAppView.computeTurnRenderInputs(
+            turn: turn, persistedAssistantTexts: [], proposedPlans: [plan], running: false)
+        XCTAssertEqual(inputs.turnPlans.map(\.id), ["plan-1"], "the turn's proposed plan card is surfaced")
+        XCTAssertTrue(inputs.visibleBlocks.isEmpty,
+                      "an inline plan item is suppressed when a proposed-plan card already renders it")
+    }
+
+    // F2: the finished-turn render signature must invalidate the memo when any external
+    // dependency changes (turn items, persisted texts, proposed plans) and stay stable
+    // otherwise — so finished turns are served from cache without going stale.
+    func test_finishedTurnRenderSignature_invalidationSemantics() {
+        let turn = AssistantTurnSnapshot(turnId: "t", items: [
+            AssistantItem(id: "a", turnId: "t", type: .tool, startedAtMs: 0)
+        ], finished: true)
+        let base = AgentAppView.finishedTurnRenderSignature(turn: turn, assistantTextsKey: "m1|x", plansKey: "0|-")
+        XCTAssertEqual(base, AgentAppView.finishedTurnRenderSignature(turn: turn, assistantTextsKey: "m1|x", plansKey: "0|-"),
+                       "identical inputs must yield an identical signature (a cache hit)")
+
+        let turn2 = AssistantTurnSnapshot(turnId: "t", items: turn.items + [
+            AssistantItem(id: "b", turnId: "t", type: .tool, startedAtMs: 1)
+        ], finished: true)
+        XCTAssertNotEqual(base, AgentAppView.finishedTurnRenderSignature(turn: turn2, assistantTextsKey: "m1|x", plansKey: "0|-"),
+                          "an added item must invalidate the cache")
+        XCTAssertNotEqual(base, AgentAppView.finishedTurnRenderSignature(turn: turn, assistantTextsKey: "m2|y", plansKey: "0|-"),
+                          "a persisted-message change must invalidate the cache (it changes the answer/worklog split)")
+        XCTAssertNotEqual(base, AgentAppView.finishedTurnRenderSignature(turn: turn, assistantTextsKey: "m1|x", plansKey: "1|p"),
+                          "a proposed-plan change must invalidate the cache")
+    }
 }
 
 private final class SlowStartRunner: AgentProviderRunner, @unchecked Sendable {
