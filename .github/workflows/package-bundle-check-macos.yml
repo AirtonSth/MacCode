@@ -52,6 +52,9 @@ jobs:
           tar -xzf "$RUNNER_TEMP/$GHOSTTYKIT_ASSET" -C .
           test -f Vendor/GhosttyKit.xcframework/macos-arm64_x86_64/libGhosttyKit.a
 
+      - name: Install Metal Toolchain
+        run: xcodebuild -downloadComponent MetalToolchain
+
       - name: Package debug bundle
         env:
           RC2_CONFIG: debug
