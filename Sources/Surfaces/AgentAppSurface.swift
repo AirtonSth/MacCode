@@ -4234,9 +4234,10 @@ public struct AgentAppView: View {
             }
             .onChange(of: vm.timeline.turns.count) { _ in
                 scheduleTimelineScrollToBottom(proxy)
-                // PERF-MAC_AGENT-012: turns trim at 80; drop expansion ids for
-                // items that no longer exist so the sets don't leak over a long
-                // session. Runs only on a turn add/remove, not per text delta.
+                // PERF-MAC_AGENT-012: drop expansion ids for items that no longer
+                // exist (turns are memory-capped at AssistantTimelineState.liveTurnLimit)
+                // so the sets don't leak over a long session. Runs only on a turn
+                // add/remove, not per text delta.
                 DispatchQueue.main.async {
                     pruneExpandedItemIds()
                 }

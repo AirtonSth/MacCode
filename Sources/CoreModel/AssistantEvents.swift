@@ -581,6 +581,11 @@ public struct AssistantTimelineState: Codable, Sendable, Equatable {
     // in-memory text stays bounded because the DB itself prunes events to ~5000 per thread,
     // and the LazyVStack only realizes on-screen rows.
     public static let liveTurnLimit = 5_000
+    // F10: pathological backstop mirroring `liveTurnLimit`. A single turn with this
+    // many items (e.g. thousands of tool calls in one response) trims its oldest items
+    // so one turn cannot grow its `items` array without bound. Newest items are kept,
+    // so the active streaming item (always newest) and its delta lookups are unaffected.
+    public static let liveTurnItemLimit = 5_000
     public static let providerRuntimeEventLimit = 500
     public static let workActivityLimit = 120
     public static let pendingRequestLimit = 200
@@ -673,6 +678,7 @@ public struct AssistantTimelineState: Codable, Sendable, Equatable {
                     var started = item
                     applyPendingDelta(pending, to: &started)
                     turns[idx].items.append(started)
+                    trimTurnItems(at: idx)
                 }
             }
             if let recorded = self.item(withId: item.id) {
@@ -833,7 +839,31 @@ public struct AssistantTimelineState: Codable, Sendable, Equatable {
 
     private mutating func trimTurns() {
         guard turns.count > Self.liveTurnLimit else { return }
-        turns = Array(turns.suffix(Self.liveTurnLimit))
+        let dropCount = turns.count - Self.liveTurnLimit
+        // F10: evicted turns' items are gone, so drop any SR1 translations keyed on
+        // those item ids — otherwise the maps retain pre-translation text for turns
+        // that no longer exist. Item ids are unique per turn, so retained turns keep
+        // their translations. (messageId translations map to persisted messages
+        // outside the timeline and are reset on thread switch, so they stay here.)
+        if !sr1TranslationsByItemId.isEmpty {
+            for turn in turns.prefix(dropCount) {
+                for item in turn.items { sr1TranslationsByItemId.removeValue(forKey: item.id) }
+            }
+        }
+        turns.removeFirst(dropCount)
+    }
+
+    // F10: keep one turn's `items` array bounded (see `liveTurnItemLimit`). Trims the
+    // oldest items and drops their orphaned SR1 item translations, mirroring `trimTurns`.
+    private mutating func trimTurnItems(at idx: Int) {
+        guard turns[idx].items.count > Self.liveTurnItemLimit else { return }
+        let dropCount = turns[idx].items.count - Self.liveTurnItemLimit
+        if !sr1TranslationsByItemId.isEmpty {
+            for item in turns[idx].items.prefix(dropCount) {
+                sr1TranslationsByItemId.removeValue(forKey: item.id)
+            }
+        }
+        turns[idx].items.removeFirst(dropCount)
     }
 
     private mutating func trimPendingRequests() {
@@ -946,6 +976,17 @@ public struct AssistantTimelineState: Codable, Sendable, Equatable {
     }
 
     public static func cappedText(_ value: String, limit: Int = liveTextLimit) -> String {
+        // PERF-MAC_AGENT (F11): `value.count` is an O(n) grapheme-cluster walk, paid on
+        // every message at thread load and on every streaming delta (`item.body + b`).
+        // For native Swift strings `value.utf8.count` is an O(1) stored byte length, and
+        // every grapheme is >= 1 UTF-8 byte, so `utf8.count <= limit` guarantees
+        // `count <= limit`. The byte fast path therefore skips the walk for the
+        // overwhelmingly common under-limit case while leaving the exact grapheme-based
+        // cap (and thus the output for every input) unchanged.
+        guard value.utf8.count > limit else { return value }
+        #if DEBUG
+        cappedTextGraphemeWalksForTesting &+= 1
+        #endif
         guard value.count > limit else { return value }
         return String(value.suffix(limit))
     }
@@ -959,5 +1000,12 @@ public struct AssistantTimelineState: Codable, Sendable, Equatable {
     /// release builds carry no shared-mutable write on the streaming path (apply()
     /// runs on both the UI main actor and the runner's background thread).
     nonisolated(unsafe) static var itemLookupComparisonsForTesting = 0
+
+    /// Test-only observability for the `cappedText` grapheme walk (F11). A perf unit
+    /// test resets this and asserts that under-limit text takes the O(1) byte fast
+    /// path and never the O(n) `String.count` grapheme walk. `nonisolated(unsafe)`
+    /// for the same reason as above: `cappedText` runs on both the UI main actor and
+    /// the runner's background thread.
+    nonisolated(unsafe) static var cappedTextGraphemeWalksForTesting = 0
     #endif
 }
