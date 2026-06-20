@@ -488,4 +488,81 @@ final class AssistantTimelineTests: XCTestCase {
         XCTAssertEqual(items.first(where: { $0.id == "b" })?.body, "",
                        "an unrelated item must never be mutated by another item's delta")
     }
+
+    // F11: `cappedText` is on the thread-load + per-streaming-delta hot path. The byte
+    // fast path must skip the O(n) grapheme walk for the common under-limit case while
+    // still capping correctly (and identically) when the byte length exceeds the limit.
+    func test_cappedText_skipsGraphemeWalkForShortStringsViaByteFastPath() {
+        AssistantTimelineState.cappedTextGraphemeWalksForTesting = 0
+        let underLimit = String(repeating: "a", count: 1_000)
+        XCTAssertEqual(AssistantTimelineState.cappedText(underLimit, limit: 80_000), underLimit)
+        XCTAssertEqual(AssistantTimelineState.cappedTextGraphemeWalksForTesting, 0,
+                       "under-limit text must take the O(1) byte fast path, never the O(n) grapheme-count walk that ramped CPU on long-thread load/streaming")
+
+        AssistantTimelineState.cappedTextGraphemeWalksForTesting = 0
+        let capped = AssistantTimelineState.cappedText(String(repeating: "b", count: 10), limit: 4)
+        XCTAssertEqual(capped, "bbbb", "over-limit ASCII must keep the last `limit` characters")
+        XCTAssertEqual(AssistantTimelineState.cappedTextGraphemeWalksForTesting, 1,
+                       "only over-byte-limit text should reach the grapheme walk")
+    }
+
+    func test_cappedText_preservesGraphemeCapForMultibyteAndEmoji() {
+        // 5 graphemes but >5 UTF-8 bytes: the byte fast path must NOT over-truncate a
+        // string whose grapheme count is within the limit.
+        let multibyte = "héllo"
+        XCTAssertGreaterThan(multibyte.utf8.count, 5)
+        XCTAssertEqual(AssistantTimelineState.cappedText(multibyte, limit: 5), multibyte,
+                       "capping must stay grapheme-based; a string within the grapheme limit is returned whole")
+        // Multi-scalar emoji graphemes still cap by grapheme suffix, not by bytes.
+        XCTAssertEqual(AssistantTimelineState.cappedText("😀😀😀😀", limit: 2), "😀😀")
+    }
+
+    // F10: when turns are evicted past `liveTurnLimit`, SR1 item translations keyed on
+    // the dropped turns' items must be pruned so the maps don't retain pre-translation
+    // text for turns that no longer exist. Retained turns keep their translations.
+    func test_trimTurns_prunesOrphanedItemTranslationsForEvictedTurns() {
+        var s = AssistantTimelineState()
+        s.apply(.turnStarted(turnId: "turn-old"))
+        s.apply(.itemStarted(item: AssistantItem(id: "old-item", turnId: "turn-old", type: .tool, startedAtMs: 0)))
+        s.apply(.sr1Translation(AssistantSR1Translation(itemId: "old-item", originalText: "orig", rewrittenText: "rw")))
+        XCTAssertNotNil(s.sr1TranslationsByItemId["old-item"])
+
+        // Push the oldest turn out of the live window.
+        let extra = AssistantTimelineState.liveTurnLimit + 1
+        for i in 0..<extra { s.apply(.turnStarted(turnId: "turn-\(i)")) }
+        // A retained (recent) turn with a translation that must survive.
+        s.apply(.itemStarted(item: AssistantItem(id: "new-item", turnId: "turn-\(extra - 1)", type: .tool, startedAtMs: 1)))
+        s.apply(.sr1Translation(AssistantSR1Translation(itemId: "new-item", originalText: "o2", rewrittenText: "r2")))
+
+        XCTAssertEqual(s.turns.count, AssistantTimelineState.liveTurnLimit,
+                       "turns stay bounded by liveTurnLimit")
+        XCTAssertFalse(s.turns.contains { $0.turnId == "turn-old" }, "oldest turn was evicted")
+        XCTAssertNil(s.sr1TranslationsByItemId["old-item"],
+                     "translation keyed on an evicted turn's item must be pruned, not leaked")
+        XCTAssertNotNil(s.sr1TranslationsByItemId["new-item"],
+                        "translation for a retained turn's item must survive trimming")
+    }
+
+    // F10: a single turn's `items` array stays bounded by `liveTurnItemLimit` (oldest
+    // dropped, newest kept) and dropped items' translations are pruned.
+    func test_trimTurnItems_boundsSingleTurnItemsAndPrunesTranslations() {
+        var s = AssistantTimelineState()
+        s.apply(.turnStarted(turnId: "t"))
+        s.apply(.itemStarted(item: AssistantItem(id: "first", turnId: "t", type: .tool, startedAtMs: 0)))
+        s.apply(.sr1Translation(AssistantSR1Translation(itemId: "first", originalText: "o", rewrittenText: "r")))
+
+        let total = AssistantTimelineState.liveTurnItemLimit + 1
+        for i in 1..<total {
+            s.apply(.itemStarted(item: AssistantItem(id: "item-\(i)", turnId: "t", type: .tool, startedAtMs: Int64(i))))
+        }
+
+        XCTAssertEqual(s.turns[0].items.count, AssistantTimelineState.liveTurnItemLimit,
+                       "one turn's items must stay bounded by liveTurnItemLimit")
+        XCTAssertFalse(s.turns[0].items.contains { $0.id == "first" },
+                       "the oldest item is trimmed when the per-turn cap is exceeded")
+        XCTAssertTrue(s.turns[0].items.contains { $0.id == "item-\(total - 1)" },
+                      "the newest item (the active streaming target) is always retained")
+        XCTAssertNil(s.sr1TranslationsByItemId["first"],
+                     "a trimmed item's translation must be pruned with it")
+    }
 }

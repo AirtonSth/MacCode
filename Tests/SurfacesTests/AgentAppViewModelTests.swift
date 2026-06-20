@@ -1,11 +1,12 @@
 import XCTest
 import AppKit
 import MachO
+import Combine
 import SwiftUI
 @testable import Surfaces
 import CoreModel
 import Persistence
-import AgentRuntime
+@testable import AgentRuntime
 
 /// Behavioural coverage for thread rename/delete in the agent app view
 /// model. Proves the sidebar contract: rename trims + persists, deleting
@@ -3382,6 +3383,209 @@ final class AgentAppViewModelTests: XCTestCase {
         await vm.loadModels()
         XCTAssertTrue(vm.availableModels.contains { $0.id == vm.model },
                       "the default model must be one the picker actually offers")
+    }
+
+    // F6: the SR1 translation maps were additive-only and never cleared on a thread
+    // switch, so they accumulated the union of every translated message (and its full
+    // original text) across every thread visited for the whole session.
+    @MainActor
+    func test_sr1TranslationMaps_resetOnThreadSwitchButSurviveReselect() async throws {
+        let (vm, threadRepo) = try makeVM()
+        let a = AgentThread(title: "A", provider: .claude, model: "m")
+        let b = AgentThread(title: "B", provider: .claude, model: "m")
+        try threadRepo.upsert(a)
+        try threadRepo.upsert(b)
+        vm.reloadThreads()
+
+        vm.selectThread(a.id)
+        let msgId = AgentMessageID(UUID())
+        vm.coordinator.onSR1TranslatedMessageId?(msgId)   // live badge -> Task { @MainActor }
+        for _ in 0..<200 where !vm.sr1TranslatedMessageIds.contains(msgId) {
+            try await Task.sleep(nanoseconds: 2_000_000)
+        }
+        XCTAssertTrue(vm.sr1TranslatedMessageIds.contains(msgId),
+                      "a live SR1 translation must mark the message on the current thread")
+
+        // Re-selecting the SAME thread must NOT wipe live translation state.
+        vm.selectThread(a.id)
+        XCTAssertTrue(vm.sr1TranslatedMessageIds.contains(msgId),
+                      "re-selecting the same thread must keep its SR1 translation badges")
+
+        // Switching to a DIFFERENT thread (no translations) must clear the maps.
+        vm.selectThread(b.id)
+        XCTAssertTrue(vm.sr1TranslatedMessageIds.isEmpty,
+                      "switching threads must reset SR1 translation state (F6: no cross-thread accumulation)")
+        XCTAssertTrue(vm.sr1OriginalTextsByMessageId.isEmpty,
+                      "switching threads must also drop the retained original texts")
+    }
+
+    // F9: deleting a thread must evict its per-thread VM caches and the coordinator's
+    // per-thread auto-continuation bookkeeping, which previously leaked one entry per
+    // deleted thread for the life of the surface.
+    @MainActor
+    func test_deleteThread_evictsPerThreadVMCachesAndCoordinatorState() throws {
+        let (vm, threadRepo) = try makeVM()
+        let a = AgentThread(title: "A", provider: .claude, model: "m")
+        let b = AgentThread(title: "B", provider: .claude, model: "m")
+        try threadRepo.upsert(a)
+        try threadRepo.upsert(b)
+        vm.reloadThreads()
+
+        // Populate a per-thread VM cache: type a draft on A, then switch away so it
+        // is stashed in composerDraftsByThread[A].
+        vm.selectThread(a.id)
+        vm.prompt = "unsent draft for A"
+        vm.selectThread(b.id)
+        // Seed the coordinator's per-thread auto-continuation state for A.
+        vm.coordinator.seedAutoContinuationStateForTesting(a.id)
+
+        XCTAssertTrue(vm.threadCacheResidueForTesting.contains(a.id),
+                      "precondition: A is present in a per-thread VM cache")
+        XCTAssertTrue(vm.coordinator.autoContinuationThreadIdsForTesting.contains(a.id),
+                      "precondition: A is present in coordinator auto-continuation state")
+
+        vm.deleteThread(a.id)
+
+        XCTAssertFalse(vm.threadCacheResidueForTesting.contains(a.id),
+                       "deleting a thread must leave no residue in any per-thread VM cache (F9)")
+        XCTAssertFalse(vm.coordinator.autoContinuationThreadIdsForTesting.contains(a.id),
+                       "deleting a thread must drop its coordinator auto-continuation state (F9)")
+    }
+
+    // F2: computeTurnRenderInputs is the single per-turn derivation that replaced the
+    // re-run-every-body-pass logic in turnView. It must produce EXACTLY what the prior
+    // composition of the (independently tested) helpers produced.
+    func test_computeTurnRenderInputs_matchesPriorHelperComposition() {
+        let turn = AssistantTurnSnapshot(
+            turnId: "turn-1",
+            items: [
+                AssistantItem(id: "msg-1", turnId: "turn-1", type: .assistantMessage, state: .completed, body: "Let me read the config first.", startedAtMs: 1_000, finishedAtMs: 2_000),
+                AssistantItem(id: "tool", turnId: "turn-1", type: .commandExecution, state: .completed, summary: "swift test", output: "PASS", startedAtMs: 2_000, finishedAtMs: 4_000),
+                AssistantItem(id: "msg-3", turnId: "turn-1", type: .assistantMessage, state: .completed, body: "All checks passed.", startedAtMs: 4_000, finishedAtMs: 5_000)
+            ],
+            finalAssistantMessage: "All checks passed.",
+            finished: true
+        )
+        let inputs = AgentAppView.computeTurnRenderInputs(
+            turn: turn, persistedAssistantTexts: [], proposedPlans: [], running: false)
+
+        let renderable = AgentAppView.renderableItems(in: turn)
+        let expectedVisible = AgentAppView.turnRenderBlocks(
+            AgentAppView.completedVisibleAssistantItems(in: turn, renderableItems: renderable))
+        let expectedWork = AgentAppView.turnRenderBlocks(
+            AgentAppView.completedWorkItems(in: turn, renderableItems: renderable))
+
+        XCTAssertEqual(inputs.visibleBlocks, expectedVisible,
+                       "visible blocks must match turnRenderBlocks(completedVisibleAssistantItems)")
+        XCTAssertEqual(inputs.completedWorkBlocks, expectedWork,
+                       "work blocks must match turnRenderBlocks(completedWorkItems) — the finalIDs split is computed once but identically")
+        XCTAssertEqual(inputs.shouldRenderFinal,
+                       AgentAppView.shouldRenderFinalAssistantMessage(turn, persistedAssistantTexts: []),
+                       "shouldRenderFinal must match the helper — here the last item already renders the answer, so the separate final block is suppressed (no double answer)")
+        XCTAssertFalse(inputs.shouldRenderFinal,
+                       "when the final text equals the last visible assistant item, the separate final block must not render")
+        XCTAssertEqual(inputs.hiddenLiveItemCount, 0, "finished turns hide nothing as live overflow")
+    }
+
+    func test_computeTurnRenderInputs_runningTurnKeepsLiveItemsAndNoFinal() {
+        let turn = AssistantTurnSnapshot(
+            turnId: "live",
+            items: [AssistantItem(id: "t", turnId: "live", type: .tool, state: .streaming, startedAtMs: 1_000)],
+            finished: false
+        )
+        let inputs = AgentAppView.computeTurnRenderInputs(
+            turn: turn, persistedAssistantTexts: [], proposedPlans: [], running: true)
+        XCTAssertEqual(inputs.visibleBlocks.count, 1, "a running turn shows its live item")
+        XCTAssertTrue(inputs.completedWorkBlocks.isEmpty, "a running turn has no completed work disclosure")
+        XCTAssertFalse(inputs.shouldRenderFinal, "a running turn has no final answer yet")
+    }
+
+    func test_computeTurnRenderInputs_filtersPlanItemsWhenPlanCardPresent() {
+        let turn = AssistantTurnSnapshot(
+            turnId: "turn-p",
+            items: [AssistantItem(id: "plan", turnId: "turn-p", type: .plan, state: .completed, body: "1. step", startedAtMs: 1_000, finishedAtMs: 2_000)],
+            finished: true
+        )
+        let plan = AssistantProposedPlan(id: "plan-1", turnId: "turn-p", markdown: "1. step")
+        let inputs = AgentAppView.computeTurnRenderInputs(
+            turn: turn, persistedAssistantTexts: [], proposedPlans: [plan], running: false)
+        XCTAssertEqual(inputs.turnPlans.map(\.id), ["plan-1"], "the turn's proposed plan card is surfaced")
+        XCTAssertTrue(inputs.visibleBlocks.isEmpty,
+                      "an inline plan item is suppressed when a proposed-plan card already renders it")
+    }
+
+    // F2: the finished-turn render signature must invalidate the memo when any external
+    // dependency changes (turn items, persisted texts, proposed plans) and stay stable
+    // otherwise — so finished turns are served from cache without going stale.
+    func test_finishedTurnRenderSignature_invalidationSemantics() {
+        let turn = AssistantTurnSnapshot(turnId: "t", items: [
+            AssistantItem(id: "a", turnId: "t", type: .tool, startedAtMs: 0)
+        ], finished: true)
+        let base = AgentAppView.finishedTurnRenderSignature(turn: turn, assistantTextsKey: "m1|x", plansKey: "0|-")
+        XCTAssertEqual(base, AgentAppView.finishedTurnRenderSignature(turn: turn, assistantTextsKey: "m1|x", plansKey: "0|-"),
+                       "identical inputs must yield an identical signature (a cache hit)")
+
+        let turn2 = AssistantTurnSnapshot(turnId: "t", items: turn.items + [
+            AssistantItem(id: "b", turnId: "t", type: .tool, startedAtMs: 1)
+        ], finished: true)
+        XCTAssertNotEqual(base, AgentAppView.finishedTurnRenderSignature(turn: turn2, assistantTextsKey: "m1|x", plansKey: "0|-"),
+                          "an added item must invalidate the cache")
+        XCTAssertNotEqual(base, AgentAppView.finishedTurnRenderSignature(turn: turn, assistantTextsKey: "m2|y", plansKey: "0|-"),
+                          "a persisted-message change must invalidate the cache (it changes the answer/worklog split)")
+        XCTAssertNotEqual(base, AgentAppView.finishedTurnRenderSignature(turn: turn, assistantTextsKey: "m1|x", plansKey: "1|p"),
+                          "a proposed-plan change must invalidate the cache")
+    }
+
+    // F1: a composer keystroke must publish the composer state ONLY, never the
+    // transcript-bearing view model — otherwise the whole transcript subtree
+    // re-evaluates on every keypress on a long thread (the reported lag).
+    @MainActor
+    func test_promptChange_publishesComposerStateNotViewModel() throws {
+        let (vm, _) = try makeVM()
+        var vmEmissions = 0
+        var composerEmissions = 0
+        let vmSub = vm.objectWillChange.sink { _ in vmEmissions += 1 }
+        let composerSub = vm.composerState.objectWillChange.sink { _ in composerEmissions += 1 }
+        defer { vmSub.cancel(); composerSub.cancel() }
+
+        // Simulate two keystrokes via the same proxy the composer binding writes to.
+        vm.prompt = "h"
+        vm.prompt = "hi"
+
+        XCTAssertEqual(vmEmissions, 0,
+                       "typing must NOT republish AgentAppViewModel — that would re-evaluate the whole transcript body per keystroke (F1)")
+        XCTAssertGreaterThanOrEqual(composerEmissions, 2,
+                                    "each composer text change must publish the composer state so the composer subtree updates")
+        XCTAssertEqual(vm.prompt, "hi", "the prompt proxy still reads/writes the composer text")
+    }
+
+    // F5: the single-pass cap+budget that replaced `map(cap) + applyBodyBudget` on the
+    // thread-open path must be byte-for-byte equivalent to the prior two-pass version.
+    func test_cappedRowsWithinBudget_matchesMapThenBudgetComposition() {
+        let base = Date(timeIntervalSinceReferenceDate: 700_000_000)
+        func msg(_ i: Int, _ content: String) -> AgentMessage {
+            AgentMessage(threadId: AgentThreadID(), role: .user, content: content, createdAt: base.addingTimeInterval(Double(i)))
+        }
+        func reference(_ rows: [AgentMessage], budget: Int) -> (rows: [AgentMessage], blanked: Int) {
+            AgentAppViewModel.applyBodyBudget(rows.map { var m = $0; m.content = AssistantTimelineState.cappedText($0.content); return m }, budget: budget)
+        }
+
+        // Under budget: caps each body, blanks nothing.
+        let small = (0..<5).map { msg($0, "row-\($0)") }
+        let fused = AgentAppViewModel.cappedRowsWithinBudget(small, budget: 1_000_000)
+        let ref = reference(small, budget: 1_000_000)
+        XCTAssertEqual(fused.blanked, 0)
+        XCTAssertEqual(fused.rows.map(\.content), ref.rows.map(\.content),
+                       "single-pass cap+budget must equal map(cap)+applyBodyBudget under budget")
+
+        // Over budget: blanks the oldest bodies, identically.
+        let big = (0..<4).map { msg($0, String(repeating: "x", count: 10)) }
+        let fusedBig = AgentAppViewModel.cappedRowsWithinBudget(big, budget: 25)
+        let refBig = reference(big, budget: 25)
+        XCTAssertGreaterThan(fusedBig.blanked, 0, "a pathological thread must blank oldest bodies")
+        XCTAssertEqual(fusedBig.blanked, refBig.blanked)
+        XCTAssertEqual(fusedBig.rows.map(\.content), refBig.rows.map(\.content),
+                       "single-pass cap+budget must equal map(cap)+applyBodyBudget over budget (oldest blanked)")
     }
 }
 

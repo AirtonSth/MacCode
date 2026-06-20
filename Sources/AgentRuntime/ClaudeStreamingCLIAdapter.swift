@@ -28,10 +28,13 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
         var pendingRequestIds = Set<String>()
         var pendingUserInputIds = Set<String>()
         var environment: [String: String] = [:]
-        // PERF-008: last emitted snapshot JSON (state fields only, reason
-        // excluded) so identical snapshots fired by high-frequency tool
-        // deltas are not re-encoded and re-broadcast.
-        var lastSnapshotStateJSON: String?
+        // PERF-008 / F4: signature of the last emitted snapshot state (the state
+        // fields only, reason excluded) so identical snapshots fired by
+        // high-frequency tool deltas are coalesced. F4 computes this directly from
+        // the structured state (a delimited string) instead of JSON-encoding the
+        // whole payload dict on every delta — the payload + its JSON encode are now
+        // built only when the state actually changed and will be broadcast.
+        var lastSnapshotStateSignature: String?
 
         init(threadId: AgentThreadID,
              process: Process,
@@ -253,7 +256,9 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
         guard let session else { throw AgentProviderAdapterError.sessionNotFound(threadId) }
         seedTranscriptOutsideLock(session: session)
         lock.lock(); defer { lock.unlock() }
-        return session.events
+        // F8: the internal buffer may transiently hold up to cap+slack events
+        // (hysteresis prune); the public readable bound stays maxReadableEvents.
+        return Array(session.events.suffix(maxReadableEvents))
     }
 
     public func rollbackThread(threadId: AgentThreadID, toTurnId: String) async throws {
@@ -403,13 +408,18 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
     }
 
     private func handleLine(_ line: String, session: Session) {
+        // F12: decode the line once and reuse the dict for both the assistant-uuid
+        // probe and the runtime-event build instead of re-running JSONSerialization
+        // for each. (The parser keeps its own decode: it has a no-reserialize fast
+        // path keyed on the raw line that must not change.)
         let rawObject = Self.jsonObject(from: line)
         if let assistantUuid = Self.assistantUuid(from: rawObject) {
             lock.lock()
             session.lastAssistantUuid = assistantUuid
             lock.unlock()
         }
-        if let runtimeEvent = ProviderRuntimeEvent.fromJSONLine(line, provider: .claude, source: "claude.stream-json") {
+        if let rawObject,
+           let runtimeEvent = ProviderRuntimeEvent.fromJSONObject(rawObject, provider: .claude, source: "claude.stream-json") {
             emit(.event(.providerRuntime(runtimeEvent)), session: session)
         }
         let parsed = session.parser.parseLine(line)
@@ -723,28 +733,46 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
         return turnId
     }
 
+    // F8: amortize the prune. Without slack, once `events` reaches the cap every
+    // subsequent append re-allocated a fresh `maxReadableEvents`-element array (the
+    // `suffix` copy) on the stdout-readability thread — O(cap) per event past the
+    // cap. Letting the internal buffer grow by `readableEventPruneSlack` before
+    // trimming amortizes that copy to O(1) per appended event. The public bound is
+    // unchanged: `readThread`/`readableEvents` return `suffix(maxReadableEvents)`.
+    static let readableEventPruneSlack = 1_024
+
     private func pruneReadableEvents(_ session: Session) {
-        guard session.events.count > maxReadableEvents else { return }
-        session.events = Array(session.events.suffix(maxReadableEvents))
+        if let trimmed = Self.prunedReadableEvents(session.events,
+                                                   cap: maxReadableEvents,
+                                                   slack: Self.readableEventPruneSlack) {
+            session.events = trimmed
+        }
+    }
+
+    /// Pure prune decision (F8): returns the trimmed events when the buffer has grown
+    /// past `cap + slack`, or nil to leave it untouched so the append stays O(1).
+    /// Extracted for unit testing the amortization contract.
+    nonisolated static func prunedReadableEvents(_ events: [AssistantEvent], cap: Int, slack: Int) -> [AssistantEvent]? {
+        guard events.count > cap + slack else { return nil }
+        return Array(events.suffix(cap))
     }
 
     private func emitSessionSnapshot(session: Session, reason: String) {
         lock.lock()
-        let payload = Self.sessionSnapshotPayload(session: session, reason: reason)
-        let providerTurnId = session.activeTurnId ?? session.completedTurnIds.last
-        // PERF-008: coalesce identical snapshots. Compute a signature over
-        // the state fields (the payload minus the per-call `reason`); if it
-        // matches the last emitted snapshot, skip the encode + broadcast.
-        // This drops the dozens-of-encodes/sec a tool-heavy turn would
-        // otherwise produce on the stdout-readability thread.
-        var stateForSignature = payload
-        stateForSignature.removeValue(forKey: "reason")
-        let signature = Self.jsonString(stateForSignature)
-        if let signature, signature == session.lastSnapshotStateJSON {
+        // PERF-008 / F4: coalesce identical snapshots. The signature is derived
+        // directly from the structured state (cheap delimited string) rather than
+        // by building + JSON-encoding the whole payload dict; a tool-heavy turn
+        // fires this per tool/request delta on the stdout-readability thread, and
+        // the vast majority coalesce away. Only when the state actually changed do
+        // we build the payload and pay the JSON encode for the broadcast.
+        let signature = Self.snapshotStateSignature(session: session)
+        if signature == session.lastSnapshotStateSignature {
             lock.unlock()
             return
         }
-        session.lastSnapshotStateJSON = signature
+        session.lastSnapshotStateSignature = signature
+        let payload = Self.sessionSnapshotPayload(session: session, reason: reason)
+        let providerTurnId = session.activeTurnId ?? session.completedTurnIds.last
         lock.unlock()
         guard let payloadJSON = Self.jsonString(payload) else { return }
         let event = AssistantEvent.providerRuntime(ProviderRuntimeEvent(
@@ -783,6 +811,50 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
             payload["lastAssistantUuid"] = lastAssistantUuid
         }
         return payload
+    }
+
+    private static func snapshotStateSignature(session: Session) -> String {
+        snapshotStateSignature(
+            model: session.model,
+            turnCount: session.completedTurnIds.count,
+            pendingRequestIds: session.pendingRequestIds,
+            pendingUserInputIds: session.pendingUserInputIds,
+            inFlightToolIds: session.inFlightToolIds,
+            providerThreadId: session.providerThreadId,
+            activeTurnId: session.activeTurnId,
+            lastCompletedTurnId: session.completedTurnIds.last,
+            lastAssistantUuid: session.lastAssistantUuid
+        )
+    }
+
+    /// F4: a cheap, collision-free signature of the snapshot state used to coalesce
+    /// identical snapshots without building or JSON-encoding the payload dict. Mirrors
+    /// the broadcast-relevant fields of `sessionSnapshotPayload` (everything except the
+    /// per-call `reason`); the id sets are sorted for set-order stability and joined
+    /// with a unit separator that cannot appear in provider ids. Pure + nonisolated for
+    /// unit testing. O(pending + inFlight), NOT O(turnCount).
+    nonisolated static func snapshotStateSignature(
+        model: String,
+        turnCount: Int,
+        pendingRequestIds: Set<String>,
+        pendingUserInputIds: Set<String>,
+        inFlightToolIds: Set<String>,
+        providerThreadId: String?,
+        activeTurnId: String?,
+        lastCompletedTurnId: String?,
+        lastAssistantUuid: String?
+    ) -> String {
+        [
+            model,
+            String(turnCount),
+            pendingRequestIds.sorted().joined(separator: ","),
+            pendingUserInputIds.sorted().joined(separator: ","),
+            inFlightToolIds.sorted().joined(separator: ","),
+            providerThreadId ?? "",
+            activeTurnId ?? "",
+            lastCompletedTurnId ?? "",
+            lastAssistantUuid ?? ""
+        ].joined(separator: "\u{1F}")
     }
 
     private static func jsonObject(from line: String) -> [String: Any]? {

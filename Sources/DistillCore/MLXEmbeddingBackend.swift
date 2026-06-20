@@ -1,4 +1,5 @@
 import Foundation
+import CoreModel
 import MLX
 import MLXEmbedders
 import MLXLMCommon

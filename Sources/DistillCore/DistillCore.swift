@@ -1407,6 +1407,11 @@ public struct MLXDistillRuntime: DistillRuntime {
     private let sessionStore = ChatSessionStore()
 
     public init(modelDirectory: URL) async throws {
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: modelDirectory.path, isDirectory: &isDirectory),
+              isDirectory.boolValue else {
+            throw DistillServiceError.modelValidationFailed("model directory missing: \(modelDirectory.path)")
+        }
         MLX.Memory.memoryLimit = Self.gpuMemoryLimitBytes
         MLX.Memory.cacheLimit = Self.gpuCacheLimitBytes
         NSLog("RemoteCodeDistillService MLX memory bounded: cacheLimit=\(Self.gpuCacheLimitBytes / 1_048_576)MB memoryLimit=\(Self.gpuMemoryLimitBytes / 1_048_576)MB")

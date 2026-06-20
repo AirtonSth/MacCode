@@ -55,4 +55,27 @@ final class AgentMessageMarkdownTests: XCTestCase {
         XCTAssertEqual(blocks, [AgentMessageMarkdownBlock(kind: .paragraph, text: "plain answer")],
                        "plain messages must not be split or reformatted just because Markdown rendering is enabled")
     }
+
+    // F3: the view re-parses markdown on every body pass (keystroke/streaming/hover/
+    // resize). Identical content must be parsed once and served from cache thereafter,
+    // and the cached result must equal a fresh parse (no correctness drift).
+    func test_blocks_areMemoizedByContent() {
+        let probe = "## F3 cache probe \u{2728}\n\n- one\n- two\n\n`inline code` and **bold**"
+        AgentMessageMarkdown.blocksComputeCountForTesting = 0
+        let first = AgentMessageMarkdown.blocks(from: probe)
+        let second = AgentMessageMarkdown.blocks(from: probe)
+        XCTAssertEqual(AgentMessageMarkdown.blocksComputeCountForTesting, 1,
+                       "identical content must be tokenized exactly once; repeat renders hit the cache")
+        XCTAssertEqual(first, second, "cached blocks must equal a fresh parse — no correctness drift")
+    }
+
+    func test_attributedInline_isMemoizedByContent() {
+        let probe = "F3 inline probe \u{2728} with `code` and *emphasis*"
+        AgentMessageMarkdown.inlineComputeCountForTesting = 0
+        let first = AgentMessageMarkdown.attributedInline(probe)
+        let second = AgentMessageMarkdown.attributedInline(probe)
+        XCTAssertEqual(AgentMessageMarkdown.inlineComputeCountForTesting, 1,
+                       "AttributedString(markdown:) is the expensive per-cell call; identical text must run it once")
+        XCTAssertEqual(first, second, "cached attributed inline must equal a fresh parse")
+    }
 }

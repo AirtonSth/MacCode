@@ -19,7 +19,44 @@ struct AgentMessageMarkdownBlock: Equatable {
 }
 
 enum AgentMessageMarkdown {
+    // F3: cache parsed blocks + attributed inline output keyed on the source text.
+    // The markdown view re-evaluates `body` on every keystroke / streaming delta /
+    // hover / window resize, and SwiftUI does NOT cache the AttributedString handed
+    // to Text(...), so a custom tokenizer + Foundation `AttributedString(markdown:)`
+    // ran for every visible block (and every table cell) on every pass. Persisted
+    // message bodies are immutable, so after the first parse every re-render of
+    // stable history is a cache hit; only the live streaming row (changing text)
+    // reparses. `countLimit` bounds memory so the growing partial bodies of one
+    // streaming turn cannot accumulate without bound; NSCache also evicts under
+    // memory pressure. NSCache is thread-safe; these run on the main actor.
+    private final class BlocksBox { let blocks: [AgentMessageMarkdownBlock]; init(_ b: [AgentMessageMarkdownBlock]) { blocks = b } }
+    private final class AttributedBox { let value: AttributedString; init(_ v: AttributedString) { value = v } }
+    private static let blocksCache: NSCache<NSString, BlocksBox> = {
+        let cache = NSCache<NSString, BlocksBox>(); cache.countLimit = 512; return cache
+    }()
+    private static let inlineCache: NSCache<NSString, AttributedBox> = {
+        let cache = NSCache<NSString, AttributedBox>(); cache.countLimit = 2_048; return cache
+    }()
+
+    #if DEBUG
+    // Test-only observability: how many times the uncached parse actually ran, so a
+    // unit test can prove repeated renders of identical content hit the cache.
+    nonisolated(unsafe) static var blocksComputeCountForTesting = 0
+    nonisolated(unsafe) static var inlineComputeCountForTesting = 0
+    #endif
+
     static func blocks(from text: String) -> [AgentMessageMarkdownBlock] {
+        let key = text as NSString
+        if let cached = blocksCache.object(forKey: key) { return cached.blocks }
+        let result = computeBlocks(from: text)
+        blocksCache.setObject(BlocksBox(result), forKey: key)
+        return result
+    }
+
+    private static func computeBlocks(from text: String) -> [AgentMessageMarkdownBlock] {
+        #if DEBUG
+        blocksComputeCountForTesting &+= 1
+        #endif
         var blocks: [AgentMessageMarkdownBlock] = []
         var paragraph: [String] = []
         var inFence = false
@@ -182,6 +219,17 @@ enum AgentMessageMarkdown {
     }
 
     static func attributedInline(_ text: String) -> AttributedString {
+        let key = text as NSString
+        if let cached = inlineCache.object(forKey: key) { return cached.value }
+        let result = computeAttributedInline(text)
+        inlineCache.setObject(AttributedBox(result), forKey: key)
+        return result
+    }
+
+    private static func computeAttributedInline(_ text: String) -> AttributedString {
+        #if DEBUG
+        inlineComputeCountForTesting &+= 1
+        #endif
         let options = AttributedString.MarkdownParsingOptions(interpretedSyntax: .inlineOnlyPreservingWhitespace)
         guard var attributed = try? AttributedString(markdown: text, options: options) else {
             return AttributedString(text)

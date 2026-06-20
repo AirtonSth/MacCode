@@ -62,6 +62,26 @@ struct TimelineItemIndex: Sendable, Equatable {
     }
 }
 
+/// F1: the composer's live text on its OWN ObservableObject. A keystroke publishes
+/// to this object (observed by the composer subtree) and NOT to AgentAppViewModel —
+/// which owns the transcript (messages/timeline) and whose `body` would otherwise
+/// re-evaluate the whole transcript on every keypress on a long thread.
+@MainActor
+public final class AgentComposerState: ObservableObject {
+    @Published public var prompt: String = ""
+}
+
+/// F1: scopes @ObservedObject observation to the composer subtree. A change to the
+/// composer text re-renders only this wrapper (and the `composer` it rebuilds),
+/// WITHOUT invalidating the enclosing AgentAppView body that owns the transcript.
+/// View-model-driven changes still reach the composer because AgentAppView re-creates
+/// this wrapper (with a fresh `content`) whenever the view model publishes.
+private struct ComposerReactiveScope<Content: View>: View {
+    @ObservedObject var composerState: AgentComposerState
+    @ViewBuilder var content: () -> Content
+    var body: some View { content() }
+}
+
 @MainActor
 public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     @Published public var threads: [AgentThread] = []
@@ -72,7 +92,15 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     @Published public var userInputSelections: [String: Set<String>] = [:]
     @Published public var userInputDrafts: [String: String] = [:]
     @Published public var focusTick: Int = 0
-    @Published public var prompt: String = ""
+    /// F1: composer text lives on `composerState` so keystrokes don't republish the
+    /// transcript-bearing view model. This proxy keeps every existing `vm.prompt`
+    /// read/write working unchanged; because it is a computed (non-@Published)
+    /// property, mutating it fires `composerState.objectWillChange`, NOT this VM's.
+    public let composerState = AgentComposerState()
+    public var prompt: String {
+        get { composerState.prompt }
+        set { composerState.prompt = newValue }
+    }
     // UX-XPLAT-009: UTF-16 cursor offset reported by PromptComposerEditor so
     // suggestions anchor at the actual insertion point, not text.endIndex.
     // nil means "not yet reported by the editor" -- suggestions fall back to
@@ -351,8 +379,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             // Mark as visited regardless of whether a user message exists — a thread
             // with no user messages won't get a better title on the next call either.
             repairedThreadIds.insert(threads[index].id)
-            guard let firstUserMessage = ((try? messageRepo.list(threadId: threads[index].id)) ?? [])
-                .first(where: { $0.role == .user }) else { continue }
+            // F13: fetch only the earliest user message (LIMIT 1) instead of loading
+            // the whole thread history + content blobs on the main actor per thread.
+            guard let firstUserMessage = try? messageRepo.firstUserMessage(threadId: threads[index].id) else { continue }
             var thread = threads[index]
             thread.title = AgentThreadTitle.titleFromFirstMessage(firstUserMessage.content)
             thread.updatedAt = Date()
@@ -388,6 +417,13 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             }
             selectedThreadId = id
             prompt = composerDraftsByThread[id] ?? ""
+            // F6: the SR1 translation maps are per-thread state. Reset them on a
+            // thread switch so they don't accumulate the union of every translated
+            // message (and its full original text) across every thread visited this
+            // session. refreshSR1TranslationStateFromTimeline() below rebuilds them
+            // from the opened thread's replayed timeline.
+            sr1TranslatedMessageIds = []
+            sr1OriginalTextsByMessageId = [:]
         } else {
             selectedThreadId = id
         }
@@ -769,11 +805,25 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     nonisolated static let fullLoadBodyBudgetBytes = 24 * 1024 * 1024  // ~24 MB of transcript text
 
     private func loadAllMessages(_ id: AgentThreadID) {
-        let all = ((try? messageRepo.list(threadId: id)) ?? []).map(Self.displayMessage)
-        let (rows, blanked) = Self.applyBodyBudget(all)
+        // F5: this read intentionally stays on the main actor. SQLiteDB serialises the
+        // C connection (FULLMUTEX), but its Swift statement cache is only safe when all
+        // access shares ONE concurrency domain (see SQLite.prepare) — this app keeps
+        // that domain on the main actor, so dispatching this read to a background queue
+        // would race the statement cache against concurrent main-actor DB access. The
+        // full (unpaged) load is deliberate for scroll stability (see above); the work
+        // that scaled with thread length was the per-row cost, cut by the utf8 fast path
+        // (F11) and the single-pass cap+budget below.
+        let loaded = try? messageRepo.listWithinBodyBudget(
+            threadId: id,
+            budget: Self.fullLoadBodyBudgetBytes,
+            contentLimit: AssistantTimelineState.liveTextLimit
+        )
+        let raw = loaded?.rows ?? []
+        let (rows, additionalBlanked) = Self.cappedRowsWithinBudget(raw)
+        let blanked = (loaded?.blanked ?? 0) + additionalBlanked
         if blanked > 0 {
             // Fail loud: a thread big enough to trip the budget loses its oldest bodies.
-            NSLog("[AgentApp] full-load body budget tripped: blanked \(blanked)/\(all.count) oldest message bodies to stay under \(Self.fullLoadBodyBudgetBytes) bytes")
+            NSLog("[AgentApp] full-load body budget tripped: blanked \(blanked)/\(raw.count) oldest message bodies to stay under \(Self.fullLoadBodyBudgetBytes) bytes")
         }
         messages = rows
     }
@@ -801,10 +851,34 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         return (result, blanked)
     }
 
-    private static func displayMessage(_ message: AgentMessage) -> AgentMessage {
-        var m = message
-        m.content = AssistantTimelineState.cappedText(m.content)
-        return m
+    /// F5: cap each message body AND enforce the memory budget in a SINGLE pass over
+    /// the rows (the common, under-budget case does no second pass), instead of mapping
+    /// a cap over all rows and then summing them again. Output is identical to
+    /// `applyBodyBudget(raw.map { cappedText($0.content) })`.
+    nonisolated static func cappedRowsWithinBudget(_ raw: [AgentMessage], budget: Int = fullLoadBodyBudgetBytes) -> (rows: [AgentMessage], blanked: Int) {
+        var rows: [AgentMessage] = []
+        rows.reserveCapacity(raw.count)
+        var total = 0
+        for message in raw {
+            var capped = message
+            capped.content = AssistantTimelineState.cappedText(message.content)
+            total += capped.content.utf8.count
+            rows.append(capped)
+        }
+        guard total > budget else { return (rows, 0) }
+        var running = total
+        var blanked = 0
+        var i = 0
+        while running > budget && i < rows.count {
+            let bytes = rows[i].content.utf8.count
+            if bytes > 0 {
+                rows[i].content = ""
+                running -= bytes
+                blanked += 1
+            }
+            i += 1
+        }
+        return (rows, blanked)
     }
 
     private func suppressPersistedFinalDuplicatedByTimeline() {
@@ -1608,6 +1682,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     public func deleteThread(_ id: AgentThreadID) {
         let undo = captureThreadDeletionUndo(ids: [id])
         try? threadRepo.delete(id: id)
+        evictThreadCaches([id])
         if selectedThreadId == id {
             selectedThreadId = nil
         messages = []
@@ -1622,6 +1697,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         guard !ids.isEmpty else { return }
         let undo = captureThreadDeletionUndo(ids: Array(ids))
         try? threadRepo.delete(ids: Array(ids))
+        evictThreadCaches(ids)
         if let selectedThreadId, ids.contains(selectedThreadId) {
             self.selectedThreadId = nil
         messages = []
@@ -1631,6 +1707,36 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         reloadThreads()
         armThreadDeletionUndo(undo)
     }
+
+    /// F9: drop deleted threads' per-thread caches so they don't leak for the life
+    /// of the surface (composer drafts, the streaming dedup caches, workspace
+    /// membership, the repaired-title marker), plus the coordinator's per-thread
+    /// auto-continuation bookkeeping. The thread's persistent state is captured for
+    /// undo separately; these transient caches rebuild on demand if a delete is
+    /// undone.
+    private func evictThreadCaches(_ ids: some Sequence<AgentThreadID>) {
+        for id in ids {
+            repairedThreadIds.remove(id)
+            threadWorkspaceCache.removeValue(forKey: id)
+            composerDraftsByThread.removeValue(forKey: id)
+            lastPersistedAssistantContentByThread.removeValue(forKey: id)
+            lastPersistedFinalIdByThread.removeValue(forKey: id)
+            coordinator.forgetThread(id)
+        }
+    }
+
+    #if DEBUG
+    /// Test-only: the set of thread ids still present in ANY per-thread VM cache,
+    /// so a test can prove `evictThreadCaches` leaves no residue after a delete.
+    var threadCacheResidueForTesting: Set<AgentThreadID> {
+        var ids = repairedThreadIds
+        ids.formUnion(threadWorkspaceCache.keys)
+        ids.formUnion(composerDraftsByThread.keys)
+        ids.formUnion(lastPersistedAssistantContentByThread.keys)
+        ids.formUnion(lastPersistedFinalIdByThread.keys)
+        return ids
+    }
+    #endif
 
     /// Snapshot the threads (+ their messages) about to be deleted, BEFORE the
     /// store removes them. Returns nil if nothing could be captured so the undo
@@ -2954,9 +3060,9 @@ public struct AgentAppView: View {
     // UX-MAC_AGENT-013: inline custom-model entry replaces the blocking NSAlert.
     @State private var showCustomModelField = false
     @State private var customModelDraft = ""
-    /// P1: true when the user has tapped the "N earlier items hidden" row to
-    /// reveal the pre-run history read-only. Reset to false on each new run.
-    @State private var transcriptHistoryRevealed = false
+    /// P1/F4: number of hidden pre-run transcript items revealed read-only.
+    /// Reset to zero on each new run and paged so one tap cannot render a huge history.
+    @State private var transcriptHistoryRevealCount = 0
 
     public init(vm: AgentAppViewModel) { self.vm = vm }
 
@@ -3079,7 +3185,7 @@ public struct AgentAppView: View {
     // of flooding the transcript with identical "Ran …" lines. A lone tool call renders
     // inline as before. Non-tool items (assistant text, reasoning, plan, errors) always
     // break a run, so the answer prose is never swallowed into a group.
-    enum TurnRenderBlock: Identifiable {
+    enum TurnRenderBlock: Identifiable, Equatable {
         case item(AssistantItem)
         case toolGroup(id: String, items: [AssistantItem])
 
@@ -3124,6 +3230,48 @@ public struct AgentAppView: View {
         }
         flushRun()
         return blocks
+    }
+
+    /// F2: the per-turn data `turnView` needs, computed once instead of re-deriving
+    /// `renderableItems` / `completedFinalAssistantItemIDs` (twice) / block grouping /
+    /// plan filtering on every SwiftUI body pass. Pure value so it can be memoized for
+    /// immutable (finished) turns and unit-tested against the prior inline logic.
+    struct TurnRenderInputs: Equatable {
+        var turnPlans: [AssistantProposedPlan]
+        var visibleBlocks: [TurnRenderBlock]
+        var completedWorkBlocks: [TurnRenderBlock]
+        var hiddenLiveItemCount: Int
+        var shouldRenderFinal: Bool
+    }
+
+    static func computeTurnRenderInputs(turn: AssistantTurnSnapshot,
+                                        persistedAssistantTexts: [String],
+                                        proposedPlans allPlans: [AssistantProposedPlan],
+                                        running: Bool) -> TurnRenderInputs {
+        let turnPlans = allPlans.filter {
+            $0.turnId == turn.turnId && !$0.markdown.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
+        let renderable = renderableItems(in: turn, persistedAssistantTexts: persistedAssistantTexts)
+            .filter { !($0.type == .plan && !turnPlans.isEmpty) }
+        let runningTurn = !turn.finished && running
+        let visibleRenderable = visibleLiveTurnItems(renderable, running: runningTurn)
+        let hiddenLiveItemCount = renderable.count - visibleRenderable.count
+        // Derive the final-answer item ids ONCE and split renderable items into the
+        // visible answer vs the "Worked" log, instead of computing finalIDs twice.
+        let finalIDs = turn.finished
+            ? completedFinalAssistantItemIDs(in: turn, renderableItems: renderable, persistedAssistantTexts: persistedAssistantTexts)
+            : []
+        let workItems = turn.finished ? renderable.filter { !finalIDs.contains($0.id) } : []
+        let visibleAssistant = turn.finished ? renderable.filter { finalIDs.contains($0.id) } : []
+        let visibleBlocks = turnRenderBlocks(turn.finished ? visibleAssistant : visibleRenderable)
+        let completedWorkBlocks = turnRenderBlocks(workItems)
+        let shouldRenderFinal = turn.finalAssistantMessage != nil
+            && shouldRenderFinalAssistantMessage(turn, persistedAssistantTexts: persistedAssistantTexts)
+        return TurnRenderInputs(turnPlans: turnPlans,
+                                visibleBlocks: visibleBlocks,
+                                completedWorkBlocks: completedWorkBlocks,
+                                hiddenLiveItemCount: hiddenLiveItemCount,
+                                shouldRenderFinal: shouldRenderFinal)
     }
 
     /// Collapsed-group header text: count-aware verb + noun, e.g. "Ran 4 commands",
@@ -3296,6 +3444,7 @@ public struct AgentAppView: View {
     // idle render to a recent tail, mirroring the running-state window; the older
     // slice stays one tap away via the existing "earlier transcript items" reveal.
     nonisolated static let idleTranscriptWindowCount = 30
+    nonisolated static let hiddenTranscriptRevealPageCount = 50
     static let liveTurnRenderableItemLimit = 48
     static let liveTurnBodyCharacterLimit = 2_000
     static let liveTurnOutputCharacterLimit = 1_500
@@ -3370,6 +3519,84 @@ public struct AgentAppView: View {
         return allItems.filter { !visibleIDs.contains($0.id) }
     }
 
+    nonisolated static func hiddenTranscriptRevealWindow(
+        allItems: [TranscriptEntry],
+        visibleWindow: [TranscriptEntry],
+        revealCount: Int
+    ) -> [TranscriptEntry] {
+        guard revealCount > 0 else { return [] }
+        return Array(hiddenTranscriptSlice(
+            allItems: allItems,
+            visibleWindow: visibleWindow
+        ).suffix(revealCount))
+    }
+
+    /// Count-only path for collapsed history. The reveal row needs only this
+    /// number; building the hidden prefix on every composer keystroke scans a
+    /// huge completed thread even though the rows are not visible.
+    nonisolated static func hiddenTranscriptCount(
+        totalCount: Int,
+        visibleCount: Int
+    ) -> Int {
+        max(0, totalCount - visibleCount)
+    }
+
+    /// Canonical transcript ordering: ascending by `sortTime`, then by `id` for a
+    /// total order (deterministic regardless of sort stability). Message and turn
+    /// ids carry distinct prefixes, so two entries never tie on (sortTime, id).
+    nonisolated static func transcriptEntryOrdersBefore(_ lhs: TranscriptEntry, _ rhs: TranscriptEntry) -> Bool {
+        if lhs.sortTime == rhs.sortTime { return lhs.id < rhs.id }
+        return lhs.sortTime < rhs.sortTime
+    }
+
+    /// F7: build the merged transcript in O(N) by merging two already-ordered
+    /// sequences instead of re-sorting the whole thread (O(N log N)) on every
+    /// structural change (turn/item/message add) during a run. `messages` are
+    /// append-only in createdAt order and `turns` in start order, so each side is
+    /// already in canonical order. The message side is verified in O(N); if a
+    /// thread ever violates the invariant (e.g. exact-timestamp ties out of id
+    /// order) we fall back to a full sort, so the output is ALWAYS identical to the
+    /// canonical ordering — only the path that produces it gets cheaper.
+    nonisolated static func mergeTranscriptEntries(messages: [AgentMessage],
+                                                  turns: [AssistantTurnSnapshot]) -> [TranscriptEntry] {
+        let messageEntries = messages.map(TranscriptEntry.message)
+        // Turns are few; sort defensively so the merge precondition always holds.
+        let turnEntries = turns.map(TranscriptEntry.turn).sorted(by: transcriptEntryOrdersBefore)
+        guard isOrderedByTranscriptOrder(messageEntries) else {
+            return (messageEntries + turnEntries).sorted(by: transcriptEntryOrdersBefore)
+        }
+        return mergeOrderedTranscriptEntries(messageEntries, turnEntries)
+    }
+
+    /// True when `entries` is already in canonical transcript order (no adjacent
+    /// inversion). O(N), no allocation.
+    nonisolated static func isOrderedByTranscriptOrder(_ entries: [TranscriptEntry]) -> Bool {
+        guard entries.count > 1 else { return true }
+        for i in 1..<entries.count where transcriptEntryOrdersBefore(entries[i], entries[i - 1]) {
+            return false
+        }
+        return true
+    }
+
+    /// Standard 2-way merge of two canonically-ordered sequences. Equivalent to
+    /// `(a + b).sorted(by: transcriptEntryOrdersBefore)` because there are no
+    /// cross-side (sortTime, id) ties (distinct id prefixes) and each input is sorted.
+    nonisolated static func mergeOrderedTranscriptEntries(_ a: [TranscriptEntry], _ b: [TranscriptEntry]) -> [TranscriptEntry] {
+        var result: [TranscriptEntry] = []
+        result.reserveCapacity(a.count + b.count)
+        var i = 0, j = 0
+        while i < a.count && j < b.count {
+            if transcriptEntryOrdersBefore(b[j], a[i]) {
+                result.append(b[j]); j += 1
+            } else {
+                result.append(a[i]); i += 1
+            }
+        }
+        if i < a.count { result.append(contentsOf: a[i...]) }
+        if j < b.count { result.append(contentsOf: b[j...]) }
+        return result
+    }
+
     // PERF-MAC_AGENT-001: the merged+sorted transcript is read from `body`, so
     // it recomputed (O(n log n)) on every @Published change — every streaming
     // delta and every keystroke. Memoize it, re-sorting only when the message
@@ -3385,11 +3612,7 @@ public struct AgentAppView: View {
         if transcriptCache.signature == signature {
             return transcriptCache.entries
         }
-        let merged = (vm.messages.map(TranscriptEntry.message) + vm.timeline.turns.map(TranscriptEntry.turn))
-            .sorted { lhs, rhs in
-                if lhs.sortTime == rhs.sortTime { return lhs.id < rhs.id }
-                return lhs.sortTime < rhs.sortTime
-            }
+        let merged = Self.mergeTranscriptEntries(messages: vm.messages, turns: vm.timeline.turns)
         transcriptCache.signature = signature
         transcriptCache.entries = merged
         return merged
@@ -3490,6 +3713,71 @@ public struct AgentAppView: View {
         var texts: [String] = []
     }
     private let assistantTextsCache = AssistantTextsCache()
+
+    // F2: per-turn render data, memoized for FINISHED turns (immutable content) so a
+    // long completed thread no longer re-derives renderableItems / final-id splitting /
+    // block grouping / plan filtering for every visible turn on every body pass. Keyed
+    // per turnId; an entry is replaced when its signature changes. Running turns are
+    // never cached (their content changes each delta) — they compute fresh.
+    private final class TurnRenderCache {
+        var entries: [String: (signature: String, value: TurnRenderInputs)] = [:]
+    }
+    private let turnRenderCache = TurnRenderCache()
+    #if DEBUG
+    // Test-only: counts how many times the uncached per-turn computation ran, so a
+    // unit test can prove finished turns are served from cache across body passes.
+    static nonisolated(unsafe) var turnRenderComputeCountForTesting = 0
+    #endif
+
+    /// F2: the memoized entry point used by `turnView`. Finished turns are immutable,
+    /// so their inputs are cached against a signature that also folds in the external
+    /// dependencies (persisted assistant texts + proposed plans). Running/unfinished
+    /// turns are computed fresh every pass.
+    private func turnRenderInputs(for turn: AssistantTurnSnapshot) -> TurnRenderInputs {
+        let running = vm.status == .running
+        guard turn.finished else {
+            return computeTurnRenderInputsCounted(turn: turn, running: running)
+        }
+        let plansKey = "\(vm.timeline.proposedPlans.count)|\(vm.timeline.proposedPlans.last?.id ?? "-")"
+        let signature = Self.finishedTurnRenderSignature(turn: turn, assistantTextsKey: assistantTextsKey, plansKey: plansKey)
+        if let cached = turnRenderCache.entries[turn.turnId], cached.signature == signature {
+            return cached.value
+        }
+        let value = computeTurnRenderInputsCounted(turn: turn, running: running)
+        // Bound the cache: a hard cap keeps it from growing with total finished turns
+        // over a very long session (entries rebuild on demand if cleared).
+        if turnRenderCache.entries.count > 1_024 { turnRenderCache.entries.removeAll(keepingCapacity: true) }
+        turnRenderCache.entries[turn.turnId] = (signature, value)
+        return value
+    }
+
+    /// Signature for a FINISHED turn's render data. A finished turn's items are
+    /// immutable, so (turnId, items.count) is a stable content key; the persisted
+    /// assistant texts and proposed plans are external dependencies that change the
+    /// answer-vs-worklog split and the plan rows, so they fold into the key too.
+    nonisolated static func finishedTurnRenderSignature(turn: AssistantTurnSnapshot,
+                                                        assistantTextsKey: String,
+                                                        plansKey: String) -> String {
+        "\(turn.turnId)|i\(turn.items.count)|\(assistantTextsKey)|pl\(plansKey)"
+    }
+
+    private func computeTurnRenderInputsCounted(turn: AssistantTurnSnapshot, running: Bool) -> TurnRenderInputs {
+        #if DEBUG
+        Self.turnRenderComputeCountForTesting &+= 1
+        #endif
+        return Self.computeTurnRenderInputs(
+            turn: turn,
+            persistedAssistantTexts: persistedAssistantTexts,
+            proposedPlans: vm.timeline.proposedPlans,
+            running: running
+        )
+    }
+
+    /// The message-only key that backs `persistedAssistantTexts`'s memo; reused as the
+    /// persisted-texts component of the finished-turn render signature.
+    private var assistantTextsKey: String {
+        "\(vm.messages.count)|\(vm.messages.last?.id.value.uuidString ?? "-")"
+    }
 
     private final class HiddenPersistedAssistantMessageCache {
         var key: String?
@@ -3836,7 +4124,10 @@ public struct AgentAppView: View {
             backgroundAwaitBanner
             pendingCallbackRows
             queuedMessagesSection
-            composer
+            // F1: render the composer inside a scope that observes only the composer
+            // text, so a keystroke re-renders the composer subtree and NOT this body
+            // (which builds the whole transcript).
+            ComposerReactiveScope(composerState: vm.composerState) { composer }
         }
         .background(DS.Palette.bg)
         // C6: Esc interrupts an in-flight run (remotecode.io parity).
@@ -4098,10 +4389,19 @@ public struct AgentAppView: View {
                         // while rows streamed in/out, so use an eager stack for the small
                         // visible window and keep full history in the model.
                         VStack(alignment: .leading, spacing: 32) {
-                            let entries = visibleTranscriptEntries
-                            let hiddenEntries = Self.hiddenTranscriptSlice(
-                                allItems: transcriptEntries,
-                                visibleWindow: entries
+                            let allEntries = transcriptEntries
+                            let entries = Self.visibleTranscriptWindow(
+                                entries: allEntries,
+                                status: vm.status,
+                                runStartedAt: vm.runStartedAt
+                            )
+                            let hiddenCount = Self.hiddenTranscriptCount(
+                                totalCount: allEntries.count,
+                                visibleCount: entries.count
+                            )
+                            let revealedHiddenCount = min(
+                                transcriptHistoryRevealCount,
+                                hiddenCount
                             )
                             TimelineScrollFollower(
                                 slack: Self.timelineBottomRevealSlack,
@@ -4114,14 +4414,25 @@ public struct AgentAppView: View {
                             // Full thread is loaded up front (no infinite-scroll paging),
                             // so there are no top/bottom history sentinels and no per-row
                             // body hydrate/evict.
-                            if !hiddenEntries.isEmpty {
+                            if hiddenCount > 0 {
                                 runningHiddenTranscriptRow(
-                                    hiddenEntries.count,
-                                    revealed: transcriptHistoryRevealed,
-                                    onReveal: { transcriptHistoryRevealed = true }
+                                    hiddenCount,
+                                    revealedCount: revealedHiddenCount,
+                                    pageCount: Self.hiddenTranscriptRevealPageCount,
+                                    onReveal: {
+                                        transcriptHistoryRevealCount = min(
+                                            hiddenCount,
+                                            transcriptHistoryRevealCount + Self.hiddenTranscriptRevealPageCount
+                                        )
+                                    }
                                 )
                             }
-                            if transcriptHistoryRevealed {
+                            if revealedHiddenCount > 0 {
+                                let hiddenEntries = Self.hiddenTranscriptRevealWindow(
+                                    allItems: allEntries,
+                                    visibleWindow: entries,
+                                    revealCount: revealedHiddenCount
+                                )
                                 ForEach(hiddenEntries) { entry in
                                     switch entry {
                                     case .message(let message):
@@ -4215,9 +4526,10 @@ public struct AgentAppView: View {
             }
             .onChange(of: vm.timeline.turns.count) { _ in
                 scheduleTimelineScrollToBottom(proxy)
-                // PERF-MAC_AGENT-012: turns trim at 80; drop expansion ids for
-                // items that no longer exist so the sets don't leak over a long
-                // session. Runs only on a turn add/remove, not per text delta.
+                // PERF-MAC_AGENT-012: drop expansion ids for items that no longer
+                // exist (turns are memory-capped at AssistantTimelineState.liveTurnLimit)
+                // so the sets don't leak over a long session. Runs only on a turn
+                // add/remove, not per text delta.
                 DispatchQueue.main.async {
                     pruneExpandedItemIds()
                 }
@@ -4226,13 +4538,13 @@ public struct AgentAppView: View {
             // P1: collapse revealed history whenever a new run starts so the
             // window resets to the live context automatically.
             .onChange(of: vm.runStartedAt) { newValue in
-                if newValue != nil { transcriptHistoryRevealed = false }
+                if newValue != nil { transcriptHistoryRevealCount = 0 }
             }
             // PERF-MAC_AGENT-023: also collapse on thread switch. Idle threads now
             // bound their render to a recent tail (visibleTranscriptWindow), so a
             // revealed flag carried into a different long thread would eagerly
             // render its whole history with no user action — reintroducing the hang.
-            .onChange(of: vm.selectedThreadId) { _ in transcriptHistoryRevealed = false }
+            .onChange(of: vm.selectedThreadId) { _ in transcriptHistoryRevealCount = 0 }
         }
     }
 
@@ -4895,17 +5207,22 @@ public struct AgentAppView: View {
 
     private func runningHiddenTranscriptRow(
         _ count: Int,
-        revealed: Bool,
+        revealedCount: Int,
+        pageCount: Int,
         onReveal: @escaping () -> Void
     ) -> some View {
-        Button(action: { if !revealed { onReveal() } }) {
+        let canRevealMore = revealedCount < count
+        let nextCount = min(max(0, pageCount), max(0, count - revealedCount))
+        return Button(action: { if canRevealMore { onReveal() } }) {
             HStack(spacing: DS.Space.sm) {
-                Image(systemName: revealed ? "chevron.up" : "ellipsis")
+                Image(systemName: canRevealMore ? "ellipsis" : "chevron.up")
                     .font(.system(size: 12, weight: .semibold))
                     .foregroundColor(DS.Palette.textTertiary)
-                Text(revealed
-                    ? "\(count) earlier transcript items (read-only)"
-                    : "\(count) earlier transcript items hidden — tap to view")
+                Text(Self.hiddenTranscriptRevealLabel(
+                    count: count,
+                    revealedCount: revealedCount,
+                    nextCount: nextCount
+                ))
                     .font(DS.Font.caption)
                     .foregroundColor(DS.Palette.textTertiary)
                     .lineLimit(1)
@@ -4918,11 +5235,39 @@ public struct AgentAppView: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .disabled(revealed)
-        .accessibilityLabel(revealed
-            ? "\(count) earlier transcript items visible, read-only"
-            : "Show \(count) earlier transcript items")
+        .disabled(!canRevealMore)
+        .accessibilityLabel(Self.hiddenTranscriptRevealAccessibilityLabel(
+            count: count,
+            revealedCount: revealedCount
+        ))
         .accessibilityIdentifier("agent.runningHiddenTranscript")
+    }
+
+    nonisolated static func hiddenTranscriptRevealLabel(
+        count: Int,
+        revealedCount: Int,
+        nextCount: Int
+    ) -> String {
+        if revealedCount <= 0 {
+            return "\(count) earlier transcript items hidden - tap to view \(nextCount)"
+        }
+        if revealedCount < count {
+            return "\(revealedCount) of \(count) earlier transcript items visible - tap to view more"
+        }
+        return "\(count) earlier transcript items visible, read-only"
+    }
+
+    nonisolated static func hiddenTranscriptRevealAccessibilityLabel(
+        count: Int,
+        revealedCount: Int
+    ) -> String {
+        if revealedCount <= 0 {
+            return "\(count) earlier transcript items hidden"
+        }
+        if revealedCount < count {
+            return "\(revealedCount) of \(count) earlier transcript items visible"
+        }
+        return "\(count) earlier transcript items visible, read-only"
     }
 
     private func hiddenLiveTurnItemsRow(_ count: Int) -> some View {
@@ -5203,31 +5548,18 @@ public struct AgentAppView: View {
 
     @ViewBuilder
     private func turnView(_ turn: AssistantTurnSnapshot) -> some View {
-        let turnPlans = proposedPlans(for: turn)
-        let renderableItems = Self.renderableItems(in: turn, persistedAssistantTexts: persistedAssistantTexts)
-            .filter { !($0.type == .plan && !turnPlans.isEmpty) }
-        let runningTurn = !turn.finished && vm.status == .running
-        let visibleRenderableItems = Self.visibleLiveTurnItems(renderableItems, running: runningTurn)
-        let hiddenLiveItemCount = renderableItems.count - visibleRenderableItems.count
-        let workItems = turn.finished ? Self.completedWorkItems(
-            in: turn,
-            renderableItems: renderableItems,
-            persistedAssistantTexts: persistedAssistantTexts
-        ) : []
-        let visibleAssistantItems = turn.finished ? Self.completedVisibleAssistantItems(
-            in: turn,
-            renderableItems: renderableItems,
-            persistedAssistantTexts: persistedAssistantTexts
-        ) : []
-        let blocks = Self.turnRenderBlocks(turn.finished ? visibleAssistantItems : visibleRenderableItems)
-        let completedWorkBlocks = Self.turnRenderBlocks(workItems)
+        // F2: all the per-turn derivation (renderableItems, final-id split, block
+        // grouping, plan filtering) is computed once here and memoized for finished
+        // turns, instead of re-running on every body pass.
+        let inputs = turnRenderInputs(for: turn)
+        let blocks = inputs.visibleBlocks
         VStack(alignment: .leading, spacing: DS.Space.xl) {
-            if turn.finished, !completedWorkBlocks.isEmpty {
-                completedWorkDisclosure(turn: turn, blocks: completedWorkBlocks)
+            if turn.finished, !inputs.completedWorkBlocks.isEmpty {
+                completedWorkDisclosure(turn: turn, blocks: inputs.completedWorkBlocks)
             }
             if !turn.finished {
-                if hiddenLiveItemCount > 0 {
-                    hiddenLiveTurnItemsRow(hiddenLiveItemCount)
+                if inputs.hiddenLiveItemCount > 0 {
+                    hiddenLiveTurnItemsRow(inputs.hiddenLiveItemCount)
                 }
                 ForEach(blocks) { block in
                     switch block {
@@ -5236,7 +5568,7 @@ public struct AgentAppView: View {
                     }
                 }
             }
-            ForEach(turnPlans) { plan in
+            ForEach(inputs.turnPlans) { plan in
                 proposedPlanRow(plan)
             }
             if turn.finished {
@@ -5249,8 +5581,7 @@ public struct AgentAppView: View {
             }
             // Only show the turn's final text if no assistant-message item
             // already rendered it (prevents the answer showing twice).
-            if let final = turn.finalAssistantMessage,
-               Self.shouldRenderFinalAssistantMessage(turn, persistedAssistantTexts: persistedAssistantTexts) {
+            if let final = turn.finalAssistantMessage, inputs.shouldRenderFinal {
                 VStack(alignment: .leading, spacing: DS.Space.xs) {
                     assistantProse(final)
                     assistantCopyBar(text: final, identifierSuffix: turn.turnId)
@@ -5305,11 +5636,6 @@ public struct AgentAppView: View {
         .frame(maxWidth: .infinity, alignment: .leading)
     }
 
-    private func proposedPlans(for turn: AssistantTurnSnapshot) -> [AssistantProposedPlan] {
-        vm.timeline.proposedPlans.filter {
-            $0.turnId == turn.turnId && !$0.markdown.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        }
-    }
 
     @ViewBuilder
     private func itemRow(_ item: AssistantItem) -> some View {
@@ -5663,7 +5989,7 @@ public struct AgentAppView: View {
                     .padding(.top, DS.Space.md)
             }
             PromptComposerEditor(
-                text: $vm.prompt,
+                text: Binding(get: { vm.prompt }, set: { vm.prompt = $0 }),
                 height: $composerEditorHeight,
                 focusTick: vm.focusTick,
                 placeholder: "Ask \(vm.provider.rawValue.capitalized) for changes…",

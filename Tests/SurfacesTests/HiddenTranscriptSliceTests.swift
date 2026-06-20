@@ -111,6 +111,23 @@ final class HiddenTranscriptSliceTests: XCTestCase {
                        "count must equal allItems.count - visibleWindow.count")
     }
 
+    func test_collapsedHiddenCount_usesCountsOnlySoTypingDoesNotScanHugeThreads() {
+        // WHY: each composer keystroke invalidates AgentAppView. When older
+        // transcript history is still collapsed, the UI only needs the reveal
+        // row's count; materializing the hidden prefix scans the whole thread
+        // and makes large threads feel frozen while typing.
+        let total = 250_000
+        let visible = AgentAppView.idleTranscriptWindowCount
+
+        let hiddenCount = AgentAppView.hiddenTranscriptCount(
+            totalCount: total,
+            visibleCount: visible
+        )
+
+        XCTAssertEqual(hiddenCount, total - visible,
+                       "collapsed transcript count must be derived without constructing the hidden prefix")
+    }
+
     func test_hiddenSlice_singleItemInVisibleWindow() {
         // WHY: boundary case — only the most-recent item is in the window
         // (suffix(1) fallback). All other items must be surfaced as hidden.

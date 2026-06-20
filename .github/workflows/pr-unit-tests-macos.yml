@@ -2,7 +2,7 @@ name: PR Unit Tests (macOS)
 
 # QA-MAC :67 -- run the SwiftPM unit suite on every PR so regressions are caught
 # at review time instead of surfacing only at release. Mirrors the environment of
-# release-macos.yml (macos-14 runner + the vendored GhosttyKit xcframework that the
+# release-macos.yml (macos-15 runner + the vendored GhosttyKit xcframework that the
 # build links) and runs scripts/test-unit.sh (the same `swift test` invocation used
 # locally). GhosttyKit is a binary vendor artifact published as a GitHub release
 # asset; we restore it from the latest release so PR builds link the same library.
@@ -21,11 +21,19 @@ permissions:
 
 jobs:
   unit-tests:
-    name: swift test (macos-14)
-    runs-on: macos-14
+    name: swift test (macos-15)
+    runs-on: macos-15
     env:
       GHOSTTYKIT_ASSET: GhosttyKit.xcframework.tar.gz
     steps:
+      - name: Select Xcode with Swift 6.1+
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+
+      - name: Export selected Xcode developer dir
+        run: echo "DEVELOPER_DIR=$(xcode-select -p)" >> "$GITHUB_ENV"
+
       - name: Checkout
         uses: actions/checkout@v4
         with:

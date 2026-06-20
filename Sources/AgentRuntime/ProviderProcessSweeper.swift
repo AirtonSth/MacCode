@@ -50,6 +50,28 @@ public enum ProviderProcessSweeper {
             .sorted { $0.pid < $1.pid }
     }
 
+    public static func currentSidecarProcesses(
+        currentPID: Int32 = ProcessInfo.processInfo.processIdentifier
+    ) -> [ProviderRuntimeProcess] {
+        currentSidecarProcesses(
+            processes: psRows(),
+            currentPID: currentPID
+        )
+    }
+
+    static func currentSidecarProcesses(
+        processes: [ProviderRuntimeProcess],
+        currentPID: Int32
+    ) -> [ProviderRuntimeProcess] {
+        let roots = processes
+            .filter { isRemoteCodeSidecarRuntime($0, currentPID: currentPID) }
+            .map(\.pid)
+        let sidecarTree = Set(roots + roots.flatMap { descendants(of: $0, in: processes) })
+        return processes
+            .filter { sidecarTree.contains($0.pid) }
+            .sorted { $0.pid < $1.pid }
+    }
+
     @discardableResult
     public static func terminateOrphanedProviderRuntimes(
         currentPID: Int32 = ProcessInfo.processInfo.processIdentifier
@@ -102,6 +124,14 @@ public enum ProviderProcessSweeper {
             || isCodexAppServerRuntime(command)
     }
 
+    static func isRemoteCodeSidecarRuntime(
+        _ process: ProviderRuntimeProcess,
+        currentPID: Int32
+    ) -> Bool {
+        guard process.pid != currentPID else { return false }
+        return isRemoteCodeDistillService(process.command)
+    }
+
     private static func isOrphanRoot(
         _ process: ProviderRuntimeProcess,
         currentPID: Int32
@@ -141,6 +171,14 @@ public enum ProviderProcessSweeper {
         let executable = String(parts[0])
         return (executable == "codex" || executable.hasSuffix("/codex"))
             && parts[1] == "app-server"
+    }
+
+    private static func isRemoteCodeDistillService(_ command: String) -> Bool {
+        guard let executable = command.split(maxSplits: 1, whereSeparator: \.isWhitespace).first else {
+            return false
+        }
+        let name = (String(executable) as NSString).lastPathComponent
+        return name == "RemoteCodeDistillService"
     }
 
     private static func psRows() -> [ProviderRuntimeProcess] {
