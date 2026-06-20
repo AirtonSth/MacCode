@@ -183,6 +183,44 @@ final class ProviderProcessSweeperTests: XCTestCase {
                        "heartbeat provider RSS must include the spawned Claude child without counting the app or user terminal Claude")
     }
 
+    func test_currentSidecarProcessesIncludesRemoteCodeDistillServiceTreeOnly() {
+        let currentPID: Int32 = 500
+        let processes = [
+            ProviderRuntimeProcess(
+                pid: currentPID,
+                ppid: 1,
+                rssKB: 200_000,
+                command: "/Applications/RemoteCode.app/Contents/MacOS/RemoteCode"
+            ),
+            ProviderRuntimeProcess(
+                pid: 301,
+                ppid: currentPID,
+                rssKB: 4_700_000,
+                command: "/Applications/RemoteCode.app/Contents/MacOS/RemoteCodeDistillService --runtime mlx"
+            ),
+            ProviderRuntimeProcess(
+                pid: 302,
+                ppid: 301,
+                rssKB: 25_000,
+                command: "/Applications/RemoteCode.app/Contents/MacOS/RemoteCodeDistillService mcp"
+            ),
+            ProviderRuntimeProcess(
+                pid: 401,
+                ppid: 1,
+                rssKB: 1_000_000,
+                command: "claude --dangerously-skip-permissions --chrome"
+            )
+        ]
+
+        let sidecars = ProviderProcessSweeper.currentSidecarProcesses(
+            processes: processes,
+            currentPID: currentPID
+        )
+
+        XCTAssertEqual(sidecars.map(\.pid), [301, 302],
+                       "Token Saver diagnostics must separate RemoteCode sidecar RSS from Agent App RSS, provider bridge RSS, and user-shell Claude RSS")
+    }
+
     func test_currentProviderProcessesDoesNotBlockOnLargeProcessLists() {
         let currentPID: Int32 = 500
         let processes = [

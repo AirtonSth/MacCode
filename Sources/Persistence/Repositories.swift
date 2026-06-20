@@ -282,6 +282,16 @@ public final class AgentThreadRepository {
     }
 }
 
+public struct AgentMessageBodyBudgetResult: Sendable, Equatable {
+    public var rows: [AgentMessage]
+    public var blanked: Int
+
+    public init(rows: [AgentMessage], blanked: Int) {
+        self.rows = rows
+        self.blanked = blanked
+    }
+}
+
 public final class AgentMessageRepository {
     let db: SQLiteDB
     public init(db: SQLiteDB) { self.db = db }
@@ -304,6 +314,113 @@ public final class AgentMessageRepository {
             out.append(message(from: st))
         }
         return out
+    }
+
+    /// Full-history load with bounded body hydration. Older rows are still returned
+    /// in order, but their bodies are blanked before SQLite reads the content blobs
+    /// when the estimated capped body bytes exceed the budget.
+    public func listWithinBodyBudget(
+        threadId: AgentThreadID,
+        budget: Int,
+        contentLimit: Int = AssistantTimelineState.liveTextLimit
+    ) throws -> AgentMessageBodyBudgetResult {
+        let metadata = try db.prepare("""
+            SELECT rowid, id, thread_id, role, created_at, length(CAST(content AS BLOB))
+            FROM agent_messages
+            WHERE thread_id = ?
+            ORDER BY created_at ASC, rowid ASC;
+            """)
+        try metadata.bind(1, threadId.value.uuidString)
+
+        struct MessageShell {
+            let rowid: Int64
+            let id: AgentMessageID
+            let threadId: AgentThreadID
+            let role: AgentMessageRole
+            let createdAt: Date
+            let estimatedBytes: Int
+        }
+
+        var shells: [MessageShell] = []
+        var totalBytes = 0
+        let cappedLimit = max(0, contentLimit)
+        let cappedByteLimit = cappedLimit >= (Int.max - 128) / 4
+            ? Int.max
+            : (cappedLimit * 4) + 128
+        while try metadata.step() {
+            guard let idText = metadata.columnText(1),
+                  let id = UUID(uuidString: idText),
+                  let threadText = metadata.columnText(2),
+                  let threadUUID = UUID(uuidString: threadText),
+                  let roleText = metadata.columnText(3),
+                  let role = AgentMessageRole(rawValue: roleText),
+                  let createdText = metadata.columnText(4),
+                  let createdAt = iso.date(from: createdText)
+            else { continue }
+            let estimatedBytes = min(Int(metadata.columnInt64(5)), cappedByteLimit)
+            totalBytes += estimatedBytes
+            shells.append(MessageShell(
+                rowid: metadata.columnInt64(0),
+                id: AgentMessageID(id),
+                threadId: AgentThreadID(threadUUID),
+                role: role,
+                createdAt: createdAt,
+                estimatedBytes: estimatedBytes
+            ))
+        }
+
+        let targetBudget = max(0, budget)
+        var firstHydratedIndex = 0
+        var blanked = 0
+        var remainingBytes = totalBytes
+        while remainingBytes > targetBudget && firstHydratedIndex < shells.count {
+            let bytes = shells[firstHydratedIndex].estimatedBytes
+            if bytes > 0 {
+                remainingBytes -= bytes
+                blanked += 1
+            }
+            firstHydratedIndex += 1
+        }
+
+        var rows = shells.map {
+            AgentMessage(
+                id: $0.id,
+                threadId: $0.threadId,
+                role: $0.role,
+                content: "",
+                createdAt: $0.createdAt
+            )
+        }
+
+        if firstHydratedIndex < shells.count {
+            let cursor = shells[firstHydratedIndex]
+            let content = try db.prepare("""
+                SELECT id, content
+                FROM agent_messages
+                WHERE thread_id = ?
+                  AND (created_at > ? OR (created_at = ? AND rowid >= ?))
+                ORDER BY created_at ASC, rowid ASC;
+                """)
+            try content.bind(1, threadId.value.uuidString)
+            let createdAtText = iso.string(from: cursor.createdAt)
+            try content.bind(2, createdAtText)
+            try content.bind(3, createdAtText)
+            try content.bind(4, cursor.rowid)
+
+            var contentByID: [AgentMessageID: String] = [:]
+            while try content.step() {
+                guard let idText = content.columnText(0),
+                      let uuid = UUID(uuidString: idText)
+                else { continue }
+                contentByID[AgentMessageID(uuid)] = AssistantTimelineState.cappedText(content.columnText(1) ?? "")
+            }
+
+            for index in firstHydratedIndex..<rows.count {
+                rows[index].content = contentByID[rows[index].id] ?? ""
+            }
+        }
+
+        return AgentMessageBodyBudgetResult(rows: rows, blanked: blanked)
     }
 
     public func count(threadId: AgentThreadID) throws -> Int {

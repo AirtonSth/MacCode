@@ -164,9 +164,28 @@ public final class AppLifecycleRecorder {
     /// logging, which drops `.info`). A gap between the last heartbeat and an
     /// unclean exit localizes a main-thread hang; a climbing rssKB localizes an
     /// out-of-memory kill.
-    public func recordHeartbeat(reason: String) {
+    public func recordHeartbeat(
+        reason: String,
+        providerProcesses: Int? = nil,
+        providerRSSKB: Int? = nil,
+        orphanProviders: Int? = nil,
+        sidecarProcesses: Int? = nil,
+        sidecarRSSKB: Int? = nil,
+        orphanSidecars: Int? = nil
+    ) {
         heartbeatSeq += 1
-        record("heartbeat seq=\(heartbeatSeq) reason=\(reason) rssKB=\(Self.footprintKB())")
+        var fields = [
+            "heartbeat seq=\(heartbeatSeq)",
+            "reason=\(reason)",
+            "rssKB=\(Self.footprintKB())"
+        ]
+        if let providerProcesses { fields.append("providerProcesses=\(providerProcesses)") }
+        if let providerRSSKB { fields.append("providerRSSKB=\(providerRSSKB)") }
+        if let orphanProviders { fields.append("orphanProviders=\(orphanProviders)") }
+        if let sidecarProcesses { fields.append("sidecarProcesses=\(sidecarProcesses)") }
+        if let sidecarRSSKB { fields.append("sidecarRSSKB=\(sidecarRSSKB)") }
+        if let orphanSidecars { fields.append("orphanSidecars=\(orphanSidecars)") }
+        record(fields.joined(separator: " "))
     }
 
     /// If a run marker from a previous launch is still present, the previous run

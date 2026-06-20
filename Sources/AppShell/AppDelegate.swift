@@ -349,9 +349,9 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
     private func logDiagnosticsHeartbeat(reason: String) {
         AppDiagnostics.heartbeat(
             reason: reason,
-            activeAgentThreads: context?.coordinator.activeThreadIdsSnapshot().count ?? 0
+            activeAgentThreads: context?.coordinator.activeThreadIdsSnapshot().count ?? 0,
+            lifecycleRecorder: lifecycleRecorder
         )
-        lifecycleRecorder?.recordHeartbeat(reason: reason)
     }
 
     private func installLifecycleRecorder() {

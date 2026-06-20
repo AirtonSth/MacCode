@@ -7,7 +7,7 @@ import XCTest
 // installationCanceledError as normal outcomes (not failures). This class
 // produces NSErrors with the Sparkle domain so the filter is exercised
 // without linking a live SPUUpdater.
-private final class FakeNSError: NSError {
+private final class FakeNSError: NSError, @unchecked Sendable {
     convenience init(domain: String, code: Int) {
         self.init(domain: domain, code: code, userInfo: nil)
     }

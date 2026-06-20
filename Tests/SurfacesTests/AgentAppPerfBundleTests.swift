@@ -202,6 +202,38 @@ final class AgentAppPerfBundleTests: XCTestCase {
                        "batched stream flush must preserve the original compressed text for the View original disclosure")
     }
 
+    func test_hiddenTranscriptRevealWindowKeepsLargeHistoryRevealBounded() {
+        let threadId = AgentThreadID()
+        let entries = (0..<140).map { index in
+            AgentAppView.TranscriptEntry.message(AgentMessage(
+                threadId: threadId,
+                role: .assistant,
+                content: "message-\(index)",
+                createdAt: Date(timeIntervalSinceReferenceDate: Double(index))
+            ))
+        }
+        let visible = Array(entries.suffix(30))
+
+        let firstReveal = AgentAppView.hiddenTranscriptRevealWindow(
+            allItems: entries,
+            visibleWindow: visible,
+            revealCount: 50
+        )
+        let secondReveal = AgentAppView.hiddenTranscriptRevealWindow(
+            allItems: entries,
+            visibleWindow: visible,
+            revealCount: 100
+        )
+
+        XCTAssertEqual(firstReveal.count, 50,
+                       "one tap must not render the entire older transcript for huge threads; reveal work stays bounded")
+        XCTAssertEqual(firstReveal.first?.id, entries[60].id,
+                       "the first reveal shows the most recent hidden entries adjacent to the visible window")
+        XCTAssertEqual(secondReveal.count, 100,
+                       "additional taps can reveal more history in bounded chunks without losing older transcript access")
+        XCTAssertEqual(secondReveal.first?.id, entries[10].id)
+    }
+
     // MARK: - PERF #1: 5,000-event thread-open replay benchmark
 
     func test_threadOpenReplayFiveThousandEventsStaysWithinBudget() async throws {

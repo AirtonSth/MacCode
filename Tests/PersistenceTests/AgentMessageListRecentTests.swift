@@ -98,4 +98,36 @@ final class AgentMessageListRecentTests: XCTestCase {
         XCTAssertNil(try repo.firstUserMessage(threadId: tid),
             "a thread with no user message must return nil so title repair skips it (and marks it visited)")
     }
+
+    func test_listWithinBodyBudgetBlanksOldestBodiesBeforeHydratingContent() throws {
+        let (repo, tid) = try makeRepo()
+        let base = Date(timeIntervalSinceReferenceDate: 700_000_000)
+        try repo.append(AgentMessage(threadId: tid, role: .user, content: String(repeating: "a", count: 40), createdAt: base))
+        try repo.append(AgentMessage(threadId: tid, role: .assistant, content: String(repeating: "b", count: 40), createdAt: base.addingTimeInterval(1)))
+        try repo.append(AgentMessage(threadId: tid, role: .assistant, content: "newest-kept", createdAt: base.addingTimeInterval(2)))
+
+        let result = try repo.listWithinBodyBudget(threadId: tid, budget: 20, contentLimit: 80_000)
+
+        XCTAssertEqual(result.blanked, 2,
+                       "the repository must blank old oversized bodies before Agent App hydrates content so long thread open does not transiently load every old blob")
+        XCTAssertEqual(result.rows.map(\.content), ["", "", "newest-kept"],
+                       "message metadata/order must remain intact while only the newest bodies inside the budget are hydrated")
+    }
+
+    func test_listWithinBodyBudgetUsesUtf8ByteEstimateForMultibyteCaps() throws {
+        let (repo, tid) = try makeRepo()
+        try repo.append(AgentMessage(
+            threadId: tid,
+            role: .user,
+            content: String(repeating: "🙂", count: 4),
+            createdAt: Date(timeIntervalSinceReferenceDate: 700_000_000)
+        ))
+
+        let result = try repo.listWithinBodyBudget(threadId: tid, budget: 10, contentLimit: 4)
+
+        XCTAssertEqual(result.blanked, 1,
+                       "body budgeting is byte-based, so a character cap must not underestimate multibyte UTF-8 content and hydrate old blobs that already exceed the byte budget")
+        XCTAssertEqual(result.rows.map(\.content), [""],
+                       "oversized multibyte content should be blanked before hydration just like oversized ASCII content")
+    }
 }

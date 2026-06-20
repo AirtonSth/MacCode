@@ -1,6 +1,7 @@
 import Foundation
 import Darwin
 import AgentRuntime
+import AppLifecycleSupport
 import CoreModel
 import Surfaces
 import os
@@ -19,7 +20,7 @@ enum AppDiagnostics {
         let historyFailures: Int
     }
 
-    /// Aggregated provider-process stats derived from a list of processes.
+    /// Aggregated process stats derived from a list of provider or sidecar processes.
     /// Pure, `nonisolated`-safe: no actor context required.
     ///
     /// WHY: the caller (`heartbeat`) dispatches `currentProviderProcesses()`
@@ -31,7 +32,7 @@ enum AppDiagnostics {
         let orphanCount: Int
     }
 
-    /// Aggregates provider stats from a list of processes.
+    /// Aggregates process stats from a list of processes.
     /// This is the pure helper that runs off the main thread in `heartbeat`.
     nonisolated static func aggregateProviderStats(
         processes: [ProviderRuntimeProcess]
@@ -51,7 +52,11 @@ enum AppDiagnostics {
     /// never competes with UI rendering on the main thread. The log entry
     /// is written back on the main actor once the scan completes.
     @MainActor
-    static func heartbeat(reason: String, activeAgentThreads: Int) {
+    static func heartbeat(
+        reason: String,
+        activeAgentThreads: Int,
+        lifecycleRecorder: AppLifecycleRecorder? = nil
+    ) {
         // Snapshot main-actor surface state before leaving the actor.
         let surfaces = SurfaceRegistry.shared.all()
         let terminalHealth = surfaces.compactMap { ($0 as? TerminalSurface)?.runtimeHealth() }
@@ -69,11 +74,22 @@ enum AppDiagnostics {
 
         // Dispatch the blocking /bin/ps scan off the main thread.
         Task.detached(priority: .utility) {
-            let processes = ProviderProcessSweeper.currentProviderProcesses()
-            let stats = aggregateProviderStats(processes: processes)
+            let providerProcesses = ProviderProcessSweeper.currentProviderProcesses()
+            let sidecarProcesses = ProviderProcessSweeper.currentSidecarProcesses()
+            let stats = aggregateProviderStats(processes: providerProcesses)
+            let sidecarStats = aggregateProviderStats(processes: sidecarProcesses)
             await MainActor.run {
                 appDiagnosticsLog.info(
-                    "app.heartbeat reason=\(reason, privacy: .public) pid=\(pid, privacy: .public) rssKB=\(rssKB, privacy: .public) surfaces=\(snapshot.surfaceCount, privacy: .public) terminals=\(snapshot.terminalCount, privacy: .public) runningTerminals=\(snapshot.runningTerminals, privacy: .public) activeAgentThreads=\(activeAgentThreads, privacy: .public) providerProcesses=\(stats.processCount, privacy: .public) providerRSSKB=\(stats.totalRSSKB, privacy: .public) orphanProviders=\(stats.orphanCount, privacy: .public) terminalPendingBytes=\(snapshot.pendingBytes, privacy: .public) terminalDroppedBytes=\(snapshot.droppedBytes, privacy: .public) terminalHistoryFailures=\(snapshot.historyFailures, privacy: .public)"
+                    "app.heartbeat reason=\(reason, privacy: .public) pid=\(pid, privacy: .public) rssKB=\(rssKB, privacy: .public) surfaces=\(snapshot.surfaceCount, privacy: .public) terminals=\(snapshot.terminalCount, privacy: .public) runningTerminals=\(snapshot.runningTerminals, privacy: .public) activeAgentThreads=\(activeAgentThreads, privacy: .public) providerProcesses=\(stats.processCount, privacy: .public) providerRSSKB=\(stats.totalRSSKB, privacy: .public) orphanProviders=\(stats.orphanCount, privacy: .public) sidecarProcesses=\(sidecarStats.processCount, privacy: .public) sidecarRSSKB=\(sidecarStats.totalRSSKB, privacy: .public) orphanSidecars=\(sidecarStats.orphanCount, privacy: .public) terminalPendingBytes=\(snapshot.pendingBytes, privacy: .public) terminalDroppedBytes=\(snapshot.droppedBytes, privacy: .public) terminalHistoryFailures=\(snapshot.historyFailures, privacy: .public)"
+                )
+                lifecycleRecorder?.recordHeartbeat(
+                    reason: reason,
+                    providerProcesses: stats.processCount,
+                    providerRSSKB: stats.totalRSSKB,
+                    orphanProviders: stats.orphanCount,
+                    sidecarProcesses: sidecarStats.processCount,
+                    sidecarRSSKB: sidecarStats.totalRSSKB,
+                    orphanSidecars: sidecarStats.orphanCount
                 )
             }
         }

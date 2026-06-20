@@ -70,6 +70,29 @@ final class AppLifecycleRecorderTests: XCTestCase {
         XCTAssertTrue(log.contains("rssKB="), "heartbeats must carry memory footprint so an out-of-memory kill is distinguishable from other deaths")
     }
 
+    func test_heartbeatAppendsProviderAndSidecarMemoryStatsToDisk() throws {
+        let (recorder, dir) = makeRecorder()
+        recorder.recordHeartbeat(
+            reason: "periodic",
+            providerProcesses: 2,
+            providerRSSKB: 235_000,
+            orphanProviders: 0,
+            sidecarProcesses: 3,
+            sidecarRSSKB: 4_750_000,
+            orphanSidecars: 0
+        )
+
+        let log = try String(contentsOf: dir.appendingPathComponent("lifecycle.log"), encoding: .utf8)
+        XCTAssertTrue(log.contains("providerProcesses=2"),
+                      "disk heartbeat must retain provider process count because unified .info logs may be unavailable after a long-run slowdown")
+        XCTAssertTrue(log.contains("providerRSSKB=235000"),
+                      "disk heartbeat must retain provider RSS so Agent App memory can be separated from provider memory pressure")
+        XCTAssertTrue(log.contains("sidecarProcesses=3"),
+                      "disk heartbeat must retain Token Saver sidecar process count separately from provider processes")
+        XCTAssertTrue(log.contains("sidecarRSSKB=4750000"),
+                      "disk heartbeat must retain Token Saver sidecar RSS because the sidecar can dominate memory pressure while Agent App RSS stays flat")
+    }
+
     func test_recordWritesForensicLineToDisk() throws {
         let (recorder, dir) = makeRecorder()
         recorder.record("signal=SIGTERM terminating=true")

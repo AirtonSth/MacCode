@@ -813,8 +813,14 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         // full (unpaged) load is deliberate for scroll stability (see above); the work
         // that scaled with thread length was the per-row cost, cut by the utf8 fast path
         // (F11) and the single-pass cap+budget below.
-        let raw = (try? messageRepo.list(threadId: id)) ?? []
-        let (rows, blanked) = Self.cappedRowsWithinBudget(raw)
+        let loaded = try? messageRepo.listWithinBodyBudget(
+            threadId: id,
+            budget: Self.fullLoadBodyBudgetBytes,
+            contentLimit: AssistantTimelineState.liveTextLimit
+        )
+        let raw = loaded?.rows ?? []
+        let (rows, additionalBlanked) = Self.cappedRowsWithinBudget(raw)
+        let blanked = (loaded?.blanked ?? 0) + additionalBlanked
         if blanked > 0 {
             // Fail loud: a thread big enough to trip the budget loses its oldest bodies.
             NSLog("[AgentApp] full-load body budget tripped: blanked \(blanked)/\(raw.count) oldest message bodies to stay under \(Self.fullLoadBodyBudgetBytes) bytes")
@@ -3054,9 +3060,9 @@ public struct AgentAppView: View {
     // UX-MAC_AGENT-013: inline custom-model entry replaces the blocking NSAlert.
     @State private var showCustomModelField = false
     @State private var customModelDraft = ""
-    /// P1: true when the user has tapped the "N earlier items hidden" row to
-    /// reveal the pre-run history read-only. Reset to false on each new run.
-    @State private var transcriptHistoryRevealed = false
+    /// P1/F4: number of hidden pre-run transcript items revealed read-only.
+    /// Reset to zero on each new run and paged so one tap cannot render a huge history.
+    @State private var transcriptHistoryRevealCount = 0
 
     public init(vm: AgentAppViewModel) { self.vm = vm }
 
@@ -3438,6 +3444,7 @@ public struct AgentAppView: View {
     // idle render to a recent tail, mirroring the running-state window; the older
     // slice stays one tap away via the existing "earlier transcript items" reveal.
     nonisolated static let idleTranscriptWindowCount = 30
+    nonisolated static let hiddenTranscriptRevealPageCount = 50
     static let liveTurnRenderableItemLimit = 48
     static let liveTurnBodyCharacterLimit = 2_000
     static let liveTurnOutputCharacterLimit = 1_500
@@ -3510,6 +3517,18 @@ public struct AgentAppView: View {
     ) -> [TranscriptEntry] {
         let visibleIDs = Set(visibleWindow.map(\.id))
         return allItems.filter { !visibleIDs.contains($0.id) }
+    }
+
+    nonisolated static func hiddenTranscriptRevealWindow(
+        allItems: [TranscriptEntry],
+        visibleWindow: [TranscriptEntry],
+        revealCount: Int
+    ) -> [TranscriptEntry] {
+        guard revealCount > 0 else { return [] }
+        return Array(hiddenTranscriptSlice(
+            allItems: allItems,
+            visibleWindow: visibleWindow
+        ).suffix(revealCount))
     }
 
     /// Count-only path for collapsed history. The reveal row needs only this
@@ -4380,6 +4399,10 @@ public struct AgentAppView: View {
                                 totalCount: allEntries.count,
                                 visibleCount: entries.count
                             )
+                            let revealedHiddenCount = min(
+                                transcriptHistoryRevealCount,
+                                hiddenCount
+                            )
                             TimelineScrollFollower(
                                 slack: Self.timelineBottomRevealSlack,
                                 pinned: timelineSticksToBottom,
@@ -4394,14 +4417,21 @@ public struct AgentAppView: View {
                             if hiddenCount > 0 {
                                 runningHiddenTranscriptRow(
                                     hiddenCount,
-                                    revealed: transcriptHistoryRevealed,
-                                    onReveal: { transcriptHistoryRevealed = true }
+                                    revealedCount: revealedHiddenCount,
+                                    pageCount: Self.hiddenTranscriptRevealPageCount,
+                                    onReveal: {
+                                        transcriptHistoryRevealCount = min(
+                                            hiddenCount,
+                                            transcriptHistoryRevealCount + Self.hiddenTranscriptRevealPageCount
+                                        )
+                                    }
                                 )
                             }
-                            if transcriptHistoryRevealed {
-                                let hiddenEntries = Self.hiddenTranscriptSlice(
+                            if revealedHiddenCount > 0 {
+                                let hiddenEntries = Self.hiddenTranscriptRevealWindow(
                                     allItems: allEntries,
-                                    visibleWindow: entries
+                                    visibleWindow: entries,
+                                    revealCount: revealedHiddenCount
                                 )
                                 ForEach(hiddenEntries) { entry in
                                     switch entry {
@@ -4508,13 +4538,13 @@ public struct AgentAppView: View {
             // P1: collapse revealed history whenever a new run starts so the
             // window resets to the live context automatically.
             .onChange(of: vm.runStartedAt) { newValue in
-                if newValue != nil { transcriptHistoryRevealed = false }
+                if newValue != nil { transcriptHistoryRevealCount = 0 }
             }
             // PERF-MAC_AGENT-023: also collapse on thread switch. Idle threads now
             // bound their render to a recent tail (visibleTranscriptWindow), so a
             // revealed flag carried into a different long thread would eagerly
             // render its whole history with no user action — reintroducing the hang.
-            .onChange(of: vm.selectedThreadId) { _ in transcriptHistoryRevealed = false }
+            .onChange(of: vm.selectedThreadId) { _ in transcriptHistoryRevealCount = 0 }
         }
     }
 
@@ -5177,17 +5207,22 @@ public struct AgentAppView: View {
 
     private func runningHiddenTranscriptRow(
         _ count: Int,
-        revealed: Bool,
+        revealedCount: Int,
+        pageCount: Int,
         onReveal: @escaping () -> Void
     ) -> some View {
-        Button(action: { if !revealed { onReveal() } }) {
+        let canRevealMore = revealedCount < count
+        let nextCount = min(max(0, pageCount), max(0, count - revealedCount))
+        return Button(action: { if canRevealMore { onReveal() } }) {
             HStack(spacing: DS.Space.sm) {
-                Image(systemName: revealed ? "chevron.up" : "ellipsis")
+                Image(systemName: canRevealMore ? "ellipsis" : "chevron.up")
                     .font(.system(size: 12, weight: .semibold))
                     .foregroundColor(DS.Palette.textTertiary)
-                Text(revealed
-                    ? "\(count) earlier transcript items (read-only)"
-                    : "\(count) earlier transcript items hidden — tap to view")
+                Text(Self.hiddenTranscriptRevealLabel(
+                    count: count,
+                    revealedCount: revealedCount,
+                    nextCount: nextCount
+                ))
                     .font(DS.Font.caption)
                     .foregroundColor(DS.Palette.textTertiary)
                     .lineLimit(1)
@@ -5200,11 +5235,39 @@ public struct AgentAppView: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .disabled(revealed)
-        .accessibilityLabel(revealed
-            ? "\(count) earlier transcript items visible, read-only"
-            : "Show \(count) earlier transcript items")
+        .disabled(!canRevealMore)
+        .accessibilityLabel(Self.hiddenTranscriptRevealAccessibilityLabel(
+            count: count,
+            revealedCount: revealedCount
+        ))
         .accessibilityIdentifier("agent.runningHiddenTranscript")
+    }
+
+    nonisolated static func hiddenTranscriptRevealLabel(
+        count: Int,
+        revealedCount: Int,
+        nextCount: Int
+    ) -> String {
+        if revealedCount <= 0 {
+            return "\(count) earlier transcript items hidden - tap to view \(nextCount)"
+        }
+        if revealedCount < count {
+            return "\(revealedCount) of \(count) earlier transcript items visible - tap to view more"
+        }
+        return "\(count) earlier transcript items visible, read-only"
+    }
+
+    nonisolated static func hiddenTranscriptRevealAccessibilityLabel(
+        count: Int,
+        revealedCount: Int
+    ) -> String {
+        if revealedCount <= 0 {
+            return "\(count) earlier transcript items hidden"
+        }
+        if revealedCount < count {
+            return "\(revealedCount) of \(count) earlier transcript items visible"
+        }
+        return "\(count) earlier transcript items visible, read-only"
     }
 
     private func hiddenLiveTurnItemsRow(_ count: Int) -> some View {
