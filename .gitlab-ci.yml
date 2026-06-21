@@ -274,13 +274,6 @@ stable_macos_arm64_dmg:
       git lfs pull
 
       VERSION="${TAG#v}"
-      RELEASE_TOOLS_TOKEN="${GITLAB_RELEASE_TOKEN:-${CI_JOB_TOKEN:-}}"
-      if [ -z "$RELEASE_TOOLS_TOKEN" ]; then
-        echo "CI_JOB_TOKEN or GITLAB_RELEASE_TOKEN is required for GitLab release assets"
-        exit 1
-      fi
-      export GITLAB_TOKEN="$RELEASE_TOOLS_TOKEN"
-
       CODESIGN_P12_BASE64="${MACOS_DEVELOPER_ID_P12_BASE64:-${MACOS_CERTIFICATE:-}}"
       CODESIGN_P12_PASSWORD="${MACOS_DEVELOPER_ID_P12_PASSWORD:-${MACOS_CERTIFICATE_PWD:-}}"
       EXPECTED_CODESIGN_IDENTITY="${MACOS_DEVELOPER_IDENTITY:-${ELECTROBUN_DEVELOPER_ID:-}}"
@@ -290,8 +283,8 @@ stable_macos_arm64_dmg:
       CLOUDFRONT_DISTRIBUTION_ID="${REMOTECODE_IO_CLOUDFRONT_DISTRIBUTION_ID:-}"
 
       test "$(uname -m)" = "arm64"
-      command -v glab >/dev/null || brew install glab
       command -v aws >/dev/null || brew install awscli
+      command -v jq >/dev/null || brew install jq
 
       if [ -z "$CODESIGN_P12_BASE64" ] || [ -z "$CODESIGN_P12_PASSWORD" ]; then
         echo "Missing Developer ID certificate variables"
@@ -424,6 +417,43 @@ stable_macos_arm64_dmg:
         --distribution-id "$CLOUDFRONT_DISTRIBUTION_ID" \
         --paths "/$S3_DOWNLOAD_PREFIX/appcast.xml" "/$S3_DOWNLOAD_PREFIX/latest/$ASSET_NAME" "/$S3_DOWNLOAD_PREFIX/$TAG/$ASSET_NAME"
 
-      glab release create "$TAG" --repo "$CI_PROJECT_PATH" --ref "$TAG" --name "RemoteCode $VERSION" --notes "RemoteCode macOS $VERSION"
-      glab release upload "$TAG" "dist/$ASSET_NAME#$ASSET_NAME#package" --repo "$CI_PROJECT_PATH" --use-package-registry --package-name release-assets
-      glab release upload "$TAG" "dist/pages/appcast.xml#appcast.xml#package" --repo "$CI_PROJECT_PATH" --use-package-registry --package-name release-assets
+      RELEASE_PAYLOAD="$(jq -n \
+        --arg tag "$TAG" \
+        --arg ref "$TAG" \
+        --arg name "RemoteCode $VERSION" \
+        --arg description "RemoteCode macOS $VERSION" \
+        --arg dmg_name "$ASSET_NAME" \
+        --arg dmg_url "$S3_DOWNLOAD_BASE_URL/$TAG/$ASSET_NAME" \
+        --arg appcast_url "$S3_DOWNLOAD_BASE_URL/appcast.xml" \
+        '{
+          tag_name: $tag,
+          ref: $ref,
+          name: $name,
+          description: $description,
+          assets: {
+            links: [
+              {name: $dmg_name, url: $dmg_url, link_type: "package"},
+              {name: "appcast.xml", url: $appcast_url, link_type: "other"}
+            ]
+          }
+        }')"
+      RELEASE_API="$CI_API_V4_URL/projects/$CI_PROJECT_ID/releases"
+      RELEASE_CODE="$(curl --silent --show-error --output /tmp/gitlab-release-response.json --write-out "%{http_code}" \
+        --request POST \
+        --header "JOB-TOKEN: $CI_JOB_TOKEN" \
+        --header "Content-Type: application/json" \
+        --data "$RELEASE_PAYLOAD" \
+        "$RELEASE_API")"
+      if [ "$RELEASE_CODE" = "409" ]; then
+        RELEASE_CODE="$(curl --silent --show-error --output /tmp/gitlab-release-response.json --write-out "%{http_code}" \
+          --request PUT \
+          --header "JOB-TOKEN: $CI_JOB_TOKEN" \
+          --header "Content-Type: application/json" \
+          --data "$RELEASE_PAYLOAD" \
+          "$RELEASE_API/$TAG")"
+      fi
+      if [ "$RELEASE_CODE" != "200" ] && [ "$RELEASE_CODE" != "201" ]; then
+        echo "GitLab release API failed with HTTP $RELEASE_CODE"
+        cat /tmp/gitlab-release-response.json
+        exit 1
+      fi
