@@ -8,7 +8,7 @@ All a developer need to code anywhere.
 
 ## Get Started
 
-[Latest Release](https://github.com/samuelfaj/remotecode.io/releases/latest/download/stable-macos-arm64-RemoteCode.dmg)
+[Latest Release](https://remotecode.io/downloads/macos/latest/stable-macos-arm64-RemoteCode.dmg)
 
 ## What RemoteCode Does
 

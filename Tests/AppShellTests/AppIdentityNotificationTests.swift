@@ -40,7 +40,7 @@ final class AppIdentityNotificationTests: XCTestCase {
         XCTAssertTrue(script.contains("<key>SUFeedURL</key><string>${SPARKLE_FEED_URL}</string>"),
                       "release bundles must point Sparkle at the stable appcast feed")
         XCTAssertTrue(script.contains("SPARKLE_FEED_URL=\"${RC2_SPARKLE_FEED_URL:-https://remotecode.io/downloads/macos/appcast.xml}\""),
-                      "default release bundles must use the public S3-backed appcast because the GitHub repo is private")
+                      "default release bundles must use the public S3-backed appcast instead of release-hosted assets")
         XCTAssertTrue(script.contains("<key>SUPublicEDKey</key><string>${SPARKLE_PUBLIC_ED_KEY}</string>"),
                       "release bundles must embed the Sparkle EdDSA public key used to verify update archives")
         XCTAssertTrue(script.contains("<key>SUEnableAutomaticChecks</key><true/>"),
@@ -80,17 +80,17 @@ final class AppIdentityNotificationTests: XCTestCase {
                       "the release workflow must use Sparkle tooling to sign the DMG enclosure")
         XCTAssertTrue(workflow.contains("dist/pages/appcast.xml"),
                       "the release workflow must generate the appcast that Sparkle polls")
-        XCTAssertTrue(workflow.contains("aws-actions/configure-aws-credentials@v4"),
+        XCTAssertTrue(workflow.contains("assume-role-with-web-identity"),
                       "release CI must assume the AWS role before publishing public artifacts to the private frontend bucket")
         XCTAssertFalse(workflow.contains("--acl public-read"),
                        "release uploads must rely on CloudFront OAC instead of public ACLs because the frontend bucket blocks public ACLs")
-        XCTAssertTrue(workflow.contains("s3://$S3_BUCKET/$S3_DOWNLOAD_PREFIX/${{ steps.release.outputs.tag }}/$ASSET_NAME"),
+        XCTAssertTrue(workflow.contains("s3://$S3_BUCKET/$S3_DOWNLOAD_PREFIX/$TAG/$ASSET_NAME"),
                       "the notarized DMG must be copied to a versioned S3 key so Sparkle does not depend on private GitHub release URLs")
         XCTAssertTrue(workflow.contains("s3://$S3_BUCKET/$S3_DOWNLOAD_PREFIX/appcast.xml"),
                       "the signed appcast must be published to the public S3-backed feed URL")
-        XCTAssertTrue(workflow.contains("RC2_SPARKLE_FEED_URL: ${{ env.S3_DOWNLOAD_BASE_URL }}/appcast.xml"),
+        XCTAssertTrue(workflow.contains("export RC2_SPARKLE_FEED_URL=\"$S3_DOWNLOAD_BASE_URL/appcast.xml\""),
                       "packaged release bundles must embed the public S3-backed appcast URL")
-        XCTAssertTrue(workflow.contains("DMG_URL=\"$S3_DOWNLOAD_BASE_URL/${{ steps.release.outputs.tag }}/$ASSET_NAME\""),
+        XCTAssertTrue(workflow.contains("DMG_URL=\"$S3_DOWNLOAD_BASE_URL/$TAG/$ASSET_NAME\""),
                       "Sparkle enclosures must point at the public versioned S3 DMG URL")
         XCTAssertTrue(workflow.contains("stable-macos-arm64-RemoteCode.dmg"),
                       "the appcast must keep referencing the notarized release DMG asset")
@@ -589,7 +589,7 @@ final class AppIdentityNotificationTests: XCTestCase {
             .deletingLastPathComponent()
             .deletingLastPathComponent()
             .deletingLastPathComponent()
-            .appendingPathComponent(".github/workflows/release-macos.yml")
+            .appendingPathComponent(".gitlab-ci.yml")
     }
 
     private func sidebarViewURL() -> URL {

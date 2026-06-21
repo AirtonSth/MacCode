@@ -1,0 +1,428 @@
+stages:
+  - lint
+  - test
+  - package
+  - release
+
+workflow:
+  rules:
+    - if: '$CI_COMMIT_TAG'
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_PIPELINE_SOURCE == "push"'
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+    - if: '$CI_PIPELINE_SOURCE == "web"'
+
+variables:
+  AWS_REGION: "us-east-1"
+  DEVELOPER_DIR: "/Applications/Xcode.app/Contents/Developer"
+  GIT_LFS_SKIP_SMUDGE: "0"
+  GIT_SUBMODULE_STRATEGY: "none"
+  HOMEBREW_NO_AUTO_UPDATE: "1"
+  S3_BUCKET: "remotecode.io"
+  S3_DOWNLOAD_BASE_URL: "https://remotecode.io/downloads/macos"
+  S3_DOWNLOAD_PREFIX: "downloads/macos"
+
+.macos_medium:
+  tags:
+    - saas-macos-medium-m1
+  image: macos-15-xcode-16
+  before_script:
+    - export DEVELOPER_DIR="${DEVELOPER_DIR:-/Applications/Xcode.app/Contents/Developer}"
+    - command -v git-lfs >/dev/null || brew install git-lfs
+    - git lfs install
+    - git lfs pull
+
+.macos_large:
+  extends: .macos_medium
+  tags:
+    - saas-macos-large-m2pro
+
+main_thread_blocking_ratchet:
+  extends: .macos_medium
+  stage: lint
+  rules:
+    - if: '$RUN_ALL_MACOS_CI == "1"'
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      changes:
+        - Sources/**/*.swift
+        - scripts/lint-main-thread-blocking.sh
+        - scripts/main-thread-blocking-baseline.txt
+        - .gitlab-ci.yml
+    - if: '$CI_PIPELINE_SOURCE == "web"'
+      when: manual
+      allow_failure: true
+  script:
+    - bash scripts/lint-main-thread-blocking.sh
+
+lint_scripts:
+  extends: .macos_medium
+  stage: lint
+  rules:
+    - if: '$RUN_ALL_MACOS_CI == "1"'
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      changes:
+        - scripts/**/*
+        - "**/*.plist"
+        - .gitlab-ci.yml
+    - if: '$CI_PIPELINE_SOURCE == "web"'
+      when: manual
+      allow_failure: true
+  script:
+    - brew install shellcheck
+    - shellcheck -S error scripts/*.sh
+    - |
+      for script in scripts/*.sh; do
+        bash -n "$script"
+      done
+    - |
+      found=0
+      while IFS= read -r plist; do
+        plutil -lint "$plist"
+        found=1
+      done < <(git ls-files '*.plist')
+      if [ "$found" = "0" ]; then
+        echo "no committed plists to lint"
+      fi
+    - |
+      if grep -nE 'PkgInfo"? *<<' scripts/package-app.sh; then
+        echo "PkgInfo must be printf'd (8 bytes), not heredoc'd (9 bytes)" >&2
+        exit 1
+      fi
+
+claude_agent_sdk_advisory:
+  extends: .macos_medium
+  stage: test
+  rules:
+    - if: '$RUN_ALL_MACOS_CI == "1"'
+    - if: '$SCHEDULED_JOB == "claude_agent_sdk_advisory"'
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      changes:
+        - Sources/AgentRuntime/ClaudeAgentSDKBridgeAdapter.swift
+        - scripts/check-claude-agent-sdk-spec.sh
+        - .gitlab-ci.yml
+    - if: '$CI_PIPELINE_SOURCE == "web"'
+      when: manual
+      allow_failure: true
+  script:
+    - command -v node >/dev/null || brew install node@22
+    - export PATH="/opt/homebrew/opt/node@22/bin:$PATH"
+    - node --version
+    - scripts/check-claude-agent-sdk-spec.sh
+
+claude_streaming_tsan:
+  extends: .macos_medium
+  stage: test
+  rules:
+    - if: '$RUN_ALL_MACOS_CI == "1"'
+    - if: '$SCHEDULED_JOB == "claude_streaming_tsan"'
+    - if: '$CI_PIPELINE_SOURCE == "web"'
+      when: manual
+      allow_failure: true
+  script:
+    - swift test --sanitize=thread --filter ClaudeStreamingCLIAdapterConcurrencyTests/test_streamEventsAndSessionQueriesStayRaceFreeDuringStreamingTurn
+
+tsan_persistence:
+  extends: .macos_medium
+  stage: test
+  rules:
+    - if: '$RUN_ALL_MACOS_CI == "1"'
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      changes:
+        - Sources/Persistence/**/*
+        - Tests/PersistenceTests/PersistenceConcurrencyStressTests.swift
+        - .gitlab-ci.yml
+    - if: '$CI_PIPELINE_SOURCE == "web"'
+      when: manual
+      allow_failure: true
+  script:
+    - swift test --sanitize=thread --filter PersistenceConcurrencyStressTests
+
+provider_binary_smoke:
+  extends: .macos_medium
+  stage: test
+  rules:
+    - if: '$RUN_ALL_MACOS_CI == "1"'
+    - if: '$SCHEDULED_JOB == "provider_binary_smoke"'
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      changes:
+        - Sources/AgentRuntime/**/*
+        - Tests/AgentRuntimeTests/**/*
+        - scripts/provider-binary-smoke.sh
+        - .gitlab-ci.yml
+    - if: '$CI_PIPELINE_SOURCE == "web"'
+      when: manual
+      allow_failure: true
+  script:
+    - scripts/provider-binary-smoke.sh
+
+terminal_teardown:
+  extends: .macos_medium
+  stage: test
+  variables:
+    RC2_TERMINAL_TEARDOWN_ITERATIONS: "100"
+  rules:
+    - if: '$RUN_ALL_MACOS_CI == "1"'
+    - if: '$SCHEDULED_JOB == "terminal_teardown"'
+    - if: '$CI_PIPELINE_SOURCE == "web"'
+      when: manual
+      allow_failure: true
+  script:
+    - scripts/terminal-teardown-leak-ci.sh
+
+token_saver_mlx_live:
+  extends: .macos_large
+  stage: test
+  timeout: 90m
+  variables:
+    REMOTE_CODE_TOKEN_SAVER_LIVE_MODEL_TEST: "1"
+    REMOTE_CODE_TOKEN_SAVER_RSS_CEILING_GB: "21"
+  rules:
+    - if: '$RUN_ALL_MACOS_CI == "1"'
+    - if: '$SCHEDULED_JOB == "token_saver_mlx_live"'
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      changes:
+        - Sources/DistillCore/**/*
+        - Sources/AgentRuntime/TokenSaverModel*.swift
+        - Tests/DistillCoreTests/DistillLiveModelTests.swift
+        - Tests/DistillCoreTests/DistillLivePerfTests.swift
+        - Tests/DistillCoreTests/MLXHotPathSafetyTests.swift
+        - .gitlab-ci.yml
+    - if: '$CI_PIPELINE_SOURCE == "web"'
+      when: manual
+      allow_failure: true
+  script:
+    - test "$(uname -m)" = "arm64"
+    - export REMOTE_CODE_TOKEN_SAVER_LIVE_MODEL_DIR="${TMPDIR:-/tmp}/RemoteCodeTokenSaverLiveModel"
+    - swift test --filter 'DistillLiveModelTests|DistillLivePerfTests|MLXHotPathSafetyTests'
+
+macos_agent_perf_guards:
+  extends: .macos_large
+  stage: test
+  variables:
+    RC2_WIDE_LAYOUT_REBUILD_BUDGET_MS: "3000"
+  rules:
+    - if: '$RUN_ALL_MACOS_CI == "1"'
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      changes:
+        - Sources/Surfaces/AgentAppSurface.swift
+        - Tests/SurfacesTests/AgentAppPerfBundleTests.swift
+        - .gitlab-ci.yml
+    - if: '$CI_PIPELINE_SOURCE == "web"'
+      when: manual
+      allow_failure: true
+  script:
+    - swift test --filter 'AgentAppPerfBundleTests/test_threadOpenReplayFiveThousandEventsStaysWithinBudget|MainWindowControllerRebuildCountTests/test_wideLayoutSixPanesFortyTabs_rebuildsWithinBudget'
+
+pr_unit_tests:
+  extends: .macos_large
+  stage: test
+  interruptible: true
+  rules:
+    - if: '$RUN_ALL_MACOS_CI == "1"'
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && ($CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "main" || $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "june-09")'
+    - if: '$CI_PIPELINE_SOURCE == "web"'
+      when: manual
+      allow_failure: true
+  script:
+    - scripts/test-unit.sh
+
+package_bundle_check:
+  extends: .macos_large
+  stage: package
+  rules:
+    - if: '$RUN_ALL_MACOS_CI == "1"'
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      changes:
+        - Sources/**/*
+        - Package.swift
+        - scripts/package-app.sh
+        - scripts/check-app-bundle.sh
+        - .gitlab-ci.yml
+    - if: '$CI_PIPELINE_SOURCE == "web"'
+      when: manual
+      allow_failure: true
+  script:
+    - xcodebuild -downloadComponent MetalToolchain
+    - RC2_CONFIG=debug bash scripts/package-app.sh
+    - bash scripts/check-app-bundle.sh dist/RemoteCode.app
+    - plutil -lint dist/RemoteCode.app/Contents/Info.plist
+
+stable_macos_arm64_dmg:
+  extends: .macos_large
+  stage: release
+  timeout: 120m
+  id_tokens:
+    GITLAB_OIDC_TOKEN:
+      aud: sts.amazonaws.com
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^v[0-9]+\.[0-9]+\.[0-9]+$/'
+    - if: '$RELEASE_TAG =~ /^v[0-9]+\.[0-9]+\.[0-9]+$/'
+  script:
+    - |
+      set -euo pipefail
+
+      ASSET_NAME="stable-macos-arm64-RemoteCode.dmg"
+      TAG="${RELEASE_TAG:-${CI_COMMIT_TAG:-}}"
+      if [ -z "$TAG" ]; then
+        echo "RELEASE_TAG or CI_COMMIT_TAG is required"
+        exit 1
+      fi
+
+      git fetch --tags origin
+      git checkout "$TAG"
+      git lfs pull
+
+      VERSION="${TAG#v}"
+      RELEASE_TOOLS_TOKEN="${GITLAB_RELEASE_TOKEN:-${CI_JOB_TOKEN:-}}"
+      if [ -z "$RELEASE_TOOLS_TOKEN" ]; then
+        echo "CI_JOB_TOKEN or GITLAB_RELEASE_TOKEN is required for GitLab release assets"
+        exit 1
+      fi
+      export GITLAB_TOKEN="$RELEASE_TOOLS_TOKEN"
+
+      CODESIGN_P12_BASE64="${MACOS_DEVELOPER_ID_P12_BASE64:-${MACOS_CERTIFICATE:-}}"
+      CODESIGN_P12_PASSWORD="${MACOS_DEVELOPER_ID_P12_PASSWORD:-${MACOS_CERTIFICATE_PWD:-}}"
+      EXPECTED_CODESIGN_IDENTITY="${MACOS_DEVELOPER_IDENTITY:-${ELECTROBUN_DEVELOPER_ID:-}}"
+      NOTARY_APPLE_ID="${APPLE_ID:-${ELECTROBUN_APPLEID:-}}"
+      NOTARY_TEAM_ID="${APPLE_TEAM_ID:-${ELECTROBUN_TEAMID:-}}"
+      NOTARY_PASSWORD="${APPLE_APP_SPECIFIC_PASSWORD:-${ELECTROBUN_APPLEIDPASS:-}}"
+      CLOUDFRONT_DISTRIBUTION_ID="${REMOTECODE_IO_CLOUDFRONT_DISTRIBUTION_ID:-}"
+
+      test "$(uname -m)" = "arm64"
+      command -v glab >/dev/null || brew install glab
+      command -v aws >/dev/null || brew install awscli
+
+      if [ -z "$CODESIGN_P12_BASE64" ] || [ -z "$CODESIGN_P12_PASSWORD" ]; then
+        echo "Missing Developer ID certificate variables"
+        exit 1
+      fi
+      if [ -z "$NOTARY_APPLE_ID" ] || [ -z "$NOTARY_TEAM_ID" ] || [ -z "$NOTARY_PASSWORD" ]; then
+        echo "Missing notarization variables"
+        exit 1
+      fi
+      if [ -z "${SPARKLE_PUBLIC_ED_KEY:-}" ] || [ -z "${SPARKLE_PRIVATE_KEY:-}" ]; then
+        echo "Missing Sparkle signing variables"
+        exit 1
+      fi
+      if [ -z "${AWS_RELEASE_UPLOAD_ROLE_ARN:-}" ]; then
+        echo "AWS_RELEASE_UPLOAD_ROLE_ARN variable is required for public macOS downloads"
+        exit 1
+      fi
+      if [ -z "$CLOUDFRONT_DISTRIBUTION_ID" ]; then
+        echo "REMOTECODE_IO_CLOUDFRONT_DISTRIBUTION_ID variable is required for release download invalidation"
+        exit 1
+      fi
+
+      TEMP_DIR="$(mktemp -d)"
+      KEYCHAIN="$TEMP_DIR/remotecode-signing.keychain-db"
+      CERTIFICATE="$TEMP_DIR/developer-id.p12"
+      printf '%s' "$CODESIGN_P12_BASE64" | base64 --decode > "$CERTIFICATE"
+      security create-keychain -p "$TEMP_DIR" "$KEYCHAIN"
+      security set-keychain-settings -lut 21600 "$KEYCHAIN"
+      security unlock-keychain -p "$TEMP_DIR" "$KEYCHAIN"
+      security import "$CERTIFICATE" -P "$CODESIGN_P12_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN"
+      security list-keychains -d user -s "$KEYCHAIN"
+      security set-key-partition-list -S apple-tool:,apple: -s -k "$TEMP_DIR" "$KEYCHAIN"
+
+      if [ -n "$EXPECTED_CODESIGN_IDENTITY" ]; then
+        IDENTITY="$EXPECTED_CODESIGN_IDENTITY"
+        if ! security find-identity -v -p codesigning "$KEYCHAIN" | grep -F "\"$IDENTITY\"" >/dev/null; then
+          echo "Expected Developer ID identity not found in imported certificate"
+          exit 1
+        fi
+      else
+        IDENTITY="$(security find-identity -v -p codesigning "$KEYCHAIN" | awk -F '"' '/Developer ID Application/ { print $2; exit }')"
+      fi
+      if [ -z "$IDENTITY" ]; then
+        echo "Developer ID Application identity not found in imported certificate"
+        exit 1
+      fi
+
+      export RC2_CODESIGN_IDENTITY="$IDENTITY"
+      export RC2_VERSION="$VERSION"
+      export RC2_DMG_NAME="$ASSET_NAME"
+      export RC2_REQUIRE_SPARKLE_KEY="1"
+      export RC2_SPARKLE_PUBLIC_ED_KEY="$SPARKLE_PUBLIC_ED_KEY"
+      export RC2_SPARKLE_FEED_URL="$S3_DOWNLOAD_BASE_URL/appcast.xml"
+
+      scripts/package-dmg.sh
+      hdiutil verify "dist/$ASSET_NAME"
+
+      xcrun notarytool submit "dist/$ASSET_NAME" \
+        --apple-id "$NOTARY_APPLE_ID" \
+        --team-id "$NOTARY_TEAM_ID" \
+        --password "$NOTARY_PASSWORD" \
+        --wait
+      xcrun stapler staple "dist/$ASSET_NAME"
+      spctl --assess --type open --context context:primary-signature --verbose=4 "dist/$ASSET_NAME"
+
+      MOUNT="$(mktemp -d)"
+      hdiutil attach -readonly -nobrowse -mountpoint "$MOUNT" "dist/$ASSET_NAME"
+      trap 'hdiutil detach "$MOUNT"; rmdir "$MOUNT"; rm -rf "$TEMP_DIR"' EXIT
+      codesign --verify --deep --strict --verbose=4 "$MOUNT/RemoteCode.app"
+      spctl --assess --type execute --verbose=4 "$MOUNT/RemoteCode.app"
+      hdiutil detach "$MOUNT"
+      rmdir "$MOUNT"
+      trap 'rm -rf "$TEMP_DIR"' EXIT
+
+      AWS_STS_OUTPUT="$(aws sts assume-role-with-web-identity \
+        --role-arn "$AWS_RELEASE_UPLOAD_ROLE_ARN" \
+        --role-session-name "GitLabRunner-${CI_PROJECT_ID}-${CI_PIPELINE_ID}" \
+        --web-identity-token "$GITLAB_OIDC_TOKEN" \
+        --duration-seconds 3600 \
+        --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' \
+        --output text)"
+      set -- $AWS_STS_OUTPUT
+      export AWS_ACCESS_KEY_ID="$1"
+      export AWS_SECRET_ACCESS_KEY="$2"
+      export AWS_SESSION_TOKEN="$3"
+
+      aws s3 cp "dist/$ASSET_NAME" "s3://$S3_BUCKET/$S3_DOWNLOAD_PREFIX/$TAG/$ASSET_NAME" \
+        --content-type "application/x-apple-diskimage" \
+        --cache-control "public, max-age=31536000, immutable"
+      aws s3 cp "dist/$ASSET_NAME" "s3://$S3_BUCKET/$S3_DOWNLOAD_PREFIX/latest/$ASSET_NAME" \
+        --content-type "application/x-apple-diskimage" \
+        --cache-control "no-cache, max-age=0"
+
+      SPARKLE_TOOLS=".build/artifacts/sparkle/Sparkle/bin"
+      SIGN_UPDATE="$SPARKLE_TOOLS/sign_update"
+      if [ ! -x "$SIGN_UPDATE" ]; then
+        echo "Sparkle sign_update tool not found at $SIGN_UPDATE"
+        exit 1
+      fi
+      KEY_FILE="$TEMP_DIR/sparkle_ed_private_key"
+      printf '%s' "$SPARKLE_PRIVATE_KEY" > "$KEY_FILE"
+      SIGNATURE="$("$SIGN_UPDATE" --ed-key-file "$KEY_FILE" "dist/$ASSET_NAME")"
+      APPCAST_URL="$S3_DOWNLOAD_BASE_URL/appcast.xml"
+      DMG_URL="$S3_DOWNLOAD_BASE_URL/$TAG/$ASSET_NAME"
+      mkdir -p dist/pages
+      cat > dist/pages/appcast.xml <<EOF
+      <?xml version="1.0" encoding="utf-8"?>
+      <rss version="2.0" xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle">
+        <channel>
+          <title>RemoteCode Updates</title>
+          <link>$APPCAST_URL</link>
+          <description>RemoteCode macOS updates</description>
+          <item>
+            <title>RemoteCode $VERSION</title>
+            <sparkle:version>$VERSION</sparkle:version>
+            <sparkle:shortVersionString>$VERSION</sparkle:shortVersionString>
+            <pubDate>$(date -Ru)</pubDate>
+            <enclosure url="$DMG_URL" type="application/x-apple-diskimage" $SIGNATURE />
+          </item>
+        </channel>
+      </rss>
+      EOF
+      grep -F "sparkle:edSignature" dist/pages/appcast.xml
+      grep -F "$ASSET_NAME" dist/pages/appcast.xml
+
+      aws s3 cp "dist/pages/appcast.xml" "s3://$S3_BUCKET/$S3_DOWNLOAD_PREFIX/appcast.xml" \
+        --content-type "application/xml; charset=utf-8" \
+        --cache-control "no-cache, max-age=0"
+      aws cloudfront create-invalidation \
+        --distribution-id "$CLOUDFRONT_DISTRIBUTION_ID" \
+        --paths "/$S3_DOWNLOAD_PREFIX/appcast.xml" "/$S3_DOWNLOAD_PREFIX/latest/$ASSET_NAME" "/$S3_DOWNLOAD_PREFIX/$TAG/$ASSET_NAME"
+
+      glab release create "$TAG" --repo "$CI_PROJECT_PATH" --ref "$TAG" --name "RemoteCode $VERSION" --notes "RemoteCode macOS $VERSION"
+      glab release upload "$TAG" "dist/$ASSET_NAME#$ASSET_NAME#package" --repo "$CI_PROJECT_PATH" --use-package-registry --package-name release-assets
+      glab release upload "$TAG" "dist/pages/appcast.xml#appcast.xml#package" --repo "$CI_PROJECT_PATH" --use-package-registry --package-name release-assets
