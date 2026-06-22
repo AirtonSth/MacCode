@@ -580,8 +580,10 @@ class FakeRouter: CommandRouting, TerminalCommandRouting {
     func notificationList(workspaceId: WorkspaceID?, unreadOnly: Bool) throws -> [[String: JSONValue]] { [] }
     func notificationMarkRead(id: String) throws {}
     func notificationDismiss(id: String) throws {}
+    var lastPrivatePushTokenUpdate: (pushToken: String, pushTokenType: String, liveActivityToken: String?, deviceID: String?)?
     func privatePushTokenUpdate(pushToken: String, pushTokenType: String, liveActivityToken: String?, deviceID: String?) throws -> JSONValue {
-        .object(["ok": .bool(true), "push_token_type": .string(pushTokenType)])
+        lastPrivatePushTokenUpdate = (pushToken, pushTokenType, liveActivityToken, deviceID)
+        return .object(["ok": .bool(true), "push_token_type": .string(pushTokenType)])
     }
     var settings: [String: String] = [:]
     func settingsGet(keys: [String]) throws -> [String: String] {
@@ -1232,6 +1234,44 @@ final class DispatcherTests: XCTestCase {
         let editor = await d.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(4), method: "project.open_in_editor", params: ["workspace_id": wid]))
         XCTAssertEqual(editor.result?.objectValue?["app"], .string("Finder"),
                        "opening a workspace in an editor must return the app that handled the request")
+    }
+
+    @MainActor
+    func test_privatePushTokenUpdateRoutesValidatedTokenOverSocket() async throws {
+        let router = FakeRouter()
+        let d = JSONRPCDispatcher(router: router)
+
+        let resp = await d.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(1), method: "private.push_token.update", params: [
+            "push_token": .string("fcm-token"),
+            "push_token_type": .string("fcm"),
+            "device_id": .string("device-1"),
+        ]))
+
+        XCTAssertNil(resp.error, "paired clients must be able to register an FCM target for backend push delivery")
+        XCTAssertEqual(resp.result?.objectValue?["ok"], .bool(true))
+        XCTAssertEqual(resp.result?.objectValue?["push_token_type"], .string("fcm"))
+        XCTAssertNil(resp.result?.objectValue?["push_token"],
+                     "the JSON-RPC response must not echo sensitive push-token material back to the caller")
+        XCTAssertEqual(router.lastPrivatePushTokenUpdate?.pushToken, "fcm-token")
+        XCTAssertEqual(router.lastPrivatePushTokenUpdate?.pushTokenType, "fcm")
+        XCTAssertNil(router.lastPrivatePushTokenUpdate?.liveActivityToken,
+                     "live activity tokens are optional because plain alert delivery still needs a stored push target")
+        XCTAssertEqual(router.lastPrivatePushTokenUpdate?.deviceID, "device-1")
+    }
+
+    @MainActor
+    func test_privatePushTokenUpdateRejectsUnsupportedTokenTypeBeforeRouting() async throws {
+        let router = FakeRouter()
+        let d = JSONRPCDispatcher(router: router)
+
+        let resp = await d.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(1), method: "private.push_token.update", params: [
+            "push_token": .string("webpush-token"),
+            "push_token_type": .string("webpush"),
+        ]))
+
+        XCTAssertEqual(resp.error?.code, -32602,
+                       "unsupported token types must fail validation before the host stores an unusable notification target")
+        XCTAssertNil(router.lastPrivatePushTokenUpdate)
     }
 
     @MainActor
