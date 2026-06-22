@@ -616,7 +616,9 @@ public final class JSONRPCDispatcher {
                 }
                 let name = params["name"]?.stringValue ?? "workspace"
                 let cwd = params["cwd"]?.stringValue ?? FileManager.default.currentDirectoryPath
-                let ws = try router.createWorkspace(name: name, cwd: cwd)
+                let ws = try withSuppressedLayoutEvents {
+                    try router.createWorkspace(name: name, cwd: cwd)
+                }
                 EventBus.shared.publish(kind: "workspace.created", payload: encode(ws))
                 let result = encode(ws)
                 recordCommandReceipt(method: req.method, clientRequestId: receiptKey, result: result)
@@ -634,13 +636,17 @@ public final class JSONRPCDispatcher {
             case "workspace.rename":
                 guard let wid = params["id"]?.stringValue.flatMap(UUID.init).map(WorkspaceID.init),
                       let name = params["name"]?.stringValue else { throw JSONRPCError.invalidParams }
-                try router.renameWorkspace(wid, name)
+                try withSuppressedLayoutEvents {
+                    try router.renameWorkspace(wid, name)
+                }
                 EventBus.shared.publish(kind: "workspace.renamed", payload: .object(["workspace_id": .string(wid.value.uuidString), "name": .string(name)]))
                 return .init(id: id, result: .bool(true))
             case "workspace.set_description":
                 guard let wid = params["id"]?.stringValue.flatMap(UUID.init).map(WorkspaceID.init),
                       let text = params["description"]?.stringValue ?? params["text"]?.stringValue else { throw JSONRPCError.invalidParams }
-                try router.setWorkspaceDescription(wid, text)
+                try withSuppressedLayoutEvents {
+                    try router.setWorkspaceDescription(wid, text)
+                }
                 EventBus.shared.publish(kind: "workspace.updated", payload: .object([
                     "workspace_id": .string(wid.value.uuidString),
                     "metadata": .object(["description": .string(text)])
@@ -649,7 +655,9 @@ public final class JSONRPCDispatcher {
             case "workspace.set_color":
                 guard let wid = params["id"]?.stringValue.flatMap(UUID.init).map(WorkspaceID.init),
                       let color = params["color"]?.stringValue else { throw JSONRPCError.invalidParams }
-                try router.setWorkspaceColor(wid, color)
+                try withSuppressedLayoutEvents {
+                    try router.setWorkspaceColor(wid, color)
+                }
                 EventBus.shared.publish(kind: "workspace.updated", payload: .object([
                     "workspace_id": .string(wid.value.uuidString),
                     "metadata": .object(["color": .string(color)])
@@ -658,7 +666,9 @@ public final class JSONRPCDispatcher {
             case "workspace.set_pinned":
                 guard let wid = params["id"]?.stringValue.flatMap(UUID.init).map(WorkspaceID.init),
                       let pinned = params["pinned"]?.boolValue else { throw JSONRPCError.invalidParams }
-                try router.setWorkspacePinned(wid, pinned)
+                try withSuppressedLayoutEvents {
+                    try router.setWorkspacePinned(wid, pinned)
+                }
                 EventBus.shared.publish(kind: "workspace.updated", payload: .object([
                     "workspace_id": .string(wid.value.uuidString),
                     "metadata": .object(["pinned": pinned ? .string("true") : .string("")])
@@ -672,7 +682,9 @@ public final class JSONRPCDispatcher {
             case "workspace.reorder":
                 guard let wid = params["id"]?.stringValue.flatMap(UUID.init).map(WorkspaceID.init) else { throw JSONRPCError.invalidParams }
                 let pos = params["position"]?.intValue ?? 0
-                try router.reorderWorkspace(wid, position: pos)
+                try withSuppressedLayoutEvents {
+                    try router.reorderWorkspace(wid, position: pos)
+                }
                 let order = try router.currentWindow().workspaces
                 EventBus.shared.publish(kind: "workspace.reordered", payload: .object([
                     "workspace_id": .string(wid.value.uuidString),
