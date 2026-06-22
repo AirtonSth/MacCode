@@ -2579,9 +2579,9 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                     let feed = FeedPanelSurface(workspaceID: workspace, title: baseTitle)
                     // Wire the in-process EventBus to the feed VM so any
                     // dispatcher mutation lights up the panel in real time.
-                    // since: nil → future events only; avoids replaying the whole retained
-                    // backlog synchronously on open (PERF-MAC_DIFF_FEED_MARKDOWN-002).
-                    let token = EventBus.shared.subscribe(since: nil) { [weak feed] ev in
+                    // Start after the current seq so opening Feed does not
+                    // replay retained backlog as if it were live activity.
+                    let token = EventBus.shared.subscribe(since: EventBus.shared.currentSeq) { [weak feed] ev in
                         guard feed != nil else { return }
                         let kind = ev.kind
                         let payload = JSONValue.object(ev.payload.objectValue ?? [:])
