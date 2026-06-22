@@ -75,6 +75,20 @@ final class BrowserWaitForJSTests: XCTestCase {
                       "Script must return a Promise so WKWebView can resolve it asynchronously rather than synchronously blocking")
     }
 
+    func test_presenceCheckScript_usesSynchronousBooleanQuery() {
+        let js = BrowserWaitForJS.presenceCheckScript(selector: "#ready")
+
+        XCTAssertTrue(js.contains("Boolean(document.querySelector"),
+                      "BrowserSurface.waitFor polls a synchronous selector check so it survives page navigations between attempts")
+        XCTAssertTrue(js.contains("#ready"))
+    }
+
+    func test_boolValue_acceptsNSNumberBridgeFromWebKit() {
+        XCTAssertTrue(BrowserWaitForJS.boolValue(NSNumber(value: true)),
+                      "WKWebView can bridge JavaScript booleans as NSNumber; treating that as timeout breaks browser.wait for present elements")
+        XCTAssertFalse(BrowserWaitForJS.boolValue(NSNumber(value: false)))
+    }
+
     func test_script_containsObserveSubtree_detectsDeepInsertion() {
         let js = BrowserWaitForJS.mutationObserverScript(selector: ".baz", timeoutMs: 1000)
         XCTAssertTrue(js.contains("subtree:true") || js.contains("subtree: true"),
