@@ -6,14 +6,6 @@ import Persistence
 let args = CommandLine.arguments
 let prog = (args.first as NSString?)?.lastPathComponent ?? "remotecode"
 
-// Parse --timeout before the global flag loop so it is available when RPC is
-// constructed.  The parser strips the token(s) and returns the cleaned list.
-let _timeoutResult = RC2CLITimeoutParser.parse(Array(args.dropFirst()))
-var receiveTimeoutMS: Int? = _timeoutResult.timeoutMS
-// Reconstructed args with --timeout removed; the loop below indexes from 1 so
-// we prepend a placeholder for the program name slot.
-let _cleanedArgs: [String] = [args.first ?? ""] + _timeoutResult.remaining
-
 func usage(_ exit: Int32 = 0) -> Never {
     let text = """
     Usage: \(prog) [--socket PATH] [--json] [--timeout MS] <command> [args...]
@@ -71,6 +63,17 @@ func diagError(_ reason: String) -> Never {
     FileHandle.standardError.write(Data("\(reason)\n".utf8))
     usage(RC2ExitCode.usageError)
 }
+
+// Parse --timeout before the global flag loop so it is available when RPC is
+// constructed. The parser strips the token(s) and returns the cleaned list.
+let _timeoutResult = RC2CLITimeoutParser.parse(Array(args.dropFirst()))
+if _timeoutResult.invalidValue != nil {
+    diagError(RC2CLIDiagnostics.invalidValue(for: "timeout"))
+}
+var receiveTimeoutMS: Int? = _timeoutResult.timeoutMS
+// Reconstructed args with --timeout removed; the loop below indexes from 1 so
+// we prepend a placeholder for the program name slot.
+let _cleanedArgs: [String] = [args.first ?? ""] + _timeoutResult.remaining
 
 func parseFlags(_ a: [String]) -> ([String: String], [String]) {
     CLIArgParser.parseFlagsWithTerminator(a)

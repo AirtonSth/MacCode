@@ -74,6 +74,8 @@ final class RC2CLITimeoutParserTests: XCTestCase {
         let result = RC2CLITimeoutParser.parse(["--timeout", "abc"])
         XCTAssertNil(result.timeoutMS,
                      "non-numeric value must return nil")
+        XCTAssertEqual(result.invalidValue, "abc",
+                       "non-numeric timeout must be reported so rc2 can fail loud instead of connecting with a misleading socket error")
     }
 
     func test_negativeValue_returnsNil() {
@@ -81,6 +83,8 @@ final class RC2CLITimeoutParserTests: XCTestCase {
         let result = RC2CLITimeoutParser.parse(["--timeout", "-1"])
         XCTAssertNil(result.timeoutMS,
                      "negative timeout must return nil")
+        XCTAssertEqual(result.invalidValue, "-1",
+                       "negative timeout must be reported so rc2 can fail loud before opening the socket")
     }
 
     func test_zeroValue_returnsNil() {
@@ -89,12 +93,15 @@ final class RC2CLITimeoutParserTests: XCTestCase {
         let result = RC2CLITimeoutParser.parse(["--timeout", "0"])
         XCTAssertNil(result.timeoutMS,
                      "zero timeout must return nil to avoid disabling the guard")
+        XCTAssertEqual(result.invalidValue, "0",
+                       "zero timeout must be reported so rc2 can explain the validation error")
     }
 
     func test_inlineEquals_nonNumeric_returnsNil() {
         // WHY: equals form must apply the same validation as space form.
         let result = RC2CLITimeoutParser.parse(["--timeout=notanumber"])
         XCTAssertNil(result.timeoutMS)
+        XCTAssertEqual(result.invalidValue, "notanumber")
     }
 
     // MARK: - edge cases
@@ -119,5 +126,14 @@ final class RC2CLITimeoutParserTests: XCTestCase {
         let result = RC2CLITimeoutParser.parse(["--timeout", "1000", "--timeout=2000"])
         XCTAssertEqual(result.timeoutMS, 2000,
                        "later --timeout must override earlier one")
+        XCTAssertNil(result.invalidValue)
+    }
+
+    func test_lastWriteWins_laterInvalidTimeoutIsReported() {
+        // WHY: if the final timeout flag is invalid, rc2 must fail loud instead
+        // of silently using an earlier valid timeout that the user tried to replace.
+        let result = RC2CLITimeoutParser.parse(["--timeout", "1000", "--timeout=0"])
+        XCTAssertNil(result.timeoutMS)
+        XCTAssertEqual(result.invalidValue, "0")
     }
 }
