@@ -23,6 +23,10 @@ final class MainWindowAccessibilityExposureTests: XCTestCase {
         router.windowController = controller
         retainedControllers.append(controller)
 
+        XCTAssertTrue(
+            controller.window.isAccessibilityElement(),
+            "The main RemoteCode window must remain an accessibility element so AXWindows can expose it directly."
+        )
         XCTAssertEqual(
             controller.window.accessibilityRole(),
             .window,
