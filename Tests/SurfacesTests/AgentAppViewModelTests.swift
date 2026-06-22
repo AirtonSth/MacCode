@@ -1156,6 +1156,47 @@ final class AgentAppViewModelTests: XCTestCase {
         }
     }
 
+    func test_send_runningThreadHandlesLocalSlashCommandInsteadOfQueueing() async throws {
+        let tmp = NSTemporaryDirectory() + "rc2-vm-agent-running-slash-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let queuedRepo = AgentQueuedMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let runner = SlowStartRunner()
+        let coord = AgentRunCoordinator(runRepo: runRepo, messageRepo: messageRepo,
+                                        threadRepo: threadRepo,
+                                        providers: [.codex: runner])
+        let vm = AgentAppViewModel(workspaceID: WorkspaceID(), cwd: tmp,
+                                   coordinator: coord,
+                                   threadRepo: threadRepo,
+                                   messageRepo: messageRepo,
+                                   queuedMessageRepo: queuedRepo,
+                                   promptHistoryStore: PromptHistoryStore(db: db))
+        vm.createThread(title: "busy slash")
+        let id = try XCTUnwrap(vm.selectedThreadId)
+        vm.prompt = "start slow run"
+
+        Task { await vm.send() }
+        await waitAsync("selected thread becomes a real active run") {
+            vm.status == .running && vm.currentRunId != nil
+        }
+        vm.interactionMode = .plan
+        vm.prompt = "/default"
+
+        await vm.send()
+
+        XCTAssertEqual(vm.interactionMode, .default,
+                       "local slash commands must update composer run mode even while a provider run is active")
+        XCTAssertEqual((try? queuedRepo.list(threadId: id).map(\.text)) ?? [], [],
+                       "local slash commands must not be queued as follow-up provider prompts")
+        XCTAssertEqual(vm.prompt, "", "handled local slash commands must clear the composer")
+        vm.stop()
+        await waitAsync("slow run can still be stopped after local slash command") {
+            runner.cancelled
+        }
+    }
+
     func test_reloadThreadsBackfillsPlaceholderTitleFromFirstUserMessage() throws {
         let (vm, repo) = try makeVM()
         let thread = AgentThread(workspaceId: vm.workspaceID, title: "Thread", provider: .claude, model: "fake-model")
