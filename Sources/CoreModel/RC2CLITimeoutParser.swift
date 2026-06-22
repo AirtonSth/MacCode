@@ -8,6 +8,11 @@
 /// Rule: only `--timeout` tokens are consumed; the remainder of the array is
 /// returned unchanged so the existing arg-loop is unaffected.
 public enum RC2CLITimeoutParser {
+    /// Default receive guard for one-shot rc2 RPCs.
+    ///
+    /// WHY: when the daemon accepts a Unix socket connection but never sends a
+    /// JSON-RPC line, the CLI must fail bounded instead of hanging forever.
+    public static let defaultReceiveTimeoutMS = 5_000
 
     public struct Result {
         /// Parsed timeout in milliseconds, or nil when absent/invalid.

@@ -9,6 +9,7 @@ let prog = (args.first as NSString?)?.lastPathComponent ?? "remotecode"
 func usage(_ exit: Int32 = 0) -> Never {
     let text = """
     Usage: \(prog) [--socket PATH] [--json] [--timeout MS] <command> [args...]
+      --timeout MS defaults to \(RC2CLITimeoutParser.defaultReceiveTimeoutMS) for one-shot RPCs
 
     Commands:
       ping
@@ -70,7 +71,7 @@ let _timeoutResult = RC2CLITimeoutParser.parse(Array(args.dropFirst()))
 if _timeoutResult.invalidValue != nil {
     diagError(RC2CLIDiagnostics.invalidValue(for: "timeout"))
 }
-var receiveTimeoutMS: Int? = _timeoutResult.timeoutMS
+var receiveTimeoutMS: Int? = _timeoutResult.timeoutMS ?? RC2CLITimeoutParser.defaultReceiveTimeoutMS
 // Reconstructed args with --timeout removed; the loop below indexes from 1 so
 // we prepend a placeholder for the program name slot.
 let _cleanedArgs: [String] = [args.first ?? ""] + _timeoutResult.remaining
@@ -244,7 +245,8 @@ func emit(_ obj: Any) {
     } else {
         if let dict = obj as? [String: Any], let err = dict["error"] as? [String: Any] {
             FileHandle.standardError.write(Data("error: \(err["message"] ?? "")\n".utf8))
-            Darwin.exit(1)
+            let isConnect = (err["_connect_failure"] as? Bool) == true
+            Darwin.exit(isConnect ? RC2ExitCode.connectFailure : RC2ExitCode.rpcError)
         }
         if let dict = obj as? [String: Any], let result = dict["result"] {
             print(prettyPrint(result))
@@ -426,7 +428,7 @@ case "events":
             let msg = String(cString: strerror(errno))
             FileHandle.standardError.write(Data("error: connect(\(socketPath)): \(msg). Is the RemoteCode app running?\n".utf8))
             Darwin.close(fd)
-            Darwin.exit(1)
+            Darwin.exit(RC2ExitCode.connectFailure)
         }
         // Send events.stream request.
         let streamReqDict: [String: Any] = [

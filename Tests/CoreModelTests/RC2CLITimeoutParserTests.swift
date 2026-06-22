@@ -66,6 +66,15 @@ final class RC2CLITimeoutParserTests: XCTestCase {
         XCTAssertEqual(result.remaining, args)
     }
 
+    func test_defaultReceiveTimeoutIsPositiveAndBounded() {
+        // WHY: a daemon can accept the Unix socket and then stop responding;
+        //      rc2 must have a default one-shot RPC guard even when the user
+        //      does not pass --timeout.
+        XCTAssertGreaterThan(RC2CLITimeoutParser.defaultReceiveTimeoutMS, 0)
+        XCTAssertLessThanOrEqual(RC2CLITimeoutParser.defaultReceiveTimeoutMS, 30_000,
+                                 "default receive timeout must be bounded enough to avoid a stuck CLI")
+    }
+
     // MARK: - invalid values
 
     func test_nonNumericValue_returnsNil() {
