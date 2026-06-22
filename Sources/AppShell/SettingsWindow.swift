@@ -1929,6 +1929,10 @@ public final class SettingsWindowController: NSObject {
         let host = NSHostingController(rootView: SettingsView(vm: viewModel))
         let win = NSWindow(contentViewController: host)
         win.title = "RemoteCode Settings"
+        win.setAccessibilityRole(.window)
+        win.setAccessibilitySubrole(.standardWindow)
+        win.setAccessibilityTitle("RemoteCode Settings")
+        win.setAccessibilityIdentifier("window.settings")
         win.styleMask = [.titled, .closable, .resizable]
         // Match the SwiftUI content frame so the window doesn't open smaller
         // than its content and jump-resize; guard against shrinking below it.
