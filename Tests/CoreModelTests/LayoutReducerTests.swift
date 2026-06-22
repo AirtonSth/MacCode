@@ -118,6 +118,22 @@ final class LayoutReducerTests: XCTestCase {
         guard case .pane = s.workspaces[wid]!.layout else { return XCTFail("expected pane after collapse") }
     }
 
+    func test_closeSurface_unknownSurface_throwsAndPreservesLayout() throws {
+        let r = LayoutReducer()
+        var s = try r.reduce(LayoutState(), .createWorkspace(name: "ws1", cwd: "/tmp", initial: nil))
+        let wid = s.window.selectedWorkspaceID!
+        let a = SurfaceDescriptor(type: .terminal, title: "a")
+        s = try r.reduce(s, .addSurface(wid, paneID: nil, descriptor: a))
+        let before = s
+
+        XCTAssertThrowsError(try r.reduce(s, .closeSurface(wid, SurfaceID()))) { error in
+            XCTAssertEqual(error as? LayoutError, .surfaceNotFound,
+                           "closing a missing tab must fail loudly instead of publishing a fake surface.closed event")
+        }
+        XCTAssertEqual(s, before,
+                       "a failed close for an unknown surface must leave the workspace layout unchanged")
+    }
+
     func test_unknown_workspace_throws() {
         let r = LayoutReducer()
         XCTAssertThrowsError(try r.reduce(LayoutState(), .selectWorkspace(WorkspaceID()))) { e in

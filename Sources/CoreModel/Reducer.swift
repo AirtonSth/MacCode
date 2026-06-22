@@ -171,6 +171,7 @@ public struct LayoutReducer {
             return next
         case .closeSurface(let wid, let sid):
             guard var ws = next.workspaces[wid] else { throw LayoutError.workspaceNotFound }
+            guard findSurface(in: ws.layout, id: sid) != nil else { throw LayoutError.surfaceNotFound }
             ws.layout = try removeSurface(in: ws.layout, surfaceID: sid)
             if let focused = ws.focusedPaneID, ws.layout.find(paneID: focused) == nil {
                 ws.focusedPaneID = ws.layout.paneIDs().first
