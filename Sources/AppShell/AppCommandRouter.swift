@@ -920,9 +920,12 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     }
 
     public func surfaceClearHistory(surface: SurfaceID) {
-        // Terminal-specific: replace scrollback by sending the clear
-        // shortcut. Browser/agent surfaces ignore.
+        // Terminal-specific: clear persisted scrollback, then replace the live
+        // terminal viewport by sending the clear shortcut. Browser/agent
+        // surfaces ignore.
         if let s = SurfaceRegistry.shared.surface(surface), s.descriptor.type == .terminal || s.descriptor.type == .ssh {
+            (s as? TerminalSurface)?.flushPersistedHistory()
+            try? context?.terminalOutputRepo.delete(surfaceID: surface.value.uuidString)
             s.sendText("\u{0C}") // ctrl-L
         }
     }
