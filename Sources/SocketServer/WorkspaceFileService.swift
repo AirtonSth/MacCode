@@ -469,14 +469,21 @@ public struct WorkspaceFileService: Sendable {
     }
 
     private func relativePath(root: URL, url: URL) -> String {
-        let rootPath = root.path
-        guard url.path != rootPath else { return "" }
-        return String(url.path.dropFirst(rootPath.count + 1))
+        let rootPath = canonicalPath(root)
+        let urlPath = canonicalPath(url)
+        guard urlPath != rootPath else { return "" }
+        guard urlPath.hasPrefix(rootPath + "/") else { return String(url.path.dropFirst(root.path.count + 1)) }
+        return String(urlPath.dropFirst(rootPath.count + 1))
     }
 
     private func parentPath(root: URL, url: URL) -> String? {
-        guard url.path != root.path else { return nil }
+        guard canonicalPath(url) != canonicalPath(root) else { return nil }
         return relativePath(root: root, url: url.deletingLastPathComponent())
+    }
+
+    private func canonicalPath(_ url: URL) -> String {
+        (try? url.resourceValues(forKeys: [.canonicalPathKey]).canonicalPath)
+            ?? url.standardizedFileURL.resolvingSymlinksInPath().path
     }
 }
 
