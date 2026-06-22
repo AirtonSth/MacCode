@@ -433,10 +433,12 @@ public final class JSONRPCDispatcher {
                 let workspace = try workspaceID(from: params)
                 let profile = try sshProfile(from: params)
                 let saved = try router.sshHostUpsert(profile, workspace: workspace)
-                var payload = encode(saved).objectValue ?? [:]
+                var redacted = saved
+                redacted.password = nil
+                var payload = encode(redacted).objectValue ?? [:]
                 payload["workspace_id"] = .string(workspace.value.uuidString)
                 EventBus.shared.publish(kind: "ssh.host.updated", payload: .object(payload))
-                return .init(id: id, result: encode(saved))
+                return .init(id: id, result: encode(redacted))
             case "ssh.host.delete":
                 let workspace = try workspaceID(from: params)
                 guard let raw = params["id"]?.stringValue,

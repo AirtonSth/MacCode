@@ -820,6 +820,38 @@ final class DispatcherTests: XCTestCase {
     }
 
     @MainActor
+    func test_sshHostUpsertDoesNotEchoPassword() async throws {
+        let router = FakeRouter()
+        let d = JSONRPCDispatcher(router: router)
+        let wid = UUID().uuidString
+        let beforeSeq = EventBus.shared.currentSeq
+
+        let saved = await d.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(1), method: "ssh.host.upsert", params: [
+            "workspace_id": .string(wid),
+            "label": .string("Prod"),
+            "destination": .string("root@example.test"),
+            "password": .string("saved-test-password")
+        ]))
+
+        guard case .object(let savedHost)? = saved.result else {
+            return XCTFail("ssh.host.upsert must return the saved host metadata")
+        }
+        XCTAssertNil(savedHost["password"],
+                     "ssh.host.upsert must accept a password for credential storage without echoing it to paired clients")
+        XCTAssertEqual(savedHost["hasSavedPassword"], .bool(true),
+                       "upsert still needs to confirm that a stored credential exists for one-tap reconnect")
+
+        let updates = EventBus.shared.recentEvents(since: beforeSeq, maxBytes: nil).events.filter { $0.kind == "ssh.host.updated" }
+        guard let update = updates.last?.payload.objectValue else {
+            return XCTFail("saving an SSH host must publish an update event for mirrored clients")
+        }
+        XCTAssertNil(update["password"],
+                     "ssh.host.updated must not retain or broadcast the saved password in the event backlog")
+        XCTAssertEqual(update["hasSavedPassword"], .bool(true),
+                       "mirrored clients still need credential metadata after event redaction")
+    }
+
+    @MainActor
     func test_sshHostRPCsScopeSavedHostsToWorkspace() async throws {
         let router = FakeRouter()
         let d = JSONRPCDispatcher(router: router)
