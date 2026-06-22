@@ -438,24 +438,67 @@ public final class AgentSkillInstaller: @unchecked Sendable {
 
     /// Resolve the RemoteCodeDistillService binary (which also serves CLI mode) the same
     /// way the service controller does: bundled aux executable, then a sibling of the
-    /// current executable, then the SPM debug build (for dev/tests).
+    /// current executable, then SwiftPM build products and XCTest bundle siblings (for dev/tests).
     public static func resolveServiceBinary(fileManager: FileManager = .default) -> URL? {
         if let bundled = Bundle.main.url(forAuxiliaryExecutable: "RemoteCodeDistillService"),
            fileManager.isExecutableFile(atPath: bundled.path) {
             return bundled
         }
-        let sibling = URL(fileURLWithPath: CommandLine.arguments[0])
-            .deletingLastPathComponent()
-            .appendingPathComponent("RemoteCodeDistillService")
-        if fileManager.isExecutableFile(atPath: sibling.path) {
+        let executableDirectory = URL(fileURLWithPath: CommandLine.arguments[0]).deletingLastPathComponent()
+        if let sibling = firstServiceSibling(in: [executableDirectory], fileManager: fileManager) {
             return sibling
         }
-        let debugBuild = URL(fileURLWithPath: fileManager.currentDirectoryPath)
-            .appendingPathComponent(".build/debug/RemoteCodeDistillService")
-        if fileManager.isExecutableFile(atPath: debugBuild.path) {
-            return debugBuild
+        let cwd = URL(fileURLWithPath: fileManager.currentDirectoryPath, isDirectory: true)
+        for candidate in swiftPMServiceBinaryCandidates(in: cwd, fileManager: fileManager) {
+            if fileManager.isExecutableFile(atPath: candidate.path) {
+                return candidate
+            }
+        }
+        if let sibling = firstServiceSibling(in: xctestBundleSearchDirectories(), fileManager: fileManager) {
+            return sibling
         }
         return nil
+    }
+
+    private static func firstServiceSibling(in directories: [URL], fileManager: FileManager) -> URL? {
+        var scannedRoots: Set<String> = []
+        for directory in directories {
+            for base in directory.ancestorDirectories() where scannedRoots.insert(base.path).inserted {
+                let sibling = base.appendingPathComponent("RemoteCodeDistillService")
+                if fileManager.isExecutableFile(atPath: sibling.path) {
+                    return sibling
+                }
+            }
+        }
+        return nil
+    }
+
+    private static func xctestBundleSearchDirectories() -> [URL] {
+        var directories: [URL] = []
+        for argument in CommandLine.arguments.dropFirst() where argument.hasSuffix(".xctest") {
+            directories.append(URL(fileURLWithPath: argument).deletingLastPathComponent())
+        }
+        return directories
+    }
+
+    private static func swiftPMServiceBinaryCandidates(in packageRoot: URL, fileManager: FileManager) -> [URL] {
+        let buildRoot = packageRoot.appendingPathComponent(".build", isDirectory: true)
+        var candidates = [
+            buildRoot.appendingPathComponent("debug/RemoteCodeDistillService"),
+            buildRoot.appendingPathComponent("release/RemoteCodeDistillService")
+        ]
+        if let triples = try? fileManager.contentsOfDirectory(
+            at: buildRoot,
+            includingPropertiesForKeys: [.isDirectoryKey],
+            options: [.skipsHiddenFiles]
+        ) {
+            for triple in triples {
+                guard (try? triple.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true else { continue }
+                candidates.append(triple.appendingPathComponent("debug/RemoteCodeDistillService"))
+                candidates.append(triple.appendingPathComponent("release/RemoteCodeDistillService"))
+            }
+        }
+        return candidates
     }
 
     /// Bridge the managed CLI onto the user's `$PATH` (`~/.local/bin/distill`) so `distill`
@@ -647,6 +690,20 @@ public enum AgentSkillCLIError: Error, Sendable, Equatable {
     /// The native RemoteCodeDistillService binary (which also serves CLI mode) could
     /// not be located, so the managed `distill` symlink cannot be installed.
     case serviceBinaryUnavailable
+}
+
+private extension URL {
+    func ancestorDirectories() -> [URL] {
+        var result: [URL] = []
+        var current = self
+        while true {
+            result.append(current)
+            let parent = current.deletingLastPathComponent()
+            guard parent.path != current.path else { break }
+            current = parent
+        }
+        return result
+    }
 }
 
 private extension String {
