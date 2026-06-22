@@ -137,5 +137,9 @@ final class AgentPromptHistoryDispatcherTests: XCTestCase {
             JSONRPCDispatcher.isReadOnlyBatchMethod("agent.prompt_history"),
             "agent.prompt_history is a read-only RPC; scoped iOS devices must be able to call it without 'write' capability"
         )
+        XCTAssertTrue(
+            JSONRPCDispatcher.isReadOnlyBatchMethod("mirror.snapshot"),
+            "mirror.snapshot is the read-only iOS mirror fast path; batching it must not require write capability"
+        )
     }
 }

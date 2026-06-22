@@ -1617,6 +1617,7 @@ public final class JSONRPCDispatcher {
             || method == "events.recent"
             || method == "settings.get"
             || method == "agent.prompt_history"
+            || method == "mirror.snapshot"
             || method.hasSuffix(".list")
             || method.hasSuffix(".read")
             || method.hasSuffix(".status")
@@ -1634,7 +1635,7 @@ public final class JSONRPCDispatcher {
         "system", "events", "settings", "rpc",
         "ssh", "fs", "files",
         "workspace", "window", "surface", "pane",
-        "agent", "git", "project", "browser",
+        "agent", "git", "project", "browser", "mirror",
         "notification", "private"
     ]
 
