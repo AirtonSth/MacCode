@@ -1,10 +1,9 @@
 import Foundation
 
-/// Retrieve/search-only MCP server core (P3-T5): a native tool surface so Claude/Codex can fetch
-/// the byte-exact original behind a `[[rc:HANDLE]]` marker without shelling out. It exposes
-/// read-only tools, `rc_retrieve` and `rc_search`. It is RETRIEVE-ONLY by design — there is no compress
-/// tool, because compressing via an MCP round-trip would send raw output through the model
-/// and pay for the tokens twice.
+/// MCP server core (P3-T5): a native tool surface so Claude/Codex can fetch the byte-exact
+/// original behind a `[[rc:HANDLE]]` marker without shelling out. It exposes read-only
+/// retrieve/search/stats tools plus a gated compression tool that only runs when the caller's
+/// estimated savings exceed the MCP round-trip cost.
 ///
 /// Speaks newline-delimited JSON-RPC 2.0 (MCP stdio framing). The transport-bearing loop
 /// lives in the executable; this type is the pure, testable message handler.
