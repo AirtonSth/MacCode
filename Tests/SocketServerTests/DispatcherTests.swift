@@ -1229,6 +1229,9 @@ final class DispatcherTests: XCTestCase {
         XCTAssertNil(ok.error, "running a known script must succeed")
         let bad = await d.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(3), method: "project.run_script", params: ["workspace_id": wid, "name": .string("nope")]))
         XCTAssertNotNil(bad.error, "running an unknown script must fail loudly")
+        let editor = await d.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(4), method: "project.open_in_editor", params: ["workspace_id": wid]))
+        XCTAssertEqual(editor.result?.objectValue?["app"], .string("Finder"),
+                       "opening a workspace in an editor must return the app that handled the request")
     }
 
     @MainActor
