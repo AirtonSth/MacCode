@@ -67,7 +67,7 @@ func diagError(_ reason: String) -> Never {
 
 // Parse --timeout before the global flag loop so it is available when RPC is
 // constructed. The parser strips the token(s) and returns the cleaned list.
-let _timeoutResult = RC2CLITimeoutParser.parse(Array(args.dropFirst()))
+let _timeoutResult = RC2CLITimeoutParser.parseLeadingGlobal(Array(args.dropFirst()))
 if _timeoutResult.invalidValue != nil {
     diagError(RC2CLIDiagnostics.invalidValue(for: "timeout"))
 }
@@ -115,7 +115,7 @@ var globalTerminated = false
 var i = 1
 while i < _cleanedArgs.count {
     let s = _cleanedArgs[i]
-    if globalTerminated { rest.append(s); i += 1; continue }
+    if globalTerminated || !rest.isEmpty { rest.append(s); i += 1; continue }
     if s == "--" { globalTerminated = true; i += 1; continue }
     if s == "--version" {
         print(RC2CLIVersion.versionString())

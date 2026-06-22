@@ -75,7 +75,45 @@ public enum RC2CLITimeoutParser {
         return Result(timeoutMS: timeoutMS, remaining: remaining, invalidValue: invalidValue)
     }
 
+    /// Parse only the leading global-flag region before the command token.
+    ///
+    /// WHY: subcommands such as `browser wait --timeout 250` also own a
+    /// `--timeout` flag.  Global timeout parsing must not strip command flags
+    /// after the first positional command.
+    public static func parseLeadingGlobal(_ args: [String]) -> Result {
+        let prefixCount = leadingGlobalArgumentCount(args)
+        let parsed = parse(Array(args.prefix(prefixCount)))
+        return Result(
+            timeoutMS: parsed.timeoutMS,
+            remaining: parsed.remaining + Array(args.dropFirst(prefixCount)),
+            invalidValue: parsed.invalidValue
+        )
+    }
+
     // MARK: - private
+
+    private static func leadingGlobalArgumentCount(_ args: [String]) -> Int {
+        var i = args.startIndex
+        while i < args.endIndex {
+            let token = args[i]
+            if token == "--" { return i }
+            if token == "--timeout" || token == "--socket" {
+                let next = args.index(after: i)
+                i = next < args.endIndex ? args.index(after: next) : next
+                continue
+            }
+            if token.hasPrefix("--timeout=")
+                || token == "--json"
+                || token == "--version"
+                || token == "--help"
+                || token == "-h" {
+                i = args.index(after: i)
+                continue
+            }
+            return i
+        }
+        return i
+    }
 
     /// Returns `ms` if it is a positive integer; nil otherwise.
     /// Zero is excluded — a zero receive-timeout disables the timeout on most

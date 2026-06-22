@@ -75,6 +75,25 @@ final class RC2CLITimeoutParserTests: XCTestCase {
                                  "default receive timeout must be bounded enough to avoid a stuck CLI")
     }
 
+    func test_leadingGlobalTimeout_doesNotStealBrowserWaitTimeout() {
+        // WHY: `browser wait --timeout` is a command-specific wait duration,
+        //      not the global Unix-socket receive timeout.
+        let args = ["browser", "wait", "--id", "s1", "--selector", "#ready", "--timeout", "250"]
+        let result = RC2CLITimeoutParser.parseLeadingGlobal(args)
+        XCTAssertNil(result.timeoutMS)
+        XCTAssertEqual(result.remaining, args)
+    }
+
+    func test_leadingGlobalTimeout_consumesOnlyBeforeCommand() {
+        // WHY: global timeout belongs before the command token and should still
+        //      work when command-specific flags later use the same spelling.
+        let result = RC2CLITimeoutParser.parseLeadingGlobal([
+            "--timeout", "1000", "--json", "browser", "wait", "--id", "s1", "--selector", "#ready", "--timeout", "250"
+        ])
+        XCTAssertEqual(result.timeoutMS, 1000)
+        XCTAssertEqual(result.remaining, ["--json", "browser", "wait", "--id", "s1", "--selector", "#ready", "--timeout", "250"])
+    }
+
     // MARK: - invalid values
 
     func test_nonNumericValue_returnsNil() {
