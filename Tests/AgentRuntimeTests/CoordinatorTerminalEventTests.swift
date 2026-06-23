@@ -12,12 +12,51 @@ import Persistence
 /// Uses the existing FakeProviderRunner/SpyProviderAdapter fakes.
 final class CoordinatorTerminalEventTests: XCTestCase {
 
-    // NOTE: T002 (double-finish -> didFinish exactly once) was DROPPED from this
-    // pass: it surfaces a REAL contract gap (AgentRunCoordinator does not currently
-    // dedup a double .finished from a misbehaving adapter, so didFinish fires twice).
-    // Fixing it is a production change to the coordinator finish path and is deferred
-    // to a focused follow-up rather than landed mid-coverage-wave. The phantom-run
-    // half of the contract (T003) is retained below.
+    func test_coordinator_doubleFinishedRun_callsDidFinishOnce() async throws {
+        let tmp = NSTemporaryDirectory() + "rc2-double-finish-run-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let thread = AgentThread(title: "double finish", provider: .codex, model: "fake-model")
+        try threadRepo.upsert(thread)
+
+        let coordinator = AgentRunCoordinator(runRepo: runRepo, messageRepo: messageRepo,
+                                              threadRepo: threadRepo,
+                                              providers: [.codex: DoubleFinishRunner()])
+
+        actor FinishTracker {
+            var calledRunIds: [AgentRunID] = []
+            func record(_ id: AgentRunID) { calledRunIds.append(id) }
+        }
+        let tracker = FinishTracker()
+
+        class Observer: AgentRunObserver {
+            let tracker: FinishTracker
+            init(_ t: FinishTracker) { tracker = t }
+            func runCoordinator(_ c: AgentRunCoordinator, didReceive event: AssistantEvent, run: AgentRunID, threadId: AgentThreadID) {}
+            func runCoordinator(_ c: AgentRunCoordinator, didFinish runId: AgentRunID, threadId: AgentThreadID, status: AgentRunStatus, finalMessage: String?, providerThreadId: String?) {
+                Task { await tracker.record(runId) }
+            }
+            func runCoordinator(_ c: AgentRunCoordinator, didChangeStatus status: AgentRunStatus, runId: AgentRunID, threadId: AgentThreadID) {}
+        }
+        let obs = Observer(tracker)
+        coordinator.addObserver(obs)
+
+        let runId = try await coordinator.startRun(AgentRunRequest(
+            threadId: thread.id, provider: .codex, model: "fake-model", cwd: tmp, prompt: "real"
+        ))
+        let deadline = Date().addingTimeInterval(3)
+        while Date() < deadline {
+            if await tracker.calledRunIds.filter({ $0 == runId }).count >= 2 { break }
+            try? await Task.sleep(nanoseconds: 20_000_000)
+        }
+        try? await Task.sleep(nanoseconds: 50_000_000)
+
+        let occurrences = await tracker.calledRunIds.filter { $0 == runId }.count
+        XCTAssertEqual(occurrences, 1,
+                       "a provider that emits .finished twice must still produce exactly one didFinish callback for the run")
+    }
 
     // MARK: - T003: phantom-run never calls didFinish
 

@@ -31,6 +31,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     private var activeProviderTextItemTypes: [AgentRunID: [String: AssistantItemType]] = [:]
     private var bufferedProviderTextItems: [AgentRunID: [String: BufferedProviderTextItem]] = [:]
     private var activeDistillOutputRuns: Set<AgentRunID> = []
+    private var finishingRuns: Set<AgentRunID> = []
     private var pendingThreadStops: Set<AgentThreadID> = []
     private var seq: [AgentRunID: Int] = [:]
     // PERF-MAC_AGENT-005: reuse one encoder instead of allocating per stream
@@ -426,6 +427,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             activeProviderTextItemTypes.removeValue(forKey: runId)
             bufferedProviderTextItems.removeValue(forKey: runId)
             activeDistillOutputRuns.remove(runId)
+            finishingRuns.remove(runId)
             seq.removeValue(forKey: runId)
             pendingThreadStops.remove(threadId)
         }
@@ -1140,6 +1142,20 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                 observer.runCoordinator(self, didChangeStatus: st, runId: runId, threadId: threadId)
             }
         case .finished(let status, let rawFinalMessage, let providerThreadId):
+            if let row = try? runRepo.get(id: runId), row.finishedAt != nil {
+                return
+            }
+            lock.lock()
+            let finishAlreadyInFlight = finishingRuns.contains(runId)
+            if finishAlreadyInFlight && allowFinalResponseTranslation {
+                lock.unlock()
+                return
+            }
+            if !finishAlreadyInFlight {
+                finishingRuns.insert(runId)
+            }
+            lock.unlock()
+
             let finalMessage = sanitizeFinalAssistantText(rawFinalMessage)
             if allowFinalResponseTranslation,
                status == .completed,
@@ -1293,6 +1309,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             activeProviderTextItemTypes.removeValue(forKey: runId)
             bufferedProviderTextItems.removeValue(forKey: runId)
             activeDistillOutputRuns.remove(runId)
+            finishingRuns.remove(runId)
             pendingThreadStops.remove(threadId)
             seq.removeValue(forKey: runId)
             // PERF-MAC_AGENT-005: flush a final prune at run end so events queued
