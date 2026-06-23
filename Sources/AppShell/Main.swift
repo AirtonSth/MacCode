@@ -19,6 +19,7 @@ struct RemoteCodeMain {
         let dbOverride = ProcessInfo.processInfo.environment["RC2_DB_PATH"]
 
         let app = NSApplication.shared
+        RemoteCodeAppearance.apply(to: app)
         app.setActivationPolicy(.regular)
         let delegate = AppDelegate(channel: channel, appSupportOverride: appSupportOverride, dbOverride: dbOverride)
         app.delegate = delegate
