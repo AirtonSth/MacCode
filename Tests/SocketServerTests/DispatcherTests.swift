@@ -580,8 +580,10 @@ class FakeRouter: CommandRouting, TerminalCommandRouting {
     func notificationList(workspaceId: WorkspaceID?, unreadOnly: Bool) throws -> [[String: JSONValue]] { [] }
     func notificationMarkRead(id: String) throws {}
     func notificationDismiss(id: String) throws {}
+    var lastPrivatePushTokenUpdate: (pushToken: String, pushTokenType: String, liveActivityToken: String?, deviceID: String?)?
     func privatePushTokenUpdate(pushToken: String, pushTokenType: String, liveActivityToken: String?, deviceID: String?) throws -> JSONValue {
-        .object(["ok": .bool(true), "push_token_type": .string(pushTokenType)])
+        lastPrivatePushTokenUpdate = (pushToken, pushTokenType, liveActivityToken, deviceID)
+        return .object(["ok": .bool(true), "push_token_type": .string(pushTokenType)])
     }
     var settings: [String: String] = [:]
     func settingsGet(keys: [String]) throws -> [String: String] {
@@ -815,6 +817,38 @@ final class DispatcherTests: XCTestCase {
         ]))
         guard case .object(let downloadResult)? = download.result else { return XCTFail("download must return an object") }
         XCTAssertEqual(downloadResult["ok"], .bool(true), "download must be exposed as a host-owned terminal/scp RPC")
+    }
+
+    @MainActor
+    func test_sshHostUpsertDoesNotEchoPassword() async throws {
+        let router = FakeRouter()
+        let d = JSONRPCDispatcher(router: router)
+        let wid = UUID().uuidString
+        let beforeSeq = EventBus.shared.currentSeq
+
+        let saved = await d.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(1), method: "ssh.host.upsert", params: [
+            "workspace_id": .string(wid),
+            "label": .string("Prod"),
+            "destination": .string("root@example.test"),
+            "password": .string("saved-test-password")
+        ]))
+
+        guard case .object(let savedHost)? = saved.result else {
+            return XCTFail("ssh.host.upsert must return the saved host metadata")
+        }
+        XCTAssertNil(savedHost["password"],
+                     "ssh.host.upsert must accept a password for credential storage without echoing it to paired clients")
+        XCTAssertEqual(savedHost["hasSavedPassword"], .bool(true),
+                       "upsert still needs to confirm that a stored credential exists for one-tap reconnect")
+
+        let updates = EventBus.shared.recentEvents(since: beforeSeq, maxBytes: nil).events.filter { $0.kind == "ssh.host.updated" }
+        guard let update = updates.last?.payload.objectValue else {
+            return XCTFail("saving an SSH host must publish an update event for mirrored clients")
+        }
+        XCTAssertNil(update["password"],
+                     "ssh.host.updated must not retain or broadcast the saved password in the event backlog")
+        XCTAssertEqual(update["hasSavedPassword"], .bool(true),
+                       "mirrored clients still need credential metadata after event redaction")
     }
 
     @MainActor
@@ -1229,6 +1263,47 @@ final class DispatcherTests: XCTestCase {
         XCTAssertNil(ok.error, "running a known script must succeed")
         let bad = await d.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(3), method: "project.run_script", params: ["workspace_id": wid, "name": .string("nope")]))
         XCTAssertNotNil(bad.error, "running an unknown script must fail loudly")
+        let editor = await d.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(4), method: "project.open_in_editor", params: ["workspace_id": wid]))
+        XCTAssertEqual(editor.result?.objectValue?["app"], .string("Finder"),
+                       "opening a workspace in an editor must return the app that handled the request")
+    }
+
+    @MainActor
+    func test_privatePushTokenUpdateRoutesValidatedTokenOverSocket() async throws {
+        let router = FakeRouter()
+        let d = JSONRPCDispatcher(router: router)
+
+        let resp = await d.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(1), method: "private.push_token.update", params: [
+            "push_token": .string("fcm-token"),
+            "push_token_type": .string("fcm"),
+            "device_id": .string("device-1"),
+        ]))
+
+        XCTAssertNil(resp.error, "paired clients must be able to register an FCM target for backend push delivery")
+        XCTAssertEqual(resp.result?.objectValue?["ok"], .bool(true))
+        XCTAssertEqual(resp.result?.objectValue?["push_token_type"], .string("fcm"))
+        XCTAssertNil(resp.result?.objectValue?["push_token"],
+                     "the JSON-RPC response must not echo sensitive push-token material back to the caller")
+        XCTAssertEqual(router.lastPrivatePushTokenUpdate?.pushToken, "fcm-token")
+        XCTAssertEqual(router.lastPrivatePushTokenUpdate?.pushTokenType, "fcm")
+        XCTAssertNil(router.lastPrivatePushTokenUpdate?.liveActivityToken,
+                     "live activity tokens are optional because plain alert delivery still needs a stored push target")
+        XCTAssertEqual(router.lastPrivatePushTokenUpdate?.deviceID, "device-1")
+    }
+
+    @MainActor
+    func test_privatePushTokenUpdateRejectsUnsupportedTokenTypeBeforeRouting() async throws {
+        let router = FakeRouter()
+        let d = JSONRPCDispatcher(router: router)
+
+        let resp = await d.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(1), method: "private.push_token.update", params: [
+            "push_token": .string("webpush-token"),
+            "push_token_type": .string("webpush"),
+        ]))
+
+        XCTAssertEqual(resp.error?.code, -32602,
+                       "unsupported token types must fail validation before the host stores an unusable notification target")
+        XCTAssertNil(router.lastPrivatePushTokenUpdate)
     }
 
     @MainActor

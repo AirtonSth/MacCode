@@ -78,10 +78,25 @@ public enum FindResultFormatter {
     }
 }
 
-/// Builds the JS snippet used by BrowserSurface.waitFor to observe the DOM
-/// instead of polling on a 50 ms timer.
+/// Builds JavaScript snippets used by BrowserSurface automation.
 /// Pure logic — no AppKit/WebKit/MainActor dependency — fully unit-testable.
 public enum BrowserWaitForJS {
+    private static func escapedTemplateLiteral(_ value: String) -> String {
+        value
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "`", with: "\\`")
+    }
+
+    public static func boolValue(_ value: Any?) -> Bool {
+        if let value = value as? Bool { return value }
+        if let value = value as? NSNumber { return value.boolValue }
+        return false
+    }
+
+    public static func presenceCheckScript(selector: String) -> String {
+        "Boolean(document.querySelector(`\(escapedTemplateLiteral(selector))`))"
+    }
+
     /// Returns a self-executing JS expression that resolves to `true` once
     /// `selector` appears in the document, or `false` on timeout.
     ///
@@ -783,16 +798,32 @@ public final class BrowserSurface: NSObject, Surface, WKNavigationDelegate, WKUI
     public func waitFor(_ selector: String, timeoutMs: Int, completion: @escaping (String) -> Void) {
         waitForToken &+= 1
         let token = waitForToken
-        let js = BrowserWaitForJS.mutationObserverScript(selector: selector, timeoutMs: timeoutMs)
-        self.evaluate(js) { [weak self] value, _ in
-            guard let self, !self.isClosed, self.waitForToken == token else {
-                completion("{\"ok\":false,\"error\":\"cancelled\"}")
-                return
-            }
-            if (value as? Bool) == true {
-                completion("{\"ok\":true}")
-            } else {
-                completion("{\"ok\":false,\"error\":\"timeout\"}")
+        let deadline = Date().addingTimeInterval(Double(max(0, timeoutMs)) / 1000.0)
+        pollWaitFor(selector: selector, token: token, deadline: deadline, completion: completion)
+    }
+
+    private func pollWaitFor(selector: String, token: Int, deadline: Date, completion: @escaping (String) -> Void) {
+        let js = BrowserWaitForJS.presenceCheckScript(selector: selector)
+        evaluate(js) { [weak self] value, _ in
+            let found = BrowserWaitForJS.boolValue(value)
+            MainActor.assumeIsolated {
+                guard let self, !self.isClosed, self.waitForToken == token else {
+                    completion("{\"ok\":false,\"error\":\"cancelled\"}")
+                    return
+                }
+                if found {
+                    completion("{\"ok\":true}")
+                    return
+                }
+                guard Date() < deadline else {
+                    completion("{\"ok\":false,\"error\":\"timeout\"}")
+                    return
+                }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
+                    MainActor.assumeIsolated {
+                        self?.pollWaitFor(selector: selector, token: token, deadline: deadline, completion: completion)
+                    }
+                }
             }
         }
     }

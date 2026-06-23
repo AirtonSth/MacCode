@@ -155,6 +155,15 @@ final class InteractiveTitlebarWindow: NSWindow {
     }
 }
 
+private extension NSWindow {
+    func configureRemoteCodeWindowAccessibility(title: String, identifier: String) {
+        setAccessibilityRole(.window)
+        setAccessibilitySubrole(.standardWindow)
+        setAccessibilityTitle(title)
+        setAccessibilityIdentifier(identifier)
+    }
+}
+
 enum PaneKeyboardResizeKey {
     private static let requiredModifiers: NSEvent.ModifierFlags = [.control, .option]
     private static let relevantModifiers: NSEvent.ModifierFlags = [.control, .option, .command, .shift]
@@ -267,6 +276,7 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
             defer: false
         )
         win.title = "RemoteCode"
+        win.configureRemoteCodeWindowAccessibility(title: "RemoteCode", identifier: "window.main")
         // Unified titlebar: content runs full height, the system title
         // bar is transparent and titleless, so the traffic-light buttons
         // float over the app's own header row (the sidebar header).
@@ -783,6 +793,7 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
             defer: false
         )
         win.title = w.title
+        win.configureRemoteCodeWindowAccessibility(title: w.title, identifier: "window.additional")
         let handler = OrphanWindowAttachHandler(windowID: w.id, window: win, context: context, router: router)
         extraWindowAttachHandlers[w.id] = handler
         win.contentView = handler.buildEmptyStateView()
@@ -1509,6 +1520,7 @@ private final class WorkspaceWindowController: NSObject, NSWindowDelegate, PaneK
             return
         }
         window.title = ws.name
+        window.configureRemoteCodeWindowAccessibility(title: ws.name, identifier: "window.workspace")
         titleLabel.stringValue = ws.name
         for subview in workspaceContent.subviews { subview.removeFromSuperview() }
         paneControllers.removeAll()

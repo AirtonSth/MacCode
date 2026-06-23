@@ -64,6 +64,30 @@ final class TerminalOutputDeleteOnCloseTests: XCTestCase {
                        "closeSurface must delete all terminal_output_chunks for the closed surface")
     }
 
+    func test_surfaceClearHistory_deletesTerminalChunksForLiveSurface() throws {
+        // WHY: the public surface.clear_history RPC promises to clear terminal
+        // history. Sending Ctrl-L alone only clears the viewport; old chunks
+        // must also disappear from read_history and persisted storage.
+        let (ctx, router) = try makeContext()
+        let ws = try router.createWorkspace(name: "w", cwd: NSTemporaryDirectory())
+
+        guard case .pane(let pane) = ctx.state.workspaces[ws.id]?.layout,
+              let descriptor = pane.surfaces.first else {
+            return XCTFail("expected initial terminal surface")
+        }
+        let surfaceID = descriptor.id.value.uuidString
+        let repo = ctx.terminalOutputRepo
+
+        try seedChunks(repo: repo, surfaceID: surfaceID)
+        XCTAssertGreaterThan(try repo.totalBytes(surfaceID: surfaceID), 0,
+                             "pre-condition: chunks must be present before clear_history")
+
+        router.surfaceClearHistory(surface: descriptor.id)
+
+        XCTAssertEqual(try repo.totalBytes(surfaceID: surfaceID), 0,
+                       "surfaceClearHistory must delete persisted terminal_output_chunks for the live surface")
+    }
+
     // MARK: - closeSurface does not delete chunks for other surfaces
 
     func test_closeSurface_doesNotDeleteChunksForLiveSurface() throws {

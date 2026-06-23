@@ -178,4 +178,63 @@ final class WorkspaceMirrorEventTests: XCTestCase {
         XCTAssertEqual(events.first?.payload.objectValue?["position"]?.intValue, 0,
                        "the reorder event must carry the drop position, matching the Dispatcher workspace.reorder schema")
     }
+
+    func test_dispatcherWorkspaceMutationsEmitOneMirrorEventPerUserAction() async throws {
+        let (_, router) = try make()
+        let dispatcher = JSONRPCDispatcher(router: router)
+        let startSeq = EventBus.shared.snapshot().lastSeq
+        var events: [EventBus.Event] = []
+        let token = EventBus.shared.subscribe(since: startSeq) { event in
+            if event.kind.hasPrefix("workspace.") { events.append(event) }
+        }
+        defer { EventBus.shared.unsubscribe(token) }
+
+        func dispatch(_ id: Int, _ method: String, _ params: [String: JSONValue]) async throws -> JSONValue? {
+            let response = await dispatcher.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(id), method: method, params: params))
+            if let error = response.error {
+                XCTFail("\(method) failed: \(error)")
+            }
+            return response.result
+        }
+
+        let firstResponse = try await dispatch(1, "workspace.create", [
+            "name": .string("one"),
+            "cwd": .string(NSTemporaryDirectory())
+        ])
+        let first = try XCTUnwrap(firstResponse?.objectValue)
+        let secondResponse = try await dispatch(2, "workspace.create", [
+            "name": .string("two"),
+            "cwd": .string(NSTemporaryDirectory())
+        ])
+        let second = try XCTUnwrap(secondResponse?.objectValue)
+        let thirdResponse = try await dispatch(3, "workspace.create", [
+            "name": .string("three"),
+            "cwd": .string(NSTemporaryDirectory())
+        ])
+        let third = try XCTUnwrap(thirdResponse?.objectValue)
+        let firstID = try XCTUnwrap(first["id"]?.objectValue?["value"]?.stringValue)
+        let secondID = try XCTUnwrap(second["id"]?.objectValue?["value"]?.stringValue)
+        let thirdID = try XCTUnwrap(third["id"]?.objectValue?["value"]?.stringValue)
+
+        _ = try await dispatch(4, "workspace.select", ["id": .string(firstID)])
+        _ = try await dispatch(5, "workspace.rename", ["id": .string(firstID), "name": .string("one renamed")])
+        _ = try await dispatch(6, "workspace.set_color", ["id": .string(firstID), "color": .string("mint")])
+        _ = try await dispatch(7, "workspace.set_pinned", ["id": .string(secondID), "pinned": .bool(true)])
+        _ = try await dispatch(8, "workspace.reorder", ["id": .string(thirdID), "position": .number(1)])
+        _ = try await dispatch(9, "workspace.close", ["id": .string(secondID)])
+
+        let counts = Dictionary(grouping: events, by: \.kind).mapValues(\.count)
+        XCTAssertEqual(counts["workspace.created"], 3,
+                       "each RPC-created workspace must emit one created event; duplicate host events make paired sidebars add duplicate rows")
+        XCTAssertEqual(counts["workspace.selected"], 1,
+                       "selecting a workspace over RPC should mirror exactly one selected row change")
+        XCTAssertEqual(counts["workspace.renamed"], 1,
+                       "renaming over RPC must not double-emit router and dispatcher rename events")
+        XCTAssertEqual(counts["workspace.updated"], 2,
+                       "color and pinned metadata updates should each publish once")
+        XCTAssertEqual(counts["workspace.reordered"], 2,
+                       "pin-driven reorder and explicit reorder should each publish once")
+        XCTAssertEqual(counts["workspace.closed"], 1,
+                       "closing over RPC should remove one mirrored workspace row")
+    }
 }

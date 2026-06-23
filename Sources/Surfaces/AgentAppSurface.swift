@@ -2035,14 +2035,14 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         guard !text.isEmpty || !attachments.isEmpty else { return }
         lastSentAttachmentCount = attachments.count
         recordPromptHistory(text)
-        if selectedThreadCanQueuePrompt {
-            await enqueuePromptWhileRunning(text: text, attached: attachments)
-            return
-        }
         if let slash = Self.localSlashCommandParts(text),
            (slash.command == "plan" || slash.command == "default"),
            !slash.argument.isEmpty {
             _ = handleSlashCommand("/\(slash.command)")
+            if selectedThreadCanQueuePrompt {
+                await enqueuePromptWhileRunning(text: slash.argument, attached: attachments)
+                return
+            }
             _ = await startProviderRun(
                 text: slash.argument,
                 attached: attachments,
@@ -2053,6 +2053,10 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         }
         if text.hasPrefix("/"), handleSlashCommand(text) {
             prompt = ""
+            return
+        }
+        if selectedThreadCanQueuePrompt {
+            await enqueuePromptWhileRunning(text: text, attached: attachments)
             return
         }
         _ = await startProviderRun(text: text, attached: attachments, recordHistory: false, interactionMode: interactionMode)

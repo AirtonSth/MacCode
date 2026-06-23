@@ -116,6 +116,28 @@ final class PaneActionTests: XCTestCase {
         XCTAssertNotNil(SurfaceRegistry.shared.surface(p2.surfaces[1].id))
     }
 
+    func test_feedPanelIgnoresBacklogPublishedBeforeOpen() throws {
+        let (_, router) = try makeContext()
+        let staleTitle = "feed-stale-\(UUID().uuidString)"
+        EventBus.shared.publish(kind: "feed.test.stale", payload: .object(["title": .string(staleTitle)]))
+        let ws = try router.createWorkspace(name: "feed-open-\(UUID().uuidString)", cwd: NSTemporaryDirectory())
+
+        let desc = try router.createSurface(workspace: ws.id, type: .rightSidebarTool, paneID: nil, title: "Feed")
+        let feed = try XCTUnwrap(SurfaceRegistry.shared.surface(desc.id) as? FeedPanelSurface)
+        drainMainQueue()
+
+        XCTAssertFalse(feed.readText().contains(staleTitle),
+                       "opening Feed must not replay retained EventBus backlog from before the panel existed")
+        XCTAssertFalse(feed.readText().contains(ws.name),
+                       "workspace events published before Feed opens must not appear as if they were live activity")
+
+        let freshTitle = "feed-fresh-\(UUID().uuidString)"
+        EventBus.shared.publish(kind: "feed.test.fresh", payload: .object(["title": .string(freshTitle)]))
+        waitUntil("Feed should still stream events published after it opens") {
+            feed.readText().contains(freshTitle)
+        }
+    }
+
     func test_focusingAnotherTabUnloadsHiddenFilePreviewSurface() throws {
         let (_, router) = try makeContext()
         let ws = try router.createWorkspace(name: "preview-memory", cwd: NSTemporaryDirectory())

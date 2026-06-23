@@ -66,6 +66,34 @@ final class RC2CLITimeoutParserTests: XCTestCase {
         XCTAssertEqual(result.remaining, args)
     }
 
+    func test_defaultReceiveTimeoutIsPositiveAndBounded() {
+        // WHY: a daemon can accept the Unix socket and then stop responding;
+        //      rc2 must have a default one-shot RPC guard even when the user
+        //      does not pass --timeout.
+        XCTAssertGreaterThan(RC2CLITimeoutParser.defaultReceiveTimeoutMS, 0)
+        XCTAssertLessThanOrEqual(RC2CLITimeoutParser.defaultReceiveTimeoutMS, 30_000,
+                                 "default receive timeout must be bounded enough to avoid a stuck CLI")
+    }
+
+    func test_leadingGlobalTimeout_doesNotStealBrowserWaitTimeout() {
+        // WHY: `browser wait --timeout` is a command-specific wait duration,
+        //      not the global Unix-socket receive timeout.
+        let args = ["browser", "wait", "--id", "s1", "--selector", "#ready", "--timeout", "250"]
+        let result = RC2CLITimeoutParser.parseLeadingGlobal(args)
+        XCTAssertNil(result.timeoutMS)
+        XCTAssertEqual(result.remaining, args)
+    }
+
+    func test_leadingGlobalTimeout_consumesOnlyBeforeCommand() {
+        // WHY: global timeout belongs before the command token and should still
+        //      work when command-specific flags later use the same spelling.
+        let result = RC2CLITimeoutParser.parseLeadingGlobal([
+            "--timeout", "1000", "--json", "browser", "wait", "--id", "s1", "--selector", "#ready", "--timeout", "250"
+        ])
+        XCTAssertEqual(result.timeoutMS, 1000)
+        XCTAssertEqual(result.remaining, ["--json", "browser", "wait", "--id", "s1", "--selector", "#ready", "--timeout", "250"])
+    }
+
     // MARK: - invalid values
 
     func test_nonNumericValue_returnsNil() {
@@ -74,6 +102,8 @@ final class RC2CLITimeoutParserTests: XCTestCase {
         let result = RC2CLITimeoutParser.parse(["--timeout", "abc"])
         XCTAssertNil(result.timeoutMS,
                      "non-numeric value must return nil")
+        XCTAssertEqual(result.invalidValue, "abc",
+                       "non-numeric timeout must be reported so rc2 can fail loud instead of connecting with a misleading socket error")
     }
 
     func test_negativeValue_returnsNil() {
@@ -81,6 +111,8 @@ final class RC2CLITimeoutParserTests: XCTestCase {
         let result = RC2CLITimeoutParser.parse(["--timeout", "-1"])
         XCTAssertNil(result.timeoutMS,
                      "negative timeout must return nil")
+        XCTAssertEqual(result.invalidValue, "-1",
+                       "negative timeout must be reported so rc2 can fail loud before opening the socket")
     }
 
     func test_zeroValue_returnsNil() {
@@ -89,12 +121,15 @@ final class RC2CLITimeoutParserTests: XCTestCase {
         let result = RC2CLITimeoutParser.parse(["--timeout", "0"])
         XCTAssertNil(result.timeoutMS,
                      "zero timeout must return nil to avoid disabling the guard")
+        XCTAssertEqual(result.invalidValue, "0",
+                       "zero timeout must be reported so rc2 can explain the validation error")
     }
 
     func test_inlineEquals_nonNumeric_returnsNil() {
         // WHY: equals form must apply the same validation as space form.
         let result = RC2CLITimeoutParser.parse(["--timeout=notanumber"])
         XCTAssertNil(result.timeoutMS)
+        XCTAssertEqual(result.invalidValue, "notanumber")
     }
 
     // MARK: - edge cases
@@ -119,5 +154,14 @@ final class RC2CLITimeoutParserTests: XCTestCase {
         let result = RC2CLITimeoutParser.parse(["--timeout", "1000", "--timeout=2000"])
         XCTAssertEqual(result.timeoutMS, 2000,
                        "later --timeout must override earlier one")
+        XCTAssertNil(result.invalidValue)
+    }
+
+    func test_lastWriteWins_laterInvalidTimeoutIsReported() {
+        // WHY: if the final timeout flag is invalid, rc2 must fail loud instead
+        // of silently using an earlier valid timeout that the user tried to replace.
+        let result = RC2CLITimeoutParser.parse(["--timeout", "1000", "--timeout=0"])
+        XCTAssertNil(result.timeoutMS)
+        XCTAssertEqual(result.invalidValue, "0")
     }
 }

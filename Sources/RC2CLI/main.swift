@@ -6,17 +6,10 @@ import Persistence
 let args = CommandLine.arguments
 let prog = (args.first as NSString?)?.lastPathComponent ?? "remotecode"
 
-// Parse --timeout before the global flag loop so it is available when RPC is
-// constructed.  The parser strips the token(s) and returns the cleaned list.
-let _timeoutResult = RC2CLITimeoutParser.parse(Array(args.dropFirst()))
-var receiveTimeoutMS: Int? = _timeoutResult.timeoutMS
-// Reconstructed args with --timeout removed; the loop below indexes from 1 so
-// we prepend a placeholder for the program name slot.
-let _cleanedArgs: [String] = [args.first ?? ""] + _timeoutResult.remaining
-
 func usage(_ exit: Int32 = 0) -> Never {
     let text = """
     Usage: \(prog) [--socket PATH] [--json] [--timeout MS] <command> [args...]
+      --timeout MS defaults to \(RC2CLITimeoutParser.defaultReceiveTimeoutMS) for one-shot RPCs
 
     Commands:
       ping
@@ -72,6 +65,17 @@ func diagError(_ reason: String) -> Never {
     usage(RC2ExitCode.usageError)
 }
 
+// Parse --timeout before the global flag loop so it is available when RPC is
+// constructed. The parser strips the token(s) and returns the cleaned list.
+let _timeoutResult = RC2CLITimeoutParser.parseLeadingGlobal(Array(args.dropFirst()))
+if _timeoutResult.invalidValue != nil {
+    diagError(RC2CLIDiagnostics.invalidValue(for: "timeout"))
+}
+var receiveTimeoutMS: Int? = _timeoutResult.timeoutMS ?? RC2CLITimeoutParser.defaultReceiveTimeoutMS
+// Reconstructed args with --timeout removed; the loop below indexes from 1 so
+// we prepend a placeholder for the program name slot.
+let _cleanedArgs: [String] = [args.first ?? ""] + _timeoutResult.remaining
+
 func parseFlags(_ a: [String]) -> ([String: String], [String]) {
     CLIArgParser.parseFlagsWithTerminator(a)
 }
@@ -111,7 +115,7 @@ var globalTerminated = false
 var i = 1
 while i < _cleanedArgs.count {
     let s = _cleanedArgs[i]
-    if globalTerminated { rest.append(s); i += 1; continue }
+    if globalTerminated || !rest.isEmpty { rest.append(s); i += 1; continue }
     if s == "--" { globalTerminated = true; i += 1; continue }
     if s == "--version" {
         print(RC2CLIVersion.versionString())
@@ -241,7 +245,8 @@ func emit(_ obj: Any) {
     } else {
         if let dict = obj as? [String: Any], let err = dict["error"] as? [String: Any] {
             FileHandle.standardError.write(Data("error: \(err["message"] ?? "")\n".utf8))
-            Darwin.exit(1)
+            let isConnect = (err["_connect_failure"] as? Bool) == true
+            Darwin.exit(isConnect ? RC2ExitCode.connectFailure : RC2ExitCode.rpcError)
         }
         if let dict = obj as? [String: Any], let result = dict["result"] {
             print(prettyPrint(result))
@@ -423,7 +428,7 @@ case "events":
             let msg = String(cString: strerror(errno))
             FileHandle.standardError.write(Data("error: connect(\(socketPath)): \(msg). Is the RemoteCode app running?\n".utf8))
             Darwin.close(fd)
-            Darwin.exit(1)
+            Darwin.exit(RC2ExitCode.connectFailure)
         }
         // Send events.stream request.
         let streamReqDict: [String: Any] = [

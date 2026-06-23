@@ -39,6 +39,25 @@ final class ManagedDistillCLIInstallTests: XCTestCase {
         XCTAssertTrue(FileManager.default.isExecutableFile(atPath: dest), "the resolved target is an executable")
     }
 
+    func test_resolveServiceBinaryFindsSwiftPMPlatformTripleBuildDirectory() throws {
+        let root = tempHome()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let binary = root.appendingPathComponent(".build/arm64-apple-macosx/debug/RemoteCodeDistillService")
+        try FileManager.default.createDirectory(at: binary.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data("binary".utf8).write(to: binary)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: binary.path)
+
+        let original = FileManager.default.currentDirectoryPath
+        XCTAssertTrue(FileManager.default.changeCurrentDirectoryPath(root.path))
+        defer { _ = FileManager.default.changeCurrentDirectoryPath(original) }
+
+        XCTAssertEqual(
+            AgentSkillInstaller.resolveServiceBinary()?.resolvingSymlinksInPath().path,
+            binary.resolvingSymlinksInPath().path,
+            "SwiftPM on modern macOS places executable products under .build/<platform-triple>/debug, not .build/debug"
+        )
+    }
+
     func test_uninstallRemovesLegacyPythonScript() throws {
         let home = tempHome()
         defer { try? FileManager.default.removeItem(at: home) }

@@ -28,6 +28,30 @@ final class WorkspaceFileServiceTests: XCTestCase {
                        "Files navigation must return workspace-relative parent paths so macOS and iOS do not navigate by absolute host paths")
     }
 
+    func testListRelativePathsStayWorkspaceRelativeWhenTmpRootIsSymlinked() throws {
+        let tmpRootPath = "/tmp/rc2-files-symlink-\(UUID().uuidString)"
+        let tmpRoot = URL(fileURLWithPath: tmpRootPath, isDirectory: true)
+        try FileManager.default.createDirectory(at: tmpRoot.appendingPathComponent("src"), withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tmpRoot) }
+        try "print(\"nested\")".write(to: tmpRoot.appendingPathComponent("src/nested.swift"), atomically: true, encoding: .utf8)
+
+        let rootList = try service.list(root: tmpRootPath, path: nil)
+        let rootEntries = try XCTUnwrap(rootList.objectValue?["entries"]?.arrayValue)
+        let srcEntry = try XCTUnwrap(rootEntries.first { $0.objectValue?["name"]?.stringValue == "src" })
+        XCTAssertEqual(srcEntry.objectValue?["relative_path"]?.stringValue, "src",
+                       "Files rows must keep workspace-relative paths even when macOS reports /tmp children through /private/tmp")
+
+        let srcList = try service.list(root: tmpRootPath, path: "src")
+        XCTAssertEqual(srcList.objectValue?["relative_path"]?.stringValue, "src",
+                       "expanded folders must round-trip the same workspace-relative path the UI sends back")
+        XCTAssertEqual(srcList.objectValue?["parent_path"]?.stringValue, "",
+                       "expanded folder breadcrumbs must not inherit /private/tmp path fragments")
+        let srcEntries = try XCTUnwrap(srcList.objectValue?["entries"]?.arrayValue)
+        let nested = try XCTUnwrap(srcEntries.first { $0.objectValue?["name"]?.stringValue == "nested.swift" })
+        XCTAssertEqual(nested.objectValue?["relative_path"]?.stringValue, "src/nested.swift",
+                       "nested file selection must open the intended file instead of a corrupted path such as rkspace/src/nested.swift")
+    }
+
     func testSvgIsPreviewMediaNotEditableText() throws {
         let svg = root.appendingPathComponent("logo.svg")
         try "<svg><text>RemoteCode</text></svg>".write(to: svg, atomically: true, encoding: .utf8)
