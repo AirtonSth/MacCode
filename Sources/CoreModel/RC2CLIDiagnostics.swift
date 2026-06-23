@@ -21,6 +21,20 @@ public enum RC2CLIDiagnostics {
         "error: invalid value for --\(flag)"
     }
 
+    /// Returns the standard daemon response timeout message.
+    ///
+    /// Format: "rc2 socket receive timed out after <ms>ms"
+    public static func responseTimedOut(afterMilliseconds milliseconds: Int) -> String {
+        "rc2 socket receive timed out after \(milliseconds)ms"
+    }
+
+    /// Returns the standard daemon EOF-before-response message.
+    ///
+    /// Format: "rc2 socket closed before sending a response"
+    public static func responseClosedBeforeReply() -> String {
+        "rc2 socket closed before sending a response"
+    }
+
     /// Returns the standard "unknown subcommand" message.
     ///
     /// Format: "error: unknown subcommand '<sub>' for '<cmd>'"
