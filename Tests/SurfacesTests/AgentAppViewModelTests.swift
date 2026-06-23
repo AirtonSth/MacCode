@@ -2801,6 +2801,10 @@ final class AgentAppViewModelTests: XCTestCase {
                       "missing attachments must fail before provider spawn instead of sending a bad path")
         XCTAssertTrue(vm.messages.contains { $0.role == .system && $0.content.contains("Attachment not found") },
                       "attachment resolution errors must be visible to the user")
+        XCTAssertEqual(vm.prompt, "review",
+                       "failed attachment validation must keep the user's draft so they can fix the file path and retry")
+        XCTAssertEqual(vm.attachments.count, 1,
+                       "failed attachment validation must keep the chip so the user can remove or reselect it")
     }
 
     func test_send_persistsExactlyOneUserAndOneAssistantMessage() async throws {

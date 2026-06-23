@@ -2133,7 +2133,6 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         loadAllMessages(tid)
         suppressPersistedFinalDuplicatedByTimeline()
         timeline.clearActivePlan()
-        prompt = ""
         resetTimelineUpdateTick()
         lastErrorRecoverable = false  // UX-MAC_AGENT-009: clear stale Retry on new run
         selectedThreadHasRecoverableContext = false  // UX-MAC_AGENT-CONTINUE: run started; hide Continue
@@ -2145,6 +2144,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             return nil
         }
         attachments = []
+        prompt = ""
         let display = resolvedAttachments.isEmpty ? text
             : text + "\n\n📎 " + resolvedAttachments.map(\.displayName).joined(separator: ", ")
         // The coordinator is the single writer of run messages — mirror
