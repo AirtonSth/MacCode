@@ -2020,6 +2020,7 @@ public struct SidebarRootView: View {
         // The sidebar material reaches the top edge; only its controls
         // start below the traffic-light band.
         .ignoresSafeArea(.container, edges: .top)
+        .preferredColorScheme(.dark)
         .sheet(isPresented: $vm.showsTokenSaverModelDownload) {
             TokenSaverModelDownloadModal(
                 state: vm.tokenSaverModelDownloadState,
@@ -4142,6 +4143,7 @@ public final class SidebarView: NSObject {
         // NSHostingView is opaque by default; let the vibrancy show.
         h.wantsLayer = true
         h.layer?.backgroundColor = NSColor.clear.cgColor
+        RemoteCodeAppearance.apply(to: h)
         self.host = h
         // Subtle Liquid Glass: an under-window vibrancy material behind
         // the translucent SwiftUI sidebar. Chrome only — per design rules
@@ -4151,6 +4153,7 @@ public final class SidebarView: NSObject {
         container.blendingMode = .behindWindow
         container.state = .active
         container.translatesAutoresizingMaskIntoConstraints = false
+        RemoteCodeAppearance.apply(to: container)
         container.addSubview(h)
         NSLayoutConstraint.activate([
             h.topAnchor.constraint(equalTo: container.topAnchor),

@@ -79,6 +79,7 @@ final class TerminalEncodeTests: XCTestCase {
         let ctrlC = key(8, chars: "\u{03}", ignoring: "c", flags: [.control])
         let optionB = key(11, chars: "∫", ignoring: "b", flags: [.option])
         let upArrow = key(126)
+        let downArrow = key(125)
         let enter = key(36)
 
         XCTAssertFalse(TerminalKeyboardInput.shouldUseTextInput(for: ctrlC),
@@ -87,8 +88,19 @@ final class TerminalEncodeTests: XCTestCase {
                        "Option-as-Meta must stay raw so shells receive ESC-prefixed input")
         XCTAssertFalse(TerminalKeyboardInput.shouldUseTextInput(for: upArrow),
                        "navigation keys must stay raw VT input instead of becoming text commands")
+        XCTAssertFalse(TerminalKeyboardInput.shouldUseTextInput(for: downArrow),
+                       "TUI Down-arrow navigation must stay on Ghostty's raw key path instead of sidebar/text-input handling")
         XCTAssertFalse(TerminalKeyboardInput.shouldUseTextInput(for: enter),
                        "Enter must stay raw CR input so command submission remains immediate")
+    }
+
+    func test_reportedDigitUsesTextInputPathForTerminalPromptChoices() {
+        let five = key(23, chars: "5", ignoring: "5")
+
+        XCTAssertTrue(TerminalKeyboardInput.shouldUseTextInput(for: five),
+                      "numbered TUI choices like 5 must reach the active terminal as printable text")
+        XCTAssertEqual(GhosttyTerminalKeyInput.text(for: five), "5",
+                       "Ghostty text extraction must preserve the exact digit typed for terminal prompt choices")
     }
 
     func test_ctrlC_isETX() {

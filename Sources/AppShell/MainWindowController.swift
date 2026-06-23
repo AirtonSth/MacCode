@@ -286,6 +286,7 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
         win.isMovableByWindowBackground = false
         win.collectionBehavior.insert(.moveToActiveSpace)
         win.minSize = NSSize(width: 900, height: 600)
+        RemoteCodeAppearance.apply(to: win)
         self.window = win
 
         super.init()
@@ -768,10 +769,21 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
         protectedFocusedView() != nil
     }
 
+    static func protectedTextFocusOwner(firstResponder: NSResponder?, within workspaceContent: NSView) -> NSView? {
+        if let textView = firstResponder as? NSTextView,
+           textView.isDescendant(of: workspaceContent) {
+            return textView
+        }
+        if let text = firstResponder as? NSText,
+           let delegateView = text.delegate as? NSView,
+           delegateView.isDescendant(of: workspaceContent) {
+            return delegateView
+        }
+        return nil
+    }
+
     private func protectedFocusedView() -> NSView? {
-        guard let responder = window.firstResponder as? NSView,
-              responder is NSTextView else { return nil }
-        return responder
+        Self.protectedTextFocusOwner(firstResponder: window.firstResponder, within: workspaceContent)
     }
 
     private func restoreProtectedFocus(_ focusedView: NSView?) {
@@ -794,6 +806,7 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
         )
         win.title = w.title
         win.configureRemoteCodeWindowAccessibility(title: w.title, identifier: "window.additional")
+        RemoteCodeAppearance.apply(to: win)
         let handler = OrphanWindowAttachHandler(windowID: w.id, window: win, context: context, router: router)
         extraWindowAttachHandlers[w.id] = handler
         win.contentView = handler.buildEmptyStateView()
@@ -1488,6 +1501,7 @@ private final class WorkspaceWindowController: NSObject, NSWindowDelegate, PaneK
         win.titleVisibility = .hidden
         win.isMovableByWindowBackground = false
         win.minSize = NSSize(width: 760, height: 520)
+        RemoteCodeAppearance.apply(to: win)
         self.window = win
         super.init()
         win.delegate = self
@@ -1575,10 +1589,10 @@ private final class WorkspaceWindowController: NSObject, NSWindowDelegate, PaneK
     }
 
     private func protectedFocusedView() -> NSView? {
-        guard let responder = window.firstResponder as? NSView,
-              responder is NSTextView,
-              responder.isDescendant(of: workspaceContent) else { return nil }
-        return responder
+        MainWindowController.protectedTextFocusOwner(
+            firstResponder: window.firstResponder,
+            within: workspaceContent
+        )
     }
 
     private func setupLayout() {
