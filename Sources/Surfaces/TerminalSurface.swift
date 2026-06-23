@@ -307,6 +307,12 @@ private final class TerminalDropContainerView: NSView {
 ///   plain-text seam.
 /// - Returns `nil` when neither type is readable.
 public enum TerminalDragPayload {
+    public enum PlainTextDropDecision: Equatable {
+        case send(String)
+        case confirm(String)
+        case reject
+    }
+
     /// Extract the plain-text value from a pasteboard for terminal input.
     /// Returns `nil` when the pasteboard has no readable `.string` content.
     public nonisolated static func plainText(from pasteboard: NSPasteboard) -> String? {
@@ -328,6 +334,15 @@ public enum TerminalDragPayload {
         case .safe: return text
         case .needsConfirm: return nil
         }
+    }
+
+    public nonisolated static func plainTextDropDecision(
+        from pasteboard: NSPasteboard,
+        confirmationAvailable: Bool
+    ) -> PlainTextDropDecision {
+        guard let text = plainText(from: pasteboard), !text.isEmpty else { return .reject }
+        if let safe = safeTextToSend(text) { return .send(safe) }
+        return confirmationAvailable ? .confirm(text) : .reject
     }
 }
 
@@ -391,6 +406,25 @@ public enum PasteGuard {
             if v == 0x7F { return .needsConfirm(reason: "control-characters") }
         }
         return .safe
+    }
+
+    public static func confirmationLineCount(for text: String) -> Int {
+        guard !text.isEmpty else { return 0 }
+        var count = 1
+        var previousWasCR = false
+        for scalar in text.unicodeScalars {
+            switch scalar.value {
+            case 0x0D:
+                count += 1
+                previousWasCR = true
+            case 0x0A:
+                if !previousWasCR { count += 1 }
+                previousWasCR = false
+            default:
+                previousWasCR = false
+            }
+        }
+        return count
     }
 }
 
@@ -799,22 +833,10 @@ public final class TerminalSurface: NSObject, Surface {
         // Forward paste-confirmation requests from the Ghostty view to any
         // app-level handler wired on this surface (e.g. AppCommandRouter).
         terminalView.onPasteNeedsConfirm = { [weak self] (text: String) in
-            guard let self else { return }
-            let lineCount = text.split(separator: "\n", omittingEmptySubsequences: false).count
-            let alert = NSAlert()
-            alert.messageText = "Paste \(lineCount) lines into the terminal?"
-            alert.informativeText = "The pasted text spans multiple lines or contains control characters and will run immediately."
-            alert.addButton(withTitle: "Paste")
-            alert.addButton(withTitle: "Cancel")
-            let onResponse: (NSApplication.ModalResponse) -> Void = { [weak self] resp in
-                guard resp == .alertFirstButtonReturn, let data = text.data(using: .utf8) else { return }
-                _ = self?.writeToPTY(data)
-            }
-            if let window = self.ghosttyView.window {
-                alert.beginSheetModal(for: window, completionHandler: onResponse)
-            } else {
-                onResponse(alert.runModal())
-            }
+            self?.confirmUnsafeTerminalInput(text)
+        }
+        terminalView.onPlainTextDragNeedsConfirm = { [weak self] text in
+            self?.confirmUnsafeTerminalInput(text)
         }
         terminalView.onTerminalSizeChange = { [weak self] size in
             guard let self else { return }
@@ -1918,6 +1940,25 @@ public final class TerminalSurface: NSObject, Surface {
             content = renderer.snapshot().string
         }
         try content.write(to: url, atomically: true, encoding: .utf8)
+    }
+
+    private func confirmUnsafeTerminalInput(_ text: String) {
+        let lineCount = PasteGuard.confirmationLineCount(for: text)
+        let lineLabel = lineCount == 1 ? "1 line" : "\(lineCount) lines"
+        let alert = NSAlert()
+        alert.messageText = "Paste \(lineLabel) into the terminal?"
+        alert.informativeText = "The pasted text spans multiple lines or contains control characters and will run immediately."
+        alert.addButton(withTitle: "Paste")
+        alert.addButton(withTitle: "Cancel")
+        let onResponse: (NSApplication.ModalResponse) -> Void = { [weak self] resp in
+            guard resp == .alertFirstButtonReturn, let data = text.data(using: .utf8) else { return }
+            _ = self?.writeToPTY(data)
+        }
+        if let window = ghosttyView.window {
+            alert.beginSheetModal(for: window, completionHandler: onResponse)
+        } else {
+            onResponse(alert.runModal())
+        }
     }
 
     public func snapshot() -> [String: String] {

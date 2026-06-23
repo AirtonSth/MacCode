@@ -101,6 +101,35 @@ final class TerminalDragPayloadTests: XCTestCase {
             "printable Unicode in a drag must be sent immediately without confirmation")
     }
 
+    // MARK: - TerminalDragPayload.plainTextDropDecision(from:confirmationAvailable:)
+
+    func test_plainTextDropDecision_sendsSafeTextImmediately() {
+        let pasteboard = makePasteboard()
+        pasteboard.setString("echo hello", forType: .string)
+
+        XCTAssertEqual(TerminalDragPayload.plainTextDropDecision(from: pasteboard, confirmationAvailable: false),
+                       .send("echo hello"),
+                       "safe single-line drags should still reach the terminal without a confirmation sheet")
+    }
+
+    func test_plainTextDropDecision_confirmsUnsafeTextWhenHandlerIsAvailable() {
+        let pasteboard = makePasteboard()
+        pasteboard.setString("echo a\necho b", forType: .string)
+
+        XCTAssertEqual(TerminalDragPayload.plainTextDropDecision(from: pasteboard, confirmationAvailable: true),
+                       .confirm("echo a\necho b"),
+                       "multi-line drags must route through confirmation instead of executing immediately")
+    }
+
+    func test_plainTextDropDecision_rejectsUnsafeTextWhenNoConfirmationHandlerIsAvailable() {
+        let pasteboard = makePasteboard()
+        pasteboard.setString("echo a\necho b", forType: .string)
+
+        XCTAssertEqual(TerminalDragPayload.plainTextDropDecision(from: pasteboard, confirmationAvailable: false),
+                       .reject,
+                       "unsafe drags must never fall back to direct execution when no confirmation UI is wired")
+    }
+
     // MARK: - GhosttyTerminalView.canAcceptDrag(from:)
 
     func test_canAcceptDrag_trueWhenPasteboardHasStringType() {
