@@ -1424,6 +1424,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     public var executionLocked: Bool { providerLocked || status == .running }
 
     public func setProviderInstance(_ id: String) {
+        guard !executionLocked else { return }
         guard let snapshot = providerSnapshots.first(where: { $0.id == id }) else { return }
         providerInstanceId = snapshot.id
         provider = snapshot.provider
@@ -1436,6 +1437,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     }
 
     public func setProvider(_ newProvider: AgentProvider) {
+        guard !executionLocked else { return }
         provider = newProvider
         providerInstanceId = newProvider.rawValue
         availableModels = []
