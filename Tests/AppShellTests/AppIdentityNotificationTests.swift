@@ -462,6 +462,48 @@ final class AppIdentityNotificationTests: XCTestCase {
                        "thread notifications are driven by terminal outcomes; streaming errors must not look like extra finishes")
     }
 
+    func testAgentRunLifecycleEventsCarryAuthoritativeRunTiming() async throws {
+        let dir = NSTemporaryDirectory() + "RC2RunTimingEvents-" + UUID().uuidString
+        let ctx = try AppContext(channel: .debug, appSupportOverride: dir)
+        ctx.coordinator.replaceProvider(.codex, runner: FakeProviderRunner(provider: .codex, scenario: .simpleAssistant(reply: "timed answer")))
+        let thread = AgentThread(title: "Timing mirror", provider: .codex, model: "fake-model")
+        try ctx.threadRepo.upsert(thread)
+
+        let startSeq = EventBus.shared.snapshot().lastSeq
+        var events: [EventBus.Event] = []
+        let token = EventBus.shared.subscribe(since: startSeq) { event in
+            guard (event.kind == "agent.run.started" || event.kind == "agent.run.finished"),
+                  event.payload.objectValue?["thread_id"]?.stringValue == thread.id.value.uuidString else { return }
+            events.append(event)
+        }
+        defer { EventBus.shared.unsubscribe(token) }
+
+        let runId = try await ctx.coordinator.startRun(AgentRunRequest(
+            threadId: thread.id,
+            provider: .codex,
+            model: "fake-model",
+            cwd: dir,
+            prompt: "time me"
+        ))
+        await waitAsync("run lifecycle timing events mirrored") {
+            events.contains { $0.kind == "agent.run.started" }
+                && events.contains { $0.kind == "agent.run.finished" }
+        }
+
+        let persisted = try XCTUnwrap(ctx.runRepo.get(id: runId))
+        let expectedStartedAtMs = Int64(persisted.startedAt.timeIntervalSince1970 * 1000)
+        let startedPayload = try XCTUnwrap(events.first { $0.kind == "agent.run.started" }?.payload.objectValue)
+        XCTAssertEqual(startedPayload["run_id"]?.stringValue, runId.value.uuidString,
+                       "mirrors need run_id to tie lifecycle events to the host run row")
+        XCTAssertEqual(startedPayload["started_at_ms"]?.intValue.map(Int64.init), expectedStartedAtMs,
+                       "started_at_ms must come from the persisted run row so iOS and macOS Working timers share one clock")
+
+        let finishedPayload = try XCTUnwrap(events.first { $0.kind == "agent.run.finished" }?.payload.objectValue)
+        XCTAssertEqual(finishedPayload["run_id"]?.stringValue, runId.value.uuidString)
+        XCTAssertNotNil(finishedPayload["duration_ms"]?.intValue,
+                        "finished events must carry host duration metadata for mirrored completed-work UI")
+    }
+
     func testAgentMessageAppendEventsCarryDurableChatHistoryToMirrors() async throws {
         let dir = NSTemporaryDirectory() + "RC2MessageEvents-" + UUID().uuidString
         let ctx = try AppContext(channel: .debug, appSupportOverride: dir)

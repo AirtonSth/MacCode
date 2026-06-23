@@ -660,6 +660,10 @@ public struct AssistantTimelineState: Codable, Sendable, Equatable {
         activePlan = nil
     }
 
+    public mutating func clearError() {
+        error = nil
+    }
+
     public mutating func apply(_ ev: AssistantEvent) {
         switch ev {
         case .threadStarted(let tid, let ptid):

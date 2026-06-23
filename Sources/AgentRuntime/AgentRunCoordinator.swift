@@ -209,6 +209,10 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         return try runRepo.get(id: runId)?.startedAt
     }
 
+    public func runStartedAt(runId: AgentRunID) throws -> Date? {
+        try runRepo.get(id: runId)?.startedAt
+    }
+
     @discardableResult
     public func startRun(_ request: AgentRunRequest, isAutoContinuation: Bool = false) async throws -> AgentRunID {
         // A user-initiated run ends any background-await auto-continuation streak;

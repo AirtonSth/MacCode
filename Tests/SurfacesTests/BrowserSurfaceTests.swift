@@ -75,6 +75,46 @@ final class BrowserSurfaceTests: XCTestCase {
                        "opening externally must send the browser tab's current URL to macOS default URL handling")
     }
 
+    func test_navigationStateObserverScriptHooksSPARouteChanges() {
+        let script = BrowserSurface.navigationStateObserverScript
+
+        XCTAssertTrue(script.contains("history.pushState"),
+                      "SPA link clicks commonly update the URL with pushState, so the browser toolbar must observe that path")
+        XCTAssertTrue(script.contains("history.replaceState"),
+                      "replaceState must also notify so redirects inside the same document update the toolbar URL")
+        XCTAssertTrue(script.contains("popstate"),
+                      "Back/Forward inside an SPA must resync the address bar after the history entry changes")
+        XCTAssertTrue(script.contains(BrowserSurface.navigationStateMessageHandlerName),
+                      "the injected script must post route changes back to BrowserSurface")
+    }
+
+    func test_navigationChromeSyncUsesClickedPageURLAndHistoryState() throws {
+        let surface = BrowserSurface(workspaceID: WorkspaceID(), initialURL: nil, title: "browser")
+        let accountURL = try XCTUnwrap(URL(string: "https://remotecode.io/account"))
+        var observed: (String, String?)?
+        surface.onNavigationChange = { _, url, title in
+            observed = (url, title)
+        }
+
+        surface.syncNavigationChromeForTesting(
+            url: accountURL,
+            title: "My account",
+            canGoBack: true,
+            canGoForward: false
+        )
+
+        XCTAssertEqual(surface.addressBarStringForTesting, "https://remotecode.io/account",
+                       "after an in-page link changes WebKit's URL, the toolbar must show the clicked page URL instead of the original page")
+        XCTAssertTrue(surface.backButtonIsEnabledForTesting,
+                      "after a clicked link creates browser history, Back must become enabled")
+        XCTAssertFalse(surface.forwardButtonIsEnabledForTesting,
+                       "Forward must stay disabled until the user actually goes back")
+        XCTAssertEqual(observed?.0, "https://remotecode.io/account",
+                       "the iOS mirror must receive the same URL that the toolbar shows")
+        XCTAssertEqual(observed?.1, "My account")
+        XCTAssertEqual(surface.descriptor.metadata["url"], "https://remotecode.io/account")
+    }
+
     private static func containsButtonTooltip(_ tooltip: String, in view: NSView) -> Bool {
         if let button = view as? NSButton, button.toolTip == tooltip {
             return true

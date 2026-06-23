@@ -1035,6 +1035,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         // Newest callback action -- see respondToPendingRequest: bumping this seq
         // stops an in-flight async approval failure from overwriting this (more
         // recent) user-input error, preserving most-recent-action-wins ordering.
+        clearVisibleErrorForNewUserMessage()
         callbackActionSeq &+= 1
         userInputSelections[request.id] = nil
         userInputDrafts[request.id] = nil
@@ -2030,11 +2031,17 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         attachments.removeAll { $0 == path }
     }
 
+    private func clearVisibleErrorForNewUserMessage() {
+        timeline.clearError()
+        lastErrorRecoverable = false
+    }
+
     public func send() async {
         let text = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty || !attachments.isEmpty else { return }
         lastSentAttachmentCount = attachments.count
         recordPromptHistory(text)
+        clearVisibleErrorForNewUserMessage()
         if let slash = Self.localSlashCommandParts(text),
            (slash.command == "plan" || slash.command == "default"),
            !slash.argument.isEmpty {
@@ -2172,7 +2179,10 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                     self.currentRunId = runId
                     self.runThreads[runId] = tid
                     self.status = .running
-                    self.runStartedAt = Date()
+                    self.runStartedAt = AgentAppViewModel.resolvedRunStartedAt(
+                        current: self.runStartedAt,
+                        persisted: (try? self.coordinator.runStartedAt(threadId: tid)) ?? (try? self.coordinator.runStartedAt(runId: runId))
+                    )
                     self.isStopping = false  // UX-MAC_AGENT-STOP: fresh run; clear stale stopping flag
                 } else {
                     self.currentRunId = nil
@@ -2202,6 +2212,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             targetThreadId = sourceThreadId
         }
         let prompt = AgentPlanImplementationPrompt.make(markdown: plan.markdown)
+        clearVisibleErrorForNewUserMessage()
         guard await startProviderRun(text: prompt, attached: [], recordHistory: false, interactionMode: .default) != nil else { return }
         try? proposedPlanRepo?.markImplemented(threadId: sourceThreadId, planId: plan.id, implementationThreadId: targetThreadId)
         var implemented = plan
@@ -2232,7 +2243,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         if lastSentAttachmentCount > 0 {
             systemNote("Retry: \(lastSentAttachmentCount) attachment(s) from the original message are not re-sent. Re-attach if needed.")
         }
-        lastErrorRecoverable = false
+        clearVisibleErrorForNewUserMessage()
         _ = await startProviderRun(text: last, attached: [], recordHistory: false, interactionMode: interactionMode)
     }
 
@@ -2469,7 +2480,10 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                     self.status = status
                     self.terminalRunIds.remove(runId)
                     self.currentRunId = runId
-                    if self.runStartedAt == nil { self.runStartedAt = Date() }
+                    self.runStartedAt = AgentAppViewModel.resolvedRunStartedAt(
+                        current: self.runStartedAt,
+                        persisted: (try? self.coordinator.runStartedAt(threadId: threadId)) ?? (try? self.coordinator.runStartedAt(runId: runId))
+                    )
                     self.isStopping = false  // UX-MAC_AGENT-STOP: new run started; clear any stale stopping flag
                 } else if Self.isTerminalRunStatus(status) {
                     // Terminal provider status can arrive immediately before
