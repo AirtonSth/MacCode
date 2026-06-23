@@ -48,4 +48,10 @@ final class ProjectScriptsTests: XCTestCase {
         XCTAssertEqual(s.first { $0.name == "test" }?.command, "swift test")
         XCTAssertEqual(s.first?.source, "Package.swift")
     }
+
+    func test_openInEditor_missingWorkspaceFailsLoudInsteadOfReportingFinder() {
+        let missing = NSTemporaryDirectory() + "rc2-ps-missing-" + UUID().uuidString
+        XCTAssertThrowsError(try ProjectScripts.openInEditor(cwd: missing, preferred: []),
+                             "a deleted workspace path must not be reported as successfully opened in Finder")
+    }
 }

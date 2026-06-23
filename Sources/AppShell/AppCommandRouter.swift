@@ -2084,7 +2084,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     }
 
     public func projectOpenInEditor(workspace: WorkspaceID) throws -> String {
-        ProjectScripts.openInEditor(cwd: try workspaceCwd(workspace))
+        try ProjectScripts.openInEditor(cwd: try workspaceCwd(workspace))
     }
 
     private func browserSurface(_ id: SurfaceID) throws -> BrowserSurface {
