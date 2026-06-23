@@ -139,6 +139,38 @@ public final class BrowserSurface: NSObject, Surface, WKNavigationDelegate, WKUI
     // desyncs and field load failures are traceable. URLs are %{public}-omitted
     // by default to avoid leaking browsed addresses; only outcomes/codes log.
     private static let log = Logger(subsystem: "io.remotecode.app", category: "browser")
+    static let navigationStateMessageHandlerName = "remoteCodeNavigationState"
+    static var navigationStateObserverScript: String {
+        """
+        (function(){
+          if (window.__remoteCodeNavigationStateObserver) { return; }
+          window.__remoteCodeNavigationStateObserver = true;
+          function notifyRemoteCodeNavigationState(){
+            try {
+              window.webkit.messageHandlers.\(navigationStateMessageHandlerName).postMessage({
+                url: String(window.location.href),
+                title: String(document.title || '')
+              });
+            } catch (e) {}
+          }
+          var originalPushState = history.pushState;
+          var originalReplaceState = history.replaceState;
+          history.pushState = function(){
+            var result = originalPushState.apply(this, arguments);
+            notifyRemoteCodeNavigationState();
+            return result;
+          };
+          history.replaceState = function(){
+            var result = originalReplaceState.apply(this, arguments);
+            notifyRemoteCodeNavigationState();
+            return result;
+          };
+          window.addEventListener('popstate', notifyRemoteCodeNavigationState);
+          window.addEventListener('hashchange', notifyRemoteCodeNavigationState);
+          setTimeout(notifyRemoteCodeNavigationState, 0);
+        })();
+        """
+    }
 
     public private(set) var descriptor: SurfaceDescriptor
     public let view: NSView
@@ -179,6 +211,10 @@ public final class BrowserSurface: NSObject, Surface, WKNavigationDelegate, WKUI
     private var progressObservation: NSKeyValueObservation?
     private var loadingObservation: NSKeyValueObservation?
     private var titleObservation: NSKeyValueObservation?
+    private var urlObservation: NSKeyValueObservation?
+    private var canGoBackObservation: NSKeyValueObservation?
+    private var canGoForwardObservation: NSKeyValueObservation?
+    private var navigationScriptMessageHandler: BrowserNavigationScriptMessageHandler?
     private var waitForToken = 0
     private var isClosed = false
     public var onNavigationChange: ((SurfaceID, String, String?) -> Void)?
@@ -198,6 +234,11 @@ public final class BrowserSurface: NSObject, Surface, WKNavigationDelegate, WKUI
 
         let cfg = WKWebViewConfiguration()
         cfg.websiteDataStore = WKWebsiteDataStore(forIdentifier: Self.dataStoreIdentifier(for: workspaceID))
+        cfg.userContentController.addUserScript(WKUserScript(
+            source: Self.navigationStateObserverScript,
+            injectionTime: .atDocumentStart,
+            forMainFrameOnly: true
+        ))
         let wv = BrowserWebView(frame: .zero, configuration: cfg)
         wv.customUserAgent = Self.currentSafariUserAgent()
         wv.setAccessibilityIdentifier("browser.webview")
@@ -421,6 +462,9 @@ public final class BrowserSurface: NSObject, Surface, WKNavigationDelegate, WKUI
         container.layer?.backgroundColor = DS.NS.bg.cgColor
         self.view = container
         super.init()
+        let navigationScriptMessageHandler = BrowserNavigationScriptMessageHandler(surface: self)
+        self.navigationScriptMessageHandler = navigationScriptMessageHandler
+        cfg.userContentController.add(navigationScriptMessageHandler, name: Self.navigationStateMessageHandlerName)
         wv.navigationDelegate = self
         wv.uiDelegate = self
         // Allow two-finger swipe-back / swipe-forward gestures (muscle memory).
@@ -491,6 +535,24 @@ public final class BrowserSurface: NSObject, Surface, WKNavigationDelegate, WKUI
                 self.publishNavigationChange(url: url, title: webView.title)
             }
         }
+        urlObservation = webView.observe(\.url, options: [.new]) { [weak self] webView, _ in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                self.syncNavigationChrome(url: webView.url, title: webView.title, publish: true)
+            }
+        }
+        canGoBackObservation = webView.observe(\.canGoBack, options: [.new]) { [weak self] webView, _ in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                self.updateNavigationButtons(canGoBack: webView.canGoBack, canGoForward: webView.canGoForward)
+            }
+        }
+        canGoForwardObservation = webView.observe(\.canGoForward, options: [.new]) { [weak self] webView, _ in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                self.updateNavigationButtons(canGoBack: webView.canGoBack, canGoForward: webView.canGoForward)
+            }
+        }
     }
 
     private func updateLoadingChrome(isLoading: Bool) {
@@ -508,10 +570,14 @@ public final class BrowserSurface: NSObject, Surface, WKNavigationDelegate, WKUI
     }
 
     private func updateNavigationButtons() {
-        backButton.isEnabled = webView.canGoBack
-        forwardButton.isEnabled = webView.canGoForward
-        backButton.contentTintColor = webView.canGoBack ? DS.NS.textSecondary : DS.NS.textSecondary.withAlphaComponent(0.35)
-        forwardButton.contentTintColor = webView.canGoForward ? DS.NS.textSecondary : DS.NS.textSecondary.withAlphaComponent(0.35)
+        updateNavigationButtons(canGoBack: webView.canGoBack, canGoForward: webView.canGoForward)
+    }
+
+    private func updateNavigationButtons(canGoBack: Bool, canGoForward: Bool) {
+        backButton.isEnabled = canGoBack
+        forwardButton.isEnabled = canGoForward
+        backButton.contentTintColor = canGoBack ? DS.NS.textSecondary : DS.NS.textSecondary.withAlphaComponent(0.35)
+        forwardButton.contentTintColor = canGoForward ? DS.NS.textSecondary : DS.NS.textSecondary.withAlphaComponent(0.35)
     }
 
     private func showError(_ message: String) {
@@ -578,6 +644,44 @@ public final class BrowserSurface: NSObject, Surface, WKNavigationDelegate, WKUI
         securityIndicator.contentTintColor = secure ? DS.NS.textSecondary : DS.NS.textTertiary
         securityIndicator.toolTip = desc
         securityIndicator.setAccessibilityLabel(desc)
+    }
+
+    private func syncNavigationChrome(url: URL?, title: String?, publish: Bool) {
+        guard let url else {
+            updateSecurityIndicator()
+            updateNavigationButtons()
+            return
+        }
+        retainedURL = url
+        addressBar.stringValue = url.absoluteString
+        addressBarSnapshot = url.absoluteString
+        if publish {
+            publishNavigationChange(url: url, title: title)
+        }
+        updateSecurityIndicator()
+        updateNavigationButtons()
+    }
+
+    func syncNavigationChromeForTesting(url: URL, title: String?, canGoBack: Bool, canGoForward: Bool) {
+        retainedURL = url
+        addressBar.stringValue = url.absoluteString
+        addressBarSnapshot = url.absoluteString
+        publishNavigationChange(url: url, title: title)
+        updateSecurityIndicator()
+        updateNavigationButtons(canGoBack: canGoBack, canGoForward: canGoForward)
+    }
+
+    var addressBarStringForTesting: String { addressBar.stringValue }
+    var backButtonIsEnabledForTesting: Bool { backButton.isEnabled }
+    var forwardButtonIsEnabledForTesting: Bool { forwardButton.isEnabled }
+
+    fileprivate func handleNavigationScriptPayload(_ payload: BrowserNavigationScriptPayload) {
+        guard let url = URL(string: payload.urlString) else { return }
+        let title = payload.title?.isEmpty == false ? payload.title : webView.title
+        syncNavigationChrome(url: url, title: title, publish: true)
+        DispatchQueue.main.async { [weak self] in
+            self?.updateNavigationButtons()
+        }
     }
 
     public func navigate(to url: URL) {
@@ -869,14 +973,8 @@ public final class BrowserSurface: NSObject, Surface, WKNavigationDelegate, WKUI
 
     public func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         Self.log.debug("nav finish host=\(webView.url?.host ?? "?", privacy: .public)")
-        if let url = webView.url {
-            addressBar.stringValue = url.absoluteString
-            addressBarSnapshot = url.absoluteString
-            publishNavigationChange(url: url, title: webView.title)
-        }
-        updateSecurityIndicator()
+        syncNavigationChrome(url: webView.url, title: webView.title, publish: true)
         hideError()
-        updateNavigationButtons()
         reloadGoogleOnceAfterClearingLegacyLayoutCookie()
     }
 
@@ -905,6 +1003,7 @@ public final class BrowserSurface: NSObject, Surface, WKNavigationDelegate, WKUI
     /// a transient banner so the navigation is not silent (UX-MAC_BROWSER-134).
     public func webView(_ webView: WKWebView, createWebViewWith configuration: WKWebViewConfiguration, for navigationAction: WKNavigationAction, windowFeatures: WKWindowFeatures) -> WKWebView? {
         if navigationAction.targetFrame == nil, let url = navigationAction.request.url {
+            syncNavigationChrome(url: url, title: webView.title, publish: true)
             webView.load(URLRequest(url: url))
             showWindowOpenBanner(for: url)
         }
@@ -1093,6 +1192,14 @@ public final class BrowserSurface: NSObject, Surface, WKNavigationDelegate, WKUI
         loadingObservation = nil
         titleObservation?.invalidate()
         titleObservation = nil
+        urlObservation?.invalidate()
+        urlObservation = nil
+        canGoBackObservation?.invalidate()
+        canGoBackObservation = nil
+        canGoForwardObservation?.invalidate()
+        canGoForwardObservation = nil
+        webView.configuration.userContentController.removeScriptMessageHandler(forName: Self.navigationStateMessageHandlerName)
+        navigationScriptMessageHandler = nil
         onNavigationChange = nil
         externalURLOpener = nil
         onOpenLinkInNewSurface = nil
@@ -1106,6 +1213,42 @@ public final class BrowserSurface: NSObject, Surface, WKNavigationDelegate, WKUI
     public func readText() -> String { webView.url?.absoluteString ?? "" }
     public func snapshot() -> [String: String] {
         ["url": webView.url?.absoluteString ?? "", "title": webView.title ?? ""]
+    }
+}
+
+private struct BrowserNavigationScriptPayload: Sendable {
+    let urlString: String
+    let title: String?
+
+    init?(body: Any) {
+        if let dict = body as? [String: Any],
+           let urlString = dict["url"] as? String {
+            self.urlString = urlString
+            self.title = dict["title"] as? String
+            return
+        }
+        if let urlString = body as? String {
+            self.urlString = urlString
+            self.title = nil
+            return
+        }
+        return nil
+    }
+}
+
+private final class BrowserNavigationScriptMessageHandler: NSObject, WKScriptMessageHandler {
+    weak var surface: BrowserSurface?
+
+    init(surface: BrowserSurface) {
+        self.surface = surface
+    }
+
+    func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
+        guard message.name == BrowserSurface.navigationStateMessageHandlerName,
+              let payload = BrowserNavigationScriptPayload(body: message.body) else { return }
+        Task { @MainActor [weak surface] in
+            surface?.handleNavigationScriptPayload(payload)
+        }
     }
 }
 

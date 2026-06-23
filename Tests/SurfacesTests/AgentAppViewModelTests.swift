@@ -819,6 +819,29 @@ final class AgentAppViewModelTests: XCTestCase {
                       "secret free-text questions use the same draft/submit path but must be distinguishable for masked rendering")
     }
 
+    func test_answeringProviderQuestionClearsStaleVisibleError() async throws {
+        let adapter = CapturingProviderAdapter(provider: .codex)
+        let (vm, _) = try makeVM(adapter: adapter)
+        vm.createThread(title: "free text input retry")
+        let request = AssistantUserInputRequest(
+            id: "question-2",
+            turnId: "turn-1",
+            prompt: "Which branch should I inspect?",
+            options: [],
+            createdAtMs: 1
+        )
+        vm.timeline.apply(.userInputRequested(request))
+        vm.timeline.apply(.error(message: "Provider user-input response failed: stale", recoverable: true))
+
+        vm.answerPendingUserInput(request, answer: "main")
+
+        XCTAssertNil(vm.timeline.error,
+                     "submitting a new provider-answer message must immediately clear the stale error banner so the UI reflects the new attempt")
+        await waitAsync("free-text provider response reaches adapter") {
+            adapter.lastUserInputResponse?.requestId == "question-2"
+        }
+    }
+
     func test_approveForSessionPromotesThreadPermissionToFullAccess() async throws {
         let adapter = CapturingProviderAdapter(provider: .codex)
         let (vm, repo) = try makeVM(adapter: adapter)
@@ -1985,6 +2008,55 @@ final class AgentAppViewModelTests: XCTestCase {
         }
         XCTAssertFalse(vm.messages.contains { $0.role == .system && $0.content.contains("Unknown command") },
                        "unknown slash commands must not be converted into local errors because providers own commands such as /goal")
+    }
+
+    func test_sendingNewPromptClearsStaleVisibleError() async throws {
+        let runner = CapturingProviderRunner(provider: .codex)
+        let (vm, _) = try makeVM(provider: runner)
+        vm.createThread(title: "retry prompt")
+        vm.timeline.apply(.error(message: "Previous provider failure", recoverable: true))
+        vm.prompt = "try again"
+
+        await vm.send()
+
+        XCTAssertNil(vm.timeline.error,
+                     "sending a new prompt must clear the stale error banner immediately so the next attempt is not shown under an old failure")
+        await waitAsync("new prompt reaches runner") {
+            runner.prompts.contains("try again")
+        }
+    }
+
+    func test_queueingNewPromptWhileRunningClearsStaleVisibleError() async throws {
+        let (vm, _) = try makeVM()
+        vm.createThread(title: "queue retry")
+        vm.status = .running
+        vm.timeline.apply(.error(message: "Previous provider failure", recoverable: true))
+        vm.prompt = "queue this"
+
+        await vm.send()
+
+        XCTAssertNil(vm.timeline.error,
+                     "queueing a new prompt is still a new user message and must clear the stale visible error before the queued turn runs")
+    }
+
+    func test_retryLastPromptClearsStaleVisibleError() async throws {
+        let runner = CapturingProviderRunner(provider: .codex)
+        let (vm, _) = try makeVM(provider: runner)
+        vm.createThread(title: "retry button")
+        vm.prompt = "first attempt"
+        await vm.send()
+        await waitAsync("first attempt reaches runner") {
+            runner.prompts.contains("first attempt")
+        }
+        vm.timeline.apply(.error(message: "Previous provider failure", recoverable: true))
+
+        await vm.retryLastPrompt()
+
+        XCTAssertNil(vm.timeline.error,
+                     "retrying the last prompt sends a new user message and must clear the stale error banner before the retried run starts")
+        await waitAsync("retry reaches runner") {
+            runner.prompts.filter { $0 == "first attempt" }.count >= 2
+        }
     }
 
     func test_planCommandMakesNextProviderRunUsePlanInteractionMode() async throws {
@@ -3361,9 +3433,12 @@ final class AgentAppViewModelTests: XCTestCase {
                                    messageRepo: messageRepo,
                                    proposedPlanRepo: proposedPlanRepo)
         vm.selectThread(thread.id)
+        vm.timeline.apply(.error(message: "Previous provider failure", recoverable: true))
 
         await vm.implementLatestPlan()
 
+        XCTAssertNil(vm.timeline.error,
+                     "implementing a proposed plan submits a new provider message and must clear any stale error banner")
         let messages = try messageRepo.list(threadId: thread.id)
         XCTAssertTrue(messages.contains {
             $0.role == .user && $0.content.contains("Implement this proposed plan now") && $0.content.contains("1. Inspect")

@@ -198,8 +198,21 @@ public final class AppContext {
         func messageJSON(_ message: AgentMessage) -> JSONValue {
             (try? JSONDecoder().decode(JSONValue.self, from: JSONEncoder().encode(message))) ?? .null
         }
-        func agentRunPayload(threadId: AgentThreadID, status: AgentRunStatus? = nil) -> JSONValue {
+        func agentRunPayload(threadId: AgentThreadID, runId: AgentRunID? = nil, status: AgentRunStatus? = nil) -> JSONValue {
             var payload: [String: JSONValue] = ["thread_id": .string(threadId.value.uuidString)]
+            if let runId {
+                payload["run_id"] = .string(runId.value.uuidString)
+                if let run = try? runRepo.get(id: runId) {
+                    let startedAtMs = Int64(run.startedAt.timeIntervalSince1970 * 1000)
+                    payload["started_at_ms"] = .number(Double(startedAtMs))
+                    payload["started_at"] = .number(Double(startedAtMs))
+                    if let finishedAt = run.finishedAt {
+                        let finishedAtMs = Int64(finishedAt.timeIntervalSince1970 * 1000)
+                        payload["finished_at_ms"] = .number(Double(finishedAtMs))
+                        payload["duration_ms"] = .number(Double(max(0, finishedAtMs - startedAtMs)))
+                    }
+                }
+            }
             if let wid = try? threadRepo.get(id: threadId)?.workspaceId {
                 payload["workspace_id"] = .string(wid.value.uuidString)
             }
@@ -208,9 +221,9 @@ public final class AppContext {
             }
             return .object(payload)
         }
-        coordinator.onRunStarted = { [weak self] tid, _ in
+        coordinator.onRunStarted = { [weak self] tid, runId in
             EventBus.shared.publish(kind: "agent.run.started",
-                                    payload: agentRunPayload(threadId: tid))
+                                    payload: agentRunPayload(threadId: tid, runId: runId))
             // Fire a "running" Live Activity push so the paired iOS card starts
             // (or refreshes) the moment a run begins, mirroring the alert path on
             // completion. Skips silently when no live-activity token is paired.
@@ -218,7 +231,8 @@ public final class AppContext {
             let title = (try? self.threadRepo.get(id: tid)?.title)?
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             let displayTitle = (title?.isEmpty == false) ? title! : "Thread"
-            let runStart = try? self.coordinator.runStartedAt(threadId: tid)
+            let runStart = (try? self.runRepo.get(id: runId)?.startedAt)
+                ?? (try? self.coordinator.runStartedAt(threadId: tid))
             let snapshot = PrivateLiveActivitySnapshot(
                 title: displayTitle,
                 statusLine: "1 active thread",
@@ -245,7 +259,7 @@ public final class AppContext {
             let t = tid.value.uuidString
             switch ev {
             case .threadStarted:
-                EventBus.shared.publish(kind: "agent.run.started", payload: agentRunPayload(threadId: tid))
+                EventBus.shared.publish(kind: "agent.run.started", payload: agentRunPayload(threadId: tid, runId: runId))
             case .turnStarted(let turnId):
                 EventBus.shared.publish(kind: "agent.turn.started",
                                         payload: .object(["thread_id": .string(t), "turn_id": .string(turnId)]))
@@ -355,13 +369,13 @@ public final class AppContext {
             case .sr1Translation:
                 break
             case .error:
-                EventBus.shared.publish(kind: "agent.run.error", payload: agentRunPayload(threadId: tid))
+                EventBus.shared.publish(kind: "agent.run.error", payload: agentRunPayload(threadId: tid, runId: runId))
             }
         }
         coordinator.onRunFinished = { tid, rid, status in
             let kind = (status == .completed) ? "agent.run.completed" : "agent.run.failed"
-            EventBus.shared.publish(kind: kind, payload: agentRunPayload(threadId: tid, status: status))
-            EventBus.shared.publish(kind: "agent.run.finished", payload: agentRunPayload(threadId: tid, status: status))
+            EventBus.shared.publish(kind: kind, payload: agentRunPayload(threadId: tid, runId: rid, status: status))
+            EventBus.shared.publish(kind: "agent.run.finished", payload: agentRunPayload(threadId: tid, runId: rid, status: status))
             // Flush any debounced usage for this run now that the run is done so
             // the final token batch is never stranded in the accumulator.
             self.flushPendingTokenSaverUsage(runId: rid)
