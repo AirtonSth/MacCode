@@ -126,6 +126,29 @@ final class WorkspaceFileServiceTests: XCTestCase {
                              "bulk delete must not allow deleting the workspace root")
     }
 
+    func testMultiDeletePreflightsAllPathsBeforeRemovingAnyFile() throws {
+        try service.createFile(root: root.path, path: "keep.txt", content: "")
+
+        XCTAssertThrowsError(try service.delete(root: root.path, paths: ["keep.txt", ""]),
+                             "multi-select delete must reject the whole request before deleting any selected file when one path is invalid")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: root.appendingPathComponent("keep.txt").path),
+                      "failed multi-select delete must not partially remove files before reporting a validation error")
+    }
+
+    func testMultiDeleteHandlesDuplicateAndNestedSelectionsWithoutFailingMidDelete() throws {
+        let folder = root.appendingPathComponent("Folder", isDirectory: true)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        try "nested".write(to: folder.appendingPathComponent("child.txt"), atomically: true, encoding: .utf8)
+
+        let deleted = try service.delete(root: root.path, paths: ["Folder", "Folder/child.txt", "Folder/child.txt"])
+
+        XCTAssertEqual(deleted.objectValue?["deleted"]?.arrayValue?.compactMap(\.stringValue),
+                       ["Folder", "Folder/child.txt"],
+                       "duplicate selections should be reported once while parent/child selections still complete")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: folder.path),
+                       "deleting a selected parent and child together must not fail after removing the parent first")
+    }
+
     func testListUsesExtensionClassificationAndDoesNotReadFileBytes() throws {
         // Write a .swift file that contains raw binary bytes so content-based
         // classification would disagree with the extension. Listing must return
