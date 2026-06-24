@@ -990,7 +990,13 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
         case .split(let s):
             // Ratios excluded from structural signature: ratio-only changes are
             // applied in place without a rebuild (PERF-MAC_SHELL_WINDOW-MED-126).
-            parts.append("split(\(s.orientation);\(s.id.uuidString){")
+            // Minimized state is chrome-affecting, though: PaneTabsView swaps
+            // controls/content when a pane crosses the threshold, so that
+            // boundary must rebuild while ordinary ratio changes stay in-place.
+            let minimized = s.ratios.indices.map {
+                PaneTabsView.isPaneMinimized(paneIndex: $0, ratios: s.ratios) ? "1" : "0"
+            }.joined(separator: ",")
+            parts.append("split(\(s.orientation);\(s.id.uuidString);min:[\(minimized)]{")
             for child in s.children { appendLayoutSignature(child, into: &parts) }
             parts.append("}")
         }

@@ -27,6 +27,19 @@ final class SplitLayoutRuntimeTests: XCTestCase {
         return nil
     }
 
+    private func findButton(_ v: NSView, toolTip: String) -> NSButton? {
+        if let button = v as? NSButton, button.toolTip == toolTip { return button }
+        for sub in v.subviews { if let f = findButton(sub, toolTip: toolTip) { return f } }
+        return nil
+    }
+
+    private func rootSplit(in node: LayoutNode?) throws -> SplitNode {
+        guard case .split(let split) = node else {
+            throw LayoutError.paneNotFound
+        }
+        return split
+    }
+
     private func makeWindowController() throws -> (AppContext, AppCommandRouter, MainWindowController) {
         let dir = NSTemporaryDirectory() + "RC2Split-" + UUID().uuidString
         let ctx = try AppContext(channel: .debug, appSupportOverride: dir)
@@ -99,6 +112,48 @@ final class SplitLayoutRuntimeTests: XCTestCase {
         let h1 = split.subviews[1].frame.height
         XCTAssertGreaterThan(h0, 0)
         XCTAssertEqual(h0, h1, accuracy: 1.5, "stacked panes must each be 50% height")
+    }
+
+    func test_minimizedStackedPaneRestoreButtonRestoresPaneAtRuntime() throws {
+        let (ctx, router, wc) = try makeWindowController()
+        _ = ctx // keep AppContext alive (router.context is weak)
+        defer { closeAndUnregisterAllSurfaces() }
+        wc.window.setContentSize(NSSize(width: 1200, height: 800))
+
+        let ws = try createWorkspaceWithoutTerminal(in: ctx, windowController: wc)
+        let pid = ws.layout.paneIDs().first!
+        _ = try router.splitPane(workspace: ws.id, paneID: pid,
+                                 direction: .down, surfaceType: .agentApp, title: "Agent App")
+
+        drainMainQueue()
+        let split = try rootSplit(in: ctx.state.workspaces[ws.id]?.layout)
+        let rebuildsAfterSplit = wc.rebuildCount
+
+        try router.paneResize(workspace: ws.id, splitID: split.id, ratios: [0.04, 0.96])
+
+        drainMainQueue()
+        wc.window.contentView?.layoutSubtreeIfNeeded()
+        let minimizedSplit = try XCTUnwrap(findSplit(wc.window.contentView!))
+        minimizedSplit.layoutSubtreeIfNeeded()
+        XCTAssertEqual(minimizedSplit.subviews[0].frame.height, 35, accuracy: 1,
+                       "minimizing a stacked pane must collapse it to the tab-row height")
+        XCTAssertGreaterThan(wc.rebuildCount, rebuildsAfterSplit,
+                             "crossing the minimized threshold must rebuild pane chrome so the restore control gets fresh ratios")
+
+        let restore = try XCTUnwrap(findButton(wc.window.contentView!, toolTip: "Maximize pane"),
+                                    "a minimized pane must expose a restore control")
+        restore.performClick(nil)
+
+        drainMainQueue()
+        wc.window.contentView?.layoutSubtreeIfNeeded()
+        let restored = try rootSplit(in: ctx.state.workspaces[ws.id]?.layout)
+        XCTAssertEqual(restored.ratios[0], 0.5, accuracy: 0.0001,
+                       "clicking the restore control must use the minimized ratios and restore an even split")
+        XCTAssertEqual(restored.ratios[1], 0.5, accuracy: 0.0001)
+        let restoredSplit = try XCTUnwrap(findSplit(wc.window.contentView!))
+        restoredSplit.layoutSubtreeIfNeeded()
+        XCTAssertGreaterThan(restoredSplit.subviews[0].frame.height, 300,
+                             "the pane must be visibly expanded again after restore")
     }
 
     func test_sidebarDividerCanResizeWorkspaceList() throws {
