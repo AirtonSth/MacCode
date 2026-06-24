@@ -879,6 +879,194 @@ final class AgentAppViewModelTests: XCTestCase {
         XCTAssertFalse(vm.askUserQuestionIsComplete(request))
     }
 
+    // Screenshot bug: with a single-select option already chosen, the user could not
+    // move the selection to "Other" because the option radio stayed marked and the
+    // bare "Other…" field had no radio to claim the selection. The Other field must
+    // be a real member of the radio group: clicking its radio selects Other and
+    // deselects any chosen option; an empty Other selection is not yet a submittable
+    // answer; typing then satisfies it; and picking an option again clears Other.
+    func test_askUserQuestionOtherRadioSelectsOtherAndIsExclusiveWithOptions() throws {
+        let (vm, _) = try makeVM()
+        vm.createThread(title: "ask other radio")
+        let question = AssistantUserInputQuestion(
+            prompt: "Which database?",
+            header: "DB",
+            options: [AssistantUserInputOption(label: "Postgres"), AssistantUserInputOption(label: "MySQL")],
+            allowsMultipleSelection: false
+        )
+        let request = AssistantUserInputRequest(
+            id: "ask-other-radio", turnId: "turn-other-radio", prompt: "Which database?",
+            questions: [question], createdAtMs: 1
+        )
+        vm.timeline.apply(.userInputRequested(request))
+
+        XCTAssertFalse(vm.askUserQuestionOtherIsSelected(question: question, request: request),
+                       "Other must start unselected so its radio renders empty on first display")
+
+        // A listed option is chosen first — this is the state the user was stuck in.
+        vm.selectAskUserQuestionOption("Postgres", question: question, request: request)
+        XCTAssertTrue(vm.askUserQuestionOptionIsSelected("Postgres", question: question, request: request))
+
+        // Clicking the Other radio moves the single selection to Other.
+        vm.selectAskUserQuestionOther(question: question, request: request)
+        XCTAssertTrue(vm.askUserQuestionOtherIsSelected(question: question, request: request),
+                      "clicking the Other radio must mark Other as the selected choice")
+        XCTAssertFalse(vm.askUserQuestionOptionIsSelected("Postgres", question: question, request: request),
+                       "selecting Other must deselect the previously chosen option (single-select group)")
+        XCTAssertFalse(vm.askUserQuestionIsComplete(request),
+                       "Other selected with no text is not yet a submittable answer")
+
+        // Typing then satisfies the question with the freeform text.
+        vm.setAskUserQuestionOther("SQLite", question: question, request: request)
+        XCTAssertTrue(vm.askUserQuestionOtherIsSelected(question: question, request: request))
+        XCTAssertEqual(vm.askUserQuestionAnswer(for: question, in: request), "SQLite")
+        XCTAssertTrue(vm.askUserQuestionIsComplete(request))
+
+        // Picking a listed option again must take selection back from Other.
+        vm.selectAskUserQuestionOption("MySQL", question: question, request: request)
+        XCTAssertFalse(vm.askUserQuestionOtherIsSelected(question: question, request: request),
+                       "choosing a listed option must clear the Other selection and its draft")
+        XCTAssertEqual(vm.askUserQuestionAnswer(for: question, in: request), "MySQL")
+    }
+
+    func test_askUserQuestionOtherRadioToggleOffLeavesQuestionUnanswered() throws {
+        let (vm, _) = try makeVM()
+        vm.createThread(title: "ask other toggle")
+        let question = AssistantUserInputQuestion(
+            prompt: "Which database?",
+            header: "DB",
+            options: [AssistantUserInputOption(label: "Postgres")],
+            allowsMultipleSelection: false
+        )
+        let request = AssistantUserInputRequest(
+            id: "ask-other-toggle", turnId: "turn-other-toggle", prompt: "Which database?",
+            questions: [question], createdAtMs: 1
+        )
+        vm.timeline.apply(.userInputRequested(request))
+
+        vm.selectAskUserQuestionOther(question: question, request: request)
+        XCTAssertTrue(vm.askUserQuestionOtherIsSelected(question: question, request: request))
+        // Clicking the active Other radio again clears it, matching how listed options
+        // toggle off — leaving nothing selected and the question unanswered.
+        vm.selectAskUserQuestionOther(question: question, request: request)
+        XCTAssertFalse(vm.askUserQuestionOtherIsSelected(question: question, request: request))
+        XCTAssertNil(vm.askUserQuestionAnswer(for: question, in: request))
+        XCTAssertFalse(vm.askUserQuestionIsComplete(request))
+    }
+
+    // The option radio and the Other radio must never both read as selected. Typing
+    // directly into the field (without first tapping the Other radio) — including a
+    // whitespace-only first keystroke that trims to empty — must still claim the
+    // exclusive selection and drop the previously chosen option, so the UI cannot show
+    // two filled radios while the answer silently stays the option.
+    func test_askUserQuestionTypingOtherClearsOptionEvenForWhitespace() throws {
+        let (vm, _) = try makeVM()
+        vm.createThread(title: "ask other whitespace")
+        let question = AssistantUserInputQuestion(
+            prompt: "Which database?",
+            header: "DB",
+            options: [AssistantUserInputOption(label: "Postgres"), AssistantUserInputOption(label: "MySQL")],
+            allowsMultipleSelection: false
+        )
+        let request = AssistantUserInputRequest(
+            id: "ask-other-ws", turnId: "turn-other-ws", prompt: "Which database?",
+            questions: [question], createdAtMs: 1
+        )
+        vm.timeline.apply(.userInputRequested(request))
+
+        vm.selectAskUserQuestionOption("Postgres", question: question, request: request)
+        // A whitespace-only first keystroke into the Other field.
+        vm.setAskUserQuestionOther(" ", question: question, request: request)
+        XCTAssertFalse(vm.askUserQuestionOptionIsSelected("Postgres", question: question, request: request),
+                       "editing the Other field must drop the chosen option so two radios are never both filled")
+        XCTAssertTrue(vm.askUserQuestionOtherIsSelected(question: question, request: request),
+                      "the Other radio must read as selected once its field is being edited")
+        XCTAssertNil(vm.askUserQuestionAnswer(for: question, in: request),
+                     "whitespace-only Other text trims empty, so the question is not yet answered")
+        XCTAssertFalse(vm.askUserQuestionIsComplete(request))
+    }
+
+    // Multi-select: Other is exclusive by design (selecting Other replaces checked
+    // options, and checking an option clears Other), so the Other control renders as a
+    // radio rather than a checkbox. This pins the intended exclusivity so a later glyph
+    // or model change cannot silently start dropping the user's combined choices without
+    // a failing test.
+    func test_askUserQuestionMultiSelectOtherIsExclusiveByDesign() throws {
+        let (vm, _) = try makeVM()
+        vm.createThread(title: "ask multi other")
+        let question = AssistantUserInputQuestion(
+            prompt: "Which targets?",
+            header: "Targets",
+            options: [AssistantUserInputOption(label: "macOS"), AssistantUserInputOption(label: "iPadOS")],
+            allowsMultipleSelection: true
+        )
+        let request = AssistantUserInputRequest(
+            id: "ask-multi-other", turnId: "turn-multi-other", prompt: "Which targets?",
+            questions: [question], createdAtMs: 1
+        )
+        vm.timeline.apply(.userInputRequested(request))
+
+        vm.selectAskUserQuestionOption("macOS", question: question, request: request)
+        vm.selectAskUserQuestionOption("iPadOS", question: question, request: request)
+        XCTAssertEqual(vm.askUserQuestionAnswer(for: question, in: request), "iPadOS, macOS")
+
+        // Selecting Other replaces the checked options (exclusive).
+        vm.selectAskUserQuestionOther(question: question, request: request)
+        XCTAssertTrue(vm.askUserQuestionOtherIsSelected(question: question, request: request))
+        XCTAssertFalse(vm.askUserQuestionOptionIsSelected("macOS", question: question, request: request))
+        XCTAssertFalse(vm.askUserQuestionOptionIsSelected("iPadOS", question: question, request: request))
+        vm.setAskUserQuestionOther("Linux", question: question, request: request)
+        XCTAssertEqual(vm.askUserQuestionAnswer(for: question, in: request), "Linux",
+                       "in multi-select, an Other answer replaces the checked options by design")
+
+        // Checking an option again clears Other.
+        vm.selectAskUserQuestionOption("macOS", question: question, request: request)
+        XCTAssertFalse(vm.askUserQuestionOtherIsSelected(question: question, request: request))
+        XCTAssertEqual(vm.askUserQuestionAnswer(for: question, in: request), "macOS")
+    }
+
+    // End-to-end: an Other answer must reach the provider as the question's answer, and
+    // submit must clear the draft so a re-displayed card never starts pre-filled.
+    func test_submitAskUserQuestionDeliversOtherDraftAndClearsItAfterward() async throws {
+        let adapter = CapturingProviderAdapter(provider: .codex)
+        let (vm, _) = try makeVM(adapter: adapter)
+        vm.createThread(title: "ask other submit")
+        let question = AssistantUserInputQuestion(
+            prompt: "Which database?",
+            header: "DB",
+            options: [AssistantUserInputOption(label: "Postgres"), AssistantUserInputOption(label: "MySQL")],
+            allowsMultipleSelection: false
+        )
+        let request = AssistantUserInputRequest(
+            id: "ask-other-submit", turnId: "turn-1", prompt: "Which database?",
+            questions: [question], createdAtMs: 1
+        )
+        vm.timeline.apply(.userInputRequested(request))
+        let key = vm.askUserQuestionKey(request, question)
+
+        // Empty Other (radio picked, no text) must NOT satisfy Submit.
+        vm.selectAskUserQuestionOther(question: question, request: request)
+        XCTAssertTrue(vm.askUserQuestionOtherIsSelected(question: question, request: request))
+        XCTAssertFalse(vm.askUserQuestionIsComplete(request),
+                       "an empty Other selection must keep Submit disabled")
+
+        // Typing through the Other path unblocks Submit.
+        vm.setAskUserQuestionOther("SQLite", question: question, request: request)
+        XCTAssertTrue(vm.askUserQuestionIsComplete(request))
+
+        vm.submitAskUserQuestion(request)
+        await waitAsync("Other answer reaches adapter") {
+            adapter.lastUserInputResponse?.requestId == "ask-other-submit"
+        }
+        let text = try XCTUnwrap(adapter.lastUserInputResponse?.text)
+        let answers = try XCTUnwrap(try JSONSerialization.jsonObject(with: Data(text.utf8)) as? [String: String])
+        XCTAssertEqual(answers["Which database?"], "SQLite",
+                       "Other freeform text must be delivered to the provider as the question's answer")
+        XCTAssertNil(vm.userInputDrafts[key],
+                     "submit must clear the Other draft so a re-shown card does not start pre-filled")
+        XCTAssertFalse(vm.askUserQuestionOtherIsSelected(question: question, request: request))
+    }
+
     func test_freeTextUserInputDraftCanAnswerProviderQuestion() async throws {
         let adapter = CapturingProviderAdapter(provider: .codex)
         let (vm, _) = try makeVM(adapter: adapter)

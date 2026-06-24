@@ -1107,12 +1107,36 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         userInputDrafts[key] = nil
     }
 
-    /// Sets the per-question freeform "Other" text. Non-empty text supersedes any
-    /// option selection for that question (the inverse of selectAskUserQuestionOption).
+    /// Sets the per-question freeform "Other" text. Editing the Other field claims the
+    /// (exclusive) selection, so it clears any option selection — mirroring
+    /// `selectAskUserQuestionOption`, which clears the draft unconditionally. Clearing
+    /// is unconditional (not gated on non-empty text) so the option radio and the Other
+    /// radio can never both read as selected, even for whitespace-only text that later
+    /// trims empty.
     public func setAskUserQuestionOther(_ text: String, question: AssistantUserInputQuestion, request: AssistantUserInputRequest) {
         let key = askUserQuestionKey(request, question)
         userInputDrafts[key] = text
-        if !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+        userInputSelections[key] = nil
+    }
+
+    /// Whether "Other" is the active choice for the question — true once its radio
+    /// has been picked or any text typed, even before the text is non-empty, so the
+    /// Other radio can render filled and the option radios empty. A present draft
+    /// (including an empty one) is the marker; `selectAskUserQuestionOption` clears it.
+    public func askUserQuestionOtherIsSelected(question: AssistantUserInputQuestion, request: AssistantUserInputRequest) -> Bool {
+        userInputDrafts[askUserQuestionKey(request, question)] != nil
+    }
+
+    /// Toggles the per-question "Other" radio. Selecting Other makes it the single
+    /// choice (clearing any option selection); clicking it again clears Other, mirroring
+    /// how the listed options toggle off. An empty Other selection stays unsubmittable
+    /// until the user types text (see `askUserQuestionAnswer`).
+    public func selectAskUserQuestionOther(question: AssistantUserInputQuestion, request: AssistantUserInputRequest) {
+        let key = askUserQuestionKey(request, question)
+        if userInputDrafts[key] != nil {
+            userInputDrafts[key] = nil
+        } else {
+            userInputDrafts[key] = ""
             userInputSelections[key] = nil
         }
     }
@@ -5022,13 +5046,7 @@ public struct AgentAppView: View {
                         ForEach(Array(question.options.enumerated()), id: \.offset) { _, option in
                             askUserQuestionOptionButton(option, question: question, request: request)
                         }
-                        let draftBinding = Binding(
-                            get: { vm.userInputDrafts[vm.askUserQuestionKey(request, question)] ?? "" },
-                            set: { vm.setAskUserQuestionOther($0, question: question, request: request) }
-                        )
-                        TextField("Other…", text: draftBinding)
-                            .textFieldStyle(.roundedBorder)
-                            .controlSize(.small)
+                        AskUserQuestionOtherField(vm: vm, question: question, request: request)
                     }
                 }
                 Button("Submit") { vm.submitAskUserQuestion(request) }
@@ -5067,6 +5085,9 @@ public struct AgentAppView: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+        // Expose selection state so VoiceOver announces "<label>, selected" — matching
+        // the Other radio and letting users hear which option in the group is chosen.
+        .accessibilityAddTraits(selected ? .isSelected : [])
         .accessibilityIdentifier("agent.askOption.\(request.id).\(question.id).\(option.label)")
     }
 
@@ -7325,6 +7346,56 @@ enum ComposerKeyResolution: Equatable {
     case applySelected
     case dismissPopup
     case passthrough(PromptComposerKeyAction)
+}
+
+// Radio + freeform field for the auto-provided "Other" choice of a structured
+// AskUserQuestion. The Other field is a real member of the radio group: tapping the
+// radio claims the single selection (clearing any chosen option) so the user is no
+// longer stuck with an option's radio marked, and typing also claims it via the
+// binding. Owns its own @FocusState so focusing the field on a radio tap does not
+// invalidate the perf-sensitive AgentAppView body.
+private struct AskUserQuestionOtherField: View {
+    @ObservedObject var vm: AgentAppViewModel
+    let question: AssistantUserInputQuestion
+    let request: AssistantUserInputRequest
+    @FocusState private var focused: Bool
+
+    var body: some View {
+        let selected = vm.askUserQuestionOtherIsSelected(question: question, request: request)
+        // Other is mutually exclusive with the listed options in BOTH single- and
+        // multi-select questions (selecting Other replaces any chosen option), so it
+        // always reads as a radio. A checkbox glyph would falsely promise it combines
+        // with checked boxes when the model actually replaces them.
+        let symbol = selected ? "largecircle.fill.circle" : "circle"
+        let draft = Binding(
+            get: { vm.userInputDrafts[vm.askUserQuestionKey(request, question)] ?? "" },
+            set: { vm.setAskUserQuestionOther($0, question: question, request: request) }
+        )
+        HStack(alignment: .center, spacing: DS.Space.sm) {
+            Button {
+                vm.selectAskUserQuestionOther(question: question, request: request)
+                if vm.askUserQuestionOtherIsSelected(question: question, request: request) {
+                    focused = true
+                }
+            } label: {
+                Image(systemName: symbol)
+                    .font(.system(size: 12))
+                    .foregroundColor(selected ? DS.Palette.accent : DS.Palette.textTertiary)
+                    // Pad the glyph so the radio has a comfortable tap target instead of a
+                    // razor-thin 12pt hit area; the listed option rows are fully tappable.
+                    .padding(3)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Other")
+            .accessibilityAddTraits(selected ? .isSelected : [])
+            .accessibilityIdentifier("agent.askOther.\(request.id).\(question.id)")
+            TextField("Other…", text: draft)
+                .textFieldStyle(.roundedBorder)
+                .controlSize(.small)
+                .focused($focused)
+        }
+    }
 }
 
 // macos:32: pure, value-type navigation logic for the caret-anchored suggestion
