@@ -56,6 +56,32 @@ final class RC2CLIDiagnosticsTests: XCTestCase {
                       "invalidValue message must start with 'error:'; got: \(msg)")
     }
 
+    // MARK: - daemon response failures
+
+    func test_responseTimeout_namesTimeoutValue() {
+        // WHY: a hung daemon socket must tell automation the receive deadline
+        //      expired instead of surfacing an empty "decode failed:" string.
+        let msg = RC2CLIDiagnostics.responseTimedOut(afterMilliseconds: 250)
+        XCTAssertTrue(msg.contains("timed out after 250ms"),
+                      "timeout diagnostic must name the elapsed deadline; got: \(msg)")
+    }
+
+    func test_responseTimeout_isSafeForJSONErrorMessage() {
+        let msg = RC2CLIDiagnostics.responseTimedOut(afterMilliseconds: 500)
+        XCTAssertFalse(msg.hasPrefix("error:"),
+                       "JSON-RPC error.message must not include the stderr prefix; got: \(msg)")
+        XCTAssertFalse(msg.contains("decode failed"),
+                       "timeout diagnostic must not look like a JSON parse failure; got: \(msg)")
+    }
+
+    func test_responseClosedBeforeReply_isExplicit() {
+        // WHY: EOF before a JSON-RPC response is a daemon/socket failure, not a
+        //      JSON parse failure, and users need that distinction.
+        let msg = RC2CLIDiagnostics.responseClosedBeforeReply()
+        XCTAssertTrue(msg.contains("closed before sending a response"),
+                      "closed-socket diagnostic must explain the missing reply; got: \(msg)")
+    }
+
     // MARK: - unknownSubcommand
 
     func test_unknownSubcommand_containsBothNames() {

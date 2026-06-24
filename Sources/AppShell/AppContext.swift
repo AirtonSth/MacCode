@@ -525,7 +525,7 @@ public final class AppContext {
                 try installer.installDistillInstructions(for: .claude)
                 _ = try installer.installDistillCLI(appSupportDirectory: appSupportDirectory)
                 try? installer.installCommandWrappers() // RTK transparent wrappers (best-effort; needs the bundled binary)
-                try? installer.installRetrieveMCP() // retrieve-only MCP (best-effort; needs the bundled binary)
+                try? installer.installRetrieveMCP() // Token Saver MCP tools (best-effort; needs the bundled binary)
                 managedDistillSkillInstallResults = [codex, claude]
                 managedDistillSkillInstallError = nil
             } else {

@@ -1424,6 +1424,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     public var executionLocked: Bool { providerLocked || status == .running }
 
     public func setProviderInstance(_ id: String) {
+        guard !executionLocked else { return }
         guard let snapshot = providerSnapshots.first(where: { $0.id == id }) else { return }
         providerInstanceId = snapshot.id
         provider = snapshot.provider
@@ -1436,6 +1437,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     }
 
     public func setProvider(_ newProvider: AgentProvider) {
+        guard !executionLocked else { return }
         provider = newProvider
         providerInstanceId = newProvider.rawValue
         availableModels = []
@@ -2133,7 +2135,6 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         loadAllMessages(tid)
         suppressPersistedFinalDuplicatedByTimeline()
         timeline.clearActivePlan()
-        prompt = ""
         resetTimelineUpdateTick()
         lastErrorRecoverable = false  // UX-MAC_AGENT-009: clear stale Retry on new run
         selectedThreadHasRecoverableContext = false  // UX-MAC_AGENT-CONTINUE: run started; hide Continue
@@ -2145,6 +2146,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             return nil
         }
         attachments = []
+        prompt = ""
         let display = resolvedAttachments.isEmpty ? text
             : text + "\n\n📎 " + resolvedAttachments.map(\.displayName).joined(separator: ", ")
         // The coordinator is the single writer of run messages — mirror
