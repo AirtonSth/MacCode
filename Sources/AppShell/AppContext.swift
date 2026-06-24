@@ -380,10 +380,13 @@ public final class AppContext {
             // the final token batch is never stranded in the accumulator.
             self.flushPendingTokenSaverUsage(runId: rid)
             self.recordSessionLearnFromRun(runId: rid, status: status) // P5 SessionLearn (off by default)
-            if status == .completed || status == .cancelled {
-                Task { @MainActor in
-                    try? await self.router?.drainNextQueuedAgentMessage(thread: tid)
-                }
+            // Drain the next queued message after ANY terminal status. A run that
+            // ended .failed previously stranded queued messages (no run to pick
+            // them up); drainNextQueuedAgentMessage re-checks the thread is not
+            // running/pending before sending, so an unconditional drain is safe
+            // and onRunFinished only fires on terminal statuses.
+            Task { @MainActor in
+                try? await self.router?.drainNextQueuedAgentMessage(thread: tid)
             }
             if let content = RemoteCodeNotificationContent.threadOutcome(
                 threadId: tid.value.uuidString,

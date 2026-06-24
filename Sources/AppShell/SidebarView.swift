@@ -234,6 +234,14 @@ public final class SidebarViewModel: ObservableObject {
     /// every render. Invalidated whenever `workspaces` is reassigned via
     /// `reload`, which is driven by the same mutations that change busy.
     private var busyStateCache: [WorkspaceID: Bool] = [:]
+    /// UX-SIDEBAR-COMPLETED-DOT: workspaces whose in-progress action just finished
+    /// (busy → idle) and that the user has not opened since. Drives the small
+    /// "action completed" dot shown in the spinner's slot. Cleared when the
+    /// workspace is selected.
+    @Published public private(set) var completedWorkspaces: Set<WorkspaceID> = []
+    /// Busy set captured on the previous `reload`, used to detect the busy → idle
+    /// transition that marks an action as completed.
+    private var previousBusyWorkspaces: Set<WorkspaceID> = []
     @Published public var selectedWorkspaceID: WorkspaceID?
     @Published public var selectedWorkspaceIDs: Set<WorkspaceID> = []
     /// IMP-MAC_SHELL_WINDOW-009: free-text filter applied to the rendered
@@ -410,12 +418,63 @@ public final class SidebarViewModel: ObservableObject {
     public func reload() {
         guard let ctx = context else { return }
         let loaded = (try? router?.listWorkspaces()) ?? ctx.state.window.workspaces.compactMap { ctx.state.workspaces[$0] }
-        if loaded != workspaces {
-            workspaces = loaded
-        }
+        // MRU: present the list ordered by most-recently-used so a workspace stays at
+        // the top after activity instead of snapping back to its prior slot. Derived
+        // from the durable per-workspace lastActivity timestamp, so it is immune to any
+        // transient window-order churn.
+        let ordered = LayoutReducer.mostRecentlyUsedOrder(loaded)
+        // Refresh the selection first so a workspace that completed AND became
+        // selected this tick is correctly treated as "being viewed" (no dot).
         selectedWorkspaceID = ctx.state.window.selectedWorkspaceID
+        updateCompletedWorkspaces(from: ordered)
+        if ordered != workspaces {
+            workspaces = ordered
+        }
         selectedWorkspaceIDs = selectedWorkspaceIDs.intersection(Set(workspaces.map(\.id)))
         reloadPrivateAccount()
+    }
+
+    /// UX-SIDEBAR-COMPLETED-DOT: detect workspaces whose action just finished and
+    /// surface the completed dot. Uses the `busy` metadata that `listWorkspaces`
+    /// already batch-computes (agent run / terminal job), so no extra DB work.
+    private func updateCompletedWorkspaces(from list: [Workspace]) {
+        let nowBusy = Set(list.filter { $0.metadata["busy"] == "true" }.map(\.id))
+        completedWorkspaces = Self.completedWorkspacesAfterReload(
+            previousBusy: previousBusyWorkspaces,
+            nowBusy: nowBusy,
+            current: completedWorkspaces,
+            existing: Set(list.map(\.id)),
+            selected: selectedWorkspaceID)
+        previousBusyWorkspaces = nowBusy
+    }
+
+    /// Pure transition: a workspace that left the busy set since last reload just
+    /// completed its action and earns a dot — unless it is the one the user is already
+    /// viewing (selected). Currently-busy workspaces show a spinner instead, and
+    /// entries for removed workspaces are dropped.
+    nonisolated static func completedWorkspacesAfterReload(
+        previousBusy: Set<WorkspaceID>,
+        nowBusy: Set<WorkspaceID>,
+        current: Set<WorkspaceID>,
+        existing: Set<WorkspaceID>,
+        selected: WorkspaceID?
+    ) -> Set<WorkspaceID> {
+        var result = current
+        for id in previousBusy.subtracting(nowBusy) where id != selected {
+            result.insert(id)
+        }
+        result.subtract(nowBusy)
+        // The workspace the user is currently viewing never shows a dot, regardless of
+        // how it was selected (click, keyboard, programmatic).
+        if let selected { result.remove(selected) }
+        result.formIntersection(existing)
+        return result
+    }
+
+    /// Test seam: mark a workspace's action as completed so the completed-dot /
+    /// clear-on-select behavior can be exercised without driving a full run.
+    func markCompletedForTesting(_ id: WorkspaceID) {
+        completedWorkspaces.insert(id)
     }
 
     private func reloadPrivateAccount() {
@@ -993,6 +1052,8 @@ public final class SidebarViewModel: ObservableObject {
         selectedWorkspaceIDs.removeAll()
         selectionAnchorID = wid
         selectedWorkspaceID = wid
+        // UX-SIDEBAR-COMPLETED-DOT: opening a workspace clears its completed dot.
+        completedWorkspaces.remove(wid)
         try? router?.selectWorkspace(wid)
     }
 
@@ -1816,6 +1877,7 @@ public struct SidebarRootView: View {
     }
 
     @ObservedObject var vm: SidebarViewModel
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var showsInsomniaOptions = false
     @State private var showsTokenSaverDetails = false
     @State private var tokenSaverNow = Date()
@@ -3812,11 +3874,25 @@ public struct SidebarRootView: View {
                         // VoiceOver and tooltip convey agent-run vs terminal.
                         .help(busyLabel)
                         .accessibilityLabel(busyLabel)
+                } else if vm.completedWorkspaces.contains(ws.id) {
+                    // UX-SIDEBAR-COMPLETED-DOT: the action finished — a small success
+                    // dot takes the spinner's slot until the user opens the workspace.
+                    Circle()
+                        .fill(DS.Palette.success)
+                        .frame(width: 7, height: 7)
+                        .frame(width: 16, height: 16)
+                        .help("Action completed")
+                        .accessibilityLabel("Action completed")
+                        .transition(.scale(scale: 0.4).combined(with: .opacity))
                 }
                 if ws.notificationsUnread > 0 {
                     DSPill("\(ws.notificationsUnread)", tone: .accent)
                 }
             }
+            // UX-SIDEBAR-COMPLETED-DOT: fade/scale the spinner→dot swap in subtly
+            // (reduced-motion shows it instantly).
+            .animation(reduceMotion ? nil : .easeOut(duration: 0.2),
+                       value: vm.completedWorkspaces.contains(ws.id))
             .padding(.horizontal, DS.Space.sm)
             .frame(height: 38)
             .background(

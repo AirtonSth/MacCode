@@ -161,3 +161,61 @@ final class PaneTabsMissingSurfaceCopyTests: XCTestCase {
                        "recovery button title must be 'Close Tab' to match the UX specification")
     }
 }
+
+// MARK: - Header double-click → pane maximize/minimize gating
+//
+// WHY: double-clicking the empty pane header bar should maximize/minimize the
+// pane (mirroring the zoom button), so the user doesn't have to hit the small
+// control precisely. But a double-click on a tab opens inline rename, and a
+// double-click on a control button is that button's own action — neither must
+// toggle the pane. These tests pin the pure gating seam the gesture delegate
+// consults so a regression can't silently start hijacking tab/button clicks.
+
+@MainActor
+final class PaneHeaderDoubleClickGateTests: XCTestCase {
+
+    private func makeTab() -> PaneTabButton {
+        PaneTabButton(surfaceID: SurfaceID(), title: "Terminal", symbol: "terminal",
+                      selected: false, onSelect: {}, onClose: {})
+    }
+
+    func test_emptyChromeHit_togglesPane() {
+        let host = NSView()
+        let chrome = NSView()
+        host.addSubview(chrome)
+        XCTAssertTrue(PaneTabsView.headerBarDoubleClickToggles(hitView: chrome, host: host),
+                      "a double-click on the bar's empty chrome must toggle the pane")
+    }
+
+    func test_hostItselfHit_togglesPane() {
+        let host = NSView()
+        XCTAssertTrue(PaneTabsView.headerBarDoubleClickToggles(hitView: host, host: host),
+                      "a double-click that lands directly on the header background must toggle the pane")
+    }
+
+    func test_tabButtonHit_doesNotTogglePane() {
+        let host = NSView()
+        let tab = makeTab()
+        host.addSubview(tab)
+        XCTAssertFalse(PaneTabsView.headerBarDoubleClickToggles(hitView: tab, host: host),
+                       "a double-click on a tab must open rename, not toggle the pane")
+    }
+
+    func test_controlButtonHit_doesNotTogglePane() {
+        let host = NSView()
+        let button = NSButton()
+        host.addSubview(button)
+        XCTAssertFalse(PaneTabsView.headerBarDoubleClickToggles(hitView: button, host: host),
+                       "a double-click on a control button must run that button's action, not toggle the pane")
+    }
+
+    func test_viewNestedInsideControlHit_doesNotTogglePane() {
+        let host = NSView()
+        let button = NSButton()
+        let inner = NSView()
+        button.addSubview(inner)
+        host.addSubview(button)
+        XCTAssertFalse(PaneTabsView.headerBarDoubleClickToggles(hitView: inner, host: host),
+                       "a hit on a subview of a control must walk up to the control and not toggle the pane")
+    }
+}

@@ -1275,6 +1275,13 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 publishQueuedMessage(kind: "agent.message.queue.updated", message)
             }
             refreshAgentSurfaces(thread: queued.threadId)
+            // Force = run now: interrupt the in-flight turn so the just-promoted
+            // front-of-queue message starts immediately. stopRun resolves to a
+            // .cancelled finish, which onRunFinished (AppContext) treats as
+            // drain-eligible -> drainNextQueuedAgentMessage sends this message.
+            // The synchronous result stays .queued; the new run begins via the
+            // run-lifecycle events that follow.
+            ctx.coordinator.stopRun(threadId: queued.threadId)
             return AgentMessageSendResult(status: .queued, queuedMessage: promoted)
         }
         _ = try ctx.queuedMessageRepo.delete(id: queued.id)
