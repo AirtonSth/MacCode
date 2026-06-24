@@ -581,25 +581,28 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
         if let resumeSessionAt, !resumeSessionAt.isEmpty {
             payload["resume_session_at"] = resumeSessionAt
         }
-        if let systemPrompt = Self.tokenSaverSystemPrompt(environment: request.environment) {
-            payload["system_prompt"] = systemPrompt
-        }
+        payload["system_prompt"] = Self.claudeSystemPrompt(environment: request.environment)
         return payload
     }
 
-    /// Token Saver system prompt for the SDK session. Codex receives the Token Saver `| distill`
-    /// rule via per-turn `developer_instructions` and the distill language via authoritative
-    /// `~/.codex/AGENTS.md`; the Claude SDK bridge sets no developer_instructions and its
-    /// `~/.claude/CLAUDE.md` is easily buried, so the SAME canonical rules must ride in the SDK
-    /// `systemPrompt` to get the same visible behavior (pipe `| distill`, speak distill language).
-    /// Gated on `RC_TOKEN_SAVER_DISTILL_HINT` (set by providerEnvironment iff Token Saver is on, and
-    /// thus the managed `distill` CLI exists) so the instruction is absent when the CLI is gone.
-    /// The SDK's omitted `systemPrompt` is an EMPTY custom prompt, so this is purely additive — it
-    /// does not introduce the `claude_code` preset. The prompt is fixed for the session's life
-    /// (the SDK query is long-lived); a mid-session Token Saver toggle takes effect on the next session.
-    static func tokenSaverSystemPrompt(environment: [String: String]) -> String? {
-        guard environment["RC_TOKEN_SAVER_DISTILL_HINT"] == "1" else { return nil }
-        return AgentSkillInstaller.distillAgentInstructionsBody
+    /// System prompt for the SDK session, set on every run (additive — the SDK's
+    /// `systemPrompt` string does not introduce the `claude_code` preset; the agent
+    /// behaviour rides on the separate `tools` preset, so this never strips it).
+    ///
+    /// Always carries the background-await self-declaration rule
+    /// (`BackgroundAwaitContinuation.systemPromptDirective`) so the agent marks any
+    /// unavoidable wait with the recovery marker independent of Token Saver. When
+    /// Token Saver is on (`RC_TOKEN_SAVER_DISTILL_HINT`, set by providerEnvironment
+    /// iff the managed `distill` CLI exists) it also carries the canonical distill
+    /// rules — the same visible behavior Codex gets via per-turn developer_instructions
+    /// and `~/.codex/AGENTS.md`. Fixed for the session's life (the SDK query is
+    /// long-lived); a mid-session Token Saver toggle takes effect on the next session.
+    static func claudeSystemPrompt(environment: [String: String]) -> String {
+        var prompt = BackgroundAwaitContinuation.systemPromptDirective
+        if environment["RC_TOKEN_SAVER_DISTILL_HINT"] == "1" {
+            prompt += "\n\n" + AgentSkillInstaller.distillAgentInstructionsBody
+        }
+        return prompt
     }
 
     private func effectiveProviderThreadId(for request: AgentRunRequest) -> String? {

@@ -73,6 +73,36 @@ final class AgentAppViewModelTests: XCTestCase {
                        "a running thread must not surface the awaiting badge")
     }
 
+    func test_isAwaitingBackgroundWork_flagsClaudeFutureTenseDeployPollerStall() throws {
+        // The reported Claude-provider stall: the agent ends its turn saying it will
+        // wait for a deploy poller that "notifies me". This completed run must read
+        // "awaiting" (warning) with the Continue banner, not a green "completed", so
+        // the user can tell the task is not actually finished.
+        let (vm, _) = try makeVM()
+        vm.status = .completed
+
+        vm.timeline.apply(.turnStarted(turnId: "t1"))
+        vm.timeline.apply(.turnCompleted(turnId: "t1", finalMessage: "I'll wait for the deploy poller to complete (it notifies me), then run the summer-gate Chrome verification across multiple accounts."))
+        XCTAssertTrue(vm.isAwaitingBackgroundWork,
+                      "a completed Claude run waiting on a background deploy poller must surface as awaiting")
+    }
+
+    func test_isAwaitingBackgroundWork_marker_surfacesForAnyPhrasing() throws {
+        // The deterministic path: when the agent self-declares the stall with the
+        // marker, the badge must surface even for phrasing the heuristic misses.
+        let (vm, _) = try makeVM()
+        vm.status = .completed
+        let novel = "Holding here until the canary bake finishes and the gate flips."
+        vm.timeline.apply(.turnStarted(turnId: "t1"))
+        vm.timeline.apply(.turnCompleted(turnId: "t1", finalMessage: novel))
+        XCTAssertFalse(vm.isAwaitingBackgroundWork,
+                       "control: novel phrasing without the marker is beyond the heuristic")
+        vm.timeline.apply(.turnStarted(turnId: "t2"))
+        vm.timeline.apply(.turnCompleted(turnId: "t2", finalMessage: "\(BackgroundAwaitContinuation.awaitingMarker)\n\(novel)"))
+        XCTAssertTrue(vm.isAwaitingBackgroundWork,
+                      "a marker-declared stall must surface as awaiting regardless of phrasing")
+    }
+
     func test_renameThread_trimsUpdatesAndPersists() throws {
         let (vm, repo) = try makeVM()
         vm.createThread(title: "first")

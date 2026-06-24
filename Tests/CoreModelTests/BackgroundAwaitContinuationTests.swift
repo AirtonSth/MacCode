@@ -31,6 +31,49 @@ final class BackgroundAwaitContinuationTests: XCTestCase {
         }
     }
 
+    // MARK: - Detector: the reported Claude-provider stall family.
+
+    func test_detectsClaudeFutureTenseWaitOnAsyncJob() {
+        // Verbatim (and close-variant) trailing messages from the reported Claude
+        // full-access run that sat at "completed" instead of finishing: the agent
+        // ended its turn saying it would *wait* (future tense, first person) on a
+        // background job — a deploy poller that "notifies me" — before continuing.
+        // The original detector only knew present-tense "waiting/standing by" + the
+        // demo-recording vocabulary, so these slipped through and nothing auto-nudged
+        // the agent to resume.
+        let stalls = [
+            "I'll wait for the deploy poller to complete (it notifies me), then run the summer-gate Chrome verification across multiple accounts.",
+            "I'll wait for the deploy poller to complete (it notifies me), then run the Chrome verification for both flows.",
+            "I'll wait for the background build to finish, then run the tests.",
+            "I'm waiting for the deploy job to complete; it notifies me when it's done."
+        ]
+        for message in stalls {
+            XCTAssertTrue(BackgroundAwaitContinuation.isAwaitingBackgroundWork(message),
+                          "must detect a Claude future-tense background-await stall: \(message)")
+        }
+    }
+
+    func test_doesNotAutoNudgeWhenWaitingOnTheUser() {
+        // Precision guard: broadening to first-person "I'll wait" must NOT make the
+        // detector fire when the agent is genuinely DONE and parked on the *human*
+        // (a review, a confirmation, a copy decision). Auto-nudging these in
+        // full-access mode would push the agent to act without the approval it is
+        // waiting for — a worse failure than the stall this feature fixes. The
+        // distinction is the absence of an agent-owned background-job noun:
+        // "notify the team" (an action the agent will take) is not "it notifies me"
+        // (a job signalling the agent), and a bare "...to complete the rollout" is
+        // not a background job.
+        let userWaits = [
+            "I'll wait for you to confirm the copy before I notify the team.",
+            "All set. I'll wait for your review before I run the migration to complete the rollout.",
+            "Done. The PR is up; I'll wait for CI to go green and the merge to finish on your end."
+        ]
+        for message in userWaits {
+            XCTAssertFalse(BackgroundAwaitContinuation.isAwaitingBackgroundWork(message),
+                           "must NOT treat a wait-on-the-user as a background-await stall: \(message)")
+        }
+    }
+
     func test_doesNotTreatNormalFinalAnswersAsBackgroundAwait() {
         // None of these should trip the detector: a real completed answer must not
         // be auto-nudged. This is the intent that matters — the detector must key
@@ -51,6 +94,52 @@ final class BackgroundAwaitContinuationTests: XCTestCase {
         }
         XCTAssertFalse(BackgroundAwaitContinuation.isAwaitingBackgroundWork(nil),
                        "nil final message must not be a stall")
+    }
+
+    // MARK: - Detector: the deterministic self-declared marker (phrase-independent).
+
+    func test_marker_detectsStallRegardlessOfPhrasing() {
+        // The whole point of the marker: it makes detection work for ANY phrasing,
+        // including ones no phrase list covers. This message uses vocabulary the
+        // heuristic lists deliberately do not match — only the marker makes it fire.
+        let novel = "Holding here until the canary bake finishes and the gate flips."
+        XCTAssertFalse(BackgroundAwaitContinuation.isAwaitingBackgroundWork(novel),
+                       "control: without the marker, novel phrasing is (correctly) beyond the heuristic backstop")
+        XCTAssertTrue(BackgroundAwaitContinuation.isAwaitingBackgroundWork("\(BackgroundAwaitContinuation.awaitingMarker)\n\(novel)"),
+                      "with the self-declared marker, the same novel phrasing must be detected deterministically")
+        // Case-insensitive, and detected even when not at the very start.
+        XCTAssertTrue(BackgroundAwaitContinuation.isAwaitingBackgroundWork("Done with step 1.\n\(BackgroundAwaitContinuation.awaitingMarker.lowercased()) waiting on the worker."),
+                      "marker detection must be case-insensitive and position-independent")
+    }
+
+    func test_strippingAwaitingMarker_removesMarkerButKeepsTheText() {
+        let raw = "\(BackgroundAwaitContinuation.awaitingMarker)\nI'll wait for the deploy poller to complete."
+        let shown = BackgroundAwaitContinuation.strippingAwaitingMarker(raw)
+        XCTAssertFalse(shown.contains(BackgroundAwaitContinuation.awaitingMarker),
+                       "the internal marker must never survive into user-facing text")
+        XCTAssertEqual(shown, "I'll wait for the deploy poller to complete.",
+                       "stripping the marker must preserve the real message and tidy the leading blank line")
+        // A message with no marker is returned unchanged.
+        XCTAssertEqual(BackgroundAwaitContinuation.strippingAwaitingMarker("All done; build is green."),
+                       "All done; build is green.")
+    }
+
+    func test_strippingAwaitingMarker_noOpPreservesNonMarkerProseVerbatim() {
+        // Intent of the no-op guard: `strippingAwaitingMarker` runs on EVERY rendered
+        // assistant message, so a message without the marker must pass through
+        // byte-for-byte — it must NOT reflow trailing whitespace or collapse the blank
+        // lines that markdown rendering depends on. Without the guard, normal prose
+        // would be silently rewritten.
+        let prose = "Line one.   \n\n\nLine two with trailing space.   "
+        XCTAssertEqual(BackgroundAwaitContinuation.strippingAwaitingMarker(prose), prose,
+                       "non-marker prose must pass through unchanged (no whitespace/newline reflow)")
+    }
+
+    func test_systemPromptDirective_namesTheExactMarker() {
+        // Injection and detection must stay in lockstep: the rule we inject must ask
+        // for the exact token the detector keys on, or recovery silently breaks.
+        XCTAssertTrue(BackgroundAwaitContinuation.systemPromptDirective.contains(BackgroundAwaitContinuation.awaitingMarker),
+                      "the injected directive must reference the exact marker the detector matches")
     }
 
     // MARK: - Decision: bounded, autonomous-only, completed-only.

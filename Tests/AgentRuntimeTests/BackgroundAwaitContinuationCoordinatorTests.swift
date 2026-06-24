@@ -93,6 +93,52 @@ final class BackgroundAwaitContinuationCoordinatorTests: XCTestCase {
                        "a full-access run stalled on a background job must auto-continue exactly \(BackgroundAwaitContinuation.maxAutoContinuations) times then stop — never silently sit at 'completed', never loop forever")
     }
 
+    func test_fullAccessClaudeStallAwaitingDeployPoller_autoNudgesUpToTheBoundThenStops() async throws {
+        // The reported bug: a Claude full-access run ended its turn saying
+        // "I'll wait for the deploy poller to complete (it notifies me), then run …"
+        // and was marked `.completed` — the deploy poller is a background job the app
+        // cannot see, so nothing ever resumed the agent. This exact final message
+        // (future-tense, first-person, async-job) must trip the detector and drive a
+        // bounded auto-nudge, identical to the original demo-recording stall.
+        let runner = StallingRunner(
+            provider: .claude,
+            finalMessage: "I'll wait for the deploy poller to complete (it notifies me), then run the summer-gate Chrome verification across multiple accounts.")
+        let (coordinator, thread, tmp) = try makeCoordinator(runner: runner)
+
+        _ = try await coordinator.startRun(AgentRunRequest(
+            threadId: thread.id, provider: .claude, model: "fake-model", cwd: tmp,
+            prompt: "implement everything", permissionMode: .fullAccess
+        ))
+
+        let expected = BackgroundAwaitContinuation.maxAutoContinuations + 1
+        await waitUntil { runner.startCount >= expected }
+        try? await Task.sleep(nanoseconds: 300_000_000)
+        XCTAssertEqual(runner.startCount, expected,
+                       "a Claude full-access run stalled on a background deploy poller must auto-continue exactly \(BackgroundAwaitContinuation.maxAutoContinuations) times then stop — not sit silently at 'completed'")
+    }
+
+    func test_fullAccessMarkerStall_autoNudgesEvenWhenPhrasingIsNovel() async throws {
+        // The robust path: the agent self-declares the stall with the marker, so the
+        // real coordinator auto-nudges regardless of wording. This message's prose
+        // ("Holding here until the canary bake finishes") matches NONE of the
+        // heuristic phrase lists — only the marker makes recovery fire end-to-end.
+        let runner = StallingRunner(
+            provider: .claude,
+            finalMessage: "\(BackgroundAwaitContinuation.awaitingMarker)\nHolding here until the canary bake finishes and the gate flips.")
+        let (coordinator, thread, tmp) = try makeCoordinator(runner: runner)
+
+        _ = try await coordinator.startRun(AgentRunRequest(
+            threadId: thread.id, provider: .claude, model: "fake-model", cwd: tmp,
+            prompt: "ship it", permissionMode: .fullAccess
+        ))
+
+        let expected = BackgroundAwaitContinuation.maxAutoContinuations + 1
+        await waitUntil { runner.startCount >= expected }
+        try? await Task.sleep(nanoseconds: 300_000_000)
+        XCTAssertEqual(runner.startCount, expected,
+                       "a self-declared (marker) stall must auto-continue to the bound regardless of phrasing")
+    }
+
     func test_supervisedStall_isNotAutoNudged() async throws {
         let runner = StallingRunner(finalMessage: "Standing by for the demo recording to complete.")
         let (coordinator, thread, tmp) = try makeCoordinator(runner: runner)
