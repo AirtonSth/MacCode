@@ -55,6 +55,42 @@ final class SurfaceVisibilityReconciliationTests: XCTestCase {
                       "closing a secondary window must preserve the remaining selected terminal visibility")
     }
 
+    func test_minimizedSplitPaneHidesSelectedTerminalAndMaximizeRestoresIt() throws {
+        let (ctx, router) = try makeContext()
+        let workspace = try router.createWorkspace(name: "split", cwd: NSTemporaryDirectory())
+        let firstSurfaceID = try selectedSurfaceID(workspace)
+        let firstPaneID = try XCTUnwrap(ctx.state.workspaces[workspace.id]?.layout.paneIDs().first)
+        let secondSurface = try router.splitPane(
+            workspace: workspace.id,
+            paneID: firstPaneID,
+            direction: .down,
+            surfaceType: .terminal,
+            title: "bottom"
+        )
+        let split = try rootSplit(in: ctx.state.workspaces[workspace.id]?.layout)
+
+        try router.paneResize(workspace: workspace.id, splitID: split.id, ratios: [0.04, 0.96])
+
+        var visible = SurfaceRegistry.shared.visibleSurfaceIDsSnapshot()
+        XCTAssertFalse(
+            visible.contains(firstSurfaceID),
+            "a minimized split pane must hide its selected terminal surface so Ghostty receives didBecomeHidden before the pane is visually collapsed"
+        )
+        XCTAssertTrue(
+            visible.contains(secondSurface.id),
+            "the non-minimized sibling terminal must remain visible while the first pane is minimized"
+        )
+
+        try router.paneResize(workspace: workspace.id, splitID: split.id, ratios: [0.5, 0.5])
+
+        visible = SurfaceRegistry.shared.visibleSurfaceIDsSnapshot()
+        XCTAssertTrue(
+            visible.contains(firstSurfaceID),
+            "maximizing/restoring the pane must mark the terminal visible again so the existing PTY/Ghostty surface resumes instead of appearing dead"
+        )
+        XCTAssertTrue(visible.contains(secondSurface.id))
+    }
+
     private func makeContext() throws -> (AppContext, AppCommandRouter) {
         let tmp = NSTemporaryDirectory() + "RC2VisibilityTest-" + UUID().uuidString
         let ctx = try AppContext(channel: .debug, appSupportOverride: tmp)
@@ -69,5 +105,12 @@ final class SurfaceVisibilityReconciliationTests: XCTestCase {
             throw XCTSkip("expected single-pane workspace")
         }
         return surfaceID
+    }
+
+    private func rootSplit(in node: LayoutNode?) throws -> SplitNode {
+        guard case .split(let split) = node else {
+            throw XCTSkip("expected split layout")
+        }
+        return split
     }
 }

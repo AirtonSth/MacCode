@@ -7264,6 +7264,20 @@ enum PromptComposerKeyAction: Equatable {
         return wantsNewline ? .insertNewline : .send
     }
 
+    static func shouldInterpretTextInput(
+        keyCode: UInt16,
+        modifiers: NSEvent.ModifierFlags,
+        characters: String?
+    ) -> Bool {
+        guard modifiers.intersection([.command, .control]).isEmpty else { return false }
+        switch keyCode {
+        case 36, 76, 125, 126, 53:
+            return false
+        default:
+            return modifiers.contains(.option) || characters?.isEmpty == false
+        }
+    }
+
     // macos:32: resolves a keystroke given whether the caret-anchored suggestion
     // popup is open. When the popup is CLOSED this ALWAYS defers to the existing
     // 2-arg `action(keyCode:modifiers:)` via `.passthrough`, so send/history
@@ -7351,6 +7365,15 @@ private final class PromptComposerTextView: NSTextView {
     }
 
     override func keyDown(with event: NSEvent) {
+        if PromptComposerKeyAction.shouldInterpretTextInput(
+            keyCode: event.keyCode,
+            modifiers: event.modifierFlags,
+            characters: event.characters
+        ) {
+            interpretKeyEvents([event])
+            return
+        }
+
         let open = popupIsOpen?() ?? false
         let resolution = PromptComposerKeyAction.resolve(
             keyCode: event.keyCode,
