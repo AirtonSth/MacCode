@@ -897,15 +897,42 @@ final class ClaudeStreamingCLIAdapterTests: XCTestCase {
 
         let on = try await configureCommand(tokenSaverOn: true)
         XCTAssertTrue(on.contains("\"system_prompt\""),
-                      "Token Saver on must send the distill system prompt on rc_configure")
+                      "rc_configure must send a system prompt")
+        XCTAssertTrue(on.contains("Background-await protocol"),
+                      "the system prompt must always carry the background-await self-declaration rule")
         XCTAssertTrue(on.contains("pipe EVERY non-interactive"),
-                      "the system prompt must carry the canonical `| distill` piping rule")
+                      "with Token Saver on, the system prompt must also carry the canonical `| distill` piping rule")
         XCTAssertTrue(on.contains("S=state"),
                       "the system prompt must carry the distill-language prefixes so user-visible replies use distill language")
 
         let off = try await configureCommand(tokenSaverOn: false)
-        XCTAssertFalse(off.contains("\"system_prompt\""),
-                       "no Token Saver hint (managed distill CLI uninstalled) must leave the SDK system prompt at its empty default")
+        // UX-MAC_AGENT-BG-AWAIT: the background-await rule rides on EVERY run, so the
+        // SDK system prompt is now always present — but Token Saver's distill rules
+        // must still be gated out when the managed CLI is uninstalled.
+        XCTAssertTrue(off.contains("\"system_prompt\""),
+                      "the background-await rule must be sent even with Token Saver off")
+        XCTAssertTrue(off.contains("Background-await protocol"),
+                      "the background-await self-declaration rule must be present regardless of Token Saver")
+        XCTAssertFalse(off.contains("pipe EVERY non-interactive"),
+                       "no Token Saver hint (managed distill CLI uninstalled) must leave the distill rules out of the system prompt")
+    }
+
+    func test_claudeSystemPrompt_alwaysCarriesBackgroundAwaitRule_distillOnlyWithTokenSaver() {
+        // Fast, direct contract for the SDK session system prompt (no bridge spawn):
+        // the background-await self-declaration rule rides on EVERY run so the agent
+        // can mark an unavoidable wait with the recovery marker; the distill rules are
+        // gated on Token Saver (the managed CLI exists) so they vanish when it is off.
+        let off = ClaudeAgentSDKBridgeAdapter.claudeSystemPrompt(environment: [:])
+        XCTAssertTrue(off.contains(BackgroundAwaitContinuation.awaitingMarker),
+                      "the background-await rule must be present even with Token Saver off")
+        XCTAssertFalse(off.contains("| distill"),
+                       "distill rules must be gated out when Token Saver is off")
+
+        let on = ClaudeAgentSDKBridgeAdapter.claudeSystemPrompt(environment: ["RC_TOKEN_SAVER_DISTILL_HINT": "1"])
+        XCTAssertTrue(on.contains(BackgroundAwaitContinuation.awaitingMarker),
+                      "the background-await rule must remain present with Token Saver on")
+        XCTAssertTrue(on.contains("| distill"),
+                      "Token Saver on must also carry the distill piping rule")
     }
 
     func test_agentSDKBridgeAdapterFinalizesAssistantTextWhenBridgeExitsWithoutResult() async throws {

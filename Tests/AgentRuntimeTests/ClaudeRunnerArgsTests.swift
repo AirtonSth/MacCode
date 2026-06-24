@@ -46,23 +46,35 @@ final class ClaudeRunnerArgsTests: XCTestCase {
                      "resumed Claude streaming sessions must not also request a new session id")
     }
 
-    func test_streamingTokenSaverHintAppendsDistillSystemPrompt() {
+    func test_streamingAlwaysAppendsBackgroundAwaitDirective_andDistillOnlyWithTokenSaver() {
+        // UX-MAC_AGENT-BG-AWAIT: the background-await self-declaration rule must ride
+        // in the system prompt on EVERY Claude run (independent of Token Saver) so the
+        // agent marks any unavoidable wait with the recovery marker. Token Saver's
+        // distill rules ride in the SAME `--append-system-prompt` value when on.
         let on = AgentRunRequest(threadId: AgentThreadID(), provider: .claude,
                                  model: "claude-opus-4-7", cwd: "/tmp", prompt: "hi",
                                  environment: ["RC_TOKEN_SAVER_DISTILL_HINT": "1"])
-        let a = ClaudeRunner.buildStreamingArgs(on)
-        guard let idx = a.firstIndex(of: "--append-system-prompt") else {
-            return XCTFail("Token Saver on must append distill instructions to the streaming CLI system prompt so Claude pipes `| distill` and speaks distill language")
+        let aOn = ClaudeRunner.buildStreamingArgs(on)
+        guard let idxOn = aOn.firstIndex(of: "--append-system-prompt") else {
+            return XCTFail("Claude streaming runs must append a system prompt carrying the background-await rule")
         }
-        XCTAssertEqual(a[a.index(after: idx)], AgentSkillInstaller.distillAgentInstructionsBody,
-                       "appended system prompt must be the canonical distill instructions, not an ad-hoc string")
-        XCTAssertTrue(AgentSkillInstaller.distillAgentInstructionsBody.contains("| distill"),
-                      "the injected body must carry the `| distill` piping rule")
+        let promptOn = aOn[aOn.index(after: idxOn)]
+        XCTAssertTrue(promptOn.contains(BackgroundAwaitContinuation.awaitingMarker),
+                      "appended system prompt must instruct the agent to self-declare a stall with the recovery marker")
+        XCTAssertTrue(promptOn.contains("| distill"),
+                      "with Token Saver on, the same appended prompt must also carry the `| distill` piping rule")
 
         let off = AgentRunRequest(threadId: AgentThreadID(), provider: .claude,
                                   model: "claude-opus-4-7", cwd: "/tmp", prompt: "hi")
-        XCTAssertNil(ClaudeRunner.buildStreamingArgs(off).firstIndex(of: "--append-system-prompt"),
-                     "no Token Saver hint (CLI uninstalled) must leave the streaming system prompt untouched")
+        let aOff = ClaudeRunner.buildStreamingArgs(off)
+        guard let idxOff = aOff.firstIndex(of: "--append-system-prompt") else {
+            return XCTFail("even with Token Saver off, the background-await rule must still be appended")
+        }
+        let promptOff = aOff[aOff.index(after: idxOff)]
+        XCTAssertTrue(promptOff.contains(BackgroundAwaitContinuation.awaitingMarker),
+                      "the background-await rule must be present regardless of Token Saver")
+        XCTAssertFalse(promptOff.contains("| distill"),
+                       "with Token Saver off (CLI uninstalled) the distill rules must NOT be appended")
     }
 
     func test_modelAndPromptPlacement() {

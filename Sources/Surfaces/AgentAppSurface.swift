@@ -5201,7 +5201,9 @@ public struct AgentAppView: View {
 
     @ViewBuilder
     private func assistantProse(_ text: String) -> some View {
-        AgentMessageMarkdownView(text: text)
+        // UX-MAC_AGENT-BG-AWAIT: the background-await self-declaration marker is an
+        // internal signal the host detects on; it must never render in the transcript.
+        AgentMessageMarkdownView(text: BackgroundAwaitContinuation.strippingAwaitingMarker(text))
             .foregroundColor(DS.Palette.text)
             .textSelection(.enabled)
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -5552,7 +5554,7 @@ public struct AgentAppView: View {
                             }
                         }
                         assistantProse(msg.content)
-                        assistantCopyBar(text: msg.content, identifierSuffix: msg.id.value.uuidString)
+                        assistantCopyBar(text: BackgroundAwaitContinuation.strippingAwaitingMarker(msg.content), identifierSuffix: msg.id.value.uuidString)
                     }
                 }
             }
@@ -5604,7 +5606,7 @@ public struct AgentAppView: View {
             if let final = turn.finalAssistantMessage, inputs.shouldRenderFinal {
                 VStack(alignment: .leading, spacing: DS.Space.xs) {
                     assistantProse(final)
-                    assistantCopyBar(text: final, identifierSuffix: turn.turnId)
+                    assistantCopyBar(text: BackgroundAwaitContinuation.strippingAwaitingMarker(final), identifierSuffix: turn.turnId)
                 }
             }
         }
