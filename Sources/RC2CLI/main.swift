@@ -199,7 +199,15 @@ struct RPC {
         var tmp = [UInt8](repeating: 0, count: 4096)
         while true {
             let n = read(fd, &tmp, tmp.count)
-            if n <= 0 { break }
+            if n == 0 {
+                return ["error": ["code": -1, "message": RC2CLIDiagnostics.responseClosedBeforeReply()]]
+            }
+            if n < 0 {
+                if (errno == EAGAIN || errno == EWOULDBLOCK), let receiveTimeoutMS {
+                    return ["error": ["code": -1, "message": RC2CLIDiagnostics.responseTimedOut(afterMilliseconds: receiveTimeoutMS)]]
+                }
+                return ["error": ["code": -1, "message": "read failed: \(String(cString: strerror(errno)))"]]
+            }
             buf.append(tmp, count: n)
             if buf.last == 0x0A { break }
         }

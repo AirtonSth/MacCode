@@ -192,9 +192,9 @@ struct RemoteCodeDistillServiceMain {
         Darwin.exit(exitCode)
     }
 
-    /// Retrieve-only MCP server (P3-T5): newline-delimited JSON-RPC 2.0 over stdio. Exposes
-    /// rc_retrieve, backed by the sidecar's GET /v1/retrieve. Fail-soft: an unavailable
-    /// service yields a "not found" tool result, never a crash.
+    /// Token Saver MCP server (P3-T5): newline-delimited JSON-RPC 2.0 over stdio.
+    /// Exposes retrieve/search/stats plus gated rc_compress through the local sidecar.
+    /// Fail-soft: an unavailable service yields an MCP error result, never a crash.
     private static func runMCP() async {
         let state = loadCLIState()
         let session = createConfiguredURLSession()

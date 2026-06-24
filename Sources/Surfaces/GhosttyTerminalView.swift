@@ -1938,24 +1938,17 @@ final class GhosttyTerminalView: NSView {
         // same PasteGuard semantics used for keyboard paste (Cmd+V) so a
         // multi-line or control-character string dragged from another app does
         // not silently execute shell commands.
-        guard let text = TerminalDragPayload.plainText(from: sender.draggingPasteboard),
-              !text.isEmpty else { return false }
-
-        if let safe = TerminalDragPayload.safeTextToSend(text) {
-            // Single-line, no control characters: send immediately.
+        switch TerminalDragPayload.plainTextDropDecision(
+            from: sender.draggingPasteboard,
+            confirmationAvailable: onPlainTextDragNeedsConfirm != nil
+        ) {
+        case .send(let safe):
             guard let data = safe.data(using: .utf8) else { return false }
             writeInputData(data)
-        } else {
-            // Multi-line or control characters: route through the confirm
-            // callback so the owning surface can present a confirmation sheet.
-            // Fall back to sending directly when no callback is wired (e.g.
-            // unit-test stubs that do not need the confirm flow).
-            if let confirm = onPlainTextDragNeedsConfirm {
-                confirm(text)
-            } else {
-                guard let data = text.data(using: .utf8) else { return false }
-                writeInputData(data)
-            }
+        case .confirm(let text):
+            onPlainTextDragNeedsConfirm?(text)
+        case .reject:
+            return false
         }
         return true
     }

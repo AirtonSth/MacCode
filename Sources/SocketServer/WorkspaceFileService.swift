@@ -230,19 +230,23 @@ public struct WorkspaceFileService: Sendable {
         guard !paths.isEmpty else {
             throw JSONRPCError(code: -32602, message: "file path required")
         }
-        var deleted: [JSONValue] = []
+        var seen = Set<String>()
+        var targets: [(url: URL, relative: String)] = []
         for path in paths {
             let file = try resolve(root: rootURL, path: path, mustExist: true)
             guard file.path != rootURL.path else {
                 throw JSONRPCError(code: -32602, message: "cannot delete workspace root", data: .string(path))
             }
-            let relative = relativePath(root: rootURL, url: file)
-            try FileManager.default.removeItem(at: file)
-            deleted.append(.string(relative))
+            guard seen.insert(file.path).inserted else { continue }
+            targets.append((file, relativePath(root: rootURL, url: file)))
+        }
+
+        for target in targets.sorted(by: { $0.url.path.count > $1.url.path.count }) {
+            try FileManager.default.removeItem(at: target.url)
         }
         return .object([
-            "deleted": .array(deleted),
-            "count": .number(Double(deleted.count))
+            "deleted": .array(targets.map { .string($0.relative) }),
+            "count": .number(Double(targets.count))
         ])
     }
 

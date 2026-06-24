@@ -54,6 +54,13 @@ final class TerminalUXGapTests: XCTestCase {
             "empty paste must be safe; blocking it produces a confusing no-op confirmation sheet")
     }
 
+    func test_pasteGuard_confirmationLineCount_countsCarriageReturnsAndCRLF() {
+        XCTAssertEqual(PasteGuard.confirmationLineCount(for: "cmd1\rcmd2"), 2,
+                       "CR-only terminal payloads execute as separate commands and the confirmation sheet must not undercount them")
+        XCTAssertEqual(PasteGuard.confirmationLineCount(for: "cmd1\r\ncmd2"), 2,
+                       "CRLF should count as one line break so the confirmation copy stays accurate")
+    }
+
     // MARK: - Font zoom HUD label
 
     // WHY: Cmd+/-/0 in the terminal changes font size but previously gave no

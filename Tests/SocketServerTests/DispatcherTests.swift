@@ -558,7 +558,11 @@ class FakeRouter: CommandRouting, TerminalCommandRouting {
         guard ProjectScripts.discover(in: projectCwd).contains(where: { $0.name == name }) else { throw JSONRPCError(code: -32602, message: "no such script") }
         return SurfaceDescriptor(type: .terminal, title: "Run: \(name)")
     }
-    func projectOpenInEditor(workspace: WorkspaceID) throws -> String { "Finder" }
+    var projectOpenInEditorError: Error?
+    func projectOpenInEditor(workspace: WorkspaceID) throws -> String {
+        if let projectOpenInEditorError { throw projectOpenInEditorError }
+        return "Finder"
+    }
     func browserNavigate(surface: SurfaceID, url: String) throws {}
     func browserBack(surface: SurfaceID) throws {}
     func browserForward(surface: SurfaceID) throws {}
@@ -1266,6 +1270,24 @@ final class DispatcherTests: XCTestCase {
         let editor = await d.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(4), method: "project.open_in_editor", params: ["workspace_id": wid]))
         XCTAssertEqual(editor.result?.objectValue?["app"], .string("Finder"),
                        "opening a workspace in an editor must return the app that handled the request")
+    }
+
+    @MainActor
+    func test_projectOpenInEditor_propagatesOpenFailureOverSocket() async throws {
+        let router = FakeRouter()
+        router.projectOpenInEditorError = ProjectScripts.OpenError.failed(cwd: "/tmp/missing-workspace")
+        let d = JSONRPCDispatcher(router: router)
+        let wid = JSONValue.string(UUID().uuidString)
+        let response = await d.dispatch(JSONRPCRequest(
+            jsonrpc: "2.0",
+            id: .number(1),
+            method: "project.open_in_editor",
+            params: ["workspace_id": wid]
+        ))
+        XCTAssertNotNil(response.error, "editor launch failure must be visible to JSON-RPC callers")
+        XCTAssertEqual(response.error?.message, "Workspace could not be opened in an editor or Finder.")
+        XCTAssertEqual(response.error?.data?.objectValue?["domain"], .string("project_scripts"))
+        XCTAssertEqual(response.error?.data?.objectValue?["kind"], .string("open_failed"))
     }
 
     @MainActor

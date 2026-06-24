@@ -1606,6 +1606,10 @@ public final class JSONRPCDispatcher {
             NSLog("[RC2.Dispatch] %@ file not found: %@", method, verbose)
             return JSONRPCError(code: -32012, message: "A required file was not found.",
                                 data: .object(["domain": .string("filesystem"), "kind": .string("not_found")]))
+        case let e as ProjectScripts.OpenError:
+            NSLog("[RC2.Dispatch] %@ project editor open failed: %@", method, verbose)
+            return JSONRPCError(code: -32012, message: "Workspace could not be opened in an editor or Finder.",
+                                data: .object(["domain": .string("project_scripts"), "kind": .string("open_failed"), "detail": .string(e.localizedDescription)]))
         default:
             // Heuristic: provider binaries (codex/claude/git) report
             // "missing"/"not found" via untyped errors; classify those.

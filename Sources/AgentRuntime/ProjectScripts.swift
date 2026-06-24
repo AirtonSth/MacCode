@@ -16,6 +16,16 @@ public struct ProjectScript: Codable, Sendable, Equatable {
 /// script is the caller's job (spawn a terminal surface). t3code's
 /// ProjectScriptsControl / open-in-editor parity (RC2-069).
 public enum ProjectScripts {
+    public enum OpenError: LocalizedError, Sendable {
+        case failed(cwd: String)
+
+        public var errorDescription: String? {
+            switch self {
+            case .failed(let cwd):
+                "Unable to open workspace in an editor or Finder: \(cwd)"
+            }
+        }
+    }
 
     public static func discover(in cwd: String) -> [ProjectScript] {
         var out: [ProjectScript] = []
@@ -55,20 +65,27 @@ public enum ProjectScripts {
     /// Open `cwd` in the first available GUI editor, else reveal in Finder.
     /// Returns the app that handled it (or "Finder").
     @discardableResult
-    public static func openInEditor(cwd: String, preferred: [String] = ["Cursor", "Visual Studio Code", "Zed", "Xcode"]) -> String {
-        for app in preferred {
+    public static func openInEditor(cwd: String, preferred: [String] = ["Cursor", "Visual Studio Code", "Zed", "Xcode"]) throws -> String {
+        func runOpen(_ arguments: [String]) -> Int32? {
             let p = Process()
             p.executableURL = URL(fileURLWithPath: "/usr/bin/open")
-            p.arguments = ["-a", app, cwd]
-            if (try? p.run()) != nil {
+            p.arguments = arguments
+            let sink = Pipe()
+            p.standardOutput = sink
+            p.standardError = sink
+            do {
+                try p.run()
                 p.waitUntilExit()
-                if p.terminationStatus == 0 { return app }
+                return p.terminationStatus
+            } catch {
+                return nil
             }
         }
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: "/usr/bin/open")
-        p.arguments = [cwd]
-        try? p.run(); p.waitUntilExit()
-        return "Finder"
+
+        for app in preferred {
+            if runOpen(["-a", app, cwd]) == 0 { return app }
+        }
+        if runOpen([cwd]) == 0 { return "Finder" }
+        throw OpenError.failed(cwd: cwd)
     }
 }

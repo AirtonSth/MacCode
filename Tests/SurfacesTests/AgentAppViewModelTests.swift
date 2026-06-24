@@ -93,6 +93,65 @@ final class AgentAppViewModelTests: XCTestCase {
         XCTAssertTrue(vm.providerLocked, "once it has a message the source is fixed")
     }
 
+    func test_providerChangeIsIgnoredAfterConversationStarts() throws {
+        let (vm, repo) = try makeVM()
+        vm.providerSnapshots = [
+            AgentProviderSnapshot(
+                id: "codex-cli",
+                provider: .codex,
+                driverKind: .codexCLI,
+                displayName: "Codex",
+                accentColor: "#2F80ED",
+                continuationGroup: "openai-codex",
+                interactionModes: [.default],
+                enabled: true,
+                installed: true,
+                status: .available,
+                authenticated: true,
+                accountLabel: "codex@example.com",
+                accountAuthMethod: "codex",
+                models: [AgentModelDescriptor(id: "gpt-5.5", label: "GPT-5.5", provider: .codex)],
+                slashCommands: []
+            ),
+            AgentProviderSnapshot(
+                id: "claude-cli",
+                provider: .claude,
+                driverKind: .claudeCLI,
+                displayName: "Claude",
+                accentColor: "#D97706",
+                continuationGroup: "anthropic-claude",
+                interactionModes: [.default],
+                enabled: true,
+                installed: true,
+                status: .available,
+                authenticated: true,
+                accountLabel: "claude@example.com",
+                accountAuthMethod: "claude.ai",
+                models: [AgentModelDescriptor(id: "claude-sonnet-4-6", label: "Claude Sonnet 4.6", provider: .claude)],
+                slashCommands: []
+            )
+        ]
+        vm.setProviderInstance("codex-cli")
+        vm.createThread(title: "locked source")
+        let id = try XCTUnwrap(vm.selectedThreadId)
+        vm.messages.append(AgentMessage(threadId: id, role: .user, content: "first turn"))
+
+        vm.setProvider(.claude)
+        vm.setProviderInstance("claude-cli")
+
+        XCTAssertEqual(vm.provider, .codex,
+                       "after the first user message, source changes must be ignored so a resumed run cannot switch provider mid-thread")
+        XCTAssertEqual(vm.providerInstanceId, "codex-cli",
+                       "provider instance must stay aligned with the locked source")
+        XCTAssertEqual(vm.model, "gpt-5.5",
+                       "blocking a source change must not clear the selected model")
+        let persisted = try XCTUnwrap(repo.get(id: id))
+        XCTAssertEqual(persisted.provider, .codex,
+                       "a blocked source change must not persist into the thread configuration")
+        XCTAssertEqual(persisted.providerInstanceId, "codex-cli")
+        XCTAssertEqual(persisted.model, "gpt-5.5")
+    }
+
     func test_modelChangePersistsAfterConversationStarts() throws {
         let (vm, repo) = try makeVM()
         vm.availableModels = [
@@ -2801,6 +2860,10 @@ final class AgentAppViewModelTests: XCTestCase {
                       "missing attachments must fail before provider spawn instead of sending a bad path")
         XCTAssertTrue(vm.messages.contains { $0.role == .system && $0.content.contains("Attachment not found") },
                       "attachment resolution errors must be visible to the user")
+        XCTAssertEqual(vm.prompt, "review",
+                       "failed attachment validation must keep the user's draft so they can fix the file path and retry")
+        XCTAssertEqual(vm.attachments.count, 1,
+                       "failed attachment validation must keep the chip so the user can remove or reselect it")
     }
 
     func test_send_persistsExactlyOneUserAndOneAssistantMessage() async throws {
