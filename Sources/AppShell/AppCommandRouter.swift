@@ -51,6 +51,8 @@ private struct ProviderProbeCapabilities {
 /// concrete Surface views. Lives on the main actor because it mutates UI.
 @MainActor
 public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, LayoutEventSuppressionRouting {
+    private static let minimizedPaneVisibilityThreshold = 0.08
+
     public weak var context: AppContext?
     public weak var windowController: MainWindowController?
     private let sshPasswordStore: SSHPasswordStoring
@@ -278,15 +280,23 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     }
 
     private func selectedSurfaceIDs(in node: LayoutNode) -> Set<SurfaceID> {
+        selectedSurfaceIDs(in: node, paneVisible: true)
+    }
+
+    private func selectedSurfaceIDs(in node: LayoutNode, paneVisible: Bool) -> Set<SurfaceID> {
         switch node {
         case .pane(let pane):
+            guard paneVisible else { return [] }
             if let selected = pane.selectedSurfaceID ?? pane.surfaces.first?.id {
                 return [selected]
             }
             return []
         case .split(let split):
-            return split.children.reduce(into: Set<SurfaceID>()) { ids, child in
-                ids.formUnion(selectedSurfaceIDs(in: child))
+            let ratios = SplitNode.normalize(split.ratios)
+            return split.children.enumerated().reduce(into: Set<SurfaceID>()) { ids, item in
+                let ratio = ratios.indices.contains(item.offset) ? ratios[item.offset] : 0
+                let childVisible = paneVisible && ratio > Self.minimizedPaneVisibilityThreshold
+                ids.formUnion(selectedSurfaceIDs(in: item.element, paneVisible: childVisible))
             }
         }
     }
@@ -2279,6 +2289,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     public func paneResize(workspace: WorkspaceID, splitID: UUID, ratios: [Double]) throws {
         try context?.apply(.resizeSplit(workspace, splitID: splitID, ratios: ratios))
         windowController?.refreshFromState()
+        reconcileSurfaceVisibility()
         publishPaneResized(workspace: workspace, splitID: splitID)
     }
 

@@ -144,6 +144,45 @@ final class ComposerSuggestionPopupTests: XCTestCase {
         )
     }
 
+    // WHY: macOS Option/dead-key input is how users type characters such as ç,
+    // á, and é on common keyboard layouts. The composer must send these events
+    // through AppKit text input so composition commits into the prompt instead
+    // of being swallowed by command/history routing.
+    func testOptionAndDeadKeyTextInputBypassesCommandRouting() {
+        XCTAssertTrue(
+            PromptComposerKeyAction.shouldInterpretTextInput(
+                keyCode: 8,
+                modifiers: .option,
+                characters: "ç"
+            ),
+            "Option+C must use AppKit text input so ç is inserted into the Agent composer"
+        )
+        XCTAssertTrue(
+            PromptComposerKeyAction.shouldInterpretTextInput(
+                keyCode: 14,
+                modifiers: .option,
+                characters: ""
+            ),
+            "dead-key composition must use AppKit text input even when the raw key event has no committed characters yet"
+        )
+        XCTAssertFalse(
+            PromptComposerKeyAction.shouldInterpretTextInput(
+                keyCode: 36,
+                modifiers: [],
+                characters: "\r"
+            ),
+            "Return must stay on the composer send/newline route, not the generic text-input route"
+        )
+        XCTAssertFalse(
+            PromptComposerKeyAction.shouldInterpretTextInput(
+                keyCode: 0,
+                modifiers: .command,
+                characters: "a"
+            ),
+            "Command shortcuts must not be treated as text input"
+        )
+    }
+
     // MARK: - Key resolution when popup is CLOSED (the critical guarantees)
 
     // WHY: THIS IS THE GUARD. With the popup closed, plain Return must SEND the
