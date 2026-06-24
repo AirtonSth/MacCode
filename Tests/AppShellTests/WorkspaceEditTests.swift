@@ -79,6 +79,61 @@ final class WorkspaceEditTests: XCTestCase {
                        "dragging a workspace row must update the host window order while preserving pinned-first sorting")
     }
 
+    // MARK: - Most-recently-used sidebar order
+
+    private func mruWorkspace(_ name: String, activity: Int64? = nil, pinned: Bool = false) -> Workspace {
+        var w = Workspace.empty(name: name, cwd: "/tmp")
+        if let activity { w.metadata[LayoutReducer.lastActivityMetadataKey] = String(activity) }
+        if pinned { w.metadata["pinned"] = "true" }
+        return w
+    }
+
+    func test_mruOrder_floatsMostRecentActivityToTop_keepingPinnedFirst() {
+        // WHY: the user's complaint — after using a workspace it must stay at the top
+        // and not snap back. MRU order is derived from a monotonic activity timestamp,
+        // so a just-used workspace sorts first within its group regardless of the
+        // (revert-prone) window order. Pins still win the top.
+        let a = mruWorkspace("never-used")
+        let b = mruWorkspace("used-earlier", activity: 100)
+        let c = mruWorkspace("used-latest", activity: 200)
+        let p = mruWorkspace("pinned", pinned: true)
+        let ordered = LayoutReducer.mostRecentlyUsedOrder([a, b, c, p])
+        XCTAssertEqual(ordered.map(\.name), ["pinned", "used-latest", "used-earlier", "never-used"],
+                       "pinned first, then most-recently-used; a never-used workspace stays below used ones")
+    }
+
+    func test_mruOrder_withoutActivityPreservesInputOrder() {
+        // WHY: until a workspace is actually used, the list must keep its existing
+        // (window/manual) order — the MRU sort only promotes workspaces that have a
+        // real activity timestamp, so an idle session looks unchanged.
+        let input = [mruWorkspace("x"), mruWorkspace("y"), mruWorkspace("z")]
+        XCTAssertEqual(LayoutReducer.mostRecentlyUsedOrder(input).map(\.name), ["x", "y", "z"],
+                       "with no activity timestamps the order is preserved (stable sort)")
+    }
+
+    func test_promoteWorkspace_stampsActivitySoSidebarOrdersMostRecentFirst() throws {
+        // WHY: end-to-end — promoting (what every run start/finish does) must stamp the
+        // activity time so the sidebar VM renders the used workspace at the top.
+        let (ctx, router) = try make()
+        let first = try router.createWorkspace(name: "first", cwd: "/tmp")
+        let second = try router.createWorkspace(name: "second", cwd: "/tmp")
+        let third = try router.createWorkspace(name: "third", cwd: "/tmp")
+        var runningThread = AgentThread(workspaceId: third.id, title: "Running", provider: .claude, model: "claude-opus-4-7")
+        runningThread.status = .running
+        try ctx.threadRepo.upsert(runningThread)
+
+        XCTAssertTrue(router.promoteWorkspaceIfBusy(third.id))
+        XCTAssertNotNil(ctx.state.workspaces[third.id]?.metadata[LayoutReducer.lastActivityMetadataKey],
+                        "an activity promote must stamp the workspace's last-activity time")
+
+        let vm = SidebarViewModel(context: ctx, router: router)
+        vm.reload()
+        XCTAssertEqual(vm.workspaces.first?.id, third.id,
+                       "the most-recently-used workspace must render at the top of the sidebar")
+        XCTAssertEqual(vm.workspaces.map(\.id), [third.id, first.id, second.id],
+                       "used workspace floats to top; the rest keep their prior relative order")
+    }
+
     func test_busyThreadPromotionPersistsWindowOrderWithinPinnedAndUnpinnedGroups() throws {
         let (ctx, router) = try make()
         let pinnedIdle = try router.createWorkspace(name: "pinned-idle", cwd: "/tmp")

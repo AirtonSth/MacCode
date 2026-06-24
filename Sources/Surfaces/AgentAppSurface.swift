@@ -565,11 +565,16 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                     reloadQueuedMessages()
                     return
                 }
-                queueStatusMessage = "Queued message will run next."
+                queueStatusMessage = "Stopping current run to start this now."
                 reloadQueuedMessages()
                 for queued in queuedMessages {
                     onQueuedMessageEvent?(AgentQueueEventKinds.updated, queued)
                 }
+                // Force = run now: interrupt the in-flight turn so the just-promoted
+                // front-of-queue message starts immediately via the run-finished
+                // drain (AppContext.onRunFinished -> drainNextQueuedAgentMessage).
+                // The cancel resolves to .cancelled, which is drain-eligible.
+                coordinator.stopRun(threadId: message.threadId)
                 return
             }
             guard let queued = try queuedMessageRepo.delete(id: message.id) else {
@@ -5859,7 +5864,10 @@ public struct AgentAppView: View {
 
     @ViewBuilder
     private var queuedMessagesSection: some View {
-        if !vm.queuedMessages.isEmpty || vm.queueStatusMessage != nil {
+        // Only render the queue block when there is actually something queued. A
+        // lingering queueStatusMessage (e.g. the "will run" confirmation after the
+        // message already drained) must not show an empty "Queued 0" header.
+        if !vm.queuedMessages.isEmpty {
             VStack(alignment: .leading, spacing: DS.Space.sm) {
                 // UX-MAC_AGENT-019: emphasize the Queued header (accent) so it's
                 // clear new sends are queuing behind the active turn.

@@ -163,8 +163,12 @@ final class AgentAppQueuedMessageAndHelperTests: XCTestCase {
         try queuedRepo.upsert(msg2)
         vm.reloadQueuedMessages()
 
-        // Simulate a running thread so the queue path is taken.
+        // Simulate a running thread (both the VM gate and the persisted row) so
+        // the queue path is taken and stopRun has a running thread to cancel.
         vm.status = .running
+        var running = try XCTUnwrap(vm.threadRepo.get(id: threadId))
+        running.status = .running
+        try vm.threadRepo.upsert(running)
 
         let second = try XCTUnwrap(vm.queuedMessages.first { $0.text == "second" })
         await vm.forceQueuedMessageNow(second)
@@ -174,8 +178,14 @@ final class AgentAppQueuedMessageAndHelperTests: XCTestCase {
         let texts = vm.queuedMessages.map(\.text)
         XCTAssertTrue(texts.prefix(1).contains("second"),
                       "forceQueuedMessageNow while running must promote the message to the front of the queue")
-        XCTAssertEqual(vm.queueStatusMessage, "Queued message will run next.",
+        XCTAssertEqual(vm.queueStatusMessage, "Stopping current run to start this now.",
                        "forceQueuedMessageNow while running must surface a confirmation message")
+        // WHY: "Force … now" must actually run the message, not just reorder it.
+        // It does so by interrupting the in-flight turn; the cancelled run then
+        // drains the now-front message. Proof the current run was preempted: the
+        // thread row transitions from .running to .cancelled.
+        XCTAssertEqual(try vm.threadRepo.get(id: threadId)?.status, .cancelled,
+                       "forceQueuedMessageNow while running must interrupt the current run so the promoted message can start now")
     }
 
     func test_reorderQueuedMessage_persistsPositionsAndReloadsInNewOrder() throws {

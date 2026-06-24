@@ -241,4 +241,59 @@ final class SidebarReorderAndFilterTests: XCTestCase {
                        "two identical URLs in the selection must be collapsed to one  -  " +
                        "creating duplicate workspaces breaks the cwd-uniqueness invariant")
     }
+
+    // MARK: - Completed-action dot (UX-SIDEBAR-COMPLETED-DOT)
+
+    func test_completedDot_appearsWhenActionFinishesOnUnselectedWorkspace() {
+        // WHY: the user's request — when the spinner finishes, a dot must remain so
+        // they know the action completed in a workspace they were not viewing.
+        let busy = WorkspaceID(), other = WorkspaceID()
+        let result = SidebarViewModel.completedWorkspacesAfterReload(
+            previousBusy: [busy], nowBusy: [], current: [],
+            existing: [busy, other], selected: other)
+        XCTAssertEqual(result, [busy],
+                       "a workspace that went busy→idle earns the completed dot")
+    }
+
+    func test_completedDot_notShownForWorkspaceUserIsViewing() {
+        // WHY: if it finishes while you are already in it, there is nothing "unseen"
+        // to flag — no dot on the selected workspace.
+        let busy = WorkspaceID()
+        let result = SidebarViewModel.completedWorkspacesAfterReload(
+            previousBusy: [busy], nowBusy: [], current: [],
+            existing: [busy], selected: busy)
+        XCTAssertTrue(result.isEmpty,
+                      "the workspace the user is viewing must not show a completed dot")
+    }
+
+    func test_completedDot_clearedWhenWorkspaceBecomesBusyAgain() {
+        // WHY: a re-run shows the spinner again, not a stale completed dot.
+        let ws = WorkspaceID()
+        let result = SidebarViewModel.completedWorkspacesAfterReload(
+            previousBusy: [], nowBusy: [ws], current: [ws],
+            existing: [ws], selected: nil)
+        XCTAssertTrue(result.isEmpty,
+                      "a workspace that is busy again shows the spinner, not the completed dot")
+    }
+
+    func test_completedDot_droppedForRemovedWorkspace() {
+        // WHY: closing a workspace must not leave a dangling dot entry.
+        let gone = WorkspaceID(), kept = WorkspaceID()
+        let result = SidebarViewModel.completedWorkspacesAfterReload(
+            previousBusy: [], nowBusy: [], current: [gone, kept],
+            existing: [kept], selected: nil)
+        XCTAssertEqual(result, [kept],
+                       "completed-dot state for a removed workspace must be dropped")
+    }
+
+    func test_completedDot_clearsWhenWorkspaceSelected() throws {
+        // WHY: opening the workspace (the user's "next click") clears the dot.
+        let (_, router, vm) = try make()
+        let ws = try router.createWorkspace(name: "w", cwd: "/tmp")
+        vm.markCompletedForTesting(ws.id)
+        XCTAssertTrue(vm.completedWorkspaces.contains(ws.id))
+        vm.select(ws.id)
+        XCTAssertFalse(vm.completedWorkspaces.contains(ws.id),
+                       "selecting a workspace must clear its completed dot")
+    }
 }

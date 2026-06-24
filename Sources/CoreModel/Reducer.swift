@@ -130,6 +130,13 @@ public struct LayoutReducer {
             guard next.workspaces[wid] != nil else { throw LayoutError.workspaceNotFound }
             guard next.window.workspaces.contains(wid) else { throw LayoutError.workspaceNotFound }
             next.window.workspaces = promote(wid, in: next.window.workspaces, workspaces: next.workspaces)
+            // MRU: stamp the time this workspace was last active so the sidebar can
+            // order by most-recently-used. This is the durable source of order; the
+            // window.workspaces reorder above is a secondary (legacy) bump.
+            if var ws = next.workspaces[wid] {
+                ws.metadata[Self.lastActivityMetadataKey] = Self.activityStamp()
+                next.workspaces[wid] = ws
+            }
             return next
         case let .setSurfaceColor(wid, sid, color):
             guard var ws = next.workspaces[wid] else { throw LayoutError.workspaceNotFound }
@@ -367,6 +374,33 @@ public struct LayoutReducer {
         let sameGroup = ids.filter { $0 != id && isPinned($0, workspaces: workspaces) == pinned }
         let otherGroup = ids.filter { isPinned($0, workspaces: workspaces) != pinned }
         return pinned ? [id] + sameGroup + otherGroup : otherGroup + [id] + sameGroup
+    }
+
+    // MARK: - Most-recently-used ordering
+
+    /// Workspace metadata key holding the epoch-ms timestamp of the last activity
+    /// (run start/finish, terminal busy, or creation). Drives the sidebar's MRU sort.
+    public static let lastActivityMetadataKey = "lastActivityAt"
+
+    static func activityStamp() -> String {
+        String(Int64(Date().timeIntervalSince1970 * 1000))
+    }
+
+    /// Pure MRU display order: pinned workspaces first, then by last-activity time
+    /// (most recent first). Ties and never-active workspaces keep their input order,
+    /// so the result is stable and a workspace that was just used stays at the top of
+    /// its group until another workspace in that group is used. Reads
+    /// `lastActivityMetadataKey`, which is written on create and on every activity promote.
+    public static func mostRecentlyUsedOrder(_ workspaces: [Workspace]) -> [Workspace] {
+        func pinned(_ w: Workspace) -> Bool { w.metadata["pinned"] == "true" }
+        func activity(_ w: Workspace) -> Int64 { Int64(w.metadata[lastActivityMetadataKey] ?? "") ?? 0 }
+        return workspaces.enumerated().sorted { a, b in
+            let pa = pinned(a.element), pb = pinned(b.element)
+            if pa != pb { return pa && !pb }
+            let ta = activity(a.element), tb = activity(b.element)
+            if ta != tb { return ta > tb }
+            return a.offset < b.offset
+        }.map(\.element)
     }
 
     private func addSurface(in node: LayoutNode, paneID: PaneID, descriptor: SurfaceDescriptor) throws -> LayoutNode {

@@ -218,6 +218,20 @@ public final class PaneTabsView: NSObject {
         v.chromeContentArea = contentArea
         v.chromeDividers = [divider]
 
+        // UX: double-clicking the empty header bar maximizes/minimizes this pane,
+        // mirroring the zoom button — so the user doesn't have to hit the small
+        // control precisely. Scoped to split panes (the only case where a zoom
+        // toggle exists). The delegate restricts recognition to the bar's empty
+        // chrome: double-clicking a tab still renames it; control buttons keep
+        // their own actions.
+        if splitContext != nil {
+            let zoomDoubleClick = NSClickGestureRecognizer(target: self, action: #selector(headerBarDoubleClicked))
+            zoomDoubleClick.numberOfClicksRequired = 2
+            zoomDoubleClick.delaysPrimaryMouseButtonEvents = false
+            zoomDoubleClick.delegate = self
+            headerBG.addGestureRecognizer(zoomDoubleClick)
+        }
+
         // Focus-follows-click: a mouseDown anywhere inside the pane root
         // (content area or tab header) records this pane as focused so
         // Cmd+W / Cmd+D act on the right pane. The closure is pure-ID
@@ -903,6 +917,10 @@ public final class PaneTabsView: NSObject {
         _ = performTogglePaneMinimized()
     }
 
+    @objc private func headerBarDoubleClicked() {
+        _ = performTogglePaneMinimized()
+    }
+
     public static func toggledPaneMinimizedRatios(paneIndex: Int, ratios: [Double]) -> [Double] {
         guard ratios.indices.contains(paneIndex), ratios.count > 1 else { return ratios }
         if isPaneMinimized(paneIndex: paneIndex, ratios: ratios) {
@@ -1192,6 +1210,35 @@ public final class PaneTabsView: NSObject {
         return max(0, targetPosition - 1)
     }
 
+}
+
+extension PaneTabsView: NSGestureRecognizerDelegate {
+    // Gate the header double-click: only the bar's empty chrome toggles the pane.
+    // A double-click on a tab (PaneTabButton) opens inline rename; a click on a
+    // control button (NSControl) keeps its own action. Both must be left alone.
+    public nonisolated func gestureRecognizer(
+        _ gestureRecognizer: NSGestureRecognizer,
+        shouldAttemptToRecognizeWith event: NSEvent
+    ) -> Bool {
+        MainActor.assumeIsolated {
+            guard let host = gestureRecognizer.view else { return true }
+            let pointInSuper = (host.superview ?? host).convert(event.locationInWindow, from: nil)
+            return Self.headerBarDoubleClickToggles(hitView: host.hitTest(pointInSuper), host: host)
+        }
+    }
+
+    /// Pure seam: a header double-click toggles the pane only when it lands on the
+    /// bar's empty chrome. If the hit view is (or descends from) a tab button or any
+    /// control before reaching `host`, the double-click belongs to that element
+    /// (tab rename / button action) and must not toggle the pane.
+    nonisolated static func headerBarDoubleClickToggles(hitView: NSView?, host: NSView) -> Bool {
+        var node = hitView
+        while let current = node, current !== host {
+            if current is PaneTabButton || current is NSControl { return false }
+            node = current.superview
+        }
+        return true
+    }
 }
 
 // MARK: - Custom tab button (icon · truncating title · close ×)
