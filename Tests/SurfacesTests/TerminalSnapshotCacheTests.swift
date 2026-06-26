@@ -29,13 +29,34 @@ import XCTest
 /// is the single decision point and is tested here in isolation.
 final class TerminalSnapshotCacheTests: XCTestCase {
 
+    /// Wrapper that defaults the F1 state-signature pair to equal values, so the
+    /// pre-existing renderer/viewport tests below read unchanged and exercise only
+    /// those two signals. The state-signature behaviour is covered separately.
+    private func cacheValid(
+        rendererVersion: UInt64,
+        cachedVersion: UInt64,
+        viewportText: String?,
+        cachedViewportText: String?,
+        stateSignature: String = "sig",
+        cachedStateSignature: String = "sig"
+    ) -> Bool {
+        TerminalSurface.snapshotCacheValid(
+            rendererVersion: rendererVersion,
+            cachedVersion: cachedVersion,
+            viewportText: viewportText,
+            cachedViewportText: cachedViewportText,
+            stateSignature: stateSignature,
+            cachedStateSignature: cachedStateSignature
+        )
+    }
+
     // MARK: - snapshotCacheValid: identical inputs
 
     func test_cacheValid_whenBothKeysMatch() {
         // WHY: the common hot path — nothing changed since last build. The seam
         // must return true so readTextSnapshot() skips the expensive rebuild.
         XCTAssertTrue(
-            TerminalSurface.snapshotCacheValid(
+            cacheValid(
                 rendererVersion: 7,
                 cachedVersion: 7,
                 viewportText: "hello\nworld",
@@ -50,7 +71,7 @@ final class TerminalSnapshotCacheTests: XCTestCase {
         // The cache must stay valid across repeated nil-viewport calls so the
         // ansi_fallback path is not rebuilt on every poll tick.
         XCTAssertTrue(
-            TerminalSurface.snapshotCacheValid(
+            cacheValid(
                 rendererVersion: 3,
                 cachedVersion: 3,
                 viewportText: nil,
@@ -67,7 +88,7 @@ final class TerminalSnapshotCacheTests: XCTestCase {
         // mutation count. The cached snapshot is stale — it does not reflect the
         // new output. Must return false so the caller rebuilds.
         XCTAssertFalse(
-            TerminalSurface.snapshotCacheValid(
+            cacheValid(
                 rendererVersion: 8,
                 cachedVersion: 7,
                 viewportText: "hello",
@@ -81,7 +102,7 @@ final class TerminalSnapshotCacheTests: XCTestCase {
         // WHY: even in the nil-viewport (ansi_fallback) path, new bytes fed to
         // the renderer must invalidate the cache.
         XCTAssertFalse(
-            TerminalSurface.snapshotCacheValid(
+            cacheValid(
                 rendererVersion: 2,
                 cachedVersion: 1,
                 viewportText: nil,
@@ -100,7 +121,7 @@ final class TerminalSnapshotCacheTests: XCTestCase {
         // snapshot even though the visible terminal content has changed, causing
         // the user's iOS mirror to show wrong text.
         XCTAssertFalse(
-            TerminalSurface.snapshotCacheValid(
+            cacheValid(
                 rendererVersion: 5,
                 cachedVersion: 5,
                 viewportText: "samuel@mac ~ % ls",
@@ -115,7 +136,7 @@ final class TerminalSnapshotCacheTests: XCTestCase {
         // readTextSnapshot() call. The nil cached key must not match the new
         // non-nil viewport text so the fresh ghostty_viewport snapshot is built.
         XCTAssertFalse(
-            TerminalSurface.snapshotCacheValid(
+            cacheValid(
                 rendererVersion: 4,
                 cachedVersion: 4,
                 viewportText: "new text",
@@ -130,7 +151,7 @@ final class TerminalSnapshotCacheTests: XCTestCase {
         // key must not match the nil current viewport so the fallback snapshot
         // is rebuilt from the current ANSIRenderer state.
         XCTAssertFalse(
-            TerminalSurface.snapshotCacheValid(
+            cacheValid(
                 rendererVersion: 4,
                 cachedVersion: 4,
                 viewportText: nil,
@@ -147,7 +168,7 @@ final class TerminalSnapshotCacheTests: XCTestCase {
         // AND ghostty repainted its frame. Both invalidation signals fire
         // simultaneously; either alone is sufficient to force a rebuild.
         XCTAssertFalse(
-            TerminalSurface.snapshotCacheValid(
+            cacheValid(
                 rendererVersion: 10,
                 cachedVersion: 9,
                 viewportText: "new frame",
@@ -163,8 +184,8 @@ final class TerminalSnapshotCacheTests: XCTestCase {
         // WHY: the seam must be side-effect-free. Repeated calls with identical
         // arguments must always return the same value; a stateful implementation
         // would silently break the skip-or-rebuild decision across poll ticks.
-        let first  = TerminalSurface.snapshotCacheValid(rendererVersion: 1, cachedVersion: 1, viewportText: "x", cachedViewportText: "x")
-        let second = TerminalSurface.snapshotCacheValid(rendererVersion: 1, cachedVersion: 1, viewportText: "x", cachedViewportText: "x")
+        let first  = cacheValid(rendererVersion: 1, cachedVersion: 1, viewportText: "x", cachedViewportText: "x")
+        let second = cacheValid(rendererVersion: 1, cachedVersion: 1, viewportText: "x", cachedViewportText: "x")
         XCTAssertEqual(first, second,
                        "snapshotCacheValid must be pure — identical inputs must always produce the same result across calls")
     }
@@ -173,9 +194,71 @@ final class TerminalSnapshotCacheTests: XCTestCase {
         // WHY: same purity requirement for the invalidation path; a stateful
         // seam might return false only once then flip to true, causing one stale
         // snapshot to be served on the second poll tick.
-        let first  = TerminalSurface.snapshotCacheValid(rendererVersion: 2, cachedVersion: 1, viewportText: "a", cachedViewportText: "b")
-        let second = TerminalSurface.snapshotCacheValid(rendererVersion: 2, cachedVersion: 1, viewportText: "a", cachedViewportText: "b")
+        let first  = cacheValid(rendererVersion: 2, cachedVersion: 1, viewportText: "a", cachedViewportText: "b")
+        let second = cacheValid(rendererVersion: 2, cachedVersion: 1, viewportText: "a", cachedViewportText: "b")
         XCTAssertEqual(first, second,
                        "snapshotCacheValid must be pure for the invalidation path — same stale inputs must always return false")
+    }
+
+    // MARK: - snapshotCacheValid: state-signature drift (audit F1)
+    //
+    // The cache embeds render-diagnostics + pending/partial/history-failure flags in
+    // the snapshot, but rendererVersion + viewportText do NOT capture those. A
+    // diagnostics change (canRender flips, blockedReason changes, outputPendingBytes
+    // moves) with the same renderer version and viewport text used to serve a snapshot
+    // with STALE diagnostics. The state signature is now part of the key.
+
+    func test_cacheInvalid_whenStateSignatureChanged_evenIfRendererAndViewportSame() {
+        XCTAssertFalse(
+            cacheValid(
+                rendererVersion: 5, cachedVersion: 5,
+                viewportText: "same", cachedViewportText: "same",
+                stateSignature: "false|0|0|window_detached|false",
+                cachedStateSignature: "false|0|0||true"
+            ),
+            "cache must be invalid when render-diagnostics/pending state changed even if renderer version and viewport text are identical — otherwise a snapshot with stale diagnostics is served")
+    }
+
+    func test_cacheValid_requiresAllThreeKeysToMatch() {
+        XCTAssertTrue(
+            cacheValid(
+                rendererVersion: 5, cachedVersion: 5,
+                viewportText: "same", cachedViewportText: "same",
+                stateSignature: "x", cachedStateSignature: "x"
+            ),
+            "cache is valid only when renderer version, viewport text AND state signature all match")
+    }
+
+    // MARK: - snapshotStateSignature seam
+
+    func test_stateSignature_differsWhenCanRenderFlips() {
+        let blocked = TerminalSurface.snapshotStateSignature(
+            outputPartial: false, outputPendingBytes: 0, historyWriteFailures: 0,
+            renderBlockedReason: "window_detached", canRender: false)
+        let live = TerminalSurface.snapshotStateSignature(
+            outputPartial: false, outputPendingBytes: 0, historyWriteFailures: 0,
+            renderBlockedReason: nil, canRender: true)
+        XCTAssertNotEqual(blocked, live,
+            "a render-gate transition (canRender / blockedReason) must change the signature so the snapshot is rebuilt with fresh diagnostics")
+    }
+
+    func test_stateSignature_differsWhenPendingBytesChange() {
+        let a = TerminalSurface.snapshotStateSignature(
+            outputPartial: false, outputPendingBytes: 0, historyWriteFailures: 0,
+            renderBlockedReason: nil, canRender: true)
+        let b = TerminalSurface.snapshotStateSignature(
+            outputPartial: false, outputPendingBytes: 128, historyWriteFailures: 0,
+            renderBlockedReason: nil, canRender: true)
+        XCTAssertNotEqual(a, b, "a change in pending bytes must invalidate the cached snapshot")
+    }
+
+    func test_stateSignature_stableForIdenticalState() {
+        let a = TerminalSurface.snapshotStateSignature(
+            outputPartial: true, outputPendingBytes: 9, historyWriteFailures: 1,
+            renderBlockedReason: "parking_window", canRender: false)
+        let b = TerminalSurface.snapshotStateSignature(
+            outputPartial: true, outputPendingBytes: 9, historyWriteFailures: 1,
+            renderBlockedReason: "parking_window", canRender: false)
+        XCTAssertEqual(a, b, "identical state must yield an identical signature so the hot path still hits the cache")
     }
 }

@@ -657,6 +657,12 @@ final class GhosttyTerminalView: NSView {
     /// sent without confirmation (same fall-through as the drag path).
     var onPasteNeedsConfirm: ((String) -> Void)?
 
+    /// Set by the owning TerminalSurface so the view can tell a legitimate teardown
+    /// (the owner is closing) from a stray close of a still-visible instance
+    /// (audit #4). Defaults to reporting "closing" so a view with no owner never
+    /// spuriously resurrects a deliberately-closed surface.
+    var ownerIsClosing: (() -> Bool)?
+
     /// Injected by the owning TerminalSurface to persist font zoom per workspace.
     /// When nil, zoom changes are session-only (not persisted).
     var fontZoomStore: (any SettingsWriteRepository)?
@@ -930,6 +936,12 @@ final class GhosttyTerminalView: NSView {
     }
 
     func closeSurface() {
+        // Audit #4 watch: closing a surface whose view is still mounted on a window
+        // is the exact precondition for the permanent-freeze bug. Log loudly so the
+        // (unproven) wrong-instance-close trigger is observable in the field.
+        if window != nil, superview != nil, ownerIsClosing?() != true {
+            NSLog("RemoteCode terminal closeSurface() on a still-mounted view (window+superview present, owner not closing) — audit #4 watch")
+        }
         renderGeneration &+= 1
         surfaceClosed = true
         if let surface = surfaceSlot.removeForClose() {
@@ -1107,6 +1119,8 @@ final class GhosttyTerminalView: NSView {
     func forceRefresh() {
         guard isRenderable else { return }
         ensureSurface()
+        // #2: restart a possibly-stalled display link before asking it to draw.
+        reassertDisplayID()
         // Renderable again (e.g. reattached to an on-screen window after a move) —
         // make sure Ghostty's renderer is resumed before we ask it to draw.
         syncOcclusion()
@@ -1121,10 +1135,15 @@ final class GhosttyTerminalView: NSView {
     func refreshSurfaceOnly() {
         guard isRenderable else { return }
         ensureSurface()
+        // #2: restart a possibly-stalled display link on reveal/relayout.
+        reassertDisplayID()
         // Resume the renderer on reattach/relayout while renderable. This is the
         // reliable resume path after a move to a new window (driven by the
         // container's layout/window-change), independent of occlusion notifications.
         syncOcclusion()
+        // F2: paint any output buffered while occluded on reveal — a bare refresh
+        // would only repaint the stale frame and the tail lines would be missing.
+        flushPendingOutput()
         let refreshedByResize = updateGhosttySize(force: true)
         guard !refreshedByResize else { return }
         if let surface = surfaceSlot.liveSurface() {
@@ -1136,7 +1155,15 @@ final class GhosttyTerminalView: NSView {
         visibleInUI = visible
         if !visible {
             renderGeneration &+= 1
-            pendingOutput.removeAll(keepingCapacity: false)
+            // F2: do NOT silently DROP the buffered tail on hide. Process it into the
+            // live surface (Ghostty owns the scrollback) WITHOUT rendering, so
+            // switching away mid-stream and back doesn't lose the last lines. Only
+            // discard when there is no surface to flush into.
+            if let surface = surfaceSlot.liveSurface() {
+                flushPendingOutput(to: surface, render: false)
+            } else {
+                pendingOutput.removeAll(keepingCapacity: false)
+            }
         }
         // Drive Ghostty's occlusion from the *full* render gate, not raw tab
         // visibility: a selected tab whose window is off screen or mid-move must
@@ -1153,6 +1180,33 @@ final class GhosttyTerminalView: NSView {
     private func syncOcclusion() {
         guard let surface = surfaceSlot.liveSurface() else { return }
         ghostty_surface_set_occlusion(surface, isRenderable)
+    }
+
+    /// Reassert the surface's display id to the current screen. Ghostty's renderer
+    /// runs an internal CVDisplayLink that can stop delivering frames ("stuck vsync")
+    /// after a display sleep/wake or a reparent, sometimes with no
+    /// `didChangeScreen` notification to re-kick it — the visible terminal then
+    /// freezes while emulation continues (audit #2). Re-pinning the display id
+    /// restarts the link. Called on focus, refresh, and user scroll, mirroring cmux
+    /// (which reasserts after focus and before every forceRefresh). Cheap/idempotent.
+    private func reassertDisplayID() {
+        guard let surface = surfaceSlot.liveSurface(),
+              let displayID = window?.screen?.displayID ?? NSScreen.main?.displayID,
+              displayID != 0 else { return }
+        ghostty_surface_set_display_id(surface, displayID)
+    }
+
+    /// Whether the view is, RIGHT NOW, on a key, on-screen, non-minimized window with
+    /// real bounds and not AppKit-hidden — independent of the logical tab-visibility
+    /// flag (`visibleInUI`). Used by the owner to detect a "stuck hidden" desync
+    /// (audit #3): the surface believes it is hidden (readerAllowsRender/occlusion
+    /// latched off) while the user is actually looking at this exact view. The key +
+    /// occlusion-visible + not-hidden combination cannot hold for a correctly-hidden
+    /// background tab, so it is a safe trigger to self-heal.
+    var isDefinitelyOnScreen: Bool {
+        guard let window, !isHidden, bounds.width > 1, bounds.height > 1 else { return false }
+        guard window.isVisible, !window.isMiniaturized, window.isKeyWindow else { return false }
+        return window.occlusionState.contains(.visible)
     }
 
     func readViewportText() -> String? {
@@ -1203,7 +1257,20 @@ final class GhosttyTerminalView: NSView {
 
     private func ensureSurface() {
         guard Self.nativeRendererEnabled else { return }
-        guard !surfaceClosed else { return }
+        if surfaceClosed {
+            // Audit #4: a closed surface normally stays closed, but if this view is
+            // still mounted on a window with valid bounds while the owner is NOT
+            // tearing down, it was closed on the wrong (still-visible) instance —
+            // recover instead of leaving the tab permanently frozen.
+            guard Self.shouldResurrectClosedSurface(
+                surfaceClosed: true,
+                hasWindow: window != nil,
+                hasNonEmptyBounds: bounds.width > 0 && bounds.height > 0,
+                ownerClosing: ownerIsClosing?() ?? true
+            ) else { return }
+            NSLog("RemoteCode terminal resurrecting a surface closed on a still-visible view (audit #4)")
+            surfaceClosed = false
+        }
         guard surfaceSlot.liveSurface() == nil else { return }
         guard window != nil else { return }
         guard bounds.width > 0, bounds.height > 0 else { return }
@@ -1279,7 +1346,8 @@ final class GhosttyTerminalView: NSView {
             windowPresent: window != nil,
             windowVisible: window?.isVisible ?? false,
             windowMiniaturized: window?.isMiniaturized ?? false,
-            windowOnScreen: window?.occlusionState.contains(.visible) ?? false
+            windowOnScreen: window?.occlusionState.contains(.visible) ?? false,
+            windowIsKey: window?.isKeyWindow ?? false
         )
     }
 
@@ -1298,10 +1366,39 @@ final class GhosttyTerminalView: NSView {
         windowPresent: Bool,
         windowVisible: Bool,
         windowMiniaturized: Bool,
-        windowOnScreen: Bool
+        windowOnScreen: Bool,
+        windowIsKey: Bool
     ) -> Bool {
         guard visibleInUI, !isHidden, hasNonEmptyBounds, windowPresent else { return false }
-        return windowVisible && !windowMiniaturized && windowOnScreen
+        // GPU-safety invariant is unchanged: a minimized or ordered-out (invisible)
+        // window has no valid Metal drawable and must never be rendered into.
+        guard windowVisible, !windowMiniaturized else { return false }
+        // `windowOnScreen` (occlusionState.contains(.visible)) has documented AppKit
+        // false-negatives: after a Space switch / display sleep-wake it can report
+        // not-visible while the window is genuinely front and on screen, with no
+        // follow-up didChangeOcclusionState notification — which latched the renderer
+        // OFF permanently (audit #1: frozen frame, dead scroll, dead echo). A KEY
+        // window is by definition the focused front window of the active app, so it
+        // HAS a live on-screen drawable. OR it in so a stale occlusionState can never
+        // freeze a window the user is actively looking at. (cmux never gates render
+        // purely on occlusionState for the same reason.)
+        return windowOnScreen || windowIsKey
+    }
+
+    /// Decide whether a surface that was closed (`surfaceClosed == true`) should be
+    /// resurrected. A closed surface normally stays closed — but if the view is still
+    /// mounted on a window with valid bounds while its OWNER is not tearing down, the
+    /// surface was closed on the wrong (still-visible) instance (audit #4: a permanent
+    /// input + scroll freeze, dead until app relaunch). In that case rebuild so a
+    /// keystroke / scroll / output recovers the tab. Pure/static so the decision is
+    /// unit-testable without AppKit.
+    nonisolated static func shouldResurrectClosedSurface(
+        surfaceClosed: Bool,
+        hasWindow: Bool,
+        hasNonEmptyBounds: Bool,
+        ownerClosing: Bool
+    ) -> Bool {
+        surfaceClosed && hasWindow && hasNonEmptyBounds && !ownerClosing
     }
 
     private static func hasActiveDisplay() -> Bool {
@@ -1318,7 +1415,11 @@ final class GhosttyTerminalView: NSView {
 
     private func updateFocus() {
         guard let surface = surfaceSlot.liveSurface() else { return }
-        ghostty_surface_set_focus(surface, window?.firstResponder === self)
+        let focused = window?.firstResponder === self
+        ghostty_surface_set_focus(surface, focused)
+        // #2: focusing the terminal is the cheapest reliable moment to restart a
+        // CVDisplayLink that stalled while the window was inactive/asleep.
+        if focused { reassertDisplayID() }
     }
 
     @discardableResult
@@ -1379,6 +1480,10 @@ final class GhosttyTerminalView: NSView {
 
     override func keyDown(with event: NSEvent) {
         guard let surface = surfaceForInput() else { return }
+        // Self-heal a stale render gate (audit #1): a keystroke proves the window is
+        // focused and on screen, so re-derive occlusion before the input is handled —
+        // otherwise a latched-off occlusion swallows the echo and typing looks dead.
+        syncOcclusion()
         if event.modifierFlags.contains(.command) {
             switch event.charactersIgnoringModifiers {
             case "c":
@@ -1881,6 +1986,12 @@ final class GhosttyTerminalView: NSView {
 
     override func scrollWheel(with event: NSEvent) {
         guard let surface = surfaceForInput() else { return }
+        // Self-heal a stale render gate (audit #1): a scroll proves the window is on
+        // screen, so re-derive occlusion before the refresh below — otherwise a
+        // latched-off occlusion makes ghostty_surface_refresh a no-op and the
+        // viewport never moves (scroll looks dead). (Display-link reassert for #2
+        // stays on the focus/refresh paths — not this high-frequency momentum path.)
+        syncOcclusion()
         var x = event.scrollingDeltaX
         var y = event.scrollingDeltaY
         var mods: Int32 = 0

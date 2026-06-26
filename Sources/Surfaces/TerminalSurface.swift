@@ -624,6 +624,9 @@ public final class TerminalSurface: NSObject, Surface {
     private var readerAllowsRender = true
     private var isDrainingHiddenBacklog = false
     private var hiddenBacklogDrainGeneration = 0
+    /// Absolute deadline after which the hidden-backlog drain stops re-arming and
+    /// force-completes, so a continuous stream can't latch canRender false (#5).
+    private var hiddenBacklogDrainDeadline: Date?
     private var focusRepairGeneration = 0
     private var busyStatePollActive = false
     private var busyStateProbeUntil = Date.distantPast
@@ -682,10 +685,12 @@ public final class TerminalSurface: NSObject, Surface {
     }
     // Cached result of readTextSnapshot(). Invalidated when either the renderer
     // mutation count or the ghostty viewport text changes (see snapshotCacheValid).
-    private var cachedTextSnapshot: (rendererVersion: UInt64, viewportText: String?, value: TerminalTextSnapshot)?
+    private var cachedTextSnapshot: (rendererVersion: UInt64, viewportText: String?, stateSignature: String, value: TerminalTextSnapshot)?
     private var parkingWindow: NSWindow?
     private var parkingConstraints: [NSLayoutConstraint] = []
     private var needsHistoryReplay = false
+    /// Guards against a second concurrent history read while one is outstanding (F4).
+    private var historyReplayInFlight = false
     private var restartBannerButton: NSButton?
 
     /// Bell preferences, configurable by the user. Defaults to silent (no sound,
@@ -702,6 +707,9 @@ public final class TerminalSurface: NSObject, Surface {
     /// surface with a fresh one in the same pane and cwd.
     public var onRestartRequested: (() -> Void)?
     private static let hiddenBacklogQuietDelay: TimeInterval = 0.25
+    /// Absolute cap on how long the hidden-backlog drain may keep re-arming before it
+    /// force-completes, even under a never-quiet stream (#5). Bounds the frozen frame.
+    private static let hiddenBacklogMaxDrainWindow: TimeInterval = 1.0
     private static let busyStateProbeDuration: TimeInterval = 2.0
     private static let busyStatePollInterval: TimeInterval = 0.25
     private static let outputTelemetryByteInterval = 8 * 1024 * 1024
@@ -830,6 +838,9 @@ public final class TerminalSurface: NSObject, Surface {
                 NSSound.beep()
             }
         }
+        // Audit #4: let the view distinguish a legitimate teardown from a stray close
+        // of a still-visible instance. A deallocated owner reports "closing" (true).
+        terminalView.ownerIsClosing = { [weak self] in self?.isClosing ?? true }
         // Forward paste-confirmation requests from the Ghostty view to any
         // app-level handler wired on this surface (e.g. AppCommandRouter).
         terminalView.onPasteNeedsConfirm = { [weak self] (text: String) in
@@ -1010,6 +1021,16 @@ public final class TerminalSurface: NSObject, Surface {
 
     private func appendDataAsync(_ data: Data, renderAllowedAtRead: Bool) {
         guard !isClosing else { return }
+        // Audit #3: if output is arriving while we believe the surface is hidden but
+        // its view is demonstrably on a key, on-screen window, the visibility reconcile
+        // desynced (a missed/incorrect setVisibleSurfaceIDs) and readerAllowsRender +
+        // occlusion are latched OFF — nothing repaints (the freeze). Recovery normally
+        // depends only on a future reconcile the user cannot trigger by scrolling or
+        // typing. Fail loud and self-heal locally so the live terminal un-freezes.
+        if Self.isLikelyStuckHidden(isVisible: isVisible, viewDefinitelyOnScreen: ghosttyView.isDefinitelyOnScreen) {
+            terminalLog.error("terminal.stuck_hidden_recover surface=\(self.descriptor.id.value.uuidString, privacy: .public) — output arrived while logically hidden but the view is on a key on-screen window; self-healing (audit #3)")
+            didBecomeVisible()
+        }
         enqueueHistory(data)
         recordOutputTelemetry(bytes: data.count)
         if awaitingSSHFirstOutput {
@@ -1125,23 +1146,43 @@ public final class TerminalSurface: NSObject, Surface {
     }
 
     private func replayPersistedHistoryIfNeeded() {
-        guard needsHistoryReplay, let historyRepo else { return }
-        needsHistoryReplay = false
+        guard needsHistoryReplay, !historyReplayInFlight, let historyRepo else { return }
+        // F4: do NOT clear needsHistoryReplay here. The flag is consumed only once the
+        // replay actually lands (or we confirm there is genuinely nothing to replay).
+        // A transient read failure — or a teardown that drops the reset — would
+        // otherwise permanently clear the flag and leave the terminal blank with no
+        // recovery. Keeping it true lets the next window attach/reparent (this
+        // method's caller, handleContainerWindowChanged) retry. The in-flight guard
+        // prevents a second concurrent read while one is outstanding.
+        historyReplayInFlight = true
         let surfaceID = descriptor.id.value.uuidString
         historyQueue.async { [weak self] in
+            var readFailed = false
             let window: TerminalOutputWindow?
             do {
                 window = try historyRepo.readWindow(surfaceID: surfaceID)
             } catch {
                 NSLog("RemoteCode terminal history restore failed surface=%@ error=%@", surfaceID, String(describing: error))
                 window = nil
+                readFailed = true
             }
-            guard let window, !window.chunks.isEmpty else { return }
-            let payload = TerminalSurface.assembleReplayPayload(from: window.chunks.map(\.data))
-            guard !payload.isEmpty else { return }
+            let payload: Data = (window.map { !$0.chunks.isEmpty } ?? false)
+                ? TerminalSurface.assembleReplayPayload(from: window!.chunks.map(\.data))
+                : Data()
             DispatchQueue.main.async { [weak self] in
-                guard let self, !self.isClosing else { return }
-                self.ghosttyView.resetSurfaceOutput(payload)
+                guard let self else { return }
+                self.historyReplayInFlight = false
+                guard !self.isClosing else { return }
+                if readFailed {
+                    // Leave needsHistoryReplay == true: the next window attach retries.
+                    return
+                }
+                if !payload.isEmpty {
+                    self.ghosttyView.resetSurfaceOutput(payload)
+                }
+                // Read succeeded (empty history is a valid "nothing to replay" state):
+                // consume the flag so the same history is never replayed twice.
+                self.needsHistoryReplay = false
             }
         }
     }
@@ -1197,6 +1238,15 @@ public final class TerminalSurface: NSObject, Surface {
         return buffer
     }
 
+    /// Pure detection seam (audit #3): a surface that believes it is hidden
+    /// (`isVisible == false`) while its view is demonstrably on a key, on-screen
+    /// window is a visibility-reconcile desync — output is arriving but
+    /// readerAllowsRender/occlusion are latched off so nothing repaints (the freeze).
+    /// `nonisolated static` so the desync condition is unit-testable without AppKit.
+    nonisolated static func isLikelyStuckHidden(isVisible: Bool, viewDefinitelyOnScreen: Bool) -> Bool {
+        !isVisible && viewDefinitelyOnScreen
+    }
+
     @discardableResult
     private func writeToPTY(_ data: Data) -> TerminalInputStatus {
         guard !data.isEmpty else { return .accepted }
@@ -1230,6 +1280,16 @@ public final class TerminalSurface: NSObject, Surface {
                     terminalLog.error("terminal.input_failed surface=\(self.descriptor.id.value.uuidString, privacy: .public) status=\(status.rawValue, privacy: .public) pid=\(self.childPID, privacy: .public)")
                 }
                 self?.markTerminalDead(reason: status.rawValue, exitStatus: nil)
+            }
+        }
+        pump.onInputStalled = { [weak self] unwritten in
+            DispatchQueue.main.async {
+                guard let self, !self.isClosing else { return }
+                // RECOVERABLE: the child is not draining stdin. We did NOT mark the
+                // terminal dead — log loudly (fail-loud) and re-publish health so the
+                // UI/mirror reflect the stall instead of input looking silently dead.
+                terminalLog.error("terminal.input_stalled surface=\(self.descriptor.id.value.uuidString, privacy: .public) unwrittenBytes=\(unwritten, privacy: .public) pid=\(self.childPID, privacy: .public)")
+                self.publishRuntimeHealth()
             }
         }
         inputPump = pump
@@ -1288,6 +1348,20 @@ public final class TerminalSurface: NSObject, Surface {
         // (PERF-136), before the cache check, so rendererMutationCount and the
         // renderer's actual state agree for every read site below.
         ensureRendererCurrent()
+        let diagnostics = renderDiagnostics()
+        // F1: the cache key must also cover the volatile state the snapshot EMBEDS
+        // (render-diagnostics, pending/partial/history-failure flags). rendererVersion
+        // + viewportText alone miss a change such as canRender flipping or
+        // outputPendingBytes moving with no renderer feed, so the cache could return a
+        // snapshot whose embedded diagnostics are stale — masking live state as stable.
+        // Fold those signals into a signature that is part of the validity check.
+        let stateSignature = Self.snapshotStateSignature(
+            outputPartial: outputPartial,
+            outputPendingBytes: outputPendingBytes,
+            historyWriteFailures: historyWriteFailures,
+            renderBlockedReason: diagnostics.blockedReason,
+            canRender: diagnostics.canRender
+        )
         if !isVisible && outputPendingBytes > 0 {
             // Hidden-output fallback: only the renderer is authoritative here.
             // The viewport key in this branch is always nil (we skip ghostty read).
@@ -1296,7 +1370,9 @@ public final class TerminalSurface: NSObject, Surface {
                    rendererVersion: rendererMutationCount,
                    cachedVersion: cached.rendererVersion,
                    viewportText: nil,
-                   cachedViewportText: cached.viewportText
+                   cachedViewportText: cached.viewportText,
+                   stateSignature: stateSignature,
+                   cachedStateSignature: cached.stateSignature
                ) {
                 return cached.value
             }
@@ -1310,10 +1386,10 @@ public final class TerminalSurface: NSObject, Surface {
                 pendingBytes: outputPendingBytes,
                 rows: terminalSize.rows,
                 cols: terminalSize.cols,
-                renderDiagnostics: renderDiagnostics()
+                renderDiagnostics: diagnostics
             )
             snap.ansiPalette = resolvedCustomPaletteHex()
-            cachedTextSnapshot = (rendererMutationCount, nil, snap)
+            cachedTextSnapshot = (rendererMutationCount, nil, stateSignature, snap)
             return snap
         }
         // Read the ghostty viewport text first (cheap when there is no pending
@@ -1325,11 +1401,12 @@ public final class TerminalSurface: NSObject, Surface {
                rendererVersion: rendererMutationCount,
                cachedVersion: cached.rendererVersion,
                viewportText: currentViewportText,
-               cachedViewportText: cached.viewportText
+               cachedViewportText: cached.viewportText,
+               stateSignature: stateSignature,
+               cachedStateSignature: cached.stateSignature
            ) {
             return cached.value
         }
-        let diagnostics = renderDiagnostics()
         var snap: TerminalTextSnapshot
         if let text = currentViewportText {
             let rendererText = renderer.snapshot().string
@@ -1386,7 +1463,7 @@ public final class TerminalSurface: NSObject, Surface {
             )
         }
         snap.ansiPalette = resolvedCustomPaletteHex()
-        cachedTextSnapshot = (rendererMutationCount, currentViewportText, snap)
+        cachedTextSnapshot = (rendererMutationCount, currentViewportText, stateSignature, snap)
         return snap
     }
 
@@ -1430,9 +1507,30 @@ public final class TerminalSurface: NSObject, Surface {
         rendererVersion: UInt64,
         cachedVersion: UInt64,
         viewportText: String?,
-        cachedViewportText: String?
+        cachedViewportText: String?,
+        stateSignature: String,
+        cachedStateSignature: String
     ) -> Bool {
-        rendererVersion == cachedVersion && viewportText == cachedViewportText
+        rendererVersion == cachedVersion
+            && viewportText == cachedViewportText
+            && stateSignature == cachedStateSignature
+    }
+
+    /// Compact signature of the volatile state that `readTextSnapshot()` embeds in a
+    /// snapshot but that is NOT captured by `rendererVersion`/`viewportText`: the
+    /// render-diagnostics outcome plus the pending/partial/history-failure flags.
+    /// Folding it into the cache key (F1) means a diagnostics change (e.g. canRender
+    /// flips, or `outputPendingBytes` moves with no renderer feed) correctly
+    /// invalidates the cache instead of returning a snapshot with stale diagnostics.
+    /// `nonisolated static` so it is pure and unit-testable.
+    nonisolated static func snapshotStateSignature(
+        outputPartial: Bool,
+        outputPendingBytes: Int,
+        historyWriteFailures: Int,
+        renderBlockedReason: String?,
+        canRender: Bool
+    ) -> String {
+        "\(outputPartial)|\(outputPendingBytes)|\(historyWriteFailures)|\(renderBlockedReason ?? "")|\(canRender)"
     }
 
     static func readTextPartialReason(outputPartial: Bool, outputPendingBytes: Int, historyWriteFailures: Int, renderBlockedReason: String? = nil) -> String? {
@@ -1751,6 +1849,7 @@ public final class TerminalSurface: NSObject, Surface {
         isVisible = false
         readerAllowsRender = false
         isDrainingHiddenBacklog = false
+        hiddenBacklogDrainDeadline = nil
         // Clear any renderer buffer from a prior hidden session so bytes from
         // one hidden period do not bleed into the next.
         hiddenRendererBuffer = Data()
@@ -1761,14 +1860,32 @@ public final class TerminalSurface: NSObject, Surface {
 
     private func beginHiddenBacklogDrain() {
         isDrainingHiddenBacklog = true
+        hiddenBacklogDrainDeadline = Date().addingTimeInterval(Self.hiddenBacklogMaxDrainWindow)
         hiddenBacklogDrainGeneration &+= 1
         scheduleHiddenBacklogDrainCompletion(generation: hiddenBacklogDrainGeneration)
     }
 
     private func continueHiddenBacklogDrainIfNeeded() {
         guard isDrainingHiddenBacklog else { return }
+        // #5: a continuous post-reveal stream (chunks closer together than the quiet
+        // delay) used to RE-ARM the completion on every chunk, so isDrainingHiddenBacklog
+        // never cleared and canRender stayed false for the whole burst — the
+        // frozen-at-reveal-frame bug. Past the absolute deadline, stop re-arming and
+        // force the drain to complete.
+        guard Self.shouldRearmHiddenBacklogDrain(now: Date(), deadline: hiddenBacklogDrainDeadline) else {
+            completeHiddenBacklogDrain()
+            return
+        }
         hiddenBacklogDrainGeneration &+= 1
         scheduleHiddenBacklogDrainCompletion(generation: hiddenBacklogDrainGeneration)
+    }
+
+    /// Pure seam (#5): whether the hidden-backlog drain may re-arm its quiet-delay
+    /// completion, or has exceeded its absolute deadline and must force-complete.
+    /// `nonisolated static` so the deadline logic is unit-testable without AppKit.
+    nonisolated static func shouldRearmHiddenBacklogDrain(now: Date, deadline: Date?) -> Bool {
+        guard let deadline else { return true }
+        return now < deadline
     }
 
     private func scheduleHiddenBacklogDrainCompletion(generation: Int) {
@@ -1777,10 +1894,19 @@ public final class TerminalSurface: NSObject, Surface {
                   self.hiddenBacklogDrainGeneration == generation,
                   self.isVisible,
                   !self.isClosing else { return }
-            self.isDrainingHiddenBacklog = false
-            self.outputPendingBytes = 0
-            self.ghosttyView.refreshSurfaceOnly()
+            self.completeHiddenBacklogDrain()
         }
+    }
+
+    private func completeHiddenBacklogDrain() {
+        guard isDrainingHiddenBacklog else { return }
+        isDrainingHiddenBacklog = false
+        hiddenBacklogDrainDeadline = nil
+        outputPendingBytes = 0
+        ghosttyView.refreshSurfaceOnly()
+        // F5: the drain just changed render/output state — publish runtime health now
+        // so the UI/mirror reconcile instead of waiting for the next busy-state poll.
+        publishRuntimeHealth()
     }
 
     public func close() {

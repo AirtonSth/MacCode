@@ -178,22 +178,26 @@ struct TerminalStartupEnvironment: Equatable {
 public final class SurfaceRuntimeBus: @unchecked Sendable {
     public static let shared = SurfaceRuntimeBus()
 
-    private let queue = DispatchQueue(label: "RemoteCode.SurfaceRuntimeBus")
+    // Lock-guarded storage instead of a serial dispatch queue (F12): the previous
+    // `queue.async` emit delivered health transitions LATE (the new state sat in a
+    // background FIFO before the sink ran), and the `queue.sync` getter could block
+    // — or deadlock if ever read from the bus queue. The sink is set once at startup
+    // and itself hops to @MainActor where it needs to, so reading it under a lock
+    // and invoking it synchronously on the emitting thread is both safe and makes
+    // health publication deterministic (no transition is dropped or reordered).
+    private let lock = NSLock()
     private var sinkStorage: (@Sendable (_ surfaceId: SurfaceID, _ health: TerminalRuntimeHealth) -> Void)?
 
     public var sink: (@Sendable (_ surfaceId: SurfaceID, _ health: TerminalRuntimeHealth) -> Void)? {
-        get { queue.sync { sinkStorage } }
-        set {
-            queue.async {
-                self.sinkStorage = newValue
-            }
-        }
+        get { lock.lock(); defer { lock.unlock() }; return sinkStorage }
+        set { lock.lock(); sinkStorage = newValue; lock.unlock() }
     }
 
     public func emit(_ surfaceId: SurfaceID, _ health: TerminalRuntimeHealth) {
-        queue.async {
-            self.sinkStorage?(surfaceId, health)
-        }
+        lock.lock()
+        let sink = sinkStorage
+        lock.unlock()
+        sink?(surfaceId, health)
     }
 }
 
@@ -240,23 +244,41 @@ final class TerminalInputPump: @unchecked Sendable {
     private let queue: DispatchQueue
     private let maxQueuedBytes: Int
     private let retryDelay: useconds_t
+    private let maxWouldBlockWaitMicros: UInt64
     private let writer: Writer
     private let lock = NSLock()
     private var queuedBytes = 0
     private var accepting = true
     private var lastFailure: TerminalInputStatus?
     var onTerminalFailure: (@Sendable (TerminalInputStatus) -> Void)?
+    /// Fired (off the pump's queue) when a single write blocks past the retry
+    /// budget because the child stopped draining its stdin. RECOVERABLE — the pump
+    /// keeps accepting input; this only surfaces "input is blocked" so the UI can
+    /// say so instead of the terminal looking silently dead. `unwrittenBytes` is how
+    /// much of the stalled chunk was abandoned.
+    var onInputStalled: (@Sendable (_ unwrittenBytes: Int) -> Void)?
 
     init(
         label: String = "rc2.terminal.input-pump",
         maxQueuedBytes: Int = 1024 * 1024,
         retryDelay: useconds_t = 2_000,
+        maxWouldBlockWaitMicros: UInt64 = 5_000_000,
         writer: @escaping Writer
     ) {
         self.queue = DispatchQueue(label: label, qos: .userInitiated)
         self.maxQueuedBytes = max(1, maxQueuedBytes)
         self.retryDelay = retryDelay
+        self.maxWouldBlockWaitMicros = maxWouldBlockWaitMicros
         self.writer = writer
+    }
+
+    /// Pure decision seam for the `.wouldBlock` retry budget. Returns true once the
+    /// cumulative time spent waiting on a non-draining PTY reaches the budget, so the
+    /// drain loop stops spinning instead of head-of-line-blocking the serial queue
+    /// (and every later keystroke) forever. `nonisolated static` so the budget logic
+    /// is unit-testable without a live pump, queue, or PTY.
+    static func shouldAbortWouldBlock(waitedMicros: UInt64, budgetMicros: UInt64) -> Bool {
+        budgetMicros > 0 && waitedMicros >= budgetMicros
     }
 
     var queuedByteCount: Int {
@@ -309,17 +331,32 @@ final class TerminalInputPump: @unchecked Sendable {
         }
 
         var offset = 0
+        var wouldBlockWaitMicros: UInt64 = 0
         while offset < data.count {
             switch writer(data, offset) {
             case .wrote(let count) where count > 0:
                 offset += count
+                wouldBlockWaitMicros = 0   // forward progress resets the stall budget
             case .wrote:
                 fail(.writeFailed)
                 return
             case .interrupted:
                 continue
             case .wouldBlock:
+                // The child stopped reading its stdin (slave tty input buffer full).
+                // Bound the retry: an open-ended `usleep`+continue spins a CPU core
+                // forever AND head-of-line-blocks every later keystroke queued behind
+                // this chunk on the serial queue — the "terminal alive but typing
+                // dead" freeze. This is RECOVERABLE backpressure, not process death,
+                // so do NOT latch accepting=false (fail()); stop waiting on this chunk
+                // and surface the stall. Subsequent input is no longer blocked.
+                if Self.shouldAbortWouldBlock(waitedMicros: wouldBlockWaitMicros,
+                                              budgetMicros: maxWouldBlockWaitMicros) {
+                    onInputStalled?(data.count - offset)
+                    return
+                }
                 usleep(retryDelay)
+                wouldBlockWaitMicros &+= UInt64(retryDelay)
                 continue
             case .failed:
                 fail(.writeFailed)

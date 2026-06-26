@@ -14,7 +14,8 @@ final class GhosttyRenderGateTests: XCTestCase {
         windowVisible: Bool = true,
         windowMiniaturized: Bool = false,
         windowOnScreen: Bool = true,
-        windowPresent: Bool = true
+        windowPresent: Bool = true,
+        windowIsKey: Bool = false
     ) -> Bool {
         GhosttyTerminalView.canRender(
             visibleInUI: true,
@@ -23,7 +24,8 @@ final class GhosttyRenderGateTests: XCTestCase {
             windowPresent: windowPresent,
             windowVisible: windowVisible,
             windowMiniaturized: windowMiniaturized,
-            windowOnScreen: windowOnScreen
+            windowOnScreen: windowOnScreen,
+            windowIsKey: windowIsKey
         )
     }
 
@@ -81,7 +83,7 @@ final class GhosttyRenderGateTests: XCTestCase {
             GhosttyTerminalView.canRender(
                 visibleInUI: true, isHidden: false, hasNonEmptyBounds: true,
                 windowPresent: false, windowVisible: false,
-                windowMiniaturized: false, windowOnScreen: false),
+                windowMiniaturized: false, windowOnScreen: false, windowIsKey: false),
             "a selected terminal whose view is mid-move (windowless) must not render — keying on visibleInUI alone freezes on nextDrawable")
     }
 
@@ -92,7 +94,7 @@ final class GhosttyRenderGateTests: XCTestCase {
             GhosttyTerminalView.canRender(
                 visibleInUI: true, isHidden: false, hasNonEmptyBounds: true,
                 windowPresent: true, windowVisible: false,
-                windowMiniaturized: false, windowOnScreen: false),
+                windowMiniaturized: false, windowOnScreen: false, windowIsKey: false),
             "a selected terminal in a new window that is not yet on screen must not render")
     }
 
@@ -104,7 +106,7 @@ final class GhosttyRenderGateTests: XCTestCase {
         let renderable = GhosttyTerminalView.canRender(
             visibleInUI: visibleInUI, isHidden: false, hasNonEmptyBounds: true,
             windowPresent: false, windowVisible: false,
-            windowMiniaturized: false, windowOnScreen: false)
+            windowMiniaturized: false, windowOnScreen: false, windowIsKey: false)
         XCTAssertTrue(visibleInUI, "precondition: the moved tab is still logically selected")
         XCTAssertNotEqual(renderable, visibleInUI,
             "render decision must NOT equal visibleInUI in the windowless mid-move state — that equality was the freeze bug")
@@ -114,17 +116,94 @@ final class GhosttyRenderGateTests: XCTestCase {
         XCTAssertFalse(
             GhosttyTerminalView.canRender(
                 visibleInUI: false, isHidden: false, hasNonEmptyBounds: true,
-                windowPresent: true, windowVisible: true, windowMiniaturized: false, windowOnScreen: true),
+                windowPresent: true, windowVisible: true, windowMiniaturized: false, windowOnScreen: true, windowIsKey: false),
             "an unselected tab must not render even if its window is on screen")
         XCTAssertFalse(
             GhosttyTerminalView.canRender(
                 visibleInUI: true, isHidden: true, hasNonEmptyBounds: true,
-                windowPresent: true, windowVisible: true, windowMiniaturized: false, windowOnScreen: true),
+                windowPresent: true, windowVisible: true, windowMiniaturized: false, windowOnScreen: true, windowIsKey: false),
             "a hidden view must not render")
         XCTAssertFalse(
             GhosttyTerminalView.canRender(
                 visibleInUI: true, isHidden: false, hasNonEmptyBounds: false,
-                windowPresent: true, windowVisible: true, windowMiniaturized: false, windowOnScreen: true),
+                windowPresent: true, windowVisible: true, windowMiniaturized: false, windowOnScreen: true, windowIsKey: false),
             "a zero-sized view has no drawable and must not render")
+    }
+
+    // MARK: - occlusionState false-negative heal (audit #1)
+    //
+    // `occlusionState.contains(.visible)` has documented AppKit false-negatives:
+    // after a Space switch / display sleep-wake it can report not-visible while the
+    // window is genuinely front and on screen, with no follow-up notification — and
+    // because syncOcclusion pushes that into a CACHED ghostty occlusion latch and
+    // neither keyDown nor scrollWheel re-derived it, the renderer stayed suspended
+    // forever (frozen frame, dead scroll, dead echo). A KEY window is, by definition,
+    // the focused front window of the active app, so it has a live on-screen
+    // drawable: the gate now treats key as on-screen.
+
+    func test_keyWindowRendersEvenWhenOcclusionStateFalseNegatives() {
+        XCTAssertTrue(
+            onScreenSelected(windowOnScreen: false, windowIsKey: true),
+            "a KEY window must render even when occlusionState falsely reports not-visible — that latch was the freeze (audit #1)")
+    }
+
+    func test_keyWindowFlagDoesNotOverrideGpuSafetyGuards() {
+        // The heal must NOT defeat the AGX-trap guards: a minimized or ordered-out
+        // window has no valid drawable even if AppKit somehow reported it as key.
+        XCTAssertFalse(
+            onScreenSelected(windowVisible: true, windowMiniaturized: true, windowOnScreen: false, windowIsKey: true),
+            "a minimized window has no drawable — isKey must not force a render into it")
+        XCTAssertFalse(
+            onScreenSelected(windowVisible: false, windowOnScreen: false, windowIsKey: true),
+            "an ordered-out (invisible) window has no drawable — isKey must not force a render into it")
+    }
+
+    func test_keyWindowDoesNotRescueAnUnselectedOrHiddenTab() {
+        XCTAssertFalse(
+            GhosttyTerminalView.canRender(
+                visibleInUI: false, isHidden: false, hasNonEmptyBounds: true,
+                windowPresent: true, windowVisible: true, windowMiniaturized: false,
+                windowOnScreen: true, windowIsKey: true),
+            "an unselected tab must still not render even in a key window")
+    }
+
+    // MARK: - surfaceClosed resurrection (audit #4)
+    //
+    // `surfaceClosed` latches permanently after closeSurface(); ensureSurface then
+    // returns forever, so a still-visible tab whose surface was closed on the wrong
+    // instance (clone / cross-client yank / double-close) is frozen for input AND
+    // scroll until app relaunch. Resurrection must fire ONLY when the view is still
+    // mounted on a window with bounds AND the owner is not legitimately closing.
+
+    func test_resurrects_whenClosedButViewStillVisibleAndOwnerNotClosing() {
+        XCTAssertTrue(
+            GhosttyTerminalView.shouldResurrectClosedSurface(
+                surfaceClosed: true, hasWindow: true, hasNonEmptyBounds: true, ownerClosing: false),
+            "a surface closed on a still-mounted view whose owner is alive must be rebuilt, not left frozen")
+    }
+
+    func test_doesNotResurrect_duringLegitimateTeardown() {
+        XCTAssertFalse(
+            GhosttyTerminalView.shouldResurrectClosedSurface(
+                surfaceClosed: true, hasWindow: true, hasNonEmptyBounds: true, ownerClosing: true),
+            "a legitimate close (owner is tearing down) must stay closed")
+    }
+
+    func test_doesNotResurrect_whenViewIsUnmountedOrZeroSized() {
+        XCTAssertFalse(
+            GhosttyTerminalView.shouldResurrectClosedSurface(
+                surfaceClosed: true, hasWindow: false, hasNonEmptyBounds: true, ownerClosing: false),
+            "a windowless (unmounted) view must not resurrect")
+        XCTAssertFalse(
+            GhosttyTerminalView.shouldResurrectClosedSurface(
+                surfaceClosed: true, hasWindow: true, hasNonEmptyBounds: false, ownerClosing: false),
+            "a zero-sized view has no drawable to rebuild into")
+    }
+
+    func test_doesNotResurrect_whenNotClosed() {
+        XCTAssertFalse(
+            GhosttyTerminalView.shouldResurrectClosedSurface(
+                surfaceClosed: false, hasWindow: true, hasNonEmptyBounds: true, ownerClosing: false),
+            "an open surface is not a resurrection candidate")
     }
 }
