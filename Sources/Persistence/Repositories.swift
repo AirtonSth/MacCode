@@ -487,11 +487,19 @@ public final class AgentMessageRepository {
     public func listPage(threadId: AgentThreadID, limit requestedLimit: Int, before beforeCursor: AgentMessageCursor?, after afterCursor: AgentMessageCursor?) throws -> AgentMessagePage {
         let limit = max(0, min(requestedLimit, 500))
         let sql: String
+        // PERSISTENCE-DATA-004: the ORDER BY tiebreaks on rowid (insertion order,
+        // a deliberate UX choice — see MessageOrderingTieBreakerTests), but the
+        // keyset predicate tiebroke on `id` (UUID). UUID order is unrelated to
+        // rowid order, so rows sharing a created_at (stored at second precision,
+        // so ties are common) could be skipped or duplicated at a page boundary.
+        // Fix: tiebreak the predicate on rowid too, resolving the cursor message's
+        // rowid via subquery. This keeps the public {createdAt, id} cursor shape
+        // unchanged while making WHERE and ORDER BY use the same key.
         if let _ = afterCursor {
             sql = """
             SELECT id, thread_id, role, content, created_at
             FROM agent_messages
-            WHERE thread_id = ? AND (created_at > ? OR (created_at = ? AND id > ?))
+            WHERE thread_id = ? AND (created_at > ? OR (created_at = ? AND rowid > (SELECT rowid FROM agent_messages WHERE id = ?)))
             ORDER BY created_at ASC, rowid ASC
             LIMIT ?;
             """
@@ -501,7 +509,7 @@ public final class AgentMessageRepository {
             sql = """
             SELECT id, thread_id, role, content, created_at
             FROM agent_messages
-            WHERE thread_id = ? AND (created_at < ? OR (created_at = ? AND id < ?))
+            WHERE thread_id = ? AND (created_at < ? OR (created_at = ? AND rowid < (SELECT rowid FROM agent_messages WHERE id = ?)))
             ORDER BY created_at DESC, rowid DESC
             LIMIT ?;
             """

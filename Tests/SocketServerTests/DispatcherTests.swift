@@ -152,7 +152,9 @@ class FakeRouter: CommandRouting, TerminalCommandRouting {
             return $0.updatedAt > $1.updatedAt
         }
     }
-    func createAgentThread(workspace: WorkspaceID?, title: String, provider: AgentProvider, model: String, permissionMode: AgentPermissionMode, reasoningEffort: AgentReasoningEffort, serviceTier: AgentServiceTier, modelSelection: AgentModelSelection?, providerInstanceId: String?) throws -> AgentThread {
+    var lastCreateSurfaceID: SurfaceID?
+    func createAgentThread(workspace: WorkspaceID?, title: String, provider: AgentProvider, model: String, permissionMode: AgentPermissionMode, reasoningEffort: AgentReasoningEffort, serviceTier: AgentServiceTier, modelSelection: AgentModelSelection?, providerInstanceId: String?, surfaceID: SurfaceID?) throws -> AgentThread {
+        lastCreateSurfaceID = surfaceID
         let thread = AgentThread(workspaceId: workspace, title: title, provider: provider,
                                  providerInstanceId: providerInstanceId,
                                  model: model,
@@ -238,9 +240,11 @@ class FakeRouter: CommandRouting, TerminalCommandRouting {
         return AgentAttachmentUploadResult(path: path, displayName: filename, kind: filename.hasSuffix(".png") ? .image : .file, mimeType: mimeType, sizeBytes: data.count)
     }
     var selectedThread: AgentThreadID?
-    func selectAgentThread(thread: AgentThreadID) throws {
+    var lastSelectSurfaceID: SurfaceID?
+    func selectAgentThread(thread: AgentThreadID, surfaceID: SurfaceID?) throws {
         guard threadStore.contains(where: { $0.id == thread }) else { throw JSONRPCError.invalidParams }
         selectedThread = thread
+        lastSelectSurfaceID = surfaceID
     }
     func listAgentMessages(thread: AgentThreadID, limit: Int) throws -> [AgentMessage] {
         Array(messageStore.filter { $0.threadId == thread }.suffix(max(0, limit)))
@@ -360,7 +364,8 @@ class FakeRouter: CommandRouting, TerminalCommandRouting {
                                            reasoningEffort: reasoningEffort ?? .medium,
                                            serviceTier: serviceTier ?? .auto,
                                            modelSelection: modelSelection,
-                                           providerInstanceId: nil)
+                                           providerInstanceId: nil,
+                                           surfaceID: nil)
         } else {
             guard let existing = threadStore.first(where: { $0.id == thread }) else { throw JSONRPCError.invalidParams }
             target = existing

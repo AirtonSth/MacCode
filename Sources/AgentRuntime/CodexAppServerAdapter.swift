@@ -169,6 +169,18 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
     }
 
     public func sendTurn(_ request: AgentRunRequest, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) async throws -> AgentRunHandle {
+        // RUN-LIFECYCLE-STREAM-003: refuse a second concurrent turn on a thread
+        // that already has a turn in flight (mirrors the Claude adapters). A live
+        // turn has a non-nil activeTurnId (cleared on completion), so a normal
+        // follow-up turn is still allowed; only a true concurrent start is
+        // rejected, instead of silently replacing the session via recordSession
+        // and misrouting the prior turn's events.
+        lock.lock()
+        let hasInFlightTurn = sessions[request.threadId]?.activeTurnId != nil
+        lock.unlock()
+        if hasInFlightTurn {
+            throw AgentProviderAdapterError.unsupported("Codex session already has an in-flight turn")
+        }
         let client = try clientFor(request: request, onEvent: onEvent)
         client.terminationHandler = { [weak self] error in
             self?.handleClientTermination(threadId: request.threadId, error: error)
