@@ -231,34 +231,55 @@ final class TerminalSnapshotCacheTests: XCTestCase {
 
     // MARK: - snapshotStateSignature seam
 
+    private func diag(
+        logicalVisible: Bool = true, registryVisible: Bool = true,
+        drainingHiddenBacklog: Bool = false, windowAttached: Bool = true,
+        parked: Bool = false, hasUsableBounds: Bool = true, hiddenAncestor: Bool = false
+    ) -> TerminalRenderDiagnostics {
+        TerminalRenderDiagnostics(
+            logicalVisible: logicalVisible, registryVisible: registryVisible,
+            drainingHiddenBacklog: drainingHiddenBacklog, windowAttached: windowAttached,
+            parked: parked, hasUsableBounds: hasUsableBounds, hiddenAncestor: hiddenAncestor)
+    }
+
     func test_stateSignature_differsWhenCanRenderFlips() {
         let blocked = TerminalSurface.snapshotStateSignature(
             outputPartial: false, outputPendingBytes: 0, historyWriteFailures: 0,
-            renderBlockedReason: "window_detached", canRender: false)
+            diagnostics: diag(windowAttached: false))   // → blockedReason window_detached, canRender false
         let live = TerminalSurface.snapshotStateSignature(
             outputPartial: false, outputPendingBytes: 0, historyWriteFailures: 0,
-            renderBlockedReason: nil, canRender: true)
+            diagnostics: diag())                         // → fully renderable
         XCTAssertNotEqual(blocked, live,
             "a render-gate transition (canRender / blockedReason) must change the signature so the snapshot is rebuilt with fresh diagnostics")
     }
 
-    func test_stateSignature_differsWhenPendingBytesChange() {
+    func test_stateSignature_differsWhenSecondaryDiagnosticFieldChanges() {
+        // `parked` flips while `windowAttached:false` keeps blockedReason == window_detached
+        // and canRender == false. The OLD blockedReason+canRender-only signature missed
+        // this; the full-diagnostics signature must catch it.
         let a = TerminalSurface.snapshotStateSignature(
             outputPartial: false, outputPendingBytes: 0, historyWriteFailures: 0,
-            renderBlockedReason: nil, canRender: true)
+            diagnostics: diag(windowAttached: false, parked: false))
         let b = TerminalSurface.snapshotStateSignature(
-            outputPartial: false, outputPendingBytes: 128, historyWriteFailures: 0,
-            renderBlockedReason: nil, canRender: true)
+            outputPartial: false, outputPendingBytes: 0, historyWriteFailures: 0,
+            diagnostics: diag(windowAttached: false, parked: true))
+        XCTAssertNotEqual(a, b,
+            "a change in ANY embedded diagnostics field must invalidate the cache, even when blockedReason/canRender are unchanged")
+    }
+
+    func test_stateSignature_differsWhenPendingBytesChange() {
+        let a = TerminalSurface.snapshotStateSignature(
+            outputPartial: false, outputPendingBytes: 0, historyWriteFailures: 0, diagnostics: diag())
+        let b = TerminalSurface.snapshotStateSignature(
+            outputPartial: false, outputPendingBytes: 128, historyWriteFailures: 0, diagnostics: diag())
         XCTAssertNotEqual(a, b, "a change in pending bytes must invalidate the cached snapshot")
     }
 
     func test_stateSignature_stableForIdenticalState() {
         let a = TerminalSurface.snapshotStateSignature(
-            outputPartial: true, outputPendingBytes: 9, historyWriteFailures: 1,
-            renderBlockedReason: "parking_window", canRender: false)
+            outputPartial: true, outputPendingBytes: 9, historyWriteFailures: 1, diagnostics: diag(parked: true))
         let b = TerminalSurface.snapshotStateSignature(
-            outputPartial: true, outputPendingBytes: 9, historyWriteFailures: 1,
-            renderBlockedReason: "parking_window", canRender: false)
+            outputPartial: true, outputPendingBytes: 9, historyWriteFailures: 1, diagnostics: diag(parked: true))
         XCTAssertEqual(a, b, "identical state must yield an identical signature so the hot path still hits the cache")
     }
 }

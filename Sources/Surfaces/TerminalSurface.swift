@@ -622,6 +622,9 @@ public final class TerminalSurface: NSObject, Surface {
     private var outputBytesAtLastTelemetry = 0
     private var lastOutputTelemetryAt = Date.distantPast
     private var readerAllowsRender = true
+    /// Set while a deferred audit-#3 stuck-hidden self-heal is pending, so output
+    /// arriving every few ms during the desync doesn't schedule (or log) it repeatedly.
+    private var stuckHiddenHealScheduled = false
     private var isDrainingHiddenBacklog = false
     private var hiddenBacklogDrainGeneration = 0
     /// Absolute deadline after which the hidden-backlog drain stops re-arming and
@@ -1027,9 +1030,21 @@ public final class TerminalSurface: NSObject, Surface {
         // occlusion are latched OFF — nothing repaints (the freeze). Recovery normally
         // depends only on a future reconcile the user cannot trigger by scrolling or
         // typing. Fail loud and self-heal locally so the live terminal un-freezes.
-        if Self.isLikelyStuckHidden(isVisible: isVisible, viewDefinitelyOnScreen: ghosttyView.isDefinitelyOnScreen) {
+        if !stuckHiddenHealScheduled,
+           Self.isLikelyStuckHidden(isVisible: isVisible, viewDefinitelyOnScreen: ghosttyView.isDefinitelyOnScreen) {
+            // DEFER the heal to the next tick: this chunk must first land in the
+            // hidden path (hiddenRendererBuffer + outputPendingBytes) consistently with
+            // the render decision captured for it. Healing inline would flip visibility
+            // mid-chunk and orphan these bytes out of the ANSIRenderer mirror (a gap in
+            // ansiText) while leaving outputPendingBytes latched. didBecomeVisible() then
+            // replays the now-complete buffer. The flag bounds this to once per episode.
+            stuckHiddenHealScheduled = true
             terminalLog.error("terminal.stuck_hidden_recover surface=\(self.descriptor.id.value.uuidString, privacy: .public) — output arrived while logically hidden but the view is on a key on-screen window; self-healing (audit #3)")
-            didBecomeVisible()
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.stuckHiddenHealScheduled = false
+                self.didBecomeVisible()
+            }
         }
         enqueueHistory(data)
         recordOutputTelemetry(bytes: data.count)
@@ -1083,8 +1098,11 @@ public final class TerminalSurface: NSObject, Surface {
             ghosttyView.processOutput(data)
         } else {
             outputPendingBytes += data.count
-            continueHiddenBacklogDrainIfNeeded()
+            // Process THIS chunk into the surface BEFORE the drain may force-complete
+            // (#5): completeHiddenBacklogDrain refreshes, and refreshing before the
+            // chunk is fed would paint a frame missing the latest bytes.
             ghosttyView.processOutput(data, render: false)
+            continueHiddenBacklogDrainIfNeeded()
         }
         scheduleBusyStateRefresh()
     }
@@ -1359,8 +1377,7 @@ public final class TerminalSurface: NSObject, Surface {
             outputPartial: outputPartial,
             outputPendingBytes: outputPendingBytes,
             historyWriteFailures: historyWriteFailures,
-            renderBlockedReason: diagnostics.blockedReason,
-            canRender: diagnostics.canRender
+            diagnostics: diagnostics
         )
         if !isVisible && outputPendingBytes > 0 {
             // Hidden-output fallback: only the renderer is authoritative here.
@@ -1527,10 +1544,15 @@ public final class TerminalSurface: NSObject, Surface {
         outputPartial: Bool,
         outputPendingBytes: Int,
         historyWriteFailures: Int,
-        renderBlockedReason: String?,
-        canRender: Bool
+        diagnostics: TerminalRenderDiagnostics
     ) -> String {
-        "\(outputPartial)|\(outputPendingBytes)|\(historyWriteFailures)|\(renderBlockedReason ?? "")|\(canRender)"
+        // Fold EVERY render-diagnostics field the snapshot embeds (not just
+        // blockedReason/canRender) so a change in any of them — e.g. `parked` flipping
+        // while a higher-priority blockedReason stays the same — still invalidates the
+        // cache and the mirror never receives a snapshot with a stale diagnostics field.
+        let d = diagnostics
+        let diag = "\(d.logicalVisible ? 1 : 0)\(d.registryVisible ? 1 : 0)\(d.drainingHiddenBacklog ? 1 : 0)\(d.windowAttached ? 1 : 0)\(d.parked ? 1 : 0)\(d.hasUsableBounds ? 1 : 0)\(d.hiddenAncestor ? 1 : 0)"
+        return "\(outputPartial)|\(outputPendingBytes)|\(historyWriteFailures)|\(diag)|\(d.blockedReason ?? "")"
     }
 
     static func readTextPartialReason(outputPartial: Bool, outputPendingBytes: Int, historyWriteFailures: Int, renderBlockedReason: String? = nil) -> String? {
@@ -1848,6 +1870,7 @@ public final class TerminalSurface: NSObject, Surface {
         ensureRendererCurrent()
         isVisible = false
         readerAllowsRender = false
+        stuckHiddenHealScheduled = false
         isDrainingHiddenBacklog = false
         hiddenBacklogDrainDeadline = nil
         // Clear any renderer buffer from a prior hidden session so bytes from

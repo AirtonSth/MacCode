@@ -935,11 +935,13 @@ final class GhosttyTerminalView: NSView {
         mouseTrackingArea = area
     }
 
-    func closeSurface() {
+    func closeSurface(silent: Bool = false) {
         // Audit #4 watch: closing a surface whose view is still mounted on a window
         // is the exact precondition for the permanent-freeze bug. Log loudly so the
-        // (unproven) wrong-instance-close trigger is observable in the field.
-        if window != nil, superview != nil, ownerIsClosing?() != true {
+        // (unproven) wrong-instance-close trigger is observable in the field. `silent`
+        // suppresses the watch for the legitimate re-create path (resetSurfaceOutput),
+        // which intentionally closes a mounted view to rebuild it.
+        if !silent, window != nil, superview != nil, ownerIsClosing?() != true {
             NSLog("RemoteCode terminal closeSurface() on a still-mounted view (window+superview present, owner not closing) — audit #4 watch")
         }
         renderGeneration &+= 1
@@ -952,7 +954,7 @@ final class GhosttyTerminalView: NSView {
     }
 
     func resetSurfaceOutput(_ data: Data) {
-        closeSurface()
+        closeSurface(silent: true)   // legitimate re-create — don't trip the #4 watch
         // Intentional re-creation: allow ensureSurface() to build a fresh surface.
         surfaceClosed = false
         processOutput(data)
@@ -1206,6 +1208,14 @@ final class GhosttyTerminalView: NSView {
     var isDefinitelyOnScreen: Bool {
         guard let window, !isHidden, bounds.width > 1, bounds.height > 1 else { return false }
         guard window.isVisible, !window.isMiniaturized, window.isKeyWindow else { return false }
+        // A collapsed/zero-width split pane keeps a key, on-screen window but is itself
+        // not visible: reject if any ancestor is hidden (matches renderDiagnostics'
+        // hiddenAncestor gate) so the stuck-hidden heal can't misfire on it.
+        var ancestor = superview
+        while let node = ancestor {
+            if node.isHidden { return false }
+            ancestor = node.superview
+        }
         return window.occlusionState.contains(.visible)
     }
 
@@ -1339,16 +1349,32 @@ final class GhosttyTerminalView: NSView {
     }
 
     private var isRenderable: Bool {
-        Self.canRender(
+        let onScreen = window?.occlusionState.contains(.visible) ?? false
+        return Self.canRender(
             visibleInUI: visibleInUI,
             isHidden: isHidden,
             hasNonEmptyBounds: bounds.width > 0 && bounds.height > 0,
             windowPresent: window != nil,
             windowVisible: window?.isVisible ?? false,
             windowMiniaturized: window?.isMiniaturized ?? false,
-            windowOnScreen: window?.occlusionState.contains(.visible) ?? false,
-            windowIsKey: window?.isKeyWindow ?? false
+            windowOnScreen: onScreen,
+            // Only consult the key-window override (audit #1) when occlusionState says
+            // not-visible — and require a LIVE drawable (awake display), so the
+            // false-negative heal can never render into an asleep display (the AGX
+            // trap the gate exists to prevent). When onScreen is already true the
+            // override is irrelevant, so skip the CGDisplayIsAsleep call entirely.
+            windowIsKey: onScreen ? false : Self.windowHasLiveKeyDrawable(window)
         )
+    }
+
+    /// A key, visible, non-minimized window normally has a live Metal drawable — EXCEPT
+    /// when its display is asleep, in which case there is no surface to render into
+    /// (rendering then is the AGX trap / silent-vanish). This is the safe predicate the
+    /// occlusionState-false-negative heal (audit #1) is allowed to trust.
+    private static func windowHasLiveKeyDrawable(_ window: NSWindow?) -> Bool {
+        guard let window, window.isKeyWindow, window.isVisible, !window.isMiniaturized else { return false }
+        guard let displayID = window.screen?.displayID, displayID != 0 else { return false }
+        return CGDisplayIsAsleep(displayID) == 0
     }
 
     /// Whether it is safe to render the Metal surface. A minimized or ordered-out
