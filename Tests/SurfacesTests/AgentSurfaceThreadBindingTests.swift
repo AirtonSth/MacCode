@@ -23,6 +23,7 @@ final class AgentSurfaceThreadBindingTests: XCTestCase {
     private struct Harness {
         let vmFactory: (AgentThreadID?) -> AgentAppViewModel
         let threadRepo: AgentThreadRepository
+        let messageRepoForTests: AgentMessageRepository
         let workspaceID: WorkspaceID
     }
 
@@ -47,7 +48,7 @@ final class AgentSurfaceThreadBindingTests: XCTestCase {
                 initialThreadId: initial
             )
         }
-        return Harness(vmFactory: factory, threadRepo: threadRepo, workspaceID: workspaceID)
+        return Harness(vmFactory: factory, threadRepo: threadRepo, messageRepoForTests: messageRepo, workspaceID: workspaceID)
     }
 
     @discardableResult
@@ -154,6 +155,28 @@ final class AgentSurfaceThreadBindingTests: XCTestCase {
         XCTAssertEqual(vm1.selectedThreadId, a.id)
         XCTAssertEqual(vm2.selectedThreadId, b.id,
             "Two agent surfaces in one workspace must own independent selected threads.")
+    }
+
+    // MARK: PERSISTENCE-DATA-002 — title repair must not bump updatedAt
+
+    func test_placeholderTitleRepair_preservesUpdatedAt() throws {
+        let h = try makeHarness()
+        // A placeholder-titled thread with a deliberately OLD activity time.
+        let old = Date(timeIntervalSince1970: 1_000_000)
+        var t = AgentThread(workspaceId: h.workspaceID, title: AgentThreadTitle.defaultTitle,
+                            provider: .codex, model: "fake-model")
+        t.updatedAt = old
+        try h.threadRepo.upsert(t)
+        try h.messageRepoForTests.append(AgentMessage(threadId: t.id, role: .user, content: "Implement the parser"))
+
+        let vm = h.vmFactory(nil)
+        vm.reloadThreads() // runs repairPlaceholderThreadTitles
+
+        let repaired = try XCTUnwrap(try h.threadRepo.get(id: t.id))
+        XCTAssertFalse(AgentThreadTitle.isPlaceholder(repaired.title),
+            "the placeholder title is repaired from the first user message")
+        XCTAssertEqual(repaired.updatedAt.timeIntervalSince1970, old.timeIntervalSince1970, accuracy: 0.001,
+            "a cosmetic title repair must NOT bump updatedAt (it reorders the rail otherwise).")
     }
 
     // MARK: Deletion recovery

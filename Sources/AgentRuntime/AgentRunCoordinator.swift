@@ -213,6 +213,14 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         try runRepo.get(id: runId)?.startedAt
     }
 
+    /// The currently-active run id for a thread (nil when idle). Lets a surface
+    /// resync its per-surface `currentRunId` when it switches to an
+    /// already-running thread, so Stop targets the right run.
+    public func activeRunId(threadId: AgentThreadID) -> AgentRunID? {
+        lock.lock(); defer { lock.unlock() }
+        return activeThreads[threadId]
+    }
+
     @discardableResult
     public func startRun(_ request: AgentRunRequest, isAutoContinuation: Bool = false) async throws -> AgentRunID {
         // A user-initiated run ends any background-await auto-continuation streak;

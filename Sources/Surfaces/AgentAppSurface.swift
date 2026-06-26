@@ -407,7 +407,10 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             guard let firstUserMessage = try? messageRepo.firstUserMessage(threadId: threads[index].id) else { continue }
             var thread = threads[index]
             thread.title = AgentThreadTitle.titleFromFirstMessage(firstUserMessage.content)
-            thread.updatedAt = Date()
+            // PERSISTENCE-DATA-002: a cosmetic title repair must NOT bump
+            // updatedAt — doing so reorders the rail (updated_at is the visible
+            // tiebreak) and made repaired threads jump to the top. Preserve the
+            // thread's real activity time so only genuine activity reorders it.
             try? threadRepo.upsert(thread)
             threads[index] = thread
         }
@@ -476,6 +479,11 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                     current: runStartedAt,
                     persisted: try? coordinator.runStartedAt(threadId: id)
                 )
+                // RUN-LIFECYCLE-STREAM-004: resync currentRunId to THIS thread's
+                // active run. Without this, switching to an already-running
+                // thread left a stale currentRunId from the previous thread, so
+                // Stop could cancel the wrong thread's run.
+                currentRunId = coordinator.activeRunId(threadId: id)
             } else {
                 currentRunId = nil
                 runStartedAt = nil
