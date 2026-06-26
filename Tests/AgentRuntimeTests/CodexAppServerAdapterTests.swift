@@ -102,6 +102,32 @@ final class CodexAppServerAdapterTests: XCTestCase {
                       "Codex app-server cancellation must stop the provider process tree after interrupting the active turn")
     }
 
+    func test_sendTurn_rejectsConcurrentInFlightTurn() async throws {
+        // RUN-LIFECYCLE-STREAM-003: a second concurrent turn on a thread with a
+        // live turn must be rejected, not silently replace the session.
+        let client = MockCodexAppServerClient(autoComplete: false)
+        let adapter = CodexAppServerAdapter { _, notificationHandler, _ in
+            client.notificationHandler = notificationHandler
+            return client
+        }
+        let threadId = AgentThreadID()
+        func makeRequest() -> AgentRunRequest {
+            AgentRunRequest(threadId: threadId, provider: .codex, model: "gpt-5.5",
+                            cwd: "/tmp/remotecode-app-server-adapter", prompt: "wait")
+        }
+        let noop: @Sendable (AgentRunEvent) -> Void = { _ in }
+
+        // First turn starts and stays in flight (autoComplete: false).
+        _ = try await adapter.sendTurn(makeRequest(), onEvent: noop)
+
+        do {
+            _ = try await adapter.sendTurn(makeRequest(), onEvent: noop)
+            XCTFail("a second concurrent turn on an in-flight thread must be rejected")
+        } catch {
+            // expected — the adapter throws rather than replacing the live session.
+        }
+    }
+
     func test_adapterFailsRunWhenAppServerProcessExitsBeforeTurnCompleted() async throws {
         let client = MockCodexAppServerClient(autoComplete: false)
         let adapter = CodexAppServerAdapter { _, notificationHandler, _ in

@@ -573,6 +573,28 @@ public final class AgentRunCoordinator: @unchecked Sendable {
 
     private func markStartFailure(_ error: Error, request: AgentRunRequest, runId: AgentRunID, adapterKey: String, binaryIdentity: String?) {
         let message = String(describing: error)
+        // RUN-LIFECYCLE-STREAM-002: if a DIFFERENT run is already live on this
+        // thread (e.g. this start lost a race and the adapter rejected it as a
+        // duplicate in-flight turn), do not clobber the live run's thread row,
+        // provider session, or broadcast a false terminal status. Record only a
+        // run-scoped failure so the survivor keeps streaming.
+        lock.lock()
+        let otherRunActive = activeThreads[request.threadId].map { $0 != runId } ?? false
+        lock.unlock()
+        if otherRunActive {
+            var failedRun = AgentRun(
+                id: runId, threadId: request.threadId, provider: request.provider,
+                providerInstanceId: request.providerInstanceId, model: request.model,
+                status: .failed, finishedAt: Date(), errorMessage: message
+            )
+            failedRun.startedAt = Date()
+            try? runRepo.upsert(failedRun)
+            for observer in observersSnapshot() {
+                observer.runCoordinator(self, didReceive: .error(message: message, recoverable: false), run: runId, threadId: request.threadId)
+            }
+            onAssistantEvent?(.error(message: message, recoverable: false), request.threadId, runId)
+            return
+        }
         var run = AgentRun(
             id: runId,
             threadId: request.threadId,
