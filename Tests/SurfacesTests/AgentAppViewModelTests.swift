@@ -477,12 +477,17 @@ final class AgentAppViewModelTests: XCTestCase {
                                                     messageRepo: messageRepo,
                                                     threadRepo: threadRepo,
                                                     providers: [.codex: capture])
+        // Per-surface binding: restore reopens the surface's bound thread. The
+        // host restore path (reinstantiateRestoredSurfaces) reads the persisted
+        // `selected_thread` metadata and passes it as initialThreadId; we mirror
+        // that here instead of relying on the removed auto-select-first behavior.
         let restartedVM = AgentAppViewModel(workspaceID: workspaceID,
                                             cwd: tmp,
                                             coordinator: secondCoordinator,
                                             threadRepo: threadRepo,
                                             messageRepo: messageRepo,
-                                            promptHistoryStore: history)
+                                            promptHistoryStore: history,
+                                            initialThreadId: threadId)
 
         XCTAssertEqual(restartedVM.selectedThreadId, threadId,
                        "after app restart, Agent App must reopen the persisted thread before follow-up sends")
@@ -1217,12 +1222,15 @@ final class AgentAppViewModelTests: XCTestCase {
                                               threadRepo: threadRepo,
                                               providerAdapters: [.codex: adapter])
 
+        // Per-surface binding: the host restore path passes the persisted
+        // `selected_thread` as initialThreadId; mirror that here.
         let vm = AgentAppViewModel(workspaceID: workspaceID,
                                    cwd: tmp,
                                    coordinator: coordinator,
                                    threadRepo: threadRepo,
                                    messageRepo: messageRepo,
-                                   promptHistoryStore: PromptHistoryStore(db: db))
+                                   promptHistoryStore: PromptHistoryStore(db: db),
+                                   initialThreadId: thread.id)
 
         XCTAssertEqual(vm.selectedThreadId, thread.id,
                        "after app restart, Agent App must reopen the persisted Codex thread")

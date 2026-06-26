@@ -140,6 +140,13 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// Fired when local Agent App controls persist thread run config so
     /// remote mirrors can receive the same thread metadata.
     public var onThreadConfigPersisted: ((AgentThread) -> Void)?
+    /// Fired when this surface's bound (selected) thread changes, so the host
+    /// can persist it into the surface descriptor metadata (`selected_thread`)
+    /// for per-surface restore. nil means the surface returned to the
+    /// fresh-composer state (e.g. its bound thread was deleted elsewhere).
+    /// This is the per-surface binding that fixes the new-tab-clone bug:
+    /// selection is owned by the surface, not auto-adopted from the workspace.
+    public var onSelectedThreadChanged: ((AgentThreadID?) -> Void)?
     public var onQueuedMessageEvent: ((String, AgentQueuedMessage) -> Void)?
     public var providerSnapshotLoader: (() async throws -> [AgentProviderSnapshot])?
     public var modelListLoader: ((AgentProvider) async throws -> [AgentModelDescriptor])?
@@ -273,7 +280,8 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         checkpointRepo: AgentTurnCheckpointRepository? = nil,
         promptHistoryStore: PromptHistoryStore? = nil,
         customModelStore: AgentCustomModelStore? = nil,
-        planNotesStore: PlanNotesStore? = nil
+        planNotesStore: PlanNotesStore? = nil,
+        initialThreadId: AgentThreadID? = nil
     ) {
         self.workspaceID = workspaceID
         self.cwd = cwd
@@ -301,6 +309,14 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             }
         }
         reloadThreads()
+        // Per-surface thread binding: select ONLY the thread this surface was
+        // restored/created with. A brand-new tab passes nil and stays on the
+        // fresh-composer state instead of auto-adopting the workspace's first
+        // thread (the new-tab-clone bug). onSelectedThreadChanged is wired by
+        // the host *after* init, so this restore-time select does not re-persist.
+        if let initialThreadId, threads.contains(where: { $0.id == initialThreadId }) {
+            selectThread(initialThreadId)
+        }
         loadGitBranch()
     }
 
@@ -354,8 +370,15 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             }
         }
         repairPlaceholderThreadTitles()
-        if selectedThreadId == nil, let first = threads.first {
-            selectThread(first.id)
+        // reloadThreads() is a PURE data reload — it must not change the
+        // selection. A new/empty tab stays thread-free (fresh composer) instead
+        // of auto-adopting threads.first (the new-tab-clone bug). The only
+        // selection mutation here is the safe deletion-recovery below.
+        if let sel = selectedThreadId, !threads.contains(where: { $0.id == sel }) {
+            // The bound thread was deleted (e.g. from another client). Fall back
+            // to the fresh-composer state rather than render a dangling selection.
+            selectedThreadId = nil
+            onSelectedThreadChanged?(nil)
         }
     }
 
@@ -427,6 +450,10 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         } else {
             selectedThreadId = id
         }
+        // Persist the per-surface binding so app restart restores THIS surface
+        // to THIS thread (not threads.first). Only fires on an actual change;
+        // wired by the host after init, so restore-time selects don't re-persist.
+        if isThreadSwitch { onSelectedThreadChanged?(id) }
         reloadQueuedMessages()
         if let t = threads.first(where: { $0.id == id }) {
             provider = t.provider
@@ -1713,30 +1740,43 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
 
     public func deleteThread(_ id: AgentThreadID) {
         let undo = captureThreadDeletionUndo(ids: [id])
+        let wasSelected = selectedThreadId == id
         try? threadRepo.delete(id: id)
         evictThreadCaches([id])
-        if selectedThreadId == id {
+        if wasSelected {
             selectedThreadId = nil
         messages = []
         timeline = AssistantTimelineState()
         resetTimelineUpdateTick()
         }
         reloadThreads()
+        // If the user deleted the thread they were viewing, reselect a remaining
+        // one (long-standing delete UX). Guarded on `wasSelected` so a surface
+        // that was already on the fresh-composer state is never auto-bound.
+        if wasSelected, selectedThreadId == nil, let next = threads.first {
+            selectThread(next.id)
+        }
         armThreadDeletionUndo(undo)
     }
 
     public func deleteThreads(_ ids: Set<AgentThreadID>) {
         guard !ids.isEmpty else { return }
         let undo = captureThreadDeletionUndo(ids: Array(ids))
+        let wasSelected = selectedThreadId.map(ids.contains) ?? false
         try? threadRepo.delete(ids: Array(ids))
         evictThreadCaches(ids)
-        if let selectedThreadId, ids.contains(selectedThreadId) {
+        if wasSelected {
             self.selectedThreadId = nil
         messages = []
         timeline = AssistantTimelineState()
         resetTimelineUpdateTick()
         }
         reloadThreads()
+        // Reselect a remaining thread when the open one was deleted (delete UX);
+        // never auto-bind a surface that was on the fresh-composer state.
+        if wasSelected, selectedThreadId == nil, let next = threads.first {
+            selectThread(next.id)
+        }
         armThreadDeletionUndo(undo)
     }
 
@@ -8034,9 +8074,11 @@ public final class AgentAppSurface: NSObject, Surface {
     /// Set by AppCommandRouter immediately after subscribe (mirrors Feed pattern).
     public var onClose: (() -> Void)?
 
-    public init(workspaceID: WorkspaceID, cwd: String, coordinator: AgentRunCoordinator, threadRepo: AgentThreadRepository, messageRepo: AgentMessageRepository, queuedMessageRepo: AgentQueuedMessageRepository? = nil, pendingCallbackRepo: ProviderPendingCallbackRepository? = nil, proposedPlanRepo: AgentProposedPlanRepository? = nil, checkpointRepo: AgentTurnCheckpointRepository? = nil, promptHistoryStore: PromptHistoryStore? = nil, customModelStore: AgentCustomModelStore? = nil, planNotesStore: PlanNotesStore? = nil, title: String = "Agent App") {
-        self.descriptor = SurfaceDescriptor(type: .agentApp, title: title, iconName: "sparkle", metadata: ["workspace": workspaceID.value.uuidString, "cwd": cwd])
-        self.viewModel = AgentAppViewModel(workspaceID: workspaceID, cwd: cwd, coordinator: coordinator, threadRepo: threadRepo, messageRepo: messageRepo, queuedMessageRepo: queuedMessageRepo, pendingCallbackRepo: pendingCallbackRepo, proposedPlanRepo: proposedPlanRepo, checkpointRepo: checkpointRepo, promptHistoryStore: promptHistoryStore, customModelStore: customModelStore, planNotesStore: planNotesStore)
+    public init(workspaceID: WorkspaceID, cwd: String, coordinator: AgentRunCoordinator, threadRepo: AgentThreadRepository, messageRepo: AgentMessageRepository, queuedMessageRepo: AgentQueuedMessageRepository? = nil, pendingCallbackRepo: ProviderPendingCallbackRepository? = nil, proposedPlanRepo: AgentProposedPlanRepository? = nil, checkpointRepo: AgentTurnCheckpointRepository? = nil, promptHistoryStore: PromptHistoryStore? = nil, customModelStore: AgentCustomModelStore? = nil, planNotesStore: PlanNotesStore? = nil, title: String = "Agent App", initialThreadId: AgentThreadID? = nil) {
+        var metadata = ["workspace": workspaceID.value.uuidString, "cwd": cwd]
+        if let initialThreadId { metadata["selected_thread"] = initialThreadId.value.uuidString }
+        self.descriptor = SurfaceDescriptor(type: .agentApp, title: title, iconName: "sparkle", metadata: metadata)
+        self.viewModel = AgentAppViewModel(workspaceID: workspaceID, cwd: cwd, coordinator: coordinator, threadRepo: threadRepo, messageRepo: messageRepo, queuedMessageRepo: queuedMessageRepo, pendingCallbackRepo: pendingCallbackRepo, proposedPlanRepo: proposedPlanRepo, checkpointRepo: checkpointRepo, promptHistoryStore: promptHistoryStore, customModelStore: customModelStore, planNotesStore: planNotesStore, initialThreadId: initialThreadId)
         let host = NSHostingView(rootView: AgentAppView(vm: viewModel))
         host.translatesAutoresizingMaskIntoConstraints = false
         let container = NSView()

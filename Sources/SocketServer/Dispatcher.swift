@@ -49,12 +49,12 @@ public protocol CommandRouting: AnyObject {
     // agent
     func openAgentApp(workspace: WorkspaceID) throws -> SurfaceDescriptor
     func listAgentThreads(workspace: WorkspaceID?) throws -> [AgentThread]
-    func createAgentThread(workspace: WorkspaceID?, title: String, provider: AgentProvider, model: String, permissionMode: AgentPermissionMode, reasoningEffort: AgentReasoningEffort, serviceTier: AgentServiceTier, modelSelection: AgentModelSelection?, providerInstanceId: String?) throws -> AgentThread
+    func createAgentThread(workspace: WorkspaceID?, title: String, provider: AgentProvider, model: String, permissionMode: AgentPermissionMode, reasoningEffort: AgentReasoningEffort, serviceTier: AgentServiceTier, modelSelection: AgentModelSelection?, providerInstanceId: String?, surfaceID: SurfaceID?) throws -> AgentThread
     func configureAgentThread(thread: AgentThreadID, provider: AgentProvider?, model: String?, permissionMode: AgentPermissionMode?, reasoningEffort: AgentReasoningEffort?, serviceTier: AgentServiceTier?, modelSelection: AgentModelSelection?, providerInstanceId: String?) throws -> AgentThread
     func configureAgentThreadExecution(thread: AgentThreadID, executionMode: AgentExecutionMode, baseBranch: String?) throws -> AgentThread
     func prepareAgentThreadForPullRequest(workspace: WorkspaceID, url: String, provider: AgentProvider, model: String, permissionMode: AgentPermissionMode, reasoningEffort: AgentReasoningEffort, serviceTier: AgentServiceTier, modelSelection: AgentModelSelection?, providerInstanceId: String?) throws -> AgentThread
     func uploadAgentAttachment(workspace: WorkspaceID, filename: String, mimeType: String?, dataBase64: String) throws -> AgentAttachmentUploadResult
-    func selectAgentThread(thread: AgentThreadID) throws
+    func selectAgentThread(thread: AgentThreadID, surfaceID: SurfaceID?) throws
     func listAgentMessages(thread: AgentThreadID, limit: Int) throws -> [AgentMessage]
     func listAgentMessagesPage(thread: AgentThreadID, limit: Int, before: AgentMessageCursor?, after: AgentMessageCursor?) throws -> AgentMessagePage
     /// PERF-007: returns the set of thread IDs that have at least one message, via a
@@ -870,7 +870,8 @@ public final class JSONRPCDispatcher {
                 let reasoning = modelSelection?.reasoningEffort ?? params["reasoning_effort"]?.stringValue.flatMap(AgentReasoningEffort.init) ?? .medium
                 let serviceTier = modelSelection?.serviceTier ?? params["service_tier"]?.stringValue.flatMap(AgentServiceTier.init) ?? .auto
                 let providerInstanceId = params["provider_instance_id"]?.stringValue ?? params["providerInstanceId"]?.stringValue
-                let t = try router.createAgentThread(workspace: wid, title: title, provider: provider, model: model, permissionMode: permission, reasoningEffort: reasoning, serviceTier: serviceTier, modelSelection: modelSelection, providerInstanceId: providerInstanceId)
+                let createSurfaceID = (params["surface_id"]?.stringValue ?? params["surfaceId"]?.stringValue).flatMap(UUID.init).map(SurfaceID.init)
+                let t = try router.createAgentThread(workspace: wid, title: title, provider: provider, model: model, permissionMode: permission, reasoningEffort: reasoning, serviceTier: serviceTier, modelSelection: modelSelection, providerInstanceId: providerInstanceId, surfaceID: createSurfaceID)
                 EventBus.shared.publish(kind: "agent.thread.created", payload: threadPayload(t))
                 return .init(id: id, result: encodeThread(t))
             case "agent.thread.configure":
@@ -933,7 +934,8 @@ public final class JSONRPCDispatcher {
                 return .init(id: id, result: encode(uploaded))
             case "agent.thread.select":
                 guard let tid = params["thread_id"]?.stringValue.flatMap(UUID.init).map(AgentThreadID.init) else { throw JSONRPCError.invalidParams }
-                try router.selectAgentThread(thread: tid)
+                let selectSurfaceID = (params["surface_id"]?.stringValue ?? params["surfaceId"]?.stringValue).flatMap(UUID.init).map(SurfaceID.init)
+                try router.selectAgentThread(thread: tid, surfaceID: selectSurfaceID)
                 EventBus.shared.publish(kind: "agent.thread.selected", payload: .object(["thread_id": .string(tid.value.uuidString)]))
                 return .init(id: id, result: .bool(true))
             case "agent.message.send":

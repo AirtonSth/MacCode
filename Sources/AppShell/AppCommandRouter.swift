@@ -182,7 +182,26 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                     case .browser:
                         surface = configureBrowserSurface(BrowserSurface(workspaceID: wid, initialURL: restoredBrowserURL(from: desc), title: title))
                     case .agentApp:
-                        let agent = AgentAppSurface(workspaceID: wid, cwd: cwd, coordinator: ctx.coordinator, threadRepo: ctx.threadRepo, messageRepo: ctx.messageRepo, queuedMessageRepo: ctx.queuedMessageRepo, pendingCallbackRepo: ctx.providerPendingCallbackRepo, proposedPlanRepo: ctx.proposedPlanRepo, checkpointRepo: ctx.turnCheckpointRepo, promptHistoryStore: PromptHistoryStore(db: ctx.db), customModelStore: AgentCustomModelStore(repo: ctx.settingsRepo), planNotesStore: PlanNotesStore(db: ctx.db), title: title)
+                        // Per-surface thread binding restore: prefer the persisted
+                        // `selected_thread`. Legacy surfaces (saved before binding
+                        // existed) have no metadata — fall back ONCE to the
+                        // workspace's first thread so the tab isn't blank, then
+                        // future selections self-persist. New tabs that were never
+                        // bound restore to the fresh-composer state (nil).
+                        let restoredThreadId: AgentThreadID? = {
+                            if let raw = desc.metadata["selected_thread"], let uuid = UUID(uuidString: raw) {
+                                return AgentThreadID(uuid)
+                            }
+                            if desc.metadata["selected_thread"] == nil {
+                                return (try? ctx.threadRepo.list(workspaceId: wid))?.first?.id
+                            }
+                            return nil
+                        }()
+                        let agent = AgentAppSurface(workspaceID: wid, cwd: cwd, coordinator: ctx.coordinator, threadRepo: ctx.threadRepo, messageRepo: ctx.messageRepo, queuedMessageRepo: ctx.queuedMessageRepo, pendingCallbackRepo: ctx.providerPendingCallbackRepo, proposedPlanRepo: ctx.proposedPlanRepo, checkpointRepo: ctx.turnCheckpointRepo, promptHistoryStore: PromptHistoryStore(db: ctx.db), customModelStore: AgentCustomModelStore(repo: ctx.settingsRepo), planNotesStore: PlanNotesStore(db: ctx.db), title: title, initialThreadId: restoredThreadId)
+                        agent.viewModel.onSelectedThreadChanged = { [weak self, weak agent] threadID in
+                            guard let self, let agent else { return }
+                            self.persistAgentSelectedThread(surfaceID: agent.descriptor.id, threadID: threadID)
+                        }
                         let token = EventBus.shared.subscribe(since: nil) { [weak agent] ev in
                             guard ev.kind.hasPrefix("agent.thread.") || ev.kind.hasPrefix("agent.message.queue") || ev.kind == "agent.message.queued" else { return }
                             DispatchQueue.main.async {
@@ -782,8 +801,13 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         let cwd = entry.workspaceCwd.isEmpty
             ? (ctx.state.workspaces[workspace]?.cwd ?? "/")
             : entry.workspaceCwd
+        // Restore the agent tab's bound thread so reopen-closed-tab returns to
+        // the same conversation rather than a fresh composer.
+        let reopenThreadId: AgentThreadID? = entry.descriptor.type == .agentApp
+            ? entry.descriptor.metadata["selected_thread"].flatMap(UUID.init).map(AgentThreadID.init)
+            : nil
         let desc = makeSurface(type: entry.descriptor.type, title: entry.descriptor.title,
-                               workspace: workspace, cwd: cwd)
+                               workspace: workspace, cwd: cwd, initialThreadId: reopenThreadId)
         try ctx.apply(.addSurface(workspace, paneID: nil, descriptor: desc))
         windowController?.refreshFromState()
         reconcileSurfaceVisibility()
@@ -1069,7 +1093,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         return try ctx.threadRepo.list(workspaceId: workspace)
     }
 
-    public func createAgentThread(workspace: WorkspaceID?, title: String, provider: AgentProvider, model: String, permissionMode: AgentPermissionMode, reasoningEffort: AgentReasoningEffort, serviceTier: AgentServiceTier = .auto, modelSelection: AgentModelSelection? = nil, providerInstanceId: String? = nil) throws -> AgentThread {
+    public func createAgentThread(workspace: WorkspaceID?, title: String, provider: AgentProvider, model: String, permissionMode: AgentPermissionMode, reasoningEffort: AgentReasoningEffort, serviceTier: AgentServiceTier = .auto, modelSelection: AgentModelSelection? = nil, providerInstanceId: String? = nil, surfaceID: SurfaceID? = nil) throws -> AgentThread {
         guard let ctx = context else { throw LayoutError.workspaceNotFound }
         let t = AgentThread(workspaceId: workspace, title: title, provider: provider,
                             providerInstanceId: normalizedProviderInstanceId(provider: provider, requested: providerInstanceId),
@@ -1078,7 +1102,10 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                             serviceTier: serviceTier,
                             modelSelection: modelSelection ?? AgentModelSelection(provider: provider, modelId: model, reasoningEffort: reasoningEffort, serviceTier: serviceTier))
         try ctx.threadRepo.upsert(t)
-        try selectAgentThread(thread: t.id)
+        // Only bind/select the new thread on the requesting surface (if any).
+        // Without a surfaceID this just refreshes rails — a thread created from
+        // one client no longer hijacks every other open agent tab.
+        try selectAgentThread(thread: t.id, surfaceID: surfaceID)
         return t
     }
 
@@ -1201,17 +1228,29 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         )
         thread.updatedAt = Date()
         try ctx.threadRepo.upsert(thread)
+        // Rail refresh only across surfaces; the initiating macOS surface (if
+        // local) selects the PR thread through its own view-model path.
         try selectAgentThread(thread: thread.id)
         return thread
     }
 
-    public func selectAgentThread(thread: AgentThreadID) throws {
+    /// Reflect a thread selection across agent surfaces.
+    ///
+    /// Selection is PER-SURFACE: by default this only refreshes every agent
+    /// surface's rail and selects the thread on the one surface identified by
+    /// `surfaceID`. Passing `surfaceID == nil` performs a rail refresh only and
+    /// selects nothing — so a thread created/selected by one client (or a
+    /// mark-read) no longer force-switches every other macOS agent tab (the
+    /// global fan-out that made iOS actions disturb macOS).
+    public func selectAgentThread(thread: AgentThreadID, surfaceID: SurfaceID? = nil) throws {
         guard let ctx = context else { throw LayoutError.workspaceNotFound }
         guard let t = try ctx.threadRepo.get(id: thread) else { throw LayoutError.workspaceNotFound }
         for s in SurfaceRegistry.shared.all() {
             guard let agent = s as? AgentAppSurface, agent.viewModel.workspaceID == t.workspaceId else { continue }
             agent.viewModel.reloadThreads()
-            agent.viewModel.selectThread(thread)
+            if let surfaceID, agent.descriptor.id == surfaceID {
+                agent.viewModel.selectThread(thread)
+            }
         }
         windowController?.refreshFromState()
     }
@@ -1710,7 +1749,15 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         guard let ctx = context else { throw LayoutError.workspaceNotFound }
         guard var t = try ctx.threadRepo.get(id: thread) else { throw LayoutError.workspaceNotFound }
         if t.hasUnread { t.hasUnread = false; try ctx.threadRepo.upsert(t) }
-        try selectAgentThread(thread: thread)
+        // Marking a thread read must NOT select it. Previously this called
+        // selectAgentThread, so an iOS client opening an old thread (which
+        // auto-marks it read) force-switched every macOS agent tab to that
+        // thread (the "iOS bugs macOS" report). Just refresh the rails so the
+        // unread badge clears everywhere; selection stays per-surface.
+        for s in SurfaceRegistry.shared.all() {
+            guard let agent = s as? AgentAppSurface, agent.viewModel.workspaceID == t.workspaceId else { continue }
+            agent.viewModel.reloadThreads()
+        }
     }
 
     public func listAgentModels(provider: AgentProvider) async -> [AgentModelDescriptor] {
@@ -2145,6 +2192,28 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         }
     }
 
+    /// Persist a per-surface agent thread binding into the surface descriptor
+    /// metadata (`selected_thread`), mirroring the browser-URL persistence path.
+    /// This is what makes app restart restore each agent tab to its OWN thread
+    /// instead of every tab converging on threads.first.
+    func persistAgentSelectedThread(surfaceID: SurfaceID, threadID: AgentThreadID?) {
+        guard let ctx = context else { return }
+        for (wid, var ws) in ctx.state.workspaces {
+            let result = updateSurface(in: ws.layout, surfaceID: surfaceID) { descriptor in
+                if let threadID {
+                    descriptor.metadata["selected_thread"] = threadID.value.uuidString
+                } else {
+                    descriptor.metadata.removeValue(forKey: "selected_thread")
+                }
+            }
+            guard result.changed else { continue }
+            ws.layout = result.node
+            ctx.state.workspaces[wid] = ws
+            ctx.scheduleSnapshotSave()
+            return
+        }
+    }
+
     private func updateSurface(in node: LayoutNode,
                                surfaceID: SurfaceID,
                                _ update: (inout SurfaceDescriptor) -> Void) -> (node: LayoutNode, changed: Bool) {
@@ -2511,7 +2580,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         }
     }
 
-    private func makeSurface(type: SurfaceType, title: String?, workspace: WorkspaceID, cwd: String) -> SurfaceDescriptor {
+    private func makeSurface(type: SurfaceType, title: String?, workspace: WorkspaceID, cwd: String, initialThreadId: AgentThreadID? = nil) -> SurfaceDescriptor {
         let baseTitle = title ?? defaultTitle(for: type)
         let descriptor = SurfaceDescriptor(type: type, title: baseTitle, iconName: type.rawValue, metadata: ["workspace": workspace.value.uuidString, "cwd": cwd])
         let terminalFontSize = context.map { SettingsStore(db: $0.db).load().terminalFontSize } ?? 0
@@ -2532,7 +2601,13 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 surface = configureBrowserSurface(BrowserSurface(workspaceID: workspace, initialURL: nil, title: baseTitle))
             case .agentApp:
                 guard let ctx = context else { return descriptor }
-                let agent = AgentAppSurface(workspaceID: workspace, cwd: cwd, coordinator: ctx.coordinator, threadRepo: ctx.threadRepo, messageRepo: ctx.messageRepo, queuedMessageRepo: ctx.queuedMessageRepo, pendingCallbackRepo: ctx.providerPendingCallbackRepo, proposedPlanRepo: ctx.proposedPlanRepo, checkpointRepo: ctx.turnCheckpointRepo, promptHistoryStore: PromptHistoryStore(db: ctx.db), customModelStore: AgentCustomModelStore(repo: ctx.settingsRepo), planNotesStore: PlanNotesStore(db: ctx.db), title: baseTitle)
+                let agent = AgentAppSurface(workspaceID: workspace, cwd: cwd, coordinator: ctx.coordinator, threadRepo: ctx.threadRepo, messageRepo: ctx.messageRepo, queuedMessageRepo: ctx.queuedMessageRepo, pendingCallbackRepo: ctx.providerPendingCallbackRepo, proposedPlanRepo: ctx.proposedPlanRepo, checkpointRepo: ctx.turnCheckpointRepo, promptHistoryStore: PromptHistoryStore(db: ctx.db), customModelStore: AgentCustomModelStore(repo: ctx.settingsRepo), planNotesStore: PlanNotesStore(db: ctx.db), title: baseTitle, initialThreadId: initialThreadId)
+                // Per-surface thread binding: persist this surface's selected
+                // thread into its descriptor metadata so app restart restores it.
+                agent.viewModel.onSelectedThreadChanged = { [weak self, weak agent] threadID in
+                    guard let self, let agent else { return }
+                    self.persistAgentSelectedThread(surfaceID: agent.descriptor.id, threadID: threadID)
+                }
                 // Socket-driven thread mutations (create/rename/delete/read)
                 // refresh this already-open surface — fixes the stale-VM gap.
                 let token = EventBus.shared.subscribe(since: nil) { [weak agent] ev in
