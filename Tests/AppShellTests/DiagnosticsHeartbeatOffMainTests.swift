@@ -17,6 +17,8 @@ import XCTest
 ///   R4 — `aggregateProviderStats` with an empty process list returns all-zero
 ///        fields; the heartbeat must log "0 providers" rather than crashing or
 ///        returning stale counts when no provider runtimes are running.
+///   R5 — only one provider `/bin/ps` scan may be in flight; overlap must skip,
+///        and completion must clear the latch so a later heartbeat can scan.
 final class DiagnosticsHeartbeatOffMainTests: XCTestCase {
 
     // MARK: - R1: pure helper is callable without actor context
@@ -86,5 +88,22 @@ final class DiagnosticsHeartbeatOffMainTests: XCTestCase {
         let footprint = AppDiagnostics.currentProcessFootprintKB()
         XCTAssertGreaterThanOrEqual(footprint, 0,
             "currentProcessFootprintKB must return >= 0; -1 indicates a mach-kernel failure that would corrupt all heartbeat footprint log entries")
+    }
+
+    // MARK: - R5: provider scan in-flight latch
+
+    @MainActor
+    func test_providerScanLatch_skipsOverlapAndClearsAfterFinish() {
+        defer { AppDiagnostics.finishProviderScanForTests() }
+
+        XCTAssertEqual(AppDiagnostics.beginProviderScanForTests(), .start,
+            "the first heartbeat in a quiet period must launch the provider scan")
+        XCTAssertEqual(AppDiagnostics.beginProviderScanForTests(), .skipInFlight,
+            "an overlapping heartbeat must skip the blocking /bin/ps provider scan")
+
+        AppDiagnostics.finishProviderScanForTests()
+
+        XCTAssertEqual(AppDiagnostics.beginProviderScanForTests(), .start,
+            "after the detached scan completes, a later heartbeat must be allowed to scan again")
     }
 }

@@ -56,6 +56,33 @@ enum AppDiagnostics {
     /// clears it back on the main actor when it finishes.
     @MainActor private static var providerScanInFlight = false
 
+    enum ProviderScanDecision: Equatable {
+        case start
+        case skipInFlight
+    }
+
+    @MainActor
+    static func beginProviderScanForTests() -> ProviderScanDecision {
+        beginProviderScan()
+    }
+
+    @MainActor
+    static func finishProviderScanForTests() {
+        finishProviderScan()
+    }
+
+    @MainActor
+    private static func beginProviderScan() -> ProviderScanDecision {
+        guard !providerScanInFlight else { return .skipInFlight }
+        providerScanInFlight = true
+        return .start
+    }
+
+    @MainActor
+    private static func finishProviderScan() {
+        providerScanInFlight = false
+    }
+
     @MainActor
     static func heartbeat(
         reason: String,
@@ -81,11 +108,10 @@ enum AppDiagnostics {
         // 60s cadence this is rare, but two concurrent sweeps would compete for CPU
         // with the UI at the worst moment. Skip the scan this tick (telemetry may miss
         // one sample) while still recording the cheap surface snapshot.
-        if providerScanInFlight {
+        if beginProviderScan() == .skipInFlight {
             appDiagnosticsLog.info("app.heartbeat reason=\(reason, privacy: .public) pid=\(pid, privacy: .public) rssKB=\(rssKB, privacy: .public) surfaces=\(snapshot.surfaceCount, privacy: .public) terminals=\(snapshot.terminalCount, privacy: .public) runningTerminals=\(snapshot.runningTerminals, privacy: .public) activeAgentThreads=\(activeAgentThreads, privacy: .public) providerScan=skipped_in_flight terminalPendingBytes=\(snapshot.pendingBytes, privacy: .public) terminalDroppedBytes=\(snapshot.droppedBytes, privacy: .public) terminalHistoryFailures=\(snapshot.historyFailures, privacy: .public)")
             return
         }
-        providerScanInFlight = true
 
         // Dispatch the blocking /bin/ps scan off the main thread.
         Task.detached(priority: .utility) {
@@ -94,7 +120,7 @@ enum AppDiagnostics {
             let stats = aggregateProviderStats(processes: providerProcesses)
             let sidecarStats = aggregateProviderStats(processes: sidecarProcesses)
             await MainActor.run {
-                providerScanInFlight = false   // F9: sweep done — allow the next tick
+                finishProviderScan()   // F9: sweep done — allow the next tick
                 appDiagnosticsLog.info(
                     "app.heartbeat reason=\(reason, privacy: .public) pid=\(pid, privacy: .public) rssKB=\(rssKB, privacy: .public) surfaces=\(snapshot.surfaceCount, privacy: .public) terminals=\(snapshot.terminalCount, privacy: .public) runningTerminals=\(snapshot.runningTerminals, privacy: .public) activeAgentThreads=\(activeAgentThreads, privacy: .public) providerProcesses=\(stats.processCount, privacy: .public) providerRSSKB=\(stats.totalRSSKB, privacy: .public) orphanProviders=\(stats.orphanCount, privacy: .public) sidecarProcesses=\(sidecarStats.processCount, privacy: .public) sidecarRSSKB=\(sidecarStats.totalRSSKB, privacy: .public) orphanSidecars=\(sidecarStats.orphanCount, privacy: .public) terminalPendingBytes=\(snapshot.pendingBytes, privacy: .public) terminalDroppedBytes=\(snapshot.droppedBytes, privacy: .public) terminalHistoryFailures=\(snapshot.historyFailures, privacy: .public)"
                 )

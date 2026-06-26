@@ -28,6 +28,21 @@ final class TerminalFreezeSeamTests: XCTestCase {
             "an already-visible surface is not stuck regardless of the on-screen probe")
     }
 
+    func test_deferredStuckHiddenHeal_rechecksBeforeReveal() {
+        XCTAssertTrue(
+            TerminalSurface.shouldRunStuckHiddenHeal(isClosing: false, isVisible: false, viewDefinitelyOnScreen: true),
+            "a still-stuck surface may run the deferred heal")
+        XCTAssertFalse(
+            TerminalSurface.shouldRunStuckHiddenHeal(isClosing: false, isVisible: false, viewDefinitelyOnScreen: false),
+            "if the view legitimately disappeared before the queued block runs, the heal must not reveal it")
+        XCTAssertFalse(
+            TerminalSurface.shouldRunStuckHiddenHeal(isClosing: false, isVisible: true, viewDefinitelyOnScreen: true),
+            "if another reconcile already made the surface visible, the queued heal must be a no-op")
+        XCTAssertFalse(
+            TerminalSurface.shouldRunStuckHiddenHeal(isClosing: true, isVisible: false, viewDefinitelyOnScreen: true),
+            "closing surfaces must never be force-revealed by a queued heal")
+    }
+
     // MARK: - audit #5: hidden-backlog drain deadline
 
     func test_drainRearm_allowedBeforeDeadline() {

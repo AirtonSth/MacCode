@@ -4,6 +4,7 @@ import CoreModel
 
 public enum TerminalInputStatus: String, Sendable, Equatable {
     case accepted
+    case inputStalled = "input_stalled"
     case queueFull = "queue_full"
     case processExited = "process_exited"
     case surfaceNotFound = "surface_not_found"
@@ -38,8 +39,8 @@ public struct TerminalTextSnapshot: Sendable, Equatable {
     /// Resolved 16-entry ANSI palette (indices 0-15) as `#rrggbb` hex strings,
     /// populated ONLY when the active Ghostty theme differs from the built-in
     /// default palette. `nil` means "default palette" -- iOS renders with its
-    /// own hardcoded default, so a nil here is byte-identical to before this
-    /// field existed (back-compat). Serialized as `ansi_palette` only when set.
+    /// own hardcoded default. Serialized as `ansi_palette: null` so clients can
+    /// clear a previously cached custom palette for the same surface.
     public var ansiPalette: [String]? = nil
     public var complete: Bool
     public var source: String
@@ -240,6 +241,11 @@ enum TerminalFileDescriptorFlags {
 
 final class TerminalInputPump: @unchecked Sendable {
     typealias Writer = @Sendable (_ data: Data, _ offset: Int) -> TerminalWriteResult
+    private enum DrainPermission {
+        case write
+        case wait
+        case stopped
+    }
 
     private let queue: DispatchQueue
     private let maxQueuedBytes: Int
@@ -250,12 +256,13 @@ final class TerminalInputPump: @unchecked Sendable {
     private var queuedBytes = 0
     private var accepting = true
     private var lastFailure: TerminalInputStatus?
+    private var drainingAcceptedBacklog = false
     var onTerminalFailure: (@Sendable (TerminalInputStatus) -> Void)?
+    var onInputResumed: (@Sendable () -> Void)?
     /// Fired (off the pump's queue) when a single write blocks past the retry
-    /// budget because the child stopped draining its stdin. RECOVERABLE — the pump
-    /// keeps accepting input; this only surfaces "input is blocked" so the UI can
-    /// say so instead of the terminal looking silently dead. `unwrittenBytes` is how
-    /// much of the stalled chunk was abandoned.
+    /// budget because the child stopped draining its stdin. The unwritten bytes
+    /// stay queued and are retried later; new input is rejected until this accepted
+    /// chunk is either delivered or the terminal stops.
     var onInputStalled: (@Sendable (_ unwrittenBytes: Int) -> Void)?
 
     init(
@@ -307,7 +314,7 @@ final class TerminalInputPump: @unchecked Sendable {
         lock.unlock()
 
         queue.async { [weak self] in
-            self?.drain(data)
+            self?.drain(data, offset: 0, countedBytes: data.count, reportStall: true, stalledRetry: false)
         }
         return .accepted
     }
@@ -323,14 +330,25 @@ final class TerminalInputPump: @unchecked Sendable {
         queue.sync {}
     }
 
-    private func drain(_ data: Data) {
-        defer {
-            lock.lock()
-            queuedBytes = max(0, queuedBytes - data.count)
-            lock.unlock()
+    private func drain(
+        _ data: Data,
+        offset initialOffset: Int,
+        countedBytes: Int,
+        reportStall: Bool,
+        stalledRetry: Bool
+    ) {
+        switch drainPermission(stalledRetry: stalledRetry) {
+        case .write:
+            break
+        case .wait:
+            scheduleRetry(data, offset: initialOffset, countedBytes: countedBytes, reportStall: reportStall, stalledRetry: false)
+            return
+        case .stopped:
+            finishQueuedBytes(countedBytes)
+            return
         }
 
-        var offset = 0
+        var offset = initialOffset
         var wouldBlockWaitMicros: UInt64 = 0
         while offset < data.count {
             switch writer(data, offset) {
@@ -338,6 +356,7 @@ final class TerminalInputPump: @unchecked Sendable {
                 offset += count
                 wouldBlockWaitMicros = 0   // forward progress resets the stall budget
             case .wrote:
+                finishQueuedBytes(countedBytes)
                 fail(.writeFailed)
                 return
             case .interrupted:
@@ -347,29 +366,97 @@ final class TerminalInputPump: @unchecked Sendable {
                 // Bound the retry: an open-ended `usleep`+continue spins a CPU core
                 // forever AND head-of-line-blocks every later keystroke queued behind
                 // this chunk on the serial queue — the "terminal alive but typing
-                // dead" freeze. This is RECOVERABLE backpressure, not process death,
-                // so do NOT latch accepting=false (fail()); stop waiting on this chunk
-                // and surface the stall. Subsequent input is no longer blocked.
+                // dead" freeze. This is RECOVERABLE backpressure, not process death:
+                // do not drop the already-accepted bytes. Pause later input, publish
+                // the stalled state, then retry the unwritten suffix asynchronously.
                 if Self.shouldAbortWouldBlock(waitedMicros: wouldBlockWaitMicros,
                                               budgetMicros: maxWouldBlockWaitMicros) {
-                    onInputStalled?(data.count - offset)
+                    pauseForStalledInput()
+                    if reportStall {
+                        onInputStalled?(data.count - offset)
+                    }
+                    scheduleRetry(data, offset: offset, countedBytes: countedBytes, reportStall: false, stalledRetry: true)
                     return
                 }
                 usleep(retryDelay)
                 wouldBlockWaitMicros &+= UInt64(retryDelay)
                 continue
             case .failed:
+                finishQueuedBytes(countedBytes)
                 fail(.writeFailed)
                 return
             }
         }
+        finishQueuedBytes(countedBytes)
+        resumeAfterStallIfNeeded()
     }
 
     private func fail(_ status: TerminalInputStatus) {
         lock.lock()
         accepting = false
         lastFailure = status
+        drainingAcceptedBacklog = false
         lock.unlock()
         onTerminalFailure?(status)
+    }
+
+    private func pauseForStalledInput() {
+        lock.lock()
+        accepting = false
+        lastFailure = .inputStalled
+        drainingAcceptedBacklog = false
+        lock.unlock()
+    }
+
+    private func resumeAfterStallIfNeeded() {
+        var didResume = false
+        lock.lock()
+        if lastFailure == .inputStalled {
+            if queuedBytes == 0 {
+                accepting = true
+                lastFailure = nil
+                drainingAcceptedBacklog = false
+                didResume = true
+            } else {
+                drainingAcceptedBacklog = true
+            }
+        }
+        lock.unlock()
+        if didResume {
+            onInputResumed?()
+        }
+    }
+
+    private func drainPermission(stalledRetry: Bool) -> DrainPermission {
+        lock.lock()
+        defer { lock.unlock() }
+        if accepting { return .write }
+        guard lastFailure == .inputStalled else { return .stopped }
+        return (stalledRetry || drainingAcceptedBacklog) ? .write : .wait
+    }
+
+    private func finishQueuedBytes(_ count: Int) {
+        lock.lock()
+        queuedBytes = max(0, queuedBytes - count)
+        lock.unlock()
+    }
+
+    private func scheduleRetry(
+        _ data: Data,
+        offset: Int,
+        countedBytes: Int,
+        reportStall: Bool,
+        stalledRetry: Bool
+    ) {
+        let delay = DispatchTimeInterval.microseconds(max(1, Int(retryDelay)))
+        queue.asyncAfter(deadline: .now() + delay) { [weak self] in
+            self?.drain(
+                data,
+                offset: offset,
+                countedBytes: countedBytes,
+                reportStall: reportStall,
+                stalledRetry: stalledRetry
+            )
+        }
     }
 }

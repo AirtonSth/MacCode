@@ -3274,12 +3274,11 @@ func terminalSnapshotJSON(_ snapshot: TerminalTextSnapshot) -> JSONValue {
         "cols": .number(Double(snapshot.cols)),
         "render_diagnostics": snapshot.renderDiagnostics.map(terminalRenderDiagnosticsJSON) ?? .null
     ]
-    // Emit `ansi_palette` ONLY for a custom theme. A nil palette (default
-    // theme) omits the key entirely so the payload is byte-identical to
-    // before this seam existed (back-compat).
-    if let palette = snapshot.ansiPalette {
-        fields["ansi_palette"] = .array(palette.map { .string($0) })
-    }
+    // Emit null for the default theme so mirrors can clear a previously cached
+    // custom palette on the same surface instead of keeping stale colors.
+    fields["ansi_palette"] = snapshot.ansiPalette.map { palette in
+        .array(palette.map { .string($0) })
+    } ?? .null
     return .object(fields)
 }
 

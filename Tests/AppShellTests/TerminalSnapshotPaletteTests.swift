@@ -8,15 +8,15 @@ import SocketServer
 /// WHY: the iOS mirror re-renders the Mac terminal's ANSI bytes through its own
 /// renderer. When a user picks a non-default Ghostty theme, the Mac surface and
 /// the iOS mirror render the SAME bytes with DIFFERENT colors (drift). The fix
-/// transmits the resolved 16-entry palette alongside the snapshot -- but ONLY
-/// when it is custom, so default-theme users see byte-identical wire payloads to
-/// before this seam existed (hard back-compat requirement).
+/// transmits the resolved 16-entry palette alongside the snapshot. Default-theme
+/// snapshots send an explicit null so iOS clears any cached custom palette for
+/// the same surface.
 ///
 /// Two layers are covered:
 ///  1. The pure encoder `ANSIPaletteMapper.customPaletteHex(from:)` (round-trip
 ///     + omit-for-default).
-///  2. The wire serializer `terminalSnapshotJSON` (includes the key only when the
-///     snapshot carries a custom palette; omits it otherwise).
+///  2. The wire serializer `terminalSnapshotJSON` (custom palette array, default
+///     palette null).
 final class TerminalSnapshotPaletteTests: XCTestCase {
 
     // MARK: - Encoder round-trip (P4: mac round-trip)
@@ -52,7 +52,7 @@ final class TerminalSnapshotPaletteTests: XCTestCase {
     }
 
     // The default palette (the exact literals the mirror also hardcodes) must
-    // encode to nil so the wire omits ansi_palette -> byte-identical to before.
+    // encode to nil so the wire sends ansi_palette=null.
     func test_defaultPalette_encodesToNil() {
         // Build a theme that resolves to exactly the default palette.
         let basic = ANSIPaletteMapper.defaultBasic
@@ -62,7 +62,7 @@ final class TerminalSnapshotPaletteTests: XCTestCase {
         let theme = ANSIThemeColors(map)
 
         XCTAssertNil(ANSIPaletteMapper.customPaletteHex(from: theme),
-            "a theme equal to the default palette must encode to nil so ansi_palette is omitted")
+            "a theme equal to the default palette must encode to nil so ansi_palette is serialized as null")
     }
 
     // A nil theme (no Ghostty config) must also encode to nil.
@@ -71,7 +71,7 @@ final class TerminalSnapshotPaletteTests: XCTestCase {
             "a nil theme must produce nil so the snapshot carries no palette")
     }
 
-    // MARK: - Wire serializer includes/omits (P4: snapshot-includes/omits)
+    // MARK: - Wire serializer includes/clears (P4: snapshot-includes/clears)
 
     private func snapshot(palette: [String]?) -> TerminalTextSnapshot {
         TerminalTextSnapshot(
@@ -103,14 +103,15 @@ final class TerminalSnapshotPaletteTests: XCTestCase {
             "ansi_palette must be the exact hex strings in order")
     }
 
-    // A snapshot with nil palette (default theme) must NOT include the key at all
-    // -- this is the back-compat guarantee for the common case.
-    func test_snapshotJSON_omitsPaletteWhenNil() {
+    // A snapshot with nil palette (default theme) must include explicit null so
+    // iOS clears any previous custom palette cached for the same surface.
+    func test_snapshotJSON_clearsPaletteWhenNil() {
         guard let obj = terminalSnapshotJSON(snapshot(palette: nil)).objectValue else {
             return XCTFail("snapshot JSON must be an object")
         }
-        XCTAssertNil(obj["ansi_palette"],
-            "a nil palette must omit ansi_palette entirely (byte-identical to before the seam)")
+        guard case .null? = obj["ansi_palette"] else {
+            return XCTFail("a nil palette must serialize ansi_palette=null so mirrors clear stale custom colors")
+        }
         // Sanity: the rest of the payload still serializes.
         XCTAssertEqual(obj["text"]?.stringValue, "x")
     }

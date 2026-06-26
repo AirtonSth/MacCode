@@ -423,16 +423,25 @@ final class PaneActionTests: XCTestCase {
         let controller = MainWindowController(context: ctx, router: router)
         router.windowController = controller
         drainMainQueue()
-        controller.window.contentView?.layoutSubtreeIfNeeded()
-        let rootBefore = try XCTUnwrap(allSubviews(of: controller.window.contentView ?? NSView()).first { $0 is PaneRootView })
+        let paneRoot = {
+            controller.window.contentView?.layoutSubtreeIfNeeded()
+            return self.allSubviews(of: controller.window.contentView ?? NSView()).first { $0 is PaneRootView }
+        }
+        waitUntil("main window must install the pane root before runtime refresh assertions") {
+            paneRoot() != nil
+        }
+        let rootBefore = try XCTUnwrap(paneRoot())
 
         XCTAssertTrue(tabProgressIndicators(in: controller, surfaceID: descriptor.id).isEmpty,
                       "idle terminal tabs must render the normal terminal icon instead of a spinner")
 
         surface.isBusy = true
         controller.refreshSurfaceRuntimeState()
-        controller.window.contentView?.layoutSubtreeIfNeeded()
-        let rootAfter = try XCTUnwrap(allSubviews(of: controller.window.contentView ?? NSView()).first { $0 is PaneRootView })
+        waitUntil("busy runtime refresh must update the existing tab spinner") {
+            controller.window.contentView?.layoutSubtreeIfNeeded()
+            return !tabProgressIndicators(in: controller, surfaceID: descriptor.id).isEmpty
+        }
+        let rootAfter = try XCTUnwrap(paneRoot())
 
         XCTAssertFalse(tabProgressIndicators(in: controller, surfaceID: descriptor.id).isEmpty,
                        "a terminal busy-state change must update the existing tab header without waiting for a layout rebuild")

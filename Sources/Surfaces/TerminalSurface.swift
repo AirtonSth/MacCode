@@ -1031,7 +1031,11 @@ public final class TerminalSurface: NSObject, Surface {
         // depends only on a future reconcile the user cannot trigger by scrolling or
         // typing. Fail loud and self-heal locally so the live terminal un-freezes.
         if !stuckHiddenHealScheduled,
-           Self.isLikelyStuckHidden(isVisible: isVisible, viewDefinitelyOnScreen: ghosttyView.isDefinitelyOnScreen) {
+           Self.shouldRunStuckHiddenHeal(
+               isClosing: isClosing,
+               isVisible: isVisible,
+               viewDefinitelyOnScreen: ghosttyView.isDefinitelyOnScreen
+           ) {
             // DEFER the heal to the next tick: this chunk must first land in the
             // hidden path (hiddenRendererBuffer + outputPendingBytes) consistently with
             // the render decision captured for it. Healing inline would flip visibility
@@ -1043,6 +1047,11 @@ public final class TerminalSurface: NSObject, Surface {
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
                 self.stuckHiddenHealScheduled = false
+                guard Self.shouldRunStuckHiddenHeal(
+                    isClosing: self.isClosing,
+                    isVisible: self.isVisible,
+                    viewDefinitelyOnScreen: self.ghosttyView.isDefinitelyOnScreen
+                ) else { return }
                 self.didBecomeVisible()
             }
         }
@@ -1265,6 +1274,16 @@ public final class TerminalSurface: NSObject, Surface {
         !isVisible && viewDefinitelyOnScreen
     }
 
+    /// Re-check used by the deferred stuck-hidden heal before it flips the surface
+    /// visible. The view can legitimately disappear between scheduling and execution.
+    nonisolated static func shouldRunStuckHiddenHeal(
+        isClosing: Bool,
+        isVisible: Bool,
+        viewDefinitelyOnScreen: Bool
+    ) -> Bool {
+        !isClosing && isLikelyStuckHidden(isVisible: isVisible, viewDefinitelyOnScreen: viewDefinitelyOnScreen)
+    }
+
     @discardableResult
     private func writeToPTY(_ data: Data) -> TerminalInputStatus {
         guard !data.isEmpty else { return .accepted }
@@ -1292,6 +1311,20 @@ public final class TerminalSurface: NSObject, Surface {
                 return .failed(errno)
             }
         })
+        attachInputPumpCallbacks(pump)
+        inputPump = pump
+    }
+
+    func installInputPumpForRuntimeHealthTests(_ pump: TerminalInputPump, processAlive: Bool = true) {
+        self.processAlive = processAlive
+        self.terminalDeadReason = nil
+        self.exitStatus = nil
+        self.terminationSignal = nil
+        attachInputPumpCallbacks(pump)
+        inputPump = pump
+    }
+
+    private func attachInputPumpCallbacks(_ pump: TerminalInputPump) {
         pump.onTerminalFailure = { [weak self] status in
             DispatchQueue.main.async {
                 if let self {
@@ -1303,14 +1336,20 @@ public final class TerminalSurface: NSObject, Surface {
         pump.onInputStalled = { [weak self] unwritten in
             DispatchQueue.main.async {
                 guard let self, !self.isClosing else { return }
-                // RECOVERABLE: the child is not draining stdin. We did NOT mark the
-                // terminal dead — log loudly (fail-loud) and re-publish health so the
-                // UI/mirror reflect the stall instead of input looking silently dead.
+                // RECOVERABLE: the child is not draining stdin. Keep the terminal
+                // alive, but publish input_accepting=false until the accepted bytes
+                // are retried and delivered.
                 terminalLog.error("terminal.input_stalled surface=\(self.descriptor.id.value.uuidString, privacy: .public) unwrittenBytes=\(unwritten, privacy: .public) pid=\(self.childPID, privacy: .public)")
                 self.publishRuntimeHealth()
             }
         }
-        inputPump = pump
+        pump.onInputResumed = { [weak self] in
+            DispatchQueue.main.async {
+                guard let self, !self.isClosing else { return }
+                terminalLog.info("terminal.input_resumed surface=\(self.descriptor.id.value.uuidString, privacy: .public) pid=\(self.childPID, privacy: .public)")
+                self.publishRuntimeHealth()
+            }
+        }
     }
 
     public func sendTextStatus(_ text: String) -> TerminalInputStatus {
