@@ -307,6 +307,7 @@ final class AppIdentityNotificationTests: XCTestCase {
 
         let content = try XCTUnwrap(RemoteCodeNotificationContent.threadOutcome(
             threadId: "thread-1",
+            workspaceId: "ws-1",
             title: "Build fix",
             phase: .completed
         ))
@@ -319,6 +320,11 @@ final class AppIdentityNotificationTests: XCTestCase {
         XCTAssertEqual(api.alertRequests.first?.title, "Thread finished")
         XCTAssertEqual(api.alertRequests.first?.body, "Build fix response is ready.",
                        "terminal outcome notifications must be sent to the private backend with the paired iOS push target")
+        // The push must carry routing keys so a tap opens the exact thread, not
+        // the default screen. workspaceId + threadId drive AppRouter.routeIntent.
+        XCTAssertEqual(api.alertRequests.first?.data["workspaceId"], "ws-1")
+        XCTAssertEqual(api.alertRequests.first?.data["threadId"], "thread-1")
+        XCTAssertEqual(api.alertRequests.first?.data["category"], "RemoteCodeThreadUpdate")
     }
 
     func testLiveActivitySnapshotContentStateMatchesOnDeviceSchemaKeys() throws {
@@ -366,6 +372,41 @@ final class AppIdentityNotificationTests: XCTestCase {
         let cancelled = PrivateLiveActivitySnapshot.terminal(threadId: "t1", title: "Build fix", phase: .cancelled)
         XCTAssertEqual(cancelled?.phase, "failed",
                        "the on-device ContentState only models running/completed/failed; cancelled maps to failed")
+    }
+
+    func testLiveActivityRunningSnapshotShowsLatestTurnAsMidRunHeartbeat() {
+        let runStart = Date(timeIntervalSince1970: 1000)
+        // A completed turn refreshes the running card with the latest assistant
+        // text + a fresh timestamp so a backgrounded card shows progress instead
+        // of freezing at the start snapshot until the run ends.
+        let withFinal = PrivateLiveActivitySnapshot.running(
+            threadId: "t1",
+            workspaceId: "ws-1",
+            title: "Build fix",
+            finalMessage: "  Applied the patch and ran the tests.  ",
+            runStartDate: runStart,
+            now: Date(timeIntervalSince1970: 1200)
+        )
+        XCTAssertEqual(withFinal.phase, "running")
+        XCTAssertEqual(withFinal.statusLine, "Working…")
+        XCTAssertEqual(withFinal.preview, "Applied the patch and ran the tests.")
+        XCTAssertEqual(withFinal.workspaceId, "ws-1")
+        XCTAssertEqual(withFinal.threadId, "t1")
+        XCTAssertEqual(withFinal.runStartDate, runStart, "elapsed-time anchor is preserved across updates")
+        XCTAssertEqual(withFinal.updatedAt, Date(timeIntervalSince1970: 1200), "a fresh timestamp resets the stale timer")
+
+        // No assistant text yet -> fall back to the thread title; long text is clamped.
+        let noFinal = PrivateLiveActivitySnapshot.running(
+            threadId: "t1", workspaceId: nil, title: "  ", finalMessage: nil, runStartDate: nil
+        )
+        XCTAssertEqual(noFinal.title, "Thread")
+        XCTAssertEqual(noFinal.preview, "Thread")
+
+        let longText = String(repeating: "x", count: 300)
+        let clamped = PrivateLiveActivitySnapshot.running(
+            threadId: "t1", workspaceId: nil, title: "T", finalMessage: longText, runStartDate: nil
+        )
+        XCTAssertEqual(clamped.preview.count, 140, "preview is clamped to keep the card glanceable")
     }
 
     func testPrivateNotificationBridgeSendsLiveActivityThroughBackendWhenTokenPaired() async throws {
@@ -720,7 +761,7 @@ private final class RecordingPrivateAccountAPI: PrivateAccountAPI, @unchecked Se
         )
     )
     var loginRequests: [[String: String]] = []
-    var alertRequests: [(accessToken: String, title: String, body: String, pushToken: String, pushTokenType: String, idempotencyKey: String)] = []
+    var alertRequests: [(accessToken: String, title: String, body: String, data: [String: String], pushToken: String, pushTokenType: String, idempotencyKey: String)] = []
     var liveActivityRequests: [(accessToken: String, event: String, contentState: PrivateLiveActivityContentState, liveActivityToken: String, pushToken: String, pushTokenType: String, idempotencyKey: String)] = []
     var liveActivityResult = PrivatePushDeliveryResult(delivered: true, errorCode: nil, shouldDropSubscription: false)
     var billingOverviewRequests: [String] = []
@@ -782,8 +823,8 @@ private final class RecordingPrivateAccountAPI: PrivateAccountAPI, @unchecked Se
         return URL(string: "https://apps.apple.com/account/subscriptions")!
     }
 
-    func deliverAlert(accessToken: String, title: String, body: String, pushToken: String, pushTokenType: String, idempotencyKey: String) async throws -> PrivatePushDeliveryResult {
-        alertRequests.append((accessToken, title, body, pushToken, pushTokenType, idempotencyKey))
+    func deliverAlert(accessToken: String, title: String, body: String, data: [String: String], pushToken: String, pushTokenType: String, idempotencyKey: String) async throws -> PrivatePushDeliveryResult {
+        alertRequests.append((accessToken, title, body, data, pushToken, pushTokenType, idempotencyKey))
         return PrivatePushDeliveryResult(delivered: true, errorCode: nil, shouldDropSubscription: false)
     }
 

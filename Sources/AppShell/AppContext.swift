@@ -288,6 +288,27 @@ public final class AppContext {
                 var p: [String: JSONValue] = ["thread_id": .string(t), "turn_id": .string(turnId)]
                 if let f = final { p["final"] = .string(f) }
                 EventBus.shared.publish(kind: "agent.turn.completed", payload: .object(p))
+                // Mid-run Live Activity heartbeat: each completed turn refreshes the
+                // paired iOS card with the latest assistant output and a fresh
+                // timestamp, so a backgrounded card shows progress and never goes
+                // stale mid-run. The host previously pushed only .start and .end, so
+                // the card froze at the start snapshot until the run finished. The
+                // backend rate-limits cadence; unpaired devices are skipped in the bridge.
+                let updateSnapshot = PrivateLiveActivitySnapshot.running(
+                    threadId: tid.value.uuidString,
+                    workspaceId: (try? self.threadRepo.get(id: tid)?.workspaceId)?.value.uuidString,
+                    title: try? self.threadRepo.get(id: tid)?.title,
+                    finalMessage: final,
+                    runStartDate: (try? self.runRepo.get(id: runId)?.startedAt)
+                        ?? (try? self.coordinator.runStartedAt(threadId: tid))
+                )
+                Task {
+                    await self.privateNotificationBridge.deliverLiveActivity(
+                        snapshot: updateSnapshot,
+                        event: .update,
+                        idempotencyKey: "activity.\(tid.value.uuidString).update.\(turnId)"
+                    )
+                }
             case .proposedPlan(let plan):
                 try? self.proposedPlanRepo.upsert(threadId: tid, plan: plan)
                 EventBus.shared.publish(kind: "agent.plan.proposed", payload: .object([
@@ -390,6 +411,7 @@ public final class AppContext {
             }
             if let content = RemoteCodeNotificationContent.threadOutcome(
                 threadId: tid.value.uuidString,
+                workspaceId: (try? self.threadRepo.get(id: tid)?.workspaceId)?.value.uuidString,
                 title: try? self.threadRepo.get(id: tid)?.title,
                 phase: status
             ) {

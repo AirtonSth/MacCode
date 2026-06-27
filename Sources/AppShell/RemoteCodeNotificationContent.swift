@@ -49,6 +49,7 @@ public struct RemoteCodeNotificationContent: Equatable, Sendable {
 
     public static func threadOutcome(
         threadId: String,
+        workspaceId: String? = nil,
         title: String?,
         phase: AgentRunStatus
     ) -> RemoteCodeNotificationContent? {
@@ -62,13 +63,25 @@ public struct RemoteCodeNotificationContent: Equatable, Sendable {
         ) else { return nil }
 
         let outcome = parts.identifierSuffix
+        // userInfo doubles as the remote-push `data` dictionary. The iOS tap
+        // handler (AppRouter.routeIntent) reads workspaceId + threadId to open the
+        // exact thread; `category` lets it pick the right notification actions.
+        // Without workspaceId the tap can only fall back to the Activity tab.
+        var userInfo: [String: String] = [
+            "threadId": threadId,
+            "outcome": outcome,
+            "category": Self.threadUpdateCategoryIdentifier,
+        ]
+        if let workspaceId, !workspaceId.trimmingCharacters(in: .whitespaces).isEmpty {
+            userInfo["workspaceId"] = workspaceId
+        }
         return RemoteCodeNotificationContent(
             identifier: "thread.\(threadId).\(outcome)",
             title: parts.title,
             body: parts.body,
             categoryIdentifier: Self.threadUpdateCategoryIdentifier,
             threadIdentifier: parts.threadIdentifier,
-            userInfo: ["threadId": threadId, "outcome": outcome]
+            userInfo: userInfo
         )
     }
 

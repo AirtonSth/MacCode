@@ -151,6 +151,35 @@ public struct PrivateLiveActivitySnapshot: Equatable, Sendable {
         )
     }
 
+    /// Builds a mid-run "running" snapshot for a Live Activity `.update` heartbeat.
+    /// Extracted (like `terminal`) so the title fallback, preview selection and
+    /// 140-char clamp are unit-testable without driving the coordinator. `finalMessage`
+    /// is the latest assistant turn text, shown as the card preview when present.
+    public static func running(
+        threadId: String,
+        workspaceId: String?,
+        title: String?,
+        finalMessage: String?,
+        runStartDate: Date?,
+        now: Date = Date()
+    ) -> PrivateLiveActivitySnapshot {
+        let normalizedTitle = title?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let displayTitle = (normalizedTitle?.isEmpty == false) ? normalizedTitle! : "Thread"
+        let finalText = finalMessage?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let preview = (finalText?.isEmpty == false) ? String(finalText!.prefix(140)) : displayTitle
+        return PrivateLiveActivitySnapshot(
+            title: displayTitle,
+            statusLine: "Working…",
+            preview: preview,
+            phase: "running",
+            activeThreadCount: 1,
+            updatedAt: now,
+            runStartDate: runStartDate,
+            workspaceId: workspaceId,
+            threadId: threadId
+        )
+    }
+
     /// Maps a terminal `AgentRunStatus` to a running/terminal Live Activity
     /// snapshot, reusing the same English copy the alert path ships. Returns nil
     /// for non-terminal phases (pending/running) so only real lifecycle ends
@@ -215,7 +244,7 @@ public protocol PrivateAccountAPI: Sendable {
     func logout(refreshToken: String) async throws
     func billingOverview(accessToken: String) async throws -> PrivateBillingOverview
     func createPortal(accessToken: String) async throws -> URL
-    func deliverAlert(accessToken: String, title: String, body: String, pushToken: String, pushTokenType: String, idempotencyKey: String) async throws -> PrivatePushDeliveryResult
+    func deliverAlert(accessToken: String, title: String, body: String, data: [String: String], pushToken: String, pushTokenType: String, idempotencyKey: String) async throws -> PrivatePushDeliveryResult
     func deliverLiveActivity(accessToken: String, event: String, contentState: PrivateLiveActivityContentState, liveActivityToken: String, pushToken: String, pushTokenType: String, idempotencyKey: String) async throws -> PrivatePushDeliveryResult
 }
 
@@ -268,9 +297,10 @@ public final class URLSessionPrivateAccountAPI: PrivateAccountAPI, @unchecked Se
         return response.portalUrl
     }
 
-    public func deliverAlert(accessToken: String, title: String, body: String, pushToken: String, pushTokenType: String, idempotencyKey: String) async throws -> PrivatePushDeliveryResult {
+    public func deliverAlert(accessToken: String, title: String, body: String, data: [String: String], pushToken: String, pushTokenType: String, idempotencyKey: String) async throws -> PrivatePushDeliveryResult {
         struct Body: Encodable {
             let body: String
+            let data: [String: String]?
             let pushToken: String
             let pushTokenType: String
             let title: String
@@ -279,7 +309,13 @@ public final class URLSessionPrivateAccountAPI: PrivateAccountAPI, @unchecked Se
             path: "/v1/private/push-notification/alert",
             method: "POST",
             accessToken: accessToken,
-            body: Body(body: body, pushToken: pushToken, pushTokenType: pushTokenType, title: title),
+            body: Body(
+                body: body,
+                data: data.isEmpty ? nil : data,
+                pushToken: pushToken,
+                pushTokenType: pushTokenType,
+                title: title
+            ),
             idempotencyKey: idempotencyKey
         )
     }
@@ -456,6 +492,10 @@ public final class PrivateNotificationBridge: @unchecked Sendable {
                 accessToken: session.accessToken,
                 title: content.title,
                 body: content.body,
+                // Carry the notification's routing keys (workspaceId/threadId/category)
+                // as the push `data` so a tap on the remote alert opens the exact
+                // thread, matching the local-notification path's userInfo.
+                data: content.userInfo,
                 pushToken: target.pushToken,
                 pushTokenType: target.pushTokenType,
                 idempotencyKey: content.identifier
