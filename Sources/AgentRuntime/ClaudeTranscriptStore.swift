@@ -162,6 +162,11 @@ public final class ClaudeTranscriptStore: @unchecked Sendable {
 
         var events: [AssistantEvent] = [.threadStarted(threadId: providerThreadId, providerThreadId: providerThreadId)]
         var emittedMessageIds = Set<String>()
+        // One assistant message (same message.id / turnId) spans multiple JSONL
+        // lines (text → tool_use → text). Accumulate the turn's assistant text
+        // across lines so a later tool-only line's turnCompleted never resets
+        // the turn's finalAssistantMessage back to nil in the reducer.
+        var finalMessagesByTurn: [String: String] = [:]
 
         for line in candidateLines {
             guard let object = Self.jsonObject(from: line),
@@ -175,23 +180,31 @@ public final class ClaudeTranscriptStore: @unchecked Sendable {
             let turnId = Self.string(message["id"]) ?? messageId
             let timestampMs = Self.timestampMs(object["timestamp"] as? String) ?? Int64(Date().timeIntervalSince1970 * 1000)
             let blocks = message["content"] as? [[String: Any]] ?? []
-            let mapped = Self.events(for: blocks, turnId: turnId, timestampMs: timestampMs)
+            let mapped = Self.events(for: blocks, turnId: turnId, lineId: messageId, timestampMs: timestampMs)
             guard !mapped.events.isEmpty else { continue }
+            if let final = mapped.finalMessage {
+                finalMessagesByTurn[turnId] = finalMessagesByTurn[turnId].map { $0 + "\n" + final } ?? final
+            }
             events.append(.turnStarted(turnId: turnId))
             events.append(contentsOf: mapped.events)
-            events.append(.turnCompleted(turnId: turnId, finalMessage: mapped.finalMessage))
+            events.append(.turnCompleted(turnId: turnId, finalMessage: finalMessagesByTurn[turnId]))
         }
 
         guard events.count > maxEvents else { return events }
         return Array(events.suffix(maxEvents))
     }
 
-    private static func events(for blocks: [[String: Any]], turnId: String, timestampMs: Int64) -> (events: [AssistantEvent], finalMessage: String?) {
+    private static func events(for blocks: [[String: Any]], turnId: String, lineId: String, timestampMs: Int64) -> (events: [AssistantEvent], finalMessage: String?) {
         var events: [AssistantEvent] = []
         var assistantTexts: [String] = []
         for (index, block) in blocks.enumerated() {
             let type = string(block["type"]) ?? "text"
-            let itemId = string(block["id"]) ?? "\(turnId)-\(index)"
+            // Fallback id keyed on the LINE (uuid), not the turn: multiple
+            // lines of one message each carry a block at index 0, and a
+            // turnId-based id collided across lines — the reducer merged the
+            // duplicate itemStarted and appended the second text block onto
+            // the first with no separator (run-on glued prose on resume).
+            let itemId = string(block["id"]) ?? "\(lineId)-\(index)"
             switch type {
             case "text":
                 let text = string(block["text"]) ?? ""

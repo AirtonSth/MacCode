@@ -104,15 +104,15 @@ final class ClaudeRunnerArgsTests: XCTestCase {
 
     func test_listModels_exposeClaudeOptionDescriptorsWithoutCodexFastTier() async {
         let models = await ClaudeRunner().listModels()
-        let opus = models.first { $0.id == "opus" }
+        let fable = models.first { $0.id == "fable" }
 
-        XCTAssertEqual(models.first?.id, "opus",
-                       "Claude fallback model options must use Claude Code's latest-model alias instead of a hardcoded dated model id")
-        XCTAssertEqual(opus?.supportedReasoningEfforts, AgentReasoningEffort.claudeSupportedCases,
+        XCTAssertEqual(models.first?.id, "fable",
+                       "Claude fallback model options must lead with the current flagship alias instead of a hardcoded dated model id")
+        XCTAssertEqual(fable?.supportedReasoningEfforts, AgentReasoningEffort.claudeSupportedCases,
                        "Claude thinking-capable models must advertise the legal effort picker values, including Max")
-        XCTAssertFalse(opus?.supportsServiceTier == true,
+        XCTAssertFalse(fable?.supportsServiceTier == true,
                        "Claude models must not expose Codex-only fast service-tier controls")
-        XCTAssertTrue(opus?.supportsCustomModel == true)
+        XCTAssertTrue(fable?.supportsCustomModel == true)
     }
 
     func test_anthropicModelDiscoveryParsesDynamicModels() {
@@ -146,7 +146,7 @@ final class ClaudeRunnerArgsTests: XCTestCase {
         let newIds = ClaudeRunner.listModels(installedVersion: "Claude Code 2.1.0").map(\.id)
         let unknownIds = ClaudeRunner.listModels(installedVersion: "Claude Code dev").map(\.id)
 
-        XCTAssertEqual(oldIds, ["opus", "sonnet", "haiku"],
+        XCTAssertEqual(oldIds, ["fable", "opus", "sonnet", "haiku"],
                        "fallback Claude options must be versionless aliases, not dated model IDs that go stale")
         XCTAssertEqual(newIds, oldIds)
         XCTAssertEqual(unknownIds, newIds,

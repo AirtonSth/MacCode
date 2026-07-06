@@ -100,9 +100,12 @@ public enum AnthropicModelDiscovery {
         session: URLSession = .shared
     ) async -> ModelListResult {
         let env = CodexRunner.processEnvironment(overrides: environment)
+        let cacheKey = credentialFingerprint(environment: env)
 
-        // Cache hit? Cache stores only live data, so a hit is never a fallback.
-        if let cached = await _cache.entry, cached.isValid(ttl: cacheTTL) {
+        // Cache hit? Cache stores only live data, keyed per credential so
+        // switching Anthropic accounts never serves another account's list;
+        // a hit is never a fallback.
+        if let cached = await _cache.entry(for: cacheKey), cached.isValid(ttl: cacheTTL) {
             return ModelListResult(models: cached.models, isFallback: false)
         }
 
@@ -117,11 +120,27 @@ public enum AnthropicModelDiscovery {
                 return ModelListResult(models: [], isFallback: true)
             }
             let models = modelDescriptors(fromListResponse: object)
-            await _cache.store(ModelDiscoveryCacheEntry(models: models, fetchedAt: Date()))
+            await _cache.store(ModelDiscoveryCacheEntry(models: models, fetchedAt: Date()), for: cacheKey)
             return ModelListResult(models: models, isFallback: false)
         } catch {
             return ModelListResult(models: [], isFallback: true)
         }
+    }
+
+    /// Cache key derived from the resolved credential (same precedence as
+    /// `AnthropicDiscoveryRequestBuilder.build`: OAuth token over API key).
+    /// Hashed so the raw secret is never held as a dictionary key; per-process
+    /// hash stability is sufficient for the in-process cache.
+    private static func credentialFingerprint(environment: [String: String]) -> String {
+        if let token = environment["ANTHROPIC_OAUTH_TOKEN"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines), !token.isEmpty {
+            return "oauth:\(token.hashValue)"
+        }
+        if let key = environment["ANTHROPIC_API_KEY"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines), !key.isEmpty {
+            return "apikey:\(key.hashValue)"
+        }
+        return "none"
     }
 
     /// Forces a fresh live fetch by clearing the cache first, then delegates
@@ -149,6 +168,9 @@ public enum AnthropicModelDiscovery {
 
     public static func latestAliasModels() -> [AgentModelDescriptor] {
         [
+            // The CLI accepts the bare "fable" alias (and "claude-fable-5");
+            // the flagship leads so it stays selectable on the fallback path.
+            descriptor(id: "fable", label: "Fable (latest)"),
             descriptor(id: "opus", label: "Opus (latest)"),
             descriptor(id: "sonnet", label: "Sonnet (latest)"),
             descriptor(id: "haiku", label: "Haiku (latest)")
@@ -157,7 +179,10 @@ public enum AnthropicModelDiscovery {
 
     private static func descriptor(id: String, label: String) -> AgentModelDescriptor {
         let lower = "\(id) \(label)".lowercased()
-        let supportsReasoning = lower.contains("opus") || lower.contains("sonnet")
+        // Reasoning support is the default: exclude the known non-reasoning
+        // family (haiku) instead of allowlisting names, so future top-tier
+        // models keep the effort/ultracode picker without a code change here.
+        let supportsReasoning = !lower.contains("haiku")
         return AgentModelDescriptor(
             id: id,
             label: label,
@@ -165,8 +190,32 @@ public enum AnthropicModelDiscovery {
             supportsReasoning: supportsReasoning,
             supportedReasoningEfforts: supportsReasoning ? AgentReasoningEffort.claudeSupportedCases : [],
             supportsCustomModel: true,
-            contextWindowTokens: 200_000
+            contextWindowTokens: contextWindowTokens(forID: id)
         )
+    }
+
+    /// Known context windows by model-id prefix (Anthropic docs, 2026-07):
+    /// Fable 5, Opus 4.6+, and Sonnet 4.6+ are 1M-context; Haiku is 200k.
+    /// First match wins, so dated/legacy ids must precede their bare alias.
+    private static let contextWindowsByIDPrefix: [(prefix: String, tokens: Int)] = [
+        ("claude-fable", 1_000_000),
+        ("fable", 1_000_000),
+        ("claude-opus-4-8", 1_000_000),
+        ("claude-opus-4-7", 1_000_000),
+        ("claude-opus-4-6", 1_000_000),
+        ("opus", 1_000_000),   // bare alias resolves to the latest Opus
+        ("claude-sonnet-5", 1_000_000),
+        ("claude-sonnet-4-6", 1_000_000),
+        ("sonnet", 1_000_000), // bare alias resolves to the latest Sonnet
+        ("claude-haiku", 200_000),
+        ("haiku", 200_000)
+    ]
+
+    /// Nil when the window is unknown so the picker hides the context pill
+    /// instead of showing a fabricated number.
+    private static func contextWindowTokens(forID id: String) -> Int? {
+        let lower = id.lowercased()
+        return contextWindowsByIDPrefix.first { lower.hasPrefix($0.prefix) }?.tokens
     }
 
     private static func string(_ object: [String: Any], _ key: String) -> String? {
@@ -186,13 +235,18 @@ public enum AnthropicModelDiscovery {
 // MARK: - Actor-isolated cache storage
 
 actor ModelDiscoveryCache {
-    var entry: ModelDiscoveryCacheEntry?
+    // Keyed by credential fingerprint so per-account lists never cross.
+    private var entries: [String: ModelDiscoveryCacheEntry] = [:]
 
-    func store(_ e: ModelDiscoveryCacheEntry) {
-        entry = e
+    func entry(for key: String) -> ModelDiscoveryCacheEntry? {
+        entries[key]
+    }
+
+    func store(_ e: ModelDiscoveryCacheEntry, for key: String) {
+        entries[key] = e
     }
 
     func reset() {
-        entry = nil
+        entries.removeAll()
     }
 }

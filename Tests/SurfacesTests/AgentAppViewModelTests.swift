@@ -209,8 +209,11 @@ final class AgentAppViewModelTests: XCTestCase {
         }
 
         let load = Task { await vm.loadModels() }
-        await waitAsync("model list loading state becomes visible") {
-            vm.modelListLoading == true && vm.modelListStatusMessage == "Loading models..."
+        // F35: progress is signalled by modelListLoading only — reusing the
+        // error-styled status message rendered a red duplicate "Loading
+        // models..." with a Retry row while the fetch was still in flight.
+        await waitAsync("model list loading state becomes visible without an error-styled status") {
+            vm.modelListLoading == true && vm.modelListStatusMessage == nil
         }
         await load.value
 
@@ -2663,9 +2666,13 @@ final class AgentAppViewModelTests: XCTestCase {
     }
 
     func test_loadModels_keepsModelValidForProvider() async throws {
+        // F8 update: loadModels no longer rewrites a non-empty pinned model
+        // against a fallback list (see AgentAppModelPickerFixesTests). The B8
+        // contract lives in the real switch flow: setProvider clears the model
+        // and loadModels must then fill in a valid one for the new provider.
         let (vm, _) = try makeVM()
-        vm.provider = .codex
-        vm.model = "bogus-not-a-real-model"
+        vm.setProvider(.codex)
+        XCTAssertEqual(vm.model, "", "a provider switch clears the model before the async load")
         await vm.loadModels()
         if !vm.availableModels.isEmpty {
             XCTAssertTrue(vm.availableModels.contains { $0.id == vm.model },

@@ -10,7 +10,8 @@ import AgentRuntime
 ///  T007 - forceQueuedMessageNow when idle promotes by deleting and starting run
 ///  T008 - forceQueuedMessageNow when running promotes to front
 ///  T019 - lastErrorRecoverable set to true on recoverable error event
-///  T020 - lastErrorRecoverable cleared on any non-error event
+///  T020 - lastErrorRecoverable persists across non-error events while the
+///         error banner is still displayed (F26), and follows a later error
 ///  T021 - lastErrorRecoverable cleared when a new run starts
 ///  T022 - retryLastPrompt clears lastErrorRecoverable
 ///  T023 - lastErrorRecoverable false when response-fail (not a prompt fail)
@@ -239,7 +240,15 @@ final class AgentAppQueuedMessageAndHelperTests: XCTestCase {
                        "a non-recoverable error must not set lastErrorRecoverable — Retry would silently send the same broken request again")
     }
 
-    func test_lastErrorRecoverable_clearedByNonErrorEvent() async throws {
+    /// F26: producers emit trailing events right after a recoverable error (Claude
+    /// auth_status appends runtime items in the same batch; the Codex resume
+    /// fallback is followed by turnStarted/deltas), while timeline.error — the
+    /// banner the Retry button is attached to — persists. Clearing the flag on any
+    /// non-error event therefore made the designed Retry affordance unreachable:
+    /// the banner stayed, styled as fatal, with no Retry. Recoverability must stay
+    /// tied to the DISPLAYED error, changing only on a later .error event or when
+    /// the error itself is cleared (new user message / new run / thread switch).
+    func test_lastErrorRecoverable_persistsAcrossNonErrorEventsWhileErrorDisplayed() async throws {
         let vm = try makeVM().0
         vm.createThread(title: "t")
         let threadId = vm.selectedThreadId!
@@ -247,19 +256,31 @@ final class AgentAppQueuedMessageAndHelperTests: XCTestCase {
 
         // Seed recoverable error.
         vm.runCoordinator(vm.coordinator,
-                          didReceive: .error(message: "timeout", recoverable: true),
+                          didReceive: .error(message: "auth expired", recoverable: true),
                           run: runId, threadId: threadId)
         await Task.yield()
         XCTAssertTrue(vm.lastErrorRecoverable)
 
-        // Any non-error event clears it.
+        // Trailing non-error events (same run) must NOT clear it: the banner is
+        // still on screen, so the Retry button must remain reachable.
         vm.runCoordinator(vm.coordinator,
                           didReceive: .turnStarted(turnId: "t1"),
                           run: runId, threadId: threadId)
         await Task.yield()
 
+        XCTAssertNotNil(vm.timeline.error,
+                        "precondition: non-error events do not clear the displayed error banner")
+        XCTAssertTrue(vm.lastErrorRecoverable,
+                      "non-error stream events must not clear lastErrorRecoverable while the error banner is displayed — that made the Retry button unreachable (F26)")
+
+        // A later error REPLACES the banner; the flag must follow its recoverability.
+        vm.runCoordinator(vm.coordinator,
+                          didReceive: .error(message: "fatal", recoverable: false),
+                          run: runId, threadId: threadId)
+        await Task.yield()
+
         XCTAssertFalse(vm.lastErrorRecoverable,
-                       "any non-error stream event must clear lastErrorRecoverable so the Retry button disappears once the agent resumes")
+                       "the flag must track the recoverability of the error currently displayed, so a later fatal error hides Retry")
     }
 
     // NOTE: T022 (retryLastPrompt clears lastErrorRecoverable) was DROPPED: it

@@ -503,6 +503,10 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         }
         loadAllMessages(id)
         timeline = AssistantTimelineState()
+        // F26: the flag now persists across non-error events (it mirrors the
+        // displayed timeline.error), so reset it whenever the timeline is rebuilt —
+        // the replay below does not restore recoverability for a stale banner.
+        lastErrorRecoverable = false
         let persistedEvents = coordinator.latestStreamEvents(threadId: id)
         // PERF: the provider-thread snapshot read (coordinator.readThread) used to
         // block thread-open for up to a provider round-trip (codex app-server),
@@ -1215,7 +1219,10 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
 
     public func loadModels() async {
         modelListLoading = true
-        modelListStatusMessage = "Loading models..."
+        // F35: progress is signalled by `modelListLoading` alone. Reusing the
+        // error-styled status message rendered a red duplicate "Loading
+        // models..." plus a Retry row while the fetch was still in flight.
+        modelListStatusMessage = nil
         defer { modelListLoading = false }
         do {
             let m: [AgentModelDescriptor]
@@ -1228,8 +1235,11 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 m = result.models
                 isFallback = result.isFallback
             } else {
+                // F33: this is CodexRunner's baked-in list, not live discovery
+                // (live codex models arrive via the provider-snapshot path), so
+                // flag it as a fallback instead of presenting it as live.
                 m = await CodexRunner().listModels()
-                isFallback = false
+                isFallback = true
             }
             await MainActor.run {
                 self.availableModels = m
@@ -1237,8 +1247,15 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 self.modelListStatusMessage = m.isEmpty ? "No models returned for \(self.providerDisplayName(self.provider)). Retry from the model menu." : nil
                 // B8: a provider switch must leave a model valid for that
                 // provider — never a stale id from the other provider.
-                if !self.modelSelectionIsValid(self.model, in: m) {
-                    self.model = m.first?.id ?? self.model
+                // F8: validate against the union of this fetch and the list
+                // the picker actually displays (snapshot rows win), and never
+                // rewrite a pinned model against a fallback list — built-in
+                // defaults are no evidence the model is gone. Empty or
+                // provably other-provider selections still reset (B8).
+                if !self.modelSelectionIsValid(self.model, in: m + self.modelOptionsForSelectedProvider) {
+                    if !isFallback || self.model.isEmpty || self.modelIsFromAnotherProvider(self.model) {
+                        self.model = m.first?.id ?? self.model
+                    }
                 }
                 self.normalizeSelectedModelOptions()
             }
@@ -1285,17 +1302,51 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         }
         if let current = selectedProviderSnapshot {
             provider = current.provider
+            // F10/F33: keep the fallback flag coherent when snapshot rows
+            // replace the VM's own fetch — a snapshot bringing a different
+            // list is live discovery, so the warning must clear; an identical
+            // list means the fallback was substituted again.
+            if availableModelsAreFallback {
+                availableModelsAreFallback = current.models.map(\.id) == availableModels.map(\.id)
+            }
             availableModels = current.models
             if !modelSelectionIsValid(model, in: current.models) {
-                model = current.models.first?.id ?? model
+                // F9: never silently swap a pinned model for the snapshot's
+                // first alias — a fallback snapshot may simply omit a
+                // live-discovered model. Fill only an empty selection (post
+                // provider switch) or evict an id from another provider; a
+                // kept-but-missing pin is explained by
+                // selectedModelUnavailableNotice in the picker.
+                if model.isEmpty || modelIsFromAnotherProvider(model) {
+                    model = current.models.first?.id ?? model
+                }
             }
             normalizeSelectedModelOptions()
         }
     }
 
+    /// F11: the picker's rows come from provider snapshots, so an explicit
+    /// "Refresh model list" must reload the snapshots too (`loadModels` alone
+    /// only rewrites `availableModels`, which the picker ignores while
+    /// snapshot rows exist) and must bypass the 1h discovery TTL — otherwise
+    /// a refresh within the TTL just serves the cached list back.
+    public func refreshModelList() async {
+        if provider == .claude {
+            _ = await AnthropicModelDiscovery.refresh()
+        }
+        await loadProviderSnapshots()
+        await loadModels()
+    }
+
     public func refreshProviderSnapshotsInBackground() {
         seedProviderSnapshotsForStartup()
-        Task { await loadProviderSnapshots() }
+        // F10: the snapshot pipeline discards the live/fallback signal, so the
+        // "built-in defaults" warning never appeared on the startup path; run
+        // the VM's own model fetch alongside to populate the fallback flag.
+        Task {
+            await loadProviderSnapshots()
+            await loadModels()
+        }
     }
 
     private func seedProviderSnapshotsForStartup() {
@@ -1333,6 +1384,29 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         return availableModels.filter { $0.provider == optionProvider }
     }
 
+    /// F9: a pinned model missing from the displayed list is kept, never
+    /// silently rewritten to the first fallback alias. This notice tells the
+    /// user why no picker row is highlighted (the pill's modelLabel already
+    /// falls back to the raw id).
+    public var selectedModelUnavailableNotice: String? {
+        guard !model.isEmpty else { return nil }
+        let options = modelOptionsForSelectedProvider
+        guard !options.isEmpty else { return nil }
+        guard !options.contains(where: { $0.id == model }) else { return nil }
+        guard !(customModelsByProvider[provider] ?? []).contains(model) else { return nil }
+        return "\(model) is not in the current model list"
+    }
+
+    /// F10/F33: `availableModelsAreFallback` describes the VM's own fetch, but
+    /// the picker prefers snapshot rows. Only claim "built-in defaults" when
+    /// the rows on screen match the flagged fetch, so a live snapshot list
+    /// never carries a false fallback warning.
+    public var displayedModelListIsFallback: Bool {
+        guard availableModelsAreFallback else { return false }
+        return modelOptionsForSelectedProvider.map(\.id)
+            == availableModels.filter { $0.provider == provider }.map(\.id)
+    }
+
     public var supportedReasoningEffortsForSelectedModel: [AgentReasoningEffort] {
         selectedModelDescriptor?.supportedReasoningEfforts ?? AgentReasoningEffort.supportedCases
     }
@@ -1366,6 +1440,16 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         return !model.isEmpty
             && (customModelsByProvider[provider] ?? []).contains(model)
             && models.contains { $0.provider == provider && $0.supportsCustomModel }
+    }
+
+    /// B8 backstop shared by the F8/F9 keep-the-pin paths: an id that provably
+    /// belongs to a different provider must never survive a provider switch,
+    /// even when the current provider's list is only a fallback.
+    private func modelIsFromAnotherProvider(_ id: String) -> Bool {
+        guard !id.isEmpty else { return false }
+        return providerSnapshots.contains { snapshot in
+            snapshot.provider != provider && snapshot.models.contains { $0.id == id }
+        }
     }
 
     public var currentModelSelection: AgentModelSelection {
@@ -1492,6 +1576,12 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         guard let snapshot = providerSnapshots.first(where: { $0.id == id }) else { return }
         providerInstanceId = snapshot.id
         provider = snapshot.provider
+        // F10/F33: same flag coherence as applyProviderSnapshots — snapshot
+        // rows replace the VM's own fetch, so a stale fallback flag must not
+        // put a false "built-in defaults" warning on the new instance's list.
+        if availableModelsAreFallback {
+            availableModelsAreFallback = snapshot.models.map(\.id) == availableModels.map(\.id)
+        }
         availableModels = snapshot.models
         if !modelSelectionIsValid(model, in: snapshot.models) {
             model = snapshot.models.first?.id ?? model
@@ -2451,11 +2541,15 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             }
             nextTimeline.apply(event)
             // UX-MAC_AGENT-009: track recoverability of the latest error so the
-            // transcript can offer Retry; any other event clears the flag.
+            // transcript can offer Retry. F26: only an .error event may change the
+            // flag — producers emit trailing runtime items right after a recoverable
+            // error (auth_status, resume fallback), and timeline.error (the banner)
+            // persists across non-error events, so clearing on any other event made
+            // the Retry affordance unreachable. The flag resets where the displayed
+            // error itself is cleared (clearVisibleErrorForNewUserMessage /
+            // startProviderRun / selectThread's timeline rebuild).
             if case let .error(_, recoverable) = event {
                 nextLastErrorRecoverable = recoverable
-            } else {
-                nextLastErrorRecoverable = false
             }
         }
         guard appliedEvent else { return }
@@ -2904,6 +2998,11 @@ public struct AgentTimelineItemPresentation: Equatable, Sendable {
 
     private static func detailText(for item: AssistantItem) -> String? {
         if item.type == .reasoning {
+            // F21: the Codex app-server adapter streams reasoning text into `output`
+            // with a constant "Reasoning" summary, so prefer the actual text over
+            // the placeholder; summary remains the fallback for providers that only
+            // send reasoning summaries.
+            if item.output?.isEmpty == false { return item.output }
             let summary = item.summary?.trimmingCharacters(in: .whitespacesAndNewlines)
             return summary?.isEmpty == false ? summary : nil
         }
@@ -3707,12 +3806,42 @@ public struct AgentAppView: View {
     private var transcriptEntries: [TranscriptEntry] {
         let signature = transcriptSignature
         if transcriptCache.signature == signature {
-            return transcriptCache.entries
+            // F1: a signature hit only proves the ORDER is unchanged — the signature
+            // deliberately ignores item bodies/outputs/states and turn completion so
+            // streaming deltas don't re-sort. The cached entries embed VALUE COPIES
+            // of the turn snapshots, so serving them verbatim froze streamed text at
+            // the last structural change. Re-materialize the turn payloads from the
+            // live timeline (shallow O(entries) map, no re-sort); messages are
+            // append-only immutable rows, so their cached copies stay.
+            return Self.rematerializedTranscriptEntries(
+                cached: transcriptCache.entries,
+                turns: vm.timeline.turns
+            )
         }
         let merged = Self.mergeTranscriptEntries(messages: vm.messages, turns: vm.timeline.turns)
         transcriptCache.signature = signature
         transcriptCache.entries = merged
         return merged
+    }
+
+    /// F1: rewrite the cached `.turn` entries with the CURRENT timeline snapshots
+    /// (matched by turnId) while preserving the cached order. The transcript cache
+    /// memoizes only the merge/sort, not the payloads: turn content mutates on every
+    /// streaming delta / state flip / completion without changing the structural
+    /// signature, so a cache hit must not serve the stale value copies.
+    nonisolated static func rematerializedTranscriptEntries(
+        cached: [TranscriptEntry],
+        turns: [AssistantTurnSnapshot]
+    ) -> [TranscriptEntry] {
+        guard !turns.isEmpty else { return cached }
+        var turnsById = [String: AssistantTurnSnapshot](minimumCapacity: turns.count)
+        for turn in turns { turnsById[turn.turnId] = turn }
+        return cached.map { entry in
+            guard case .turn(let stale) = entry, let live = turnsById[stale.turnId] else {
+                return entry
+            }
+            return .turn(live)
+        }
     }
 
     private var visibleTranscriptEntries: [TranscriptEntry] {
@@ -3771,6 +3900,16 @@ public struct AgentAppView: View {
         return sig
     }
 
+    /// F40: order-sensitive, non-cancelling fold of per-turn item counts. The previous
+    /// XOR fold cancelled for equal-count turns (h ^ h == 0), so a flush in which two
+    /// equal-count turns each gained an item ({c,c} -> {c+1,c+1}) left the hash — and
+    /// therefore the cached signature and the stale transcript merge — unchanged.
+    nonisolated static func turnItemCountsHash(_ turns: [AssistantTurnSnapshot]) -> Int {
+        var hasher = Hasher()
+        for turn in turns { hasher.combine(turn.items.count) }
+        return hasher.finalize()
+    }
+
     // PERF-MAC_AGENT-011: cache the signature string so a single SwiftUI body
     // pass computes it only once regardless of how many consumers read it.
     private final class SignatureCache {
@@ -3789,7 +3928,7 @@ public struct AgentAppView: View {
         let lastId = vm.messages.last?.id.value.uuidString ?? "-"
         let turnCount = vm.timeline.turns.count
         // Cheap hash of per-turn item counts — changes when an item is added to any turn.
-        let itemCountsHash = vm.timeline.turns.reduce(0) { $0 ^ ($1.items.count &* 2654435761) }
+        let itemCountsHash = Self.turnItemCountsHash(vm.timeline.turns)
         let c = signatureCache
         if c.lastMessages == msgCount && c.lastFirstId == firstId && c.lastLastId == lastId
             && c.lastTurnsCount == turnCount && c.lastTurnsItemCountsHash == itemCountsHash {
@@ -3938,6 +4077,11 @@ public struct AgentAppView: View {
         .task {
             if vm.providerSnapshots.isEmpty {
                 await vm.loadProviderSnapshots()
+                // F10: the snapshot path drops the live/fallback signal —
+                // run the VM's own fetch so availableModelsAreFallback (and
+                // with it the "built-in defaults" warning + Refresh row) is
+                // populated on startup, not only after a manual retry.
+                await vm.loadModels()
             }
         }
         .onDeleteCommand { deleteSelectedThreads() }
@@ -6483,14 +6627,25 @@ public struct AgentAppView: View {
             }
             if !modelOptions.isEmpty || !customModels.isEmpty {
                 compactMenuSection("Model")
-                if vm.availableModelsAreFallback && vm.provider == .claude {
+                // F33: no provider gate — codex's baked-in list must surface
+                // the same fallback notice + refresh affordance as claude.
+                if vm.displayedModelListIsFallback {
                     Text("Using built-in defaults - live list unavailable")
                         .font(DS.Font.caption)
                         .foregroundColor(DS.Palette.textSecondary)
                     compactMenuRow("Refresh model list", selected: false) {
-                        Task { await vm.loadModels() }
+                        // F11: reloads snapshots (the rows the picker shows)
+                        // and bypasses the discovery TTL, not just loadModels.
+                        Task { await vm.refreshModelList() }
                     }
                     .disabled(vm.modelListLoading)
+                }
+                // F9: a pinned model missing from the displayed list is kept —
+                // explain why no row is checked instead of silently swapping.
+                if let unavailableNotice = vm.selectedModelUnavailableNotice {
+                    Text(unavailableNotice)
+                        .font(DS.Font.caption)
+                        .foregroundColor(DS.Palette.warning)
                 }
                 let visibleModelCount = showAllModelOptions ? modelOptions.count : min(3, modelOptions.count)
                 let visibleCustomModelCount = showAllModelOptions ? customModels.count : max(0, 3 - visibleModelCount)
@@ -6538,6 +6693,9 @@ public struct AgentAppView: View {
                         showModelOptions = false
                     }
                     .disabled(running)
+                    // F34: bare names don't distinguish Ultracode/Max/Extra
+                    // High — say what each level buys before it is selected.
+                    .help(effort.pickerHelpText)
                 }
             }
             if vm.supportsServiceTierForSelectedModel {
@@ -8209,5 +8367,24 @@ private struct TabColorMenuLabel: View {
         }
         image.isTemplate = false
         return image
+    }
+}
+
+// F34: effort semantics are non-obvious — especially "Ultracode" vs "Max" vs
+// "Extra High" — so the picker rows carry tooltips that spell out what each
+// level buys (and costs) before the user commits to it. Ultracode is not a
+// plain effort value: it is xhigh effort plus standing workflow orchestration
+// (see AgentReasoningEffort.claudeSupportedCases).
+extension AgentReasoningEffort {
+    var pickerHelpText: String {
+        switch self {
+        case .minimal: return "Fastest — minimal reasoning"
+        case .low: return "Light reasoning for simple tasks"
+        case .medium: return "Balanced reasoning (default)"
+        case .high: return "Deeper reasoning for harder tasks"
+        case .xhigh: return "Very deep reasoning for hard problems"
+        case .max: return "Deepest reasoning the model supports — slowest, most tokens"
+        case .ultracode: return "Extra High effort + autonomous workflow orchestration"
+        }
     }
 }

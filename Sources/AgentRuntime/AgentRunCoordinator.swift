@@ -225,8 +225,14 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     public func startRun(_ request: AgentRunRequest, isAutoContinuation: Bool = false) async throws -> AgentRunID {
         // A user-initiated run ends any background-await auto-continuation streak;
         // the auto-nudge path passes `isAutoContinuation: true` to preserve the bound.
+        // F37: it must also invalidate any ALREADY-SCHEDULED continuation (same
+        // token bump as markStopRequested) — resetting only the count left the
+        // stale nudge armed, so a user prompt that completed within the delay
+        // window was followed by an unrequested autonomous "continue" turn built
+        // from the old run's metadata.
         if !isAutoContinuation {
             resetAutoContinuationStreak(request.threadId)
+            invalidateScheduledAutoContinuation(request.threadId)
         }
         let recoveryContext = request.providerThreadId == nil ? try recoverableResumeContext(for: request) : nil
         let resumeCursor = request.providerThreadId ?? recoveryContext?.resumeCursor
@@ -361,6 +367,19 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             markStopRequested(threadId: threadId, runId: runId)
             return
         }
+        // F19: nothing to stop unless the thread is actually running/pending. A
+        // second Stop click, or a stop for a long-finished thread, previously fell
+        // into the session/recover branches below and either re-broadcast a
+        // spurious `.cancelled` (phantom "Thread cancelled" notification, queued
+        // messages drained unprompted) or respawned a provider process for a dead
+        // thread just to interrupt it. Guard BEFORE touching adapter sessions.
+        guard let thread = try? threadRepo.get(id: threadId),
+              thread.status == .running || thread.status == .pending else {
+            lock.lock()
+            pendingThreadStops.remove(threadId)
+            lock.unlock()
+            return
+        }
         if let adapter = try? adapterForThread(threadId), adapter.hasSession(threadId: threadId) {
             do {
                 try adapter.stopSession(threadId: threadId)
@@ -390,7 +409,12 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                     try await self.recoverAdapterSessionIfNeeded(threadId: threadId, adapter: adapter)
                     if adapter.hasSession(threadId: threadId) {
                         try adapter.interruptTurn(threadId: threadId)
-                        self.markStopRequested(threadId: threadId, runId: nil)
+                        // F19: the session was recovered only to deliver the
+                        // interrupt — do not leave the respawned provider
+                        // process resident after a stop. markStopRequested is
+                        // NOT repeated here: the synchronous fall-through below
+                        // already broadcast the cancel for this stop.
+                        try? adapter.stopSession(threadId: threadId)
                     }
                 } catch {
                     // Pending cancellation (recorded synchronously below) covers this;
@@ -398,20 +422,40 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                 }
             }
         }
-        guard let thread = try? threadRepo.get(id: threadId),
-              thread.status == .running || thread.status == .pending else {
-            lock.lock()
-            pendingThreadStops.remove(threadId)
-            lock.unlock()
-            return
-        }
         lock.lock()
         pendingThreadStops.insert(threadId)
         lock.unlock()
         markStopRequested(threadId: threadId, runId: nil)
     }
 
+    /// F19: release a thread's resident provider adapter session WITHOUT emitting
+    /// any run-lifecycle events. For the idle-session reaper: the reaped thread
+    /// finished long ago, so routing the release through stopRun/markStopRequested
+    /// broadcast a spurious `.cancelled` ("Thread cancelled" notification, status
+    /// pill flip, queued-message drain) for a thread nobody stopped. No-op when the
+    /// thread still has an active run or no live session.
+    public func releaseProviderSession(threadId: AgentThreadID) {
+        lock.lock()
+        let hasActiveRun = activeThreads[threadId] != nil
+        lock.unlock()
+        guard !hasActiveRun else { return }
+        guard let adapter = try? adapterForThread(threadId),
+              adapter.hasSession(threadId: threadId) else { return }
+        try? adapter.stopSession(threadId: threadId)
+        try? providerSessionRepo?.markStopped(threadId: threadId)
+    }
+
     private func markStopRequested(threadId: AgentThreadID, runId: AgentRunID?) {
+        // F17: handle.cancel() can finish the run synchronously (the codex adapter
+        // emits .finished(.cancelled) inside cancel), and the .finished path has
+        // then already run the FULL terminal sequence — run row, thread row,
+        // didFinish observers and onRunFinished. Re-broadcasting here would
+        // double-fire didChangeStatus/onRunFinished for the same run (duplicate
+        // notifications, two concurrent queue drains), so a run that is already
+        // terminal is done.
+        if let runId, (try? runRepo.get(id: runId))?.finishedAt != nil {
+            return
+        }
         let stoppedRunId = runId ?? AgentRunID()
         if let runId {
             try? runRepo.markStopped(id: runId, status: .cancelled)
@@ -490,6 +534,15 @@ public final class AgentRunCoordinator: @unchecked Sendable {
 
     private func resetAutoContinuationStreak(_ threadId: AgentThreadID) {
         lock.lock(); autoContinuationCounts[threadId] = 0; lock.unlock()
+    }
+
+    /// F37: bump the thread's continuation token so any pending scheduled
+    /// auto-continuation aborts its validity check when it fires. Called on
+    /// user-initiated starts; markStopRequested does the same on stop.
+    private func invalidateScheduledAutoContinuation(_ threadId: AgentThreadID) {
+        lock.lock()
+        autoContinuationTokens[threadId] = (autoContinuationTokens[threadId] ?? 0) + 1
+        lock.unlock()
     }
 
     /// Decide, at run finish, whether a full-access run stalled awaiting a
@@ -1384,10 +1437,19 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             }
             onRunFinished?(threadId, runId, status)
         case .error(let m):
-            for observer in observersSnapshot() {
-                observer.runCoordinator(self, didReceive: .error(message: m, recoverable: false), run: runId, threadId: threadId)
-            }
-            onAssistantEvent?(.error(message: m, recoverable: false), threadId, runId)
+            // F22: route the error through the .event path so it is PERSISTED as a
+            // stream event (same batched appendStreamEvent flow as every other
+            // timeline event) before notifying observers. Without this, a failed
+            // run left no explanation after a thread switch or relaunch — replay
+            // (latestStreamEvents) only restores persisted events, and errors for
+            // non-selected threads were dropped entirely. Observer/onAssistantEvent
+            // broadcasting is unchanged: the .event path performs both.
+            handle(
+                event: .event(.error(message: m, recoverable: false)),
+                runId: runId,
+                threadId: threadId,
+                allowFinalResponseTranslation: false
+            )
             try? providerSessionRepo?.updateDiagnostics(threadId: threadId, lastEventKind: "error", lastErrorMessage: m)
         }
     }

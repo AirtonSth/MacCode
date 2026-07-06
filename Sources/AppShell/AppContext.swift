@@ -514,13 +514,22 @@ public final class AppContext {
     /// Claude's PostToolUse compression state path. Single source for both the normal run path
     /// (`AppCommandRouter.providerEnvironment`) and the recovered-session path (the coordinator
     /// rebuilds its own request env, bypassing providerEnvironment). Empty when Token Saver is off:
-    /// the managed `distill` CLI is uninstalled then, so a `cmd | distill` pipe would fail.
+    /// the managed `distill` CLI is uninstalled then, so a `cmd | distill` pipe would fail. The
+    /// pipe hint is also withheld when the managed CLI failed to install (F25) — same failure mode.
     func tokenSaverAgentEnvironment(provider: AgentProvider) -> [String: String] {
         guard SettingsStore(db: db).load().tokenSaverEnabled else { return [:] }
+        var env: [String: String] = [:]
         // Signal the agent to pipe large command output through the managed `distill` CLI. Codex
         // (app-server) reads this in its per-turn developer_instructions; the Claude SDK bridge
         // reads it to inject the distill systemPrompt.
-        var env = ["RC_TOKEN_SAVER_DISTILL_HINT": "1"]
+        // F25: only when the managed CLI install actually succeeded — the toggle can be on while
+        // reconcileManagedDistillSkills failed (missing/unresolvable RemoteCodeDistillService), and
+        // the hint drives hard "pipe EVERY command through distill" instructions, so sending it
+        // without the binary makes every piped agent command fail with `command not found` (127).
+        // Reconcile runs at launch and on every toggle, so the error state is current here.
+        if managedDistillSkillInstallError == nil {
+            env["RC_TOKEN_SAVER_DISTILL_HINT"] = "1"
+        }
         if provider == .claude {
             // Claude additionally auto-compresses tool output via the SDK-bridge PostToolUse hook,
             // which talks straight to the sidecar over HTTP using this state file.
@@ -1410,10 +1419,12 @@ public final class AppContext {
         // Marking the session stopped in the DB does not free the underlying
         // provider process (codex app-server / node bridge). Release every
         // reaped thread's adapter session so the idle processes are actually
-        // terminated. stopRun(threadId:) hits the adapter.stopSession path for
-        // threads with no active run, which is exactly the idle/reaped case.
+        // terminated. F19: use the lifecycle-silent release — routing this
+        // through stopRun(threadId:) broadcast a spurious "Thread cancelled"
+        // for threads that finished hours ago and could even respawn a provider
+        // process for a dead thread via the recover-then-interrupt fallback.
         for threadId in result.stoppedThreadIds {
-            coordinator.stopRun(threadId: threadId)
+            coordinator.releaseProviderSession(threadId: threadId)
         }
         return result
     }

@@ -196,4 +196,40 @@ final class CodexAppServerModelCacheTests: XCTestCase {
         XCTAssertEqual(counter.current, 2,
                        "refreshModels must bypass TTL and call discovery even when cache is fresh")
     }
+
+    // -------------------------------------------------------------------------
+    // MARK: - listModelsResult fallback signal
+    // -------------------------------------------------------------------------
+
+    func test_listModelsResult_isFallback_true_whenDiscoveryReturnsEmpty() async {
+        // WHY: a broken codex binary/app-server must not present the hardcoded
+        // list as live data — callers need this signal to surface "model list
+        // unavailable" instead of silently serving the static list as if the
+        // user's account really offered exactly those models.
+        let adapter = makeAdapter(discoveredModels: { [] })
+
+        let result = await adapter.listModelsResult()
+        XCTAssertTrue(result.isFallback,
+                      "empty live discovery must be flagged as a fallback, not presented as live data")
+        XCTAssertFalse(result.models.isEmpty,
+                       "the fallback result must still carry the hardcoded baseline so the picker stays usable")
+    }
+
+    func test_listModelsResult_isFallback_false_onLiveDiscoveryAndCacheHit() async {
+        // WHY: live data must never trigger the fallback warning — the cache
+        // stores only live data, so a cache hit is live too.
+        let live = [
+            AgentModelDescriptor(id: "live-model-1", label: "Live 1", provider: .codex,
+                                 supportsReasoning: false, supportsServiceTier: false, supportsCustomModel: true)
+        ]
+        let adapter = makeAdapter(discoveredModels: { live })
+
+        let first = await adapter.listModelsResult()
+        XCTAssertFalse(first.isFallback,
+                       "successful live discovery must not be flagged as a fallback")
+        let cached = await adapter.listModelsResult()
+        XCTAssertFalse(cached.isFallback,
+                       "a cache hit serves previously fetched live data and is never a fallback")
+        XCTAssertEqual(cached.models.map(\.id), ["live-model-1"])
+    }
 }

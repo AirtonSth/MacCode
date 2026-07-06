@@ -115,10 +115,14 @@ public enum ProviderCLIProbe {
         return AuthStatus(authenticated: nil, accountLabel: accountLabel, accountAuthMethod: accountAuthMethod)
     }
 
+    /// Interactive slash-command discovery. `<binary> --help` is NOT a valid
+    /// source: its "Commands:" section lists CLI *subcommands* (exec, install,
+    /// setup-token, ...) plus wrapped description fragments, none of which are
+    /// interactive slash commands — probing it filled the composer autocomplete
+    /// with bogus entries on both providers. Return nothing so the curated
+    /// per-provider defaults stay the only slash-command source.
     public static func slashCommands(provider: AgentProvider, binaryPath: String, environment: [String: String] = [:], timeoutSeconds: TimeInterval = 2.0) -> [String] {
-        guard let result = run(binaryPath: binaryPath, arguments: ["--help"], environment: environment, timeoutSeconds: timeoutSeconds),
-              result.status == 0 else { return [] }
-        return parseCommands(from: result.stdout)
+        []
     }
 
     public static func update(provider: AgentProvider, binaryPath: String, environment: [String: String] = [:], timeoutSeconds: TimeInterval = 120.0) -> UpdateResult {
@@ -339,28 +343,4 @@ public enum ProviderCLIProbe {
         return nil
     }
 
-    private static func parseCommands(from helpText: String) -> [String] {
-        var commands: [String] = []
-        var inCommands = false
-        for rawLine in helpText.split(whereSeparator: \.isNewline).map(String.init) {
-            let line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
-            if line == "Commands:" {
-                inCommands = true
-                continue
-            }
-            guard inCommands else { continue }
-            if line.isEmpty { break }
-            guard let token = line.split(whereSeparator: \.isWhitespace).first else { continue }
-            let primary = String(token).split(separator: "|").first.map(String.init) ?? String(token)
-            guard primary.range(of: #"^[A-Za-z][A-Za-z0-9_-]*$"#, options: .regularExpression) != nil,
-                  primary != "help" else { continue }
-            commands.append("/" + primary)
-        }
-        return unique(commands)
-    }
-
-    private static func unique(_ values: [String]) -> [String] {
-        var seen = Set<String>()
-        return values.filter { seen.insert($0).inserted }
-    }
 }

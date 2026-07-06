@@ -270,7 +270,7 @@ enum ProcessTerminator {
     // Grace window between SIGTERM and SIGKILL escalation.
     static let graceInterval: TimeInterval = 2.0
 
-    static func terminateTree(_ process: Process) {
+    static func terminateTree(_ process: Process, grace: TimeInterval = graceInterval) {
         let root = process.processIdentifier
         // Enumerate the tree once (children first so leaves die before parents),
         // including the root, then signal each node.
@@ -280,13 +280,16 @@ enum ProcessTerminator {
             kill(step.pid, step.signal)
         }
 
-        // Cancel must always win: give SIGTERM a brief grace period, then
-        // escalate any survivors to SIGKILL.
-        Thread.sleep(forTimeInterval: graceInterval)
-
-        let escalation = terminationPlan(pids: pids, isAlive: Self.isAlive(_:), graceElapsed: true)
-        for step in escalation {
-            kill(step.pid, step.signal)
+        // Cancel must always win: give SIGTERM a grace period, then escalate any
+        // survivors to SIGKILL. The grace wait is scheduled on a background
+        // queue — every cancel path (Stop button, queue drain, idle reap) runs
+        // on the main thread, so sleeping here froze the UI for the whole
+        // grace window (F15). Never block the calling thread.
+        DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + grace) {
+            let escalation = terminationPlan(pids: pids, isAlive: Self.isAlive(_:), graceElapsed: true)
+            for step in escalation {
+                kill(step.pid, step.signal)
+            }
         }
     }
 

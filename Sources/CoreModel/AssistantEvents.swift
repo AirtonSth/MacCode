@@ -597,6 +597,10 @@ public struct AssistantTimelineState: Codable, Sendable, Equatable {
     public static let workActivityLimit = 120
     public static let pendingRequestLimit = 200
     public static let proposedPlanLimit = 50
+    // F39: bound for the itemDelta-before-itemStarted pairing buffer. Orphan ids
+    // (per-line UUID fallbacks, items evicted by trimTurnItems) never pair, so
+    // without a cap the buffer grows monotonically for the life of the timeline.
+    public static let pendingItemDeltaLimit = 64
 
     public var threadId: String?
     public var providerThreadId: String?
@@ -613,6 +617,10 @@ public struct AssistantTimelineState: Codable, Sendable, Equatable {
     public var sr1TranslationsByItemId: [String: AssistantSR1Translation]
     public var sr1TranslationsByMessageId: [String: AssistantSR1Translation]
     private var pendingItemDeltas: [String: PendingItemDelta]
+    // F39: insertion order of pendingItemDeltas keys so the cap evicts oldest-first
+    // (Dictionary has no stable order; a legit early-arriving delta is always the
+    // newest entry and must survive eviction until its itemStarted lands).
+    private var pendingItemDeltaOrder: [String]
 
     private struct PendingItemDelta: Codable, Sendable, Equatable {
         var body: String = ""
@@ -630,6 +638,7 @@ public struct AssistantTimelineState: Codable, Sendable, Equatable {
         self.sr1TranslationsByItemId = [:]
         self.sr1TranslationsByMessageId = [:]
         self.pendingItemDeltas = [:]
+        self.pendingItemDeltaOrder = []
     }
 
     public var latestAssistantMessage: String? {
@@ -674,6 +683,7 @@ public struct AssistantTimelineState: Codable, Sendable, Equatable {
             ensureTurn(item.turnId)
             if let idx = turns.firstIndex(where: { $0.turnId == item.turnId }) {
                 let pending = pendingItemDeltas.removeValue(forKey: item.id)
+                if pending != nil { pendingItemDeltaOrder.removeAll { $0 == item.id } }
                 if let itemIndex = turns[idx].items.firstIndex(where: { $0.id == item.id }) {
                     let existing = turns[idx].items[itemIndex]
                     var merged = item
@@ -707,6 +717,7 @@ public struct AssistantTimelineState: Codable, Sendable, Equatable {
             }
             if !applied {
                 var pending = pendingItemDeltas[iid] ?? PendingItemDelta()
+                if pendingItemDeltas[iid] == nil { pendingItemDeltaOrder.append(iid) }
                 if let b = bodyAppend {
                     pending.body = Self.cappedText(pending.body + b, limit: Self.liveTextLimit)
                 }
@@ -715,6 +726,7 @@ public struct AssistantTimelineState: Codable, Sendable, Equatable {
                 }
                 if let s = summary { pending.summary = s }
                 pendingItemDeltas[iid] = pending
+                trimPendingItemDeltas()
             }
         case .itemState(let iid, let state):
             mutateItem(iid) { $0.state = state }
@@ -739,6 +751,11 @@ public struct AssistantTimelineState: Codable, Sendable, Equatable {
             if let final, !final.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 clearActivePlan()
             }
+            // F39: any delta still unmatched at turn end can no longer pair with a
+            // live item (items open with the turn), so drop the buffer instead of
+            // retaining orphan text for the life of the timeline.
+            pendingItemDeltas.removeAll()
+            pendingItemDeltaOrder.removeAll()
         case .proposedPlan(let plan):
             proposedPlans.removeAll { $0.id == plan.id }
             proposedPlans.append(plan)
@@ -882,6 +899,18 @@ public struct AssistantTimelineState: Codable, Sendable, Equatable {
         pendingRequests = Array(pendingRequests.suffix(Self.pendingRequestLimit))
     }
 
+    // F39: keep the delta-before-itemStarted buffer bounded (see
+    // `pendingItemDeltaLimit`). Evicts oldest-first so a delta that legitimately
+    // raced ahead of its itemStarted (always the newest entry) survives.
+    private mutating func trimPendingItemDeltas() {
+        guard pendingItemDeltas.count > Self.pendingItemDeltaLimit else { return }
+        let dropCount = pendingItemDeltas.count - Self.pendingItemDeltaLimit
+        for key in pendingItemDeltaOrder.prefix(dropCount) {
+            pendingItemDeltas.removeValue(forKey: key)
+        }
+        pendingItemDeltaOrder.removeFirst(dropCount)
+    }
+
     private mutating func trimPendingUserInputs() {
         guard pendingUserInputs.count > Self.pendingRequestLimit else { return }
         pendingUserInputs = Array(pendingUserInputs.suffix(Self.pendingRequestLimit))
@@ -1018,5 +1047,10 @@ public struct AssistantTimelineState: Codable, Sendable, Equatable {
     /// for the same reason as above: `cappedText` runs on both the UI main actor and
     /// the runner's background thread.
     nonisolated(unsafe) static var cappedTextGraphemeWalksForTesting = 0
+
+    /// Test-only observability for the F39 pendingItemDeltas bound: the buffer is
+    /// private (pairing internals), so the memory-cap test reads its size here
+    /// instead of poking at eviction side effects only.
+    public var pendingItemDeltaCountForTesting: Int { pendingItemDeltas.count }
     #endif
 }

@@ -161,6 +161,42 @@ final class AnthropicModelDiscoverySourceTests: XCTestCase {
         XCTAssertEqual(cached.models.count, 1)
     }
 
+    func test_cache_isKeyedByCredential_secondAccountRefetches() async {
+        // WHY: the 1h cache used to be global — after account A's fetch, account B
+        // (a different credential, e.g. one WITH Fable access) was served A's list
+        // for up to an hour. The cache must be keyed by the credential so switching
+        // accounts triggers a fresh fetch, while each account keeps its own entry.
+        let session = stubbedSession()
+
+        // Account A populates its cache entry.
+        _ = await URLProtocolStub.withHandler({ _ in (200, self.makeModelListBody(ids: ["claude-opus-4-8"])) }) {
+            await AnthropicModelDiscovery.listModelsResult(
+                environment: ["ANTHROPIC_API_KEY": "sk-ant-account-a"],
+                session: session
+            )
+        }
+
+        // Account B must hit the network, not account A's cache.
+        let accountB = await URLProtocolStub.withHandler({ _ in (200, self.makeModelListBody(ids: ["claude-fable-5"])) }) {
+            await AnthropicModelDiscovery.listModelsResult(
+                environment: ["ANTHROPIC_API_KEY": "sk-ant-account-b"],
+                session: self.stubbedSession()
+            )
+        }
+        XCTAssertEqual(accountB.models.map(\.id), ["claude-fable-5"],
+            "a different credential must trigger a fresh fetch, not serve account A's cached list; got \(accountB.models.map(\.id))")
+        XCTAssertFalse(accountB.isFallback)
+
+        // Account A's entry must survive account B's fetch (no handler installed:
+        // a cache miss here would fail the fetch and return the empty fallback).
+        let accountA = await AnthropicModelDiscovery.listModelsResult(
+            environment: ["ANTHROPIC_API_KEY": "sk-ant-account-a"],
+            session: stubbedSession()
+        )
+        XCTAssertEqual(accountA.models.map(\.id), ["claude-opus-4-8"],
+            "account A's cached list must survive account B's fetch; got \(accountA.models.map(\.id))")
+    }
+
     // MARK: - refresh()
 
     func test_refresh_bypassesCache_andReturnsFreshData() async {

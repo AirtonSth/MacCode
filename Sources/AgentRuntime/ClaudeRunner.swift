@@ -164,6 +164,11 @@ public final class ClaudeRunner: AgentProviderRunner, @unchecked Sendable {
         let parser = ClaudeParser()
         let timeline = TimelineAggregator()
         let outBuf = LineBuffer()
+        // Serializes the stdout readabilityHandler against the termination
+        // drain: nil-ing a readabilityHandler does not wait for a callback
+        // already running, and LineBuffer is not thread-safe. Taken BEFORE
+        // the fd read so byte order is preserved across the two readers.
+        let stdoutReadLock = NSLock()
         let cancelFlag = AgentCancelFlag()
         let emitLine: (String) -> Void = { line in
             if let runtimeEvent = ProviderRuntimeEvent.fromJSONLine(line, provider: .claude, source: "claude.stream-json") {
@@ -178,6 +183,8 @@ public final class ClaudeRunner: AgentProviderRunner, @unchecked Sendable {
         }
 
         stdoutPipe.fileHandleForReading.readabilityHandler = { handle in
+            stdoutReadLock.lock()
+            defer { stdoutReadLock.unlock() }
             let data = handle.availableData
             if data.isEmpty { return }
             for line in outBuf.take(data) {
@@ -203,9 +210,27 @@ public final class ClaudeRunner: AgentProviderRunner, @unchecked Sendable {
             stderrPipe.fileHandleForReading.readabilityHandler = nil
             // Drain bytes that arrived between the last read and EOF, plus
             // the final unterminated line, before finalizing the parser.
+            // Under the lock: an in-flight readabilityHandler callback may
+            // still be reading/parsing concurrently.
+            stdoutReadLock.lock()
             let tail = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
             for line in outBuf.take(tail) + outBuf.flush() {
                 emitLine(line)
+            }
+            stdoutReadLock.unlock()
+            // Mirror the stdout drain for stderr: a CLI that exits instantly
+            // (auth error, crash banner) writes the only explanation to
+            // stderr, and the async handler can lose the race with the
+            // teardown above, leaving the bytes undelivered in the pipe.
+            let stderrTail = stderrPipe.fileHandleForReading.readDataToEndOfFile()
+            if !stderrTail.isEmpty,
+               let visible = Self.displayableStderr(String(data: stderrTail, encoding: .utf8) ?? "") {
+                onEvent(.event(.providerRuntime(ProviderStderrClassifier.runtimeEvent(
+                    message: visible,
+                    provider: .claude,
+                    source: "claude.stream-json.stderr"
+                ))))
+                onEvent(.error("[claude stderr] " + visible))
             }
             for ev in parser.finalize() {
                 timeline.apply(ev)

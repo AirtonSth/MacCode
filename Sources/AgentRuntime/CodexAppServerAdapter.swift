@@ -120,17 +120,31 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
     }
 
     public func listModels() async -> [AgentModelDescriptor] {
-        return await resolvedModels(forceRefresh: false)
+        return await listModelsResult().models
+    }
+
+    /// Like `listModels()` but carries the fallback signal (mirrors
+    /// `ClaudeRunner.listModelsResult`): `isFallback == true` means live
+    /// app-server discovery produced nothing and the hardcoded CodexRunner
+    /// list was substituted, so callers can surface "model list failed"
+    /// instead of presenting the static list as live data.
+    public func listModelsResult() async -> ModelListResult {
+        return await resolvedModelsResult(forceRefresh: false)
     }
 
     /// Force the next `listModels()` call to bypass the TTL and re-fetch from
     /// the live Codex app-server. Call when the user explicitly refreshes the
     /// model picker. The method itself triggers one fetch immediately.
     public func refreshModels() async -> [AgentModelDescriptor] {
-        return await resolvedModels(forceRefresh: true)
+        return await refreshModelsResult().models
     }
 
-    private func resolvedModels(forceRefresh: Bool) async -> [AgentModelDescriptor] {
+    /// `refreshModels()` with the fallback signal, see `listModelsResult()`.
+    public func refreshModelsResult() async -> ModelListResult {
+        return await resolvedModelsResult(forceRefresh: true)
+    }
+
+    private func resolvedModelsResult(forceRefresh: Bool) async -> ModelListResult {
         let now = Date()
         // Read cached value under lock.
         lock.lock()
@@ -145,7 +159,8 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         )
 
         if !needsFetch, let cached {
-            return cached
+            // The cache stores only live discovery data, so a hit is never a fallback.
+            return ModelListResult(models: cached, isFallback: false)
         }
 
         // Attempt live discovery.
@@ -156,12 +171,13 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
             cachedModels = discovered
             modelCacheLastFetchedAt = now
             lock.unlock()
-            return discovered
+            return ModelListResult(models: discovered, isFallback: false)
         }
 
-        // Fallback: return the hardcoded list from CodexRunner (always non-empty).
+        // Fallback: return the hardcoded list from CodexRunner (always non-empty),
+        // flagged so callers do not present it as live discovery.
         let fallback = await CodexRunner(binaryNameOverride: binaryNameOverride).listModels()
-        return fallback
+        return ModelListResult(models: fallback, isFallback: true)
     }
 
     public func startSession(_ request: AgentRunRequest, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) async throws -> AgentRunHandle {
@@ -697,22 +713,26 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
                 events.append(.activePlanUpdated(plan))
             }
         case "thread/goal/updated", "thread.goal.updated":
-            let turnId = activeTurnId(threadId: threadId) ?? ""
-            let itemId = "goal-\(string(payload, "threadId") ?? providerThreadId(threadId: threadId) ?? threadId.value.uuidString)"
+            let turnId = goalTurnId(threadId: threadId)
+            let itemId = "goal-\(string(payload, "threadId") ?? providerThreadId(threadId: threadId) ?? threadId.value.uuidString)-\(turnId.isEmpty ? String(now) : turnId)"
             let detail = Self.goalDetail(from: payload)
+            // The app-server re-sends the FULL goal state on every update, so the
+            // detail rides in itemStarted's `output` (mirroring thread/status/changed):
+            // the reducer's itemStarted merge then REPLACES the stale detail. An
+            // outputAppend delta would glue consecutive state snapshots together.
             events.append(.itemStarted(item: AssistantItem(
                 id: itemId,
                 turnId: turnId,
                 type: .tool,
                 state: .completed,
                 summary: "Goal updated",
+                output: detail,
                 startedAtMs: now,
                 finishedAtMs: now
             )))
-            events.append(.itemDelta(itemId: itemId, bodyAppend: nil, outputAppend: detail, summary: "Goal updated"))
         case "thread/goal/cleared", "thread.goal.cleared":
-            let turnId = activeTurnId(threadId: threadId) ?? ""
-            let itemId = "goal-cleared-\(string(payload, "threadId") ?? providerThreadId(threadId: threadId) ?? threadId.value.uuidString)"
+            let turnId = goalTurnId(threadId: threadId)
+            let itemId = "goal-cleared-\(string(payload, "threadId") ?? providerThreadId(threadId: threadId) ?? threadId.value.uuidString)-\(turnId.isEmpty ? String(now) : turnId)"
             events.append(.itemStarted(item: AssistantItem(
                 id: itemId,
                 turnId: turnId,
@@ -1072,6 +1092,18 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
     private func activeTurnId(threadId: AgentThreadID) -> String? {
         lock.lock(); defer { lock.unlock() }
         return sessions[threadId]?.activeTurnId
+    }
+
+    /// Turn to attach thread/goal notifications to. Goal events can arrive with
+    /// no active turn (the server races the turn/start response; a goal cleared
+    /// lands right after turn/completed). Falling back to the last completed
+    /// turn keeps them rendering chronologically at the bottom of the transcript
+    /// instead of merging into the reducer's first phantom ""-id turn; the
+    /// callers also scope the goal item id by this turn so item ids stay unique
+    /// across turns (reducer invariant).
+    private func goalTurnId(threadId: AgentThreadID) -> String {
+        lock.lock(); defer { lock.unlock() }
+        return sessions[threadId]?.activeTurnId ?? sessions[threadId]?.completedTurnIds.last ?? ""
     }
 
     private func providerThreadId(threadId: AgentThreadID) -> String? {

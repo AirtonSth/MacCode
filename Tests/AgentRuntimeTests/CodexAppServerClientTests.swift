@@ -343,6 +343,48 @@ final class CodexAppServerClientTests: XCTestCase {
         )
     }
 
+    func test_nonJSONStdoutNoiseLineDoesNotFailPendingRPCs() async throws {
+        // WHY: the codex binary can print plain-text banners/update notices to
+        // stdout between JSON-RPC frames. One such line must not fail every
+        // in-flight request (thread/resume, turn/start) — the server is healthy
+        // and answers right after the noise, so failing the pending RPCs would
+        // abort a run start for no reason.
+        let script = try makeFakeAppServerPeer()
+        let client = try CodexAppServerClient(
+            binary: script,
+            arguments: [],
+            cwd: FileManager.default.temporaryDirectory.path
+        )
+        defer { client.stop() }
+
+        _ = try await client.initialize()
+        let result = try await client.requestJSONObject(method: "test/noise")
+        XCTAssertEqual(result["ok"] as? Bool, true,
+                       "an RPC in flight while a non-JSON stdout line arrives must still resolve from its real JSON response")
+    }
+
+    func test_processExitIncludesStderrTailInTerminationError() async throws {
+        // WHY: when `codex app-server` panics/exits early, the actual reason is
+        // on stderr. The processExited error must carry that tail — otherwise
+        // the user's error banner is the tautological "process exited: process
+        // exited" and the one line explaining the failure is discarded.
+        let script = try makeCrashingAppServerPeer(stderrMessage: "thread 'main' panicked: unsupported --flag")
+        let client = try CodexAppServerClient(
+            binary: script,
+            arguments: [],
+            cwd: FileManager.default.temporaryDirectory.path
+        )
+        defer { client.stop() }
+
+        do {
+            _ = try await client.initialize()
+            XCTFail("initialize must fail when the app-server dies before answering")
+        } catch {
+            XCTAssertTrue(String(describing: error).contains("unsupported --flag"),
+                          "the processExited error must include the stderr tail explaining why the server died; got: \(error)")
+        }
+    }
+
     private func collaborationSettings(from response: [String: Any]) throws -> [String: Any] {
         let params = try XCTUnwrap(response["lastParams"] as? [String: Any])
         let collaboration = try XCTUnwrap(params["collaborationMode"] as? [String: Any])
@@ -549,10 +591,38 @@ final class CodexAppServerClientTests: XCTestCase {
                         "lastParams": msg.get("params", {})
                     }
                 }), flush=True)
+            elif method == "test/noise":
+                print("codex v99 update available! run `codex upgrade` to update.", flush=True)
+                print(json.dumps({
+                    "id": msg["id"],
+                    "result": {"ok": True}
+                }), flush=True)
             elif msg.get("id") == 77:
                 continue
             elif method == "initialized":
                 continue
+        """
+        try source.write(to: script, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: script.path)
+        return script.path
+    }
+
+    /// A peer that accepts the first request, prints a failure reason to
+    /// stderr, and dies — the "codex app-server panics at startup" shape.
+    /// It reads one stdin line first so the client's request write succeeds
+    /// deterministically before the process exits.
+    private func makeCrashingAppServerPeer(stderrMessage: String) throws -> String {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("remotecode-codex-app-server-tests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let script = dir.appendingPathComponent("crashing-codex-app-server.py")
+        let source = """
+        #!/usr/bin/env python3
+        import sys
+
+        sys.stdin.readline()
+        print("\(stderrMessage)", file=sys.stderr, flush=True)
+        sys.exit(2)
         """
         try source.write(to: script, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: script.path)

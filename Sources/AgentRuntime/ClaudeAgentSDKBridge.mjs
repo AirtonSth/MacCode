@@ -23,6 +23,7 @@ let current = {
   resumeSessionAt: undefined,
   sessionId: undefined,
   env: process.env,
+  effort: undefined,
   settings: undefined,
   systemPrompt: undefined,
 };
@@ -384,6 +385,9 @@ function ensureQuery() {
       systemPrompt: current.systemPrompt,
       tools: { type: 'preset', preset: 'claude_code' },
       mcpServers,
+      // Reasoning effort for the query ('low'…'max'; the host maps ultracode to
+      // 'xhigh' + the ultracode/enableWorkflows settings payload below).
+      effort: current.effort,
       settings: current.settings,
       // Load filesystem settings so the SDK discovers Agent Skills (e.g. the managed
       // /distill skill in ~/.claude/skills and project .claude/skills). Without this the
@@ -447,10 +451,23 @@ function ensureQuery() {
   (async () => {
     try {
       for await (const message of activeQuery) {
+        // Track the live session id so a query restarted after sdk_error resumes
+        // the same conversation instead of starting a blank one.
+        if (message && typeof message.session_id === 'string' && message.session_id) {
+          current.resume = message.session_id;
+        }
         emit(message);
       }
     } catch (error) {
       emit({ type: 'sdk_error', message: String(error?.message || error) });
+      // The query is dead: settle in-flight callbacks and reset the stream
+      // state so the host (which treats sdk_error as terminal for the run)
+      // can start a fresh query on the next rc_turn instead of feeding a
+      // dead iterator forever.
+      activeQuery = null;
+      drainPendingCallbacks();
+      queue = [];
+      waiters = [];
     }
   })();
   return activeQuery;
@@ -596,6 +613,7 @@ for await (const line of rl) {
       resumeSessionAt: command.resume_session_at || undefined,
       sessionId: command.session_id || undefined,
       env: { ...process.env, ...(command.environment || {}) },
+      effort: command.effort || undefined,
       settings: command.settings || undefined,
       systemPrompt: command.system_prompt || undefined,
     };

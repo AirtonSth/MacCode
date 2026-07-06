@@ -105,20 +105,27 @@ final class ProviderCLIProbeTests: XCTestCase {
                      "a missing provider runtime from a minimal macOS GUI PATH is an environment failure, not lost Codex authentication")
     }
 
-    func test_slashCommandProbeReadsProviderHelpCommandsAndEnvironment() throws {
+    func test_slashCommandProbeIgnoresHelpSubcommands() throws {
+        // WHY: `--help` lists CLI *subcommands* (exec, install, setup-token, ...)
+        // plus wrapped description fragments ("server" below) — none of which are
+        // interactive slash commands. Deriving suggestions from it filled the
+        // composer autocomplete with bogus "/exec", "/Only", "/dialog" entries,
+        // so the probe must contribute nothing and leave the curated per-provider
+        // defaults as the only slash-command source.
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let binary = dir.appendingPathComponent("codex")
         try """
         #!/bin/sh
-        if [ "$1" = "--help" ] && [ "$CODEX_HOME" = "\(dir.path)" ]; then
+        if [ "$1" = "--help" ]; then
           cat <<'EOF'
         Usage: codex [OPTIONS] <COMMAND>
 
         Commands:
           exec      Run Codex non-interactively
           review    Run a code review
-          app-server [experimental] Run the app server
+          app-server [experimental] Run the app
+                     server behind a local socket
           help      Print help
 
         Options:
@@ -136,8 +143,8 @@ final class ProviderCLIProbeTests: XCTestCase {
             environment: ["CODEX_HOME": dir.path]
         )
 
-        XCTAssertEqual(commands, ["/exec", "/review", "/app-server"],
-                       "provider snapshots should expose provider-owned commands from the configured binary/home instead of relying only on stale hard-coded slash commands")
+        XCTAssertEqual(commands, [],
+                       "CLI subcommands and wrapped help fragments must never surface as composer slash-command suggestions")
     }
 
     func test_updateRunsProviderUpdateWithEnvironment() throws {

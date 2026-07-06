@@ -191,12 +191,13 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
         XCTAssertEqual(codex.accountLabel, "work@example.com")
         XCTAssertEqual(codex.accountAuthMethod, "ChatGPT",
                        "provider snapshots must carry richer account auth metadata through the same instance-scoped probe cache as auth labels")
-        XCTAssertTrue(codex.slashCommands.contains("/review"))
+        XCTAssertFalse(codex.slashCommands.contains("/review"),
+                       "provider --help lists CLI subcommands, not interactive slash commands; snapshots must not surface them as composer suggestions")
         XCTAssertEqual(codex.skills, ["sam-review-code"],
                        "provider snapshots must discover Codex skills from the selected CODEX_HOME so composer suggestions reflect the active provider instance")
         let count = try String(contentsOf: probeCount, encoding: .utf8)
-        XCTAssertEqual(count, "avh",
-                       "provider cards reload frequently; runtime CLI probes must be cached per binary/home so repeated refreshes do not keep spawning Codex or Claude and stall the app")
+        XCTAssertEqual(count, "av",
+                       "provider cards reload frequently; version/auth probes must be cached per binary/home, and CLI help must not be probed for slash-command suggestions")
         XCTAssertEqual(first.count, second.count)
     }
 
@@ -282,7 +283,7 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
         let snapshots = await router.listAgentProviderSnapshots()
         let claude = try XCTUnwrap(snapshots.first { $0.id == "claude-old" })
 
-        XCTAssertEqual(claude.models.map(\.id), ["opus", "sonnet", "haiku"],
+        XCTAssertEqual(claude.models.map(\.id), ["fable", "opus", "sonnet", "haiku"],
                        "provider snapshots must use versionless Claude Code model aliases when the dynamic Anthropic Models API is unavailable")
         XCTAssertEqual(claude.models.first?.supportedReasoningEfforts, AgentReasoningEffort.claudeSupportedCases,
                        "alias fallback Claude models must preserve the full Claude effort picker (incl. Max + Ultracode) on macOS and iOS")

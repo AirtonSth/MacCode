@@ -12,6 +12,7 @@ import CoreModel
 /// - message_delta { delta }
 /// - message_stop {}
 /// - result { type: "result", subtype?, error? }
+/// - sdk_error { message } — Agent SDK bridge query failure; terminal for the turn
 public final class ClaudeParser {
     public init() {}
 
@@ -193,6 +194,14 @@ public final class ClaudeParser {
             // message:{content:[{type:"text",text:…}|{type:"tool_use",…}]}}.
             ensureTurn(&out)
             let msg = obj["message"] as? [String: Any] ?? [:]
+            // `--replay-user-messages` echoes the host's own prompt back as a
+            // `user` message. Its text/thinking blocks are the USER's words, not
+            // assistant prose: rendering them duplicated every prompt into the
+            // turn, and feeding them into the assembled-body state made
+            // finalize() persist the prompt as an interrupted run's final
+            // assistant answer. Only tool_result blocks (which ride on
+            // user-role messages) may be processed for user messages.
+            let isUserMessage = type == "user" || (msg["role"] as? String) == "user"
             let content = msg["content"] as? [[String: Any]] ?? []
             for block in content {
                 let bt = (block["type"] as? String) ?? "text"
@@ -200,6 +209,7 @@ public final class ClaudeParser {
                 let turnId = currentTurnId ?? ""
                 switch bt {
                 case "text":
+                    if isUserMessage { break }
                     let text = block["text"] as? String ?? ""
                     if text.isEmpty { break }
                     if assembledAssistantBodyMatches(text) || hasEmittedAssistantBody(text) { break }
@@ -209,6 +219,7 @@ public final class ClaudeParser {
                     out.append(.itemDelta(itemId: itemId, bodyAppend: text, outputAppend: nil, summary: nil))
                     out.append(.itemCompleted(itemId: itemId, finalState: .completed))
                 case "thinking":
+                    if isUserMessage { break }
                     let text = block["thinking"] as? String ?? ""
                     out.append(.itemStarted(item: AssistantItem(id: itemId, turnId: turnId, type: .reasoning, state: .streaming, summary: nil, body: "", startedAtMs: now)))
                     out.append(.itemDelta(itemId: itemId, bodyAppend: text, outputAppend: nil, summary: nil))
@@ -261,6 +272,19 @@ public final class ClaudeParser {
         case "error":
             let msg = (obj["error"] as? [String: Any])?["message"] as? String ?? "claude error"
             out.append(.error(message: msg, recoverable: false))
+        case "sdk_error":
+            // Sole failure signal of the Agent SDK bridge's query loop
+            // (ClaudeAgentSDKBridge.mjs): the query died mid-run and no `result`
+            // will ever follow, so the turn must be completed here — otherwise
+            // the adapter never emits .finished and the run hangs in 'running'.
+            out.append(.error(message: stringValue(obj["message"]) ?? "Claude Agent SDK error", recoverable: false))
+            ensureTurn(&out)
+            if let tid = currentTurnId {
+                out.append(.turnCompleted(turnId: tid, finalMessage: nil))
+                currentTurnId = nil
+                resetAssistantBodyDedupState()
+                indexToAssistantBody = [:]
+            }
         case "plan_update", "update_plan":
             if let plan = activePlan(from: obj, now: now) {
                 out.append(.activePlanUpdated(plan))

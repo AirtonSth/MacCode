@@ -6,7 +6,7 @@ public enum CodexAppServerError: Error, CustomStringConvertible {
     case spawnFailed(String)
     case invalidJSON(String)
     case rpcError(code: Int?, message: String)
-    case processExited
+    case processExited(stderrTail: String)
     case responseTypeMismatch
 
     public var description: String {
@@ -15,7 +15,10 @@ public enum CodexAppServerError: Error, CustomStringConvertible {
         case .spawnFailed(let message): return "Failed to spawn Codex app-server: \(message)"
         case .invalidJSON(let line): return "Codex app-server emitted invalid JSON: \(line)"
         case .rpcError(_, let message): return "Codex app-server RPC error: \(message)"
-        case .processExited: return "Codex app-server process exited"
+        case .processExited(let stderrTail):
+            return stderrTail.isEmpty
+                ? "Codex app-server process exited"
+                : "Codex app-server process exited: \(stderrTail)"
         case .responseTypeMismatch: return "Codex app-server response had an unexpected shape"
         }
     }
@@ -100,6 +103,9 @@ public final class CodexAppServerClient: @unchecked Sendable {
     private var notificationHandler: NotificationHandler?
     private var serverRequestHandler: ServerRequestHandler?
     private var stderrBuffer = Data()
+    // Only the stderr tail is ever surfaced (termination diagnostics), so cap
+    // the buffer instead of growing it for the app-server's whole lifetime.
+    private static let stderrTailByteLimit = 8_192
     public var terminationHandler: (@Sendable (Error) -> Void)?
 
     public init(
@@ -146,11 +152,16 @@ public final class CodexAppServerClient: @unchecked Sendable {
             guard !data.isEmpty else { return }
             self.parseQueue.async {
                 self.stderrBuffer.append(data)
+                if self.stderrBuffer.count > Self.stderrTailByteLimit {
+                    self.stderrBuffer.removeFirst(self.stderrBuffer.count - Self.stderrTailByteLimit)
+                }
             }
         }
         process.terminationHandler = { [weak self] _ in
-            self?.failPending(CodexAppServerError.processExited)
-            self?.terminationHandler?(CodexAppServerError.processExited)
+            guard let self else { return }
+            let error = CodexAppServerError.processExited(stderrTail: self.drainedStderrTail())
+            self.failPending(error)
+            self.terminationHandler?(error)
         }
 
         do {
@@ -297,7 +308,25 @@ public final class CodexAppServerClient: @unchecked Sendable {
         if process.isRunning {
             ProcessTerminator.terminateTree(process)
         }
-        failPending(CodexAppServerError.processExited)
+        failPending(CodexAppServerError.processExited(stderrTail: ""))
+    }
+
+    /// Surfaces WHY the app-server died: drains any stderr bytes the async
+    /// readability handler has not consumed yet, then snapshots the buffered
+    /// tail so the termination error carries the crash/exit reason instead of
+    /// a bare "process exited". Only called after the process terminated, so
+    /// the drain cannot block on a live writer.
+    private func drainedStderrTail() -> String {
+        let handle = stderrPipe.fileHandleForReading
+        handle.readabilityHandler = nil
+        let remaining = handle.readDataToEndOfFile()
+        return parseQueue.sync {
+            if !remaining.isEmpty {
+                stderrBuffer.append(remaining)
+            }
+            let tail = stderrBuffer.suffix(Self.stderrTailByteLimit)
+            return String(decoding: tail, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+        }
     }
 
     private func request<T>(method: String, params: Any?) async throws -> T {
@@ -338,7 +367,11 @@ public final class CodexAppServerClient: @unchecked Sendable {
     private func handleLine(_ line: String) {
         guard let data = line.data(using: .utf8),
               let object = try? JSONSerialization.jsonObject(with: data) as? JSONObject else {
-            failPending(CodexAppServerError.invalidJSON(line))
+            // A stray non-JSON stdout line (update notice, banner, log) must not
+            // fail every pending RPC — the server is healthy and will still
+            // answer them. Skip the noise; failPending is reserved for process
+            // exit and explicit stop.
+            NSLog("[codex app-server] ignoring non-JSON stdout line: %@", String(line.prefix(200)))
             return
         }
 
@@ -404,7 +437,7 @@ public final class CodexAppServerClient: @unchecked Sendable {
             try GuardedStdinWrite.write(line,
                                         to: stdinPipe.fileHandleForWriting,
                                         process: process,
-                                        notFound: { CodexAppServerError.processExited })
+                                        notFound: { CodexAppServerError.processExited(stderrTail: "") })
         }
     }
 

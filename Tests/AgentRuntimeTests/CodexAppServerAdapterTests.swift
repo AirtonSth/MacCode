@@ -1690,7 +1690,7 @@ final class CodexAppServerAdapterTests: XCTestCase {
 
         try? await Task.sleep(nanoseconds: 50_000_000)
         let events = await sink.snapshot()
-        XCTAssertTrue(events.contains { if case .itemDelta(_, _, let output, let summary) = $0 { return summary == "Goal updated" && output?.contains("Objective: finish audit") == true && output?.contains("Tokens: 42 / 100") == true } else { return false } },
+        XCTAssertTrue(events.contains { if case .itemStarted(let item) = $0 { return item.summary == "Goal updated" && item.output?.contains("Objective: finish audit") == true && item.output?.contains("Tokens: 42 / 100") == true } else { return false } },
                       "generated app-server goal updates must be readable in the Agent App, not only preserved as raw runtime JSON")
         XCTAssertTrue(events.contains { if case .itemDelta(_, _, let output, let summary) = $0 { return summary == "Turn diff updated" && output == "diff --git a/file b/file" } else { return false } },
                       "turn/diff/updated should surface the aggregated provider diff as file-change activity")
@@ -1729,6 +1729,108 @@ final class CodexAppServerAdapterTests: XCTestCase {
         XCTAssertTrue(events.contains { if case .itemStarted(let item) = $0 { return item.summary == "Goal cleared" && item.output == "Goal cleared" } else { return false } })
         XCTAssertTrue(events.contains { if case .providerRuntime(let runtime) = $0 { return runtime.method == "thread/goal/updated" } else { return false } },
                       "semantic notification mapping must remain additive to raw provider event capture")
+    }
+
+    func test_secondGoalUpdateReplacesGoalDetailInsteadOfAppending() async throws {
+        // WHY: the app-server re-sends thread/goal/updated with the FULL goal
+        // state on every progress tick. The single goal transcript row must
+        // always show ONLY the latest state; append semantics glue stale and
+        // new snapshots together ("...Tokens: 42 / 100Objective: ...") and
+        // garble the row a little more on every update.
+        let client = MockCodexAppServerClient(autoComplete: false)
+        let adapter = CodexAppServerAdapter { _, notificationHandler, _ in
+            client.notificationHandler = notificationHandler
+            return client
+        }
+        let log = OrderedEventLog()
+        _ = try await adapter.sendTurn(AgentRunRequest(
+            threadId: AgentThreadID(),
+            provider: .codex,
+            model: "gpt-5.5",
+            cwd: "/tmp/remotecode-app-server-adapter",
+            prompt: "/goal finish audit"
+        )) { log.record($0) }
+
+        func goalPayload(tokensUsed: Int) -> [String: Any] {
+            [
+                "threadId": "codex-thread-1",
+                "goal": [
+                    "objective": "finish audit",
+                    "status": "active",
+                    "tokensUsed": tokensUsed,
+                    "tokenBudget": 100
+                ]
+            ]
+        }
+        client.notificationHandler?("thread/goal/updated", goalPayload(tokensUsed: 42))
+        client.notificationHandler?("thread/goal/updated", goalPayload(tokensUsed: 58))
+
+        var timeline = AssistantTimelineState()
+        for event in log.assistantEvents { timeline.apply(event) }
+        let goalItems = timeline.turns.flatMap(\.items).filter { $0.summary == "Goal updated" }
+        XCTAssertEqual(goalItems.count, 1, "repeated goal updates within one turn must merge into a single goal row")
+        XCTAssertEqual(goalItems.first?.output,
+                       "Objective: finish audit\nStatus: active\nTokens: 58 / 100",
+                       "the goal row must show ONLY the latest goal state; appending renders stale+new snapshots concatenated")
+    }
+
+    func test_goalEventsWithNoActiveTurnAttachToLatestTurnWithTurnScopedItemIds() async throws {
+        // WHY: goal notifications can land when no turn is active (e.g.
+        // thread/goal/cleared right after turn/completed). With turnId "" they
+        // merge into the FIRST phantom ""-id turn the reducer ever created —
+        // several turns up the transcript — and a single global goal item id
+        // shared across turns breaks the reducer's unique-item-id invariant.
+        let client = MockCodexAppServerClient(autoComplete: false)
+        let adapter = CodexAppServerAdapter { _, notificationHandler, _ in
+            client.notificationHandler = notificationHandler
+            return client
+        }
+        let log = OrderedEventLog()
+        _ = try await adapter.sendTurn(AgentRunRequest(
+            threadId: AgentThreadID(),
+            provider: .codex,
+            model: "gpt-5.5",
+            cwd: "/tmp/remotecode-app-server-adapter",
+            prompt: "/goal finish audit"
+        )) { log.record($0) }
+
+        func goalItems(summary: String) -> [AssistantItem] {
+            log.assistantEvents.compactMap {
+                if case .itemStarted(let item) = $0, item.summary == summary { return item }
+                return nil
+            }
+        }
+        let goalPayload: [String: Any] = [
+            "threadId": "codex-thread-1",
+            "goal": ["objective": "finish audit", "status": "active"]
+        ]
+
+        client.notificationHandler?("thread/goal/updated", goalPayload)
+        let inTurn = try XCTUnwrap(goalItems(summary: "Goal updated").first)
+        XCTAssertEqual(inTurn.turnId, "turn-app-server-1")
+
+        // Turn completes: activeTurnId is cleared but the session and its
+        // notification handler stay registered.
+        client.notificationHandler?("turn/completed", ["threadId": "codex-thread-1", "turnId": "turn-app-server-1"])
+        client.notificationHandler?("thread/goal/updated", goalPayload)
+        client.notificationHandler?("thread/goal/cleared", ["threadId": "codex-thread-1"])
+
+        let betweenTurns = try XCTUnwrap(goalItems(summary: "Goal updated").last)
+        XCTAssertEqual(betweenTurns.turnId, "turn-app-server-1",
+                       "a goal update with no active turn must attach to the last completed turn, not a phantom \"\" turn")
+        let cleared = try XCTUnwrap(goalItems(summary: "Goal cleared").first)
+        XCTAssertEqual(cleared.turnId, "turn-app-server-1",
+                       "goal cleared right after turn/completed must attach to that turn, not a phantom \"\" turn")
+
+        // A later turn must produce a DIFFERENT goal item id: item ids are
+        // unique across turns (invariant relied on by the reducer's
+        // newest-first item lookup and SR1 translation eviction).
+        client.notificationHandler?("turn/started", ["threadId": "codex-thread-1", "turnId": "turn-app-server-2"])
+        client.notificationHandler?("thread/goal/updated", goalPayload)
+        let secondTurnGoal = try XCTUnwrap(goalItems(summary: "Goal updated").last)
+        XCTAssertEqual(secondTurnGoal.turnId, "turn-app-server-2")
+        XCTAssertNotEqual(secondTurnGoal.id, inTurn.id,
+                          "goal item ids must be turn-scoped so two turns never share one item id")
     }
 
     func test_adapterMapsCommonAppServerItemLifecycleAndDeltas() async throws {
@@ -1856,6 +1958,27 @@ final class CodexAppServerAdapterTests: XCTestCase {
         let events = try await adapter.readThread(threadId: threadId)
         XCTAssertTrue(events.contains { if case .tokenUsage(let usage) = $0 { return usage.totalTokens == 12 && usage.contextWindow == 100 } else { return false } })
         XCTAssertTrue(events.contains { if case .contextCompaction(let summary) = $0 { return summary == "Snapshot compacted" } else { return false } })
+    }
+}
+
+// Records assistant events synchronously in emission order (the adapter's emit
+// path is synchronous). The actor-based EventSink records through unordered
+// Tasks, which cannot back ordering-sensitive assertions such as
+// "the LAST goal update wins".
+private final class OrderedEventLog: @unchecked Sendable {
+    private let lock = NSLock()
+    private var events: [AssistantEvent] = []
+
+    func record(_ event: AgentRunEvent) {
+        guard case .event(let assistantEvent) = event else { return }
+        lock.lock()
+        events.append(assistantEvent)
+        lock.unlock()
+    }
+
+    var assistantEvents: [AssistantEvent] {
+        lock.lock(); defer { lock.unlock() }
+        return events
     }
 }
 
@@ -2084,7 +2207,7 @@ private final class MockCodexAppServerClient: CodexAppServerControlling, @unchec
     }
 
     func simulateTermination() {
-        terminationHandler?(CodexAppServerError.processExited)
+        terminationHandler?(CodexAppServerError.processExited(stderrTail: ""))
     }
 
     func initialize(clientName: String, clientTitle: String, clientVersion: String) async throws -> CodexAppServerInitializeResult {

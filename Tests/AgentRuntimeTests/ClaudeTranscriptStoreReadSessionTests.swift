@@ -128,6 +128,56 @@ final class ClaudeTranscriptStoreReadSessionTests: XCTestCase {
     // exercised an empty read. The dedup/cap behavior is covered by
     // ClaudeTranscriptStoreTailLinesTests (bounded tail) instead.
 
+    // MARK: - multi-line messages (audit F38)
+
+    // WHY: real Claude session files split ONE assistant message (same
+    // message.id) across several JSONL lines — text → tool_use → text — each
+    // line carrying a single block at index 0 under a distinct line `uuid`.
+    // The turnId-based fallback item id collided across those lines, so the
+    // reducer merged the second text block INTO the first and appended with no
+    // separator (run-on glued prose on resume); and each line's turnCompleted
+    // carried only that line's text (nil for tool-only lines), so the turn's
+    // final assistant message was wiped by the tool_use line.
+    func test_readSession_multiLineMessage_keepsTextBlocksSeparateAndFinalMessageIntact() throws {
+        let base = try makeTempDir()
+        defer { try? fm.removeItem(at: base) }
+        let configRoot = base.appendingPathComponent("config/projects", isDirectory: true)
+        try fm.createDirectory(at: configRoot, withIntermediateDirectories: true)
+        let threadId = "thread-multiline"
+
+        func line(uuid: String, block: [String: Any]) throws -> String {
+            let obj: [String: Any] = [
+                "type": "assistant",
+                "uuid": uuid,
+                "message": ["id": "msg-multi", "content": [block]]
+            ]
+            return String(data: try JSONSerialization.data(withJSONObject: obj), encoding: .utf8)!
+        }
+        let lines = [
+            try line(uuid: "u1", block: ["type": "text", "text": "First paragraph."]),
+            try line(uuid: "u2", block: ["type": "tool_use", "name": "Bash", "input": ["command": "ls"]]),
+            try line(uuid: "u3", block: ["type": "text", "text": "Second paragraph."])
+        ]
+        try lines.joined(separator: "\n").data(using: .utf8)!
+            .write(to: configRoot.appendingPathComponent(threadId + ".jsonl"))
+
+        let store = ClaudeTranscriptStore(fileManager: fm)
+        let events = store.readSession(
+            providerThreadId: threadId,
+            environment: ["CLAUDE_CONFIG_DIR": base.appendingPathComponent("config").path]
+        )
+
+        var state = AssistantTimelineState()
+        for event in events { state.apply(event) }
+        let bodies = state.turns.flatMap { $0.items }
+            .filter { $0.type == .assistantMessage }
+            .map(\.body)
+        XCTAssertEqual(bodies, ["First paragraph.", "Second paragraph."],
+                       "the two text blocks belong to DIFFERENT lines: colliding item ids glue them into one run-on paragraph")
+        XCTAssertEqual(state.turns.first?.finalAssistantMessage, "First paragraph.\nSecond paragraph.",
+                       "a tool_use-only line must not reset the turn's final assistant message to nil")
+    }
+
     // MARK: - emptyThreadId returns empty
 
     func test_readSession_emptyThreadId_returnsEmpty() {

@@ -12,6 +12,11 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
         let stderrPipe: Pipe
         let parser = ClaudeParser()
         let lineBuffer = LineBuffer()
+        // Serializes the stdout readabilityHandler against finishTerminated's
+        // EOF drain: nil-ing a readabilityHandler does not wait for a callback
+        // already running, and LineBuffer is not thread-safe. Taken BEFORE the
+        // fd read so byte order is preserved across the two readers.
+        let stdoutReadLock = NSLock()
         let writeQueue = DispatchQueue(label: "remotecode.claude-sdk.write")
         var events: [AssistantEvent] = []
         var status: AgentRunStatus = .running
@@ -19,6 +24,7 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
         var model: String
         var permissionMode: AgentPermissionMode
         var interactionMode: AgentInteractionMode
+        let reasoningEffort: AgentReasoningEffort?
         var activeTurnId: String?
         var completedTurnIds: [String] = []
         var inFlightRunId: AgentRunID?
@@ -36,6 +42,7 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
              model: String,
              permissionMode: AgentPermissionMode,
              interactionMode: AgentInteractionMode,
+             reasoningEffort: AgentReasoningEffort?,
              providerThreadId: String?) {
             self.threadId = threadId
             self.process = process
@@ -45,6 +52,7 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
             self.model = model
             self.permissionMode = permissionMode
             self.interactionMode = interactionMode
+            self.reasoningEffort = reasoningEffort
             self.providerThreadId = providerThreadId
         }
     }
@@ -265,9 +273,28 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
                                  provisioningCallback: (@Sendable (AgentRunEvent) -> Void)?) async throws -> Session {
         lock.lock()
         if let existing = sessions[request.threadId] {
+            // Model/permission changes switch live over the bridge (rc_set_model /
+            // rc_set_permission), but effort is fixed for the life of the SDK query —
+            // there is no live effort control — so an effort change is a runtime
+            // switch: respawn with resume, mirroring ClaudeStreamingCLIAdapter.canReuse.
+            // An in-flight turn keeps the session (sendTurn rejects it right after,
+            // exactly as before; recoverSession just re-attaches).
+            if existing.reasoningEffort == request.reasoningEffort || existing.inFlightRunId != nil {
+                lock.unlock()
+                try applyRuntimeSwitchIfNeeded(existing, request: request)
+                return existing
+            }
+            // Stash the live session id as the resume cursor for the respawn:
+            // configurePayload/effectiveProviderThreadId consult this map whenever
+            // the request itself carries no providerThreadId.
+            if request.providerThreadId?.isEmpty != false,
+               let resumeId = existing.providerThreadId, !resumeId.isEmpty {
+                rollbackProviderThreadIds[request.threadId] = resumeId
+            }
+            sessions.removeValue(forKey: request.threadId)
             lock.unlock()
-            try applyRuntimeSwitchIfNeeded(existing, request: request)
-            return existing
+            terminate(existing)
+            return try await startNewSession(request, provisioningCallback: provisioningCallback)
         }
         lock.unlock()
         return try await startNewSession(request, provisioningCallback: provisioningCallback)
@@ -308,9 +335,12 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
                               model: request.model,
                               permissionMode: request.permissionMode,
                               interactionMode: request.interactionMode,
+                              reasoningEffort: request.reasoningEffort,
                               providerThreadId: effectiveProviderThreadId)
         stdoutPipe.fileHandleForReading.readabilityHandler = { [weak self, weak session] handle in
             guard let self, let session else { return }
+            session.stdoutReadLock.lock()
+            defer { session.stdoutReadLock.unlock() }
             let data = handle.availableData
             guard !data.isEmpty else { return }
             for line in session.lineBuffer.take(data) {
@@ -429,7 +459,7 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
     private func installSDKPackage(in directory: URL,
                                    packageSpec: String,
                                    onProgress: (@Sendable (AgentRunEvent) -> Void)? = nil) async throws {
-        let (process, outputPipe) = try Self.makeNpmInstallProcess(in: directory, packageSpec: packageSpec, onProgress: onProgress)
+        let (process, outputPipe, outputBuffer) = try Self.makeNpmInstallProcess(in: directory, packageSpec: packageSpec, onProgress: onProgress)
         // Wait for termination via a continuation; the cooperative-pool thread is NOT blocked.
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             process.terminationHandler = { proc in
@@ -441,8 +471,7 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
                     return
                 }
                 if proc.terminationStatus != 0 {
-                    let data = outputPipe.fileHandleForReading.readDataToEndOfFile()
-                    let text = String(data: data, encoding: .utf8) ?? ""
+                    let text = Self.npmInstallFailureText(buffered: outputBuffer, outputPipe: outputPipe)
                     continuation.resume(throwing: AgentProviderAdapterError.unsupported("Claude Agent SDK package install failed: \(text)"))
                 } else {
                     continuation.resume()
@@ -467,12 +496,36 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
         UInt64(sdkInstallTimeoutSeconds() * 1_000_000_000)
     }
 
+    // Minimal locked byte accumulator for the npm install output.
+    // Internal (not private) so the failure-text regression test can drive
+    // makeNpmInstallProcess/npmInstallFailureText directly.
+    final class LockedDataBuffer: @unchecked Sendable {
+        private let lock = NSLock()
+        private var data = Data()
+        func append(_ chunk: Data) { lock.lock(); data.append(chunk); lock.unlock() }
+        var value: Data { lock.lock(); defer { lock.unlock() }; return data }
+    }
+
+    // Assembles the diagnostic text for a failed npm install: everything the
+    // progress readabilityHandler already consumed (`buffered`) plus the
+    // undelivered tail still in the pipe. Tail-only (the pre-fix behaviour)
+    // was usually EMPTY because the progress handler had drained the pipe,
+    // yielding "install failed: " with no explanation.
+    static func npmInstallFailureText(buffered: LockedDataBuffer, outputPipe: Pipe) -> String {
+        var data = buffered.value
+        data.append(outputPipe.fileHandleForReading.readDataToEndOfFile())
+        return String(data: data, encoding: .utf8) ?? ""
+    }
+
     // Shared npm install process setup (spawn only — caller awaits termination).
-    private static func makeNpmInstallProcess(in directory: URL,
-                                              packageSpec: String,
-                                              onProgress: (@Sendable (AgentRunEvent) -> Void)?) throws -> (Process, Pipe) {
-        guard let npm = ProcessLocator.resolve("npm") else {
-            throw AgentRunError.missingBinary("npm")
+    // Internal + npmBinary injection so tests can exercise the streamed-output
+    // buffering against a deterministic fake npm.
+    static func makeNpmInstallProcess(in directory: URL,
+                                      packageSpec: String,
+                                      onProgress: (@Sendable (AgentRunEvent) -> Void)?,
+                                      npmBinary: String = "npm") throws -> (Process, Pipe, LockedDataBuffer) {
+        guard let npm = ProcessLocator.resolve(npmBinary) else {
+            throw AgentRunError.missingBinary(npmBinary)
         }
         let process = Process()
         process.executableURL = URL(fileURLWithPath: npm)
@@ -482,10 +535,15 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
         let outputPipe = Pipe()
         process.standardOutput = outputPipe
         process.standardError = outputPipe
+        let outputBuffer = LockedDataBuffer()
         if let onProgress {
             outputPipe.fileHandleForReading.readabilityHandler = { handle in
                 let data = handle.availableData
-                guard !data.isEmpty, let text = String(data: data, encoding: .utf8) else { return }
+                guard !data.isEmpty else { return }
+                // Keep every consumed chunk: on failure this buffer (plus the
+                // pipe tail) is the only source of npm's real error text.
+                outputBuffer.append(data)
+                guard let text = String(data: data, encoding: .utf8) else { return }
                 for line in text.components(separatedBy: "\n") {
                     guard let parsed = NpmInstallProgressParser.parse(line: line) else { continue }
                     let payload = Self.provisioningPayload(stage: parsed.stage, progress: parsed.progress, packageSpec: packageSpec)
@@ -500,7 +558,7 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
             outputPipe.fileHandleForReading.readabilityHandler = nil
             throw AgentRunError.spawnFailed(error.localizedDescription)
         }
-        return (process, outputPipe)
+        return (process, outputPipe, outputBuffer)
     }
 
     private static func provisioningPayload(stage: String, progress: Double, packageSpec: String) -> [String: Any] {
@@ -580,6 +638,15 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
         ]
         if let resumeSessionAt, !resumeSessionAt.isEmpty {
             payload["resume_session_at"] = resumeSessionAt
+        }
+        // Effort + ultracode settings reuse ClaudeRunner's canonical CLI mapping
+        // (ultracode → xhigh effort + {"ultracode":true,"enableWorkflows":true},
+        // effort always sent) so the SDK bridge and the streaming CLI never drift.
+        if let effort = ClaudeRunner.effortArgs(request.reasoningEffort).last {
+            payload["effort"] = effort
+        }
+        if let settings = ClaudeRunner.ultracodeSettingsArgs(request.reasoningEffort).last {
+            payload["settings"] = settings
         }
         payload["system_prompt"] = Self.claudeSystemPrompt(environment: request.environment)
         return payload
@@ -671,23 +738,40 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
 
     private func handleStderr(_ data: Data, session: Session) {
         let raw = String(data: data, encoding: .utf8) ?? ""
-        guard !raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        // The bridge is a Node process: it prints Deprecation/Experimental
+        // warnings to stderr during normal successful runs. Only lines the
+        // classifier keeps may surface as a fatal error — the same gate as
+        // ClaudeStreamingCLIAdapter.handleStderr / ClaudeRunner.
+        guard let visible = ClaudeRunner.displayableStderr(raw) else { return }
         let event = AssistantEvent.providerRuntime(ProviderStderrClassifier.runtimeEvent(
-            message: raw,
+            message: visible,
             provider: .claude,
             source: "claude.agent-sdk.stderr"
         ))
         record(event, session: session)
         emit(.event(event), session: session)
-        emit(.error("[claude sdk stderr] " + raw), session: session)
+        emit(.error("[claude sdk stderr] " + visible), session: session)
     }
 
     private func finishTerminated(_ session: Session) {
         session.stdoutPipe.fileHandleForReading.readabilityHandler = nil
         session.stderrPipe.fileHandleForReading.readabilityHandler = nil
+        // Drain under the lock: an in-flight readabilityHandler callback may
+        // still be reading/parsing — the lock keeps LineBuffer access and fd
+        // read order serialized so no final line is split or reordered.
+        session.stdoutReadLock.lock()
         let tail = session.stdoutPipe.fileHandleForReading.readDataToEndOfFile()
         for line in session.lineBuffer.take(tail) + session.lineBuffer.flush() {
             handleLine(line, session: session)
+        }
+        session.stdoutReadLock.unlock()
+        // Mirror the stdout drain for stderr: a bridge that dies instantly
+        // (missing module, ESM syntax error, auth failure) writes the only
+        // explanation to stderr, and the async handler can lose the race with
+        // the teardown above, leaving the bytes undelivered in the pipe.
+        let stderrTail = session.stderrPipe.fileHandleForReading.readDataToEndOfFile()
+        if !stderrTail.isEmpty {
+            handleStderr(stderrTail, session: session)
         }
         for event in session.parser.finalize() {
             handleFinalizedEvent(event, session: session)
