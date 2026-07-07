@@ -82,6 +82,19 @@ private struct ComposerReactiveScope<Content: View>: View {
     var body: some View { content() }
 }
 
+/// Thread mutations performed by the macOS UI itself (create/rename/pin/color/
+/// reorder/delete/auto-title). Surfaces must stay free of SocketServer imports,
+/// so the VM reports these through a dependency-free callback and the host
+/// (AppCommandRouter) publishes the matching mirror events. Without this, only
+/// RPC-driven mutations reached connected mirrors and mac-side thread CRUD was
+/// invisible on iOS until a full thread-list refetch.
+public enum AgentThreadLifecycleEvent {
+    case created(AgentThread)
+    case updated(AgentThread)
+    case reordered(WorkspaceID, [AgentThreadID])
+    case deleted([AgentThreadID])
+}
+
 @MainActor
 public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     @Published public var threads: [AgentThread] = []
@@ -140,6 +153,10 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// Fired when local Agent App controls persist thread run config so
     /// remote mirrors can receive the same thread metadata.
     public var onThreadConfigPersisted: ((AgentThread) -> Void)?
+    /// Fired after macOS-UI thread lifecycle mutations are persisted (post
+    /// repo write + reloadThreads) so the host can mirror them to remote
+    /// clients. Wired by AppCommandRouter like onThreadConfigPersisted.
+    public var onThreadLifecycle: ((AgentThreadLifecycleEvent) -> Void)?
     /// Fired when this surface's bound (selected) thread changes, so the host
     /// can persist it into the surface descriptor metadata (`selected_thread`)
     /// for per-surface restore. nil means the surface returned to the
@@ -413,6 +430,11 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             // thread's real activity time so only genuine activity reorders it.
             try? threadRepo.upsert(thread)
             threads[index] = thread
+            // Mirror the repaired title so remote thread lists don't keep
+            // showing the placeholder. Loop-safe: repairedThreadIds plus the
+            // now-non-placeholder title prevent re-entry on the reloadThreads
+            // the host's event subscription triggers.
+            onThreadLifecycle?(.updated(thread))
         }
     }
 
@@ -664,7 +686,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// Pure reorder helper: moves the element at `from` to `to` within `queue`.
     /// Out-of-bounds indices or a single-item queue are no-ops.
     /// Positions in returned elements are NOT updated — caller persists as needed.
-    nonisolated static func reorderQueue(
+    /// public: reused by AppCommandRouter's agent.message.queue.reorder RPC so
+    /// the mirror path performs the same mutation as the mac drag-reorder.
+    nonisolated public static func reorderQueue(
         _ queue: [AgentQueuedMessage],
         from: Int,
         to: Int
@@ -1720,6 +1744,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                             serviceTier: serviceTier, modelSelection: currentModelSelection)
         try? threadRepo.upsert(t)
         reloadThreads()
+        onThreadLifecycle?(.created(threads.first(where: { $0.id == t.id }) ?? t))
         selectThread(t.id)
     }
 
@@ -1746,6 +1771,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             )
             pullRequestURL = ""
             reloadThreads()
+            onThreadLifecycle?(.created(threads.first(where: { $0.id == thread.id }) ?? thread))
             selectThread(thread.id)
             pullRequestStatusMessage = "Opened \(thread.title)"
         } catch {
@@ -1760,6 +1786,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         t.updatedAt = Date()
         try? threadRepo.upsert(t)
         reloadThreads()
+        onThreadLifecycle?(.updated(threads.first(where: { $0.id == id }) ?? t))
     }
 
     /// A2: set/clear a thread's swatch color (empty string clears).
@@ -1769,11 +1796,15 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         t.updatedAt = Date()
         try? threadRepo.upsert(t)
         reloadThreads()
+        onThreadLifecycle?(.updated(threads.first(where: { $0.id == id }) ?? t))
     }
 
     public func setThreadPinned(_ id: AgentThreadID, _ pinned: Bool) {
         try? threadRepo.setPinned(id: id, pinned: pinned)
         reloadThreads()
+        if let updated = threads.first(where: { $0.id == id }) {
+            onThreadLifecycle?(.updated(updated))
+        }
     }
 
     public func reorderThread(_ id: AgentThreadID, before target: AgentThreadID) {
@@ -1781,6 +1812,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
               let targetIndex = threads.firstIndex(where: { $0.id == target }) else { return }
         try? threadRepo.reorder(id: id, position: targetIndex)
         reloadThreads()
+        onThreadLifecycle?(.reordered(workspaceID, threads.map(\.id)))
     }
 
     // UX-XPLAT-DELETE-UNDO: thread deletion stays IMMEDIATE and final (the
@@ -1848,6 +1880,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         resetTimelineUpdateTick()
         }
         reloadThreads()
+        onThreadLifecycle?(.deleted([id]))
         // If the user deleted the thread they were viewing, reselect a remaining
         // one (long-standing delete UX). Guarded on `wasSelected` so a surface
         // that was already on the fresh-composer state is never auto-bound.
@@ -1870,6 +1903,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         resetTimelineUpdateTick()
         }
         reloadThreads()
+        onThreadLifecycle?(.deleted(Array(ids)))
         // Reselect a remaining thread when the open one was deleted (delete UX);
         // never auto-bind a surface that was on the fresh-composer state.
         if wasSelected, selectedThreadId == nil, let next = threads.first {
@@ -1980,6 +2014,11 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         pendingThreadDeletionUndo = nil
         threadDeletionUndoExpiryTask?.cancel()
         reloadThreads()
+        // Remote mirrors already saw the delete event; re-announce the restored
+        // threads so they reappear without a manual thread-list refetch.
+        for snapshot in undo.snapshots {
+            onThreadLifecycle?(.created(threads.first(where: { $0.id == snapshot.thread.id }) ?? snapshot.thread))
+        }
         if let restore = undo.previouslySelectedThreadId,
            threads.contains(where: { $0.id == restore }) {
             selectThread(restore)

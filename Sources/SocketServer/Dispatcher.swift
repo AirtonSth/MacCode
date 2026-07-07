@@ -66,9 +66,16 @@ public protocol CommandRouting: AnyObject {
     func updateAgentQueuedMessage(id: AgentQueuedMessageID, text: String, attachments: [AgentAttachment]) throws -> AgentQueuedMessage
     func cancelAgentQueuedMessage(id: AgentQueuedMessageID) throws -> AgentQueuedMessage
     func forceAgentQueuedMessageNow(id: AgentQueuedMessageID) async throws -> AgentMessageSendResult
+    /// Moves a queued message to `position` (0-based target index) within its
+    /// thread's queue, renumbering every affected message — the same repo
+    /// mutation the mac queue drag-reorder performs.
+    func reorderAgentQueuedMessage(thread: AgentThreadID, id: AgentQueuedMessageID, position: Int) throws
     func sendAgentMessage(thread: AgentThreadID, text: String, provider: AgentProvider?, model: String?, permissionMode: AgentPermissionMode?, reasoningEffort: AgentReasoningEffort?, serviceTier: AgentServiceTier?, interactionMode: AgentInteractionMode?, modelSelection: AgentModelSelection?, providerInstanceId: String?, attachments: [AgentAttachment]) async throws -> AgentMessageSendResult
     func implementAgentPlan(thread: AgentThreadID, planId: String, planMarkdown: String?, newThread: Bool, provider: AgentProvider?, model: String?, permissionMode: AgentPermissionMode?, reasoningEffort: AgentReasoningEffort?, serviceTier: AgentServiceTier?, modelSelection: AgentModelSelection?) async throws -> (runId: AgentRunID, implementationThreadId: AgentThreadID)
     func saveAgentPlan(thread: AgentThreadID, planId: String, planMarkdown: String?, relativePath: String?) throws -> (path: String, relativePath: String)
+    /// Per-thread plan notes (mac plan sidebar). Returns "" when none exist.
+    func agentPlanNotes(thread: AgentThreadID) throws -> String
+    func saveAgentPlanNotes(thread: AgentThreadID, notes: String) throws
     func commandReceipt(method: String, clientRequestId: String) -> JSONValue?
     func recordCommandReceipt(method: String, clientRequestId: String, result: JSONValue)
     func respondAgentRequest(thread: AgentThreadID, requestId: String, response: AgentProviderRequestResponse) async throws
@@ -80,6 +87,10 @@ public protocol CommandRouting: AnyObject {
     func agentCheckpointDiff(thread: AgentThreadID, checkpointTurnCount: Int, path: String?) throws -> String
     func revertAgentThreadToCheckpoint(thread: AgentThreadID, checkpointTurnCount: Int) async throws -> AgentTurnCheckpointSummary
     func stopAgentRun(thread: AgentThreadID) throws
+    /// Resume a relaunch-interrupted thread (the mac Continue button path):
+    /// the coordinator replays the saved resume cursor without a new user
+    /// message. Returns the new run id when one started.
+    func continueAgentRun(thread: AgentThreadID) async throws -> AgentRunID?
     func deleteAgentThread(thread: AgentThreadID) throws
     func deleteAgentThreads(_ threads: [AgentThreadID]) throws
     func renameAgentThread(thread: AgentThreadID, title: String) throws -> AgentThread
@@ -995,6 +1006,19 @@ public final class JSONRPCDispatcher {
                 let result = messageSendResultPayload(forced)
                 recordCommandReceipt(method: req.method, clientRequestId: receiptKey, result: result)
                 return .init(id: id, result: result)
+            case "agent.message.queue.reorder":
+                guard let tid = params["thread_id"]?.stringValue.flatMap(UUID.init).map(AgentThreadID.init),
+                      let qid = params["queued_message_id"]?.stringValue.flatMap(UUID.init).map(AgentQueuedMessageID.init)
+                        ?? params["id"]?.stringValue.flatMap(UUID.init).map(AgentQueuedMessageID.init),
+                      let position = params["position"]?.intValue else { throw JSONRPCError.invalidParams }
+                let receiptKey = params["client_request_id"]?.stringValue
+                if let (_, cached) = commandReceipt(method: req.method, params: params) {
+                    return .init(id: id, result: cached)
+                }
+                try router.reorderAgentQueuedMessage(thread: tid, id: qid, position: position)
+                let result: JSONValue = .bool(true)
+                recordCommandReceipt(method: req.method, clientRequestId: receiptKey, result: result)
+                return .init(id: id, result: result)
             case "agent.plan.implement":
                 guard let tid = params["thread_id"]?.stringValue.flatMap(UUID.init).map(AgentThreadID.init),
                       let planId = params["plan_id"]?.stringValue else { throw JSONRPCError.invalidParams }
@@ -1051,6 +1075,20 @@ public final class JSONRPCDispatcher {
                 ])
                 recordCommandReceipt(method: req.method, clientRequestId: receiptKey, result: result)
                 return .init(id: id, result: result)
+            case "agent.plan.notes.get":
+                guard let tid = params["thread_id"]?.stringValue.flatMap(UUID.init).map(AgentThreadID.init) else { throw JSONRPCError.invalidParams }
+                return .init(id: id, result: .object(["notes": .string(try router.agentPlanNotes(thread: tid))]))
+            case "agent.plan.notes.save":
+                guard let tid = params["thread_id"]?.stringValue.flatMap(UUID.init).map(AgentThreadID.init),
+                      let notes = params["notes"]?.stringValue else { throw JSONRPCError.invalidParams }
+                let receiptKey = params["client_request_id"]?.stringValue
+                if let (_, cached) = commandReceipt(method: req.method, params: params) {
+                    return .init(id: id, result: cached)
+                }
+                try router.saveAgentPlanNotes(thread: tid, notes: notes)
+                let result: JSONValue = .bool(true)
+                recordCommandReceipt(method: req.method, clientRequestId: receiptKey, result: result)
+                return .init(id: id, result: result)
             case "agent.message.list":
                 guard let tid = params["thread_id"]?.stringValue.flatMap(UUID.init).map(AgentThreadID.init) else { throw JSONRPCError.invalidParams }
                 let limit = params["limit"]?.intValue ?? 200
@@ -1076,6 +1114,16 @@ public final class JSONRPCDispatcher {
                 }
                 try router.stopAgentRun(thread: tid)
                 let result: JSONValue = .bool(true)
+                recordCommandReceipt(method: req.method, clientRequestId: receiptKey, result: result)
+                return .init(id: id, result: result)
+            case "agent.run.continue":
+                guard let tid = params["thread_id"]?.stringValue.flatMap(UUID.init).map(AgentThreadID.init) else { throw JSONRPCError.invalidParams }
+                let receiptKey = params["client_request_id"]?.stringValue
+                if let (_, cached) = commandReceipt(method: req.method, params: params) {
+                    return .init(id: id, result: cached)
+                }
+                let continuedRunId = try await router.continueAgentRun(thread: tid)
+                let result: JSONValue = continuedRunId.map { .object(["run_id": .string($0.value.uuidString)]) } ?? .bool(true)
                 recordCommandReceipt(method: req.method, clientRequestId: receiptKey, result: result)
                 return .init(id: id, result: result)
             case "agent.request.respond":

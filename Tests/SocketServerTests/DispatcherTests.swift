@@ -389,6 +389,26 @@ class FakeRouter: CommandRouting, TerminalCommandRouting {
         lastSavedPlan = (thread, planId, planMarkdown, relativePath)
         return ("/tmp/\(relativePath ?? "plan.md")", relativePath ?? ".remotecode/plans/plan.md")
     }
+    var planNotesByThread: [AgentThreadID: String] = [:]
+    func agentPlanNotes(thread: AgentThreadID) throws -> String {
+        planNotesByThread[thread] ?? ""
+    }
+    func saveAgentPlanNotes(thread: AgentThreadID, notes: String) throws {
+        planNotesByThread[thread] = notes
+    }
+    var reorderAgentQueuedMessageCallCount = 0
+    func reorderAgentQueuedMessage(thread: AgentThreadID, id: AgentQueuedMessageID, position: Int) throws {
+        reorderAgentQueuedMessageCallCount += 1
+        var queue = queuedMessageStore.filter { $0.threadId == thread }
+        guard let fromIndex = queue.firstIndex(where: { $0.id == id }) else { throw JSONRPCError.invalidParams }
+        let moved = queue.remove(at: fromIndex)
+        queue.insert(moved, at: max(0, min(position, queue.count - 1)))
+        queuedMessageStore.removeAll { $0.threadId == thread }
+        for (index, var message) in queue.enumerated() {
+            message.position = index + 1
+            queuedMessageStore.append(message)
+        }
+    }
     func commandReceipt(method: String, clientRequestId: String) -> JSONValue? {
         commandReceipts["\(method):\(clientRequestId)"]
     }
@@ -441,6 +461,13 @@ class FakeRouter: CommandRouting, TerminalCommandRouting {
     func stopAgentRun(thread: AgentThreadID) throws {
         stopAgentRunCallCount += 1
         stoppedAgentThreads.append(thread)
+    }
+    var continueAgentRunCallCount = 0
+    var continuedAgentThreads: [AgentThreadID] = []
+    func continueAgentRun(thread: AgentThreadID) async throws -> AgentRunID? {
+        continueAgentRunCallCount += 1
+        continuedAgentThreads.append(thread)
+        return AgentRunID()
     }
     var threadStore: [AgentThread] = []
     var deleteAgentThreadCallCount = 0

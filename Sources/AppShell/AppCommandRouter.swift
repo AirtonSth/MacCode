@@ -75,6 +75,14 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     }
 
     private func publishAgentThreadUpdated(_ thread: AgentThread) {
+        EventBus.shared.publish(kind: "agent.thread.updated", payload: agentThreadPayload(thread))
+    }
+
+    /// Full thread payload for host-UI-driven thread mirror events. Shape is
+    /// IDENTICAL to Dispatcher.threadPayload so iOS decodes RPC-driven and
+    /// mac-UI-driven mutations with one code path. provider_locked derives
+    /// best-effort from the message repo (false on error).
+    private func agentThreadPayload(_ thread: AgentThread) -> JSONValue {
         let locked = !((try? listAgentMessages(thread: thread.id, limit: 1)) ?? []).isEmpty
         var payload: [String: JSONValue] = [
             "thread_id": .string(thread.id.value.uuidString),
@@ -83,22 +91,50 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             "display_title": .string(AgentThreadTitle.display(thread.title)),
             "displayTitle": .string(AgentThreadTitle.display(thread.title)),
             "provider": .string(thread.provider.rawValue),
+            "provider_instance_id": thread.providerInstanceId.map { .string($0) } ?? .null,
+            "providerInstanceId": thread.providerInstanceId.map { .string($0) } ?? .null,
             "model": .string(thread.model),
             "provider_locked": .bool(locked),
             "providerLocked": .bool(locked),
             "permission_mode": .string(thread.permissionMode.rawValue),
             "reasoning_effort": .string(thread.reasoningEffort.rawValue),
             "service_tier": .string(thread.serviceTier.rawValue),
-            "execution_mode": .string(thread.executionMode.rawValue),
-            "pinned": .bool(thread.pinned),
-            "sort_order": .number(Double(thread.sortOrder))
+            "model_selection": jsonValue(thread.modelSelection),
+            "execution_mode": .string(thread.executionMode.rawValue)
         ]
-        payload["provider_instance_id"] = thread.providerInstanceId.map { .string($0) } ?? .null
-        payload["providerInstanceId"] = thread.providerInstanceId.map { .string($0) } ?? .null
         payload["base_branch"] = thread.baseBranch.map { .string($0) } ?? .null
         payload["worktree_path"] = thread.worktreePath.map { .string($0) } ?? .null
         payload["color"] = thread.color.map { .string($0) } ?? .null
-        EventBus.shared.publish(kind: "agent.thread.updated", payload: .object(payload))
+        payload["pinned"] = .bool(thread.pinned)
+        payload["sort_order"] = .number(Double(thread.sortOrder))
+        return .object(payload)
+    }
+
+    /// Mirrors macOS-UI thread lifecycle mutations (AgentAppViewModel
+    /// onThreadLifecycle) onto the EventBus with the same event kinds the
+    /// RPC paths publish, so connected mirrors stay live for mac-side CRUD.
+    private func publishAgentThreadLifecycle(_ event: AgentThreadLifecycleEvent) {
+        switch event {
+        case .created(let thread):
+            EventBus.shared.publish(kind: "agent.thread.created", payload: agentThreadPayload(thread))
+        case .updated(let thread):
+            EventBus.shared.publish(kind: "agent.thread.updated", payload: agentThreadPayload(thread))
+        case .reordered(let workspaceId, let order):
+            EventBus.shared.publish(kind: "agent.thread.reordered", payload: .object([
+                "workspace_id": .string(workspaceId.value.uuidString),
+                "order": .array(order.map { .string($0.value.uuidString) })
+            ]))
+        case .deleted(let ids):
+            if ids.count > 1 {
+                EventBus.shared.publish(kind: "agent.thread.deleted_many", payload: .object([
+                    "thread_ids": .array(ids.map { .string($0.value.uuidString) })
+                ]))
+            } else if let id = ids.first {
+                EventBus.shared.publish(kind: "agent.thread.deleted", payload: .object([
+                    "thread_id": .string(id.value.uuidString)
+                ]))
+            }
+        }
     }
 
     private func publishQueuedMessage(kind: String, _ message: AgentQueuedMessage) {
@@ -244,6 +280,9 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                         }
                         agent.viewModel.onThreadConfigPersisted = { [weak self] thread in
                             self?.publishAgentThreadUpdated(thread)
+                        }
+                        agent.viewModel.onThreadLifecycle = { [weak self] event in
+                            self?.publishAgentThreadLifecycle(event)
                         }
                         agent.viewModel.onQueuedMessageEvent = { [weak self] kind, message in
                             self?.publishQueuedMessage(kind: kind, message)
@@ -1344,6 +1383,49 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         )
     }
 
+    /// Mirror-path equivalent of AgentAppViewModel.reorderQueuedMessage: moves
+    /// the queued message to `position` (0-based target index, clamped) and
+    /// renumbers every message in the thread's queue. Publishes
+    /// agent.message.queue.updated for EVERY queued message so mirrors that
+    /// upsert-by-id and sort-by-position converge on the new order.
+    public func reorderAgentQueuedMessage(thread: AgentThreadID, id: AgentQueuedMessageID, position: Int) throws {
+        guard let ctx = context else { throw LayoutError.workspaceNotFound }
+        let queue = try ctx.queuedMessageRepo.list(threadId: thread)
+        guard let fromIndex = queue.firstIndex(where: { $0.id == id }) else { throw JSONRPCError.invalidParams }
+        let dest = max(0, min(position, queue.count - 1))
+        let reordered = AgentAppViewModel.reorderQueue(queue, from: fromIndex, to: dest)
+        let now = Date()
+        for (index, var message) in reordered.enumerated() {
+            message.position = index + 1
+            message.updatedAt = now
+            try ctx.queuedMessageRepo.upsert(message)
+        }
+        for message in try ctx.queuedMessageRepo.list(threadId: thread) {
+            publishQueuedMessage(kind: "agent.message.queue.updated", message)
+        }
+        refreshAgentSurfaces(thread: thread)
+    }
+
+    public func agentPlanNotes(thread: AgentThreadID) throws -> String {
+        guard let ctx = context else { throw LayoutError.workspaceNotFound }
+        return PlanNotesStore(db: ctx.db).load(threadId: thread)
+    }
+
+    public func saveAgentPlanNotes(thread: AgentThreadID, notes: String) throws {
+        guard let ctx = context else { throw LayoutError.workspaceNotFound }
+        PlanNotesStore(db: ctx.db).save(notes, threadId: thread)
+        // HC-5 spirit: a mirror-driven mutation must be visible on the Mac
+        // immediately — refresh any open surface bound to this thread.
+        for s in SurfaceRegistry.shared.all() {
+            guard let agent = s as? AgentAppSurface, agent.viewModel.selectedThreadId == thread else { continue }
+            agent.viewModel.planNotes = notes
+        }
+        EventBus.shared.publish(kind: "agent.plan.notes.updated", payload: .object([
+            "thread_id": .string(thread.value.uuidString),
+            "notes": .string(notes)
+        ]))
+    }
+
     public func sendAgentMessage(thread: AgentThreadID, text: String, provider: AgentProvider?, model: String?, permissionMode: AgentPermissionMode?, reasoningEffort: AgentReasoningEffort?, serviceTier: AgentServiceTier? = nil, interactionMode: AgentInteractionMode? = nil, modelSelection: AgentModelSelection? = nil, providerInstanceId: String? = nil, attachments: [AgentAttachment] = []) async throws -> AgentMessageSendResult {
         guard let ctx = context else { throw LayoutError.workspaceNotFound }
         if let existing = try ctx.threadRepo.get(id: thread),
@@ -1358,7 +1440,18 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             refreshAgentSurfaces(thread: thread)
             return AgentMessageSendResult(status: .queued, queuedMessage: queued)
         }
-        var t = try configureAgentThread(thread: thread, provider: provider, model: model, permissionMode: permissionMode, reasoningEffort: reasoningEffort, serviceTier: serviceTier, modelSelection: modelSelection, providerInstanceId: providerInstanceId)
+        // A message-send is not a provider-change gesture. The provider INSTANCE
+        // is immutable once the thread has started (A1 parity), so never forward it
+        // into configureAgentThread on a started thread: a mirror client that
+        // re-derives its instance id from the provider snapshot list can carry an id
+        // that no longer matches the thread's locked instance, and configureAgentThread
+        // would otherwise reject the send with -32013 ("Provider instance is locked")
+        // — leaving the user unable to send. Provider itself is still forwarded so a
+        // genuine provider mismatch stays a loud -32010 rather than silently mutating
+        // model/session state. The explicit agent.thread.configure RPC keeps enforcing
+        // both locks for the UI's change-provider gesture.
+        let alreadyStarted = !((try? ctx.messageRepo.listRecent(threadId: thread, limit: 1)) ?? []).isEmpty
+        var t = try configureAgentThread(thread: thread, provider: provider, model: model, permissionMode: permissionMode, reasoningEffort: reasoningEffort, serviceTier: serviceTier, modelSelection: modelSelection, providerInstanceId: alreadyStarted ? nil : providerInstanceId)
         if AgentThreadTitle.isPlaceholder(t.title),
            ((try? ctx.messageRepo.listRecent(threadId: thread, limit: 1)) ?? []).isEmpty {
             t.title = AgentThreadTitle.titleFromFirstMessage(text)
@@ -1683,6 +1776,20 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     public func stopAgentRun(thread: AgentThreadID) throws {
         guard let ctx = context else { throw LayoutError.workspaceNotFound }
         ctx.coordinator.stopRun(threadId: thread)
+    }
+
+    /// UX-MAC_AGENT-CONTINUE parity for mirror clients: resume a
+    /// relaunch-interrupted thread exactly like the mac Continue button
+    /// (AgentAppViewModel.continueInterruptedThread) — an empty prompt routes
+    /// through the coordinator's recoverableResumeContext path, which picks up
+    /// the saved resume cursor without persisting a new user message.
+    public func continueAgentRun(thread: AgentThreadID) async throws -> AgentRunID? {
+        guard let ctx = context else { throw LayoutError.workspaceNotFound }
+        if let existing = try ctx.threadRepo.get(id: thread), existing.status == .running {
+            throw JSONRPCError(code: -32000, message: "Thread already has an active run.")
+        }
+        let result = try await sendAgentMessage(thread: thread, text: "", provider: nil, model: nil, permissionMode: nil, reasoningEffort: nil)
+        return result.runId
     }
 
     public func deleteAgentThread(thread: AgentThreadID) throws {
@@ -2210,6 +2317,17 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             ws.layout = result.node
             ctx.state.workspaces[wid] = ws
             ctx.scheduleSnapshotSave()
+            // Mirror the rebind: layout metadata mutations publish no event of
+            // their own, so a mounted remote mirror of this surface would never
+            // follow the mac-side thread selection. Shape matches the
+            // surface.set_color emitter (Dispatcher "surface.updated"); an
+            // empty selected_thread clears the binding on the client.
+            EventBus.shared.publish(kind: "surface.updated", payload: .object([
+                "workspace_id": .string(wid.value.uuidString),
+                "id": .string(surfaceID.value.uuidString),
+                "surface_id": .string(surfaceID.value.uuidString),
+                "metadata": .object(["selected_thread": .string(threadID?.value.uuidString ?? "")])
+            ]))
             return
         }
     }
@@ -2652,6 +2770,9 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 }
                 agent.viewModel.onThreadConfigPersisted = { [weak self] thread in
                     self?.publishAgentThreadUpdated(thread)
+                }
+                agent.viewModel.onThreadLifecycle = { [weak self] event in
+                    self?.publishAgentThreadLifecycle(event)
                 }
                 agent.viewModel.onQueuedMessageEvent = { [weak self] kind, message in
                     self?.publishQueuedMessage(kind: kind, message)

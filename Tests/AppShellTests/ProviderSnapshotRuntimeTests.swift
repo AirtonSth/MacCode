@@ -504,6 +504,79 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
         XCTAssertEqual(request.environment["REMOTE_CODE_INSTANCE"], "work")
     }
 
+    func test_sendOnStartedThreadToleratesMismatchedProviderInstanceIdAndKeepsLockedInstance() async throws {
+        // A thread is locked to one of several configured provider instances. A
+        // mirror client (iOS/macOS) can re-derive its provider-instance id from the
+        // provider snapshot list and end up forwarding a DIFFERENT, still-valid
+        // instance id than the one the thread is bound to. Once the thread has
+        // started, a message-send carrying that mismatched id must NOT be rejected
+        // with the provider-instance lock (-32013): the user must always be able to
+        // send, and the run must stay on the thread's original locked instance —
+        // never silently hop to the forwarded one. This reproduces the field bug
+        // "Provider instance is locked once the thread has started" that blocked
+        // sending from the mobile mirror.
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let workspaceDir = root.appendingPathComponent("workspace", isDirectory: true)
+        let homeA = root.appendingPathComponent("codex-a", isDirectory: true)
+        let homeB = root.appendingPathComponent("codex-b", isDirectory: true)
+        try FileManager.default.createDirectory(at: workspaceDir, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: homeA, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: homeB, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        defer { closeAndUnregisterAllSurfaces() }
+
+        let ctx = try AppContext(channel: .debug, appSupportOverride: root.appendingPathComponent("support").path)
+        let router = AppCommandRouter(context: ctx)
+        ctx.router = router
+        let fakeBinary = "/usr/bin/env"
+        try ctx.settingsRepo.set("agent.provider.instances", """
+        [
+          {"id":"codex-a","provider":"codex","displayName":"Codex A","binaryPath":"\(fakeBinary)","homePath":"\(homeA.path)","enabled":true,"env":{"REMOTE_CODE_INSTANCE":"a"}},
+          {"id":"codex-b","provider":"codex","displayName":"Codex B","binaryPath":"\(fakeBinary)","homePath":"\(homeB.path)","enabled":true,"env":{"REMOTE_CODE_INSTANCE":"b"}}
+        ]
+        """)
+
+        let capture = RequestCaptureRunner(provider: .codex)
+        ctx.coordinator.replaceProvider(.codex, runner: capture)
+        let workspace = try router.createWorkspace(name: "instance-lock", cwd: workspaceDir.path)
+        let thread = try router.createAgentThread(
+            workspace: workspace.id,
+            title: "locked",
+            provider: .codex,
+            model: "gpt-5.5",
+            permissionMode: .supervised,
+            reasoningEffort: .medium,
+            providerInstanceId: "codex-b"
+        )
+        XCTAssertEqual(thread.providerInstanceId, "codex-b")
+
+        // Mark the thread "started" so its provider/instance are locked host-side.
+        try ctx.messageRepo.append(AgentMessage(threadId: thread.id, role: .user, content: "first"))
+        try ctx.messageRepo.append(AgentMessage(threadId: thread.id, role: .assistant, content: "reply"))
+
+        // Mirror client forwards the OTHER (still-valid) instance id on the started
+        // thread. Before the fix this threw -32013; now the send must proceed.
+        _ = try await router.sendAgentMessage(
+            thread: thread.id,
+            text: "second message",
+            provider: .codex,
+            model: "gpt-5.5",
+            permissionMode: nil,
+            reasoningEffort: nil,
+            serviceTier: nil,
+            interactionMode: nil,
+            modelSelection: nil,
+            providerInstanceId: "codex-a"
+        )
+
+        let request = try XCTUnwrap(capture.lastRequest)
+        XCTAssertEqual(request.providerInstanceId, "codex-b",
+                       "a started-thread send must run on the thread's locked instance, never the mismatched id the client forwarded")
+        XCTAssertEqual(request.environment["CODEX_HOME"], homeB.path,
+                       "the run must stay isolated to the locked instance's home, proving the forwarded instance did not take effect")
+        XCTAssertEqual(request.environment["REMOTE_CODE_INSTANCE"], "b")
+    }
+
     func test_providerInstanceConfigRoutesClaudeHomeThroughProcessHome() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         let workspaceDir = root.appendingPathComponent("workspace", isDirectory: true)

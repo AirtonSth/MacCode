@@ -6,9 +6,22 @@ final class WebSocketEventBatcher: @unchecked Sendable {
     /// perceptible latency; keyed-batch events use the larger `delay` window.
     static let crossKindDelay: TimeInterval = 0.015
 
+    /// PERF (token-delta frame churn): high-frequency streaming kinds that are
+    /// safe to hold for the short cross-kind window on .full connections. One
+    /// provider token = one agent.item.delta event; without buffering, every
+    /// token wakes the socket with its own frame. Ordering is preserved (all
+    /// frames flow through the same nil-key buffer) and any non-delta event
+    /// flushes the buffer immediately, so interactive events are never delayed.
+    static let fullStreamCoalescedKinds: Set<String> = ["agent.item.delta"]
+
     private let enabled: Bool
     private let filter: EventStreamFilter
     private let delay: TimeInterval
+    /// When true (full-filter connections), agent.item.delta frames buffer for
+    /// `crossKindDelay` and everything else flushes the buffer then sends
+    /// immediately. Independent of `enabled`, which drives the cellular-safe
+    /// keyed/nil-key batching.
+    private let coalescesStreamingDeltas: Bool
     private let send: @Sendable (Data) -> Void
     private let queue = DispatchQueue(label: "io.remotecode.ws-event-batcher")
     // Keyed (coalescing) state
@@ -22,16 +35,38 @@ final class WebSocketEventBatcher: @unchecked Sendable {
     init(enabled: Bool,
          filter: EventStreamFilter,
          delay: TimeInterval = 0.075,
+         coalescesStreamingDeltas: Bool = false,
          send: @escaping @Sendable (Data) -> Void) {
         self.enabled = enabled
         self.filter = filter
         self.delay = max(0, delay)
+        self.coalescesStreamingDeltas = coalescesStreamingDeltas
         self.send = send
     }
 
     func enqueue(event: EventBus.Event, data: Data) {
         guard enabled else {
-            queue.async { self.send(data) }
+            guard coalescesStreamingDeltas else {
+                queue.async { self.send(data) }
+                return
+            }
+            if Self.fullStreamCoalescedKinds.contains(event.kind) {
+                queue.async {
+                    self.nilKeyQueue.append(data)
+                    guard !self.nilKeyScheduled else { return }
+                    self.nilKeyScheduled = true
+                    self.queue.asyncAfter(deadline: .now() + Self.crossKindDelay) {
+                        self.flushLocked()
+                    }
+                }
+            } else {
+                // Non-delta: append after any buffered deltas (order preserved)
+                // and flush NOW so interactive events pay zero added latency.
+                queue.async {
+                    self.nilKeyQueue.append(data)
+                    self.flushLocked()
+                }
+            }
             return
         }
 

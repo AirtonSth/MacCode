@@ -311,11 +311,13 @@ public final class AppContext {
                 }
             case .proposedPlan(let plan):
                 try? self.proposedPlanRepo.upsert(threadId: tid, plan: plan)
-                EventBus.shared.publish(kind: "agent.plan.proposed", payload: .object([
+                var planPayload: [String: JSONValue] = [
                     "thread_id": .string(t),
                     "plan_id": .string(plan.id),
                     "markdown": .string(plan.markdown)
-                ]))
+                ]
+                if let turnId = plan.turnId { planPayload["turn_id"] = .string(turnId) }
+                EventBus.shared.publish(kind: "agent.plan.proposed", payload: .object(planPayload))
             case .activePlanUpdated(let plan):
                 var payload: [String: JSONValue] = [
                     "thread_id": .string(t),
@@ -332,13 +334,15 @@ public final class AppContext {
                 EventBus.shared.publish(kind: "agent.plan.active_updated", payload: .object(payload))
             case .requestOpened(let request):
                 try? self.providerPendingCallbackRepo.record(threadId: tid, request: request)
-                EventBus.shared.publish(kind: "agent.request.opened", payload: .object([
+                var requestPayload: [String: JSONValue] = [
                     "thread_id": .string(t),
                     "request_id": .string(request.id),
                     "kind": .string(request.kind.rawValue),
                     "title": .string(request.title),
                     "detail": request.detail.map(JSONValue.string) ?? .null
-                ]))
+                ]
+                if let turnId = request.turnId { requestPayload["turn_id"] = .string(turnId) }
+                EventBus.shared.publish(kind: "agent.request.opened", payload: .object(requestPayload))
             case .requestResolved(let requestId, let state):
                 try? self.providerPendingCallbackRepo.resolve(threadId: tid, requestId: requestId, kind: .approval, state: state)
                 EventBus.shared.publish(kind: "agent.request.resolved", payload: .object([
@@ -348,14 +352,32 @@ public final class AppContext {
                 ]))
             case .userInputRequested(let request):
                 try? self.providerPendingCallbackRepo.record(threadId: tid, userInput: request)
-                EventBus.shared.publish(kind: "agent.user_input.requested", payload: .object([
+                var userInputPayload: [String: JSONValue] = [
                     "thread_id": .string(t),
                     "request_id": .string(request.id),
                     "prompt": .string(request.prompt),
                     "options": .array(request.options.map(JSONValue.string)),
                     "allows_multiple_selection": .bool(request.allowsMultipleSelection),
-                    "is_secret": .bool(request.isSecret)
-                ]))
+                    "is_secret": .bool(request.isSecret),
+                    // Structured AskUserQuestion payload: without it iOS can only
+                    // render a degraded flat prompt for multi-question requests.
+                    "questions": .array(request.questions.map { question in
+                        var q: [String: JSONValue] = [
+                            "id": .string(question.id),
+                            "prompt": .string(question.prompt),
+                            "options": .array(question.options.map { option in
+                                var o: [String: JSONValue] = ["label": .string(option.label)]
+                                if let detail = option.detail { o["detail"] = .string(detail) }
+                                return .object(o)
+                            }),
+                            "allows_multiple_selection": .bool(question.allowsMultipleSelection)
+                        ]
+                        if let header = question.header { q["header"] = .string(header) }
+                        return .object(q)
+                    })
+                ]
+                if let turnId = request.turnId { userInputPayload["turn_id"] = .string(turnId) }
+                EventBus.shared.publish(kind: "agent.user_input.requested", payload: .object(userInputPayload))
             case .userInputResolved(let requestId, let answer):
                 try? self.providerPendingCallbackRepo.resolve(threadId: tid, requestId: requestId, kind: .userInput, state: .resolved)
                 EventBus.shared.publish(kind: "agent.user_input.resolved", payload: .object([
@@ -375,6 +397,17 @@ public final class AppContext {
                 if let compactsAutomatically = usage.compactsAutomatically {
                     p["compacts_automatically"] = .bool(compactsAutomatically)
                 }
+                // Cache-token split (G3): mirrors the billed-unit breakdown so
+                // remote clients can compute net dollars like the mac does.
+                if let uncached = usage.uncachedInputTokens {
+                    p["uncached_input_tokens"] = .number(Double(uncached))
+                }
+                if let creation = usage.cacheCreationInputTokens {
+                    p["cache_creation_input_tokens"] = .number(Double(creation))
+                }
+                if let read = usage.cacheReadInputTokens {
+                    p["cache_read_input_tokens"] = .number(Double(read))
+                }
                 EventBus.shared.publish(kind: "agent.thread.token_usage", payload: .object(p))
             case .accountUsage(let usage):
                 self.recordTokenSaverAccountUsage(usage)
@@ -387,10 +420,26 @@ public final class AppContext {
                 ]))
             case .providerRuntime(let event):
                 EventBus.shared.publish(kind: "agent.provider_runtime.event", payload: runtimeEventPayload(event, threadId: t))
-            case .sr1Translation:
-                break
-            case .error:
-                EventBus.shared.publish(kind: "agent.run.error", payload: agentRunPayload(threadId: tid, runId: runId))
+            case .sr1Translation(let translation):
+                // Mirror SR1 rewrites so remote clients can badge translated
+                // messages and offer "show original" like the mac UI. Texts are
+                // capped: the model carries no bound of its own.
+                var sr1Payload: [String: JSONValue] = [
+                    "thread_id": .string(t),
+                    "original_text": .string(AssistantTimelineState.cappedText(translation.originalText)),
+                    "rewritten_text": .string(AssistantTimelineState.cappedText(translation.rewrittenText))
+                ]
+                if let itemId = translation.itemId { sr1Payload["item_id"] = .string(itemId) }
+                if let messageId = translation.messageId { sr1Payload["message_id"] = .string(messageId) }
+                EventBus.shared.publish(kind: "agent.sr1.translation", payload: .object(sr1Payload))
+            case .error(let message, let recoverable):
+                // Carry the provider error text + recoverability so remote
+                // clients can show the reason and a Retry affordance instead
+                // of a bare FAIL badge.
+                var errorPayload = agentRunPayload(threadId: tid, runId: runId).objectValue ?? [:]
+                errorPayload["message"] = .string(message)
+                errorPayload["recoverable"] = .bool(recoverable)
+                EventBus.shared.publish(kind: "agent.run.error", payload: .object(errorPayload))
             }
         }
         coordinator.onRunFinished = { tid, rid, status in

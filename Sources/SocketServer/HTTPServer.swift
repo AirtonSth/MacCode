@@ -497,7 +497,11 @@ public final class DirectHTTPServer: @unchecked Sendable {
                 }
             )
             let batcher = WebSocketEventBatcher(enabled: wsFilter == .cellularSafe,
-                                                filter: wsFilter) { data in
+                                                filter: wsFilter,
+                                                // PERF: coalesce per-token agent.item.delta
+                                                // frames on .full connections; non-delta
+                                                // events flush the buffer immediately.
+                                                coalescesStreamingDeltas: wsFilter == .full) { data in
                 _ = outbound.enqueue(data)
             }
             // PERF-MAC_SOCKET-:110 -- honor the client's last-seen seq so a
