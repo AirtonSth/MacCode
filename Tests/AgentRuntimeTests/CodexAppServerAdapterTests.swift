@@ -59,6 +59,83 @@ final class CodexAppServerAdapterTests: XCTestCase {
         XCTAssertTrue(events.contains { if case .providerRuntime(let event) = $0 { return event.source == "codex.app-server" && event.method == "turn/completed" } else { return false } })
     }
 
+    func test_activeThreadStatusDefersFinishAfterTurnCompletedUntilIdle() async throws {
+        // WHY: Codex can report turn/completed while its app-server still reports
+        // the thread active and keeps sending visible work updates. The Agent App
+        // must keep the run busy so the composer queues/rejects new sends instead
+        // of starting a second turn against a still-working Codex session.
+        let client = MockCodexAppServerClient(autoComplete: false)
+        let adapter = CodexAppServerAdapter { _, notificationHandler, _ in
+            client.notificationHandler = notificationHandler
+            return client
+        }
+        let threadId = AgentThreadID()
+        let sink = EventSink()
+        let request = AgentRunRequest(
+            threadId: threadId,
+            provider: .codex,
+            model: "gpt-5.5",
+            cwd: "/tmp/remotecode-app-server-adapter",
+            prompt: "long codex task"
+        )
+
+        _ = try await adapter.sendTurn(request) { event in
+            Task { await sink.record(event) }
+        }
+        client.notificationHandler?("thread/status/changed", [
+            "threadId": "codex-thread-1",
+            "status": ["type": "active", "activeFlags": ["runningCommand"]]
+        ])
+        client.notificationHandler?("turn/completed", [
+            "threadId": "codex-thread-1",
+            "turnId": "turn-app-server-1",
+            "finalMessage": "done"
+        ])
+        client.notificationHandler?("process/outputDelta", [
+            "processHandle": "proc-after-completed",
+            "stream": "stdout",
+            "delta": "still working\n"
+        ])
+
+        try await Task.sleep(nanoseconds: 50_000_000)
+        let prematureFinish = await sink.finish
+        XCTAssertNil(prematureFinish,
+                     "turn/completed must not finish the local run while Codex still reports the thread active")
+
+        do {
+            _ = try await adapter.sendTurn(request) { _ in }
+            XCTFail("a second Codex turn must be rejected while the previous app-server thread is still active")
+        } catch {
+            // expected: active Codex status keeps the turn in flight.
+        }
+
+        client.notificationHandler?("thread/status/changed", [
+            "threadId": "codex-thread-1",
+            "status": ["type": "idle"]
+        ])
+
+        let deadline = Date().addingTimeInterval(3)
+        while Date() < deadline {
+            if let finish = await sink.finish {
+                XCTAssertEqual(finish.0, .completed)
+                XCTAssertEqual(finish.1, "done")
+                XCTAssertEqual(finish.2, "codex-thread-1")
+                let events = await sink.snapshot()
+                XCTAssertTrue(events.contains {
+                    if case .itemStarted(let item) = $0 {
+                        return item.summary == "Thread status changed"
+                            && item.output == "idle"
+                            && item.turnId == "turn-app-server-1"
+                    }
+                    return false
+                }, "the idle status that releases a deferred finish must still attach to the completed Codex turn")
+                return
+            }
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        XCTFail("idle Codex thread status must release the deferred completed turn")
+    }
+
     func test_adapterInterruptUsesActiveAppServerTurn() async throws {
         let client = MockCodexAppServerClient(autoComplete: false)
         let adapter = CodexAppServerAdapter { _, notificationHandler, _ in

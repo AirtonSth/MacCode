@@ -28,6 +28,8 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         var client: CodexAppServerControlling
         var providerThreadId: String
         var activeTurnId: String?
+        var threadStatusType: String?
+        var pendingFinish: PendingFinish?
         var status: AgentRunStatus
         var onEvent: (@Sendable (AgentRunEvent) -> Void)?
         var interactionMode: AgentInteractionMode
@@ -47,6 +49,13 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         var startedItemIds: Set<String>
         var streamedItemIds: Set<String>
         var permissionMode: AgentPermissionMode
+    }
+
+    private struct PendingFinish {
+        let status: AgentRunStatus
+        let finalMessage: String?
+        let providerThreadId: String?
+        let turnId: String?
     }
 
     private struct PendingApproval {
@@ -192,7 +201,10 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         // rejected, instead of silently replacing the session via recordSession
         // and misrouting the prior turn's events.
         lock.lock()
-        let hasInFlightTurn = sessions[request.threadId]?.activeTurnId != nil
+        let session = sessions[request.threadId]
+        let hasInFlightTurn = session?.activeTurnId != nil
+            || session?.pendingFinish != nil
+            || Self.isActiveThreadStatus(session?.threadStatusType)
         lock.unlock()
         if hasInFlightTurn {
             throw AgentProviderAdapterError.unsupported("Codex session already has an in-flight turn")
@@ -525,7 +537,9 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
                 markFinished(threadId: threadId, status: .failed, turnId: activeTurnId(threadId: threadId))
             }
         case "thread/status/changed", "thread.status.changed":
-            let turnId = activeTurnId(threadId: threadId) ?? ""
+            let statusType = Self.threadStatusType(from: payload)
+            let pending = statusType.flatMap { updateThreadStatus(threadId: threadId, statusType: $0) }
+            let turnId = pending?.turnId ?? activeTurnId(threadId: threadId) ?? ""
             let itemId = "thread-status-\(string(payload, "threadId") ?? providerThreadId(threadId: threadId) ?? threadId.value.uuidString)"
             events.append(.itemStarted(item: AssistantItem(
                 id: itemId,
@@ -537,6 +551,10 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
                 startedAtMs: now,
                 finishedAtMs: now
             )))
+            if let pending {
+                finished = .finished(pending.status, finalMessage: pending.finalMessage, providerThreadId: pending.providerThreadId)
+                markFinished(threadId: threadId, status: pending.status, turnId: pending.turnId)
+            }
         case "turn/started":
             if let turnId = string(payload, "turnId") ?? (payload["turn"] as? [String: Any]).flatMap({ string($0, "id") }) {
                 setActiveTurn(threadId: threadId, turnId: turnId)
@@ -916,8 +934,18 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
                 }
             }
             events.append(.turnCompleted(turnId: turnId, finalMessage: final.isEmpty ? nil : final))
-            finished = .finished(.completed, finalMessage: final.isEmpty ? nil : final, providerThreadId: providerThreadId(threadId: threadId))
-            markFinished(threadId: threadId, status: .completed, turnId: turnId)
+            let pending = PendingFinish(
+                status: .completed,
+                finalMessage: final.isEmpty ? nil : final,
+                providerThreadId: providerThreadId(threadId: threadId),
+                turnId: turnId
+            )
+            if shouldDeferFinishUntilIdle(threadId: threadId) {
+                recordPendingFinish(threadId: threadId, pending: pending)
+            } else {
+                finished = .finished(pending.status, finalMessage: pending.finalMessage, providerThreadId: pending.providerThreadId)
+                markFinished(threadId: threadId, status: pending.status, turnId: pending.turnId)
+            }
         case "turn/failed", "turn.failed":
             let turnId = string(payload, "turnId") ?? string(payload, "turn_id") ?? (payload["turn"] as? [String: Any]).flatMap({ string($0, "id") }) ?? activeTurnId(threadId: threadId) ?? ""
             let error = payload["error"] as? [String: Any] ?? payload
@@ -1048,6 +1076,8 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
             client: client,
             providerThreadId: providerThreadId,
             activeTurnId: nil,
+            threadStatusType: nil,
+            pendingFinish: nil,
             status: .running,
             onEvent: onEvent,
             interactionMode: interactionMode,
@@ -1086,6 +1116,28 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
     private func setActiveTurn(threadId: AgentThreadID, turnId: String) {
         lock.lock()
         sessions[threadId]?.activeTurnId = turnId
+        lock.unlock()
+    }
+
+    private func updateThreadStatus(threadId: AgentThreadID, statusType: String) -> PendingFinish? {
+        lock.lock()
+        sessions[threadId]?.threadStatusType = statusType
+        let pending = Self.isIdleThreadStatus(statusType) ? sessions[threadId]?.pendingFinish : nil
+        if pending != nil {
+            sessions[threadId]?.pendingFinish = nil
+        }
+        lock.unlock()
+        return pending
+    }
+
+    private func shouldDeferFinishUntilIdle(threadId: AgentThreadID) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        return Self.isActiveThreadStatus(sessions[threadId]?.threadStatusType)
+    }
+
+    private func recordPendingFinish(threadId: AgentThreadID, pending: PendingFinish) {
+        lock.lock()
+        sessions[threadId]?.pendingFinish = pending
         lock.unlock()
     }
 
@@ -1147,6 +1199,8 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         lock.lock()
         sessions[threadId]?.status = status
         sessions[threadId]?.activeTurnId = nil
+        sessions[threadId]?.threadStatusType = nil
+        sessions[threadId]?.pendingFinish = nil
         if let turnId, !turnId.isEmpty, sessions[threadId]?.completedTurnIds.contains(turnId) == false {
             sessions[threadId]?.completedTurnIds.append(turnId)
         }
@@ -1937,6 +1991,23 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         let type = string(status, "type") ?? string(payload, "status") ?? "unknown"
         let flags = joinedStrings(status["activeFlags"]) ?? joinedStrings(status["active_flags"])
         return [type, flags.map { "Flags: \($0)" }].compactMap { $0?.nilIfEmpty }.joined(separator: "\n")
+    }
+
+    private static func threadStatusType(from payload: [String: Any]) -> String? {
+        let status = payload["status"] as? [String: Any] ?? payload
+        return (string(status, "type") ?? string(payload, "status"))?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+            .nilIfEmpty
+    }
+
+    private static func isActiveThreadStatus(_ statusType: String?) -> Bool {
+        guard let statusType else { return false }
+        return statusType == "active" || statusType == "running" || statusType == "busy"
+    }
+
+    private static func isIdleThreadStatus(_ statusType: String) -> Bool {
+        statusType == "idle" || statusType == "completed" || statusType == "complete"
     }
 
     private static func hookDetail(from payload: [String: Any]) -> String? {
