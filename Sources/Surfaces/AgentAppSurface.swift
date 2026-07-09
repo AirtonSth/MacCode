@@ -164,6 +164,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// This is the per-surface binding that fixes the new-tab-clone bug:
     /// selection is owned by the surface, not auto-adopted from the workspace.
     public var onSelectedThreadChanged: ((AgentThreadID?) -> Void)?
+    /// Fired only after a macOS TextEditor save is durable, so AppCommandRouter
+    /// can publish the same realtime event as the mirror-driven RPC path.
+    public var onPlanNotesPersisted: ((AgentThreadID, String) -> Void)?
     public var onQueuedMessageEvent: ((String, AgentQueuedMessage) -> Void)?
     public var providerSnapshotLoader: (() async throws -> [AgentProviderSnapshot])?
     public var modelListLoader: ((AgentProvider) async throws -> [AgentModelDescriptor])?
@@ -243,6 +246,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// PERF: tracks thread ids whose placeholder titles have already been repaired
     /// so reloadThreads never issues a full messageRepo.list for the same thread twice.
     private var repairedThreadIds: Set<AgentThreadID> = []
+    /// Programmatic loads and mirror updates also trigger SwiftUI's onChange.
+    /// Consume the matching callback once so they never echo as a second save.
+    private var ignoredPlanNotesSave: (threadId: AgentThreadID, notes: String)?
 
     // Monotonic ticket for user callback actions (approval responses, user-input
     // answers). respondToPendingRequest resolves async; this seq lets its failure
@@ -567,8 +573,14 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         reloadCheckpoints()
         suppressPersistedFinalDuplicatedByTimeline()
         resetTimelineUpdateTick()
-        // Restore persisted plan notes for the opened thread.
-        planNotes = planNotesStore?.load(threadId: id) ?? ""
+        // Restore persisted plan notes for the opened thread. A failed read must
+        // not masquerade as absent notes and then overwrite the durable value.
+        do {
+            setPlanNotesWithoutSaving(try planNotesStore?.load(threadId: id) ?? "", threadId: id)
+        } catch {
+            setPlanNotesWithoutSaving("", threadId: id)
+            statusMessage = "Could not load plan notes: \(error)"
+        }
         // UX-MAC_AGENT-001: route first-responder to the composer on every
         // open/switch so the user can type without a manual click.
         focusTick &+= 1
@@ -577,8 +589,31 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// Called by the plan sidebar whenever planNotes changes to persist the
     /// current text keyed by the active thread.
     public func savePlanNotes() {
-        guard let id = selectedThreadId else { return }
-        planNotesStore?.save(planNotes, threadId: id)
+        guard let id = selectedThreadId, let planNotesStore else { return }
+        if let ignoredPlanNotesSave {
+            self.ignoredPlanNotesSave = nil
+            if ignoredPlanNotesSave.threadId == id, ignoredPlanNotesSave.notes == planNotes {
+                return
+            }
+        }
+        do {
+            try planNotesStore.save(planNotes, threadId: id)
+            onPlanNotesPersisted?(id, planNotes)
+        } catch {
+            statusMessage = "Could not save plan notes: \(error)"
+        }
+    }
+
+    /// Applies host-authoritative notes without re-entering the local save path
+    /// when SwiftUI observes the programmatic property change.
+    public func applyMirroredPlanNotes(_ notes: String, threadId: AgentThreadID) {
+        guard selectedThreadId == threadId else { return }
+        setPlanNotesWithoutSaving(notes, threadId: threadId)
+    }
+
+    private func setPlanNotesWithoutSaving(_ notes: String, threadId: AgentThreadID) {
+        ignoredPlanNotesSave = (threadId, notes)
+        planNotes = notes
     }
 
     public func reloadQueuedMessages() {

@@ -3,6 +3,26 @@ import CoreModel
 import Persistence
 import AgentRuntime
 
+public struct AgentActiveRunSnapshot: Sendable, Equatable {
+    public let runId: AgentRunID
+    public let startedAt: Date
+
+    public init(runId: AgentRunID, startedAt: Date) {
+        self.runId = runId
+        self.startedAt = startedAt
+    }
+}
+
+public struct AgentThreadMirrorSnapshot: Sendable, Equatable {
+    public let events: [AssistantEvent]
+    public let eventWatermark: Int64
+
+    public init(events: [AssistantEvent], eventWatermark: Int64) {
+        self.events = events
+        self.eventWatermark = eventWatermark
+    }
+}
+
 @MainActor
 public protocol CommandRouting: AnyObject {
     // window/workspace/pane/surface
@@ -82,11 +102,13 @@ public protocol CommandRouting: AnyObject {
     func respondAgentUserInput(thread: AgentThreadID, requestId: String, text: String) async throws
     func listAgentPendingCallbacks(thread: AgentThreadID) throws -> AssistantPendingCallbacksSnapshot
     func readAgentThreadEvents(thread: AgentThreadID) async throws -> [AssistantEvent]
+    func readAgentThreadMirrorSnapshot(thread: AgentThreadID) async throws -> AgentThreadMirrorSnapshot
     func rollbackAgentThread(thread: AgentThreadID, toTurnId: String) async throws
     func listAgentThreadCheckpoints(thread: AgentThreadID) throws -> [AgentTurnCheckpointSummary]
     func agentCheckpointDiff(thread: AgentThreadID, checkpointTurnCount: Int, path: String?) throws -> String
     func revertAgentThreadToCheckpoint(thread: AgentThreadID, checkpointTurnCount: Int) async throws -> AgentTurnCheckpointSummary
     func stopAgentRun(thread: AgentThreadID) throws
+    func activeAgentRun(thread: AgentThreadID) throws -> AgentActiveRunSnapshot?
     /// Resume a relaunch-interrupted thread (the mac Continue button path):
     /// the coordinator replays the saved resume cursor without a new user
     /// message. Returns the new run id when one started.
@@ -165,6 +187,11 @@ public extension CommandRouting {
     func closeWorkspace(_ id: WorkspaceID) throws {
         try closeWorkspace(id, publishEvent: true)
     }
+
+    func activeAgentRun(thread: AgentThreadID) throws -> AgentActiveRunSnapshot? {
+        nil
+    }
+
 }
 
 @MainActor
@@ -1085,6 +1112,14 @@ public final class JSONRPCDispatcher {
                 if let (_, cached) = commandReceipt(method: req.method, params: params) {
                     return .init(id: id, result: cached)
                 }
+                if let expected = params["expected_notes"]?.stringValue,
+                   try router.agentPlanNotes(thread: tid) != expected {
+                    throw JSONRPCError(
+                        code: -32009,
+                        message: "Plan notes changed on another device.",
+                        data: nil
+                    )
+                }
                 try router.saveAgentPlanNotes(thread: tid, notes: notes)
                 let result: JSONValue = .bool(true)
                 recordCommandReceipt(method: req.method, clientRequestId: receiptKey, result: result)
@@ -1163,6 +1198,13 @@ public final class JSONRPCDispatcher {
                 return .init(id: id, result: encode(try router.listAgentPendingCallbacks(thread: tid)))
             case "agent.thread.read":
                 guard let tid = params["thread_id"]?.stringValue.flatMap(UUID.init).map(AgentThreadID.init) else { throw JSONRPCError.invalidParams }
+                if params["include_event_watermark"]?.boolValue == true {
+                    let snapshot = try await router.readAgentThreadMirrorSnapshot(thread: tid)
+                    return .init(id: id, result: .object([
+                        "events": encode(snapshot.events),
+                        "event_watermark": .number(Double(snapshot.eventWatermark))
+                    ]))
+                }
                 return .init(id: id, result: encode(try await router.readAgentThreadEvents(thread: tid)))
             case "agent.thread.rollback":
                 guard let tid = params["thread_id"]?.stringValue.flatMap(UUID.init).map(AgentThreadID.init),
@@ -1887,6 +1929,7 @@ public final class JSONRPCDispatcher {
         let locked = providerLocked(thread)
         object["providerLocked"] = .bool(locked)
         object["provider_locked"] = .bool(locked)
+        appendActiveRun(to: &object, thread: thread.id)
         return .object(object)
     }
 
@@ -1905,7 +1948,23 @@ public final class JSONRPCDispatcher {
         let locked = lockedThreads.contains(thread.id)
         object["providerLocked"] = .bool(locked)
         object["provider_locked"] = .bool(locked)
+        appendActiveRun(to: &object, thread: thread.id)
         return .object(object)
+    }
+
+    private func appendActiveRun(
+        to object: inout [String: JSONValue],
+        thread: AgentThreadID
+    ) {
+        guard let active = try? router.activeAgentRun(thread: thread) else {
+            object["active_run_id"] = .null
+            object["active_run_started_at_ms"] = .null
+            return
+        }
+        object["active_run_id"] = .string(active.runId.value.uuidString)
+        object["active_run_started_at_ms"] = .number(Double(
+            Int64(active.startedAt.timeIntervalSince1970 * 1_000)
+        ))
     }
 
     private func messageSendResultPayload(_ result: AgentMessageSendResult) -> JSONValue {

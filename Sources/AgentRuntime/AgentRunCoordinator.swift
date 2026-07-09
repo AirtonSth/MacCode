@@ -44,7 +44,14 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     // the timestamp of the last flush, so 2-3 writes/event collapse into batched
     // flushes (see shouldFlushStreamBatch). All touched under `lock`.
     private var pendingStreamWrites: [AgentThreadID: StreamWriteBatch] = [:]
+    /// Run ownership for each buffered thread batch. Recovery may snapshot while
+    /// `sendTurn` is still returning, before `activeThreads` is registered.
+    private var pendingStreamRunIds: [AgentThreadID: AgentRunID] = [:]
     private var lastStreamFlushMs: [AgentThreadID: Int64] = [:]
+    /// Once a drained batch loses an AssistantEvent, no later snapshot can
+    /// honestly certify a watermark for that thread. Retain the first failure
+    /// and fail recovery loudly instead of silently advancing iOS past the gap.
+    private var mirrorPersistenceFailures: [AgentThreadID: Error] = [:]
     // UX-MAC_AGENT-BG-AWAIT: per-thread consecutive auto-continuation count and a
     // monotonic token used to cancel a scheduled continuation when the thread is
     // stopped or a fresh run starts. Both touched under `lock`. See
@@ -62,6 +69,10 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     /// Seconds a checkpoint revert stays reversible after it runs.
     public static let checkpointRevertUndoWindow: TimeInterval = 10
     private let lock = NSLock()
+    /// Serializes persisted AssistantEvent snapshots with their EventBus
+    /// publication. The recursive form also tolerates persistence diagnostics
+    /// emitted while a buffered snapshot is being flushed.
+    private let mirrorEventLock = NSRecursiveLock()
     private var observerRefs: [WeakAgentRunObserver] = []
     public var observer: AgentRunObserver? {
         get {
@@ -489,6 +500,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         }
         streamEventsSincePrune.removeValue(forKey: threadId)
         pendingStreamWrites.removeValue(forKey: threadId)
+        pendingStreamRunIds.removeValue(forKey: threadId)
         lastStreamFlushMs.removeValue(forKey: threadId)
         // PERF-MAC_AGENT-008: thread closed -> evict the dedup cache entry so
         // cancelled threads do not retain their final-answer text indefinitely.
@@ -626,6 +638,11 @@ public final class AgentRunCoordinator: @unchecked Sendable {
 
     private func markStartFailure(_ error: Error, request: AgentRunRequest, runId: AgentRunID, adapterKey: String, binaryIdentity: String?) {
         let message = String(describing: error)
+        defer {
+            lock.lock()
+            seq.removeValue(forKey: runId)
+            lock.unlock()
+        }
         // RUN-LIFECYCLE-STREAM-002: if a DIFFERENT run is already live on this
         // thread (e.g. this start lost a race and the adapter rejected it as a
         // duplicate in-flight turn), do not clobber the live run's thread row,
@@ -642,10 +659,11 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             )
             failedRun.startedAt = Date()
             try? runRepo.upsert(failedRun)
-            for observer in observersSnapshot() {
-                observer.runCoordinator(self, didReceive: .error(message: message, recoverable: false), run: runId, threadId: request.threadId)
-            }
-            onAssistantEvent?(.error(message: message, recoverable: false), request.threadId, runId)
+            publishImmediateAssistantEvent(
+                .error(message: message, recoverable: false),
+                threadId: request.threadId,
+                runId: runId
+            )
             return
         }
         var run = AgentRun(
@@ -682,9 +700,12 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         ))
         for observer in observersSnapshot() {
             observer.runCoordinator(self, didChangeStatus: .failed, runId: runId, threadId: request.threadId)
-            observer.runCoordinator(self, didReceive: .error(message: message, recoverable: false), run: runId, threadId: request.threadId)
         }
-        onAssistantEvent?(.error(message: message, recoverable: false), request.threadId, runId)
+        publishImmediateAssistantEvent(
+            .error(message: message, recoverable: false),
+            threadId: request.threadId,
+            runId: runId
+        )
         onRunFinished?(request.threadId, runId, .failed)
     }
 
@@ -760,6 +781,35 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     /// replay at 500 here was truncating the reopened transcript to its last few turns.
     public func latestStreamEvents(threadId: AgentThreadID) -> [AssistantEvent] {
         (try? runRepo.listLatestStreamEvents(threadId: threadId, limit: .max)) ?? []
+    }
+
+    /// Returns the exact locally-processed AssistantEvent snapshot while
+    /// preventing a matching EventBus publication from crossing the caller's
+    /// watermark capture. This is the recovery contract used by iOS; unlike
+    /// `readThread`, it never races a fresh provider-side mutable snapshot.
+    public func withMirrorEventSnapshot<T>(
+        threadId: AgentThreadID,
+        _ body: ([AssistantEvent]) -> T
+    ) throws -> T {
+        mirrorEventLock.lock()
+        defer { mirrorEventLock.unlock() }
+        lock.lock()
+        let priorFailure = mirrorPersistenceFailures[threadId]
+        lock.unlock()
+        if let priorFailure { throw priorFailure }
+        lock.lock()
+        let bufferedRunId = pendingStreamRunIds[threadId]
+        lock.unlock()
+        if let runId = bufferedRunId ?? activeRunId(threadId: threadId) {
+            if let error = flushPendingStreamWritesResult(runId: runId, threadId: threadId) {
+                throw error
+            }
+        }
+        return body(try runRepo.listLatestStreamEvents(
+            threadId: threadId,
+            limit: .max,
+            strictDecoding: true
+        ))
     }
 
     public func activeThreadIdsSnapshot() -> Set<AgentThreadID> {
@@ -916,6 +966,9 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         }
         let items = batch.drain()
         pendingStreamWrites[threadId] = batch
+        if batch.isEmpty {
+            pendingStreamRunIds.removeValue(forKey: threadId)
+        }
         lastStreamFlushMs[threadId] = nowMs
         return BatchFlush(items: items, pruneDue: pruneDue)
     }
@@ -924,10 +977,17 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     /// in seq order, optionally prunes, then writes diagnostics ONCE using the last
     /// event's kind. This preserves the persisted content/order of the old per-event
     /// path while collapsing 2-3 writes/event into one batched flush.
-    private func flushStreamWrites(_ flush: BatchFlush, runId: AgentRunID, threadId: AgentThreadID) {
+    @discardableResult
+    private func flushStreamWrites(
+        _ flush: BatchFlush,
+        runId: AgentRunID,
+        threadId: AgentThreadID
+    ) -> Error? {
+        var persistedEventCount = 0
         do {
             for item in flush.items {
                 try runRepo.appendStreamEvent(runId: runId, seq: item.seq, kind: item.kind, payloadJSON: item.payloadJSON)
+                persistedEventCount += 1
                 if let providerEvent = item.providerEvent {
                     try runRepo.appendProviderEventLog(threadId: threadId, runId: runId, event: providerEvent)
                 }
@@ -938,8 +998,13 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             if let lastKind = flush.items.last?.kind {
                 try providerSessionRepo?.updateDiagnostics(threadId: threadId, lastEventKind: lastKind, lastErrorMessage: nil)
             }
+            return nil
         } catch {
+            if persistedEventCount < flush.items.count {
+                recordMirrorPersistenceFailure(error, threadId: threadId)
+            }
             emitPersistenceIssue("run.stream_event.append", error: error, runId: runId, threadId: threadId)
+            return error
         }
     }
 
@@ -947,13 +1012,33 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     /// on terminal/stop paths so the tail of a fast stream is never stranded in the
     /// buffer once the run is no longer producing events.
     private func flushPendingStreamWrites(runId: AgentRunID, threadId: AgentThreadID) {
+        _ = flushPendingStreamWritesResult(runId: runId, threadId: threadId)
+    }
+
+    private func flushPendingStreamWritesResult(
+        runId: AgentRunID,
+        threadId: AgentThreadID
+    ) -> Error? {
+        mirrorEventLock.lock()
+        defer { mirrorEventLock.unlock() }
         lock.lock()
+        if let bufferedRunId = pendingStreamRunIds[threadId], bufferedRunId != runId {
+            lock.unlock()
+            let error = NSError(
+                domain: "RemoteCode.AgentRunCoordinator",
+                code: 409,
+                userInfo: [NSLocalizedDescriptionKey: "Buffered mirror events changed run ownership."]
+            )
+            recordMirrorPersistenceFailure(error, threadId: threadId)
+            return error
+        }
         let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
         let flush = takeStreamFlushLocked(threadId: threadId, pruneDue: false, nowMs: nowMs)
         lock.unlock()
         if let flush, !flush.items.isEmpty {
-            flushStreamWrites(flush, runId: runId, threadId: threadId)
+            return flushStreamWrites(flush, runId: runId, threadId: threadId)
         }
+        return nil
     }
 
     private func updateProviderRuntimePayload(
@@ -1138,11 +1223,31 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                     return
                 }
             }
+            mirrorEventLock.lock()
+            defer { mirrorEventLock.unlock() }
+            lock.lock()
+            let priorBufferedRunId = pendingStreamRunIds[threadId].flatMap { owner in
+                owner == runId ? nil : owner
+            }
+            lock.unlock()
+            if let priorBufferedRunId {
+                _ = flushPendingStreamWritesResult(
+                    runId: priorBufferedRunId,
+                    threadId: threadId
+                )
+            }
             lock.lock()
             let s = (seq[runId] ?? 0) + 1
             seq[runId] = s
-            let data = try? streamEventEncoder.encode(ev)
             lock.unlock()
+            let data: Data?
+            do {
+                data = try streamEventEncoder.encode(ev)
+            } catch {
+                recordMirrorPersistenceFailure(error, threadId: threadId)
+                emitPersistenceIssue("run.stream_event.encode", error: error, runId: runId, threadId: threadId)
+                data = nil
+            }
             // PERF-MAC_AGENT-007: buffer the per-event writes (stream event +
             // optional provider-event log) and flush them in batches instead of
             // 2-3 synchronous transactions per delta. Prune cadence and diagnostics
@@ -1153,9 +1258,21 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                 let providerEvent: ProviderRuntimeEvent?
                 if case .providerRuntime(let runtimeEvent) = ev { providerEvent = runtimeEvent } else { providerEvent = nil }
                 lock.lock()
+                if let owner = pendingStreamRunIds[threadId], owner != runId {
+                    lock.unlock()
+                    let error = NSError(
+                        domain: "RemoteCode.AgentRunCoordinator",
+                        code: 409,
+                        userInfo: [NSLocalizedDescriptionKey: "Buffered mirror events changed run ownership."]
+                    )
+                    recordMirrorPersistenceFailure(error, threadId: threadId)
+                    emitPersistenceIssue("run.stream_event.owner", error: error, runId: runId, threadId: threadId)
+                    return
+                }
                 var batch = pendingStreamWrites[threadId] ?? StreamWriteBatch()
                 batch.append(StreamWriteItem(seq: s, kind: ev.debugDescription, payloadJSON: payloadJSON, providerEvent: providerEvent))
                 pendingStreamWrites[threadId] = batch
+                pendingStreamRunIds[threadId] = runId
                 // Prune at most once per `streamEventPruneInterval` events per thread.
                 let pruneCount = (streamEventsSincePrune[threadId] ?? 0) + 1
                 let pruneDue = pruneCount >= Self.streamEventPruneInterval
@@ -1223,7 +1340,9 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             for observer in observersSnapshot() {
                 observer.runCoordinator(self, didReceive: ev, run: runId, threadId: threadId)
             }
-            onAssistantEvent?(ev, threadId, runId)
+            if data != nil {
+                onAssistantEvent?(ev, threadId, runId)
+            }
         case .status(let st):
             for observer in observersSnapshot() {
                 observer.runCoordinator(self, didChangeStatus: st, runId: runId, threadId: threadId)
@@ -1406,6 +1525,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             // PERF-MAC_AGENT-007: buffer was drained by flushPendingStreamWrites
             // above; drop the per-thread batch + flush clock so they don't leak.
             pendingStreamWrites.removeValue(forKey: threadId)
+            pendingStreamRunIds.removeValue(forKey: threadId)
             lastStreamFlushMs.removeValue(forKey: threadId)
             // PERF-MAC_AGENT-008: thread closed -> evict the dedup cache entry so
             // finished threads do not retain their final-answer text indefinitely.
@@ -2021,8 +2141,80 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         for observer in observersSnapshot() {
             observer.runCoordinator(self, didReceive: .error(message: message, recoverable: false), run: runId, threadId: threadId)
         }
-        onAssistantEvent?(.error(message: message, recoverable: false), threadId, runId)
+        // A persistence diagnostic is intentionally local-only. Publishing an
+        // event that cannot enter the durable snapshot would let remote mirrors
+        // advance their EventBus watermark past unrecoverable history.
         onPersistenceIssue?(message, threadId, runId)
+    }
+
+    /// Persists coordinator-synthesized events before publishing them. Provider
+    /// stream events use the normal batch path; start failures cannot because a
+    /// second run may already own the same thread buffer and a failed start is
+    /// never registered in `activeThreads` for snapshot-triggered flushing.
+    private func publishImmediateAssistantEvent(
+        _ event: AssistantEvent,
+        threadId: AgentThreadID,
+        runId: AgentRunID
+    ) {
+        mirrorEventLock.lock()
+        defer { mirrorEventLock.unlock() }
+
+        lock.lock()
+        let eventSequence = (seq[runId] ?? 0) + 1
+        seq[runId] = eventSequence
+        lock.unlock()
+
+        let data: Data
+        do {
+            data = try streamEventEncoder.encode(event)
+        } catch {
+            recordMirrorPersistenceFailure(error, threadId: threadId)
+            emitPersistenceIssue("run.stream_event.encode", error: error, runId: runId, threadId: threadId)
+            return
+        }
+        guard let json = String(data: data, encoding: .utf8) else {
+            let error = NSError(
+                domain: "RemoteCode.AgentRunCoordinator",
+                code: 422,
+                userInfo: [NSLocalizedDescriptionKey: "AssistantEvent JSON was not UTF-8."]
+            )
+            recordMirrorPersistenceFailure(error, threadId: threadId)
+            emitPersistenceIssue("run.stream_event.encode", error: error, runId: runId, threadId: threadId)
+            return
+        }
+        do {
+            try runRepo.appendStreamEvent(
+                runId: runId,
+                seq: eventSequence,
+                kind: event.debugDescription,
+                payloadJSON: streamPayloadCompactor?(json) ?? json
+            )
+        } catch {
+            recordMirrorPersistenceFailure(error, threadId: threadId)
+            emitPersistenceIssue("run.stream_event.append", error: error, runId: runId, threadId: threadId)
+            return
+        }
+        do {
+            try providerSessionRepo?.updateDiagnostics(
+                threadId: threadId,
+                lastEventKind: event.debugDescription,
+                lastErrorMessage: nil
+            )
+        } catch {
+            emitPersistenceIssue("provider_session.diagnostics.update", error: error, runId: runId, threadId: threadId)
+        }
+        for observer in observersSnapshot() {
+            observer.runCoordinator(self, didReceive: event, run: runId, threadId: threadId)
+        }
+        onAssistantEvent?(event, threadId, runId)
+    }
+
+    private func recordMirrorPersistenceFailure(_ error: Error, threadId: AgentThreadID) {
+        lock.lock()
+        if mirrorPersistenceFailures[threadId] == nil {
+            mirrorPersistenceFailures[threadId] = error
+        }
+        lock.unlock()
     }
 
     private func observersSnapshot() -> [AgentRunObserver] {

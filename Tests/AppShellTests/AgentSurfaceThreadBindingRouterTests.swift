@@ -157,4 +157,77 @@ final class AgentSurfaceThreadBindingRouterTests: XCTestCase {
         XCTAssertEqual(restored.first?.viewModel.selectedThreadId, threadId,
             "each agent tab must reopen its OWN bound thread after restart, not threads.first.")
     }
+
+    // MARK: Plan-note realtime mirror wiring
+
+    func test_localPlanNotesSave_persistsThenPublishesOneMirrorEvent() throws {
+        let dir = NSTemporaryDirectory() + "RC2PlanNotes-Local-" + UUID().uuidString
+        let (_, router) = try makeRouter(dir)
+        let ws = try router.createWorkspace(name: "PLAN-LOCAL", cwd: NSTemporaryDirectory())
+        defer { closeAndUnregisterAgentSurfaces(workspace: ws.id) }
+        let thread = try router.createAgentThread(workspace: ws.id, title: "plan", provider: .codex, model: "fake-model", permissionMode: .supervised, reasoningEffort: .medium)
+        let desc = try router.createSurface(workspace: ws.id, type: .agentApp, paneID: nil, title: "Agent App")
+        let surface = try XCTUnwrap(SurfaceRegistry.shared.surface(desc.id) as? AgentAppSurface)
+        surface.viewModel.selectThread(thread.id)
+        let before = EventBus.shared.currentSeq
+
+        surface.viewModel.planNotes = "typed on Mac"
+        surface.viewModel.savePlanNotes()
+
+        XCTAssertEqual(try router.agentPlanNotes(thread: thread.id), "typed on Mac",
+                       "the host must persist local notes before advertising them to mirrors")
+        let updates = EventBus.shared.recentEvents(since: before, maxBytes: nil).events.filter {
+            $0.kind == "agent.plan.notes.updated"
+        }
+        XCTAssertEqual(updates.count, 1,
+                       "one local TextEditor save must produce exactly one realtime mirror update")
+        XCTAssertEqual(updates.first?.payload.objectValue?["thread_id"]?.stringValue, thread.id.value.uuidString)
+        XCTAssertEqual(updates.first?.payload.objectValue?["notes"]?.stringValue, "typed on Mac")
+    }
+
+    func test_remotePlanNotesUpdate_doesNotEchoThroughLocalSaveObserver() throws {
+        let dir = NSTemporaryDirectory() + "RC2PlanNotes-Remote-" + UUID().uuidString
+        let (_, router) = try makeRouter(dir)
+        let ws = try router.createWorkspace(name: "PLAN-REMOTE", cwd: NSTemporaryDirectory())
+        defer { closeAndUnregisterAgentSurfaces(workspace: ws.id) }
+        let thread = try router.createAgentThread(workspace: ws.id, title: "plan", provider: .codex, model: "fake-model", permissionMode: .supervised, reasoningEffort: .medium)
+        let desc = try router.createSurface(workspace: ws.id, type: .agentApp, paneID: nil, title: "Agent App")
+        let surface = try XCTUnwrap(SurfaceRegistry.shared.surface(desc.id) as? AgentAppSurface)
+        surface.viewModel.selectThread(thread.id)
+        let before = EventBus.shared.currentSeq
+
+        try router.saveAgentPlanNotes(thread: thread.id, notes: "received from iOS")
+        surface.viewModel.savePlanNotes() // Simulates TextEditor's onChange callback.
+
+        let updates = EventBus.shared.recentEvents(since: before, maxBytes: nil).events.filter {
+            $0.kind == "agent.plan.notes.updated"
+        }
+        XCTAssertEqual(updates.count, 1,
+                       "applying an iOS note must publish once at the RPC source and never echo through TextEditor")
+    }
+
+    func test_remotePlanNotesPersistenceFailurePublishesNoSuccessEvent() throws {
+        let dir = NSTemporaryDirectory() + "RC2PlanNotes-Failure-" + UUID().uuidString
+        let (ctx, router) = try makeRouter(dir)
+        let ws = try router.createWorkspace(name: "PLAN-FAIL", cwd: NSTemporaryDirectory())
+        defer { closeAndUnregisterAgentSurfaces(workspace: ws.id) }
+        let thread = try router.createAgentThread(workspace: ws.id, title: "plan", provider: .codex, model: "fake-model", permissionMode: .supervised, reasoningEffort: .medium)
+        try ctx.db.execute("""
+            CREATE TRIGGER fail_plan_notes_insert
+            BEFORE INSERT ON settings
+            WHEN NEW.key LIKE 'agent.plan_notes.%'
+            BEGIN
+                SELECT RAISE(FAIL, 'injected plan-notes write failure');
+            END;
+            """)
+        let before = EventBus.shared.currentSeq
+
+        XCTAssertThrowsError(try router.saveAgentPlanNotes(thread: thread.id, notes: "not durable"))
+
+        let updates = EventBus.shared.recentEvents(since: before, maxBytes: nil).events.filter {
+            $0.kind == "agent.plan.notes.updated"
+        }
+        XCTAssertTrue(updates.isEmpty,
+                      "a failed write must not advertise notes that the host cannot read back after restart")
+    }
 }

@@ -78,6 +78,13 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         EventBus.shared.publish(kind: "agent.thread.updated", payload: agentThreadPayload(thread))
     }
 
+    private func publishAgentPlanNotesUpdated(thread: AgentThreadID, notes: String) {
+        EventBus.shared.publish(kind: "agent.plan.notes.updated", payload: .object([
+            "thread_id": .string(thread.value.uuidString),
+            "notes": .string(notes)
+        ]))
+    }
+
     /// Full thread payload for host-UI-driven thread mirror events. Shape is
     /// IDENTICAL to Dispatcher.threadPayload so iOS decodes RPC-driven and
     /// mac-UI-driven mutations with one code path. provider_locked derives
@@ -283,6 +290,9 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                         }
                         agent.viewModel.onThreadLifecycle = { [weak self] event in
                             self?.publishAgentThreadLifecycle(event)
+                        }
+                        agent.viewModel.onPlanNotesPersisted = { [weak self] thread, notes in
+                            self?.publishAgentPlanNotesUpdated(thread: thread, notes: notes)
                         }
                         agent.viewModel.onQueuedMessageEvent = { [weak self] kind, message in
                             self?.publishQueuedMessage(kind: kind, message)
@@ -1408,22 +1418,19 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
 
     public func agentPlanNotes(thread: AgentThreadID) throws -> String {
         guard let ctx = context else { throw LayoutError.workspaceNotFound }
-        return PlanNotesStore(db: ctx.db).load(threadId: thread)
+        return try PlanNotesStore(db: ctx.db).load(threadId: thread)
     }
 
     public func saveAgentPlanNotes(thread: AgentThreadID, notes: String) throws {
         guard let ctx = context else { throw LayoutError.workspaceNotFound }
-        PlanNotesStore(db: ctx.db).save(notes, threadId: thread)
+        try PlanNotesStore(db: ctx.db).save(notes, threadId: thread)
         // HC-5 spirit: a mirror-driven mutation must be visible on the Mac
         // immediately — refresh any open surface bound to this thread.
         for s in SurfaceRegistry.shared.all() {
             guard let agent = s as? AgentAppSurface, agent.viewModel.selectedThreadId == thread else { continue }
-            agent.viewModel.planNotes = notes
+            agent.viewModel.applyMirroredPlanNotes(notes, threadId: thread)
         }
-        EventBus.shared.publish(kind: "agent.plan.notes.updated", payload: .object([
-            "thread_id": .string(thread.value.uuidString),
-            "notes": .string(notes)
-        ]))
+        publishAgentPlanNotesUpdated(thread: thread, notes: notes)
     }
 
     public func sendAgentMessage(thread: AgentThreadID, text: String, provider: AgentProvider?, model: String?, permissionMode: AgentPermissionMode?, reasoningEffort: AgentReasoningEffort?, serviceTier: AgentServiceTier? = nil, interactionMode: AgentInteractionMode? = nil, modelSelection: AgentModelSelection? = nil, providerInstanceId: String? = nil, attachments: [AgentAttachment] = []) async throws -> AgentMessageSendResult {
@@ -1741,6 +1748,18 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         return try await ctx.coordinator.readThread(threadId: thread)
     }
 
+    public func readAgentThreadMirrorSnapshot(
+        thread: AgentThreadID
+    ) async throws -> AgentThreadMirrorSnapshot {
+        guard let ctx = context else { throw LayoutError.workspaceNotFound }
+        return try ctx.coordinator.withMirrorEventSnapshot(threadId: thread) { events in
+            AgentThreadMirrorSnapshot(
+                events: events,
+                eventWatermark: EventBus.shared.currentSeq
+            )
+        }
+    }
+
     public func rollbackAgentThread(thread: AgentThreadID, toTurnId: String) async throws {
         guard let ctx = context else { throw LayoutError.workspaceNotFound }
         try await ctx.coordinator.rollbackThread(threadId: thread, toTurnId: toTurnId)
@@ -1776,6 +1795,15 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     public func stopAgentRun(thread: AgentThreadID) throws {
         guard let ctx = context else { throw LayoutError.workspaceNotFound }
         ctx.coordinator.stopRun(threadId: thread)
+    }
+
+    public func activeAgentRun(thread: AgentThreadID) throws -> AgentActiveRunSnapshot? {
+        guard let ctx = context,
+              let runId = ctx.coordinator.activeRunId(threadId: thread),
+              let startedAt = try ctx.coordinator.runStartedAt(runId: runId) else {
+            return nil
+        }
+        return AgentActiveRunSnapshot(runId: runId, startedAt: startedAt)
     }
 
     /// UX-MAC_AGENT-CONTINUE parity for mirror clients: resume a
@@ -2773,6 +2801,9 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 }
                 agent.viewModel.onThreadLifecycle = { [weak self] event in
                     self?.publishAgentThreadLifecycle(event)
+                }
+                agent.viewModel.onPlanNotesPersisted = { [weak self] thread, notes in
+                    self?.publishAgentPlanNotesUpdated(thread: thread, notes: notes)
                 }
                 agent.viewModel.onQueuedMessageEvent = { [weak self] kind, message in
                     self?.publishQueuedMessage(kind: kind, message)
