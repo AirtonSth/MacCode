@@ -18,6 +18,17 @@ final class PetPlacementTests: XCTestCase {
         )
     }
 
+    func test_petScreenFramePreservesOffsetDisplayCoordinates() {
+        XCTAssertEqual(
+            PetScreenGeometry.petPlacementFrame(
+                screenFrame: CGRect(x: 3_337, y: 158, width: 1_728, height: 1_117),
+                visibleFrame: CGRect(x: 3_400, y: 218, width: 1_600, height: 1_025)
+            ),
+            CGRect(x: 3_337, y: 158, width: 1_728, height: 1_085),
+            "secondary-display offsets must not become artificial margins"
+        )
+    }
+
     func test_normalizedPositionAlwaysClampsToUnitRange() {
         XCTAssertEqual(PetNormalizedPosition(x: -2, y: 5), PetNormalizedPosition(x: 0, y: 1))
     }

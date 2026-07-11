@@ -471,6 +471,7 @@ public final class PetWindowController: NSObject {
     var petPanelForTests: NSPanel? { petPanel }
     var popoverPanelForTests: NSPanel? { popoverPanel }
     var spriteAccessibilityViewForTests: NSView? { spriteView }
+    func finishDragForTests(frame: CGRect) { finishDrag(frame: frame) }
 
     public func show() {
         ensurePetPanel()

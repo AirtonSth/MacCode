@@ -92,6 +92,38 @@ final class PetWindowAndLifecycleTests: XCTestCase {
             "a borderless desktop pet must not inherit normal-window Dock/menu constraints")
     }
 
+    func test_dragBeyondBottomLeftClampsAndPersistsPhysicalScreenEdge() throws {
+        let db = try database()
+        let placementStore = PetPlacementStore(repository: SettingsRepository(db: db))
+        let model = PetViewModel(settings: AppSettings(petEnabled: true))
+        let controller = PetWindowController(model: model, placementStore: placementStore)
+        defer { controller.stop() }
+
+        controller.show()
+        let panel = try XCTUnwrap(controller.petPanelForTests)
+        let screen = try XCTUnwrap(panel.screen ?? NSScreen.main)
+        let placementFrame = PetScreenGeometry.petPlacementFrame(
+            screenFrame: screen.frame,
+            visibleFrame: screen.visibleFrame
+        )
+        let draggedBeyondEdge = CGRect(
+            x: placementFrame.minX - 10,
+            y: placementFrame.minY - 10,
+            width: panel.frame.width,
+            height: panel.frame.height
+        )
+
+        controller.finishDragForTests(frame: draggedBeyondEdge)
+
+        XCTAssertEqual(panel.frame.minX, placementFrame.minX, accuracy: 0.001)
+        XCTAssertEqual(panel.frame.minY, placementFrame.minY, accuracy: 0.001)
+        XCTAssertEqual(
+            try XCTUnwrap(placementStore.load()).position,
+            PetNormalizedPosition(x: 0, y: 0),
+            "relaunch must restore the exact physical bottom-left edge after the user drags there"
+        )
+    }
+
     func test_animationStateResizeKeepsVisualPanelOnChosenScreenEdges() throws {
         let db = try database()
         let atlas = try PetAtlas.bundled()
