@@ -443,6 +443,7 @@ public final class PetWindowController: NSObject {
     public var onToggleAnimations: (() -> Void)?
     public var onAdoptFreePosition: (() -> Void)?
     public var onInteraction: (() -> Void)?
+    public var onCareAction: ((PetCareAction) -> Void)?
 
     private let model: PetViewModel
     private let placementStore: PetPlacementStore
@@ -472,6 +473,8 @@ public final class PetWindowController: NSObject {
     var popoverPanelForTests: NSPanel? { popoverPanel }
     var spriteAccessibilityViewForTests: NSView? { spriteView }
     func finishDragForTests(frame: CGRect) { finishDrag(frame: frame) }
+    func contextMenuForTests() -> NSMenu { contextMenu() }
+    func invokeCareMenuItemForTests(_ item: NSMenuItem) { contextCareAction(item) }
 
     public func show() {
         ensurePetPanel()
@@ -859,9 +862,23 @@ public final class PetWindowController: NSObject {
     }
 
     private func showContextMenu(event: NSEvent, in view: NSView) {
+        NSMenu.popUpContextMenu(contextMenu(), with: event, for: view)
+    }
+
+    private func contextMenu() -> NSMenu {
         let menu = NSMenu(title: "Remote Code Pet")
         menu.addItem(menuItem("Open Remote Code", #selector(contextOpenRemoteCode)))
         menu.addItem(menuItem("Open ready items", #selector(contextOpenReadyItems)))
+        menu.addItem(.separator())
+        let careItem = NSMenuItem(title: "Care", action: nil, keyEquivalent: "")
+        let careMenu = NSMenu(title: "Care")
+        for action in PetCareAction.allCases {
+            let item = menuItem(action.title, #selector(contextCareAction(_:)))
+            item.representedObject = action.rawValue
+            careMenu.addItem(item)
+        }
+        careItem.submenu = careMenu
+        menu.addItem(careItem)
         menu.addItem(.separator())
         menu.addItem(menuItem(
             model.settings.petAnimationsEnabled ? "Pause animations" : "Resume animations",
@@ -869,7 +886,7 @@ public final class PetWindowController: NSObject {
         ))
         menu.addItem(menuItem("Settings…", #selector(contextOpenSettings)))
         menu.addItem(menuItem("Hide pet", #selector(contextHidePet)))
-        NSMenu.popUpContextMenu(menu, with: event, for: view)
+        return menu
     }
 
     private func menuItem(_ title: String, _ action: Selector) -> NSMenuItem {
@@ -881,6 +898,11 @@ public final class PetWindowController: NSObject {
     @objc private func contextOpenRemoteCode() { onOpenRemoteCode?() }
     @objc private func contextOpenReadyItems() { openPopover() }
     @objc private func contextToggleAnimations() { onToggleAnimations?() }
+    @objc private func contextCareAction(_ sender: NSMenuItem) {
+        guard let rawValue = sender.representedObject as? String,
+              let action = PetCareAction(rawValue: rawValue) else { return }
+        onCareAction?(action)
+    }
     @objc private func contextOpenSettings() { onOpenSettings?() }
     @objc private func contextHidePet() { onHidePet?() }
 }

@@ -8,16 +8,22 @@ final class PetAssetRuntimeTests: XCTestCase {
         let atlas = try PetAtlas.bundled()
         let manifest = atlas.manifest
 
-        XCTAssertEqual(manifest.schemaVersion, 1)
+        XCTAssertEqual(manifest.schemaVersion, 2)
         XCTAssertEqual(manifest.dimensions.width, 1_536)
-        XCTAssertEqual(manifest.dimensions.height, 3_328)
+        XCTAssertEqual(manifest.dimensions.height, 6_656)
         XCTAssertEqual(manifest.grid.columns, 8)
-        XCTAssertEqual(manifest.grid.rows, 16)
+        XCTAssertEqual(manifest.grid.rows, 32)
         XCTAssertEqual(manifest.grid.frameWidth, 192)
         XCTAssertEqual(manifest.grid.frameHeight, 208)
         XCTAssertEqual(manifest.rows.map(\.state), PetAnimationState.allCases)
-        XCTAssertEqual(manifest.rows.reduce(0) { $0 + $1.frames }, 120)
-        XCTAssertEqual(manifest.unusedFrameCount, 8)
+        XCTAssertEqual(manifest.rows.reduce(0) { $0 + $1.frames }, 256)
+        XCTAssertEqual(manifest.unusedFrameCount, 0)
+        XCTAssertTrue(
+            manifest.rows
+                .filter { $0.state.isCompanionReaction }
+                .allSatisfy { $0.mode == .onceHold },
+            "companion reactions must finish all eight authored frames and wait for the reducer's exact return state"
+        )
     }
 
     func test_bundledAtlas_resolvesFullAtlasAndEveryStateRow_withoutDecodingRows() throws {
@@ -31,7 +37,7 @@ final class PetAssetRuntimeTests: XCTestCase {
             XCTAssertEqual(url.lastPathComponent, "remote-code-black-cat-\(state.rawValue).png")
         }
         XCTAssertTrue(atlas.decodedRowStates.isEmpty,
-            "resource validation must inspect image metadata, not decode the 20 MB full atlas")
+            "resource validation must inspect image metadata without decoding the full atlas")
     }
 
     func test_frameCropping_isExactAndNearestNeighbor_withBoundedRowCache() throws {
@@ -54,7 +60,7 @@ final class PetAssetRuntimeTests: XCTestCase {
             "runtime memory must retain only the active row and bounded adjacent rows")
     }
 
-    func test_all120UsedFrames_decodeAndCropAcrossEveryStateRow() throws {
+    func test_all256AuthoredFramesDecodeAndCropAcrossEveryStateRow() throws {
         let atlas = try PetAtlas.bundled()
         var croppedFrameCount = 0
 
@@ -70,7 +76,7 @@ final class PetAssetRuntimeTests: XCTestCase {
                 "serial validation must release the previous decoded row")
         }
 
-        XCTAssertEqual(croppedFrameCount, 120)
+        XCTAssertEqual(croppedFrameCount, 256)
     }
 
     func test_stateVisualBoundsRemoveOnlyTransparentPaddingWithoutClippingOrFrameJitter() throws {
@@ -110,7 +116,7 @@ final class PetAssetRuntimeTests: XCTestCase {
                 "every state must use one stable tight canvas across all of its animation frames")
         }
 
-        XCTAssertEqual(frameCount, 120)
+        XCTAssertEqual(frameCount, 256)
     }
 
     func test_allFramesHaveNoSmallFragmentsFromAdjacentSourceCells() throws {
@@ -122,10 +128,11 @@ final class PetAssetRuntimeTests: XCTestCase {
             for index in 0..<row.frames {
                 let frame = try atlas.frame(state: row.state, index: index)
                 for component in alphaComponents(in: frame.image) {
-                    // The packer maps each source cell to x=26...166 with at most one pixel of motion.
-                    // Small components at either horizontal limit are adjacent-cell spill, not Pet art.
-                    let touchesHorizontalSourceCropEdge = component.bounds.minX <= 27
-                        || component.bounds.maxX >= 164
+                    // Atlas v2 maps each isolated source cell into x=8...184. A component
+                    // reaching that outer draw boundary signals a broken source isolation;
+                    // authored stars and motion marks may legitimately sit farther inward.
+                    let touchesHorizontalSourceCropEdge = component.bounds.minX <= 8
+                        || component.bounds.maxX >= 184
                     if touchesHorizontalSourceCropEdge, component.pixelCount <= 64 {
                         suspiciousFragments.append(
                             "\(row.state.rawValue)[\(index)] area=\(component.pixelCount) bounds=\(component.bounds)"
@@ -146,8 +153,8 @@ final class PetAssetRuntimeTests: XCTestCase {
 
         XCTAssertEqual(canonical.state, .listening)
         XCTAssertEqual(canonical.index, 0)
-        XCTAssertThrowsError(try atlas.frame(state: .listening, index: 6)) { error in
-            XCTAssertEqual(error as? PetAtlasError, .invalidFrame(state: .listening, index: 6))
+        XCTAssertThrowsError(try atlas.frame(state: .listening, index: 8)) { error in
+            XCTAssertEqual(error as? PetAtlasError, .invalidFrame(state: .listening, index: 8))
         }
     }
 
@@ -184,10 +191,29 @@ final class PetAssetRuntimeTests: XCTestCase {
 
         controller.setReducedMotion(false)
         try controller.setState(.sleeping)
-        XCTAssertEqual(scheduler.activeTimerCount, 0,
-            "the idle sleeping state must stay static instead of spending energy on a repeating timer")
+        XCTAssertEqual(scheduler.activeTimerCount, 1,
+            "visible sleep must animate breathing, ear twitches, tail motion, and drifting Zzz")
         XCTAssertEqual(controller.currentFrameIndex, 0,
-            "sleeping must project the manifest canonical static frame")
+            "sleeping begins at its first authored frame")
+        scheduler.fireActiveTimer()
+        XCTAssertEqual(controller.currentFrameIndex, 1,
+            "the sleeping companion must visibly advance while normal animation is allowed")
+    }
+
+    func test_everyAuthoredReactionAdvancesWhenAnimationPolicyAllowsMotion() throws {
+        let scheduler = TestPetAnimationScheduler()
+        let controller = try PetAnimationController(atlas: .bundled(), scheduler: scheduler)
+
+        for state in PetAnimationState.allCases {
+            try controller.setState(state, derivedTerminalState: .idle)
+            XCTAssertEqual(scheduler.activeTimerCount, 1,
+                "\(state.rawValue) must start animated instead of rendering as a static reaction")
+            XCTAssertEqual(controller.currentFrameIndex, 0)
+            scheduler.fireActiveTimer()
+            XCTAssertEqual(controller.currentFrameIndex, 1,
+                "\(state.rawValue) must contain visible authored frame progression")
+        }
+        XCTAssertEqual(scheduler.maximumActiveTimerCount, 1)
     }
 
     func test_loopPlayback_wraps_andKeepsSingleTimer() throws {
@@ -236,7 +262,7 @@ final class PetAssetRuntimeTests: XCTestCase {
             "onceThenWaiting must continue with the waiting loop")
 
         try controller.setState(.interrupted, derivedTerminalState: .reconnecting)
-        for _ in 0..<6 { scheduler.fireActiveTimer() }
+        for _ in 0..<8 { scheduler.fireActiveTimer() }
         XCTAssertEqual(controller.currentState, .reconnecting)
         XCTAssertEqual(controller.currentFrameIndex, 0)
         XCTAssertEqual(scheduler.activeTimerCount, 1,

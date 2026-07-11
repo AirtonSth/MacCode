@@ -1,7 +1,7 @@
 import Foundation
 import CoreModel
 
-/// Stable row order for Remote Code Pet Atlas v1.
+/// Stable row order for Remote Code Pet Atlas v2.
 ///
 /// Do not reorder cases without shipping a new atlas schema version. The raw value is
 /// also the manifest key used by the renderer and settings diagnostics.
@@ -22,6 +22,22 @@ public enum PetAnimationState: String, CaseIterable, Codable, Sendable, Equatabl
     case interrupted
     case reconnecting
     case sleeping
+    case idleBall
+    case idleScratch
+    case idleGroom
+    case idleStretch
+    case idleBox
+    case idleButterfly
+    case eating
+    case drinking
+    case purring
+    case playing
+    case comfort
+    case notificationPounce
+    case workingMouse
+    case workingBug
+    case workingEngineer
+    case celebrateTreat
 
     /// Maps provider item types into the atlas vocabulary. `nil` is a deliberate
     /// noise decision, not an unknown mapping.
@@ -51,6 +67,7 @@ public enum PetAnimationState: String, CaseIterable, Codable, Sendable, Equatabl
     private var priority: Int {
         switch self {
         case .idle: return 0
+        case .idleBall, .idleScratch, .idleGroom, .idleStretch, .idleBox, .idleButterfly: return 10
         case .sleeping: return 100
         case .waiting: return 200
         case .reconnecting: return 300
@@ -61,11 +78,27 @@ public enum PetAnimationState: String, CaseIterable, Codable, Sendable, Equatabl
         case .terminal: return 620
         case .search: return 630
         case .gitReview: return 640
+        case .workingMouse, .workingBug, .workingEngineer: return 680
+        case .notificationPounce: return 685
+        case .eating, .drinking, .purring, .playing, .comfort: return 690
         case .interrupted: return 700
         case .success: return 800
+        case .celebrateTreat: return 810
         case .failed: return 900
         case .question: return 1_000
         case .approval: return 1_010
+        }
+    }
+
+    var isCompanionReaction: Bool {
+        switch self {
+        case .idleBall, .idleScratch, .idleGroom, .idleStretch,
+             .idleBox, .idleButterfly, .eating, .drinking,
+             .purring, .playing, .comfort, .notificationPounce,
+             .workingMouse, .workingBug, .workingEngineer, .celebrateTreat:
+            return true
+        default:
+            return false
         }
     }
 
