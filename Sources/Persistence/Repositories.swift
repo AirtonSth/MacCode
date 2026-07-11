@@ -6,6 +6,7 @@ let iso = ISO8601DateFormatter()
 public enum PersistenceDataError: Error, CustomStringConvertible {
     case corruptProviderEventLog(String)
     case corruptCheckpoint(String)
+    case corruptStreamEvent(String)
 
     public var description: String {
         switch self {
@@ -13,6 +14,8 @@ public enum PersistenceDataError: Error, CustomStringConvertible {
             return "Corrupt provider event log: \(message)"
         case .corruptCheckpoint(let message):
             return "Corrupt agent checkpoint: \(message)"
+        case .corruptStreamEvent(let message):
+            return "Corrupt agent stream event: \(message)"
         }
     }
 }
@@ -938,9 +941,13 @@ public final class AgentRunRepository {
         return 0
     }
 
-    public func listLatestStreamEvents(threadId: AgentThreadID, limit: Int = 500) throws -> [AssistantEvent] {
+    public func listLatestStreamEvents(
+        threadId: AgentThreadID,
+        limit: Int = 500,
+        strictDecoding: Bool = false
+    ) throws -> [AssistantEvent] {
         let st = try db.prepare("""
-            SELECT payload_json
+            SELECT payload_json, id
             FROM (
                 SELECT e.payload_json, r.started_at, e.seq, e.id
                 FROM agent_stream_events e
@@ -956,10 +963,21 @@ public final class AgentRunRepository {
         var events: [AssistantEvent] = []
         let decoder = JSONDecoder()
         while try st.step() {
+            let eventId = st.columnInt64(1)
             guard let json = st.columnText(0),
-                  let data = json.data(using: .utf8),
-                  let event = try? decoder.decode(AssistantEvent.self, from: data) else { continue }
-            events.append(event)
+                  let data = json.data(using: .utf8) else {
+                if strictDecoding {
+                    throw PersistenceDataError.corruptStreamEvent("row \(eventId) has no UTF-8 payload")
+                }
+                continue
+            }
+            do {
+                events.append(try decoder.decode(AssistantEvent.self, from: data))
+            } catch {
+                if strictDecoding {
+                    throw PersistenceDataError.corruptStreamEvent("row \(eventId) has an invalid AssistantEvent payload")
+                }
+            }
         }
         return events
     }

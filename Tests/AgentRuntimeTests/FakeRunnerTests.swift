@@ -893,8 +893,9 @@ final class FakeRunnerTests: XCTestCase {
 
         coordinator.stopRun(threadId: thread.id)
 
-        try await waitUntil("persisted provider session recovered and interrupted") {
-            adapter.interruptTurnCallCount == 1
+        try await waitUntil("persisted provider recovery before stop interrupt") {
+            adapter.lastProviderThreadId == "codex-thread-recovered"
+                && adapter.interruptTurnCallCount == 1
         }
 
         XCTAssertEqual(adapter.lastProviderThreadId, "codex-thread-recovered",

@@ -390,10 +390,20 @@ class FakeRouter: CommandRouting, TerminalCommandRouting {
         return ("/tmp/\(relativePath ?? "plan.md")", relativePath ?? ".remotecode/plans/plan.md")
     }
     var planNotesByThread: [AgentThreadID: String] = [:]
+    var planNotesSaveCallCount = 0
+    var planNotesReadShouldFail = false
+    var planNotesSaveShouldFail = false
     func agentPlanNotes(thread: AgentThreadID) throws -> String {
-        planNotesByThread[thread] ?? ""
+        if planNotesReadShouldFail {
+            throw JSONRPCError(code: -32000, message: "Injected plan-notes read failure.")
+        }
+        return planNotesByThread[thread] ?? ""
     }
     func saveAgentPlanNotes(thread: AgentThreadID, notes: String) throws {
+        planNotesSaveCallCount += 1
+        if planNotesSaveShouldFail {
+            throw JSONRPCError(code: -32000, message: "Injected plan-notes persistence failure.")
+        }
         planNotesByThread[thread] = notes
     }
     var reorderAgentQueuedMessageCallCount = 0
@@ -431,6 +441,12 @@ class FakeRouter: CommandRouting, TerminalCommandRouting {
     func readAgentThreadEvents(thread: AgentThreadID) async throws -> [AssistantEvent] {
         readAgentEvents
     }
+    func readAgentThreadMirrorSnapshot(thread: AgentThreadID) async throws -> AgentThreadMirrorSnapshot {
+        AgentThreadMirrorSnapshot(
+            events: readAgentEvents,
+            eventWatermark: EventBus.shared.currentSeq
+        )
+    }
     func rollbackAgentThread(thread: AgentThreadID, toTurnId: String) async throws {
         rollbackCallCount += 1
         lastRollback = (thread, toTurnId)
@@ -461,6 +477,10 @@ class FakeRouter: CommandRouting, TerminalCommandRouting {
     func stopAgentRun(thread: AgentThreadID) throws {
         stopAgentRunCallCount += 1
         stoppedAgentThreads.append(thread)
+    }
+    var activeAgentRuns: [AgentThreadID: AgentActiveRunSnapshot] = [:]
+    func activeAgentRun(thread: AgentThreadID) throws -> AgentActiveRunSnapshot? {
+        activeAgentRuns[thread]
     }
     var continueAgentRunCallCount = 0
     var continuedAgentThreads: [AgentThreadID] = []
@@ -2187,6 +2207,11 @@ final class DispatcherTests: XCTestCase {
         let thread = AgentThread(workspaceId: nil, title: fullTitle, provider: .claude, model: "fake-model")
         router.threadStore = [thread]
         router.messageStore = [AgentMessage(threadId: thread.id, role: .user, content: "start")]
+        let runId = AgentRunID(UUID(uuidString: "00000000-0000-0000-0000-000000000123")!)
+        router.activeAgentRuns[thread.id] = AgentActiveRunSnapshot(
+            runId: runId,
+            startedAt: Date(timeIntervalSince1970: 1_700_000_000.125)
+        )
         let d = JSONRPCDispatcher(router: router)
 
         let resp = await d.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(1), method: "agent.thread.list", params: nil))
@@ -2200,6 +2225,33 @@ final class DispatcherTests: XCTestCase {
         XCTAssertEqual(first["providerLocked"], .bool(true),
                        "iOS mirrors must know when to hide the source picker for existing threads")
         XCTAssertEqual(first["provider_locked"], .bool(true))
+        XCTAssertEqual(first["active_run_id"], .string(runId.value.uuidString))
+        XCTAssertEqual(first["active_run_started_at_ms"], .number(1_700_000_000_125),
+                       "iOS rebaseline must retain the Mac-owned elapsed-run clock")
+    }
+
+    @MainActor
+    func testAgentThreadReadCanReturnTypedMirrorSnapshotWithEventWatermark() async throws {
+        let router = FakeRouter()
+        let thread = AgentThreadID()
+        router.readAgentEvents = [.turnStarted(turnId: "turn-mirror")]
+        let dispatcher = JSONRPCDispatcher(router: router)
+
+        let response = await dispatcher.dispatch(JSONRPCRequest(
+            jsonrpc: "2.0",
+            id: .number(1),
+            method: "agent.thread.read",
+            params: [
+                "thread_id": .string(thread.value.uuidString),
+                "include_event_watermark": .bool(true)
+            ]
+        ))
+
+        let result = try XCTUnwrap(response.result?.objectValue)
+        XCTAssertEqual(result["event_watermark"], .number(Double(EventBus.shared.currentSeq)))
+        XCTAssertEqual(result["events"]?.arrayValue?.count, 1)
+        XCTAssertNotNil(result["events"]?.arrayValue?.first?.objectValue?["turnStarted"],
+                        "the mirror snapshot must preserve the typed AssistantEvent wire shape")
     }
 
     @MainActor
@@ -2318,6 +2370,107 @@ final class DispatcherTests: XCTestCase {
         XCTAssertEqual(result["complete"], .bool(false))
         XCTAssertEqual(result["partial_reason"], .string("ghostty_unavailable"),
                        "snapshot reads must say when terminal text is degraded so iOS does not show fake complete output")
+    }
+
+    @MainActor
+    func testAgentPlanNotesSaveRejectsStaleExpectedValue() async throws {
+        let router = FakeRouter()
+        let thread = AgentThreadID()
+        router.planNotesByThread[thread] = "newer Mac notes"
+        let dispatcher = JSONRPCDispatcher(router: router)
+
+        let rejected = await dispatcher.dispatch(JSONRPCRequest(
+            jsonrpc: "2.0",
+            id: .number(1),
+            method: "agent.plan.notes.save",
+            params: [
+                "thread_id": .string(thread.value.uuidString),
+                "notes": .string("stale iOS overwrite"),
+                "expected_notes": .string("older notes"),
+                "client_request_id": .string(UUID().uuidString)
+            ]
+        ))
+
+        XCTAssertEqual(rejected.error?.code, -32009)
+        XCTAssertEqual(rejected.error?.message, "Plan notes changed on another device.")
+        XCTAssertEqual(router.planNotesByThread[thread], "newer Mac notes",
+                       "a stale mobile save must not overwrite the authoritative Mac value")
+
+        let accepted = await dispatcher.dispatch(JSONRPCRequest(
+            jsonrpc: "2.0",
+            id: .number(2),
+            method: "agent.plan.notes.save",
+            params: [
+                "thread_id": .string(thread.value.uuidString),
+                "notes": .string("merged iOS notes"),
+                "expected_notes": .string("newer Mac notes"),
+                "client_request_id": .string(UUID().uuidString)
+            ]
+        ))
+
+        XCTAssertNil(accepted.error)
+        XCTAssertEqual(accepted.result, .bool(true))
+        XCTAssertEqual(router.planNotesByThread[thread], "merged iOS notes")
+    }
+
+    @MainActor
+    func testAgentPlanNotesPersistenceFailureIsNotReturnedOrCachedAsSuccess() async throws {
+        let router = FakeRouter()
+        let thread = AgentThreadID()
+        let requestID = UUID().uuidString
+        let dispatcher = JSONRPCDispatcher(router: router)
+        let request = JSONRPCRequest(
+            jsonrpc: "2.0",
+            id: .number(1),
+            method: "agent.plan.notes.save",
+            params: [
+                "thread_id": .string(thread.value.uuidString),
+                "notes": .string("durable notes"),
+                "expected_notes": .string(""),
+                "client_request_id": .string(requestID)
+            ]
+        )
+
+        router.planNotesSaveShouldFail = true
+        let failed = await dispatcher.dispatch(request)
+
+        XCTAssertNil(failed.result, "a failed durable write must never return RPC success")
+        XCTAssertNotNil(failed.error)
+        XCTAssertNil(router.commandReceipt(method: request.method, clientRequestId: requestID),
+                     "a failed durable write must not poison retries with a cached success receipt")
+
+        router.planNotesSaveShouldFail = false
+        let retried = await dispatcher.dispatch(request)
+
+        XCTAssertEqual(retried.result, .bool(true))
+        XCTAssertEqual(router.planNotesSaveCallCount, 2,
+                       "the same request ID must reach persistence again after the first write failed")
+        XCTAssertEqual(router.planNotesByThread[thread], "durable notes")
+    }
+
+    @MainActor
+    func testAgentPlanNotesCASReadFailureDoesNotAssumeEmptyValueOrWrite() async throws {
+        let router = FakeRouter()
+        let thread = AgentThreadID()
+        router.planNotesReadShouldFail = true
+        let dispatcher = JSONRPCDispatcher(router: router)
+
+        let failed = await dispatcher.dispatch(JSONRPCRequest(
+            jsonrpc: "2.0",
+            id: .number(1),
+            method: "agent.plan.notes.save",
+            params: [
+                "thread_id": .string(thread.value.uuidString),
+                "notes": .string("must not write"),
+                "expected_notes": .string("")
+            ]
+        ))
+
+        XCTAssertNil(failed.result,
+                     "a failed authoritative read must never be treated as an empty CAS value")
+        XCTAssertNotNil(failed.error)
+        XCTAssertEqual(router.planNotesSaveCallCount, 0,
+                       "CAS must stop before persistence when the authoritative read failed")
     }
 
     // Verifies that the encode<T> helper's new path (JSONDecoder -> JSONValue) produces the

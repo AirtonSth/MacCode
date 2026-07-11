@@ -18,13 +18,13 @@ public final class PlanNotesStore {
     }
 
     /// Returns the full plan notes for the thread, or "" when absent.
-    public func load(threadId: AgentThreadID) -> String {
-        (try? repo.get(Self.storageKey(for: threadId))) ?? ""
+    public func load(threadId: AgentThreadID) throws -> String {
+        try repo.get(Self.storageKey(for: threadId)) ?? ""
     }
 
     /// Persists the plan notes for the thread. Passing "" overwrites prior content.
-    public func save(_ notes: String, threadId: AgentThreadID) {
-        try? repo.set(Self.storageKey(for: threadId), notes)
+    public func save(_ notes: String, threadId: AgentThreadID) throws {
+        try repo.set(Self.storageKey(for: threadId), notes)
     }
 
     /// Stable, deterministic key for a thread. Public for test assertions.
