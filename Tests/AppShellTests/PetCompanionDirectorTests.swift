@@ -98,7 +98,8 @@ final class PetCompanionDirectorTests: XCTestCase {
     }
 
     func test_directorDelayContractsStayInsideProductBounds() {
-        XCTAssertEqual(PetCompanionDirector.ambientDelayRange, 35...75)
+        XCTAssertEqual(PetCompanionDirector.ambientDelayRange, 300...600,
+            "ambient play should stay infrequent so the default companion does not distract the user")
         XCTAssertEqual(PetCompanionDirector.workDelayRange, 25...50)
     }
 }

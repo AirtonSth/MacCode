@@ -85,7 +85,7 @@ public struct PetCompanionEligibility: Sendable, Equatable {
 }
 
 public struct PetCompanionDirector: Sendable {
-    public static let ambientDelayRange = 35...75
+    public static let ambientDelayRange = 300...600
     public static let workDelayRange = 25...50
 
     private static let ambientStates: [PetAnimationState] = [

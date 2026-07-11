@@ -200,11 +200,11 @@ final class PetAssetRuntimeTests: XCTestCase {
             "the sleeping companion must visibly advance while normal animation is allowed")
     }
 
-    func test_everyAuthoredReactionAdvancesWhenAnimationPolicyAllowsMotion() throws {
+    func test_everyNonIdleAuthoredReactionAdvancesWhenAnimationPolicyAllowsMotion() throws {
         let scheduler = TestPetAnimationScheduler()
         let controller = try PetAnimationController(atlas: .bundled(), scheduler: scheduler)
 
-        for state in PetAnimationState.allCases {
+        for state in PetAnimationState.allCases where state != .idle {
             try controller.setState(state, derivedTerminalState: .idle)
             XCTAssertEqual(scheduler.activeTimerCount, 1,
                 "\(state.rawValue) must start animated instead of rendering as a static reaction")
@@ -214,6 +214,34 @@ final class PetAssetRuntimeTests: XCTestCase {
                 "\(state.rawValue) must contain visible authored frame progression")
         }
         XCTAssertEqual(scheduler.maximumActiveTimerCount, 1)
+    }
+
+    func test_idlePlaybackHoldsStillBeforeAndBetweenNaturalMotionBursts() throws {
+        let scheduler = TestPetAnimationScheduler()
+        let controller = try PetAnimationController(atlas: .bundled(), scheduler: scheduler)
+        try controller.setState(.idle)
+
+        XCTAssertEqual(controller.currentFrameIndex, 0)
+        XCTAssertTrue(
+            (12.0...24.0).contains(try XCTUnwrap(scheduler.lastInterval)),
+            "default idle should rest before blinking or moving its tail"
+        )
+
+        scheduler.fireActiveTimer()
+        XCTAssertEqual(controller.currentFrameIndex, 1,
+            "the idle motion burst should still use the authored movement")
+        XCTAssertEqual(try XCTUnwrap(scheduler.lastInterval), 0.25, accuracy: 0.001,
+            "authored idle motion should keep its natural 4 FPS speed")
+
+        for _ in 0..<7 { scheduler.fireActiveTimer() }
+
+        XCTAssertEqual(controller.currentFrameIndex, 0)
+        XCTAssertTrue(
+            (12.0...24.0).contains(try XCTUnwrap(scheduler.lastInterval)),
+            "each completed idle burst should return to a calm variable rest"
+        )
+        XCTAssertEqual(scheduler.maximumActiveTimerCount, 1,
+            "calmer idle playback must not introduce a second timer")
     }
 
     func test_loopPlayback_wraps_andKeepsSingleTimer() throws {
@@ -366,12 +394,15 @@ private final class TestPetAnimationTimer: PetAnimationTimer {
 private final class TestPetAnimationScheduler: PetAnimationScheduling {
     private var timers: [TestPetAnimationTimer] = []
     private(set) var maximumActiveTimerCount = 0
+    private(set) var scheduledIntervals: [TimeInterval] = []
 
     var activeTimerCount: Int { timers.filter(\.isValid).count }
+    var lastInterval: TimeInterval? { scheduledIntervals.last }
 
-    func schedule(interval _: TimeInterval, handler: @escaping @MainActor () -> Void) -> any PetAnimationTimer {
+    func schedule(interval: TimeInterval, handler: @escaping @MainActor () -> Void) -> any PetAnimationTimer {
         let timer = TestPetAnimationTimer(handler: handler)
         timers.append(timer)
+        scheduledIntervals.append(interval)
         maximumActiveTimerCount = max(maximumActiveTimerCount, activeTimerCount)
         return timer
     }
