@@ -1083,6 +1083,21 @@ final class DispatcherTests: XCTestCase {
         let router = FakeRouter(); router.gitCwd = dir
         let d = JSONRPCDispatcher(router: router)
         let workspaceUUID = UUID()
+        let workspaceID = WorkspaceID(workspaceUUID)
+        let terminal = SurfaceDescriptor(type: .terminal, title: "terminal")
+        let gitSurface = SurfaceDescriptor(
+            type: .rightSidebarTool,
+            title: "Git",
+            metadata: ["tool": "diff"]
+        )
+        let pane = PaneNode(surfaces: [terminal, gitSurface], selectedSurfaceID: terminal.id)
+        router.workspaces = [Workspace(
+            id: workspaceID,
+            name: "git-route",
+            cwd: dir,
+            layout: .pane(pane),
+            focusedPaneID: pane.id
+        )]
         let wid = JSONValue.string(workspaceUUID.uuidString)
 
         let status = await d.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(1), method: "git.status", params: ["workspace_id": wid]))
@@ -1098,8 +1113,27 @@ final class DispatcherTests: XCTestCase {
         XCTAssertEqual(bo["ok"], .bool(true), "create_branch must report success over the wire")
         XCTAssertEqual(GitDiff.branches(in: dir).current, "feat", "the socket call must actually move HEAD")
 
+        var pushEvents: [EventBus.Event] = []
+        let pushToken = EventBus.shared.subscribe(since: EventBus.shared.currentSeq) { event in
+            if event.kind == "git.push" { pushEvents.append(event) }
+        }
+        defer { EventBus.shared.unsubscribe(pushToken) }
+        let pushed = await d.dispatch(JSONRPCRequest(
+            jsonrpc: "2.0",
+            id: .number(4),
+            method: "git.push",
+            params: ["workspace_id": wid]
+        ))
+        XCTAssertNil(pushed.error)
+        XCTAssertEqual(pushEvents.count, 1)
+        XCTAssertEqual(pushEvents.first?.payload.objectValue, [
+            "workspace_id": .string(workspaceUUID.uuidString),
+            "surface_id": .string(gitSurface.id.value.uuidString),
+            "ok": .bool(true)
+        ], "Socket Git outcomes must carry the exact canonical Git surface in the same workspace.")
+
         try "changed\n".write(toFile: dir + "/a.txt", atomically: true, encoding: .utf8)
-        let delivery = await d.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(4), method: "git.delivery_plan", params: [
+        let delivery = await d.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(5), method: "git.delivery_plan", params: [
             "workspace_id": wid,
             "copy": .object([
                 "branchName": .string("agent/provider-copy"),
@@ -1121,7 +1155,7 @@ final class DispatcherTests: XCTestCase {
             if event.kind == "git.deliver" { deliveryEvents.append(event) }
         }
         defer { EventBus.shared.unsubscribe(deliveryToken) }
-        let delivered = await d.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(5), method: "git.deliver", params: ["workspace_id": wid]))
+        let delivered = await d.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(6), method: "git.deliver", params: ["workspace_id": wid]))
         guard case .object(let result)? = delivered.result else { return XCTFail("git.deliver must return one-shot delivery phase status") }
         XCTAssertEqual(result["ok"], .bool(true), "git.deliver must execute branch, commit, and push through the socket")
         guard case .array(let deliveredPhases)? = result["phases"], deliveredPhases.count == 4 else {
@@ -1132,6 +1166,7 @@ final class DispatcherTests: XCTestCase {
             "One RPC delivery must publish one canonical Pet/mirror outcome.")
         XCTAssertEqual(deliveryEvents.first?.payload.objectValue, [
             "workspace_id": .string(workspaceUUID.uuidString),
+            "surface_id": .string(gitSurface.id.value.uuidString),
             "ok": .bool(true)
         ])
     }

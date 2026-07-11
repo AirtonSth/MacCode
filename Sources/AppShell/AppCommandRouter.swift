@@ -757,6 +757,40 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         return desc
     }
 
+    public func ensureGitSurface(workspace: WorkspaceID) throws -> SurfaceDescriptor {
+        guard let ctx = context,
+              let workspaceState = ctx.state.workspaces[workspace] else {
+            throw LayoutError.workspaceNotFound
+        }
+        var existing: SurfaceDescriptor?
+        forEachSurface(in: workspaceState.layout) { descriptor in
+            guard existing == nil,
+                  descriptor.type == .rightSidebarTool,
+                  descriptor.metadata["tool"] == "diff" else { return }
+            existing = descriptor
+        }
+        if let existing { return existing }
+
+        let targetPaneID = workspaceState.focusedPaneID ?? workspaceState.layout.paneIDs().first
+        let previousSurfaceID = targetPaneID.flatMap {
+            workspaceState.layout.find(paneID: $0)?.selectedSurfaceID
+        }
+        let descriptor = makeSurface(
+            type: .rightSidebarTool,
+            title: "Git",
+            workspace: workspace,
+            cwd: workspaceState.cwd
+        )
+        try ctx.apply(.addSurface(workspace, paneID: targetPaneID, descriptor: descriptor))
+        if let previousSurfaceID {
+            try ctx.apply(.focusSurface(workspace, previousSurfaceID))
+        }
+        windowController?.refreshFromState()
+        reconcileSurfaceVisibility()
+        publishSurfaceCreated(workspace: workspace, surface: descriptor)
+        return descriptor
+    }
+
     public func splitPane(workspace: WorkspaceID, paneID: PaneID, direction: SplitDirection, surfaceType: SurfaceType, title: String?) throws -> SurfaceDescriptor {
         guard let ctx = context else { throw LayoutError.workspaceNotFound }
         let desc = makeSurface(type: surfaceType, title: title, workspace: workspace, cwd: ctx.state.workspaces[workspace]?.cwd ?? "/")

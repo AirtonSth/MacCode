@@ -111,6 +111,7 @@ public protocol CommandRouting: AnyObject {
     func gitLog(workspace: WorkspaceID, limit: Int) throws -> [GitCommit]
     func gitDiff(workspace: WorkspaceID, path: String?, ignoreWhitespace: Bool) throws -> String
     func gitPush(workspace: WorkspaceID) throws -> GitActionResult
+    func ensureGitSurface(workspace: WorkspaceID) throws -> SurfaceDescriptor
     func gitPullRequestURL(workspace: WorkspaceID) throws -> String?
     func gitDeliveryPlan(workspace: WorkspaceID, copy: GitDeliveryCopy?) throws -> GitDeliveryPlan
     func gitDeliver(workspace: WorkspaceID, copy: GitDeliveryCopy?) throws -> GitDeliveryResult
@@ -164,6 +165,32 @@ public protocol CommandRouting: AnyObject {
 public extension CommandRouting {
     func closeWorkspace(_ id: WorkspaceID) throws {
         try closeWorkspace(id, publishEvent: true)
+    }
+
+    func ensureGitSurface(workspace: WorkspaceID) throws -> SurfaceDescriptor {
+        guard let workspaceState = try listWorkspaces().first(where: { $0.id == workspace }) else {
+            throw LayoutError.workspaceNotFound
+        }
+        if let surface = canonicalGitSurface(in: workspaceState.layout) {
+            return surface
+        }
+        return try createSurface(
+            workspace: workspaceState.id,
+            type: .rightSidebarTool,
+            paneID: nil,
+            title: "Git"
+        )
+    }
+}
+
+private func canonicalGitSurface(in node: LayoutNode) -> SurfaceDescriptor? {
+    switch node {
+    case .pane(let pane):
+        return pane.surfaces.first {
+            $0.type == .rightSidebarTool && $0.metadata["tool"] == "diff"
+        }
+    case .split(let split):
+        return split.children.lazy.compactMap { canonicalGitSurface(in: $0) }.first
     }
 }
 
@@ -1362,8 +1389,13 @@ public final class JSONRPCDispatcher {
                 if let (_, cached) = commandReceipt(method: req.method, params: params) {
                     return .init(id: id, result: cached)
                 }
+                let destination = try router.ensureGitSurface(workspace: wid)
                 let r = try router.gitPush(workspace: wid)
-                EventBus.shared.publish(kind: "git.push", payload: .object(["workspace_id": .string(wid.value.uuidString), "ok": .bool(r.ok)]))
+                EventBus.shared.publish(kind: "git.push", payload: .object([
+                    "workspace_id": .string(wid.value.uuidString),
+                    "surface_id": .string(destination.id.value.uuidString),
+                    "ok": .bool(r.ok)
+                ]))
                 let result = encode(r)
                 recordCommandReceipt(method: req.method, clientRequestId: receiptKey, result: result)
                 return .init(id: id, result: result)
@@ -1376,8 +1408,13 @@ public final class JSONRPCDispatcher {
                 return .init(id: id, result: encode(try router.gitDeliveryPlan(workspace: wid, copy: gitDeliveryCopy(from: params))))
             case "git.deliver":
                 guard let wid = params["workspace_id"]?.stringValue.flatMap(UUID.init).map(WorkspaceID.init) else { throw JSONRPCError.invalidParams }
+                let destination = try router.ensureGitSurface(workspace: wid)
                 let r = try router.gitDeliver(workspace: wid, copy: gitDeliveryCopy(from: params))
-                EventBus.shared.publish(kind: "git.deliver", payload: .object(["workspace_id": .string(wid.value.uuidString), "ok": .bool(r.ok)]))
+                EventBus.shared.publish(kind: "git.deliver", payload: .object([
+                    "workspace_id": .string(wid.value.uuidString),
+                    "surface_id": .string(destination.id.value.uuidString),
+                    "ok": .bool(r.ok)
+                ]))
                 return .init(id: id, result: encode(r))
             case "project.scripts":
                 guard let wid = params["workspace_id"]?.stringValue.flatMap(UUID.init).map(WorkspaceID.init) else { throw JSONRPCError.invalidParams }

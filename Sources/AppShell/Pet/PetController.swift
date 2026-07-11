@@ -558,6 +558,8 @@ public final class PetController {
                 try router.selectWorkspace(workspaceID)
             }
             try router.focusSurface(workspace: workspaceID, surface: surfaceID)
+            router.windowController?.flushPendingRefresh()
+            router.windowController?.focusSurface(surfaceID)
             guard let workspace = context.state.workspaces[workspaceID],
                   let paneID = workspace.focusedPaneID else { return false }
             return workspace.layout.find(paneID: paneID)?.selectedSurfaceID == surfaceID

@@ -370,6 +370,41 @@ final class PetAttentionStoreTests: XCTestCase {
         XCTAssertTrue(try fixture.notifications.list(unreadOnly: true).isEmpty)
     }
 
+    func test_gitNotificationsPreferExactSurfaceAndRetainLegacyWorkspaceRoute() throws {
+        let fixture = try fixture()
+        let workspaceID = WorkspaceID(UUID())
+        let surfaceID = SurfaceID(UUID())
+        try fixture.notifications.insert(AppNotification(
+            id: "git-exact",
+            workspaceId: workspaceID,
+            surfaceId: surfaceID,
+            title: "ignored",
+            category: PetNotificationCategory.gitCompleted.rawValue,
+            createdAt: Date(timeIntervalSince1970: 20)
+        ))
+        try fixture.notifications.insert(AppNotification(
+            id: "git-legacy",
+            workspaceId: workspaceID,
+            title: "ignored",
+            category: PetNotificationCategory.gitFailed.rawValue,
+            createdAt: Date(timeIntervalSince1970: 10)
+        ))
+
+        let routes = Dictionary(uniqueKeysWithValues: try fixture.store.refresh().items.map {
+            ($0.id, $0.route)
+        })
+
+        XCTAssertEqual(
+            routes["notification:git-exact"],
+            .surface(surfaceID: surfaceID, workspaceID: workspaceID)
+        )
+        XCTAssertEqual(
+            routes["notification:git-legacy"],
+            .workspace(workspaceID: workspaceID),
+            "Persisted pre-surface Git rows must remain actionable after upgrading."
+        )
+    }
+
     func test_openAndMarkRead_retainsActionRequiredNotificationsUntilCanonicalResolution() throws {
         let fixture = try fixture()
         let workspaceID = WorkspaceID(UUID())
@@ -716,12 +751,14 @@ final class PetAttentionStoreTests: XCTestCase {
         let fixture = try fixture()
         let recorder = PetTerminalNotificationRecorder(repository: fixture.notifications)
         let workspaceID = WorkspaceID(UUID())
+        let surfaceID = SurfaceID(UUID())
 
         let git = EventBus.Event(
             seq: 9,
             kind: "git.deliver",
             payload: .object([
                 "workspace_id": .string(workspaceID.value.uuidString),
+                "surface_id": .string(surfaceID.value.uuidString),
                 "ok": .bool(false),
                 "branch": .string("secret/path"),
                 "output": .string("token=private")
@@ -734,6 +771,7 @@ final class PetAttentionStoreTests: XCTestCase {
         XCTAssertEqual(recorded.title, "Git delivery failed")
         XCTAssertNil(recorded.body)
         XCTAssertEqual(recorded.workspaceId, workspaceID)
+        XCTAssertEqual(recorded.surfaceId, surfaceID)
         XCTAssertNil(try recorder.record(event: EventBus.Event(
             seq: 10,
             kind: "agent.run.finished",

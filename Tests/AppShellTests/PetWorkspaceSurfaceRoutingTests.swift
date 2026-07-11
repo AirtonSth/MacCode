@@ -9,7 +9,7 @@ import Surfaces
 /// after the exact main or detached destination is mounted and visible.
 @MainActor
 final class PetWorkspaceSurfaceRoutingTests: XCTestCase {
-    func test_mainWorkspaceRouteClearsOnlyAfterSelectingExactVisibleWindow() throws {
+    func test_legacyGitWorkspaceRouteClearsOnlyAfterSelectingExactVisibleWindow() throws {
         let fixture = try makeFixture(prefix: "MainWorkspace")
         defer { fixture.cleanup() }
         let workspace = try fixture.router.createWorkspace(name: "MAIN-TARGET", cwd: NSTemporaryDirectory())
@@ -74,7 +74,54 @@ final class PetWorkspaceSurfaceRoutingTests: XCTestCase {
         XCTAssertNil(pet.modelForTests.routeError)
     }
 
-    func test_detachedWorkspaceRoutePreservesMainSelectionAndClearsAfterActivation() throws {
+    func test_mainSurfaceRouteFlushesWorkspaceSwitchBeforeClearing() throws {
+        let fixture = try makeFixture(prefix: "MainSurfaceWorkspaceSwitch")
+        defer { fixture.cleanup() }
+        let targetWorkspace = try fixture.router.createWorkspace(
+            name: "BACKGROUND-TARGET",
+            cwd: NSTemporaryDirectory()
+        )
+        let targetSurfaceID = try fixture.focusedSurfaceID(in: targetWorkspace.id)
+        fixture.trackSurfaces(in: targetWorkspace.id)
+        let foregroundWorkspace = try fixture.router.createWorkspace(
+            name: "FOREGROUND",
+            cwd: NSTemporaryDirectory()
+        )
+        fixture.trackSurfaces(in: foregroundWorkspace.id)
+        try fixture.notifications.insert(AppNotification(
+            id: "main-surface-workspace-switch",
+            workspaceId: targetWorkspace.id,
+            surfaceId: targetSurfaceID,
+            title: "unsafe script detail",
+            category: PetNotificationCategory.projectScriptCompleted.rawValue
+        ))
+
+        let pet = try fixture.startPet()
+        defer { pet.stop() }
+        XCTAssertEqual(fixture.context.state.window.selectedWorkspaceID, foregroundWorkspace.id)
+        XCTAssertFalse(
+            SurfaceRegistry.shared.surface(targetSurfaceID)?.view.window
+                === fixture.windowController.window,
+            "The target must begin outside the destination window so this reproduces the live workspace-switch race."
+        )
+
+        fixture.open(itemID: "notification:main-surface-workspace-switch", with: pet)
+
+        XCTAssertEqual(fixture.context.state.window.selectedWorkspaceID, targetWorkspace.id)
+        XCTAssertEqual(try fixture.focusedSurfaceID(in: targetWorkspace.id), targetSurfaceID)
+        XCTAssertTrue(
+            SurfaceRegistry.shared.surface(targetSurfaceID)?.view.window
+                === fixture.windowController.window,
+            "The queued workspace refresh must be flushed before route verification."
+        )
+        XCTAssertTrue(
+            try fixture.notifications.list(unreadOnly: true).isEmpty,
+            "A project outcome clears only after the exact switched-to surface is mounted."
+        )
+        XCTAssertNil(pet.modelForTests.routeError)
+    }
+
+    func test_legacyDetachedGitWorkspaceRoutePreservesMainSelectionAndClearsAfterActivation() throws {
         let fixture = try makeFixture(prefix: "DetachedWorkspace")
         defer { fixture.cleanup() }
         let detachedWorkspace = try fixture.router.createWorkspace(
@@ -161,18 +208,27 @@ final class PetWorkspaceSurfaceRoutingTests: XCTestCase {
         )
         fixture.trackSurfaces(in: existingWorkspace.id)
         let staleWorkspaceID = WorkspaceID(UUID())
-        let staleSurfaceID = SurfaceID(UUID())
+        let staleGitSurfaceID = SurfaceID(UUID())
+        let staleProjectSurfaceID = SurfaceID(UUID())
         try fixture.notifications.insert(AppNotification(
-            id: "stale-workspace",
+            id: "stale-git-workspace",
             workspaceId: staleWorkspaceID,
             title: "unsafe git detail",
             category: PetNotificationCategory.gitCompleted.rawValue,
             createdAt: Date(timeIntervalSince1970: 200)
         ))
         try fixture.notifications.insert(AppNotification(
+            id: "stale-git-surface",
+            workspaceId: existingWorkspace.id,
+            surfaceId: staleGitSurfaceID,
+            title: "unsafe git detail",
+            category: PetNotificationCategory.gitFailed.rawValue,
+            createdAt: Date(timeIntervalSince1970: 150)
+        ))
+        try fixture.notifications.insert(AppNotification(
             id: "stale-surface",
             workspaceId: existingWorkspace.id,
-            surfaceId: staleSurfaceID,
+            surfaceId: staleProjectSurfaceID,
             title: "unsafe script detail",
             category: PetNotificationCategory.projectScriptCompleted.rawValue,
             createdAt: Date(timeIntervalSince1970: 100)
@@ -180,15 +236,16 @@ final class PetWorkspaceSurfaceRoutingTests: XCTestCase {
 
         let pet = try fixture.startPet()
         defer { pet.stop() }
-        fixture.open(itemID: "notification:stale-workspace", with: pet)
+        fixture.open(itemID: "notification:stale-git-workspace", with: pet)
+        fixture.open(itemID: "notification:stale-git-surface", with: pet)
         fixture.open(itemID: "notification:stale-surface", with: pet)
 
         XCTAssertEqual(
             Set(try fixture.notifications.list(unreadOnly: true).map(\.id)),
-            Set(["stale-workspace", "stale-surface"]),
+            Set(["stale-git-workspace", "stale-git-surface", "stale-surface"]),
             "Missing exact destinations must never acknowledge ready items the user could not inspect."
         )
-        XCTAssertEqual(pet.modelForTests.count, 2)
+        XCTAssertEqual(pet.modelForTests.count, 3)
         XCTAssertEqual(
             pet.modelForTests.routeError,
             "The exact destination could not be opened. The item was kept."
