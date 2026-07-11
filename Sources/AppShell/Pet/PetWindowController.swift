@@ -166,6 +166,16 @@ enum PetPopoverSizing {
 }
 
 enum PetScreenGeometry {
+    static func petPlacementFrame(screenFrame: CGRect, visibleFrame: CGRect) -> CGRect {
+        let topEdge = min(screenFrame.maxY, max(screenFrame.minY, visibleFrame.maxY))
+        return CGRect(
+            x: screenFrame.minX,
+            y: screenFrame.minY,
+            width: screenFrame.width,
+            height: topEdge - screenFrame.minY
+        )
+    }
+
     static func largestPositiveIntersectionIndex(
         frame: CGRect,
         screenFrames: [CGRect]
@@ -647,11 +657,12 @@ public final class PetWindowController: NSObject {
     private func finishDrag(frame: CGRect) {
         guard let panel = petPanel,
               let screen = screen(containing: frame) ?? fallbackScreen() else { return }
-        let clamped = PetPlacement.clamped(frame: frame, to: screen.visibleFrame)
+        let placementFrame = petPlacementFrame(for: screen)
+        let clamped = PetPlacement.clamped(frame: frame, to: placementFrame)
         panel.setFrame(clamped, display: true)
         placementStore.save(PetStoredPlacement(
             displayID: displayID(for: screen),
-            position: PetPlacement.normalizedPosition(for: clamped, in: screen.visibleFrame)
+            position: PetPlacement.normalizedPosition(for: clamped, in: placementFrame)
         ))
         onAdoptFreePosition?()
         if isPopoverVisible { positionPopover() }
@@ -677,7 +688,7 @@ public final class PetWindowController: NSObject {
         return PetPlacement.frame(
             size: size,
             normalizedPosition: normalized,
-            in: targetScreen.visibleFrame
+            in: petPlacementFrame(for: targetScreen)
         )
     }
 
@@ -689,7 +700,7 @@ public final class PetWindowController: NSObject {
 
         let targetScreen = screen(containing: panel.frame) ?? fallbackScreen()
         let normalized = targetScreen.map {
-            PetPlacement.normalizedPosition(for: panel.frame, in: $0.visibleFrame)
+            PetPlacement.normalizedPosition(for: panel.frame, in: petPlacementFrame(for: $0))
         }
         panel.setContentSize(size)
         if let targetScreen, let normalized {
@@ -697,7 +708,7 @@ public final class PetWindowController: NSObject {
                 PetPlacement.frame(
                     size: size,
                     normalizedPosition: normalized,
-                    in: targetScreen.visibleFrame
+                    in: petPlacementFrame(for: targetScreen)
                 ),
                 display: true
             )
@@ -726,6 +737,13 @@ public final class PetWindowController: NSObject {
             screenFrames: screens.map(\.frame)
         ) else { return nil }
         return screens[index]
+    }
+
+    private func petPlacementFrame(for screen: NSScreen) -> CGRect {
+        PetScreenGeometry.petPlacementFrame(
+            screenFrame: screen.frame,
+            visibleFrame: screen.visibleFrame
+        )
     }
 
     private func popoverTargetScreen() -> NSScreen? {

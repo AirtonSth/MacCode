@@ -4,6 +4,20 @@ import XCTest
 final class PetPlacementTests: XCTestCase {
     private let visibleFrame = CGRect(x: 100, y: 100, width: 1_000, height: 700)
 
+    func test_petScreenFrameUsesPhysicalSideAndBottomEdgesButKeepsMenuBarClear() {
+        let screenFrame = CGRect(x: 0, y: 0, width: 1_000, height: 800)
+        let dockAndMenuVisibleFrame = CGRect(x: 80, y: 60, width: 840, height: 710)
+
+        XCTAssertEqual(
+            PetScreenGeometry.petPlacementFrame(
+                screenFrame: screenFrame,
+                visibleFrame: dockAndMenuVisibleFrame
+            ),
+            CGRect(x: 0, y: 0, width: 1_000, height: 770),
+            "the pet may occupy Dock-reserved side/bottom space, but must remain below the menu bar"
+        )
+    }
+
     func test_normalizedPositionAlwaysClampsToUnitRange() {
         XCTAssertEqual(PetNormalizedPosition(x: -2, y: 5), PetNormalizedPosition(x: 0, y: 1))
     }
