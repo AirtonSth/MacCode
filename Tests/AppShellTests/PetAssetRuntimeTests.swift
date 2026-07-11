@@ -73,6 +73,46 @@ final class PetAssetRuntimeTests: XCTestCase {
         XCTAssertEqual(croppedFrameCount, 120)
     }
 
+    func test_stateVisualBoundsRemoveOnlyTransparentPaddingWithoutClippingOrFrameJitter() throws {
+        let atlas = try PetAtlas.bundled()
+        var frameCount = 0
+
+        for row in atlas.manifest.rows {
+            var sourceUnion: CGRect?
+            var displayUnion: CGRect?
+            let expectedSourceBounds = row.visualBounds.rect
+            let expectedDisplayBounds = CGRect(origin: .zero, size: expectedSourceBounds.size)
+
+            for index in 0..<row.frames {
+                let frame = try atlas.frame(state: row.state, index: index)
+                let sourceComponents = alphaComponents(in: frame.image)
+                let displayComponents = alphaComponents(in: frame.displayImage)
+                let sourceBounds = try XCTUnwrap(union(of: sourceComponents))
+                let displayBounds = try XCTUnwrap(union(of: displayComponents))
+
+                XCTAssertTrue(expectedSourceBounds.contains(sourceBounds),
+                    "\(row.state.rawValue)[\(index)] must not be clipped by its stable visual envelope")
+                XCTAssertEqual(
+                    sourceComponents.reduce(0) { $0 + $1.pixelCount },
+                    displayComponents.reduce(0) { $0 + $1.pixelCount },
+                    "visual trimming may remove transparent padding only"
+                )
+                XCTAssertEqual(frame.displayImage.width, Int(expectedSourceBounds.width))
+                XCTAssertEqual(frame.displayImage.height, Int(expectedSourceBounds.height))
+                sourceUnion = sourceUnion.map { $0.union(sourceBounds) } ?? sourceBounds
+                displayUnion = displayUnion.map { $0.union(displayBounds) } ?? displayBounds
+                frameCount += 1
+            }
+
+            XCTAssertEqual(sourceUnion, expectedSourceBounds,
+                "the manifest envelope must stay tight so screen-edge placement has no hidden margin")
+            XCTAssertEqual(displayUnion, expectedDisplayBounds,
+                "every state must use one stable tight canvas across all of its animation frames")
+        }
+
+        XCTAssertEqual(frameCount, 120)
+    }
+
     func test_allFramesHaveNoSmallFragmentsFromAdjacentSourceCells() throws {
         let atlas = try PetAtlas.bundled()
         var suspiciousFragments: [String] = []
@@ -207,6 +247,12 @@ final class PetAssetRuntimeTests: XCTestCase {
 private struct AlphaComponent {
     let pixelCount: Int
     let bounds: CGRect
+}
+
+private func union(of components: [AlphaComponent]) -> CGRect? {
+    components.reduce(nil) { result, component in
+        result.map { $0.union(component.bounds) } ?? component.bounds
+    }
 }
 
 private func alphaComponents(in image: CGImage, threshold: UInt8 = 1) -> [AlphaComponent] {

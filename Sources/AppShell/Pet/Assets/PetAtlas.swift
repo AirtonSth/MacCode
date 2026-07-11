@@ -31,12 +31,24 @@ struct PetAtlasManifest: Decodable, Equatable {
     }
 
     struct Row: Decodable, Equatable {
+        struct VisualBounds: Decodable, Equatable {
+            let height: Int
+            let width: Int
+            let x: Int
+            let y: Int
+
+            var rect: CGRect {
+                CGRect(x: x, y: y, width: width, height: height)
+            }
+        }
+
         let canonicalFrame: Int
         let fps: Int
         let frames: Int
         let mode: PlaybackMode
         let row: Int
         let state: PetAnimationState
+        let visualBounds: VisualBounds
     }
 
     let atlas: String
@@ -77,10 +89,20 @@ struct PetAtlasManifest: Decodable, Equatable {
             throw PetAtlasError.invalidManifest("rows must match the stable 16-state atlas order")
         }
         for row in rows {
+            let visualBounds = row.visualBounds.rect
+            let frameBounds = CGRect(
+                x: 0,
+                y: 0,
+                width: grid.frameWidth,
+                height: grid.frameHeight
+            )
             guard (1...grid.columns).contains(row.frames),
                   row.frames > row.canonicalFrame,
                   row.canonicalFrame >= 0,
-                  row.fps > 0 else {
+                  row.fps > 0,
+                  visualBounds.width > 0,
+                  visualBounds.height > 0,
+                  frameBounds.contains(visualBounds) else {
                 throw PetAtlasError.invalidManifest("invalid playback metadata for \(row.state.rawValue)")
             }
         }
@@ -95,6 +117,7 @@ struct PetAtlasFrame {
     let state: PetAnimationState
     let index: Int
     let image: CGImage
+    let displayImage: CGImage
     let interpolationQuality: CGInterpolationQuality = .none
 
     /// Rendering entry point for AppKit/SwiftUI bridges. Pixel art must never be
@@ -202,7 +225,18 @@ final class PetAtlas {
               image.height == manifest.grid.frameHeight else {
             throw PetAtlasError.invalidFrame(state: state, index: index)
         }
-        return PetAtlasFrame(state: state, index: index, image: image)
+        let visualBounds = row.visualBounds.rect
+        guard let displayImage = image.cropping(to: visualBounds),
+              displayImage.width == Int(visualBounds.width),
+              displayImage.height == Int(visualBounds.height) else {
+            throw PetAtlasError.invalidFrame(state: state, index: index)
+        }
+        return PetAtlasFrame(
+            state: state,
+            index: index,
+            image: image,
+            displayImage: displayImage
+        )
     }
 
     func canonicalFrame(for state: PetAnimationState) throws -> PetAtlasFrame {
