@@ -50,6 +50,19 @@ public struct AppSettings: Codable, Sendable, Equatable {
     /// preserving). Off by default — opt-in, since it makes stored history lossy-recoverable.
     public var historyCompactionEnabled: Bool
 
+    /// Floating desktop pet. On by default so it is visible without setup.
+    public var petEnabled: Bool
+    public var petAnimationsEnabled: Bool
+    public var petReadyCounterEnabled: Bool
+    /// "bottomRight" | "bottomLeft" | "free".
+    public var petPosition: String
+    /// Display scale multiplier: 0.75, 1, 1.25, or 1.5.
+    public var petSize: Double
+    /// "all" | "completed" | "needsYou".
+    public var petAttentionFilter: String
+    /// App override may only reduce motion beyond the system preference.
+    public var petReduceMotion: Bool
+
     public init(diffWordWrap: Bool = false,
                 diffIgnoreWhitespace: Bool = false,
                 sidebarSort: String = "updated",
@@ -60,7 +73,14 @@ public struct AppSettings: Codable, Sendable, Equatable {
                 tokenSaverEnabled: Bool = false,
                 terminalFontSize: Double = 0,
                 sessionLearnEnabled: Bool = false,
-                historyCompactionEnabled: Bool = false) {
+                historyCompactionEnabled: Bool = false,
+                petEnabled: Bool = true,
+                petAnimationsEnabled: Bool = true,
+                petReadyCounterEnabled: Bool = true,
+                petPosition: String = "bottomRight",
+                petSize: Double = 1.5,
+                petAttentionFilter: String = "all",
+                petReduceMotion: Bool = false) {
         self.diffWordWrap = diffWordWrap
         self.diffIgnoreWhitespace = diffIgnoreWhitespace
         self.sidebarSort = sidebarSort
@@ -72,6 +92,13 @@ public struct AppSettings: Codable, Sendable, Equatable {
         self.terminalFontSize = terminalFontSize
         self.sessionLearnEnabled = sessionLearnEnabled
         self.historyCompactionEnabled = historyCompactionEnabled
+        self.petEnabled = petEnabled
+        self.petAnimationsEnabled = petAnimationsEnabled
+        self.petReadyCounterEnabled = petReadyCounterEnabled
+        self.petPosition = petPosition
+        self.petSize = petSize
+        self.petAttentionFilter = petAttentionFilter
+        self.petReduceMotion = petReduceMotion
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -86,6 +113,13 @@ public struct AppSettings: Codable, Sendable, Equatable {
         case terminalFontSize
         case sessionLearnEnabled
         case historyCompactionEnabled
+        case petEnabled
+        case petAnimationsEnabled
+        case petReadyCounterEnabled
+        case petPosition
+        case petSize
+        case petAttentionFilter
+        case petReduceMotion
     }
 
     public init(from decoder: Decoder) throws {
@@ -101,6 +135,13 @@ public struct AppSettings: Codable, Sendable, Equatable {
         terminalFontSize = try c.decodeIfPresent(Double.self, forKey: .terminalFontSize) ?? 0
         sessionLearnEnabled = try c.decodeIfPresent(Bool.self, forKey: .sessionLearnEnabled) ?? false
         historyCompactionEnabled = try c.decodeIfPresent(Bool.self, forKey: .historyCompactionEnabled) ?? false
+        petEnabled = try c.decodeIfPresent(Bool.self, forKey: .petEnabled) ?? true
+        petAnimationsEnabled = try c.decodeIfPresent(Bool.self, forKey: .petAnimationsEnabled) ?? true
+        petReadyCounterEnabled = try c.decodeIfPresent(Bool.self, forKey: .petReadyCounterEnabled) ?? true
+        petPosition = try c.decodeIfPresent(String.self, forKey: .petPosition) ?? "bottomRight"
+        petSize = try c.decodeIfPresent(Double.self, forKey: .petSize) ?? 1.5
+        petAttentionFilter = try c.decodeIfPresent(String.self, forKey: .petAttentionFilter) ?? "all"
+        petReduceMotion = try c.decodeIfPresent(Bool.self, forKey: .petReduceMotion) ?? false
     }
 }
 
@@ -132,16 +173,24 @@ public final class SettingsStore {
     /// Seam for testing: inject any SettingsWriteRepository.
     init(repo: any SettingsWriteRepository) { self.repo = repo }
 
+    private func loadFromRepository() throws -> AppSettings {
+        guard let json = try repo.get(key), let data = json.data(using: .utf8),
+              let settings = try? JSONDecoder().decode(AppSettings.self, from: data) else {
+            return AppSettings()
+        }
+        return settings
+    }
+
     public func load() -> AppSettings {
         if let cached = cache.get() { return cached }
-        guard let json = try? repo.get(key), let data = json.data(using: .utf8),
-              let s = try? JSONDecoder().decode(AppSettings.self, from: data) else {
-            let defaults = AppSettings()
-            cache.set(defaults)
-            return defaults
-        }
+        let s = (try? loadFromRepository()) ?? AppSettings()
         cache.set(s)
         return s
+    }
+
+    public func reload() -> AppSettings {
+        cache.invalidate()
+        return load()
     }
 
     public func save(_ settings: AppSettings) {
@@ -157,7 +206,16 @@ public final class SettingsStore {
 
     /// Read-modify-write a single field without clobbering the others.
     public func update(_ mutate: (inout AppSettings) -> Void) {
-        var s = load(); mutate(&s); save(s)
+        do {
+            // SettingsStore instances have independent caches. Read the canonical
+            // row directly so a stale instance cannot resurrect older field values.
+            var settings = try loadFromRepository()
+            mutate(&settings)
+            save(settings)
+        } catch {
+            // A failed read must not turn into defaults and overwrite valid settings.
+            onWriteError?(error)
+        }
     }
 }
 

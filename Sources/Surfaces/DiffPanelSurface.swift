@@ -200,6 +200,9 @@ public final class DiffPanelViewModel: ObservableObject {
     /// Injected git operations. Default = LiveGitClient (real git).
     /// Tests inject a fake to avoid shelling out to git (QA :93).
     let gitClient: any GitClient
+    /// Host bridge for user-visible local Git outcomes. Never carries branch
+    /// names, commit messages, paths, commands, or stderr.
+    public var gitOutcomeHandler: ((String, Bool) -> Void)?
     /// FSEvents stream token for cwd watch; nil until `startFSWatcher()` is called.
     private var fsStream: FSEventStreamRef?
     /// Wall-clock time of the last auto-refresh triggered by FSEvents.
@@ -500,14 +503,14 @@ public final class DiffPanelViewModel: ObservableObject {
 
     public func switchBranch(_ name: String) {
         let gc = gitClient
-        runAction(successMessage: "Switched to \(name)") { gc.checkout(in: $0, branch: name) }
+        runAction(eventKind: "git.checkout", successMessage: "Switched to \(name)") { gc.checkout(in: $0, branch: name) }
     }
 
     /// UX-004: stash uncommitted work, then switch — the guarded path
     /// offered when the working tree is dirty.
     public func stashAndSwitchBranch(_ name: String) {
         let gc = gitClient
-        runAction(successMessage: "Stashed changes and switched to \(name)") {
+        runAction(eventKind: "git.checkout", successMessage: "Stashed changes and switched to \(name)") {
             gc.stashAndCheckout(in: $0, branch: name)
         }
     }
@@ -516,7 +519,7 @@ public final class DiffPanelViewModel: ObservableObject {
         let n = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !n.isEmpty else { return }
         let gc = gitClient
-        runAction(successMessage: "Created branch \(n)") { gc.createBranch(in: $0, name: n) }
+        runAction(eventKind: "git.branch_created", successMessage: "Created branch \(n)") { gc.createBranch(in: $0, name: n) }
     }
 
     public func commit() {
@@ -530,7 +533,7 @@ public final class DiffPanelViewModel: ObservableObject {
         let amend = amendLastCommit
         let argv = Self.commitArgv(message: msg, amend: amend)
         let label = amend ? "Amended last commit" : "Committed all changes (\(n) file\(n == 1 ? "" : "s"))"
-        runAction(clearMessageOnOK: true, successMessage: label) { cwd in
+        runAction(eventKind: "git.commit", clearMessageOnOK: true, successMessage: label) { cwd in
             Self.runGitCommit(cwd: cwd, argv: argv)
         }
         if amend { amendLastCommit = false }
@@ -550,7 +553,7 @@ public final class DiffPanelViewModel: ObservableObject {
         // Amend path: stage everything and amend.
         if amend {
             let argv = Self.commitArgv(message: msg, amend: true)
-            runAction(clearMessageOnOK: true, successMessage: "Amended last commit") { cwd in
+            runAction(eventKind: "git.commit", clearMessageOnOK: true, successMessage: "Amended last commit") { cwd in
                 Self.runGitCommit(cwd: cwd, argv: argv)
             }
             amendLastCommit = false
@@ -567,7 +570,7 @@ public final class DiffPanelViewModel: ObservableObject {
         }
         let n = paths.count
         let gc = gitClient
-        runAction(clearMessageOnOK: true,
+        runAction(eventKind: "git.commit", clearMessageOnOK: true,
                   successMessage: "Committed \(n) selected file\(n == 1 ? "" : "s")") {
             gc.commitPaths(in: $0, message: msg, paths: paths)
         }
@@ -602,7 +605,7 @@ public final class DiffPanelViewModel: ObservableObject {
     public func push() {
         let branch = branches.current ?? "branch"
         let gc = gitClient
-        runAction(successMessage: "Pushed \(branch)") { gc.push(in: $0) }
+        runAction(eventKind: "git.push", successMessage: "Pushed \(branch)") { gc.push(in: $0) }
     }
 
     /// Fetch remote refs (`git fetch --prune`) without touching the working tree.
@@ -791,7 +794,8 @@ public final class DiffPanelViewModel: ObservableObject {
     /// Runs a mutating git op off the main thread, then re-reads summary,
     /// branches and log so the panel always reflects post-op truth.
     /// Failures surface in `lastError` — never silent (CLAUDE.md Rule 6).
-    private func runAction(clearMessageOnOK: Bool = false,
+    private func runAction(eventKind: String? = nil,
+                           clearMessageOnOK: Bool = false,
                            successMessage: String? = nil,
                            _ op: @escaping @Sendable (String) -> GitActionResult) {
         let cwd = self.cwd
@@ -809,6 +813,9 @@ public final class DiffPanelViewModel: ObservableObject {
                 self.branches = b
                 self.commits = log
                 self.isBusy = false
+                if let eventKind {
+                    self.gitOutcomeHandler?(eventKind, r.ok)
+                }
                 if r.ok {
                     self.lastError = nil
                     self.lastErrorRaw = nil
@@ -1978,6 +1985,15 @@ public final class DiffPanelSurface: NSObject, Surface {
         ])
         self.view = container
         super.init()
+        let surfaceID = descriptor.id
+        self.viewModel.gitOutcomeHandler = { kind, succeeded in
+            LocalGitActivityBus.shared.emit(LocalGitActivity(
+                kind: kind,
+                workspaceID: workspaceID,
+                surfaceID: surfaceID,
+                succeeded: succeeded
+            ))
+        }
     }
 
     public func focus() { view.window?.makeFirstResponder(view) }

@@ -23,6 +23,13 @@ final class SettingsStoreTests: XCTestCase {
         XCTAssertTrue(d.insomniaAllowScreenSaverAfter45MinutesOfInactivity)
         XCTAssertFalse(d.tokenSaverEnabled)
         XCTAssertEqual(d.terminalFontSize, 0)
+        XCTAssertTrue(d.petEnabled, "a fresh install must show the pet without requiring setup")
+        XCTAssertTrue(d.petAnimationsEnabled)
+        XCTAssertTrue(d.petReadyCounterEnabled)
+        XCTAssertEqual(d.petPosition, "bottomRight")
+        XCTAssertEqual(d.petSize, 1.5, "the pet must start at the existing 150% size")
+        XCTAssertEqual(d.petAttentionFilter, "all")
+        XCTAssertFalse(d.petReduceMotion)
     }
 
     func test_saveThenLoadRoundTrips() throws {
@@ -36,7 +43,14 @@ final class SettingsStoreTests: XCTestCase {
             insomniaAllowSystemSleepWhenDisplayClosed: true,
             insomniaAllowScreenSaverAfter45MinutesOfInactivity: false,
             tokenSaverEnabled: true,
-            terminalFontSize: 16
+            terminalFontSize: 16,
+            petEnabled: true,
+            petAnimationsEnabled: false,
+            petReadyCounterEnabled: false,
+            petPosition: "free",
+            petSize: 1.5,
+            petAttentionFilter: "needsYou",
+            petReduceMotion: true
         ))
         let r = s.load()
         XCTAssertTrue(r.diffWordWrap && r.diffIgnoreWhitespace)
@@ -47,6 +61,13 @@ final class SettingsStoreTests: XCTestCase {
         XCTAssertFalse(r.insomniaAllowScreenSaverAfter45MinutesOfInactivity)
         XCTAssertTrue(r.tokenSaverEnabled)
         XCTAssertEqual(r.terminalFontSize, 16, "terminalFontSize must round-trip so new terminals keep the chosen base font")
+        XCTAssertTrue(r.petEnabled)
+        XCTAssertFalse(r.petAnimationsEnabled)
+        XCTAssertFalse(r.petReadyCounterEnabled)
+        XCTAssertEqual(r.petPosition, "free")
+        XCTAssertEqual(r.petSize, 1.5)
+        XCTAssertEqual(r.petAttentionFilter, "needsYou")
+        XCTAssertTrue(r.petReduceMotion)
     }
 
     func test_updatePreservesOtherFields() throws {
@@ -72,6 +93,13 @@ final class SettingsStoreTests: XCTestCase {
         XCTAssertTrue(r.insomniaAllowScreenSaverAfter45MinutesOfInactivity)
         XCTAssertFalse(r.tokenSaverEnabled)
         XCTAssertEqual(r.terminalFontSize, 0, "older settings blobs must default terminal font size to Ghostty default")
+        XCTAssertTrue(r.petEnabled, "settings created before the pet existed must receive the current pet default")
+        XCTAssertTrue(r.petAnimationsEnabled)
+        XCTAssertTrue(r.petReadyCounterEnabled)
+        XCTAssertEqual(r.petPosition, "bottomRight")
+        XCTAssertEqual(r.petSize, 1.5, "older blobs without a pet size must receive the current 150% default")
+        XCTAssertEqual(r.petAttentionFilter, "all")
+        XCTAssertFalse(r.petReduceMotion)
     }
 
     func test_corruptBlobDegradesToDefaults() throws {
@@ -79,5 +107,14 @@ final class SettingsStoreTests: XCTestCase {
         try SettingsRepository(db: db).set("app_settings", "{not valid json")
         XCTAssertEqual(s.load(), AppSettings(),
                        "a garbled blob must not crash — fall back to defaults")
+    }
+
+    func test_explicitPetPreferencesOverrideDefaults() throws {
+        let (s, _) = try store()
+        s.save(AppSettings(petEnabled: false, petSize: 1))
+
+        let r = s.load()
+        XCTAssertFalse(r.petEnabled, "a user who disables the pet must keep that choice")
+        XCTAssertEqual(r.petSize, 1, "a user-selected 100% size must survive relaunch")
     }
 }

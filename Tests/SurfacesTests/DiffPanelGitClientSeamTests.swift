@@ -201,6 +201,57 @@ final class DiffPanelGitClientSeamTests: XCTestCase {
             "so 'Copy details' can recover the full git message")
     }
 
+    func test_localGitOutcome_reportsOnlyCanonicalKindAndBooleanResult() {
+        let file = GitFileEntry(
+            path: "private.swift",
+            oldPath: nil,
+            status: .modified,
+            additions: 1,
+            deletions: 0,
+            binary: false
+        )
+        let fake = FakeGitClient(
+            summary: GitSummary(
+                isGitRepo: true,
+                branch: "main",
+                dirty: true,
+                files: [file],
+                totalAdditions: 1,
+                totalDeletions: 0
+            ),
+            actionResult: GitActionResult(ok: true, message: "private output")
+        )
+        let vm = DiffPanelViewModel(cwd: "/private/path", gitClient: fake)
+        var outcomes: [(String, Bool)] = []
+        vm.gitOutcomeHandler = { outcomes.append(($0, $1)) }
+
+        vm.switchBranch("secret-branch")
+        waitUntil("checkout outcome") { outcomes.count == 1 }
+        XCTAssertEqual(outcomes[0].0, "git.checkout")
+        XCTAssertTrue(outcomes[0].1)
+
+        vm.newBranch("secret-created-branch")
+        waitUntil("branch outcome") { outcomes.count == 2 }
+        XCTAssertEqual(outcomes[1].0, "git.branch_created")
+        XCTAssertTrue(outcomes[1].1)
+
+        vm.commitMessage = "private commit message"
+        vm.selectedFiles = [file.path]
+        vm.commitSelected()
+        waitUntil("commit outcome") { outcomes.count == 3 }
+        XCTAssertEqual(outcomes[2].0, "git.commit")
+        XCTAssertTrue(outcomes[2].1)
+
+        fake.stubbedActionResult = GitActionResult(ok: false, message: "token=hunter2")
+        vm.push()
+        waitUntil("push outcome") { outcomes.count == 4 }
+        XCTAssertEqual(outcomes[3].0, "git.push")
+        XCTAssertFalse(outcomes[3].1)
+        XCTAssertFalse(outcomes.map(\.0).joined().contains("secret-branch"))
+        XCTAssertFalse(outcomes.map(\.0).joined().contains("private commit message"))
+        XCTAssertFalse(outcomes.map(\.0).joined().contains("hunter2"))
+    }
+
     // MARK: - production default unchanged
 
     /// WHY: the seam must be invisible to callers that don't inject a client.

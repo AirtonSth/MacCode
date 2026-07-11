@@ -133,6 +133,7 @@ public protocol CommandRouting: AnyObject {
     func gitLog(workspace: WorkspaceID, limit: Int) throws -> [GitCommit]
     func gitDiff(workspace: WorkspaceID, path: String?, ignoreWhitespace: Bool) throws -> String
     func gitPush(workspace: WorkspaceID) throws -> GitActionResult
+    func ensureGitSurface(workspace: WorkspaceID) throws -> SurfaceDescriptor
     func gitPullRequestURL(workspace: WorkspaceID) throws -> String?
     func gitDeliveryPlan(workspace: WorkspaceID, copy: GitDeliveryCopy?) throws -> GitDeliveryPlan
     func gitDeliver(workspace: WorkspaceID, copy: GitDeliveryCopy?) throws -> GitDeliveryResult
@@ -192,6 +193,31 @@ public extension CommandRouting {
         nil
     }
 
+    func ensureGitSurface(workspace: WorkspaceID) throws -> SurfaceDescriptor {
+        guard let workspaceState = try listWorkspaces().first(where: { $0.id == workspace }) else {
+            throw LayoutError.workspaceNotFound
+        }
+        if let surface = canonicalGitSurface(in: workspaceState.layout) {
+            return surface
+        }
+        return try createSurface(
+            workspace: workspaceState.id,
+            type: .rightSidebarTool,
+            paneID: nil,
+            title: "Git"
+        )
+    }
+}
+
+private func canonicalGitSurface(in node: LayoutNode) -> SurfaceDescriptor? {
+    switch node {
+    case .pane(let pane):
+        return pane.surfaces.first {
+            $0.type == .rightSidebarTool && $0.metadata["tool"] == "diff"
+        }
+    case .split(let split):
+        return split.children.lazy.compactMap { canonicalGitSurface(in: $0) }.first
+    }
 }
 
 @MainActor
@@ -1352,7 +1378,6 @@ public final class JSONRPCDispatcher {
                     return .init(id: id, result: cached)
                 }
                 try router.markAgentThreadRead(thread: tid)
-                EventBus.shared.publish(kind: "agent.thread.read", payload: .object(["thread_id": .string(tid.value.uuidString)]))
                 let result = JSONValue.bool(true)
                 recordCommandReceipt(method: req.method, clientRequestId: receiptKey, result: result)
                 return .init(id: id, result: result)
@@ -1405,8 +1430,13 @@ public final class JSONRPCDispatcher {
                 if let (_, cached) = commandReceipt(method: req.method, params: params) {
                     return .init(id: id, result: cached)
                 }
+                let destination = try router.ensureGitSurface(workspace: wid)
                 let r = try router.gitPush(workspace: wid)
-                EventBus.shared.publish(kind: "git.push", payload: .object(["workspace_id": .string(wid.value.uuidString), "ok": .bool(r.ok)]))
+                EventBus.shared.publish(kind: "git.push", payload: .object([
+                    "workspace_id": .string(wid.value.uuidString),
+                    "surface_id": .string(destination.id.value.uuidString),
+                    "ok": .bool(r.ok)
+                ]))
                 let result = encode(r)
                 recordCommandReceipt(method: req.method, clientRequestId: receiptKey, result: result)
                 return .init(id: id, result: result)
@@ -1419,8 +1449,13 @@ public final class JSONRPCDispatcher {
                 return .init(id: id, result: encode(try router.gitDeliveryPlan(workspace: wid, copy: gitDeliveryCopy(from: params))))
             case "git.deliver":
                 guard let wid = params["workspace_id"]?.stringValue.flatMap(UUID.init).map(WorkspaceID.init) else { throw JSONRPCError.invalidParams }
+                let destination = try router.ensureGitSurface(workspace: wid)
                 let r = try router.gitDeliver(workspace: wid, copy: gitDeliveryCopy(from: params))
-                EventBus.shared.publish(kind: "git.deliver", payload: .object(["workspace_id": .string(wid.value.uuidString), "ok": .bool(r.ok)]))
+                EventBus.shared.publish(kind: "git.deliver", payload: .object([
+                    "workspace_id": .string(wid.value.uuidString),
+                    "surface_id": .string(destination.id.value.uuidString),
+                    "ok": .bool(r.ok)
+                ]))
                 return .init(id: id, result: encode(r))
             case "project.scripts":
                 guard let wid = params["workspace_id"]?.stringValue.flatMap(UUID.init).map(WorkspaceID.init) else { throw JSONRPCError.invalidParams }
@@ -1429,7 +1464,6 @@ public final class JSONRPCDispatcher {
                 guard let wid = params["workspace_id"]?.stringValue.flatMap(UUID.init).map(WorkspaceID.init),
                       let name = params["name"]?.stringValue else { throw JSONRPCError.invalidParams }
                 let s = try router.projectRunScript(workspace: wid, name: name)
-                EventBus.shared.publish(kind: "project.script_started", payload: .object(["workspace_id": .string(wid.value.uuidString), "name": .string(name)]))
                 return .init(id: id, result: encode(s))
             case "project.open_in_editor":
                 guard let wid = params["workspace_id"]?.stringValue.flatMap(UUID.init).map(WorkspaceID.init) else { throw JSONRPCError.invalidParams }
@@ -1445,7 +1479,6 @@ public final class JSONRPCDispatcher {
                 let provider = AgentProvider(rawValue: params["provider"]?.stringValue ?? "codex") ?? .codex
                 let instanceId = params["provider_instance_id"]?.stringValue ?? params["providerInstanceId"]?.stringValue
                 let result = try await router.updateAgentProvider(provider: provider, providerInstanceId: instanceId)
-                EventBus.shared.publish(kind: "agent.provider.updated", payload: result)
                 return .init(id: id, result: result)
             case "agent.state.current":
                 let w = try router.currentWindow()
@@ -1516,11 +1549,6 @@ public final class JSONRPCDispatcher {
                 let body = params["body"]?.stringValue
                 let category = params["category"]?.stringValue
                 let nid = try router.notificationCreate(workspaceId: wid, title: title, body: body, category: category)
-                EventBus.shared.publish(kind: "notification.created", payload: .object([
-                    "id": .string(nid),
-                    "title": .string(title),
-                    "push_policy": .string("background_only")
-                ]))
                 return .init(id: id, result: .object([
                     "id": .string(nid),
                     "push_policy": .string("background_only")
@@ -1533,12 +1561,10 @@ public final class JSONRPCDispatcher {
             case "notification.mark_read":
                 guard let nid = params["id"]?.stringValue else { throw JSONRPCError.invalidParams }
                 try router.notificationMarkRead(id: nid)
-                EventBus.shared.publish(kind: "notification.read", payload: .object(["id": .string(nid)]))
                 return .init(id: id, result: .bool(true))
             case "notification.dismiss":
                 guard let nid = params["id"]?.stringValue else { throw JSONRPCError.invalidParams }
                 try router.notificationDismiss(id: nid)
-                EventBus.shared.publish(kind: "notification.dismissed", payload: .object(["id": .string(nid)]))
                 return .init(id: id, result: .bool(true))
             case "private.push_token.update":
                 guard let pushToken = params["push_token"]?.stringValue,

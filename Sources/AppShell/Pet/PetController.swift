@@ -1,0 +1,696 @@
+import AppKit
+import CoreModel
+import Foundation
+import Persistence
+import SocketServer
+import Surfaces
+
+@MainActor
+public final class PetController {
+    private let context: AppContext
+    private let router: AppCommandRouter
+    private let settingsStore: SettingsStore
+    private let attentionStore: PetAttentionStore
+    private let notificationRecorder: PetTerminalNotificationRecorder
+    private let model: PetViewModel
+    private var animationController: PetAnimationController?
+    private var windowController: PetWindowController?
+    private let systemMonitor = PetSystemActivityMonitor()
+    private let openSettings: (PetSettingsRoute) -> Bool
+    private let idleTimeoutNanoseconds: UInt64
+
+    static let projectionWatermarkKey = "pet.event-projection-watermark.v1"
+
+    private var reducer = PetEventReducer()
+    private var eventSubscription: UUID?
+    private var notificationTokens: [NSObjectProtocol] = []
+    private var transientTask: Task<Void, Never>?
+    private var attentionRefreshTask: Task<Void, Never>?
+    private var idleTask: Task<Void, Never>?
+    private var projectionWatermark: Int64?
+    private var projectionErrorMessage: String?
+    private var projectionRecoveryBlocked = false
+    private var lastHandledEventSequence: Int64?
+    private(set) var handledEventOutOfOrderForTests = false
+    private(set) var handledEventCountForTests = 0
+
+    var modelForTests: PetViewModel { model }
+    var windowControllerForTests: PetWindowController { windowController! }
+    var animationTimerIsRunningForTests: Bool { animationController?.timerIsRunning == true }
+    var visualRuntimeIsLoadedForTests: Bool {
+        animationController != nil && windowController != nil
+    }
+    var afterStartupCursorCapturedForTests: (() -> Void)?
+    var destinationWindowIsKeyForTests: ((NSWindow) -> Bool)?
+
+    public init(
+        context: AppContext,
+        router: AppCommandRouter,
+        openSettings: @escaping (PetSettingsRoute) -> Bool,
+        idleTimeoutNanoseconds: UInt64 = 600_000_000_000
+    ) throws {
+        self.context = context
+        self.router = router
+        self.openSettings = openSettings
+        self.idleTimeoutNanoseconds = idleTimeoutNanoseconds
+        self.settingsStore = SettingsStore(db: context.db)
+        let settings = settingsStore.load()
+        self.model = PetViewModel(settings: settings)
+        self.attentionStore = PetAttentionStore(
+            threadRepository: context.threadRepo,
+            callbackRepository: context.providerPendingCallbackRepo,
+            notificationRepository: NotificationRepository(db: context.db),
+            markAgentThreadRead: { try router.markAgentThreadRead(thread: $0) },
+            markNotificationRead: { try router.notificationMarkRead(id: $0) }
+        )
+        self.notificationRecorder = PetTerminalNotificationRecorder(
+            repository: NotificationRepository(db: context.db)
+        )
+    }
+
+    public func start() {
+        guard eventSubscription == nil else { return }
+        let subscription = EventBus.shared.subscribeFromCurrent(filter: .full) { [weak self] event in
+            guard !Self.isPrefilteredNoiseKind(event.kind) else { return }
+            DispatchQueue.main.async { self?.handle(event) }
+        }
+        eventSubscription = subscription.id
+        let cursor = subscription.cursor
+        projectionErrorMessage = prepareProjectionRecovery(capturedCursor: cursor)
+        projectionRecoveryBlocked = projectionErrorMessage != nil
+        afterStartupCursorCapturedForTests?()
+        refreshAttentionNow()
+        applySettings(settingsStore.load())
+        if let projectionErrorMessage { model.routeError = projectionErrorMessage }
+
+        observeSettings()
+        configureSystemMonitor()
+        systemMonitor.start()
+        scheduleIdleTimeout()
+    }
+
+    nonisolated static func isPrefilteredNoiseKind(_ kind: String) -> Bool {
+        switch kind {
+        case "agent.item.delta", "agent.item.progress",
+             "surface.output", "surface.output.summary",
+             "agent.thread.token_usage", "agent.account.usage", "agent.account.usage.refresh",
+             "fs.workspace.changed", "files.state.updated",
+             "pane.resized", "pane.split", "pane.swapped",
+             "surface.created", "surface.closed", "surface.focused", "surface.moved",
+             "surface.reordered", "surface.renamed", "surface.updated", "window.created",
+             "workspace.created", "workspace.closed", "workspace.renamed",
+             "workspace.reordered", "workspace.selected", "workspace.updated":
+            return true
+        default:
+            return false
+        }
+    }
+
+    public func stop() {
+        if let eventSubscription {
+            EventBus.shared.unsubscribe(eventSubscription)
+        }
+        eventSubscription = nil
+        transientTask?.cancel()
+        transientTask = nil
+        attentionRefreshTask?.cancel()
+        attentionRefreshTask = nil
+        idleTask?.cancel()
+        idleTask = nil
+        animationController?.stop()
+        windowController?.stop()
+        animationController = nil
+        windowController = nil
+        systemMonitor.stop()
+        for token in notificationTokens {
+            NotificationCenter.default.removeObserver(token)
+        }
+        notificationTokens.removeAll()
+    }
+
+    private func prepareProjectionRecovery(capturedCursor: Int64) -> String? {
+        do {
+            let raw = try context.settingsRepo.get(Self.projectionWatermarkKey)
+            guard let raw, let stored = Int64(raw) else {
+                try persistProjectionWatermark(capturedCursor)
+                return nil
+            }
+
+            if stored > capturedCursor {
+                projectionWatermark = stored
+                let durableLastSequence = try context.eventLog.lastSeq()
+                guard durableLastSequence <= capturedCursor else {
+                    return "Ready-item recovery is waiting for the event log."
+                }
+                try persistProjectionWatermark(capturedCursor)
+                return nil
+            }
+            projectionWatermark = stored
+            var scanCursor = stored
+            let decoder = JSONDecoder()
+            let timestampFormatter = ISO8601DateFormatter()
+            while scanCursor < capturedCursor {
+                let rows = try context.eventLog.read(since: scanCursor, limit: 500)
+                    .filter { $0.seq <= capturedCursor }
+                guard !rows.isEmpty else { break }
+
+                for row in rows {
+                    if Self.isPotentialProjectionKind(row.kind) {
+                        do {
+                            guard let data = row.payloadJSON.data(using: .utf8) else {
+                                throw CocoaError(.fileReadCorruptFile)
+                            }
+                            let payload = try decoder.decode(JSONValue.self, from: data)
+                            let event = EventBus.Event(
+                                seq: row.seq,
+                                kind: row.kind,
+                                payload: payload,
+                                ts: timestampFormatter.date(from: row.createdAt)?.timeIntervalSince1970
+                                    ?? Date().timeIntervalSince1970
+                            )
+                            if Self.isProjectionCandidate(event) {
+                                _ = try notificationRecorder.record(event: event, replaying: true)
+                            }
+                        } catch {
+                            NSLog("Remote Code pet attention recovery failed at seq %lld: %@", row.seq, String(describing: error))
+                            return "A ready item could not be restored."
+                        }
+                    }
+                    scanCursor = row.seq
+                }
+                try persistProjectionWatermark(scanCursor)
+                if rows.count < 500 { break }
+            }
+            // All persisted candidates through this launch cursor were projected.
+            // Any sequence gaps are non-persisted `surface.output` noise by contract.
+            try persistProjectionWatermark(capturedCursor)
+            return nil
+        } catch {
+            NSLog("Remote Code pet projection watermark failed: %@", String(describing: error))
+            return "Ready-item recovery could not be initialized."
+        }
+    }
+
+    private static func isPotentialProjectionKind(_ kind: String) -> Bool {
+        [
+            "git.push", "git.deliver", "project.script.finished",
+            "ssh.transfer.completed", "ssh.transfer.failed", "ssh.session.updated",
+            "agent.provider.updated", "files.edit.conflict", "files.edit.saved",
+            "files.edit.discarded", "files.edit.closed"
+        ].contains(kind)
+    }
+
+    private static func isProjectionCandidate(_ event: EventBus.Event) -> Bool {
+        if PetTerminalNotificationRecorder.classify(event) != nil { return true }
+        if event.kind == "ssh.session.updated",
+           case .object(let payload) = event.payload,
+           (payload["status"]?.stringValue == "connected"
+                || payload["reason"]?.stringValue == "user_requested"),
+           payload["surface_id"]?.stringValue.flatMap(UUID.init(uuidString:)) != nil {
+            return true
+        }
+        guard ["files.edit.saved", "files.edit.discarded", "files.edit.closed"].contains(event.kind),
+              case .object(let payload) = event.payload,
+              payload["session_id"]?.stringValue?.isEmpty == false else { return false }
+        return true
+    }
+
+    private func advanceProjectionWatermark(to sequence: Int64) {
+        guard !projectionRecoveryBlocked else { return }
+        guard sequence > (projectionWatermark ?? -1) else { return }
+        do {
+            try persistProjectionWatermark(sequence)
+            projectionErrorMessage = nil
+        } catch {
+            projectionRecoveryBlocked = true
+            projectionErrorMessage = "Ready-item recovery could not be updated."
+            model.routeError = projectionErrorMessage
+            NSLog("Remote Code pet projection watermark write failed at seq %lld: %@", sequence, String(describing: error))
+        }
+    }
+
+    private func persistProjectionWatermark(_ sequence: Int64) throws {
+        try context.settingsRepo.set(Self.projectionWatermarkKey, String(sequence))
+        projectionWatermark = sequence
+    }
+
+    private func ensureVisualRuntime() throws {
+        guard animationController == nil, windowController == nil else { return }
+        let animationController = try PetAnimationController(atlas: .bundled())
+        let windowController = PetWindowController(
+            model: model,
+            placementStore: PetPlacementStore(repository: context.settingsRepo)
+        )
+        self.animationController = animationController
+        self.windowController = windowController
+        wireCallbacks(animationController: animationController, windowController: windowController)
+        if let frame = animationController.currentFrame {
+            model.setFrame(frame)
+        }
+    }
+
+    private func wireCallbacks(
+        animationController: PetAnimationController,
+        windowController: PetWindowController
+    ) {
+        animationController.onFrame = { [weak model, weak windowController] frame in
+            model?.setFrame(frame)
+            windowController?.animationFrameDidChange()
+        }
+        animationController.onError = { [weak model] _ in
+            model?.routeError = "Pet artwork could not be loaded."
+        }
+        windowController.onOpenItem = { [weak self] item in self?.open(item) }
+        windowController.onMarkAllViewed = { [weak self] in self?.markAllViewed() }
+        windowController.onOpenRemoteCode = { [weak self] in self?.showRemoteCode() }
+        windowController.onOpenSettings = { [weak self] in
+            _ = self?.openSettings(.general)
+        }
+        windowController.onHidePet = { [weak self] in self?.setPetEnabled(false) }
+        windowController.onToggleAnimations = { [weak self] in self?.toggleAnimations() }
+        windowController.onAdoptFreePosition = { [weak self] in self?.adoptFreePosition() }
+        windowController.onInteraction = { [weak self] in self?.handleInteraction() }
+    }
+
+    @discardableResult
+    public func togglePopoverFromKeyboard() -> Bool {
+        guard model.settings.petEnabled, let windowController else { return false }
+        windowController.show()
+        handleInteraction()
+        windowController.togglePopover()
+        return true
+    }
+
+    private func configureSystemMonitor() {
+        systemMonitor.onScreenLockChanged = { [weak self] locked in
+            self?.handleSystemScreenLockChanged(locked)
+        }
+        systemMonitor.onWake = { [weak self] in
+            self?.handleSystemWake()
+        }
+        systemMonitor.onScreenParametersChanged = { [weak self] in
+            self?.windowController?.screensDidChange()
+        }
+        systemMonitor.onAccessibilityDisplayOptionsChanged = { [weak self] in
+            self?.applySettings(self?.settingsStore.load() ?? AppSettings())
+        }
+    }
+
+    func handleSystemScreenLockChanged(_ locked: Bool) {
+        animationController?.setScreenLocked(locked)
+        apply(reducer.reduce(
+            .screenLockChanged(isLocked: locked),
+            atMilliseconds: monotonicMilliseconds()
+        ))
+        if !locked { scheduleIdleTimeout() }
+    }
+
+    func handleSystemWake() {
+        apply(reducer.reduce(.wake, atMilliseconds: monotonicMilliseconds()))
+        scheduleIdleTimeout()
+    }
+
+    private func observeSettings() {
+        let settingsToken = NotificationCenter.default.addObserver(
+            forName: .petSettingsDidChange,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in
+                guard let self else { return }
+                self.applySettings(self.settingsStore.reload())
+                self.refreshAttentionNow()
+            }
+        }
+        let resetToken = NotificationCenter.default.addObserver(
+            forName: .petResetPositionRequested,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in self?.windowController?.resetPosition() }
+        }
+        notificationTokens = [settingsToken, resetToken]
+    }
+
+    private func handle(_ event: EventBus.Event) {
+        handledEventCountForTests += 1
+        if let lastHandledEventSequence, event.seq <= lastHandledEventSequence {
+            handledEventOutOfOrderForTests = true
+        }
+        lastHandledEventSequence = event.seq
+        let attentionProjectionChanged = [
+            "notification.created", "notification.read", "notification.dismissed",
+            "agent.thread.read", "agent.thread.updated", "agent.thread.deleted", "agent.thread.deleted_many"
+        ].contains(event.kind)
+        let focusedSurfaceByWorkspace = context.state.workspaces.reduce(
+            into: [WorkspaceID: SurfaceID]()
+        ) { result, entry in
+            let workspace = entry.value
+            guard let paneID = workspace.focusedPaneID,
+                  let surfaceID = workspace.layout.find(paneID: paneID)?.selectedSurfaceID else { return }
+            result[entry.key] = surfaceID
+        }
+        let detachedWorkspaceIDs = Set(context.state.workspaces.keys.filter {
+            router.windowController?.workspaceWindow(for: $0) != nil
+        })
+        let focusDestination = PetAttentionFocusPolicy.resolveDestination(
+            event: event,
+            mainSelectedWorkspaceID: context.state.window.selectedWorkspaceID,
+            focusedSurfaceByWorkspace: focusedSurfaceByWorkspace,
+            detachedWorkspaceIDs: detachedWorkspaceIDs
+        )
+        let destinationWindow = focusDestination.detachedWorkspaceID
+            .flatMap { router.windowController?.workspaceWindow(for: $0) }
+            ?? router.windowController?.window
+        let shouldPersist = PetAttentionFocusPolicy.shouldPersist(
+            event: event,
+            isAppActive: NSApplication.shared.isActive,
+            isDestinationWindowFocused: destinationWindow?.isVisible == true
+                && destinationWindow?.isMiniaturized == false
+                && destinationWindow?.isKeyWindow == true,
+            selectedWorkspaceID: focusDestination.selectedWorkspaceID,
+            focusedSurfaceID: focusDestination.focusedSurfaceID
+        )
+        let projectionCandidate = Self.isProjectionCandidate(event)
+        var projectionChanged = false
+        var projectionFailed = false
+        if projectionCandidate {
+            if shouldPersist {
+                do {
+                    _ = try notificationRecorder.record(event: event)
+                    projectionChanged = true
+                    advanceProjectionWatermark(to: event.seq)
+                } catch {
+                    projectionFailed = true
+                    projectionRecoveryBlocked = true
+                    projectionErrorMessage = "A ready item could not be saved."
+                    NSLog("Remote Code pet attention projection failed at seq %lld: %@", event.seq, String(describing: error))
+                }
+            } else {
+                advanceProjectionWatermark(to: event.seq)
+            }
+        }
+        guard let domainEvent = PetEventDecoder.decode(event) else {
+            if projectionFailed { model.routeError = projectionErrorMessage }
+            if projectionChanged || attentionProjectionChanged { scheduleAttentionRefresh() }
+            return
+        }
+        let reduction = reducer.reduce(domainEvent, atMilliseconds: monotonicMilliseconds())
+        if case .ignored = reduction.disposition {
+            // Noise, duplicate compatibility events, and explicit user disconnects
+            // do not count as activity for the idle-sleep policy.
+        } else {
+            scheduleIdleTimeout()
+        }
+        apply(reduction)
+        if projectionFailed { model.routeError = projectionErrorMessage }
+        if projectionChanged || reduction.shouldRefreshAttention {
+            scheduleAttentionRefresh()
+        }
+    }
+
+    private func apply(_ reduction: PetEventReduction) {
+        applyTransientTimerDirective(reduction.transientTimerDirective)
+        guard reduction.state != model.animationState else { return }
+        model.setAnimationState(reduction.state)
+        let derived: PetAnimationState = model.count > 0 ? .waiting : .idle
+        do {
+            try animationController?.setState(reduction.state, derivedTerminalState: derived)
+            model.routeError = projectionErrorMessage
+        } catch {
+            model.routeError = "Pet animation is unavailable."
+        }
+
+    }
+
+    private func applyTransientTimerDirective(_ directive: PetTransientTimerDirective?) {
+        guard let directive else { return }
+        transientTask?.cancel()
+        transientTask = nil
+        guard case .schedule(let milliseconds) = directive else { return }
+        let nanoseconds = UInt64(max(0, milliseconds)) * 1_000_000
+        transientTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: nanoseconds)
+            guard !Task.isCancelled else { return }
+            await MainActor.run {
+                guard let self else { return }
+                self.apply(self.reducer.reduce(
+                    .transientExpired,
+                    atMilliseconds: self.monotonicMilliseconds()
+                ))
+            }
+        }
+    }
+
+    private func scheduleAttentionRefresh() {
+        attentionRefreshTask?.cancel()
+        attentionRefreshTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 50_000_000)
+            guard !Task.isCancelled else { return }
+            await MainActor.run { self?.refreshAttentionNow() }
+        }
+    }
+
+    private func refreshAttentionNow() {
+        do {
+            let snapshot = try attentionStore.refresh(filter: attentionFilter(model.settings.petAttentionFilter))
+            model.apply(snapshot: snapshot)
+            model.routeError = projectionErrorMessage
+            apply(reducer.reduce(
+                .attentionHydrated(attentionHydration(from: snapshot)),
+                atMilliseconds: monotonicMilliseconds()
+            ))
+            if snapshot.count == 0 { scheduleIdleTimeout() }
+        } catch {
+            model.routeError = "Ready items could not be loaded."
+        }
+    }
+
+    private func attentionHydration(from snapshot: PetAttentionSnapshot) -> PetAttentionHydration {
+        var approvalIDs: Set<String> = []
+        var questionIDs: Set<String> = []
+        var fileConflictIDs: Set<String> = []
+        var isReconnecting = false
+
+        for item in snapshot.items {
+            switch item.kind {
+            case .callback(let kind, _):
+                let reducerID: String
+                if case .callback(let threadID, let requestID, _) = item.source {
+                    reducerID = "\(threadID.value.uuidString):\(requestID)"
+                } else {
+                    reducerID = item.id
+                }
+                if kind == .approval {
+                    approvalIDs.insert(reducerID)
+                } else {
+                    questionIDs.insert(reducerID)
+                }
+            case .notification(let category):
+                if category == .fileConflict {
+                    let persistedID: String
+                    if case .notification(let id) = item.source {
+                        persistedID = id
+                    } else {
+                        persistedID = item.id
+                    }
+                    let prefix = "pet.file-conflict."
+                    fileConflictIDs.insert(
+                        persistedID.hasPrefix(prefix)
+                            ? String(persistedID.dropFirst(prefix.count))
+                            : persistedID
+                    )
+                }
+                if category == .serverListenerFailed || category == .sshUnexpectedDisconnect {
+                    isReconnecting = true
+                }
+            case .agentOutcome:
+                break
+            }
+        }
+
+        return PetAttentionHydration(
+            approvalIDs: approvalIDs,
+            questionIDs: questionIDs,
+            fileConflictIDs: fileConflictIDs,
+            count: snapshot.count,
+            isReconnecting: isReconnecting
+        )
+    }
+
+    private func open(_ item: PetAttentionItem) {
+        do {
+            let result = try attentionStore.openAndMarkRead(itemID: item.id) { [weak self] route in
+                guard let self else { return false }
+                return try self.verifyAndOpen(route)
+            }
+            switch result {
+            case .marked, .retainedBlocker:
+                model.routeError = nil
+                windowController?.closePopover(restoringPreviousKeyWindow: false)
+                refreshAttentionNow()
+            case .routeRejected:
+                model.routeError = "The exact destination could not be opened. The item was kept."
+            case .notFound:
+                model.routeError = "Item no longer exists."
+            }
+        } catch {
+            model.routeError = "The exact destination could not be opened. The item was kept."
+        }
+    }
+
+    private func verifyAndOpen(_ route: PetAttentionRoute) throws -> Bool {
+        switch route {
+        case .agentThread(let threadID, _):
+            let descriptor = try router.openAgentThread(thread: threadID, markRead: false)
+            guard let window = SurfaceRegistry.shared.surface(descriptor.id)?.view.window else { return false }
+            return window.isVisible && !window.isMiniaturized && destinationWindowIsKey(window)
+        case .surface(let surfaceID, let requestedWorkspaceID):
+            let requestedStillOwnsSurface = requestedWorkspaceID.flatMap { workspaceID in
+                context.state.workspaces[workspaceID]?.layout.contains(surfaceID: surfaceID) == true
+                    ? workspaceID
+                    : nil
+            }
+            guard let workspaceID = requestedStillOwnsSurface ?? context.state.workspaces.first(where: {
+                $0.value.layout.contains(surfaceID: surfaceID)
+            })?.key else { return false }
+            guard let destinationWindow = activateDestinationWindow(for: workspaceID) else { return false }
+            if router.windowController?.workspaceWindow(for: workspaceID) == nil {
+                try router.selectWorkspace(workspaceID)
+            }
+            try router.focusSurface(workspace: workspaceID, surface: surfaceID)
+            router.windowController?.flushPendingRefresh()
+            router.windowController?.focusSurface(surfaceID)
+            guard let workspace = context.state.workspaces[workspaceID],
+                  let paneID = workspace.focusedPaneID else { return false }
+            return workspace.layout.find(paneID: paneID)?.selectedSurfaceID == surfaceID
+                && destinationWindow.isVisible
+                && !destinationWindow.isMiniaturized
+                && destinationWindowIsKey(destinationWindow)
+                && SurfaceRegistry.shared.surface(surfaceID)?.view.window === destinationWindow
+        case .workspace(let workspaceID):
+            guard let destinationWindow = activateDestinationWindow(for: workspaceID) else { return false }
+            if router.windowController?.workspaceWindow(for: workspaceID) == nil {
+                try router.selectWorkspace(workspaceID)
+                guard context.state.window.selectedWorkspaceID == workspaceID else { return false }
+            }
+            return destinationWindow.isVisible
+                && !destinationWindow.isMiniaturized
+                && destinationWindowIsKey(destinationWindow)
+        case .settings(let settingsRoute):
+            return openSettings(settingsRoute)
+        }
+    }
+
+    private func activateDestinationWindow(for workspaceID: WorkspaceID) -> NSWindow? {
+        NSApplication.shared.activate(ignoringOtherApps: true)
+        if let detachedWindow = router.windowController?.workspaceWindow(for: workspaceID) {
+            detachedWindow.makeKeyAndOrderFront(nil)
+            return detachedWindow
+        }
+        router.windowController?.show()
+        return router.windowController?.window
+    }
+
+    private func destinationWindowIsKey(_ window: NSWindow) -> Bool {
+        destinationWindowIsKeyForTests?(window) ?? window.isKeyWindow
+    }
+
+    private func markAllViewed() {
+        do {
+            _ = try attentionStore.markAllRead()
+            refreshAttentionNow()
+        } catch {
+            model.routeError = "Ready items could not be updated."
+        }
+    }
+
+    private func showRemoteCode() {
+        NSApplication.shared.activate(ignoringOtherApps: true)
+        router.windowController?.show()
+        windowController?.closePopover(restoringPreviousKeyWindow: false)
+    }
+
+    private func toggleAnimations() {
+        settingsStore.update { $0.petAnimationsEnabled.toggle() }
+        applySettings(settingsStore.load())
+        NotificationCenter.default.post(name: .petSettingsDidChange, object: self)
+    }
+
+    private func setPetEnabled(_ enabled: Bool) {
+        settingsStore.update { $0.petEnabled = enabled }
+        applySettings(settingsStore.load())
+        NotificationCenter.default.post(name: .petSettingsDidChange, object: self)
+    }
+
+    private func adoptFreePosition() {
+        settingsStore.update { $0.petPosition = "free" }
+        model.apply(settings: settingsStore.load())
+        NotificationCenter.default.post(name: .petSettingsDidChange, object: self)
+    }
+
+    private func applySettings(_ settings: AppSettings) {
+        model.apply(settings: settings)
+        if settings.petEnabled {
+            do {
+                let visualRuntimeWasLoaded = animationController != nil
+                try ensureVisualRuntime()
+                animationController?.setVisible(true)
+                animationController?.setAnimationsEnabled(settings.petAnimationsEnabled)
+                animationController?.setReducedMotion(
+                    settings.petReduceMotion || NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+                )
+                windowController?.applySettings(settings)
+                if !visualRuntimeWasLoaded {
+                    let derived: PetAnimationState = model.count > 0 ? .waiting : .idle
+                    try animationController?.setState(model.animationState, derivedTerminalState: derived)
+                }
+            } catch {
+                model.routeError = "Pet animation is unavailable."
+            }
+            scheduleIdleTimeout()
+        } else {
+            animationController?.setVisible(false)
+            windowController?.applySettings(settings)
+            idleTask?.cancel()
+            idleTask = nil
+        }
+    }
+
+    private func handleInteraction() {
+        apply(reducer.reduce(.interactionBegan, atMilliseconds: monotonicMilliseconds()))
+        scheduleIdleTimeout()
+    }
+
+    private func scheduleIdleTimeout() {
+        idleTask?.cancel()
+        guard model.settings.petEnabled else {
+            idleTask = nil
+            return
+        }
+        idleTask = Task { [weak self] in
+            guard let self else { return }
+            try? await Task.sleep(nanoseconds: self.idleTimeoutNanoseconds)
+            guard !Task.isCancelled else { return }
+            await MainActor.run {
+                guard self.model.count == 0, self.reducer.activeRunCount == 0 else { return }
+                self.apply(self.reducer.reduce(
+                    .idleTimeout,
+                    atMilliseconds: self.monotonicMilliseconds()
+                ))
+            }
+        }
+    }
+
+    private func attentionFilter(_ raw: String) -> PetAttentionFilter {
+        switch raw {
+        case "completed": return .completed
+        case "needsYou": return .needsYou
+        default: return .all
+        }
+    }
+
+    private func monotonicMilliseconds() -> Int64 {
+        Int64(DispatchTime.now().uptimeNanoseconds / 1_000_000)
+    }
+}

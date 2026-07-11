@@ -48,4 +48,128 @@ final class RetrieveMCPInstallTests: XCTestCase {
         XCTAssertFalse(toml2.contains("[mcp_servers.remotecode-distill-retrieve]"))
         XCTAssertTrue(toml2.contains("model = \"gpt\""), "user TOML preserved on uninstall")
     }
+
+    func test_installRetrieveMCPMigratesLegacyUnmarkedCodexTableToManagedBlock() throws {
+        let fixture = try makeFixture(codexConfig: """
+        [mcp_servers.remotecode-distill-retrieve]
+        command = "/legacy/RemoteCodeDistillService"
+        args = ["legacy"]
+        """)
+        defer { try? FileManager.default.removeItem(at: fixture.home) }
+
+        try fixture.installer.installRetrieveMCP(serviceBinaryURL: fixture.binary)
+
+        let toml = try String(contentsOf: fixture.codexConfig, encoding: .utf8)
+        XCTAssertEqual(
+            toml.components(separatedBy: "[mcp_servers.remotecode-distill-retrieve]").count - 1,
+            1,
+            "the reserved MCP table must have one owner so Codex can parse config.toml"
+        )
+        XCTAssertFalse(toml.contains("/legacy/RemoteCodeDistillService"))
+        XCTAssertTrue(toml.contains("command = \"\(fixture.binary.path)\""))
+        XCTAssertEqual(toml.components(separatedBy: AgentSkillInstaller.mcpBeginMarker).count - 1, 1)
+    }
+
+    func test_installRetrieveMCPMigratesSemanticallyEquivalentQuotedLegacyTable() throws {
+        let fixture = try makeFixture(codexConfig: """
+        ["mcp_servers"."remotecode-distill-retrieve"]
+        command = "/legacy/quoted-service"
+        args = ["mcp"]
+        """)
+        defer { try? FileManager.default.removeItem(at: fixture.home) }
+
+        try fixture.installer.installRetrieveMCP(serviceBinaryURL: fixture.binary)
+
+        let toml = try String(contentsOf: fixture.codexConfig, encoding: .utf8)
+        XCTAssertFalse(toml.contains("[\"mcp_servers\".\"remotecode-distill-retrieve\"]"))
+        XCTAssertFalse(toml.contains("/legacy/quoted-service"))
+        XCTAssertEqual(toml.components(separatedBy: "[mcp_servers.remotecode-distill-retrieve]").count - 1, 1)
+    }
+
+    func test_installRetrieveMCPIsByteStableAfterLegacyTableMigration() throws {
+        let fixture = try makeFixture(codexConfig: """
+        [mcp_servers.remotecode-distill-retrieve]
+        command = "/legacy/RemoteCodeDistillService"
+        args = ["mcp"]
+        """)
+        defer { try? FileManager.default.removeItem(at: fixture.home) }
+
+        try fixture.installer.installRetrieveMCP(serviceBinaryURL: fixture.binary)
+        let migrated = try Data(contentsOf: fixture.codexConfig)
+        let migratedText = try XCTUnwrap(String(data: migrated, encoding: .utf8))
+        XCTAssertEqual(
+            migratedText.components(separatedBy: "[mcp_servers.remotecode-distill-retrieve]").count - 1,
+            1,
+            "idempotence is meaningful only after the legacy duplicate is reconciled"
+        )
+
+        try fixture.installer.installRetrieveMCP(serviceBinaryURL: fixture.binary)
+        let reinstalled = try Data(contentsOf: fixture.codexConfig)
+
+        XCTAssertEqual(reinstalled, migrated, "reconciliation must not grow or reorder config.toml")
+    }
+
+    func test_installRetrieveMCPMigrationPreservesUnrelatedCodexTables() throws {
+        let fixture = try makeFixture(codexConfig: """
+        model = "gpt"
+
+        [mcp_servers.other]
+        command = "/usr/bin/other"
+        args = ["serve"]
+
+        [mcp_servers.remotecode-distill-retrieve]
+        command = "/legacy/RemoteCodeDistillService"
+        args = ["mcp"]
+
+        [projects."/tmp/proj]name"]
+        trust_level = "trusted"
+
+        [mcp_servers.remotecode-distill-retrieve-backup]
+        command = "/usr/bin/backup"
+
+        [mcp_servers."remotecode-distill-retrieve "]
+        command = "/usr/bin/distinct"
+        """)
+        defer { try? FileManager.default.removeItem(at: fixture.home) }
+
+        try fixture.installer.installRetrieveMCP(serviceBinaryURL: fixture.binary)
+
+        let toml = try String(contentsOf: fixture.codexConfig, encoding: .utf8)
+        XCTAssertEqual(toml.components(separatedBy: "[mcp_servers.remotecode-distill-retrieve]").count - 1, 1)
+        XCTAssertFalse(toml.contains("/legacy/RemoteCodeDistillService"))
+        XCTAssertTrue(toml.contains("model = \"gpt\""))
+        XCTAssertTrue(toml.contains("""
+        [mcp_servers.other]
+        command = "/usr/bin/other"
+        args = ["serve"]
+        """))
+        XCTAssertTrue(toml.contains("""
+        [mcp_servers.remotecode-distill-retrieve-backup]
+        command = "/usr/bin/backup"
+        """))
+        XCTAssertTrue(toml.contains("""
+        [mcp_servers."remotecode-distill-retrieve "]
+        command = "/usr/bin/distinct"
+        """))
+        XCTAssertTrue(toml.contains("""
+        [projects."/tmp/proj]name"]
+        trust_level = "trusted"
+        """))
+    }
+
+    private func makeFixture(
+        codexConfig contents: String
+    ) throws -> (home: URL, binary: URL, codexConfig: URL, installer: AgentSkillInstaller) {
+        let home = tempHome()
+        let binary = home.appendingPathComponent("bin/RemoteCodeDistillService")
+        try FileManager.default.createDirectory(at: binary.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data("binary".utf8).write(to: binary)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: binary.path)
+
+        let codexConfig = home.appendingPathComponent(".codex/config.toml")
+        try FileManager.default.createDirectory(at: codexConfig.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data(contents.utf8).write(to: codexConfig)
+
+        return (home, binary, codexConfig, AgentSkillInstaller(homeDirectory: home))
+    }
 }

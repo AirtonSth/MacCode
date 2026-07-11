@@ -65,6 +65,7 @@ CLI="$BIN_DIR/rc2"
 DISTILL_SERVICE="$BIN_DIR/RemoteCodeDistillService"
 MLX_METALLIB="$BIN_DIR/mlx.metallib"
 SURFACES_RESOURCES="$BIN_DIR/RemoteCode_Surfaces.bundle"
+APP_SHELL_RESOURCES="$BIN_DIR/RemoteCode_AppShell.bundle"
 if [ ! -x "$BIN" ]; then echo "missing $BIN"; exit 1; fi
 if [ ! -x "$DISTILL_SERVICE" ]; then echo "missing $DISTILL_SERVICE"; exit 1; fi
 scripts/build-mlx-metallib.sh "$MLX_METALLIB"
@@ -118,6 +119,11 @@ fi
 if [ -d "$SURFACES_RESOURCES" ]; then
   cp -R "$SURFACES_RESOURCES" "$STAGING_APP/Contents/Resources/RemoteCode_Surfaces.bundle"
 fi
+if [ ! -d "$APP_SHELL_RESOURCES" ]; then
+  echo "missing $APP_SHELL_RESOURCES" >&2
+  exit 1
+fi
+cp -R "$APP_SHELL_RESOURCES" "$STAGING_APP/Contents/Resources/RemoteCode_AppShell.bundle"
 if [ -f "Resources/AppIcon.icns" ]; then
   cp "Resources/AppIcon.icns" "$STAGING_APP/Contents/Resources/AppIcon.icns"
 fi

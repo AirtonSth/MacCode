@@ -36,6 +36,13 @@ final class AppSettingsFieldCoverageTests: XCTestCase {
             "terminalFontSize",
             "sessionLearnEnabled",
             "historyCompactionEnabled",
+            "petEnabled",
+            "petAnimationsEnabled",
+            "petReadyCounterEnabled",
+            "petPosition",
+            "petSize",
+            "petAttentionFilter",
+            "petReduceMotion",
         ]
         let actual = Set(AppSettingsKeys.userTunableKeys)
         XCTAssertEqual(
@@ -122,6 +129,22 @@ final class AppSettingsFieldCoverageTests: XCTestCase {
         vm.setInsomniaAllowScreenSaverAfter45MinutesOfInactivity(false)
         XCTAssertFalse(vm.appSettings.insomniaAllowScreenSaverAfter45MinutesOfInactivity)
         XCTAssertFalse(SettingsStore(db: ctx.db).load().insomniaAllowScreenSaverAfter45MinutesOfInactivity)
+
+        vm.setPetEnabled(true)
+        vm.setPetAnimationsEnabled(false)
+        vm.setPetReadyCounterEnabled(false)
+        vm.setPetPosition("free")
+        vm.setPetSize(1.5)
+        vm.setPetAttentionFilter("needsYou")
+        vm.setPetReduceMotion(true)
+        let pet = SettingsStore(db: ctx.db).load()
+        XCTAssertTrue(pet.petEnabled, "show-pet changes must survive Settings relaunch")
+        XCTAssertFalse(pet.petAnimationsEnabled)
+        XCTAssertFalse(pet.petReadyCounterEnabled)
+        XCTAssertEqual(pet.petPosition, "free")
+        XCTAssertEqual(pet.petSize, 1.5)
+        XCTAssertEqual(pet.petAttentionFilter, "needsYou")
+        XCTAssertTrue(pet.petReduceMotion)
     }
 
     /// reload() must reflect the last-persisted value, not a stale in-memory value.

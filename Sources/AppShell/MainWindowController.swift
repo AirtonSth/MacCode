@@ -604,9 +604,18 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
         hasPendingRefresh = true
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
+            guard self.hasPendingRefresh else { return }
             self.hasPendingRefresh = false
             self._performRefreshFromState()
         }
+    }
+
+    /// Exact-route callers need the destination view mounted before they can
+    /// verify its owning window and acknowledge unread attention.
+    func flushPendingRefresh() {
+        guard hasPendingRefresh else { return }
+        hasPendingRefresh = false
+        _performRefreshFromState()
     }
 
     private func _performRefreshFromState() {

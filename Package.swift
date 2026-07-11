@@ -125,6 +125,9 @@ let package = Package(
                 .product(name: "Sparkle", package: "Sparkle")
             ],
             path: "Sources/AppShell",
+            resources: [
+                .copy("Resources/Pet")
+            ],
             linkerSettings: [
                 .linkedFramework("IOKit")
             ]

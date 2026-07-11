@@ -409,7 +409,8 @@ public final class AgentSkillInstaller: @unchecked Sendable {
         \(Self.mcpEndMarker)
         """
         let existing = (try? String(contentsOf: url, encoding: .utf8)) ?? ""
-        let next = Self.upsertMarkerBlock(existing, begin: Self.mcpBeginMarker, end: Self.mcpEndMarker, block: block)
+        let migrated = Self.removingTOMLTable(existing, named: "mcp_servers.\(Self.retrieveMCPName)")
+        let next = Self.upsertMarkerBlock(migrated, begin: Self.mcpBeginMarker, end: Self.mcpEndMarker, block: block)
         try Data(next.utf8).write(to: url, options: .atomic)
     }
 
@@ -434,6 +435,117 @@ public final class AgentSkillInstaller: @unchecked Sendable {
         }
         let base = text.trimmingCharacters(in: .whitespacesAndNewlines)
         return base.isEmpty ? block + "\n" : base + "\n\n" + block + "\n"
+    }
+
+    private static func removingTOMLTable(_ text: String, named tableName: String) -> String {
+        let lines = text.split(separator: "\n", omittingEmptySubsequences: false)
+        var result: [Substring] = []
+        var isRemovingTable = false
+        var didRemoveTable = false
+
+        for line in lines {
+            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+            if isExactTOMLTableHeader(trimmed, tableName: tableName) {
+                isRemovingTable = true
+                didRemoveTable = true
+                continue
+            }
+            if isRemovingTable {
+                if trimmed == mcpEndMarker || isTOMLTableHeader(trimmed) {
+                    isRemovingTable = false
+                } else {
+                    continue
+                }
+            }
+            result.append(line)
+        }
+
+        return didRemoveTable ? result.joined(separator: "\n") : text
+    }
+
+    private static func isExactTOMLTableHeader(_ line: String, tableName: String) -> Bool {
+        guard let header = tomlTableHeader(in: line), !header.isArray else { return false }
+        let compactName = removingWhitespaceOutsideTOMLQuotes(header.name)
+        guard let separator = tableName.firstIndex(of: ".") else {
+            return compactName == tableName
+        }
+        let prefix = tableName[..<separator]
+        let leaf = tableName[tableName.index(after: separator)...]
+        let prefixes = [String(prefix), "\"\(prefix)\"", "'\(prefix)'"]
+        let leaves = [String(leaf), "\"\(leaf)\"", "'\(leaf)'"]
+        return prefixes.contains { prefix in
+            leaves.contains { leaf in compactName == "\(prefix).\(leaf)" }
+        }
+    }
+
+    private static func removingWhitespaceOutsideTOMLQuotes(_ value: Substring) -> String {
+        var result = ""
+        var activeQuote: Character?
+        var isEscaped = false
+
+        for character in value {
+            if let quote = activeQuote {
+                result.append(character)
+                if quote == "\"", character == "\\", !isEscaped {
+                    isEscaped = true
+                    continue
+                }
+                if character == quote, !isEscaped {
+                    activeQuote = nil
+                }
+                isEscaped = false
+            } else if character == "\"" || character == "'" {
+                activeQuote = character
+                result.append(character)
+            } else if !character.isWhitespace {
+                result.append(character)
+            }
+        }
+        return result
+    }
+
+    private static func isTOMLTableHeader(_ line: String) -> Bool {
+        tomlTableHeader(in: line) != nil
+    }
+
+    private static func tomlTableHeader(in line: String) -> (name: Substring, isArray: Bool)? {
+        guard line.hasPrefix("[") else { return nil }
+        let isArray = line.hasPrefix("[[")
+        var index = line.index(line.startIndex, offsetBy: isArray ? 2 : 1)
+        let nameStart = index
+        var activeQuote: Character?
+        var isEscaped = false
+
+        while index < line.endIndex {
+            let character = line[index]
+            if let quote = activeQuote {
+                if quote == "\"", character == "\\", !isEscaped {
+                    isEscaped = true
+                } else {
+                    if character == quote, !isEscaped {
+                        activeQuote = nil
+                    }
+                    isEscaped = false
+                }
+            } else if character == "\"" || character == "'" {
+                activeQuote = character
+            } else if character == "]" {
+                let nameEnd = index
+                var remainderStart = line.index(after: index)
+                if isArray {
+                    guard remainderStart < line.endIndex, line[remainderStart] == "]" else {
+                        index = remainderStart
+                        continue
+                    }
+                    remainderStart = line.index(after: remainderStart)
+                }
+                let remainder = line[remainderStart...].trimmingCharacters(in: .whitespaces)
+                guard remainder.isEmpty || remainder.hasPrefix("#") else { return nil }
+                return (line[nameStart..<nameEnd], isArray)
+            }
+            index = line.index(after: index)
+        }
+        return nil
     }
 
     /// Resolve the RemoteCodeDistillService binary (which also serves CLI mode) the same

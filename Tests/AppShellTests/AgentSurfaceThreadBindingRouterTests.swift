@@ -77,6 +77,54 @@ final class AgentSurfaceThreadBindingRouterTests: XCTestCase {
             "mark-read must not yank an open macOS agent tab to another thread (Bug B).")
     }
 
+    func test_selectThread_readWriteFailureKeepsUnreadAndPublishesNoReadEvent() throws {
+        let dir = NSTemporaryDirectory() + "RC2Bind-ReadFailure-" + UUID().uuidString
+        let (ctx, router) = try makeRouter(dir)
+        let workspace = try router.createWorkspace(name: "READ-FAILURE", cwd: NSTemporaryDirectory())
+        defer { closeAndUnregisterAgentSurfaces(workspace: workspace.id) }
+        var thread = try router.createAgentThread(
+            workspace: workspace.id,
+            title: "unread",
+            provider: .codex,
+            model: "fake-model",
+            permissionMode: .supervised,
+            reasoningEffort: .medium
+        )
+        thread.hasUnread = true
+        try ctx.threadRepo.upsert(thread)
+        let descriptor = try router.createSurface(
+            workspace: workspace.id,
+            type: .agentApp,
+            paneID: nil,
+            title: "Agent App"
+        )
+        let surface = try XCTUnwrap(SurfaceRegistry.shared.surface(descriptor.id) as? AgentAppSurface)
+        surface.viewModel.reloadThreads()
+        var readEvents: [EventBus.Event] = []
+        let token = EventBus.shared.subscribe(since: EventBus.shared.currentSeq) { event in
+            guard event.kind == "agent.thread.read" else { return }
+            readEvents.append(event)
+        }
+        defer { EventBus.shared.unsubscribe(token) }
+        try ctx.db.execute("""
+            CREATE TRIGGER fail_agent_thread_read
+            BEFORE UPDATE OF has_unread ON agent_threads
+            WHEN OLD.id = '\(thread.id.value.uuidString)' AND NEW.has_unread = 0
+            BEGIN
+                SELECT RAISE(FAIL, 'forced read failure');
+            END;
+            """)
+
+        surface.viewModel.selectThread(thread.id)
+
+        XCTAssertTrue(try XCTUnwrap(ctx.threadRepo.get(id: thread.id)).hasUnread,
+            "a failed canonical read write must leave persisted attention unread")
+        XCTAssertTrue(surface.viewModel.threads.first(where: { $0.id == thread.id })?.hasUnread == true,
+            "the local rail must clear only after the canonical read mutation succeeds")
+        XCTAssertTrue(readEvents.isEmpty,
+            "a failed read write must never publish agent.thread.read")
+    }
+
     // MARK: Bug B vector 2 — untargeted create must not yank
 
     func test_createThreadWithoutSurfaceID_doesNotYankOpenSurface() throws {
@@ -125,6 +173,228 @@ final class AgentSurfaceThreadBindingRouterTests: XCTestCase {
         XCTAssertEqual(s1.viewModel.selectedThreadId, b.id,
             "an untargeted select must not move any surface's selection")
         XCTAssertEqual(s2.viewModel.selectedThreadId, b.id)
+    }
+
+    // MARK: Canonical exact-thread route
+
+    func test_openAgentThread_reusesAgentSurface_andBindsExactThreadWithoutImplicitRead() throws {
+        let dir = NSTemporaryDirectory() + "RC2Bind-OpenExisting-" + UUID().uuidString
+        let (ctx, router) = try makeRouter(dir)
+        let controller = MainWindowController(context: ctx, router: router)
+        router.windowController = controller
+        defer { controller.window.orderOut(nil) }
+
+        let targetWorkspace = try router.createWorkspace(name: "TARGET", cwd: NSTemporaryDirectory())
+        defer { closeAndUnregisterAgentSurfaces(workspace: targetWorkspace.id) }
+        let previous = try router.createAgentThread(
+            workspace: targetWorkspace.id,
+            title: "previous",
+            provider: .codex,
+            model: "fake-model",
+            permissionMode: .supervised,
+            reasoningEffort: .medium
+        )
+        var target = try router.createAgentThread(
+            workspace: targetWorkspace.id,
+            title: "target",
+            provider: .codex,
+            model: "fake-model",
+            permissionMode: .supervised,
+            reasoningEffort: .medium
+        )
+        target.hasUnread = true
+        try ctx.threadRepo.upsert(target)
+
+        let existing = try router.createSurface(
+            workspace: targetWorkspace.id,
+            type: .agentApp,
+            paneID: nil,
+            title: "Agent App"
+        )
+        let surface = try XCTUnwrap(SurfaceRegistry.shared.surface(existing.id) as? AgentAppSurface)
+        surface.viewModel.selectThread(previous.id)
+
+        let otherWorkspace = try router.createWorkspace(name: "OTHER", cwd: NSTemporaryDirectory())
+        XCTAssertEqual(ctx.state.window.selectedWorkspaceID, otherWorkspace.id)
+        var readEvents: [EventBus.Event] = []
+        let token = EventBus.shared.subscribe(since: EventBus.shared.currentSeq) { event in
+            guard event.kind == "agent.thread.read",
+                  case .object(let payload) = event.payload,
+                  payload["thread_id"]?.stringValue == target.id.value.uuidString else { return }
+            readEvents.append(event)
+        }
+        defer { EventBus.shared.unsubscribe(token) }
+
+        let routed = try router.openAgentThread(thread: target.id, markRead: false)
+
+        XCTAssertTrue(controller.window.isVisible,
+            "opening an exact thread must activate and show the RemoteCode window")
+        XCTAssertEqual(ctx.state.window.selectedWorkspaceID, targetWorkspace.id,
+            "the thread repository workspace is authoritative for the destination")
+        XCTAssertEqual(routed.id, existing.id,
+            "an existing Agent App surface must be reused instead of adding duplicate tabs")
+        XCTAssertEqual(surface.viewModel.selectedThreadId, target.id,
+            "the addressed surface must bind the exact requested thread")
+        XCTAssertTrue(try XCTUnwrap(ctx.threadRepo.get(id: target.id)).hasUnread,
+            "navigation without markRead must preserve unread state")
+        XCTAssertTrue(readEvents.isEmpty,
+            "a deferred Pet route must not tell mirrors the thread was read before canonical acknowledgement")
+    }
+
+    func test_openAgentThread_createsAgentSurface_andMarksReadOnlyAfterBinding() throws {
+        let dir = NSTemporaryDirectory() + "RC2Bind-OpenCreate-" + UUID().uuidString
+        let (ctx, router) = try makeRouter(dir)
+        let controller = MainWindowController(context: ctx, router: router)
+        router.windowController = controller
+        router.destinationWindowIsKeyForTests = { $0 === controller.window }
+        defer { controller.window.orderOut(nil) }
+        let workspace = try router.createWorkspace(name: "CREATE", cwd: NSTemporaryDirectory())
+        defer { closeAndUnregisterAgentSurfaces(workspace: workspace.id) }
+        var target = try router.createAgentThread(
+            workspace: workspace.id,
+            title: "unread",
+            provider: .codex,
+            model: "fake-model",
+            permissionMode: .supervised,
+            reasoningEffort: .medium
+        )
+        target.hasUnread = true
+        try ctx.threadRepo.upsert(target)
+        XCTAssertTrue(agentSurfaces(in: workspace.id).isEmpty)
+        var readEvents: [EventBus.Event] = []
+        let token = EventBus.shared.subscribe(since: EventBus.shared.currentSeq) { event in
+            guard event.kind == "agent.thread.read",
+                  case .object(let payload) = event.payload,
+                  payload["thread_id"]?.stringValue == target.id.value.uuidString else { return }
+            readEvents.append(event)
+        }
+        defer { EventBus.shared.unsubscribe(token) }
+
+        let routed = try router.openAgentThread(thread: target.id, markRead: true)
+        let created = try XCTUnwrap(SurfaceRegistry.shared.surface(routed.id) as? AgentAppSurface)
+
+        XCTAssertEqual(agentSurfaces(in: workspace.id).count, 1,
+            "the canonical route must create one Agent App surface when none exists")
+        XCTAssertEqual(created.viewModel.selectedThreadId, target.id,
+            "the new surface must bind successfully before the route can complete")
+        XCTAssertFalse(try XCTUnwrap(ctx.threadRepo.get(id: target.id)).hasUnread,
+            "a successful route requested with markRead must clear unread state")
+        XCTAssertEqual(readEvents.count, 1,
+            "verified routing must broadcast exactly one canonical read event")
+    }
+
+    func test_openAgentThread_missingDestinationWindowPreservesUnread() throws {
+        let dir = NSTemporaryDirectory() + "RC2Bind-OpenMissingWindow-" + UUID().uuidString
+        let (ctx, router) = try makeRouter(dir)
+        let workspace = try router.createWorkspace(name: "MISSING-WINDOW", cwd: NSTemporaryDirectory())
+        defer { closeAndUnregisterAgentSurfaces(workspace: workspace.id) }
+        var target = try router.createAgentThread(
+            workspace: workspace.id,
+            title: "unread",
+            provider: .codex,
+            model: "fake-model",
+            permissionMode: .supervised,
+            reasoningEffort: .medium
+        )
+        target.hasUnread = true
+        try ctx.threadRepo.upsert(target)
+
+        XCTAssertThrowsError(try router.openAgentThread(thread: target.id, markRead: true)) { error in
+            XCTAssertEqual(error as? LayoutError, .surfaceNotFound)
+        }
+        XCTAssertTrue(try XCTUnwrap(ctx.threadRepo.get(id: target.id)).hasUnread,
+            "a route without a concrete destination window must retain unread attention")
+    }
+
+    func test_openAgentThread_nonKeyDestinationWindowPreservesUnread() throws {
+        let dir = NSTemporaryDirectory() + "RC2Bind-OpenNonKeyWindow-" + UUID().uuidString
+        let (ctx, router) = try makeRouter(dir)
+        let controller = MainWindowController(context: ctx, router: router)
+        router.windowController = controller
+        router.destinationWindowIsKeyForTests = { _ in false }
+        defer { controller.window.orderOut(nil) }
+        let workspace = try router.createWorkspace(name: "NON-KEY-WINDOW", cwd: NSTemporaryDirectory())
+        defer { closeAndUnregisterAgentSurfaces(workspace: workspace.id) }
+        var target = try router.createAgentThread(
+            workspace: workspace.id,
+            title: "unread",
+            provider: .codex,
+            model: "fake-model",
+            permissionMode: .supervised,
+            reasoningEffort: .medium
+        )
+        target.hasUnread = true
+        try ctx.threadRepo.upsert(target)
+
+        XCTAssertThrowsError(try router.openAgentThread(thread: target.id, markRead: true)) { error in
+            XCTAssertEqual(error as? LayoutError, .surfaceNotFound)
+        }
+        XCTAssertTrue(try XCTUnwrap(ctx.threadRepo.get(id: target.id)).hasUnread,
+            "a route whose destination did not become key must retain unread attention")
+    }
+
+    func test_openAgentThread_activatesOwningDetachedWindowBeforeMarkingRead() throws {
+        let dir = NSTemporaryDirectory() + "RC2Bind-OpenDetached-" + UUID().uuidString
+        let (ctx, router) = try makeRouter(dir)
+        let controller = MainWindowController(context: ctx, router: router)
+        router.windowController = controller
+        defer { controller.window.orderOut(nil) }
+
+        let targetWorkspace = try router.createWorkspace(name: "DETACHED", cwd: NSTemporaryDirectory())
+        defer { closeAndUnregisterAgentSurfaces(workspace: targetWorkspace.id) }
+        var target = try router.createAgentThread(
+            workspace: targetWorkspace.id,
+            title: "target",
+            provider: .codex,
+            model: "fake-model",
+            permissionMode: .supervised,
+            reasoningEffort: .medium
+        )
+        let descriptor = try router.createSurface(
+            workspace: targetWorkspace.id,
+            type: .agentApp,
+            paneID: nil,
+            title: "Agent App"
+        )
+        let surface = try XCTUnwrap(SurfaceRegistry.shared.surface(descriptor.id) as? AgentAppSurface)
+        let otherWorkspace = try router.createWorkspace(name: "MAIN", cwd: NSTemporaryDirectory())
+        controller.openWorkspaceInNewWindow(targetWorkspace.id)
+        let detachedWindow = try XCTUnwrap(controller.workspaceWindow(for: targetWorkspace.id))
+        router.destinationWindowIsKeyForTests = { $0 === detachedWindow }
+        defer { detachedWindow.orderOut(nil) }
+        target.hasUnread = true
+        try ctx.threadRepo.upsert(target)
+
+        _ = try router.openAgentThread(thread: target.id, markRead: true)
+
+        XCTAssertTrue(detachedWindow.isVisible)
+        XCTAssertTrue(
+            detachedWindow.isKeyWindow || !NSApp.isActive,
+            "The owning window must become key whenever the XCTest host permits app activation."
+        )
+        XCTAssertTrue(surface.view.window === detachedWindow)
+        XCTAssertEqual(ctx.state.window.selectedWorkspaceID, otherWorkspace.id)
+        XCTAssertFalse(try XCTUnwrap(ctx.threadRepo.get(id: target.id)).hasUnread)
+    }
+
+    func test_openAgentThread_failedDestination_preservesUnread() throws {
+        let dir = NSTemporaryDirectory() + "RC2Bind-OpenFailure-" + UUID().uuidString
+        let (ctx, router) = try makeRouter(dir)
+        let target = AgentThread(
+            workspaceId: nil,
+            title: "orphan",
+            provider: .codex,
+            model: "fake-model",
+            status: .completed,
+            hasUnread: true
+        )
+        try ctx.threadRepo.upsert(target)
+
+        XCTAssertThrowsError(try router.openAgentThread(thread: target.id, markRead: true)) { error in
+            XCTAssertEqual(error as? LayoutError, .workspaceNotFound)
+        }
+        XCTAssertTrue(try XCTUnwrap(ctx.threadRepo.get(id: target.id)).hasUnread,
+            "route failure must never clear an item the user could not open")
     }
 
     // MARK: Per-surface binding persists across restart

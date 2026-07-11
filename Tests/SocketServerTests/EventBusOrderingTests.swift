@@ -11,6 +11,120 @@ import XCTest
 /// or missing events on the iOS mirror.
 final class EventBusOrderingTests: XCTestCase {
 
+    func test_reentrantPublishThenUnsubscribeAndConcurrentSubscribeRemainFIFO() throws {
+        let bus = EventBus()
+        let outerDeliveryStarted = expectation(description: "outer event entered subscriber delivery")
+        let outerPublishReturned = expectation(description: "outer publish returned without deadlock")
+        let concurrentSubscriptionAttempted = expectation(description: "concurrent subscription attempted during delivery")
+        let concurrentSubscriptionInstalled = expectation(description: "concurrent subscription installed")
+        let releaseOuterDelivery = DispatchSemaphore(value: 0)
+        let originalReceived = LockedEventSequences()
+        let concurrentReceived = LockedEventSequences()
+        let concurrentCursor = LockedEventSequences()
+
+        var originalSubscriptionID: UUID!
+        originalSubscriptionID = bus.subscribe(since: nil) { event in
+            originalReceived.append(event.seq)
+            guard event.kind == "outer" else { return }
+
+            outerDeliveryStarted.fulfill()
+            releaseOuterDelivery.wait()
+
+            // WHY: a handler may derive a follow-up event and then retire itself.
+            // The follow-up must be queued after the current delivery, so this
+            // subscriber cannot receive the event it just produced.
+            bus.publish(kind: "inner", payload: .null)
+            bus.unsubscribe(originalSubscriptionID)
+        }
+
+        DispatchQueue.global().async {
+            bus.publish(kind: "outer", payload: .null)
+            outerPublishReturned.fulfill()
+        }
+        wait(for: [outerDeliveryStarted], timeout: 1)
+
+        DispatchQueue.global().async {
+            concurrentSubscriptionAttempted.fulfill()
+            let subscription = bus.subscribeFromCurrent { event in
+                concurrentReceived.append(event.seq)
+            }
+            concurrentCursor.append(subscription.cursor)
+            concurrentSubscriptionInstalled.fulfill()
+        }
+
+        wait(for: [concurrentSubscriptionAttempted], timeout: 1)
+        releaseOuterDelivery.signal()
+        wait(for: [outerPublishReturned, concurrentSubscriptionInstalled], timeout: 2)
+
+        // A synchronous publish from outside the delivery queue drains any
+        // already-queued inner event before this final event returns.
+        bus.publish(kind: "final", payload: .null)
+
+        let cursor = try XCTUnwrap(concurrentCursor.values.first)
+        XCTAssertTrue(cursor == 1 || cursor == 2,
+                      "the racing subscription must linearize either before or after the queued inner event")
+        let expectedConcurrentEvents: [Int64] = cursor == 1 ? [2, 3] : cursor == 2 ? [3] : []
+        XCTAssertEqual(originalReceived.values, [1],
+                       "publish-then-unsubscribe during delivery must not recursively redeliver the derived event to the retiring subscriber")
+        XCTAssertEqual(concurrentReceived.values, expectedConcurrentEvents,
+                       "the atomic cursor defines the exact no-gap, no-duplicate FIFO stream after concurrent subscription mutation")
+        XCTAssertEqual(bus.subscriberCountForTests, 1,
+                       "the retiring subscriber must be removed before queued delivery resumes")
+        XCTAssertEqual(bus.snapshot().recent.map(\.seq), [1, 2, 3],
+                       "reentrant publication must allocate one sequence exactly once and preserve global FIFO order")
+    }
+
+    func test_concurrentPublishersDeliverInAssignedSequenceOrder() {
+        let bus = EventBus()
+        let firstReachedPersistence = expectation(description: "seq 1 reached persistence")
+        let delivered = expectation(description: "both events delivered")
+        delivered.expectedFulfillmentCount = 2
+        let releaseFirst = DispatchSemaphore(value: 0)
+        let received = LockedEventSequences()
+
+        bus.persister = { event in
+            guard event.seq == 1 else { return }
+            firstReachedPersistence.fulfill()
+            releaseFirst.wait()
+        }
+        _ = bus.subscribe(since: nil) { event in
+            received.append(event.seq)
+            delivered.fulfill()
+        }
+
+        DispatchQueue.global().async {
+            bus.publish(kind: "first", payload: .null)
+        }
+        wait(for: [firstReachedPersistence], timeout: 1)
+        DispatchQueue.global().async {
+            bus.publish(kind: "second", payload: .null)
+        }
+        Thread.sleep(forTimeInterval: 0.05)
+        releaseFirst.signal()
+        wait(for: [delivered], timeout: 2)
+
+        XCTAssertEqual(
+            received.values,
+            [1, 2],
+            "Assigned sequence is the reducer contract; concurrent publishers must not deliver seq 2 before seq 1."
+        )
+    }
+
+    func test_subscribeFromCurrentAtomicallyCapturesCursorAndReceivesOnlyFutureEvents() {
+        let bus = EventBus(recentLimit: 1)
+        bus.publish(kind: "old.a", payload: .null)
+        bus.publish(kind: "old.b", payload: .null)
+        var received: [EventBus.Event] = []
+
+        let subscription = bus.subscribeFromCurrent { received.append($0) }
+        bus.publish(kind: "live.c", payload: .null)
+        bus.publish(kind: "live.d", payload: .null)
+
+        XCTAssertEqual(subscription.cursor, 2)
+        XCTAssertEqual(received.map(\.seq), [3, 4])
+        XCTAssertEqual(received.map(\.kind), ["live.c", "live.d"])
+    }
+
     // MARK: - Backlog-vs-live interleave
 
     /// Scenario: client subscribes after several events have already been
@@ -214,5 +328,22 @@ final class EventBusOrderingTests: XCTestCase {
                        "recentEvents must not report truncation when all events fit -- a wrong byte count from the precompute path causes iOS to request a full baseline on every reconnect")
         XCTAssertEqual(result.events.map(\.seq).sorted(), [1, 2, 3],
                        "all three persisted events must be present after reload -- a precompute encoding mismatch would silently drop events via over-aggressive trimRecent")
+    }
+}
+
+private final class LockedEventSequences: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage: [Int64] = []
+
+    func append(_ value: Int64) {
+        lock.lock()
+        storage.append(value)
+        lock.unlock()
+    }
+
+    var values: [Int64] {
+        lock.lock()
+        defer { lock.unlock() }
+        return storage
     }
 }

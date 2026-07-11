@@ -29,6 +29,7 @@ final class AgentAppViewModelTests: XCTestCase {
                                    coordinator: coord, threadRepo: threadRepo,
                                    messageRepo: messageRepo,
                                    promptHistoryStore: PromptHistoryStore(db: db))
+        wireCanonicalThreadRead(vm, repo: threadRepo)
         return (vm, threadRepo)
     }
 
@@ -46,7 +47,19 @@ final class AgentAppViewModelTests: XCTestCase {
                                    coordinator: coord, threadRepo: threadRepo,
                                    messageRepo: messageRepo,
                                    promptHistoryStore: PromptHistoryStore(db: db))
+        wireCanonicalThreadRead(vm, repo: threadRepo)
         return (vm, threadRepo)
+    }
+
+    private func wireCanonicalThreadRead(_ vm: AgentAppViewModel, repo: AgentThreadRepository) {
+        vm.markThreadRead = { id in
+            guard var thread = try repo.get(id: id) else {
+                throw NSError(domain: "AgentAppViewModelTests", code: 404)
+            }
+            guard thread.hasUnread else { return }
+            thread.hasUnread = false
+            try repo.upsert(thread)
+        }
     }
 
     func test_isAwaitingBackgroundWork_flagsCompletedStallButNotNormalCompletion() throws {
@@ -2037,42 +2050,85 @@ final class AgentAppViewModelTests: XCTestCase {
         XCTAssertTrue(preview?.contains("hidden from preview") == true)
     }
 
-    func test_finishCallback_marksCompletedThreadUnreadUntilOpened() async throws {
+    func test_finishCallbackReflectsCoordinatorOwnedUnreadUntilOpened() async throws {
         let (vm, repo) = try makeVM()
         vm.createThread(title: "done")
-        let id = vm.selectedThreadId!
+        let id = try XCTUnwrap(vm.selectedThreadId)
+        var completed = try XCTUnwrap(repo.get(id: id))
+        completed.status = .completed
+        completed.hasUnread = true
+        try repo.upsert(completed)
+        let callbackFinished = expectation(description: "finish callback applied")
+        vm.onRunCompleted = { callbackFinished.fulfill() }
         vm.runCoordinator(vm.coordinator, didFinish: AgentRunID(), threadId: id, status: .completed,
                           finalMessage: "done", providerThreadId: nil)
+        await fulfillment(of: [callbackFinished], timeout: 2)
 
-        await waitAsync("completed thread marked unread") {
-            (try? repo.get(id: id)?.hasUnread) == true
-        }
-        vm.reloadThreads()
         XCTAssertTrue(vm.threads.first { $0.id == id }?.hasUnread ?? false,
-                      "completed work must leave a visible unread indicator even for the currently selected thread")
+                      "the callback must reflect coordinator-owned unread state in the rail")
 
         vm.selectThread(id)
         XCTAssertEqual(try repo.get(id: id)?.hasUnread, false,
                        "clicking/opening the completed thread must clear the indicator")
     }
 
-    func test_runningThreadClearsPriorCompletedUnreadIndicator() async throws {
+    func test_delayedFinishCallbackNeverResurrectsCoordinatorUnreadAfterRead() async throws {
+        let (vm, repo) = try makeVM()
+        vm.createThread(title: "done")
+        let id = try XCTUnwrap(vm.selectedThreadId)
+        var completed = try XCTUnwrap(repo.get(id: id))
+        completed.status = .completed
+        completed.hasUnread = true
+        try repo.upsert(completed)
+        vm.reloadThreads()
+        vm.selectThread(id)
+        XCTAssertFalse(try XCTUnwrap(repo.get(id: id)).hasUnread,
+            "the canonical read must clear coordinator-owned completion attention")
+        let callbackFinished = expectation(description: "delayed finish callback applied")
+        vm.onRunCompleted = { callbackFinished.fulfill() }
+
+        vm.runCoordinator(
+            vm.coordinator,
+            didFinish: AgentRunID(),
+            threadId: id,
+            status: .completed,
+            finalMessage: "done",
+            providerThreadId: nil
+        )
+        await fulfillment(of: [callbackFinished], timeout: 2)
+
+        XCTAssertFalse(try XCTUnwrap(repo.get(id: id)).hasUnread,
+            "a delayed view callback must never overwrite a newer canonical read")
+        vm.reloadThreads()
+        XCTAssertFalse(vm.threads.first(where: { $0.id == id })?.hasUnread ?? true,
+            "the local rail must keep the newer read state")
+    }
+
+    func test_runningStatusCallbackReflectsCoordinatorClearedUnreadIndicator() async throws {
         let (vm, repo) = try makeVM()
         vm.createThread(title: "rerun")
-        let id = vm.selectedThreadId!
+        let id = try XCTUnwrap(vm.selectedThreadId)
+        var completed = try XCTUnwrap(repo.get(id: id))
+        completed.status = .completed
+        completed.hasUnread = true
+        try repo.upsert(completed)
         vm.runCoordinator(vm.coordinator, didFinish: AgentRunID(), threadId: id, status: .completed,
                           finalMessage: "done", providerThreadId: nil)
-        await waitAsync("completed thread marked unread") {
-            (try? repo.get(id: id)?.hasUnread) == true
+        await waitAsync("completion callback reflects coordinator unread") {
+            vm.threads.first(where: { $0.id == id })?.hasUnread == true
         }
+        var running = try XCTUnwrap(repo.get(id: id))
+        running.status = .running
+        running.hasUnread = false
+        try repo.upsert(running)
 
         vm.runCoordinator(vm.coordinator, didChangeStatus: .running, runId: AgentRunID(), threadId: id)
 
-        await waitAsync("running thread clears completed dot") {
-            (try? repo.get(id: id)?.hasUnread) == false
+        await waitAsync("running callback reflects coordinator read state") {
+            vm.threads.first(where: { $0.id == id })?.hasUnread == false
         }
         XCTAssertFalse(vm.threads.first { $0.id == id }?.hasUnread ?? true,
-                       "starting a new spinner must hide the prior completed dot until this run completes again")
+                       "the rail must reflect the coordinator's running-state unread reset")
     }
 
     func test_threadRowSelectionCheckNeverAppearsForClickedThread() {

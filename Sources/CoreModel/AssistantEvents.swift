@@ -75,6 +75,7 @@ public enum AssistantRequestState: String, Codable, Sendable {
     case cancelled
     case resolved
     case stale
+    case acknowledged
 }
 
 public struct AssistantPendingRequest: Codable, Sendable, Equatable, Identifiable {

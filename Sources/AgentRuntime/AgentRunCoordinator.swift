@@ -189,6 +189,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         for thread in try threadRepo.list() where thread.status == .running {
             var copy = thread
             copy.status = .interrupted
+            copy.hasUnread = Self.hasUnread(for: .interrupted)
             copy.updatedAt = now
             try threadRepo.upsert(copy)
         }
@@ -473,6 +474,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         }
         if var thread = try? threadRepo.get(id: threadId), thread.status == .running || thread.status == .pending {
             thread.status = .cancelled
+            thread.hasUnread = Self.hasUnread(for: .cancelled)
             thread.updatedAt = Date()
             try? threadRepo.upsert(thread)
         }
@@ -680,6 +682,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         try? runRepo.upsert(run)
         if var thread = try? threadRepo.get(id: request.threadId) {
             thread.status = .failed
+            thread.hasUnread = Self.hasUnread(for: .failed)
             thread.updatedAt = Date()
             try? threadRepo.upsert(thread)
         }
@@ -1447,6 +1450,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                 }
                 var copy = t
                 copy.status = status
+                copy.hasUnread = Self.hasUnread(for: status)
                 if let ptid = providerThreadId { copy.providerThreadId = ptid }
                 copy.updatedAt = Date()
                 try threadRepo.upsert(copy)
@@ -1747,6 +1751,15 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         guard trimmed.count > "/distill".count else { return true }
         let boundary = trimmed.index(trimmed.startIndex, offsetBy: "/distill".count)
         return trimmed[boundary].isWhitespace
+    }
+
+    private static func hasUnread(for status: AgentRunStatus) -> Bool {
+        switch status {
+        case .completed, .failed, .interrupted:
+            true
+        case .pending, .running, .cancelled:
+            false
+        }
     }
 
     private func rememberCompletedTurn(_ turnId: String, runId: AgentRunID) {
