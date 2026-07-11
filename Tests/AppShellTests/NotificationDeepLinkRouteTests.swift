@@ -1,5 +1,6 @@
 import XCTest
 @testable import AppShell
+@testable import Surfaces
 import CoreModel
 
 /// Verifies the pure notification payload -> RouteIntent mapper.
@@ -14,6 +15,15 @@ import CoreModel
 ///   tests enforce the contract so callers can trust the output.
 @MainActor
 final class NotificationDeepLinkRouteTests: XCTestCase {
+
+    private func closeAndUnregisterAgentSurfaces(workspace: WorkspaceID) {
+        for surface in SurfaceRegistry.shared.all() {
+            guard let agent = surface as? AgentAppSurface,
+                  agent.viewModel.workspaceID == workspace else { continue }
+            agent.close()
+            SurfaceRegistry.shared.unregister(agent.descriptor.id)
+        }
+    }
 
     // MARK: - Valid payload
 
@@ -143,5 +153,43 @@ final class NotificationDeepLinkRouteTests: XCTestCase {
 
         XCTAssertNotEqual(intent1, intent2,
             "intents for different thread UUIDs must not be equal — equality is required for stable navigation deduplication")
+    }
+
+    func test_openNotificationRoute_usesCanonicalExactThreadRoute_andMarksRead() throws {
+        let dir = NSTemporaryDirectory() + "RC2NotificationRoute-" + UUID().uuidString
+        let context = try AppContext(channel: .debug, appSupportOverride: dir)
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let controller = MainWindowController(context: context, router: router)
+        router.windowController = controller
+        router.destinationWindowIsKeyForTests = { $0 === controller.window }
+        let delegate = AppDelegate(channel: .debug, appSupportOverride: dir)
+        delegate.context = context
+        delegate.router = router
+        delegate.windowController = controller
+        defer { controller.window.orderOut(nil) }
+
+        let workspace = try router.createWorkspace(name: "NOTIFICATION", cwd: NSTemporaryDirectory())
+        defer { closeAndUnregisterAgentSurfaces(workspace: workspace.id) }
+        var thread = try router.createAgentThread(
+            workspace: workspace.id,
+            title: "finished",
+            provider: .codex,
+            model: "fake-model",
+            permissionMode: .supervised,
+            reasoningEffort: .medium
+        )
+        thread.hasUnread = true
+        try context.threadRepo.upsert(thread)
+
+        let routed = try delegate.openNotificationRoute(
+            NotificationRouteIntent(threadId: thread.id, workspaceId: workspace.id)
+        )
+        let surface = try XCTUnwrap(SurfaceRegistry.shared.surface(routed.id) as? AgentAppSurface)
+
+        XCTAssertEqual(surface.viewModel.selectedThreadId, thread.id,
+            "notification taps must use the same exact-surface binding route as the pet")
+        XCTAssertFalse(try XCTUnwrap(context.threadRepo.get(id: thread.id)).hasUnread,
+            "a notification item is read only after its exact thread opened")
     }
 }

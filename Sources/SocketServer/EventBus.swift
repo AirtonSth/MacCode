@@ -19,6 +19,8 @@ public final class EventBus: @unchecked Sendable {
     }
 
     private let lock = NSLock()
+    private let deliveryQueue = DispatchQueue(label: "com.remotecode.eventbus.delivery")
+    private let deliveryQueueKey = DispatchSpecificKey<UInt8>()
     private var lastSeq: Int64 = 0
     private struct Subscriber {
         let filter: EventStreamFilter
@@ -67,6 +69,7 @@ public final class EventBus: @unchecked Sendable {
         self.recentLimit = max(0, recentLimit)
         self.recentByteLimit = max(0, recentByteLimit)
         self.clock = clock
+        deliveryQueue.setSpecific(key: deliveryQueueKey, value: 1)
     }
 
     /// QA-002: inject a fixed or advancing clock so event timestamps are
@@ -85,6 +88,14 @@ public final class EventBus: @unchecked Sendable {
     }
 
     public func publish(kind: String, payload: JSONValue) {
+        if DispatchQueue.getSpecific(key: deliveryQueueKey) != nil {
+            deliveryQueue.async { [self] in publishSerialized(kind: kind, payload: payload) }
+        } else {
+            deliveryQueue.sync { publishSerialized(kind: kind, payload: payload) }
+        }
+    }
+
+    private func publishSerialized(kind: String, payload: JSONValue) {
         lock.lock()
         lastSeq += 1
         let ev = Event(seq: lastSeq, kind: kind, payload: payload, ts: clock().timeIntervalSince1970)
@@ -144,6 +155,38 @@ public final class EventBus: @unchecked Sendable {
 
     @discardableResult
     public func subscribe(since: Int64?, filter: EventStreamFilter = .full, _ handler: @escaping (Event) -> Void) -> UUID {
+        if DispatchQueue.getSpecific(key: deliveryQueueKey) != nil {
+            return subscribeSerialized(since: since, filter: filter, handler)
+        }
+        return deliveryQueue.sync {
+            subscribeSerialized(since: since, filter: filter, handler)
+        }
+    }
+
+    /// Atomically captures the current sequence and installs a live subscriber.
+    /// Callers that must recover durable state through the captured cursor can do
+    /// that work after registration without relying on the bounded recent ring to
+    /// bridge a cursor-to-subscribe race.
+    public func subscribeFromCurrent(
+        filter: EventStreamFilter = .full,
+        _ handler: @escaping (Event) -> Void
+    ) -> (id: UUID, cursor: Int64) {
+        let register = { [self] in
+            let cursor = currentSeq
+            let id = subscribeSerialized(since: cursor, filter: filter, handler)
+            return (id: id, cursor: cursor)
+        }
+        if DispatchQueue.getSpecific(key: deliveryQueueKey) != nil {
+            return register()
+        }
+        return deliveryQueue.sync(execute: register)
+    }
+
+    private func subscribeSerialized(
+        since: Int64?,
+        filter: EventStreamFilter,
+        _ handler: @escaping (Event) -> Void
+    ) -> UUID {
         let id = UUID()
         lock.lock()
         subscribers[id] = Subscriber(filter: filter, handler: handler)
@@ -158,6 +201,14 @@ public final class EventBus: @unchecked Sendable {
     }
 
     public func unsubscribe(_ id: UUID) {
+        if DispatchQueue.getSpecific(key: deliveryQueueKey) != nil {
+            unsubscribeSerialized(id)
+        } else {
+            deliveryQueue.sync { unsubscribeSerialized(id) }
+        }
+    }
+
+    private func unsubscribeSerialized(_ id: UUID) {
         lock.lock()
         subscribers.removeValue(forKey: id)
         subscribersSnapshot = Array(subscribers.values)

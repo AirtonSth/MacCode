@@ -584,8 +584,8 @@ final class TokenSaverCompressionTests: XCTestCase {
         ))
 
         let expected = "Recebi o pedido em /distill e vou criar um jogo Snake HTML mínimo em /tmp."
-        let deadline = Date().addingTimeInterval(3)
-        while Date() < deadline,
+        let liveDeadline = Date().addingTimeInterval(3)
+        while Date() < liveDeadline,
               !observer.recordedEvents.contains(where: { $0.bodyAppendForTest == expected }) {
             try? await Task.sleep(nanoseconds: 10_000_000)
         }
@@ -597,7 +597,8 @@ final class TokenSaverCompressionTests: XCTestCase {
                        "raw SR1 provider text must not reach the live timeline")
         XCTAssertFalse(liveBodies.contains("S received."))
 
-        while Date() < deadline,
+        let replayDeadline = Date().addingTimeInterval(3)
+        while Date() < replayDeadline,
               !coordinator.latestStreamEvents(threadId: thread.id)
                 .compactMap(\.bodyAppendForTest)
                 .joined(separator: "\n")

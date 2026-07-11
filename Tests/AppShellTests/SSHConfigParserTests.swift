@@ -1,6 +1,7 @@
 import XCTest
 @testable import AppShell
 @testable import CoreModel
+import SocketServer
 
 // Tests for SSHConfigParser (pure, non-MainActor) and the SSHSurface
 // disconnect path (via the testing accessor, nil router).
@@ -232,5 +233,57 @@ final class SSHSurfaceDisconnectTests: XCTestCase {
         surface.disconnectForTesting()
         surface.disconnectForTesting()
         XCTAssertEqual(surface.snapshot()["ssh_status"], "disconnected")
+    }
+
+    func testDisconnectEventsDistinguishUserRequestFromUnexpectedChildExit() throws {
+        let workspaceID = WorkspaceID()
+        let surface = try SSHSurface(workspaceID: workspaceID, cwd: "/tmp", title: "t", router: nil)
+        var events: [EventBus.Event] = []
+        let token = EventBus.shared.subscribe(since: EventBus.shared.currentSeq) { event in
+            if event.kind == "ssh.session.updated" { events.append(event) }
+        }
+        defer { EventBus.shared.unsubscribe(token) }
+
+        surface.disconnectForTesting()
+        surface.unexpectedDisconnectForTesting()
+        surface.close()
+
+        XCTAssertEqual(events.count, 3)
+        XCTAssertEqual(events[0].payload.objectValue, [
+            "workspace_id": .string(workspaceID.value.uuidString),
+            "surface_id": .string(surface.descriptor.id.value.uuidString),
+            "status": .string("disconnected"),
+            "reason": .string("user_requested")
+        ])
+        XCTAssertEqual(events[1].payload.objectValue, [
+            "workspace_id": .string(workspaceID.value.uuidString),
+            "surface_id": .string(surface.descriptor.id.value.uuidString),
+            "status": .string("disconnected"),
+            "reason": .string("unexpected_child_exit")
+        ])
+        XCTAssertEqual(events[2].payload.objectValue?["reason"], .string("user_requested"))
+    }
+
+    func testInitialConnectionFailurePublishesOneSafeSessionOutcome() throws {
+        let workspaceID = WorkspaceID()
+        let surface = try SSHSurface(workspaceID: workspaceID, cwd: "/tmp/private", title: "t", router: nil)
+        var events: [EventBus.Event] = []
+        let token = EventBus.shared.subscribe(since: EventBus.shared.currentSeq) { event in
+            if event.kind == "ssh.session.updated" { events.append(event) }
+        }
+        defer { EventBus.shared.unsubscribe(token) }
+
+        surface.connectionFailedForTesting()
+
+        XCTAssertEqual(events.count, 1)
+        XCTAssertEqual(events[0].payload.objectValue, [
+            "workspace_id": .string(workspaceID.value.uuidString),
+            "surface_id": .string(surface.descriptor.id.value.uuidString),
+            "status": .string("disconnected"),
+            "reason": .string("connection_failed")
+        ])
+        XCTAssertEqual(surface.snapshot()["ssh_status"], "disconnected")
+        XCTAssertFalse(String(describing: events[0].payload).contains("/tmp/private"),
+            "Connection failures must never publish paths or raw error details to Pet/mirrors.")
     }
 }

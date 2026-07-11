@@ -51,11 +51,15 @@ private struct ProviderProbeCapabilities {
 /// concrete Surface views. Lives on the main actor because it mutates UI.
 @MainActor
 public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, LayoutEventSuppressionRouting {
+    typealias SSHCommandRunner = @Sendable (String, [String], String?) throws -> (exitCode: Int32, output: String)
+
     private static let minimizedPaneVisibilityThreshold = 0.08
 
     public weak var context: AppContext?
     public weak var windowController: MainWindowController?
+    var destinationWindowIsKeyForTests: ((NSWindow) -> Bool)?
     private let sshPasswordStore: SSHPasswordStoring
+    private let sshCommandRunner: SSHCommandRunner
     private var providerProbeCache: [ProviderProbeCacheKey: ProviderProbeCapabilities] = [:]
     private var providerUpdateLocks = Set<ProviderProbeCacheKey>()
     private let providerProbeCacheTTL: TimeInterval = 30
@@ -69,13 +73,26 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         self.init(context: context, sshPasswordStore: KeychainSSHPasswordStore())
     }
 
-    init(context: AppContext, sshPasswordStore: SSHPasswordStoring) {
+    init(
+        context: AppContext,
+        sshPasswordStore: SSHPasswordStoring,
+        sshCommandRunner: @escaping SSHCommandRunner = { executable, arguments, password in
+            try AppCommandRouter.runCommandBlocking(executable: executable, arguments: arguments, password: password)
+        }
+    ) {
         self.context = context
         self.sshPasswordStore = sshPasswordStore
+        self.sshCommandRunner = sshCommandRunner
     }
 
     private func publishAgentThreadUpdated(_ thread: AgentThread) {
         EventBus.shared.publish(kind: "agent.thread.updated", payload: agentThreadPayload(thread))
+    }
+
+    private func publishAgentThreadRead(_ threadID: AgentThreadID) {
+        EventBus.shared.publish(kind: "agent.thread.read", payload: .object([
+            "thread_id": .string(threadID.value.uuidString)
+        ]))
     }
 
     /// Full thread payload for host-UI-driven thread mirror events. Shape is
@@ -237,6 +254,10 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                         agent.viewModel.onSelectedThreadChanged = { [weak self, weak agent] threadID in
                             guard let self, let agent else { return }
                             self.persistAgentSelectedThread(surfaceID: agent.descriptor.id, threadID: threadID)
+                        }
+                        agent.viewModel.markThreadRead = { [weak self] threadID in
+                            guard let self else { throw LayoutError.workspaceNotFound }
+                            try self.markAgentThreadRead(thread: threadID)
                         }
                         let token = EventBus.shared.subscribe(since: nil) { [weak agent] ev in
                             guard ev.kind.hasPrefix("agent.thread.") || ev.kind.hasPrefix("agent.message.queue") || ev.kind == "agent.message.queued" else { return }
@@ -736,6 +757,40 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         return desc
     }
 
+    public func ensureGitSurface(workspace: WorkspaceID) throws -> SurfaceDescriptor {
+        guard let ctx = context,
+              let workspaceState = ctx.state.workspaces[workspace] else {
+            throw LayoutError.workspaceNotFound
+        }
+        var existing: SurfaceDescriptor?
+        forEachSurface(in: workspaceState.layout) { descriptor in
+            guard existing == nil,
+                  descriptor.type == .rightSidebarTool,
+                  descriptor.metadata["tool"] == "diff" else { return }
+            existing = descriptor
+        }
+        if let existing { return existing }
+
+        let targetPaneID = workspaceState.focusedPaneID ?? workspaceState.layout.paneIDs().first
+        let previousSurfaceID = targetPaneID.flatMap {
+            workspaceState.layout.find(paneID: $0)?.selectedSurfaceID
+        }
+        let descriptor = makeSurface(
+            type: .rightSidebarTool,
+            title: "Git",
+            workspace: workspace,
+            cwd: workspaceState.cwd
+        )
+        try ctx.apply(.addSurface(workspace, paneID: targetPaneID, descriptor: descriptor))
+        if let previousSurfaceID {
+            try ctx.apply(.focusSurface(workspace, previousSurfaceID))
+        }
+        windowController?.refreshFromState()
+        reconcileSurfaceVisibility()
+        publishSurfaceCreated(workspace: workspace, surface: descriptor)
+        return descriptor
+    }
+
     public func splitPane(workspace: WorkspaceID, paneID: PaneID, direction: SplitDirection, surfaceType: SurfaceType, title: String?) throws -> SurfaceDescriptor {
         guard let ctx = context else { throw LayoutError.workspaceNotFound }
         let desc = makeSurface(type: surfaceType, title: title, workspace: workspace, cwd: ctx.state.workspaces[workspace]?.cwd ?? "/")
@@ -1127,6 +1182,103 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         try createSurface(workspace: workspace, type: .agentApp, paneID: nil, title: "Agent App")
     }
 
+    /// Open one exact agent thread in a concrete Agent App surface.
+    ///
+    /// This is the canonical deep-link path for system notifications and other
+    /// attention surfaces. It deliberately keeps `selectAgentThread`'s nil-target
+    /// behavior unchanged: remote mark-read/list refreshes must not yank an
+    /// arbitrary macOS tab. A user-initiated open instead resolves one surface,
+    /// focuses it, binds the thread to that surface ID, verifies the binding, and
+    /// only then clears unread state when requested.
+    @discardableResult
+    public func openAgentThread(thread threadID: AgentThreadID, markRead: Bool = false) throws -> SurfaceDescriptor {
+        guard let ctx = context,
+              let thread = try ctx.threadRepo.get(id: threadID),
+              let workspaceID = thread.workspaceId,
+              ctx.state.workspaces[workspaceID] != nil else {
+            throw LayoutError.workspaceNotFound
+        }
+
+        NSApplication.shared.activate(ignoringOtherApps: true)
+        let destinationWindow: NSWindow?
+        if let detachedWindow = windowController?.workspaceWindow(for: workspaceID) {
+            detachedWindow.makeKeyAndOrderFront(nil)
+            destinationWindow = detachedWindow
+        } else {
+            windowController?.show()
+            try selectWorkspace(workspaceID)
+            destinationWindow = windowController?.window
+        }
+        guard let destinationWindow else {
+            throw LayoutError.surfaceNotFound
+        }
+
+        let surface: AgentAppSurface
+        if let existing = preferredAgentAppSurface(in: workspaceID) {
+            surface = existing
+        } else {
+            let descriptor = try openAgentApp(workspace: workspaceID)
+            guard let created = SurfaceRegistry.shared.surface(descriptor.id) as? AgentAppSurface else {
+                throw LayoutError.surfaceNotFound
+            }
+            surface = created
+        }
+
+        try focusSurface(workspace: workspaceID, surface: surface.descriptor.id)
+        try selectAgentThread(
+            thread: threadID,
+            surfaceID: surface.descriptor.id,
+            markReadOnSelection: false
+        )
+        windowController?.flushPendingRefresh()
+        guard surface.viewModel.selectedThreadId == threadID else {
+            throw LayoutError.surfaceNotFound
+        }
+        destinationWindow.contentView?.layoutSubtreeIfNeeded()
+        destinationWindow.makeKeyAndOrderFront(nil)
+        guard destinationWindow.isVisible,
+              destinationWindow.isMiniaturized == false else {
+            throw LayoutError.surfaceNotFound
+        }
+        if markRead,
+           (!destinationWindowIsKey(destinationWindow) || surface.view.window !== destinationWindow) {
+            throw LayoutError.surfaceNotFound
+        }
+
+        if markRead {
+            try markAgentThreadRead(thread: threadID)
+        }
+        return surface.descriptor
+    }
+
+    /// Prefer the currently focused Agent App tab, then layout order. This makes
+    /// an explicit deep link deterministic without changing any sibling surface.
+    private func preferredAgentAppSurface(in workspaceID: WorkspaceID) -> AgentAppSurface? {
+        guard let workspace = context?.state.workspaces[workspaceID] else { return nil }
+        let candidates = SurfaceRegistry.shared.all().compactMap { $0 as? AgentAppSurface }
+            .filter { $0.viewModel.workspaceID == workspaceID }
+        guard !candidates.isEmpty else { return nil }
+
+        if let focusedPaneID = workspace.focusedPaneID,
+           let selectedID = workspace.layout.find(paneID: focusedPaneID)?.selectedSurfaceID,
+           let focused = candidates.first(where: { $0.descriptor.id == selectedID }) {
+            return focused
+        }
+
+        for paneID in workspace.layout.paneIDs() {
+            for descriptor in workspace.layout.find(paneID: paneID)?.surfaces ?? [] {
+                if let candidate = candidates.first(where: { $0.descriptor.id == descriptor.id }) {
+                    return candidate
+                }
+            }
+        }
+        return nil
+    }
+
+    private func destinationWindowIsKey(_ window: NSWindow) -> Bool {
+        destinationWindowIsKeyForTests?(window) ?? window.isKeyWindow
+    }
+
     public func listAgentThreads(workspace: WorkspaceID?) throws -> [AgentThread] {
         guard let ctx = context else { return [] }
         return try ctx.threadRepo.list(workspaceId: workspace)
@@ -1282,13 +1434,21 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     /// mark-read) no longer force-switches every other macOS agent tab (the
     /// global fan-out that made iOS actions disturb macOS).
     public func selectAgentThread(thread: AgentThreadID, surfaceID: SurfaceID? = nil) throws {
+        try selectAgentThread(thread: thread, surfaceID: surfaceID, markReadOnSelection: true)
+    }
+
+    private func selectAgentThread(
+        thread: AgentThreadID,
+        surfaceID: SurfaceID?,
+        markReadOnSelection: Bool
+    ) throws {
         guard let ctx = context else { throw LayoutError.workspaceNotFound }
         guard let t = try ctx.threadRepo.get(id: thread) else { throw LayoutError.workspaceNotFound }
         for s in SurfaceRegistry.shared.all() {
             guard let agent = s as? AgentAppSurface, agent.viewModel.workspaceID == t.workspaceId else { continue }
             agent.viewModel.reloadThreads()
             if let surfaceID, agent.descriptor.id == surfaceID {
-                agent.viewModel.selectThread(thread)
+                agent.viewModel.selectThread(thread, markRead: markReadOnSelection)
             }
         }
         windowController?.refreshFromState()
@@ -1855,7 +2015,11 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     public func markAgentThreadRead(thread: AgentThreadID) throws {
         guard let ctx = context else { throw LayoutError.workspaceNotFound }
         guard var t = try ctx.threadRepo.get(id: thread) else { throw LayoutError.workspaceNotFound }
-        if t.hasUnread { t.hasUnread = false; try ctx.threadRepo.upsert(t) }
+        let didMarkRead = t.hasUnread
+        if didMarkRead {
+            t.hasUnread = false
+            try ctx.threadRepo.upsert(t)
+        }
         // Marking a thread read must NOT select it. Previously this called
         // selectAgentThread, so an iOS client opening an old thread (which
         // auto-marks it read) force-switched every macOS agent tab to that
@@ -1864,6 +2028,9 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         for s in SurfaceRegistry.shared.all() {
             guard let agent = s as? AgentAppSurface, agent.viewModel.workspaceID == t.workspaceId else { continue }
             agent.viewModel.reloadThreads()
+        }
+        if didMarkRead {
+            publishAgentThreadRead(thread)
         }
     }
 
@@ -2041,7 +2208,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             ProviderCLIProbe.update(provider: provider, binaryPath: binaryPath, environment: env)
         }.value
         providerProbeCache.removeValue(forKey: key)
-        return .object([
+        let response = JSONValue.object([
             "provider": .string(provider.rawValue),
             "provider_instance_id": providerInstanceId.map { .string($0) } ?? .null,
             "binary_path": .string(binaryPath),
@@ -2050,6 +2217,12 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             "stdout": .string(result.stdout),
             "stderr": .string(result.stderr)
         ])
+        EventBus.shared.publish(kind: "agent.provider.updated", payload: .object([
+            "provider": .string(provider.rawValue),
+            "ok": .bool(result.ok),
+            "status": .number(Double(result.status))
+        ]))
+        return response
     }
 
     public func agentPromptHistory(workspace: WorkspaceID?, limit: Int) throws -> [String] {
@@ -2248,10 +2421,21 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         }
         // Run it in a fresh terminal surface (t3code ProjectScriptsControl).
         let desc = try createSurface(workspace: workspace, type: .terminal, paneID: nil, title: "Run: \(name)")
-        if let term = SurfaceRegistry.shared.surface(desc.id) {
-            term.sendText(script.command + "\n")
+        guard let context, let terminal = SurfaceRegistry.shared.surface(desc.id) as? TerminalSurface else {
+            throw LayoutError.surfaceNotFound
         }
+        context.projectScriptRuns.register(workspaceID: workspace, surfaceID: desc.id, name: name)
+        EventBus.shared.publish(kind: "project.script_started", payload: .object([
+            "workspace_id": .string(workspace.value.uuidString),
+            "surface_id": .string(desc.id.value.uuidString),
+            "name": .string(name)
+        ]))
+        terminal.sendText(Self.projectScriptTerminalInput(command: script.command))
         return desc
+    }
+
+    static func projectScriptTerminalInput(command: String) -> String {
+        "exec \(command)\n"
     }
 
     public func projectOpenInEditor(workspace: WorkspaceID) throws -> String {
@@ -2518,6 +2702,10 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         }
         // Mirror into macOS notification center.
         SystemNotifier.shared.post(title: title, body: body, category: category)
+        var eventPayload: [String: JSONValue] = ["id": .string(n.id)]
+        if let workspaceId { eventPayload["workspace_id"] = .string(workspaceId.value.uuidString) }
+        if let category { eventPayload["category"] = .string(category) }
+        EventBus.shared.publish(kind: "notification.created", payload: .object(eventPayload))
         return n.id
     }
 
@@ -2544,11 +2732,13 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     public func notificationMarkRead(id: String) throws {
         guard let ctx = context else { return }
         try NotificationRepository(db: ctx.db).markRead(id: id)
+        EventBus.shared.publish(kind: "notification.read", payload: .object(["id": .string(id)]))
     }
 
     public func notificationDismiss(id: String) throws {
         guard let ctx = context else { return }
         try NotificationRepository(db: ctx.db).dismiss(id: id)
+        EventBus.shared.publish(kind: "notification.dismissed", payload: .object(["id": .string(id)]))
     }
 
     public func privatePushTokenUpdate(pushToken: String, pushTokenType: String, liveActivityToken: String?, deviceID: String?) throws -> JSONValue {
@@ -2726,6 +2916,10 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                     guard let self, let agent else { return }
                     self.persistAgentSelectedThread(surfaceID: agent.descriptor.id, threadID: threadID)
                 }
+                agent.viewModel.markThreadRead = { [weak self] threadID in
+                    guard let self else { throw LayoutError.workspaceNotFound }
+                    try self.markAgentThreadRead(thread: threadID)
+                }
                 // Socket-driven thread mutations (create/rename/delete/read)
                 // refresh this already-open surface — fixes the stale-VM gap.
                 let token = EventBus.shared.subscribe(since: nil) { [weak agent] ev in
@@ -2882,35 +3076,69 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         return resolved
     }
 
-    private func runSSHTransfer(surface: SurfaceID, upload: Bool, localPath: String, remotePath: String) throws -> JSONValue {
-        let (profile, appendOutput) = try sshTransferProfileAndOutput(for: surface)
-        let args = upload
-            ? SSHCommandBuilder.scpUploadArguments(profile: profile, localPath: localPath, remotePath: remotePath)
-            : SSHCommandBuilder.scpDownloadArguments(profile: profile, remotePath: remotePath, localPath: localPath)
-        let kind = upload ? "upload" : "download"
+    private struct SSHTransferLifecycle {
+        let workspaceID: WorkspaceID
+        let surfaceID: SurfaceID
+        let transferID: String
+        let direction: String
+        let startedAt: Date
+    }
+
+    private func beginSSHTransfer(surface: SurfaceID, direction: String) throws -> SSHTransferLifecycle {
+        let workspaceID = try locateSurface(surface).workspaceID
+        let lifecycle = SSHTransferLifecycle(
+            workspaceID: workspaceID,
+            surfaceID: surface,
+            transferID: UUID().uuidString,
+            direction: direction,
+            startedAt: Date()
+        )
         EventBus.shared.publish(kind: "ssh.transfer.started", payload: .object([
+            "workspace_id": .string(workspaceID.value.uuidString),
             "surface_id": .string(surface.value.uuidString),
-            "direction": .string(kind),
-            "local_path": .string(localPath),
-            "remote_path": .string(remotePath)
+            "transfer_id": .string(lifecycle.transferID),
+            "direction": .string(direction)
         ]))
-        appendOutput("\n[ssh \(kind) started]\n")
-        let result = try runCommand(executable: "/usr/bin/scp", arguments: args, password: profile.password)
-        if !result.output.isEmpty { appendOutput(result.output) }
-        let ok = result.exitCode == 0
-        appendOutput("[ssh \(kind) \(ok ? "completed" : "failed")]\n")
-        EventBus.shared.publish(kind: ok ? "ssh.transfer.completed" : "ssh.transfer.failed", payload: .object([
-            "surface_id": .string(surface.value.uuidString),
-            "direction": .string(kind),
-            "local_path": .string(localPath),
-            "remote_path": .string(remotePath),
-            "exit_code": .number(Double(result.exitCode))
+        return lifecycle
+    }
+
+    private func finishSSHTransfer(_ lifecycle: SSHTransferLifecycle, exitCode: Int32?) {
+        let succeeded = exitCode == 0
+        let durationMilliseconds = max(0, Int64(Date().timeIntervalSince(lifecycle.startedAt) * 1_000))
+        EventBus.shared.publish(kind: succeeded ? "ssh.transfer.completed" : "ssh.transfer.failed", payload: .object([
+            "workspace_id": .string(lifecycle.workspaceID.value.uuidString),
+            "surface_id": .string(lifecycle.surfaceID.value.uuidString),
+            "transfer_id": .string(lifecycle.transferID),
+            "direction": .string(lifecycle.direction),
+            "exit_code": exitCode.map { .number(Double($0)) } ?? .null,
+            "duration_ms": .number(Double(durationMilliseconds)),
+            "result": .string(succeeded ? "success" : "failure")
         ]))
-        return .object([
-            "ok": .bool(ok),
-            "exit_code": .number(Double(result.exitCode)),
-            "output": .string(result.output)
-        ])
+    }
+
+    private func runSSHTransfer(surface: SurfaceID, upload: Bool, localPath: String, remotePath: String) throws -> JSONValue {
+        let kind = upload ? "upload" : "download"
+        let lifecycle = try beginSSHTransfer(surface: surface, direction: kind)
+        do {
+            let (profile, appendOutput) = try sshTransferProfileAndOutput(for: surface)
+            let args = upload
+                ? SSHCommandBuilder.scpUploadArguments(profile: profile, localPath: localPath, remotePath: remotePath)
+                : SSHCommandBuilder.scpDownloadArguments(profile: profile, remotePath: remotePath, localPath: localPath)
+            appendOutput("\n[ssh \(kind) started]\n")
+            let result = try runCommand(executable: "/usr/bin/scp", arguments: args, password: profile.password)
+            if !result.output.isEmpty { appendOutput(result.output) }
+            let ok = result.exitCode == 0
+            appendOutput("[ssh \(kind) \(ok ? "completed" : "failed")]\n")
+            finishSSHTransfer(lifecycle, exitCode: result.exitCode)
+            return .object([
+                "ok": .bool(ok),
+                "exit_code": .number(Double(result.exitCode)),
+                "output": .string(result.output)
+            ])
+        } catch {
+            finishSSHTransfer(lifecycle, exitCode: nil)
+            throw error
+        }
     }
 
     /// Async transfer: resolves actor state on the main actor, runs the scp
@@ -2925,37 +3153,32 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     }
 
     private func runSSHTransferAsync(surface: SurfaceID, upload: Bool, localPath: String, remotePath: String) async throws -> JSONValue {
-        let (profile, appendOutput) = try sshTransferProfileAndOutput(for: surface)
-        let args = upload
-            ? SSHCommandBuilder.scpUploadArguments(profile: profile, localPath: localPath, remotePath: remotePath)
-            : SSHCommandBuilder.scpDownloadArguments(profile: profile, remotePath: remotePath, localPath: localPath)
         let kind = upload ? "upload" : "download"
-        EventBus.shared.publish(kind: "ssh.transfer.started", payload: .object([
-            "surface_id": .string(surface.value.uuidString),
-            "direction": .string(kind),
-            "local_path": .string(localPath),
-            "remote_path": .string(remotePath)
-        ]))
-        appendOutput("\n[ssh \(kind) started]\n")
-        let password = profile.password
-        let result = try await Task.detached {
-            try Self.runCommandBlocking(executable: "/usr/bin/scp", arguments: args, password: password)
-        }.value
-        if !result.output.isEmpty { appendOutput(result.output) }
-        let ok = result.exitCode == 0
-        appendOutput("[ssh \(kind) \(ok ? "completed" : "failed")]\n")
-        EventBus.shared.publish(kind: ok ? "ssh.transfer.completed" : "ssh.transfer.failed", payload: .object([
-            "surface_id": .string(surface.value.uuidString),
-            "direction": .string(kind),
-            "local_path": .string(localPath),
-            "remote_path": .string(remotePath),
-            "exit_code": .number(Double(result.exitCode))
-        ]))
-        return .object([
-            "ok": .bool(ok),
-            "exit_code": .number(Double(result.exitCode)),
-            "output": .string(result.output)
-        ])
+        let lifecycle = try beginSSHTransfer(surface: surface, direction: kind)
+        do {
+            let (profile, appendOutput) = try sshTransferProfileAndOutput(for: surface)
+            let args = upload
+                ? SSHCommandBuilder.scpUploadArguments(profile: profile, localPath: localPath, remotePath: remotePath)
+                : SSHCommandBuilder.scpDownloadArguments(profile: profile, remotePath: remotePath, localPath: localPath)
+            appendOutput("\n[ssh \(kind) started]\n")
+            let password = profile.password
+            let commandRunner = sshCommandRunner
+            let result = try await Task.detached {
+                try commandRunner("/usr/bin/scp", args, password)
+            }.value
+            if !result.output.isEmpty { appendOutput(result.output) }
+            let ok = result.exitCode == 0
+            appendOutput("[ssh \(kind) \(ok ? "completed" : "failed")]\n")
+            finishSSHTransfer(lifecycle, exitCode: result.exitCode)
+            return .object([
+                "ok": .bool(ok),
+                "exit_code": .number(Double(result.exitCode)),
+                "output": .string(result.output)
+            ])
+        } catch {
+            finishSSHTransfer(lifecycle, exitCode: nil)
+            throw error
+        }
     }
 
     /// Async remote listing: spawns the remote shell off the main run loop.
@@ -3014,7 +3237,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     }
 
     private func runCommand(executable: String, arguments: [String], password: String?) throws -> (exitCode: Int32, output: String) {
-        try Self.runCommandBlocking(executable: executable, arguments: arguments, password: password)
+        try sshCommandRunner(executable, arguments, password)
     }
 
     /// Off-actor process execution. Pure local work (no actor state), so it is

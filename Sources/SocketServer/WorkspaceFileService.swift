@@ -634,32 +634,32 @@ public final class FileEditSessionStore: @unchecked Sendable {
 
     public func save(sessionID: String) throws -> JSONValue {
         lock.lock()
+        var lockHeld = true
+        defer {
+            if lockHeld { lock.unlock() }
+        }
         guard var session = sessions[sessionID] else {
-            lock.unlock()
             throw JSONRPCError(code: -32602, message: "edit session not found", data: .string(sessionID))
         }
-        do {
-            let currentData = try readEditableFileData(path: session.path)
-            guard hash(currentData) == session.baseHash else {
-                let payload = sessionJSON(session, includeContent: true)
-                lock.unlock()
-                EventBus.shared.publish(kind: "files.edit.conflict", payload: .object(payload.merging(["reason": .string("disk_changed")]) { _, new in new }))
-                throw JSONRPCError(code: -32013, message: "disk changed", data: .object(payload))
-            }
-            let data = encodeText(session.draftText, encoding: session.encoding)
-            try atomicWrite(data, to: URL(fileURLWithPath: session.path))
-            session.baseHash = hash(data)
-            session.baseModifiedAt = (try? FileManager.default.attributesOfItem(atPath: session.path)[.modificationDate]) as? Date
-            session.dirty = false
-            sessions[sessionID] = session
-            let payload = sessionJSON(session, includeContent: true).merging(["disk_hash": .string("sha256:\(session.baseHash)")]) { _, new in new }
+        let currentData = try readEditableFileData(path: session.path)
+        guard hash(currentData) == session.baseHash else {
+            let payload = sessionJSON(session, includeContent: true)
+            lockHeld = false
             lock.unlock()
-            EventBus.shared.publish(kind: "files.edit.saved", payload: .object(payload))
-            return .object(payload)
-        } catch {
-            lock.unlock()
-            throw error
+            EventBus.shared.publish(kind: "files.edit.conflict", payload: .object(payload.merging(["reason": .string("disk_changed")]) { _, new in new }))
+            throw JSONRPCError(code: -32013, message: "disk changed", data: .object(payload))
         }
+        let data = encodeText(session.draftText, encoding: session.encoding)
+        try atomicWrite(data, to: URL(fileURLWithPath: session.path))
+        session.baseHash = hash(data)
+        session.baseModifiedAt = (try? FileManager.default.attributesOfItem(atPath: session.path)[.modificationDate]) as? Date
+        session.dirty = false
+        sessions[sessionID] = session
+        let payload = sessionJSON(session, includeContent: true).merging(["disk_hash": .string("sha256:\(session.baseHash)")]) { _, new in new }
+        lockHeld = false
+        lock.unlock()
+        EventBus.shared.publish(kind: "files.edit.saved", payload: .object(payload))
+        return .object(payload)
     }
 
     public func discard(sessionID: String) throws -> JSONValue {
