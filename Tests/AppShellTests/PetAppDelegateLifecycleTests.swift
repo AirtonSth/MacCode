@@ -5,6 +5,23 @@ import Persistence
 
 @MainActor
 final class PetAppDelegateLifecycleTests: XCTestCase {
+    func test_defaultSettingsStartVisiblePetAtExisting150PercentSize() throws {
+        let fixture = try makeDelegate()
+        defer { fixture.delegate.stopPetController() }
+
+        fixture.delegate.startPetController()
+
+        let settings = SettingsStore(db: fixture.context.db).load()
+        XCTAssertTrue(settings.petEnabled)
+        XCTAssertEqual(settings.petSize, 1.5)
+        let pet = try XCTUnwrap(fixture.delegate.petController)
+        XCTAssertTrue(pet.visualRuntimeIsLoadedForTests)
+        let panel = try XCTUnwrap(pet.windowControllerForTests.petPanelForTests)
+        XCTAssertTrue(panel.isVisible, "a fresh install must show the Pet immediately")
+        XCTAssertEqual(panel.frame.width, 177, accuracy: 0.5)
+        XCTAssertEqual(panel.frame.height, 192, accuracy: 0.5)
+    }
+
     func test_appDelegateOwnsPetStartStopAndDisabledMenuResult() throws {
         let fixture = try makeDelegate(petEnabled: false)
         defer { fixture.delegate.stopPetController() }
@@ -13,7 +30,7 @@ final class PetAppDelegateLifecycleTests: XCTestCase {
 
         let pet = try XCTUnwrap(fixture.delegate.petController)
         XCTAssertFalse(pet.visualRuntimeIsLoadedForTests,
-            "Default-off startup must keep lightweight projection without loading Pet artwork or windows.")
+            "Explicitly disabled startup must keep lightweight projection without loading Pet artwork or windows.")
         XCTAssertFalse(fixture.delegate.togglePetPopover(),
             "The menu command must reject a disabled Pet instead of opening hidden UI.")
         fixture.delegate.stopPetController()
@@ -31,7 +48,7 @@ final class PetAppDelegateLifecycleTests: XCTestCase {
         XCTAssertTrue(pet.windowControllerForTests.isPopoverVisible)
     }
 
-    func test_enablingDefaultOffPetLoadsVisualRuntimeOnDemand() async throws {
+    func test_enablingExplicitlyDisabledPetLoadsVisualRuntimeOnDemand() async throws {
         let fixture = try makeDelegate(petEnabled: false)
         defer { fixture.delegate.stopPetController() }
         fixture.delegate.startPetController()
@@ -70,11 +87,13 @@ final class PetAppDelegateLifecycleTests: XCTestCase {
     }
 
     private func makeDelegate(
-        petEnabled: Bool
+        petEnabled: Bool? = nil
     ) throws -> (delegate: AppDelegate, context: AppContext, router: AppCommandRouter) {
         let directory = NSTemporaryDirectory() + "RC2PetDelegate-\(UUID().uuidString)"
         let context = try AppContext(channel: .debug, appSupportOverride: directory)
-        SettingsStore(db: context.db).update { $0.petEnabled = petEnabled }
+        if let petEnabled {
+            SettingsStore(db: context.db).update { $0.petEnabled = petEnabled }
+        }
         let router = AppCommandRouter(context: context)
         context.router = router
         let windowController = MainWindowController(context: context, router: router)

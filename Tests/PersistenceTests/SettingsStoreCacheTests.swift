@@ -118,13 +118,13 @@ final class SettingsStoreCacheTests: XCTestCase {
         let repo = CountingSettingsRepository()
         let observer = SettingsStore(repo: repo)
         let writer = SettingsStore(repo: repo)
-        XCTAssertFalse(observer.load().petEnabled)
+        XCTAssertTrue(observer.load().petEnabled)
 
-        writer.update { $0.petEnabled = true }
+        writer.update { $0.petEnabled = false }
 
-        XCTAssertFalse(observer.load().petEnabled,
+        XCTAssertTrue(observer.load().petEnabled,
             "ordinary load must retain the per-instance cache until explicitly invalidated")
-        XCTAssertTrue(observer.reload().petEnabled,
+        XCTAssertFalse(observer.reload().petEnabled,
             "settings-change observers must be able to refresh writes made through another store instance")
     }
 
@@ -132,13 +132,13 @@ final class SettingsStoreCacheTests: XCTestCase {
         let repo = CountingSettingsRepository()
         let staleWriter = SettingsStore(repo: repo)
         let petWriter = SettingsStore(repo: repo)
-        XCTAssertFalse(staleWriter.load().petEnabled)
+        XCTAssertTrue(staleWriter.load().petEnabled)
 
-        petWriter.update { $0.petEnabled = true }
+        petWriter.update { $0.petEnabled = false }
         staleWriter.update { $0.insomniaEnabled = false }
 
         let persisted = SettingsStore(repo: repo).load()
-        XCTAssertTrue(persisted.petEnabled,
+        XCTAssertFalse(persisted.petEnabled,
             "a partial update from a stale SettingsStore must preserve fields written by another surface")
         XCTAssertFalse(persisted.insomniaEnabled,
             "the requested field mutation must still persist after reloading canonical settings")

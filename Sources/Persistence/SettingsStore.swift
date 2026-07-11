@@ -50,7 +50,7 @@ public struct AppSettings: Codable, Sendable, Equatable {
     /// preserving). Off by default — opt-in, since it makes stored history lossy-recoverable.
     public var historyCompactionEnabled: Bool
 
-    /// Floating desktop pet. Off by default so existing installs are never surprised.
+    /// Floating desktop pet. On by default so it is visible without setup.
     public var petEnabled: Bool
     public var petAnimationsEnabled: Bool
     public var petReadyCounterEnabled: Bool
@@ -74,11 +74,11 @@ public struct AppSettings: Codable, Sendable, Equatable {
                 terminalFontSize: Double = 0,
                 sessionLearnEnabled: Bool = false,
                 historyCompactionEnabled: Bool = false,
-                petEnabled: Bool = false,
+                petEnabled: Bool = true,
                 petAnimationsEnabled: Bool = true,
                 petReadyCounterEnabled: Bool = true,
                 petPosition: String = "bottomRight",
-                petSize: Double = 1,
+                petSize: Double = 1.5,
                 petAttentionFilter: String = "all",
                 petReduceMotion: Bool = false) {
         self.diffWordWrap = diffWordWrap
@@ -135,11 +135,11 @@ public struct AppSettings: Codable, Sendable, Equatable {
         terminalFontSize = try c.decodeIfPresent(Double.self, forKey: .terminalFontSize) ?? 0
         sessionLearnEnabled = try c.decodeIfPresent(Bool.self, forKey: .sessionLearnEnabled) ?? false
         historyCompactionEnabled = try c.decodeIfPresent(Bool.self, forKey: .historyCompactionEnabled) ?? false
-        petEnabled = try c.decodeIfPresent(Bool.self, forKey: .petEnabled) ?? false
+        petEnabled = try c.decodeIfPresent(Bool.self, forKey: .petEnabled) ?? true
         petAnimationsEnabled = try c.decodeIfPresent(Bool.self, forKey: .petAnimationsEnabled) ?? true
         petReadyCounterEnabled = try c.decodeIfPresent(Bool.self, forKey: .petReadyCounterEnabled) ?? true
         petPosition = try c.decodeIfPresent(String.self, forKey: .petPosition) ?? "bottomRight"
-        petSize = try c.decodeIfPresent(Double.self, forKey: .petSize) ?? 1
+        petSize = try c.decodeIfPresent(Double.self, forKey: .petSize) ?? 1.5
         petAttentionFilter = try c.decodeIfPresent(String.self, forKey: .petAttentionFilter) ?? "all"
         petReduceMotion = try c.decodeIfPresent(Bool.self, forKey: .petReduceMotion) ?? false
     }
