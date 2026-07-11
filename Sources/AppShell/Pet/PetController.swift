@@ -253,8 +253,9 @@ public final class PetController {
         animationController: PetAnimationController,
         windowController: PetWindowController
     ) {
-        animationController.onFrame = { [weak model] frame in
+        animationController.onFrame = { [weak model, weak windowController] frame in
             model?.setFrame(frame)
+            windowController?.animationFrameDidChange()
         }
         animationController.onError = { [weak model] _ in
             model?.routeError = "Pet artwork could not be loaded."

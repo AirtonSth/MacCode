@@ -43,8 +43,8 @@ public final class PetViewModel: ObservableObject {
     func setFrame(_ frame: PetAtlasFrame) {
         currentFrame = frame
         currentImage = NSImage(
-            cgImage: frame.image,
-            size: NSSize(width: frame.image.width, height: frame.image.height)
+            cgImage: frame.displayImage,
+            size: NSSize(width: frame.displayImage.width, height: frame.displayImage.height)
         )
     }
 

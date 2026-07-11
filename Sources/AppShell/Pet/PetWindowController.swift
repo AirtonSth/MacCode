@@ -266,7 +266,7 @@ private struct PetSpriteView: View {
                 Image(nsImage: image)
                     .resizable()
                     .interpolation(.none)
-                    .aspectRatio(192.0 / 208.0, contentMode: .fit)
+                    .aspectRatio(contentMode: .fit)
                     .accessibilityHidden(true)
             } else {
                 Color.clear
@@ -571,7 +571,7 @@ public final class PetWindowController: NSObject {
             self?.onInteraction?()
             self?.finishDrag(frame: frame)
         }
-        hosting.imageProvider = { [weak self] in self?.model.currentFrame?.image }
+        hosting.imageProvider = { [weak self] in self?.model.currentFrame?.displayImage }
         hosting.badgeVisibleProvider = { [weak self] in self?.model.badgeText != nil }
         hosting.accessibilityValueProvider = { [weak self] in
             self?.model.accessibilityValue ?? "Pet status unavailable"
@@ -681,9 +681,42 @@ public final class PetWindowController: NSObject {
         )
     }
 
+    func animationFrameDidChange() {
+        guard let panel = petPanel else { return }
+        let size = petSize(scale: model.settings.petSize)
+        guard abs(panel.frame.width - size.width) > 0.01
+                || abs(panel.frame.height - size.height) > 0.01 else { return }
+
+        let targetScreen = screen(containing: panel.frame) ?? fallbackScreen()
+        let normalized = targetScreen.map {
+            PetPlacement.normalizedPosition(for: panel.frame, in: $0.visibleFrame)
+        }
+        panel.setContentSize(size)
+        if let targetScreen, let normalized {
+            panel.setFrame(
+                PetPlacement.frame(
+                    size: size,
+                    normalizedPosition: normalized,
+                    in: targetScreen.visibleFrame
+                ),
+                display: true
+            )
+        } else {
+            panel.setFrame(resolvePetFrame(size: size, settings: model.settings), display: true)
+        }
+        if isPopoverVisible { positionPopover() }
+    }
+
     private func petSize(scale: Double) -> CGSize {
         let scale = CGFloat([0.75, 1, 1.25, 1.5].contains(scale) ? scale : 1)
-        return CGSize(width: 118 * scale, height: 128 * scale)
+        guard let image = model.currentFrame?.displayImage else {
+            return CGSize(width: 118 * scale, height: 128 * scale)
+        }
+        let sourcePixelScale = CGFloat(118.0 / 192.0)
+        return CGSize(
+            width: (CGFloat(image.width) * sourcePixelScale * scale).rounded(),
+            height: (CGFloat(image.height) * sourcePixelScale * scale).rounded()
+        )
     }
 
     private func screen(containing frame: CGRect) -> NSScreen? {

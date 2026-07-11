@@ -52,6 +52,80 @@ final class PetWindowAndLifecycleTests: XCTestCase {
         XCTAssertTrue(pet.isVisible)
     }
 
+    func test_animationStateResizeKeepsVisualPanelOnChosenScreenEdges() throws {
+        let db = try database()
+        let atlas = try PetAtlas.bundled()
+        let model = PetViewModel(settings: AppSettings(petEnabled: true))
+        model.setFrame(try atlas.canonicalFrame(for: .idle))
+        let controller = PetWindowController(
+            model: model,
+            placementStore: PetPlacementStore(repository: SettingsRepository(db: db))
+        )
+        defer { controller.stop() }
+
+        controller.show()
+        let panel = try XCTUnwrap(controller.petPanelForTests)
+        let screen = try XCTUnwrap(panel.screen ?? NSScreen.main)
+        panel.setFrame(
+            PetPlacement.frame(
+                size: panel.frame.size,
+                normalizedPosition: PetNormalizedPosition(x: 0, y: 0),
+                in: screen.visibleFrame
+            ),
+            display: false
+        )
+
+        let sleeping = try atlas.canonicalFrame(for: .sleeping)
+        model.setFrame(sleeping)
+        controller.animationFrameDidChange()
+
+        XCTAssertEqual(panel.frame.minX, screen.visibleFrame.minX, accuracy: 0.001)
+        XCTAssertEqual(panel.frame.minY, screen.visibleFrame.minY, accuracy: 0.001)
+        XCTAssertEqual(
+            panel.frame.width,
+            (CGFloat(sleeping.displayImage.width) * CGFloat(118.0 / 192.0) * 1.5).rounded(),
+            accuracy: 0.001
+        )
+        XCTAssertEqual(
+            panel.frame.height,
+            (CGFloat(sleeping.displayImage.height) * CGFloat(118.0 / 192.0) * 1.5).rounded(),
+            accuracy: 0.001
+        )
+    }
+
+    func test_visualEnvelopePreservesEverySupportedPetScale() throws {
+        let db = try database()
+        let atlas = try PetAtlas.bundled()
+        let frame = try atlas.canonicalFrame(for: .idle)
+        let model = PetViewModel(settings: AppSettings(petEnabled: true))
+        model.setFrame(frame)
+        let controller = PetWindowController(
+            model: model,
+            placementStore: PetPlacementStore(repository: SettingsRepository(db: db))
+        )
+        defer { controller.stop() }
+        controller.show()
+        let panel = try XCTUnwrap(controller.petPanelForTests)
+        let sourcePixelScale = CGFloat(118.0 / 192.0)
+
+        for scale in [0.75, 1.0, 1.25, 1.5] {
+            let settings = AppSettings(petEnabled: true, petSize: scale)
+            model.apply(settings: settings)
+            controller.applySettings(settings)
+
+            XCTAssertEqual(
+                panel.frame.width,
+                (CGFloat(frame.displayImage.width) * sourcePixelScale * scale).rounded(),
+                accuracy: 0.001
+            )
+            XCTAssertEqual(
+                panel.frame.height,
+                (CGFloat(frame.displayImage.height) * sourcePixelScale * scale).rounded(),
+                accuracy: 0.001
+            )
+        }
+    }
+
     func test_viewModelFormatsBadgeAndSeparatesNeedsYouFromCompleted() {
         let model = PetViewModel(settings: AppSettings(petEnabled: true))
         let callback = PetAttentionItem(
@@ -580,11 +654,30 @@ final class PetWindowAndLifecycleTests: XCTestCase {
         defer { controller.stop() }
 
         controller.start()
+        let panel = try XCTUnwrap(controller.windowControllerForTests.petPanelForTests)
+        let screen = try XCTUnwrap(panel.screen ?? NSScreen.main)
+        panel.setFrame(
+            PetPlacement.frame(
+                size: panel.frame.size,
+                normalizedPosition: PetNormalizedPosition(x: 0, y: 0),
+                in: screen.visibleFrame
+            ),
+            display: false
+        )
+        let idleSize = panel.frame.size
         try await Task.sleep(nanoseconds: 30_000_000)
         XCTAssertEqual(controller.modelForTests.animationState, .sleeping)
+        XCTAssertNotEqual(panel.frame.size, idleSize,
+            "the controller frame callback must resize the window to the sleeping visual envelope")
+        XCTAssertEqual(panel.frame.minX, screen.visibleFrame.minX, accuracy: 0.001)
+        XCTAssertEqual(panel.frame.minY, screen.visibleFrame.minY, accuracy: 0.001)
 
         controller.windowControllerForTests.onInteraction?()
         XCTAssertEqual(controller.modelForTests.animationState, .idle)
+        XCTAssertEqual(panel.frame.width, idleSize.width, accuracy: 0.001)
+        XCTAssertEqual(panel.frame.height, idleSize.height, accuracy: 0.001)
+        XCTAssertEqual(panel.frame.minX, screen.visibleFrame.minX, accuracy: 0.001)
+        XCTAssertEqual(panel.frame.minY, screen.visibleFrame.minY, accuracy: 0.001)
 
         XCTAssertTrue(controller.togglePopoverFromKeyboard())
         XCTAssertTrue(controller.windowControllerForTests.isVisible)

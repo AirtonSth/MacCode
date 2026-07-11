@@ -27,7 +27,8 @@
       "mode" : "loop",
       "row" : 0,
       "source" : "gpt-image-sequence",
-      "state" : "idle"
+      "state" : "idle",
+      "visualBounds" : { "height" : 113, "width" : 115, "x" : 51, "y" : 71 }
     },
     {
       "canonicalFrame" : 0,
@@ -36,7 +37,8 @@
       "mode" : "loop",
       "row" : 1,
       "source" : "gpt-image-static-pose-with-subpixel-motion",
-      "state" : "listening"
+      "state" : "listening",
+      "visualBounds" : { "height" : 103, "width" : 103, "x" : 44, "y" : 71 }
     },
     {
       "canonicalFrame" : 0,
@@ -45,7 +47,8 @@
       "mode" : "loop",
       "row" : 2,
       "source" : "gpt-image-static-pose-with-subpixel-motion",
-      "state" : "thinking"
+      "state" : "thinking",
+      "visualBounds" : { "height" : 109, "width" : 93, "x" : 45, "y" : 65 }
     },
     {
       "canonicalFrame" : 0,
@@ -54,7 +57,8 @@
       "mode" : "loop",
       "row" : 3,
       "source" : "gpt-image-sequence",
-      "state" : "coding"
+      "state" : "coding",
+      "visualBounds" : { "height" : 112, "width" : 118, "x" : 41, "y" : 75 }
     },
     {
       "canonicalFrame" : 0,
@@ -63,7 +67,8 @@
       "mode" : "loop",
       "row" : 4,
       "source" : "gpt-image-static-pose-with-subpixel-motion",
-      "state" : "editing"
+      "state" : "editing",
+      "visualBounds" : { "height" : 95, "width" : 110, "x" : 44, "y" : 63 }
     },
     {
       "canonicalFrame" : 0,
@@ -72,7 +77,8 @@
       "mode" : "loop",
       "row" : 5,
       "source" : "gpt-image-static-pose-with-subpixel-motion",
-      "state" : "terminal"
+      "state" : "terminal",
+      "visualBounds" : { "height" : 94, "width" : 101, "x" : 51, "y" : 65 }
     },
     {
       "canonicalFrame" : 0,
@@ -81,7 +87,8 @@
       "mode" : "loop",
       "row" : 6,
       "source" : "gpt-image-static-pose-with-subpixel-motion",
-      "state" : "search"
+      "state" : "search",
+      "visualBounds" : { "height" : 95, "width" : 107, "x" : 36, "y" : 64 }
     },
     {
       "canonicalFrame" : 0,
@@ -90,7 +97,8 @@
       "mode" : "loop",
       "row" : 7,
       "source" : "gpt-image-static-pose-with-subpixel-motion",
-      "state" : "gitReview"
+      "state" : "gitReview",
+      "visualBounds" : { "height" : 95, "width" : 113, "x" : 30, "y" : 65 }
     },
     {
       "canonicalFrame" : 0,
@@ -99,7 +107,8 @@
       "mode" : "onceHold",
       "row" : 8,
       "source" : "gpt-image-sequence",
-      "state" : "success"
+      "state" : "success",
+      "visualBounds" : { "height" : 118, "width" : 126, "x" : 39, "y" : 67 }
     },
     {
       "canonicalFrame" : 0,
@@ -108,7 +117,8 @@
       "mode" : "loop",
       "row" : 9,
       "source" : "gpt-image-sequence",
-      "state" : "approval"
+      "state" : "approval",
+      "visualBounds" : { "height" : 113, "width" : 125, "x" : 34, "y" : 65 }
     },
     {
       "canonicalFrame" : 0,
@@ -117,7 +127,8 @@
       "mode" : "loop",
       "row" : 10,
       "source" : "gpt-image-static-pose-with-subpixel-motion",
-      "state" : "question"
+      "state" : "question",
+      "visualBounds" : { "height" : 94, "width" : 106, "x" : 38, "y" : 60 }
     },
     {
       "canonicalFrame" : 0,
@@ -126,7 +137,8 @@
       "mode" : "loop",
       "row" : 11,
       "source" : "gpt-image-static-pose-with-subpixel-motion",
-      "state" : "waiting"
+      "state" : "waiting",
+      "visualBounds" : { "height" : 95, "width" : 94, "x" : 43, "y" : 61 }
     },
     {
       "canonicalFrame" : 0,
@@ -135,7 +147,8 @@
       "mode" : "onceThenWaiting",
       "row" : 12,
       "source" : "gpt-image-static-pose-with-subpixel-motion",
-      "state" : "failed"
+      "state" : "failed",
+      "visualBounds" : { "height" : 103, "width" : 86, "x" : 60, "y" : 50 }
     },
     {
       "canonicalFrame" : 0,
@@ -144,7 +157,8 @@
       "mode" : "onceThenDerived",
       "row" : 13,
       "source" : "gpt-image-static-pose-with-subpixel-motion",
-      "state" : "interrupted"
+      "state" : "interrupted",
+      "visualBounds" : { "height" : 105, "width" : 97, "x" : 45, "y" : 48 }
     },
     {
       "canonicalFrame" : 0,
@@ -153,7 +167,8 @@
       "mode" : "loop",
       "row" : 14,
       "source" : "gpt-image-static-pose-with-subpixel-motion",
-      "state" : "reconnecting"
+      "state" : "reconnecting",
+      "visualBounds" : { "height" : 91, "width" : 134, "x" : 33, "y" : 66 }
     },
     {
       "canonicalFrame" : 0,
@@ -162,7 +177,8 @@
       "mode" : "loop",
       "row" : 15,
       "source" : "gpt-image-static-pose-with-subpixel-motion",
-      "state" : "sleeping"
+      "state" : "sleeping",
+      "visualBounds" : { "height" : 86, "width" : 118, "x" : 25, "y" : 69 }
     }
   ],
   "schemaVersion" : 1

@@ -5,7 +5,7 @@ import Persistence
 
 @MainActor
 final class PetAppDelegateLifecycleTests: XCTestCase {
-    func test_defaultSettingsStartVisiblePetAtExisting150PercentSize() throws {
+    func test_defaultSettingsStartVisiblePetAtExisting150PercentVisualSizeWithoutTransparentCanvasPadding() throws {
         let fixture = try makeDelegate()
         defer { fixture.delegate.stopPetController() }
 
@@ -18,8 +18,28 @@ final class PetAppDelegateLifecycleTests: XCTestCase {
         XCTAssertTrue(pet.visualRuntimeIsLoadedForTests)
         let panel = try XCTUnwrap(pet.windowControllerForTests.petPanelForTests)
         XCTAssertTrue(panel.isVisible, "a fresh install must show the Pet immediately")
-        XCTAssertEqual(panel.frame.width, 177, accuracy: 0.5)
-        XCTAssertEqual(panel.frame.height, 192, accuracy: 0.5)
+
+        let atlas = try PetAtlas.bundled()
+        let row = try XCTUnwrap(atlas.manifest.row(for: .idle))
+        var visualBounds: CGRect?
+        for index in 0..<row.frames {
+            let bounds = try opaqueBounds(of: atlas.frame(state: .idle, index: index).image)
+            visualBounds = visualBounds.map { $0.union(bounds) } ?? bounds
+        }
+        let idleBounds = try XCTUnwrap(visualBounds)
+        let existingSourcePixelScale = CGFloat(118.0 / 192.0)
+        XCTAssertEqual(
+            panel.frame.width,
+            (idleBounds.width * existingSourcePixelScale * 1.5).rounded(),
+            accuracy: 0.5,
+            "the panel must omit stable transparent padding while preserving the current 150% cat size"
+        )
+        XCTAssertEqual(
+            panel.frame.height,
+            (idleBounds.height * existingSourcePixelScale * 1.5).rounded(),
+            accuracy: 0.5,
+            "visual placement must use the opaque animation envelope so the cat can touch the screen edge"
+        )
     }
 
     func test_appDelegateOwnsPetStartStopAndDisabledMenuResult() throws {
@@ -105,4 +125,16 @@ final class PetAppDelegateLifecycleTests: XCTestCase {
         delegate.settings = SettingsWindowController(context: context)
         return (delegate, context, router)
     }
+}
+
+private func opaqueBounds(of image: CGImage) throws -> CGRect {
+    let mask = try XCTUnwrap(PetSpriteAlphaMask(image: image))
+    var bounds: CGRect?
+    for y in 0..<mask.height {
+        for x in 0..<mask.width where mask.isOpaque(x: x, y: y) {
+            let pixel = CGRect(x: x, y: y, width: 1, height: 1)
+            bounds = bounds.map { $0.union(pixel) } ?? pixel
+        }
+    }
+    return try XCTUnwrap(bounds)
 }
