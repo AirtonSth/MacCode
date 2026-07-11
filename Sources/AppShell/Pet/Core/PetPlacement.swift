@@ -27,7 +27,7 @@ public enum PetPlacement {
     public static func clamped(
         frame: CGRect,
         to visibleFrame: CGRect,
-        margin: CGFloat = 16
+        margin: CGFloat = 0
     ) -> CGRect {
         let safe = safeFrame(visibleFrame, margin: margin)
         let size = CGSize(
@@ -46,7 +46,7 @@ public enum PetPlacement {
     public static func normalizedPosition(
         for frame: CGRect,
         in visibleFrame: CGRect,
-        margin: CGFloat = 16
+        margin: CGFloat = 0
     ) -> PetNormalizedPosition {
         let safe = safeFrame(visibleFrame, margin: margin)
         let clampedFrame = clamped(frame: frame, to: visibleFrame, margin: margin)
@@ -61,7 +61,7 @@ public enum PetPlacement {
         size requestedSize: CGSize,
         normalizedPosition: PetNormalizedPosition,
         in visibleFrame: CGRect,
-        margin: CGFloat = 16
+        margin: CGFloat = 0
     ) -> CGRect {
         let safe = safeFrame(visibleFrame, margin: margin)
         let size = CGSize(
