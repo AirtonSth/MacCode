@@ -1,0 +1,467 @@
+{
+  "atlas" : "remote-code-black-cat-atlas.png",
+  "dimensions" : {
+    "height" : 6656,
+    "width" : 1536
+  },
+  "fallbackState" : "idle",
+  "grid" : {
+    "columns" : 8,
+    "frameHeight" : 208,
+    "frameWidth" : 192,
+    "origin" : "top-left",
+    "rows" : 32
+  },
+  "name" : "remote-code-black-cat-atlas-v2",
+  "rows" : [
+    {
+      "canonicalFrame" : 0,
+      "fps" : 4,
+      "frames" : 8,
+      "mode" : "loop",
+      "row" : 0,
+      "state" : "idle",
+      "visualBounds" : {
+        "height" : 106,
+        "width" : 100,
+        "x" : 46,
+        "y" : 51
+      }
+    },
+    {
+      "canonicalFrame" : 0,
+      "fps" : 6,
+      "frames" : 8,
+      "mode" : "loop",
+      "row" : 1,
+      "state" : "listening",
+      "visualBounds" : {
+        "height" : 112,
+        "width" : 132,
+        "x" : 30,
+        "y" : 48
+      }
+    },
+    {
+      "canonicalFrame" : 0,
+      "fps" : 6,
+      "frames" : 8,
+      "mode" : "loop",
+      "row" : 2,
+      "state" : "thinking",
+      "visualBounds" : {
+        "height" : 121,
+        "width" : 124,
+        "x" : 34,
+        "y" : 44
+      }
+    },
+    {
+      "canonicalFrame" : 0,
+      "fps" : 8,
+      "frames" : 8,
+      "mode" : "loop",
+      "row" : 3,
+      "state" : "coding",
+      "visualBounds" : {
+        "height" : 94,
+        "width" : 128,
+        "x" : 32,
+        "y" : 57
+      }
+    },
+    {
+      "canonicalFrame" : 0,
+      "fps" : 8,
+      "frames" : 8,
+      "mode" : "loop",
+      "row" : 4,
+      "state" : "editing",
+      "visualBounds" : {
+        "height" : 100,
+        "width" : 126,
+        "x" : 33,
+        "y" : 54
+      }
+    },
+    {
+      "canonicalFrame" : 0,
+      "fps" : 8,
+      "frames" : 8,
+      "mode" : "loop",
+      "row" : 5,
+      "state" : "terminal",
+      "visualBounds" : {
+        "height" : 99,
+        "width" : 114,
+        "x" : 39,
+        "y" : 55
+      }
+    },
+    {
+      "canonicalFrame" : 0,
+      "fps" : 7,
+      "frames" : 8,
+      "mode" : "loop",
+      "row" : 6,
+      "state" : "search",
+      "visualBounds" : {
+        "height" : 98,
+        "width" : 132,
+        "x" : 30,
+        "y" : 55
+      }
+    },
+    {
+      "canonicalFrame" : 0,
+      "fps" : 7,
+      "frames" : 8,
+      "mode" : "loop",
+      "row" : 7,
+      "state" : "gitReview",
+      "visualBounds" : {
+        "height" : 94,
+        "width" : 121,
+        "x" : 36,
+        "y" : 57
+      }
+    },
+    {
+      "canonicalFrame" : 0,
+      "fps" : 10,
+      "frames" : 8,
+      "mode" : "onceHold",
+      "row" : 8,
+      "state" : "success",
+      "visualBounds" : {
+        "height" : 126,
+        "width" : 138,
+        "x" : 27,
+        "y" : 41
+      }
+    },
+    {
+      "canonicalFrame" : 0,
+      "fps" : 6,
+      "frames" : 8,
+      "mode" : "loop",
+      "row" : 9,
+      "state" : "approval",
+      "visualBounds" : {
+        "height" : 112,
+        "width" : 160,
+        "x" : 16,
+        "y" : 48
+      }
+    },
+    {
+      "canonicalFrame" : 0,
+      "fps" : 6,
+      "frames" : 8,
+      "mode" : "loop",
+      "row" : 10,
+      "state" : "question",
+      "visualBounds" : {
+        "height" : 116,
+        "width" : 120,
+        "x" : 36,
+        "y" : 46
+      }
+    },
+    {
+      "canonicalFrame" : 0,
+      "fps" : 7,
+      "frames" : 8,
+      "mode" : "loop",
+      "row" : 11,
+      "state" : "waiting",
+      "visualBounds" : {
+        "height" : 102,
+        "width" : 118,
+        "x" : 37,
+        "y" : 53
+      }
+    },
+    {
+      "canonicalFrame" : 0,
+      "fps" : 8,
+      "frames" : 8,
+      "mode" : "onceThenWaiting",
+      "row" : 12,
+      "state" : "failed",
+      "visualBounds" : {
+        "height" : 114,
+        "width" : 138,
+        "x" : 27,
+        "y" : 47
+      }
+    },
+    {
+      "canonicalFrame" : 0,
+      "fps" : 8,
+      "frames" : 8,
+      "mode" : "onceThenDerived",
+      "row" : 13,
+      "state" : "interrupted",
+      "visualBounds" : {
+        "height" : 120,
+        "width" : 116,
+        "x" : 38,
+        "y" : 44
+      }
+    },
+    {
+      "canonicalFrame" : 0,
+      "fps" : 6,
+      "frames" : 8,
+      "mode" : "loop",
+      "row" : 14,
+      "state" : "reconnecting",
+      "visualBounds" : {
+        "height" : 114,
+        "width" : 126,
+        "x" : 33,
+        "y" : 47
+      }
+    },
+    {
+      "canonicalFrame" : 0,
+      "fps" : 3,
+      "frames" : 8,
+      "mode" : "loop",
+      "row" : 15,
+      "state" : "sleeping",
+      "visualBounds" : {
+        "height" : 82,
+        "width" : 138,
+        "x" : 27,
+        "y" : 63
+      }
+    },
+    {
+      "canonicalFrame" : 0,
+      "fps" : 7,
+      "frames" : 8,
+      "mode" : "onceHold",
+      "row" : 16,
+      "state" : "idleBall",
+      "visualBounds" : {
+        "height" : 116,
+        "width" : 121,
+        "x" : 36,
+        "y" : 46
+      }
+    },
+    {
+      "canonicalFrame" : 0,
+      "fps" : 7,
+      "frames" : 8,
+      "mode" : "onceHold",
+      "row" : 17,
+      "state" : "idleScratch",
+      "visualBounds" : {
+        "height" : 120,
+        "width" : 108,
+        "x" : 42,
+        "y" : 44
+      }
+    },
+    {
+      "canonicalFrame" : 0,
+      "fps" : 7,
+      "frames" : 8,
+      "mode" : "onceHold",
+      "row" : 18,
+      "state" : "idleGroom",
+      "visualBounds" : {
+        "height" : 120,
+        "width" : 110,
+        "x" : 41,
+        "y" : 44
+      }
+    },
+    {
+      "canonicalFrame" : 0,
+      "fps" : 7,
+      "frames" : 8,
+      "mode" : "onceHold",
+      "row" : 19,
+      "state" : "idleStretch",
+      "visualBounds" : {
+        "height" : 116,
+        "width" : 126,
+        "x" : 33,
+        "y" : 46
+      }
+    },
+    {
+      "canonicalFrame" : 0,
+      "fps" : 7,
+      "frames" : 8,
+      "mode" : "onceHold",
+      "row" : 20,
+      "state" : "idleBox",
+      "visualBounds" : {
+        "height" : 124,
+        "width" : 158,
+        "x" : 17,
+        "y" : 42
+      }
+    },
+    {
+      "canonicalFrame" : 0,
+      "fps" : 7,
+      "frames" : 8,
+      "mode" : "onceHold",
+      "row" : 21,
+      "state" : "idleButterfly",
+      "visualBounds" : {
+        "height" : 128,
+        "width" : 121,
+        "x" : 36,
+        "y" : 40
+      }
+    },
+    {
+      "canonicalFrame" : 0,
+      "fps" : 7,
+      "frames" : 8,
+      "mode" : "onceHold",
+      "row" : 22,
+      "state" : "eating",
+      "visualBounds" : {
+        "height" : 104,
+        "width" : 112,
+        "x" : 40,
+        "y" : 52
+      }
+    },
+    {
+      "canonicalFrame" : 0,
+      "fps" : 7,
+      "frames" : 8,
+      "mode" : "onceHold",
+      "row" : 23,
+      "state" : "drinking",
+      "visualBounds" : {
+        "height" : 104,
+        "width" : 116,
+        "x" : 38,
+        "y" : 52
+      }
+    },
+    {
+      "canonicalFrame" : 0,
+      "fps" : 7,
+      "frames" : 8,
+      "mode" : "onceHold",
+      "row" : 24,
+      "state" : "purring",
+      "visualBounds" : {
+        "height" : 128,
+        "width" : 112,
+        "x" : 40,
+        "y" : 40
+      }
+    },
+    {
+      "canonicalFrame" : 0,
+      "fps" : 7,
+      "frames" : 8,
+      "mode" : "onceHold",
+      "row" : 25,
+      "state" : "playing",
+      "visualBounds" : {
+        "height" : 108,
+        "width" : 126,
+        "x" : 33,
+        "y" : 50
+      }
+    },
+    {
+      "canonicalFrame" : 0,
+      "fps" : 7,
+      "frames" : 8,
+      "mode" : "onceHold",
+      "row" : 26,
+      "state" : "comfort",
+      "visualBounds" : {
+        "height" : 104,
+        "width" : 104,
+        "x" : 44,
+        "y" : 52
+      }
+    },
+    {
+      "canonicalFrame" : 0,
+      "fps" : 10,
+      "frames" : 8,
+      "mode" : "onceHold",
+      "row" : 27,
+      "state" : "notificationPounce",
+      "visualBounds" : {
+        "height" : 126,
+        "width" : 114,
+        "x" : 39,
+        "y" : 41
+      }
+    },
+    {
+      "canonicalFrame" : 0,
+      "fps" : 8,
+      "frames" : 8,
+      "mode" : "onceHold",
+      "row" : 28,
+      "state" : "workingMouse",
+      "visualBounds" : {
+        "height" : 104,
+        "width" : 160,
+        "x" : 16,
+        "y" : 52
+      }
+    },
+    {
+      "canonicalFrame" : 0,
+      "fps" : 8,
+      "frames" : 8,
+      "mode" : "onceHold",
+      "row" : 29,
+      "state" : "workingBug",
+      "visualBounds" : {
+        "height" : 108,
+        "width" : 154,
+        "x" : 19,
+        "y" : 50
+      }
+    },
+    {
+      "canonicalFrame" : 0,
+      "fps" : 8,
+      "frames" : 8,
+      "mode" : "onceHold",
+      "row" : 30,
+      "state" : "workingEngineer",
+      "visualBounds" : {
+        "height" : 112,
+        "width" : 146,
+        "x" : 23,
+        "y" : 48
+      }
+    },
+    {
+      "canonicalFrame" : 0,
+      "fps" : 10,
+      "frames" : 8,
+      "mode" : "onceHold",
+      "row" : 31,
+      "state" : "celebrateTreat",
+      "visualBounds" : {
+        "height" : 104,
+        "width" : 160,
+        "x" : 16,
+        "y" : 52
+      }
+    }
+  ],
+  "schemaVersion" : 2
+}

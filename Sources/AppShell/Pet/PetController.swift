@@ -25,12 +25,16 @@ public final class PetController {
     private var eventSubscription: UUID?
     private var notificationTokens: [NSObjectProtocol] = []
     private var transientTask: Task<Void, Never>?
+    private var companionTask: Task<Void, Never>?
+    private var pendingCompanionCue: PetCompanionCue?
     private var attentionRefreshTask: Task<Void, Never>?
     private var idleTask: Task<Void, Never>?
     private var projectionWatermark: Int64?
     private var projectionErrorMessage: String?
     private var projectionRecoveryBlocked = false
     private var lastHandledEventSequence: Int64?
+    private var companionDirector = PetCompanionDirector()
+    private var isScreenLocked = false
     private(set) var handledEventOutOfOrderForTests = false
     private(set) var handledEventCountForTests = 0
 
@@ -113,6 +117,9 @@ public final class PetController {
         eventSubscription = nil
         transientTask?.cancel()
         transientTask = nil
+        companionTask?.cancel()
+        companionTask = nil
+        pendingCompanionCue = nil
         attentionRefreshTask?.cancel()
         attentionRefreshTask = nil
         idleTask?.cancel()
@@ -270,6 +277,13 @@ public final class PetController {
         windowController.onToggleAnimations = { [weak self] in self?.toggleAnimations() }
         windowController.onAdoptFreePosition = { [weak self] in self?.adoptFreePosition() }
         windowController.onInteraction = { [weak self] in self?.handleInteraction() }
+        windowController.onCareAction = { [weak self] action in
+            guard let self else { return }
+            self.playCompanionCue(PetCompanionDirector.careCue(
+                action: action,
+                returnState: self.reducer.state
+            ), allowsStaticReaction: true)
+        }
     }
 
     @discardableResult
@@ -297,6 +311,7 @@ public final class PetController {
     }
 
     func handleSystemScreenLockChanged(_ locked: Bool) {
+        isScreenLocked = locked
         animationController?.setScreenLocked(locked)
         apply(reducer.reduce(
             .screenLockChanged(isLocked: locked),
@@ -403,6 +418,12 @@ public final class PetController {
             scheduleIdleTimeout()
         }
         apply(reduction)
+        if case .ignored = reduction.disposition {
+            // Duplicate terminal compatibility events do not increment celebrations.
+        } else if case .agentRunFinished(_, .completed) = domainEvent,
+                  let cue = companionDirector.successCue(returnState: reducer.companionBaseState) {
+            playCompanionCue(cue)
+        }
         if projectionFailed { model.routeError = projectionErrorMessage }
         if projectionChanged || reduction.shouldRefreshAttention {
             scheduleAttentionRefresh()
@@ -411,16 +432,17 @@ public final class PetController {
 
     private func apply(_ reduction: PetEventReduction) {
         applyTransientTimerDirective(reduction.transientTimerDirective)
-        guard reduction.state != model.animationState else { return }
-        model.setAnimationState(reduction.state)
-        let derived: PetAnimationState = model.count > 0 ? .waiting : .idle
-        do {
-            try animationController?.setState(reduction.state, derivedTerminalState: derived)
-            model.routeError = projectionErrorMessage
-        } catch {
-            model.routeError = "Pet animation is unavailable."
+        if reduction.state != model.animationState {
+            model.setAnimationState(reduction.state)
+            let derived: PetAnimationState = model.count > 0 ? .waiting : .idle
+            do {
+                try animationController?.setState(reduction.state, derivedTerminalState: derived)
+                model.routeError = projectionErrorMessage
+            } catch {
+                model.routeError = "Pet animation is unavailable."
+            }
         }
-
+        scheduleCompanionBehavior()
     }
 
     private func applyTransientTimerDirective(_ directive: PetTransientTimerDirective?) {
@@ -445,7 +467,7 @@ public final class PetController {
     private func scheduleAttentionRefresh() {
         attentionRefreshTask?.cancel()
         attentionRefreshTask = Task { [weak self] in
-            try? await Task.sleep(nanoseconds: 50_000_000)
+            try? await Task.sleep(nanoseconds: 10_000_000)
             guard !Task.isCancelled else { return }
             await MainActor.run { self?.refreshAttentionNow() }
         }
@@ -453,13 +475,22 @@ public final class PetController {
 
     private func refreshAttentionNow() {
         do {
+            let previousCount = model.count
             let snapshot = try attentionStore.refresh(filter: attentionFilter(model.settings.petAttentionFilter))
             model.apply(snapshot: snapshot)
             model.routeError = projectionErrorMessage
-            apply(reducer.reduce(
+            let reduction = reducer.reduce(
                 .attentionHydrated(attentionHydration(from: snapshot)),
                 atMilliseconds: monotonicMilliseconds()
-            ))
+            )
+            apply(reduction)
+            if let cue = companionDirector.notificationCue(
+                previousCount: previousCount,
+                newCount: snapshot.count,
+                baseState: reduction.state
+            ) {
+                playCompanionCue(cue)
+            }
             if snapshot.count == 0 { scheduleIdleTimeout() }
         } catch {
             model.routeError = "Ready items could not be loaded."
@@ -645,21 +676,105 @@ public final class PetController {
                     let derived: PetAnimationState = model.count > 0 ? .waiting : .idle
                     try animationController?.setState(model.animationState, derivedTerminalState: derived)
                 }
+                if let cue = pendingCompanionCue {
+                    pendingCompanionCue = nil
+                    playCompanionCue(cue)
+                }
             } catch {
                 model.routeError = "Pet animation is unavailable."
             }
             scheduleIdleTimeout()
+            scheduleCompanionBehavior()
         } else {
             animationController?.setVisible(false)
             windowController?.applySettings(settings)
             idleTask?.cancel()
             idleTask = nil
+            companionTask?.cancel()
+            companionTask = nil
+            pendingCompanionCue = nil
         }
     }
 
     private func handleInteraction() {
         apply(reducer.reduce(.interactionBegan, atMilliseconds: monotonicMilliseconds()))
         scheduleIdleTimeout()
+    }
+
+    private func companionEligibility() -> PetCompanionEligibility {
+        let settings = model.settings
+        return PetCompanionEligibility(
+            baseState: reducer.state,
+            attentionCount: model.count,
+            activeRunCount: reducer.activeRunCount,
+            isVisible: windowController?.isVisible == true,
+            animationsEnabled: settings.petAnimationsEnabled,
+            reducedMotion: settings.petReduceMotion
+                || NSWorkspace.shared.accessibilityDisplayShouldReduceMotion,
+            screenLocked: isScreenLocked
+        )
+    }
+
+    private func scheduleCompanionBehavior() {
+        companionTask?.cancel()
+        companionTask = nil
+        let eligibility = companionEligibility()
+        let delayRange: ClosedRange<Int>
+        if eligibility.allowsWorkCue {
+            delayRange = PetCompanionDirector.workDelayRange
+        } else if eligibility.allowsAmbientCue {
+            delayRange = PetCompanionDirector.ambientDelayRange
+        } else {
+            return
+        }
+        let delay = Int.random(in: delayRange)
+        companionTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(delay) * 1_000_000_000)
+            guard !Task.isCancelled else { return }
+            await MainActor.run {
+                guard let self else { return }
+                self.companionTask = nil
+                let eligibility = self.companionEligibility()
+                let cue: PetCompanionCue?
+                if eligibility.allowsWorkCue {
+                    cue = self.companionDirector.nextWorkCue(
+                        eligibility: eligibility,
+                        preferredIndex: Int.random(in: 0..<3)
+                    )
+                } else if eligibility.allowsAmbientCue {
+                    cue = self.companionDirector.nextAmbientCue(
+                        eligibility: eligibility,
+                        preferredIndex: Int.random(in: 0..<7)
+                    )
+                } else {
+                    cue = nil
+                }
+                if let cue {
+                    self.playCompanionCue(cue)
+                } else {
+                    self.scheduleCompanionBehavior()
+                }
+            }
+        }
+    }
+
+    private func playCompanionCue(
+        _ cue: PetCompanionCue,
+        allowsStaticReaction: Bool = false
+    ) {
+        guard model.settings.petEnabled, !isScreenLocked else { return }
+        let motionAllowed = model.settings.petAnimationsEnabled
+            && !model.settings.petReduceMotion
+            && !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+        guard allowsStaticReaction || motionAllowed else { return }
+        guard animationController != nil else {
+            pendingCompanionCue = cue
+            return
+        }
+        apply(reducer.reduce(
+            .companionCue(cue),
+            atMilliseconds: monotonicMilliseconds()
+        ))
     }
 
     private func scheduleIdleTimeout() {

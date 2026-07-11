@@ -66,6 +66,7 @@ public enum PetDomainEvent: Sendable, Equatable {
     case questionResolved(requestID: String)
     case agentRunError(runID: String, recoverable: Bool)
     case agentRunFinished(runID: String, status: AgentRunStatus)
+    case companionCue(PetCompanionCue)
     case transientExpired
     case attentionHydrated(PetAttentionHydration)
     case attentionCountChanged(Int)
@@ -135,6 +136,7 @@ public struct PetEventReducer: Sendable {
     private var isSleeping = false
     private var isScreenLocked = false
     private var transientState: PetAnimationState?
+    private var companionReturnState: PetAnimationState?
     private var terminalRunIDs: Set<String> = []
     private var terminalRunOrder: [String] = []
     private var lastEmittedState: PetAnimationState?
@@ -150,6 +152,7 @@ public struct PetEventReducer: Sendable {
     }
 
     public var activeRunCount: Int { activeRunIDs.count }
+    var companionBaseState: PetAnimationState { derivedState(includeTransient: false) }
 
     public static func mappedState(for event: PetDomainEvent) -> PetAnimationState? {
         switch event {
@@ -219,7 +222,7 @@ public struct PetEventReducer: Sendable {
             return .idle
         case .agentItemCompleted, .agentItemDelta, .agentItemProgress,
              .approvalOpened, .approvalResolved, .questionOpened, .questionResolved,
-             .transientExpired, .interactionBegan, .surfaceOutput, .tokenUsage,
+             .companionCue, .transientExpired, .interactionBegan, .surfaceOutput, .tokenUsage,
              .layoutChanged, .filesystemChanged:
             return nil
         }
@@ -243,6 +246,10 @@ public struct PetEventReducer: Sendable {
         let previousState = state
         let mappedState = Self.mappedState(for: event)
         let shouldRefreshAttention = mutateState(for: event)
+        if let companionReturnState,
+           derivedState(includeTransient: false) != companionReturnState {
+            clearTransient()
+        }
         let nextState = derivedState()
         state = nextState
 
@@ -328,6 +335,18 @@ public struct PetEventReducer: Sendable {
                 setTransient(state, milliseconds: Self.standardTransientMilliseconds)
             }
             return status != .cancelled
+        case .companionCue(let cue):
+            guard (cue.returnState == state || cue.returnState == companionBaseState),
+                  cue.state.isCompanionReaction,
+                  state != .approval,
+                  state != .question,
+                  state != .sleeping else { return false }
+            setTransient(
+                cue.state,
+                milliseconds: Self.standardTransientMilliseconds,
+                companionReturnState: cue.returnState
+            )
+            return false
         case .transientExpired:
             clearTransient()
             return false
@@ -432,29 +451,36 @@ public struct PetEventReducer: Sendable {
         }
     }
 
-    private mutating func setTransient(_ state: PetAnimationState, milliseconds: Int64) {
+    private mutating func setTransient(
+        _ state: PetAnimationState,
+        milliseconds: Int64,
+        companionReturnState: PetAnimationState? = nil
+    ) {
         transientState = state
+        self.companionReturnState = companionReturnState
         pendingTransientTimerDirective = .schedule(milliseconds: milliseconds)
     }
 
     private mutating func setPersistentTransient(_ state: PetAnimationState) {
         transientState = state
+        companionReturnState = nil
         pendingTransientTimerDirective = .cancel
     }
 
     private mutating func clearTransient(matching state: PetAnimationState? = nil) {
         guard transientState != nil, state == nil || transientState == state else { return }
         transientState = nil
+        companionReturnState = nil
         pendingTransientTimerDirective = .cancel
     }
 
-    private func derivedState() -> PetAnimationState {
+    private func derivedState(includeTransient: Bool = true) -> PetAnimationState {
         if isScreenLocked { return .sleeping }
 
         var candidates: [PetAnimationState] = [.idle]
         if !approvalRequestIDs.isEmpty || !fileConflictIDs.isEmpty { candidates.append(.approval) }
         if !questionRequestIDs.isEmpty { candidates.append(.question) }
-        if let transientState { candidates.append(transientState) }
+        if includeTransient, let transientState { candidates.append(transientState) }
         candidates.append(contentsOf: activeItems.values)
         if !activeRunIDs.isEmpty { candidates.append(.coding) }
         if isReconnecting { candidates.append(.reconnecting) }

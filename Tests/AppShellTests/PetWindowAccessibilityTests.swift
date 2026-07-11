@@ -82,6 +82,24 @@ final class PetWindowAccessibilityTests: XCTestCase {
         XCTAssertTrue(controller.isPopoverVisible)
     }
 
+    func test_contextMenuContainsCareSubmenuAndRoutesEveryCareAction() throws {
+        let controller = try controller()
+        var received: [PetCareAction] = []
+        controller.onCareAction = { received.append($0) }
+
+        let menu = controller.contextMenuForTests()
+        let care = try XCTUnwrap(menu.items.first(where: { $0.title == "Care" })?.submenu)
+        XCTAssertEqual(care.items.map(\.title), PetCareAction.allCases.map(\.title))
+
+        for item in care.items {
+            XCTAssertNotNil(item.action)
+            XCTAssertTrue(item.target === controller)
+            controller.invokeCareMenuItemForTests(item)
+        }
+        XCTAssertEqual(received, PetCareAction.allCases,
+            "every right-click care command must reach the authored reaction router")
+    }
+
     func test_popoverSizingUsesFittingHeightAndCapsToScreenSafeMaximum() {
         let visibleFrame = CGRect(x: 0, y: 0, width: 800, height: 700)
 

@@ -127,7 +127,6 @@ final class PetAnimationController {
             && !isScreenLocked
             && animationsEnabled
             && !reducedMotion
-            && currentState != .sleeping
     }
 
     private func reconcilePolicy() {
