@@ -73,6 +73,33 @@ final class PetAssetRuntimeTests: XCTestCase {
         XCTAssertEqual(croppedFrameCount, 120)
     }
 
+    func test_allFramesHaveNoSmallFragmentsFromAdjacentSourceCells() throws {
+        let atlas = try PetAtlas.bundled()
+        var suspiciousFragments: [String] = []
+
+        for row in atlas.manifest.rows {
+            try atlas.activate(row.state)
+            for index in 0..<row.frames {
+                let frame = try atlas.frame(state: row.state, index: index)
+                for component in alphaComponents(in: frame.image) {
+                    // The packer maps each source cell to x=26...166 with at most one pixel of motion.
+                    // Small components at either horizontal limit are adjacent-cell spill, not Pet art.
+                    let touchesHorizontalSourceCropEdge = component.bounds.minX <= 27
+                        || component.bounds.maxX >= 164
+                    if touchesHorizontalSourceCropEdge, component.pixelCount <= 64 {
+                        suspiciousFragments.append(
+                            "\(row.state.rawValue)[\(index)] area=\(component.pixelCount) bounds=\(component.bounds)"
+                        )
+                    }
+                }
+            }
+        }
+
+        XCTAssertTrue(suspiciousFragments.isEmpty,
+            "sprite frames must not retain small alpha fragments from neighboring source cells:\n"
+                + suspiciousFragments.joined(separator: "\n"))
+    }
+
     func test_canonicalFrame_usesManifestIndex_andRejectsUnusedCell() throws {
         let atlas = try PetAtlas.bundled()
         let canonical = try atlas.canonicalFrame(for: .listening)
@@ -175,6 +202,76 @@ final class PetAssetRuntimeTests: XCTestCase {
         XCTAssertEqual(scheduler.activeTimerCount, 1,
             "onceThenDerived must continue with the caller's derived loop")
     }
+}
+
+private struct AlphaComponent {
+    let pixelCount: Int
+    let bounds: CGRect
+}
+
+private func alphaComponents(in image: CGImage, threshold: UInt8 = 1) -> [AlphaComponent] {
+    let width = image.width
+    let height = image.height
+    let bytesPerRow = width * 4
+    var pixels = [UInt8](repeating: 0, count: bytesPerRow * height)
+    let colorSpace = CGColorSpaceCreateDeviceRGB()
+    let context = CGContext(
+        data: &pixels,
+        width: width,
+        height: height,
+        bitsPerComponent: 8,
+        bytesPerRow: bytesPerRow,
+        space: colorSpace,
+        bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+    )!
+    context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
+
+    var visited = [Bool](repeating: false, count: width * height)
+    var components: [AlphaComponent] = []
+    let neighbors = [
+        (-1, -1), (0, -1), (1, -1),
+        (-1, 0),            (1, 0),
+        (-1, 1),  (0, 1),   (1, 1),
+    ]
+
+    for y in 0..<height {
+        for x in 0..<width {
+            let start = y * width + x
+            guard !visited[start], pixels[y * bytesPerRow + x * 4 + 3] >= threshold else { continue }
+            visited[start] = true
+            var queue = [(x, y)]
+            var cursor = 0
+            var minX = x
+            var maxX = x
+            var minY = y
+            var maxY = y
+
+            while cursor < queue.count {
+                let (currentX, currentY) = queue[cursor]
+                cursor += 1
+                minX = min(minX, currentX)
+                maxX = max(maxX, currentX)
+                minY = min(minY, currentY)
+                maxY = max(maxY, currentY)
+
+                for (dx, dy) in neighbors {
+                    let nextX = currentX + dx
+                    let nextY = currentY + dy
+                    guard nextX >= 0, nextX < width, nextY >= 0, nextY < height else { continue }
+                    let next = nextY * width + nextX
+                    guard !visited[next], pixels[nextY * bytesPerRow + nextX * 4 + 3] >= threshold else { continue }
+                    visited[next] = true
+                    queue.append((nextX, nextY))
+                }
+            }
+
+            components.append(AlphaComponent(
+                pixelCount: queue.count,
+                bounds: CGRect(x: minX, y: minY, width: maxX - minX + 1, height: maxY - minY + 1)
+            ))
+        }
+    }
+    return components
 }
 
 private final class TestPetAnimationTimer: PetAnimationTimer {
