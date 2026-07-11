@@ -173,14 +173,17 @@ public final class SettingsStore {
     /// Seam for testing: inject any SettingsWriteRepository.
     init(repo: any SettingsWriteRepository) { self.repo = repo }
 
+    private func loadFromRepository() throws -> AppSettings {
+        guard let json = try repo.get(key), let data = json.data(using: .utf8),
+              let settings = try? JSONDecoder().decode(AppSettings.self, from: data) else {
+            return AppSettings()
+        }
+        return settings
+    }
+
     public func load() -> AppSettings {
         if let cached = cache.get() { return cached }
-        guard let json = try? repo.get(key), let data = json.data(using: .utf8),
-              let s = try? JSONDecoder().decode(AppSettings.self, from: data) else {
-            let defaults = AppSettings()
-            cache.set(defaults)
-            return defaults
-        }
+        let s = (try? loadFromRepository()) ?? AppSettings()
         cache.set(s)
         return s
     }
@@ -203,7 +206,16 @@ public final class SettingsStore {
 
     /// Read-modify-write a single field without clobbering the others.
     public func update(_ mutate: (inout AppSettings) -> Void) {
-        var s = load(); mutate(&s); save(s)
+        do {
+            // SettingsStore instances have independent caches. Read the canonical
+            // row directly so a stale instance cannot resurrect older field values.
+            var settings = try loadFromRepository()
+            mutate(&settings)
+            save(settings)
+        } catch {
+            // A failed read must not turn into defaults and overwrite valid settings.
+            onWriteError?(error)
+        }
     }
 }
 

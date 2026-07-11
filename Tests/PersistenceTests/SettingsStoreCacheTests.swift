@@ -9,6 +9,7 @@ private final class CountingSettingsRepository: SettingsWriteRepository {
     private let lock = NSLock()
     private var store: [String: String] = [:]
     private var _getCallCount = 0
+    private var _shouldFailGet = false
     private var _shouldFailSet = false
 
     var getCallCount: Int {
@@ -27,9 +28,21 @@ private final class CountingSettingsRepository: SettingsWriteRepository {
         }
     }
 
+    var shouldFailGet: Bool {
+        get {
+            lock.lock(); defer { lock.unlock() }
+            return _shouldFailGet
+        }
+        set {
+            lock.lock(); defer { lock.unlock() }
+            _shouldFailGet = newValue
+        }
+    }
+
     func get(_ key: String) throws -> String? {
         lock.lock(); defer { lock.unlock() }
         _getCallCount += 1
+        if _shouldFailGet { throw CountingErr.injected }
         return store[key]
     }
 
@@ -115,6 +128,42 @@ final class SettingsStoreCacheTests: XCTestCase {
             "settings-change observers must be able to refresh writes made through another store instance")
     }
 
+    func test_updateReloadsCanonicalValueBeforeMutatingOneField() {
+        let repo = CountingSettingsRepository()
+        let staleWriter = SettingsStore(repo: repo)
+        let petWriter = SettingsStore(repo: repo)
+        XCTAssertFalse(staleWriter.load().petEnabled)
+
+        petWriter.update { $0.petEnabled = true }
+        staleWriter.update { $0.insomniaEnabled = false }
+
+        let persisted = SettingsStore(repo: repo).load()
+        XCTAssertTrue(persisted.petEnabled,
+            "a partial update from a stale SettingsStore must preserve fields written by another surface")
+        XCTAssertFalse(persisted.insomniaEnabled,
+            "the requested field mutation must still persist after reloading canonical settings")
+    }
+
+    func test_updateDoesNotOverwriteValidSettingsWhenCanonicalReadFails() {
+        let repo = CountingSettingsRepository()
+        let store = SettingsStore(repo: repo)
+        store.save(AppSettings(diffWordWrap: true, petEnabled: true))
+        XCTAssertTrue(store.load().petEnabled, "precondition: persisted settings must be readable")
+
+        var receivedError = false
+        store.onWriteError = { _ in receivedError = true }
+        repo.shouldFailGet = true
+        store.update { $0.insomniaEnabled = true }
+        repo.shouldFailGet = false
+
+        let persisted = SettingsStore(repo: repo).load()
+        XCTAssertTrue(receivedError, "a failed canonical read must be surfaced to the caller")
+        XCTAssertTrue(persisted.diffWordWrap)
+        XCTAssertTrue(persisted.petEnabled)
+        XCTAssertFalse(persisted.insomniaEnabled,
+            "the requested mutation must not save defaults when the canonical read fails")
+    }
+
     // MARK: failed write does NOT invalidate cache
 
     func test_failedWriteDoesNotInvalidateCache() {
@@ -146,9 +195,9 @@ final class SettingsStoreCacheTests: XCTestCase {
         _ = store.load()                                // decode #2
 
         XCTAssertEqual(
-            repo.getCallCount, 2,
-            "update() calls save() internally; the cache must be invalidated so " +
-            "the next load() reflects the mutated value from the repo"
+            repo.getCallCount, 3,
+            "update() must reload canonical settings before mutation, then invalidate " +
+            "its cache so the next load() re-reads the persisted value"
         )
     }
 

@@ -612,7 +612,10 @@ final class PetWindowAndLifecycleTests: XCTestCase {
 
         controller.handleSystemWake()
         XCTAssertEqual(controller.modelForTests.animationState, .idle)
-        try await Task.sleep(nanoseconds: 30_000_000)
+        for _ in 0..<40 {
+            if controller.modelForTests.animationState == .sleeping { break }
+            try await Task.sleep(nanoseconds: 5_000_000)
+        }
 
         XCTAssertEqual(controller.modelForTests.animationState, .sleeping,
             "Wake must rearm the idle deadline instead of leaving the Pet permanently awake.")
