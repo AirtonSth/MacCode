@@ -223,8 +223,8 @@ final class PetAssetRuntimeTests: XCTestCase {
 
         XCTAssertEqual(controller.currentFrameIndex, 0)
         XCTAssertTrue(
-            (12.0...24.0).contains(try XCTUnwrap(scheduler.lastInterval)),
-            "default idle should rest before blinking or moving its tail"
+            (6.0...12.0).contains(try XCTUnwrap(scheduler.lastInterval)),
+            "default idle should stay alive without returning to continuous motion"
         )
 
         scheduler.fireActiveTimer()
@@ -237,8 +237,8 @@ final class PetAssetRuntimeTests: XCTestCase {
 
         XCTAssertEqual(controller.currentFrameIndex, 0)
         XCTAssertTrue(
-            (12.0...24.0).contains(try XCTUnwrap(scheduler.lastInterval)),
-            "each completed idle burst should return to a calm variable rest"
+            (6.0...12.0).contains(try XCTUnwrap(scheduler.lastInterval)),
+            "each completed idle burst should return to a short natural rest"
         )
         XCTAssertEqual(scheduler.maximumActiveTimerCount, 1,
             "calmer idle playback must not introduce a second timer")

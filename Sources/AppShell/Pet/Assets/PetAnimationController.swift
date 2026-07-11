@@ -44,7 +44,7 @@ final class FoundationPetAnimationScheduler: PetAnimationScheduling {
 /// before scheduling. Paused policies project the manifest's canonical frame.
 @MainActor
 final class PetAnimationController {
-    private static let idleRestDelayRange: ClosedRange<TimeInterval> = 12...24
+    private static let idleRestDelayRange: ClosedRange<TimeInterval> = 6...12
 
     private let atlas: PetAtlas
     private let scheduler: any PetAnimationScheduling
