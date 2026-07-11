@@ -44,6 +44,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
     private let bonjourDelegate = BonjourDelegate()
     public var palette: CommandPalette?
     public var settings: SettingsWindowController?
+    public private(set) var petController: PetController?
     public var updater: AppUpdateChecking?
     public let channel: ReleaseChannel
     private let appSupportOverride: String?
@@ -152,12 +153,19 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
             let json = String(data: payloadData, encoding: .utf8) ?? "null"
             _ = try? log.append(seq: ev.seq, kind: ev.kind, payloadJSON: json)
         }
+        do {
+            EventBus.shared.reloadFromPersistence(lastSeq: try log.lastSeq(), recent: [])
+        } catch {
+            appLifecycleLog.error("event_log.sequence_init_failed error=\(error.localizedDescription, privacy: .public)")
+        }
         updater = SparkleAppUpdater.defaultIfConfigured()
         updater?.onWillInstallUpdate = { [weak self] in
             self?.persistRestorableStateBeforeUpdate()
         }
         windowController = MainWindowController(context: context, router: router, updater: updater)
         router.windowController = windowController
+        settings = SettingsWindowController(context: context, updater: updater)
+        startPetController()
 
         // start unix socket server
         let socketPath = AppPaths.socketPath(for: channel)
@@ -166,6 +174,10 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         do {
             try server.start()
             socketServer = server
+            try? Self.resolvePetServerFailure(
+                server: "rc2 socket",
+                repository: NotificationRepository(db: context.db)
+            )
         } catch {
             NSLog("Failed to start socket server: \(error)")
             recordServerStartupFailure("rc2 socket", reason: error.localizedDescription)
@@ -198,7 +210,6 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         configureDirectAccess()
 
         palette = CommandPalette(router: router)
-        settings = SettingsWindowController(context: context, updater: updater)
         SystemNotifier.shared.bootstrap()
         SystemNotifier.shared.onNotificationResponse = { [weak self] response in
             self?.handleNotificationResponse(response)
@@ -250,20 +261,51 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
     private func runDeferredStartup() {
         terminateOrphanedProviderRuntimes(reason: "launch")
 
-        if let log = context?.eventLog, let rows = try? log.read(since: 0, limit: 256) {
-            let events = rows.compactMap { row -> EventBus.Event? in
-                guard let data = row.payloadJSON.data(using: .utf8),
-                      let val = try? JSONDecoder().decode(JSONValue.self, from: data)
-                else { return nil }
-                return EventBus.Event(seq: row.seq, kind: row.kind, payload: val, ts: Date().timeIntervalSince1970)
+        if let log = context?.eventLog {
+            do {
+                let rows = try log.read(since: 0, limit: 256)
+                let events = rows.compactMap { row -> EventBus.Event? in
+                    guard let data = row.payloadJSON.data(using: .utf8),
+                          let val = try? JSONDecoder().decode(JSONValue.self, from: data)
+                    else { return nil }
+                    return EventBus.Event(seq: row.seq, kind: row.kind, payload: val, ts: Date().timeIntervalSince1970)
+                }
+                EventBus.shared.reloadFromPersistence(lastSeq: try log.lastSeq(), recent: events)
+            } catch {
+                appLifecycleLog.error("event_log.deferred_reload_failed error=\(error.localizedDescription, privacy: .public)")
             }
-            EventBus.shared.reloadFromPersistence(lastSeq: (try? log.lastSeq()) ?? 0, recent: events)
         }
 
         // Rebuild Surface objects from restored layout descriptors, then drop
         // the restoring affordance and render the real layout.
         router?.reinstantiateRestoredSurfaces()
         windowController?.markRestorationComplete()
+    }
+
+    func startPetController() {
+        guard petController == nil, let context, let router else { return }
+        do {
+            let controller = try PetController(
+                context: context,
+                router: router,
+                openSettings: { [weak self] route in
+                    guard let self, let settings = self.settings else { return false }
+                    if let window = self.windowController?.window {
+                        return settings.show(route: route, attachedTo: window)
+                    }
+                    return settings.show(route: route)
+                }
+            )
+            petController = controller
+            controller.start()
+        } catch {
+            appLifecycleLog.error("pet.start_failed error=\(error.localizedDescription, privacy: .public)")
+        }
+    }
+
+    func stopPetController() {
+        petController?.stop()
+        petController = nil
     }
 
     public func checkForUpdatesAfterOpeningApp() {
@@ -287,6 +329,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
             context?.reconcileManagedDistillSkills(tokenSaverEnabled: false)
         }
         persistRestorableStateBeforeUpdate()
+        stopPetController()
         stopLiveRuntimesForAppTermination()
         socketServer?.stop()
         httpServer?.stop()
@@ -492,7 +535,52 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
     private func recordServerStartupFailure(_ server: String, reason: String) {
         serverStartupFailures.append((server: server, reason: reason))
         lifecycleRecorder?.record("server_startup_failure server=\(server) reason=\(reason)")
+        if let context {
+            do {
+                try Self.projectPetServerFailure(
+                    server: server,
+                    repository: NotificationRepository(db: context.db)
+                )
+            } catch {
+                appLifecycleLog.error("pet.server_failure_projection_failed error=\(error.localizedDescription, privacy: .public)")
+            }
+        }
         NotificationCenter.default.post(name: Self.serverStartupFailureNotification, object: self)
+    }
+
+    static func petServerFailureID(server: String) -> String {
+        let stableServer = server.lowercased().map { $0.isLetter || $0.isNumber ? $0 : "-" }
+            .reduce(into: "") { $0.append($1) }
+        return "pet.server-failure.\(stableServer)"
+    }
+
+    @discardableResult
+    static func projectPetServerFailure(
+        server: String,
+        repository: NotificationRepository
+    ) throws -> String {
+        let id = petServerFailureID(server: server)
+        let category = PetNotificationCategory.serverListenerFailed
+        try repository.resurface(AppNotification(
+            id: id,
+            title: category.presentation.title,
+            body: nil,
+            category: category.rawValue
+        ))
+        EventBus.shared.publish(kind: "notification.created", payload: .object([
+            "id": .string(id),
+            "category": .string(category.rawValue)
+        ]))
+        return id
+    }
+
+    static func resolvePetServerFailure(
+        server: String,
+        repository: NotificationRepository
+    ) throws {
+        let id = petServerFailureID(server: server)
+        try repository.markRead(id: id)
+        EventBus.shared.publish(kind: "notification.read", payload: .object(["id": .string(id)]))
     }
 
     private func configureDirectAccess() {
@@ -513,6 +601,10 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         do {
             try http.start()
             httpServer = http
+            try? Self.resolvePetServerFailure(
+                server: "HTTP server",
+                repository: NotificationRepository(db: context.db)
+            )
             NSLog("Direct HTTP server listening on \(loopbackOnly ? "127.0.0.1" : "0.0.0.0"):18217 (loopback=\(loopbackOnly))")
         } catch {
             NSLog("Failed to start HTTP server: \(error)")
@@ -644,6 +736,14 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         applyKeybindingOverride(to: paletteItem, command: "commandPalette.toggle")
         keybindableMenuItems = [(item: paletteItem, command: "commandPalette.toggle")]
         viewMenu.addItem(paletteItem)
+        let petItem = NSMenuItem(
+            title: "Open Remote Code Pet",
+            action: #selector(togglePetPopoverFromMenu),
+            keyEquivalent: "p"
+        )
+        petItem.keyEquivalentModifierMask = [.command, .option]
+        petItem.target = self
+        viewMenu.addItem(petItem)
         // UX-MAC_APPSHELL-TOKENSAVER-KEYBOARD: keyboard-reachable Token Saver toggle
         // (Cmd+Shift+S). Posts rc2TokenSaverToggle; SidebarViewModel observes and
         // calls setTokenSaverEnabled(!current). Cmd+Shift+S is unused in this menu map.
@@ -953,6 +1053,16 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         NotificationCenter.default.post(name: .rc2TokenSaverToggle, object: nil)
     }
 
+    @objc private func togglePetPopoverFromMenu() {
+        if !togglePetPopover() {
+            NSSound.beep()
+        }
+    }
+
+    func togglePetPopover() -> Bool {
+        petController?.togglePopoverFromKeyboard() == true
+    }
+
     @objc private func showSettings() {
         if let window = windowController?.window {
             settings?.show(attachedTo: window)
@@ -1153,11 +1263,22 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
             return (ks, vs)
         }, uniquingKeysWith: { a, _ in a })
         guard let intent = Self.routeFromNotification(userInfo: stringInfo) else { return }
-        windowController?.show()
-        if let wid = intent.workspaceId {
-            try? router?.selectWorkspace(wid)
+        do {
+            try openNotificationRoute(intent)
+        } catch {
+            NSLog("RemoteCode notification route failed thread=%@ error=%@",
+                  intent.threadId.value.uuidString, error.localizedDescription)
         }
-        try? router?.selectAgentThread(thread: intent.threadId)
+    }
+
+    /// Testable notification seam. The thread repository is authoritative for
+    /// workspace selection; `workspaceId` remains payload metadata for backwards
+    /// compatibility. The canonical router verifies exact surface binding before
+    /// marking the notification's thread read.
+    @discardableResult
+    func openNotificationRoute(_ intent: NotificationRouteIntent) throws -> SurfaceDescriptor {
+        guard let router else { throw LayoutError.workspaceNotFound }
+        return try router.openAgentThread(thread: intent.threadId, markRead: true)
     }
 
     /// Pure mapper: notification userInfo -> RouteIntent.

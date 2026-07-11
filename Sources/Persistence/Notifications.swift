@@ -30,16 +30,53 @@ public final class NotificationRepository {
             VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET title=excluded.title, body=excluded.body, category=excluded.category, read_at=excluded.read_at, dismissed_at=excluded.dismissed_at;
         """)
-        try st.bind(1, n.id)
-        try st.bind(2, n.workspaceId?.value.uuidString)
-        try st.bind(3, n.surfaceId?.value.uuidString)
-        try st.bind(4, n.title)
-        try st.bind(5, n.body)
-        try st.bind(6, n.category)
-        try st.bind(7, iso.string(from: n.createdAt))
-        try st.bind(8, n.readAt.map { iso.string(from: $0) })
-        try st.bind(9, n.dismissedAt.map { iso.string(from: $0) })
+        try bind(n, to: st)
         _ = try st.step()
+    }
+
+    /// Idempotent event projection. Unlike `insert`, replaying the same stable
+    /// event ID must not clear an existing read/dismissed timestamp and resurrect
+    /// an item the user already acknowledged.
+    public func insertIfAbsent(_ n: AppNotification) throws {
+        let st = try db.prepare("""
+            INSERT OR IGNORE INTO notifications(id, workspace_id, surface_id, title, body, category, created_at, read_at, dismissed_at)
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?);
+        """)
+        try bind(n, to: st)
+        _ = try st.step()
+    }
+
+    /// Reopens one stable stateful notification for a new live occurrence.
+    /// Durable replay uses `insertIfAbsent` instead so an acknowledged historical
+    /// event cannot resurrect itself during startup recovery.
+    public func resurface(_ n: AppNotification) throws {
+        let st = try db.prepare("""
+            INSERT INTO notifications(id, workspace_id, surface_id, title, body, category, created_at, read_at, dismissed_at)
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                workspace_id=excluded.workspace_id,
+                surface_id=excluded.surface_id,
+                title=excluded.title,
+                body=excluded.body,
+                category=excluded.category,
+                created_at=excluded.created_at,
+                read_at=excluded.read_at,
+                dismissed_at=excluded.dismissed_at;
+        """)
+        try bind(n, to: st)
+        _ = try st.step()
+    }
+
+    private func bind(_ notification: AppNotification, to statement: SQLiteStatement) throws {
+        try statement.bind(1, notification.id)
+        try statement.bind(2, notification.workspaceId?.value.uuidString)
+        try statement.bind(3, notification.surfaceId?.value.uuidString)
+        try statement.bind(4, notification.title)
+        try statement.bind(5, notification.body)
+        try statement.bind(6, notification.category)
+        try statement.bind(7, iso.string(from: notification.createdAt))
+        try statement.bind(8, notification.readAt.map { iso.string(from: $0) })
+        try statement.bind(9, notification.dismissedAt.map { iso.string(from: $0) })
     }
 
     /// Fetch non-dismissed notifications newest-first, bounded by `limit` to

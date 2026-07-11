@@ -1082,7 +1082,8 @@ final class DispatcherTests: XCTestCase {
         sh(["git", "-C", dir, "push", "-q", "origin", "main"])
         let router = FakeRouter(); router.gitCwd = dir
         let d = JSONRPCDispatcher(router: router)
-        let wid = JSONValue.string(UUID().uuidString)
+        let workspaceUUID = UUID()
+        let wid = JSONValue.string(workspaceUUID.uuidString)
 
         let status = await d.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(1), method: "git.status", params: ["workspace_id": wid]))
         guard case .object(let so)? = status.result else { return XCTFail("git.status must return an object") }
@@ -1115,6 +1116,11 @@ final class DispatcherTests: XCTestCase {
             return XCTFail("git.delivery_plan must expose branch/commit/push/pull_request phase status for safe agent delivery")
         }
 
+        var deliveryEvents: [EventBus.Event] = []
+        let deliveryToken = EventBus.shared.subscribe(since: EventBus.shared.currentSeq) { event in
+            if event.kind == "git.deliver" { deliveryEvents.append(event) }
+        }
+        defer { EventBus.shared.unsubscribe(deliveryToken) }
         let delivered = await d.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(5), method: "git.deliver", params: ["workspace_id": wid]))
         guard case .object(let result)? = delivered.result else { return XCTFail("git.deliver must return one-shot delivery phase status") }
         XCTAssertEqual(result["ok"], .bool(true), "git.deliver must execute branch, commit, and push through the socket")
@@ -1122,6 +1128,12 @@ final class DispatcherTests: XCTestCase {
             return XCTFail("git.deliver must return each stacked phase")
         }
         XCTAssertEqual(GitDiff.branches(in: dir).current, "agent/a-txt")
+        XCTAssertEqual(deliveryEvents.count, 1,
+            "One RPC delivery must publish one canonical Pet/mirror outcome.")
+        XCTAssertEqual(deliveryEvents.first?.payload.objectValue, [
+            "workspace_id": .string(workspaceUUID.uuidString),
+            "ok": .bool(true)
+        ])
     }
 
     @MainActor

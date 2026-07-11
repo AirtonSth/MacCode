@@ -164,6 +164,8 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// This is the per-surface binding that fixes the new-tab-clone bug:
     /// selection is owned by the surface, not auto-adopted from the workspace.
     public var onSelectedThreadChanged: ((AgentThreadID?) -> Void)?
+    /// Canonical host mutation used when local selection acknowledges unread work.
+    public var markThreadRead: ((AgentThreadID) throws -> Void)?
     public var onQueuedMessageEvent: ((String, AgentQueuedMessage) -> Void)?
     public var providerSnapshotLoader: (() async throws -> [AgentProviderSnapshot])?
     public var modelListLoader: ((AgentProvider) async throws -> [AgentModelDescriptor])?
@@ -454,7 +456,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         timelineItemIndex.location(of: id)
     }
 
-    public func selectThread(_ id: AgentThreadID) {
+    public func selectThread(_ id: AgentThreadID, markRead: Bool = true) {
         let isThreadSwitch = selectedThreadId != id
         if isThreadSwitch {
             // IMP-MAC_AGENT-011: stash the leaving thread's draft before swapping,
@@ -514,14 +516,18 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         // UX-MAC_AGENT-CONTINUE: check whether the newly selected thread was
         // interrupted by a relaunch and has a recoverable provider session.
         selectedThreadHasRecoverableContext = coordinator.hasRecoverableContext(threadId: id)
-        // B6: opening a thread marks it read (persist + reflect in the rail
-        // without re-querying, which would recurse through reloadThreads).
-        if var t = try? threadRepo.get(id: id), t.hasUnread {
-            t.hasUnread = false
-            try? threadRepo.upsert(t)
-        }
-        if let idx = threads.firstIndex(where: { $0.id == id }), threads[idx].hasUnread {
-            threads[idx].hasUnread = false
+        // B6: the host owns the one throwing persistence + publication mutation.
+        // Reflect success locally without re-querying; retain persisted rail state
+        // when the mutation fails.
+        if markRead, let markThreadRead {
+            do {
+                try markThreadRead(id)
+                if let idx = threads.firstIndex(where: { $0.id == id }) {
+                    threads[idx].hasUnread = false
+                }
+            } catch {
+                reloadThreads()
+            }
         }
         loadAllMessages(id)
         timeline = AssistantTimelineState()
@@ -2647,12 +2653,6 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                     self.scheduleTimelineUpdateTick()
                 }
             }
-            if status == .completed, var t = try? self.threadRepo.get(id: finishedTid) {
-                // Completed work leaves an unread marker until the user
-                // explicitly opens/clicks the thread row.
-                t.hasUnread = true
-                try? self.threadRepo.upsert(t)
-            }
             if finishedTid == self.selectedThreadId {
                 self.status = status
                 self.currentRunId = nil
@@ -2682,10 +2682,6 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 }
             }
             guard threadWorkspace == self.workspaceID else { return }
-            if status == .running, var t = try? self.threadRepo.get(id: threadId), t.hasUnread {
-                t.hasUnread = false
-                try? self.threadRepo.upsert(t)
-            }
             self.reloadThreads()
             if threadId == self.selectedThreadId {
                 if status == .running {

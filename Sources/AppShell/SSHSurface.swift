@@ -374,6 +374,7 @@ final class SSHSurface: NSObject, SSHTransferSurface {
             startSessionAliveTimer()
             next.focus()
             EventBus.shared.publish(kind: "ssh.session.updated", payload: .object([
+                "workspace_id": .string(workspaceID.value.uuidString),
                 "surface_id": .string(descriptor.id.value.uuidString),
                 "profile_id": .string(saved.id.value.uuidString),
                 "destination": .string(saved.destination),
@@ -382,8 +383,10 @@ final class SSHSurface: NSObject, SSHTransferSurface {
             reloadHosts()
             sshLog.info("ssh connect ok: \(saved.destination, privacy: .private)")
         } catch {
+            descriptor.metadata["ssh_status"] = "disconnected"
             viewModel.status = "Failed"
             viewModel.error = error.localizedDescription
+            publishDisconnected(reason: "connection_failed")
             sshLog.error("ssh connect failed: \(error.localizedDescription, privacy: .public)")
         }
     }
@@ -400,6 +403,7 @@ final class SSHSurface: NSObject, SSHTransferSurface {
         viewModel.transferSidebarVisible = false
         showPlaceholder()
         syncTransferSidebarWidth(animated: true)
+        publishDisconnected(reason: "user_requested")
         sshLog.info("ssh disconnect: user requested")
     }
 
@@ -441,12 +445,7 @@ final class SSHSurface: NSObject, SSHTransferSurface {
                 guard let self, self.descriptor.metadata["ssh_status"] == "connected" else { return }
                 let alive = self.terminal?.runtimeHealth().processAlive ?? false
                 if !alive {
-                    self.stopSessionAliveTimer()
-                    self.terminal = nil
-                    self.descriptor.metadata["ssh_status"] = "disconnected"
-                    self.viewModel.status = "Disconnected"
-                    self.viewModel.sessionDead = true
-                    sshLog.info("ssh session: child exited, status flipped to Disconnected")
+                    self.handleUnexpectedDisconnect()
                 }
             }
         }
@@ -462,6 +461,34 @@ final class SSHSurface: NSObject, SSHTransferSurface {
     // Testing accessor so tests can trigger the disconnect path without a timer.
     func disconnectForTesting() {
         disconnect()
+    }
+
+    func unexpectedDisconnectForTesting() {
+        handleUnexpectedDisconnect()
+    }
+
+    func connectionFailedForTesting() {
+        descriptor.metadata["ssh_status"] = "disconnected"
+        publishDisconnected(reason: "connection_failed")
+    }
+
+    private func handleUnexpectedDisconnect() {
+        stopSessionAliveTimer()
+        terminal = nil
+        descriptor.metadata["ssh_status"] = "disconnected"
+        viewModel.status = "Disconnected"
+        viewModel.sessionDead = true
+        publishDisconnected(reason: "unexpected_child_exit")
+        sshLog.info("ssh session: child exited, status flipped to Disconnected")
+    }
+
+    private func publishDisconnected(reason: String) {
+        EventBus.shared.publish(kind: "ssh.session.updated", payload: .object([
+            "workspace_id": .string(workspaceID.value.uuidString),
+            "surface_id": .string(descriptor.id.value.uuidString),
+            "status": .string("disconnected"),
+            "reason": .string(reason)
+        ]))
     }
 
     // Testing accessor for import - allows injecting a custom file URL.
@@ -753,6 +780,7 @@ final class SSHSurface: NSObject, SSHTransferSurface {
     func close() {
         stopSessionAliveTimer()
         terminal?.close()
+        publishDisconnected(reason: "user_requested")
     }
 
     func sendText(_ text: String) {

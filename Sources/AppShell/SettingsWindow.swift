@@ -35,6 +35,13 @@ public struct AppSettingsKeys {
         "terminalFontSize",
         "sessionLearnEnabled",
         "historyCompactionEnabled",
+        "petEnabled",
+        "petAnimationsEnabled",
+        "petReadyCounterEnabled",
+        "petPosition",
+        "petSize",
+        "petAttentionFilter",
+        "petReduceMotion",
     ]
 }
 
@@ -395,6 +402,11 @@ public final class SettingsViewModel: ObservableObject {
                 self.reload()
             }
         })
+        changeObservers.append(NotificationCenter.default.addObserver(
+            forName: .petSettingsDidChange, object: nil, queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in self?.reload() }
+        })
         // Observe bind failures from AppDelegate.configureDirectAccess(). When
         // the HTTP server fails to start after we toggled remote access on, revert
         // the toggle to off (matching the stored preference AppDelegate already
@@ -462,7 +474,7 @@ public final class SettingsViewModel: ObservableObject {
         if let app = NSApp, let delegate = app.delegate as? AppDelegate {
             serverStartupFailures = delegate.serverStartupFailures
         }
-        appSettings = settingsStore.load()
+        appSettings = settingsStore.reload()
         refreshDistillInstallStatus()
         codexPath = cliPath(key: "cli.codex.path", fallback: "codex")
         claudePath = cliPath(key: "cli.claude.path", fallback: "claude")
@@ -597,6 +609,55 @@ public final class SettingsViewModel: ObservableObject {
     public func setHistoryCompactionEnabled(_ on: Bool) {
         appSettings.historyCompactionEnabled = on
         settingsStore.update { $0.historyCompactionEnabled = on }
+    }
+
+    public func setPetEnabled(_ on: Bool) {
+        appSettings.petEnabled = on
+        settingsStore.update { $0.petEnabled = on }
+        postPetSettingsDidChange()
+    }
+
+    public func setPetAnimationsEnabled(_ on: Bool) {
+        appSettings.petAnimationsEnabled = on
+        settingsStore.update { $0.petAnimationsEnabled = on }
+        postPetSettingsDidChange()
+    }
+
+    public func setPetReadyCounterEnabled(_ on: Bool) {
+        appSettings.petReadyCounterEnabled = on
+        settingsStore.update { $0.petReadyCounterEnabled = on }
+        postPetSettingsDidChange()
+    }
+
+    public func setPetPosition(_ value: String) {
+        let normalized = ["bottomRight", "bottomLeft", "free"].contains(value) ? value : "bottomRight"
+        appSettings.petPosition = normalized
+        settingsStore.update { $0.petPosition = normalized }
+        postPetSettingsDidChange()
+    }
+
+    public func setPetSize(_ value: Double) {
+        let normalized = [0.75, 1, 1.25, 1.5].contains(value) ? value : 1
+        appSettings.petSize = normalized
+        settingsStore.update { $0.petSize = normalized }
+        postPetSettingsDidChange()
+    }
+
+    public func setPetAttentionFilter(_ value: String) {
+        let normalized = ["all", "completed", "needsYou"].contains(value) ? value : "all"
+        appSettings.petAttentionFilter = normalized
+        settingsStore.update { $0.petAttentionFilter = normalized }
+        postPetSettingsDidChange()
+    }
+
+    public func setPetReduceMotion(_ on: Bool) {
+        appSettings.petReduceMotion = on
+        settingsStore.update { $0.petReduceMotion = on }
+        postPetSettingsDidChange()
+    }
+
+    private func postPetSettingsDidChange() {
+        NotificationCenter.default.post(name: .petSettingsDidChange, object: nil)
     }
 
     /// Update the Codex CLI path draft. The UI passes `committed: false` on
@@ -864,9 +925,63 @@ public final class SettingsViewModel: ObservableObject {
     }
 }
 
+private final class SettingsRouteRegistry {
+    private weak var generalAnchor: NSView?
+    private weak var providersAnchor: NSView?
+
+    func register(_ view: NSView, for route: PetSettingsRoute) {
+        switch route {
+        case .general:
+            generalAnchor = view
+        case .providers:
+            providersAnchor = view
+        }
+    }
+
+    func present(_ route: PetSettingsRoute, in window: NSWindow) -> Bool {
+        guard let anchor = anchor(for: route), anchor.window === window else { return false }
+        anchor.scrollToVisible(anchor.bounds)
+        window.contentView?.layoutSubtreeIfNeeded()
+        return isVisible(route, in: window)
+    }
+
+    func isVisible(_ route: PetSettingsRoute, in window: NSWindow) -> Bool {
+        guard window.isVisible,
+              let anchor = anchor(for: route),
+              anchor.window === window else { return false }
+        let visible = anchor.visibleRect.intersection(anchor.bounds)
+        return visible.width > 0 && visible.height > 0
+    }
+
+    private func anchor(for route: PetSettingsRoute) -> NSView? {
+        switch route {
+        case .general:
+            return generalAnchor
+        case .providers:
+            return providersAnchor
+        }
+    }
+}
+
+private struct SettingsRouteAnchor: NSViewRepresentable {
+    let route: PetSettingsRoute
+    let registry: SettingsRouteRegistry
+
+    func makeNSView(context: Context) -> NSView {
+        let view = NSView()
+        registry.register(view, for: route)
+        return view
+    }
+
+    func updateNSView(_ nsView: NSView, context: Context) {
+        registry.register(nsView, for: route)
+    }
+}
+
 public struct SettingsView: View {
     @ObservedObject var vm: SettingsViewModel
     private let onClose: (() -> Void)?
+    private let routeRegistry: SettingsRouteRegistry?
 
     // Hoisted so device rows don't each allocate a formatter on every render.
     private static let deviceDateFormatter = ISO8601DateFormatter()
@@ -897,6 +1012,17 @@ public struct SettingsView: View {
     public init(vm: SettingsViewModel, onClose: (() -> Void)? = nil) {
         self.vm = vm
         self.onClose = onClose
+        self.routeRegistry = nil
+    }
+
+    fileprivate init(
+        vm: SettingsViewModel,
+        onClose: (() -> Void)?,
+        routeRegistry: SettingsRouteRegistry
+    ) {
+        self.vm = vm
+        self.onClose = onClose
+        self.routeRegistry = routeRegistry
     }
 
     public var body: some View {
@@ -970,9 +1096,12 @@ public struct SettingsView: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: DS.Space.lg) {
                     remoteAccessSection
+                        .background(routeAnchor(.general))
+                        .accessibilityIdentifier("settings.section.general")
                     diffDefaultsSection
                     terminalSection
                     sidebarSection
+                    petSection
                     insomniaSection
                     tokenSaverSection
                     keybindingsSection
@@ -980,6 +1109,8 @@ public struct SettingsView: View {
                     customModelsSection
                     trustedDevicesSection
                     diagnosticsSection
+                        .background(routeAnchor(.providers))
+                        .accessibilityIdentifier("settings.section.providers")
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
@@ -994,6 +1125,14 @@ public struct SettingsView: View {
         }
         .onChange(of: vm.codexPath) { codexPathDraft = $0 }
         .onChange(of: vm.claudePath) { claudePathDraft = $0 }
+    }
+
+    @ViewBuilder
+    private func routeAnchor(_ route: PetSettingsRoute) -> some View {
+        if let routeRegistry {
+            SettingsRouteAnchor(route: route, registry: routeRegistry)
+                .allowsHitTesting(false)
+        }
     }
 
     private func settingRow<Content: View>(_ label: String, @ViewBuilder _ control: () -> Content) -> some View {
@@ -1103,6 +1242,109 @@ public struct SettingsView: View {
                 .foregroundColor(DS.Palette.textTertiary)
         }
         .dsPanel(padding: DS.Space.lg)
+    }
+
+    private var petSection: some View {
+        VStack(alignment: .leading, spacing: DS.Space.md) {
+            DSSectionHeaderG("Desktop Pet")
+
+            settingRow("Show black cat pet") {
+                Toggle("", isOn: Binding(
+                    get: { vm.appSettings.petEnabled },
+                    set: { vm.setPetEnabled($0) }
+                ))
+                .labelsHidden()
+                .accessibilityIdentifier("settings.pet.enabled.toggle")
+            }
+
+            if vm.appSettings.petEnabled {
+                settingRow("Play animations") {
+                    Toggle("", isOn: Binding(
+                        get: { vm.appSettings.petAnimationsEnabled },
+                        set: { vm.setPetAnimationsEnabled($0) }
+                    ))
+                    .labelsHidden()
+                    .accessibilityIdentifier("settings.pet.animations.toggle")
+                }
+
+                settingRow("Show ready counter") {
+                    Toggle("", isOn: Binding(
+                        get: { vm.appSettings.petReadyCounterEnabled },
+                        set: { vm.setPetReadyCounterEnabled($0) }
+                    ))
+                    .labelsHidden()
+                    .accessibilityIdentifier("settings.pet.counter.toggle")
+                }
+
+                settingRow("Reduce motion") {
+                    Toggle("", isOn: Binding(
+                        get: { vm.appSettings.petReduceMotion },
+                        set: { vm.setPetReduceMotion($0) }
+                    ))
+                    .labelsHidden()
+                    .accessibilityIdentifier("settings.pet.reduceMotion.toggle")
+                }
+
+                settingRow("Position") {
+                    Picker("", selection: Binding(
+                        get: { vm.appSettings.petPosition },
+                        set: { vm.setPetPosition($0) }
+                    )) {
+                        Text("Bottom right").tag("bottomRight")
+                        Text("Bottom left").tag("bottomLeft")
+                        Text("Free").tag("free")
+                    }
+                    .labelsHidden()
+                    .frame(width: 150)
+                    .accessibilityIdentifier("settings.pet.position.picker")
+                }
+
+                settingRow("Size") {
+                    Picker("", selection: Binding(
+                        get: { vm.appSettings.petSize },
+                        set: { vm.setPetSize($0) }
+                    )) {
+                        Text("75%").tag(0.75)
+                        Text("100%").tag(1.0)
+                        Text("125%").tag(1.25)
+                        Text("150%").tag(1.5)
+                    }
+                    .labelsHidden()
+                    .frame(width: 120)
+                    .accessibilityIdentifier("settings.pet.size.picker")
+                }
+
+                settingRow("Attention items") {
+                    Picker("", selection: Binding(
+                        get: { vm.appSettings.petAttentionFilter },
+                        set: { vm.setPetAttentionFilter($0) }
+                    )) {
+                        Text("All").tag("all")
+                        Text("Completed only").tag("completed")
+                        Text("Needs you").tag("needsYou")
+                    }
+                    .labelsHidden()
+                    .frame(width: 160)
+                    .accessibilityIdentifier("settings.pet.filter.picker")
+                }
+
+                HStack {
+                    Spacer()
+                    Button("Reset position") {
+                        NotificationCenter.default.post(name: .petResetPositionRequested, object: nil)
+                    }
+                    .buttonStyle(DSSecondaryButtonStyle())
+                    .accessibilityIdentifier("settings.pet.resetPosition")
+                }
+            }
+
+            Text("The pet starts and stops with Remote Code. Rows use fixed summaries and never expose prompts, commands, file contents, tokens, or secret answers.")
+                .font(DS.Font.caption)
+                .foregroundColor(DS.Palette.textTertiary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .dsPanel(padding: DS.Space.lg)
+        .accessibilityIdentifier("settings.pet.section")
     }
 
     private var insomniaSection: some View {
@@ -1923,10 +2165,18 @@ public struct AccountView: View {
 public final class SettingsWindowController: NSObject {
     public let window: NSWindow
     public let viewModel: SettingsViewModel
+    private let routeRegistry: SettingsRouteRegistry
+    private var presentedRoute: PetSettingsRoute?
 
     public init(context: AppContext, updater: AppUpdateChecking? = nil) {
         self.viewModel = SettingsViewModel(context: context, updater: updater)
-        let host = NSHostingController(rootView: SettingsView(vm: viewModel))
+        let routeRegistry = SettingsRouteRegistry()
+        self.routeRegistry = routeRegistry
+        let host = NSHostingController(rootView: SettingsView(
+            vm: viewModel,
+            onClose: nil,
+            routeRegistry: routeRegistry
+        ))
         let win = NSWindow(contentViewController: host)
         win.title = "RemoteCode Settings"
         win.setAccessibilityRole(.window)
@@ -1940,14 +2190,18 @@ public final class SettingsWindowController: NSObject {
         win.contentMinSize = NSSize(width: 620, height: 480)
         win.center()
         self.window = win
-        host.rootView = SettingsView(vm: viewModel) { [weak win] in
-            guard let win else { return }
-            if let parent = win.sheetParent {
-                parent.endSheet(win)
-            } else {
-                win.close()
-            }
-        }
+        host.rootView = SettingsView(
+            vm: viewModel,
+            onClose: { [weak win] in
+                guard let win else { return }
+                if let parent = win.sheetParent {
+                    parent.endSheet(win)
+                } else {
+                    win.close()
+                }
+            },
+            routeRegistry: routeRegistry
+        )
     }
 
     public func show() {
@@ -1968,12 +2222,38 @@ public final class SettingsWindowController: NSObject {
         parent.beginSheet(window)
     }
 
+    @discardableResult
+    public func show(route: PetSettingsRoute) -> Bool {
+        show()
+        return present(route)
+    }
+
+    @discardableResult
+    public func show(route: PetSettingsRoute, attachedTo parent: NSWindow) -> Bool {
+        show(attachedTo: parent)
+        return present(route)
+    }
+
     public func close() {
         if let parent = window.sheetParent {
             parent.endSheet(window)
         } else {
             window.close()
         }
+    }
+
+    var presentedRouteForTests: PetSettingsRoute? { presentedRoute }
+
+    func isRouteVisibleForTests(_ route: PetSettingsRoute) -> Bool {
+        routeRegistry.isVisible(route, in: window)
+    }
+
+    private func present(_ route: PetSettingsRoute) -> Bool {
+        presentedRoute = nil
+        window.contentView?.layoutSubtreeIfNeeded()
+        guard routeRegistry.present(route, in: window) else { return false }
+        presentedRoute = route
+        return true
     }
 }
 

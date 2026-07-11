@@ -1,0 +1,169 @@
+{
+  "atlas" : "remote-code-black-cat-atlas.png",
+  "dimensions" : {
+    "height" : 3328,
+    "width" : 1536
+  },
+  "fallbackState" : "idle",
+  "grid" : {
+    "columns" : 8,
+    "frameHeight" : 208,
+    "frameWidth" : 192,
+    "origin" : "top-left",
+    "rows" : 16
+  },
+  "name" : "Remote Code Black Cat",
+  "provenance" : {
+    "generator" : "built-in GPT image generation plus deterministic CoreGraphics packing",
+    "identitySource" : "macos-app\/mascot.png",
+    "motionSource" : "plan-pet\/assets\/generated\/animation-sequences.png",
+    "poseSource" : "plan-pet\/assets\/generated\/reaction-system.png"
+  },
+  "rows" : [
+    {
+      "canonicalFrame" : 0,
+      "fps" : 4,
+      "frames" : 8,
+      "mode" : "loop",
+      "row" : 0,
+      "source" : "gpt-image-sequence",
+      "state" : "idle"
+    },
+    {
+      "canonicalFrame" : 0,
+      "fps" : 6,
+      "frames" : 6,
+      "mode" : "loop",
+      "row" : 1,
+      "source" : "gpt-image-static-pose-with-subpixel-motion",
+      "state" : "listening"
+    },
+    {
+      "canonicalFrame" : 0,
+      "fps" : 6,
+      "frames" : 8,
+      "mode" : "loop",
+      "row" : 2,
+      "source" : "gpt-image-static-pose-with-subpixel-motion",
+      "state" : "thinking"
+    },
+    {
+      "canonicalFrame" : 0,
+      "fps" : 8,
+      "frames" : 8,
+      "mode" : "loop",
+      "row" : 3,
+      "source" : "gpt-image-sequence",
+      "state" : "coding"
+    },
+    {
+      "canonicalFrame" : 0,
+      "fps" : 8,
+      "frames" : 8,
+      "mode" : "loop",
+      "row" : 4,
+      "source" : "gpt-image-static-pose-with-subpixel-motion",
+      "state" : "editing"
+    },
+    {
+      "canonicalFrame" : 0,
+      "fps" : 8,
+      "frames" : 8,
+      "mode" : "loop",
+      "row" : 5,
+      "source" : "gpt-image-static-pose-with-subpixel-motion",
+      "state" : "terminal"
+    },
+    {
+      "canonicalFrame" : 0,
+      "fps" : 7,
+      "frames" : 8,
+      "mode" : "loop",
+      "row" : 6,
+      "source" : "gpt-image-static-pose-with-subpixel-motion",
+      "state" : "search"
+    },
+    {
+      "canonicalFrame" : 0,
+      "fps" : 7,
+      "frames" : 8,
+      "mode" : "loop",
+      "row" : 7,
+      "source" : "gpt-image-static-pose-with-subpixel-motion",
+      "state" : "gitReview"
+    },
+    {
+      "canonicalFrame" : 0,
+      "fps" : 10,
+      "frames" : 8,
+      "mode" : "onceHold",
+      "row" : 8,
+      "source" : "gpt-image-sequence",
+      "state" : "success"
+    },
+    {
+      "canonicalFrame" : 0,
+      "fps" : 6,
+      "frames" : 6,
+      "mode" : "loop",
+      "row" : 9,
+      "source" : "gpt-image-sequence",
+      "state" : "approval"
+    },
+    {
+      "canonicalFrame" : 0,
+      "fps" : 6,
+      "frames" : 6,
+      "mode" : "loop",
+      "row" : 10,
+      "source" : "gpt-image-static-pose-with-subpixel-motion",
+      "state" : "question"
+    },
+    {
+      "canonicalFrame" : 0,
+      "fps" : 4,
+      "frames" : 8,
+      "mode" : "loop",
+      "row" : 11,
+      "source" : "gpt-image-static-pose-with-subpixel-motion",
+      "state" : "waiting"
+    },
+    {
+      "canonicalFrame" : 0,
+      "fps" : 8,
+      "frames" : 8,
+      "mode" : "onceThenWaiting",
+      "row" : 12,
+      "source" : "gpt-image-static-pose-with-subpixel-motion",
+      "state" : "failed"
+    },
+    {
+      "canonicalFrame" : 0,
+      "fps" : 8,
+      "frames" : 6,
+      "mode" : "onceThenDerived",
+      "row" : 13,
+      "source" : "gpt-image-static-pose-with-subpixel-motion",
+      "state" : "interrupted"
+    },
+    {
+      "canonicalFrame" : 0,
+      "fps" : 6,
+      "frames" : 8,
+      "mode" : "loop",
+      "row" : 14,
+      "source" : "gpt-image-static-pose-with-subpixel-motion",
+      "state" : "reconnecting"
+    },
+    {
+      "canonicalFrame" : 0,
+      "fps" : 3,
+      "frames" : 8,
+      "mode" : "loop",
+      "row" : 15,
+      "source" : "gpt-image-static-pose-with-subpixel-motion",
+      "state" : "sleeping"
+    }
+  ],
+  "schemaVersion" : 1
+}

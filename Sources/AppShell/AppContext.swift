@@ -7,6 +7,62 @@ import SocketServer
 import Surfaces
 import DistillCore
 
+struct ProjectScriptRunOutcome: Sendable, Equatable {
+    let workspaceID: WorkspaceID
+    let surfaceID: SurfaceID
+    let name: String
+    let exitCode: Int32?
+    let durationMilliseconds: Int64
+
+    var result: String { exitCode == 0 ? "success" : "failure" }
+}
+
+final class ProjectScriptRunRegistry: @unchecked Sendable {
+    private struct Entry {
+        let workspaceID: WorkspaceID
+        let name: String
+        let startedAt: Date
+    }
+
+    private let lock = NSLock()
+    private var entries: [SurfaceID: Entry] = [:]
+    private let now: @Sendable () -> Date
+
+    init(now: @escaping @Sendable () -> Date = { Date() }) {
+        self.now = now
+    }
+
+    func register(workspaceID: WorkspaceID, surfaceID: SurfaceID, name: String) {
+        lock.lock()
+        entries[surfaceID] = Entry(workspaceID: workspaceID, name: name, startedAt: now())
+        lock.unlock()
+    }
+
+    func consumeTerminalDeath(surfaceID: SurfaceID, health: TerminalRuntimeHealth) -> ProjectScriptRunOutcome? {
+        guard !health.processAlive else { return nil }
+        lock.lock()
+        let entry = entries.removeValue(forKey: surfaceID)
+        lock.unlock()
+        guard let entry else { return nil }
+
+        let duration = max(0, Int64(now().timeIntervalSince(entry.startedAt) * 1_000))
+        return ProjectScriptRunOutcome(
+            workspaceID: entry.workspaceID,
+            surfaceID: surfaceID,
+            name: entry.name,
+            exitCode: Self.exitCode(rawStatus: health.exitStatus, terminationSignal: health.terminationSignal),
+            durationMilliseconds: duration
+        )
+    }
+
+    private static func exitCode(rawStatus: Int32?, terminationSignal: Int32?) -> Int32? {
+        guard let rawStatus else { return nil }
+        let signal = terminationSignal ?? (rawStatus & 0x7F)
+        guard signal == 0 else { return 128 + signal }
+        return (rawStatus >> 8) & 0xFF
+    }
+}
+
 @MainActor
 public final class AppContext {
     public let channel: ReleaseChannel
@@ -30,6 +86,7 @@ public final class AppContext {
     public let tokenSaverSavingsRepo: TokenSaverSavingsRepository
     public let privateNotificationBridge: PrivateNotificationBridge
     public let tokenSaverDistillServiceController: TokenSaverDistillServiceController
+    let projectScriptRuns = ProjectScriptRunRegistry()
     public private(set) var managedDistillSkillInstallResults: [AgentSkillInstallResult] = []
     /// Last managed-distill reconcile error (nil when off or installed cleanly). Lets
     /// the UI distinguish "Token Saver off" from "install failed" instead of both
@@ -503,7 +560,19 @@ public final class AppContext {
             }
             EventBus.shared.publish(kind: "surface.output", payload: .object(payload))
         }
+        LocalGitActivityBus.shared.sink = { activity in
+            guard ["git.checkout", "git.branch_created", "git.commit", "git.push"].contains(activity.kind) else {
+                return
+            }
+            EventBus.shared.publish(kind: activity.kind, payload: .object([
+                "workspace_id": .string(activity.workspaceID.value.uuidString),
+                "surface_id": .string(activity.surfaceID.value.uuidString),
+                "ok": .bool(activity.succeeded)
+            ]))
+        }
+        let projectScriptRuns = self.projectScriptRuns
         SurfaceRuntimeBus.shared.sink = { sid, health in
+            let projectScriptOutcome = projectScriptRuns.consumeTerminalDeath(surfaceID: sid, health: health)
             Task { @MainActor [weak self] in
                 if self?.router?.promoteWorkspaceContainingBusySurface(sid) != true {
                     self?.router?.windowController?.refreshSurfaceRuntimeState()
@@ -527,6 +596,16 @@ public final class AppContext {
                 "rows": .number(Double(health.rows)),
                 "cols": .number(Double(health.cols))
             ]))
+            if let outcome = projectScriptOutcome {
+                EventBus.shared.publish(kind: "project.script.finished", payload: .object([
+                    "workspace_id": .string(outcome.workspaceID.value.uuidString),
+                    "surface_id": .string(outcome.surfaceID.value.uuidString),
+                    "name": .string(outcome.name),
+                    "exit_code": outcome.exitCode.map { .number(Double($0)) } ?? .null,
+                    "duration_ms": .number(Double(outcome.durationMilliseconds)),
+                    "result": .string(outcome.result)
+                ]))
+            }
         }
 
         // Flush any pending debounced usage writes before the process exits so no

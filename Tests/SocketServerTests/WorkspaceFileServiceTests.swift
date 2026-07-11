@@ -13,6 +13,7 @@ final class WorkspaceFileServiceTests: XCTestCase {
     }
 
     override func tearDownWithError() throws {
+        FileEditSessionStore.shared.resetForTests()
         if let root {
             try? FileManager.default.removeItem(at: root)
         }
@@ -204,5 +205,68 @@ final class WorkspaceFileServiceTests: XCTestCase {
 
         XCTAssertThrowsError(try FileEditSessionStore.shared.save(sessionID: sessionID),
                              "save conflict checks must not read an externally-grown file without the edit size cap")
+    }
+
+    func testEditLifecyclePublishesEveryCorrelatedProducerEvent() throws {
+        let file = root.appendingPathComponent("notes.txt")
+        try "base".write(to: file, atomically: true, encoding: .utf8)
+        let workspaceID = WorkspaceID()
+        let surfaceID = SurfaceID()
+        var events: [EventBus.Event] = []
+        let token = EventBus.shared.subscribe(since: EventBus.shared.currentSeq) { event in
+            if event.kind.hasPrefix("files.edit.") { events.append(event) }
+        }
+        defer { EventBus.shared.unsubscribe(token) }
+
+        let successful = try FileEditSessionStore.shared.open(
+            surfaceID: surfaceID,
+            workspaceID: workspaceID,
+            root: root.path,
+            path: "notes.txt"
+        )
+        let successfulID = try XCTUnwrap(successful.objectValue?["session_id"]?.stringValue)
+        _ = try FileEditSessionStore.shared.applyPatch(
+            sessionID: successfulID,
+            baseDraftRevision: 1,
+            rangeLocation: 4,
+            rangeLength: 0,
+            replacement: " safe",
+            deviceID: "test-device"
+        )
+        _ = try FileEditSessionStore.shared.save(sessionID: successfulID)
+        _ = try FileEditSessionStore.shared.close(sessionID: successfulID)
+
+        let conflicted = try FileEditSessionStore.shared.open(
+            surfaceID: surfaceID,
+            workspaceID: workspaceID,
+            root: root.path,
+            path: "notes.txt"
+        )
+        let conflictedID = try XCTUnwrap(conflicted.objectValue?["session_id"]?.stringValue)
+        _ = try FileEditSessionStore.shared.applyPatch(
+            sessionID: conflictedID,
+            baseDraftRevision: 1,
+            rangeLocation: 0,
+            rangeLength: 0,
+            replacement: "draft ",
+            deviceID: nil
+        )
+        try "external".write(to: file, atomically: true, encoding: .utf8)
+        XCTAssertThrowsError(try FileEditSessionStore.shared.save(sessionID: conflictedID))
+        _ = try FileEditSessionStore.shared.discard(sessionID: conflictedID)
+        _ = try FileEditSessionStore.shared.close(sessionID: conflictedID)
+
+        XCTAssertEqual(events.map(\.kind), [
+            "files.edit.opened", "files.edit.patch_applied", "files.edit.saved", "files.edit.closed",
+            "files.edit.opened", "files.edit.patch_applied", "files.edit.conflict", "files.edit.discarded", "files.edit.closed"
+        ])
+        for event in events {
+            let payload = try XCTUnwrap(event.payload.objectValue)
+            XCTAssertEqual(payload["workspace_id"], .string(workspaceID.value.uuidString))
+            XCTAssertEqual(payload["surface_id"], .string(surfaceID.value.uuidString))
+            XCTAssertFalse(try XCTUnwrap(payload["session_id"]?.stringValue).isEmpty)
+        }
+        let conflict = try XCTUnwrap(events.first { $0.kind == "files.edit.conflict" })
+        XCTAssertEqual(conflict.payload.objectValue?["reason"], .string("disk_changed"))
     }
 }

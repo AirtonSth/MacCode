@@ -101,6 +101,20 @@ final class SettingsStoreCacheTests: XCTestCase {
         XCTAssertTrue(result.tokenSaverEnabled, "cached load must return all fields from the last write")
     }
 
+    func test_reloadObservesWriteFromAnotherStoreInstance() {
+        let repo = CountingSettingsRepository()
+        let observer = SettingsStore(repo: repo)
+        let writer = SettingsStore(repo: repo)
+        XCTAssertFalse(observer.load().petEnabled)
+
+        writer.update { $0.petEnabled = true }
+
+        XCTAssertFalse(observer.load().petEnabled,
+            "ordinary load must retain the per-instance cache until explicitly invalidated")
+        XCTAssertTrue(observer.reload().petEnabled,
+            "settings-change observers must be able to refresh writes made through another store instance")
+    }
+
     // MARK: failed write does NOT invalidate cache
 
     func test_failedWriteDoesNotInvalidateCache() {
