@@ -44,10 +44,13 @@ final class FoundationPetAnimationScheduler: PetAnimationScheduling {
 /// before scheduling. Paused policies project the manifest's canonical frame.
 @MainActor
 final class PetAnimationController {
+    private static let idleRestDelayRange: ClosedRange<TimeInterval> = 12...24
+
     private let atlas: PetAtlas
     private let scheduler: any PetAnimationScheduling
     private var timer: (any PetAnimationTimer)?
     private var derivedTerminalState: PetAnimationState?
+    private var isIdleResting = false
 
     private var isVisible = true
     private var isScreenLocked = false
@@ -84,6 +87,7 @@ final class PetAnimationController {
     ) throws {
         let previous = currentState
         stopTimer()
+        isIdleResting = false
         currentState = state
         self.derivedTerminalState = derivedTerminalState
         try atlas.activate(state, adjacent: [previous])
@@ -131,6 +135,7 @@ final class PetAnimationController {
 
     private func reconcilePolicy() {
         stopTimer()
+        isIdleResting = false
         guard let row = atlas.manifest.row(for: currentState) else { return }
         if shouldAnimate {
             scheduleTimer(for: row)
@@ -145,8 +150,25 @@ final class PetAnimationController {
     }
 
     private func scheduleTimer(for row: PetAtlasManifest.Row) {
+        if currentState == .idle {
+            scheduleIdleRest(for: row)
+        } else {
+            scheduleFrameTimer(for: row)
+        }
+    }
+
+    private func scheduleFrameTimer(for row: PetAtlasManifest.Row) {
         stopTimer()
         timer = scheduler.schedule(interval: 1.0 / Double(row.fps)) { [weak self] in
+            self?.tick()
+        }
+    }
+
+    private func scheduleIdleRest(for row: PetAtlasManifest.Row) {
+        stopTimer()
+        isIdleResting = true
+        currentFrameIndex = row.canonicalFrame
+        timer = scheduler.schedule(interval: Double.random(in: Self.idleRestDelayRange)) { [weak self] in
             self?.tick()
         }
     }
@@ -163,6 +185,14 @@ final class PetAnimationController {
             return
         }
 
+        if currentState == .idle, isIdleResting {
+            isIdleResting = false
+            currentFrameIndex = min(row.canonicalFrame + 1, row.frames - 1)
+            publishCurrentFrameOrStop()
+            scheduleFrameTimer(for: row)
+            return
+        }
+
         let last = row.frames - 1
         if currentFrameIndex < last {
             currentFrameIndex += 1
@@ -175,8 +205,11 @@ final class PetAnimationController {
 
         switch row.mode {
         case .loop:
-            currentFrameIndex = 0
+            currentFrameIndex = currentState == .idle ? row.canonicalFrame : 0
             publishCurrentFrameOrStop()
+            if currentState == .idle {
+                scheduleIdleRest(for: row)
+            }
         case .onceHold:
             stopTimer()
         case .onceThenWaiting:
