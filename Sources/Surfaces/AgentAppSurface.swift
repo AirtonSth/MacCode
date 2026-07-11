@@ -167,6 +167,13 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// Canonical host mutation used when local selection acknowledges unread work.
     public var markThreadRead: ((AgentThreadID) throws -> Void)?
     public var onQueuedMessageEvent: ((String, AgentQueuedMessage) -> Void)?
+    /// UX-MAC_AGENT-OPEN-SPLIT: wired by AppCommandRouter. A clicked file mention
+    /// (absolute path, already resolved) opens — or reuses — a Files split panel
+    /// to the right of this surface.
+    public var onOpenFileInSplit: ((String) -> Void)?
+    /// UX-MAC_AGENT-OPEN-SPLIT: wired by AppCommandRouter. A clicked web link
+    /// opens — or reuses — a Browser split panel to the right of this surface.
+    public var onOpenURLInSplit: ((URL) -> Void)?
     public var providerSnapshotLoader: (() async throws -> [AgentProviderSnapshot])?
     public var modelListLoader: ((AgentProvider) async throws -> [AgentModelDescriptor])?
     public var providerLaunchConfig: ((AgentProvider, String?) -> (binary: String?, environment: [String: String]))?
@@ -3076,6 +3083,38 @@ public struct AgentTimelineItemPresentation: Equatable, Sendable {
         return AgentAppView.cappedVisibleText(body, limit: AgentAppView.commandPreviewCharacterLimit, truncatedLabel: "hidden from preview")
     }
 
+    /// UX-MAC_AGENT-OPEN-SPLIT: the openable target of a tool call — Read/Edit-style
+    /// inputs carry a file path, fetch-style inputs a URL. Drives the transcript's
+    /// "open in split panel" affordance on tool rows.
+    enum ToolOpenTarget: Equatable {
+        case file(String)
+        case url(URL)
+    }
+
+    static func toolOpenTarget(for item: AssistantItem) -> ToolOpenTarget? {
+        switch item.type {
+        case .tool, .mcpToolCall, .dynamicToolCall, .collabToolCall, .commandExecution, .fileChange:
+            break
+        default:
+            return nil
+        }
+        let body = item.body.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !body.isEmpty,
+              let data = body.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+        for key in ["file_path", "path", "notebook_path"] {
+            if let value = (obj[key] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines), !value.isEmpty {
+                return .file(value)
+            }
+        }
+        if let raw = (obj["url"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
+           let url = URL(string: raw),
+           ["http", "https"].contains(url.scheme?.lowercased() ?? "") {
+            return .url(url)
+        }
+        return nil
+    }
+
     /// A compact, human-readable rendering of a tool-input value for the one-line digest.
     /// Scalars print their value; arrays/objects print a shape hint instead of raw braces.
     static func shortValue(_ value: Any?) -> String {
@@ -4109,6 +4148,12 @@ public struct AgentAppView: View {
         }
         .background(DS.Palette.bg)
         .background(newThreadShortcut)
+        // UX-MAC_AGENT-OPEN-SPLIT: any tapped link inside this surface's markdown
+        // (file mentions, bare URLs, markdown links) routes through the VM so it
+        // opens — or reuses — a split panel to the right instead of leaving the app.
+        .environment(\.openURL, OpenURLAction { url in
+            vm.handleTranscriptLink(url) ? .handled : .systemAction
+        })
         .task {
             if vm.providerSnapshots.isEmpty {
                 await vm.loadProviderSnapshots()
@@ -6005,16 +6050,36 @@ public struct AgentAppView: View {
 
             // The command / input that ran (e.g. the bash command) — the key context that
             // was missing. Always visible (truncated when collapsed); full when expanded.
+            // UX-MAC_AGENT-OPEN-SPLIT: when the input is a file path or URL, a trailing
+            // button opens it in a split panel (Files / Browser) to the right.
             if let command, !command.isEmpty {
-                Text(command)
-                    .font(DS.Font.monoSmall).foregroundColor(DS.Palette.textSecondary)
-                    .textSelection(.enabled)
-                    .lineLimit(expanded ? nil : 3)
-                    .truncationMode(.tail)
-                    .padding(.horizontal, DS.Space.sm).padding(.vertical, 6)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(DS.Palette.surface)
-                    .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+                HStack(alignment: .top, spacing: DS.Space.xs) {
+                    Text(command)
+                        .font(DS.Font.monoSmall).foregroundColor(DS.Palette.textSecondary)
+                        .textSelection(.enabled)
+                        .lineLimit(expanded ? nil : 3)
+                        .truncationMode(.tail)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    if let target = AgentTimelineItemPresentation.toolOpenTarget(for: item) {
+                        Button {
+                            switch target {
+                            case .file(let path): vm.openFileMention(path)
+                            case .url(let url): vm.openLinkMention(url)
+                            }
+                        } label: {
+                            Image(systemName: "arrow.up.forward.square")
+                                .font(.system(size: 10))
+                                .foregroundColor(DS.Palette.textTertiary)
+                        }
+                        .buttonStyle(.plain)
+                        .help("Open in split panel")
+                        .accessibilityIdentifier("agent.tool.openInSplit.\(item.id)")
+                    }
+                }
+                .padding(.horizontal, DS.Space.sm).padding(.vertical, 6)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(DS.Palette.surface)
+                .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
             }
 
             // Output, collapsed by default and capped so a noisy command (or a Skill dump)
@@ -8421,5 +8486,122 @@ extension AgentReasoningEffort {
         case .max: return "Deepest reasoning the model supports — slowest, most tokens"
         case .ultracode: return "Extra High effort + autonomous workflow orchestration"
         }
+    }
+}
+
+// MARK: - Clickable transcript mentions (UX-MAC_AGENT-OPEN-SPLIT)
+// File paths and links mentioned in transcript prose (and tool rows) are tappable.
+// The VM resolves the raw mention against the thread's working directory and hands
+// an absolute path / URL to the router callbacks, which open (or reuse) a split
+// panel to the right of the surface.
+extension AgentAppViewModel {
+    /// Routes a tapped transcript link. Returns true when handled here (file
+    /// mention or web link); false lets the system handler take over.
+    @discardableResult
+    public func handleTranscriptLink(_ url: URL) -> Bool {
+        if let raw = AgentMessageMarkdown.filePath(fromFileLink: url) {
+            openFileMention(raw)
+            return true
+        }
+        switch url.scheme?.lowercased() {
+        case "http", "https":
+            openLinkMention(url)
+            return true
+        case "file":
+            openFileMention(url.path)
+            return true
+        default:
+            return false
+        }
+    }
+
+    public func openLinkMention(_ url: URL) {
+        if let onOpenURLInSplit {
+            onOpenURLInSplit(url)
+        } else {
+            NSWorkspace.shared.open(url)
+        }
+    }
+
+    public func openFileMention(_ raw: String) {
+        guard let resolved = Self.resolveFileMention(raw, root: worktreePath ?? cwd) else {
+            NSSound.beep()
+            return
+        }
+        if let onOpenFileInSplit {
+            onOpenFileInSplit(resolved)
+        } else {
+            NSWorkspace.shared.open(URL(fileURLWithPath: resolved))
+        }
+    }
+
+    /// Resolves a raw file mention to an existing absolute path: strips a
+    /// `:line(:col)` suffix, expands `~`, resolves relative tokens against `root`,
+    /// falls back to a bounded workspace search for bare filenames, then to the
+    /// nearest existing ancestor directory (a mention of a since-deleted file still
+    /// lands near it). nil when nothing on disk plausibly matches.
+    nonisolated static func resolveFileMention(_ raw: String, root: String, fileManager: FileManager = .default) -> String? {
+        let token = strippingLineSuffix(raw.trimmingCharacters(in: .whitespacesAndNewlines))
+        guard !token.isEmpty else { return nil }
+        let expanded = (token as NSString).expandingTildeInPath
+        let candidate: String
+        if expanded.hasPrefix("/") {
+            candidate = (expanded as NSString).standardizingPath
+        } else {
+            candidate = ((root as NSString).appendingPathComponent(expanded) as NSString).standardizingPath
+        }
+        if fileManager.fileExists(atPath: candidate) { return candidate }
+        if !token.contains("/"), let hit = searchWorkspace(filename: token, root: root, fileManager: fileManager) {
+            return hit
+        }
+        // Nearest existing ancestor — but never degrade to "/" or to the workspace
+        // root itself: a mention that resolves nowhere near anything real is a
+        // false positive, not a navigation target.
+        let standardizedRoot = (root as NSString).standardizingPath
+        var dir = candidate
+        while dir.count > 1 {
+            dir = (dir as NSString).deletingLastPathComponent
+            if dir.isEmpty || dir == "/" || dir == standardizedRoot { return nil }
+            if fileManager.fileExists(atPath: dir) { return dir }
+        }
+        return nil
+    }
+
+    /// "path.swift:12" / "path.swift:12:5" → "path.swift". Only digit-only
+    /// trailing segments are stripped, so "http://host:8080" shapes are safe.
+    nonisolated static func strippingLineSuffix(_ token: String) -> String {
+        let parts = token.split(separator: ":", omittingEmptySubsequences: false)
+        guard parts.count > 1 else { return token }
+        var end = parts.count
+        while end > 1, !parts[end - 1].isEmpty, parts[end - 1].allSatisfy(\.isNumber) { end -= 1 }
+        return parts[0..<end].joined(separator: ":")
+    }
+
+    /// Bounded search for a bare filename mention ("Reducer.swift") under the
+    /// workspace root. Skips hidden directories and common dependency/build dirs;
+    /// caps visited entries so a huge tree cannot stall the click.
+    nonisolated static func searchWorkspace(filename: String, root: String, fileManager: FileManager = .default, visitLimit: Int = 25_000) -> String? {
+        let skippedDirectories: Set<String> = ["node_modules", "DerivedData", "Pods", "dist", "build", "target", "vendor"]
+        let rootURL = URL(fileURLWithPath: root, isDirectory: true)
+        guard let enumerator = fileManager.enumerator(
+            at: rootURL,
+            includingPropertiesForKeys: [.isDirectoryKey],
+            options: [.skipsPackageDescendants]
+        ) else { return nil }
+        var visited = 0
+        for case let url as URL in enumerator {
+            visited += 1
+            if visited > visitLimit { return nil }
+            let name = url.lastPathComponent
+            let isDirectory = (try? url.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true
+            if isDirectory, name.hasPrefix(".") || skippedDirectories.contains(name) {
+                enumerator.skipDescendants()
+                continue
+            }
+            // standardizingPath: the enumerator yields /private/var/... forms for
+            // symlinked roots; callers compare against the standardized root.
+            if name == filename { return (url.path as NSString).standardizingPath }
+        }
+        return nil
     }
 }

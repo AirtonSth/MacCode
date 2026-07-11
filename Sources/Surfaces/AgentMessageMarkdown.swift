@@ -242,7 +242,152 @@ enum AgentMessageMarkdown {
             attributed[range].backgroundColor = DS.Palette.surfaceOverlay
             attributed[range].foregroundColor = DS.Palette.accent
         }
+        return applyingDetectedLinks(to: attributed)
+    }
+
+    // MARK: Clickable mentions (UX-MAC_AGENT-OPEN-SPLIT)
+    // Bare URLs and file-path mentions in transcript prose become tappable `.link`
+    // runs so a click can open a Browser / Files split panel. File mentions use a
+    // custom scheme carrying the raw token; the click handler resolves it against
+    // the thread's working directory (detection stays a pure function of the text,
+    // keeping the NSCache text-keyed).
+
+    static let fileLinkScheme = "remotecode-file"
+
+    static func fileLinkURL(for rawPath: String) -> URL? {
+        var comps = URLComponents()
+        comps.scheme = fileLinkScheme
+        comps.host = "open"
+        comps.queryItems = [URLQueryItem(name: "path", value: rawPath)]
+        return comps.url
+    }
+
+    static func filePath(fromFileLink url: URL) -> String? {
+        guard url.scheme == fileLinkScheme else { return nil }
+        return URLComponents(url: url, resolvingAgainstBaseURL: false)?
+            .queryItems?.first(where: { $0.name == "path" })?.value
+    }
+
+    // Explicit-scheme / www. / localhost URLs only — no bare-domain detection, so
+    // file names like "Reducer.swift" or "config.dev" never false-positive as web links.
+    private static let urlRegex = try! NSRegularExpression(
+        pattern: #"(?i)\b(?:https?://|file:///|www\.)[^\s<>"'\)\]\}]+|(?<![\w.])localhost:\d+[^\s<>"'\)\]\}]*"#
+    )
+
+    // Two shapes: rooted paths (`/abs`, `~/x`, `./x`, `../x`) and relative paths that
+    // contain a slash AND end in a file extension (so "and/or" or "I/O" never match).
+    // Both accept a trailing `:line(:col)` suffix.
+    private static let pathRegex = try! NSRegularExpression(
+        pattern: #"(?<![\w@.\-/])(?:~|\.{1,2})?/(?:[\w.\-+@]+/)*[\w.\-+@]+(?::\d+(?::\d+)?)?|(?<![\w@.\-/~])(?:[\w.\-+@]+/)+[\w.\-+@]+\.[A-Za-z]\w{0,7}(?::\d+(?::\d+)?)?"#
+    )
+
+    // Bare filenames ("Package.swift", "foo.test.ts") are only linked inside inline
+    // code spans, where a file mention is unambiguous.
+    private static let bareFilenameRegex = try! NSRegularExpression(
+        pattern: #"(?<![\w.\-/~])[\w\-]+(?:\.[\w\-]+)*\.[A-Za-z]\w{0,7}(?::\d+(?::\d+)?)?(?![\w/])"#
+    )
+
+    static func applyingDetectedLinks(to source: AttributedString) -> AttributedString {
+        var attributed = source
+        let text = String(attributed.characters)
+        guard text.contains("/") || text.contains(".") else { return attributed }
+
+        func attributedRange(_ range: Range<String.Index>) -> Range<AttributedString.Index>? {
+            let startOffset = text.distance(from: text.startIndex, to: range.lowerBound)
+            let length = text.distance(from: range.lowerBound, to: range.upperBound)
+            guard let start = attributed.characters.index(attributed.startIndex, offsetBy: startOffset, limitedBy: attributed.endIndex),
+                  let end = attributed.characters.index(start, offsetBy: length, limitedBy: attributed.endIndex) else { return nil }
+            return start..<end
+        }
+        func hasExistingLink(_ range: Range<AttributedString.Index>) -> Bool {
+            attributed[range].runs.contains { $0.link != nil }
+        }
+        func markLink(_ range: Range<AttributedString.Index>, url: URL) {
+            attributed[range].link = url
+            // Scope-qualified: AppKit is imported too, and both scopes define
+            // `underlineStyle` with different value types.
+            attributed[range].swiftUI.underlineStyle = .single
+            attributed[range].foregroundColor = DS.Palette.accent
+        }
+
+        var claimed: [Range<String.Index>] = []
+        let fullRange = NSRange(text.startIndex..., in: text)
+
+        for match in urlRegex.matches(in: text, range: fullRange) {
+            guard let raw = Range(match.range, in: text) else { continue }
+            let range = trimmingTrailingPunctuation(text, raw)
+            guard !range.isEmpty, let ar = attributedRange(range), !hasExistingLink(ar) else { continue }
+            let token = String(text[range])
+            guard let url = normalizedWebURL(token) else { continue }
+            if url.isFileURL {
+                guard let fileLink = fileLinkURL(for: url.path) else { continue }
+                markLink(ar, url: fileLink)
+            } else {
+                markLink(ar, url: url)
+            }
+            claimed.append(range)
+        }
+
+        for match in pathRegex.matches(in: text, range: fullRange) {
+            guard let raw = Range(match.range, in: text) else { continue }
+            let range = trimmingTrailingPunctuation(text, raw)
+            guard !range.isEmpty,
+                  !claimed.contains(where: { $0.overlaps(range) }),
+                  let ar = attributedRange(range), !hasExistingLink(ar) else { continue }
+            guard let fileLink = fileLinkURL(for: String(text[range])) else { continue }
+            markLink(ar, url: fileLink)
+            claimed.append(range)
+        }
+
+        // Bare filenames: restricted to inline-code runs. Collect ranges first —
+        // mutating link attributes while iterating `runs` would invalidate them.
+        let codeStringRanges: [Range<String.Index>] = attributed.runs
+            .filter { $0.inlinePresentationIntent?.contains(.code) == true }
+            .compactMap { run in
+                let startOffset = attributed.characters.distance(from: attributed.startIndex, to: run.range.lowerBound)
+                let length = attributed.characters.distance(from: run.range.lowerBound, to: run.range.upperBound)
+                guard let start = text.index(text.startIndex, offsetBy: startOffset, limitedBy: text.endIndex),
+                      let end = text.index(start, offsetBy: length, limitedBy: text.endIndex) else { return nil }
+                return start..<end
+            }
+        for codeRange in codeStringRanges {
+            let nsRange = NSRange(codeRange, in: text)
+            for match in bareFilenameRegex.matches(in: text, range: nsRange) {
+                guard let range = Range(match.range, in: text),
+                      !claimed.contains(where: { $0.overlaps(range) }),
+                      let ar = attributedRange(range), !hasExistingLink(ar) else { continue }
+                guard let fileLink = fileLinkURL(for: String(text[range])) else { continue }
+                markLink(ar, url: fileLink)
+                claimed.append(range)
+            }
+        }
         return attributed
+    }
+
+    /// "https://x", "file:///x" parse directly; "www.x" and "localhost:3000" get a
+    /// scheme prepended so the resulting `.link` URL is loadable.
+    static func normalizedWebURL(_ token: String) -> URL? {
+        let lower = token.lowercased()
+        if lower.hasPrefix("www.") { return URL(string: "https://\(token)") }
+        if lower.hasPrefix("localhost:") { return URL(string: "http://\(token)") }
+        return URL(string: token)
+    }
+
+    /// Sentence punctuation glued to a match ("see /a/b.swift.") is not part of the
+    /// token. A trailing ")" is kept only when the token contains its "(".
+    private static func trimmingTrailingPunctuation(_ text: String, _ range: Range<String.Index>) -> Range<String.Index> {
+        var upper = range.upperBound
+        while upper > range.lowerBound {
+            let last = text[text.index(before: upper)]
+            if ".,;:!?\"'".contains(last) {
+                upper = text.index(before: upper)
+            } else if last == ")", !text[range.lowerBound..<upper].contains("(") {
+                upper = text.index(before: upper)
+            } else {
+                break
+            }
+        }
+        return range.lowerBound..<upper
     }
 
     /// IMP-010: Copies `text` to the system general pasteboard.

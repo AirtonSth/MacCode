@@ -40,6 +40,40 @@ public indirect enum LayoutNode: Codable, Sendable, Equatable {
         case .split(let s): return s.children.contains(where: { $0.contains(surfaceID: surfaceID) })
         }
     }
+
+    /// The first pane in visual order (leftmost/topmost leaf) of this subtree.
+    public func firstPane() -> PaneNode? {
+        switch self {
+        case .pane(let p): return p
+        case .split(let s): return s.children.lazy.compactMap { $0.firstPane() }.first
+        }
+    }
+
+    /// The pane immediately to the visual right of `paneID`: the nearest ancestor
+    /// horizontal split in which the subtree holding the pane has a right sibling
+    /// decides, and the sibling's leftmost pane is returned. nil when the pane is
+    /// already right-most (or not in this tree). Horizontal splits lay children
+    /// left→right in array order (see MainWindowController.buildLayoutView).
+    public func rightNeighborPane(of paneID: PaneID) -> PaneNode? {
+        func search(_ node: LayoutNode) -> (found: Bool, neighbor: PaneNode?) {
+            switch node {
+            case .pane(let pane):
+                return (pane.id == paneID, nil)
+            case .split(let split):
+                for (index, child) in split.children.enumerated() {
+                    let result = search(child)
+                    guard result.found else { continue }
+                    if let neighbor = result.neighbor { return (true, neighbor) }
+                    if split.orientation == .horizontal, index + 1 < split.children.count {
+                        return (true, split.children[index + 1].firstPane())
+                    }
+                    return (true, nil)
+                }
+                return (false, nil)
+            }
+        }
+        return search(self).neighbor
+    }
 }
 
 public struct PaneNode: Codable, Sendable, Equatable {

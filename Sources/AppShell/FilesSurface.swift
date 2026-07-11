@@ -53,6 +53,10 @@ final class FilesSurface: NSObject, Surface {
     func sendText(_ text: String) { model.insertText(text) }
     func readText() -> String { model.visibleText }
     func snapshot() -> [String: String] { ["selected_path": model.selectedPath ?? ""] }
+
+    /// UX-MAC_AGENT-OPEN-SPLIT: programmatic navigation used when the Agent App
+    /// reuses this panel as the right-hand split for a clicked file mention.
+    func reveal(relativePath: String) { model.reveal(relativePath: relativePath) }
 }
 
 struct FileTabDragPayload {
@@ -1064,6 +1068,20 @@ final class FilesViewModel: ObservableObject {
         } catch {
             isLoading = false
             errorText = String(describing: error)
+        }
+    }
+
+    /// UX-MAC_AGENT-OPEN-SPLIT: reveal a workspace-relative path — select it when
+    /// already listed, otherwise navigate to its parent directory and select the
+    /// entry there (a directory path opens the directory itself).
+    func reveal(relativePath: String) {
+        if let known = allKnownEntry(relativePath: relativePath) {
+            select(known)
+            return
+        }
+        loadDirectory((relativePath as NSString).deletingLastPathComponent)
+        if let entry = entries.first(where: { $0.relativePath == relativePath }) {
+            select(entry)
         }
     }
 

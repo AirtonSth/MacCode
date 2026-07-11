@@ -290,6 +290,16 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                         agent.viewModel.onReviewRequested = { [weak self] in
                             _ = try? self?.createSurface(workspace: wid, type: .rightSidebarTool, paneID: nil, title: "Git")
                         }
+                        // UX-MAC_AGENT-OPEN-SPLIT: clicked file mentions / links open
+                        // (or reuse) a split panel to the right of this agent surface.
+                        agent.viewModel.onOpenFileInSplit = { [weak self, weak agent] path in
+                            guard let self, let agent else { return }
+                            self.openFileInAdjacentSplit(workspace: wid, sourceSurface: agent.descriptor.id, absolutePath: path)
+                        }
+                        agent.viewModel.onOpenURLInSplit = { [weak self, weak agent] url in
+                            guard let self, let agent else { return }
+                            self.openURLInAdjacentSplit(workspace: wid, sourceSurface: agent.descriptor.id, url: url)
+                        }
                         agent.viewModel.onRunStateChange = { [weak self] in
                             guard let self else { return }
                             if !self.promoteWorkspaceIfBusy(wid) {
@@ -823,6 +833,119 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         windowController?.refreshFromState()
         reconcileSurfaceVisibility()
         publishPaneSplit(workspace: workspace, surface: desc)
+        return desc
+    }
+
+    // MARK: Agent App "open in adjacent split" (UX-MAC_AGENT-OPEN-SPLIT)
+    // A clicked file mention / link in the Agent App transcript opens in a split
+    // panel to the RIGHT of the agent surface. Reuse order: an existing
+    // Files/Browser surface in the right-neighbor pane is navigated + focused; a
+    // right-neighbor pane without one gets a new tab; no right neighbor creates
+    // a right split from the agent's pane.
+
+    public func openFileInAdjacentSplit(workspace: WorkspaceID, sourceSurface: SurfaceID, absolutePath: String) {
+        guard let ctx = context, let ws = ctx.state.workspaces[workspace],
+              let info = workspaceRelativeTarget(workspace: workspace, path: absolutePath) else {
+            // Outside the workspace root the root-scoped Files panel can't show
+            // it — hand the (already validated to exist) path to the system.
+            NSWorkspace.shared.open(URL(fileURLWithPath: absolutePath))
+            return
+        }
+        let sourcePane = paneIDContaining(surface: sourceSurface, in: ws.layout)
+        if let sourcePane, let neighbor = ws.layout.rightNeighborPane(of: sourcePane) {
+            if let filesDesc = neighbor.surfaces.first(where: { $0.type == .files }),
+               let files = SurfaceRegistry.shared.surface(filesDesc.id) as? FilesSurface {
+                files.reveal(relativePath: info.relativePath)
+                updateSurfaceDescriptor(workspace: workspace, surface: filesDesc.id) { descriptor in
+                    descriptor.title = info.title
+                    descriptor.metadata["selected_path"] = info.relativePath
+                    descriptor.metadata["selected_relative_path"] = info.relativePath
+                }
+                try? ctx.apply(.focusSurface(workspace, filesDesc.id))
+                windowController?.refreshFromState()
+                reconcileSurfaceVisibility()
+                return
+            }
+            let desc = makeFilesSurface(workspace: workspace, cwd: ws.cwd, title: info.title, selectedPath: info.relativePath)
+            try? ctx.apply(.addSurface(workspace, paneID: neighbor.id, descriptor: desc))
+            windowController?.refreshFromState()
+            reconcileSurfaceVisibility()
+            publishSurfaceCreated(workspace: workspace, surface: desc)
+            return
+        }
+        guard let targetPane = sourcePane ?? ws.focusedPaneID ?? ws.layout.paneIDs().first else { return }
+        let desc = makeFilesSurface(workspace: workspace, cwd: ws.cwd, title: info.title, selectedPath: info.relativePath)
+        try? ctx.apply(.splitPane(workspace, paneID: targetPane, direction: .right, newSurface: desc))
+        windowController?.refreshFromState()
+        reconcileSurfaceVisibility()
+        publishPaneSplit(workspace: workspace, surface: desc)
+    }
+
+    public func openURLInAdjacentSplit(workspace: WorkspaceID, sourceSurface: SurfaceID, url: URL) {
+        guard let ctx = context, let ws = ctx.state.workspaces[workspace] else {
+            NSWorkspace.shared.open(url)
+            return
+        }
+        let title = url.host ?? "browser"
+        let sourcePane = paneIDContaining(surface: sourceSurface, in: ws.layout)
+        if let sourcePane, let neighbor = ws.layout.rightNeighborPane(of: sourcePane) {
+            if let browserDesc = neighbor.surfaces.first(where: { $0.type == .browser }),
+               let browser = SurfaceRegistry.shared.surface(browserDesc.id) as? BrowserSurface {
+                browser.navigate(to: url)
+                persistBrowserNavigation(surfaceID: browserDesc.id, url: url.absoluteString, title: nil)
+                try? ctx.apply(.focusSurface(workspace, browserDesc.id))
+                windowController?.refreshFromState()
+                reconcileSurfaceVisibility()
+                return
+            }
+            let desc = makeBrowserSurface(workspace: workspace, url: url, title: title)
+            try? ctx.apply(.addSurface(workspace, paneID: neighbor.id, descriptor: desc))
+            windowController?.refreshFromState()
+            reconcileSurfaceVisibility()
+            publishSurfaceCreated(workspace: workspace, surface: desc)
+            return
+        }
+        guard let targetPane = sourcePane ?? ws.focusedPaneID ?? ws.layout.paneIDs().first else {
+            NSWorkspace.shared.open(url)
+            return
+        }
+        let desc = makeBrowserSurface(workspace: workspace, url: url, title: title)
+        try? ctx.apply(.splitPane(workspace, paneID: targetPane, direction: .right, newSurface: desc))
+        windowController?.refreshFromState()
+        reconcileSurfaceVisibility()
+        publishPaneSplit(workspace: workspace, surface: desc)
+    }
+
+    /// Workspace-relative path + tab title for an absolute target. Files resolve
+    /// via `fileTabInfo`; directories (which `read` rejects) via `list`.
+    private func workspaceRelativeTarget(workspace: WorkspaceID, path: String) -> (relativePath: String, title: String)? {
+        if let info = try? fileTabInfo(workspace: workspace, path: path) { return info }
+        guard let cwd = try? workspaceCwd(workspace),
+              let listed = try? WorkspaceFileService().list(root: cwd, path: path).objectValue,
+              let relativePath = listed["relative_path"]?.stringValue else { return nil }
+        let title = (relativePath as NSString).lastPathComponent
+        return (relativePath, title.isEmpty ? "Files" : title)
+    }
+
+    /// Layout-descriptor mutation (title/metadata) for an existing surface,
+    /// mirroring persistBrowserNavigation's persistence path.
+    private func updateSurfaceDescriptor(workspace: WorkspaceID, surface: SurfaceID, _ mutate: (inout SurfaceDescriptor) -> Void) {
+        guard let ctx = context, var ws = ctx.state.workspaces[workspace] else { return }
+        let result = updateSurface(in: ws.layout, surfaceID: surface, mutate)
+        guard result.changed else { return }
+        ws.layout = result.node
+        ws.updatedAt = Date()
+        ctx.state.workspaces[workspace] = ws
+        ctx.scheduleSnapshotSave()
+    }
+
+    private func makeBrowserSurface(workspace: WorkspaceID, url: URL, title: String) -> SurfaceDescriptor {
+        let browser = configureBrowserSurface(BrowserSurface(workspaceID: workspace, initialURL: url, title: title))
+        SurfaceRegistry.shared.register(browser)
+        var desc = browser.descriptor
+        // Persist the target up front so an app restart before the first
+        // navigation callback still restores this tab to its URL.
+        desc.metadata["url"] = url.absoluteString
         return desc
     }
 
@@ -2952,6 +3075,16 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 }
                 agent.viewModel.onReviewRequested = { [weak self] in
                     _ = try? self?.createSurface(workspace: workspace, type: .rightSidebarTool, paneID: nil, title: "Git")
+                }
+                // UX-MAC_AGENT-OPEN-SPLIT: clicked file mentions / links open
+                // (or reuse) a split panel to the right of this agent surface.
+                agent.viewModel.onOpenFileInSplit = { [weak self, weak agent] path in
+                    guard let self, let agent else { return }
+                    self.openFileInAdjacentSplit(workspace: workspace, sourceSurface: agent.descriptor.id, absolutePath: path)
+                }
+                agent.viewModel.onOpenURLInSplit = { [weak self, weak agent] url in
+                    guard let self, let agent else { return }
+                    self.openURLInAdjacentSplit(workspace: workspace, sourceSurface: agent.descriptor.id, url: url)
                 }
                 agent.viewModel.onRunStateChange = { [weak self] in
                     guard let self else { return }
