@@ -207,6 +207,86 @@ final class WorkspaceFileServiceTests: XCTestCase {
                              "save conflict checks must not read an externally-grown file without the edit size cap")
     }
 
+    func testEditConflictSaveReleasesLockExactlyOnceBeforeConcurrentFollowUp() throws {
+        let file = root.appendingPathComponent("conflict.txt")
+        let concurrentFile = root.appendingPathComponent("concurrent.txt")
+        try "base".write(to: file, atomically: true, encoding: .utf8)
+        try "concurrent".write(to: concurrentFile, atomically: true, encoding: .utf8)
+        let opened = try FileEditSessionStore.shared.open(
+            surfaceID: SurfaceID(),
+            workspaceID: WorkspaceID(),
+            root: root.path,
+            path: "conflict.txt"
+        )
+        let sessionID = try XCTUnwrap(opened.objectValue?["session_id"]?.stringValue)
+        _ = try FileEditSessionStore.shared.applyPatch(
+            sessionID: sessionID,
+            baseDraftRevision: 1,
+            rangeLocation: 0,
+            rangeLength: 0,
+            replacement: "draft ",
+            deviceID: nil
+        )
+        try "external".write(to: file, atomically: true, encoding: .utf8)
+
+        let clockEntered = DispatchSemaphore(value: 0)
+        let releaseClock = DispatchSemaphore(value: 0)
+        let concurrentOpenFinished = DispatchSemaphore(value: 0)
+        let followUpFinished = DispatchSemaphore(value: 0)
+        FileEditSessionStore.shared.setClockForTests {
+            clockEntered.signal()
+            _ = releaseClock.wait(timeout: .now() + 2)
+            return Date()
+        }
+
+        let rootPath = root.path
+        let token = EventBus.shared.subscribe(since: EventBus.shared.currentSeq) { event in
+            guard event.kind == "files.edit.conflict",
+                  event.payload.objectValue?["session_id"]?.stringValue == sessionID else { return }
+            DispatchQueue.global(qos: .userInitiated).async {
+                defer { concurrentOpenFinished.signal() }
+                _ = try? FileEditSessionStore.shared.open(
+                    surfaceID: SurfaceID(),
+                    workspaceID: WorkspaceID(),
+                    root: rootPath,
+                    path: "concurrent.txt"
+                )
+            }
+            XCTAssertEqual(
+                clockEntered.wait(timeout: .now() + 1),
+                .success,
+                "the competing edit open must own the store lock before the conflict save unwinds"
+            )
+        }
+        defer { EventBus.shared.unsubscribe(token) }
+
+        XCTAssertThrowsError(
+            try FileEditSessionStore.shared.save(sessionID: sessionID),
+            "a disk conflict must fail without corrupting the shared edit-session lock"
+        )
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            _ = FileEditSessionStore.shared.session(sessionID: sessionID)
+            followUpFinished.signal()
+        }
+
+        let earlyFollowUp = followUpFinished.wait(timeout: .now() + 0.1)
+        XCTAssertEqual(
+            earlyFollowUp,
+            .timedOut,
+            "a conflict save must not unlock a critical section currently owned by another edit operation"
+        )
+
+        releaseClock.signal()
+        XCTAssertEqual(concurrentOpenFinished.wait(timeout: .now() + 1), .success)
+        if earlyFollowUp == .timedOut {
+            XCTAssertEqual(followUpFinished.wait(timeout: .now() + 1), .success)
+        }
+
+        _ = try FileEditSessionStore.shared.discard(sessionID: sessionID)
+        _ = try FileEditSessionStore.shared.close(sessionID: sessionID)
+    }
+
     func testEditLifecyclePublishesEveryCorrelatedProducerEvent() throws {
         let file = root.appendingPathComponent("notes.txt")
         try "base".write(to: file, atomically: true, encoding: .utf8)
