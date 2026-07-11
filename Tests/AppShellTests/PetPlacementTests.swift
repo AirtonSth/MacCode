@@ -21,6 +21,33 @@ final class PetPlacementTests: XCTestCase {
         )
     }
 
+    func test_defaultPlacementAllowsPetToTouchEveryVisibleEdge() {
+        let size = CGSize(width: 100, height: 100)
+        let bottomLeft = PetPlacement.frame(
+            size: size,
+            normalizedPosition: PetNormalizedPosition(x: 0, y: 0),
+            in: visibleFrame
+        )
+        let topRight = PetPlacement.frame(
+            size: size,
+            normalizedPosition: PetNormalizedPosition(x: 1, y: 1),
+            in: visibleFrame
+        )
+
+        XCTAssertEqual(bottomLeft.minX, visibleFrame.minX, accuracy: 0.001)
+        XCTAssertEqual(bottomLeft.minY, visibleFrame.minY, accuracy: 0.001)
+        XCTAssertEqual(topRight.maxX, visibleFrame.maxX, accuracy: 0.001)
+        XCTAssertEqual(topRight.maxY, visibleFrame.maxY, accuracy: 0.001)
+        XCTAssertEqual(
+            PetPlacement.normalizedPosition(for: bottomLeft, in: visibleFrame),
+            PetNormalizedPosition(x: 0, y: 0)
+        )
+        XCTAssertEqual(
+            PetPlacement.normalizedPosition(for: topRight, in: visibleFrame),
+            PetNormalizedPosition(x: 1, y: 1)
+        )
+    }
+
     func test_clampKeepsEveryPetEdgeInsideVisibleFrameMargin() {
         let margin: CGFloat = 16
         let size = CGSize(width: 100, height: 100)
