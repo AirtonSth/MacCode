@@ -46,6 +46,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
     public var settings: SettingsWindowController?
     public private(set) var petController: PetController?
     public var updater: AppUpdateChecking?
+    var keyWindowProviderForTests: (() -> NSWindow?)?
     public let channel: ReleaseChannel
     private let appSupportOverride: String?
     private let dbOverride: String?
@@ -1192,11 +1193,16 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
     }
 
     @objc private func closeActiveTabOrWindow() {
+        let keyWindow = keyWindowProviderForTests?() ?? NSApp.keyWindow
+        if keyWindow === settings?.window {
+            settings?.close()
+            return
+        }
         // Route through the window controller so the focused pane's
         // unsaved-changes confirm runs; fall back to closing the key
         // window only when no surface is open.
         if windowController?.closeFocusedSurface() == true { return }
-        (NSApp.keyWindow ?? window)?.performClose(nil)
+        (keyWindow ?? window)?.performClose(nil)
     }
 
     @objc private func reopenClosedTab() {

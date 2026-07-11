@@ -1247,6 +1247,7 @@ public struct SettingsView: View {
     private var petSection: some View {
         VStack(alignment: .leading, spacing: DS.Space.md) {
             DSSectionHeaderG("Desktop Pet")
+                .accessibilityIdentifier("settings.pet.section")
 
             settingRow("Show black cat pet") {
                 Toggle("", isOn: Binding(
@@ -1344,7 +1345,6 @@ public struct SettingsView: View {
                 .fixedSize(horizontal: false, vertical: true)
         }
         .dsPanel(padding: DS.Space.lg)
-        .accessibilityIdentifier("settings.pet.section")
     }
 
     private var insomniaSection: some View {
