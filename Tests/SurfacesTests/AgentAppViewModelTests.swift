@@ -2783,6 +2783,78 @@ final class AgentAppViewModelTests: XCTestCase {
                        "macOS must not keep sending a Claude model id after Source switches to Grok")
     }
 
+    func test_sourceAlwaysResolvesToASelectedSnapshotId() throws {
+        let (vm, _) = try makeVM()
+        // Simulate the common mismatch: thread/default stores "codex" while
+        // host snapshots advertise "codex-cli".
+        vm.provider = .codex
+        vm.providerInstanceId = "codex"
+        let snapshots = [
+            AgentProviderSnapshot(
+                id: "codex-cli",
+                provider: .codex,
+                driverKind: .codexCLI,
+                displayName: "Codex",
+                accentColor: "#2F80ED",
+                continuationGroup: "openai-codex",
+                interactionModes: [.default],
+                enabled: true,
+                installed: true,
+                status: .available,
+                models: [AgentModelDescriptor(id: "gpt-5.5", label: "GPT-5.5", provider: .codex)],
+                slashCommands: []
+            ),
+            AgentProviderSnapshot(
+                id: "claude-cli",
+                provider: .claude,
+                driverKind: .claudeCLI,
+                displayName: "Claude",
+                accentColor: "#D97706",
+                continuationGroup: "anthropic-claude",
+                interactionModes: [.default],
+                enabled: true,
+                installed: true,
+                status: .available,
+                models: [AgentModelDescriptor(id: "claude-sonnet-4-6", label: "Claude Sonnet 4.6", provider: .claude)],
+                slashCommands: []
+            ),
+            AgentProviderSnapshot(
+                id: "grok-cli",
+                provider: .grok,
+                driverKind: .grokCLI,
+                displayName: "Grok",
+                accentColor: "#1DA1F2",
+                continuationGroup: "xai-grok",
+                interactionModes: [.default],
+                enabled: true,
+                installed: true,
+                status: .available,
+                models: [AgentModelDescriptor(id: "grok-4.5", label: "Grok 4.5", provider: .grok)],
+                slashCommands: []
+            )
+        ]
+        // applyProviderSnapshots is private; load through the public snapshot path
+        // used by the UI by setting snapshots and re-applying via setProviderInstance
+        // after remapping: first set snapshots, then use setProvider which remaps.
+        vm.providerSnapshots = snapshots
+        // Force remap the way applyProviderSnapshots does when id is stale:
+        // setProvider on current provider should bind to the real snapshot id.
+        vm.setProvider(.codex)
+
+        XCTAssertEqual(vm.providerInstanceId, "codex-cli",
+                       "Source must bind to a real snapshot id so the menu can mark one row")
+        XCTAssertEqual(vm.selectedProviderSnapshot?.id, "codex-cli")
+        XCTAssertEqual(vm.selectedProviderSnapshot?.provider, .codex)
+        // Exactly one Source is selected for the checkmark.
+        let selectedCount = snapshots.filter { $0.id == vm.selectedProviderSnapshot?.id }.count
+        XCTAssertEqual(selectedCount, 1, "exactly one Source must be marked in the picker")
+
+        vm.setProvider(.grok)
+        XCTAssertEqual(vm.providerInstanceId, "grok-cli")
+        XCTAssertEqual(vm.selectedProviderSnapshot?.displayName, "Grok")
+        XCTAssertEqual(vm.model, "grok-4.5")
+    }
+
     func test_providerInstanceSwitchToGrokReplacesForeignModels() throws {
         let (vm, _) = try makeVM()
         vm.provider = .codex

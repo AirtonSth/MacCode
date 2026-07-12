@@ -1369,10 +1369,18 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
 
     private func applyProviderSnapshots(_ snapshots: [AgentProviderSnapshot]) {
         providerSnapshots = snapshots
-        if selectedProviderSnapshot == nil {
-            providerInstanceId = snapshots.first(where: { $0.provider == provider })?.id ?? provider.rawValue
+        // Always bind providerInstanceId to a real snapshot id. Threads often
+        // store "codex" while snapshots use "codex-cli"; without remapping the
+        // Source menu never shows a checkmark (selected: id == providerInstanceId).
+        if snapshots.first(where: { $0.id == providerInstanceId }) == nil {
+            providerInstanceId = snapshots.first(where: { $0.provider == provider && $0.enabled })?.id
+                ?? snapshots.first(where: { $0.provider == provider })?.id
+                ?? snapshots.first(where: \.enabled)?.id
+                ?? snapshots.first?.id
+                ?? provider.rawValue
         }
         if let current = selectedProviderSnapshot {
+            providerInstanceId = current.id
             provider = current.provider
             // F10/F33: keep the fallback flag coherent when snapshot rows
             // replace the VM's own fetch — a snapshot bringing a different
@@ -1675,9 +1683,21 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     public func setProvider(_ newProvider: AgentProvider) {
         guard !executionLocked else { return }
         provider = newProvider
-        providerInstanceId = newProvider.rawValue
-        availableModels = []
-        model = ""
+        // Prefer a real snapshot id when snapshots are loaded so Source stays
+        // checkmarked after a Source switch (ids are "codex-cli", not "codex").
+        if let snap = providerSnapshots.first(where: { $0.provider == newProvider && $0.enabled })
+            ?? providerSnapshots.first(where: { $0.provider == newProvider }) {
+            providerInstanceId = snap.id
+            if availableModelsAreFallback {
+                availableModelsAreFallback = snap.models.map(\.id) == availableModels.map(\.id)
+            }
+            availableModels = snap.models
+            model = snap.models.first?.id ?? ""
+        } else {
+            providerInstanceId = newProvider.rawValue
+            availableModels = []
+            model = ""
+        }
         normalizeSelectedModelOptions()
         persistThreadConfig()
     }
@@ -6717,7 +6737,13 @@ public struct AgentAppView: View {
                 if !vm.providerSnapshots.isEmpty {
                     compactMenuSection("Source")
                     ForEach(vm.providerSnapshots.filter(\.enabled), id: \.id) { snapshot in
-                        compactMenuRow(snapshot.displayName, selected: snapshot.id == vm.providerInstanceId) {
+                        // Resolve via selectedProviderSnapshot so a stale
+                        // providerInstanceId ("codex" vs "codex-cli") still
+                        // marks exactly one Source row.
+                        compactMenuRow(
+                            snapshot.displayName,
+                            selected: snapshot.id == vm.selectedProviderSnapshot?.id
+                        ) {
                             vm.setProviderInstance(snapshot.id)
                         }
                         .disabled(running)
@@ -7646,6 +7672,13 @@ enum PromptComposerKeyAction: Equatable {
         return wantsNewline ? .insertNewline : .send
     }
 
+    /// Whether this key should go through AppKit text input (`interpretKeyEvents`)
+    /// instead of send/history/popup routing.
+    ///
+    /// Dead keys (ABNT/US-International acute, tilde, circumflex, …) often arrive
+    /// with empty `characters` and no Option modifier on the first press. Those
+    /// MUST still use text input so marked-text composition can commit ç/á/é/…
+    /// into the prompt. Only Return/arrows/Esc stay on the command routes.
     static func shouldInterpretTextInput(
         keyCode: UInt16,
         modifiers: NSEvent.ModifierFlags,
@@ -7656,7 +7689,7 @@ enum PromptComposerKeyAction: Equatable {
         case 36, 76, 125, 126, 53:
             return false
         default:
-            return modifiers.contains(.option) || characters?.isEmpty == false
+            return true
         }
     }
 
@@ -7797,6 +7830,13 @@ private final class PromptComposerTextView: NSTextView {
     }
 
     override func keyDown(with event: NSEvent) {
+        // Never divert send/history/popup while a dead-key / IME composition is
+        // in progress — Return must commit the accent (é), not send the message.
+        if hasMarkedText() {
+            interpretKeyEvents([event])
+            return
+        }
+
         if PromptComposerKeyAction.shouldInterpretTextInput(
             keyCode: event.keyCode,
             modifiers: event.modifierFlags,
@@ -7965,7 +8005,9 @@ private struct PromptComposerEditor: NSViewRepresentable {
         textView.onPopupDismiss = onPopupDismiss
         textView.isEditable = isEnabled
         textView.placeholderString = placeholder
-        if textView.string != text {
+        // Do not clobber an in-progress dead-key / IME composition: replacing
+        // `string` while marked text is active aborts accents (ç/á/é) and CJK.
+        if textView.string != text, !textView.hasMarkedText() {
             context.coordinator.applyExternalText(text, to: textView)
         }
         context.coordinator.recalculateHeight()

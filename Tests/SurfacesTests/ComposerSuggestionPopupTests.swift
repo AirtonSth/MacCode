@@ -145,9 +145,9 @@ final class ComposerSuggestionPopupTests: XCTestCase {
     }
 
     // WHY: macOS Option/dead-key input is how users type characters such as ç,
-    // á, and é on common keyboard layouts. The composer must send these events
-    // through AppKit text input so composition commits into the prompt instead
-    // of being swallowed by command/history routing.
+    // á, and é on common keyboard layouts (ABNT, US-International). The composer
+    // must send these events through AppKit text input so composition commits
+    // into the prompt instead of being swallowed by command/history routing.
     func testOptionAndDeadKeyTextInputBypassesCommandRouting() {
         XCTAssertTrue(
             PromptComposerKeyAction.shouldInterpretTextInput(
@@ -163,7 +163,25 @@ final class ComposerSuggestionPopupTests: XCTestCase {
                 modifiers: .option,
                 characters: ""
             ),
-            "dead-key composition must use AppKit text input even when the raw key event has no committed characters yet"
+            "Option dead-key composition must use AppKit text input even with empty characters"
+        )
+        // ABNT / many layouts: acute/tilde dead keys arrive WITHOUT Option and
+        // with empty characters on the first press. They must still compose.
+        XCTAssertTrue(
+            PromptComposerKeyAction.shouldInterpretTextInput(
+                keyCode: 24,
+                modifiers: [],
+                characters: ""
+            ),
+            "plain dead-key (empty characters, no Option) must use AppKit text input for accents"
+        )
+        XCTAssertTrue(
+            PromptComposerKeyAction.shouldInterpretTextInput(
+                keyCode: 0,
+                modifiers: [],
+                characters: "a"
+            ),
+            "plain letter keys must use AppKit text input"
         )
         XCTAssertFalse(
             PromptComposerKeyAction.shouldInterpretTextInput(
