@@ -116,7 +116,12 @@ final class PetCompanionControllerTests: XCTestCase {
             petReduceMotion: reduceMotion
         ))
         return (
-            try PetController(context: context, router: router, openSettings: { _ in false }),
+            try PetController(
+                context: context,
+                router: router,
+                openSettings: { _ in false },
+                extendedReactionDurationProvider: { 100 }
+            ),
             context
         )
     }

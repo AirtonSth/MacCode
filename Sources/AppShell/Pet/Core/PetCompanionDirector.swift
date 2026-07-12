@@ -31,10 +31,16 @@ public enum PetCareAction: String, CaseIterable, Sendable, Equatable {
 public struct PetCompanionCue: Sendable, Equatable {
     public let state: PetAnimationState
     public let returnState: PetAnimationState
+    public let durationMilliseconds: Int64
 
-    public init(state: PetAnimationState, returnState: PetAnimationState) {
+    public init(
+        state: PetAnimationState,
+        returnState: PetAnimationState,
+        durationMilliseconds: Int64 = 1_200
+    ) {
         self.state = state
         self.returnState = returnState
+        self.durationMilliseconds = max(0, durationMilliseconds)
     }
 }
 
@@ -85,8 +91,9 @@ public struct PetCompanionEligibility: Sendable, Equatable {
 }
 
 public struct PetCompanionDirector: Sendable {
-    public static let ambientDelayRange = 300...600
+    public static let ambientDelayRange = 120...240
     public static let workDelayRange = 25...50
+    public static let extendedReactionDurationRange: ClosedRange<Int64> = 30_000...40_000
 
     private static let ambientStates: [PetAnimationState] = [
         .idleBall, .idleScratch, .idleGroom, .idleStretch,
@@ -113,12 +120,17 @@ public struct PetCompanionDirector: Sendable {
             previous: lastAmbientState
         )
         lastAmbientState = state
-        return PetCompanionCue(state: state, returnState: eligibility.baseState)
+        return PetCompanionCue(
+            state: state,
+            returnState: eligibility.baseState,
+            durationMilliseconds: 30_000
+        )
     }
 
     public mutating func nextWorkCue(
         eligibility: PetCompanionEligibility,
-        preferredIndex: Int
+        preferredIndex: Int,
+        durationMilliseconds: Int64 = 35_000
     ) -> PetCompanionCue? {
         guard eligibility.allowsWorkCue else { return nil }
         let state = Self.nonRepeatingState(
@@ -127,7 +139,11 @@ public struct PetCompanionDirector: Sendable {
             previous: lastWorkState
         )
         lastWorkState = state
-        return PetCompanionCue(state: state, returnState: eligibility.baseState)
+        return PetCompanionCue(
+            state: state,
+            returnState: eligibility.baseState,
+            durationMilliseconds: durationMilliseconds
+        )
     }
 
     public mutating func notificationCue(
@@ -149,9 +165,14 @@ public struct PetCompanionDirector: Sendable {
 
     public static func careCue(
         action: PetCareAction,
-        returnState: PetAnimationState
+        returnState: PetAnimationState,
+        durationMilliseconds: Int64 = 35_000
     ) -> PetCompanionCue {
-        PetCompanionCue(state: action.animationState, returnState: returnState)
+        PetCompanionCue(
+            state: action.animationState,
+            returnState: returnState,
+            durationMilliseconds: durationMilliseconds
+        )
     }
 
     private static func nonRepeatingState(

@@ -9,6 +9,74 @@ enum PetAtlasError: Error, Equatable {
     case invalidFrame(state: PetAnimationState, index: Int)
 }
 
+enum PetIdleMicroAction: String, CaseIterable, Decodable, Sendable, Equatable {
+    case blink
+    case tail
+    case ears
+    case gaze
+
+    static let restDelayRange: ClosedRange<TimeInterval> = 6...10
+
+    static func select(_ roll: Int) -> PetIdleMicroAction {
+        switch min(max(roll, 0), 99) {
+        case 0..<65: return .blink
+        case 65..<90: return .gaze
+        case 90..<96: return .tail
+        default: return .ears
+        }
+    }
+
+    var framesPerSecond: Int {
+        switch self {
+        case .blink: return 24
+        case .gaze: return 5
+        case .tail: return 5
+        case .ears: return 12
+        }
+    }
+}
+
+enum PetIdleGazeDirection: Sendable, Equatable {
+    case center
+    case left
+    case right
+    case up
+    case down
+
+    var frameIndex: Int {
+        switch self {
+        case .center: return 0
+        case .left: return 1
+        case .right: return 3
+        case .up: return 5
+        case .down: return 7
+        }
+    }
+
+    static func resolve(deltaX: CGFloat, deltaY: CGFloat, deadZone: CGFloat = 12) -> Self {
+        guard max(abs(deltaX), abs(deltaY)) > deadZone else { return .center }
+        if abs(deltaX) > abs(deltaY) {
+            return deltaX < 0 ? .left : .right
+        }
+        return deltaY < 0 ? .down : .up
+    }
+}
+
+private struct PetIdleMicroManifest: Decodable {
+    let actions: [PetIdleMicroAction]
+    let frames: Int
+    let visualBounds: PetAtlasManifest.Row.VisualBounds
+
+    func validated(frameBounds: CGRect) throws -> Self {
+        guard actions == PetIdleMicroAction.allCases,
+              frames == 8,
+              frameBounds.contains(visualBounds.rect) else {
+            throw PetAtlasError.invalidManifest("invalid idle micro-action manifest")
+        }
+        return self
+    }
+}
+
 struct PetAtlasManifest: Decodable, Equatable {
     struct Dimensions: Decodable, Equatable {
         let height: Int
@@ -140,6 +208,9 @@ final class PetAtlas {
 
     private let rowURLs: [PetAnimationState: URL]
     private var rowImages: [PetAnimationState: CGImage] = [:]
+    private let idleMicroManifest: PetIdleMicroManifest
+    private let idleMicroRowURLs: [PetIdleMicroAction: URL]
+    private var idleMicroRowImage: (action: PetIdleMicroAction, image: CGImage)?
 
     var decodedRowStates: Set<PetAnimationState> { Set(rowImages.keys) }
 
@@ -168,6 +239,38 @@ final class PetAtlas {
         )
         self.atlasURL = atlasURL
 
+        let idleMicroManifestURL = directory
+            .appendingPathComponent("remote-code-black-cat-idle-microactions.json")
+        guard FileManager.default.fileExists(atPath: idleMicroManifestURL.path) else {
+            throw PetAtlasError.missingResource(idleMicroManifestURL.lastPathComponent)
+        }
+        let idleMicroData = try Data(contentsOf: idleMicroManifestURL)
+        self.idleMicroManifest = try JSONDecoder().decode(
+            PetIdleMicroManifest.self,
+            from: idleMicroData
+        ).validated(frameBounds: CGRect(
+            x: 0,
+            y: 0,
+            width: manifest.grid.frameWidth,
+            height: manifest.grid.frameHeight
+        ))
+
+        var idleMicroRows: [PetIdleMicroAction: URL] = [:]
+        for action in PetIdleMicroAction.allCases {
+            let filename = "remote-code-black-cat-idle-\(action.rawValue).png"
+            let url = directory.appendingPathComponent(filename)
+            guard FileManager.default.fileExists(atPath: url.path) else {
+                throw PetAtlasError.missingResource(filename)
+            }
+            try Self.validateImageMetadata(
+                at: url,
+                width: manifest.dimensions.width,
+                height: manifest.grid.frameHeight
+            )
+            idleMicroRows[action] = url
+        }
+        self.idleMicroRowURLs = idleMicroRows
+
         var rows: [PetAnimationState: URL] = [:]
         for state in PetAnimationState.allCases {
             let filename = "remote-code-black-cat-\(state.rawValue).png"
@@ -192,7 +295,43 @@ final class PetAtlas {
         return url
     }
 
+    func idleMicroActionRowURL(for action: PetIdleMicroAction) throws -> URL {
+        guard let url = idleMicroRowURLs[action] else {
+            throw PetAtlasError.missingResource("remote-code-black-cat-idle-\(action.rawValue).png")
+        }
+        return url
+    }
+
+    func idleMicroActionFrame(action: PetIdleMicroAction, index: Int) throws -> PetAtlasFrame {
+        guard (0..<idleMicroManifest.frames).contains(index) else {
+            throw PetAtlasError.invalidFrame(state: .idle, index: index)
+        }
+        if idleMicroRowImage?.action != action {
+            idleMicroRowImage = (action, try decodeIdleMicroRow(action))
+        }
+        guard let rowImage = idleMicroRowImage?.image else {
+            throw PetAtlasError.invalidImage("idle-\(action.rawValue) row did not decode")
+        }
+        let rect = CGRect(
+            x: index * manifest.grid.frameWidth,
+            y: 0,
+            width: manifest.grid.frameWidth,
+            height: manifest.grid.frameHeight
+        )
+        let visualBounds = idleMicroManifest.visualBounds.rect
+        guard let image = rowImage.cropping(to: rect),
+              let displayImage = image.cropping(to: visualBounds) else {
+            throw PetAtlasError.invalidFrame(state: .idle, index: index)
+        }
+        return PetAtlasFrame(state: .idle, index: index, image: image, displayImage: displayImage)
+    }
+
+    func canonicalIdleMicroActionFrame() throws -> PetAtlasFrame {
+        try idleMicroActionFrame(action: .blink, index: 0)
+    }
+
     func activate(_ state: PetAnimationState, adjacent: [PetAnimationState] = []) throws {
+        if state != .idle { idleMicroRowImage = nil }
         var desired: [PetAnimationState] = [state]
         for candidate in adjacent where !desired.contains(candidate) && desired.count < 3 {
             desired.append(candidate)
@@ -248,6 +387,22 @@ final class PetAtlas {
 
     private func decodeRow(_ state: PetAnimationState) throws -> CGImage {
         let url = try rowURL(for: state)
+        guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
+              let image = CGImageSourceCreateImageAtIndex(source, 0, [
+                  kCGImageSourceShouldCacheImmediately: true
+              ] as CFDictionary),
+              image.width == manifest.dimensions.width,
+              image.height == manifest.grid.frameHeight,
+              image.alphaInfo != .none,
+              image.alphaInfo != .noneSkipFirst,
+              image.alphaInfo != .noneSkipLast else {
+            throw PetAtlasError.invalidImage(url.lastPathComponent)
+        }
+        return image
+    }
+
+    private func decodeIdleMicroRow(_ action: PetIdleMicroAction) throws -> CGImage {
+        let url = try idleMicroActionRowURL(for: action)
         guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
               let image = CGImageSourceCreateImageAtIndex(source, 0, [
                   kCGImageSourceShouldCacheImmediately: true

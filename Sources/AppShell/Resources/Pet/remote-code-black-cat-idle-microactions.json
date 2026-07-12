@@ -1,0 +1,15 @@
+{
+  "actions" : [
+    "blink",
+    "tail",
+    "ears",
+    "gaze"
+  ],
+  "frames" : 8,
+  "visualBounds" : {
+    "height" : 106,
+    "width" : 100,
+    "x" : 48,
+    "y" : 50
+  }
+}

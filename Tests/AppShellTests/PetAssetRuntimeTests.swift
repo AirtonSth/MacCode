@@ -40,6 +40,31 @@ final class PetAssetRuntimeTests: XCTestCase {
             "resource validation must inspect image metadata without decoding the full atlas")
     }
 
+    func test_bundledAtlas_resolvesFourIndependentDefaultMicroActionRows() throws {
+        let atlas = try PetAtlas.bundled()
+        let canonicalPixels = rgbaBytes(of: try atlas.canonicalIdleMicroActionFrame().image)
+
+        for action in PetIdleMicroAction.allCases {
+            let url = try atlas.idleMicroActionRowURL(for: action)
+            XCTAssertTrue(FileManager.default.fileExists(atPath: url.path))
+            XCTAssertEqual(url.lastPathComponent, "remote-code-black-cat-idle-\(action.rawValue).png")
+            for index in 0..<8 {
+                let frame = try atlas.idleMicroActionFrame(action: action, index: index)
+                XCTAssertEqual(frame.image.width, 192)
+                XCTAssertEqual(frame.image.height, 208)
+                XCTAssertEqual(
+                    alphaComponents(in: frame.image).reduce(0) { $0 + $1.pixelCount },
+                    alphaComponents(in: frame.displayImage).reduce(0) { $0 + $1.pixelCount },
+                    "idle-\(action.rawValue)[\(index)] must not clip any generated sprite pixels"
+                )
+                if index == 0 {
+                    XCTAssertEqual(rgbaBytes(of: frame.image), canonicalPixels,
+                        "every micro-action must return to the exact same neutral pose")
+                }
+            }
+        }
+    }
+
     func test_frameCropping_isExactAndNearestNeighbor_withBoundedRowCache() throws {
         let atlas = try PetAtlas.bundled()
         try atlas.activate(.idle, adjacent: [.coding])
@@ -216,40 +241,102 @@ final class PetAssetRuntimeTests: XCTestCase {
         XCTAssertEqual(scheduler.maximumActiveTimerCount, 1)
     }
 
-    func test_idlePlaybackHoldsStillBeforeAndBetweenNaturalMotionBursts() throws {
+    func test_idlePlaybackRunsOneNaturalMicroActionAtATime() throws {
         let scheduler = TestPetAnimationScheduler()
-        let controller = try PetAnimationController(atlas: .bundled(), scheduler: scheduler)
+        let controller = try PetAnimationController(
+            atlas: .bundled(),
+            scheduler: scheduler,
+            idleActionProvider: { .blink },
+            idleRestDelayProvider: { 4 }
+        )
         try controller.setState(.idle)
 
         XCTAssertEqual(controller.currentFrameIndex, 0)
-        XCTAssertTrue(
-            (6.0...12.0).contains(try XCTUnwrap(scheduler.lastInterval)),
-            "default idle should stay alive without returning to continuous motion"
-        )
+        XCTAssertEqual(try XCTUnwrap(scheduler.lastInterval), 4)
 
         scheduler.fireActiveTimer()
         XCTAssertEqual(controller.currentFrameIndex, 1,
-            "the idle motion burst should still use the authored movement")
-        XCTAssertEqual(try XCTUnwrap(scheduler.lastInterval), 0.25, accuracy: 0.001,
-            "authored idle motion should keep its natural 4 FPS speed")
+            "a blink must begin without also moving the tail or ears")
+        XCTAssertEqual(controller.currentIdleMicroAction, .blink)
+        XCTAssertEqual(try XCTUnwrap(scheduler.lastInterval), 1.0 / 24.0, accuracy: 0.001,
+            "a feline blink should close and reopen in roughly 167 milliseconds")
 
-        for _ in 0..<7 { scheduler.fireActiveTimer() }
+        for _ in 0..<3 { scheduler.fireActiveTimer() }
 
         XCTAssertEqual(controller.currentFrameIndex, 0)
-        XCTAssertTrue(
-            (6.0...12.0).contains(try XCTUnwrap(scheduler.lastInterval)),
-            "each completed idle burst should return to a short natural rest"
-        )
+        XCTAssertNil(controller.currentIdleMicroAction)
+        XCTAssertEqual(try XCTUnwrap(scheduler.lastInterval), 4)
         XCTAssertEqual(scheduler.maximumActiveTimerCount, 1,
-            "calmer idle playback must not introduce a second timer")
+            "independent micro-actions must preserve one-timer ownership")
+    }
+
+    func test_idleGazeUsesOnlyTheCursorDirectedEyeFrameThenReturnsNeutral() throws {
+        let scheduler = TestPetAnimationScheduler()
+        let controller = try PetAnimationController(
+            atlas: .bundled(),
+            scheduler: scheduler,
+            idleActionProvider: { .gaze },
+            idleRestDelayProvider: { 3 }
+        )
+        controller.idleGazeDirectionProvider = { .right }
+        try controller.setState(.idle)
+
+        scheduler.fireActiveTimer()
+        XCTAssertEqual(controller.currentIdleMicroAction, .gaze)
+        XCTAssertEqual(controller.currentFrameIndex, 3,
+            "only the pupils should select the right-facing cursor frame")
+
+        scheduler.fireActiveTimer()
+        XCTAssertEqual(controller.currentFrameIndex, 3,
+            "the directed gaze should hold briefly instead of scanning every direction")
+        scheduler.fireActiveTimer()
+        XCTAssertEqual(controller.currentFrameIndex, 0)
+        XCTAssertNil(controller.currentIdleMicroAction)
+        XCTAssertEqual(scheduler.maximumActiveTimerCount, 1)
+        XCTAssertEqual(PetIdleGazeDirection.resolve(deltaX: -40, deltaY: 4), .left)
+        XCTAssertEqual(PetIdleGazeDirection.resolve(deltaX: 40, deltaY: 4), .right)
+        XCTAssertEqual(PetIdleGazeDirection.resolve(deltaX: 4, deltaY: 40), .up)
+        XCTAssertEqual(PetIdleGazeDirection.resolve(deltaX: 4, deltaY: -40), .down)
+        XCTAssertEqual(PetIdleGazeDirection.resolve(deltaX: 4, deltaY: 4), .center)
+    }
+
+    func test_defaultMicroActionWeightsFavorBlinkAndKeepTailAndEarsRare() {
+        XCTAssertEqual(PetIdleMicroAction.restDelayRange, 6...10,
+            "4.1–6.5 feline blinks per minute maps to a natural 9–15 second expected blink cadence")
+        XCTAssertEqual((0..<65).map(PetIdleMicroAction.select).filter { $0 == .blink }.count, 65)
+        XCTAssertEqual((65..<90).map(PetIdleMicroAction.select).filter { $0 == .gaze }.count, 25)
+        XCTAssertEqual((90..<96).map(PetIdleMicroAction.select).filter { $0 == .tail }.count, 6)
+        XCTAssertEqual((96..<100).map(PetIdleMicroAction.select).filter { $0 == .ears }.count, 4)
+    }
+
+    func test_extendedCompanionReactionLoopsUntilReducerReturnsIt() throws {
+        let scheduler = TestPetAnimationScheduler()
+        let controller = try PetAnimationController(atlas: .bundled(), scheduler: scheduler)
+
+        try controller.setState(.eating)
+        for _ in 0..<8 { scheduler.fireActiveTimer() }
+        XCTAssertEqual(controller.currentFrameIndex, 0)
+        XCTAssertEqual(scheduler.activeTimerCount, 1,
+            "a 30–40 second care reaction must keep animating instead of freezing")
+
+        try controller.setState(.notificationPounce)
+        for _ in 0..<7 { scheduler.fireActiveTimer() }
+        XCTAssertEqual(controller.currentFrameIndex, 7)
+        XCTAssertEqual(scheduler.activeTimerCount, 0,
+            "short event feedback must not repeat for 30–40 seconds")
     }
 
     func test_loopPlayback_wraps_andKeepsSingleTimer() throws {
         let scheduler = TestPetAnimationScheduler()
-        let controller = try PetAnimationController(atlas: .bundled(), scheduler: scheduler)
+        let controller = try PetAnimationController(
+            atlas: .bundled(),
+            scheduler: scheduler,
+            idleActionProvider: { .blink },
+            idleRestDelayProvider: { 4 }
+        )
         try controller.setState(.idle)
 
-        for _ in 0..<8 { scheduler.fireActiveTimer() }
+        for _ in 0..<4 { scheduler.fireActiveTimer() }
 
         XCTAssertEqual(controller.currentState, .idle)
         XCTAssertEqual(controller.currentFrameIndex, 0)
@@ -301,6 +388,21 @@ final class PetAssetRuntimeTests: XCTestCase {
 private struct AlphaComponent {
     let pixelCount: Int
     let bounds: CGRect
+}
+
+private func rgbaBytes(of image: CGImage) -> [UInt8] {
+    var pixels = [UInt8](repeating: 0, count: image.width * image.height * 4)
+    let context = CGContext(
+        data: &pixels,
+        width: image.width,
+        height: image.height,
+        bitsPerComponent: 8,
+        bytesPerRow: image.width * 4,
+        space: CGColorSpaceCreateDeviceRGB(),
+        bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+    )!
+    context.draw(image, in: CGRect(x: 0, y: 0, width: image.width, height: image.height))
+    return pixels
 }
 
 private func union(of components: [AlphaComponent]) -> CGRect? {

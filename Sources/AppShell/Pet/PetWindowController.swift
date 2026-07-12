@@ -722,6 +722,16 @@ public final class PetWindowController: NSObject {
         if isPopoverVisible { positionPopover() }
     }
 
+    func idleGazeDirection() -> PetIdleGazeDirection {
+        guard let panel = petPanel else { return .center }
+        let cursor = NSEvent.mouseLocation
+        return PetIdleGazeDirection.resolve(
+            deltaX: cursor.x - panel.frame.midX,
+            deltaY: cursor.y - panel.frame.midY,
+            deadZone: 12
+        )
+    }
+
     private func petSize(scale: Double) -> CGSize {
         let scale = CGFloat([0.75, 1, 1.25, 1.5].contains(scale) ? scale : 1)
         guard let image = model.currentFrame?.displayImage else {

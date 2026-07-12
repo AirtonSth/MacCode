@@ -20,11 +20,15 @@ final class PetAppDelegateLifecycleTests: XCTestCase {
         XCTAssertTrue(panel.isVisible, "a fresh install must show the Pet immediately")
 
         let atlas = try PetAtlas.bundled()
-        let row = try XCTUnwrap(atlas.manifest.row(for: .idle))
         var visualBounds: CGRect?
-        for index in 0..<row.frames {
-            let bounds = try opaqueBounds(of: atlas.frame(state: .idle, index: index).image)
-            visualBounds = visualBounds.map { $0.union(bounds) } ?? bounds
+        for action in PetIdleMicroAction.allCases {
+            for index in 0..<8 {
+                let bounds = try opaqueBounds(of: atlas.idleMicroActionFrame(
+                    action: action,
+                    index: index
+                ).image)
+                visualBounds = visualBounds.map { $0.union(bounds) } ?? bounds
+            }
         }
         let idleBounds = try XCTUnwrap(visualBounds)
         let existingSourcePixelScale = CGFloat(118.0 / 192.0)

@@ -343,7 +343,7 @@ public struct PetEventReducer: Sendable {
                   state != .sleeping else { return false }
             setTransient(
                 cue.state,
-                milliseconds: Self.standardTransientMilliseconds,
+                milliseconds: cue.durationMilliseconds,
                 companionReturnState: cue.returnState
             )
             return false
