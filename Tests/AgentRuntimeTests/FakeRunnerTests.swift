@@ -1232,15 +1232,21 @@ final class FakeRunnerTests: XCTestCase {
     }
 
     func test_stopRunInterruptsActiveProviderAdapterForCodexAndClaude() async throws {
-        for provider in [AgentProvider.codex, .claude] {
+        for provider in [AgentProvider.codex, .claude, .grok] {
             let tmp = NSTemporaryDirectory() + "rc2-active-stop-\(provider.rawValue)-" + UUID().uuidString
             let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
             let threadRepo = AgentThreadRepository(db: db)
             let messageRepo = AgentMessageRepository(db: db)
             let runRepo = AgentRunRepository(db: db)
+            let model: String
+            switch provider {
+            case .codex: model = "gpt-5.5"
+            case .claude: model = "claude-opus-4-7"
+            case .grok: model = "grok-4.5"
+            }
             let thread = AgentThread(title: "stop \(provider.rawValue)",
                                      provider: provider,
-                                     model: provider == .codex ? "gpt-5.5" : "claude-opus-4-7")
+                                     model: model)
             try threadRepo.upsert(thread)
             let adapter = SpyProviderAdapter(provider: provider, finishImmediately: false)
             let coordinator = AgentRunCoordinator(runRepo: runRepo,

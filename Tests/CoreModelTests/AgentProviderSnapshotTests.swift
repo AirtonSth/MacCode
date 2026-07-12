@@ -92,4 +92,47 @@ final class AgentProviderSnapshotTests: XCTestCase {
         XCTAssertEqual(snapshot.statusDetail, "Update available: Claude Code 2.2.0",
                        "provider status cards must show stale CLI advisories before long-running agent work starts on an outdated provider")
     }
+
+    func test_grokIsFirstClassProviderInAllCasesAndSnapshot() {
+        XCTAssertTrue(AgentProvider.allCases.contains(.grok),
+                      "Grok must be selectable on the same Source surface as Codex/Claude")
+        XCTAssertEqual(AgentProvider.grok.rawValue, "grok")
+
+        let models = [AgentModelDescriptor(id: "grok-4.5", label: "Grok 4.5", provider: .grok)]
+        let snapshot = AgentProviderSnapshotFactory.snapshot(
+            provider: .grok,
+            models: models,
+            binaryPath: "/Users/me/.grok/bin/grok",
+            version: "grok 0.2.93",
+            authenticated: true
+        )
+
+        XCTAssertEqual(snapshot.provider, .grok)
+        XCTAssertEqual(snapshot.driverKind, .grokCLI)
+        XCTAssertEqual(snapshot.displayName, "Grok")
+        XCTAssertEqual(snapshot.id, "grok-cli")
+        XCTAssertTrue(snapshot.installed)
+        XCTAssertEqual(snapshot.status, .available)
+        XCTAssertEqual(snapshot.models.first?.provider, .grok)
+        XCTAssertFalse(snapshot.slashCommands.isEmpty,
+                       "composer slash defaults must exist for Grok like other providers")
+    }
+
+    func test_grokWireDecodeDoesNotRemapToCodexOrClaude() throws {
+        let json = #"{"id":"grok-4.5","label":"Grok 4.5","provider":"grok","supportsReasoning":true}"#.data(using: .utf8)!
+        let descriptor = try JSONDecoder().decode(AgentModelDescriptor.self, from: json)
+        XCTAssertEqual(descriptor.provider, .grok)
+        XCTAssertNotEqual(descriptor.provider, .codex)
+        XCTAssertNotEqual(descriptor.provider, .claude)
+
+        let snapshotJSON = """
+        {"id":"grok-cli","provider":"grok","driverKind":"grok_cli","displayName":"Grok",
+         "accentColor":"#1DA1F2","continuationGroup":"xai-grok","interactionModes":["default","plan"],
+         "enabled":true,"installed":true,"status":"available","environmentKeys":[],
+         "models":[],"slashCommands":["/model"],"skills":[]}
+        """.data(using: .utf8)!
+        let snapshot = try JSONDecoder().decode(AgentProviderSnapshot.self, from: snapshotJSON)
+        XCTAssertEqual(snapshot.provider, .grok)
+        XCTAssertEqual(snapshot.driverKind, .grokCLI)
+    }
 }

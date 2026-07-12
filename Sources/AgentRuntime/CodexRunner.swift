@@ -45,6 +45,7 @@ public enum ProcessLocator {
             .map(String.init)
         paths.insert("\(homeDirectory)/.remote-code/bin", at: 0)
         paths.append(contentsOf: [
+            "\(homeDirectory)/.grok/bin",
             "/opt/homebrew/bin",
             "/usr/local/bin",
             "\(homeDirectory)/.local/bin",

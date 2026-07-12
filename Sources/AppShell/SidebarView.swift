@@ -2746,9 +2746,7 @@ public struct SidebarRootView: View {
 
     private func tokenSaverDefaultWeeklyLimitTokens(for provider: AgentProvider) -> Int {
         switch provider {
-        case .claude:
-            return 1_000_000
-        case .codex:
+        case .claude, .codex, .grok:
             return 1_000_000
         }
     }
@@ -3052,6 +3050,8 @@ public struct SidebarRootView: View {
             return Color(nsColor: .systemOrange)
         case .codex:
             return Color(nsColor: .systemBlue)
+        case .grok:
+            return Color(nsColor: .systemTeal)
         }
     }
 
@@ -3059,6 +3059,7 @@ public struct SidebarRootView: View {
         switch provider {
         case .claude: return "Claude"
         case .codex: return "Codex"
+        case .grok: return "Grok"
         }
     }
 

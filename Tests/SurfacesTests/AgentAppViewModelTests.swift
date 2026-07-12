@@ -2753,6 +2753,88 @@ final class AgentAppViewModelTests: XCTestCase {
                        "macOS must not keep sending the old Codex model after the user switches Source to Claude")
     }
 
+    func test_providerSwitchToGrokClearsStaleCodexAndClaudeModels() throws {
+        let (vm, _) = try makeVM()
+        vm.provider = .codex
+        vm.availableModels = [
+            AgentModelDescriptor(id: "gpt-5.5", label: "GPT-5.5", provider: .codex)
+        ]
+        vm.model = "gpt-5.5"
+
+        vm.setProvider(.grok)
+
+        XCTAssertEqual(vm.provider, .grok)
+        XCTAssertEqual(vm.providerInstanceId, AgentProvider.grok.rawValue)
+        XCTAssertEqual(vm.availableModels, [],
+                       "macOS Source→Grok must clear stale Codex model rows while Grok models load")
+        XCTAssertEqual(vm.model, "",
+                       "macOS must not keep sending a Codex model id after Source switches to Grok")
+
+        vm.provider = .claude
+        vm.availableModels = [
+            AgentModelDescriptor(id: "claude-sonnet-4-6", label: "Claude Sonnet 4.6", provider: .claude)
+        ]
+        vm.model = "claude-sonnet-4-6"
+        vm.setProvider(.grok)
+
+        XCTAssertEqual(vm.provider, .grok)
+        XCTAssertEqual(vm.availableModels, [])
+        XCTAssertEqual(vm.model, "",
+                       "macOS must not keep sending a Claude model id after Source switches to Grok")
+    }
+
+    func test_providerInstanceSwitchToGrokReplacesForeignModels() throws {
+        let (vm, _) = try makeVM()
+        vm.provider = .codex
+        vm.providerInstanceId = "codex-cli"
+        vm.availableModels = [
+            AgentModelDescriptor(id: "gpt-5.5", label: "GPT-5.5", provider: .codex)
+        ]
+        vm.model = "gpt-5.5"
+        let grokModels = [
+            AgentModelDescriptor(id: "grok-4.5", label: "Grok 4.5", provider: .grok, supportsReasoning: true)
+        ]
+        vm.providerSnapshots = [
+            AgentProviderSnapshot(
+                id: "codex-cli",
+                provider: .codex,
+                driverKind: .codexCLI,
+                displayName: "Codex",
+                accentColor: "#2F80ED",
+                continuationGroup: "openai-codex",
+                interactionModes: [.default],
+                enabled: true,
+                installed: true,
+                status: .available,
+                models: [AgentModelDescriptor(id: "gpt-5.5", label: "GPT-5.5", provider: .codex)],
+                slashCommands: []
+            ),
+            AgentProviderSnapshot(
+                id: "grok-cli",
+                provider: .grok,
+                driverKind: .grokCLI,
+                displayName: "Grok",
+                accentColor: "#1DA1F2",
+                continuationGroup: "xai-grok",
+                interactionModes: [.default, .plan],
+                enabled: true,
+                installed: true,
+                status: .available,
+                models: grokModels,
+                slashCommands: []
+            )
+        ]
+
+        vm.setProviderInstance("grok-cli")
+
+        XCTAssertEqual(vm.provider, .grok)
+        XCTAssertEqual(vm.providerInstanceId, "grok-cli")
+        XCTAssertEqual(vm.availableModels.map(\.id), ["grok-4.5"],
+                       "instance switch to Grok must replace Codex model rows with Grok snapshot models")
+        XCTAssertEqual(vm.model, "grok-4.5",
+                       "foreign Codex model id must be replaced by the first Grok model after instance switch")
+    }
+
     func test_providerInstancePickerCannotShowClaudeSourceWithCodexModels() throws {
         let (vm, _) = try makeVM()
         vm.provider = .codex

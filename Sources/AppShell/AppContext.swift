@@ -185,11 +185,14 @@ public final class AppContext {
         let claude: AgentProviderAdapter = ProcessInfo.processInfo.environment["RC_CLAUDE_AGENT_SDK_ENABLED"] == "0"
             ? ClaudeStreamingCLIAdapter(binaryNameOverride: try? settingsRepo.get("cli.claude.path"))
             : ClaudeAgentSDKBridgeAdapter()
+        let grok = OneShotProviderAdapter(
+            runner: GrokRunner(binaryNameOverride: try? settingsRepo.get("cli.grok.path"))
+        )
         self.coordinator = AgentRunCoordinator(
             runRepo: runRepo, messageRepo: messageRepo, threadRepo: threadRepo,
             providerSessionRepo: providerSessionRuntimeRepo,
             checkpointRepo: turnCheckpointRepo,
-            providerAdapters: [.codex: codex, .claude: claude]
+            providerAdapters: [.codex: codex, .claude: claude, .grok: grok]
         )
         try coordinator.reconcileOnLaunch()
         try? tokenSaverSavingsRepo.prune()

@@ -35,6 +35,8 @@ enum ProviderStderrClassifier {
             if lower.contains("codex") && lower.contains("warning") { return false }
         case .claude:
             if lower.contains("claude") && lower.contains("warning") { return false }
+        case .grok:
+            if lower.contains("grok") && lower.contains("warning") { return false }
         }
         return true
     }

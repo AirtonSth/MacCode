@@ -356,6 +356,7 @@ public struct AgentModelDescriptor: Codable, Sendable, Equatable, Hashable {
 public enum AgentProviderDriverKind: String, Codable, Sendable {
     case codexCLI = "codex_cli"
     case claudeCLI = "claude_cli"
+    case grokCLI = "grok_cli"
 }
 
 public enum AgentProviderSnapshotStatus: String, Codable, Sendable {
@@ -525,6 +526,44 @@ public enum AgentProviderSnapshotFactory {
                 displayName: displayName ?? "Claude",
                 accentColor: accentColor ?? "#D97706",
                 continuationGroup: "anthropic-claude",
+                interactionModes: [.default, .plan],
+                enabled: enabled,
+                installed: installed,
+                version: version,
+                status: status,
+                statusDetail: statusDetail,
+                authenticated: authenticated,
+                accountLabel: accountLabel,
+                accountAuthMethod: accountAuthMethod,
+                binaryPath: binaryPath?.isEmpty == false ? binaryPath : nil,
+                homePath: homePath?.isEmpty == false ? homePath : nil,
+                environmentKeys: environmentKeys,
+                models: models,
+                slashCommands: uniqueSlashCommands(defaults: ["/clear", "/default", "/model", "/plan", "/status", "/fork"], probed: slashCommands),
+                skills: unique(skills),
+                advisory: advisory,
+                updateState: updateState
+            )
+        case .grok:
+            let status: AgentProviderSnapshotStatus = enabled
+                ? (!installed || models.isEmpty ? .unavailable : (authenticated == false || updateState == "update_available" ? .warning : .available))
+                : .disabled
+            let statusDetail = Self.statusDetail(
+                providerName: "Grok",
+                installed: installed,
+                hasModels: !models.isEmpty,
+                authenticated: authenticated,
+                advisory: advisory,
+                updateState: updateState,
+                enabled: enabled
+            )
+            return AgentProviderSnapshot(
+                id: id ?? "grok-cli",
+                provider: .grok,
+                driverKind: .grokCLI,
+                displayName: displayName ?? "Grok",
+                accentColor: accentColor ?? "#1DA1F2",
+                continuationGroup: "xai-grok",
                 interactionModes: [.default, .plan],
                 enabled: enabled,
                 installed: installed,

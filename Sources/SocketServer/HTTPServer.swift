@@ -775,7 +775,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
                 "ssh": [
                     "methods": ["ssh.host.list", "ssh.host.upsert", "ssh.host.delete", "ssh.connect", "ssh.disconnect", "ssh.transfer.upload", "ssh.transfer.download", "ssh.files.local.list", "ssh.files.remote.list"]
                 ],
-                "agent": ["providers": ["codex", "claude"], "supports_stream_events": true, "supports_resume": true],
+                "agent": ["providers": ["codex", "claude", "grok"], "supports_stream_events": true, "supports_resume": true],
                 "browser_automation": [
                     "p0": ["navigate", "back", "forward", "reload", "url.get", "mirror_url.get"],
                     "p1": ["click", "fill", "type", "focus", "hover", "check", "uncheck", "select", "eval", "snapshot", "screenshot", "wait"],

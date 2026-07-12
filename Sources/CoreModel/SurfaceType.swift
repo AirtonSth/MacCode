@@ -29,6 +29,7 @@ public enum SurfaceFocusIntent: Sendable, Equatable {
 public enum AgentProvider: String, Codable, Sendable, CaseIterable {
     case codex
     case claude
+    case grok
 }
 
 public struct SurfaceDescriptor: Codable, Sendable, Hashable {

@@ -722,6 +722,8 @@ public final class AgentSkillInstaller: @unchecked Sendable {
         switch provider {
         case .claude: return claudeInstructionsURL
         case .codex: return codexInstructionsURL
+        case .grok:
+            return homeDirectoryURL().appendingPathComponent(".grok/AGENTS.md")
         }
     }
 
@@ -738,7 +740,15 @@ public final class AgentSkillInstaller: @unchecked Sendable {
         switch provider {
         case .claude: return claudeSkillsRoot
         case .codex: return codexSkillsRoot
+        case .grok:
+            return homeDirectoryURL().appendingPathComponent(".grok/skills", isDirectory: true)
         }
+    }
+
+    private func homeDirectoryURL() -> URL {
+        claudeSkillsRoot
+            .deletingLastPathComponent() // .claude
+            .deletingLastPathComponent() // home
     }
 
     public static func sha256Hex(_ data: Data) -> String {

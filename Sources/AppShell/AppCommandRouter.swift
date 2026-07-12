@@ -2187,9 +2187,15 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
 
     public func listAgentModels(provider: AgentProvider) async -> [AgentModelDescriptor] {
         let binary = configuredProviderBinary(provider)
-        let runner: AgentProviderRunner = provider == .codex
-            ? CodexRunner(binaryNameOverride: binary)
-            : ClaudeRunner(binaryNameOverride: binary)
+        let runner: AgentProviderRunner
+        switch provider {
+        case .codex:
+            runner = CodexRunner(binaryNameOverride: binary)
+        case .claude:
+            runner = ClaudeRunner(binaryNameOverride: binary)
+        case .grok:
+            runner = GrokRunner(binaryNameOverride: binary)
+        }
         return await runner.listModels()
     }
 
@@ -2280,6 +2286,8 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         case .claude:
             let apiModels = await AnthropicModelDiscovery.listModels(environment: environment)
             return apiModels.isEmpty ? ClaudeRunner.listModels(installedVersion: installedVersion) : apiModels
+        case .grok:
+            return GrokRunner.listModels(installedVersion: installedVersion)
         }
     }
 
@@ -2314,6 +2322,10 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             home = environment["CODEX_HOME"] ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".codex").path
         case .claude:
             home = environment["HOME"] ?? FileManager.default.homeDirectoryForCurrentUser.path
+        case .grok:
+            home = environment["GROK_HOME"]
+                ?? environment["HOME"]
+                ?? FileManager.default.homeDirectoryForCurrentUser.path
         }
         let skillsRoot: URL
         switch provider {
@@ -2321,6 +2333,8 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             skillsRoot = URL(fileURLWithPath: home, isDirectory: true).appendingPathComponent("skills", isDirectory: true)
         case .claude:
             skillsRoot = URL(fileURLWithPath: home, isDirectory: true).appendingPathComponent(".claude/skills", isDirectory: true)
+        case .grok:
+            skillsRoot = URL(fileURLWithPath: home, isDirectory: true).appendingPathComponent(".grok/skills", isDirectory: true)
         }
         return Self.discoverSkillNames(in: skillsRoot)
     }
@@ -2437,6 +2451,8 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 env["CODEX_HOME"] = env["CODEX_HOME"] ?? home
             case .claude:
                 env["HOME"] = env["HOME"] ?? home
+            case .grok:
+                env["HOME"] = env["HOME"] ?? home
             }
         }
         // VITAL for the savings report: tag the agent's environment with the provider so the
@@ -2476,6 +2492,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         switch provider {
         case .codex: key = "cli.codex.path"
         case .claude: key = "cli.claude.path"
+        case .grok: key = "cli.grok.path"
         }
         guard let value = try? context?.settingsRepo.get(key)?.trimmingCharacters(in: .whitespacesAndNewlines),
               !value.isEmpty else { return nil }

@@ -417,7 +417,7 @@ public final class JSONRPCDispatcher {
                         ])
                     ]),
                     "agent": .object([
-                        "providers": .array([.string("codex"), .string("claude")]),
+                        "providers": .array([.string("codex"), .string("claude"), .string("grok")]),
                         "supports_stream_events": .bool(true),
                         "supports_resume": .bool(true)
                     ]),

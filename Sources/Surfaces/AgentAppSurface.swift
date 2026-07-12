@@ -1427,7 +1427,8 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             let codexModels = await CodexRunner().listModels()
             let fallback = [
                 AgentProviderSnapshotFactory.snapshot(provider: .codex, models: codexModels, binaryPath: ""),
-                AgentProviderSnapshotFactory.snapshot(provider: .claude, models: ClaudeRunner.listModels(installedVersion: nil), binaryPath: "")
+                AgentProviderSnapshotFactory.snapshot(provider: .claude, models: ClaudeRunner.listModels(installedVersion: nil), binaryPath: ""),
+                AgentProviderSnapshotFactory.snapshot(provider: .grok, models: GrokRunner.listModels(installedVersion: nil), binaryPath: "")
             ]
             await MainActor.run {
                 guard self.providerSnapshots.isEmpty else { return }
@@ -1542,7 +1543,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         if efforts.isEmpty {
             reasoningEffort = .medium
         } else if !efforts.contains(reasoningEffort) {
-            reasoningEffort = efforts.first ?? .medium
+            // Prefer the model default when clamping (Grok 4.5 default is high;
+            // otherwise keep the first advertised level).
+            reasoningEffort = efforts.contains(.high) ? .high : (efforts.first ?? .medium)
         }
         if !supportsServiceTierForSelectedModel {
             serviceTier = .auto
@@ -1619,7 +1622,14 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         if snapshot.authenticated == false {
             command = "\(snapshot.provider.rawValue) login"
         } else {
-            command = snapshot.provider == .codex ? "npm install -g @openai/codex" : "npm install -g @anthropic-ai/claude-code"
+            switch snapshot.provider {
+            case .codex:
+                command = "npm install -g @openai/codex"
+            case .claude:
+                command = "npm install -g @anthropic-ai/claude-code"
+            case .grok:
+                command = "curl -fsSL https://x.ai/cli/install.sh | bash"
+            }
         }
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(command, forType: .string)

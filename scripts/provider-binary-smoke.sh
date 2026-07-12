@@ -45,6 +45,22 @@ else
   echo "SKIP: codex binary not found"
 fi
 
+if command -v grok >/dev/null 2>&1; then
+  ran=1
+  grok_version="$(grok --version 2>&1)"
+  grok_help="$(grok --help 2>&1)"
+  require_text "grok --help" "$grok_help" "--output-format"
+  require_text "grok --help" "$grok_help" "streaming-json"
+  require_text "grok --help" "$grok_help" "--permission-mode"
+  require_text "grok --help" "$grok_help" "--resume"
+  require_text "grok --help" "$grok_help" "--model"
+  require_text "grok --help" "$grok_help" "--single"
+  require_text "grok --help" "$grok_help" "agent"
+  echo "PASS: grok smoke: $grok_version"
+else
+  echo "SKIP: grok binary not found"
+fi
+
 if [[ "$ran" -eq 0 ]]; then
   echo "SKIP: no provider binaries found; lane is gated by installed binaries"
 fi

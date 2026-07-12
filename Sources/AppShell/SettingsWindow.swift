@@ -263,12 +263,15 @@ public final class SettingsViewModel: ObservableObject {
     var _pendingRemoteAccessToggle = false
     @Published public var codexPath: String = ""
     @Published public var claudePath: String = ""
+    @Published public var grokPath: String = ""
     /// Last value that was actually persisted + wired into the coordinator.
     /// Used by CLIPathCommitPolicy to skip no-op commits.
     public var committedCodexPath: String = ""
     public var committedClaudePath: String = ""
+    public var committedGrokPath: String = ""
     @Published public var codexAvailable: Bool = false
     @Published public var claudeAvailable: Bool = false
+    @Published public var grokAvailable: Bool = false
     @Published public var devices: [DeviceTrust] = []
     @Published public var auditLogEntries: [AuditLogEntry] = []
     @Published public var newPairingCode: String?
@@ -478,10 +481,13 @@ public final class SettingsViewModel: ObservableObject {
         refreshDistillInstallStatus()
         codexPath = cliPath(key: "cli.codex.path", fallback: "codex")
         claudePath = cliPath(key: "cli.claude.path", fallback: "claude")
+        grokPath = cliPath(key: "cli.grok.path", fallback: "grok")
         committedCodexPath = codexPath
         committedClaudePath = claudePath
+        committedGrokPath = grokPath
         codexAvailable = resolveAvailable(codexPath)
         claudeAvailable = resolveAvailable(claudePath)
+        grokAvailable = resolveAvailable(grokPath)
         // Do NOT clear providerUpdateMessages here — an account/remote-access
         // notification-driven reload was erasing update results the user may
         // be reading (P2-Settings-6).  Messages are cleared only by the setters
@@ -689,6 +695,17 @@ public final class SettingsViewModel: ObservableObject {
             committedClaudePath = path
             providerUpdateMessages[.claude] = nil
             saveCLIPath(key: "cli.claude.path", provider: .claude, path: path)
+        }
+    }
+
+    /// Update the Grok CLI path draft. Same commit policy as Codex/Claude paths.
+    public func setGrokPath(_ path: String, committed: Bool = true) {
+        grokPath = path
+        grokAvailable = resolveAvailable(path)
+        if CLIPathCommitPolicy.shouldApply(old: committedGrokPath, new: path, committed: committed) {
+            committedGrokPath = path
+            providerUpdateMessages[.grok] = nil
+            saveCLIPath(key: "cli.grok.path", provider: .grok, path: path)
         }
     }
 
@@ -913,6 +930,11 @@ public final class SettingsViewModel: ObservableObject {
             } else {
                 context.coordinator.replaceProviderAdapter(.claude, adapter: ClaudeAgentSDKBridgeAdapter())
             }
+        case .grok:
+            context.coordinator.replaceProviderAdapter(
+                .grok,
+                adapter: OneShotProviderAdapter(runner: GrokRunner(binaryNameOverride: trimmed.isEmpty ? nil : trimmed))
+            )
         }
     }
 
@@ -1008,6 +1030,7 @@ public struct SettingsView: View {
     /// mid-edit keystrokes don't fire saveCLIPath / replaceProviderAdapter.
     @State private var codexPathDraft: String = ""
     @State private var claudePathDraft: String = ""
+    @State private var grokPathDraft: String = ""
 
     public init(vm: SettingsViewModel, onClose: (() -> Void)? = nil) {
         self.vm = vm
@@ -1122,9 +1145,11 @@ public struct SettingsView: View {
         .onAppear {
             codexPathDraft = vm.codexPath
             claudePathDraft = vm.claudePath
+            grokPathDraft = vm.grokPath
         }
         .onChange(of: vm.codexPath) { codexPathDraft = $0 }
         .onChange(of: vm.claudePath) { claudePathDraft = $0 }
+        .onChange(of: vm.grokPath) { grokPathDraft = $0 }
     }
 
     @ViewBuilder
@@ -1702,6 +1727,14 @@ public struct SettingsView: View {
                 onCommit: { vm.setClaudePath(claudePathDraft, committed: true) },
                 available: vm.claudeAvailable,
                 provider: .claude
+            )
+            cliPathRow(
+                label: "Grok path",
+                draft: $grokPathDraft,
+                onDraftChange: { vm.setGrokPath($0, committed: false) },
+                onCommit: { vm.setGrokPath(grokPathDraft, committed: true) },
+                available: vm.grokAvailable,
+                provider: .grok
             )
             if vm.showsAppUpdates {
                 appUpdatesRow
