@@ -333,6 +333,26 @@ enum ScrollbackKeyAction {
 }
 
 enum GhosttyTerminalKeyInput {
+    /// How printable keyDowns must reach Ghostty.
+    ///
+    /// Full-screen TUIs (Grok, vim, etc.) enable Kitty keyboard progressive
+    /// enhancement and treat `ghostty_surface_text` as *paste*, not typing.
+    /// Space and other committed printables must go through `ghostty_surface_key`
+    /// so the encoder emits proper key events. Dead keys / IME marked text still
+    /// need AppKit `interpretKeyEvents` so composition can run.
+    enum PrintableRoute: Equatable {
+        /// Dead-key / IME composition — call `interpretKeyEvents` only.
+        case composeViaTextInput
+        /// Committed printable (incl. Space) — send `ghostty_surface_key` PRESS.
+        case surfaceKey
+    }
+
+    static func printableRoute(hasMarkedText: Bool, characters: String?) -> PrintableRoute {
+        if hasMarkedText { return .composeViaTextInput }
+        if characters?.isEmpty != false { return .composeViaTextInput }
+        return .surfaceKey
+    }
+
     static func text(for event: NSEvent) -> String? {
         guard let text = event.characters, !text.isEmpty else { return nil }
         if text.count == 1, let scalar = text.unicodeScalars.first {
@@ -1548,21 +1568,29 @@ final class GhosttyTerminalView: NSView {
             return
         }
         if TerminalKeyboardInput.shouldUseTextInput(for: event) {
-            // Route printable input through AppKit's text-input system so the
-            // active keyboard layout owns composition. Dead keys (´ ` ^ ~ ¨ on
-            // ABNT2 / US-International / Portuguese etc.) compose accented glyphs
-            // — ~ then a → ã, ' then e → é — via our NSTextInputClient
-            // (setMarkedText → ghostty_surface_preedit, then insertText commits
-            // the composed text). Non-dead-key layouts commit the literal char
-            // directly (~/`/'/" on a plain US layout), exactly like Terminal.app.
-            //
-            // We deliberately do NOT short-circuit ~/`/'/" to literal bytes here:
-            // that older workaround (added before this view had NSTextInputClient
-            // conformance) force-translated every dead key to its spacing glyph,
-            // so ã/õ/á/é never composed — the user saw "~a" instead of "ã".
-            interpretKeyEvents([event])
-            return
+            // Dead keys / IME: empty `characters` or active marked text must go
+            // through AppKit so ABNT2/US-International can compose ã/é/õ.
+            // Committed printables (Space, a-z, digits, punctuation) must use
+            // ghostty_surface_key — not interpretKeyEvents→surface_text — so
+            // TUIs like Grok receive typed key events (Kitty keyboard protocol)
+            // instead of paste-style injection that they ignore for prompt input.
+            switch GhosttyTerminalKeyInput.printableRoute(
+                hasMarkedText: hasMarkedText(),
+                characters: event.characters
+            ) {
+            case .composeViaTextInput:
+                interpretKeyEvents([event])
+                return
+            case .surfaceKey:
+                sendGhosttyKeyPress(event, to: surface)
+                return
+            }
         }
+        sendGhosttyKeyPress(event, to: surface)
+    }
+
+    /// Deliver a key press/repeat to Ghostty with optional UTF-8 text attached.
+    private func sendGhosttyKeyPress(_ event: NSEvent, to surface: ghostty_surface_t) {
         var key = ghosttyKeyEvent(for: event, action: event.isARepeat ? GHOSTTY_ACTION_REPEAT : GHOSTTY_ACTION_PRESS)
         if let text = textForEvent(event) {
             text.withCString { ptr in
@@ -2120,6 +2148,7 @@ final class GhosttyTerminalView: NSView {
         return surfaceSlot.liveSurface()
     }
 
+    /// Paste / multi-byte clipboard path. Ghostty may apply bracketed paste.
     private func sendText(_ text: String, to surface: ghostty_surface_t) {
         // Use the true UTF-8 byte length, not strlen — strlen stops at the first
         // embedded NUL, truncating pasted/bracketed content that contains \0.
@@ -2129,6 +2158,20 @@ final class GhosttyTerminalView: NSView {
             guard let base = buf.baseAddress else { return }
             base.withMemoryRebound(to: CChar.self, capacity: buf.count) { ptr in
                 ghostty_surface_text(surface, ptr, UInt(buf.count))
+            }
+        }
+    }
+
+    /// Committed typed text from IME / dead-key composition (not paste).
+    /// Uses the embedder typed-input entry so shells and TUIs treat it as
+    /// keystrokes rather than a paste payload.
+    private func sendTypedInput(_ text: String, to surface: ghostty_surface_t) {
+        let bytes = Array(text.utf8)
+        guard !bytes.isEmpty else { return }
+        bytes.withUnsafeBufferPointer { buf in
+            guard let base = buf.baseAddress else { return }
+            base.withMemoryRebound(to: CChar.self, capacity: buf.count) { ptr in
+                ghostty_surface_text_input(surface, ptr, UInt(buf.count))
             }
         }
     }
@@ -2285,8 +2328,19 @@ extension GhosttyTerminalView: NSTextInputClient {
         setPreedit(Self.nextPreedit(for: .insert))
         guard let text = Self.plainString(from: string), !text.isEmpty,
               let surface = surfaceForInput() else { return }
-        sendText(text, to: surface)
+        // IME / dead-key commit path only (keyDown printables use surface_key).
+        // Must not use ghostty_surface_text — that is the paste path and breaks
+        // interactive TUI prompts (Grok Space, shell autosuggest, etc.).
+        sendTypedInput(text, to: surface)
     }
+
+    /// AppKit also invokes the single-argument responder-chain form.
+    override func insertText(_ insertString: Any) {
+        insertText(insertString, replacementRange: NSRange(location: NSNotFound, length: 0))
+    }
+
+    /// Silence beeps for unused text-system selectors from interpretKeyEvents.
+    override func doCommand(by selector: Selector) {}
 
     func setMarkedText(_ string: Any, selectedRange: NSRange, replacementRange: NSRange) {
         setPreedit(Self.nextPreedit(for: .setMarked(string)))

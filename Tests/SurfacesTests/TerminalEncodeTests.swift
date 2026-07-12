@@ -103,6 +103,48 @@ final class TerminalEncodeTests: XCTestCase {
                        "Ghostty text extraction must preserve the exact digit typed for terminal prompt choices")
     }
 
+    func test_spaceIsPrintableAndRoutesToGhosttySurfaceKey() {
+        // WHY: Grok (and other full-screen TUIs) enable Kitty keyboard protocol and
+        // treat ghostty_surface_text as paste, not typing. Space must be classified
+        // as a committed printable that goes through ghostty_surface_key PRESS.
+        let space = key(49, chars: " ", ignoring: " ")
+
+        XCTAssertTrue(TerminalKeyboardInput.shouldUseTextInput(for: space),
+                      "Space is printable input for terminal classification, not a raw VT special key")
+        XCTAssertEqual(
+            GhosttyTerminalKeyInput.printableRoute(hasMarkedText: false, characters: " "),
+            .surfaceKey,
+            "Space must use the Ghostty key-event path so Grok receives a typed Space, not a paste payload"
+        )
+        XCTAssertEqual(GhosttyTerminalKeyInput.text(for: space), " ",
+                       "Ghostty must attach the space character to the key event text field")
+    }
+
+    func test_deadKeyAndMarkedTextComposeViaTextInput_notSurfaceKey() {
+        // WHY: ABNT2 / US-International dead keys report empty characters; forcing
+        // surface_key would skip composition and break accents (ã, é, õ).
+        XCTAssertEqual(
+            GhosttyTerminalKeyInput.printableRoute(hasMarkedText: false, characters: ""),
+            .composeViaTextInput,
+            "empty characters means a dead key / incomplete composition — AppKit must own the event"
+        )
+        XCTAssertEqual(
+            GhosttyTerminalKeyInput.printableRoute(hasMarkedText: false, characters: nil),
+            .composeViaTextInput,
+            "nil characters must stay on the composition path"
+        )
+        XCTAssertEqual(
+            GhosttyTerminalKeyInput.printableRoute(hasMarkedText: true, characters: "a"),
+            .composeViaTextInput,
+            "while marked text is active, even a letter must stay on interpretKeyEvents so IME can commit"
+        )
+        XCTAssertEqual(
+            GhosttyTerminalKeyInput.printableRoute(hasMarkedText: false, characters: "a"),
+            .surfaceKey,
+            "a plain committed letter must still go through surface_key for TUI typing fidelity"
+        )
+    }
+
     func test_ctrlC_isETX() {
         let e = key(8, chars: "c", ignoring: "c", flags: [.control])
         XCTAssertEqual(TerminalTextView.encode(e), Data([0x03]))   // Ctrl-C → 0x03
