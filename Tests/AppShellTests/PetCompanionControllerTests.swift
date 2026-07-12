@@ -39,6 +39,108 @@ final class PetCompanionControllerTests: XCTestCase {
         }
     }
 
+    func test_ambientReactionUsesInjectedDurationThenReturnsToIdle() async throws {
+        var delayRequestCount = 0
+        let controller = try makeController(
+            prefix: "AmbientDuration",
+            extendedReactionDurationProvider: { 120 },
+            companionDelayProvider: { _ in
+                delayRequestCount += 1
+                return delayRequestCount == 1 ? 0 : 60
+            }
+        )
+        defer { controller.stop() }
+        controller.start()
+
+        try await waitForState(in: [
+            .idleBall, .idleScratch, .idleGroom, .idleStretch,
+            .idleBox, .idleButterfly, .eating,
+        ], controller: controller)
+        try await waitForState(.idle, controller: controller)
+    }
+
+    func test_eligibleRefreshDoesNotRestartTheCompanionCountdown() async throws {
+        var requestedRanges: [ClosedRange<Int>] = []
+        let controller = try makeController(
+            prefix: "StableCountdown",
+            companionDelayProvider: { range in
+                requestedRanges.append(range)
+                return 60
+            }
+        )
+        defer { controller.stop() }
+        controller.start()
+        XCTAssertEqual(requestedRanges, [35...55])
+
+        NotificationCenter.default.post(name: .petSettingsDidChange, object: nil)
+        try await Task.sleep(nanoseconds: 50_000_000)
+
+        XCTAssertEqual(requestedRanges, [35...55],
+            "an eligible refresh must not postpone the one-minute companion deadline")
+    }
+
+    func test_ineligibleRefreshCancelsCountdownAndRearmsAfterMotionReturns() async throws {
+        var requestedRanges: [ClosedRange<Int>] = []
+        var durationRequestCount = 0
+        let (controller, context) = try makeControllerWithContext(
+            prefix: "CountdownCancellation",
+            extendedReactionDurationProvider: {
+                durationRequestCount += 1
+                return 120
+            },
+            companionDelayProvider: { range in
+                requestedRanges.append(range)
+                return requestedRanges.count == 1 ? 1 : range.upperBound
+            }
+        )
+        defer { controller.stop() }
+        controller.start()
+        XCTAssertEqual(requestedRanges, [35...55])
+
+        SettingsStore(db: context.db).update { $0.petAnimationsEnabled = false }
+        NotificationCenter.default.post(name: .petSettingsDidChange, object: nil)
+        try await Task.sleep(nanoseconds: 50_000_000)
+
+        SettingsStore(db: context.db).update { $0.petAnimationsEnabled = true }
+        NotificationCenter.default.post(name: .petSettingsDidChange, object: nil)
+        try await Task.sleep(nanoseconds: 1_200_000_000)
+
+        XCTAssertEqual(requestedRanges, [35...55, 35...55],
+            "losing eligibility must cancel the old deadline so re-enabling motion can arm a fresh one")
+        XCTAssertEqual(durationRequestCount, 0,
+            "the cancelled deadline must not survive as a ghost reaction after motion is re-enabled")
+    }
+
+    func test_activeWorkUsesTheCompanionDelayAndDurationProviders() async throws {
+        var requestedRanges: [ClosedRange<Int>] = []
+        var durationRequestCount = 0
+        let controller = try makeController(
+            prefix: "WorkTiming",
+            extendedReactionDurationProvider: {
+                durationRequestCount += 1
+                return 120
+            },
+            companionDelayProvider: { range in
+                requestedRanges.append(range)
+                return requestedRanges.count == 1 ? 1 : range.upperBound
+            }
+        )
+        defer { controller.stop() }
+        controller.start()
+
+        EventBus.shared.publish(kind: "agent.run.started", payload: .object([
+            "run_id": .string(UUID().uuidString),
+        ]))
+        try await waitForState(in: [
+            .workingMouse, .workingBug, .workingEngineer,
+        ], controller: controller)
+        try await waitForState(.coding, controller: controller)
+
+        XCTAssertEqual(requestedRanges.first, 35...55)
+        XCTAssertEqual(durationRequestCount, 1,
+            "work reactions must use the same randomized 10–20 second provider as ambient and Care")
+    }
+
     func test_newReadyItemPouncesOnceThenReturnsToWaitingBadgeState() async throws {
         let (controller, context) = try makeControllerWithContext(prefix: "Pounce")
         defer { controller.stop() }
@@ -92,19 +194,25 @@ final class PetCompanionControllerTests: XCTestCase {
     private func makeController(
         prefix: String,
         animationsEnabled: Bool = true,
-        reduceMotion: Bool = false
+        reduceMotion: Bool = false,
+        extendedReactionDurationProvider: @escaping () -> Int64 = { 100 },
+        companionDelayProvider: @escaping (ClosedRange<Int>) -> Int = { _ in 60 }
     ) throws -> PetController {
         try makeControllerWithContext(
             prefix: prefix,
             animationsEnabled: animationsEnabled,
-            reduceMotion: reduceMotion
+            reduceMotion: reduceMotion,
+            extendedReactionDurationProvider: extendedReactionDurationProvider,
+            companionDelayProvider: companionDelayProvider
         ).controller
     }
 
     private func makeControllerWithContext(
         prefix: String,
         animationsEnabled: Bool = true,
-        reduceMotion: Bool = false
+        reduceMotion: Bool = false,
+        extendedReactionDurationProvider: @escaping () -> Int64 = { 100 },
+        companionDelayProvider: @escaping (ClosedRange<Int>) -> Int = { _ in 60 }
     ) throws -> (controller: PetController, context: AppContext) {
         let directory = NSTemporaryDirectory() + "RC2PetCompanion\(prefix)-\(UUID().uuidString)"
         let context = try AppContext(channel: .debug, appSupportOverride: directory)
@@ -120,7 +228,8 @@ final class PetCompanionControllerTests: XCTestCase {
                 context: context,
                 router: router,
                 openSettings: { _ in false },
-                extendedReactionDurationProvider: { 100 }
+                extendedReactionDurationProvider: extendedReactionDurationProvider,
+                companionDelayProvider: companionDelayProvider
             ),
             context
         )
@@ -146,6 +255,20 @@ final class PetCompanionControllerTests: XCTestCase {
         }
         XCTFail(
             "expected \(expected.rawValue), got \(controller.modelForTests.animationState.rawValue)"
+        )
+    }
+
+    private func waitForState(
+        in expected: Set<PetAnimationState>,
+        controller: PetController
+    ) async throws {
+        for _ in 0..<120 {
+            if expected.contains(controller.modelForTests.animationState) { return }
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        XCTFail(
+            "expected one of \(expected.map(\.rawValue).sorted()), got "
+                + controller.modelForTests.animationState.rawValue
         )
     }
 }

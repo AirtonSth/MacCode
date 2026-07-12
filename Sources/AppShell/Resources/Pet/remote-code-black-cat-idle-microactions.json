@@ -2,8 +2,7 @@
   "actions" : [
     "blink",
     "tail",
-    "ears",
-    "gaze"
+    "ears"
   ],
   "frames" : 8,
   "visualBounds" : {

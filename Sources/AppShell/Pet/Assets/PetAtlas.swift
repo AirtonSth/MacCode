@@ -13,15 +13,13 @@ enum PetIdleMicroAction: String, CaseIterable, Decodable, Sendable, Equatable {
     case blink
     case tail
     case ears
-    case gaze
 
     static let restDelayRange: ClosedRange<TimeInterval> = 6...10
 
     static func select(_ roll: Int) -> PetIdleMicroAction {
         switch min(max(roll, 0), 99) {
         case 0..<65: return .blink
-        case 65..<90: return .gaze
-        case 90..<96: return .tail
+        case 65..<85: return .tail
         default: return .ears
         }
     }
@@ -29,36 +27,9 @@ enum PetIdleMicroAction: String, CaseIterable, Decodable, Sendable, Equatable {
     var framesPerSecond: Int {
         switch self {
         case .blink: return 24
-        case .gaze: return 5
         case .tail: return 5
         case .ears: return 12
         }
-    }
-}
-
-enum PetIdleGazeDirection: Sendable, Equatable {
-    case center
-    case left
-    case right
-    case up
-    case down
-
-    var frameIndex: Int {
-        switch self {
-        case .center: return 0
-        case .left: return 1
-        case .right: return 3
-        case .up: return 5
-        case .down: return 7
-        }
-    }
-
-    static func resolve(deltaX: CGFloat, deltaY: CGFloat, deadZone: CGFloat = 12) -> Self {
-        guard max(abs(deltaX), abs(deltaY)) > deadZone else { return .center }
-        if abs(deltaX) > abs(deltaY) {
-            return deltaX < 0 ? .left : .right
-        }
-        return deltaY < 0 ? .down : .up
     }
 }
 

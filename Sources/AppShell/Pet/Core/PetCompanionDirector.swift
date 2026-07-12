@@ -91,9 +91,9 @@ public struct PetCompanionEligibility: Sendable, Equatable {
 }
 
 public struct PetCompanionDirector: Sendable {
-    public static let ambientDelayRange = 120...240
-    public static let workDelayRange = 25...50
-    public static let extendedReactionDurationRange: ClosedRange<Int64> = 30_000...40_000
+    public static let ambientDelayRange = 35...55
+    public static let workDelayRange = 35...55
+    public static let extendedReactionDurationRange: ClosedRange<Int64> = 10_000...20_000
 
     private static let ambientStates: [PetAnimationState] = [
         .idleBall, .idleScratch, .idleGroom, .idleStretch,
@@ -111,7 +111,8 @@ public struct PetCompanionDirector: Sendable {
 
     public mutating func nextAmbientCue(
         eligibility: PetCompanionEligibility,
-        preferredIndex: Int
+        preferredIndex: Int,
+        durationMilliseconds: Int64 = 15_000
     ) -> PetCompanionCue? {
         guard eligibility.allowsAmbientCue else { return nil }
         let state = Self.nonRepeatingState(
@@ -123,14 +124,14 @@ public struct PetCompanionDirector: Sendable {
         return PetCompanionCue(
             state: state,
             returnState: eligibility.baseState,
-            durationMilliseconds: 30_000
+            durationMilliseconds: durationMilliseconds
         )
     }
 
     public mutating func nextWorkCue(
         eligibility: PetCompanionEligibility,
         preferredIndex: Int,
-        durationMilliseconds: Int64 = 35_000
+        durationMilliseconds: Int64 = 15_000
     ) -> PetCompanionCue? {
         guard eligibility.allowsWorkCue else { return nil }
         let state = Self.nonRepeatingState(
@@ -166,7 +167,7 @@ public struct PetCompanionDirector: Sendable {
     public static func careCue(
         action: PetCareAction,
         returnState: PetAnimationState,
-        durationMilliseconds: Int64 = 35_000
+        durationMilliseconds: Int64 = 15_000
     ) -> PetCompanionCue {
         PetCompanionCue(
             state: action.animationState,

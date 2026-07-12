@@ -66,7 +66,6 @@ final class PetAnimationController {
 
     var onFrame: ((PetAtlasFrame) -> Void)?
     var onError: ((Error) -> Void)?
-    var idleGazeDirectionProvider: () -> PetIdleGazeDirection = { .center }
     var timerIsRunning: Bool { timer?.isValid == true }
 
     convenience init(atlas: PetAtlas) throws {
@@ -213,9 +212,6 @@ final class PetAnimationController {
             return [1, 2, 3, 2, 1, 0]
         case .ears:
             return [1, 2, 3, 4, 5, 6, 7, 0]
-        case .gaze:
-            let direction = idleGazeDirectionProvider().frameIndex
-            return direction == 0 ? [0] : [direction, direction, 0]
         }
     }
 

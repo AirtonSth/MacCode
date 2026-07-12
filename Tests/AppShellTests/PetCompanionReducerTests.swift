@@ -38,7 +38,7 @@ final class PetCompanionReducerTests: XCTestCase {
             atMilliseconds: 0
         )
         XCTAssertEqual(care.state, .purring)
-        XCTAssertEqual(care.transientTimerDirective, .schedule(milliseconds: 35_000))
+        XCTAssertEqual(care.transientTimerDirective, .schedule(milliseconds: 15_000))
         XCTAssertEqual(reducer.reduce(.transientExpired, atMilliseconds: 1_200).state, .idle)
 
         XCTAssertEqual(

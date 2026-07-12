@@ -40,9 +40,12 @@ final class PetAssetRuntimeTests: XCTestCase {
             "resource validation must inspect image metadata without decoding the full atlas")
     }
 
-    func test_bundledAtlas_resolvesFourIndependentDefaultMicroActionRows() throws {
+    func test_bundledAtlas_resolvesThreeIndependentDefaultMicroActionRowsWithoutCursorGaze() throws {
         let atlas = try PetAtlas.bundled()
         let canonicalPixels = rgbaBytes(of: try atlas.canonicalIdleMicroActionFrame().image)
+
+        XCTAssertEqual(PetIdleMicroAction.allCases, [.blink, .tail, .ears],
+            "default idle must use believable isolated feline motion instead of cursor-driven pupils")
 
         for action in PetIdleMicroAction.allCases {
             let url = try atlas.idleMicroActionRowURL(for: action)
@@ -63,6 +66,13 @@ final class PetAssetRuntimeTests: XCTestCase {
                 }
             }
         }
+
+        let resourceDirectory = try atlas.idleMicroActionRowURL(for: .blink).deletingLastPathComponent()
+        let gazeResource = resourceDirectory.appendingPathComponent(
+            "remote-code-black-cat-idle-gaze.png"
+        )
+        XCTAssertFalse(FileManager.default.fileExists(atPath: gazeResource.path),
+            "the rejected cursor-gaze sprite must not remain packaged as dead runtime behavior")
     }
 
     func test_frameCropping_isExactAndNearestNeighbor_withBoundedRowCache() throws {
@@ -270,60 +280,121 @@ final class PetAssetRuntimeTests: XCTestCase {
             "independent micro-actions must preserve one-timer ownership")
     }
 
-    func test_idleGazeUsesOnlyTheCursorDirectedEyeFrameThenReturnsNeutral() throws {
-        let scheduler = TestPetAnimationScheduler()
-        let controller = try PetAnimationController(
-            atlas: .bundled(),
-            scheduler: scheduler,
-            idleActionProvider: { .gaze },
-            idleRestDelayProvider: { 3 }
-        )
-        controller.idleGazeDirectionProvider = { .right }
-        try controller.setState(.idle)
-
-        scheduler.fireActiveTimer()
-        XCTAssertEqual(controller.currentIdleMicroAction, .gaze)
-        XCTAssertEqual(controller.currentFrameIndex, 3,
-            "only the pupils should select the right-facing cursor frame")
-
-        scheduler.fireActiveTimer()
-        XCTAssertEqual(controller.currentFrameIndex, 3,
-            "the directed gaze should hold briefly instead of scanning every direction")
-        scheduler.fireActiveTimer()
-        XCTAssertEqual(controller.currentFrameIndex, 0)
-        XCTAssertNil(controller.currentIdleMicroAction)
-        XCTAssertEqual(scheduler.maximumActiveTimerCount, 1)
-        XCTAssertEqual(PetIdleGazeDirection.resolve(deltaX: -40, deltaY: 4), .left)
-        XCTAssertEqual(PetIdleGazeDirection.resolve(deltaX: 40, deltaY: 4), .right)
-        XCTAssertEqual(PetIdleGazeDirection.resolve(deltaX: 4, deltaY: 40), .up)
-        XCTAssertEqual(PetIdleGazeDirection.resolve(deltaX: 4, deltaY: -40), .down)
-        XCTAssertEqual(PetIdleGazeDirection.resolve(deltaX: 4, deltaY: 4), .center)
+    func test_defaultMicroActionWeightsPreserveBlinkAndMakeTailAndEarsNoticeable() {
+        XCTAssertEqual(PetIdleMicroAction.restDelayRange, 6...10,
+            "the approved blink distribution must remain unchanged")
+        let actions = (0..<100).map(PetIdleMicroAction.select)
+        XCTAssertEqual(actions.filter { $0 == .blink }.count, 65)
+        XCTAssertEqual(actions.filter { $0 == .tail }.count, 20)
+        XCTAssertEqual(actions.filter { $0 == .ears }.count, 15)
+        XCTAssertEqual(PetIdleMicroAction.select(-1), .blink)
+        XCTAssertEqual(PetIdleMicroAction.select(0), .blink)
+        XCTAssertEqual(PetIdleMicroAction.select(64), .blink)
+        XCTAssertEqual(PetIdleMicroAction.select(65), .tail)
+        XCTAssertEqual(PetIdleMicroAction.select(84), .tail)
+        XCTAssertEqual(PetIdleMicroAction.select(85), .ears)
+        XCTAssertEqual(PetIdleMicroAction.select(99), .ears)
+        XCTAssertEqual(PetIdleMicroAction.select(100), .ears)
     }
 
-    func test_defaultMicroActionWeightsFavorBlinkAndKeepTailAndEarsRare() {
-        XCTAssertEqual(PetIdleMicroAction.restDelayRange, 6...10,
-            "4.1–6.5 feline blinks per minute maps to a natural 9–15 second expected blink cadence")
-        XCTAssertEqual((0..<65).map(PetIdleMicroAction.select).filter { $0 == .blink }.count, 65)
-        XCTAssertEqual((65..<90).map(PetIdleMicroAction.select).filter { $0 == .gaze }.count, 25)
-        XCTAssertEqual((90..<96).map(PetIdleMicroAction.select).filter { $0 == .tail }.count, 6)
-        XCTAssertEqual((96..<100).map(PetIdleMicroAction.select).filter { $0 == .ears }.count, 4)
+    func test_defaultTailAndEarMicroActionsPlayTheirNaturalSequenceThenRest() throws {
+        let cases: [(PetIdleMicroAction, [Int], TimeInterval)] = [
+            (.tail, [1, 2, 3, 2, 1, 0], 1.0 / 5.0),
+            (.ears, [1, 2, 3, 4, 5, 6, 7, 0], 1.0 / 12.0),
+        ]
+
+        for (action, sequence, frameInterval) in cases {
+            let scheduler = TestPetAnimationScheduler()
+            let controller = try PetAnimationController(
+                atlas: .bundled(),
+                scheduler: scheduler,
+                idleActionProvider: { action },
+                idleRestDelayProvider: { 4 }
+            )
+            try controller.setState(.idle)
+
+            scheduler.fireActiveTimer()
+            XCTAssertEqual(controller.currentIdleMicroAction, action)
+            XCTAssertEqual(controller.currentFrameIndex, sequence[0])
+            XCTAssertEqual(try XCTUnwrap(scheduler.lastInterval), frameInterval, accuracy: 0.001)
+            for frame in sequence.dropFirst() {
+                scheduler.fireActiveTimer()
+                XCTAssertEqual(controller.currentFrameIndex, frame)
+            }
+
+            XCTAssertNil(controller.currentIdleMicroAction)
+            XCTAssertEqual(try XCTUnwrap(scheduler.lastInterval), 4)
+            XCTAssertEqual(scheduler.maximumActiveTimerCount, 1)
+        }
+    }
+
+    func test_companionPlaybackRatesMatchTheAuthoredPhysicalAction() throws {
+        let manifest = try PetAtlas.bundled().manifest
+        let expected: [PetAnimationState: Int] = [
+            .idleBall: 3,
+            .idleScratch: 4,
+            .idleGroom: 3,
+            .idleStretch: 2,
+            .idleBox: 2,
+            .idleButterfly: 4,
+            .eating: 3,
+            .drinking: 3,
+            .purring: 3,
+            .playing: 4,
+            .comfort: 3,
+            .workingMouse: 4,
+            .workingBug: 4,
+            .workingEngineer: 3,
+            .notificationPounce: 7,
+            .celebrateTreat: 7,
+        ]
+
+        for (state, fps) in expected {
+            let row = try XCTUnwrap(manifest.row(for: state))
+            XCTAssertEqual(row.fps, fps,
+                "\(state.rawValue) must not replay whole-body poses at tongue- or paw-level speed")
+        }
+        let sleeping = try XCTUnwrap(manifest.row(for: .sleeping))
+        XCTAssertEqual(sleeping.fps, 3,
+            "the already-approved sleeping animation must retain its cadence")
+        XCTAssertEqual(sleeping.frames, 8,
+            "the already-approved sleeping animation must retain all authored frames")
+        XCTAssertEqual(sleeping.mode, .loop,
+            "the already-approved sleeping animation must keep looping")
     }
 
     func test_extendedCompanionReactionLoopsUntilReducerReturnsIt() throws {
         let scheduler = TestPetAnimationScheduler()
         let controller = try PetAnimationController(atlas: .bundled(), scheduler: scheduler)
 
-        try controller.setState(.eating)
-        for _ in 0..<8 { scheduler.fireActiveTimer() }
-        XCTAssertEqual(controller.currentFrameIndex, 0)
-        XCTAssertEqual(scheduler.activeTimerCount, 1,
-            "a 30–40 second care reaction must keep animating instead of freezing")
+        let extendedStates: [PetAnimationState] = [
+            .idleBall, .idleScratch, .idleGroom, .idleStretch,
+            .idleBox, .idleButterfly, .eating, .drinking,
+            .purring, .playing, .comfort, .workingMouse,
+            .workingBug, .workingEngineer,
+        ]
+        XCTAssertEqual(
+            Set(PetAnimationState.allCases.filter(\.isExtendedCompanionReaction)),
+            Set(extendedStates),
+            "the explicit extended-reaction contract must not silently drop a state"
+        )
 
-        try controller.setState(.notificationPounce)
-        for _ in 0..<7 { scheduler.fireActiveTimer() }
-        XCTAssertEqual(controller.currentFrameIndex, 7)
-        XCTAssertEqual(scheduler.activeTimerCount, 0,
-            "short event feedback must not repeat for 30–40 seconds")
+        for state in extendedStates {
+            try controller.setState(state)
+            for _ in 0..<8 { scheduler.fireActiveTimer() }
+            XCTAssertEqual(controller.currentFrameIndex, 0,
+                "\(state.rawValue) must restart its authored story while the transient owns the Pet")
+            XCTAssertEqual(scheduler.activeTimerCount, 1,
+                "\(state.rawValue) must keep animating throughout its 10–20 second transient")
+        }
+
+        for state in [PetAnimationState.notificationPounce, .celebrateTreat] {
+            try controller.setState(state)
+            for _ in 0..<7 { scheduler.fireActiveTimer() }
+            XCTAssertEqual(controller.currentFrameIndex, 7)
+            XCTAssertEqual(scheduler.activeTimerCount, 0,
+                "short \(state.rawValue) feedback must remain a one-shot")
+        }
     }
 
     func test_loopPlayback_wraps_andKeepsSingleTimer() throws {
