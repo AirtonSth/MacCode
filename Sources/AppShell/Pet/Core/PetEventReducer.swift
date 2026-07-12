@@ -82,6 +82,8 @@ public enum PetDomainEvent: Sendable, Equatable {
     case wake
     case screenLockChanged(isLocked: Bool)
     case interactionBegan
+    case petDragBegan
+    case petDragEnded
     case surfaceOutput
     case tokenUsage
     case layoutChanged
@@ -135,6 +137,7 @@ public struct PetEventReducer: Sendable {
     private var isReconnecting = false
     private var isSleeping = false
     private var isScreenLocked = false
+    public private(set) var isBeingDragged = false
     private var transientState: PetAnimationState?
     private var companionReturnState: PetAnimationState?
     private var terminalRunIDs: Set<String> = []
@@ -152,7 +155,9 @@ public struct PetEventReducer: Sendable {
     }
 
     public var activeRunCount: Int { activeRunIDs.count }
-    var companionBaseState: PetAnimationState { derivedState(includeTransient: false) }
+    var companionBaseState: PetAnimationState {
+        derivedState(includeTransient: false, includeDragPose: false)
+    }
 
     public static func mappedState(for event: PetDomainEvent) -> PetAnimationState? {
         switch event {
@@ -222,7 +227,8 @@ public struct PetEventReducer: Sendable {
             return .idle
         case .agentItemCompleted, .agentItemDelta, .agentItemProgress,
              .approvalOpened, .approvalResolved, .questionOpened, .questionResolved,
-             .companionCue, .transientExpired, .interactionBegan, .surfaceOutput, .tokenUsage,
+             .companionCue, .transientExpired, .interactionBegan, .petDragBegan, .petDragEnded,
+             .surfaceOutput, .tokenUsage,
              .layoutChanged, .filesystemChanged:
             return nil
         }
@@ -247,7 +253,7 @@ public struct PetEventReducer: Sendable {
         let mappedState = Self.mappedState(for: event)
         let shouldRefreshAttention = mutateState(for: event)
         if let companionReturnState,
-           derivedState(includeTransient: false) != companionReturnState {
+           derivedState(includeTransient: false, includeDragPose: false) != companionReturnState {
             clearTransient()
         }
         let nextState = derivedState()
@@ -338,9 +344,15 @@ public struct PetEventReducer: Sendable {
         case .companionCue(let cue):
             guard (cue.returnState == state || cue.returnState == companionBaseState),
                   cue.state.isCompanionReaction,
-                  state != .approval,
-                  state != .question,
-                  state != .sleeping else { return false }
+                  !isBeingDragged,
+                  !isScreenLocked,
+                  !isSleeping,
+                  approvalRequestIDs.isEmpty,
+                  questionRequestIDs.isEmpty,
+                  fileConflictIDs.isEmpty,
+                  transientState != .failed,
+                  transientState != .interrupted
+            else { return false }
             setTransient(
                 cue.state,
                 milliseconds: cue.durationMilliseconds,
@@ -353,6 +365,16 @@ public struct PetEventReducer: Sendable {
         case .interactionBegan:
             clearTransient()
             isSleeping = false
+            return false
+        case .petDragBegan:
+            if transientState?.isCompanionReaction == true {
+                clearTransient()
+            }
+            isBeingDragged = true
+            isSleeping = false
+            return false
+        case .petDragEnded:
+            isBeingDragged = false
             return false
         case .attentionHydrated(let hydration):
             approvalRequestIDs = hydration.approvalIDs
@@ -443,6 +465,7 @@ public struct PetEventReducer: Sendable {
             return false
         case .screenLockChanged(let isLocked):
             isScreenLocked = isLocked
+            if isLocked { isBeingDragged = false }
             if !isLocked { isSleeping = false }
             return false
         case .agentItemDelta, .agentItemProgress, .surfaceOutput, .tokenUsage,
@@ -474,8 +497,12 @@ public struct PetEventReducer: Sendable {
         pendingTransientTimerDirective = .cancel
     }
 
-    private func derivedState(includeTransient: Bool = true) -> PetAnimationState {
+    private func derivedState(
+        includeTransient: Bool = true,
+        includeDragPose: Bool = true
+    ) -> PetAnimationState {
         if isScreenLocked { return .sleeping }
+        if includeDragPose, isBeingDragged { return .pickedUp }
 
         var candidates: [PetAnimationState] = [.idle]
         if !approvalRequestIDs.isEmpty || !fileConflictIDs.isEmpty { candidates.append(.approval) }

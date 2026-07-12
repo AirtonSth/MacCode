@@ -93,11 +93,11 @@ public struct PetCompanionEligibility: Sendable, Equatable {
 public struct PetCompanionDirector: Sendable {
     public static let ambientDelayRange = 35...55
     public static let workDelayRange = 35...55
-    public static let extendedReactionDurationRange: ClosedRange<Int64> = 10_000...20_000
+    public static let extendedReactionDurationRange: ClosedRange<Int64> = 6_000...12_000
 
     private static let ambientStates: [PetAnimationState] = [
         .idleBall, .idleScratch, .idleGroom, .idleStretch,
-        .idleBox, .idleButterfly, .eating,
+        .idleBox, .idleButterfly, .eating, .idleYawn,
     ]
     private static let workStates: [PetAnimationState] = [
         .workingMouse, .workingBug, .workingEngineer,
@@ -112,7 +112,7 @@ public struct PetCompanionDirector: Sendable {
     public mutating func nextAmbientCue(
         eligibility: PetCompanionEligibility,
         preferredIndex: Int,
-        durationMilliseconds: Int64 = 15_000
+        durationMilliseconds: Int64 = 9_000
     ) -> PetCompanionCue? {
         guard eligibility.allowsAmbientCue else { return nil }
         let state = Self.nonRepeatingState(
@@ -131,7 +131,7 @@ public struct PetCompanionDirector: Sendable {
     public mutating func nextWorkCue(
         eligibility: PetCompanionEligibility,
         preferredIndex: Int,
-        durationMilliseconds: Int64 = 15_000
+        durationMilliseconds: Int64 = 9_000
     ) -> PetCompanionCue? {
         guard eligibility.allowsWorkCue else { return nil }
         let state = Self.nonRepeatingState(
@@ -152,7 +152,9 @@ public struct PetCompanionDirector: Sendable {
         newCount: Int,
         baseState: PetAnimationState
     ) -> PetCompanionCue? {
-        guard previousCount == 0, newCount > 0, baseState != .approval, baseState != .question else {
+        guard previousCount == 0,
+              newCount > 0,
+              ![.approval, .question, .sleeping, .failed, .interrupted].contains(baseState) else {
             return nil
         }
         return PetCompanionCue(state: .notificationPounce, returnState: baseState)
@@ -167,7 +169,7 @@ public struct PetCompanionDirector: Sendable {
     public static func careCue(
         action: PetCareAction,
         returnState: PetAnimationState,
-        durationMilliseconds: Int64 = 15_000
+        durationMilliseconds: Int64 = 9_000
     ) -> PetCompanionCue {
         PetCompanionCue(
             state: action.animationState,

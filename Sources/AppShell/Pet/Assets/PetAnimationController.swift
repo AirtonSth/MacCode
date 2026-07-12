@@ -140,6 +140,30 @@ final class PetAnimationController {
         stopTimer()
     }
 
+    func loopSafeDurationMilliseconds(
+        for state: PetAnimationState,
+        requested: Int64
+    ) -> Int64 {
+        let allowed = PetCompanionDirector.extendedReactionDurationRange
+        guard state.isExtendedCompanionReaction,
+              allowed.contains(requested),
+              let row = atlas.manifest.row(for: state) else {
+            return requested
+        }
+        let frameMilliseconds = 1_000.0 / Double(row.fps)
+        let cycleMilliseconds = frameMilliseconds * Double(row.frames)
+        let maximumCycles = Int(ceil(Double(allowed.upperBound) / cycleMilliseconds)) + 1
+        let candidates = (1...maximumCycles).flatMap { cycle -> [Int64] in
+            let boundary = Double(cycle) * cycleMilliseconds
+            return [boundary - frameMilliseconds / 2, boundary + frameMilliseconds / 2]
+                .map { Int64($0.rounded()) }
+                .filter(allowed.contains)
+        }
+        return candidates.min {
+            abs($0 - requested) < abs($1 - requested)
+        } ?? requested
+    }
+
     private var shouldAnimate: Bool {
         isVisible
             && !isScreenLocked

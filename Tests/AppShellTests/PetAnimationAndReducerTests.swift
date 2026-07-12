@@ -3,7 +3,7 @@ import XCTest
 import CoreModel
 
 final class PetAnimationAndReducerTests: XCTestCase {
-    func test_manifestOrderContainsExactlyTheThirtyTwoStableAtlasRows() {
+    func test_manifestOrderContainsExactlyTheThirtyFourStableAtlasRows() {
         XCTAssertEqual(
             PetAnimationState.allCases.map(\.rawValue),
             [
@@ -13,7 +13,8 @@ final class PetAnimationAndReducerTests: XCTestCase {
                 "idleBall", "idleScratch", "idleGroom", "idleStretch",
                 "idleBox", "idleButterfly", "eating", "drinking",
                 "purring", "playing", "comfort", "notificationPounce",
-                "workingMouse", "workingBug", "workingEngineer", "celebrateTreat"
+                "workingMouse", "workingBug", "workingEngineer", "celebrateTreat",
+                "idleYawn", "pickedUp"
             ],
             "Atlas row order is a shipped resource contract; reordering a case renders the wrong reaction."
         )
