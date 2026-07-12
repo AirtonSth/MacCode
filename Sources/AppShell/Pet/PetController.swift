@@ -19,6 +19,7 @@ public final class PetController {
     private let openSettings: (PetSettingsRoute) -> Bool
     private let idleTimeoutNanoseconds: UInt64
     private let extendedReactionDurationProvider: () -> Int64
+    private let companionDelayProvider: (ClosedRange<Int>) -> Int
 
     static let projectionWatermarkKey = "pet.event-projection-watermark.v1"
 
@@ -55,6 +56,9 @@ public final class PetController {
         idleTimeoutNanoseconds: UInt64 = 600_000_000_000,
         extendedReactionDurationProvider: @escaping () -> Int64 = {
             Int64.random(in: PetCompanionDirector.extendedReactionDurationRange)
+        },
+        companionDelayProvider: @escaping (ClosedRange<Int>) -> Int = {
+            Int.random(in: $0)
         }
     ) throws {
         self.context = context
@@ -62,6 +66,7 @@ public final class PetController {
         self.openSettings = openSettings
         self.idleTimeoutNanoseconds = idleTimeoutNanoseconds
         self.extendedReactionDurationProvider = extendedReactionDurationProvider
+        self.companionDelayProvider = companionDelayProvider
         self.settingsStore = SettingsStore(db: context.db)
         let settings = settingsStore.load()
         self.model = PetViewModel(settings: settings)
@@ -271,9 +276,6 @@ public final class PetController {
         }
         animationController.onError = { [weak model] _ in
             model?.routeError = "Pet artwork could not be loaded."
-        }
-        animationController.idleGazeDirectionProvider = { [weak windowController] in
-            windowController?.idleGazeDirection() ?? .center
         }
         windowController.onOpenItem = { [weak self] item in self?.open(item) }
         windowController.onMarkAllViewed = { [weak self] in self?.markAllViewed() }
@@ -725,8 +727,6 @@ public final class PetController {
     }
 
     private func scheduleCompanionBehavior() {
-        companionTask?.cancel()
-        companionTask = nil
         let eligibility = companionEligibility()
         let delayRange: ClosedRange<Int>
         if eligibility.allowsWorkCue {
@@ -734,9 +734,12 @@ public final class PetController {
         } else if eligibility.allowsAmbientCue {
             delayRange = PetCompanionDirector.ambientDelayRange
         } else {
+            companionTask?.cancel()
+            companionTask = nil
             return
         }
-        let delay = Int.random(in: delayRange)
+        guard companionTask == nil else { return }
+        let delay = companionDelayProvider(delayRange)
         companionTask = Task { [weak self] in
             try? await Task.sleep(nanoseconds: UInt64(delay) * 1_000_000_000)
             guard !Task.isCancelled else { return }
@@ -754,7 +757,8 @@ public final class PetController {
                 } else if eligibility.allowsAmbientCue {
                     cue = self.companionDirector.nextAmbientCue(
                         eligibility: eligibility,
-                        preferredIndex: Int.random(in: 0..<7)
+                        preferredIndex: Int.random(in: 0..<7),
+                        durationMilliseconds: self.randomExtendedReactionDuration()
                     )
                 } else {
                     cue = nil

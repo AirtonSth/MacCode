@@ -240,7 +240,7 @@
     },
     {
       "canonicalFrame" : 0,
-      "fps" : 7,
+      "fps" : 3,
       "frames" : 8,
       "mode" : "onceHold",
       "row" : 16,
@@ -254,7 +254,7 @@
     },
     {
       "canonicalFrame" : 0,
-      "fps" : 7,
+      "fps" : 4,
       "frames" : 8,
       "mode" : "onceHold",
       "row" : 17,
@@ -268,7 +268,7 @@
     },
     {
       "canonicalFrame" : 0,
-      "fps" : 7,
+      "fps" : 3,
       "frames" : 8,
       "mode" : "onceHold",
       "row" : 18,
@@ -282,7 +282,7 @@
     },
     {
       "canonicalFrame" : 0,
-      "fps" : 7,
+      "fps" : 2,
       "frames" : 8,
       "mode" : "onceHold",
       "row" : 19,
@@ -296,7 +296,7 @@
     },
     {
       "canonicalFrame" : 0,
-      "fps" : 7,
+      "fps" : 2,
       "frames" : 8,
       "mode" : "onceHold",
       "row" : 20,
@@ -310,7 +310,7 @@
     },
     {
       "canonicalFrame" : 0,
-      "fps" : 7,
+      "fps" : 4,
       "frames" : 8,
       "mode" : "onceHold",
       "row" : 21,
@@ -324,7 +324,7 @@
     },
     {
       "canonicalFrame" : 0,
-      "fps" : 7,
+      "fps" : 3,
       "frames" : 8,
       "mode" : "onceHold",
       "row" : 22,
@@ -338,7 +338,7 @@
     },
     {
       "canonicalFrame" : 0,
-      "fps" : 7,
+      "fps" : 3,
       "frames" : 8,
       "mode" : "onceHold",
       "row" : 23,
@@ -352,7 +352,7 @@
     },
     {
       "canonicalFrame" : 0,
-      "fps" : 7,
+      "fps" : 3,
       "frames" : 8,
       "mode" : "onceHold",
       "row" : 24,
@@ -366,7 +366,7 @@
     },
     {
       "canonicalFrame" : 0,
-      "fps" : 7,
+      "fps" : 4,
       "frames" : 8,
       "mode" : "onceHold",
       "row" : 25,
@@ -380,7 +380,7 @@
     },
     {
       "canonicalFrame" : 0,
-      "fps" : 7,
+      "fps" : 3,
       "frames" : 8,
       "mode" : "onceHold",
       "row" : 26,
@@ -394,7 +394,7 @@
     },
     {
       "canonicalFrame" : 0,
-      "fps" : 10,
+      "fps" : 7,
       "frames" : 8,
       "mode" : "onceHold",
       "row" : 27,
@@ -408,7 +408,7 @@
     },
     {
       "canonicalFrame" : 0,
-      "fps" : 8,
+      "fps" : 4,
       "frames" : 8,
       "mode" : "onceHold",
       "row" : 28,
@@ -422,7 +422,7 @@
     },
     {
       "canonicalFrame" : 0,
-      "fps" : 8,
+      "fps" : 4,
       "frames" : 8,
       "mode" : "onceHold",
       "row" : 29,
@@ -436,7 +436,7 @@
     },
     {
       "canonicalFrame" : 0,
-      "fps" : 8,
+      "fps" : 3,
       "frames" : 8,
       "mode" : "onceHold",
       "row" : 30,
@@ -450,7 +450,7 @@
     },
     {
       "canonicalFrame" : 0,
-      "fps" : 10,
+      "fps" : 7,
       "frames" : 8,
       "mode" : "onceHold",
       "row" : 31,
