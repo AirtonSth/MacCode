@@ -14,10 +14,18 @@ final class PetCompanionDirectorTests: XCTestCase {
             screenLocked: false
         )
 
-        let first = director.nextAmbientCue(eligibility: eligible, preferredIndex: 0)
-        let second = director.nextAmbientCue(eligibility: eligible, preferredIndex: 0)
+        let first = director.nextAmbientCue(
+            eligibility: eligible,
+            preferredIndex: 0
+        )
+        let second = director.nextAmbientCue(
+            eligibility: eligible,
+            preferredIndex: 0
+        )
 
         XCTAssertEqual(first?.returnState, .idle)
+        XCTAssertEqual(first?.durationMilliseconds, 30_000)
+        XCTAssertEqual(second?.durationMilliseconds, 30_000)
         XCTAssertNotEqual(first?.state, second?.state,
             "a companion should not repeat the same ambient behavior back-to-back")
         XCTAssertNil(director.nextAmbientCue(
@@ -46,11 +54,20 @@ final class PetCompanionDirectorTests: XCTestCase {
             screenLocked: false
         )
 
-        let first = director.nextWorkCue(eligibility: eligible, preferredIndex: 0)
-        let second = director.nextWorkCue(eligibility: eligible, preferredIndex: 0)
+        let first = director.nextWorkCue(
+            eligibility: eligible,
+            preferredIndex: 0,
+            durationMilliseconds: 30_000
+        )
+        let second = director.nextWorkCue(
+            eligibility: eligible,
+            preferredIndex: 0,
+            durationMilliseconds: 40_000
+        )
         XCTAssertEqual(first?.state, .workingMouse)
         XCTAssertNotEqual(first?.state, second?.state)
         XCTAssertEqual(first?.returnState, .coding)
+        XCTAssertEqual(first?.durationMilliseconds, 30_000)
     }
 
     func test_notificationPounceOnlyOccursOnZeroToPositiveAndNeverOverridesBlockers() {
@@ -91,15 +108,24 @@ final class PetCompanionDirectorTests: XCTestCase {
         ])
         for (action, state) in expected {
             XCTAssertEqual(
-                PetCompanionDirector.careCue(action: action, returnState: .reconnecting),
-                PetCompanionCue(state: state, returnState: .reconnecting)
+                PetCompanionDirector.careCue(
+                    action: action,
+                    returnState: .reconnecting,
+                    durationMilliseconds: 35_000
+                ),
+                PetCompanionCue(
+                    state: state,
+                    returnState: .reconnecting,
+                    durationMilliseconds: 35_000
+                )
             )
         }
     }
 
     func test_directorDelayContractsStayInsideProductBounds() {
-        XCTAssertEqual(PetCompanionDirector.ambientDelayRange, 300...600,
-            "ambient play should stay infrequent so the default companion does not distract the user")
+        XCTAssertEqual(PetCompanionDirector.ambientDelayRange, 120...240,
+            "default emotions should begin every two to four minutes")
         XCTAssertEqual(PetCompanionDirector.workDelayRange, 25...50)
+        XCTAssertEqual(PetCompanionDirector.extendedReactionDurationRange, 30_000...40_000)
     }
 }

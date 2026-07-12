@@ -7,11 +7,15 @@ final class PetCompanionReducerTests: XCTestCase {
         _ = reducer.reduce(.agentRunStarted(runID: "run-1"), atMilliseconds: 0)
 
         let reaction = reducer.reduce(
-            .companionCue(PetCompanionCue(state: .workingMouse, returnState: .coding)),
+            .companionCue(PetCompanionCue(
+                state: .workingMouse,
+                returnState: .coding,
+                durationMilliseconds: 30_000
+            )),
             atMilliseconds: 1
         )
         XCTAssertEqual(reaction.state, .workingMouse)
-        XCTAssertEqual(reaction.transientTimerDirective, .schedule(milliseconds: 1_200))
+        XCTAssertEqual(reaction.transientTimerDirective, .schedule(milliseconds: 30_000))
 
         XCTAssertEqual(
             reducer.reduce(.approvalOpened(requestID: "approval-1"), atMilliseconds: 2).state,
@@ -29,13 +33,12 @@ final class PetCompanionReducerTests: XCTestCase {
     func test_careAndNotificationCuesReturnToTheirExactBaseStates() {
         var reducer = PetEventReducer(coalescingWindowMilliseconds: 0)
 
-        XCTAssertEqual(
-            reducer.reduce(
-                .companionCue(PetCompanionDirector.careCue(action: .pet, returnState: .idle)),
-                atMilliseconds: 0
-            ).state,
-            .purring
+        let care = reducer.reduce(
+            .companionCue(PetCompanionDirector.careCue(action: .pet, returnState: .idle)),
+            atMilliseconds: 0
         )
+        XCTAssertEqual(care.state, .purring)
+        XCTAssertEqual(care.transientTimerDirective, .schedule(milliseconds: 35_000))
         XCTAssertEqual(reducer.reduce(.transientExpired, atMilliseconds: 1_200).state, .idle)
 
         XCTAssertEqual(

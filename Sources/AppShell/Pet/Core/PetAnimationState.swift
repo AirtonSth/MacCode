@@ -102,6 +102,18 @@ public enum PetAnimationState: String, CaseIterable, Codable, Sendable, Equatabl
         }
     }
 
+    var isExtendedCompanionReaction: Bool {
+        switch self {
+        case .idleBall, .idleScratch, .idleGroom, .idleStretch,
+             .idleBox, .idleButterfly, .eating, .drinking,
+             .purring, .playing, .comfort,
+             .workingMouse, .workingBug, .workingEngineer:
+            return true
+        default:
+            return false
+        }
+    }
+
     public static func highestPriority(in states: [PetAnimationState]) -> PetAnimationState? {
         states.max { lhs, rhs in lhs.priority < rhs.priority }
     }

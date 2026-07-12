@@ -18,6 +18,7 @@ public final class PetController {
     private let systemMonitor = PetSystemActivityMonitor()
     private let openSettings: (PetSettingsRoute) -> Bool
     private let idleTimeoutNanoseconds: UInt64
+    private let extendedReactionDurationProvider: () -> Int64
 
     static let projectionWatermarkKey = "pet.event-projection-watermark.v1"
 
@@ -51,12 +52,16 @@ public final class PetController {
         context: AppContext,
         router: AppCommandRouter,
         openSettings: @escaping (PetSettingsRoute) -> Bool,
-        idleTimeoutNanoseconds: UInt64 = 600_000_000_000
+        idleTimeoutNanoseconds: UInt64 = 600_000_000_000,
+        extendedReactionDurationProvider: @escaping () -> Int64 = {
+            Int64.random(in: PetCompanionDirector.extendedReactionDurationRange)
+        }
     ) throws {
         self.context = context
         self.router = router
         self.openSettings = openSettings
         self.idleTimeoutNanoseconds = idleTimeoutNanoseconds
+        self.extendedReactionDurationProvider = extendedReactionDurationProvider
         self.settingsStore = SettingsStore(db: context.db)
         let settings = settingsStore.load()
         self.model = PetViewModel(settings: settings)
@@ -267,6 +272,9 @@ public final class PetController {
         animationController.onError = { [weak model] _ in
             model?.routeError = "Pet artwork could not be loaded."
         }
+        animationController.idleGazeDirectionProvider = { [weak windowController] in
+            windowController?.idleGazeDirection() ?? .center
+        }
         windowController.onOpenItem = { [weak self] item in self?.open(item) }
         windowController.onMarkAllViewed = { [weak self] in self?.markAllViewed() }
         windowController.onOpenRemoteCode = { [weak self] in self?.showRemoteCode() }
@@ -281,7 +289,8 @@ public final class PetController {
             guard let self else { return }
             self.playCompanionCue(PetCompanionDirector.careCue(
                 action: action,
-                returnState: self.reducer.state
+                returnState: self.reducer.state,
+                durationMilliseconds: self.randomExtendedReactionDuration()
             ), allowsStaticReaction: true)
         }
     }
@@ -739,7 +748,8 @@ public final class PetController {
                 if eligibility.allowsWorkCue {
                     cue = self.companionDirector.nextWorkCue(
                         eligibility: eligibility,
-                        preferredIndex: Int.random(in: 0..<3)
+                        preferredIndex: Int.random(in: 0..<3),
+                        durationMilliseconds: self.randomExtendedReactionDuration()
                     )
                 } else if eligibility.allowsAmbientCue {
                     cue = self.companionDirector.nextAmbientCue(
@@ -775,6 +785,10 @@ public final class PetController {
             .companionCue(cue),
             atMilliseconds: monotonicMilliseconds()
         ))
+    }
+
+    private func randomExtendedReactionDuration() -> Int64 {
+        extendedReactionDurationProvider()
     }
 
     private func scheduleIdleTimeout() {

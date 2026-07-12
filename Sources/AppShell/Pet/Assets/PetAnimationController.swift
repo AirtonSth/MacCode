@@ -44,13 +44,15 @@ final class FoundationPetAnimationScheduler: PetAnimationScheduling {
 /// before scheduling. Paused policies project the manifest's canonical frame.
 @MainActor
 final class PetAnimationController {
-    private static let idleRestDelayRange: ClosedRange<TimeInterval> = 6...12
-
     private let atlas: PetAtlas
     private let scheduler: any PetAnimationScheduling
+    private let idleActionProvider: () -> PetIdleMicroAction
+    private let idleRestDelayProvider: () -> TimeInterval
     private var timer: (any PetAnimationTimer)?
     private var derivedTerminalState: PetAnimationState?
     private var isIdleResting = false
+    private var idleFrameSequence: [Int] = []
+    private var idleFrameSequencePosition = 0
 
     private var isVisible = true
     private var isScreenLocked = false
@@ -60,20 +62,33 @@ final class PetAnimationController {
     private(set) var currentState: PetAnimationState = .idle
     private(set) var currentFrameIndex = 0
     private(set) var currentFrame: PetAtlasFrame?
+    private(set) var currentIdleMicroAction: PetIdleMicroAction?
 
     var onFrame: ((PetAtlasFrame) -> Void)?
     var onError: ((Error) -> Void)?
+    var idleGazeDirectionProvider: () -> PetIdleGazeDirection = { .center }
     var timerIsRunning: Bool { timer?.isValid == true }
 
     convenience init(atlas: PetAtlas) throws {
         try self.init(atlas: atlas, scheduler: FoundationPetAnimationScheduler())
     }
 
-    init(atlas: PetAtlas, scheduler: any PetAnimationScheduling) throws {
+    init(
+        atlas: PetAtlas,
+        scheduler: any PetAnimationScheduling,
+        idleActionProvider: @escaping () -> PetIdleMicroAction = {
+            PetIdleMicroAction.select(Int.random(in: 0..<100))
+        },
+        idleRestDelayProvider: @escaping () -> TimeInterval = {
+            Double.random(in: PetIdleMicroAction.restDelayRange)
+        }
+    ) throws {
         self.atlas = atlas
         self.scheduler = scheduler
+        self.idleActionProvider = idleActionProvider
+        self.idleRestDelayProvider = idleRestDelayProvider
         try atlas.activate(.idle)
-        currentFrame = try atlas.canonicalFrame(for: .idle)
+        currentFrame = try atlas.canonicalIdleMicroActionFrame()
         currentFrameIndex = currentFrame?.index ?? 0
     }
 
@@ -87,7 +102,7 @@ final class PetAnimationController {
     ) throws {
         let previous = currentState
         stopTimer()
-        isIdleResting = false
+        resetIdlePlayback()
         currentState = state
         self.derivedTerminalState = derivedTerminalState
         try atlas.activate(state, adjacent: [previous])
@@ -135,7 +150,7 @@ final class PetAnimationController {
 
     private func reconcilePolicy() {
         stopTimer()
-        isIdleResting = false
+        resetIdlePlayback()
         guard let row = atlas.manifest.row(for: currentState) else { return }
         if shouldAnimate {
             scheduleTimer(for: row)
@@ -167,15 +182,53 @@ final class PetAnimationController {
     private func scheduleIdleRest(for row: PetAtlasManifest.Row) {
         stopTimer()
         isIdleResting = true
+        currentIdleMicroAction = nil
+        idleFrameSequence = []
+        idleFrameSequencePosition = 0
         currentFrameIndex = row.canonicalFrame
-        timer = scheduler.schedule(interval: Double.random(in: Self.idleRestDelayRange)) { [weak self] in
+        publishCurrentFrameOrStop()
+        timer = scheduler.schedule(interval: idleRestDelayProvider()) { [weak self] in
             self?.tick()
+        }
+    }
+
+    private func beginIdleMicroAction() {
+        let action = idleActionProvider()
+        currentIdleMicroAction = action
+        idleFrameSequence = frameSequence(for: action)
+        idleFrameSequencePosition = 0
+        currentFrameIndex = idleFrameSequence[0]
+        publishCurrentFrameOrStop()
+        stopTimer()
+        timer = scheduler.schedule(interval: 1.0 / Double(action.framesPerSecond)) { [weak self] in
+            self?.tick()
+        }
+    }
+
+    private func frameSequence(for action: PetIdleMicroAction) -> [Int] {
+        switch action {
+        case .blink:
+            return [1, 2, 4, 0]
+        case .tail:
+            return [1, 2, 3, 2, 1, 0]
+        case .ears:
+            return [1, 2, 3, 4, 5, 6, 7, 0]
+        case .gaze:
+            let direction = idleGazeDirectionProvider().frameIndex
+            return direction == 0 ? [0] : [direction, direction, 0]
         }
     }
 
     private func stopTimer() {
         timer?.invalidate()
         timer = nil
+    }
+
+    private func resetIdlePlayback() {
+        isIdleResting = false
+        currentIdleMicroAction = nil
+        idleFrameSequence = []
+        idleFrameSequencePosition = 0
     }
 
     private func tick() {
@@ -187,9 +240,21 @@ final class PetAnimationController {
 
         if currentState == .idle, isIdleResting {
             isIdleResting = false
-            currentFrameIndex = min(row.canonicalFrame + 1, row.frames - 1)
-            publishCurrentFrameOrStop()
-            scheduleFrameTimer(for: row)
+            beginIdleMicroAction()
+            return
+        }
+
+        if currentState == .idle, currentIdleMicroAction != nil {
+            if idleFrameSequencePosition + 1 < idleFrameSequence.count {
+                idleFrameSequencePosition += 1
+                currentFrameIndex = idleFrameSequence[idleFrameSequencePosition]
+                publishCurrentFrameOrStop()
+                if idleFrameSequencePosition + 1 == idleFrameSequence.count {
+                    scheduleIdleRest(for: row)
+                }
+            } else {
+                scheduleIdleRest(for: row)
+            }
             return
         }
 
@@ -197,7 +262,9 @@ final class PetAnimationController {
         if currentFrameIndex < last {
             currentFrameIndex += 1
             publishCurrentFrameOrStop()
-            if currentFrameIndex == last, row.mode == .onceHold {
+            if currentFrameIndex == last,
+               row.mode == .onceHold,
+               !currentState.isExtendedCompanionReaction {
                 stopTimer()
             }
             return
@@ -211,7 +278,12 @@ final class PetAnimationController {
                 scheduleIdleRest(for: row)
             }
         case .onceHold:
-            stopTimer()
+            if currentState.isExtendedCompanionReaction {
+                currentFrameIndex = 0
+                publishCurrentFrameOrStop()
+            } else {
+                stopTimer()
+            }
         case .onceThenWaiting:
             transitionAfterOnce(to: .waiting)
         case .onceThenDerived:
@@ -229,7 +301,15 @@ final class PetAnimationController {
     }
 
     private func publishCurrentFrame() throws {
-        let frame = try atlas.frame(state: currentState, index: currentFrameIndex)
+        let frame: PetAtlasFrame
+        if currentState == .idle {
+            frame = try atlas.idleMicroActionFrame(
+                action: currentIdleMicroAction ?? .blink,
+                index: currentFrameIndex
+            )
+        } else {
+            frame = try atlas.frame(state: currentState, index: currentFrameIndex)
+        }
         currentFrame = frame
         onFrame?(frame)
     }
