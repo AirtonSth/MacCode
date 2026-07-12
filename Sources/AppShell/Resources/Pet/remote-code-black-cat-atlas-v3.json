@@ -1,7 +1,7 @@
 {
   "atlas" : "remote-code-black-cat-atlas.png",
   "dimensions" : {
-    "height" : 6656,
+    "height" : 7072,
     "width" : 1536
   },
   "fallbackState" : "idle",
@@ -10,9 +10,9 @@
     "frameHeight" : 208,
     "frameWidth" : 192,
     "origin" : "top-left",
-    "rows" : 32
+    "rows" : 34
   },
-  "name" : "remote-code-black-cat-atlas-v2",
+  "name" : "remote-code-black-cat-atlas-v3",
   "rows" : [
     {
       "canonicalFrame" : 0,
@@ -22,206 +22,206 @@
       "row" : 0,
       "state" : "idle",
       "visualBounds" : {
-        "height" : 106,
-        "width" : 100,
-        "x" : 46,
-        "y" : 51
+        "height" : 104,
+        "width" : 99,
+        "x" : 47,
+        "y" : 52
       }
     },
     {
       "canonicalFrame" : 0,
-      "fps" : 6,
+      "fps" : 3,
       "frames" : 8,
       "mode" : "loop",
       "row" : 1,
       "state" : "listening",
       "visualBounds" : {
-        "height" : 112,
-        "width" : 132,
-        "x" : 30,
-        "y" : 48
+        "height" : 114,
+        "width" : 140,
+        "x" : 15,
+        "y" : 47
       }
     },
     {
       "canonicalFrame" : 0,
-      "fps" : 6,
+      "fps" : 3,
       "frames" : 8,
       "mode" : "loop",
       "row" : 2,
       "state" : "thinking",
       "visualBounds" : {
-        "height" : 121,
-        "width" : 124,
-        "x" : 34,
-        "y" : 44
+        "height" : 135,
+        "width" : 136,
+        "x" : 46,
+        "y" : 25
       }
     },
     {
       "canonicalFrame" : 0,
-      "fps" : 8,
+      "fps" : 4,
       "frames" : 8,
       "mode" : "loop",
       "row" : 3,
       "state" : "coding",
       "visualBounds" : {
-        "height" : 94,
-        "width" : 128,
-        "x" : 32,
-        "y" : 57
+        "height" : 88,
+        "width" : 122,
+        "x" : 43,
+        "y" : 60
       }
     },
     {
       "canonicalFrame" : 0,
-      "fps" : 8,
+      "fps" : 4,
       "frames" : 8,
       "mode" : "loop",
       "row" : 4,
       "state" : "editing",
       "visualBounds" : {
         "height" : 100,
-        "width" : 126,
+        "width" : 128,
         "x" : 33,
         "y" : 54
       }
     },
     {
       "canonicalFrame" : 0,
-      "fps" : 8,
+      "fps" : 4,
       "frames" : 8,
       "mode" : "loop",
       "row" : 5,
       "state" : "terminal",
       "visualBounds" : {
-        "height" : 99,
-        "width" : 114,
-        "x" : 39,
-        "y" : 55
+        "height" : 92,
+        "width" : 106,
+        "x" : 44,
+        "y" : 58
       }
     },
     {
       "canonicalFrame" : 0,
-      "fps" : 7,
+      "fps" : 3,
       "frames" : 8,
       "mode" : "loop",
       "row" : 6,
       "state" : "search",
       "visualBounds" : {
-        "height" : 98,
-        "width" : 132,
-        "x" : 30,
-        "y" : 55
+        "height" : 108,
+        "width" : 120,
+        "x" : 36,
+        "y" : 50
       }
     },
     {
       "canonicalFrame" : 0,
-      "fps" : 7,
+      "fps" : 3,
       "frames" : 8,
       "mode" : "loop",
       "row" : 7,
       "state" : "gitReview",
       "visualBounds" : {
-        "height" : 94,
-        "width" : 121,
-        "x" : 36,
-        "y" : 57
-      }
-    },
-    {
-      "canonicalFrame" : 0,
-      "fps" : 10,
-      "frames" : 8,
-      "mode" : "onceHold",
-      "row" : 8,
-      "state" : "success",
-      "visualBounds" : {
-        "height" : 126,
-        "width" : 138,
-        "x" : 27,
-        "y" : 41
-      }
-    },
-    {
-      "canonicalFrame" : 0,
-      "fps" : 6,
-      "frames" : 8,
-      "mode" : "loop",
-      "row" : 9,
-      "state" : "approval",
-      "visualBounds" : {
-        "height" : 112,
-        "width" : 160,
-        "x" : 16,
-        "y" : 48
-      }
-    },
-    {
-      "canonicalFrame" : 0,
-      "fps" : 6,
-      "frames" : 8,
-      "mode" : "loop",
-      "row" : 10,
-      "state" : "question",
-      "visualBounds" : {
-        "height" : 116,
-        "width" : 120,
-        "x" : 36,
-        "y" : 46
+        "height" : 110,
+        "width" : 130,
+        "x" : 31,
+        "y" : 49
       }
     },
     {
       "canonicalFrame" : 0,
       "fps" : 7,
+      "frames" : 8,
+      "mode" : "onceHold",
+      "row" : 8,
+      "state" : "success",
+      "visualBounds" : {
+        "height" : 122,
+        "width" : 146,
+        "x" : 25,
+        "y" : 54
+      }
+    },
+    {
+      "canonicalFrame" : 0,
+      "fps" : 3,
+      "frames" : 8,
+      "mode" : "loop",
+      "row" : 9,
+      "state" : "approval",
+      "visualBounds" : {
+        "height" : 104,
+        "width" : 128,
+        "x" : 25,
+        "y" : 52
+      }
+    },
+    {
+      "canonicalFrame" : 0,
+      "fps" : 3,
+      "frames" : 8,
+      "mode" : "loop",
+      "row" : 10,
+      "state" : "question",
+      "visualBounds" : {
+        "height" : 114,
+        "width" : 125,
+        "x" : 47,
+        "y" : 42
+      }
+    },
+    {
+      "canonicalFrame" : 0,
+      "fps" : 2,
       "frames" : 8,
       "mode" : "loop",
       "row" : 11,
       "state" : "waiting",
       "visualBounds" : {
         "height" : 102,
-        "width" : 118,
-        "x" : 37,
+        "width" : 120,
+        "x" : 49,
         "y" : 53
       }
     },
     {
       "canonicalFrame" : 0,
-      "fps" : 8,
+      "fps" : 7,
       "frames" : 8,
       "mode" : "onceThenWaiting",
       "row" : 12,
       "state" : "failed",
       "visualBounds" : {
-        "height" : 114,
-        "width" : 138,
-        "x" : 27,
-        "y" : 47
+        "height" : 88,
+        "width" : 116,
+        "x" : 33,
+        "y" : 60
       }
     },
     {
       "canonicalFrame" : 0,
-      "fps" : 8,
+      "fps" : 7,
       "frames" : 8,
       "mode" : "onceThenDerived",
       "row" : 13,
       "state" : "interrupted",
       "visualBounds" : {
-        "height" : 120,
-        "width" : 116,
-        "x" : 38,
-        "y" : 44
+        "height" : 94,
+        "width" : 97,
+        "x" : 48,
+        "y" : 57
       }
     },
     {
       "canonicalFrame" : 0,
-      "fps" : 6,
+      "fps" : 3,
       "frames" : 8,
       "mode" : "loop",
       "row" : 14,
       "state" : "reconnecting",
       "visualBounds" : {
-        "height" : 114,
-        "width" : 126,
-        "x" : 33,
-        "y" : 47
+        "height" : 105,
+        "width" : 113,
+        "x" : 48,
+        "y" : 51
       }
     },
     {
@@ -246,10 +246,10 @@
       "row" : 16,
       "state" : "idleBall",
       "visualBounds" : {
-        "height" : 116,
-        "width" : 121,
-        "x" : 36,
-        "y" : 46
+        "height" : 106,
+        "width" : 118,
+        "x" : 37,
+        "y" : 52
       }
     },
     {
@@ -260,10 +260,10 @@
       "row" : 17,
       "state" : "idleScratch",
       "visualBounds" : {
-        "height" : 120,
-        "width" : 108,
-        "x" : 42,
-        "y" : 44
+        "height" : 108,
+        "width" : 98,
+        "x" : 47,
+        "y" : 50
       }
     },
     {
@@ -274,10 +274,10 @@
       "row" : 18,
       "state" : "idleGroom",
       "visualBounds" : {
-        "height" : 120,
-        "width" : 110,
-        "x" : 41,
-        "y" : 44
+        "height" : 110,
+        "width" : 100,
+        "x" : 46,
+        "y" : 49
       }
     },
     {
@@ -288,10 +288,10 @@
       "row" : 19,
       "state" : "idleStretch",
       "visualBounds" : {
-        "height" : 116,
-        "width" : 126,
-        "x" : 33,
-        "y" : 46
+        "height" : 104,
+        "width" : 136,
+        "x" : 28,
+        "y" : 52
       }
     },
     {
@@ -302,10 +302,10 @@
       "row" : 20,
       "state" : "idleBox",
       "visualBounds" : {
-        "height" : 124,
-        "width" : 158,
-        "x" : 17,
-        "y" : 42
+        "height" : 108,
+        "width" : 138,
+        "x" : 27,
+        "y" : 50
       }
     },
     {
@@ -316,10 +316,10 @@
       "row" : 21,
       "state" : "idleButterfly",
       "visualBounds" : {
-        "height" : 128,
-        "width" : 121,
-        "x" : 36,
-        "y" : 40
+        "height" : 147,
+        "width" : 172,
+        "x" : 10,
+        "y" : 18
       }
     },
     {
@@ -330,10 +330,10 @@
       "row" : 22,
       "state" : "eating",
       "visualBounds" : {
-        "height" : 104,
-        "width" : 112,
-        "x" : 40,
-        "y" : 52
+        "height" : 112,
+        "width" : 108,
+        "x" : 42,
+        "y" : 48
       }
     },
     {
@@ -345,8 +345,8 @@
       "state" : "drinking",
       "visualBounds" : {
         "height" : 104,
-        "width" : 116,
-        "x" : 38,
+        "width" : 155,
+        "x" : 10,
         "y" : 52
       }
     },
@@ -358,10 +358,10 @@
       "row" : 24,
       "state" : "purring",
       "visualBounds" : {
-        "height" : 128,
-        "width" : 112,
-        "x" : 40,
-        "y" : 40
+        "height" : 122,
+        "width" : 108,
+        "x" : 42,
+        "y" : 32
       }
     },
     {
@@ -372,10 +372,10 @@
       "row" : 25,
       "state" : "playing",
       "visualBounds" : {
-        "height" : 108,
-        "width" : 126,
-        "x" : 33,
-        "y" : 50
+        "height" : 104,
+        "width" : 141,
+        "x" : 28,
+        "y" : 54
       }
     },
     {
@@ -386,10 +386,10 @@
       "row" : 26,
       "state" : "comfort",
       "visualBounds" : {
-        "height" : 104,
-        "width" : 104,
-        "x" : 44,
-        "y" : 52
+        "height" : 96,
+        "width" : 96,
+        "x" : 48,
+        "y" : 56
       }
     },
     {
@@ -400,10 +400,10 @@
       "row" : 27,
       "state" : "notificationPounce",
       "visualBounds" : {
-        "height" : 126,
-        "width" : 114,
-        "x" : 39,
-        "y" : 41
+        "height" : 98,
+        "width" : 152,
+        "x" : 20,
+        "y" : 58
       }
     },
     {
@@ -414,9 +414,9 @@
       "row" : 28,
       "state" : "workingMouse",
       "visualBounds" : {
-        "height" : 104,
-        "width" : 160,
-        "x" : 16,
+        "height" : 109,
+        "width" : 150,
+        "x" : 18,
         "y" : 52
       }
     },
@@ -428,10 +428,10 @@
       "row" : 29,
       "state" : "workingBug",
       "visualBounds" : {
-        "height" : 108,
-        "width" : 154,
-        "x" : 19,
-        "y" : 50
+        "height" : 99,
+        "width" : 141,
+        "x" : 18,
+        "y" : 55
       }
     },
     {
@@ -442,10 +442,10 @@
       "row" : 30,
       "state" : "workingEngineer",
       "visualBounds" : {
-        "height" : 112,
-        "width" : 146,
-        "x" : 23,
-        "y" : 48
+        "height" : 106,
+        "width" : 130,
+        "x" : 31,
+        "y" : 51
       }
     },
     {
@@ -456,12 +456,40 @@
       "row" : 31,
       "state" : "celebrateTreat",
       "visualBounds" : {
-        "height" : 104,
-        "width" : 160,
-        "x" : 16,
-        "y" : 52
+        "height" : 112,
+        "width" : 154,
+        "x" : 19,
+        "y" : 48
+      }
+    },
+    {
+      "canonicalFrame" : 0,
+      "fps" : 2,
+      "frames" : 8,
+      "mode" : "onceHold",
+      "row" : 32,
+      "state" : "idleYawn",
+      "visualBounds" : {
+        "height" : 110,
+        "width" : 98,
+        "x" : 47,
+        "y" : 49
+      }
+    },
+    {
+      "canonicalFrame" : 0,
+      "fps" : 3,
+      "frames" : 8,
+      "mode" : "loop",
+      "row" : 33,
+      "state" : "pickedUp",
+      "visualBounds" : {
+        "height" : 140,
+        "width" : 82,
+        "x" : 62,
+        "y" : 26
       }
     }
   ],
-  "schemaVersion" : 2
+  "schemaVersion" : 3
 }

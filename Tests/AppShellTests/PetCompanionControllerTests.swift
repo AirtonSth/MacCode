@@ -13,8 +13,25 @@ final class PetCompanionControllerTests: XCTestCase {
 
         controller.windowControllerForTests.onCareAction?(.pet)
         XCTAssertEqual(controller.modelForTests.animationState, .purring)
+        XCTAssertEqual(controller.lastScheduledTransientMillisecondsForTests, 100,
+            "short injected durations stay exact for deterministic controller tests")
 
         try await waitForState(.idle, controller: controller)
+    }
+
+    func test_controllerSchedulesTheLoopAlignedDurationInsteadOfTheRawRandomValue() throws {
+        let controller = try makeController(
+            prefix: "LoopAlignedDuration",
+            extendedReactionDurationProvider: { 9_000 }
+        )
+        defer { controller.stop() }
+        controller.start()
+
+        controller.windowControllerForTests.onCareAction?(.feed)
+
+        XCTAssertEqual(controller.modelForTests.animationState, .eating)
+        XCTAssertEqual(controller.lastScheduledTransientMillisecondsForTests, 8_167,
+            "production wiring must end eating on its neutral loop seam instead of mid-bite")
     }
 
     func test_careActionUsesStaticFrameAndExpiresUnderReduceMotionOrPause() async throws {
@@ -39,6 +56,36 @@ final class PetCompanionControllerTests: XCTestCase {
         }
     }
 
+    func test_screenLockCancelsDragWithoutResurrectingPickedUpOnUnlock() throws {
+        let controller = try makeController(prefix: "DragScreenLock")
+        defer { controller.stop() }
+        controller.start()
+
+        controller.windowControllerForTests.beginDragForTests()
+        XCTAssertEqual(controller.modelForTests.animationState, .pickedUp)
+        XCTAssertEqual(controller.windowControllerForTests.dragLifecycleForTests?.active, true)
+
+        controller.handleSystemScreenLockChanged(true)
+        XCTAssertEqual(controller.modelForTests.animationState, .sleeping)
+        XCTAssertEqual(controller.windowControllerForTests.dragLifecycleForTests?.active, false)
+        XCTAssertEqual(controller.windowControllerForTests.dragLifecycleForTests?.monitoring, false)
+        XCTAssertEqual(controller.windowControllerForTests.dragLifecycleForTests?.cursorPushed, false)
+
+        controller.handleSystemScreenLockChanged(false)
+        XCTAssertNotEqual(controller.modelForTests.animationState, .pickedUp)
+    }
+
+    func test_stopDuringActiveDragCannotRearmCancelledControllerTasks() throws {
+        let controller = try makeController(prefix: "StopDuringDrag")
+        controller.start()
+        controller.windowControllerForTests.beginDragForTests()
+
+        controller.stop()
+
+        XCTAssertFalse(controller.hasScheduledTasksForTests,
+            "stopping from pickedUp must not rearm idle or companion work")
+    }
+
     func test_ambientReactionUsesInjectedDurationThenReturnsToIdle() async throws {
         var delayRequestCount = 0
         let controller = try makeController(
@@ -54,7 +101,7 @@ final class PetCompanionControllerTests: XCTestCase {
 
         try await waitForState(in: [
             .idleBall, .idleScratch, .idleGroom, .idleStretch,
-            .idleBox, .idleButterfly, .eating,
+            .idleBox, .idleButterfly, .eating, .idleYawn,
         ], controller: controller)
         try await waitForState(.idle, controller: controller)
     }
@@ -138,7 +185,7 @@ final class PetCompanionControllerTests: XCTestCase {
 
         XCTAssertEqual(requestedRanges.first, 35...55)
         XCTAssertEqual(durationRequestCount, 1,
-            "work reactions must use the same randomized 10–20 second provider as ambient and Care")
+            "work reactions must use the same randomized 6–12 second provider as ambient and Care")
     }
 
     func test_newReadyItemPouncesOnceThenReturnsToWaitingBadgeState() async throws {

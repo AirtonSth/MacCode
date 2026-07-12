@@ -1,7 +1,7 @@
 import Foundation
 import CoreModel
 
-/// Stable row order for Remote Code Pet Atlas v2.
+/// Stable row order for Remote Code Pet Atlas schema v3.
 ///
 /// Do not reorder cases without shipping a new atlas schema version. The raw value is
 /// also the manifest key used by the renderer and settings diagnostics.
@@ -38,6 +38,8 @@ public enum PetAnimationState: String, CaseIterable, Codable, Sendable, Equatabl
     case workingBug
     case workingEngineer
     case celebrateTreat
+    case idleYawn
+    case pickedUp
 
     /// Maps provider item types into the atlas vocabulary. `nil` is a deliberate
     /// noise decision, not an unknown mapping.
@@ -67,7 +69,7 @@ public enum PetAnimationState: String, CaseIterable, Codable, Sendable, Equatabl
     private var priority: Int {
         switch self {
         case .idle: return 0
-        case .idleBall, .idleScratch, .idleGroom, .idleStretch, .idleBox, .idleButterfly: return 10
+        case .idleBall, .idleScratch, .idleGroom, .idleStretch, .idleBox, .idleButterfly, .idleYawn: return 10
         case .sleeping: return 100
         case .waiting: return 200
         case .reconnecting: return 300
@@ -87,12 +89,13 @@ public enum PetAnimationState: String, CaseIterable, Codable, Sendable, Equatabl
         case .failed: return 900
         case .question: return 1_000
         case .approval: return 1_010
+        case .pickedUp: return 1_100
         }
     }
 
     var isCompanionReaction: Bool {
         switch self {
-        case .idleBall, .idleScratch, .idleGroom, .idleStretch,
+        case .idleBall, .idleScratch, .idleGroom, .idleStretch, .idleYawn,
              .idleBox, .idleButterfly, .eating, .drinking,
              .purring, .playing, .comfort, .notificationPounce,
              .workingMouse, .workingBug, .workingEngineer, .celebrateTreat:
@@ -104,7 +107,7 @@ public enum PetAnimationState: String, CaseIterable, Codable, Sendable, Equatabl
 
     var isExtendedCompanionReaction: Bool {
         switch self {
-        case .idleBall, .idleScratch, .idleGroom, .idleStretch,
+        case .idleBall, .idleScratch, .idleGroom,
              .idleBox, .idleButterfly, .eating, .drinking,
              .purring, .playing, .comfort,
              .workingMouse, .workingBug, .workingEngineer:

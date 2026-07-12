@@ -22,20 +22,164 @@ final class PetWindowAccessibilityTests: XCTestCase {
         )
     }
 
-    func test_dragThresholdUsesFourPointsAndFinishResetsTheDecision() {
+    func test_dragThresholdEasesTheClickedPixelOntoTheScruffAnchor() throws {
         var interaction = PetDragInteraction()
-        interaction.begin(mouseLocation: .zero, windowOrigin: CGPoint(x: 40, y: 60))
+        interaction.begin(mouseLocation: CGPoint(x: 100, y: 100))
 
-        XCTAssertNil(interaction.draggedWindowOrigin(to: CGPoint(x: 3.9, y: 0)))
+        XCTAssertEqual(interaction.update(to: CGPoint(x: 103.9, y: 100)), .pending)
         XCTAssertFalse(interaction.didDrag)
-        XCTAssertEqual(
-            interaction.draggedWindowOrigin(to: CGPoint(x: 4, y: 0)),
-            CGPoint(x: 44, y: 60)
-        )
+        XCTAssertEqual(interaction.update(to: CGPoint(x: 104, y: 100)), .began)
         XCTAssertTrue(interaction.didDrag)
+
+        let cursor = CGPoint(x: 104, y: 100)
+        interaction.beginScruffTransition(
+            cursorLocation: cursor,
+            windowOrigin: CGPoint(x: 40, y: 60)
+        )
+        let targetOffset = PetScruffAnchor.offset(in: CGSize(width: 100, height: 100))
+        var origin: CGPoint?
+        for _ in 0..<16 {
+            origin = interaction.anchoredWindowOrigin(
+                cursorLocation: cursor,
+                targetGrabOffset: targetOffset
+            )
+        }
+        let finalOrigin = try XCTUnwrap(origin)
+        XCTAssertEqual(cursor.x - finalOrigin.x, targetOffset.x, accuracy: 0.1)
+        XCTAssertEqual(cursor.y - finalOrigin.y, targetOffset.y, accuracy: 0.1)
+        XCTAssertEqual(interaction.update(to: CGPoint(x: 108, y: 100)), .dragging,
+            "the drag-began event must be emitted exactly once")
+
         XCTAssertTrue(interaction.finish(), "mouse-up must retain the drag decision for routing")
         XCTAssertFalse(interaction.didDrag, "mouse-up must reset click-through state after routing")
         XCTAssertFalse(interaction.finish(), "a consumed drag must not leak into the next interaction")
+    }
+
+    func test_scruffAnchorStaysAtTheHeadInsteadOfTheClickedBodyPixel() {
+        XCTAssertEqual(PetScruffAnchor.normalized.x, 0.5, accuracy: 0.001)
+        XCTAssertEqual(PetScruffAnchor.normalized.y, 0.82, accuracy: 0.001)
+        let offset = PetScruffAnchor.offset(in: CGSize(width: 120, height: 150))
+        XCTAssertEqual(offset.x, 60, accuracy: 0.001)
+        XCTAssertEqual(offset.y, 123, accuracy: 0.001)
+    }
+
+    func test_dragLifecycleRestoresBeforeDropAndBalancesCursorMonitoring() throws {
+        let controller = try controller()
+        defer { controller.stop() }
+        controller.show()
+        let panel = try XCTUnwrap(controller.petPanelForTests)
+        var transitions: [Bool] = []
+        let restoredSize = CGSize(width: 120, height: 150)
+        controller.onDragStateChanged = { isDragging in
+            transitions.append(isDragging)
+            if !isDragging {
+                panel.setFrame(
+                    CGRect(origin: panel.frame.origin, size: restoredSize),
+                    display: false
+                )
+            }
+        }
+
+        controller.beginDragForTests()
+        XCTAssertEqual(transitions, [true])
+        XCTAssertEqual(controller.dragLifecycleForTests?.active, true)
+        XCTAssertEqual(controller.dragLifecycleForTests?.monitoring, true)
+        XCTAssertEqual(controller.dragLifecycleForTests?.cursorPushed, true)
+
+        controller.completeDragForTests(asDrop: true)
+
+        XCTAssertEqual(transitions, [true, false], "drag begin/end must each emit exactly once")
+        XCTAssertEqual(controller.dragLifecycleForTests?.active, false)
+        XCTAssertEqual(controller.dragLifecycleForTests?.monitoring, false)
+        XCTAssertEqual(controller.dragLifecycleForTests?.cursorPushed, false)
+        XCTAssertEqual(panel.frame.size, restoredSize,
+            "semantic pose size must be restored before drop clamp/persistence reads the frame")
+    }
+
+    func test_dragCancellationDoesNotRouteAFalseDrop() throws {
+        let controller = try controller()
+        defer { controller.stop() }
+        controller.show()
+        var transitions: [Bool] = []
+        controller.onDragStateChanged = { transitions.append($0) }
+
+        controller.beginDragForTests()
+        controller.cancelActiveDrag()
+        controller.cancelActiveDrag()
+
+        XCTAssertEqual(transitions, [true, false])
+        XCTAssertEqual(controller.dragLifecycleForTests?.active, false)
+        XCTAssertEqual(controller.dragLifecycleForTests?.monitoring, false)
+        XCTAssertEqual(controller.dragLifecycleForTests?.cursorPushed, false)
+    }
+
+    func test_dragCancellationConsumesThePhysicalMouseUpWithoutOpeningThePopover() {
+        let view = PetSpriteHostingView(rootView: EmptyView())
+        var clickCount = 0
+        view.onClick = { clickCount += 1 }
+
+        view.beginActiveDragForTests()
+        view.cancelActiveDrag()
+        view.routeMouseUpForTests()
+
+        XCTAssertEqual(clickCount, 0,
+            "Escape, screen lock, or hide must not reinterpret the cancelled drag release as a click")
+    }
+
+    func test_escapeAndWindowRemovalCancelTheRealDragRouteAndConsumeRelease() {
+        for route in ["escape", "window-removal"] {
+            let view = PetSpriteHostingView(rootView: EmptyView())
+            var transitions: [Bool] = []
+            var clickCount = 0
+            view.onDragStateChanged = { transitions.append($0) }
+            view.onClick = { clickCount += 1 }
+            view.beginActiveDragForTests()
+
+            if route == "escape" {
+                view.cancelOperation(nil)
+            } else {
+                view.viewWillMove(toWindow: nil)
+            }
+            view.routeMouseUpForTests()
+
+            XCTAssertEqual(transitions, [true, false], "\(route) must close pickedUp exactly once")
+            XCTAssertEqual(clickCount, 0, "\(route) must consume the later physical release")
+            XCTAssertEqual(view.dragLifecycleForTests.active, false)
+            XCTAssertEqual(view.dragLifecycleForTests.monitoring, false)
+            XCTAssertEqual(view.dragLifecycleForTests.cursorPushed, false)
+        }
+    }
+
+    func test_hideCancelsPickedUpAndConsumesTheLaterPhysicalRelease() throws {
+        let controller = try controller()
+        defer { controller.stop() }
+        controller.show()
+        controller.beginDragForTests()
+
+        controller.hide()
+        controller.routeMouseUpForTests()
+
+        XCTAssertEqual(controller.dragLifecycleForTests?.active, false)
+        XCTAssertEqual(controller.dragLifecycleForTests?.monitoring, false)
+        XCTAssertEqual(controller.dragLifecycleForTests?.cursorPushed, false)
+        XCTAssertFalse(controller.isPopoverVisible,
+            "a release after Hide Pet must not reopen the hidden companion")
+    }
+
+    func test_lostMouseUpFallbackCompletesDropAndBalancesCursorMonitoring() throws {
+        let controller = try controller()
+        defer { controller.stop() }
+        controller.show()
+        var transitions: [Bool] = []
+        controller.onDragStateChanged = { transitions.append($0) }
+        controller.beginDragForTests()
+
+        controller.fallbackMouseUpForTests()
+
+        XCTAssertEqual(transitions, [true, false])
+        XCTAssertEqual(controller.dragLifecycleForTests?.active, false)
+        XCTAssertEqual(controller.dragLifecycleForTests?.monitoring, false)
+        XCTAssertEqual(controller.dragLifecycleForTests?.cursorPushed, false)
     }
 
     func test_alphaMaskBuildsOncePerFrameInsteadOfCopyingProviderDataPerHover() throws {

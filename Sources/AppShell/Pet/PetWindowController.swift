@@ -9,78 +9,6 @@ private final class PetPopoverPanel: NSPanel {
     override var canBecomeMain: Bool { false }
 }
 
-struct PetDragInteraction {
-    static let threshold: CGFloat = 4
-
-    private var mouseDownLocation: CGPoint?
-    private var windowOriginAtMouseDown: CGPoint?
-    private(set) var didDrag = false
-
-    mutating func begin(mouseLocation: CGPoint, windowOrigin: CGPoint?) {
-        mouseDownLocation = mouseLocation
-        windowOriginAtMouseDown = windowOrigin
-        didDrag = false
-    }
-
-    mutating func draggedWindowOrigin(to current: CGPoint) -> CGPoint? {
-        guard let down = mouseDownLocation,
-              let origin = windowOriginAtMouseDown else { return nil }
-        let delta = CGSize(width: current.x - down.x, height: current.y - down.y)
-        if !didDrag, hypot(delta.width, delta.height) >= Self.threshold {
-            didDrag = true
-        }
-        guard didDrag else { return nil }
-        return CGPoint(x: origin.x + delta.width, y: origin.y + delta.height)
-    }
-
-    mutating func finish() -> Bool {
-        let wasDrag = didDrag
-        mouseDownLocation = nil
-        windowOriginAtMouseDown = nil
-        didDrag = false
-        return wasDrag
-    }
-}
-
-struct PetSpriteAlphaMask {
-    let width: Int
-    let height: Int
-    private let alpha: [UInt8]
-
-    init?(image: CGImage) {
-        let width = image.width
-        let height = image.height
-        guard width > 0, height > 0 else { return nil }
-
-        var rgba = [UInt8](repeating: 0, count: width * height * 4)
-        let rendered = rgba.withUnsafeMutableBytes { bytes -> Bool in
-            guard let data = bytes.baseAddress,
-                  let context = CGContext(
-                      data: data,
-                      width: width,
-                      height: height,
-                      bitsPerComponent: 8,
-                      bytesPerRow: width * 4,
-                      space: CGColorSpaceCreateDeviceRGB(),
-                      bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
-                          | CGBitmapInfo.byteOrder32Big.rawValue
-                  ) else { return false }
-            context.interpolationQuality = .none
-            context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
-            return true
-        }
-        guard rendered else { return nil }
-        self.width = width
-        self.height = height
-        self.alpha = stride(from: 3, to: rgba.count, by: 4).map { rgba[$0] }
-    }
-
-    func isOpaque(x: Int, y: Int, threshold: UInt8 = 8) -> Bool {
-        guard (0..<width).contains(x), (0..<height).contains(y) else { return false }
-        return alpha[y * width + x] > threshold
-    }
-}
-
 enum PetAccessibilityIdentifier {
     static func row(_ raw: String) -> String {
         SHA256.hash(data: Data(raw.utf8))
@@ -185,84 +113,6 @@ enum PetScreenGeometry {
             .filter { $0.area > 0 }
             .max { lhs, rhs in lhs.area < rhs.area }?
             .index
-    }
-}
-
-final class PetSpriteHostingView<Content: View>: NSHostingView<Content> {
-    var onClick: (() -> Void)?
-    var onRightClick: ((NSEvent) -> Void)?
-    var onDragEnded: ((CGRect) -> Void)?
-    var imageProvider: (() -> CGImage?)?
-    var badgeVisibleProvider: (() -> Bool)?
-    var accessibilityValueProvider: (() -> String)?
-
-    private var dragInteraction = PetDragInteraction()
-    private var alphaMaskImage: CGImage?
-    private var alphaMask: PetSpriteAlphaMask?
-    private(set) var alphaMaskBuildCountForTests = 0
-
-    var didDrag: Bool { dragInteraction.didDrag }
-
-    override func hitTest(_ point: NSPoint) -> NSView? {
-        isOpaque(at: point) ? super.hitTest(point) : nil
-    }
-
-    override func mouseDown(with event: NSEvent) {
-        dragInteraction.begin(
-            mouseLocation: NSEvent.mouseLocation,
-            windowOrigin: window?.frame.origin
-        )
-    }
-
-    override func mouseDragged(with event: NSEvent) {
-        guard let origin = dragInteraction.draggedWindowOrigin(to: NSEvent.mouseLocation),
-              let window else { return }
-        window.setFrameOrigin(origin)
-    }
-
-    override func mouseUp(with event: NSEvent) {
-        let wasDrag = dragInteraction.finish()
-        if wasDrag, let frame = window?.frame {
-            onDragEnded?(frame)
-        } else {
-            onClick?()
-        }
-    }
-
-    override func rightMouseDown(with event: NSEvent) {
-        onRightClick?(event)
-    }
-
-    func isOpaque(at point: CGPoint) -> Bool {
-        guard bounds.contains(point) else { return false }
-        if badgeVisibleProvider?() == true {
-            let badgeRect = CGRect(x: bounds.maxX - 34, y: bounds.maxY - 34, width: 34, height: 34)
-            if badgeRect.contains(point) { return true }
-        }
-        guard let image = imageProvider?() else { return true }
-        if alphaMaskImage !== image {
-            alphaMaskImage = image
-            alphaMask = PetSpriteAlphaMask(image: image)
-            alphaMaskBuildCountForTests += 1
-        }
-        guard let alphaMask else { return true }
-        let x = min(image.width - 1, max(0, Int(point.x / max(1, bounds.width) * CGFloat(image.width))))
-        let y = min(image.height - 1, max(0, Int(point.y / max(1, bounds.height) * CGFloat(image.height))))
-        return alphaMask.isOpaque(x: x, y: y)
-    }
-
-    override func accessibilityValue() -> Any? {
-        accessibilityValueProvider?() ?? super.accessibilityValue()
-    }
-
-    override func accessibilityRole() -> NSAccessibility.Role? {
-        .button
-    }
-
-    override func accessibilityPerformPress() -> Bool {
-        guard let onClick else { return false }
-        onClick()
-        return true
     }
 }
 
@@ -444,6 +294,7 @@ public final class PetWindowController: NSObject {
     public var onAdoptFreePosition: (() -> Void)?
     public var onInteraction: (() -> Void)?
     public var onCareAction: ((PetCareAction) -> Void)?
+    public var onDragStateChanged: ((Bool) -> Void)?
 
     private let model: PetViewModel
     private let placementStore: PetPlacementStore
@@ -472,6 +323,13 @@ public final class PetWindowController: NSObject {
     var petPanelForTests: NSPanel? { petPanel }
     var popoverPanelForTests: NSPanel? { popoverPanel }
     var spriteAccessibilityViewForTests: NSView? { spriteView }
+    var dragLifecycleForTests: (active: Bool, monitoring: Bool, cursorPushed: Bool)? {
+        spriteView?.dragLifecycleForTests
+    }
+    func beginDragForTests() { spriteView?.beginActiveDragForTests() }
+    func completeDragForTests(asDrop: Bool) { spriteView?.completeActiveDragForTests(asDrop: asDrop) }
+    func routeMouseUpForTests() { spriteView?.routeMouseUpForTests() }
+    func fallbackMouseUpForTests() { spriteView?.fallbackMouseUpForTests() }
     func finishDragForTests(frame: CGRect) { finishDrag(frame: frame) }
     func contextMenuForTests() -> NSMenu { contextMenu() }
     func invokeCareMenuItemForTests(_ item: NSMenuItem) { contextCareAction(item) }
@@ -485,8 +343,13 @@ public final class PetWindowController: NSObject {
 
     public func hide() {
         closePopover()
+        cancelActiveDrag()
         petPanel?.orderOut(nil)
         removeMouseMonitors()
+    }
+
+    func cancelActiveDrag() {
+        spriteView?.cancelActiveDrag()
     }
 
     public func stop() {
@@ -582,8 +445,11 @@ public final class PetWindowController: NSObject {
             self.showContextMenu(event: event, in: hosting)
         }
         hosting.onDragEnded = { [weak self] frame in
-            self?.onInteraction?()
-            self?.finishDrag(frame: frame)
+            guard let self else { return }
+            self.finishDrag(frame: self.petPanel?.frame ?? frame)
+        }
+        hosting.onDragStateChanged = { [weak self] isDragging in
+            self?.onDragStateChanged?(isDragging)
         }
         hosting.imageProvider = { [weak self] in self?.model.currentFrame?.displayImage }
         hosting.badgeVisibleProvider = { [weak self] in self?.model.badgeText != nil }

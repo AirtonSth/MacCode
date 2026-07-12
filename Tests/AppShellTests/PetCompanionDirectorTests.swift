@@ -17,17 +17,17 @@ final class PetCompanionDirectorTests: XCTestCase {
         let first = director.nextAmbientCue(
             eligibility: eligible,
             preferredIndex: 0,
-            durationMilliseconds: 10_000
+            durationMilliseconds: 6_000
         )
         let second = director.nextAmbientCue(
             eligibility: eligible,
             preferredIndex: 0,
-            durationMilliseconds: 20_000
+            durationMilliseconds: 12_000
         )
 
         XCTAssertEqual(first?.returnState, .idle)
-        XCTAssertEqual(first?.durationMilliseconds, 10_000)
-        XCTAssertEqual(second?.durationMilliseconds, 20_000)
+        XCTAssertEqual(first?.durationMilliseconds, 6_000)
+        XCTAssertEqual(second?.durationMilliseconds, 12_000)
         XCTAssertNotEqual(first?.state, second?.state,
             "a companion should not repeat the same ambient behavior back-to-back")
         XCTAssertNil(director.nextAmbientCue(
@@ -41,8 +41,34 @@ final class PetCompanionDirectorTests: XCTestCase {
                 screenLocked: false
             ),
             preferredIndex: 1,
-            durationMilliseconds: 15_000
+            durationMilliseconds: 9_000
         ))
+    }
+
+    func test_ambientPoolKeepsYawAndStretchAsDistinctNonRepeatingReactions() {
+        let eligible = PetCompanionEligibility(
+            baseState: .idle,
+            attentionCount: 0,
+            activeRunCount: 0,
+            isVisible: true,
+            animationsEnabled: true,
+            reducedMotion: false,
+            screenLocked: false
+        )
+        var observed: Set<PetAnimationState> = []
+
+        for preferredIndex in 0..<8 {
+            var director = PetCompanionDirector()
+            observed.insert(director.nextAmbientCue(
+                eligibility: eligible,
+                preferredIndex: preferredIndex
+            )?.state ?? .idle)
+        }
+
+        XCTAssertEqual(observed, [
+            .idleBall, .idleScratch, .idleGroom, .idleStretch,
+            .idleBox, .idleButterfly, .eating, .idleYawn,
+        ], "yawning and stretching must remain independently selectable feline behaviors")
     }
 
     func test_workCueRequiresActiveWorkAndCyclesMouseBugEngineerWithoutRepeat() {
@@ -60,17 +86,17 @@ final class PetCompanionDirectorTests: XCTestCase {
         let first = director.nextWorkCue(
             eligibility: eligible,
             preferredIndex: 0,
-            durationMilliseconds: 10_000
+            durationMilliseconds: 6_000
         )
         let second = director.nextWorkCue(
             eligibility: eligible,
             preferredIndex: 0,
-            durationMilliseconds: 20_000
+            durationMilliseconds: 12_000
         )
         XCTAssertEqual(first?.state, .workingMouse)
         XCTAssertNotEqual(first?.state, second?.state)
         XCTAssertEqual(first?.returnState, .coding)
-        XCTAssertEqual(first?.durationMilliseconds, 10_000)
+        XCTAssertEqual(first?.durationMilliseconds, 6_000)
     }
 
     func test_notificationPounceOnlyOccursOnZeroToPositiveAndNeverOverridesBlockers() {
@@ -83,6 +109,9 @@ final class PetCompanionDirectorTests: XCTestCase {
         XCTAssertNil(director.notificationCue(previousCount: 3, newCount: 4, baseState: .waiting))
         XCTAssertNil(director.notificationCue(previousCount: 0, newCount: 1, baseState: .approval))
         XCTAssertNil(director.notificationCue(previousCount: 0, newCount: 1, baseState: .question))
+        XCTAssertNil(director.notificationCue(previousCount: 0, newCount: 1, baseState: .failed))
+        XCTAssertNil(director.notificationCue(previousCount: 0, newCount: 1, baseState: .interrupted))
+        XCTAssertNil(director.notificationCue(previousCount: 0, newCount: 1, baseState: .sleeping))
     }
 
     func test_everyThirdSuccessfulOutcomeUsesTreatCelebration() {
@@ -114,12 +143,12 @@ final class PetCompanionDirectorTests: XCTestCase {
                 PetCompanionDirector.careCue(
                     action: action,
                     returnState: .reconnecting,
-                    durationMilliseconds: 15_000
+                    durationMilliseconds: 9_000
                 ),
                 PetCompanionCue(
                     state: state,
                     returnState: .reconnecting,
-                    durationMilliseconds: 15_000
+                    durationMilliseconds: 9_000
                 )
             )
         }
@@ -128,17 +157,17 @@ final class PetCompanionDirectorTests: XCTestCase {
     func test_directorDelayContractsStayInsideProductBounds() {
         XCTAssertEqual(PetCompanionDirector.ambientDelayRange, 35...55)
         XCTAssertEqual(PetCompanionDirector.workDelayRange, 35...55)
-        XCTAssertEqual(PetCompanionDirector.extendedReactionDurationRange, 10_000...20_000)
+        XCTAssertEqual(PetCompanionDirector.extendedReactionDurationRange, 6_000...12_000)
         XCTAssertEqual(
             PetCompanionDirector.ambientDelayRange.lowerBound
                 + Int(PetCompanionDirector.extendedReactionDurationRange.lowerBound / 1_000),
-            45,
-            "the earliest start-to-start cadence should remain calm"
+            41,
+            "the earliest start-to-start cadence must include the full six-second reaction"
         )
         XCTAssertEqual(
             PetCompanionDirector.ambientDelayRange.upperBound
                 + Int(PetCompanionDirector.extendedReactionDurationRange.upperBound / 1_000),
-            75,
+            67,
             "random reactions should still occur about once per minute"
         )
     }

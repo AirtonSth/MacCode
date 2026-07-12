@@ -107,14 +107,14 @@ struct PetAtlasManifest: Decodable, Equatable {
     }
 
     func validated() throws -> PetAtlasManifest {
-        guard schemaVersion == 2 else {
-            throw PetAtlasError.invalidManifest("schemaVersion must be 2")
+        guard schemaVersion == 3 else {
+            throw PetAtlasError.invalidManifest("schemaVersion must be 3")
         }
-        guard dimensions == Dimensions(height: 6_656, width: 1_536) else {
-            throw PetAtlasError.invalidManifest("atlas dimensions must be 1536x6656")
+        guard dimensions == Dimensions(height: 7_072, width: 1_536) else {
+            throw PetAtlasError.invalidManifest("atlas dimensions must be 1536x7072")
         }
-        guard grid == Grid(columns: 8, frameHeight: 208, frameWidth: 192, origin: "top-left", rows: 32) else {
-            throw PetAtlasError.invalidManifest("grid must be 8x32 with 192x208 top-left frames")
+        guard grid == Grid(columns: 8, frameHeight: 208, frameWidth: 192, origin: "top-left", rows: 34) else {
+            throw PetAtlasError.invalidManifest("grid must be 8x34 with 192x208 top-left frames")
         }
         guard grid.columns * grid.frameWidth == dimensions.width,
               grid.rows * grid.frameHeight == dimensions.height else {
@@ -125,7 +125,7 @@ struct PetAtlasManifest: Decodable, Equatable {
         }
         guard rows.map(\.state) == PetAnimationState.allCases,
               rows.map(\.row) == Array(0..<grid.rows) else {
-            throw PetAtlasError.invalidManifest("rows must match the stable 32-state atlas order")
+            throw PetAtlasError.invalidManifest("rows must match the stable 34-state atlas order")
         }
         for row in rows {
             let visualBounds = row.visualBounds.rect
@@ -145,8 +145,8 @@ struct PetAtlasManifest: Decodable, Equatable {
                 throw PetAtlasError.invalidManifest("invalid playback metadata for \(row.state.rawValue)")
             }
         }
-        guard rows.reduce(0, { $0 + $1.frames }) == 256, unusedFrameCount == 0 else {
-            throw PetAtlasError.invalidManifest("atlas must contain exactly 256 authored frames")
+        guard rows.reduce(0, { $0 + $1.frames }) == 272, unusedFrameCount == 0 else {
+            throw PetAtlasError.invalidManifest("atlas must contain exactly 272 authored frames")
         }
         return self
     }
@@ -186,7 +186,7 @@ final class PetAtlas {
     var decodedRowStates: Set<PetAnimationState> { Set(rowImages.keys) }
 
     static func bundled() throws -> PetAtlas {
-        let name = "remote-code-black-cat-atlas-v2"
+        let name = "remote-code-black-cat-atlas-v3"
         guard let manifestURL = Bundle.module.url(forResource: name, withExtension: "json", subdirectory: "Pet")
                 ?? Bundle.module.url(forResource: name, withExtension: "json") else {
             throw PetAtlasError.missingResource("\(name).json")

@@ -39,10 +39,17 @@ public final class PetController {
     private var isScreenLocked = false
     private(set) var handledEventOutOfOrderForTests = false
     private(set) var handledEventCountForTests = 0
+    private(set) var lastScheduledTransientMillisecondsForTests: Int64?
 
     var modelForTests: PetViewModel { model }
     var windowControllerForTests: PetWindowController { windowController! }
     var animationTimerIsRunningForTests: Bool { animationController?.timerIsRunning == true }
+    var hasScheduledTasksForTests: Bool {
+        transientTask != nil
+            || companionTask != nil
+            || attentionRefreshTask != nil
+            || idleTask != nil
+    }
     var visualRuntimeIsLoadedForTests: Bool {
         animationController != nil && windowController != nil
     }
@@ -121,6 +128,7 @@ public final class PetController {
     }
 
     public func stop() {
+        windowController?.cancelActiveDrag()
         if let eventSubscription {
             EventBus.shared.unsubscribe(eventSubscription)
         }
@@ -287,6 +295,9 @@ public final class PetController {
         windowController.onToggleAnimations = { [weak self] in self?.toggleAnimations() }
         windowController.onAdoptFreePosition = { [weak self] in self?.adoptFreePosition() }
         windowController.onInteraction = { [weak self] in self?.handleInteraction() }
+        windowController.onDragStateChanged = { [weak self] isDragging in
+            self?.handlePetDragStateChanged(isDragging)
+        }
         windowController.onCareAction = { [weak self] action in
             guard let self else { return }
             self.playCompanionCue(PetCompanionDirector.careCue(
@@ -322,6 +333,7 @@ public final class PetController {
     }
 
     func handleSystemScreenLockChanged(_ locked: Bool) {
+        if locked { windowController?.cancelActiveDrag() }
         isScreenLocked = locked
         animationController?.setScreenLocked(locked)
         apply(reducer.reduce(
@@ -460,7 +472,9 @@ public final class PetController {
         guard let directive else { return }
         transientTask?.cancel()
         transientTask = nil
+        lastScheduledTransientMillisecondsForTests = nil
         guard case .schedule(let milliseconds) = directive else { return }
+        lastScheduledTransientMillisecondsForTests = milliseconds
         let nanoseconds = UInt64(max(0, milliseconds)) * 1_000_000
         transientTask = Task { [weak self] in
             try? await Task.sleep(nanoseconds: nanoseconds)
@@ -712,6 +726,14 @@ public final class PetController {
         scheduleIdleTimeout()
     }
 
+    private func handlePetDragStateChanged(_ isDragging: Bool) {
+        apply(reducer.reduce(
+            isDragging ? .petDragBegan : .petDragEnded,
+            atMilliseconds: monotonicMilliseconds()
+        ))
+        scheduleIdleTimeout()
+    }
+
     private func companionEligibility() -> PetCompanionEligibility {
         let settings = model.settings
         return PetCompanionEligibility(
@@ -757,7 +779,7 @@ public final class PetController {
                 } else if eligibility.allowsAmbientCue {
                     cue = self.companionDirector.nextAmbientCue(
                         eligibility: eligibility,
-                        preferredIndex: Int.random(in: 0..<7),
+                        preferredIndex: Int.random(in: 0..<8),
                         durationMilliseconds: self.randomExtendedReactionDuration()
                     )
                 } else {
@@ -781,12 +803,21 @@ public final class PetController {
             && !model.settings.petReduceMotion
             && !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
         guard allowsStaticReaction || motionAllowed else { return }
-        guard animationController != nil else {
+        guard let animationController else {
             pendingCompanionCue = cue
             return
         }
+        let alignedDuration = animationController.loopSafeDurationMilliseconds(
+            for: cue.state,
+            requested: cue.durationMilliseconds
+        )
+        let effectiveCue = PetCompanionCue(
+            state: cue.state,
+            returnState: cue.returnState,
+            durationMilliseconds: alignedDuration
+        )
         apply(reducer.reduce(
-            .companionCue(cue),
+            .companionCue(effectiveCue),
             atMilliseconds: monotonicMilliseconds()
         ))
     }
