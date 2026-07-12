@@ -25,6 +25,29 @@ fail() { echo "FAIL: $1" >&2; fails=$((fails + 1)); }
 json_lint() {
   swift -e 'import Foundation; let url = URL(fileURLWithPath: CommandLine.arguments[1]); _ = try JSONSerialization.jsonObject(with: Data(contentsOf: url))' "$1" >/dev/null 2>&1
 }
+pet_manifest_contract() {
+  swift - "$1" >/dev/null 2>&1 <<'SWIFT'
+import Foundation
+
+let url = URL(fileURLWithPath: CommandLine.arguments[1])
+guard let object = try JSONSerialization.jsonObject(with: Data(contentsOf: url)) as? [String: Any],
+      object["schemaVersion"] as? Int == 3,
+      let dimensions = object["dimensions"] as? [String: Any],
+      dimensions["width"] as? Int == 1_536,
+      dimensions["height"] as? Int == 7_072,
+      let grid = object["grid"] as? [String: Any],
+      grid["columns"] as? Int == 8,
+      grid["rows"] as? Int == 34,
+      grid["frameWidth"] as? Int == 192,
+      grid["frameHeight"] as? Int == 208,
+      let rows = object["rows"] as? [[String: Any]],
+      rows.count == 34,
+      rows.allSatisfy({ $0["frames"] as? Int == 8 }),
+      Set(rows.compactMap { $0["state"] as? String }).count == 34 else {
+    exit(1)
+}
+SWIFT
+}
 
 # 1. Info.plist exists and is valid.
 if [ ! -f "$PLIST" ]; then
@@ -84,7 +107,9 @@ fi
 # this structural check protects the distributable .app boundary.
 PET_DIR="$APP/Contents/Resources/RemoteCode_AppShell.bundle/Pet"
 PET_ATLAS="$PET_DIR/remote-code-black-cat-atlas.png"
-PET_MANIFEST="$PET_DIR/remote-code-black-cat-atlas-v1.json"
+PET_MANIFEST="$PET_DIR/remote-code-black-cat-atlas-v3.json"
+PET_MICRO_MANIFEST="$PET_DIR/remote-code-black-cat-idle-microactions.json"
+PET_EXPECTED_RESOURCE_COUNT=40
 if [ ! -d "$PET_DIR" ]; then
   fail "missing AppShell pet resources at $PET_DIR"
 else
@@ -93,24 +118,42 @@ else
     PET_WIDTH="$(sips -g pixelWidth "$PET_ATLAS" 2>/dev/null | awk '/pixelWidth:/ { print $2 }')"
     PET_HEIGHT="$(sips -g pixelHeight "$PET_ATLAS" 2>/dev/null | awk '/pixelHeight:/ { print $2 }')"
     PET_ALPHA="$(sips -g hasAlpha "$PET_ATLAS" 2>/dev/null | awk '/hasAlpha:/ { print $2 }')"
-    if [ "$PET_WIDTH" = "1536" ] && [ "$PET_HEIGHT" = "3328" ] && [ "$PET_ALPHA" = "yes" ]; then
-      note "pet atlas is 1536x3328 RGBA"
+    if [ "$PET_WIDTH" = "1536" ] && [ "$PET_HEIGHT" = "7072" ] && [ "$PET_ALPHA" = "yes" ]; then
+      note "pet atlas is 1536x7072 RGBA"
     else
-      fail "pet atlas must be 1536x3328 with alpha (got ${PET_WIDTH}x${PET_HEIGHT}, alpha=$PET_ALPHA)"
+      fail "pet atlas must be 1536x7072 with alpha (got ${PET_WIDTH}x${PET_HEIGHT}, alpha=$PET_ALPHA)"
     fi
   fi
   if [ ! -f "$PET_MANIFEST" ]; then
     fail "missing pet atlas manifest"
-  elif ! json_lint "$PET_MANIFEST"; then
-    fail "pet atlas manifest is not valid JSON"
+  elif ! json_lint "$PET_MANIFEST" || ! pet_manifest_contract "$PET_MANIFEST"; then
+    fail "pet atlas manifest does not satisfy the v3 34-row contract"
   else
-    note "pet atlas manifest is valid JSON"
+    note "pet atlas manifest satisfies the v3 34-row contract"
   fi
 
-  PET_STATES="idle listening thinking coding editing terminal search gitReview success approval question waiting failed interrupted reconnecting sleeping"
+  PET_STATES="idle listening thinking coding editing terminal search gitReview success approval question waiting failed interrupted reconnecting sleeping idleBall idleScratch idleGroom idleStretch idleBox idleButterfly eating drinking purring playing comfort notificationPounce workingMouse workingBug workingEngineer celebrateTreat idleYawn pickedUp"
   for state in $PET_STATES; do
     [ -f "$PET_DIR/remote-code-black-cat-$state.png" ] || fail "missing pet state row: $state"
   done
+
+  for action in idle-blink idle-tail idle-ears; do
+    [ -f "$PET_DIR/remote-code-black-cat-$action.png" ] || fail "missing pet micro-action row: $action"
+  done
+  if [ ! -f "$PET_MICRO_MANIFEST" ]; then
+    fail "missing pet micro-action manifest"
+  elif ! json_lint "$PET_MICRO_MANIFEST"; then
+    fail "pet micro-action manifest is not valid JSON"
+  else
+    note "pet micro-action manifest is valid JSON"
+  fi
+
+  PET_RESOURCE_COUNT="$(find "$PET_DIR" -type f -name 'remote-code-black-cat-*' | wc -l | tr -d ' ')"
+  if [ "$PET_RESOURCE_COUNT" = "$PET_EXPECTED_RESOURCE_COUNT" ]; then
+    note "pet resource set contains all $PET_EXPECTED_RESOURCE_COUNT v3 files"
+  else
+    fail "pet resource set must contain $PET_EXPECTED_RESOURCE_COUNT files (got $PET_RESOURCE_COUNT)"
+  fi
 fi
 
 if [ "$fails" -ne 0 ]; then
