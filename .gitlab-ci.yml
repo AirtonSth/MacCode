@@ -310,12 +310,43 @@ stable_macos_arm64_dmg:
       TEMP_DIR="$(mktemp -d)"
       KEYCHAIN="$TEMP_DIR/remotecode-signing.keychain-db"
       CERTIFICATE="$TEMP_DIR/developer-id.p12"
+      ORIGINAL_USER_KEYCHAINS="$TEMP_DIR/original-user-keychains.txt"
+      security list-keychains -d user \
+        | sed -e 's/^[[:space:]]*"//' -e 's/"[[:space:]]*$//' \
+        > "$ORIGINAL_USER_KEYCHAINS"
+      MOUNT=""
+      cleanup_release_keychain() {
+        set +e
+        if [ -n "$MOUNT" ] && [ -d "$MOUNT" ]; then
+          hdiutil detach "$MOUNT" >/dev/null 2>&1 || true
+          rmdir "$MOUNT" >/dev/null 2>&1 || true
+        fi
+        original_keychains=()
+        while IFS= read -r original_keychain; do
+          if [ -n "$original_keychain" ]; then
+            original_keychains+=("$original_keychain")
+          fi
+        done < "$ORIGINAL_USER_KEYCHAINS"
+        if [ "${#original_keychains[@]}" -gt 0 ]; then
+          security list-keychains -d user -s "${original_keychains[@]}"
+        fi
+        security delete-keychain "$KEYCHAIN" >/dev/null 2>&1 || true
+        rm -rf "$TEMP_DIR"
+      }
+      trap cleanup_release_keychain EXIT
+
       printf '%s' "$CODESIGN_P12_BASE64" | base64 --decode > "$CERTIFICATE"
       security create-keychain -p "$TEMP_DIR" "$KEYCHAIN"
       security set-keychain-settings -lut 21600 "$KEYCHAIN"
       security unlock-keychain -p "$TEMP_DIR" "$KEYCHAIN"
       security import "$CERTIFICATE" -P "$CODESIGN_P12_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN"
-      security list-keychains -d user -s "$KEYCHAIN"
+      signing_keychains=("$KEYCHAIN")
+      while IFS= read -r original_keychain; do
+        if [ -n "$original_keychain" ]; then
+          signing_keychains+=("$original_keychain")
+        fi
+      done < "$ORIGINAL_USER_KEYCHAINS"
+      security list-keychains -d user -s "${signing_keychains[@]}"
       security set-key-partition-list -S apple-tool:,apple: -s -k "$TEMP_DIR" "$KEYCHAIN"
 
       if [ -n "$EXPECTED_CODESIGN_IDENTITY" ]; then
@@ -352,12 +383,11 @@ stable_macos_arm64_dmg:
 
       MOUNT="$(mktemp -d)"
       hdiutil attach -readonly -nobrowse -mountpoint "$MOUNT" "dist/$ASSET_NAME"
-      trap 'hdiutil detach "$MOUNT"; rmdir "$MOUNT"; rm -rf "$TEMP_DIR"' EXIT
       codesign --verify --deep --strict --verbose=4 "$MOUNT/RemoteCode.app"
       spctl --assess --type execute --verbose=4 "$MOUNT/RemoteCode.app"
       hdiutil detach "$MOUNT"
       rmdir "$MOUNT"
-      trap 'rm -rf "$TEMP_DIR"' EXIT
+      MOUNT=""
 
       AWS_STS_OUTPUT="$(aws sts assume-role-with-web-identity \
         --role-arn "$AWS_RELEASE_UPLOAD_ROLE_ARN" \
