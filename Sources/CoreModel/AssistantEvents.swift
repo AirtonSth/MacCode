@@ -451,6 +451,21 @@ public struct ProviderRuntimeEvent: Codable, Sendable, Equatable, Identifiable {
         return fromJSONObject(obj, provider: provider, source: source, receivedAtMs: receivedAtMs)
     }
 
+    /// Token-stream methods already render as Thought / answer prose. Emitting them
+    /// into the Work log rewrites a strip *above* the user message on every token
+    /// (Grok `thought`/`text`, Claude `content_block_delta`, …).
+    public var surfacesInWorkLog: Bool {
+        switch method {
+        case "thought", "text",
+             "content_block_delta", "content_block_start", "content_block_stop",
+             "message_start", "message_delta", "message_stop",
+             "ping", "input_json_delta":
+            return false
+        default:
+            return true
+        }
+    }
+
     /// F12: dict-accepting variant so a caller that has already decoded the line
     /// (e.g. ClaudeStreamingCLIAdapter.handleLine) does not pay a second
     /// JSONSerialization decode of the same line just to build the runtime event.
@@ -574,9 +589,21 @@ public struct AssistantTurnSnapshot: Codable, Sendable, Equatable {
     public var items: [AssistantItem]
     public var finalAssistantMessage: String?
     public var finished: Bool
+    /// Wall-clock when the turn opened (turnStarted). Used for transcript ordering
+    /// while the turn still has no items — without this, empty turns sort at epoch 0
+    /// and briefly render *above* the user message that triggered them.
+    public var startedAtMs: Int64?
 
-    public init(turnId: String, items: [AssistantItem] = [], finalAssistantMessage: String? = nil, finished: Bool = false) {
-        self.turnId = turnId; self.items = items; self.finalAssistantMessage = finalAssistantMessage; self.finished = finished
+    public init(turnId: String,
+                items: [AssistantItem] = [],
+                finalAssistantMessage: String? = nil,
+                finished: Bool = false,
+                startedAtMs: Int64? = nil) {
+        self.turnId = turnId
+        self.items = items
+        self.finalAssistantMessage = finalAssistantMessage
+        self.finished = finished
+        self.startedAtMs = startedAtMs
     }
 }
 
@@ -679,7 +706,7 @@ public struct AssistantTimelineState: Codable, Sendable, Equatable {
         case .threadStarted(let tid, let ptid):
             self.threadId = tid; self.providerThreadId = ptid
         case .turnStarted(let tid):
-            ensureTurn(tid)
+            ensureTurn(tid, startedAtMs: Int64(Date().timeIntervalSince1970 * 1000))
         case .itemStarted(let item):
             ensureTurn(item.turnId)
             if let idx = turns.firstIndex(where: { $0.turnId == item.turnId }) {
@@ -831,14 +858,16 @@ public struct AssistantTimelineState: Codable, Sendable, Equatable {
             if providerRuntimeEvents.count > Self.providerRuntimeEventLimit {
                 providerRuntimeEvents.removeFirst(providerRuntimeEvents.count - Self.providerRuntimeEventLimit)
             }
-            recordActivity(AssistantWorkActivity(
-                id: "runtime:\(event.id)",
-                kind: .runtime,
-                title: "\(event.provider.rawValue) runtime: \(event.method)",
-                detail: event.source,
-                state: nil,
-                createdAtMs: event.receivedAtMs
-            ))
+            if event.surfacesInWorkLog {
+                recordActivity(AssistantWorkActivity(
+                    id: "runtime:\(event.id)",
+                    kind: .runtime,
+                    title: "\(event.provider.rawValue) runtime: \(event.method)",
+                    detail: event.source,
+                    state: nil,
+                    createdAtMs: event.receivedAtMs
+                ))
+            }
         case .sr1Translation(let translation):
             if let itemId = translation.itemId, !itemId.isEmpty {
                 sr1TranslationsByItemId[itemId] = translation
@@ -859,11 +888,19 @@ public struct AssistantTimelineState: Codable, Sendable, Equatable {
         }
     }
 
-    private mutating func ensureTurn(_ tid: String) {
-        if turns.firstIndex(where: { $0.turnId == tid }) == nil {
-            turns.append(AssistantTurnSnapshot(turnId: tid))
-            trimTurns()
+    private mutating func ensureTurn(_ tid: String, startedAtMs: Int64? = nil) {
+        if let idx = turns.firstIndex(where: { $0.turnId == tid }) {
+            // Keep the earliest start time if turnStarted arrives after itemStarted.
+            if turns[idx].startedAtMs == nil, let startedAtMs {
+                turns[idx].startedAtMs = startedAtMs
+            }
+            return
         }
+        turns.append(AssistantTurnSnapshot(
+            turnId: tid,
+            startedAtMs: startedAtMs ?? Int64(Date().timeIntervalSince1970 * 1000)
+        ))
+        trimTurns()
     }
 
     private mutating func trimTurns() {

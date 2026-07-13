@@ -67,6 +67,37 @@ final class TokenSaverAccountUsageRefresherTests: XCTestCase {
         XCTAssertEqual(remaining?.weeklyWindowDurationMinutes, 10_080)
     }
 
+    func test_grokBillingLogLineParsesCreditUsagePercent() {
+        // WHY: Token Saver Grok ring was stuck on "No data" because account
+        // refresh never read Grok's local billing snapshot (creditUsagePercent).
+        let line = #"""
+        {"ts":"2026-07-13T23:32:27.798Z","src":"shell","lvl":"info","msg":"billing: fetched credits config","ctx":{"config":{"creditUsagePercent":29.0,"currentPeriod":{"type":"USAGE_PERIOD_TYPE_WEEKLY","start":"2026-07-08T20:46:41.975270+00:00","end":"2026-07-15T20:46:41.975270+00:00"},"billingPeriodStart":"2026-07-08T20:46:41.975270+00:00","billingPeriodEnd":"2026-07-15T20:46:41.975270+00:00"},"subscriptionTier":"SuperGrok Heavy"}}
+        """#
+        let usage = AssistantAccountUsageParser.grokBillingLogLine(line)
+        XCTAssertEqual(usage?.provider, .grok)
+        XCTAssertEqual(usage?.weeklyUsedPercent, 29)
+        XCTAssertEqual(usage?.weeklyWindowDurationMinutes, 10_080)
+        XCTAssertNotNil(usage?.weeklyResetsAtMs,
+                        "billingPeriodEnd must become weeklyResetsAt so the card can show reset timing")
+    }
+
+    func test_grokFromBillingLogFile_picksNewestPercent() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("rc-grok-billing-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let log = dir.appendingPathComponent("unified.jsonl")
+        let body = """
+        {"msg":"noise","ctx":{}}
+        {"msg":"billing: fetched credits config","ctx":{"config":{"creditUsagePercent":10.0,"billingPeriodEnd":"2026-07-15T20:46:41.975270+00:00"}}}
+        {"msg":"billing: fetched credits config","ctx":{"config":{"creditUsagePercent":42.5,"billingPeriodEnd":"2026-07-15T20:46:41.975270+00:00"}}}
+        """
+        try body.write(to: log, atomically: true, encoding: .utf8)
+        let usage = AssistantAccountUsageParser.grokFromBillingLogFile(at: log)
+        XCTAssertEqual(usage?.weeklyUsedPercent, 42.5,
+                       "must use the newest billing line so the purple ring matches live Grok credits")
+    }
+
     func test_claudeUsageScreenParsesInteractiveUsageDialog() {
         let output = """
         Settings  Status Config Usage Stats

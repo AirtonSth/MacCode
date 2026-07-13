@@ -396,6 +396,81 @@ final class PetAssetRuntimeTests: XCTestCase {
         }.count, 2, "stretching needs visibly extended body frames and no seated yawn substitution")
     }
 
+    func test_waitingThinksBeforeYawning_withoutRestoringTheHourglass() throws {
+        // WHY: waiting can persist behind the unread badge, so its loop must communicate patience
+        // without freezing on the rejected hourglass or opening the yawn immediately.
+        let atlas = try PetAtlas.bundled()
+        let frames = try (0..<8).map { try atlas.frame(state: .waiting, index: $0).image }
+        let mouthPixels = try frames.map {
+            pinkPixelCount(in: $0, rect: try XCTUnwrap(mouthRegion(in: $0)))
+        }
+        let peak = try XCTUnwrap(mouthPixels.enumerated().max(by: { $0.element < $1.element }))
+
+        XCTAssertTrue((5...6).contains(peak.offset),
+            "waiting must think first and yawn only after the pause")
+        XCTAssertGreaterThanOrEqual(peak.element, 40, "waiting needs one readable seated yawn")
+        XCTAssertLessThanOrEqual(mouthPixels[7], max(20, peak.element / 2),
+            "the waiting loop must settle neutral after the yawn")
+
+        for (index, frame) in frames.enumerated() {
+            let cat = try XCTUnwrap(darkFurComponent(in: frame))
+            let protectedCatBounds = cat.bounds.insetBy(dx: -8, dy: -8)
+            let pixels = rgbaBytes(of: frame)
+            let detachedHourglassPixels = (0..<(frame.width * frame.height)).filter { pixel in
+                let x = pixel % frame.width
+                let y = pixel / frame.width
+                guard !protectedCatBounds.contains(CGPoint(x: x, y: y)) else { return false }
+                let offset = pixel * 4
+                let red = Int(pixels[offset])
+                let green = Int(pixels[offset + 1])
+                let blue = Int(pixels[offset + 2])
+                return pixels[offset + 3] >= 64
+                    && red > 140
+                    && green > 80
+                    && blue < 120
+                    && red - blue > 50
+            }.count
+            XCTAssertEqual(detachedHourglassPixels, 0,
+                "waiting[\(index)] must not restore the detached gold hourglass")
+        }
+    }
+
+    func test_butterflyFramesContainExactlyOneCatSizedFurComponent() throws {
+        // WHY: a neighboring source cell once leaked into this row and rendered a second cat.
+        let atlas = try PetAtlas.bundled()
+        for index in 0..<8 {
+            let frame = try atlas.frame(state: .idleButterfly, index: index).image
+            let pixels = rgbaBytes(of: frame)
+            let cats = matchingComponents(width: frame.width, height: frame.height) { pixel in
+                let offset = pixel * 4
+                let channels = [Int(pixels[offset]), Int(pixels[offset + 1]), Int(pixels[offset + 2])]
+                return pixels[offset + 3] >= 16
+                    && (channels.max() ?? 255) < 80
+                    && (channels.max() ?? 0) - (channels.min() ?? 0) < 28
+            }.filter { $0.pixelCount >= 500 }
+
+            XCTAssertEqual(cats.count, 1,
+                "idleButterfly[\(index)] must contain exactly one cat, never a duplicate or ghost")
+        }
+    }
+
+    func test_boxReactionShowsAirborneEntryOcclusionAndReturn() throws {
+        // WHY: replacing the original jump with a crawl made the box interaction read incorrectly.
+        let atlas = try PetAtlas.bundled()
+        let cats = try (0..<8).map {
+            try XCTUnwrap(darkFurComponent(in: atlas.frame(state: .idleBox, index: $0).image))
+        }
+
+        XCTAssertLessThan(cats[2].bounds.minY, cats[0].bounds.minY - 20,
+            "idleBox must include a clearly airborne jump frame")
+        XCTAssertGreaterThan(cats[3].bounds.midY, cats[2].bounds.midY + 10,
+            "the airborne cat must descend into the box instead of teleporting")
+        XCTAssertLessThan(cats[4].bounds.height, cats[0].bounds.height * 0.95,
+            "the box must occlude the cat while it peeks from inside")
+        XCTAssertGreaterThanOrEqual(boundingBoxOverlapRatio(cats[7], cats[0]), 0.5,
+            "idleBox must return to the original seated pose after hopping out")
+    }
+
     func test_pickedUpHangsFromAStableInvisibleScruffWithoutAPropLine() throws {
         let atlas = try PetAtlas.bundled()
         let frames = try (0..<8).map { try atlas.frame(state: .pickedUp, index: $0).image }

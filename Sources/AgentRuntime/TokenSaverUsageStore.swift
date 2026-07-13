@@ -180,7 +180,8 @@ public struct TokenSaverUsageSnapshot: Codable, Sendable, Equatable {
     public static func empty(period: TokenSaverPeriod = .sevenDays) -> TokenSaverUsageSnapshot {
         TokenSaverUsageSnapshot(period: period, providers: [
             TokenSaverProviderUsage(provider: .claude),
-            TokenSaverProviderUsage(provider: .codex)
+            TokenSaverProviderUsage(provider: .codex),
+            TokenSaverProviderUsage(provider: .grok)
         ])
     }
 }
@@ -219,7 +220,27 @@ public final class TokenSaverUsageStore: @unchecked Sendable {
               snapshot.period == period else {
             return .empty(period: period)
         }
-        return snapshot
+        // Older usage.json files predate Grok; ensure every managed agent provider
+        // has a row so Token Saver rings never look like the provider is missing.
+        return Self.ensuringManagedProviders(snapshot)
+    }
+
+    /// Inserts zero rows for claude/codex/grok when a loaded snapshot omits them.
+    public static func ensuringManagedProviders(_ snapshot: TokenSaverUsageSnapshot) -> TokenSaverUsageSnapshot {
+        let required: [AgentProvider] = [.claude, .codex, .grok]
+        var providers = snapshot.providers
+        for provider in required where !providers.contains(where: { $0.provider == provider }) {
+            providers.append(TokenSaverProviderUsage(provider: provider))
+        }
+        // Stable order: claude, codex, grok, then any extras.
+        providers.sort { lhs, rhs in
+            let order: [AgentProvider: Int] = [.claude: 0, .codex: 1, .grok: 2]
+            let l = order[lhs.provider] ?? 100
+            let r = order[rhs.provider] ?? 100
+            if l != r { return l < r }
+            return lhs.provider.rawValue < rhs.provider.rawValue
+        }
+        return TokenSaverUsageSnapshot(period: snapshot.period, providers: providers, daily: snapshot.daily)
     }
 
     public func save(_ snapshot: TokenSaverUsageSnapshot) throws {

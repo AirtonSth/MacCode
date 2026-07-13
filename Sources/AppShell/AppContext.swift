@@ -790,9 +790,11 @@ public final class AppContext {
 
         let codexBinary = (try? settingsRepo.get("cli.codex.path"))?.trimmingCharacters(in: .whitespacesAndNewlines)
         let claudeBinary = (try? settingsRepo.get("cli.claude.path"))?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let grokBinary = (try? settingsRepo.get("cli.grok.path"))?.trimmingCharacters(in: .whitespacesAndNewlines)
         let request = TokenSaverAccountUsageRefreshRequest(
             codexBinary: codexBinary?.isEmpty == false ? codexBinary! : "codex",
             claudeBinary: claudeBinary?.isEmpty == false ? claudeBinary! : "claude",
+            grokBinary: grokBinary?.isEmpty == false ? grokBinary! : "grok",
             cwd: state.workspaces.values.first?.cwd ?? NSHomeDirectory(),
             environment: [:]
         )

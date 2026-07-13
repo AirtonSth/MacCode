@@ -3807,9 +3807,24 @@ public struct AgentAppView: View {
     static func liveRenderableCopy(_ item: AssistantItem) -> AssistantItem {
         var copy = item
         copy.summary = cappedOptionalVisibleText(copy.summary, limit: liveTurnSummaryCharacterLimit)
-        copy.body = cappedVisibleText(copy.body, limit: liveTurnBodyCharacterLimit)
+        // Streaming Thought: keep the *tail* (latest tokens) like the Grok TUI.
+        // Head-capping freezes early chain-of-thought while later tokens rewrite
+        // "on top" of the answer without the user seeing them.
+        if item.type == .reasoning, item.state == .streaming {
+            copy.body = cappedVisibleTextTail(copy.body, limit: liveTurnBodyCharacterLimit)
+        } else {
+            copy.body = cappedVisibleText(copy.body, limit: liveTurnBodyCharacterLimit)
+        }
         copy.output = cappedOptionalVisibleText(copy.output, limit: liveTurnOutputCharacterLimit)
         return copy
+    }
+
+    /// Keep the newest `limit` characters (plus a short head-omission marker).
+    static func cappedVisibleTextTail(_ text: String, limit: Int, truncatedLabel: String = "earlier characters truncated in live view") -> String {
+        guard text.count > limit else { return text }
+        let tail = text.suffix(limit)
+        let dropped = text.count - tail.count
+        return "... \(dropped) \(truncatedLabel) ...\n\(tail)"
     }
 
     static func toolCommandPreview(for item: AssistantItem) -> String? {
@@ -3837,8 +3852,16 @@ public struct AgentAppView: View {
             case .message(let message):
                 return message.createdAt.timeIntervalSince1970
             case .turn(let turn):
-                let started = turn.items.map(\.startedAtMs).min()
-                return started.map { TimeInterval($0) / 1000 } ?? 0
+                // Prefer first item time (stable once content exists). Fall back to
+                // turn.startedAtMs so an empty live turn does not sort at epoch 0
+                // (which placed Thinking… *above* the user message that triggered it).
+                if let started = turn.items.map(\.startedAtMs).min() {
+                    return TimeInterval(started) / 1000
+                }
+                if let started = turn.startedAtMs {
+                    return TimeInterval(started) / 1000
+                }
+                return TimeInterval.greatestFiniteMagnitude
             }
         }
     }

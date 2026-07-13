@@ -490,7 +490,8 @@ final class InsomniaSidebarTests: XCTestCase {
         let view = SidebarRootView.TokenSaverActivityRings(values: .init(
             tokenSaverProgress: 0.2,
             claudeUsedProgress: 0.42,
-            codexUsedProgress: codexUsedProgress
+            codexUsedProgress: codexUsedProgress,
+            grokUsedProgress: 0
         ))
             .frame(width: 104, height: 104)
         let renderer = ImageRenderer(content: view)

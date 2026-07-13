@@ -104,7 +104,8 @@ final class TokenSaverCardSeamTests: XCTestCase {
             savedTokens: 0,
             savedProgress: 0,
             claudeUsedProgress: 0,
-            codexUsedProgress: 0
+            codexUsedProgress: 0,
+            grokUsedProgress: 0
         )
         XCTAssertTrue(label.lowercased().contains("today"),
                       "Scope 'today' must appear in the rings a11y label to confirm :187 rename flows through")
@@ -175,7 +176,8 @@ final class TokenSaverCardSeamTests: XCTestCase {
             savedTokens: 50_000,
             savedProgress: 0.42,
             claudeUsedProgress: 0.57,
-            codexUsedProgress: 0.33
+            codexUsedProgress: 0.33,
+            grokUsedProgress: 0.12
         )
         XCTAssertFalse(label.isEmpty, "Rings a11y label must be non-empty so VoiceOver reads something")
     }
@@ -187,7 +189,8 @@ final class TokenSaverCardSeamTests: XCTestCase {
             savedTokens: 120_000,
             savedProgress: 0.6,
             claudeUsedProgress: 0.4,
-            codexUsedProgress: 0.2
+            codexUsedProgress: 0.2,
+            grokUsedProgress: 0.1
         )
         XCTAssertTrue(label.contains("120K") || label.contains("120k"),
                       "Rings label must include the saved token count formatted as K: \(label)")
@@ -218,7 +221,8 @@ final class TokenSaverCardSeamTests: XCTestCase {
             savedTokens: 0,
             savedProgress: 0,
             claudeUsedProgress: 0.75,
-            codexUsedProgress: 0
+            codexUsedProgress: 0,
+            grokUsedProgress: 0
         )
         XCTAssertTrue(label.contains("75%"),
                       "Rings label must include claude used percent: \(label)")
@@ -231,10 +235,28 @@ final class TokenSaverCardSeamTests: XCTestCase {
             savedTokens: 0,
             savedProgress: 0,
             claudeUsedProgress: 0,
-            codexUsedProgress: 0.50
+            codexUsedProgress: 0.50,
+            grokUsedProgress: 0
         )
         XCTAssertTrue(label.contains("50%"),
                       "Rings label must include codex used percent: \(label)")
+    }
+
+    func test_ringsAccessibilityLabel_containsGrokPercent() {
+        // WHY: Grok is a first-class Agent provider; its usage ring must be
+        // readable by VoiceOver like Claude/Codex, not only visible as purple.
+        let label = SidebarRootView.ringsAccessibilityLabel(
+            scope: "week",
+            savedTokens: 0,
+            savedProgress: 0,
+            claudeUsedProgress: 0,
+            codexUsedProgress: 0,
+            grokUsedProgress: 0.41
+        )
+        XCTAssertTrue(label.lowercased().contains("grok"),
+                      "Rings label must name Grok: \(label)")
+        XCTAssertTrue(label.contains("41%"),
+                      "Rings label must include Grok used percent: \(label)")
     }
 
     func test_ringsAccessibilityLabel_namesProvidedTarget() {
@@ -246,7 +268,8 @@ final class TokenSaverCardSeamTests: XCTestCase {
             savedProgress: 1,
             savedGoalTokens: 10_000_000,
             claudeUsedProgress: 0.4,
-            codexUsedProgress: 0.2
+            codexUsedProgress: 0.2,
+            grokUsedProgress: 0.1
         )
         XCTAssertTrue(label.contains("10M target"),
                       "Rings label must name the fixed target: \(label)")
@@ -262,9 +285,28 @@ final class TokenSaverCardSeamTests: XCTestCase {
             savedTokens: 0,
             savedProgress: 0,
             claudeUsedProgress: 0,
-            codexUsedProgress: 0
+            codexUsedProgress: 0,
+            grokUsedProgress: 0
         )
         XCTAssertFalse(label.isEmpty)
+    }
+
+    func test_managedProviderIDs_includeGrok() {
+        // WHY: Grok savings must count in managed rows, not collapse into "CLI & other".
+        XCTAssertTrue(TokenSaverSavingsDisplay.managedProviderIDs.contains("grok"),
+                      "Grok is a managed agent provider and must appear in Token Saver rows")
+        XCTAssertTrue(TokenSaverSavingsDisplay.managedProviderIDs.contains("claude"))
+        XCTAssertTrue(TokenSaverSavingsDisplay.managedProviderIDs.contains("codex"))
+    }
+
+    func test_emptyUsageSnapshot_includesGrokProvider() {
+        // WHY: empty state must reserve a Grok slot so the purple ring/row exists
+        // before the first Grok run or account-usage refresh.
+        let providers = Set(TokenSaverUsageSnapshot.empty().providers.map(\.provider))
+        XCTAssertTrue(providers.contains(.grok),
+                      "empty snapshot must include .grok so Token Saver UI does not omit the ring until first use")
+        XCTAssertTrue(providers.contains(.claude))
+        XCTAssertTrue(providers.contains(.codex))
     }
 
     // MARK: - Token Saver saved-token targets
