@@ -28,6 +28,9 @@ let package = Package(
         // mirrors mlx-swift-lm's to keep resolution to the same revision.
         .package(url: "https://github.com/ml-explore/mlx-swift", .upToNextMinor(from: "0.31.3")),
         .package(url: "https://github.com/huggingface/swift-huggingface", from: "0.9.0"),
+        // swift-transformers 1.3.3 still expects Jinja object keys to be String.
+        // Pin the last compatible Jinja release until transformers adopts ObjectKey.
+        .package(url: "https://github.com/huggingface/swift-jinja.git", exact: "2.3.6"),
         .package(url: "https://github.com/huggingface/swift-transformers", from: "1.3.0")
     ],
     targets: [
