@@ -1853,7 +1853,7 @@ public struct TokenSaverBreakdownFormatter {
 }
 
 public enum TokenSaverSavingsDisplay {
-    public static let managedProviderIDs: Set<String> = ["claude", "codex"]
+    public static let managedProviderIDs: Set<String> = ["claude", "codex", "grok"]
 
     public static func otherSavingsRow(
         from summary: TokenSaverSavingsSummary,
@@ -2412,7 +2412,8 @@ public struct SidebarRootView: View {
             savedProgress: ringVals.tokenSaverProgress,
             savedGoalTokens: tokenSaverSavingsGoalTokens(for: tokenSaverDetailsScope),
             claudeUsedProgress: ringVals.claudeUsedProgress,
-            codexUsedProgress: ringVals.codexUsedProgress
+            codexUsedProgress: ringVals.codexUsedProgress,
+            grokUsedProgress: ringVals.grokUsedProgress
         )
         return Button {
             toggleTokenSaverDetails(refreshWhenOpening: true)
@@ -2486,7 +2487,7 @@ public struct SidebarRootView: View {
     }
 
     private var tokenSaverHeadline: String {
-        guard let user = vm.privateAccountUser else { return "Track Claude + Codex savings" }
+        guard let user = vm.privateAccountUser else { return "Track Claude + Codex + Grok savings" }
         return Self.tokenSaverCardHeadline(
             subscribed: user.subscribed,
             enabled: vm.tokenSaverEnabled,
@@ -2500,13 +2501,13 @@ public struct SidebarRootView: View {
         guard let user = vm.privateAccountUser else { return "Sign in to track account usage" }
         let used = vm.tokenSaverUsageSnapshot.usedTokens
         if user.subscribed {
-            return used > 0 ? "Used \(Self.formatTokenCount(used)) in Claude + Codex" : "Enable to save tokens locally"
+            return used > 0 ? "Used \(Self.formatTokenCount(used)) in Claude + Codex + Grok" : "Enable to save tokens locally"
         }
-        return used > 0 ? "Used \(Self.formatTokenCount(used)) in Claude + Codex" : "Subscribe to activate local savings"
+        return used > 0 ? "Used \(Self.formatTokenCount(used)) in Claude + Codex + Grok" : "Subscribe to activate local savings"
     }
 
     private var tokenSaverHelpText: String {
-        "Token Saver shows Claude and Codex usage plus saved or potential tokens. Paid users can enable the local MLX model."
+        "Token Saver shows Claude, Codex, and Grok usage plus saved or potential tokens. Paid users can enable the local MLX model."
     }
 
     private var tokenSaverAccessibilityValue: String {
@@ -2545,10 +2546,12 @@ public struct SidebarRootView: View {
     ) -> TokenSaverActivityRings.Values {
         let claude = tokenSaverProviderUsage(.claude, in: snapshot)
         let codex = tokenSaverProviderUsage(.codex, in: snapshot)
+        let grok = tokenSaverProviderUsage(.grok, in: snapshot)
         return TokenSaverActivityRings.Values(
             tokenSaverProgress: tokenSaverSavingsProgress(for: snapshot, scope: scope),
             claudeUsedProgress: tokenSaverUsedLimitProgress(for: claude, provider: .claude, scope: scope) ?? 0,
-            codexUsedProgress: tokenSaverUsedLimitProgress(for: codex, provider: .codex, scope: scope) ?? 0
+            codexUsedProgress: tokenSaverUsedLimitProgress(for: codex, provider: .codex, scope: scope) ?? 0,
+            grokUsedProgress: tokenSaverUsedLimitProgress(for: grok, provider: .grok, scope: scope) ?? 0
         )
     }
 
@@ -2561,7 +2564,8 @@ public struct SidebarRootView: View {
             savedProgress: ringVals.tokenSaverProgress,
             savedGoalTokens: tokenSaverSavingsGoalTokens(for: tokenSaverDetailsScope),
             claudeUsedProgress: ringVals.claudeUsedProgress,
-            codexUsedProgress: ringVals.codexUsedProgress
+            codexUsedProgress: ringVals.codexUsedProgress,
+            grokUsedProgress: ringVals.grokUsedProgress
         )
     }
 
@@ -2842,6 +2846,7 @@ public struct SidebarRootView: View {
             VStack(alignment: .leading, spacing: DS.Space.sm) {
                 tokenSaverProviderRow(provider: .claude)
                 tokenSaverProviderRow(provider: .codex)
+                tokenSaverProviderRow(provider: .grok)
                 if let other = tokenSaverScopedOtherSavings() {
                     tokenSaverOtherSavingsRow(saved: other.savedTokens, runs: other.runs)
                 }
@@ -2868,7 +2873,8 @@ public struct SidebarRootView: View {
             savedProgress: detailsRingVals.tokenSaverProgress,
             savedGoalTokens: tokenSaverSavingsGoalTokens(for: tokenSaverDetailsScope),
             claudeUsedProgress: detailsRingVals.claudeUsedProgress,
-            codexUsedProgress: detailsRingVals.codexUsedProgress
+            codexUsedProgress: detailsRingVals.codexUsedProgress,
+            grokUsedProgress: detailsRingVals.grokUsedProgress
         )
         return HStack(alignment: .center, spacing: DS.Space.lg) {
             TokenSaverActivityRings(values: detailsRingVals, a11yLabel: detailsRingsLabel)
@@ -2889,6 +2895,11 @@ public struct SidebarRootView: View {
                     color: tokenSaverProviderColor(.codex),
                     label: tokenSaverProviderTitle(.codex),
                     value: tokenSaverLimitSummary(provider: .codex, in: snapshot, scope: tokenSaverDetailsScope)
+                )
+                tokenSaverRingLegendRow(
+                    color: tokenSaverProviderColor(.grok),
+                    label: tokenSaverProviderTitle(.grok),
+                    value: tokenSaverLimitSummary(provider: .grok, in: snapshot, scope: tokenSaverDetailsScope)
                 )
                 Text("Showing \(tokenSaverLimitScopeTitle(for: tokenSaverDetailsScope))")
                     .font(DS.Font.caption2)
@@ -2972,7 +2983,7 @@ public struct SidebarRootView: View {
         .accessibilityElement(children: .combine)
     }
 
-    /// Reconciling row for savings not attributed to Claude/Codex — direct `distill`
+    /// Reconciling row for savings not attributed to Claude/Codex/Grok — direct `distill`
     /// CLI usage (provider "unknown"). Keeps the visible rows summing to the headline.
     private func tokenSaverOtherSavingsRow(saved: Int, runs: Int) -> some View {
         VStack(alignment: .leading, spacing: 3) {
@@ -3040,6 +3051,7 @@ public struct SidebarRootView: View {
             "Used \(Self.formatTokenCount(tokenSaverScopeUsedTokens(in: snapshot, scope: tokenSaverDetailsScope)))",
             "\(tokenSaverProviderTitle(.claude)) \(tokenSaverLimitSummary(provider: .claude, in: snapshot, scope: tokenSaverDetailsScope))",
             "\(tokenSaverProviderTitle(.codex)) \(tokenSaverLimitSummary(provider: .codex, in: snapshot, scope: tokenSaverDetailsScope))",
+            "\(tokenSaverProviderTitle(.grok)) \(tokenSaverLimitSummary(provider: .grok, in: snapshot, scope: tokenSaverDetailsScope))",
             "Showing \(tokenSaverLimitScopeTitle(for: tokenSaverDetailsScope))"
         ].joined(separator: ", ")
     }
@@ -3051,7 +3063,8 @@ public struct SidebarRootView: View {
         case .codex:
             return Color(nsColor: .systemBlue)
         case .grok:
-            return Color(nsColor: .systemTeal)
+            // Product request: purple Grok ring (distinct from Claude orange / Codex blue).
+            return Color(nsColor: .systemPurple)
         }
     }
 
@@ -3356,18 +3369,20 @@ public struct SidebarRootView: View {
         savedProgress: Double,
         savedGoalTokens: Int = 10_000_000,
         claudeUsedProgress: Double,
-        codexUsedProgress: Double
+        codexUsedProgress: Double,
+        grokUsedProgress: Double
     ) -> String {
         let savedPct = Int((min(max(savedProgress, 0), 1) * 100).rounded())
         let claudePct = Int((min(max(claudeUsedProgress, 0), 1) * 100).rounded())
         let codexPct = Int((min(max(codexUsedProgress, 0), 1) * 100).rounded())
+        let grokPct = Int((min(max(grokUsedProgress, 0), 1) * 100).rounded())
         let savedStr = savedTokens >= 1_000_000
             ? String(format: "%.1fM", Double(savedTokens) / 1_000_000)
             : savedTokens >= 1_000
                 ? String(format: "%.0fK", Double(savedTokens) / 1_000)
                 : "\(savedTokens)"
         let goalStr = formatTokenCountPublic(max(savedGoalTokens, 1))
-        return "Token Saver rings, \(scope): saved \(savedStr) tokens toward \(goalStr) target (\(savedPct)%), Claude used \(claudePct)%, Codex used \(codexPct)%"
+        return "Token Saver rings, \(scope): saved \(savedStr) tokens toward \(goalStr) target (\(savedPct)%), Claude used \(claudePct)%, Codex used \(codexPct)%, Grok used \(grokPct)%"
     }
 
     struct TokenSaverActivityRings: View {
@@ -3375,6 +3390,7 @@ public struct SidebarRootView: View {
             let tokenSaverProgress: Double
             let claudeUsedProgress: Double
             let codexUsedProgress: Double
+            let grokUsedProgress: Double
         }
 
         let values: Values
@@ -3400,8 +3416,10 @@ public struct SidebarRootView: View {
             let scale = max(side / 34.0, 0.1)
             return ZStack {
                 TokenSaverActivityRing(progress: values.tokenSaverProgress, color: DS.Palette.success, inset: 2 * scale, lineWidth: 4.0 * scale)
-                TokenSaverActivityRing(progress: values.claudeUsedProgress, color: Color(nsColor: .systemOrange), inset: 8.2 * scale, lineWidth: 3.2 * scale)
-                TokenSaverActivityRing(progress: values.codexUsedProgress, color: Color(nsColor: .systemBlue), inset: 13.8 * scale, lineWidth: 2.0 * scale)
+                TokenSaverActivityRing(progress: values.claudeUsedProgress, color: Color(nsColor: .systemOrange), inset: 7.4 * scale, lineWidth: 3.0 * scale)
+                TokenSaverActivityRing(progress: values.codexUsedProgress, color: Color(nsColor: .systemBlue), inset: 12.2 * scale, lineWidth: 2.2 * scale)
+                // Innermost: Grok purple ring (requested product color).
+                TokenSaverActivityRing(progress: values.grokUsedProgress, color: Color(nsColor: .systemPurple), inset: 16.6 * scale, lineWidth: 1.8 * scale)
             }
         }
     }

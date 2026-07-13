@@ -54,8 +54,8 @@ public actor MLXEmbeddingBackend {
     private func loadedContainer() async throws -> EmbedderModelContainer {
         if let container { return container }
         let loaded = try await EmbedderModelFactory.shared.loadContainer(
-            from: #hubDownloader(),
-            using: #huggingFaceTokenizerLoader(),
+            from: MLXHuggingFaceBridges.hubDownloader(),
+            using: MLXHuggingFaceBridges.tokenizerLoader(),
             configuration: configuration
         )
         container = loaded

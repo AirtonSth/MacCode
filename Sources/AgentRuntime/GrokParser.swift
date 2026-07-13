@@ -75,6 +75,11 @@ public final class GrokParser {
                 // Re-emit so TimelineAggregator.providerThreadId is the real session.
                 out.append(.threadStarted(threadId: sid, providerThreadId: sid))
             }
+            // Token Saver rings need these events — without them Grok stays "No data"
+            // while Claude/Codex fill weekly used % / token totals.
+            if let usage = Self.tokenUsage(from: obj) {
+                out.append(.tokenUsage(usage))
+            }
             closeOpenItems(&out)
             if let turnId = currentTurnId, !turnFinished {
                 turnFinished = true
@@ -218,5 +223,75 @@ public final class GrokParser {
             return value as? String
         }
         return s
+    }
+
+    /// Maps Grok `end` spend fields into the shared token-usage event.
+    ///
+    /// Observed shape (streaming-json):
+    /// ```json
+    /// "usage": {
+    ///   "input_tokens": 25103,
+    ///   "cache_read_input_tokens": 6016,
+    ///   "output_tokens": 18,
+    ///   "reasoning_tokens": 13,
+    ///   "total_tokens": 31137
+    /// },
+    /// "modelUsage": { "grok-4.5": { "inputTokens": …, "outputTokens": …, "cacheReadInputTokens": … } }
+    /// ```
+    static func tokenUsage(from obj: [String: Any]) -> AssistantTokenUsage? {
+        if let modelUsage = obj["modelUsage"] as? [String: Any] ?? obj["model_usage"] as? [String: Any] {
+            var uncached = 0
+            var read = 0
+            var output = 0
+            for value in modelUsage.values {
+                guard let usage = value as? [String: Any] else { continue }
+                uncached += intValue(usage["inputTokens"]) ?? intValue(usage["input_tokens"]) ?? 0
+                read += intValue(usage["cacheReadInputTokens"]) ?? intValue(usage["cache_read_input_tokens"]) ?? 0
+                output += intValue(usage["outputTokens"]) ?? intValue(usage["output_tokens"]) ?? 0
+            }
+            // Prefer top-level usage for cache-read when modelUsage omitted it.
+            if read == 0, let top = obj["usage"] as? [String: Any] {
+                read = intValue(top["cache_read_input_tokens"]) ?? intValue(top["cacheReadInputTokens"]) ?? 0
+            }
+            let input = uncached + read
+            let total = input + output
+            guard total > 0 else { return nil }
+            return AssistantTokenUsage(
+                inputTokens: input,
+                outputTokens: output,
+                totalTokens: total,
+                uncachedInputTokens: uncached,
+                cacheReadInputTokens: read > 0 ? read : nil
+            )
+        }
+
+        let usage = obj["usage"] as? [String: Any] ?? obj["token_usage"] as? [String: Any]
+        guard let usage else { return nil }
+        let uncached = intValue(usage["input_tokens"]) ?? intValue(usage["inputTokens"]) ?? 0
+        let read = intValue(usage["cache_read_input_tokens"]) ?? intValue(usage["cacheReadInputTokens"]) ?? 0
+        let output = intValue(usage["output_tokens"]) ?? intValue(usage["outputTokens"]) ?? 0
+        // reasoning_tokens are billed as output-side work; include in total when
+        // present and not already folded into output_tokens.
+        let reasoning = intValue(usage["reasoning_tokens"]) ?? intValue(usage["reasoningTokens"]) ?? 0
+        let input = uncached + read
+        let total = intValue(usage["total_tokens"])
+            ?? intValue(usage["totalTokens"])
+            ?? (input + output + reasoning)
+        guard total > 0 || input > 0 || output > 0 else { return nil }
+        return AssistantTokenUsage(
+            inputTokens: input,
+            outputTokens: max(output, reasoning > 0 && output == 0 ? reasoning : output),
+            totalTokens: total,
+            uncachedInputTokens: uncached,
+            cacheReadInputTokens: read > 0 ? read : nil
+        )
+    }
+
+    private static func intValue(_ any: Any?) -> Int? {
+        if let i = any as? Int { return i }
+        if let d = any as? Double { return Int(d) }
+        if let n = any as? NSNumber { return n.intValue }
+        if let s = any as? String { return Int(s) }
+        return nil
     }
 }
