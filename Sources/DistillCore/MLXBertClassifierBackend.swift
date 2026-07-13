@@ -73,7 +73,7 @@ public actor MLXBertClassifierBackend {
     private func ensureLoaded() async throws {
         if bert != nil { return }
         // Download the checkpoint dir (safetensors + config + tokenizer).
-        let dir = try await #hubDownloader().download(
+        let dir = try await MLXHuggingFaceBridges.hubDownloader().download(
             id: model.repoId, revision: model.revision,
             matching: ["*.safetensors", "*.json", "*.txt", "tokenizer*", "vocab*"],
             useLatest: false, progressHandler: { _ in })
@@ -100,7 +100,7 @@ public actor MLXBertClassifierBackend {
         // tokenizer built from vocab.txt for checkpoints that ship no tokenizer.json
         // (e.g. dslim/bert-base-NER).
         do {
-            let tok = try await #huggingFaceTokenizerLoader().load(from: dir)
+            let tok = try await MLXHuggingFaceBridges.tokenizerLoader().load(from: dir)
             clsTokenId = tok.convertTokenToId("[CLS]") ?? 101
             sepTokenId = tok.convertTokenToId("[SEP]") ?? 102
             padTokenId = tok.convertTokenToId("[PAD]") ?? 0

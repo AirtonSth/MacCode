@@ -1420,7 +1420,7 @@ public struct MLXDistillRuntime: DistillRuntime {
         await RCGemma4ModelOverride.register()
         self.modelContainer = try await LLMModelFactory.shared.loadContainer(
             from: modelDirectory,
-            using: #huggingFaceTokenizerLoader()
+            using: MLXHuggingFaceBridges.tokenizerLoader()
         )
     }
 
