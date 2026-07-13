@@ -129,6 +129,50 @@ final class WebSocketIntegrationTests: XCTestCase {
                        "iOS marks the connection live only after the first frame; the host must not wait for the periodic heartbeat and race the socket receive timeout.")
     }
 
+    func testWebSocketAnswersTheInitialIOSPingWhileReceivingTheImmediateHeartbeat() async throws {
+        let (server, port) = try startServer(heartbeatInterval: 5,
+                                             clientReceiveTimeoutSeconds: 5)
+        defer { server.stop() }
+        try await Task.sleep(nanoseconds: 80_000_000)
+
+        let task = wsTask(port: port, sinceSeq: EventBus.shared.currentSeq)
+        defer { task.cancel(with: .normalClosure, reason: nil) }
+        let heartbeat = expectation(description: "the receive pump drains the immediate heartbeat")
+        let receiver = Task {
+            var sawFirstMessage = false
+            while !Task.isCancelled {
+                do {
+                    let message = try await task.receive()
+                    guard !sawFirstMessage else { continue }
+                    sawFirstMessage = true
+                    let data: Data
+                    switch message {
+                    case .data(let value): data = value
+                    case .string(let value): data = Data(value.utf8)
+                    @unknown default:
+                        XCTFail("unexpected websocket message type")
+                        return
+                    }
+                    let obj = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+                    XCTAssertEqual(obj["type"] as? String, "heartbeat",
+                                   "the receive pump must preserve the first application frame")
+                    heartbeat.fulfill()
+                } catch {
+                    return
+                }
+            }
+        }
+        defer { receiver.cancel() }
+        let pong = expectation(description: "the host answers URLSession's initial ping")
+        task.sendPing { error in
+            XCTAssertNil(error,
+                         "iOS uses this pong as its transport barrier before replaying missed events")
+            pong.fulfill()
+        }
+
+        await fulfillment(of: [pong, heartbeat], timeout: 2)
+    }
+
     func testWebSocketCloseUnsubscribesEventBus() async throws {
         let baselineSubscribers = EventBus.shared.subscriberCountForTests
         let (server, port) = try startServer()

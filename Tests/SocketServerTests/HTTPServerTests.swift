@@ -172,6 +172,59 @@ final class HTTPServerTests: XCTestCase {
         XCTAssertEqual(frame.count, 127)
     }
 
+    func test_webSocketConnectionWriterSerializesApplicationAndControlFrames() {
+        let firstEntered = DispatchSemaphore(value: 0)
+        let releaseFirst = DispatchSemaphore(value: 0)
+        let secondEntered = DispatchSemaphore(value: 0)
+        let writer = WebSocketConnectionWriter { _, data in
+            if data == Data([1]) {
+                firstEntered.signal()
+                _ = releaseFirst.wait(timeout: .now() + 2)
+            } else {
+                secondEntered.signal()
+            }
+            return true
+        }
+        let group = DispatchGroup()
+
+        group.enter()
+        DispatchQueue.global().async {
+            _ = writer.send(opcode: 0x1, data: Data([1]))
+            group.leave()
+        }
+        XCTAssertEqual(firstEntered.wait(timeout: .now() + 1), .success)
+
+        group.enter()
+        DispatchQueue.global().async {
+            _ = writer.send(opcode: 0xA, data: Data([2]))
+            group.leave()
+        }
+        XCTAssertEqual(secondEntered.wait(timeout: .now() + 0.1), .timedOut,
+                       "pong bytes must not interleave with an application frame already being written")
+        releaseFirst.signal()
+        XCTAssertEqual(secondEntered.wait(timeout: .now() + 1), .success)
+        XCTAssertEqual(group.wait(timeout: .now() + 1), .success)
+    }
+
+    func test_webSocketReceiveTimeoutOutlivesTheIOSKeepaliveCadence() {
+        let timeout = DirectHTTPServer.webSocketReceiveTimeoutSeconds(
+            requestTimeoutSeconds: 20,
+            heartbeatInterval: 20
+        )
+
+        XCTAssertGreaterThan(timeout, 25,
+                             "the host must not close a healthy socket before the next iOS keepalive ping")
+        XCTAssertEqual(timeout, 60)
+        XCTAssertEqual(
+            DirectHTTPServer.webSocketReceiveTimeoutSeconds(
+                requestTimeoutSeconds: 90,
+                heartbeatInterval: 20
+            ),
+            90,
+            "an explicitly longer operator timeout must remain authoritative"
+        )
+    }
+
     // MARK: - Auth-gate coverage (T010-T012, T006) — loopbackOnly: false
 
     /// Minimal auth provider used only by the auth-gate tests below.

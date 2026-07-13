@@ -1226,9 +1226,16 @@ public final class JSONRPCDispatcher {
                 guard let tid = params["thread_id"]?.stringValue.flatMap(UUID.init).map(AgentThreadID.init) else { throw JSONRPCError.invalidParams }
                 if params["include_event_watermark"]?.boolValue == true {
                     let snapshot = try await router.readAgentThreadMirrorSnapshot(thread: tid)
+                    let eventLimit = params["event_limit"]?.intValue
+                    if let eventLimit, !(1...5_000).contains(eventLimit) {
+                        throw JSONRPCError.invalidParams
+                    }
+                    let events = eventLimit.map { Array(snapshot.events.suffix($0)) }
+                        ?? snapshot.events
                     return .init(id: id, result: .object([
-                        "events": encode(snapshot.events),
-                        "event_watermark": .number(Double(snapshot.eventWatermark))
+                        "events": encode(events),
+                        "event_watermark": .number(Double(snapshot.eventWatermark)),
+                        "events_truncated": .bool(events.count < snapshot.events.count)
                     ]))
                 }
                 return .init(id: id, result: encode(try await router.readAgentThreadEvents(thread: tid)))

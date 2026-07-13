@@ -191,6 +191,18 @@ public final class DirectHTTPServer: @unchecked Sendable {
     static let maxClientFramePayloadBytes = 1024 * 1024
     public static let maxWebSocketOutboundQueuedBytes = 1024 * 1024
     static let wsHeartbeatInterval: TimeInterval = 20
+    static let minimumWebSocketReceiveTimeoutSeconds = 60
+
+    static func webSocketReceiveTimeoutSeconds(
+        requestTimeoutSeconds: Int,
+        heartbeatInterval: TimeInterval
+    ) -> Int {
+        max(
+            requestTimeoutSeconds,
+            minimumWebSocketReceiveTimeoutSeconds,
+            Int(ceil(heartbeatInterval * 3))
+        )
+    }
 
     /// Pure helper: decides whether the `/v1/ws` upgrade must present a valid
     /// bearer token. Mirrors the HTTP `/v1/*` auth gate: loopback-only binds are
@@ -459,17 +471,42 @@ public final class DirectHTTPServer: @unchecked Sendable {
                 }
             }
             performWSHandshake(fd: fd, key: key)
+            // The request-header timeout is intentionally short, but a live
+            // mobile WebSocket must outlive the iOS 25-second keepalive cadence.
+            // Otherwise the host closes healthy sockets before their next ping.
+            var wsReceiveTimeout = timeval(
+                tv_sec: Self.webSocketReceiveTimeoutSeconds(
+                    requestTimeoutSeconds: receiveTimeoutSeconds,
+                    heartbeatInterval: heartbeatInterval
+                ),
+                tv_usec: 0
+            )
+            setsockopt(
+                fd,
+                SOL_SOCKET,
+                SO_RCVTIMEO,
+                &wsReceiveTimeout,
+                socklen_t(MemoryLayout<timeval>.size)
+            )
             let wsCompressionEnabled = headers["x-rc2-ws-encoding"]?
                 .split(separator: ",")
                 .map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
                 .contains(PayloadCodec.lzfse.wireName) == true
             let wsFilter = EventStreamFilter.parse(headers["x-rc2-ws-filter"])
+            let frameWriter = WebSocketConnectionWriter { [weak self] opcode, data in
+                guard let self else { return false }
+                return self.sendWSFrame(fd: fd, opcode: opcode, data: data)
+            }
             let subIDBox = LockedSubscriberID()
             let outbound = WebSocketOutboundQueue(
                 maxQueuedBytes: webSocketOutboundMaxQueuedBytes,
                 writer: { [weak self] data in
                     guard let self else { return false }
-                    return self.sendWSEvent(fd: fd, data: data, compressed: wsCompressionEnabled)
+                    return self.sendWSEvent(
+                        writer: frameWriter,
+                        data: data,
+                        compressed: wsCompressionEnabled
+                    )
                 },
                 onClose: { [weak self] reason in
                     // QA-008: structured log on the WS slow-client disconnect
@@ -491,7 +528,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
                     // raw machine tokens. Additive: existing `reason` field preserved.
                     if let self,
                        let closeObj = try? JSONSerialization.data(withJSONObject: wsClosePayload(reason: reason)) {
-                        self.sendWSText(fd: fd, data: closeObj)
+                        self.sendWSText(writer: frameWriter, data: closeObj)
                     }
                     shutdown(fd, SHUT_RDWR)
                 }
@@ -550,7 +587,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
             // METRICS: track active client count for /v1/health.
             wsTracker.clientConnected()
             // keep connection open; read incoming frames (ping/pong/close)
-            wsServeLoop(fd: fd, outbound: outbound)
+            wsServeLoop(fd: fd, writer: frameWriter)
             heartbeat.cancel()
             outbound.drain()
             wsTracker.clientDisconnected(queuedBytes: outbound.queuedByteCount)
@@ -893,17 +930,21 @@ public final class DirectHTTPServer: @unchecked Sendable {
         _ = writeAll(fd: fd, data: data)
     }
 
-    private func sendWSEvent(fd: Int32, data: Data, compressed: Bool) -> Bool {
+    private func sendWSEvent(
+        writer: WebSocketConnectionWriter,
+        data: Data,
+        compressed: Bool
+    ) -> Bool {
         if compressed,
            let envelope = try? PayloadCodec.encodeWebSocketEnvelope(data),
            envelope.count < data.count {
-            return sendWSFrame(fd: fd, opcode: 0x2, data: envelope)
+            return writer.send(opcode: 0x2, data: envelope)
         }
-        return sendWSFrame(fd: fd, opcode: 0x1, data: data)
+        return writer.send(opcode: 0x1, data: data)
     }
 
-    private func sendWSText(fd: Int32, data: Data) {
-        _ = sendWSFrame(fd: fd, opcode: 0x1, data: data)
+    private func sendWSText(writer: WebSocketConnectionWriter, data: Data) {
+        _ = writer.send(opcode: 0x1, data: data)
     }
 
     private func sendWSFrame(fd: Int32, opcode: UInt8, data: Data) -> Bool {
@@ -926,7 +967,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
         return writeAll(fd: fd, data: frame)
     }
 
-    private func wsServeLoop(fd: Int32, outbound: WebSocketOutboundQueue) {
+    private func wsServeLoop(fd: Int32, writer: WebSocketConnectionWriter) {
         // PERF-009: keep a contiguous [UInt8] buffer with a read offset
         // instead of Data + removeFirst(consumed). removeFirst is O(n) per
         // frame (shifting the whole buffer), which is quadratic under
@@ -943,13 +984,13 @@ public final class DirectHTTPServer: @unchecked Sendable {
                 offset += consumed
                 switch frame.opcode {
                 case 0x8: // close
-                    sendCloseFrame(fd: fd); return
+                    sendCloseFrame(writer: writer); return
                 case 0x9: // ping -> pong
                     guard frame.payload.count <= 125 else {
-                        sendCloseFrame(fd: fd)
+                        sendCloseFrame(writer: writer)
                         return
                     }
-                    sendPongFrame(fd: fd, payload: frame.payload)
+                    sendPongFrame(writer: writer, payload: frame.payload)
                 case 0xA: // pong
                     continue
                 case 0x1, 0x2:
@@ -1053,9 +1094,8 @@ public final class DirectHTTPServer: @unchecked Sendable {
         return (WSFrame(opcode: hdr.opcode, payload: Data(payload)), idx + hdr.payloadLen)
     }
 
-    private func sendPongFrame(fd: Int32, payload: Data) {
-        let frame = Self.pongFrame(payload: payload)
-        _ = writeAll(fd: fd, data: frame)
+    private func sendPongFrame(writer: WebSocketConnectionWriter, payload: Data) {
+        _ = writer.send(opcode: 0xA, data: Data(payload.prefix(125)))
     }
 
     static func pongFrame(payload: Data) -> Data {
@@ -1067,11 +1107,8 @@ public final class DirectHTTPServer: @unchecked Sendable {
         return frame
     }
 
-    private func sendCloseFrame(fd: Int32) {
-        var frame = Data()
-        frame.append(0x88) // FIN + close
-        frame.append(0x00) // empty payload
-        _ = writeAll(fd: fd, data: frame)
+    private func sendCloseFrame(writer: WebSocketConnectionWriter) {
+        _ = writer.send(opcode: 0x8, data: Data())
     }
 
     private func writeAll(fd: Int32, data: Data) -> Bool {
