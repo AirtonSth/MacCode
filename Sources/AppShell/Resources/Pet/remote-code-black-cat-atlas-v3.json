@@ -302,10 +302,10 @@
       "row" : 20,
       "state" : "idleBox",
       "visualBounds" : {
-        "height" : 108,
-        "width" : 138,
-        "x" : 27,
-        "y" : 50
+        "height" : 165,
+        "width" : 168,
+        "x" : 12,
+        "y" : 39
       }
     },
     {
