@@ -2252,6 +2252,40 @@ final class DispatcherTests: XCTestCase {
         XCTAssertEqual(result["events"]?.arrayValue?.count, 1)
         XCTAssertNotNil(result["events"]?.arrayValue?.first?.objectValue?["turnStarted"],
                         "the mirror snapshot must preserve the typed AssistantEvent wire shape")
+        XCTAssertEqual(result["events_truncated"], .bool(false))
+    }
+
+    @MainActor
+    func testAgentThreadReadCanBoundLargeMobileRecoverySnapshots() async throws {
+        let router = FakeRouter()
+        let thread = AgentThreadID()
+        router.readAgentEvents = [
+            .turnStarted(turnId: "turn-1"),
+            .turnStarted(turnId: "turn-2"),
+            .turnStarted(turnId: "turn-3")
+        ]
+        let dispatcher = JSONRPCDispatcher(router: router)
+
+        let response = await dispatcher.dispatch(JSONRPCRequest(
+            jsonrpc: "2.0",
+            id: .number(1),
+            method: "agent.thread.read",
+            params: [
+                "thread_id": .string(thread.value.uuidString),
+                "include_event_watermark": .bool(true),
+                "event_limit": .number(2)
+            ]
+        ))
+
+        let result = try XCTUnwrap(response.result?.objectValue)
+        let events = try XCTUnwrap(result["events"]?.arrayValue)
+        XCTAssertEqual(events.count, 2)
+        XCTAssertNotNil(events.first?.objectValue?["turnStarted"]?.objectValue)
+        XCTAssertEqual(events.first?.objectValue?["turnStarted"]?.objectValue?["turnId"], .string("turn-2"),
+                       "bounded recovery must keep the newest contiguous event suffix")
+        XCTAssertEqual(result["event_watermark"], .number(Double(EventBus.shared.currentSeq)),
+                       "truncating old payload must not move the authoritative event cursor")
+        XCTAssertEqual(result["events_truncated"], .bool(true))
     }
 
     @MainActor

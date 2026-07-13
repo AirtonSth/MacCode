@@ -1,6 +1,26 @@
 import Foundation
 import Darwin
 
+/// Serializes complete WebSocket frames for one TCP connection.
+///
+/// Application frames are written by `WebSocketOutboundQueue`, while pong and
+/// close frames are produced by the receive loop. Both paths share this writer
+/// so bytes from two frames can never interleave on the socket.
+final class WebSocketConnectionWriter: @unchecked Sendable {
+    private let lock = NSLock()
+    private let writeFrame: @Sendable (UInt8, Data) -> Bool
+
+    init(writeFrame: @escaping @Sendable (UInt8, Data) -> Bool) {
+        self.writeFrame = writeFrame
+    }
+
+    func send(opcode: UInt8, data: Data) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return writeFrame(opcode, data)
+    }
+}
+
 final class WebSocketOutboundQueue: @unchecked Sendable {
     enum EnqueueResult: Equatable {
         case accepted
