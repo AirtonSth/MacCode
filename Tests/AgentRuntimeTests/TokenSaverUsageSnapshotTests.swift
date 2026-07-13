@@ -13,4 +13,19 @@ final class TokenSaverUsageSnapshotTests: XCTestCase {
         XCTAssertTrue(providers.contains(.claude))
         XCTAssertTrue(providers.contains(.codex))
     }
+
+    func test_ensuringManagedProviders_addsMissingGrokToLegacySnapshot() {
+        // WHY: usage.json written before Grok support only has claude/codex;
+        // load must backfill Grok so the UI never treats it as absent.
+        let legacy = TokenSaverUsageSnapshot(period: .sevenDays, providers: [
+            TokenSaverProviderUsage(provider: .claude, actualProviderTokens: 10, weeklyUsedPercent: 50),
+            TokenSaverProviderUsage(provider: .codex, actualProviderTokens: 20, weeklyUsedPercent: 30)
+        ])
+        let fixed = TokenSaverUsageStore.ensuringManagedProviders(legacy)
+        let byProvider = Dictionary(uniqueKeysWithValues: fixed.providers.map { ($0.provider, $0) })
+        XCTAssertNotNil(byProvider[.grok], "legacy snapshots must gain a Grok row")
+        XCTAssertEqual(byProvider[.claude]?.actualProviderTokens, 10,
+                       "backfill must not wipe existing Claude totals")
+        XCTAssertEqual(byProvider[.codex]?.weeklyUsedPercent, 30)
+    }
 }
