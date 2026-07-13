@@ -109,7 +109,7 @@ public struct TokenSaverSavingsSummary: Sendable, Equatable {
     }
 
     /// Saved tokens attributed to providers NOT in `known` (e.g. direct `distill` CLI
-    /// usage recorded as "unknown"). The Token Saver card shows only Claude + Codex
+    /// usage recorded as "unknown"). The Token Saver card shows Claude + Codex + Grok
     /// rows; without surfacing this, the headline total (which sums ALL providers) would
     /// not reconcile with the visible rows — exactly the "Saved 23K but Claude/Codex 0"
     /// confusion. So: total == sum(known rows) + this.

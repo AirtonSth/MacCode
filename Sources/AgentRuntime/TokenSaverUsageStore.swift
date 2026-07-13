@@ -180,7 +180,8 @@ public struct TokenSaverUsageSnapshot: Codable, Sendable, Equatable {
     public static func empty(period: TokenSaverPeriod = .sevenDays) -> TokenSaverUsageSnapshot {
         TokenSaverUsageSnapshot(period: period, providers: [
             TokenSaverProviderUsage(provider: .claude),
-            TokenSaverProviderUsage(provider: .codex)
+            TokenSaverProviderUsage(provider: .codex),
+            TokenSaverProviderUsage(provider: .grok)
         ])
     }
 }
