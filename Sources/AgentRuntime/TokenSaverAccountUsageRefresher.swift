@@ -6,17 +6,24 @@ import RemoteCodeCSystem
 public struct TokenSaverAccountUsageRefreshRequest: Sendable, Equatable {
     public let codexBinary: String
     public let claudeBinary: String
+    public let grokBinary: String
+    /// Override for tests; default is `~/.grok/logs/unified.jsonl`.
+    public let grokBillingLogURL: URL?
     public let cwd: String
     public let environment: [String: String]
 
     public init(
         codexBinary: String = "codex",
         claudeBinary: String = "claude",
+        grokBinary: String = "grok",
+        grokBillingLogURL: URL? = nil,
         cwd: String = NSHomeDirectory(),
         environment: [String: String] = [:]
     ) {
         self.codexBinary = codexBinary
         self.claudeBinary = claudeBinary
+        self.grokBinary = grokBinary
+        self.grokBillingLogURL = grokBillingLogURL
         self.cwd = cwd
         self.environment = environment
     }
@@ -87,6 +94,102 @@ public enum AssistantAccountUsageParser {
             return AssistantAccountUsage(provider: .claude, weeklyUsedPercent: used, weeklyWindowDurationMinutes: 10_080)
         }
         return nil
+    }
+
+    /// Parses Grok shell billing log lines (`billing: fetched credits config`).
+    ///
+    /// Observed shape in `~/.grok/logs/unified.jsonl`:
+    /// ```json
+    /// {"msg":"billing: fetched credits config","ctx":{"config":{
+    ///   "creditUsagePercent":29.0,
+    ///   "billingPeriodEnd":"2026-07-15T20:46:41.975270+00:00",
+    ///   "currentPeriod":{"type":"USAGE_PERIOD_TYPE_WEEKLY",...}
+    /// }}}
+    /// ```
+    public static func grokBillingLogLine(_ line: String) -> AssistantAccountUsage? {
+        let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty,
+              let data = trimmed.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return nil
+        }
+        return grokBillingJSON(obj)
+    }
+
+    public static func grokBillingJSON(_ obj: [String: Any]) -> AssistantAccountUsage? {
+        let msg = (obj["msg"] as? String) ?? (obj["message"] as? String) ?? ""
+        let ctx = obj["ctx"] as? [String: Any] ?? obj["context"] as? [String: Any] ?? obj
+        let config = ctx["config"] as? [String: Any] ?? obj["config"] as? [String: Any]
+        guard let config else { return nil }
+        // Prefer billing log lines; also accept bare credit-config objects that
+        // carry creditUsagePercent (unit tests / future cache files).
+        let looksLikeBilling = msg.contains("billing") || msg.contains("credits")
+            || config["creditUsagePercent"] != nil || config["credit_usage_percent"] != nil
+        guard looksLikeBilling else { return nil }
+        let percent = double(config["creditUsagePercent"])
+            ?? double(config["credit_usage_percent"])
+            ?? double(config["usedPercent"])
+            ?? double(config["used_percent"])
+        guard let percent else { return nil }
+        let periodEnd = config["billingPeriodEnd"] as? String
+            ?? config["billing_period_end"] as? String
+            ?? (config["currentPeriod"] as? [String: Any])?["end"] as? String
+            ?? (config["current_period"] as? [String: Any])?["end"] as? String
+        let resetsAtMs = parseISO8601Milliseconds(periodEnd)
+        return AssistantAccountUsage(
+            provider: .grok,
+            weeklyUsedPercent: percent,
+            weeklyWindowDurationMinutes: 10_080,
+            weeklyResetsAtMs: resetsAtMs
+        )
+    }
+
+    /// Scans a Grok unified log file (newest first within the last `maxBytes`) for
+    /// the freshest `billing: fetched credits config` entry.
+    public static func grokFromBillingLogFile(
+        at url: URL,
+        maxBytes: Int = 512 * 1024
+    ) -> AssistantAccountUsage? {
+        guard FileManager.default.fileExists(atPath: url.path) else { return nil }
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
+        defer { try? handle.close() }
+        let size: UInt64
+        do {
+            size = try handle.seekToEnd()
+        } catch {
+            return nil
+        }
+        let start = size > UInt64(maxBytes) ? size - UInt64(maxBytes) : 0
+        do {
+            try handle.seek(toOffset: start)
+        } catch {
+            return nil
+        }
+        guard let data = try? handle.readToEnd(), !data.isEmpty else { return nil }
+        // Drop partial first line when we mid-started the file.
+        var text = String(data: data, encoding: .utf8) ?? ""
+        if start > 0, let nl = text.firstIndex(of: "\n") {
+            text = String(text[text.index(after: nl)...])
+        }
+        // Newest last in the log — walk reverse.
+        for line in text.split(separator: "\n", omittingEmptySubsequences: true).reversed() {
+            if let usage = grokBillingLogLine(String(line)) {
+                return usage
+            }
+        }
+        return nil
+    }
+
+    private static func parseISO8601Milliseconds(_ value: String?) -> Int64? {
+        guard let value, !value.isEmpty else { return nil }
+        let withFraction = ISO8601DateFormatter()
+        withFraction.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let date = withFraction.date(from: value) {
+            return Int64(date.timeIntervalSince1970 * 1000)
+        }
+        let plain = ISO8601DateFormatter()
+        plain.formatOptions = [.withInternetDateTime]
+        return plain.date(from: value).map { Int64($0.timeIntervalSince1970 * 1000) }
     }
 
     public static func claudeUsageScreen(_ text: String) -> AssistantAccountUsage? {
@@ -246,7 +349,8 @@ public final class TokenSaverAccountUsageRefresher: TokenSaverAccountUsageRefres
     public func refreshAccountUsage(_ request: TokenSaverAccountUsageRefreshRequest) async -> [AssistantAccountUsage] {
         async let codex = withProviderTimeout { await self.fetchCodexUsage(request) }
         async let claude = withProviderTimeout { await self.fetchClaudeUsage(request) }
-        return await [codex, claude]
+        async let grok = withProviderTimeout { await self.fetchGrokUsage(request) }
+        return await [codex, claude, grok]
             .compactMap { $0 }
             .sorted { $0.provider.rawValue < $1.provider.rawValue }
     }
@@ -319,6 +423,17 @@ public final class TokenSaverAccountUsageRefresher: TokenSaverAccountUsageRefres
             return usage
         }
         return nil
+    }
+
+    /// Grok weekly credit usage is written by the shell to
+    /// `~/.grok/logs/unified.jsonl` (`billing: fetched credits config`).
+    /// Headless `/usage` does not return a machine-readable account probe, so
+    /// we read the freshest local billing snapshot (same source the TUI uses).
+    private func fetchGrokUsage(_ request: TokenSaverAccountUsageRefreshRequest) async -> AssistantAccountUsage? {
+        let url = request.grokBillingLogURL
+            ?? FileManager.default.homeDirectoryForCurrentUser
+                .appendingPathComponent(".grok/logs/unified.jsonl")
+        return AssistantAccountUsageParser.grokFromBillingLogFile(at: url)
     }
 
     private func runClaudeUsageScreen(_ request: TokenSaverAccountUsageRefreshRequest) async -> AssistantAccountUsage? {
