@@ -2037,6 +2037,30 @@ final class AgentAppViewModelTests: XCTestCase {
                        "stored/completed data remains full; only active live UI copies are capped")
     }
 
+    /// Streaming Thought must show the *latest* tokens (terminal UX), not a frozen
+    /// head of the chain-of-thought that freezes while later reasoning keeps growing.
+    func test_streamingReasoningLiveCapKeepsTailNotHead() {
+        let head = String(repeating: "A", count: 80)
+        let tail = "LATEST-THOUGHT-TOKEN"
+        let pad = String(repeating: "b", count: AgentAppView.liveTurnBodyCharacterLimit)
+        let body = head + pad + tail
+        let item = AssistantItem(id: "r1", turnId: "t1", type: .reasoning, state: .streaming,
+                                 body: body, startedAtMs: 1)
+        let visible = AgentAppView.visibleLiveTurnItems([item], running: true)
+        XCTAssertEqual(visible.count, 1)
+        XCTAssertTrue(visible[0].body.contains(tail),
+                      "live Thinking… must show the newest reasoning tokens like the Grok TUI")
+        XCTAssertFalse(visible[0].body.hasPrefix(head),
+                       "capping the head freezes early thoughts while later ones rewrite 'on top' of the answer")
+        let completed = AssistantItem(id: "r2", turnId: "t1", type: .reasoning, state: .completed,
+                                      body: body, startedAtMs: 1)
+        let completedVisible = AgentAppView.visibleLiveTurnItems([completed], running: true)
+        XCTAssertTrue(completedVisible[0].body.hasPrefix(head),
+                      "completed Thought rows keep the conventional head cap for stable collapsed previews")
+        XCTAssertFalse(completedVisible[0].body.contains(tail),
+                       "completed head-cap must not keep the tail window used only while streaming")
+    }
+
     func test_toolCommandPreviewCapsLongCommandsForCollapsedRows() {
         let command = "gh api graphql " + String(repeating: "x", count: AgentAppView.commandPreviewCharacterLimit + 200)
         let body = #"{"command":"\#(command)"}"#

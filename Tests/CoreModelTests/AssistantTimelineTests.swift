@@ -403,6 +403,46 @@ final class AssistantTimelineTests: XCTestCase {
                       "work log must include raw provider runtime events so unknown Codex/Claude progress remains visible")
     }
 
+    /// Grok (and Claude) stream one NDJSON line per token. Surfacing every
+    /// `thought`/`text` as a Work log row puts a flickering "runtime: thought"
+    /// strip *above* the user message and rewrites it on every token.
+    func test_tokenStreamRuntimeEventsDoNotFloodWorkLog() {
+        var s = AssistantTimelineState()
+        for i in 0..<12 {
+            s.apply(.providerRuntime(ProviderRuntimeEvent(
+                id: "tok-\(i)",
+                provider: .grok,
+                source: "grok.streaming-json",
+                method: i.isMultiple(of: 2) ? "thought" : "text",
+                payloadJSON: #"{"type":"thought","data":"x"}"#,
+                receivedAtMs: Int64(i)
+            )))
+        }
+        s.apply(.providerRuntime(ProviderRuntimeEvent(
+            id: "end-1",
+            provider: .grok,
+            source: "grok.streaming-json",
+            method: "end",
+            payloadJSON: #"{"type":"end"}"#,
+            receivedAtMs: 99
+        )))
+
+        XCTAssertFalse(s.workActivities.contains { $0.id.hasPrefix("runtime:tok-") },
+                       "per-token runtime activities must be suppressed so Work log stays tool/lifecycle oriented")
+        XCTAssertTrue(s.workActivities.contains { $0.id == "runtime:end-1" && $0.title.contains("end") },
+                      "lifecycle events like end must still surface in the Work log")
+        XCTAssertEqual(s.providerRuntimeEvents.count, 13,
+                       "raw runtime buffer still keeps stream events for debug/replay; only the Work log is filtered")
+    }
+
+    func test_turnStartedRecordsStartedAtMsForTranscriptOrdering() {
+        var s = AssistantTimelineState()
+        s.apply(.turnStarted(turnId: "turn-live"))
+        let started = s.turns.first?.startedAtMs
+        XCTAssertNotNil(started, "empty turns need a start timestamp so they do not sort at epoch 0 before the user message")
+        XCTAssertGreaterThan(started ?? 0, 0)
+    }
+
     func test_workActivitiesTrackProviderPercentProgress() {
         var s = AssistantTimelineState()
         s.apply(.turnStarted(turnId: "turn-1"))

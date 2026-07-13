@@ -38,6 +38,30 @@ final class GrokRunnerArgsTests: XCTestCase {
         XCTAssertTrue(a[1].contains("Default mode."))
     }
 
+    /// Token-level NDJSON lines are already parsed into Thought/answer items.
+    /// Emitting them as providerRuntime floods Work log above the user message.
+    func test_streamTokenLinesDoNotBecomeProviderRuntimeEvents() {
+        XCTAssertNil(GrokRunner.providerRuntimeEventIfNeeded(
+            line: #"{"type":"thought","data":"The"}"#,
+            source: "grok.streaming-json"
+        ), "thought tokens must not become Work log / runtime noise")
+        XCTAssertNil(GrokRunner.providerRuntimeEventIfNeeded(
+            line: #"{"type":"text","data":"hi"}"#,
+            source: "grok.streaming-json"
+        ), "text tokens must not become Work log / runtime noise")
+        let end = GrokRunner.providerRuntimeEventIfNeeded(
+            line: #"{"type":"end","stopReason":"EndTurn","sessionId":"s1"}"#,
+            source: "grok.streaming-json"
+        )
+        XCTAssertEqual(end?.method, "end",
+                       "lifecycle end events stay visible for debug/session resume diagnostics")
+        let err = GrokRunner.providerRuntimeEventIfNeeded(
+            line: #"{"type":"error","message":"auth"}"#,
+            source: "grok.streaming-json"
+        )
+        XCTAssertEqual(err?.method, "error")
+    }
+
     func test_modelAndPermissionMapping() {
         let a = GrokRunner.buildArgs(req(mode: .fullAccess, model: "grok-4.5"))
         XCTAssertEqual(a[a.index(after: a.firstIndex(of: "--model")!)], "grok-4.5")

@@ -151,7 +151,10 @@ public final class GrokRunner: AgentProviderRunner, @unchecked Sendable {
         let stdoutReadLock = NSLock()
         let cancelFlag = AgentCancelFlag()
         let emitLine: (String) -> Void = { line in
-            if let runtimeEvent = ProviderRuntimeEvent.fromJSONLine(line, provider: .grok, source: "grok.streaming-json") {
+            // Token lines (thought/text) become Thought/answer items via GrokParser.
+            // Do not also emit providerRuntime for them — that floods Work log with
+            // "grok runtime: thought" rows above the user message on every token.
+            if let runtimeEvent = Self.providerRuntimeEventIfNeeded(line: line, source: "grok.streaming-json") {
                 let ev = AssistantEvent.providerRuntime(runtimeEvent)
                 timeline.apply(ev)
                 onEvent(.event(ev))
@@ -238,5 +241,29 @@ public final class GrokRunner: AgentProviderRunner, @unchecked Sendable {
 
     public static func displayableStderr(_ raw: String) -> String? {
         ProviderStderrClassifier.displayableStderr(raw, provider: .grok)
+    }
+
+    /// Lifecycle / tool / error lines become `providerRuntime` for debug + Work log.
+    /// Pure token stream types are excluded — they already map to timeline items.
+    public static func providerRuntimeEventIfNeeded(
+        line: String,
+        source: String,
+        receivedAtMs: Int64 = Int64(Date().timeIntervalSince1970 * 1000)
+    ) -> ProviderRuntimeEvent? {
+        guard let event = ProviderRuntimeEvent.fromJSONLine(
+            line, provider: .grok, source: source, receivedAtMs: receivedAtMs
+        ) else { return nil }
+        if Self.isTokenStreamMethod(event.method) { return nil }
+        return event
+    }
+
+    /// Grok `streaming-json` emits one NDJSON object per reasoning/answer token.
+    static func isTokenStreamMethod(_ method: String) -> Bool {
+        switch method {
+        case "thought", "text":
+            return true
+        default:
+            return false
+        }
     }
 }
