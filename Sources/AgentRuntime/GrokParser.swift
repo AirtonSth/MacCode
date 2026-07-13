@@ -4,10 +4,15 @@ import CoreModel
 /// Parser for official Grok Build CLI headless output
 /// (`grok -p … --output-format streaming-json`).
 ///
-/// Event shape (observed from grok 0.2.x):
+/// Event shape (observed from grok 0.2.x / headless streaming-json docs):
 /// - `{"type":"thought","data":"…"}` — reasoning token stream
 /// - `{"type":"text","data":"…"}` — assistant text stream
 /// - `{"type":"end","stopReason":"…","sessionId":"…","requestId":"…"}`
+/// - optional tool_call / tool_result (non-exhaustive; treat unknown types as no-ops)
+///
+/// Phase boundaries match Grok TUI ordering: thought phases complete before
+/// text/tools, and a later thought phase opens a new reasoning item (does not
+/// keep rewriting the first Thought block above the answer).
 ///
 /// Maps into the shared AssistantEvent model used by Agent App.
 public final class GrokParser {
@@ -44,6 +49,10 @@ public final class GrokParser {
             ensureTurn(&out)
             let chunk = textChunk(from: obj)
             guard !chunk.isEmpty else { return out }
+            // Terminal UX: a new thought phase after answer/tool text is a *new*
+            // Thinking… row (chronological), not more tokens on the first Thought
+            // block sitting above the message.
+            closeAssistantItem(&out)
             let itemId = openReasoningItem(&out, now: now)
             out.append(.itemDelta(itemId: itemId, bodyAppend: chunk, outputAppend: nil, summary: nil))
 
@@ -51,6 +60,9 @@ public final class GrokParser {
             ensureTurn(&out)
             let chunk = textChunk(from: obj)
             guard !chunk.isEmpty else { return out }
+            // Seal Thinking… → Thought before the answer streams so reasoning
+            // cannot keep expanding on top of the assistant message.
+            closeReasoningItem(&out)
             let itemId = openAssistantItem(&out, now: now)
             assembledAssistantBody += chunk
             out.append(.itemDelta(itemId: itemId, bodyAppend: chunk, outputAppend: nil, summary: nil))
@@ -72,6 +84,7 @@ public final class GrokParser {
 
         case "error":
             ensureTurn(&out)
+            closeOpenItems(&out)
             let message = (obj["message"] as? String)
                 ?? (obj["data"] as? String)
                 ?? (obj["error"] as? String)
@@ -86,6 +99,9 @@ public final class GrokParser {
 
         case "tool_call", "tool_use", "tool":
             ensureTurn(&out)
+            // Tools break a thought phase (same as the Grok TUI timeline order).
+            closeReasoningItem(&out)
+            closeAssistantItem(&out)
             let name = (obj["name"] as? String)
                 ?? (obj["tool"] as? String)
                 ?? (obj["toolName"] as? String)
@@ -176,15 +192,23 @@ public final class GrokParser {
         return id
     }
 
-    private func closeOpenItems(_ out: inout [AssistantEvent]) {
+    private func closeReasoningItem(_ out: inout [AssistantEvent]) {
         if let id = reasoningItemId {
             out.append(.itemCompleted(itemId: id, finalState: .completed))
             reasoningItemId = nil
         }
+    }
+
+    private func closeAssistantItem(_ out: inout [AssistantEvent]) {
         if let id = assistantItemId {
             out.append(.itemCompleted(itemId: id, finalState: .completed))
             assistantItemId = nil
         }
+    }
+
+    private func closeOpenItems(_ out: inout [AssistantEvent]) {
+        closeReasoningItem(&out)
+        closeAssistantItem(&out)
     }
 
     private func encodeJSON(_ value: Any) -> String? {

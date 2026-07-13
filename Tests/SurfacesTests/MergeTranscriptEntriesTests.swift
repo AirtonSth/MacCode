@@ -74,4 +74,23 @@ final class MergeTranscriptEntriesTests: XCTestCase {
         let tEarly = [turn("a", 1000)]
         assertMatchesSort(mLate, tEarly, "a turn entirely before a message must come first")
     }
+
+    /// Empty turns (turnStarted, no items yet) used to report sortTime=0 and
+    /// jump *above* the just-sent user bubble until the first thought arrived.
+    func test_emptyTurnWithStartedAtSortsAfterUserMessage() {
+        let userAt: TimeInterval = 1_700_000_000
+        let m = [msg(UUID(), userAt)]
+        let empty = AssistantTurnSnapshot(turnId: "live",
+                                          items: [],
+                                          startedAtMs: Int64((userAt + 0.05) * 1000))
+        let ids = AgentAppView.mergeTranscriptEntries(messages: m, turns: [empty]).map(\.id)
+        XCTAssertEqual(ids.first, AgentAppView.TranscriptEntry.message(m[0]).id,
+                       "user message must stay above the live turn while it has no items yet")
+        XCTAssertEqual(ids.last, AgentAppView.TranscriptEntry.turn(empty).id)
+
+        let emptySort = AgentAppView.TranscriptEntry.turn(empty).sortTime
+        XCTAssertGreaterThan(emptySort, 0,
+                             "empty turns must not fall back to epoch 0 (which reorders them before every message)")
+        XCTAssertGreaterThanOrEqual(emptySort, userAt)
+    }
 }

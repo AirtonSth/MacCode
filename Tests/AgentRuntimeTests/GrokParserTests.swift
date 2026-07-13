@@ -59,4 +59,83 @@ final class GrokParserTests: XCTestCase {
             return false
         }, "CLI error events must appear in the timeline so users see why the turn failed")
     }
+
+    /// Terminal UX: thought → text must finish the Thought row so it collapses to
+    /// "Thought" and stops rewriting above the assistant answer while tokens arrive.
+    func test_textPhaseClosesReasoningBeforeAssistantStreams() {
+        let parser = GrokParser()
+        var events: [AssistantEvent] = []
+        events += parser.parseLine(#"{"type":"thought","data":"plan"}"#)
+        events += parser.parseLine(#"{"type":"text","data":"hello"}"#)
+
+        let reasoningIds = events.compactMap { ev -> String? in
+            if case .itemStarted(let item) = ev, item.type == .reasoning { return item.id }
+            return nil
+        }
+        let assistantIds = events.compactMap { ev -> String? in
+            if case .itemStarted(let item) = ev, item.type == .assistantMessage { return item.id }
+            return nil
+        }
+        XCTAssertEqual(reasoningIds.count, 1, "one Thought row for the thought phase")
+        XCTAssertEqual(assistantIds.count, 1, "assistant text opens its own item")
+
+        let reasoningId = reasoningIds[0]
+        let completedReasoningBeforeText = events.firstIndex {
+            if case .itemCompleted(let id, .completed) = $0 { return id == reasoningId }
+            return false
+        }
+        let assistantStart = events.firstIndex {
+            if case .itemStarted(let item) = $0 { return item.id == assistantIds[0] }
+            return false
+        }
+        XCTAssertNotNil(completedReasoningBeforeText,
+                        "reasoning must complete when text starts so the UI collapses Thinking… → Thought")
+        XCTAssertNotNil(assistantStart)
+        if let completedReasoningBeforeText, let assistantStart {
+            XCTAssertLessThan(completedReasoningBeforeText, assistantStart,
+                              "Thought must finish before the answer streams so it cannot keep mutating on top of the message")
+        }
+    }
+
+    /// Multi-phase agent turns re-open Thought after tools/text (Grok TUI order),
+    /// rather than appending late thoughts into the first reasoning block at the top.
+    func test_thoughtAfterTextOpensNewReasoningPhase() {
+        let parser = GrokParser()
+        var events: [AssistantEvent] = []
+        events += parser.parseLine(#"{"type":"thought","data":"first"}"#)
+        events += parser.parseLine(#"{"type":"text","data":"mid"}"#)
+        events += parser.parseLine(#"{"type":"thought","data":"second"}"#)
+        events += parser.parseLine(#"{"type":"text","data":"final"}"#)
+        events += parser.finalize()
+
+        let reasoningStarts = events.compactMap { ev -> String? in
+            if case .itemStarted(let item) = ev, item.type == .reasoning { return item.id }
+            return nil
+        }
+        XCTAssertEqual(Set(reasoningStarts).count, 2,
+                       "each thought phase after text must be its own timeline item (terminal interleaving)")
+
+        var timeline = AssistantTimelineState()
+        for ev in events { timeline.apply(ev) }
+        let bodies = timeline.turns.first?.items.filter { $0.type == .reasoning }.map(\.body) ?? []
+        XCTAssertEqual(bodies, ["first", "second"],
+                       "late thoughts must not concatenate into the first Thought block above the answer")
+    }
+
+    func test_toolCallClosesOpenReasoning() {
+        let parser = GrokParser()
+        var events: [AssistantEvent] = []
+        events += parser.parseLine(#"{"type":"thought","data":"need shell"}"#)
+        events += parser.parseLine(#"{"type":"tool_call","id":"t1","name":"run_terminal_command","input":{"command":"echo hi"}}"#)
+
+        let reasoningId = events.compactMap { ev -> String? in
+            if case .itemStarted(let item) = ev, item.type == .reasoning { return item.id }
+            return nil
+        }.first
+        XCTAssertNotNil(reasoningId)
+        XCTAssertTrue(events.contains {
+            if case .itemCompleted(let id, .completed) = $0 { return id == reasoningId }
+            return false
+        }, "tool calls must seal the Thought row so tool lines render after it, not under an ever-growing Thinking… block")
+    }
 }
