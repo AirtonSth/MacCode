@@ -45,6 +45,13 @@ public final class SQLiteDB {
     // (~40-50 distinct strings), so unbounded growth is not a practical risk.
     private var stmtCache: [String: OpaquePointer] = [:]
 
+    private func resetCachedStatements() {
+        for statement in stmtCache.values {
+            sqlite3_reset(statement)
+            sqlite3_clear_bindings(statement)
+        }
+    }
+
     // Returns a cached-and-reset statement, or compiles a fresh one.
     // Caller is responsible for serialisation (either via `performSync` or a
     // single-writer context); see `prepare` for the thread-safety rationale.
@@ -147,7 +154,12 @@ public final class SQLiteDB {
     }
 
     public func performSync<T>(_ block: (SQLiteDB) throws -> T) rethrows -> T {
-        try queue.sync { try block(self) }
+        try queue.sync {
+            // Early-returned SELECTs must not retain a WAL read snapshot after
+            // the serialized operation ends, including when the block throws.
+            defer { resetCachedStatements() }
+            return try block(self)
+        }
     }
 
     public func prepare(_ sql: String) throws -> SQLiteStatement {
