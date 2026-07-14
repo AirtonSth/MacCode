@@ -2909,14 +2909,50 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         EventBus.shared.publish(kind: "notification.dismissed", payload: .object(["id": .string(id)]))
     }
 
-    public func privatePushTokenUpdate(pushToken: String, pushTokenType: String, liveActivityToken: String?, deviceID: String?) throws -> JSONValue {
+    public func privatePushTokenUpdate(
+        pushToken: String,
+        pushTokenType: String,
+        liveActivityToken: String?,
+        deviceID: String?,
+        tokenPurpose: String? = nil,
+        environment: String? = nil,
+        serverID: String? = nil,
+        activityGeneration: Int? = nil,
+        activityID: String? = nil,
+        contractVersion: Int? = nil,
+        capabilities: [String]? = nil
+    ) throws -> JSONValue {
         guard let ctx = context else { throw LayoutError.workspaceNotFound }
-        PrivatePushTargetStore(repo: ctx.settingsRepo).save(
+        let store = PrivatePushTargetStore(repo: ctx.settingsRepo)
+        store.save(
             pushToken: pushToken,
             pushTokenType: pushTokenType,
             liveActivityToken: liveActivityToken,
             deviceId: deviceID
         )
+        if let tokenPurpose,
+           let purpose = PrivatePushTokenPurpose(rawValue: tokenPurpose),
+           let environment,
+           let pushEnvironment = PrivatePushEnvironment(rawValue: environment),
+           let deviceID,
+           let serverID {
+            let token = purpose == .alert ? pushToken : (liveActivityToken ?? pushToken)
+            let target = PrivatePushTargetRecord(
+                deviceId: deviceID,
+                serverId: serverID,
+                purpose: purpose,
+                environment: pushEnvironment,
+                token: token,
+                activityGeneration: activityGeneration.flatMap { $0 >= 0 ? UInt64($0) : nil },
+                activityId: activityID,
+                contractVersion: contractVersion ?? 1,
+                capabilities: capabilities
+            )
+            try store.upsert(target)
+            if target.supportsLiveActivityV2 {
+                ctx.liveActivitySyncCoordinator.submitTokenRegistration(target)
+            }
+        }
         return .object([
             "ok": .bool(true),
             "push_token_type": .string(pushTokenType)

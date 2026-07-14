@@ -471,6 +471,165 @@ final class AppIdentityNotificationTests: XCTestCase {
                      "a backend token-drop response on the Live Activity path must clear the stale push target, mirroring the alert path")
     }
 
+    func testPrivateNotificationBridgeRegistersTypedLiveActivityTokenWithAuthenticatedBackend() async throws {
+        let dir = NSTemporaryDirectory() + "RC2LiveActivityV2Registration-" + UUID().uuidString
+        let ctx = try AppContext(channel: .debug, appSupportOverride: dir)
+        let accountStore = PrivateAccountSessionStore(repo: ctx.settingsRepo)
+        let targetStore = PrivatePushTargetStore(repo: ctx.settingsRepo)
+        let api = RecordingPrivateAccountAPI()
+        accountStore.save(api.session)
+        let bridge = PrivateNotificationBridge(accountStore: accountStore, pushTargetStore: targetStore, api: api)
+        let target = PrivatePushTargetRecord(
+            deviceId: "device-1", serverId: "server-1", purpose: .activityUpdate,
+            environment: .sandbox, token: "update-token", contractVersion: 2,
+            capabilities: ["live_activity_v2"]
+        )
+
+        await bridge.registerLiveActivityTokenV2(target)
+
+        let request = try XCTUnwrap(api.liveActivityV2TokenRegistrations.first)
+        XCTAssertEqual(request.accessToken, "access-token")
+        XCTAssertEqual(request.registration.deviceId, "device-1")
+        XCTAssertEqual(request.registration.environment, .sandbox)
+        XCTAssertEqual(request.registration.token, "update-token")
+        XCTAssertEqual(request.registration.tokenKind, .update,
+                       "an ActivityKit update token must use the backend's update registry, not push-to-start")
+    }
+
+    func testPrivateNotificationBridgeDeliversV2AndInvalidatesOnlyRejectedActivityToken() async throws {
+        let dir = NSTemporaryDirectory() + "RC2LiveActivityV2Delivery-" + UUID().uuidString
+        let ctx = try AppContext(channel: .debug, appSupportOverride: dir)
+        let accountStore = PrivateAccountSessionStore(repo: ctx.settingsRepo)
+        let targetStore = PrivatePushTargetStore(repo: ctx.settingsRepo)
+        let api = RecordingPrivateAccountAPI()
+        api.liveActivityV2Result = PrivatePushDeliveryResult(
+            delivered: false, errorCode: "apns/Unregistered", shouldDropSubscription: true
+        )
+        accountStore.save(api.session)
+        let alert = PrivatePushTargetRecord(
+            deviceId: "device-1", serverId: "server-1", purpose: .alert,
+            environment: .sandbox, token: "alert-token"
+        )
+        let start = PrivatePushTargetRecord(
+            deviceId: "device-1", serverId: "server-1", purpose: .pushToStart,
+            environment: .sandbox, token: "start-token", activityGeneration: 3,
+            contractVersion: 2, capabilities: ["live_activity_v2"]
+        )
+        try targetStore.upsert(alert)
+        try targetStore.upsert(start)
+        let bridge = PrivateNotificationBridge(accountStore: accountStore, pushTargetStore: targetStore, api: api)
+        let projection = PrivateLiveActivityProjectionV2(
+            statusLine: "1 active run", phase: .running, activeThreadCount: 1,
+            updatedAt: 900, sessionId: "server-1:8:3", hostId: "server-1",
+            epoch: "8", revision: 4
+        )
+        let delivery = LiveActivitySyncDelivery(
+            event: .start, projection: projection, activityGeneration: 3,
+            idempotencyKey: "activity.server-1.8.3.4.start"
+        )
+
+        await bridge.deliverLiveActivity(delivery)
+
+        let request = try XCTUnwrap(api.liveActivityV2Deliveries.first)
+        XCTAssertEqual(request.accessToken, "access-token")
+        XCTAssertEqual(request.request.activitySessionId, "server-1:8:3")
+        XCTAssertEqual(request.request.deviceId, "device-1")
+        XCTAssertEqual(request.idempotencyKey, "activity.server-1.8.3.4.start")
+        XCTAssertEqual(try targetStore.records(), [alert],
+                       "an invalid ActivityKit token must not erase the device alert token")
+    }
+
+    func testUnrelatedV2TargetDoesNotSuppressLegacyLiveActivityFallback() async throws {
+        let dir = NSTemporaryDirectory() + "RC2LiveActivityV2Fallback-" + UUID().uuidString
+        let ctx = try AppContext(channel: .debug, appSupportOverride: dir)
+        let accountStore = PrivateAccountSessionStore(repo: ctx.settingsRepo)
+        let targetStore = PrivatePushTargetStore(repo: ctx.settingsRepo)
+        let api = RecordingPrivateAccountAPI()
+        accountStore.save(api.session)
+        targetStore.save(
+            pushToken: "apns-token", pushTokenType: "apns",
+            liveActivityToken: "legacy-activity-token", deviceId: "legacy-device"
+        )
+        try targetStore.upsert(PrivatePushTargetRecord(
+            deviceId: "other-device", serverId: "other-server", purpose: .pushToStart,
+            environment: .sandbox, token: "other-token", contractVersion: 2,
+            capabilities: ["live_activity_v2"]
+        ))
+        let bridge = PrivateNotificationBridge(accountStore: accountStore, pushTargetStore: targetStore, api: api)
+        let projection = PrivateLiveActivityProjectionV2(
+            statusLine: "1 active run", phase: .running, activeThreadCount: 1,
+            updatedAt: 900, sessionId: "server-1:8:3", hostId: "server-1",
+            epoch: "8", revision: 1
+        )
+
+        await bridge.deliverLiveActivity(LiveActivitySyncDelivery(
+            event: .start, projection: projection, activityGeneration: 3,
+            idempotencyKey: "activity.server-1.8.3.1.start"
+        ))
+
+        XCTAssertEqual(api.liveActivityRequests.count, 1,
+                       "v2 capability on a different host must not disable this host's legacy fallback")
+        XCTAssertTrue(api.liveActivityV2Deliveries.isEmpty)
+    }
+
+    func testConcurrentPush401ResponsesShareOneSessionRefreshAndRetryOnce() async throws {
+        let dir = NSTemporaryDirectory() + "RC2PrivatePushRefresh-" + UUID().uuidString
+        let ctx = try AppContext(channel: .debug, appSupportOverride: dir)
+        let accountStore = PrivateAccountSessionStore(repo: ctx.settingsRepo)
+        let targetStore = PrivatePushTargetStore(repo: ctx.settingsRepo)
+        let api = ConcurrentExpiryPrivateAccountAPI()
+        accountStore.save(api.session)
+        targetStore.save(
+            pushToken: "apns-token", pushTokenType: "apns",
+            liveActivityToken: nil, deviceId: "device-1"
+        )
+        let bridge = PrivateNotificationBridge(accountStore: accountStore, pushTargetStore: targetStore, api: api)
+        let first = try XCTUnwrap(RemoteCodeNotificationContent.threadOutcome(
+            threadId: "thread-1", title: "First", phase: .completed
+        ))
+        let second = try XCTUnwrap(RemoteCodeNotificationContent.threadOutcome(
+            threadId: "thread-2", title: "Second", phase: .completed
+        ))
+
+        async let firstDelivery: Void = bridge.deliver(first)
+        async let secondDelivery: Void = bridge.deliver(second)
+        _ = await (firstDelivery, secondDelivery)
+
+        XCTAssertEqual(api.refreshCallCount, 1,
+                       "concurrent access-token expiry must share one refresh instead of creating a retry storm")
+        XCTAssertEqual(api.successfulAlertTokens, ["refreshed-access-token", "refreshed-access-token"])
+        XCTAssertEqual(accountStore.load()?.accessToken, "refreshed-access-token")
+    }
+
+    func testConcurrentPushRefreshFailureClearsSessionWithoutRetryStorm() async throws {
+        let dir = NSTemporaryDirectory() + "RC2PrivatePushRefreshFailure-" + UUID().uuidString
+        let ctx = try AppContext(channel: .debug, appSupportOverride: dir)
+        let accountStore = PrivateAccountSessionStore(repo: ctx.settingsRepo)
+        let targetStore = PrivatePushTargetStore(repo: ctx.settingsRepo)
+        let api = ConcurrentExpiryPrivateAccountAPI(refreshFails: true)
+        accountStore.save(api.session)
+        targetStore.save(
+            pushToken: "apns-token", pushTokenType: "apns",
+            liveActivityToken: nil, deviceId: "device-1"
+        )
+        let bridge = PrivateNotificationBridge(accountStore: accountStore, pushTargetStore: targetStore, api: api)
+        let first = try XCTUnwrap(RemoteCodeNotificationContent.threadOutcome(
+            threadId: "thread-1", title: "First", phase: .completed
+        ))
+        let second = try XCTUnwrap(RemoteCodeNotificationContent.threadOutcome(
+            threadId: "thread-2", title: "Second", phase: .completed
+        ))
+
+        async let firstDelivery: Void = bridge.deliver(first)
+        async let secondDelivery: Void = bridge.deliver(second)
+        _ = await (firstDelivery, secondDelivery)
+
+        XCTAssertEqual(api.refreshCallCount, 1)
+        XCTAssertNil(accountStore.load(),
+                     "terminal refresh failure must clear the unusable private session")
+        XCTAssertTrue(api.successfulAlertTokens.isEmpty)
+    }
+
     func testStreamingErrorsDoNotEmitTerminalRunNotificationsBeforeFinish() async throws {
         let dir = NSTemporaryDirectory() + "RC2Notify-" + UUID().uuidString
         let ctx = try AppContext(channel: .debug, appSupportOverride: dir)
@@ -748,7 +907,7 @@ private final class PairingResultBox: @unchecked Sendable {
     }
 }
 
-private final class RecordingPrivateAccountAPI: PrivateAccountAPI, @unchecked Sendable {
+private class RecordingPrivateAccountAPI: PrivateAccountAPI, @unchecked Sendable {
     let session = PrivateAccountSession(
         accessToken: "access-token",
         refreshToken: "refresh-token",
@@ -763,7 +922,10 @@ private final class RecordingPrivateAccountAPI: PrivateAccountAPI, @unchecked Se
     var loginRequests: [[String: String]] = []
     var alertRequests: [(accessToken: String, title: String, body: String, data: [String: String], pushToken: String, pushTokenType: String, idempotencyKey: String)] = []
     var liveActivityRequests: [(accessToken: String, event: String, contentState: PrivateLiveActivityContentState, liveActivityToken: String, pushToken: String, pushTokenType: String, idempotencyKey: String)] = []
+    var liveActivityV2TokenRegistrations: [(accessToken: String, registration: PrivateLiveActivityV2TokenRegistration)] = []
+    var liveActivityV2Deliveries: [(accessToken: String, request: PrivateLiveActivityV2DeliveryRequest, idempotencyKey: String)] = []
     var liveActivityResult = PrivatePushDeliveryResult(delivered: true, errorCode: nil, shouldDropSubscription: false)
+    var liveActivityV2Result = PrivatePushDeliveryResult(delivered: true, errorCode: nil, shouldDropSubscription: false)
     var billingOverviewRequests: [String] = []
     var portalRequests: [String] = []
     var refreshRequests: [String] = []
@@ -828,8 +990,86 @@ private final class RecordingPrivateAccountAPI: PrivateAccountAPI, @unchecked Se
         return PrivatePushDeliveryResult(delivered: true, errorCode: nil, shouldDropSubscription: false)
     }
 
-    func deliverLiveActivity(accessToken: String, event: String, contentState: PrivateLiveActivityContentState, liveActivityToken: String, pushToken: String, pushTokenType: String, idempotencyKey: String) async throws -> PrivatePushDeliveryResult {
+    func deliverLiveActivity(accessToken: String, event: String, contentState: PrivateLiveActivityContentState, timestampSeconds: Int64, liveActivityToken: String, pushToken: String, pushTokenType: String, idempotencyKey: String) async throws -> PrivatePushDeliveryResult {
         liveActivityRequests.append((accessToken, event, contentState, liveActivityToken, pushToken, pushTokenType, idempotencyKey))
         return liveActivityResult
+    }
+
+    func registerLiveActivityTokenV2(
+        accessToken: String,
+        registration: PrivateLiveActivityV2TokenRegistration
+    ) async throws {
+        liveActivityV2TokenRegistrations.append((accessToken, registration))
+    }
+
+    func deliverLiveActivityV2(
+        accessToken: String,
+        request: PrivateLiveActivityV2DeliveryRequest,
+        idempotencyKey: String
+    ) async throws -> PrivatePushDeliveryResult {
+        liveActivityV2Deliveries.append((accessToken, request, idempotencyKey))
+        return liveActivityV2Result
+    }
+}
+
+private actor TwoAttemptGate {
+    private var arrivalCount = 0
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func arrive() async {
+        arrivalCount += 1
+        if arrivalCount == 2 {
+            waiters.forEach { $0.resume() }
+            waiters.removeAll()
+            return
+        }
+        await withCheckedContinuation { continuation in
+            waiters.append(continuation)
+        }
+    }
+}
+
+private final class ConcurrentExpiryPrivateAccountAPI: RecordingPrivateAccountAPI, @unchecked Sendable {
+    private let gate = TwoAttemptGate()
+    private let lock = NSLock()
+    private let refreshFails: Bool
+    private var refreshCount = 0
+    private var successfulTokens: [String] = []
+
+    var refreshCallCount: Int { lock.withLock { refreshCount } }
+    var successfulAlertTokens: [String] { lock.withLock { successfulTokens.sorted() } }
+
+    init(refreshFails: Bool = false) {
+        self.refreshFails = refreshFails
+        super.init()
+    }
+
+    override func refresh(refreshToken: String) async throws -> PrivateAccountSession {
+        lock.withLock { refreshCount += 1 }
+        if refreshFails {
+            throw PrivateAccountAPIError.http(401)
+        }
+        return PrivateAccountSession(
+            accessToken: "refreshed-access-token",
+            refreshToken: "refreshed-refresh-token",
+            user: session.user
+        )
+    }
+
+    override func deliverAlert(
+        accessToken: String,
+        title: String,
+        body: String,
+        data: [String: String],
+        pushToken: String,
+        pushTokenType: String,
+        idempotencyKey: String
+    ) async throws -> PrivatePushDeliveryResult {
+        if accessToken == "access-token" {
+            await gate.arrive()
+            throw PrivateAccountAPIError.http(401)
+        }
+        lock.withLock { successfulTokens.append(accessToken) }
+        return PrivatePushDeliveryResult(delivered: true, errorCode: nil, shouldDropSubscription: false)
     }
 }

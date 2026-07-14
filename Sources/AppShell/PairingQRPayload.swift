@@ -2,6 +2,19 @@ import CoreImage
 import CoreImage.CIFilterBuiltins
 import Foundation
 
+public enum DirectAccessConfiguration {
+    public static let defaultPort: UInt16 = 18217
+
+    public static func port(
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> UInt16 {
+        guard let raw = environment["RC2_HTTP_PORT"],
+              let value = UInt16(raw),
+              value > 0 else { return defaultPort }
+        return value
+    }
+}
+
 /// Pure helpers for building and rendering the QR-code pairing payload.
 ///
 /// WHY: The 6-digit pairing code alone is not enough for zero-tap pairing —
@@ -28,7 +41,7 @@ public enum PairingQRPayload {
     /// - Parameters:
     ///   - code:     The short-lived pairing code (6 alphanumeric chars).
     ///   - host:     The Mac's reachable LAN hostname or IP address.
-    ///   - port:     The HTTP listener port (always 18217 in production).
+    ///   - port:     The HTTP listener port (18217 unless RC2_HTTP_PORT overrides it).
     ///   - serverId: The stable server identity persisted in settings ("server_id").
     /// - Returns: The URL string to encode into the QR code.
     ///

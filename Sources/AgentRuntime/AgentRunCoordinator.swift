@@ -9,6 +9,38 @@ import os
 // through the unified logging system, keyed by thread/run ids.
 private let agentRunLog = Logger(subsystem: "io.remotecode.agent", category: "run")
 
+/// Immutable host-authoritative view of the runs currently registered in the
+/// coordinator. The list is sorted by run ID so consumers never inherit
+/// dictionary iteration order when choosing a primary run.
+public struct ActiveRunProjection: Equatable, Sendable {
+    public struct Run: Equatable, Sendable {
+        public let threadId: AgentThreadID
+        public let runId: AgentRunID
+
+        public init(threadId: AgentThreadID, runId: AgentRunID) {
+            self.threadId = threadId
+            self.runId = runId
+        }
+    }
+
+    public let runs: [Run]
+
+    public init(runs: [Run]) {
+        self.runs = runs.sorted {
+            $0.runId.value.uuidString < $1.runId.value.uuidString
+        }
+    }
+
+    public var activeRunCount: Int { runs.count }
+    public var primaryRunId: AgentRunID? { runs.first?.runId }
+}
+
+public enum ActiveRunProjectionCause: Equatable, Sendable {
+    case started
+    case finished(AgentRunStatus)
+    case launchReconciliation
+}
+
 public protocol AgentRunObserver: AnyObject {
     func runCoordinator(_ c: AgentRunCoordinator, didReceive event: AssistantEvent, run: AgentRunID, threadId: AgentThreadID)
     func runCoordinator(_ c: AgentRunCoordinator, didFinish runId: AgentRunID, threadId: AgentThreadID, status: AgentRunStatus, finalMessage: String?, providerThreadId: String?)
@@ -91,6 +123,9 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     public var onRunStarted: ((AgentThreadID, AgentRunID) -> Void)?
     public var onAssistantEvent: ((AssistantEvent, AgentThreadID, AgentRunID) -> Void)?
     public var onRunFinished: ((AgentThreadID, AgentRunID, AgentRunStatus) -> Void)?
+    /// Fires only after `activeThreads` commits. Consumers can therefore project
+    /// aggregate state without racing the provider's async start/finish path.
+    public var onActiveRunProjectionChanged: ((ActiveRunProjection, ActiveRunProjectionCause) -> Void)?
     public var onMessageAppended: ((AgentMessage) -> Void)?
     public var onPersistenceIssue: ((String, AgentThreadID, AgentRunID) -> Void)?
 
@@ -199,6 +234,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                 try providerSessionRepo.markStopped(threadId: session.threadId, at: now)
             }
         }
+        onActiveRunProjectionChanged?(ActiveRunProjection(runs: []), .launchReconciliation)
     }
 
     public func runStatus(_ runId: AgentRunID) throws -> AgentRunStatus? {
@@ -308,7 +344,6 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             lastEventKind: "run.started",
             runtimePayloadJSON: existingRuntimePayload
         ))
-        onRunStarted?(effectiveRequest.threadId, effectiveRequest.runId)
         agentRunLog.info("run.started thread=\(effectiveRequest.threadId.value.uuidString, privacy: .public) run=\(effectiveRequest.runId.value.uuidString, privacy: .public) provider=\(effectiveRequest.provider.rawValue, privacy: .public) model=\(effectiveRequest.model, privacy: .public)")
 
         let runId = effectiveRequest.runId
@@ -344,17 +379,24 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         }
         lock.lock()
         let shouldCancel: Bool
+        let activeProjection: ActiveRunProjection?
         if terminalStatus == nil {
             active[runId] = handle
             activeThreads[effectiveRequest.threadId] = runId
             activeRunMetadata[runId] = (effectiveRequest.provider, effectiveRequest.providerInstanceId, effectiveRequest.model, effectiveRequest.cwd, effectiveRequest.serviceTier, effectiveRequest.permissionMode, effectiveRequest.interactionMode, adapterKey, binaryIdentity)
             seq[runId] = 0
             shouldCancel = pendingThreadStops.remove(effectiveRequest.threadId) != nil
+            activeProjection = activeRunProjectionLocked()
         } else {
             pendingThreadStops.remove(effectiveRequest.threadId)
             shouldCancel = false
+            activeProjection = nil
         }
         lock.unlock()
+        if let activeProjection {
+            onRunStarted?(effectiveRequest.threadId, effectiveRequest.runId)
+            onActiveRunProjectionChanged?(activeProjection, .started)
+        }
         if shouldCancel { handle.cancel() }
         return runId
     }
@@ -487,9 +529,12 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             flushPendingStreamWrites(runId: runId, threadId: threadId)
         }
         lock.lock()
+        var activeProjection: ActiveRunProjection?
         if let runId {
             active.removeValue(forKey: runId)
-            activeThreads.removeValue(forKey: threadId)
+            if activeThreads.removeValue(forKey: threadId) != nil {
+                activeProjection = activeRunProjectionLocked()
+            }
             activeRunMetadata.removeValue(forKey: runId)
             activeTurnIds.removeValue(forKey: runId)
             activeAssistantMessageIds.removeValue(forKey: runId)
@@ -512,6 +557,9 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         autoContinuationCounts.removeValue(forKey: threadId)
         autoContinuationTokens[threadId] = (autoContinuationTokens[threadId] ?? 0) + 1
         lock.unlock()
+        if let activeProjection {
+            onActiveRunProjectionChanged?(activeProjection, .finished(.cancelled))
+        }
         for observer in observersSnapshot() {
             observer.runCoordinator(self, didChangeStatus: .cancelled, runId: stoppedRunId, threadId: threadId)
         }
@@ -818,6 +866,12 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     public func activeThreadIdsSnapshot() -> Set<AgentThreadID> {
         lock.lock(); defer { lock.unlock() }
         return Set(activeThreads.keys)
+    }
+
+    private func activeRunProjectionLocked() -> ActiveRunProjection {
+        ActiveRunProjection(runs: activeThreads.map {
+            ActiveRunProjection.Run(threadId: $0.key, runId: $0.value)
+        })
     }
 
     /// Returns true when the thread has a recoverable provider session (was
@@ -1534,7 +1588,9 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             // PERF-MAC_AGENT-008: thread closed -> evict the dedup cache entry so
             // finished threads do not retain their final-answer text indefinitely.
             lastPersistedAssistantContent.removeValue(forKey: threadId)
+            let activeProjection = activeRunProjectionLocked()
             lock.unlock()
+            onActiveRunProjectionChanged?(activeProjection, .finished(status))
             if pendingPrune {
                 do {
                     try runRepo.pruneStreamEvents(threadId: threadId)

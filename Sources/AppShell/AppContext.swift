@@ -85,6 +85,7 @@ public final class AppContext {
     public let turnCheckpointRepo: AgentTurnCheckpointRepository
     public let tokenSaverSavingsRepo: TokenSaverSavingsRepository
     public let privateNotificationBridge: PrivateNotificationBridge
+    public let liveActivitySyncCoordinator: LiveActivitySyncCoordinator
     public let tokenSaverDistillServiceController: TokenSaverDistillServiceController
     let projectScriptRuns = ProjectScriptRunRegistry()
     public private(set) var managedDistillSkillInstallResults: [AgentSkillInstallResult] = []
@@ -174,10 +175,27 @@ public final class AppContext {
         self.proposedPlanRepo = AgentProposedPlanRepository(db: db)
         self.turnCheckpointRepo = AgentTurnCheckpointRepository(db: db)
         self.tokenSaverSavingsRepo = TokenSaverSavingsRepository(db: db)
-        self.privateNotificationBridge = PrivateNotificationBridge(
+        let privateNotificationBridge = PrivateNotificationBridge(
             accountStore: PrivateAccountSessionStore(repo: self.settingsRepo),
             pushTargetStore: PrivatePushTargetStore(repo: self.settingsRepo)
         )
+        self.privateNotificationBridge = privateNotificationBridge
+        let liveActivityIdentity = try LiveActivityIdentityStore.beginBoot(settings: self.settingsRepo)
+        let settingsRepo = self.settingsRepo
+        self.liveActivitySyncCoordinator = LiveActivitySyncCoordinator(
+            serverId: liveActivityIdentity.serverId,
+            bootEpoch: liveActivityIdentity.bootEpoch,
+            initialActivityGeneration: liveActivityIdentity.activityGeneration,
+            registerToken: { target in
+                await privateNotificationBridge.registerLiveActivityTokenV2(target)
+            }
+        ) { delivery in
+            try? LiveActivityIdentityStore.persistActivityGeneration(
+                delivery.activityGeneration,
+                settings: settingsRepo
+            )
+            await privateNotificationBridge.deliverLiveActivity(delivery)
+        }
         self.tokenSaverDistillServiceController = TokenSaverDistillServiceController(
             appSupportDirectory: self.appSupportDirectory
         )
@@ -194,6 +212,19 @@ public final class AppContext {
             checkpointRepo: turnCheckpointRepo,
             providerAdapters: [.codex: codex, .claude: claude, .grok: grok]
         )
+        let liveActivitySyncCoordinator = self.liveActivitySyncCoordinator
+        coordinator.onActiveRunProjectionChanged = { projection, cause in
+            let syncCause: LiveActivitySyncCause
+            switch cause {
+            case .started:
+                syncCause = .started
+            case .finished(let status):
+                syncCause = .finished(status)
+            case .launchReconciliation:
+                syncCause = .launchReconciliation
+            }
+            liveActivitySyncCoordinator.submit(projection, cause: syncCause)
+        }
         try coordinator.reconcileOnLaunch()
         try? tokenSaverSavingsRepo.prune()
         self.coordinator.promptCompressor = { [weak self] prompt, provider, threadId in
@@ -284,33 +315,6 @@ public final class AppContext {
         coordinator.onRunStarted = { [weak self] tid, runId in
             EventBus.shared.publish(kind: "agent.run.started",
                                     payload: agentRunPayload(threadId: tid, runId: runId))
-            // Fire a "running" Live Activity push so the paired iOS card starts
-            // (or refreshes) the moment a run begins, mirroring the alert path on
-            // completion. Skips silently when no live-activity token is paired.
-            guard let self else { return }
-            let title = (try? self.threadRepo.get(id: tid)?.title)?
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            let displayTitle = (title?.isEmpty == false) ? title! : "Thread"
-            let runStart = (try? self.runRepo.get(id: runId)?.startedAt)
-                ?? (try? self.coordinator.runStartedAt(threadId: tid))
-            let snapshot = PrivateLiveActivitySnapshot(
-                title: displayTitle,
-                statusLine: "1 active thread",
-                preview: displayTitle,
-                phase: "running",
-                activeThreadCount: 1,
-                updatedAt: Date(),
-                runStartDate: runStart,
-                workspaceId: (try? self.threadRepo.get(id: tid)?.workspaceId)?.value.uuidString,
-                threadId: tid.value.uuidString
-            )
-            Task {
-                await self.privateNotificationBridge.deliverLiveActivity(
-                    snapshot: snapshot,
-                    event: .start,
-                    idempotencyKey: "activity.\(tid.value.uuidString).start"
-                )
-            }
         }
         coordinator.onMessageAppended = { message in
             EventBus.shared.publish(kind: "agent.message.appended", payload: messageJSON(message))
@@ -348,27 +352,7 @@ public final class AppContext {
                 var p: [String: JSONValue] = ["thread_id": .string(t), "turn_id": .string(turnId)]
                 if let f = final { p["final"] = .string(f) }
                 EventBus.shared.publish(kind: "agent.turn.completed", payload: .object(p))
-                // Mid-run Live Activity heartbeat: each completed turn refreshes the
-                // paired iOS card with the latest assistant output and a fresh
-                // timestamp, so a backgrounded card shows progress and never goes
-                // stale mid-run. The host previously pushed only .start and .end, so
-                // the card froze at the start snapshot until the run finished. The
-                // backend rate-limits cadence; unpaired devices are skipped in the bridge.
-                let updateSnapshot = PrivateLiveActivitySnapshot.running(
-                    threadId: tid.value.uuidString,
-                    workspaceId: (try? self.threadRepo.get(id: tid)?.workspaceId)?.value.uuidString,
-                    title: try? self.threadRepo.get(id: tid)?.title,
-                    finalMessage: final,
-                    runStartDate: (try? self.runRepo.get(id: runId)?.startedAt)
-                        ?? (try? self.coordinator.runStartedAt(threadId: tid))
-                )
-                Task {
-                    await self.privateNotificationBridge.deliverLiveActivity(
-                        snapshot: updateSnapshot,
-                        event: .update,
-                        idempotencyKey: "activity.\(tid.value.uuidString).update.\(turnId)"
-                    )
-                }
+                self.liveActivitySyncCoordinator.submitHeartbeat()
             case .proposedPlan(let plan):
                 try? self.proposedPlanRepo.upsert(threadId: tid, plan: plan)
                 var planPayload: [String: JSONValue] = [
@@ -527,22 +511,6 @@ public final class AppContext {
                 SystemNotifier.shared.post(content)
                 Task {
                     await self.privateNotificationBridge.deliver(content)
-                }
-            }
-            // Terminal Live Activity push: end the paired iOS card with the run
-            // outcome (mid-session terminal update) so it stops showing a frozen
-            // "running" state. Non-terminal phases produce no snapshot.
-            if let endSnapshot = PrivateLiveActivitySnapshot.terminal(
-                threadId: tid.value.uuidString,
-                title: try? self.threadRepo.get(id: tid)?.title,
-                phase: status
-            ) {
-                Task {
-                    await self.privateNotificationBridge.deliverLiveActivity(
-                        snapshot: endSnapshot,
-                        event: .end,
-                        idempotencyKey: "activity.\(tid.value.uuidString).end.\(endSnapshot.phase)"
-                    )
                 }
             }
         }

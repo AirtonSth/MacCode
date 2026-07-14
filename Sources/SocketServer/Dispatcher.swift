@@ -164,7 +164,19 @@ public protocol CommandRouting: AnyObject {
     func notificationList(workspaceId: WorkspaceID?, unreadOnly: Bool) throws -> [[String: JSONValue]]
     func notificationMarkRead(id: String) throws
     func notificationDismiss(id: String) throws
-    func privatePushTokenUpdate(pushToken: String, pushTokenType: String, liveActivityToken: String?, deviceID: String?) throws -> JSONValue
+    func privatePushTokenUpdate(
+        pushToken: String,
+        pushTokenType: String,
+        liveActivityToken: String?,
+        deviceID: String?,
+        tokenPurpose: String?,
+        environment: String?,
+        serverID: String?,
+        activityGeneration: Int?,
+        activityID: String?,
+        contractVersion: Int?,
+        capabilities: [String]?
+    ) throws -> JSONValue
     // settings
     func settingsGet(keys: [String]) throws -> [String: String]
     func settingsSet(key: String, value: String) throws
@@ -1575,13 +1587,67 @@ public final class JSONRPCDispatcher {
                 return .init(id: id, result: .bool(true))
             case "private.push_token.update":
                 guard let pushToken = params["push_token"]?.stringValue,
+                      !pushToken.isEmpty,
                       let pushTokenType = params["push_token_type"]?.stringValue,
                       pushTokenType == "apns" || pushTokenType == "fcm" else { throw JSONRPCError.invalidParams }
+                let tokenPurpose = params["token_purpose"]?.stringValue
+                let environment = params["environment"]?.stringValue
+                let serverID = params["server_id"]?.stringValue
+                let activityGeneration = params["activity_generation"]?.intValue
+                let activityID = params["activity_id"]?.stringValue
+                let contractVersion = params["contract_version"]?.intValue
+                let capabilityValues = params["capabilities"]?.arrayValue
+                let capabilities = capabilityValues?.compactMap(\.stringValue)
+                let hasTypedMetadata = tokenPurpose != nil || environment != nil || serverID != nil ||
+                    params["activity_generation"] != nil || params["activity_id"] != nil ||
+                    contractVersion != nil || params["capabilities"] != nil
+                if hasTypedMetadata {
+                    if params["activity_generation"] != nil, activityGeneration == nil {
+                        throw JSONRPCError.invalidParams
+                    }
+                    if params["activity_id"] != nil, activityID == nil {
+                        throw JSONRPCError.invalidParams
+                    }
+                    if params["contract_version"] != nil, contractVersion == nil {
+                        throw JSONRPCError.invalidParams
+                    }
+                    if params["capabilities"] != nil,
+                       capabilityValues == nil || capabilityValues?.count != capabilities?.count {
+                        throw JSONRPCError.invalidParams
+                    }
+                    guard let tokenPurpose,
+                          ["alert", "push_to_start", "activity_update"].contains(tokenPurpose),
+                          let environment,
+                          ["sandbox", "production"].contains(environment),
+                          let deviceID = params["device_id"]?.stringValue,
+                          !deviceID.isEmpty,
+                          let serverID,
+                          !serverID.isEmpty,
+                          activityGeneration.map({ $0 >= 0 }) ?? true,
+                          contractVersion.map({ $0 >= 1 }) ?? true else {
+                        throw JSONRPCError.invalidParams
+                    }
+                    if tokenPurpose != "alert" {
+                        guard let activityToken = params["live_activity_token"]?.stringValue,
+                              !activityToken.isEmpty else { throw JSONRPCError.invalidParams }
+                    }
+                    if capabilities?.contains("live_activity_v2") == true,
+                       (contractVersion ?? 1) < 2 {
+                        throw JSONRPCError.invalidParams
+                    }
+                }
                 let result = try router.privatePushTokenUpdate(
                     pushToken: pushToken,
                     pushTokenType: pushTokenType,
                     liveActivityToken: params["live_activity_token"]?.stringValue,
-                    deviceID: params["device_id"]?.stringValue
+                    deviceID: params["device_id"]?.stringValue,
+                    tokenPurpose: tokenPurpose,
+                    environment: environment,
+                    serverID: serverID,
+                    activityGeneration: activityGeneration,
+                    activityID: activityID,
+                    contractVersion: contractVersion,
+                    capabilities: capabilities
                 )
                 return .init(id: id, result: result)
             case "pane.list":

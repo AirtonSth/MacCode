@@ -597,7 +597,8 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         let loopbackOnly = remoteEnabled != "1"
         let dispatcher = JSONRPCDispatcher(router: router)
         let serverId = stableServerId()
-        let http = DirectHTTPServer(port: 18217, loopbackOnly: loopbackOnly,
+        let port = DirectAccessConfiguration.port()
+        let http = DirectHTTPServer(port: port, loopbackOnly: loopbackOnly,
                                     dispatcher: dispatcher, auth: auth, serverId: serverId)
         do {
             try http.start()
@@ -606,7 +607,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
                 server: "HTTP server",
                 repository: NotificationRepository(db: context.db)
             )
-            NSLog("Direct HTTP server listening on \(loopbackOnly ? "127.0.0.1" : "0.0.0.0"):18217 (loopback=\(loopbackOnly))")
+            NSLog("Direct HTTP server listening on \(loopbackOnly ? "127.0.0.1" : "0.0.0.0"):\(port) (loopback=\(loopbackOnly))")
         } catch {
             NSLog("Failed to start HTTP server: \(error)")
             recordServerStartupFailure("HTTP server", reason: error.localizedDescription)
@@ -615,7 +616,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         if loopbackOnly {
             NSLog("Bonjour not published: remote access is disabled")
         } else {
-            publishBonjour(serverId: serverId)
+            publishBonjour(serverId: serverId, port: port)
         }
     }
 
@@ -1302,15 +1303,15 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
     /// GAP-4: publish `_remotecode._tcp` so the iOS app can find this
     /// Mac on the LAN. TXT carries the stable identity + version so the
     /// client can show it before connecting.
-    private func publishBonjour(serverId: String) {
+    private func publishBonjour(serverId: String, port: UInt16) {
         let name = Host.current().localizedName ?? ProcessInfo.processInfo.hostName
-        let svc = NetService(domain: "", type: "_remotecode._tcp.", name: name, port: 18217)
+        let svc = NetService(domain: "", type: "_remotecode._tcp.", name: name, port: Int32(port))
         let txt = Self.bonjourTXTRecord(serverId: serverId, version: AppVersion.short)
         svc.setTXTRecord(NetService.data(fromTXTRecord: txt))
         svc.delegate = bonjourDelegate
         svc.publish()
         bonjour = svc
-        NSLog("Bonjour published: \(name) _remotecode._tcp:18217")
+        NSLog("Bonjour published: \(name) _remotecode._tcp:\(port)")
     }
 }
 
