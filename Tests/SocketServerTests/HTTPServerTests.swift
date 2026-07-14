@@ -1,5 +1,6 @@
 import XCTest
 import Darwin
+import CoreModel
 @testable import SocketServer
 
 final class HTTPServerTests: XCTestCase {
@@ -38,7 +39,9 @@ final class HTTPServerTests: XCTestCase {
     @MainActor
     func test_rpc_route_dispatches_to_desktop_router() throws {
         let port = UInt16.random(in: 33000...44000)
-        let dispatcher = JSONRPCDispatcher(router: FakeRouter())
+        let router = FakeRouter()
+        router.workspaces = [Workspace.empty(name: "mobile", cwd: "/tmp")]
+        let dispatcher = JSONRPCDispatcher(router: router)
         let s = DirectHTTPServer(port: port, loopbackOnly: true, dispatcher: dispatcher, bootEpoch: 1)
         try s.start()
         defer { s.stop() }
@@ -48,7 +51,7 @@ final class HTTPServerTests: XCTestCase {
         req.httpMethod = "POST"
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         req.httpBody = """
-        {"jsonrpc":"2.0","id":"rpc-route","method":"workspace.create","params":{"name":"mobile","cwd":"/tmp"}}
+        {"jsonrpc":"2.0","id":"rpc-route","method":"workspace.list","params":{}}
         """.data(using: .utf8)!
 
         let routed = expectation(description: "rpc routed")
@@ -57,8 +60,8 @@ final class HTTPServerTests: XCTestCase {
             if let r = resp as? HTTPURLResponse { XCTAssertEqual(r.statusCode, 200) }
             let obj = (try? JSONSerialization.jsonObject(with: data ?? Data())) as? [String: Any]
             XCTAssertEqual(obj?["id"] as? String, "rpc-route")
-            let result = obj?["result"] as? [String: Any]
-            XCTAssertEqual(result?["name"] as? String, "mobile")
+            let result = obj?["result"] as? [[String: Any]]
+            XCTAssertEqual(result?.first?["name"] as? String, "mobile")
             XCTAssertNil(obj?["error"], "mobile RPC must reach the desktop JSON-RPC dispatcher")
             routed.fulfill()
         }.resume()

@@ -7,6 +7,54 @@ import Foundation
 public final class EventBus: @unchecked Sendable {
     public static let shared = EventBus()
 
+    public struct MutationEventIntent: Sendable, Equatable {
+        public let kind: String
+        public let payload: JSONValue
+        public let createdAt: Date
+
+        public init(kind: String, payload: JSONValue, createdAt: Date) {
+            self.kind = kind
+            self.payload = payload
+            self.createdAt = createdAt
+        }
+    }
+
+    public final class MutationEventSink: @unchecked Sendable {
+        fileprivate enum AppendResult {
+            case captured
+            case suppressed
+            case sealed
+        }
+
+        private let lock = NSLock()
+        private var intents: [MutationEventIntent] = []
+        private var sealed = false
+
+        public init() {}
+
+        fileprivate func append(
+            _ intent: MutationEventIntent,
+            captureEnabled: Bool
+        ) -> AppendResult {
+            lock.lock()
+            defer { lock.unlock() }
+            guard !sealed else { return .sealed }
+            guard captureEnabled else { return .suppressed }
+            intents.append(intent)
+            return .captured
+        }
+
+        public func seal() throws -> [MutationEventIntent] {
+            lock.lock()
+            defer { lock.unlock() }
+            sealed = true
+            return intents
+        }
+    }
+
+    @TaskLocal public static var activeMutationEventSink: MutationEventSink?
+    @TaskLocal public static var suppressMutationEventCapture = false
+
     public struct Event: Codable, Sendable {
         public let seq: Int64
         public let kind: String
@@ -103,10 +151,66 @@ public final class EventBus: @unchecked Sendable {
     }
 
     public func publish(kind: String, payload: JSONValue) {
+        if let sink = Self.activeMutationEventSink {
+            lock.lock()
+            let createdAt = clock()
+            lock.unlock()
+            switch sink.append(
+                MutationEventIntent(kind: kind, payload: payload, createdAt: createdAt),
+                captureEnabled: !Self.suppressMutationEventCapture
+            ) {
+            case .captured, .suppressed:
+                return
+            case .sealed:
+                NSLog("[RC2.EventBus] late mutation event escaped sealed receipt sink: %@", kind)
+            }
+        }
         if DispatchQueue.getSpecific(key: deliveryQueueKey) != nil {
             deliveryQueue.async { [self] in publishSerialized(kind: kind, payload: payload) }
         } else {
             deliveryQueue.sync { publishSerialized(kind: kind, payload: payload) }
+        }
+    }
+
+    /// Serializes durable sequence allocation against every normal publisher.
+    /// The closure commits receipt/outcome/events while the EventBus sequence is
+    /// reserved; fanout and replay retention happen only after it returns.
+    public func commitPersistedEvents(
+        _ commit: (Int64) throws -> [Event]
+    ) throws -> [Event] {
+        precondition(DispatchQueue.getSpecific(key: deliveryQueueKey) == nil)
+        return try deliveryQueue.sync {
+            snapshotBarrierLock.lock()
+            let floor: Int64
+            lock.lock()
+            floor = lastSeq
+            lock.unlock()
+            do {
+                let events = try commit(floor)
+                var deliveries: [(Event, [Subscriber])] = []
+                lock.lock()
+                for event in events {
+                    precondition(event.seq > lastSeq)
+                    lastSeq = event.seq
+                    domainRevisions = Self.revisions(after: event, current: domainRevisions)
+                    if shouldRetainRecentEvent?(event) ?? true {
+                        retainRecent(event)
+                    }
+                    deliveries.append((event, subscribersSnapshot))
+                }
+                lock.unlock()
+                snapshotBarrierLock.unlock()
+                for (event, subscribers) in deliveries {
+                    for subscriber in subscribers {
+                        guard let mapped = subscriber.filter.map(event) else { continue }
+                        subscriber.handler(mapped)
+                    }
+                }
+                return events
+            } catch {
+                snapshotBarrierLock.unlock()
+                throw error
+            }
         }
     }
 
@@ -123,11 +227,11 @@ public final class EventBus: @unchecked Sendable {
         let p = persister
         lock.unlock()
         snapshotBarrierLock.unlock()
-        p?(ev)
         for s in subs {
             guard let mapped = s.filter.map(ev) else { continue }
             s.handler(mapped)
         }
+        p?(ev)
     }
 
     public func reloadFromPersistence(lastSeq: Int64, recent: [Event]) {

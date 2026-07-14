@@ -50,7 +50,7 @@ private struct ProviderProbeCapabilities {
 /// Bridges the JSON-RPC dispatcher to the in-process domain state plus the
 /// concrete Surface views. Lives on the main actor because it mutates UI.
 @MainActor
-public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, LayoutEventSuppressionRouting, ConnectionSnapshotRouting {
+public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, LayoutEventSuppressionRouting, ConnectionSnapshotRouting, CommandReceiptStateRouting {
     typealias SSHCommandRunner = @Sendable (String, [String], String?) throws -> (exitCode: Int32, output: String)
 
     private static let minimizedPaneVisibilityThreshold = 0.08
@@ -2035,6 +2035,121 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
               let data = try? JSONEncoder().encode(result),
               let json = String(data: data, encoding: .utf8) else { return }
         try? ctx.commandReceiptRepo.record(method: method, clientRequestId: clientRequestId, resultJSON: json)
+    }
+
+    public func claimCommandReceipt(
+        method: String,
+        clientRequestId: String,
+        ownerFingerprint: String,
+        paramsHash: String
+    ) throws -> CommandReceiptClaimResult {
+        guard let context else { throw LayoutError.workspaceNotFound }
+        return try context.commandReceiptRepo.claim(
+            method: method,
+            clientRequestId: clientRequestId,
+            ownerFingerprint: ownerFingerprint,
+            paramsHash: paramsHash
+        )
+    }
+
+    public func commitCommandReceipt(
+        method: String,
+        clientRequestId: String,
+        ownerFingerprint: String,
+        paramsHash: String,
+        result: JSONValue
+    ) throws {
+        guard let context else { throw LayoutError.workspaceNotFound }
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        let data = try encoder.encode(result)
+        guard let json = String(data: data, encoding: .utf8) else {
+            throw JSONRPCError.internalError
+        }
+        try context.commandReceiptRepo.commit(
+            method: method,
+            clientRequestId: clientRequestId,
+            ownerFingerprint: ownerFingerprint,
+            paramsHash: paramsHash,
+            resultJSON: json
+        )
+    }
+
+    public func finalizeCommandReceipt(
+        method: String,
+        clientRequestId: String,
+        ownerFingerprint: String,
+        paramsHash: String,
+        result: JSONValue,
+        events: [EventBus.MutationEventIntent],
+        minimumEventSequence: Int64
+    ) throws -> [EventBus.Event] {
+        guard let context else { throw LayoutError.workspaceNotFound }
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        let resultData = try encoder.encode(result)
+        guard let resultJSON = String(data: resultData, encoding: .utf8) else {
+            throw JSONRPCError.internalError
+        }
+        let intents = try events.map { event -> CommandReceiptEventIntent in
+            let payloadData = try encoder.encode(event.payload)
+            guard let payloadJSON = String(data: payloadData, encoding: .utf8) else {
+                throw JSONRPCError.internalError
+            }
+            return CommandReceiptEventIntent(
+                kind: event.kind,
+                payloadJSON: payloadJSON,
+                createdAt: event.createdAt
+            )
+        }
+        let persisted = try context.commandReceiptRepo.finalize(
+            method: method,
+            clientRequestId: clientRequestId,
+            ownerFingerprint: ownerFingerprint,
+            paramsHash: paramsHash,
+            resultJSON: resultJSON,
+            events: intents,
+            minimumEventSequence: minimumEventSequence
+        )
+        return try persisted.map { event in
+            guard let payloadData = event.payloadJSON.data(using: .utf8) else {
+                throw JSONRPCError.internalError
+            }
+            return EventBus.Event(
+                seq: event.seq,
+                kind: event.kind,
+                payload: try JSONDecoder().decode(JSONValue.self, from: payloadData),
+                ts: event.createdAt.timeIntervalSince1970
+            )
+        }
+    }
+
+    public func markCommandReceiptUnknown(
+        method: String,
+        clientRequestId: String,
+        ownerFingerprint: String,
+        paramsHash: String
+    ) throws {
+        guard let context else { throw LayoutError.workspaceNotFound }
+        try context.commandReceiptRepo.markUnknown(
+            method: method,
+            clientRequestId: clientRequestId,
+            ownerFingerprint: ownerFingerprint,
+            paramsHash: paramsHash
+        )
+    }
+
+    public func commandReceiptStatus(
+        method: String,
+        clientRequestId: String,
+        ownerFingerprint: String
+    ) throws -> CommandReceiptStatusResult {
+        guard let context else { throw LayoutError.workspaceNotFound }
+        return try context.commandReceiptRepo.status(
+            method: method,
+            clientRequestId: clientRequestId,
+            ownerFingerprint: ownerFingerprint
+        )
     }
 
     public func respondAgentRequest(thread: AgentThreadID, requestId: String, response: AgentProviderRequestResponse) async throws {

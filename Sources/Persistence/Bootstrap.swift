@@ -92,6 +92,8 @@ public final class Bootstrap {
     private func openAndMigrate(dbPath: String) throws -> SQLiteDB {
         let db = try SQLiteDB(path: dbPath)
         try Schema.migrate(db)
+        try db.enableFullDurability()
+        try CommandReceiptRepository(db: db).recoverInterruptedClaims()
         try initDefaults(db: db)
         return db
     }

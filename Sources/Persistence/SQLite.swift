@@ -121,15 +121,29 @@ public final class SQLiteDB {
     }
 
     public func execute(_ sql: String) throws {
-        try queue.sync {
-            var err: UnsafeMutablePointer<CChar>?
-            let rc = sqlite3_exec(handle, sql, nil, nil, &err)
-            if rc != SQLITE_OK {
-                let m = err.map { String(cString: $0) } ?? "exec failed"
-                if let err { sqlite3_free(err) }
-                throw SQLiteError.execute(m)
-            }
+        if DispatchQueue.getSpecific(key: Self.queueKey) != nil {
+            try executeDirect(sql)
+            return
         }
+        try queue.sync { try executeDirect(sql) }
+    }
+
+    private func executeDirect(_ sql: String) throws {
+        var err: UnsafeMutablePointer<CChar>?
+        let rc = sqlite3_exec(handle, sql, nil, nil, &err)
+        if rc != SQLITE_OK {
+            let message = err.map { String(cString: $0) } ?? "exec failed"
+            if let err { sqlite3_free(err) }
+            throw SQLiteError.execute(message)
+        }
+    }
+
+    /// Receipt and event commits require power-loss durability. This database
+    /// also stores the surrounding domain state, so SQLite durability is a
+    /// connection-wide setting rather than a per-table setting.
+    public func enableFullDurability() throws {
+        try execute("PRAGMA synchronous=FULL;")
+        try execute("PRAGMA fullfsync=ON;")
     }
 
     public func performSync<T>(_ block: (SQLiteDB) throws -> T) rethrows -> T {

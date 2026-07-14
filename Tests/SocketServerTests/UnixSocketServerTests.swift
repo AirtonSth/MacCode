@@ -4,6 +4,37 @@ import Darwin
 
 final class UnixSocketServerTests: XCTestCase {
     @MainActor
+    func testSocketIsCurrentUserOwnedAndMode0600BeforeClientsConnect() throws {
+        let socketURL = URL(fileURLWithPath: "/tmp/rc2-p-\(UUID().uuidString.prefix(8)).sock")
+        let server = UnixSocketServer(socketPath: socketURL.path, dispatcher: JSONRPCDispatcher(router: FakeRouter()))
+        try server.start()
+        defer { server.stop() }
+
+        let attributes = try FileManager.default.attributesOfItem(atPath: socketURL.path)
+        XCTAssertEqual((attributes[.ownerAccountID] as? NSNumber)?.uint32Value, geteuid(),
+                       "local IPC must be owned by the current user")
+        XCTAssertEqual((attributes[.posixPermissions] as? NSNumber)?.uint16Value, UInt16(0o600),
+                       "local IPC must not grant group or other access")
+    }
+
+    @MainActor
+    func testLocalIPCMutationUsesSharedHandlerWithoutRemoteWireIdentity() async throws {
+        let router = FakeRouter()
+        let dispatcher = JSONRPCDispatcher(router: router)
+        let response = await dispatcher.dispatchLocalIPC(JSONRPCRequest(
+            jsonrpc: "2.0",
+            id: .string("local"),
+            method: "workspace.create",
+            params: ["name": .string("local"), "cwd": .string("/tmp")]
+        ))
+
+        XCTAssertNil(response.error)
+        XCTAssertEqual(response.result?.objectValue?["name"], .string("local"))
+        XCTAssertEqual(router.workspaces.count, 1,
+                       "owner-only local IPC must keep the CLI domain-handler path without remote receipt fields")
+    }
+
+    @MainActor
     func testEventStreamDeliversLiveEventsOverSerializedUnixSocketWriter() throws {
         let socketURL = FileManager.default.temporaryDirectory
             .appendingPathComponent("rc2-unix-\(UUID().uuidString).sock")

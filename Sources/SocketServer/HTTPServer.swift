@@ -1133,7 +1133,18 @@ public final class DirectHTTPServer: @unchecked Sendable {
             method: method,
             params: params
         )
-        let response = await dispatcher.dispatch(request)
+        let mutationContext = MutationRequestContext(
+            ownerFingerprint: ownerFingerprint,
+            hostId: serverId,
+            bootEpoch: bootEpoch,
+            activeConnection: { [activeWebSocketConnections] connectionID, ownerFingerprint in
+                activeWebSocketConnections.watermark(
+                    for: connectionID,
+                    ownerFingerprint: ownerFingerprint
+                ) != nil
+            }
+        )
+        let response = await dispatcher.dispatch(request, mutationContext: mutationContext)
         guard let encoded = try? JSONEncoder().encode(response),
               var object = try? JSONSerialization.jsonObject(with: encoded) as? [String: Any] else {
             return rpcErrorObject(.internalError, id: wireID)
