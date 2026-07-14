@@ -2917,19 +2917,17 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         tokenPurpose: String? = nil,
         environment: String? = nil,
         serverID: String? = nil,
+        bootEpoch: Int? = nil,
         activityGeneration: Int? = nil,
         activityID: String? = nil,
+        activitySessionID: String? = nil,
+        registrationRevision: Int? = nil,
         contractVersion: Int? = nil,
         capabilities: [String]? = nil
     ) throws -> JSONValue {
         guard let ctx = context else { throw LayoutError.workspaceNotFound }
         let store = PrivatePushTargetStore(repo: ctx.settingsRepo)
-        store.save(
-            pushToken: pushToken,
-            pushTokenType: pushTokenType,
-            liveActivityToken: liveActivityToken,
-            deviceId: deviceID
-        )
+        var ownership: LiveActivityTokenOwnership?
         if let tokenPurpose,
            let purpose = PrivatePushTokenPurpose(rawValue: tokenPurpose),
            let environment,
@@ -2945,18 +2943,45 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 token: token,
                 activityGeneration: activityGeneration.flatMap { $0 >= 0 ? UInt64($0) : nil },
                 activityId: activityID,
+                bootEpoch: bootEpoch.flatMap { $0 >= 0 ? UInt64($0) : nil },
+                activitySessionId: activitySessionID,
                 contractVersion: contractVersion ?? 1,
                 capabilities: capabilities
             )
-            try store.upsert(target)
             if target.supportsLiveActivityV2 {
-                ctx.liveActivitySyncCoordinator.submitTokenRegistration(target)
+                let bound = try ctx.liveActivitySyncCoordinator.submitTokenRegistration(target)
+                guard purpose != .activityUpdate || bound.ownership != nil else {
+                    throw LiveActivityTokenBindingError.unknownAuthoritativeScope
+                }
+                try store.upsert(bound)
+                ownership = bound.ownership
+            } else {
+                try store.upsert(target)
             }
         }
-        return .object([
+        store.save(
+            pushToken: pushToken,
+            pushTokenType: pushTokenType,
+            liveActivityToken: liveActivityToken,
+            deviceId: deviceID
+        )
+        var result: [String: JSONValue] = [
             "ok": .bool(true),
             "push_token_type": .string(pushTokenType)
-        ])
+        ]
+        if let registrationRevision {
+            result["registration_revision"] = .number(Double(registrationRevision))
+        }
+        if let ownership {
+            result["ownership"] = .object([
+                "activity_id": .string(ownership.activityId),
+                "host_id": .string(ownership.hostId),
+                "boot_epoch": .number(Double(ownership.bootEpoch)),
+                "activity_generation": .number(Double(ownership.activityGeneration)),
+                "activity_session_id": .string(ownership.activitySessionId)
+            ])
+        }
+        return .object(result)
     }
 
     public func settingsGet(keys: [String]) throws -> [String: String] {

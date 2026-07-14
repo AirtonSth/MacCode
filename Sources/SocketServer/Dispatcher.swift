@@ -172,8 +172,11 @@ public protocol CommandRouting: AnyObject {
         tokenPurpose: String?,
         environment: String?,
         serverID: String?,
+        bootEpoch: Int?,
         activityGeneration: Int?,
         activityID: String?,
+        activitySessionID: String?,
+        registrationRevision: Int?,
         contractVersion: Int?,
         capabilities: [String]?
     ) throws -> JSONValue
@@ -1593,18 +1596,26 @@ public final class JSONRPCDispatcher {
                 let tokenPurpose = params["token_purpose"]?.stringValue
                 let environment = params["environment"]?.stringValue
                 let serverID = params["server_id"]?.stringValue
+                let bootEpoch = params["boot_epoch"]?.intValue
                 let activityGeneration = params["activity_generation"]?.intValue
                 let activityID = params["activity_id"]?.stringValue
+                let activitySessionID = params["activity_session_id"]?.stringValue
+                let registrationRevision = params["registration_revision"]?.intValue
                 let contractVersion = params["contract_version"]?.intValue
                 let capabilityValues = params["capabilities"]?.arrayValue
                 let capabilities = capabilityValues?.compactMap(\.stringValue)
                 let hasTypedMetadata = tokenPurpose != nil || environment != nil || serverID != nil ||
-                    params["activity_generation"] != nil || params["activity_id"] != nil ||
+                    params["boot_epoch"] != nil || params["activity_generation"] != nil ||
+                    params["activity_id"] != nil || params["activity_session_id"] != nil ||
+                    params["registration_revision"] != nil ||
                     contractVersion != nil || params["capabilities"] != nil
                 if hasTypedMetadata {
                     if params["activity_generation"] != nil, activityGeneration == nil {
                         throw JSONRPCError.invalidParams
                     }
+                    if params["boot_epoch"] != nil, bootEpoch == nil { throw JSONRPCError.invalidParams }
+                    if params["activity_session_id"] != nil, activitySessionID == nil { throw JSONRPCError.invalidParams }
+                    if params["registration_revision"] != nil, registrationRevision == nil { throw JSONRPCError.invalidParams }
                     if params["activity_id"] != nil, activityID == nil {
                         throw JSONRPCError.invalidParams
                     }
@@ -1623,7 +1634,9 @@ public final class JSONRPCDispatcher {
                           !deviceID.isEmpty,
                           let serverID,
                           !serverID.isEmpty,
+                          bootEpoch.map({ $0 >= 0 }) ?? true,
                           activityGeneration.map({ $0 >= 0 }) ?? true,
+                          registrationRevision.map({ $0 >= 0 }) ?? true,
                           contractVersion.map({ $0 >= 1 }) ?? true else {
                         throw JSONRPCError.invalidParams
                     }
@@ -1644,8 +1657,11 @@ public final class JSONRPCDispatcher {
                     tokenPurpose: tokenPurpose,
                     environment: environment,
                     serverID: serverID,
+                    bootEpoch: bootEpoch,
                     activityGeneration: activityGeneration,
                     activityID: activityID,
+                    activitySessionID: activitySessionID,
+                    registrationRevision: registrationRevision,
                     contractVersion: contractVersion,
                     capabilities: capabilities
                 )

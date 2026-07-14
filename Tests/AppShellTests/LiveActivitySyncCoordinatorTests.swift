@@ -117,7 +117,7 @@ final class LiveActivitySyncCoordinatorTests: XCTestCase {
                        "activity generations must survive host restarts instead of reusing an old session identity")
     }
 
-    func testTokenRotationsSerializeBeforeImmediateStartDelivery() async {
+    func testTokenRotationsSerializeBeforeImmediateStartDelivery() async throws {
         let recorder = OrderedSyncRecorder()
         let sync = LiveActivitySyncCoordinator(
             serverId: "server-1",
@@ -137,13 +137,317 @@ final class LiveActivitySyncCoordinatorTests: XCTestCase {
         )
         let run = ("10000000-0000-0000-0000-000000000001", "20000000-0000-0000-0000-000000000001")
 
-        sync.submitTokenRegistration(old)
-        sync.submitTokenRegistration(newest)
+        try sync.submitTokenRegistration(old)
+        try sync.submitTokenRegistration(newest)
         sync.submit(active([run]), cause: .started, now: Date(timeIntervalSince1970: 100))
         await sync.flush()
 
         XCTAssertEqual(recorder.events, ["register:old-token", "register:new-token", "deliver:start"],
                        "the backend must persist the newest token before an immediate lifecycle delivery selects it")
+    }
+
+    func testAcceptanceOutboxReplaysPersistedDeliveryAfterRelaunch() async throws {
+        let tmp = NSTemporaryDirectory() + "rc2-live-activity-outbox-relaunch-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let store = LiveActivityAcceptanceOutboxStore(settings: SettingsRepository(db: db))
+        let delivery = makeDelivery(event: .start, generation: 3, revision: 1)
+        try store.enqueue(delivery, targets: [makeTarget(for: delivery)])
+        let sender = OutboxSender()
+        let outbox = LiveActivityAcceptanceOutbox(
+            store: store,
+            send: { record in try await sender.send(record) }
+        )
+
+        outbox.resumePending()
+        await sender.waitForAttempts(1)
+        await outbox.flush()
+
+        XCTAssertEqual(sender.attempts.map(\.idempotencyKey), [delivery.idempotencyKey])
+        XCTAssertTrue(try store.pending().isEmpty,
+                      "a relaunched Mac must drain durable projections only after backend acceptance")
+    }
+
+    func testAcceptanceOutboxRetriesResponseLossWithSameIdempotencyKey() async throws {
+        let tmp = NSTemporaryDirectory() + "rc2-live-activity-outbox-response-loss-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let store = LiveActivityAcceptanceOutboxStore(settings: SettingsRepository(db: db))
+        let clock = ManualOutboxClock(now: Date(timeIntervalSince1970: 1_000))
+        let scheduler = ManualOutboxScheduler()
+        let sender = OutboxSender(failedStartAttempts: 1)
+        let outbox = LiveActivityAcceptanceOutbox(
+            store: store,
+            now: { clock.read() },
+            retryDelay: { _ in 10 },
+            schedule: { delay, callback in scheduler.schedule(delay, callback) },
+            send: { record in try await sender.send(record) }
+        )
+        let delivery = makeDelivery(event: .start, generation: 3, revision: 1)
+
+        try outbox.accept(delivery, targets: [makeTarget(for: delivery)])
+        await sender.waitForAttempts(1)
+        await outbox.flush()
+        XCTAssertEqual(try store.pending().map(\.delivery.idempotencyKey), [delivery.idempotencyKey])
+        clock.advance(by: 10)
+        scheduler.fireAll()
+        await sender.waitForAttempts(2)
+        await outbox.flush()
+
+        XCTAssertEqual(sender.attempts.map(\.idempotencyKey),
+                       [delivery.idempotencyKey, delivery.idempotencyKey],
+                       "a lost HTTP response must retry the exact durable idempotency record")
+        XCTAssertTrue(try store.pending().isEmpty)
+    }
+
+    func testTerminalProjectionBypassesBlackHoledStartAndRetiresItAfterAck() async throws {
+        let tmp = NSTemporaryDirectory() + "rc2-live-activity-outbox-terminal-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let store = LiveActivityAcceptanceOutboxStore(settings: SettingsRepository(db: db))
+        let clock = ManualOutboxClock(now: Date(timeIntervalSince1970: 2_000))
+        let scheduler = ManualOutboxScheduler()
+        let sender = OutboxSender(failedStartAttempts: .max)
+        let outbox = LiveActivityAcceptanceOutbox(
+            store: store,
+            now: { clock.read() },
+            retryDelay: { _ in 30 },
+            schedule: { delay, callback in scheduler.schedule(delay, callback) },
+            send: { record in try await sender.send(record) }
+        )
+        let start = makeDelivery(event: .start, generation: 4, revision: 1)
+        let end = makeDelivery(event: .end, generation: 4, revision: 2)
+
+        try outbox.accept(start, targets: [makeTarget(for: start)])
+        await sender.waitForAttempts(1)
+        try outbox.accept(end, targets: [makeTarget(for: end)])
+        await sender.waitForAttempts(2)
+        await outbox.flush()
+
+        XCTAssertEqual(sender.attempts.map(\.event), [.start, .end],
+                       "a terminal event must reach the backend before a black-holed start retries")
+        XCTAssertTrue(try store.pending().isEmpty,
+                      "terminal acknowledgement must retire superseded records in the same session")
+        clock.advance(by: 30)
+        scheduler.fireAll()
+        await outbox.flush()
+        XCTAssertEqual(sender.attempts.count, 2,
+                       "a retired start must never retry after the terminal acknowledgement")
+    }
+
+    func testAcceptanceOutboxKeepsStartAndCoalescesOnlyUpdates() async throws {
+        let tmp = NSTemporaryDirectory() + "rc2-live-activity-outbox-coalesce-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let store = LiveActivityAcceptanceOutboxStore(settings: SettingsRepository(db: db))
+        let start = makeDelivery(event: .start, generation: 5, revision: 1)
+        let oldUpdate = makeDelivery(event: .update, generation: 5, revision: 2)
+        let latestUpdate = makeDelivery(event: .update, generation: 5, revision: 3)
+        let target = makeTarget(for: start)
+        try store.enqueue(start, targets: [target])
+        try store.enqueue(oldUpdate, targets: [target])
+        try store.enqueue(latestUpdate, targets: [target])
+        let sender = OutboxSender()
+        let outbox = LiveActivityAcceptanceOutbox(
+            store: store,
+            send: { record in try await sender.send(record) }
+        )
+
+        outbox.resumePending()
+        await sender.waitForAttempts(2)
+        await outbox.flush()
+
+        XCTAssertEqual(sender.attempts.map(\.event), [.start, .update])
+        XCTAssertEqual(sender.attempts.map(\.projection.revision), [1, 3],
+                       "updates may coalesce, but a pending start must remain the session barrier")
+    }
+
+    func testOlderTerminalBarrierAcksBeforePreservedHigherGeneration() async throws {
+        let tmp = NSTemporaryDirectory() + "rc2-live-activity-outbox-generation-barrier-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let store = LiveActivityAcceptanceOutboxStore(settings: SettingsRepository(db: db))
+        let oldEnd = makeDelivery(event: .end, generation: 6, revision: 4)
+        let newStart = makeDelivery(event: .start, generation: 7, revision: 1)
+        try store.enqueue(newStart, targets: [makeTarget(for: newStart)])
+        try store.enqueue(oldEnd, targets: [makeTarget(for: oldEnd)])
+        let sender = OutboxSender()
+        let outbox = LiveActivityAcceptanceOutbox(
+            store: store,
+            send: { record in try await sender.send(record) }
+        )
+
+        outbox.resumePending()
+        await sender.waitForAttempts(2)
+        await outbox.flush()
+
+        XCTAssertEqual(sender.attempts.map(\.activityGeneration), [6, 7],
+                       "a higher generation cannot start until the prior terminal barrier is accepted")
+        XCTAssertTrue(try store.pending().isEmpty,
+                      "acknowledging an older terminal must preserve then deliver the higher generation")
+    }
+
+    func testPerDeviceAcceptanceKeepsOnlyTimedOutDevicePending() async throws {
+        let tmp = NSTemporaryDirectory() + "rc2-live-activity-outbox-devices-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let store = LiveActivityAcceptanceOutboxStore(settings: SettingsRepository(db: db))
+        let clock = ManualOutboxClock(now: Date(timeIntervalSince1970: 3_000))
+        let scheduler = ManualOutboxScheduler()
+        let sender = DeviceOutboxSender(failingDeviceID: "device-b")
+        let delivery = makeDelivery(event: .update, generation: 8, revision: 2)
+        let outbox = LiveActivityAcceptanceOutbox(
+            store: store,
+            now: { clock.read() },
+            retryDelay: { _ in 10 },
+            schedule: { delay, callback in scheduler.schedule(delay, callback) },
+            send: { record in try await sender.send(record) }
+        )
+
+        try outbox.accept(delivery, targets: [
+            makeTarget(for: delivery, deviceId: "device-a"),
+            makeTarget(for: delivery, deviceId: "device-b")
+        ])
+        await sender.waitForAttempts(2)
+        await outbox.flush()
+
+        let pending = try store.pending()
+        XCTAssertEqual(pending.count, 1)
+        guard case .v2(let pendingTarget) = try XCTUnwrap(pending.first).target else {
+            return XCTFail("only the timed-out typed target should remain")
+        }
+        XCTAssertEqual(pendingTarget.deviceId, "device-b",
+                       "device A acceptance must never delete or acknowledge device B's failed record")
+        XCTAssertEqual(sender.count(for: "device-a"), 1)
+
+        clock.advance(by: 10)
+        sender.allowRetries()
+        scheduler.fireAll()
+        await sender.waitForAttempts(3)
+        await outbox.flush()
+
+        XCTAssertTrue(try store.pending().isEmpty)
+        XCTAssertEqual(sender.count(for: "device-a"), 1,
+                       "retrying device B must not resend or tombstone already accepted device A")
+        XCTAssertEqual(sender.count(for: "device-b"), 2)
+    }
+
+    func testHigherGenerationWaitsForScheduledOlderTerminalRetry() async throws {
+        let tmp = NSTemporaryDirectory() + "rc2-live-activity-outbox-terminal-retry-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let store = LiveActivityAcceptanceOutboxStore(settings: SettingsRepository(db: db))
+        let clock = ManualOutboxClock(now: Date(timeIntervalSince1970: 4_000))
+        let scheduler = ManualOutboxScheduler()
+        let sender = DeviceOutboxSender(failingDeviceID: "device-1")
+        let oldEnd = makeDelivery(event: .end, generation: 8, revision: 3)
+        let newStart = makeDelivery(event: .start, generation: 9, revision: 1)
+        let outbox = LiveActivityAcceptanceOutbox(
+            store: store,
+            now: { clock.read() },
+            retryDelay: { _ in 10 },
+            schedule: { delay, callback in scheduler.schedule(delay, callback) },
+            send: { record in try await sender.send(record) }
+        )
+
+        try outbox.accept(oldEnd, targets: [makeTarget(for: oldEnd)])
+        try outbox.accept(newStart, targets: [makeTarget(for: newStart)])
+        await sender.waitForAttempts(1)
+        await outbox.flush()
+        XCTAssertEqual(sender.generations, [8],
+                       "a ready newer start cannot bypass an older terminal barrier awaiting retry")
+
+        sender.allowRetries()
+        clock.advance(by: 10)
+        scheduler.fireAll()
+        await sender.waitForAttempts(3)
+        await outbox.flush()
+        XCTAssertEqual(sender.generations, [8, 8, 9])
+    }
+
+    func testIosGenerationDriftBindsUpdateTokenToCurrentMacGeneration() async throws {
+        let registrations = TargetRegistrationRecorder()
+        let sync = LiveActivitySyncCoordinator(
+            serverId: "server-1",
+            bootEpoch: 9,
+            initialActivityGeneration: 4,
+            registerToken: { registrations.append($0) },
+            deliver: { _ in }
+        )
+        let run = ("10000000-0000-0000-0000-000000000001", "20000000-0000-0000-0000-000000000001")
+        sync.submit(active([run]), cause: .started)
+        await sync.flush()
+        let drifted = PrivatePushTargetRecord(
+            deviceId: "device-1", serverId: "untrusted-ios-host", purpose: .activityUpdate,
+            environment: .sandbox, token: "update-token", activityGeneration: 999,
+            activityId: "activity-1", contractVersion: 2, capabilities: ["live_activity_v2"]
+        )
+
+        let bound = try sync.submitTokenRegistration(drifted)
+        await sync.flush()
+
+        XCTAssertEqual(bound.ownership, LiveActivityTokenOwnership(
+            activityId: "activity-1", hostId: "server-1", bootEpoch: 9,
+            activityGeneration: 5, activitySessionId: "server-1:9:5"
+        ), "the Mac projection owns generation; an iOS-local counter cannot replace it")
+        XCTAssertEqual(registrations.targets.last, bound)
+        let partialAuthority = PrivatePushTargetRecord(
+            deviceId: "device-1", serverId: "server-1", purpose: .activityUpdate,
+            environment: .sandbox, token: "partial-token", activityGeneration: 5,
+            activityId: "activity-partial", bootEpoch: 9,
+            contractVersion: 2, capabilities: ["live_activity_v2"]
+        )
+        XCTAssertThrowsError(try sync.submitTokenRegistration(partialAuthority),
+                             "partial remote ownership must not be silently rebound to the current generation")
+    }
+
+    func testLateOldActivityTokenRetainsOldOwnershipAfterNewGeneration() async throws {
+        let sync = LiveActivitySyncCoordinator(
+            serverId: "server-1", bootEpoch: 9, initialActivityGeneration: 4,
+            registerToken: { _ in }, deliver: { _ in }
+        )
+        let run = ("10000000-0000-0000-0000-000000000001", "20000000-0000-0000-0000-000000000001")
+        sync.submit(active([run]), cause: .started)
+        await sync.flush()
+        let old = PrivatePushTargetRecord(
+            deviceId: "device-1", serverId: "server-1", purpose: .activityUpdate,
+            environment: .sandbox, token: "old-token", activityGeneration: 5,
+            activityId: "old-activity", bootEpoch: 9, activitySessionId: "server-1:9:5",
+            contractVersion: 2, capabilities: ["live_activity_v2"]
+        )
+        let first = try sync.submitTokenRegistration(old)
+        sync.submit(active([]), cause: .finished(.completed))
+        sync.submit(active([run]), cause: .started)
+        await sync.flush()
+
+        let late = PrivatePushTargetRecord(
+            deviceId: "device-1", serverId: "server-1", purpose: .activityUpdate,
+            environment: .sandbox, token: "rotated-old-token", activityGeneration: 6,
+            activityId: "old-activity", contractVersion: 2, capabilities: ["live_activity_v2"]
+        )
+        let rebound = try sync.submitTokenRegistration(late)
+        let otherDevice = PrivatePushTargetRecord(
+            deviceId: "device-2", serverId: "server-1", purpose: .activityUpdate,
+            environment: .sandbox, token: "other-device-token", activityGeneration: 5,
+            activityId: "old-activity", contractVersion: 2, capabilities: ["live_activity_v2"]
+        )
+        let otherBound = try sync.submitTokenRegistration(otherDevice)
+
+        XCTAssertEqual(first.ownership?.activityGeneration, 5)
+        XCTAssertEqual(rebound.ownership, first.ownership,
+                       "a late token rotation for an old Activity must not attach to the newest generation")
+        XCTAssertEqual(otherBound.ownership?.activityGeneration, 6,
+                       "an activity ID mapping from one device must not bind another device to its old generation")
+    }
+
+    func testCoordinatorSurfacesAcceptancePersistenceFailure() async {
+        let errors = DeliveryErrorRecorder()
+        let sync = LiveActivitySyncCoordinator(
+            serverId: "server-1",
+            bootEpoch: 3,
+            onDeliveryError: { error, delivery in errors.append(error, delivery: delivery) },
+            deliver: { _ in throw OutboxTestError.persistence }
+        )
+        let run = ("10000000-0000-0000-0000-000000000001", "20000000-0000-0000-0000-000000000001")
+
+        sync.submit(active([run]), cause: .started)
+        await sync.flush()
+
+        XCTAssertEqual(errors.count, 1,
+                       "serialized lifecycle delivery must surface durable-acceptance failure instead of swallowing it")
     }
 
     func testV2ContractEncodesRootSharedFieldNamesAndEpochIntegers() throws {
@@ -252,8 +556,8 @@ final class LiveActivitySyncCoordinatorTests: XCTestCase {
         HTTPRecordingURLProtocol.setHandler { request in
             recorder.append(request)
             let body = request.url?.path.hasSuffix("/deliver") == true
-                ? Data(#"{"delivered":true,"shouldDropSubscription":false}"#.utf8)
-                : Data()
+                ? Data(#"{"accepted":false,"id":"outbox-1","status":"pending","attempts":0,"nextAttemptAt":1783998600000}"#.utf8)
+                : Data(#"{"token":{"activityKey":"active-threads","deviceId":"device-1","environment":"sandbox","tokenKind":"pushToStart"}}"#.utf8)
             let response = HTTPURLResponse(
                 url: try XCTUnwrap(request.url),
                 statusCode: 200,
@@ -291,11 +595,14 @@ final class LiveActivitySyncCoordinatorTests: XCTestCase {
                 token: "start-token", tokenKind: .pushToStart
             )
         )
-        _ = try await api.deliverLiveActivityV2(
+        let ack = try await api.deliverLiveActivityV2(
             accessToken: "access-token",
             request: PrivateLiveActivityV2DeliveryRequest(delivery: delivery, target: target),
             idempotencyKey: delivery.idempotencyKey
         )
+        XCTAssertEqual(ack.status, "pending")
+        XCTAssertEqual(ack.accepted, false)
+        XCTAssertEqual(ack.nextAttemptAt, "1783998600000.0")
 
         let requests = recorder.requests
         XCTAssertEqual(requests.map { $0.url?.path }, [
@@ -343,6 +650,41 @@ final class LiveActivitySyncCoordinatorTests: XCTestCase {
                        "an invalid ActivityKit token must not erase the device alert token")
     }
 
+    func testLateOldEndSelectsExactOldActivityOwnershipNeverLegacyNewestToken() throws {
+        let tmp = NSTemporaryDirectory() + "rc2-private-target-old-activity-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let settings = SettingsRepository(db: db)
+        let targetStore = PrivatePushTargetStore(repo: settings)
+        targetStore.save(
+            pushToken: "newest-alert", pushTokenType: "apns",
+            liveActivityToken: "newest-legacy-activity", deviceId: "device-1"
+        )
+        let old = PrivatePushTargetRecord(
+            deviceId: "device-1", serverId: "server-1", purpose: .activityUpdate,
+            environment: .sandbox, token: "old-update", activityGeneration: 8,
+            activityId: "old-activity", bootEpoch: 7, activitySessionId: "server-1:7:8",
+            contractVersion: 2, capabilities: ["live_activity_v2"]
+        )
+        let newest = PrivatePushTargetRecord(
+            deviceId: "device-1", serverId: "server-1", purpose: .activityUpdate,
+            environment: .sandbox, token: "new-update", activityGeneration: 9,
+            activityId: "new-activity", bootEpoch: 7, activitySessionId: "server-1:7:9",
+            contractVersion: 2, capabilities: ["live_activity_v2"]
+        )
+        try targetStore.upsert(old)
+        try targetStore.upsert(newest)
+        let bridge = PrivateNotificationBridge(
+            accountStore: PrivateAccountSessionStore(repo: settings),
+            pushTargetStore: targetStore
+        )
+        let oldEnd = makeDelivery(event: .end, generation: 8, revision: 4)
+
+        XCTAssertEqual(try bridge.acceptanceTargets(for: oldEnd), [.v2(old)])
+        let unknown = makeDelivery(event: .end, generation: 10, revision: 1)
+        XCTAssertThrowsError(try bridge.acceptanceTargets(for: unknown),
+                             "a missing typed ownership must not fall through to the newest legacy token")
+    }
+
     func testV2CapabilityIsDisabledByDefault() {
         let target = PrivatePushTargetRecord(
             deviceId: "device-1", serverId: "server-1", purpose: .pushToStart,
@@ -358,6 +700,47 @@ final class LiveActivitySyncCoordinatorTests: XCTestCase {
         XCTAssertEqual(DirectAccessConfiguration.port(environment: ["RC2_HTTP_PORT": "18218"]), 18218)
         XCTAssertEqual(DirectAccessConfiguration.port(environment: ["RC2_HTTP_PORT": "invalid"]), 18217)
         XCTAssertEqual(DirectAccessConfiguration.port(environment: ["RC2_HTTP_PORT": "70000"]), 18217)
+    }
+
+    private func makeDelivery(
+        event: PrivateLiveActivityEvent,
+        generation: UInt64,
+        revision: Int64
+    ) -> LiveActivitySyncDelivery {
+        LiveActivitySyncDelivery(
+            event: event,
+            projection: PrivateLiveActivityProjectionV2(
+                statusLine: event == .end ? "0 active runs" : "1 active run",
+                phase: event == .end ? .completed : .running,
+                activeThreadCount: event == .end ? 0 : 1,
+                updatedAt: 1_000,
+                sessionId: "server-1:7:\(generation)",
+                hostId: "server-1",
+                epoch: "7",
+                revision: revision
+            ),
+            activityGeneration: generation,
+            idempotencyKey: "activity.server-1.7.\(generation).\(revision).\(event.rawValue)"
+        )
+    }
+
+    private func makeTarget(
+        for delivery: LiveActivitySyncDelivery,
+        deviceId: String = "device-1"
+    ) -> LiveActivityAcceptanceTarget {
+        .v2(PrivatePushTargetRecord(
+            deviceId: deviceId,
+            serverId: delivery.projection.hostId,
+            purpose: delivery.event == .start ? .pushToStart : .activityUpdate,
+            environment: .sandbox,
+            token: "token-\(deviceId)",
+            activityGeneration: delivery.activityGeneration,
+            activityId: "activity-\(deviceId)",
+            bootEpoch: UInt64(delivery.projection.epoch),
+            activitySessionId: delivery.projection.sessionId,
+            contractVersion: 2,
+            capabilities: ["live_activity_v2"]
+        ))
     }
 }
 
@@ -398,6 +781,139 @@ private final class OrderedSyncRecorder: @unchecked Sendable {
 
     func append(_ value: String) { lock.withLock { values.append(value) } }
     var events: [String] { lock.withLock { values } }
+}
+
+private enum OutboxTestError: Error {
+    case responseLost
+    case persistence
+}
+
+private final class OutboxSender: @unchecked Sendable {
+    private let lock = NSLock()
+    private let failedStartAttempts: Int
+    private var values: [LiveActivitySyncDelivery] = []
+    private var waiters: [(Int, CheckedContinuation<Void, Never>)] = []
+
+    init(failedStartAttempts: Int = 0) {
+        self.failedStartAttempts = failedStartAttempts
+    }
+
+    func send(_ record: LiveActivityAcceptanceRecord) async throws -> PrivateLiveActivityV2DeliveryAck {
+        let delivery = record.delivery
+        let result = lock.withLock { () -> (Int, [CheckedContinuation<Void, Never>]) in
+            values.append(delivery)
+            let count = values.count
+            let ready = waiters.filter { $0.0 <= count }
+            waiters.removeAll { $0.0 <= count }
+            return (values.filter { $0.event == .start }.count, ready.map(\.1))
+        }
+        result.1.forEach { $0.resume() }
+        if delivery.event == .start, result.0 <= failedStartAttempts {
+            throw OutboxTestError.responseLost
+        }
+        return PrivateLiveActivityV2DeliveryAck(
+            id: "ack-\(delivery.idempotencyKey)",
+            status: "queued",
+            attempts: 0,
+            nextAttemptAt: nil
+        )
+    }
+
+    func waitForAttempts(_ count: Int) async {
+        await withCheckedContinuation { continuation in
+            let alreadyReady = lock.withLock { () -> Bool in
+                if values.count >= count { return true }
+                waiters.append((count, continuation))
+                return false
+            }
+            if alreadyReady { continuation.resume() }
+        }
+    }
+
+    var attempts: [LiveActivitySyncDelivery] { lock.withLock { values } }
+}
+
+private final class ManualOutboxClock: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: Date
+
+    init(now: Date) { value = now }
+    func read() -> Date { lock.withLock { value } }
+    func advance(by interval: TimeInterval) { lock.withLock { value.addTimeInterval(interval) } }
+}
+
+private final class ManualOutboxScheduler: @unchecked Sendable {
+    private let lock = NSLock()
+    private var callbacks: [@Sendable () -> Void] = []
+
+    func schedule(_ delay: TimeInterval, _ callback: @escaping @Sendable () -> Void) {
+        lock.withLock { callbacks.append(callback) }
+    }
+
+    func fireAll() {
+        let values = lock.withLock { () -> [@Sendable () -> Void] in
+            defer { callbacks.removeAll() }
+            return callbacks
+        }
+        values.forEach { $0() }
+    }
+}
+
+private final class DeliveryErrorRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var values: [String] = []
+
+    func append(_ error: Error, delivery: LiveActivitySyncDelivery) {
+        lock.withLock { values.append(delivery.idempotencyKey + ":" + String(describing: error)) }
+    }
+
+    var count: Int { lock.withLock { values.count } }
+}
+
+private final class TargetRegistrationRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var values: [PrivatePushTargetRecord] = []
+    func append(_ target: PrivatePushTargetRecord) { lock.withLock { values.append(target) } }
+    var targets: [PrivatePushTargetRecord] { lock.withLock { values } }
+}
+
+private final class DeviceOutboxSender: @unchecked Sendable {
+    private let lock = NSLock()
+    private let failingDeviceID: String
+    private var retryAllowed = false
+    private var deviceIDs: [String] = []
+    private var generationValues: [UInt64] = []
+    private var waiters: [(Int, CheckedContinuation<Void, Never>)] = []
+
+    init(failingDeviceID: String) { self.failingDeviceID = failingDeviceID }
+
+    func send(_ record: LiveActivityAcceptanceRecord) async throws -> PrivateLiveActivityV2DeliveryAck {
+        guard case .v2(let target) = record.target else { throw OutboxTestError.responseLost }
+        let result = lock.withLock { () -> (Bool, [CheckedContinuation<Void, Never>]) in
+            deviceIDs.append(target.deviceId)
+            generationValues.append(record.delivery.activityGeneration)
+            let ready = waiters.filter { $0.0 <= deviceIDs.count }
+            waiters.removeAll { $0.0 <= deviceIDs.count }
+            return (retryAllowed, ready.map(\.1))
+        }
+        result.1.forEach { $0.resume() }
+        if target.deviceId == failingDeviceID, !result.0 { throw OutboxTestError.responseLost }
+        return PrivateLiveActivityV2DeliveryAck(id: record.recordID, status: "pending", attempts: 0, nextAttemptAt: nil)
+    }
+
+    func allowRetries() { lock.withLock { retryAllowed = true } }
+    func count(for deviceID: String) -> Int { lock.withLock { deviceIDs.filter { $0 == deviceID }.count } }
+    var generations: [UInt64] { lock.withLock { generationValues } }
+    func waitForAttempts(_ count: Int) async {
+        await withCheckedContinuation { continuation in
+            let ready = lock.withLock { () -> Bool in
+                if deviceIDs.count >= count { return true }
+                waiters.append((count, continuation))
+                return false
+            }
+            if ready { continuation.resume() }
+        }
+    }
 }
 
 private final class HTTPRecordingURLProtocol: URLProtocol, @unchecked Sendable {

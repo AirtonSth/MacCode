@@ -114,7 +114,7 @@ public struct PrivateLiveActivityProjectionV2: Codable, Equatable, Sendable {
     }
 }
 
-public struct LiveActivitySyncDelivery: Equatable, Sendable {
+public struct LiveActivitySyncDelivery: Codable, Equatable, Sendable {
     public let event: PrivateLiveActivityEvent
     public let projection: PrivateLiveActivityProjectionV2
     public let activityGeneration: UInt64
@@ -128,12 +128,124 @@ public enum LiveActivitySyncCause: Equatable, Sendable {
     case launchReconciliation
 }
 
+public enum LiveActivityTokenBindingError: Error, Equatable {
+    case missingActivityID
+    case unknownAuthoritativeScope
+}
+
+private final class LiveActivityTokenScopeBinder: @unchecked Sendable {
+    private let lock = NSLock()
+    private let serverId: String
+    private let bootEpoch: UInt64
+    private var currentGeneration: UInt64
+    private var knownScopes: Set<LiveActivityTokenOwnership>
+    private var ownershipByTargetActivity: [String: LiveActivityTokenOwnership]
+
+    init(
+        serverId: String,
+        bootEpoch: UInt64,
+        initialGeneration: UInt64,
+        initialTargets: [PrivatePushTargetRecord]
+    ) {
+        self.serverId = serverId
+        self.bootEpoch = bootEpoch
+        self.currentGeneration = initialGeneration
+        let current = Self.ownership(
+            activityId: "",
+            serverId: serverId,
+            bootEpoch: bootEpoch,
+            generation: initialGeneration
+        )
+        var known = Set<LiveActivityTokenOwnership>()
+        known.insert(current)
+        var mappings: [String: LiveActivityTokenOwnership] = [:]
+        for target in initialTargets {
+            guard let ownership = target.ownership else { continue }
+            known.insert(ownership)
+            mappings[Self.mappingKey(target: target, activityId: ownership.activityId)] = ownership
+        }
+        self.knownScopes = known
+        self.ownershipByTargetActivity = mappings
+    }
+
+    func recordGeneration(_ generation: UInt64) {
+        lock.withLock {
+            currentGeneration = generation
+            knownScopes.insert(Self.ownership(
+                activityId: "",
+                serverId: serverId,
+                bootEpoch: bootEpoch,
+                generation: generation
+            ))
+        }
+    }
+
+    func bind(_ target: PrivatePushTargetRecord) throws -> PrivatePushTargetRecord {
+        guard target.purpose == .activityUpdate else { return target }
+        guard let activityId = target.activityId, !activityId.isEmpty else {
+            throw LiveActivityTokenBindingError.missingActivityID
+        }
+        return try lock.withLock {
+            let mappingKey = Self.mappingKey(target: target, activityId: activityId)
+            if let existing = ownershipByTargetActivity[mappingKey] {
+                return target.bound(to: existing)
+            }
+            let ownership: LiveActivityTokenOwnership
+            if let proposed = target.ownership {
+                let scopeMarker = Self.ownership(
+                    activityId: "",
+                    serverId: proposed.hostId,
+                    bootEpoch: proposed.bootEpoch,
+                    generation: proposed.activityGeneration
+                )
+                guard knownScopes.contains(scopeMarker),
+                      proposed.activitySessionId == scopeMarker.activitySessionId else {
+                    throw LiveActivityTokenBindingError.unknownAuthoritativeScope
+                }
+                ownership = proposed
+            } else if target.bootEpoch != nil || target.activitySessionId != nil {
+                throw LiveActivityTokenBindingError.unknownAuthoritativeScope
+            } else {
+                ownership = Self.ownership(
+                    activityId: activityId,
+                    serverId: serverId,
+                    bootEpoch: bootEpoch,
+                    generation: currentGeneration
+                )
+            }
+            ownershipByTargetActivity[mappingKey] = ownership
+            return target.bound(to: ownership)
+        }
+    }
+
+    private static func ownership(
+        activityId: String,
+        serverId: String,
+        bootEpoch: UInt64,
+        generation: UInt64
+    ) -> LiveActivityTokenOwnership {
+        LiveActivityTokenOwnership(
+            activityId: activityId,
+            hostId: serverId,
+            bootEpoch: bootEpoch,
+            activityGeneration: generation,
+            activitySessionId: "\(serverId):\(bootEpoch):\(generation)"
+        )
+    }
+
+    private static func mappingKey(target: PrivatePushTargetRecord, activityId: String) -> String {
+        "\(target.deviceId)|\(target.environment.rawValue)|\(activityId)"
+    }
+}
+
 /// One long-lived mailbox serializes lifecycle transitions and network delivery.
 /// Callers submit synchronously from coordinator callbacks; no per-event
 /// unstructured Task can reorder start/update/end.
 public final class LiveActivitySyncCoordinator: @unchecked Sendable {
-    public typealias Delivery = @Sendable (LiveActivitySyncDelivery) async -> Void
-    public typealias TokenRegistration = @Sendable (PrivatePushTargetRecord) async -> Void
+    public typealias Delivery = @Sendable (LiveActivitySyncDelivery) async throws -> Void
+    public typealias DeliveryError = @Sendable (Error, LiveActivitySyncDelivery) -> Void
+    public typealias TokenRegistration = @Sendable (PrivatePushTargetRecord) async throws -> Void
+    public typealias TokenRegistrationError = @Sendable (Error, PrivatePushTargetRecord) -> Void
 
     private enum Command: @unchecked Sendable {
         case registerToken(PrivatePushTargetRecord)
@@ -143,15 +255,26 @@ public final class LiveActivitySyncCoordinator: @unchecked Sendable {
     }
 
     private let continuation: AsyncStream<Command>.Continuation
+    private let tokenScopeBinder: LiveActivityTokenScopeBinder
     private var worker: Task<Void, Never>?
 
     public init(
         serverId: String,
         bootEpoch: UInt64,
         initialActivityGeneration: UInt64 = 0,
+        initialTokenTargets: [PrivatePushTargetRecord] = [],
         registerToken: @escaping TokenRegistration = { _ in },
+        onTokenRegistrationError: @escaping TokenRegistrationError = { _, _ in },
+        onDeliveryError: @escaping DeliveryError = { _, _ in },
         deliver: @escaping Delivery
     ) {
+        let tokenScopeBinder = LiveActivityTokenScopeBinder(
+            serverId: serverId,
+            bootEpoch: bootEpoch,
+            initialGeneration: initialActivityGeneration,
+            initialTargets: initialTokenTargets
+        )
+        self.tokenScopeBinder = tokenScopeBinder
         var capturedContinuation: AsyncStream<Command>.Continuation?
         let stream = AsyncStream<Command> { capturedContinuation = $0 }
         self.continuation = capturedContinuation!
@@ -163,7 +286,11 @@ public final class LiveActivitySyncCoordinator: @unchecked Sendable {
             for await command in stream {
                 switch command {
                 case .registerToken(let target):
-                    await registerToken(target)
+                    do {
+                        try await registerToken(target)
+                    } catch {
+                        onTokenRegistrationError(error, target)
+                    }
                 case .projection(let projection, let cause, let now):
                     let previousCount = latest.activeRunCount
                     latest = projection
@@ -172,6 +299,7 @@ public final class LiveActivitySyncCoordinator: @unchecked Sendable {
                         event = .end
                     } else if previousCount == 0, projection.activeRunCount > 0 {
                         activityGeneration &+= 1
+                        tokenScopeBinder.recordGeneration(activityGeneration)
                         stateRevision = 0
                         event = .start
                     } else if projection.activeRunCount == 0 {
@@ -180,7 +308,7 @@ public final class LiveActivitySyncCoordinator: @unchecked Sendable {
                         event = .update
                     }
                     stateRevision &+= 1
-                    await deliver(Self.delivery(
+                    let delivery = Self.delivery(
                         projection: projection,
                         cause: cause,
                         event: event,
@@ -189,11 +317,16 @@ public final class LiveActivitySyncCoordinator: @unchecked Sendable {
                         activityGeneration: activityGeneration,
                         stateRevision: stateRevision,
                         now: now
-                    ))
+                    )
+                    do {
+                        try await deliver(delivery)
+                    } catch {
+                        onDeliveryError(error, delivery)
+                    }
                 case .heartbeat(let now):
                     guard latest.activeRunCount > 0 else { continue }
                     stateRevision &+= 1
-                    await deliver(Self.delivery(
+                    let delivery = Self.delivery(
                         projection: latest,
                         cause: .changed,
                         event: .update,
@@ -202,7 +335,12 @@ public final class LiveActivitySyncCoordinator: @unchecked Sendable {
                         activityGeneration: activityGeneration,
                         stateRevision: stateRevision,
                         now: now
-                    ))
+                    )
+                    do {
+                        try await deliver(delivery)
+                    } catch {
+                        onDeliveryError(error, delivery)
+                    }
                 case .flush(let barrier):
                     barrier.resume()
                 }
@@ -219,8 +357,11 @@ public final class LiveActivitySyncCoordinator: @unchecked Sendable {
         continuation.yield(.projection(projection, cause, now))
     }
 
-    public func submitTokenRegistration(_ target: PrivatePushTargetRecord) {
-        continuation.yield(.registerToken(target))
+    @discardableResult
+    public func submitTokenRegistration(_ target: PrivatePushTargetRecord) throws -> PrivatePushTargetRecord {
+        let bound = try tokenScopeBinder.bind(target)
+        continuation.yield(.registerToken(bound))
+        return bound
     }
 
     public func submitHeartbeat(now: Date = Date()) {

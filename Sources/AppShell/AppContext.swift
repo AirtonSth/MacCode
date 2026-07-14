@@ -85,6 +85,7 @@ public final class AppContext {
     public let turnCheckpointRepo: AgentTurnCheckpointRepository
     public let tokenSaverSavingsRepo: TokenSaverSavingsRepository
     public let privateNotificationBridge: PrivateNotificationBridge
+    public let liveActivityAcceptanceOutbox: LiveActivityAcceptanceOutbox
     public let liveActivitySyncCoordinator: LiveActivitySyncCoordinator
     public let tokenSaverDistillServiceController: TokenSaverDistillServiceController
     let projectScriptRuns = ProjectScriptRunRegistry()
@@ -175,26 +176,45 @@ public final class AppContext {
         self.proposedPlanRepo = AgentProposedPlanRepository(db: db)
         self.turnCheckpointRepo = AgentTurnCheckpointRepository(db: db)
         self.tokenSaverSavingsRepo = TokenSaverSavingsRepository(db: db)
+        let privatePushTargetStore = PrivatePushTargetStore(repo: self.settingsRepo)
         let privateNotificationBridge = PrivateNotificationBridge(
             accountStore: PrivateAccountSessionStore(repo: self.settingsRepo),
-            pushTargetStore: PrivatePushTargetStore(repo: self.settingsRepo)
+            pushTargetStore: privatePushTargetStore
         )
         self.privateNotificationBridge = privateNotificationBridge
         let liveActivityIdentity = try LiveActivityIdentityStore.beginBoot(settings: self.settingsRepo)
         let settingsRepo = self.settingsRepo
+        let liveActivityAcceptanceOutbox = LiveActivityAcceptanceOutbox(
+            store: LiveActivityAcceptanceOutboxStore(settings: settingsRepo),
+            onError: { error, delivery in
+                NSLog("Live Activity outbox error key=\(delivery?.idempotencyKey ?? "unknown"): \(error)")
+            }
+        ) { record in
+            try await privateNotificationBridge.sendLiveActivityAcceptance(record)
+        }
+        self.liveActivityAcceptanceOutbox = liveActivityAcceptanceOutbox
         self.liveActivitySyncCoordinator = LiveActivitySyncCoordinator(
             serverId: liveActivityIdentity.serverId,
             bootEpoch: liveActivityIdentity.bootEpoch,
             initialActivityGeneration: liveActivityIdentity.activityGeneration,
+            initialTokenTargets: try privatePushTargetStore.records(),
             registerToken: { target in
-                await privateNotificationBridge.registerLiveActivityTokenV2(target)
+                try privatePushTargetStore.upsert(target)
+                try await privateNotificationBridge.registerLiveActivityTokenV2(target)
+            },
+            onTokenRegistrationError: { error, target in
+                NSLog("Live Activity token registration failed device=\(target.deviceId): \(error)")
+            },
+            onDeliveryError: { error, delivery in
+                NSLog("Live Activity durable acceptance failed key=\(delivery.idempotencyKey): \(error)")
             }
         ) { delivery in
-            try? LiveActivityIdentityStore.persistActivityGeneration(
+            try LiveActivityIdentityStore.persistActivityGeneration(
                 delivery.activityGeneration,
                 settings: settingsRepo
             )
-            await privateNotificationBridge.deliverLiveActivity(delivery)
+            let targets = try privateNotificationBridge.acceptanceTargets(for: delivery)
+            try liveActivityAcceptanceOutbox.accept(delivery, targets: targets)
         }
         self.tokenSaverDistillServiceController = TokenSaverDistillServiceController(
             appSupportDirectory: self.appSupportDirectory
@@ -225,6 +245,7 @@ public final class AppContext {
             }
             liveActivitySyncCoordinator.submit(projection, cause: syncCause)
         }
+        liveActivityAcceptanceOutbox.resumePending()
         try coordinator.reconcileOnLaunch()
         try? tokenSaverSavingsRepo.prune()
         self.coordinator.promptCompressor = { [weak self] prompt, provider, threadId in

@@ -638,17 +638,20 @@ class FakeRouter: CommandRouting, TerminalCommandRouting {
     func notificationDismiss(id: String) throws {}
     var lastPrivatePushTokenUpdate: (
         pushToken: String, pushTokenType: String, liveActivityToken: String?, deviceID: String?,
-        tokenPurpose: String?, environment: String?, serverID: String?, activityGeneration: Int?,
-        activityID: String?, contractVersion: Int?, capabilities: [String]?
+        tokenPurpose: String?, environment: String?, serverID: String?, bootEpoch: Int?,
+        activityGeneration: Int?, activityID: String?, activitySessionID: String?,
+        registrationRevision: Int?, contractVersion: Int?, capabilities: [String]?
     )?
     func privatePushTokenUpdate(
         pushToken: String, pushTokenType: String, liveActivityToken: String?, deviceID: String?,
-        tokenPurpose: String?, environment: String?, serverID: String?, activityGeneration: Int?,
-        activityID: String?, contractVersion: Int?, capabilities: [String]?
+        tokenPurpose: String?, environment: String?, serverID: String?, bootEpoch: Int?,
+        activityGeneration: Int?, activityID: String?, activitySessionID: String?,
+        registrationRevision: Int?, contractVersion: Int?, capabilities: [String]?
     ) throws -> JSONValue {
         lastPrivatePushTokenUpdate = (
             pushToken, pushTokenType, liveActivityToken, deviceID, tokenPurpose, environment,
-            serverID, activityGeneration, activityID, contractVersion, capabilities
+            serverID, bootEpoch, activityGeneration, activityID, activitySessionID,
+            registrationRevision, contractVersion, capabilities
         )
         return .object(["ok": .bool(true), "push_token_type": .string(pushTokenType)])
     }
@@ -1452,22 +1455,28 @@ final class DispatcherTests: XCTestCase {
                 "push_token_type": .string("apns"),
                 "live_activity_token": .string("start-token"),
                 "device_id": .string("device-1"),
-                "token_purpose": .string("push_to_start"),
+                "token_purpose": .string("activity_update"),
                 "environment": .string("sandbox"),
                 "server_id": .string("server-1"),
+                "boot_epoch": .number(8),
                 "activity_generation": .number(4),
                 "activity_id": .string("activity-1"),
+                "activity_session_id": .string("server-1:8:4"),
+                "registration_revision": .number(12),
                 "contract_version": .number(2),
                 "capabilities": .array([.string("live_activity_v2")])
             ]
         ))
 
         XCTAssertNil(response.error)
-        XCTAssertEqual(router.lastPrivatePushTokenUpdate?.tokenPurpose, "push_to_start")
+        XCTAssertEqual(router.lastPrivatePushTokenUpdate?.tokenPurpose, "activity_update")
         XCTAssertEqual(router.lastPrivatePushTokenUpdate?.environment, "sandbox")
         XCTAssertEqual(router.lastPrivatePushTokenUpdate?.serverID, "server-1")
+        XCTAssertEqual(router.lastPrivatePushTokenUpdate?.bootEpoch, 8)
         XCTAssertEqual(router.lastPrivatePushTokenUpdate?.activityGeneration, 4)
         XCTAssertEqual(router.lastPrivatePushTokenUpdate?.activityID, "activity-1")
+        XCTAssertEqual(router.lastPrivatePushTokenUpdate?.activitySessionID, "server-1:8:4")
+        XCTAssertEqual(router.lastPrivatePushTokenUpdate?.registrationRevision, 12)
         XCTAssertEqual(router.lastPrivatePushTokenUpdate?.contractVersion, 2)
         XCTAssertEqual(router.lastPrivatePushTokenUpdate?.capabilities, ["live_activity_v2"])
     }

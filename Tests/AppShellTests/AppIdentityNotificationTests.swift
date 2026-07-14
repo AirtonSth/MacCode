@@ -295,6 +295,42 @@ final class AppIdentityNotificationTests: XCTestCase {
                        "the Mac must retain the paired iOS APNS target before it can ask private.remotecode.io to deliver alerts")
     }
 
+    func testUpdateTokenRPCAckReturnsMacAuthoritativeOwnershipInSnakeCase() throws {
+        let dir = NSTemporaryDirectory() + "RC2LiveActivityOwnershipAck-" + UUID().uuidString
+        let ctx = try AppContext(channel: .debug, appSupportOverride: dir)
+        let router = AppCommandRouter(context: ctx)
+        ctx.router = router
+
+        let result = try router.privatePushTokenUpdate(
+            pushToken: "apns-token",
+            pushTokenType: "apns",
+            liveActivityToken: "activity-token",
+            deviceID: "device-1",
+            tokenPurpose: "activity_update",
+            environment: "sandbox",
+            serverID: "untrusted-ios-host",
+            activityGeneration: 999,
+            activityID: "activity-1",
+            registrationRevision: 17,
+            contractVersion: 2,
+            capabilities: ["live_activity_v2"]
+        )
+
+        let object = try XCTUnwrap(result.objectValue)
+        let ownership = try XCTUnwrap(object["ownership"]?.objectValue)
+        XCTAssertEqual(object["ok"], .bool(true))
+        XCTAssertEqual(object["push_token_type"], .string("apns"))
+        XCTAssertEqual(object["registration_revision"], .number(17))
+        XCTAssertEqual(ownership["activity_id"], .string("activity-1"))
+        XCTAssertNotNil(ownership["host_id"])
+        XCTAssertNotNil(ownership["boot_epoch"])
+        XCTAssertNotNil(ownership["activity_generation"])
+        XCTAssertNotNil(ownership["activity_session_id"])
+        XCTAssertNil(ownership["activityId"], "the paired-device RPC contract is canonical snake_case")
+        XCTAssertNotEqual(ownership["activity_generation"], .number(999),
+                          "the Mac must not acknowledge an iOS-local generation as authoritative")
+    }
+
     func testPrivateNotificationBridgeSendsThreadOutcomeThroughBackendPush() async throws {
         let dir = NSTemporaryDirectory() + "RC2PrivateBridge-" + UUID().uuidString
         let ctx = try AppContext(channel: .debug, appSupportOverride: dir)
@@ -481,11 +517,13 @@ final class AppIdentityNotificationTests: XCTestCase {
         let bridge = PrivateNotificationBridge(accountStore: accountStore, pushTargetStore: targetStore, api: api)
         let target = PrivatePushTargetRecord(
             deviceId: "device-1", serverId: "server-1", purpose: .activityUpdate,
-            environment: .sandbox, token: "update-token", contractVersion: 2,
+            environment: .sandbox, token: "update-token", activityGeneration: 3,
+            activityId: "activity-1", bootEpoch: 8,
+            activitySessionId: "server-1:8:3", contractVersion: 2,
             capabilities: ["live_activity_v2"]
         )
 
-        await bridge.registerLiveActivityTokenV2(target)
+        try await bridge.registerLiveActivityTokenV2(target)
 
         let request = try XCTUnwrap(api.liveActivityV2TokenRegistrations.first)
         XCTAssertEqual(request.accessToken, "access-token")
@@ -494,16 +532,22 @@ final class AppIdentityNotificationTests: XCTestCase {
         XCTAssertEqual(request.registration.token, "update-token")
         XCTAssertEqual(request.registration.tokenKind, .update,
                        "an ActivityKit update token must use the backend's update registry, not push-to-start")
+        XCTAssertEqual(request.registration.hostId, "server-1")
+        XCTAssertEqual(request.registration.bootEpoch, 8)
+        XCTAssertEqual(request.registration.activityGeneration, 3)
+        XCTAssertEqual(request.registration.activitySessionId, "server-1:8:3")
+        XCTAssertEqual(request.registration.activityId, "activity-1")
     }
 
-    func testPrivateNotificationBridgeDeliversV2AndInvalidatesOnlyRejectedActivityToken() async throws {
+    func testPrivateNotificationBridgeAcceptsQueuedV2AckWithoutLocalTokenTombstone() async throws {
         let dir = NSTemporaryDirectory() + "RC2LiveActivityV2Delivery-" + UUID().uuidString
         let ctx = try AppContext(channel: .debug, appSupportOverride: dir)
         let accountStore = PrivateAccountSessionStore(repo: ctx.settingsRepo)
         let targetStore = PrivatePushTargetStore(repo: ctx.settingsRepo)
         let api = RecordingPrivateAccountAPI()
-        api.liveActivityV2Result = PrivatePushDeliveryResult(
-            delivered: false, errorCode: "apns/Unregistered", shouldDropSubscription: true
+        api.liveActivityV2Result = PrivateLiveActivityV2DeliveryAck(
+            id: "outbox-1", status: "queued", attempts: 0,
+            nextAttemptAt: "2026-07-14T00:30:00.000Z"
         )
         accountStore.save(api.session)
         let alert = PrivatePushTargetRecord(
@@ -535,8 +579,44 @@ final class AppIdentityNotificationTests: XCTestCase {
         XCTAssertEqual(request.request.activitySessionId, "server-1:8:3")
         XCTAssertEqual(request.request.deviceId, "device-1")
         XCTAssertEqual(request.idempotencyKey, "activity.server-1.8.3.4.start")
-        XCTAssertEqual(try targetStore.records(), [alert],
-                       "an invalid ActivityKit token must not erase the device alert token")
+        XCTAssertEqual(try targetStore.records(), [alert, start],
+                       "queued acceptance is not an immediate APNs failure; backend owns permanent-token tombstones")
+    }
+
+    func testPrivateNotificationBridgeRefreshesV2Acceptance401AndRetriesOnce() async throws {
+        let dir = NSTemporaryDirectory() + "RC2LiveActivityV2Refresh-" + UUID().uuidString
+        let ctx = try AppContext(channel: .debug, appSupportOverride: dir)
+        let accountStore = PrivateAccountSessionStore(repo: ctx.settingsRepo)
+        let targetStore = PrivatePushTargetStore(repo: ctx.settingsRepo)
+        let api = RecordingPrivateAccountAPI()
+        api.liveActivityV2RequiresRefresh = true
+        accountStore.save(api.session)
+        try targetStore.upsert(PrivatePushTargetRecord(
+            deviceId: "device-1", serverId: "server-1", purpose: .pushToStart,
+            environment: .sandbox, token: "start-token", activityGeneration: 3,
+            contractVersion: 2, capabilities: ["live_activity_v2"]
+        ))
+        let bridge = PrivateNotificationBridge(accountStore: accountStore, pushTargetStore: targetStore, api: api)
+        let projection = PrivateLiveActivityProjectionV2(
+            statusLine: "1 active run", phase: .running, activeThreadCount: 1,
+            updatedAt: 900, sessionId: "server-1:8:3", hostId: "server-1",
+            epoch: "8", revision: 1
+        )
+
+        let delivery = LiveActivitySyncDelivery(
+            event: .start, projection: projection, activityGeneration: 3,
+            idempotencyKey: "activity.server-1.8.3.1.start"
+        )
+        let target = try XCTUnwrap(try targetStore.records().first)
+        let ack = try await bridge.sendLiveActivityAcceptance(LiveActivityAcceptanceRecord(
+            delivery: delivery,
+            target: .v2(target)
+        ))
+
+        XCTAssertEqual(api.refreshRequests, ["refresh-token"])
+        XCTAssertEqual(api.liveActivityV2Deliveries.map(\.accessToken),
+                       ["access-token", "refreshed-access-token"])
+        XCTAssertEqual(ack.status, "queued")
     }
 
     func testUnrelatedV2TargetDoesNotSuppressLegacyLiveActivityFallback() async throws {
@@ -925,7 +1005,10 @@ private class RecordingPrivateAccountAPI: PrivateAccountAPI, @unchecked Sendable
     var liveActivityV2TokenRegistrations: [(accessToken: String, registration: PrivateLiveActivityV2TokenRegistration)] = []
     var liveActivityV2Deliveries: [(accessToken: String, request: PrivateLiveActivityV2DeliveryRequest, idempotencyKey: String)] = []
     var liveActivityResult = PrivatePushDeliveryResult(delivered: true, errorCode: nil, shouldDropSubscription: false)
-    var liveActivityV2Result = PrivatePushDeliveryResult(delivered: true, errorCode: nil, shouldDropSubscription: false)
+    var liveActivityV2Result = PrivateLiveActivityV2DeliveryAck(
+        id: "outbox-default", status: "queued", attempts: 0, nextAttemptAt: nil
+    )
+    var liveActivityV2RequiresRefresh = false
     var billingOverviewRequests: [String] = []
     var portalRequests: [String] = []
     var refreshRequests: [String] = []
@@ -998,16 +1081,30 @@ private class RecordingPrivateAccountAPI: PrivateAccountAPI, @unchecked Sendable
     func registerLiveActivityTokenV2(
         accessToken: String,
         registration: PrivateLiveActivityV2TokenRegistration
-    ) async throws {
+    ) async throws -> PrivateLiveActivityV2TokenRegistrationAck {
         liveActivityV2TokenRegistrations.append((accessToken, registration))
+        return PrivateLiveActivityV2TokenRegistrationAck(token: .init(
+            activityKey: registration.activityKey,
+            deviceId: registration.deviceId,
+            environment: registration.environment,
+            tokenKind: registration.tokenKind,
+            hostId: registration.hostId,
+            bootEpoch: registration.bootEpoch,
+            activityGeneration: registration.activityGeneration,
+            activitySessionId: registration.activitySessionId,
+            activityId: registration.activityId
+        ))
     }
 
     func deliverLiveActivityV2(
         accessToken: String,
         request: PrivateLiveActivityV2DeliveryRequest,
         idempotencyKey: String
-    ) async throws -> PrivatePushDeliveryResult {
+    ) async throws -> PrivateLiveActivityV2DeliveryAck {
         liveActivityV2Deliveries.append((accessToken, request, idempotencyKey))
+        if liveActivityV2RequiresRefresh, accessToken == "access-token" {
+            throw PrivateAccountAPIError.http(401)
+        }
         return liveActivityV2Result
     }
 }
