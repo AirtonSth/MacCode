@@ -55,6 +55,50 @@ private final class Phase3SnapshotAuth: DirectAuthProvider {
 
 final class ConnectionSnapshotPhase3Tests: XCTestCase {
     @MainActor
+    func test_syncSnapshotImmediatelyAfterWelcomeSeesRegisteredConnection() async throws {
+        let router = Phase3SnapshotFakeRouter()
+        let port = UInt16.random(in: 33_000...44_000)
+        let server = DirectHTTPServer(
+            port: port,
+            loopbackOnly: true,
+            dispatcher: JSONRPCDispatcher(router: router),
+            serverId: "phase3-host",
+            bootEpoch: 73
+        )
+        let releaseWelcomeHandler = DispatchSemaphore(value: 0)
+        server.afterWelcomeWriteForTests = { _ in
+            _ = releaseWelcomeHandler.wait(timeout: .now() + 2)
+        }
+        try server.start()
+        try await Task.sleep(nanoseconds: 80_000_000)
+
+        let socket = webSocketTask(port: port)
+        socket.resume()
+        defer {
+            releaseWelcomeHandler.signal()
+            socket.cancel(with: .normalClosure, reason: nil)
+            server.stop()
+        }
+        let welcome = try await receiveObject(socket)
+        let connectionID = try XCTUnwrap(welcome["connectionId"] as? String)
+
+        let snapshot = try await rpc(
+            port: port,
+            id: "immediate-after-welcome",
+            params: [
+                "connectionId": connectionID,
+                "expectedHostId": "phase3-host",
+                "expectedBootEpoch": 73,
+                "supportedStateVersion": 3,
+            ]
+        )
+
+        XCTAssertNil(snapshot["error"],
+                     "welcome ownership must be registered before the client can act on that welcome")
+        XCTAssertEqual(router.snapshotReadCount, 1)
+    }
+
+    @MainActor
     func test_syncSnapshot_requiresSameAuthenticatedOwnerAsWebSocket() async throws {
         let tokenA = "phase3-owner-token-a"
         let tokenB = "phase3-owner-token-b"

@@ -287,6 +287,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
     private let acceptedSockets = AcceptedSocketRegistry()
 
     var acceptedSocketCountForTests: Int { acceptedSockets.count }
+    var afterWelcomeWriteForTests: ((String) -> Void)?
 
     public init(port: UInt16 = 18217, loopbackOnly: Bool = true, dispatcher: JSONRPCDispatcher, auth: DirectAuthProvider? = nil, serverId: String = ProcessInfo.processInfo.globallyUniqueString, bootEpoch: UInt64, clientReceiveTimeoutSeconds: Int = 20, webSocketOutboundMaxQueuedBytes: Int = DirectHTTPServer.maxWebSocketOutboundQueuedBytes) {
         self.port = port
@@ -545,16 +546,17 @@ public final class DirectHTTPServer: @unchecked Sendable {
                 oldestReplaySequence: eventSnapshot.oldestReplaySequence,
                 capabilities: ["events.replay", "jsonrpc.batch", "snapshot.v3"]
             ))
-            guard let welcomeData = try? welcome.encoded(),
-                  frameWriter.send(opcode: 0x1, data: welcomeData) else {
-                return
-            }
             activeWebSocketConnections.insert(
                 connectionId,
                 ownerFingerprint: webSocketOwnerFingerprint,
                 watermark: sequenceWatermark
             )
             defer { activeWebSocketConnections.remove(connectionId) }
+            guard let welcomeData = try? welcome.encoded(),
+                  frameWriter.send(opcode: 0x1, data: welcomeData) else {
+                return
+            }
+            afterWelcomeWriteForTests?(connectionId)
             let subIDBox = LockedSubscriberID()
             let writeFailureClosing = connectionClosingData(
                 connectionId: connectionId,
