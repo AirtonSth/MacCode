@@ -1,5 +1,107 @@
 import Foundation
 
+public struct ConnectionDomainRevisions: Codable, Equatable, Sendable {
+    public let shell: Int64
+    public let surfaces: Int64
+    public let agentThreads: Int64
+    public let browser: Int64
+    public let files: Int64
+
+    public init(shell: Int64, surfaces: Int64, agentThreads: Int64, browser: Int64, files: Int64) {
+        self.shell = shell
+        self.surfaces = surfaces
+        self.agentThreads = agentThreads
+        self.browser = browser
+        self.files = files
+    }
+
+    var jsonValue: JSONValue {
+        .object([
+            "shell": .number(Double(shell)),
+            "surfaces": .number(Double(surfaces)),
+            "agentThreads": .number(Double(agentThreads)),
+            "browser": .number(Double(browser)),
+            "files": .number(Double(files)),
+        ])
+    }
+}
+
+public struct ConnectionSnapshotWorkspaceItems: Equatable, Sendable {
+    public let workspaceId: String
+    public let items: [JSONValue]
+
+    public init(workspaceId: String, items: [JSONValue]) {
+        self.workspaceId = workspaceId
+        self.items = items
+    }
+
+    var jsonValue: JSONValue {
+        .object(["workspaceId": .string(workspaceId), "items": .array(items)])
+    }
+}
+
+public struct ConnectionSnapshotSurfaceState: Equatable, Sendable {
+    public let workspaceId: String
+    public let surfaceId: String
+    public let state: JSONValue
+
+    public init(workspaceId: String, surfaceId: String, state: JSONValue) {
+        self.workspaceId = workspaceId
+        self.surfaceId = surfaceId
+        self.state = state
+    }
+
+    var jsonValue: JSONValue {
+        .object([
+            "workspaceId": .string(workspaceId),
+            "surfaceId": .string(surfaceId),
+            "state": state,
+        ])
+    }
+}
+
+public struct ConnectionSnapshotReadState: Equatable, Sendable {
+    public let selectedWorkspaceId: String?
+    public let workspaces: [JSONValue]
+    public let surfaces: [ConnectionSnapshotWorkspaceItems]
+    public let agentThreads: [ConnectionSnapshotWorkspaceItems]
+    public let browserStates: [ConnectionSnapshotSurfaceState]
+    public let filesStates: [ConnectionSnapshotSurfaceState]
+
+    public init(
+        selectedWorkspaceId: String?,
+        workspaces: [JSONValue],
+        surfaces: [ConnectionSnapshotWorkspaceItems],
+        agentThreads: [ConnectionSnapshotWorkspaceItems],
+        browserStates: [ConnectionSnapshotSurfaceState],
+        filesStates: [ConnectionSnapshotSurfaceState]
+    ) {
+        self.selectedWorkspaceId = selectedWorkspaceId
+        self.workspaces = workspaces
+        self.surfaces = surfaces
+        self.agentThreads = agentThreads
+        self.browserStates = browserStates
+        self.filesStates = filesStates
+    }
+
+    func jsonValue(domainRevisions: ConnectionDomainRevisions) -> JSONValue {
+        .object([
+            "selectedWorkspaceId": selectedWorkspaceId.map(JSONValue.string) ?? .null,
+            "workspaces": .array(workspaces),
+            "surfaces": .array(surfaces.map(\.jsonValue)),
+            "agentThreads": .array(agentThreads.map(\.jsonValue)),
+            "browserStates": .array(browserStates.map(\.jsonValue)),
+            "filesStates": .array(filesStates.map(\.jsonValue)),
+            "domainRevisions": domainRevisions.jsonValue,
+        ])
+    }
+}
+
+@MainActor
+public protocol ConnectionSnapshotRouting: AnyObject {
+    func readConnectionSnapshotState() throws -> ConnectionSnapshotReadState
+}
+
 enum ConnectionProtocolFailure: Error, Equatable, CustomStringConvertible {
     case frameTooLarge
     case malformedJSON
@@ -253,6 +355,9 @@ enum ConnectionTransportFrame: Equatable, Sendable {
         guard hasStrictIntegerFields(object, type: type) else {
             throw ConnectionProtocolFailure.invalidFrame
         }
+        if type == "snapshot", !hasStrictSnapshotRevisionFields(object) {
+            throw ConnectionProtocolFailure.invalidFrame
+        }
 
         let decoder = JSONDecoder()
         do {
@@ -348,6 +453,15 @@ enum ConnectionTransportFrame: Equatable, Sendable {
         return !CFNumberIsFloatType(number)
     }
 
+    private static func hasStrictSnapshotRevisionFields(_ object: [String: Any]) -> Bool {
+        guard let state = object["state"] as? [String: Any],
+              let revisions = state["domainRevisions"] as? [String: Any],
+              Set(revisions.keys) == ["shell", "surfaces", "agentThreads", "browser", "files"] else {
+            return false
+        }
+        return revisions.values.allSatisfy(isStrictInteger)
+    }
+
     private static func validate(_ frame: ConnectionWelcomeFrame) throws {
         try validateCommon(
             protocolVersion: frame.protocolVersion,
@@ -358,8 +472,9 @@ enum ConnectionTransportFrame: Equatable, Sendable {
             bootEpoch: frame.bootEpoch
         )
         guard frame.serverTimeEpochMs >= 0,
-              frame.heartbeatIntervalMs > 0,
+              (1...5_000).contains(frame.heartbeatIntervalMs),
               frame.heartbeatTimeoutMs > frame.heartbeatIntervalMs,
+              frame.heartbeatTimeoutMs <= 10_000,
               frame.currentSequence >= 0,
               frame.oldestReplaySequence >= 0,
               frame.oldestReplaySequence <= frame.currentSequence,
@@ -452,7 +567,7 @@ enum ConnectionTransportFrame: Equatable, Sendable {
         guard allowedReasons.contains(frame.reason),
               frame.requestedAfterSequence >= 0,
               frame.currentSequence >= frame.requestedAfterSequence,
-              frame.snapshotMethod == "mirror.snapshot" else {
+              frame.snapshotMethod == "sync.snapshot" else {
             throw ConnectionProtocolFailure.invalidFrame
         }
     }
@@ -469,7 +584,7 @@ enum ConnectionTransportFrame: Equatable, Sendable {
         guard frame.sequence >= 0,
               isNonEmpty(frame.snapshotId),
               frame.generatedAtEpochMs >= 0,
-              frame.stateVersion >= 1,
+              frame.stateVersion == 3,
               isValidSnapshotState(frame.state) else {
             throw ConnectionProtocolFailure.invalidFrame
         }
@@ -488,6 +603,7 @@ enum ConnectionTransportFrame: Equatable, Sendable {
         guard case .object(let state) = value,
               Set(state.keys) == [
                   "selectedWorkspaceId", "workspaces", "surfaces", "agentThreads",
+                  "browserStates", "filesStates", "domainRevisions",
               ] else {
             return false
         }
@@ -496,9 +612,144 @@ enum ConnectionTransportFrame: Equatable, Sendable {
         case .string(let value)?: guard isNonEmpty(value) else { return false }
         default: return false
         }
-        for key in ["workspaces", "surfaces", "agentThreads"] {
+        for key in ["workspaces", "surfaces", "agentThreads", "browserStates", "filesStates"] {
             guard case .array? = state[key] else { return false }
         }
+        guard case .array(let workspaceValues)? = state["workspaces"] else { return false }
+        let workspaceIDs = workspaceValues.compactMap { item -> String? in
+            guard case .object(let object) = item else { return nil }
+            return object["id"]?.stringValue
+        }
+        guard workspaceIDs.count == workspaceValues.count,
+              Set(workspaceIDs).count == workspaceIDs.count,
+              workspaceIDs.allSatisfy(isNonEmpty) else {
+            return false
+        }
+        let workspaceSet = Set(workspaceIDs)
+        if case .string(let selected)? = state["selectedWorkspaceId"],
+           !workspaceSet.contains(selected) {
+            return false
+        }
+
+        var surfaceReferences: [String: (workspaceID: String, type: String)] = [:]
+        guard validateSurfaceItems(
+            state["surfaces"],
+            workspaceIDs: workspaceSet,
+            references: &surfaceReferences
+        ) else { return false }
+        var threadIDs = Set<String>()
+        guard validateWorkspaceItems(
+            state["agentThreads"],
+            workspaceIDs: workspaceSet,
+            itemIDs: &threadIDs
+        ) else { return false }
+        var surfaceStateIDs = Set<String>()
+        guard validateSurfaceStates(
+            state["browserStates"],
+            expectedType: "browser",
+            surfaceReferences: surfaceReferences,
+            stateIDs: &surfaceStateIDs
+        ), validateSurfaceStates(
+            state["filesStates"],
+            expectedType: "files",
+            surfaceReferences: surfaceReferences,
+            stateIDs: &surfaceStateIDs
+        ) else { return false }
+
+        guard case .object(let revisions)? = state["domainRevisions"],
+              Set(revisions.keys) == ["shell", "surfaces", "agentThreads", "browser", "files"] else {
+            return false
+        }
+        return revisions.values.allSatisfy { value in
+            guard case .number(let revision) = value else { return false }
+            return revision.isFinite && revision >= 0 && revision.rounded(.towardZero) == revision
+        }
+    }
+
+    private static func validateWorkspaceItems(
+        _ value: JSONValue?,
+        workspaceIDs: Set<String>,
+        itemIDs: inout Set<String>
+    ) -> Bool {
+        guard case .array(let groups)? = value else { return false }
+        var groupedWorkspaceIDs = Set<String>()
+        for group in groups {
+            guard case .object(let object) = group,
+                  Set(object.keys) == ["workspaceId", "items"],
+                  let workspaceID = object["workspaceId"]?.stringValue,
+                  workspaceIDs.contains(workspaceID),
+                  groupedWorkspaceIDs.insert(workspaceID).inserted,
+                  case .array(let items)? = object["items"] else {
+                return false
+            }
+            for item in items {
+                guard case .object(let itemObject) = item,
+                      let itemID = itemObject["id"]?.stringValue,
+                      isNonEmpty(itemID),
+                      itemIDs.insert(itemID).inserted else {
+                    return false
+                }
+            }
+        }
         return true
+    }
+
+    private static func validateSurfaceItems(
+        _ value: JSONValue?,
+        workspaceIDs: Set<String>,
+        references: inout [String: (workspaceID: String, type: String)]
+    ) -> Bool {
+        guard case .array(let groups)? = value else { return false }
+        var groupedWorkspaceIDs = Set<String>()
+        for group in groups {
+            guard case .object(let object) = group,
+                  Set(object.keys) == ["workspaceId", "items"],
+                  let workspaceID = object["workspaceId"]?.stringValue,
+                  workspaceIDs.contains(workspaceID),
+                  groupedWorkspaceIDs.insert(workspaceID).inserted,
+                  case .array(let items)? = object["items"] else {
+                return false
+            }
+            for item in items {
+                guard case .object(let itemObject) = item,
+                      let itemID = itemObject["id"]?.stringValue,
+                      let type = itemObject["type"]?.stringValue,
+                      isNonEmpty(itemID),
+                      isNonEmpty(type),
+                      references[itemID] == nil else {
+                    return false
+                }
+                references[itemID] = (workspaceID, type)
+            }
+        }
+        return true
+    }
+
+    private static func validateSurfaceStates(
+        _ value: JSONValue?,
+        expectedType: String,
+        surfaceReferences: [String: (workspaceID: String, type: String)],
+        stateIDs: inout Set<String>
+    ) -> Bool {
+        guard case .array(let values)? = value else { return false }
+        var typedStateIDs = Set<String>()
+        for value in values {
+            guard case .object(let object) = value,
+                  Set(object.keys) == ["workspaceId", "surfaceId", "state"],
+                  let workspaceID = object["workspaceId"]?.stringValue,
+                  let surfaceID = object["surfaceId"]?.stringValue,
+                  let reference = surfaceReferences[surfaceID],
+                  reference.workspaceID == workspaceID,
+                  reference.type == expectedType,
+                  typedStateIDs.insert(surfaceID).inserted,
+                  stateIDs.insert(surfaceID).inserted,
+                  case .object? = object["state"] else {
+                return false
+            }
+        }
+        let expectedIDs = Set(surfaceReferences.compactMap { id, reference in
+            reference.type == expectedType ? id : nil
+        })
+        return typedStateIDs == expectedIDs
     }
 }

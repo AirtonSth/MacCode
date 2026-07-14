@@ -17,6 +17,15 @@
       }
     ],
     "surfaces": [],
-    "agentThreads": []
+    "agentThreads": [],
+    "browserStates": [],
+    "filesStates": [],
+    "domainRevisions": {
+      "shell": 1051,
+      "surfaces": 1051,
+      "agentThreads": 1051,
+      "browser": 1051,
+      "files": 1051
+    }
   }
 }

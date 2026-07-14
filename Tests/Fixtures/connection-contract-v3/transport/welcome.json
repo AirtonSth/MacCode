@@ -11,6 +11,7 @@
   "oldestReplaySequence": 900,
   "capabilities": [
     "events.replay",
-    "jsonrpc.batch"
+    "jsonrpc.batch",
+    "snapshot.v3"
   ]
 }

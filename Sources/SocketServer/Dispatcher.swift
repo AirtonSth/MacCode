@@ -333,6 +333,15 @@ public final class JSONRPCDispatcher {
     private var volatileCommandReceipts = BoundedReceiptCache()
     public init(router: CommandRouting) { self.router = router }
 
+    func readConnectionSnapshot() throws -> EventBus.SnapshotBarrierResult<ConnectionSnapshotReadState> {
+        guard let snapshotRouter = router as? ConnectionSnapshotRouting else {
+            throw JSONRPCError.notSupported("sync.snapshot")
+        }
+        return try EventBus.shared.withSnapshotBarrier {
+            try snapshotRouter.readConnectionSnapshotState()
+        }
+    }
+
     private func commandReceipt(method: String, params: [String: JSONValue]) -> (String, JSONValue)? {
         guard let receiptKey = params["client_request_id"]?.stringValue else { return nil }
         if let durable = router.commandReceipt(method: method, clientRequestId: receiptKey) {
@@ -1843,6 +1852,7 @@ public final class JSONRPCDispatcher {
             || method == "settings.get"
             || method == "agent.prompt_history"
             || method == "mirror.snapshot"
+            || method == "sync.snapshot"
             || method.hasSuffix(".list")
             || method.hasSuffix(".read")
             || method.hasSuffix(".status")
@@ -1861,7 +1871,7 @@ public final class JSONRPCDispatcher {
         "ssh", "fs", "files",
         "workspace", "window", "surface", "pane",
         "agent", "git", "project", "browser", "mirror",
-        "notification", "private"
+        "notification", "private", "sync"
     ]
 
     /// Required capability for a known method, or nil when the method is not

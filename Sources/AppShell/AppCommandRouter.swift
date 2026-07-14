@@ -50,7 +50,7 @@ private struct ProviderProbeCapabilities {
 /// Bridges the JSON-RPC dispatcher to the in-process domain state plus the
 /// concrete Surface views. Lives on the main actor because it mutates UI.
 @MainActor
-public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, LayoutEventSuppressionRouting {
+public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, LayoutEventSuppressionRouting, ConnectionSnapshotRouting {
     typealias SSHCommandRunner = @Sendable (String, [String], String?) throws -> (exitCode: Int32, output: String)
 
     private static let minimizedPaneVisibilityThreshold = 0.08
@@ -442,6 +442,112 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             else { ws.metadata.removeValue(forKey: "busy") }
             return ws
         }
+    }
+
+    public func readConnectionSnapshotState() throws -> ConnectionSnapshotReadState {
+        guard let ctx = context else {
+            return ConnectionSnapshotReadState(
+                selectedWorkspaceId: nil,
+                workspaces: [],
+                surfaces: [],
+                agentThreads: [],
+                browserStates: [],
+                filesStates: []
+            )
+        }
+        let workspaceIDs = ctx.state.window.workspaces
+        let workspaces = workspaceIDs.compactMap { ctx.state.workspaces[$0] }
+        let threads = try ctx.threadRepo.list(workspaceId: nil)
+        var surfaceGroups: [ConnectionSnapshotWorkspaceItems] = []
+        var threadGroups: [ConnectionSnapshotWorkspaceItems] = []
+        var browserStates: [ConnectionSnapshotSurfaceState] = []
+        var filesStates: [ConnectionSnapshotSurfaceState] = []
+
+        for workspace in workspaces {
+            var descriptors: [SurfaceDescriptor] = []
+            forEachSurface(in: workspace.layout) { descriptors.append($0) }
+            surfaceGroups.append(ConnectionSnapshotWorkspaceItems(
+                workspaceId: workspace.id.value.uuidString,
+                items: descriptors.map(Self.connectionSnapshotSurface)
+            ))
+            let workspaceThreads = threads
+                .filter { $0.workspaceId == workspace.id }
+                .sorted { $0.id.value.uuidString < $1.id.value.uuidString }
+            threadGroups.append(ConnectionSnapshotWorkspaceItems(
+                workspaceId: workspace.id.value.uuidString,
+                items: workspaceThreads.map(Self.connectionSnapshotThread)
+            ))
+
+            for descriptor in descriptors {
+                switch descriptor.type {
+                case .browser:
+                    let url = (try? browserSurface(descriptor.id).currentURL())
+                        ?? descriptor.metadata["url"]
+                        ?? ""
+                    browserStates.append(ConnectionSnapshotSurfaceState(
+                        workspaceId: workspace.id.value.uuidString,
+                        surfaceId: descriptor.id.value.uuidString,
+                        state: .object(["url": .string(url)])
+                    ))
+                case .files:
+                    let stored = decodeFilesState(descriptor.metadata["files_state"])
+                    let stableState = stored ?? [
+                        "surface_id": .string(descriptor.id.value.uuidString),
+                        "workspace_id": .string(workspace.id.value.uuidString),
+                        "selected_path": descriptor.metadata["selected_path"].map(JSONValue.string) ?? .null,
+                        "revision": .number(Double(
+                            descriptor.metadata["files_state_revision"].flatMap(Int.init) ?? 0
+                        )),
+                    ]
+                    filesStates.append(ConnectionSnapshotSurfaceState(
+                        workspaceId: workspace.id.value.uuidString,
+                        surfaceId: descriptor.id.value.uuidString,
+                        state: .object(stableState)
+                    ))
+                case .terminal, .ssh, .agentApp, .markdown, .filePreview, .rightSidebarTool:
+                    break
+                }
+            }
+        }
+
+        return ConnectionSnapshotReadState(
+            selectedWorkspaceId: ctx.state.window.selectedWorkspaceID?.value.uuidString,
+            workspaces: workspaces.map(Self.connectionSnapshotWorkspace),
+            surfaces: surfaceGroups,
+            agentThreads: threadGroups,
+            browserStates: browserStates,
+            filesStates: filesStates
+        )
+    }
+
+    nonisolated private static func connectionSnapshotJSON<T: Encodable>(_ value: T) -> JSONValue {
+        guard let data = try? JSONEncoder().encode(value),
+              let object = try? JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed]) else {
+            return .null
+        }
+        return JSONValue.from(object)
+    }
+
+    nonisolated private static func connectionSnapshotWorkspace(_ workspace: Workspace) -> JSONValue {
+        guard case .object(var object) = connectionSnapshotJSON(workspace) else { return .null }
+        object["id"] = .string(workspace.id.value.uuidString)
+        return .object(object)
+    }
+
+    nonisolated private static func connectionSnapshotSurface(_ surface: SurfaceDescriptor) -> JSONValue {
+        guard case .object(var object) = connectionSnapshotJSON(surface) else { return .null }
+        object["id"] = .string(surface.id.value.uuidString)
+        object["type"] = .string(surface.type.rawValue)
+        return .object(object)
+    }
+
+    nonisolated private static func connectionSnapshotThread(_ thread: AgentThread) -> JSONValue {
+        guard case .object(var object) = connectionSnapshotJSON(thread) else { return .null }
+        object["id"] = .string(thread.id.value.uuidString)
+        object["workspaceId"] = thread.workspaceId
+            .map { .string($0.value.uuidString) }
+            ?? .null
+        return .object(object)
     }
 
     public func isWorkspaceBusy(_ id: WorkspaceID) -> Bool {

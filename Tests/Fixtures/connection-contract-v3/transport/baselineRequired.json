@@ -7,5 +7,5 @@
   "reason": "eventGap",
   "requestedAfterSequence": 1043,
   "currentSequence": 1051,
-  "snapshotMethod": "mirror.snapshot"
+  "snapshotMethod": "sync.snapshot"
 }

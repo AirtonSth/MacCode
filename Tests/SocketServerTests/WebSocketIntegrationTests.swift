@@ -117,7 +117,9 @@ final class WebSocketIntegrationTests: XCTestCase {
         XCTAssertNotNil(obj["oldestReplaySequence"])
         XCTAssertEqual((obj["heartbeatIntervalMs"] as? NSNumber)?.int64Value, 5_000)
         XCTAssertEqual((obj["heartbeatTimeoutMs"] as? NSNumber)?.int64Value, 10_000)
-        XCTAssertEqual(obj["capabilities"] as? [String], ["events.replay", "jsonrpc.batch"])
+        XCTAssertEqual(obj["capabilities"] as? [String], [
+            "events.replay", "jsonrpc.batch", "snapshot.v3",
+        ])
     }
 
     func testWebSocketSendsImmediateFrameBeforeReceiveTimeout() async throws {

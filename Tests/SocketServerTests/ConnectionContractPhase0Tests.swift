@@ -54,7 +54,9 @@ final class ConnectionContractPhase0Tests: XCTestCase {
         try assertRejected("welcome") { $0["hostId"] = "" }
         try assertRejected("welcome") { $0["serverTimeEpochMs"] = -1 }
         try assertRejected("welcome") { $0["heartbeatIntervalMs"] = 0 }
+        try assertRejected("welcome") { $0["heartbeatIntervalMs"] = 5001 }
         try assertRejected("welcome") { $0["heartbeatTimeoutMs"] = $0["heartbeatIntervalMs"] }
+        try assertRejected("welcome") { $0["heartbeatTimeoutMs"] = 10001 }
         try assertRejected("welcome") { $0["currentSequence"] = -1 }
         try assertRejected("welcome") { $0["oldestReplaySequence"] = 1043 }
         try assertRejected("welcome") { $0["capabilities"] = [] }
@@ -98,7 +100,7 @@ final class ConnectionContractPhase0Tests: XCTestCase {
 
         var versionOne = try fixtureObject("snapshot")
         versionOne["stateVersion"] = 1
-        XCTAssertNoThrow(try ConnectionTransportFrame.decodeStrict(try jsonData(versionOne)))
+        XCTAssertThrowsError(try ConnectionTransportFrame.decodeStrict(try jsonData(versionOne)))
         try assertRejected("snapshot") { $0["sequence"] = -1 }
         try assertRejected("snapshot") { $0["snapshotId"] = " " }
         try assertRejected("snapshot") { $0["generatedAtEpochMs"] = -1 }
@@ -224,11 +226,12 @@ final class ConnectionContractPhase0Tests: XCTestCase {
                 includingPropertiesForKeys: nil
             ).filter { $0.pathExtension == "json" }
             for local in files {
+                let relativePath = "\(category)/\(local.lastPathComponent)"
                 let canonical = canonicalRoot
                     .appendingPathComponent(category)
                     .appendingPathComponent(local.lastPathComponent)
                 XCTAssertEqual(try Data(contentsOf: local), try Data(contentsOf: canonical),
-                               "\(category)/\(local.lastPathComponent) drifted from the canonical contract fixture")
+                               "\(relativePath) drifted from the canonical contract fixture")
             }
         }
     }

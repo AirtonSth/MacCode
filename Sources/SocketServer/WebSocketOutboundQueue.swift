@@ -230,3 +230,127 @@ final class LockedSubscriberID: @unchecked Sendable {
         }
     }
 }
+
+enum ConnectionSequenceRecordResult: Equatable {
+    case advanced
+    case bufferedForSnapshot
+    case coveredBySnapshot
+    case gap(expected: Int64, received: Int64)
+}
+
+enum ConnectionSnapshotAdoptionResult: Equatable {
+    case adopted(sequence: Int64)
+    case gap(expected: Int64, received: Int64)
+}
+
+final class ConnectionSequenceWatermark: @unchecked Sendable {
+    private let lock = NSLock()
+    private var sequence: Int64
+    private var snapshotCoveredThrough: Int64 = 0
+    private var snapshotInFlight = false
+    private var pendingSequences = Set<Int64>()
+
+    init(initialSequence: Int64) {
+        self.sequence = max(0, initialSequence)
+    }
+
+    var value: Int64 {
+        lock.lock(); defer { lock.unlock() }
+        return sequence
+    }
+
+    func beginSnapshot() -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard !snapshotInFlight else { return false }
+        snapshotInFlight = true
+        pendingSequences.removeAll(keepingCapacity: true)
+        return true
+    }
+
+    func recordEnqueuedEvent(sequence next: Int64) -> ConnectionSequenceRecordResult {
+        lock.lock(); defer { lock.unlock() }
+        if next == sequence + 1 {
+            sequence = next
+            drainPendingLocked()
+            return .advanced
+        }
+        if next <= snapshotCoveredThrough {
+            return .coveredBySnapshot
+        }
+        if snapshotInFlight, next > sequence + 1 {
+            pendingSequences.insert(next)
+            return .bufferedForSnapshot
+        }
+        return .gap(expected: sequence + 1, received: next)
+    }
+
+    func adoptSnapshot(sequence next: Int64) -> ConnectionSnapshotAdoptionResult {
+        lock.lock(); defer { lock.unlock() }
+        guard snapshotInFlight else {
+            return .gap(expected: sequence + 1, received: next)
+        }
+        var candidateSequence = max(sequence, next)
+        var remaining = pendingSequences.filter { $0 > candidateSequence }
+        while remaining.remove(candidateSequence + 1) != nil {
+            candidateSequence += 1
+        }
+        snapshotInFlight = false
+        if let received = remaining.min() {
+            pendingSequences.removeAll(keepingCapacity: true)
+            return .gap(expected: candidateSequence + 1, received: received)
+        }
+        sequence = candidateSequence
+        snapshotCoveredThrough = max(snapshotCoveredThrough, next)
+        pendingSequences.removeAll(keepingCapacity: true)
+        return .adopted(sequence: sequence)
+    }
+
+    func cancelSnapshot() {
+        lock.lock()
+        snapshotInFlight = false
+        pendingSequences.removeAll(keepingCapacity: true)
+        lock.unlock()
+    }
+
+    private func drainPendingLocked() {
+        while pendingSequences.remove(sequence + 1) != nil {
+            sequence += 1
+        }
+    }
+}
+
+final class ActiveWebSocketConnectionRegistry: @unchecked Sendable {
+    private struct Entry {
+        let ownerFingerprint: String
+        let watermark: ConnectionSequenceWatermark
+    }
+
+    private let lock = NSLock()
+    private var entries: [String: Entry] = [:]
+
+    func insert(
+        _ connectionID: String,
+        ownerFingerprint: String,
+        watermark: ConnectionSequenceWatermark
+    ) {
+        lock.lock()
+        entries[connectionID] = Entry(ownerFingerprint: ownerFingerprint, watermark: watermark)
+        lock.unlock()
+    }
+
+    func watermark(
+        for connectionID: String,
+        ownerFingerprint: String
+    ) -> ConnectionSequenceWatermark? {
+        lock.lock(); defer { lock.unlock() }
+        guard let entry = entries[connectionID],
+              entry.ownerFingerprint == ownerFingerprint else {
+            return nil
+        }
+        return entry.watermark
+    }
+
+    func remove(_ connectionID: String) {
+        lock.lock(); entries.removeValue(forKey: connectionID); lock.unlock()
+    }
+}
