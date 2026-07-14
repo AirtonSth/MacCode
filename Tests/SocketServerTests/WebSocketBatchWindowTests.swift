@@ -17,12 +17,11 @@ import XCTest
 ///   iOS mirror state depends on deterministic event ordering; coalescing must
 ///   never silently reorder events.
 ///
-/// - Keyed (coalescing) events must still coalesce per key, last-write-wins:
-///   existing keyed-batch guarantee must not regress.
+/// - Keyed events must remain one-for-one and in arrival order:
+///   dropping an intermediate event creates an unrecoverable sequence gap.
 ///
-/// - Keyed and nil-key events in the same window flush together, keyed first:
-///   a single WS frame burst should carry both kinds; flushing separately would
-///   double frame count for mixed batches.
+/// - Keyed and nil-key events in the same window retain global arrival order:
+///   the reducer consumes one ordered sequence across all event kinds.
 ///
 /// - When batching is disabled (`enabled: false`) nil-key events send immediately:
 ///   the cross-kind window must not activate when batching is turned off.
@@ -77,9 +76,9 @@ final class WebSocketBatchWindowTests: XCTestCase {
                        "arrival order must be preserved exactly within a flush group")
     }
 
-    func test_keyedEventsCoalesce_lastWriteWins() {
-        // WHY: the existing keyed-batch guarantee (last write per key wins) must
-        // not regress after adding the nil-key window.
+    func test_keyedEvents_preserveEverySequenceInArrivalOrder() {
+        // WHY: last-write-wins would remove an event sequence and force the
+        // client into baseline recovery despite a healthy socket.
         let old = Data("old".utf8)
         let new = Data("new".utf8)
         let events: [(key: String?, data: Data, t: TimeInterval)] = [
@@ -88,14 +87,13 @@ final class WebSocketBatchWindowTests: XCTestCase {
         ]
         let groups = WebSocketEventBatcher.groupFlushes(events: events, window: 0.015)
         XCTAssertEqual(groups.count, 1)
-        XCTAssertEqual(groups[0], [new],
-                       "two keyed events with the same key must coalesce; only the last data value must be sent")
+        XCTAssertEqual(groups[0], [old, new],
+                       "two keyed events must both be delivered in arrival order")
     }
 
-    func test_mixedKeyedAndNilKey_sameWindow_flushTogether_keyedFirst() {
-        // WHY: if keyed and nil-key events share a window they must flush in one
-        // batch (fewer WS frames); keyed frames first so coalesced state arrives
-        // before supplementary nil-key events.
+    func test_mixedKeyedAndNilKey_sameWindow_preservesArrivalOrder() {
+        // WHY: the event cursor is global; grouping by key before delivery would
+        // reorder sequence numbers across event kinds.
         let keyed = Data("keyed".utf8)
         let nilKey = Data("nil".utf8)
         let events: [(key: String?, data: Data, t: TimeInterval)] = [
@@ -105,9 +103,8 @@ final class WebSocketBatchWindowTests: XCTestCase {
         let groups = WebSocketEventBatcher.groupFlushes(events: events, window: 0.015)
         XCTAssertEqual(groups.count, 1,
                        "keyed and nil-key events within the same window must flush together")
-        XCTAssertEqual(groups[0].first, keyed,
-                       "keyed frames must precede nil-key frames in the flush group")
-        XCTAssertEqual(groups[0].last, nilKey)
+        XCTAssertEqual(groups[0], [nilKey, keyed],
+                       "mixed frames must retain their global arrival order")
     }
 
     func test_emptyInput_returnsEmptyGroups() {
@@ -189,6 +186,28 @@ final class WebSocketBatchWindowTests: XCTestCase {
 
         XCTAssertEqual(sent.values().count, 1,
                        "disabled batcher must deliver nil-key events immediately without buffering")
+    }
+
+    func test_CONN003_batchPermutations_neverDropOrReorderSequences() {
+        // WHY: last-write-wins keyed batching silently removes event sequences;
+        // replay cursors cannot advance safely across a frame that was never sent.
+        let permutations: [[(String?, Int64)]] = [
+            [("surface:1", 1043), (nil, 1044), ("surface:1", 1045)],
+            [(nil, 1043), ("surface:1", 1044), ("surface:2", 1045), (nil, 1046)],
+            [("surface:1", 1043), ("surface:2", 1044), ("surface:1", 1045)],
+        ]
+
+        for permutation in permutations {
+            let events = permutation.enumerated().map { index, item in
+                (key: item.0,
+                 data: Data("\(item.1)".utf8),
+                 t: TimeInterval(index) * 0.001)
+            }
+            let groups = WebSocketEventBatcher.groupFlushes(events: events, window: 0.015)
+            let delivered = groups.flatMap { $0 }.compactMap { Int64(String(decoding: $0, as: UTF8.self)) }
+            XCTAssertEqual(delivered, permutation.map(\.1),
+                           "every accepted sequence must be delivered once in arrival order")
+        }
     }
 }
 

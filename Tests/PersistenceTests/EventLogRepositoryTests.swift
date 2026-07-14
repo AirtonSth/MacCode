@@ -215,4 +215,17 @@ final class EventLogRepositoryTests: XCTestCase {
         XCTAssertEqual(rows[0].payloadJSON, payload,
             "payloadJSON must round-trip verbatim so consumers decode the correct event body")
     }
+
+    func test_readNewest_loadsNewestRetainedRangeInAscendingSequenceOrder() throws {
+        let db = try makeDB()
+        let repo = EventLogRepository(db: db)
+        for sequence in 1...8 {
+            try repo.append(seq: Int64(sequence), kind: "event.\(sequence)", payloadJSON: "{}")
+        }
+
+        let rows = try repo.read(since: -1, limit: 3)
+
+        XCTAssertEqual(rows.map(\.seq), [6, 7, 8],
+                       "startup replay must load the newest retained range and preserve reducer order")
+    }
 }

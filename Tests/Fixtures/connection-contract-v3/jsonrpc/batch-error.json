@@ -1,0 +1,22 @@
+[
+  {
+    "jsonrpc": "2.0",
+    "id": "request-005",
+    "error": {
+      "code": -32602,
+      "message": "Invalid params"
+    }
+  },
+  {
+    "jsonrpc": "2.0",
+    "id": "request-006",
+    "error": {
+      "code": -32097,
+      "message": "Connection is stale.",
+      "data": {
+        "reason": "baselineRequired",
+        "retryable": true
+      }
+    }
+  }
+]

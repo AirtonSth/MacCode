@@ -184,6 +184,43 @@ final class EventBusTests: XCTestCase {
             "live event seq 3 must arrive after an empty backlog -- " +
             "the subscriber must not be silently dropped when its since-seq equals lastSeq")
     }
+
+    func test_persistedReplay_exposesOldestRetainedSequenceAndRequiresBaselineForGap() {
+        let bus = EventBus()
+        let retained = (1048...1051).map {
+            EventBus.Event(seq: Int64($0), kind: "workspace.updated", payload: .null, ts: 0)
+        }
+        bus.reloadFromPersistence(lastSeq: 1051, recent: retained)
+
+        let replay = bus.recentEvents(since: 1043, maxBytes: nil)
+
+        XCTAssertTrue(replay.requiresBaseline,
+                      "a cursor older than the retained range cannot be repaired by partial replay")
+        XCTAssertEqual(replay.events.map(\.seq), [1048, 1049, 1050, 1051])
+    }
+
+    func test_asyncEventLogLane_doesNotBlockSubscriberDelivery() {
+        let bus = EventBus()
+        let allowPersistence = DispatchSemaphore(value: 0)
+        let persistenceStarted = expectation(description: "persistence started")
+        let delivered = expectation(description: "subscriber delivered")
+        let publishFinished = expectation(description: "publish finished")
+        bus.persister = { _ in
+            persistenceStarted.fulfill()
+            _ = allowPersistence.wait(timeout: .now() + 1)
+        }
+        _ = bus.subscribe(since: nil) { _ in delivered.fulfill() }
+
+        DispatchQueue.global().async {
+            bus.publish(kind: "workspace.updated", payload: .null)
+            publishFinished.fulfill()
+        }
+
+        wait(for: [persistenceStarted], timeout: 0.5)
+        wait(for: [delivered], timeout: 0.1)
+        allowPersistence.signal()
+        wait(for: [publishFinished], timeout: 0.5)
+    }
 }
 
 private final class LockedStrings {

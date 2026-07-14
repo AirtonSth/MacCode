@@ -1,0 +1,16 @@
+{
+  "protocolVersion": 3,
+  "type": "welcome",
+  "connectionId": "connection-001",
+  "hostId": "host-001",
+  "bootEpoch": 42,
+  "serverTimeEpochMs": 1784030400000,
+  "heartbeatIntervalMs": 15000,
+  "heartbeatTimeoutMs": 45000,
+  "eventCursor": 1042,
+  "capabilities": [
+    "events.replay",
+    "jsonrpc.batch",
+    "snapshot.v3"
+  ]
+}

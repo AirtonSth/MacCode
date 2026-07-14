@@ -268,6 +268,9 @@ public final class DirectHTTPServer: @unchecked Sendable {
     private var listenFD: Int32 = -1
     private var running = false
     private var accept: Thread?
+    private let acceptedSockets = AcceptedSocketRegistry()
+
+    var acceptedSocketCountForTests: Int { acceptedSockets.count }
 
     public init(port: UInt16 = 18217, loopbackOnly: Bool = true, dispatcher: JSONRPCDispatcher, auth: DirectAuthProvider? = nil, serverId: String = ProcessInfo.processInfo.globallyUniqueString, heartbeatInterval: TimeInterval = 20, clientReceiveTimeoutSeconds: Int = 20, webSocketOutboundMaxQueuedBytes: Int = DirectHTTPServer.maxWebSocketOutboundQueuedBytes) {
         self.port = port
@@ -311,6 +314,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
             close(listenFD); listenFD = -1
             throw POSIXError(.EIO)
         }
+        acceptedSockets.activate()
         running = true
         let t = Thread { [weak self] in self?.acceptLoop() }
         t.name = "RC2.HTTPAccept"
@@ -333,6 +337,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
             close(listenFD)
             listenFD = -1
         }
+        acceptedSockets.shutdownAll()
     }
 
     private func acceptLoop() {
@@ -343,7 +348,15 @@ public final class DirectHTTPServer: @unchecked Sendable {
             if fd < 0 { if !running { return }; continue }
             disableSIGPIPE(fd: fd)
             let peer = Self.peerIP(caddr)
-            DispatchQueue.global().async { [weak self] in self?.handle(fd: fd, peer: peer) }
+            let registry = acceptedSockets
+            guard registry.register(fd) else { continue }
+            DispatchQueue.global().async { [weak self] in
+                guard let self else {
+                    registry.close(fd)
+                    return
+                }
+                self.handle(fd: fd, peer: peer)
+            }
         }
     }
 
@@ -374,7 +387,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
         defer {
             if !handedOff {
                 if let s = subID { EventBus.shared.unsubscribe(s) }
-                close(fd)
+                acceptedSockets.close(fd)
             }
         }
         // Apply a receive timeout so a slow/stuck client cannot block this
@@ -533,7 +546,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
                     shutdown(fd, SHUT_RDWR)
                 }
             )
-            let batcher = WebSocketEventBatcher(enabled: wsFilter == .cellularSafe,
+            let batcher = WebSocketEventBatcher(enabled: false,
                                                 filter: wsFilter,
                                                 // PERF: coalesce per-token agent.item.delta
                                                 // frames on .full connections; non-delta
@@ -589,6 +602,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
             // keep connection open; read incoming frames (ping/pong/close)
             wsServeLoop(fd: fd, writer: frameWriter)
             heartbeat.cancel()
+            batcher.stop()
             outbound.drain()
             wsTracker.clientDisconnected(queuedBytes: outbound.queuedByteCount)
             return
@@ -683,11 +697,19 @@ public final class DirectHTTPServer: @unchecked Sendable {
             // on this path and is intentionally not touched by the Task.
             handedOff = true
             let ae = headers["accept-encoding"]
+            let registry = acceptedSockets
             Task { [weak self] in
-                guard let self else { close(fd); return }
+                guard let self else {
+                    registry.close(fd)
+                    return
+                }
                 let respData = await self.dispatchRPC(bodyData: bodyData)
+                guard registry.isActive(fd) else {
+                    registry.close(fd)
+                    return
+                }
                 self.send(fd: fd, status: 200, contentType: "application/json", body: respData, acceptEncoding: ae)
-                close(fd)
+                registry.close(fd)
             }
             return
         case ("POST", "/v1/pair"):

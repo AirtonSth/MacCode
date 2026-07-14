@@ -1,0 +1,22 @@
+{
+  "protocolVersion": 3,
+  "type": "snapshot",
+  "connectionId": "connection-001",
+  "hostId": "host-001",
+  "bootEpoch": 42,
+  "sequence": 1051,
+  "snapshotId": "snapshot-1051",
+  "generatedAtEpochMs": 1784030416000,
+  "stateVersion": 3,
+  "state": {
+    "selectedWorkspaceId": "workspace-001",
+    "workspaces": [
+      {
+        "id": "workspace-001",
+        "name": "Remote Code"
+      }
+    ],
+    "surfaces": [],
+    "agentThreads": []
+  }
+}
