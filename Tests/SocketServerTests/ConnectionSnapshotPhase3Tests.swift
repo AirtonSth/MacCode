@@ -20,7 +20,11 @@ private final class Phase3SnapshotFakeRouter: FakeRouter, ConnectionSnapshotRout
             )],
             agentThreads: [ConnectionSnapshotWorkspaceItems(
                 workspaceId: workspaceID,
-                items: [.object(["id": .string(threadID), "title": .string("Thread")])]
+                items: [.object([
+                    "id": .string(threadID),
+                    "workspaceId": .string(workspaceID),
+                    "title": .string("Thread"),
+                ])]
             )],
             browserStates: [ConnectionSnapshotSurfaceState(
                 workspaceId: workspaceID,
@@ -283,6 +287,35 @@ final class ConnectionSnapshotPhase3Tests: XCTestCase {
         }
     }
 
+    func test_snapshotFrame_requiresAgentThreadWorkspaceToMatchItsGroup() throws {
+        let valid = validState()
+        XCTAssertNoThrow(try snapshotFrame(state: valid).encoded(),
+                         "a thread whose workspaceId matches its group must be accepted")
+
+        try assertSnapshotRejected(valid) { state in
+            guard case .array(var groups)? = state["agentThreads"],
+                  case .object(var group) = groups[0],
+                  case .array(var items)? = group["items"],
+                  case .object(var thread) = items[0] else { return }
+            thread.removeValue(forKey: "workspaceId")
+            items[0] = .object(thread)
+            group["items"] = .array(items)
+            groups[0] = .object(group)
+            state["agentThreads"] = .array(groups)
+        }
+        try assertSnapshotRejected(valid) { state in
+            guard case .array(var groups)? = state["agentThreads"],
+                  case .object(var group) = groups[0],
+                  case .array(var items)? = group["items"],
+                  case .object(var thread) = items[0] else { return }
+            thread["workspaceId"] = .string("workspace-2")
+            items[0] = .object(thread)
+            group["items"] = .array(items)
+            groups[0] = .object(group)
+            state["agentThreads"] = .array(groups)
+        }
+    }
+
     func test_eventBusSnapshotBarrier_assignsConcurrentEventImmediatelyAfterWatermark() {
         let bus = EventBus()
         bus.publish(kind: "workspace.created", payload: .object([:]))
@@ -477,7 +510,10 @@ final class ConnectionSnapshotPhase3Tests: XCTestCase {
             ])]),
             "agentThreads": .array([.object([
                 "workspaceId": .string("workspace-1"),
-                "items": .array([.object(["id": .string("thread-1")])]),
+                "items": .array([.object([
+                    "id": .string("thread-1"),
+                    "workspaceId": .string("workspace-1"),
+                ])]),
             ])]),
             "browserStates": .array([.object([
                 "workspaceId": .string("workspace-1"),

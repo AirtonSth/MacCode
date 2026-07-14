@@ -685,7 +685,10 @@ enum ConnectionTransportFrame: Equatable, Sendable {
             for item in items {
                 guard case .object(let itemObject) = item,
                       let itemID = itemObject["id"]?.stringValue,
+                      let itemWorkspaceID = itemObject["workspaceId"]?.stringValue,
                       isNonEmpty(itemID),
+                      isNonEmpty(itemWorkspaceID),
+                      itemWorkspaceID == workspaceID,
                       itemIDs.insert(itemID).inserted else {
                     return false
                 }
