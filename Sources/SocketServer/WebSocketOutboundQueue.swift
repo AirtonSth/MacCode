@@ -28,24 +28,64 @@ final class WebSocketOutboundQueue: @unchecked Sendable {
         case closed
     }
 
+    private enum State: Equatable {
+        case open
+        case terminalReserved
+        case terminalQueued
+        case terminalSent
+        case closed
+    }
+
     private let queue: DispatchQueue
     private let maxQueuedBytes: Int
     private let lock = NSLock()
     private var queuedBytes = 0
-    private var closed = false
-    private let writer: @Sendable (Data) -> Bool
-    private let onClose: @Sendable (String) -> Void
+    private var state: State = .open
+    private let applicationWriter: @Sendable (Data) -> Bool
+    private let controlWriter: @Sendable (UInt8, Data) -> Bool
+    private let writeFailureClosingData: Data
+    private let onTerminal: @Sendable (String) -> Void
+    private let didSendTerminal: @Sendable () -> Void
+    private let acceptedSubmissionHook: @Sendable () -> Void
+    private let terminationAttemptHook: @Sendable () -> Void
 
     init(
+        label: String = "rc2.ws.outbound",
+        maxQueuedBytes: Int = 1024 * 1024,
+        applicationWriter: @escaping @Sendable (Data) -> Bool,
+        controlWriter: @escaping @Sendable (UInt8, Data) -> Bool,
+        writeFailureClosingData: Data,
+        onTerminal: @escaping @Sendable (String) -> Void,
+        didSendTerminal: @escaping @Sendable () -> Void,
+        acceptedSubmissionHook: @escaping @Sendable () -> Void = {},
+        terminationAttemptHook: @escaping @Sendable () -> Void = {}
+    ) {
+        self.queue = DispatchQueue(label: label)
+        self.maxQueuedBytes = max(1, maxQueuedBytes)
+        self.applicationWriter = applicationWriter
+        self.controlWriter = controlWriter
+        self.writeFailureClosingData = writeFailureClosingData
+        self.onTerminal = onTerminal
+        self.didSendTerminal = didSendTerminal
+        self.acceptedSubmissionHook = acceptedSubmissionHook
+        self.terminationAttemptHook = terminationAttemptHook
+    }
+
+    convenience init(
         label: String = "rc2.ws.outbound",
         maxQueuedBytes: Int = 1024 * 1024,
         writer: @escaping @Sendable (Data) -> Bool,
         onClose: @escaping @Sendable (String) -> Void
     ) {
-        self.queue = DispatchQueue(label: label)
-        self.maxQueuedBytes = max(1, maxQueuedBytes)
-        self.writer = writer
-        self.onClose = onClose
+        self.init(
+            label: label,
+            maxQueuedBytes: maxQueuedBytes,
+            applicationWriter: writer,
+            controlWriter: { _, _ in true },
+            writeFailureClosingData: Data(),
+            onTerminal: onClose,
+            didSendTerminal: {}
+        )
     }
 
     var queuedByteCount: Int {
@@ -54,37 +94,125 @@ final class WebSocketOutboundQueue: @unchecked Sendable {
     }
 
     func enqueue(_ data: Data) -> EnqueueResult {
+        let result = enqueueApplication(data)
+        if result == .queueFull {
+            _ = terminate(errorData: nil, closingData: nil, reason: "queue_full")
+        }
+        return result
+    }
+
+    func enqueueApplication(_ data: Data) -> EnqueueResult {
         guard !data.isEmpty else { return .accepted }
         lock.lock()
-        if closed {
+        guard state == .open else {
             lock.unlock()
             return .closed
         }
         guard queuedBytes + data.count <= maxQueuedBytes else {
-            closed = true
+            state = .terminalReserved
             lock.unlock()
-            onClose("queue_full")
             return .queueFull
         }
         queuedBytes += data.count
+        acceptedSubmissionHook()
+        queue.async { [weak self] in self?.writeApplication(data) }
         lock.unlock()
-
-        queue.async { [weak self] in
-            guard let self else { return }
-            let ok = self.writer(data)
-            self.lock.lock()
-            self.queuedBytes = max(0, self.queuedBytes - data.count)
-            if !ok { self.closed = true }
-            self.lock.unlock()
-            if !ok {
-                self.onClose("write_failed")
-            }
-        }
         return .accepted
     }
 
+    func enqueueControl(opcode: UInt8, data: Data) -> EnqueueResult {
+        lock.lock()
+        guard state == .open else {
+            lock.unlock()
+            return .closed
+        }
+        acceptedSubmissionHook()
+        queue.async { [weak self] in self?.writeControl(opcode: opcode, data: data) }
+        lock.unlock()
+        return .accepted
+    }
+
+    @discardableResult
+    func terminate(errorData: Data?, closingData: Data?, reason: String) -> Bool {
+        terminationAttemptHook()
+        lock.lock()
+        guard state == .open || state == .terminalReserved else {
+            lock.unlock()
+            return false
+        }
+        state = .terminalQueued
+        lock.unlock()
+
+        onTerminal(reason)
+        queue.async { [weak self] in
+            guard let self, self.beginQueuedTerminalSend() else { return }
+            if let errorData { _ = self.controlWriter(0x1, errorData) }
+            if let closingData { _ = self.controlWriter(0x1, closingData) }
+            _ = self.controlWriter(0x8, Data())
+            self.didSendTerminal()
+        }
+        return true
+    }
+
+    func close() {
+        lock.lock()
+        if state == .open || state == .terminalReserved { state = .closed }
+        lock.unlock()
+    }
+
     func drain() {
+        finish()
+    }
+
+    func finish() {
         queue.sync {}
+    }
+
+    private func writeApplication(_ data: Data) {
+        guard shouldWriteQueuedItem() else {
+            removeQueuedBytes(data.count)
+            return
+        }
+        let succeeded = applicationWriter(data)
+        removeQueuedBytes(data.count)
+        if !succeeded { terminateImmediatelyAfterWriteFailure() }
+    }
+
+    private func writeControl(opcode: UInt8, data: Data) {
+        guard shouldWriteQueuedItem() else { return }
+        if !controlWriter(opcode, data) { terminateImmediatelyAfterWriteFailure() }
+    }
+
+    private func shouldWriteQueuedItem() -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        return state != .terminalSent && state != .closed
+    }
+
+    private func beginQueuedTerminalSend() -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard state == .terminalQueued else { return false }
+        state = .terminalSent
+        return true
+    }
+
+    private func removeQueuedBytes(_ count: Int) {
+        lock.lock()
+        queuedBytes = max(0, queuedBytes - count)
+        lock.unlock()
+    }
+
+    private func terminateImmediatelyAfterWriteFailure() {
+        lock.lock()
+        guard state != .terminalSent && state != .closed else {
+            lock.unlock()
+            return
+        }
+        state = .terminalSent
+        lock.unlock()
+        onTerminal("write_failed")
+        _ = controlWriter(0x1, writeFailureClosingData)
+        _ = controlWriter(0x8, Data())
+        didSendTerminal()
     }
 }
 

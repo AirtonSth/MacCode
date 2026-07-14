@@ -10,6 +10,7 @@ final class ConnectionLifecyclePhase0Tests: XCTestCase {
             port: port,
             loopbackOnly: true,
             dispatcher: JSONRPCDispatcher(router: FakeRouter()),
+            bootEpoch: 1,
             clientReceiveTimeoutSeconds: 5
         )
         try server.start()

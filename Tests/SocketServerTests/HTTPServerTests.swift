@@ -12,7 +12,7 @@ final class HTTPServerTests: XCTestCase {
     func test_health_and_discovery_loopback() throws {
         let port = UInt16.random(in: 33000...44000)
         let dispatcher = JSONRPCDispatcher(router: FakeRouter())
-        let s = DirectHTTPServer(port: port, loopbackOnly: true, dispatcher: dispatcher)
+        let s = DirectHTTPServer(port: port, loopbackOnly: true, dispatcher: dispatcher, bootEpoch: 1)
         try s.start()
         defer { s.stop() }
         // wait for accept thread
@@ -39,7 +39,7 @@ final class HTTPServerTests: XCTestCase {
     func test_rpc_route_dispatches_to_desktop_router() throws {
         let port = UInt16.random(in: 33000...44000)
         let dispatcher = JSONRPCDispatcher(router: FakeRouter())
-        let s = DirectHTTPServer(port: port, loopbackOnly: true, dispatcher: dispatcher)
+        let s = DirectHTTPServer(port: port, loopbackOnly: true, dispatcher: dispatcher, bootEpoch: 1)
         try s.start()
         defer { s.stop() }
         Thread.sleep(forTimeInterval: 0.05)
@@ -77,7 +77,7 @@ final class HTTPServerTests: XCTestCase {
 
         let port = UInt16.random(in: 33000...44000)
         let dispatcher = JSONRPCDispatcher(router: FakeRouter())
-        let s = DirectHTTPServer(port: port, loopbackOnly: true, dispatcher: dispatcher)
+        let s = DirectHTTPServer(port: port, loopbackOnly: true, dispatcher: dispatcher, bootEpoch: 1)
         try s.start()
         defer { s.stop() }
         Thread.sleep(forTimeInterval: 0.05)
@@ -105,7 +105,7 @@ final class HTTPServerTests: XCTestCase {
     func test_httpRejectsOversizedBodyFromContentLengthBeforeBodyRead() throws {
         let port = UInt16.random(in: 33000...44000)
         let dispatcher = JSONRPCDispatcher(router: FakeRouter())
-        let s = DirectHTTPServer(port: port, loopbackOnly: true, dispatcher: dispatcher)
+        let s = DirectHTTPServer(port: port, loopbackOnly: true, dispatcher: dispatcher, bootEpoch: 1)
         try s.start()
         defer { s.stop() }
         Thread.sleep(forTimeInterval: 0.05)
@@ -136,6 +136,7 @@ final class HTTPServerTests: XCTestCase {
             port: port,
             loopbackOnly: true,
             dispatcher: dispatcher,
+            bootEpoch: 1,
             clientReceiveTimeoutSeconds: 1
         )
         try s.start()
@@ -206,22 +207,102 @@ final class HTTPServerTests: XCTestCase {
         XCTAssertEqual(group.wait(timeout: .now() + 1), .success)
     }
 
-    func test_webSocketReceiveTimeoutOutlivesTheIOSKeepaliveCadence() {
-        let timeout = DirectHTTPServer.webSocketReceiveTimeoutSeconds(
-            requestTimeoutSeconds: 20,
-            heartbeatInterval: 20
+    func test_webSocketLivenessPolicyUsesCanonicalFiveAndTenSecondDeadlines() {
+        XCTAssertEqual(DirectHTTPServer.wsHeartbeatInterval, 5,
+                       "welcome must advertise the canonical RFC ping interval")
+        XCTAssertEqual(DirectHTTPServer.wsHeartbeatTimeout, 10,
+                       "a receive black hole must be detected within ten seconds")
+        XCTAssertGreaterThan(DirectHTTPServer.wsHeartbeatTimeout,
+                             DirectHTTPServer.wsHeartbeatInterval)
+        XCTAssertGreaterThan(DirectHTTPServer.wsSocketReadTimeout,
+                             DirectHTTPServer.wsHeartbeatTimeout,
+                             "socket read timeout is a fallback; matching RFC pong owns liveness")
+    }
+
+    func test_webSocketLiveness_requiresExactPongPayloadByTenSecondDeadline() {
+        let nonce = Data("server-nonce".utf8)
+        let state = WebSocketLivenessState(
+            now: 0,
+            interval: 5,
+            timeout: 10,
+            nonce: { nonce }
         )
 
-        XCTAssertGreaterThan(timeout, 25,
-                             "the host must not close a healthy socket before the next iOS keepalive ping")
-        XCTAssertEqual(timeout, 60)
-        XCTAssertEqual(
-            DirectHTTPServer.webSocketReceiveTimeoutSeconds(
-                requestTimeoutSeconds: 90,
-                heartbeatInterval: 20
-            ),
-            90,
-            "an explicitly longer operator timeout must remain authoritative"
+        XCTAssertEqual(state.nextAction(now: 4.99), .none)
+        XCTAssertEqual(state.nextAction(now: 5), .ping(nonce))
+        XCTAssertFalse(state.acceptPong(Data("wrong".utf8), now: 6),
+                       "an unrelated pong must not prove this connection is live")
+        XCTAssertEqual(state.nextAction(now: 9.99), .none)
+        XCTAssertEqual(state.nextAction(now: 10), .timedOut)
+
+        let late = WebSocketLivenessState(
+            now: 0,
+            interval: 5,
+            timeout: 10,
+            nonce: { nonce }
+        )
+        XCTAssertEqual(late.nextAction(now: 5), .ping(nonce))
+        XCTAssertFalse(late.acceptPong(nonce, now: 10),
+                       "a matching pong at or after the deadline must not revive the connection")
+        XCTAssertEqual(late.nextAction(now: 10), .timedOut)
+
+        let matched = WebSocketLivenessState(
+            now: 0,
+            interval: 5,
+            timeout: 10,
+            nonce: { nonce }
+        )
+        XCTAssertEqual(matched.nextAction(now: 5), .ping(nonce))
+        XCTAssertTrue(matched.acceptPong(nonce, now: 6))
+        XCTAssertEqual(matched.nextAction(now: 10.99), .none)
+        XCTAssertEqual(matched.nextAction(now: 11), .ping(nonce),
+                       "a matching pong resets proof and schedules the next server ping")
+    }
+
+    func test_connectionOutboundOwner_ordersAcceptedWorkThenTerminalAndRejectsLaterFrames() {
+        let recorded = RecordedFrames()
+        let owner = WebSocketOutboundQueue(
+            maxQueuedBytes: 1_024,
+            applicationWriter: { data in
+                recorded.append("app:\(String(decoding: data, as: UTF8.self))")
+                return true
+            },
+            controlWriter: { opcode, data in
+                recorded.append("control:\(opcode):\(String(decoding: data, as: UTF8.self))")
+                return true
+            },
+            writeFailureClosingData: Data("write-failure".utf8),
+            onTerminal: { reason in recorded.append("terminal:\(reason)") },
+            didSendTerminal: { recorded.append("shutdown") }
+        )
+
+        XCTAssertEqual(owner.enqueueApplication(Data("event-1".utf8)), .accepted)
+        XCTAssertTrue(owner.terminate(
+            errorData: Data("error".utf8),
+            closingData: Data("closing".utf8),
+            reason: "protocolError"
+        ))
+        XCTAssertEqual(owner.enqueueApplication(Data("event-too-late".utf8)), .closed)
+        owner.finish()
+
+        XCTAssertEqual(recorded.snapshot, [
+            "terminal:protocolError",
+            "app:event-1",
+            "control:1:error",
+            "control:1:closing",
+            "control:8:",
+            "shutdown",
+        ], "accepted work must complete before one terminal sequence; no event may follow closing")
+    }
+
+    func test_connectionOutboundOwner_concurrentTerminateCannotOvertakeAcceptedSubmission() {
+        assertConcurrentTerminateCannotOvertake(
+            expectedFirstFrame: "app:event",
+            submit: { $0.enqueueApplication(Data("event".utf8)) }
+        )
+        assertConcurrentTerminateCannotOvertake(
+            expectedFirstFrame: "control:9:ping",
+            submit: { $0.enqueueControl(opcode: 0x9, data: Data("ping".utf8)) }
         )
     }
 
@@ -371,5 +452,78 @@ final class HTTPServerTests: XCTestCase {
             if out.range(of: Data("\r\n\r\n".utf8)) != nil { break }
         }
         return String(decoding: out, as: UTF8.self)
+    }
+
+    private func assertConcurrentTerminateCannotOvertake(
+        expectedFirstFrame: String,
+        submit: @escaping @Sendable (WebSocketOutboundQueue) -> WebSocketOutboundQueue.EnqueueResult,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        let acceptanceReached = DispatchSemaphore(value: 0)
+        let terminationAttempted = DispatchSemaphore(value: 0)
+        let completed = DispatchGroup()
+        let recorded = RecordedFrames()
+        let owner = WebSocketOutboundQueue(
+            maxQueuedBytes: 1_024,
+            applicationWriter: { data in
+                recorded.append("app:\(String(decoding: data, as: UTF8.self))")
+                return true
+            },
+            controlWriter: { opcode, data in
+                recorded.append("control:\(opcode):\(String(decoding: data, as: UTF8.self))")
+                return true
+            },
+            writeFailureClosingData: Data(),
+            onTerminal: { _ in },
+            didSendTerminal: {},
+            acceptedSubmissionHook: {
+                acceptanceReached.signal()
+                if terminationAttempted.wait(timeout: .now() + 2) == .timedOut {
+                    recorded.append("termination-timeout")
+                }
+            },
+            terminationAttemptHook: { terminationAttempted.signal() }
+        )
+
+        completed.enter()
+        DispatchQueue.global().async {
+            if submit(owner) != .accepted { recorded.append("submission-rejected") }
+            completed.leave()
+        }
+        XCTAssertEqual(acceptanceReached.wait(timeout: .now() + 2), .success, file: file, line: line)
+
+        completed.enter()
+        DispatchQueue.global().async {
+            _ = owner.terminate(
+                errorData: nil,
+                closingData: Data("closing".utf8),
+                reason: "protocolError"
+            )
+            completed.leave()
+        }
+
+        XCTAssertEqual(completed.wait(timeout: .now() + 2), .success, file: file, line: line)
+        owner.finish()
+        XCTAssertEqual(recorded.snapshot, [
+            expectedFirstFrame,
+            "control:1:closing",
+            "control:8:",
+        ], "an accepted submission must enter the serial queue before a concurrent terminal sequence",
+           file: file, line: line)
+    }
+
+    private final class RecordedFrames: @unchecked Sendable {
+        private let lock = NSLock()
+        private var values: [String] = []
+
+        func append(_ value: String) {
+            lock.lock(); values.append(value); lock.unlock()
+        }
+
+        var snapshot: [String] {
+            lock.lock(); defer { lock.unlock() }
+            return values
+        }
     }
 }

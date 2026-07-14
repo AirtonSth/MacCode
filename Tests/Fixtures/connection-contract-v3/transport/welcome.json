@@ -5,12 +5,12 @@
   "hostId": "host-001",
   "bootEpoch": 42,
   "serverTimeEpochMs": 1784030400000,
-  "heartbeatIntervalMs": 15000,
-  "heartbeatTimeoutMs": 45000,
-  "eventCursor": 1042,
+  "heartbeatIntervalMs": 5000,
+  "heartbeatTimeoutMs": 10000,
+  "currentSequence": 1042,
+  "oldestReplaySequence": 900,
   "capabilities": [
     "events.replay",
-    "jsonrpc.batch",
-    "snapshot.v3"
+    "jsonrpc.batch"
   ]
 }

@@ -4,14 +4,10 @@ import Foundation
 import SocketServer
 
 /// Tests for the direct-access configuration surface of `AppDelegate`:
-/// `stableServerId` (T020), the Bonjour TXT record (T021), and the GAP-5
-/// auth-provider retention regression (T019).
+/// the Bonjour TXT record (T021) and the GAP-5 auth-provider retention
+/// regression (T019).
 ///
 /// WHY these matter:
-///   T020 — the server id is the identity the iOS client pins (RCA-022). If an
-///          empty persisted value were treated as valid, the pin would key on
-///          "" and every device would have to re-pair; if it were non-stable
-///          across launches the same break would happen on every restart.
 ///   T021 — the Bonjour TXT record is the *only* data the iOS client reads
 ///          before connecting. A dropped/renamed key makes this Mac silently
 ///          undiscoverable or mis-identified on the LAN.
@@ -21,54 +17,6 @@ import SocketServer
 ///          provider deallocates the instant launch returns and pairing AND the
 ///          LAN auth gate silently break. This file pins that ownership.
 final class DirectAccessConfigTests: XCTestCase {
-
-    // MARK: - T020: stableServerId pure decision (AppDelegate.swift:443-460)
-
-    func test_resolveServerId_returnsPersistedWhenPresent() {
-        // A non-empty persisted id must always win so the identity stays stable
-        // across launches (GAP-2): re-minting on each restart would force the
-        // iOS identity pin to invalidate and re-pair every time.
-        let result = AppDelegate.resolveServerId(persisted: "ABC-123", fresh: "FRESH-999")
-        XCTAssertEqual(result, "ABC-123",
-            "a non-empty persisted server_id must be reused verbatim; minting a " +
-            "fresh one despite a stored value would break the RCA-022 identity pin")
-    }
-
-    func test_resolveServerId_ignoresEmptyPersisted() {
-        // Empty string is NOT a valid identity. Treating "" as valid would pin
-        // the client to the empty id and silently break auth/identity matching.
-        let result = AppDelegate.resolveServerId(persisted: "", fresh: "FRESH-999")
-        XCTAssertEqual(result, "FRESH-999",
-            "an empty persisted value must be treated as missing so the caller " +
-            "mints a real id; keying identity on \"\" would silently break pairing")
-    }
-
-    func test_resolveServerId_ignoresNilPersisted() {
-        // No stored value yet (first launch) -> caller must mint a fresh id.
-        let result = AppDelegate.resolveServerId(persisted: nil, fresh: "FRESH-999")
-        XCTAssertEqual(result, "FRESH-999",
-            "with no persisted id the fresh mint must be used so a first launch " +
-            "still publishes a stable identity")
-    }
-
-    func test_resolveServerId_isDeterministicForSameInput() {
-        // Determinism: identical input must yield identical output, otherwise the
-        // published server id could differ between two reads in the same launch.
-        let a = AppDelegate.resolveServerId(persisted: "STABLE-ID", fresh: nil)
-        let b = AppDelegate.resolveServerId(persisted: "STABLE-ID", fresh: nil)
-        XCTAssertEqual(a, b, "same persisted input must resolve to the same id every time")
-        XCTAssertEqual(a, "STABLE-ID")
-    }
-
-    func test_resolveServerId_differsForDifferentInput() {
-        // Two different Macs (different persisted ids) must resolve to different
-        // ids so the iOS client can tell them apart on the same LAN.
-        let macA = AppDelegate.resolveServerId(persisted: "MAC-A", fresh: nil)
-        let macB = AppDelegate.resolveServerId(persisted: "MAC-B", fresh: nil)
-        XCTAssertNotEqual(macA, macB,
-            "distinct persisted ids must resolve distinctly so two Macs are not " +
-            "collapsed into one identity on the LAN")
-    }
 
     // MARK: - T021: Bonjour TXT record builder (AppDelegate.swift:1010-1024)
 

@@ -12,14 +12,16 @@ import CoreModel
 final class WebSocketIntegrationTests: XCTestCase {
 
     private func startServer(
-        heartbeatInterval: TimeInterval = DirectHTTPServer.wsHeartbeatInterval,
         clientReceiveTimeoutSeconds: Int = 20,
-        webSocketOutboundMaxQueuedBytes: Int = DirectHTTPServer.maxWebSocketOutboundQueuedBytes
+        webSocketOutboundMaxQueuedBytes: Int = DirectHTTPServer.maxWebSocketOutboundQueuedBytes,
+        serverId: String = "test-host",
+        bootEpoch: UInt64 = 42
     ) throws -> (DirectHTTPServer, UInt16) {
         let port = UInt16.random(in: 33000...44000)
         let server = DirectHTTPServer(port: port, loopbackOnly: true,
                                       dispatcher: JSONRPCDispatcher(router: FakeRouter()),
-                                      heartbeatInterval: heartbeatInterval,
+                                      serverId: serverId,
+                                      bootEpoch: bootEpoch,
                                       clientReceiveTimeoutSeconds: clientReceiveTimeoutSeconds,
                                       webSocketOutboundMaxQueuedBytes: webSocketOutboundMaxQueuedBytes)
         try server.start()
@@ -80,8 +82,23 @@ final class WebSocketIntegrationTests: XCTestCase {
         return condition()
     }
 
-    func testHeartbeatFrameFiresOverLiveWebSocket() async throws {
-        let (server, port) = try startServer(heartbeatInterval: 0.05)
+    private func object(from message: URLSessionWebSocketTask.Message) throws -> [String: Any] {
+        let data: Data
+        switch message {
+        case .data(let value): data = value
+        case .string(let value): data = Data(value.utf8)
+        @unknown default: throw TimeoutError.timedOut
+        }
+        return try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+    }
+
+    private func uniqueEventKind(_ prefix: String) -> String {
+        let suffix = UUID().uuidString.lowercased().replacingOccurrences(of: "-", with: "")
+        return "\(prefix).\(suffix)"
+    }
+
+    func test_CONN001_firstFrameIsCanonicalWelcomeBeforeReplay() async throws {
+        let (server, port) = try startServer()
         defer { server.stop() }
         try await Task.sleep(nanoseconds: 80_000_000)
 
@@ -89,26 +106,22 @@ final class WebSocketIntegrationTests: XCTestCase {
         let task = wsTask(port: port, sinceSeq: baseline)
         defer { task.cancel(with: .normalClosure, reason: nil) }
 
-        for _ in 0..<5 {
-            let message = try await receiveWithTimeout(task)
-            let data: Data
-            switch message {
-            case .data(let d): data = d
-            case .string(let s): data = Data(s.utf8)
-            @unknown default: continue
-            }
-            guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { continue }
-            if obj["type"] as? String == "heartbeat" {
-                XCTAssertNotNil(obj["ts"], "heartbeat frames must carry a timestamp for client freshness UI")
-                return
-            }
-        }
-        XCTFail("did not receive a heartbeat frame over the live WebSocket")
+        let obj = try object(from: await receiveWithTimeout(task))
+        XCTAssertEqual(obj["type"] as? String, "welcome",
+                       "the authenticated socket must establish v3 identity before replay or live events")
+        XCTAssertEqual(obj["protocolVersion"] as? Int, 3)
+        XCTAssertEqual(obj["hostId"] as? String, "test-host")
+        XCTAssertGreaterThan((obj["bootEpoch"] as? NSNumber)?.uint64Value ?? 0, 0)
+        XCTAssertNotNil(obj["connectionId"] as? String)
+        XCTAssertEqual((obj["currentSequence"] as? NSNumber)?.int64Value, baseline)
+        XCTAssertNotNil(obj["oldestReplaySequence"])
+        XCTAssertEqual((obj["heartbeatIntervalMs"] as? NSNumber)?.int64Value, 5_000)
+        XCTAssertEqual((obj["heartbeatTimeoutMs"] as? NSNumber)?.int64Value, 10_000)
+        XCTAssertEqual(obj["capabilities"] as? [String], ["events.replay", "jsonrpc.batch"])
     }
 
     func testWebSocketSendsImmediateFrameBeforeReceiveTimeout() async throws {
-        let (server, port) = try startServer(heartbeatInterval: 5,
-                                             clientReceiveTimeoutSeconds: 1)
+        let (server, port) = try startServer(clientReceiveTimeoutSeconds: 1)
         defer { server.stop() }
         try await Task.sleep(nanoseconds: 80_000_000)
 
@@ -125,19 +138,18 @@ final class WebSocketIntegrationTests: XCTestCase {
             return
         }
         let obj = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
-        XCTAssertEqual(obj["type"] as? String, "heartbeat",
-                       "iOS marks the connection live only after the first frame; the host must not wait for the periodic heartbeat and race the socket receive timeout.")
+        XCTAssertEqual(obj["type"] as? String, "welcome",
+                       "the host must send v3 identity immediately and before the receive timeout")
     }
 
-    func testWebSocketAnswersTheInitialIOSPingWhileReceivingTheImmediateHeartbeat() async throws {
-        let (server, port) = try startServer(heartbeatInterval: 5,
-                                             clientReceiveTimeoutSeconds: 5)
+    func testWebSocketAnswersTheInitialIOSPingWhileReceivingTheImmediateWelcome() async throws {
+        let (server, port) = try startServer(clientReceiveTimeoutSeconds: 5)
         defer { server.stop() }
         try await Task.sleep(nanoseconds: 80_000_000)
 
         let task = wsTask(port: port, sinceSeq: EventBus.shared.currentSeq)
         defer { task.cancel(with: .normalClosure, reason: nil) }
-        let heartbeat = expectation(description: "the receive pump drains the immediate heartbeat")
+        let welcome = expectation(description: "the receive pump drains the immediate welcome")
         let receiver = Task {
             var sawFirstMessage = false
             while !Task.isCancelled {
@@ -154,9 +166,9 @@ final class WebSocketIntegrationTests: XCTestCase {
                         return
                     }
                     let obj = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
-                    XCTAssertEqual(obj["type"] as? String, "heartbeat",
+                    XCTAssertEqual(obj["type"] as? String, "welcome",
                                    "the receive pump must preserve the first application frame")
-                    heartbeat.fulfill()
+                    welcome.fulfill()
                 } catch {
                     return
                 }
@@ -170,7 +182,176 @@ final class WebSocketIntegrationTests: XCTestCase {
             pong.fulfill()
         }
 
-        await fulfillment(of: [pong, heartbeat], timeout: 2)
+        await fulfillment(of: [pong, welcome], timeout: 2)
+    }
+
+    func test_CONN002_malformedOrUnknownClientEnvelope_failsClosedWithTypedErrorAndClosing() async throws {
+        for invalid in [
+            "{not-json",
+            #"{"protocolVersion":3,"type":"unknown","unexpected":true}"#,
+        ] {
+            let (server, port) = try startServer()
+            let task = wsTask(port: port, sinceSeq: EventBus.shared.currentSeq)
+            let welcome = try object(from: await receiveWithTimeout(task))
+            XCTAssertEqual(welcome["type"] as? String, "welcome")
+
+            try await task.send(.string(invalid))
+            let error = try object(from: await receiveWithTimeout(task))
+            XCTAssertEqual(error["type"] as? String, "error")
+            XCTAssertEqual(error["protocolVersion"] as? Int, 3)
+            XCTAssertEqual(error["code"] as? String, "protocolError")
+            XCTAssertEqual(error["retryable"] as? Bool, false)
+            XCTAssertNil(error["unexpected"], "safe protocol diagnostics must never echo unknown input fields")
+
+            let closing = try object(from: await receiveWithTimeout(task))
+            XCTAssertEqual(closing["type"] as? String, "closing")
+            XCTAssertEqual(closing["reason"] as? String, "protocolError")
+            XCTAssertEqual(closing["retryable"] as? Bool, false)
+            task.cancel(with: .normalClosure, reason: nil)
+            server.stop()
+        }
+    }
+
+    func test_CONN003_eventFrameUsesWelcomeOwnershipAndContiguousSequence() async throws {
+        let (server, port) = try startServer(serverId: "event-host")
+        defer { server.stop() }
+        let baseline = EventBus.shared.currentSeq
+        let task = wsTask(port: port, sinceSeq: baseline)
+        defer { task.cancel(with: .normalClosure, reason: nil) }
+
+        let welcome = try object(from: await receiveWithTimeout(task))
+        XCTAssertEqual(welcome["type"] as? String, "welcome")
+        let connectionId = try XCTUnwrap(welcome["connectionId"] as? String)
+        let bootEpoch = try XCTUnwrap((welcome["bootEpoch"] as? NSNumber)?.uint64Value)
+        let kind = uniqueEventKind("test.ws.typed_event")
+        EventBus.shared.publish(kind: kind, payload: .object(["value": .number(7)]))
+
+        let event = try await receiveEvent(task, kind: kind)
+        XCTAssertEqual(event["type"] as? String, "event")
+        XCTAssertEqual(event["protocolVersion"] as? Int, 3)
+        XCTAssertEqual(event["connectionId"] as? String, connectionId)
+        XCTAssertEqual(event["hostId"] as? String, "event-host")
+        XCTAssertEqual((event["bootEpoch"] as? NSNumber)?.uint64Value, bootEpoch)
+        XCTAssertEqual((event["sequence"] as? NSNumber)?.int64Value, baseline + 1)
+        XCTAssertNil(event["seq"], "v3 events must use the canonical sequence field")
+    }
+
+    func test_CONN005_welcomeExposesReplayWindowForGapDetection() async throws {
+        let (server, port) = try startServer()
+        defer { server.stop() }
+        EventBus.shared.publish(kind: "test.ws.replay_window", payload: .object([:]))
+        let expected = EventBus.shared.snapshot()
+        let task = wsTask(port: port, sinceSeq: expected.lastSeq)
+        defer { task.cancel(with: .normalClosure, reason: nil) }
+
+        let welcome = try object(from: await receiveWithTimeout(task))
+        XCTAssertEqual((welcome["currentSequence"] as? NSNumber)?.int64Value, expected.lastSeq)
+        XCTAssertEqual(
+            (welcome["oldestReplaySequence"] as? NSNumber)?.int64Value,
+            expected.recent.first?.seq ?? expected.lastSeq
+        )
+    }
+
+    func test_CONN006_simultaneousSocketsUseDistinctConnectionIDsWithOneHostEpoch() async throws {
+        let baselineSubscribers = EventBus.shared.subscriberCountForTests
+        let (server, port) = try startServer(serverId: "stable-host")
+        defer { server.stop() }
+
+        let first = wsTask(port: port, sinceSeq: EventBus.shared.currentSeq)
+        let second = wsTask(port: port, sinceSeq: EventBus.shared.currentSeq)
+        defer {
+            first.cancel(with: .normalClosure, reason: nil)
+            second.cancel(with: .normalClosure, reason: nil)
+        }
+        async let firstMessage = receiveWithTimeout(first)
+        async let secondMessage = receiveWithTimeout(second)
+        let firstWelcome = try object(from: await firstMessage)
+        let secondWelcome = try object(from: await secondMessage)
+        let firstConnection = try XCTUnwrap(firstWelcome["connectionId"] as? String)
+        let secondConnection = try XCTUnwrap(secondWelcome["connectionId"] as? String)
+        XCTAssertNotEqual(secondConnection, firstConnection,
+                          "connectionId must identify one physical socket, not the host process")
+        XCTAssertEqual(firstWelcome["hostId"] as? String, "stable-host")
+        XCTAssertEqual(secondWelcome["hostId"] as? String, "stable-host")
+        XCTAssertEqual(
+            (secondWelcome["bootEpoch"] as? NSNumber)?.uint64Value,
+            (firstWelcome["bootEpoch"] as? NSNumber)?.uint64Value
+        )
+
+        first.cancel(with: .normalClosure, reason: nil)
+        second.cancel(with: .normalClosure, reason: nil)
+        let cleanedUp = await waitUntil {
+            EventBus.shared.subscriberCountForTests == baselineSubscribers
+        }
+        XCTAssertTrue(cleanedUp)
+    }
+
+    func test_CONN006_controlledHostRestartKeepsHostIDAndChangesBootEpoch() async throws {
+        let (firstServer, firstPort) = try startServer(serverId: "restart-host", bootEpoch: 41)
+        let first = wsTask(port: firstPort, sinceSeq: EventBus.shared.currentSeq)
+        let firstWelcome = try object(from: await receiveWithTimeout(first))
+        first.cancel(with: .normalClosure, reason: nil)
+        firstServer.stop()
+
+        let (secondServer, secondPort) = try startServer(serverId: "restart-host", bootEpoch: 42)
+        defer { secondServer.stop() }
+        let second = wsTask(port: secondPort, sinceSeq: EventBus.shared.currentSeq)
+        defer { second.cancel(with: .normalClosure, reason: nil) }
+        let secondWelcome = try object(from: await receiveWithTimeout(second))
+
+        XCTAssertEqual(firstWelcome["hostId"] as? String, secondWelcome["hostId"] as? String)
+        XCTAssertEqual((firstWelcome["bootEpoch"] as? NSNumber)?.uint64Value, 41)
+        XCTAssertEqual((secondWelcome["bootEpoch"] as? NSNumber)?.uint64Value, 42,
+                       "a controlled process restart must publish the newly persisted boot epoch")
+    }
+
+    func test_CONN009_pingPongIsLivenessAuthorityAndWelcomeAdvertisesDeadline() async throws {
+        let (server, port) = try startServer()
+        defer { server.stop() }
+        let task = wsTask(port: port, sinceSeq: EventBus.shared.currentSeq)
+        defer { task.cancel(with: .normalClosure, reason: nil) }
+        let welcome = try object(from: await receiveWithTimeout(task))
+        XCTAssertGreaterThan((welcome["heartbeatTimeoutMs"] as? NSNumber)?.int64Value ?? 0, 0)
+        let receiver = Task {
+            while !Task.isCancelled {
+                do { _ = try await task.receive() } catch { return }
+            }
+        }
+        defer { receiver.cancel() }
+
+        let pong = expectation(description: "RFC ping receives pong")
+        task.sendPing { error in
+            XCTAssertNil(error)
+            pong.fulfill()
+        }
+        await fulfillment(of: [pong], timeout: 3)
+    }
+
+    func test_CONN009_typedHeartbeatFollowsWelcomeAndKeepsConnectionIdentity() async throws {
+        let (server, port) = try startServer()
+        defer { server.stop() }
+        let task = wsTask(port: port, sinceSeq: EventBus.shared.currentSeq)
+        defer { task.cancel(with: .normalClosure, reason: nil) }
+        let welcome = try object(from: await receiveWithTimeout(task))
+        XCTAssertEqual((welcome["heartbeatTimeoutMs"] as? NSNumber)?.int64Value, 10_000)
+        let connectionId = try XCTUnwrap(welcome["connectionId"] as? String)
+
+        let heartbeat = try object(from: await receiveWithTimeout(task, seconds: 6))
+        XCTAssertEqual(heartbeat["type"] as? String, "heartbeat")
+        XCTAssertEqual(heartbeat["connectionId"] as? String, connectionId)
+        XCTAssertEqual(heartbeat["hostId"] as? String, welcome["hostId"] as? String)
+        XCTAssertEqual(
+            (heartbeat["bootEpoch"] as? NSNumber)?.uint64Value,
+            (welcome["bootEpoch"] as? NSNumber)?.uint64Value
+        )
+        XCTAssertNotNil(heartbeat["lastReceivedSequence"])
+        XCTAssertNil(heartbeat["sequence"], "typed heartbeat is sequence-neutral")
+        XCTAssertFalse((heartbeat["nonce"] as? String)?.isEmpty ?? true)
+
+        let kind = uniqueEventKind("test.ws.after_heartbeat")
+        EventBus.shared.publish(kind: kind, payload: .object(["live": .bool(true)]))
+        let event = try await receiveEvent(task, kind: kind)
+        XCTAssertEqual(event["connectionId"] as? String, connectionId)
     }
 
     func testWebSocketCloseUnsubscribesEventBus() async throws {
@@ -193,7 +374,7 @@ final class WebSocketIntegrationTests: XCTestCase {
                       "closing a live WS task must unsubscribe from EventBus so repeated mobile reconnects do not leak subscribers")
     }
 
-    func testSlowClientQueueFullClosesLiveWebSocketWithServerClosePayload() async throws {
+    func testSlowClientQueueFullClosesLiveWebSocketWithTypedClosingFrame() async throws {
         let (server, port) = try startServer(webSocketOutboundMaxQueuedBytes: 128)
         defer { server.stop() }
         try await Task.sleep(nanoseconds: 80_000_000)
@@ -202,7 +383,7 @@ final class WebSocketIntegrationTests: XCTestCase {
         defer { task.cancel(with: .normalClosure, reason: nil) }
         try await Task.sleep(nanoseconds: 150_000_000)
 
-        let kind = "test.ws.queuefull.\(UUID().uuidString)"
+        let kind = uniqueEventKind("test.ws.queuefull")
         EventBus.shared.publish(kind: kind, payload: .object([
             "blob": .string(String(repeating: "x", count: 4_096))
         ]))
@@ -216,10 +397,10 @@ final class WebSocketIntegrationTests: XCTestCase {
             @unknown default: continue
             }
             guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { continue }
-            if obj["type"] as? String == "server_close" {
+            if obj["type"] as? String == "closing" {
                 XCTAssertEqual(obj["reason"] as? String, "queue_full",
                                "live WS slow-client close must carry the stable queue_full reason")
-                XCTAssertEqual(obj["action"] as? String, "reconnect_with_baseline",
+                XCTAssertEqual(obj["retryable"] as? Bool, true,
                                "client recovery must be explicit after a queue_full close")
                 let dropped = await waitUntil { server.wsTracker.slowClientDrops >= 1 }
                 XCTAssertTrue(dropped, "live queue_full close must increment slow-client diagnostics")
@@ -227,7 +408,7 @@ final class WebSocketIntegrationTests: XCTestCase {
             }
         }
 
-        XCTFail("live queue_full path must send a server_close frame before shutting down the socket")
+        XCTFail("live queue_full path must send a typed closing frame before shutting down the socket")
     }
 
     func testCompressionNegotiationDeliversDecodableEnvelope() async throws {
@@ -246,7 +427,7 @@ final class WebSocketIntegrationTests: XCTestCase {
 
         // A large, highly-compressible payload so the envelope is strictly smaller
         // than the raw frame (the server only sends a binary envelope when it wins).
-        let kind = "test.ws.compress.\(UUID().uuidString)"
+        let kind = uniqueEventKind("test.ws.compress")
         let big = String(repeating: "same visible state ", count: 400)
         EventBus.shared.publish(kind: kind, payload: .object(["blob": .string(big)]))
 
@@ -294,8 +475,8 @@ final class WebSocketIntegrationTests: XCTestCase {
         try await Task.sleep(nanoseconds: 150_000_000)
 
         // Publish a DROPPED diagnostic event first, then a KEPT critical event.
-        let droppedKind = "diagnostic.test.\(UUID().uuidString)"   // priority .diagnostic -> filtered out
-        let keptKind = "test.ws.critical.\(UUID().uuidString)"     // default -> .critical -> kept
+        let droppedKind = uniqueEventKind("diagnostic.test")   // priority .diagnostic -> filtered out
+        let keptKind = uniqueEventKind("test.ws.critical")     // default -> .critical -> kept
         EventBus.shared.publish(kind: droppedKind, payload: .object(["d": .bool(true)]))
         EventBus.shared.publish(kind: keptKind, payload: .object(["k": .bool(true)]))
 
@@ -333,15 +514,15 @@ final class WebSocketIntegrationTests: XCTestCase {
         let task = wsTask(port: port, sinceSeq: baseline)
         try await Task.sleep(nanoseconds: 150_000_000)   // let the upgrade + subscribe complete
 
-        let kind = "test.ws.roundtrip.\(UUID().uuidString)"
+        let kind = uniqueEventKind("test.ws.roundtrip")
         EventBus.shared.publish(kind: kind, payload: .object(["hello": .string("ws"), "n": .number(7)]))
 
         let obj = try await receiveEvent(task, kind: kind)
         let payload = obj["payload"] as? [String: Any]
         XCTAssertEqual(payload?["hello"] as? String, "ws",
                        "the live WS client must receive the exact payload published on EventBus after the handshake")
-        XCTAssertNotNil(obj["seq"], "delivered events must carry an ordering seq")
-        if let seq = (obj["seq"] as? NSNumber)?.int64Value {
+        XCTAssertNotNil(obj["sequence"], "delivered events must carry an ordering sequence")
+        if let seq = (obj["sequence"] as? NSNumber)?.int64Value {
             XCTAssertGreaterThan(seq, baseline, "delivered seq must be strictly after the subscribed-from baseline")
         }
 
@@ -356,14 +537,14 @@ final class WebSocketIntegrationTests: XCTestCase {
         // Event A is published BEFORE the client subscribes-from-head; it must NOT
         // be delivered. Event B is published after and MUST be. The baseline is
         // captured AFTER the stale publish, so the since-seq head sits past it.
-        let staleKind = "test.ws.stale.\(UUID().uuidString)"
+        let staleKind = uniqueEventKind("test.ws.stale")
         EventBus.shared.publish(kind: staleKind, payload: .object(["pre": .bool(true)]))
         let baseline = EventBus.shared.currentSeq
 
         let task = wsTask(port: port, sinceSeq: baseline)
         try await Task.sleep(nanoseconds: 150_000_000)
 
-        let freshKind = "test.ws.fresh.\(UUID().uuidString)"
+        let freshKind = uniqueEventKind("test.ws.fresh")
         EventBus.shared.publish(kind: freshKind, payload: .object(["post": .bool(true)]))
 
         // The first non-heartbeat event we see must be the fresh one -- if the stale

@@ -48,7 +48,7 @@ final class CellularDataOptimizationTests: XCTestCase {
         let router = FakeRouter()
         router.workspaces = (0..<40).map { Workspace.empty(name: "workspace-\($0)-\(String(repeating: "x", count: 40))", cwd: "/tmp/project-\($0)") }
         let dispatcher = JSONRPCDispatcher(router: router)
-        let server = DirectHTTPServer(port: port, loopbackOnly: true, dispatcher: dispatcher)
+        let server = DirectHTTPServer(port: port, loopbackOnly: true, dispatcher: dispatcher, bootEpoch: 1)
         try server.start()
         defer { server.stop() }
         Thread.sleep(forTimeInterval: 0.05)
@@ -88,7 +88,7 @@ final class CellularDataOptimizationTests: XCTestCase {
         let port = UInt16.random(in: 33000...44000)
         let router = FakeRouter()
         router.workspaces = [Workspace.empty(name: "compressed-request", cwd: "/tmp")]
-        let server = DirectHTTPServer(port: port, loopbackOnly: true, dispatcher: JSONRPCDispatcher(router: router))
+        let server = DirectHTTPServer(port: port, loopbackOnly: true, dispatcher: JSONRPCDispatcher(router: router), bootEpoch: 1)
         try server.start()
         defer { server.stop() }
         try await Task.sleep(nanoseconds: 50_000_000)

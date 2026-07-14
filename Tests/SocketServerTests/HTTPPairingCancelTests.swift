@@ -94,7 +94,7 @@ final class HTTPPairingCancelTests: XCTestCase {
         // strong reference for the server's lifetime.
         let auth = FakeAuth()
         let s = DirectHTTPServer(port: port, loopbackOnly: true,
-                                 dispatcher: JSONRPCDispatcher(router: FakeRouter()), auth: auth)
+                                 dispatcher: JSONRPCDispatcher(router: FakeRouter()), auth: auth, bootEpoch: 1)
         try s.start(); defer { s.stop() }
         let base = "http://127.0.0.1:\(port)"
         waitReady(base)
@@ -110,7 +110,7 @@ final class HTTPPairingCancelTests: XCTestCase {
         let port = UInt16.random(in: 33000...44000)
         let auth = FakeAuth()
         let s = DirectHTTPServer(port: port, loopbackOnly: true,
-                                 dispatcher: JSONRPCDispatcher(router: FakeRouter()), auth: auth)
+                                 dispatcher: JSONRPCDispatcher(router: FakeRouter()), auth: auth, bootEpoch: 1)
         try s.start(); defer { s.stop() }
         let base = "http://127.0.0.1:\(port)"
         waitReady(base)
@@ -136,7 +136,7 @@ final class HTTPPairingCancelTests: XCTestCase {
         // Hold a strong ref: DirectHTTPServer.auth is `weak` (see warmup note).
         let auth = FakeAuth()
         let s = DirectHTTPServer(port: port, loopbackOnly: true,
-                                 dispatcher: JSONRPCDispatcher(router: FakeRouter()), auth: auth)
+                                 dispatcher: JSONRPCDispatcher(router: FakeRouter()), auth: auth, bootEpoch: 1)
         try s.start(); defer { s.stop() }
         let base = "http://127.0.0.1:\(port)"
         waitReady(base)
@@ -152,7 +152,7 @@ final class HTTPPairingCancelTests: XCTestCase {
     func test_cancelWithoutAuthProvider_returns503() throws {
         let port = UInt16.random(in: 33000...44000)
         let s = DirectHTTPServer(port: port, loopbackOnly: true,
-                                 dispatcher: JSONRPCDispatcher(router: FakeRouter()), auth: nil)
+                                 dispatcher: JSONRPCDispatcher(router: FakeRouter()), auth: nil, bootEpoch: 1)
         try s.start(); defer { s.stop() }
         let base = "http://127.0.0.1:\(port)"
         // No auth -> /v1/pair warmup also 503; healthz still confirms ready.

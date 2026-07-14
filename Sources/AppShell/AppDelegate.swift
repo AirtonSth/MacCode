@@ -623,7 +623,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
             return
         }
         let remoteEnabled = (try? context.settingsRepo.get("remote_access_enabled")) ?? "0"
-        let serverId = stableServerId()
+        let serverId = context.liveActivityHostIdentity.serverId
         let port = DirectAccessConfiguration.port()
         if directAccessSupervisor == nil {
             directAccessSupervisor = DirectAccessLifecycleSupervisor(
@@ -660,7 +660,8 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         let loopbackOnly = !remoteEnabled
         let dispatcher = JSONRPCDispatcher(router: router)
         let http = DirectHTTPServer(port: port, loopbackOnly: loopbackOnly,
-                                    dispatcher: dispatcher, auth: auth, serverId: serverId)
+                                    dispatcher: dispatcher, auth: auth, serverId: serverId,
+                                    bootEpoch: context.liveActivityHostIdentity.bootEpoch)
         try http.start()
         httpServer = http
         try? Self.resolvePetServerFailure(
@@ -671,29 +672,6 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         if loopbackOnly {
             NSLog("Bonjour not published: remote access is disabled")
         }
-    }
-
-    /// GAP-2: a stable host identity persisted across launches so the
-    /// mobile client's identity pin (RCA-022) does not break on every
-    /// restart and force a re-pair.
-    private func stableServerId() -> String {
-        let persisted = (try? context.settingsRepo.get("server_id")) ?? nil
-        if let existing = Self.resolveServerId(persisted: persisted, fresh: nil) {
-            return existing
-        }
-        let fresh = UUID().uuidString
-        try? context.settingsRepo.set("server_id", fresh)
-        return fresh
-    }
-
-    /// Pure decision for `stableServerId` (GAP-2/T020). Returns the persisted
-    /// id only when it is present AND non-empty; otherwise nil to signal the
-    /// caller must mint+persist a fresh one. Empty-string must NOT be treated
-    /// as a valid id, or the identity pin (RCA-022) would key on "" and break.
-    /// `fresh` lets a test inject a deterministic mint value for the miss case.
-    nonisolated static func resolveServerId(persisted: String?, fresh: String?) -> String? {
-        if let persisted, !persisted.isEmpty { return persisted }
-        return fresh
     }
 
     /// Pure builder for the Bonjour TXT record (GAP-4/T021). Extracted so the

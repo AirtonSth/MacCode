@@ -85,6 +85,7 @@ public final class AppContext {
     public let turnCheckpointRepo: AgentTurnCheckpointRepository
     public let tokenSaverSavingsRepo: TokenSaverSavingsRepository
     public let privateNotificationBridge: PrivateNotificationBridge
+    public let liveActivityHostIdentity: LiveActivityHostIdentity
     public let liveActivityAcceptanceOutbox: LiveActivityAcceptanceOutbox
     public let liveActivitySyncCoordinator: LiveActivitySyncCoordinator
     public let tokenSaverDistillServiceController: TokenSaverDistillServiceController
@@ -183,6 +184,7 @@ public final class AppContext {
         )
         self.privateNotificationBridge = privateNotificationBridge
         let liveActivityIdentity = try LiveActivityIdentityStore.beginBoot(settings: self.settingsRepo)
+        self.liveActivityHostIdentity = liveActivityIdentity
         let settingsRepo = self.settingsRepo
         let liveActivityAcceptanceOutbox = LiveActivityAcceptanceOutbox(
             store: LiveActivityAcceptanceOutboxStore(settings: settingsRepo),

@@ -1,70 +1,14 @@
 import XCTest
 @testable import SocketServer
 
-/// Unit tests for the pure host-contract seams introduced in :22, :23.
+/// Unit tests for the pure host-contract seam introduced in :23.
 ///
 /// WHY: these seams are the authoritative source of the iOS↔macOS wire contract
-/// for WS close payloads and pairing error codes. Testing them in isolation
+/// for pairing error codes. Testing it in isolation
 /// means a regression (wrong code, missing field, renamed key) fails immediately
 /// without spinning up a live socket, so the iOS team can rely on the pinned
 /// shapes being stable.
 final class HostContractSeamsTests: XCTestCase {
-
-    // MARK: - :22  wsClosePayload
-
-    /// WHY: iOS reads `reason` to decide reconnect strategy. If `reason` is
-    /// absent or changes, the iOS slow-client recovery path silently breaks.
-    func test_wsClosePayload_preservesStableReasonField() {
-        let p = wsClosePayload(reason: "queue_full")
-        XCTAssertEqual(p["reason"] as? String, "queue_full",
-            "stable machine code 'reason' must be preserved so existing iOS parsers that read it continue working without a client-side change (additive contract)")
-    }
-
-    /// WHY: :22 contract requires a human-localizable `message` so iOS banner
-    /// copy does not show a raw jargon token. If the field is absent iOS must
-    /// fall back to a generic string, degrading UX.
-    func test_wsClosePayload_addsHumanMessageField() {
-        let p = wsClosePayload(reason: "queue_full")
-        let msg = p["message"] as? String
-        XCTAssertNotNil(msg, "message field must be present for iOS banner localisation (:22)")
-        XCTAssertFalse(msg?.isEmpty == true, "message must be non-empty")
-        // Must not be a raw token copy -- iOS shows this verbatim in UI.
-        XCTAssertNotEqual(msg, "queue_full",
-            "message must be a human sentence, not a copy of the machine reason token")
-    }
-
-    /// WHY: `type` and `action` are required so iOS can route the frame without
-    /// inspecting `reason`, and know what recovery to perform.
-    func test_wsClosePayload_hasTypeAndAction() {
-        let p = wsClosePayload(reason: "queue_full")
-        XCTAssertEqual(p["type"] as? String, "server_close",
-            "type field must be 'server_close' so iOS frame router does not need to inspect reason")
-        XCTAssertEqual(p["action"] as? String, "reconnect_with_baseline",
-            "action must be 'reconnect_with_baseline' so iOS knows to request a full state baseline on reconnect")
-    }
-
-    /// WHY: write_failed is the other real reason code emitted by
-    /// WebSocketOutboundQueue. It must also get a human message, not fall
-    /// through to the raw token.
-    func test_wsClosePayload_writeFailed_hasHumanMessage() {
-        let p = wsClosePayload(reason: "write_failed")
-        let msg = p["message"] as? String
-        XCTAssertNotNil(msg, "write_failed must also produce a human-readable message")
-        XCTAssertNotEqual(msg, "write_failed",
-            "write_failed message must be a human sentence, not the raw reason token")
-    }
-
-    /// WHY: unknown future reason codes must not crash or return an empty
-    /// message. The fallback interpolates the reason so support logs are still
-    /// useful even for codes added after this release.
-    func test_wsClosePayload_unknownReason_fallsBackGracefully() {
-        let p = wsClosePayload(reason: "future_code_xyz")
-        XCTAssertEqual(p["reason"] as? String, "future_code_xyz",
-            "unknown reason must still be forwarded as the machine code")
-        let msg = p["message"] as? String
-        XCTAssertNotNil(msg, "unknown reason must still produce a non-nil message")
-        XCTAssertFalse(msg?.isEmpty == true, "unknown reason message must be non-empty")
-    }
 
     // MARK: - :23  pairingErrorPayload
 

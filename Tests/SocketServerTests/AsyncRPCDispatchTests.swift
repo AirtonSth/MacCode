@@ -16,7 +16,8 @@ final class AsyncRPCDispatchTests: XCTestCase {
         // the pure async seam directly. We just need a constructed server.
         return DirectHTTPServer(port: UInt16.random(in: 33000...44000),
                                 loopbackOnly: true,
-                                dispatcher: dispatcher)
+                                dispatcher: dispatcher,
+                                bootEpoch: 1)
     }
 
     /// WHY: the /v1/rpc Task awaits exactly this method to produce the bytes
@@ -61,5 +62,126 @@ final class AsyncRPCDispatchTests: XCTestCase {
                        "unparseable bytes must map to the JSON-RPC parseError code")
         XCTAssertNil(obj?["result"],
                      "a parse failure must not also carry a result")
+        XCTAssertTrue(obj?.keys.contains("id") == true)
+        XCTAssertTrue(obj?["id"] is NSNull,
+                      "JSON-RPC parse failures must preserve the required id key as null")
+    }
+
+    @MainActor
+    func test_dispatchRPC_structurallyInvalidRequest_returnsInvalidRequestNotParseError() async throws {
+        let server = makeServer()
+        let bodies = [
+            #"{"jsonrpc":"1.0","id":"bad-version","method":"workspace.create","params":{}}"#,
+            #"{"jsonrpc":"2.0","method":"workspace.create","params":{}}"#,
+            #"{"jsonrpc":"2.0","id":"unknown-key","method":"workspace.create","params":{},"extra":true}"#,
+        ]
+
+        for body in bodies {
+            let response = await server.dispatchRPC(bodyData: Data(body.utf8))
+            let object = try XCTUnwrap(JSONSerialization.jsonObject(with: response) as? [String: Any])
+            let error = try XCTUnwrap(object["error"] as? [String: Any])
+            XCTAssertEqual(error["code"] as? Int, -32600,
+                           "valid JSON with an invalid JSON-RPC shape must return Invalid Request")
+        }
+    }
+
+    @MainActor
+    func test_dispatchRPC_nullID_isPreservedInSuccessfulResponse() async throws {
+        let server = makeServer()
+        let body = #"{"jsonrpc":"2.0","id":null,"method":"workspace.create","params":{"name":"null-id","cwd":"/tmp"}}"#
+
+        let response = await server.dispatchRPC(bodyData: Data(body.utf8))
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: response) as? [String: Any])
+
+        XCTAssertTrue(object.keys.contains("id"))
+        XCTAssertTrue(object["id"] is NSNull,
+                      "an explicit null request id must remain explicit for exact response correlation")
+        XCTAssertNotNil(object["result"])
+    }
+
+    @MainActor
+    func test_dispatchRPC_fractionalNumericID_roundTripsExactlyAndBooleanIDIsRejected() async throws {
+        let server = makeServer()
+        let fractional = await server.dispatchRPC(bodyData: Data(
+            #"{"jsonrpc":"2.0","id":1.5,"method":"workspace.create","params":{"name":"fractional","cwd":"/tmp"}}"#.utf8
+        ))
+        let fractionalObject = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: fractional) as? [String: Any]
+        )
+        XCTAssertEqual((fractionalObject["id"] as? NSNumber)?.doubleValue, 1.5,
+                       "finite numeric ids must preserve their exact wire value")
+        XCTAssertNotNil(fractionalObject["result"])
+
+        let boolean = await server.dispatchRPC(bodyData: Data(
+            #"{"jsonrpc":"2.0","id":true,"method":"workspace.create","params":{}}"#.utf8
+        ))
+        let booleanObject = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: boolean) as? [String: Any]
+        )
+        XCTAssertEqual((booleanObject["error"] as? [String: Any])?["code"] as? Int, -32600)
+        XCTAssertTrue(booleanObject["id"] is NSNull,
+                      "boolean ids must fail closed and must not masquerade as numeric ids")
+    }
+
+    @MainActor
+    func test_dispatchRPC_topLevelBatch_dispatchesEveryItemWithIndependentIDsAndErrors() async throws {
+        let server = makeServer()
+        let body = #"""
+        [
+          {"jsonrpc":"2.0","id":"one","method":"workspace.create","params":{"name":"one","cwd":"/tmp"}},
+          {"jsonrpc":"2.0","id":"bad","method":7,"params":{}},
+          {"jsonrpc":"2.0","id":"two","method":"workspace.create","params":{"name":"two","cwd":"/tmp"}}
+        ]
+        """#
+
+        let response = await server.dispatchRPC(bodyData: Data(body.utf8))
+        let items = try XCTUnwrap(JSONSerialization.jsonObject(with: response) as? [[String: Any]])
+        XCTAssertEqual(items.count, 3)
+        let byID = Dictionary(uniqueKeysWithValues: items.compactMap { item -> (String, [String: Any])? in
+            guard let id = item["id"] as? String else { return nil }
+            return (id, item)
+        })
+        XCTAssertNotNil(byID["one"]?["result"])
+        XCTAssertEqual((byID["bad"]?["error"] as? [String: Any])?["code"] as? Int, -32600)
+        XCTAssertNotNil(byID["two"]?["result"])
+    }
+
+    @MainActor
+    func test_dispatchRPC_emptyBatch_returnsInvalidRequestObject() async throws {
+        let response = await makeServer().dispatchRPC(bodyData: Data("[]".utf8))
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: response) as? [String: Any])
+        XCTAssertEqual((object["error"] as? [String: Any])?["code"] as? Int, -32600)
+        XCTAssertTrue(object["id"] is NSNull)
+    }
+
+    @MainActor
+    func test_dispatchRPC_duplicateBatchIDs_rejectsAmbiguousCorrelation() async throws {
+        let body = #"[{"jsonrpc":"2.0","id":1,"method":"system.ping"},{"jsonrpc":"2.0","id":1.0,"method":"system.ping"}]"#
+        let response = await makeServer().dispatchRPC(bodyData: Data(body.utf8))
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: response) as? [String: Any])
+        XCTAssertEqual((object["error"] as? [String: Any])?["code"] as? Int, -32600)
+        XCTAssertTrue(object["id"] is NSNull,
+                      "duplicate numeric ids must reject the batch before results become ambiguous")
+    }
+
+    @MainActor
+    func test_dispatchRPC_adjacentLargeIntegerBatchIDsRemainDistinctAndExact() async throws {
+        let body = #"[{"jsonrpc":"2.0","id":9007199254740992,"method":"system.ping"},{"jsonrpc":"2.0","id":9007199254740993,"method":"system.ping"}]"#
+        let response = await makeServer().dispatchRPC(bodyData: Data(body.utf8))
+        let items = try XCTUnwrap(JSONSerialization.jsonObject(with: response) as? [[String: Any]])
+
+        XCTAssertEqual(items.count, 2)
+        XCTAssertEqual((items[0]["id"] as? NSNumber)?.stringValue, "9007199254740992")
+        XCTAssertEqual((items[1]["id"] as? NSNumber)?.stringValue, "9007199254740993",
+                       "adjacent integers above Double's exact range must not collapse to one correlation id")
+
+        let duplicate = #"[{"jsonrpc":"2.0","id":9007199254740993,"method":"system.ping"},{"jsonrpc":"2.0","id":9007199254740993,"method":"system.ping"}]"#
+        let duplicateResponse = await makeServer().dispatchRPC(bodyData: Data(duplicate.utf8))
+        let duplicateObject = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: duplicateResponse) as? [String: Any]
+        )
+        XCTAssertEqual((duplicateObject["error"] as? [String: Any])?["code"] as? Int, -32600)
+        XCTAssertTrue(duplicateObject["id"] is NSNull,
+                      "an exact repeated large-integer id must still reject the batch")
     }
 }
