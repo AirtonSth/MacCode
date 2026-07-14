@@ -42,6 +42,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
     var authProviderIsRetained: Bool { authProvider != nil }
     private var bonjour: NetService?
     private let bonjourDelegate = BonjourDelegate()
+    private var directAccessSupervisor: DirectAccessLifecycleSupervisor?
     public var palette: CommandPalette?
     public var settings: SettingsWindowController?
     public private(set) var petController: PetController?
@@ -208,6 +209,18 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
                                                name: .rc2RemoteAccessSettingChanged, object: nil)
         NotificationCenter.default.addObserver(self, selector: #selector(keybindingsReloaded),
                                                name: .rc2KeybindingsReloaded, object: nil)
+        NSWorkspace.shared.notificationCenter.addObserver(
+            self,
+            selector: #selector(workspaceWillSleep),
+            name: NSWorkspace.willSleepNotification,
+            object: nil
+        )
+        NSWorkspace.shared.notificationCenter.addObserver(
+            self,
+            selector: #selector(workspaceDidWake),
+            name: NSWorkspace.didWakeNotification,
+            object: nil
+        )
         configureDirectAccess()
 
         palette = CommandPalette(router: router)
@@ -333,13 +346,14 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         stopPetController()
         stopLiveRuntimesForAppTermination()
         socketServer?.stop()
-        httpServer?.stop()
-        bonjour?.stop()
+        directAccessSupervisor?.shutdown()
+        directAccessSupervisor = nil
         providerSessionReaperTimer?.invalidate()
         ccrRetentionTimer?.invalidate()
         diagnosticsHeartbeatTimer?.invalidate()
         tokenSaverAccountUsageRefreshTimer?.invalidate()
         NotificationCenter.default.removeObserver(self)
+        NSWorkspace.shared.notificationCenter.removeObserver(self)
     }
 
     private func disableInsomniaForAppClose() {
@@ -514,6 +528,21 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         configureDirectAccess()
     }
 
+    @objc private func workspaceWillSleep() {
+        directAccessSupervisor?.suspend()
+    }
+
+    @objc private func workspaceDidWake() {
+        guard let context else { return }
+        let remoteEnabled = ((try? context.settingsRepo.get("remote_access_enabled")) ?? "0") == "1"
+        do {
+            try directAccessSupervisor?.resume(remoteEnabled: remoteEnabled)
+        } catch {
+            NSLog("Failed to restart HTTP server after wake: \(error)")
+            recordServerStartupFailure("HTTP server", reason: error.localizedDescription)
+        }
+    }
+
     /// Invoked when KeybindingsSettingsPane posts `.rc2KeybindingsReloaded`
     /// (file-watcher change or manual Reload). The cache is already invalidated
     /// by the pane before the post; re-running applyKeybindingOverride here
@@ -585,61 +614,64 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
     }
 
     private func configureDirectAccess() {
-        httpServer?.stop()
-        httpServer = nil
-        bonjour?.stop()
-        bonjour = nil
         // Clear previous HTTP failure state so re-configure starts fresh.
         serverStartupFailures.removeAll { $0.server == "HTTP server" }
 
-        guard let context, let router, let auth = localAuth else { return }
+        guard let context, router != nil, localAuth != nil else {
+            directAccessSupervisor?.shutdown()
+            directAccessSupervisor = nil
+            return
+        }
         let remoteEnabled = (try? context.settingsRepo.get("remote_access_enabled")) ?? "0"
-        let loopbackOnly = remoteEnabled != "1"
-        let dispatcher = JSONRPCDispatcher(router: router)
-        let serverId = stableServerId()
-        let http = DirectHTTPServer(port: 18217, loopbackOnly: loopbackOnly,
-                                    dispatcher: dispatcher, auth: auth, serverId: serverId)
-        do {
-            try http.start()
-            httpServer = http
-            try? Self.resolvePetServerFailure(
-                server: "HTTP server",
-                repository: NotificationRepository(db: context.db)
+        let serverId = context.liveActivityHostIdentity.serverId
+        let port = DirectAccessConfiguration.port()
+        if directAccessSupervisor == nil {
+            directAccessSupervisor = DirectAccessLifecycleSupervisor(
+                startServer: { [weak self] enabled in
+                    try self?.startDirectHTTPServer(remoteEnabled: enabled, serverId: serverId, port: port)
+                },
+                stopServer: { [weak self] in
+                    self?.httpServer?.stop()
+                    self?.httpServer = nil
+                },
+                publishBonjour: { [weak self] in
+                    self?.publishBonjour(serverId: serverId, port: port)
+                },
+                stopBonjour: { [weak self] in
+                    self?.bonjour?.stop()
+                    self?.bonjour = nil
+                },
+                retryLogger: { attempt, delay, error in
+                    let nsError = error as NSError
+                    NSLog("Direct HTTP retry scheduled attempt=\(attempt) delay=\(delay)s reason=\(nsError.domain):\(nsError.code)")
+                }
             )
-            NSLog("Direct HTTP server listening on \(loopbackOnly ? "127.0.0.1" : "0.0.0.0"):18217 (loopback=\(loopbackOnly))")
+        }
+        do {
+            try directAccessSupervisor?.configure(remoteEnabled: remoteEnabled == "1")
         } catch {
             NSLog("Failed to start HTTP server: \(error)")
             recordServerStartupFailure("HTTP server", reason: error.localizedDescription)
         }
+    }
 
+    private func startDirectHTTPServer(remoteEnabled: Bool, serverId: String, port: UInt16) throws {
+        guard let context, let router, let auth = localAuth else { return }
+        let loopbackOnly = !remoteEnabled
+        let dispatcher = JSONRPCDispatcher(router: router)
+        let http = DirectHTTPServer(port: port, loopbackOnly: loopbackOnly,
+                                    dispatcher: dispatcher, auth: auth, serverId: serverId,
+                                    bootEpoch: context.liveActivityHostIdentity.bootEpoch)
+        try http.start()
+        httpServer = http
+        try? Self.resolvePetServerFailure(
+            server: "HTTP server",
+            repository: NotificationRepository(db: context.db)
+        )
+        NSLog("Direct HTTP server listening on \(loopbackOnly ? "127.0.0.1" : "0.0.0.0"):\(port) (loopback=\(loopbackOnly))")
         if loopbackOnly {
             NSLog("Bonjour not published: remote access is disabled")
-        } else {
-            publishBonjour(serverId: serverId)
         }
-    }
-
-    /// GAP-2: a stable host identity persisted across launches so the
-    /// mobile client's identity pin (RCA-022) does not break on every
-    /// restart and force a re-pair.
-    private func stableServerId() -> String {
-        let persisted = (try? context.settingsRepo.get("server_id")) ?? nil
-        if let existing = Self.resolveServerId(persisted: persisted, fresh: nil) {
-            return existing
-        }
-        let fresh = UUID().uuidString
-        try? context.settingsRepo.set("server_id", fresh)
-        return fresh
-    }
-
-    /// Pure decision for `stableServerId` (GAP-2/T020). Returns the persisted
-    /// id only when it is present AND non-empty; otherwise nil to signal the
-    /// caller must mint+persist a fresh one. Empty-string must NOT be treated
-    /// as a valid id, or the identity pin (RCA-022) would key on "" and break.
-    /// `fresh` lets a test inject a deterministic mint value for the miss case.
-    nonisolated static func resolveServerId(persisted: String?, fresh: String?) -> String? {
-        if let persisted, !persisted.isEmpty { return persisted }
-        return fresh
     }
 
     /// Pure builder for the Bonjour TXT record (GAP-4/T021). Extracted so the
@@ -1302,15 +1334,15 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
     /// GAP-4: publish `_remotecode._tcp` so the iOS app can find this
     /// Mac on the LAN. TXT carries the stable identity + version so the
     /// client can show it before connecting.
-    private func publishBonjour(serverId: String) {
+    private func publishBonjour(serverId: String, port: UInt16) {
         let name = Host.current().localizedName ?? ProcessInfo.processInfo.hostName
-        let svc = NetService(domain: "", type: "_remotecode._tcp.", name: name, port: 18217)
+        let svc = NetService(domain: "", type: "_remotecode._tcp.", name: name, port: Int32(port))
         let txt = Self.bonjourTXTRecord(serverId: serverId, version: AppVersion.short)
         svc.setTXTRecord(NetService.data(fromTXTRecord: txt))
         svc.delegate = bonjourDelegate
         svc.publish()
         bonjour = svc
-        NSLog("Bonjour published: \(name) _remotecode._tcp:18217")
+        NSLog("Bonjour published: \(name) _remotecode._tcp:\(port)")
     }
 }
 

@@ -1,0 +1,10 @@
+{
+  "protocolVersion": 3,
+  "type": "heartbeat",
+  "connectionId": "connection-001",
+  "hostId": "host-001",
+  "bootEpoch": 42,
+  "sentAtEpochMs": 1784030415000,
+  "lastReceivedSequence": 1043,
+  "nonce": "heartbeat-001"
+}

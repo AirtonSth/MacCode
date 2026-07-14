@@ -3,12 +3,30 @@ import Foundation
 // Reuses the module-level `iso` ISO8601DateFormatter declared in Repositories.swift
 // (hoisted; no per-append allocation).
 
+enum EventRetentionPolicy {
+    static let cap = 5_000
+
+    /// Caller must own the surrounding transaction so its event write and both
+    /// retention deletes commit or roll back together. Receipt rows are permanent.
+    static func prune(db: SQLiteDB, cap: Int = cap) throws {
+        let boundedCap = max(0, cap)
+        try db.execute("""
+            DELETE FROM events
+            WHERE id <= (SELECT MAX(id) FROM events) - \(boundedCap);
+        """)
+        try db.execute("""
+            DELETE FROM command_receipt_events
+            WHERE NOT EXISTS (
+                SELECT 1 FROM events WHERE events.seq = command_receipt_events.seq
+            );
+        """)
+    }
+}
+
 public final class EventLogRepository {
     let db: SQLiteDB
-    // Prune runs every 256 appends. Max transient row count: cap + 255 = 5255.
-    private static let cap = 5000
-    private static let pruneInterval = 256
-    private var appendCount = 0
+    // Enforced after every append so the documented cap is never exceeded.
+    private static let cap = EventRetentionPolicy.cap
 
     public init(db: SQLiteDB) { self.db = db }
 
@@ -20,24 +38,19 @@ public final class EventLogRepository {
     }
 
     public func append(seq: Int64, kind: String, payloadJSON: String) throws {
-        let st = try db.prepare("""
-            INSERT INTO events(seq, kind, request_id, origin_client_id, payload_json, created_at)
-            VALUES(?, ?, NULL, NULL, ?, ?);
-        """)
-        try st.bind(1, seq)
-        try st.bind(2, kind)
-        try st.bind(3, payloadJSON)
-        try st.bind(4, iso.string(from: Date()))
-        _ = try st.step()
-        appendCount += 1
-        if appendCount % EventLogRepository.pruneInterval == 0 {
-            // Retain only the newest `cap` rows. Uses a correlated max-id subquery
-            // so SQLite can resolve the threshold with a single scan, avoiding the
-            // full anti-join of the NOT IN (...LIMIT) form.
-            try db.execute("""
-                DELETE FROM events
-                WHERE id <= (SELECT MAX(id) FROM events) - \(EventLogRepository.cap);
-            """)
+        try db.performSync { db in
+            try db.transaction {
+                let st = try db.prepare("""
+                    INSERT INTO events(seq, kind, request_id, origin_client_id, payload_json, created_at)
+                    VALUES(?, ?, NULL, NULL, ?, ?);
+                """)
+                try st.bind(1, seq)
+                try st.bind(2, kind)
+                try st.bind(3, payloadJSON)
+                try st.bind(4, iso.string(from: Date()))
+                _ = try st.step()
+                try EventRetentionPolicy.prune(db: db, cap: EventLogRepository.cap)
+            }
         }
     }
 

@@ -15,6 +15,9 @@ public func unixSocketListenerEventPayload(bound: Bool, path: String) -> [String
     ]
 }
 
+/// Same-user local IPC server. The filesystem socket is owner-only (`0600`),
+/// and requests intentionally use shared domain handlers without remote
+/// transport identity or durable transport receipts.
 public final class UnixSocketServer: @unchecked Sendable {
     private static let maxClientLineBytes = 1024 * 1024
 
@@ -65,6 +68,21 @@ public final class UnixSocketServer: @unchecked Sendable {
             }))
             throw NSError(domain: "RemoteCode.Socket", code: Int(errno), userInfo: [NSLocalizedDescriptionKey: "bind: \(msg)"])
         }
+        // Establish same-user scope before the socket begins listening. A
+        // permission failure is fatal; never expose the local IPC endpoint
+        // with permissions inherited from the process umask.
+        if chmod(socketPath, 0o600) < 0 {
+            let savedErrno = errno
+            let msg = String(cString: strerror(savedErrno))
+            close(listenFD)
+            listenFD = -1
+            unlink(socketPath)
+            throw NSError(
+                domain: "RemoteCode.Socket",
+                code: Int(savedErrno),
+                userInfo: [NSLocalizedDescriptionKey: "chmod: \(msg)"]
+            )
+        }
         if Darwin.listen(listenFD, 16) < 0 {
             let msg = String(cString: strerror(errno))
             close(listenFD)
@@ -77,8 +95,6 @@ public final class UnixSocketServer: @unchecked Sendable {
             }))
             throw NSError(domain: "RemoteCode.Socket", code: Int(errno), userInfo: [NSLocalizedDescriptionKey: "listen: \(msg)"])
         }
-        // tighten permissions
-        chmod(socketPath, 0o600)
         running = true
 
         let t = Thread { [weak self] in self?.acceptLoop() }
@@ -194,7 +210,7 @@ public final class UnixSocketServer: @unchecked Sendable {
             // happen on the main thread.
             DispatchQueue.main.async {
                 let task = Task { @MainActor in
-                    let resp = await self.dispatcher.dispatch(req)
+                    let resp = await self.dispatcher.dispatchLocalIPC(req)
                     slot.value = resp
                     semaphore.signal()
                 }

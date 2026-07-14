@@ -7,6 +7,54 @@ import Foundation
 public final class EventBus: @unchecked Sendable {
     public static let shared = EventBus()
 
+    public struct MutationEventIntent: Sendable, Equatable {
+        public let kind: String
+        public let payload: JSONValue
+        public let createdAt: Date
+
+        public init(kind: String, payload: JSONValue, createdAt: Date) {
+            self.kind = kind
+            self.payload = payload
+            self.createdAt = createdAt
+        }
+    }
+
+    public final class MutationEventSink: @unchecked Sendable {
+        fileprivate enum AppendResult {
+            case captured
+            case suppressed
+            case sealed
+        }
+
+        private let lock = NSLock()
+        private var intents: [MutationEventIntent] = []
+        private var sealed = false
+
+        public init() {}
+
+        fileprivate func append(
+            _ intent: MutationEventIntent,
+            captureEnabled: Bool
+        ) -> AppendResult {
+            lock.lock()
+            defer { lock.unlock() }
+            guard !sealed else { return .sealed }
+            guard captureEnabled else { return .suppressed }
+            intents.append(intent)
+            return .captured
+        }
+
+        public func seal() throws -> [MutationEventIntent] {
+            lock.lock()
+            defer { lock.unlock() }
+            sealed = true
+            return intents
+        }
+    }
+
+    @TaskLocal public static var activeMutationEventSink: MutationEventSink?
+    @TaskLocal public static var suppressMutationEventCapture = false
+
     public struct Event: Codable, Sendable {
         public let seq: Int64
         public let kind: String
@@ -19,9 +67,13 @@ public final class EventBus: @unchecked Sendable {
     }
 
     private let lock = NSLock()
+    private let snapshotBarrierLock = NSLock()
     private let deliveryQueue = DispatchQueue(label: "com.remotecode.eventbus.delivery")
     private let deliveryQueueKey = DispatchSpecificKey<UInt8>()
     private var lastSeq: Int64 = 0
+    private var domainRevisions = ConnectionDomainRevisions(
+        shell: 0, surfaces: 0, agentThreads: 0, browser: 0, files: 0
+    )
     private struct Subscriber {
         let filter: EventStreamFilter
         let handler: (Event) -> Void
@@ -61,6 +113,17 @@ public final class EventBus: @unchecked Sendable {
         public let requiresBaseline: Bool
     }
 
+    public struct SnapshotMetadata: Sendable, Equatable {
+        public let sequence: Int64
+        public let oldestReplaySequence: Int64
+        public let domainRevisions: ConnectionDomainRevisions
+    }
+
+    public struct SnapshotBarrierResult<Value> {
+        public let state: Value
+        public let metadata: SnapshotMetadata
+    }
+
     public init(
         recentLimit: Int = 512,
         recentByteLimit: Int = 2 * 1024 * 1024,
@@ -88,6 +151,20 @@ public final class EventBus: @unchecked Sendable {
     }
 
     public func publish(kind: String, payload: JSONValue) {
+        if let sink = Self.activeMutationEventSink {
+            lock.lock()
+            let createdAt = clock()
+            lock.unlock()
+            switch sink.append(
+                MutationEventIntent(kind: kind, payload: payload, createdAt: createdAt),
+                captureEnabled: !Self.suppressMutationEventCapture
+            ) {
+            case .captured, .suppressed:
+                return
+            case .sealed:
+                NSLog("[RC2.EventBus] late mutation event escaped sealed receipt sink: %@", kind)
+            }
+        }
         if DispatchQueue.getSpecific(key: deliveryQueueKey) != nil {
             deliveryQueue.async { [self] in publishSerialized(kind: kind, payload: payload) }
         } else {
@@ -95,21 +172,66 @@ public final class EventBus: @unchecked Sendable {
         }
     }
 
+    /// Serializes durable sequence allocation against every normal publisher.
+    /// The closure commits receipt/outcome/events while the EventBus sequence is
+    /// reserved; fanout and replay retention happen only after it returns.
+    public func commitPersistedEvents(
+        _ commit: (Int64) throws -> [Event]
+    ) throws -> [Event] {
+        precondition(DispatchQueue.getSpecific(key: deliveryQueueKey) == nil)
+        return try deliveryQueue.sync {
+            snapshotBarrierLock.lock()
+            let floor: Int64
+            lock.lock()
+            floor = lastSeq
+            lock.unlock()
+            do {
+                let events = try commit(floor)
+                var deliveries: [(Event, [Subscriber])] = []
+                lock.lock()
+                for event in events {
+                    precondition(event.seq > lastSeq)
+                    lastSeq = event.seq
+                    domainRevisions = Self.revisions(after: event, current: domainRevisions)
+                    if shouldRetainRecentEvent?(event) ?? true {
+                        retainRecent(event)
+                    }
+                    deliveries.append((event, subscribersSnapshot))
+                }
+                lock.unlock()
+                snapshotBarrierLock.unlock()
+                for (event, subscribers) in deliveries {
+                    for subscriber in subscribers {
+                        guard let mapped = subscriber.filter.map(event) else { continue }
+                        subscriber.handler(mapped)
+                    }
+                }
+                return events
+            } catch {
+                snapshotBarrierLock.unlock()
+                throw error
+            }
+        }
+    }
+
     private func publishSerialized(kind: String, payload: JSONValue) {
+        snapshotBarrierLock.lock()
         lock.lock()
         lastSeq += 1
         let ev = Event(seq: lastSeq, kind: kind, payload: payload, ts: clock().timeIntervalSince1970)
+        domainRevisions = Self.revisions(after: ev, current: domainRevisions)
         if shouldRetainRecentEvent?(ev) ?? true {
             retainRecent(ev)
         }
         let subs = subscribersSnapshot
         let p = persister
         lock.unlock()
-        p?(ev)
+        snapshotBarrierLock.unlock()
         for s in subs {
             guard let mapped = s.filter.map(ev) else { continue }
             s.handler(mapped)
         }
+        p?(ev)
     }
 
     public func reloadFromPersistence(lastSeq: Int64, recent: [Event]) {
@@ -149,6 +271,9 @@ public final class EventBus: @unchecked Sendable {
             self.recentBytes += bytes
         }
         self.recent.sort { $0.seq < $1.seq }
+        for event in self.recent {
+            domainRevisions = Self.revisions(after: event, current: domainRevisions)
+        }
         trimRecent()
         lock.unlock()
     }
@@ -161,6 +286,40 @@ public final class EventBus: @unchecked Sendable {
         return deliveryQueue.sync {
             subscribeSerialized(since: since, filter: filter, handler)
         }
+    }
+
+    /// Installs a subscriber and reports an expired replay cursor before any
+    /// future event can be delivered. The callback runs on the delivery queue,
+    /// so callers can enqueue baselineRequired ahead of the live stream.
+    @discardableResult
+    public func subscribeDetectingReplayExpiry(
+        since: Int64,
+        filter: EventStreamFilter = .full,
+        onReplayExpired: @escaping (SnapshotMetadata) -> Void,
+        _ handler: @escaping (Event) -> Void
+    ) -> UUID {
+        let register = { [self] in
+            lock.lock()
+            let metadata = snapshotMetadataLocked()
+            let replayFloor = replayFloorLocked()
+            let replayExpired = since < replayFloor
+            let subscriptionCursor = replayExpired ? lastSeq : since
+            let id = UUID()
+            subscribers[id] = Subscriber(filter: filter, handler: handler)
+            subscribersSnapshot = Array(subscribers.values)
+            let backlog = recent.compactMap { event -> Event? in
+                guard event.seq > subscriptionCursor else { return nil }
+                return filter.map(event)
+            }
+            lock.unlock()
+            if replayExpired { onReplayExpired(metadata) }
+            for event in backlog { handler(event) }
+            return id
+        }
+        if DispatchQueue.getSpecific(key: deliveryQueueKey) != nil {
+            return register()
+        }
+        return deliveryQueue.sync(execute: register)
     }
 
     /// Atomically captures the current sequence and installs a live subscriber.
@@ -220,22 +379,41 @@ public final class EventBus: @unchecked Sendable {
         return (lastSeq, recent)
     }
 
+    public func snapshotMetadata() -> SnapshotMetadata {
+        lock.lock(); defer { lock.unlock() }
+        return snapshotMetadataLocked()
+    }
+
+    public func withSnapshotBarrier<Value>(
+        _ readState: () throws -> Value
+    ) rethrows -> SnapshotBarrierResult<Value> {
+        snapshotBarrierLock.lock()
+        defer { snapshotBarrierLock.unlock() }
+        let state = try readState()
+        lock.lock()
+        let metadata = snapshotMetadataLocked()
+        lock.unlock()
+        return SnapshotBarrierResult(state: state, metadata: metadata)
+    }
+
     public func recentEvents(since: Int64, maxBytes: Int?) -> RecentEventsResult {
         lock.lock()
         let currentLastSeq = lastSeq
         let candidates = recent.filter { $0.seq > since }
+        let replayFloor = replayFloorLocked()
+        let replayExpired = since < replayFloor
         lock.unlock()
 
         guard let maxBytes, maxBytes > 0 else {
             return RecentEventsResult(lastSeq: currentLastSeq,
                                       events: candidates,
-                                      truncated: false,
-                                      requiresBaseline: false)
+                                      truncated: replayExpired,
+                                      requiresBaseline: replayExpired)
         }
 
         var selected: [Event] = []
         var used = 0
-        var truncated = false
+        var truncated = replayExpired
         for event in candidates {
             let size = encodedSize(event)
             if used + size > maxBytes {
@@ -249,6 +427,51 @@ public final class EventBus: @unchecked Sendable {
                                   events: selected,
                                   truncated: truncated,
                                   requiresBaseline: truncated)
+    }
+
+    private func snapshotMetadataLocked() -> SnapshotMetadata {
+        let replayFloor = replayFloorLocked()
+        return SnapshotMetadata(
+            sequence: lastSeq,
+            oldestReplaySequence: replayFloor < lastSeq ? replayFloor + 1 : lastSeq,
+            domainRevisions: domainRevisions
+        )
+    }
+
+    /// Returns the oldest cursor that can reach `lastSeq` using only a
+    /// contiguous suffix of retained events. A filtered or missing tail leaves
+    /// only `lastSeq` itself replayable.
+    private func replayFloorLocked() -> Int64 {
+        var floor = lastSeq
+        for event in recent.reversed() {
+            if event.seq > floor { continue }
+            guard event.seq == floor else { break }
+            guard floor > 0 else { break }
+            floor -= 1
+        }
+        return floor
+    }
+
+    private static func revisions(
+        after event: Event,
+        current: ConnectionDomainRevisions
+    ) -> ConnectionDomainRevisions {
+        let kind = event.kind
+        let shell = kind.hasPrefix("workspace.")
+            || kind.hasPrefix("window.")
+            || kind.hasPrefix("pane.")
+            || kind == "settings.updated"
+        let surfaces = kind.hasPrefix("surface.") || kind.hasPrefix("pane.")
+        let agentThreads = kind.hasPrefix("agent.")
+        let browser = kind.hasPrefix("browser.") || kind == "surface.browser"
+        let files = kind.hasPrefix("files.") || kind.hasPrefix("fs.")
+        return ConnectionDomainRevisions(
+            shell: shell ? max(current.shell, event.seq) : current.shell,
+            surfaces: surfaces ? max(current.surfaces, event.seq) : current.surfaces,
+            agentThreads: agentThreads ? max(current.agentThreads, event.seq) : current.agentThreads,
+            browser: browser ? max(current.browser, event.seq) : current.browser,
+            files: files ? max(current.files, event.seq) : current.files
+        )
     }
 
     private func retainRecent(_ ev: Event) {

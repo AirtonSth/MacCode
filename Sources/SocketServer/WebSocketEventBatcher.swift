@@ -31,6 +31,7 @@ final class WebSocketEventBatcher: @unchecked Sendable {
     // Nil-key (cross-kind) batch state
     private var nilKeyQueue: [Data] = []
     private var nilKeyScheduled = false
+    private var stopped = false
 
     init(enabled: Bool,
          filter: EventStreamFilter,
@@ -47,11 +48,15 @@ final class WebSocketEventBatcher: @unchecked Sendable {
     func enqueue(event: EventBus.Event, data: Data) {
         guard enabled else {
             guard coalescesStreamingDeltas else {
-                queue.async { self.send(data) }
+                queue.async {
+                    guard !self.stopped else { return }
+                    self.send(data)
+                }
                 return
             }
             if Self.fullStreamCoalescedKinds.contains(event.kind) {
                 queue.async {
+                    guard !self.stopped else { return }
                     self.nilKeyQueue.append(data)
                     guard !self.nilKeyScheduled else { return }
                     self.nilKeyScheduled = true
@@ -63,6 +68,7 @@ final class WebSocketEventBatcher: @unchecked Sendable {
                 // Non-delta: append after any buffered deltas (order preserved)
                 // and flush NOW so interactive events pay zero added latency.
                 queue.async {
+                    guard !self.stopped else { return }
                     self.nilKeyQueue.append(data)
                     self.flushLocked()
                 }
@@ -72,6 +78,7 @@ final class WebSocketEventBatcher: @unchecked Sendable {
 
         if let key = filter.coalescingKey(for: event) {
             queue.async {
+                guard !self.stopped else { return }
                 if self.pending[key] == nil {
                     self.order.append(key)
                 }
@@ -86,6 +93,7 @@ final class WebSocketEventBatcher: @unchecked Sendable {
             // No coalescing key: buffer for the short cross-kind window so
             // bursts of mixed events coalesce into fewer frames.
             queue.async {
+                guard !self.stopped else { return }
                 self.nilKeyQueue.append(data)
                 guard !self.nilKeyScheduled else { return }
                 self.nilKeyScheduled = true
@@ -102,7 +110,19 @@ final class WebSocketEventBatcher: @unchecked Sendable {
         }
     }
 
+    func stop() {
+        queue.sync {
+            stopped = true
+            scheduled = false
+            nilKeyScheduled = false
+            pending.removeAll(keepingCapacity: false)
+            order.removeAll(keepingCapacity: false)
+            nilKeyQueue.removeAll(keepingCapacity: false)
+        }
+    }
+
     private func flushLocked() {
+        guard !stopped else { return }
         scheduled = false
         nilKeyScheduled = false
 
@@ -131,8 +151,9 @@ final class WebSocketEventBatcher: @unchecked Sendable {
 
     /// Pure helper: given a sequence of (key, data, relativeTimestamp) tuples,
     /// returns the flush groups that a batcher with `window` would produce.
-    /// A group is the set of unique data values flushed together: keyed entries
-    /// coalesce (last write wins per key), nil-key entries accumulate in order.
+    /// A group contains every frame in arrival order. Keyed last-write-wins
+    /// coalescing is intentionally disabled because it can remove sequence
+    /// numbers and reorder mixed event streams.
     /// Events with t <= window are in the first group; events with t > window
     /// start the next group. This models a single-timer flush per window.
     ///
@@ -146,22 +167,11 @@ final class WebSocketEventBatcher: @unchecked Sendable {
 
         var groups: [[Data]] = []
         var windowStart = events[0].t
-        // Keyed state within the current window
-        var keyedOrder: [String] = []
-        var keyedPending: [String: Data] = [:]
-        // Nil-key state within the current window
-        var nilKeyBuf: [Data] = []
+        var frames: [Data] = []
 
         func flushWindow() {
-            var group: [Data] = []
-            for k in keyedOrder {
-                if let d = keyedPending[k] { group.append(d) }
-            }
-            group.append(contentsOf: nilKeyBuf)
-            if !group.isEmpty { groups.append(group) }
-            keyedOrder.removeAll(keepingCapacity: true)
-            keyedPending.removeAll(keepingCapacity: true)
-            nilKeyBuf.removeAll(keepingCapacity: true)
+            if !frames.isEmpty { groups.append(frames) }
+            frames.removeAll(keepingCapacity: true)
         }
 
         for ev in events {
@@ -169,12 +179,7 @@ final class WebSocketEventBatcher: @unchecked Sendable {
                 flushWindow()
                 windowStart = ev.t
             }
-            if let key = ev.key {
-                if keyedPending[key] == nil { keyedOrder.append(key) }
-                keyedPending[key] = ev.data
-            } else {
-                nilKeyBuf.append(ev.data)
-            }
+            frames.append(ev.data)
         }
         flushWindow()
         return groups

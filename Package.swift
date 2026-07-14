@@ -174,7 +174,10 @@ let package = Package(
         .testTarget(
             name: "SocketServerTests",
             dependencies: ["SocketServer", "CoreModel", "Persistence"],
-            path: "Tests/SocketServerTests"
+            path: "Tests/SocketServerTests",
+            resources: [
+                .copy("Fixtures")
+            ]
         ),
         .testTarget(
             name: "SurfacesTests",

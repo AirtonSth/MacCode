@@ -764,7 +764,7 @@ public final class SettingsViewModel: ObservableObject {
             // Build the QR payload immediately after minting the code.
             // host: prefer the persisted server_id's companion host if stored;
             // fall back to ProcessInfo hostname which is always available on macOS.
-            // port: 18217 is the sole production HTTP listener port (AppDelegate:510).
+            // Keep pairing on the same listener port as AppDelegate/Bonjour.
             // server_id: read from settingsRepo — same key AppDelegate writes on first start.
             // WHY: encoding these alongside the code means iOS can open the TCP
             // connection without any manual IP entry.
@@ -773,7 +773,7 @@ public final class SettingsViewModel: ObservableObject {
             pairingQRPayload = PairingQRPayload.buildPayload(
                 code: pc.code,
                 host: host,
-                port: 18217,
+                port: DirectAccessConfiguration.port(),
                 serverId: serverId
             )
         } catch {
@@ -1190,7 +1190,7 @@ public struct SettingsView: View {
                     .foregroundColor(DS.Palette.danger)
                     .accessibilityIdentifier("settings.remoteAccess.bindFailedNote")
             } else {
-                Text("Off binds the host API to 127.0.0.1. On binds to 0.0.0.0:18217 and publishes Bonjour; paired-device tokens are still required.")
+                Text("Off binds the host API to 127.0.0.1. On binds to 0.0.0.0:\(DirectAccessConfiguration.port()) and publishes Bonjour; paired-device tokens are still required.")
                     .font(DS.Font.caption)
                     .foregroundColor(DS.Palette.textTertiary)
             }

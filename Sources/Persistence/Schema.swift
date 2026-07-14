@@ -9,7 +9,7 @@ public struct SchemaStep {
 }
 
 public enum Schema {
-    public static let currentVersion: Int = 31
+    public static let currentVersion: Int = 33
 
     public static let steps: [SchemaStep] = [
         SchemaStep(1, """
@@ -461,6 +461,36 @@ public enum Schema {
         CREATE INDEX IF NOT EXISTS idx_shared_memory_blocks_hash ON shared_memory_blocks(content_hash);
         CREATE INDEX IF NOT EXISTS idx_shared_memory_blocks_handle ON shared_memory_blocks(reversible_handle);
         CREATE INDEX IF NOT EXISTS idx_shared_memory_blocks_access ON shared_memory_blocks(last_access_ms);
+        """),
+        SchemaStep(32, """
+        ALTER TABLE command_receipts ADD COLUMN owner_fingerprint TEXT;
+        ALTER TABLE command_receipts ADD COLUMN params_hash TEXT;
+        ALTER TABLE command_receipts ADD COLUMN state TEXT;
+        ALTER TABLE command_receipts ADD COLUMN updated_at TEXT;
+        """),
+        SchemaStep(33, """
+        ALTER TABLE command_receipts ADD COLUMN event_start_seq INTEGER;
+        ALTER TABLE command_receipts ADD COLUMN event_end_seq INTEGER;
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_events_unique_seq ON events(seq);
+        CREATE TABLE IF NOT EXISTS event_sequence (
+            singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+            last_seq INTEGER NOT NULL
+        );
+        INSERT OR IGNORE INTO event_sequence(singleton, last_seq)
+        VALUES(1, (SELECT COALESCE(MAX(seq), 0) FROM events));
+        UPDATE event_sequence
+        SET last_seq = MAX(last_seq, (SELECT COALESCE(MAX(seq), 0) FROM events))
+        WHERE singleton = 1;
+        CREATE TABLE IF NOT EXISTS command_receipt_events (
+            method TEXT NOT NULL,
+            client_request_id TEXT NOT NULL,
+            ordinal INTEGER NOT NULL,
+            seq INTEGER NOT NULL UNIQUE,
+            PRIMARY KEY(method, client_request_id, ordinal),
+            FOREIGN KEY(method, client_request_id)
+                REFERENCES command_receipts(method, client_request_id)
+                ON DELETE CASCADE
+        );
         """)
     ]
 

@@ -102,15 +102,15 @@ final class HTTPPairingTests: XCTestCase {
     func test_aaa_dispatchRPCSeam_dispatchesRoundTrip() async throws {
         let dispatcher = JSONRPCDispatcher(router: FakeRouter())
         let s = DirectHTTPServer(port: UInt16.random(in: 33000...44000), loopbackOnly: true,
-                                 dispatcher: dispatcher, auth: FakeAuth())
+                                 dispatcher: dispatcher, auth: FakeAuth(), bootEpoch: 1)
         // No start() needed: dispatchRPC(bodyData:) is a pure in-process call.
-        let body = Data("{\"jsonrpc\":\"2.0\",\"id\":\"warmup\",\"method\":\"workspace.create\",\"params\":{\"name\":\"seam\",\"cwd\":\"/tmp\"}}".utf8)
+        let body = Data("{\"jsonrpc\":\"2.0\",\"id\":\"warmup\",\"method\":\"workspace.list\",\"params\":{}}".utf8)
         let respData = await s.dispatchRPC(bodyData: body)
         let obj = (try? JSONSerialization.jsonObject(with: respData)) as? [String: Any]
         XCTAssertEqual(obj?["id"] as? String, "warmup",
                        "dispatchRPC seam must round-trip the request id to the dispatcher response, proving the seam reaches the router")
         XCTAssertNil(obj?["error"],
-                     "a well-formed workspace.create request through the dispatchRPC seam must not produce an RPC error")
+                     "a read-only request through the dispatchRPC seam must not require remote mutation identity")
     }
 
     @MainActor
@@ -118,7 +118,7 @@ final class HTTPPairingTests: XCTestCase {
         let port = UInt16.random(in: 33000...44000)
         let auth = FakeAuth()
         let s = DirectHTTPServer(port: port, loopbackOnly: true,
-                                 dispatcher: JSONRPCDispatcher(router: FakeRouter()), auth: auth)
+                                 dispatcher: JSONRPCDispatcher(router: FakeRouter()), auth: auth, bootEpoch: 1)
         try s.start(); defer { s.stop() }
         let base = "http://127.0.0.1:\(port)"
         waitReady(base)
@@ -143,7 +143,7 @@ final class HTTPPairingTests: XCTestCase {
         let port = UInt16.random(in: 33000...44000)
         let auth = FakeAuth()
         let s = DirectHTTPServer(port: port, loopbackOnly: true,
-                                 dispatcher: JSONRPCDispatcher(router: FakeRouter()), auth: auth)
+                                 dispatcher: JSONRPCDispatcher(router: FakeRouter()), auth: auth, bootEpoch: 1)
         try s.start(); defer { s.stop() }
         let base = "http://127.0.0.1:\(port)"
         waitReady(base)
@@ -163,7 +163,7 @@ final class HTTPPairingTests: XCTestCase {
         let port = UInt16.random(in: 33000...44000)
         let auth = FakeAuth()
         let s = DirectHTTPServer(port: port, loopbackOnly: true,
-                                 dispatcher: JSONRPCDispatcher(router: FakeRouter()), auth: auth)
+                                 dispatcher: JSONRPCDispatcher(router: FakeRouter()), auth: auth, bootEpoch: 1)
         try s.start(); defer { s.stop() }
         let base = "http://127.0.0.1:\(port)"
         waitReady(base)
@@ -183,7 +183,7 @@ final class HTTPPairingTests: XCTestCase {
         let port = UInt16.random(in: 33000...44000)
         let auth = FakeAuth(); auth.autoApprove = false
         let s = DirectHTTPServer(port: port, loopbackOnly: true,
-                                 dispatcher: JSONRPCDispatcher(router: FakeRouter()), auth: auth)
+                                 dispatcher: JSONRPCDispatcher(router: FakeRouter()), auth: auth, bootEpoch: 1)
         try s.start(); defer { s.stop() }
         let base = "http://127.0.0.1:\(port)"
         waitReady(base)

@@ -49,6 +49,7 @@ public final class Bootstrap {
             try FileManager.default.createDirectory(at: supportURL, withIntermediateDirectories: true)
             createdAS = true
         }
+        try Self.setPermissions(0o700, at: supportURL.path)
         touched.append(supportURL.path)
         let dbPath = dbPathOverride ?? supportURL.appendingPathComponent("remotecode.sqlite").path
         let firstRun = !FileManager.default.fileExists(atPath: dbPath)
@@ -56,6 +57,7 @@ public final class Bootstrap {
 
         do {
             let db = try openAndMigrate(dbPath: dbPath)
+            try Self.hardenDatabaseFamily(at: dbPath)
             return (BootstrapReport(
                 createdAppSupport: createdAS,
                 createdSchema: firstRun,
@@ -77,6 +79,7 @@ public final class Bootstrap {
                 }
             }
             let db = try openAndMigrate(dbPath: dbPath)
+            try Self.hardenDatabaseFamily(at: dbPath)
             return (BootstrapReport(
                 createdAppSupport: createdAS,
                 createdSchema: true,
@@ -92,6 +95,8 @@ public final class Bootstrap {
     private func openAndMigrate(dbPath: String) throws -> SQLiteDB {
         let db = try SQLiteDB(path: dbPath)
         try Schema.migrate(db)
+        try db.enableFullDurability()
+        try CommandReceiptRepository(db: db).recoverInterruptedClaims()
         try initDefaults(db: db)
         return db
     }
@@ -142,5 +147,19 @@ public final class Bootstrap {
             try st.bind(3, now)
             _ = try st.step()
         }
+    }
+
+    private static func hardenDatabaseFamily(at databasePath: String) throws {
+        for path in [databasePath, databasePath + "-wal", databasePath + "-shm"]
+        where FileManager.default.fileExists(atPath: path) {
+            try setPermissions(0o600, at: path)
+        }
+    }
+
+    private static func setPermissions(_ permissions: Int, at path: String) throws {
+        try FileManager.default.setAttributes(
+            [.posixPermissions: NSNumber(value: permissions)],
+            ofItemAtPath: path
+        )
     }
 }

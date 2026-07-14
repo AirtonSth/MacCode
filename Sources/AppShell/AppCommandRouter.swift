@@ -50,7 +50,7 @@ private struct ProviderProbeCapabilities {
 /// Bridges the JSON-RPC dispatcher to the in-process domain state plus the
 /// concrete Surface views. Lives on the main actor because it mutates UI.
 @MainActor
-public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, LayoutEventSuppressionRouting {
+public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, LayoutEventSuppressionRouting, NotificationEventPublishingRouting, ConnectionSnapshotRouting, CommandReceiptStateRouting {
     typealias SSHCommandRunner = @Sendable (String, [String], String?) throws -> (exitCode: Int32, output: String)
 
     private static let minimizedPaneVisibilityThreshold = 0.08
@@ -442,6 +442,112 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             else { ws.metadata.removeValue(forKey: "busy") }
             return ws
         }
+    }
+
+    public func readConnectionSnapshotState() throws -> ConnectionSnapshotReadState {
+        guard let ctx = context else {
+            return ConnectionSnapshotReadState(
+                selectedWorkspaceId: nil,
+                workspaces: [],
+                surfaces: [],
+                agentThreads: [],
+                browserStates: [],
+                filesStates: []
+            )
+        }
+        let workspaceIDs = ctx.state.window.workspaces
+        let workspaces = workspaceIDs.compactMap { ctx.state.workspaces[$0] }
+        let threads = try ctx.threadRepo.list(workspaceId: nil)
+        var surfaceGroups: [ConnectionSnapshotWorkspaceItems] = []
+        var threadGroups: [ConnectionSnapshotWorkspaceItems] = []
+        var browserStates: [ConnectionSnapshotSurfaceState] = []
+        var filesStates: [ConnectionSnapshotSurfaceState] = []
+
+        for workspace in workspaces {
+            var descriptors: [SurfaceDescriptor] = []
+            forEachSurface(in: workspace.layout) { descriptors.append($0) }
+            surfaceGroups.append(ConnectionSnapshotWorkspaceItems(
+                workspaceId: workspace.id.value.uuidString,
+                items: descriptors.map(Self.connectionSnapshotSurface)
+            ))
+            let workspaceThreads = threads
+                .filter { $0.workspaceId == workspace.id }
+                .sorted { $0.id.value.uuidString < $1.id.value.uuidString }
+            threadGroups.append(ConnectionSnapshotWorkspaceItems(
+                workspaceId: workspace.id.value.uuidString,
+                items: workspaceThreads.map(Self.connectionSnapshotThread)
+            ))
+
+            for descriptor in descriptors {
+                switch descriptor.type {
+                case .browser:
+                    let url = (try? browserSurface(descriptor.id).currentURL())
+                        ?? descriptor.metadata["url"]
+                        ?? ""
+                    browserStates.append(ConnectionSnapshotSurfaceState(
+                        workspaceId: workspace.id.value.uuidString,
+                        surfaceId: descriptor.id.value.uuidString,
+                        state: .object(["url": .string(url)])
+                    ))
+                case .files:
+                    let stored = decodeFilesState(descriptor.metadata["files_state"])
+                    let stableState = stored ?? [
+                        "surface_id": .string(descriptor.id.value.uuidString),
+                        "workspace_id": .string(workspace.id.value.uuidString),
+                        "selected_path": descriptor.metadata["selected_path"].map(JSONValue.string) ?? .null,
+                        "revision": .number(Double(
+                            descriptor.metadata["files_state_revision"].flatMap(Int.init) ?? 0
+                        )),
+                    ]
+                    filesStates.append(ConnectionSnapshotSurfaceState(
+                        workspaceId: workspace.id.value.uuidString,
+                        surfaceId: descriptor.id.value.uuidString,
+                        state: .object(stableState)
+                    ))
+                case .terminal, .ssh, .agentApp, .markdown, .filePreview, .rightSidebarTool:
+                    break
+                }
+            }
+        }
+
+        return ConnectionSnapshotReadState(
+            selectedWorkspaceId: ctx.state.window.selectedWorkspaceID?.value.uuidString,
+            workspaces: workspaces.map(Self.connectionSnapshotWorkspace),
+            surfaces: surfaceGroups,
+            agentThreads: threadGroups,
+            browserStates: browserStates,
+            filesStates: filesStates
+        )
+    }
+
+    nonisolated private static func connectionSnapshotJSON<T: Encodable>(_ value: T) -> JSONValue {
+        guard let data = try? JSONEncoder().encode(value),
+              let object = try? JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed]) else {
+            return .null
+        }
+        return JSONValue.from(object)
+    }
+
+    nonisolated private static func connectionSnapshotWorkspace(_ workspace: Workspace) -> JSONValue {
+        guard case .object(var object) = connectionSnapshotJSON(workspace) else { return .null }
+        object["id"] = .string(workspace.id.value.uuidString)
+        return .object(object)
+    }
+
+    nonisolated private static func connectionSnapshotSurface(_ surface: SurfaceDescriptor) -> JSONValue {
+        guard case .object(var object) = connectionSnapshotJSON(surface) else { return .null }
+        object["id"] = .string(surface.id.value.uuidString)
+        object["type"] = .string(surface.type.rawValue)
+        return .object(object)
+    }
+
+    nonisolated private static func connectionSnapshotThread(_ thread: AgentThread) -> JSONValue {
+        guard case .object(var object) = connectionSnapshotJSON(thread) else { return .null }
+        object["id"] = .string(thread.id.value.uuidString)
+        object["workspaceId"] = thread.workspaceId
+            .map { .string($0.value.uuidString) }
+            ?? .null
+        return .object(object)
     }
 
     public func isWorkspaceBusy(_ id: WorkspaceID) -> Bool {
@@ -1931,6 +2037,121 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         try? ctx.commandReceiptRepo.record(method: method, clientRequestId: clientRequestId, resultJSON: json)
     }
 
+    public func claimCommandReceipt(
+        method: String,
+        clientRequestId: String,
+        ownerFingerprint: String,
+        paramsHash: String
+    ) throws -> CommandReceiptClaimResult {
+        guard let context else { throw LayoutError.workspaceNotFound }
+        return try context.commandReceiptRepo.claim(
+            method: method,
+            clientRequestId: clientRequestId,
+            ownerFingerprint: ownerFingerprint,
+            paramsHash: paramsHash
+        )
+    }
+
+    public func commitCommandReceipt(
+        method: String,
+        clientRequestId: String,
+        ownerFingerprint: String,
+        paramsHash: String,
+        result: JSONValue
+    ) throws {
+        guard let context else { throw LayoutError.workspaceNotFound }
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        let data = try encoder.encode(result)
+        guard let json = String(data: data, encoding: .utf8) else {
+            throw JSONRPCError.internalError
+        }
+        try context.commandReceiptRepo.commit(
+            method: method,
+            clientRequestId: clientRequestId,
+            ownerFingerprint: ownerFingerprint,
+            paramsHash: paramsHash,
+            resultJSON: json
+        )
+    }
+
+    public func finalizeCommandReceipt(
+        method: String,
+        clientRequestId: String,
+        ownerFingerprint: String,
+        paramsHash: String,
+        result: JSONValue,
+        events: [EventBus.MutationEventIntent],
+        minimumEventSequence: Int64
+    ) throws -> [EventBus.Event] {
+        guard let context else { throw LayoutError.workspaceNotFound }
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        let resultData = try encoder.encode(result)
+        guard let resultJSON = String(data: resultData, encoding: .utf8) else {
+            throw JSONRPCError.internalError
+        }
+        let intents = try events.map { event -> CommandReceiptEventIntent in
+            let payloadData = try encoder.encode(event.payload)
+            guard let payloadJSON = String(data: payloadData, encoding: .utf8) else {
+                throw JSONRPCError.internalError
+            }
+            return CommandReceiptEventIntent(
+                kind: event.kind,
+                payloadJSON: payloadJSON,
+                createdAt: event.createdAt
+            )
+        }
+        let persisted = try context.commandReceiptRepo.finalize(
+            method: method,
+            clientRequestId: clientRequestId,
+            ownerFingerprint: ownerFingerprint,
+            paramsHash: paramsHash,
+            resultJSON: resultJSON,
+            events: intents,
+            minimumEventSequence: minimumEventSequence
+        )
+        return try persisted.map { event in
+            guard let payloadData = event.payloadJSON.data(using: .utf8) else {
+                throw JSONRPCError.internalError
+            }
+            return EventBus.Event(
+                seq: event.seq,
+                kind: event.kind,
+                payload: try JSONDecoder().decode(JSONValue.self, from: payloadData),
+                ts: event.createdAt.timeIntervalSince1970
+            )
+        }
+    }
+
+    public func markCommandReceiptUnknown(
+        method: String,
+        clientRequestId: String,
+        ownerFingerprint: String,
+        paramsHash: String
+    ) throws {
+        guard let context else { throw LayoutError.workspaceNotFound }
+        try context.commandReceiptRepo.markUnknown(
+            method: method,
+            clientRequestId: clientRequestId,
+            ownerFingerprint: ownerFingerprint,
+            paramsHash: paramsHash
+        )
+    }
+
+    public func commandReceiptStatus(
+        method: String,
+        clientRequestId: String,
+        ownerFingerprint: String
+    ) throws -> CommandReceiptStatusResult {
+        guard let context else { throw LayoutError.workspaceNotFound }
+        return try context.commandReceiptRepo.status(
+            method: method,
+            clientRequestId: clientRequestId,
+            ownerFingerprint: ownerFingerprint
+        )
+    }
+
     public func respondAgentRequest(thread: AgentThreadID, requestId: String, response: AgentProviderRequestResponse) async throws {
         guard let ctx = context else { throw LayoutError.workspaceNotFound }
         let state: AssistantRequestState = {
@@ -2909,18 +3130,79 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         EventBus.shared.publish(kind: "notification.dismissed", payload: .object(["id": .string(id)]))
     }
 
-    public func privatePushTokenUpdate(pushToken: String, pushTokenType: String, liveActivityToken: String?, deviceID: String?) throws -> JSONValue {
+    public func privatePushTokenUpdate(
+        pushToken: String,
+        pushTokenType: String,
+        liveActivityToken: String?,
+        deviceID: String?,
+        tokenPurpose: String? = nil,
+        environment: String? = nil,
+        serverID: String? = nil,
+        bootEpoch: Int? = nil,
+        activityGeneration: Int? = nil,
+        activityID: String? = nil,
+        activitySessionID: String? = nil,
+        registrationRevision: Int? = nil,
+        contractVersion: Int? = nil,
+        capabilities: [String]? = nil
+    ) throws -> JSONValue {
         guard let ctx = context else { throw LayoutError.workspaceNotFound }
-        PrivatePushTargetStore(repo: ctx.settingsRepo).save(
+        let store = PrivatePushTargetStore(repo: ctx.settingsRepo)
+        var ownership: LiveActivityTokenOwnership?
+        if let tokenPurpose,
+           let purpose = PrivatePushTokenPurpose(rawValue: tokenPurpose),
+           let environment,
+           let pushEnvironment = PrivatePushEnvironment(rawValue: environment),
+           let deviceID,
+           let serverID {
+            let token = purpose == .alert ? pushToken : (liveActivityToken ?? pushToken)
+            let target = PrivatePushTargetRecord(
+                deviceId: deviceID,
+                serverId: serverID,
+                purpose: purpose,
+                environment: pushEnvironment,
+                token: token,
+                activityGeneration: activityGeneration.flatMap { $0 >= 0 ? UInt64($0) : nil },
+                activityId: activityID,
+                bootEpoch: bootEpoch.flatMap { $0 >= 0 ? UInt64($0) : nil },
+                activitySessionId: activitySessionID,
+                contractVersion: contractVersion ?? 1,
+                capabilities: capabilities
+            )
+            if target.supportsLiveActivityV2 {
+                let bound = try ctx.liveActivitySyncCoordinator.submitTokenRegistration(target)
+                guard purpose != .activityUpdate || bound.ownership != nil else {
+                    throw LiveActivityTokenBindingError.unknownAuthoritativeScope
+                }
+                try store.upsert(bound)
+                ownership = bound.ownership
+            } else {
+                try store.upsert(target)
+            }
+        }
+        store.save(
             pushToken: pushToken,
             pushTokenType: pushTokenType,
             liveActivityToken: liveActivityToken,
             deviceId: deviceID
         )
-        return .object([
+        var result: [String: JSONValue] = [
             "ok": .bool(true),
             "push_token_type": .string(pushTokenType)
-        ])
+        ]
+        if let registrationRevision {
+            result["registration_revision"] = .number(Double(registrationRevision))
+        }
+        if let ownership {
+            result["ownership"] = .object([
+                "activity_id": .string(ownership.activityId),
+                "host_id": .string(ownership.hostId),
+                "boot_epoch": .number(Double(ownership.bootEpoch)),
+                "activity_generation": .number(Double(ownership.activityGeneration)),
+                "activity_session_id": .string(ownership.activitySessionId)
+            ])
+        }
+        return .object(result)
     }
 
     public func settingsGet(keys: [String]) throws -> [String: String] {

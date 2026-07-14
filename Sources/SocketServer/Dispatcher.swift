@@ -164,7 +164,22 @@ public protocol CommandRouting: AnyObject {
     func notificationList(workspaceId: WorkspaceID?, unreadOnly: Bool) throws -> [[String: JSONValue]]
     func notificationMarkRead(id: String) throws
     func notificationDismiss(id: String) throws
-    func privatePushTokenUpdate(pushToken: String, pushTokenType: String, liveActivityToken: String?, deviceID: String?) throws -> JSONValue
+    func privatePushTokenUpdate(
+        pushToken: String,
+        pushTokenType: String,
+        liveActivityToken: String?,
+        deviceID: String?,
+        tokenPurpose: String?,
+        environment: String?,
+        serverID: String?,
+        bootEpoch: Int?,
+        activityGeneration: Int?,
+        activityID: String?,
+        activitySessionID: String?,
+        registrationRevision: Int?,
+        contractVersion: Int?,
+        capabilities: [String]?
+    ) throws -> JSONValue
     // settings
     func settingsGet(keys: [String]) throws -> [String: String]
     func settingsSet(key: String, value: String) throws
@@ -231,6 +246,10 @@ public protocol TerminalCommandRouting: AnyObject {
 public protocol LayoutEventSuppressionRouting: AnyObject {
     func withSuppressedLayoutEvents<T>(_ body: () throws -> T) rethrows -> T
 }
+
+/// Marker for domain routers that already publish the canonical notification
+/// projection events. Test/minimal routers omit it and use Dispatcher fallback.
+public protocol NotificationEventPublishingRouting: AnyObject {}
 
 /// Bounded idempotency cache with insertion-order eviction (oldest-first) and TTL.
 /// - `cap`: maximum number of entries before the oldest is dropped.
@@ -315,10 +334,147 @@ public func coalescePairingRequest(
 @MainActor
 public final class JSONRPCDispatcher {
     let router: CommandRouting
+    public nonisolated let commandReceiptMetrics: CommandReceiptMetrics
     private var volatileCommandReceipts = BoundedReceiptCache()
-    public init(router: CommandRouting) { self.router = router }
+    @TaskLocal private static var centralMutationExecution = false
+    private var volatileUnknownReceipts: [String: (ownerFingerprint: String, paramsHash: String)] = [:]
+    public nonisolated static let hostMutationMethods = HostMutationContract.methods
+    private nonisolated static let durableSynchronousMutationMethods: Set<String> = [
+        "workspace.create",
+        "workspace.select",
+        "workspace.close",
+        "workspace.rename",
+        "workspace.set_description",
+        "workspace.set_color",
+        "workspace.set_pinned",
+        "workspace.reorder",
+        "workspace.move_to_window",
+        "window.create",
+        "window.close",
+        "window.focus",
+        "pane.resize",
+        "pane.swap",
+        "surface.create",
+        "surface.close",
+        "surface.focus",
+        "surface.move",
+        "surface.rename",
+        "surface.reorder",
+        "surface.set_color",
+        "surface.split",
+        "surface.clear_history",
+        "surface.send_key",
+        "surface.send_text",
+        "fs.workspace.create_file",
+        "fs.workspace.delete",
+        "fs.workspace.rename",
+        "files.edit.open",
+        "files.edit.apply_patch",
+        "files.edit.save",
+        "files.edit.discard",
+        "files.edit.close",
+        "files.state.update",
+        "files.tab.open",
+        "files.tab.split",
+        "notification.create",
+        "notification.dismiss",
+        "notification.mark_read",
+        "settings.set",
+        "private.push_token.update",
+        "project.open_in_editor",
+        "git.checkout",
+        "git.commit",
+        "git.create_branch",
+        "git.deliver",
+        "git.push",
+        "ssh.connect",
+        "ssh.disconnect",
+        "ssh.host.upsert",
+        "ssh.host.delete",
+        "ssh.transfer.upload",
+        "ssh.transfer.download",
+        "project.run_script",
+        "agent.open",
+        "agent.thread.create",
+        "agent.thread.prepare_pr",
+        "agent.thread.rollback",
+        "agent.thread.delete",
+        "agent.thread.delete_many",
+        "agent.thread.rename",
+        "agent.thread.set_pinned",
+        "agent.thread.set_color",
+        "agent.thread.reorder",
+        "agent.thread.configure",
+        "agent.thread.execution.configure",
+        "agent.thread.mark_read",
+        "agent.thread.select",
+        "browser.navigate",
+        "browser.back",
+        "browser.forward",
+        "browser.reload",
+        "browser.click",
+        "browser.fill",
+        "browser.type",
+        "browser.focus",
+        "browser.hover",
+        "browser.check",
+        "browser.uncheck",
+        "browser.select",
+        "browser.eval",
+        "browser.screenshot",
+        "browser.mirror_url.get",
+        "agent.message.send",
+        "agent.message.queue.cancel",
+        "agent.message.queue.force_now",
+        "agent.message.queue.reorder",
+        "agent.message.queue.update",
+        "agent.run.continue",
+        "agent.run.stop",
+        "agent.request.respond",
+        "agent.user_input.respond",
+        "agent.plan.implement",
+        "agent.plan.save",
+        "agent.plan.notes.save",
+        "agent.checkpoint.revert",
+        "agent.attachment.upload",
+        "agent.provider.update",
+    ]
+    private nonisolated static let canonicalImmediateEventMethods: Set<String> = [
+        "agent.message.send",
+        "agent.message.queue.cancel",
+        "agent.message.queue.force_now",
+        "agent.message.queue.reorder",
+        "agent.message.queue.update",
+        "agent.run.continue",
+        "agent.run.stop",
+        "agent.request.respond",
+        "agent.user_input.respond",
+        "agent.plan.implement",
+        "agent.plan.save",
+        "agent.plan.notes.save",
+        "agent.checkpoint.revert",
+        "agent.attachment.upload",
+        "agent.provider.update",
+    ]
+    public init(
+        router: CommandRouting,
+        commandReceiptMetrics: CommandReceiptMetrics = CommandReceiptMetrics()
+    ) {
+        self.router = router
+        self.commandReceiptMetrics = commandReceiptMetrics
+    }
+
+    func readConnectionSnapshot() throws -> EventBus.SnapshotBarrierResult<ConnectionSnapshotReadState> {
+        guard let snapshotRouter = router as? ConnectionSnapshotRouting else {
+            throw JSONRPCError.notSupported("sync.snapshot")
+        }
+        return try EventBus.shared.withSnapshotBarrier {
+            try snapshotRouter.readConnectionSnapshotState()
+        }
+    }
 
     private func commandReceipt(method: String, params: [String: JSONValue]) -> (String, JSONValue)? {
+        guard !Self.centralMutationExecution else { return nil }
         guard let receiptKey = params["client_request_id"]?.stringValue else { return nil }
         if let durable = router.commandReceipt(method: method, clientRequestId: receiptKey) {
             return (receiptKey, durable)
@@ -330,6 +486,7 @@ public final class JSONRPCDispatcher {
     }
 
     private func recordCommandReceipt(method: String, clientRequestId: String?, result: JSONValue) {
+        guard !Self.centralMutationExecution else { return }
         guard let clientRequestId else { return }
         volatileCommandReceipts.insert(key: "\(method):\(clientRequestId)", value: result)
         router.recordCommandReceipt(method: method, clientRequestId: clientRequestId, result: result)
@@ -340,6 +497,89 @@ public final class JSONRPCDispatcher {
             return try suppressingRouter.withSuppressedLayoutEvents(body)
         }
         return try body()
+    }
+
+    private func publishCanonicalImmediateEvent(
+        method: String,
+        params: [String: JSONValue],
+        result: JSONValue
+    ) {
+        func string(_ keys: String...) -> JSONValue? {
+            keys.lazy.compactMap { params[$0]?.stringValue }.first.map(JSONValue.string)
+        }
+        var payload: [String: JSONValue] = [:]
+        let kind: String
+        switch method {
+        case "agent.message.send":
+            kind = "agent.message.accepted"
+            payload["thread_id"] = string("thread_id")
+        case "agent.message.queue.cancel":
+            kind = "agent.message.queue.cancelled"
+            payload["queued_message_id"] = string("queued_message_id", "id")
+        case "agent.message.queue.force_now":
+            kind = "agent.message.queue.force_requested"
+            payload["queued_message_id"] = string("queued_message_id", "id")
+        case "agent.message.queue.reorder":
+            kind = "agent.message.queue.updated"
+            payload["thread_id"] = string("thread_id")
+            payload["queued_message_id"] = string("queued_message_id", "id")
+        case "agent.message.queue.update":
+            kind = "agent.message.queue.updated"
+            payload["queued_message_id"] = string("queued_message_id", "id")
+        case "agent.run.continue":
+            kind = "agent.run.continue_requested"
+            payload["thread_id"] = string("thread_id")
+        case "agent.run.stop":
+            kind = "agent.run.stop_requested"
+            payload["thread_id"] = string("thread_id")
+        case "agent.request.respond":
+            kind = "agent.request.resolved"
+            payload["thread_id"] = string("thread_id")
+            payload["request_id"] = string("request_id")
+        case "agent.user_input.respond":
+            kind = "agent.user_input.resolved"
+            payload["thread_id"] = string("thread_id")
+            payload["request_id"] = string("request_id")
+        case "agent.plan.implement":
+            kind = "agent.plan.implemented"
+            payload["thread_id"] = string("thread_id")
+            payload["plan_id"] = string("plan_id")
+            if let object = result.objectValue {
+                payload["run_id"] = object["run_id"]
+                payload["implementation_thread_id"] = object["implementation_thread_id"]
+            }
+        case "agent.plan.save":
+            kind = "agent.plan.saved"
+            payload["thread_id"] = string("thread_id")
+            payload["plan_id"] = string("plan_id")
+            payload["relative_path"] = result.objectValue?["relative_path"]
+        case "agent.plan.notes.save":
+            kind = "agent.plan.notes.updated"
+            payload["thread_id"] = string("thread_id")
+        case "agent.checkpoint.revert":
+            kind = "agent.checkpoint.reverted"
+            payload["thread_id"] = string("thread_id")
+            if let object = result.objectValue {
+                payload["turn_count"] = object["checkpointTurnCount"] ?? object["checkpoint_turn_count"]
+                payload["turn_id"] = object["turnId"] ?? object["turn_id"]
+                payload["checkpoint_ref"] = object["checkpointRef"] ?? object["checkpoint_ref"]
+            }
+        case "agent.attachment.upload":
+            kind = "agent.attachment.uploaded"
+            payload["workspace_id"] = string("workspace_id")
+            if let object = result.objectValue {
+                payload["display_name"] = object["displayName"] ?? object["display_name"]
+                payload["size_bytes"] = object["sizeBytes"] ?? object["size_bytes"]
+            }
+        case "agent.provider.update":
+            kind = "agent.provider.updated"
+            payload["provider"] = result.objectValue?["provider"] ?? string("provider") ?? .string("codex")
+            payload["ok"] = result.objectValue?["ok"]
+            payload["status"] = result.objectValue?["status"]
+        default:
+            return
+        }
+        EventBus.shared.publish(kind: kind, payload: .object(payload.compactMapValues { $0 }))
     }
 
     /// Translate symbolic key names (cmux v2 contract) into raw bytes
@@ -368,7 +608,415 @@ public final class JSONRPCDispatcher {
         }
     }
 
+    /// Local same-user IPC entry point. This path intentionally shares the
+    /// AppCommandRouter domain handlers without fabricating remote transport
+    /// identity or durable transport receipts. Network servers must call the
+    /// mutation-context overload below.
+    public func dispatchLocalIPC(_ req: JSONRPCRequest) async -> JSONRPCResponse {
+        await dispatchCore(req)
+    }
+
+    /// Backward-compatible local/test entry point. Production TCP/HTTP code
+    /// must never use this context-free overload.
     public func dispatch(_ req: JSONRPCRequest) async -> JSONRPCResponse {
+        await dispatchLocalIPC(req)
+    }
+
+    public func dispatch(
+        _ req: JSONRPCRequest,
+        mutationContext: MutationRequestContext?
+    ) async -> JSONRPCResponse {
+        guard let mutationContext else { return await dispatchCore(req) }
+        if req.method == "command.receipt.status" {
+            return commandReceiptStatus(req, context: mutationContext)
+        }
+        guard Self.hostMutationMethods.contains(req.method) else {
+            return await dispatchCore(req)
+        }
+        return await dispatchRemoteMutation(req, context: mutationContext)
+    }
+
+    private func dispatchRemoteMutation(
+        _ req: JSONRPCRequest,
+        context: MutationRequestContext
+    ) async -> JSONRPCResponse {
+        let params = req.params ?? [:]
+        guard let identity = mutationIdentity(params: params, context: context) else {
+            return .init(id: req.id, error: JSONRPCError(
+                code: -32097,
+                message: "Connection is stale. Refresh the authoritative host state before mutating."
+            ))
+        }
+        let businessParams = HostMutationContract.businessParams(params)
+        do {
+            try HostMutationContract.preflight(method: req.method, params: businessParams)
+        } catch let error as JSONRPCError {
+            return .init(id: req.id, error: error)
+        } catch {
+            return .init(id: req.id, error: .invalidParams)
+        }
+        let paramsHash: String
+        do {
+            paramsHash = try HostMutationContract.paramsHash(method: req.method, params)
+        } catch {
+            return .init(id: req.id, error: .invalidParams)
+        }
+        let key = "\(req.method):\(identity.clientRequestId)"
+        if let unknown = volatileUnknownReceipts[key] {
+            if unknown.ownerFingerprint != context.ownerFingerprint {
+                commandReceiptMetrics.recordClaim(.ownerMismatch, latencyMilliseconds: 0)
+                return receiptFailure(
+                    id: req.id,
+                    code: -32094,
+                    reason: "idempotencyOwnerMismatch",
+                    method: req.method,
+                    clientRequestId: identity.clientRequestId,
+                    retryable: false,
+                    requiresSnapshot: false
+                )
+            }
+            if unknown.paramsHash != paramsHash {
+                commandReceiptMetrics.recordClaim(.requestMismatch, latencyMilliseconds: 0)
+                return receiptFailure(
+                    id: req.id,
+                    code: -32093,
+                    reason: "idempotencyRequestMismatch",
+                    method: req.method,
+                    clientRequestId: identity.clientRequestId,
+                    retryable: false,
+                    requiresSnapshot: false
+                )
+            }
+            commandReceiptMetrics.recordClaim(.unknown, latencyMilliseconds: 0)
+            return receiptFailure(
+                id: req.id,
+                code: -32095,
+                reason: "commandOutcomeUnknown",
+                method: req.method,
+                clientRequestId: identity.clientRequestId,
+                retryable: false,
+                requiresSnapshot: true
+            )
+        }
+        guard let receiptRouter = router as? CommandReceiptStateRouting else {
+            return receiptFailure(
+                id: req.id,
+                code: -32091,
+                reason: "commandReceiptUnavailable",
+                method: req.method,
+                clientRequestId: identity.clientRequestId,
+                retryable: true,
+                requiresSnapshot: false
+            )
+        }
+
+        let claim: CommandReceiptClaimResult
+        let claimStarted = DispatchTime.now().uptimeNanoseconds
+        do {
+            claim = try receiptRouter.claimCommandReceipt(
+                method: req.method,
+                clientRequestId: identity.clientRequestId,
+                ownerFingerprint: context.ownerFingerprint,
+                paramsHash: paramsHash
+            )
+            commandReceiptMetrics.recordClaim(
+                claim,
+                latencyMilliseconds: Self.elapsedMilliseconds(since: claimStarted)
+            )
+        } catch {
+            commandReceiptMetrics.recordClaimFailure(
+                latencyMilliseconds: Self.elapsedMilliseconds(since: claimStarted)
+            )
+            return receiptFailure(
+                id: req.id,
+                code: -32091,
+                reason: "commandReceiptUnavailable",
+                method: req.method,
+                clientRequestId: identity.clientRequestId,
+                retryable: true,
+                requiresSnapshot: false
+            )
+        }
+
+        switch claim {
+        case .claimed:
+            break
+        case .inProgress:
+            return receiptFailure(
+                id: req.id,
+                code: -32096,
+                reason: "commandInProgress",
+                method: req.method,
+                clientRequestId: identity.clientRequestId,
+                retryable: true,
+                requiresSnapshot: false
+            )
+        case .committed(let resultJSON):
+            guard let data = resultJSON.data(using: .utf8),
+                  let result = try? JSONDecoder().decode(JSONValue.self, from: data) else {
+                return receiptFailure(
+                    id: req.id,
+                    code: -32092,
+                    reason: "legacyReceiptUnverifiable",
+                    method: req.method,
+                    clientRequestId: identity.clientRequestId,
+                    retryable: false,
+                    requiresSnapshot: true
+                )
+            }
+            return .init(id: req.id, result: result)
+        case .unknown:
+            return receiptFailure(
+                id: req.id,
+                code: -32095,
+                reason: "commandOutcomeUnknown",
+                method: req.method,
+                clientRequestId: identity.clientRequestId,
+                retryable: false,
+                requiresSnapshot: true
+            )
+        case .ownerMismatch:
+            return receiptFailure(
+                id: req.id,
+                code: -32094,
+                reason: "idempotencyOwnerMismatch",
+                method: req.method,
+                clientRequestId: identity.clientRequestId,
+                retryable: false,
+                requiresSnapshot: false
+            )
+        case .requestMismatch:
+            return receiptFailure(
+                id: req.id,
+                code: -32093,
+                reason: "idempotencyRequestMismatch",
+                method: req.method,
+                clientRequestId: identity.clientRequestId,
+                retryable: false,
+                requiresSnapshot: false
+            )
+        case .legacyUnverifiable:
+            return receiptFailure(
+                id: req.id,
+                code: -32092,
+                reason: "legacyReceiptUnverifiable",
+                method: req.method,
+                clientRequestId: identity.clientRequestId,
+                retryable: false,
+                requiresSnapshot: true
+            )
+        }
+
+        let businessRequest = JSONRPCRequest(
+            jsonrpc: req.jsonrpc,
+            id: req.id,
+            method: req.method,
+            params: businessParams
+        )
+        let eventSink: EventBus.MutationEventSink? = Self.durableSynchronousMutationMethods.contains(req.method)
+            ? EventBus.MutationEventSink()
+            : nil
+        let response: JSONRPCResponse
+        response = await Self.$centralMutationExecution.withValue(true) {
+            if let eventSink {
+                return await EventBus.$activeMutationEventSink.withValue(eventSink) {
+                    if Self.canonicalImmediateEventMethods.contains(req.method) {
+                        let response = await EventBus.$suppressMutationEventCapture.withValue(true) {
+                            await dispatchCore(businessRequest)
+                        }
+                        if response.error == nil, let result = response.result {
+                            publishCanonicalImmediateEvent(
+                                method: req.method,
+                                params: businessParams,
+                                result: result
+                            )
+                        }
+                        return response
+                    }
+                    return await dispatchCore(businessRequest)
+                }
+            }
+            return await dispatchCore(businessRequest)
+        }
+        guard response.error == nil, let result = response.result else {
+            volatileUnknownReceipts[key] = (context.ownerFingerprint, paramsHash)
+            commandReceiptMetrics.recordUnknownOutcome()
+            try? receiptRouter.markCommandReceiptUnknown(
+                method: req.method,
+                clientRequestId: identity.clientRequestId,
+                ownerFingerprint: context.ownerFingerprint,
+                paramsHash: paramsHash
+            )
+            return receiptFailure(
+                id: req.id,
+                code: -32095,
+                reason: "commandOutcomeUnknown",
+                method: req.method,
+                clientRequestId: identity.clientRequestId,
+                retryable: false,
+                requiresSnapshot: true
+            )
+        }
+        let finalizationStarted = DispatchTime.now().uptimeNanoseconds
+        do {
+            if let eventSink {
+                let events = try eventSink.seal()
+                _ = try EventBus.shared.commitPersistedEvents { minimumEventSequence in
+                    try receiptRouter.finalizeCommandReceipt(
+                        method: req.method,
+                        clientRequestId: identity.clientRequestId,
+                        ownerFingerprint: context.ownerFingerprint,
+                        paramsHash: paramsHash,
+                        result: result,
+                        events: events,
+                        minimumEventSequence: minimumEventSequence
+                    )
+                }
+            } else {
+                try receiptRouter.commitCommandReceipt(
+                    method: req.method,
+                    clientRequestId: identity.clientRequestId,
+                    ownerFingerprint: context.ownerFingerprint,
+                    paramsHash: paramsHash,
+                    result: result
+                )
+            }
+            commandReceiptMetrics.recordFinalization(
+                success: true,
+                latencyMilliseconds: Self.elapsedMilliseconds(since: finalizationStarted)
+            )
+            return response
+        } catch {
+            commandReceiptMetrics.recordFinalization(
+                success: false,
+                latencyMilliseconds: Self.elapsedMilliseconds(since: finalizationStarted)
+            )
+            volatileUnknownReceipts[key] = (context.ownerFingerprint, paramsHash)
+            commandReceiptMetrics.recordUnknownOutcome()
+            try? receiptRouter.markCommandReceiptUnknown(
+                method: req.method,
+                clientRequestId: identity.clientRequestId,
+                ownerFingerprint: context.ownerFingerprint,
+                paramsHash: paramsHash
+            )
+            return receiptFailure(
+                id: req.id,
+                code: -32095,
+                reason: "commandOutcomeUnknown",
+                method: req.method,
+                clientRequestId: identity.clientRequestId,
+                retryable: false,
+                requiresSnapshot: true
+            )
+        }
+    }
+
+    private nonisolated static func elapsedMilliseconds(since start: UInt64) -> Double {
+        let end = DispatchTime.now().uptimeNanoseconds
+        return Double(end >= start ? end - start : 0) / 1_000_000
+    }
+
+    private func commandReceiptStatus(
+        _ req: JSONRPCRequest,
+        context: MutationRequestContext
+    ) -> JSONRPCResponse {
+        let params = req.params ?? [:]
+        guard let identity = mutationIdentity(params: params, context: context),
+              let method = params["method"]?.stringValue,
+              Self.hostMutationMethods.contains(method),
+              let receiptRouter = router as? CommandReceiptStateRouting else {
+            return .init(id: req.id, error: .invalidParams)
+        }
+        let status: CommandReceiptStatusResult
+        do {
+            status = try receiptRouter.commandReceiptStatus(
+                method: method,
+                clientRequestId: identity.clientRequestId,
+                ownerFingerprint: context.ownerFingerprint
+            )
+        } catch {
+            return receiptFailure(
+                id: req.id,
+                code: -32091,
+                reason: "commandReceiptUnavailable",
+                method: method,
+                clientRequestId: identity.clientRequestId,
+                retryable: true,
+                requiresSnapshot: false
+            )
+        }
+        if status == .ownerMismatch {
+            return receiptFailure(
+                id: req.id,
+                code: -32094,
+                reason: "idempotencyOwnerMismatch",
+                method: method,
+                clientRequestId: identity.clientRequestId,
+                retryable: false,
+                requiresSnapshot: false
+            )
+        }
+        let values: (String, Bool, Bool)
+        switch status {
+        case .absent: values = ("absent", true, false)
+        case .inProgress: values = ("inProgress", true, false)
+        case .committed: values = ("committed", false, false)
+        case .unknown: values = ("unknown", false, true)
+        case .legacyUnverifiable: values = ("legacyUnverifiable", false, true)
+        case .ownerMismatch: fatalError("handled above")
+        }
+        return .init(id: req.id, result: .object([
+            "status": .string(values.0),
+            "method": .string(method),
+            "clientRequestId": .string(identity.clientRequestId),
+            "retryable": .bool(values.1),
+            "requiresSnapshot": .bool(values.2),
+        ]))
+    }
+
+    private func mutationIdentity(
+        params: [String: JSONValue],
+        context: MutationRequestContext
+    ) -> (clientRequestId: String, connectionId: String)? {
+        guard let clientRequestId = params["client_request_id"]?.stringValue,
+              !clientRequestId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              let connectionId = params["connection_id"]?.stringValue,
+              !connectionId.isEmpty,
+              params["expected_host_id"]?.stringValue == context.hostId,
+              case .number(let epoch)? = params["expected_boot_epoch"],
+              epoch.isFinite,
+              epoch.rounded(.towardZero) == epoch,
+              epoch >= 0,
+              UInt64(epoch) == context.bootEpoch,
+              context.ownsActiveConnection(connectionId) else {
+            return nil
+        }
+        return (clientRequestId, connectionId)
+    }
+
+    private func receiptFailure(
+        id: JSONRPCID?,
+        code: Int,
+        reason: String,
+        method: String,
+        clientRequestId: String,
+        retryable: Bool,
+        requiresSnapshot: Bool
+    ) -> JSONRPCResponse {
+        .init(id: id, error: JSONRPCError(
+            code: code,
+            message: reason,
+            data: .object([
+                "reason": .string(reason),
+                "method": .string(method),
+                "clientRequestId": .string(clientRequestId),
+                "retryable": .bool(retryable),
+                "requiresSnapshot": .bool(requiresSnapshot),
+            ])
+        ))
+    }
+
+    private func dispatchCore(_ req: JSONRPCRequest) async -> JSONRPCResponse {
         let id = req.id
         let params = req.params ?? [:]
         do {
@@ -383,7 +1031,7 @@ public final class JSONRPCDispatcher {
                         return .init(id: id, error: JSONRPCError(code: -32602, message: "Batch only supports read-only RPC methods.", data: .string(method)))
                     }
                     let callParams = call["params"]?.objectValue ?? [:]
-                    let response = await dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(index), method: method, params: callParams))
+                    let response = await dispatchCore(JSONRPCRequest(jsonrpc: "2.0", id: .number(index), method: method, params: callParams))
                     if let error = response.error {
                         results.append(.object([
                             "error": .object([
@@ -551,12 +1199,36 @@ public final class JSONRPCDispatcher {
                 guard let sid = params["surface_id"]?.stringValue.flatMap(UUID.init).map(SurfaceID.init) ?? params["id"]?.stringValue.flatMap(UUID.init).map(SurfaceID.init),
                       let local = params["local_path"]?.stringValue,
                       let remote = params["remote_path"]?.stringValue else { throw JSONRPCError.invalidParams }
-                return .init(id: id, result: try router.sshTransferUpload(surface: sid, localPath: local, remotePath: remote))
+                EventBus.shared.publish(kind: "ssh.transfer.started", payload: .object([
+                    "surface_id": .string(sid.value.uuidString),
+                    "direction": .string("upload"),
+                    "local_path": .string(local),
+                    "remote_path": .string(remote)
+                ]))
+                let result = try router.sshTransferUpload(surface: sid, localPath: local, remotePath: remote)
+                EventBus.shared.publish(kind: "ssh.transfer.finished", payload: .object([
+                    "surface_id": .string(sid.value.uuidString),
+                    "direction": .string("upload"),
+                    "result": result
+                ]))
+                return .init(id: id, result: result)
             case "ssh.transfer.download":
                 guard let sid = params["surface_id"]?.stringValue.flatMap(UUID.init).map(SurfaceID.init) ?? params["id"]?.stringValue.flatMap(UUID.init).map(SurfaceID.init),
                       let remote = params["remote_path"]?.stringValue,
                       let local = params["local_path"]?.stringValue else { throw JSONRPCError.invalidParams }
-                return .init(id: id, result: try router.sshTransferDownload(surface: sid, remotePath: remote, localPath: local))
+                EventBus.shared.publish(kind: "ssh.transfer.started", payload: .object([
+                    "surface_id": .string(sid.value.uuidString),
+                    "direction": .string("download"),
+                    "local_path": .string(local),
+                    "remote_path": .string(remote)
+                ]))
+                let result = try router.sshTransferDownload(surface: sid, remotePath: remote, localPath: local)
+                EventBus.shared.publish(kind: "ssh.transfer.finished", payload: .object([
+                    "surface_id": .string(sid.value.uuidString),
+                    "direction": .string("download"),
+                    "result": result
+                ]))
+                return .init(id: id, result: result)
             case "ssh.files.local.list":
                 return .init(id: id, result: try router.sshFilesLocalList(path: params["path"]?.stringValue))
             case "ssh.files.remote.list":
@@ -844,38 +1516,52 @@ public final class JSONRPCDispatcher {
             case "surface.send_text":
                 guard let sid = params["id"]?.stringValue.flatMap(UUID.init).map(SurfaceID.init),
                       let text = params["text"]?.stringValue else { throw JSONRPCError.invalidParams }
+                let result: JSONValue
                 if let terminalRouter = router as? TerminalCommandRouting {
-                    return .init(id: id, result: try terminalRouter.sendTextResult(surface: sid, text: text))
+                    result = try terminalRouter.sendTextResult(surface: sid, text: text)
+                } else {
+                    try router.sendText(surface: sid, text: text)
+                    // UX-009: fold a liveness check into the response so a
+                    // non-terminal surface reports "delivered" only when the
+                    // target is alive; a dead surface reports "accepted" + a
+                    // warning instead of falsely reading as success.
+                    let alive = router.surfaceHealth(surface: sid)
+                    result = .object([
+                        "status": .string(alive ? "delivered" : "accepted"),
+                        "accepted": .bool(true),
+                        "delivered": .bool(alive),
+                        "surface_alive": .bool(alive)
+                    ])
                 }
-                try router.sendText(surface: sid, text: text)
-                // UX-009: fold a liveness check into the response so a
-                // non-terminal surface reports "delivered" only when the
-                // target is alive; a dead surface reports "accepted" + a
-                // warning instead of falsely reading as success.
-                let alive = router.surfaceHealth(surface: sid)
-                return .init(id: id, result: .object([
-                    "status": .string(alive ? "delivered" : "accepted"),
-                    "accepted": .bool(true),
-                    "delivered": .bool(alive),
-                    "surface_alive": .bool(alive)
+                EventBus.shared.publish(kind: "surface.updated", payload: .object([
+                    "id": .string(sid.value.uuidString),
+                    "action": .string("send_text")
                 ]))
+                return .init(id: id, result: result)
             case "surface.send_key":
                 guard let sid = params["id"]?.stringValue.flatMap(UUID.init).map(SurfaceID.init),
                       let key = params["key"]?.stringValue else { throw JSONRPCError.invalidParams }
                 let sequence = encodeKey(key)
+                let result: JSONValue
                 if let terminalRouter = router as? TerminalCommandRouting {
-                    return .init(id: id, result: try terminalRouter.sendTextResult(surface: sid, text: sequence))
+                    result = try terminalRouter.sendTextResult(surface: sid, text: sequence)
+                } else {
+                    try router.sendText(surface: sid, text: sequence)
+                    // UX-009: same delivered/accepted liveness contract as
+                    // surface.send_text for non-terminal surfaces.
+                    let alive = router.surfaceHealth(surface: sid)
+                    result = .object([
+                        "status": .string(alive ? "delivered" : "accepted"),
+                        "accepted": .bool(true),
+                        "delivered": .bool(alive),
+                        "surface_alive": .bool(alive)
+                    ])
                 }
-                try router.sendText(surface: sid, text: sequence)
-                // UX-009: same delivered/accepted liveness contract as
-                // surface.send_text for non-terminal surfaces.
-                let alive = router.surfaceHealth(surface: sid)
-                return .init(id: id, result: .object([
-                    "status": .string(alive ? "delivered" : "accepted"),
-                    "accepted": .bool(true),
-                    "delivered": .bool(alive),
-                    "surface_alive": .bool(alive)
+                EventBus.shared.publish(kind: "surface.updated", payload: .object([
+                    "id": .string(sid.value.uuidString),
+                    "action": .string("send_key")
                 ]))
+                return .init(id: id, result: result)
             case "surface.health":
                 guard let sid = params["id"]?.stringValue.flatMap(UUID.init).map(SurfaceID.init) else { throw JSONRPCError.invalidParams }
                 if let terminalRouter = router as? TerminalCommandRouting {
@@ -886,6 +1572,10 @@ public final class JSONRPCDispatcher {
             case "surface.clear_history":
                 guard let sid = params["id"]?.stringValue.flatMap(UUID.init).map(SurfaceID.init) else { throw JSONRPCError.invalidParams }
                 router.surfaceClearHistory(surface: sid)
+                EventBus.shared.publish(kind: "surface.updated", payload: .object([
+                    "id": .string(sid.value.uuidString),
+                    "action": .string("clear_history")
+                ]))
                 return .init(id: id, result: .bool(true))
             case "surface.read_text":
                 guard let sid = params["id"]?.stringValue.flatMap(UUID.init).map(SurfaceID.init) else { throw JSONRPCError.invalidParams }
@@ -916,7 +1606,13 @@ public final class JSONRPCDispatcher {
                 return .init(id: id, result: .object(result))
             case "agent.open":
                 guard let wid = params["workspace_id"]?.stringValue.flatMap(UUID.init).map(WorkspaceID.init) else { throw JSONRPCError.invalidParams }
-                let s = try router.openAgentApp(workspace: wid)
+                let s = try withSuppressedLayoutEvents {
+                    try router.openAgentApp(workspace: wid)
+                }
+                EventBus.shared.publish(kind: "surface.created", payload: .object([
+                    "workspace_id": .string(wid.value.uuidString),
+                    "surface": encode(s)
+                ]))
                 return .init(id: id, result: encode(s))
             case "agent.thread.list":
                 let wid: WorkspaceID? = params["workspace_id"]?.stringValue.flatMap(UUID.init).map(WorkspaceID.init)
@@ -983,6 +1679,9 @@ public final class JSONRPCDispatcher {
                 let providerInstanceId = params["provider_instance_id"]?.stringValue ?? params["providerInstanceId"]?.stringValue
                 let t = try router.prepareAgentThreadForPullRequest(workspace: wid, url: url, provider: provider, model: model, permissionMode: permission, reasoningEffort: reasoning, serviceTier: serviceTier, modelSelection: modelSelection, providerInstanceId: providerInstanceId)
                 EventBus.shared.publish(kind: "agent.thread.created", payload: threadPayload(t))
+                EventBus.shared.publish(kind: "agent.thread.selected", payload: .object([
+                    "thread_id": .string(t.id.value.uuidString)
+                ]))
                 return .init(id: id, result: encodeThread(t))
             case "agent.attachment.upload":
                 guard let wid = params["workspace_id"]?.stringValue.flatMap(UUID.init).map(WorkspaceID.init),
@@ -1247,6 +1946,10 @@ public final class JSONRPCDispatcher {
                     return .init(id: id, result: cached)
                 }
                 try await router.rollbackAgentThread(thread: tid, toTurnId: turnId)
+                EventBus.shared.publish(kind: "agent.thread.rolled_back", payload: .object([
+                    "thread_id": .string(tid.value.uuidString),
+                    "turn_id": .string(turnId)
+                ]))
                 let result: JSONValue = .bool(true)
                 recordCommandReceipt(method: req.method, clientRequestId: receiptKey, result: result)
                 return .init(id: id, result: result)
@@ -1385,6 +2088,10 @@ public final class JSONRPCDispatcher {
                     return .init(id: id, result: cached)
                 }
                 try router.markAgentThreadRead(thread: tid)
+                EventBus.shared.publish(kind: "agent.thread.updated", payload: .object([
+                    "thread_id": .string(tid.value.uuidString),
+                    "unread": .bool(false)
+                ]))
                 let result = JSONValue.bool(true)
                 recordCommandReceipt(method: req.method, clientRequestId: receiptKey, result: result)
                 return .init(id: id, result: result)
@@ -1437,7 +2144,9 @@ public final class JSONRPCDispatcher {
                 if let (_, cached) = commandReceipt(method: req.method, params: params) {
                     return .init(id: id, result: cached)
                 }
-                let destination = try router.ensureGitSurface(workspace: wid)
+                let destination = try withSuppressedLayoutEvents {
+                    try router.ensureGitSurface(workspace: wid)
+                }
                 let r = try router.gitPush(workspace: wid)
                 EventBus.shared.publish(kind: "git.push", payload: .object([
                     "workspace_id": .string(wid.value.uuidString),
@@ -1456,7 +2165,9 @@ public final class JSONRPCDispatcher {
                 return .init(id: id, result: encode(try router.gitDeliveryPlan(workspace: wid, copy: gitDeliveryCopy(from: params))))
             case "git.deliver":
                 guard let wid = params["workspace_id"]?.stringValue.flatMap(UUID.init).map(WorkspaceID.init) else { throw JSONRPCError.invalidParams }
-                let destination = try router.ensureGitSurface(workspace: wid)
+                let destination = try withSuppressedLayoutEvents {
+                    try router.ensureGitSurface(workspace: wid)
+                }
                 let r = try router.gitDeliver(workspace: wid, copy: gitDeliveryCopy(from: params))
                 EventBus.shared.publish(kind: "git.deliver", payload: .object([
                     "workspace_id": .string(wid.value.uuidString),
@@ -1475,6 +2186,10 @@ public final class JSONRPCDispatcher {
             case "project.open_in_editor":
                 guard let wid = params["workspace_id"]?.stringValue.flatMap(UUID.init).map(WorkspaceID.init) else { throw JSONRPCError.invalidParams }
                 let app = try router.projectOpenInEditor(workspace: wid)
+                EventBus.shared.publish(kind: "project.opened_in_editor", payload: .object([
+                    "workspace_id": .string(wid.value.uuidString),
+                    "app": .string(app)
+                ]))
                 return .init(id: id, result: .object(["app": .string(app)]))
             case "agent.models.list":
                 let provider = AgentProvider(rawValue: params["provider"]?.stringValue ?? "codex") ?? .codex
@@ -1506,14 +2221,26 @@ public final class JSONRPCDispatcher {
             case "browser.back":
                 guard let sid = params["id"]?.stringValue.flatMap(UUID.init).map(SurfaceID.init) else { throw JSONRPCError.invalidParams }
                 try router.browserBack(surface: sid)
+                EventBus.shared.publish(kind: "surface.browser", payload: .object([
+                    "surface_id": .string(sid.value.uuidString),
+                    "action": .string("back")
+                ]))
                 return .init(id: id, result: .bool(true))
             case "browser.forward":
                 guard let sid = params["id"]?.stringValue.flatMap(UUID.init).map(SurfaceID.init) else { throw JSONRPCError.invalidParams }
                 try router.browserForward(surface: sid)
+                EventBus.shared.publish(kind: "surface.browser", payload: .object([
+                    "surface_id": .string(sid.value.uuidString),
+                    "action": .string("forward")
+                ]))
                 return .init(id: id, result: .bool(true))
             case "browser.reload":
                 guard let sid = params["id"]?.stringValue.flatMap(UUID.init).map(SurfaceID.init) else { throw JSONRPCError.invalidParams }
                 try router.browserReload(surface: sid)
+                EventBus.shared.publish(kind: "surface.browser", payload: .object([
+                    "surface_id": .string(sid.value.uuidString),
+                    "action": .string("reload")
+                ]))
                 return .init(id: id, result: .bool(true))
             case "browser.url.get":
                 guard let sid = params["id"]?.stringValue.flatMap(UUID.init).map(SurfaceID.init) else { throw JSONRPCError.invalidParams }
@@ -1522,16 +2249,28 @@ public final class JSONRPCDispatcher {
             case "browser.mirror_url.get":
                 guard let sid = params["id"]?.stringValue.flatMap(UUID.init).map(SurfaceID.init) else { throw JSONRPCError.invalidParams }
                 let mirror = try router.browserMirrorURL(surface: sid)
+                EventBus.shared.publish(kind: "browser.mirror_url.registered", payload: .object([
+                    "surface_id": .string(sid.value.uuidString),
+                    "is_file": mirror["is_file"] ?? .bool(false)
+                ]))
                 return .init(id: id, result: .object(mirror))
             case "browser.eval":
                 guard let sid = params["id"]?.stringValue.flatMap(UUID.init).map(SurfaceID.init),
                       let script = params["script"]?.stringValue else { throw JSONRPCError.invalidParams }
                 let s = try await router.browserEval(surface: sid, script: script)
+                EventBus.shared.publish(kind: "surface.browser", payload: .object([
+                    "surface_id": .string(sid.value.uuidString),
+                    "action": .string("eval")
+                ]))
                 return .init(id: id, result: .string(s))
             case "browser.screenshot":
                 guard let sid = params["id"]?.stringValue.flatMap(UUID.init).map(SurfaceID.init) else { throw JSONRPCError.invalidParams }
                 let path = params["path"]?.stringValue
                 let resolved = try router.browserScreenshot(surface: sid, savePath: path)
+                EventBus.shared.publish(kind: "browser.screenshot.created", payload: .object([
+                    "surface_id": .string(sid.value.uuidString),
+                    "filename": .string(URL(fileURLWithPath: resolved).lastPathComponent)
+                ]))
                 return .init(id: id, result: .object(["path": .string(resolved)]))
             case "browser.snapshot":
                 guard let sid = params["id"]?.stringValue.flatMap(UUID.init).map(SurfaceID.init) else { throw JSONRPCError.invalidParams }
@@ -1543,6 +2282,10 @@ public final class JSONRPCDispatcher {
                 let kind = String(req.method.dropFirst("browser.".count))
                 let value = params["value"]?.stringValue
                 let json = try await router.browserAction(surface: sid, kind: kind, ref: ref, value: value)
+                EventBus.shared.publish(kind: "surface.browser", payload: .object([
+                    "surface_id": .string(sid.value.uuidString),
+                    "action": .string(kind)
+                ]))
                 return .init(id: id, result: .string(json))
             case "browser.wait":
                 guard let sid = params["id"]?.stringValue.flatMap(UUID.init).map(SurfaceID.init),
@@ -1556,6 +2299,13 @@ public final class JSONRPCDispatcher {
                 let body = params["body"]?.stringValue
                 let category = params["category"]?.stringValue
                 let nid = try router.notificationCreate(workspaceId: wid, title: title, body: body, category: category)
+                if !(router is NotificationEventPublishingRouting) {
+                    EventBus.shared.publish(kind: "notification.created", payload: .object([
+                        "id": .string(nid),
+                        "workspace_id": wid.map { .string($0.value.uuidString) } ?? .null,
+                        "title": .string(title)
+                    ]))
+                }
                 return .init(id: id, result: .object([
                     "id": .string(nid),
                     "push_policy": .string("background_only")
@@ -1568,21 +2318,104 @@ public final class JSONRPCDispatcher {
             case "notification.mark_read":
                 guard let nid = params["id"]?.stringValue else { throw JSONRPCError.invalidParams }
                 try router.notificationMarkRead(id: nid)
+                if !(router is NotificationEventPublishingRouting) {
+                    EventBus.shared.publish(kind: "notification.read", payload: .object([
+                        "id": .string(nid)
+                    ]))
+                }
                 return .init(id: id, result: .bool(true))
             case "notification.dismiss":
                 guard let nid = params["id"]?.stringValue else { throw JSONRPCError.invalidParams }
                 try router.notificationDismiss(id: nid)
+                if !(router is NotificationEventPublishingRouting) {
+                    EventBus.shared.publish(kind: "notification.dismissed", payload: .object([
+                        "id": .string(nid)
+                    ]))
+                }
                 return .init(id: id, result: .bool(true))
             case "private.push_token.update":
                 guard let pushToken = params["push_token"]?.stringValue,
+                      !pushToken.isEmpty,
                       let pushTokenType = params["push_token_type"]?.stringValue,
                       pushTokenType == "apns" || pushTokenType == "fcm" else { throw JSONRPCError.invalidParams }
+                let tokenPurpose = params["token_purpose"]?.stringValue
+                let environment = params["environment"]?.stringValue
+                let serverID = params["server_id"]?.stringValue
+                let bootEpoch = params["boot_epoch"]?.intValue
+                let activityGeneration = params["activity_generation"]?.intValue
+                let activityID = params["activity_id"]?.stringValue
+                let activitySessionID = params["activity_session_id"]?.stringValue
+                let registrationRevision = params["registration_revision"]?.intValue
+                let contractVersion = params["contract_version"]?.intValue
+                let capabilityValues = params["capabilities"]?.arrayValue
+                let capabilities = capabilityValues?.compactMap(\.stringValue)
+                let hasTypedMetadata = tokenPurpose != nil || environment != nil || serverID != nil ||
+                    params["boot_epoch"] != nil || params["activity_generation"] != nil ||
+                    params["activity_id"] != nil || params["activity_session_id"] != nil ||
+                    params["registration_revision"] != nil ||
+                    contractVersion != nil || params["capabilities"] != nil
+                if hasTypedMetadata {
+                    if params["activity_generation"] != nil, activityGeneration == nil {
+                        throw JSONRPCError.invalidParams
+                    }
+                    if params["boot_epoch"] != nil, bootEpoch == nil { throw JSONRPCError.invalidParams }
+                    if params["activity_session_id"] != nil, activitySessionID == nil { throw JSONRPCError.invalidParams }
+                    if params["registration_revision"] != nil, registrationRevision == nil { throw JSONRPCError.invalidParams }
+                    if params["activity_id"] != nil, activityID == nil {
+                        throw JSONRPCError.invalidParams
+                    }
+                    if params["contract_version"] != nil, contractVersion == nil {
+                        throw JSONRPCError.invalidParams
+                    }
+                    if params["capabilities"] != nil,
+                       capabilityValues == nil || capabilityValues?.count != capabilities?.count {
+                        throw JSONRPCError.invalidParams
+                    }
+                    guard let tokenPurpose,
+                          ["alert", "push_to_start", "activity_update"].contains(tokenPurpose),
+                          let environment,
+                          ["sandbox", "production"].contains(environment),
+                          let deviceID = params["device_id"]?.stringValue,
+                          !deviceID.isEmpty,
+                          let serverID,
+                          !serverID.isEmpty,
+                          bootEpoch.map({ $0 >= 0 }) ?? true,
+                          activityGeneration.map({ $0 >= 0 }) ?? true,
+                          registrationRevision.map({ $0 >= 0 }) ?? true,
+                          contractVersion.map({ $0 >= 1 }) ?? true else {
+                        throw JSONRPCError.invalidParams
+                    }
+                    if tokenPurpose != "alert" {
+                        guard let activityToken = params["live_activity_token"]?.stringValue,
+                              !activityToken.isEmpty else { throw JSONRPCError.invalidParams }
+                    }
+                    if capabilities?.contains("live_activity_v2") == true,
+                       (contractVersion ?? 1) < 2 {
+                        throw JSONRPCError.invalidParams
+                    }
+                }
                 let result = try router.privatePushTokenUpdate(
                     pushToken: pushToken,
                     pushTokenType: pushTokenType,
                     liveActivityToken: params["live_activity_token"]?.stringValue,
-                    deviceID: params["device_id"]?.stringValue
+                    deviceID: params["device_id"]?.stringValue,
+                    tokenPurpose: tokenPurpose,
+                    environment: environment,
+                    serverID: serverID,
+                    bootEpoch: bootEpoch,
+                    activityGeneration: activityGeneration,
+                    activityID: activityID,
+                    activitySessionID: activitySessionID,
+                    registrationRevision: registrationRevision,
+                    contractVersion: contractVersion,
+                    capabilities: capabilities
                 )
+                EventBus.shared.publish(kind: "private.push_token.updated", payload: .object([
+                    "push_token_type": .string(pushTokenType),
+                    "device_id": params["device_id"] ?? .null,
+                    "token_purpose": tokenPurpose.map(JSONValue.string) ?? .null,
+                    "environment": environment.map(JSONValue.string) ?? .null
+                ]))
                 return .init(id: id, result: result)
             case "pane.list":
                 guard let wid = params["workspace_id"]?.stringValue.flatMap(UUID.init).map(WorkspaceID.init) else { throw JSONRPCError.invalidParams }
@@ -1669,15 +2502,25 @@ public final class JSONRPCDispatcher {
             case "window.focus":
                 guard let wid = params["id"]?.stringValue.flatMap(UUID.init).map(WindowID.init) else { throw JSONRPCError.invalidParams }
                 try router.focusWindow(wid)
+                EventBus.shared.publish(kind: "window.focused", payload: .object([
+                    "id": .string(wid.value.uuidString)
+                ]))
                 return .init(id: id, result: .bool(true))
             case "window.close":
                 guard let wid = params["id"]?.stringValue.flatMap(UUID.init).map(WindowID.init) else { throw JSONRPCError.invalidParams }
                 try router.closeWindow(wid)
+                EventBus.shared.publish(kind: "window.closed", payload: .object([
+                    "id": .string(wid.value.uuidString)
+                ]))
                 return .init(id: id, result: .bool(true))
             case "workspace.move_to_window":
                 guard let workspaceId = params["workspace_id"]?.stringValue.flatMap(UUID.init).map(WorkspaceID.init),
                       let target = params["window_id"]?.stringValue.flatMap(UUID.init).map(WindowID.init) else { throw JSONRPCError.invalidParams }
                 try router.moveWorkspaceToWindow(workspace: workspaceId, target: target)
+                EventBus.shared.publish(kind: "workspace.updated", payload: .object([
+                    "workspace_id": .string(workspaceId.value.uuidString),
+                    "window_id": .string(target.value.uuidString)
+                ]))
                 return .init(id: id, result: .bool(true))
             case "pane.swap":
                 guard let wid = params["workspace_id"]?.stringValue.flatMap(UUID.init).map(WorkspaceID.init),
@@ -1749,22 +2592,29 @@ public final class JSONRPCDispatcher {
         }
     }
 
+    nonisolated public static let readOnlyBatchMethods: Set<String> = [
+        "rpc.batch",
+        "system.ping", "system.capabilities", "system.identify",
+        "events.recent", "settings.get",
+        "ssh.host.list", "ssh.files.local.list", "ssh.files.remote.list",
+        "fs.roots", "fs.list", "fs.workspace.list", "fs.workspace.read", "fs.workspace.preview_url",
+        "files.state.get",
+        "workspace.list", "workspace.current",
+        "surface.health", "surface.read_text", "surface.read_history",
+        "agent.thread.list", "agent.message.queue.list", "agent.plan.notes.get",
+        "agent.message.list", "agent.message.get", "agent.pending_callbacks.list",
+        "agent.thread.read", "agent.checkpoint.list", "agent.checkpoint.diff",
+        "git.status", "git.branches", "git.log", "git.diff", "git.pull_request_url", "git.delivery_plan",
+        "project.scripts",
+        "agent.models.list", "agent.providers.list", "agent.state.current", "agent.prompt_history",
+        "browser.url.get", "browser.snapshot", "browser.wait",
+        "notification.list",
+        "pane.list", "pane.surfaces", "mirror.snapshot",
+        "window.list", "window.current",
+    ]
+
     nonisolated public static func isReadOnlyBatchMethod(_ method: String) -> Bool {
-        method.hasPrefix("system.")
-            || method == "workspace.list"
-            || method == "workspace.current"
-            // QA-XPLAT :10 -- window.current is read-only and the iOS client
-            // batches it (HostSession baseline batch); without this the host
-            // rejected it from a read-only batch, a silent cross-repo gate drift.
-            || method == "window.current"
-            || method == "events.recent"
-            || method == "settings.get"
-            || method == "agent.prompt_history"
-            || method == "mirror.snapshot"
-            || method.hasSuffix(".list")
-            || method.hasSuffix(".read")
-            || method.hasSuffix(".status")
-            || method.hasSuffix(".get")
+        readOnlyBatchMethods.contains(method)
     }
 
     // MARK: - P2 per-route capability scopes
@@ -1779,7 +2629,7 @@ public final class JSONRPCDispatcher {
         "ssh", "fs", "files",
         "workspace", "window", "surface", "pane",
         "agent", "git", "project", "browser", "mirror",
-        "notification", "private"
+        "notification", "private", "sync"
     ]
 
     /// Required capability for a known method, or nil when the method is not

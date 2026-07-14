@@ -1410,9 +1410,67 @@ public final class ProviderSessionRuntimeRepository {
     }
 }
 
+public enum CommandReceiptClaimResult: Sendable, Equatable {
+    case claimed
+    case inProgress
+    case committed(resultJSON: String)
+    case unknown
+    case ownerMismatch
+    case requestMismatch
+    case legacyUnverifiable
+}
+
+public enum CommandReceiptStatusResult: Sendable, Equatable {
+    case absent
+    case inProgress
+    case committed
+    case unknown
+    case ownerMismatch
+    case legacyUnverifiable
+}
+
+public struct CommandReceiptEventIntent: Sendable, Equatable {
+    public let kind: String
+    public let payloadJSON: String
+    public let createdAt: Date
+
+    public init(kind: String, payloadJSON: String, createdAt: Date) {
+        self.kind = kind
+        self.payloadJSON = payloadJSON
+        self.createdAt = createdAt
+    }
+}
+
+public struct PersistedCommandReceiptEvent: Sendable, Equatable {
+    public let seq: Int64
+    public let ordinal: Int
+    public let kind: String
+    public let payloadJSON: String
+    public let createdAt: Date
+}
+
 public final class CommandReceiptRepository {
     let db: SQLiteDB
-    public init(db: SQLiteDB) { self.db = db }
+    private let eventRetentionCap: Int
+    public init(db: SQLiteDB, eventRetentionCap: Int = 5_000) {
+        self.db = db
+        self.eventRetentionCap = max(0, eventRetentionCap)
+    }
+
+    /// A process that exits after the durable claim but before finalization
+    /// leaves an unprovable outcome. Recovery is permanent and runs before
+    /// command admission during bootstrap; claims are never leased or replayed.
+    public func recoverInterruptedClaims() throws {
+        try db.performSync { db in
+            let update = try db.prepare("""
+                UPDATE command_receipts
+                SET state = 'unknown', result_json = '', updated_at = ?
+                WHERE state = 'claimed';
+            """)
+            try update.bind(1, iso.string(from: Date()))
+            _ = try update.step()
+        }
+    }
 
     public func get(method: String, clientRequestId: String) throws -> String? {
         let st = try db.prepare("""
@@ -1436,6 +1494,344 @@ public final class CommandReceiptRepository {
         try st.bind(3, resultJSON)
         try st.bind(4, iso.string(from: Date()))
         _ = try st.step()
+    }
+
+    public func claim(
+        method: String,
+        clientRequestId: String,
+        ownerFingerprint: String,
+        paramsHash: String
+    ) throws -> CommandReceiptClaimResult {
+        try db.performSync { db in
+            try db.transaction {
+                if let existing = try receipt(
+                    db: db,
+                    method: method,
+                    clientRequestId: clientRequestId
+                ) {
+                    guard let existingOwner = existing.ownerFingerprint,
+                          let existingHash = existing.paramsHash,
+                          let state = existing.state else {
+                        return .legacyUnverifiable
+                    }
+                    guard existingOwner == ownerFingerprint else { return .ownerMismatch }
+                    guard existingHash == paramsHash else { return .requestMismatch }
+                    switch state {
+                    case "claimed": return .inProgress
+                    case "committed": return .committed(resultJSON: existing.resultJSON)
+                    case "unknown": return .unknown
+                    default: return .legacyUnverifiable
+                    }
+                }
+
+                let now = iso.string(from: Date())
+                let insert = try db.prepare("""
+                    INSERT INTO command_receipts(
+                        method, client_request_id, result_json, created_at,
+                        owner_fingerprint, params_hash, state, updated_at
+                    ) VALUES(?, ?, '', ?, ?, ?, 'claimed', ?);
+                """)
+                try insert.bind(1, method)
+                try insert.bind(2, clientRequestId)
+                try insert.bind(3, now)
+                try insert.bind(4, ownerFingerprint)
+                try insert.bind(5, paramsHash)
+                try insert.bind(6, now)
+                _ = try insert.step()
+                return .claimed
+            }
+        }
+    }
+
+    public func commit(
+        method: String,
+        clientRequestId: String,
+        ownerFingerprint: String,
+        paramsHash: String,
+        resultJSON: String
+    ) throws {
+        _ = try finalize(
+            method: method,
+            clientRequestId: clientRequestId,
+            ownerFingerprint: ownerFingerprint,
+            paramsHash: paramsHash,
+            resultJSON: resultJSON,
+            events: []
+        )
+    }
+
+    /// Atomically persists the exact command outcome, its ordered event outbox,
+    /// the allocated durable sequence range, and the claimed -> committed
+    /// transition. A failed transaction is reread; an unchanged claim retries
+    /// finalization once with the captured outcome/events and never reruns the
+    /// domain effect.
+    public func finalize(
+        method: String,
+        clientRequestId: String,
+        ownerFingerprint: String,
+        paramsHash: String,
+        resultJSON: String,
+        events: [CommandReceiptEventIntent],
+        minimumEventSequence: Int64 = 0
+    ) throws -> [PersistedCommandReceiptEvent] {
+        var lastError: Error?
+        for attempt in 0..<2 {
+            do {
+                return try finalizeOnce(
+                    method: method,
+                    clientRequestId: clientRequestId,
+                    ownerFingerprint: ownerFingerprint,
+                    paramsHash: paramsHash,
+                    resultJSON: resultJSON,
+                    events: events,
+                    minimumEventSequence: minimumEventSequence
+                )
+            } catch {
+                lastError = error
+                switch try claim(
+                    method: method,
+                    clientRequestId: clientRequestId,
+                    ownerFingerprint: ownerFingerprint,
+                    paramsHash: paramsHash
+                ) {
+                case .committed:
+                    return try persistedEvents(method: method, clientRequestId: clientRequestId)
+                case .inProgress where attempt == 0:
+                    continue
+                default:
+                    throw error
+                }
+            }
+        }
+        throw lastError ?? SQLiteError.execute("Command receipt finalization failed.")
+    }
+
+    public func markUnknown(
+        method: String,
+        clientRequestId: String,
+        ownerFingerprint: String,
+        paramsHash: String
+    ) throws {
+        try transition(
+            method: method,
+            clientRequestId: clientRequestId,
+            ownerFingerprint: ownerFingerprint,
+            paramsHash: paramsHash,
+            state: "unknown",
+            resultJSON: ""
+        )
+    }
+
+    public func status(
+        method: String,
+        clientRequestId: String,
+        ownerFingerprint: String
+    ) throws -> CommandReceiptStatusResult {
+        try db.performSync { db in
+            guard let existing = try receipt(
+                db: db,
+                method: method,
+                clientRequestId: clientRequestId
+            ) else { return .absent }
+            guard let existingOwner = existing.ownerFingerprint,
+                  let state = existing.state else {
+                return .legacyUnverifiable
+            }
+            guard existingOwner == ownerFingerprint else { return .ownerMismatch }
+            switch state {
+            case "claimed": return .inProgress
+            case "committed": return .committed
+            case "unknown": return .unknown
+            default: return .legacyUnverifiable
+            }
+        }
+    }
+
+    private func transition(
+        method: String,
+        clientRequestId: String,
+        ownerFingerprint: String,
+        paramsHash: String,
+        state: String,
+        resultJSON: String
+    ) throws {
+        try db.performSync { db in
+            try db.transaction {
+                guard let existing = try receipt(
+                    db: db,
+                    method: method,
+                    clientRequestId: clientRequestId
+                ), existing.ownerFingerprint == ownerFingerprint,
+                   existing.paramsHash == paramsHash,
+                   existing.state == "claimed" else {
+                    throw SQLiteError.execute("Command receipt transition lost its immutable claim.")
+                }
+                let update = try db.prepare("""
+                    UPDATE command_receipts
+                    SET state = ?, result_json = ?, updated_at = ?
+                    WHERE method = ? AND client_request_id = ? AND state = 'claimed';
+                """)
+                try update.bind(1, state)
+                try update.bind(2, resultJSON)
+                try update.bind(3, iso.string(from: Date()))
+                try update.bind(4, method)
+                try update.bind(5, clientRequestId)
+                _ = try update.step()
+            }
+        }
+    }
+
+    private func finalizeOnce(
+        method: String,
+        clientRequestId: String,
+        ownerFingerprint: String,
+        paramsHash: String,
+        resultJSON: String,
+        events: [CommandReceiptEventIntent],
+        minimumEventSequence: Int64
+    ) throws -> [PersistedCommandReceiptEvent] {
+        try db.performSync { db in
+            try db.transaction {
+                guard let existing = try receipt(
+                    db: db,
+                    method: method,
+                    clientRequestId: clientRequestId
+                ), existing.ownerFingerprint == ownerFingerprint,
+                   existing.paramsHash == paramsHash,
+                   existing.state == "claimed" else {
+                    throw SQLiteError.execute("Command receipt finalization lost its immutable claim.")
+                }
+
+                let sequence = try db.prepare(
+                    "SELECT last_seq FROM event_sequence WHERE singleton = 1;"
+                )
+                guard try sequence.step() else {
+                    throw SQLiteError.execute("Durable event sequence is unavailable.")
+                }
+                let previousSequence = max(sequence.columnInt64(0), minimumEventSequence)
+                var persisted: [PersistedCommandReceiptEvent] = []
+                persisted.reserveCapacity(events.count)
+
+                for (ordinal, event) in events.enumerated() {
+                    let eventSequence = previousSequence + Int64(ordinal) + 1
+                    let createdAt = iso.string(from: event.createdAt)
+                    let insertEvent = try db.prepare("""
+                        INSERT INTO events(
+                            seq, kind, request_id, origin_client_id, payload_json, created_at
+                        ) VALUES(?, ?, ?, ?, ?, ?);
+                    """)
+                    try insertEvent.bind(1, eventSequence)
+                    try insertEvent.bind(2, event.kind)
+                    try insertEvent.bind(3, clientRequestId)
+                    try insertEvent.bind(4, ownerFingerprint)
+                    try insertEvent.bind(5, event.payloadJSON)
+                    try insertEvent.bind(6, createdAt)
+                    _ = try insertEvent.step()
+
+                    let link = try db.prepare("""
+                        INSERT INTO command_receipt_events(
+                            method, client_request_id, ordinal, seq
+                        ) VALUES(?, ?, ?, ?);
+                    """)
+                    try link.bind(1, method)
+                    try link.bind(2, clientRequestId)
+                    try link.bind(3, ordinal)
+                    try link.bind(4, eventSequence)
+                    _ = try link.step()
+                    persisted.append(PersistedCommandReceiptEvent(
+                        seq: eventSequence,
+                        ordinal: ordinal,
+                        kind: event.kind,
+                        payloadJSON: event.payloadJSON,
+                        createdAt: event.createdAt
+                    ))
+                }
+
+                let finalSequence = previousSequence + Int64(events.count)
+                let updateSequence = try db.prepare("""
+                    UPDATE event_sequence SET last_seq = ? WHERE singleton = 1;
+                """)
+                try updateSequence.bind(1, finalSequence)
+                _ = try updateSequence.step()
+
+                let updateReceipt = try db.prepare("""
+                    UPDATE command_receipts
+                    SET state = 'committed', result_json = ?, updated_at = ?,
+                        event_start_seq = ?, event_end_seq = ?
+                    WHERE method = ? AND client_request_id = ? AND state = 'claimed';
+                """)
+                try updateReceipt.bind(1, resultJSON)
+                try updateReceipt.bind(2, iso.string(from: Date()))
+                try updateReceipt.bind(3, persisted.first?.seq)
+                try updateReceipt.bind(4, persisted.last?.seq)
+                try updateReceipt.bind(5, method)
+                try updateReceipt.bind(6, clientRequestId)
+                _ = try updateReceipt.step()
+                if !persisted.isEmpty {
+                    // The just-finalized events are newest and therefore remain
+                    // available to `persistedEvents` for ambiguous-commit reread.
+                    // Only old replay payloads and their now-useless links prune.
+                    try EventRetentionPolicy.prune(db: db, cap: eventRetentionCap)
+                }
+                return persisted
+            }
+        }
+    }
+
+    private func persistedEvents(
+        method: String,
+        clientRequestId: String
+    ) throws -> [PersistedCommandReceiptEvent] {
+        try db.performSync { db in
+            let statement = try db.prepare("""
+                SELECT e.seq, cre.ordinal, e.kind, e.payload_json, e.created_at
+                FROM command_receipt_events cre
+                JOIN events e ON e.seq = cre.seq
+                WHERE cre.method = ? AND cre.client_request_id = ?
+                ORDER BY cre.ordinal ASC;
+            """)
+            try statement.bind(1, method)
+            try statement.bind(2, clientRequestId)
+            var events: [PersistedCommandReceiptEvent] = []
+            while try statement.step() {
+                events.append(PersistedCommandReceiptEvent(
+                    seq: statement.columnInt64(0),
+                    ordinal: Int(statement.columnInt64(1)),
+                    kind: statement.columnText(2) ?? "",
+                    payloadJSON: statement.columnText(3) ?? "null",
+                    createdAt: parseDate(statement.columnText(4))
+                ))
+            }
+            return events
+        }
+    }
+
+    private struct StoredReceipt {
+        let resultJSON: String
+        let ownerFingerprint: String?
+        let paramsHash: String?
+        let state: String?
+    }
+
+    private func receipt(
+        db: SQLiteDB,
+        method: String,
+        clientRequestId: String
+    ) throws -> StoredReceipt? {
+        let statement = try db.prepare("""
+            SELECT result_json, owner_fingerprint, params_hash, state
+            FROM command_receipts
+            WHERE method = ? AND client_request_id = ?;
+        """)
+        try statement.bind(1, method)
+        try statement.bind(2, clientRequestId)
+        guard try statement.step() else { return nil }
+        return StoredReceipt(
+            resultJSON: statement.columnText(0) ?? "",
+            ownerFingerprint: statement.columnText(1),
+            paramsHash: statement.columnText(2),
+            state: statement.columnText(3)
+        )
     }
 }
 

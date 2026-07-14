@@ -1,0 +1,11 @@
+{
+  "protocolVersion": 3,
+  "type": "baselineRequired",
+  "connectionId": "connection-001",
+  "hostId": "host-001",
+  "bootEpoch": 42,
+  "reason": "eventGap",
+  "requestedAfterSequence": 1043,
+  "currentSequence": 1051,
+  "snapshotMethod": "sync.snapshot"
+}

@@ -1,0 +1,16 @@
+[
+  {
+    "jsonrpc": "2.0",
+    "id": "request-003",
+    "result": {
+      "pong": true
+    }
+  },
+  {
+    "jsonrpc": "2.0",
+    "id": "request-004",
+    "result": {
+      "workspaces": []
+    }
+  }
+]

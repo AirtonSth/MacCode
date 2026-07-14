@@ -1,0 +1,15 @@
+{
+  "protocolVersion": 3,
+  "type": "event",
+  "connectionId": "connection-001",
+  "hostId": "host-001",
+  "bootEpoch": 42,
+  "sequence": 1043,
+  "eventId": "event-1043",
+  "occurredAtEpochMs": 1784030401000,
+  "kind": "workspace.updated",
+  "payload": {
+    "workspaceId": "workspace-001",
+    "revision": 8
+  }
+}

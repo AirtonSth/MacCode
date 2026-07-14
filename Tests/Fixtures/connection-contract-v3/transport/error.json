@@ -1,0 +1,11 @@
+{
+  "protocolVersion": 3,
+  "type": "error",
+  "connectionId": "connection-001",
+  "hostId": "host-001",
+  "bootEpoch": 42,
+  "code": "unsupportedMessage",
+  "message": "The message type is not supported by this host.",
+  "retryable": false,
+  "requestId": "request-009"
+}

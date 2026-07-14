@@ -231,10 +231,151 @@ public struct PrivateLiveActivitySnapshot: Equatable, Sendable {
 /// Idempotency-key namespace for Live Activity pushes, parallel to the
 /// `thread.<id>.<outcome>` keys the alert path uses. Kept distinct so a Live
 /// Activity update and an alert for the same run never collide on the backend.
-public enum PrivateLiveActivityEvent: String, Sendable {
+public enum PrivateLiveActivityEvent: String, Codable, Equatable, Sendable {
     case start
     case update
     case end
+}
+
+struct PrivateLiveActivityDeliveryRequestBody<ContentState: Encodable>: Encodable {
+    let contentState: ContentState
+    let event: String
+    let liveActivityToken: String
+    let pushToken: String
+    let pushTokenType: String
+    let timestampSeconds: Int64
+}
+
+public enum PrivateLiveActivityV2TokenKind: String, Codable, Equatable, Sendable {
+    case pushToStart
+    case update
+}
+
+public struct PrivateLiveActivityV2TokenRegistration: Codable, Equatable, Sendable {
+    public let protocolVersion: Int
+    public let activityKey: String
+    public let deviceId: String
+    public let environment: PrivatePushEnvironment
+    public let token: String
+    public let tokenKind: PrivateLiveActivityV2TokenKind
+    public let hostId: String?
+    public let bootEpoch: UInt64?
+    public let activityGeneration: UInt64?
+    public let activitySessionId: String?
+    public let activityId: String?
+
+    public init(
+        protocolVersion: Int = 2,
+        activityKey: String = "active-threads",
+        deviceId: String,
+        environment: PrivatePushEnvironment,
+        token: String,
+        tokenKind: PrivateLiveActivityV2TokenKind,
+        hostId: String? = nil,
+        bootEpoch: UInt64? = nil,
+        activityGeneration: UInt64? = nil,
+        activitySessionId: String? = nil,
+        activityId: String? = nil
+    ) {
+        self.protocolVersion = protocolVersion
+        self.activityKey = activityKey
+        self.deviceId = deviceId
+        self.environment = environment
+        self.token = token
+        self.tokenKind = tokenKind
+        self.hostId = hostId
+        self.bootEpoch = bootEpoch
+        self.activityGeneration = activityGeneration
+        self.activitySessionId = activitySessionId
+        self.activityId = activityId
+    }
+}
+
+public struct LiveActivityTokenOwnership: Codable, Equatable, Hashable, Sendable {
+    public let activityId: String
+    public let hostId: String
+    public let bootEpoch: UInt64
+    public let activityGeneration: UInt64
+    public let activitySessionId: String
+
+    public init(activityId: String, hostId: String, bootEpoch: UInt64, activityGeneration: UInt64, activitySessionId: String) {
+        self.activityId = activityId
+        self.hostId = hostId
+        self.bootEpoch = bootEpoch
+        self.activityGeneration = activityGeneration
+        self.activitySessionId = activitySessionId
+    }
+}
+
+public struct PrivateLiveActivityV2TokenRegistrationAck: Codable, Equatable, Sendable {
+    public struct Token: Codable, Equatable, Sendable {
+        public let activityKey: String
+        public let deviceId: String
+        public let environment: PrivatePushEnvironment
+        public let tokenKind: PrivateLiveActivityV2TokenKind
+        public let hostId: String?
+        public let bootEpoch: UInt64?
+        public let activityGeneration: UInt64?
+        public let activitySessionId: String?
+        public let activityId: String?
+
+        public var ownership: LiveActivityTokenOwnership? {
+            guard let activityId, let hostId, let bootEpoch, let activityGeneration, let activitySessionId else { return nil }
+            return LiveActivityTokenOwnership(
+                activityId: activityId, hostId: hostId, bootEpoch: bootEpoch,
+                activityGeneration: activityGeneration, activitySessionId: activitySessionId
+            )
+        }
+    }
+
+    public let token: Token
+}
+
+/// Flat backend v2 request. This is the single adapter between the internal
+/// host projection and `/live-activities/deliver`; ActivityKit content-state
+/// nesting remains a backend responsibility.
+public struct PrivateLiveActivityV2DeliveryRequest: Codable, Equatable, Sendable {
+    public let protocolVersion: Int
+    public let activityKey: String
+    public let activitySessionId: String
+    public let hostId: String
+    public let bootEpoch: UInt64
+    public let activityGeneration: UInt64
+    public let revision: Int64
+    public let event: PrivateLiveActivityEvent
+    public let deviceId: String
+    public let environment: PrivatePushEnvironment
+    public let phase: PrivateLiveActivityProjectionPhase
+    public let activeThreadCount: Int
+    public let title: String
+    public let statusLine: String
+    public let preview: String
+    public let updatedAtEpochSeconds: Int64
+    public let runStartEpochSeconds: Int64?
+    public let workspaceId: String?
+    public let threadId: String?
+
+    public init(delivery: LiveActivitySyncDelivery, target: PrivatePushTargetRecord) {
+        protocolVersion = 2
+        activityKey = "active-threads"
+        activitySessionId = delivery.projection.sessionId
+        hostId = delivery.projection.hostId
+        bootEpoch = UInt64(delivery.projection.epoch) ?? 0
+        activityGeneration = delivery.activityGeneration
+        revision = delivery.projection.revision
+        event = delivery.event
+        deviceId = target.deviceId
+        environment = target.environment
+        phase = delivery.projection.phase
+        activeThreadCount = delivery.projection.activeThreadCount
+        title = delivery.projection.title
+        statusLine = delivery.projection.statusLine
+        preview = delivery.projection.preview
+        updatedAtEpochSeconds = Int64(delivery.projection.updatedAt)
+        runStartEpochSeconds = delivery.projection.runStartDate.map(Int64.init)
+        workspaceId = delivery.projection.workspaceId
+        threadId = delivery.projection.threadId
+    }
 }
 
 public protocol PrivateAccountAPI: Sendable {
@@ -245,7 +386,26 @@ public protocol PrivateAccountAPI: Sendable {
     func billingOverview(accessToken: String) async throws -> PrivateBillingOverview
     func createPortal(accessToken: String) async throws -> URL
     func deliverAlert(accessToken: String, title: String, body: String, data: [String: String], pushToken: String, pushTokenType: String, idempotencyKey: String) async throws -> PrivatePushDeliveryResult
-    func deliverLiveActivity(accessToken: String, event: String, contentState: PrivateLiveActivityContentState, liveActivityToken: String, pushToken: String, pushTokenType: String, idempotencyKey: String) async throws -> PrivatePushDeliveryResult
+    func deliverLiveActivity(accessToken: String, event: String, contentState: PrivateLiveActivityContentState, timestampSeconds: Int64, liveActivityToken: String, pushToken: String, pushTokenType: String, idempotencyKey: String) async throws -> PrivatePushDeliveryResult
+    func registerLiveActivityTokenV2(accessToken: String, registration: PrivateLiveActivityV2TokenRegistration) async throws -> PrivateLiveActivityV2TokenRegistrationAck
+    func deliverLiveActivityV2(accessToken: String, request: PrivateLiveActivityV2DeliveryRequest, idempotencyKey: String) async throws -> PrivateLiveActivityV2DeliveryAck
+}
+
+public extension PrivateAccountAPI {
+    func registerLiveActivityTokenV2(
+        accessToken: String,
+        registration: PrivateLiveActivityV2TokenRegistration
+    ) async throws -> PrivateLiveActivityV2TokenRegistrationAck {
+        throw PrivateAccountAPIError.invalidResponse
+    }
+
+    func deliverLiveActivityV2(
+        accessToken: String,
+        request: PrivateLiveActivityV2DeliveryRequest,
+        idempotencyKey: String
+    ) async throws -> PrivateLiveActivityV2DeliveryAck {
+        throw PrivateAccountAPIError.invalidResponse
+    }
 }
 
 public enum PrivateAccountAPIError: Error, Equatable {
@@ -254,6 +414,9 @@ public enum PrivateAccountAPIError: Error, Equatable {
 }
 
 public final class URLSessionPrivateAccountAPI: PrivateAccountAPI, @unchecked Sendable {
+    static let liveActivityV2DeliveryPath = "/v1/private/push-notification/live-activities/deliver"
+    static let liveActivityV2TokensPath = "/v1/private/push-notification/live-activities/tokens"
+
     private let baseURL: URL
     private let session: URLSession
     private let decoder = JSONDecoder()
@@ -324,30 +487,51 @@ public final class URLSessionPrivateAccountAPI: PrivateAccountAPI, @unchecked Se
         accessToken: String,
         event: String,
         contentState: PrivateLiveActivityContentState,
+        timestampSeconds: Int64,
         liveActivityToken: String,
         pushToken: String,
         pushTokenType: String,
         idempotencyKey: String
     ) async throws -> PrivatePushDeliveryResult {
-        struct Body: Encodable {
-            let contentState: PrivateLiveActivityContentState
-            let event: String
-            let liveActivityToken: String
-            let pushToken: String
-            let pushTokenType: String
-        }
         return try await request(
             path: "/v1/private/push-notification/deliver",
             method: "POST",
             accessToken: accessToken,
-            body: Body(
+            body: PrivateLiveActivityDeliveryRequestBody(
                 contentState: contentState,
                 event: event,
                 liveActivityToken: liveActivityToken,
                 pushToken: pushToken,
-                pushTokenType: pushTokenType
+                pushTokenType: pushTokenType,
+                timestampSeconds: timestampSeconds
             ),
             idempotencyKey: idempotencyKey
+        )
+    }
+
+    public func deliverLiveActivityV2(
+        accessToken: String,
+        request deliveryRequest: PrivateLiveActivityV2DeliveryRequest,
+        idempotencyKey: String
+    ) async throws -> PrivateLiveActivityV2DeliveryAck {
+        try await request(
+            path: Self.liveActivityV2DeliveryPath,
+            method: "POST",
+            accessToken: accessToken,
+            body: deliveryRequest,
+            idempotencyKey: idempotencyKey
+        )
+    }
+
+    public func registerLiveActivityTokenV2(
+        accessToken: String,
+        registration: PrivateLiveActivityV2TokenRegistration
+    ) async throws -> PrivateLiveActivityV2TokenRegistrationAck {
+        try await request(
+            path: Self.liveActivityV2TokensPath,
+            method: "POST",
+            accessToken: accessToken,
+            body: registration
         )
     }
 
@@ -438,11 +622,103 @@ public struct PrivatePushTarget: Codable, Equatable, Sendable {
     public let updatedAt: Date
 }
 
+public enum PrivatePushTokenPurpose: String, Codable, Equatable, Sendable {
+    case alert
+    case pushToStart = "push_to_start"
+    case activityUpdate = "activity_update"
+}
+
+public enum PrivatePushEnvironment: String, Codable, Equatable, Sendable {
+    case sandbox
+    case production
+}
+
+public struct PrivatePushTargetRecord: Codable, Equatable, Sendable {
+    public let deviceId: String
+    public let serverId: String
+    public let purpose: PrivatePushTokenPurpose
+    public let environment: PrivatePushEnvironment
+    public let token: String
+    public let activityGeneration: UInt64?
+    public let activityId: String?
+    public let bootEpoch: UInt64?
+    public let activitySessionId: String?
+    public let contractVersion: Int
+    public let capabilities: [String]?
+    public let updatedAt: Date
+
+    public init(
+        deviceId: String,
+        serverId: String,
+        purpose: PrivatePushTokenPurpose,
+        environment: PrivatePushEnvironment,
+        token: String,
+        activityGeneration: UInt64? = nil,
+        activityId: String? = nil,
+        bootEpoch: UInt64? = nil,
+        activitySessionId: String? = nil,
+        contractVersion: Int = 1,
+        capabilities: [String]? = nil,
+        updatedAt: Date = Date()
+    ) {
+        self.deviceId = deviceId
+        self.serverId = serverId
+        self.purpose = purpose
+        self.environment = environment
+        self.token = token
+        self.activityGeneration = activityGeneration
+        self.activityId = activityId
+        self.bootEpoch = bootEpoch
+        self.activitySessionId = activitySessionId
+        self.contractVersion = contractVersion
+        self.capabilities = capabilities
+        self.updatedAt = updatedAt
+    }
+
+    public var supportsLiveActivityV2: Bool {
+        contractVersion >= 2 && (capabilities ?? []).contains("live_activity_v2")
+    }
+
+    public var ownership: LiveActivityTokenOwnership? {
+        guard purpose == .activityUpdate,
+              let activityId,
+              let bootEpoch,
+              let activityGeneration,
+              let activitySessionId else { return nil }
+        return LiveActivityTokenOwnership(
+            activityId: activityId,
+            hostId: serverId,
+            bootEpoch: bootEpoch,
+            activityGeneration: activityGeneration,
+            activitySessionId: activitySessionId
+        )
+    }
+
+    public func bound(to ownership: LiveActivityTokenOwnership) -> PrivatePushTargetRecord {
+        PrivatePushTargetRecord(
+            deviceId: deviceId,
+            serverId: ownership.hostId,
+            purpose: purpose,
+            environment: environment,
+            token: token,
+            activityGeneration: ownership.activityGeneration,
+            activityId: ownership.activityId,
+            bootEpoch: ownership.bootEpoch,
+            activitySessionId: ownership.activitySessionId,
+            contractVersion: contractVersion,
+            capabilities: capabilities,
+            updatedAt: updatedAt
+        )
+    }
+}
+
 public final class PrivatePushTargetStore: @unchecked Sendable {
     private let repo: SettingsRepository
     private let key = "private.push.target"
+    private let recordsKey = "private.push.targets.v2"
     private let decoder = JSONDecoder()
     private let encoder = JSONEncoder()
+    private let lock = NSLock()
 
     public init(repo: SettingsRepository) {
         self.repo = repo
@@ -470,6 +746,122 @@ public final class PrivatePushTargetStore: @unchecked Sendable {
     public func clear() {
         try? repo.set(key, "")
     }
+
+    public func records() throws -> [PrivatePushTargetRecord] {
+        try lock.withLock { try loadRecordsUnlocked() }
+    }
+
+    public func upsert(_ record: PrivatePushTargetRecord) throws {
+        try lock.withLock {
+            var values = try loadRecordsUnlocked()
+            values.removeAll { Self.sameIdentity($0, record) }
+            values.append(record)
+            try saveRecordsUnlocked(values)
+        }
+    }
+
+    public func invalidate(
+        deviceId: String,
+        serverId: String,
+        purpose: PrivatePushTokenPurpose,
+        environment: PrivatePushEnvironment,
+        activityGeneration: UInt64? = nil,
+        activityId: String? = nil
+    ) throws {
+        try lock.withLock {
+            var values = try loadRecordsUnlocked()
+            values.removeAll {
+                $0.deviceId == deviceId &&
+                $0.serverId == serverId &&
+                $0.purpose == purpose &&
+                $0.environment == environment &&
+                $0.activityGeneration == activityGeneration &&
+                $0.activityId == activityId
+            }
+            try saveRecordsUnlocked(values)
+        }
+    }
+
+    private func loadRecordsUnlocked() throws -> [PrivatePushTargetRecord] {
+        guard let json = try repo.get(recordsKey),
+              let data = json.data(using: .utf8),
+              !data.isEmpty else { return [] }
+        return try decoder.decode([PrivatePushTargetRecord].self, from: data)
+    }
+
+    private func saveRecordsUnlocked(_ records: [PrivatePushTargetRecord]) throws {
+        let data = try encoder.encode(records)
+        guard let json = String(data: data, encoding: .utf8) else { return }
+        try repo.set(recordsKey, json)
+    }
+
+    private static func sameIdentity(_ lhs: PrivatePushTargetRecord, _ rhs: PrivatePushTargetRecord) -> Bool {
+        lhs.deviceId == rhs.deviceId &&
+        lhs.serverId == rhs.serverId &&
+        lhs.purpose == rhs.purpose &&
+        lhs.environment == rhs.environment &&
+        lhs.activityGeneration == rhs.activityGeneration &&
+        lhs.activityId == rhs.activityId &&
+        lhs.bootEpoch == rhs.bootEpoch &&
+        lhs.activitySessionId == rhs.activitySessionId
+    }
+}
+
+private actor PrivatePushSessionRefresher {
+    private let accountStore: PrivateAccountSessionStore
+    private let api: PrivateAccountAPI
+    private var refreshTask: Task<PrivateAccountSession, Error>?
+
+    init(accountStore: PrivateAccountSessionStore, api: PrivateAccountAPI) {
+        self.accountStore = accountStore
+        self.api = api
+    }
+
+    func perform<Response: Sendable>(
+        session fallbackSession: PrivateAccountSession,
+        operation: @escaping @Sendable (String) async throws -> Response
+    ) async throws -> Response {
+        let session = accountStore.load() ?? fallbackSession
+        do {
+            return try await operation(session.accessToken)
+        } catch let error as PrivateAccountAPIError where error == .http(401) {
+            let refreshed = try await refreshedSession(replacing: session)
+            do {
+                return try await operation(refreshed.accessToken)
+            } catch let retryError as PrivateAccountAPIError where retryError == .http(401) {
+                accountStore.clear()
+                throw retryError
+            }
+        }
+    }
+
+    private func refreshedSession(
+        replacing staleSession: PrivateAccountSession
+    ) async throws -> PrivateAccountSession {
+        if let current = accountStore.load(), current.accessToken != staleSession.accessToken {
+            return current
+        }
+        if let refreshTask {
+            return try await refreshTask.value
+        }
+
+        let api = self.api
+        let refreshToken = staleSession.refreshToken
+        let task = Task {
+            try await api.refresh(refreshToken: refreshToken)
+        }
+        refreshTask = task
+        do {
+            let session = try await task.value
+            accountStore.save(session)
+            refreshTask = nil
+            return session
+        } catch {
+            refreshTask = nil
+            accountStore.clear()
+            throw error
+        }
+    }
 }
 
 public final class PrivateNotificationBridge: @unchecked Sendable {
@@ -477,29 +869,31 @@ public final class PrivateNotificationBridge: @unchecked Sendable {
     private let accountStore: PrivateAccountSessionStore
     private let pushTargetStore: PrivatePushTargetStore
     private let api: PrivateAccountAPI
+    private let sessionRefresher: PrivatePushSessionRefresher
 
     public init(accountStore: PrivateAccountSessionStore, pushTargetStore: PrivatePushTargetStore, api: PrivateAccountAPI = URLSessionPrivateAccountAPI()) {
         self.accountStore = accountStore
         self.pushTargetStore = pushTargetStore
         self.api = api
+        self.sessionRefresher = PrivatePushSessionRefresher(accountStore: accountStore, api: api)
     }
 
     public func deliver(_ content: RemoteCodeNotificationContent) async {
         guard let session = accountStore.load(), session.user.subscribed,
               let target = pushTargetStore.load() else { return }
         do {
-            let result = try await api.deliverAlert(
-                accessToken: session.accessToken,
-                title: content.title,
-                body: content.body,
-                // Carry the notification's routing keys (workspaceId/threadId/category)
-                // as the push `data` so a tap on the remote alert opens the exact
-                // thread, matching the local-notification path's userInfo.
-                data: content.userInfo,
-                pushToken: target.pushToken,
-                pushTokenType: target.pushTokenType,
-                idempotencyKey: content.identifier
-            )
+            let result = try await sessionRefresher.perform(session: session) { accessToken in
+                try await self.api.deliverAlert(
+                    accessToken: accessToken,
+                    title: content.title,
+                    body: content.body,
+                    // Carry routing keys so a remote alert opens the exact thread.
+                    data: content.userInfo,
+                    pushToken: target.pushToken,
+                    pushTokenType: target.pushTokenType,
+                    idempotencyKey: content.identifier
+                )
+            }
             if result.shouldDropSubscription {
                 pushTargetStore.clear()
             }
@@ -525,21 +919,157 @@ public final class PrivateNotificationBridge: @unchecked Sendable {
               let liveActivityToken = target.liveActivityToken,
               !liveActivityToken.isEmpty else { return }
         do {
-            let result = try await api.deliverLiveActivity(
-                accessToken: session.accessToken,
-                event: event.rawValue,
-                contentState: snapshot.contentState(),
-                liveActivityToken: liveActivityToken,
-                pushToken: target.pushToken,
-                pushTokenType: target.pushTokenType,
-                idempotencyKey: idempotencyKey
-            )
+            let result = try await sessionRefresher.perform(session: session) { accessToken in
+                try await self.api.deliverLiveActivity(
+                    accessToken: accessToken,
+                    event: event.rawValue,
+                    contentState: snapshot.contentState(),
+                    timestampSeconds: Int64(snapshot.updatedAt.timeIntervalSince1970),
+                    liveActivityToken: liveActivityToken,
+                    pushToken: target.pushToken,
+                    pushTokenType: target.pushTokenType,
+                    idempotencyKey: idempotencyKey
+                )
+            }
             if result.shouldDropSubscription {
                 pushTargetStore.clear()
             }
         } catch {
             Self.log.error("Private live-activity delivery failed: \(String(describing: error), privacy: .public)")
             return
+        }
+    }
+
+    public func registerLiveActivityTokenV2(_ target: PrivatePushTargetRecord) async throws {
+        guard target.supportsLiveActivityV2,
+              let session = accountStore.load(),
+              session.user.subscribed else { throw PrivateAccountAPIError.invalidResponse }
+
+        let tokenKind: PrivateLiveActivityV2TokenKind
+        switch target.purpose {
+        case .pushToStart:
+            tokenKind = .pushToStart
+        case .activityUpdate:
+            guard target.ownership != nil else { throw LiveActivityTokenBindingError.unknownAuthoritativeScope }
+            tokenKind = .update
+        case .alert:
+            throw PrivateAccountAPIError.invalidResponse
+        }
+
+        let ack = try await sessionRefresher.perform(session: session) { accessToken in
+            try await self.api.registerLiveActivityTokenV2(
+                accessToken: accessToken,
+                registration: PrivateLiveActivityV2TokenRegistration(
+                    deviceId: target.deviceId,
+                    environment: target.environment,
+                    token: target.token,
+                    tokenKind: tokenKind,
+                    hostId: target.ownership?.hostId,
+                    bootEpoch: target.ownership?.bootEpoch,
+                    activityGeneration: target.ownership?.activityGeneration,
+                    activitySessionId: target.ownership?.activitySessionId,
+                    activityId: target.ownership?.activityId
+                )
+            )
+        }
+        if tokenKind == .update, ack.token.ownership != target.ownership {
+            throw PrivateAccountAPIError.invalidResponse
+        }
+    }
+
+
+    /// Compatibility wrapper for callers outside the durable acceptance outbox.
+    public func deliverLiveActivity(_ delivery: LiveActivitySyncDelivery) async {
+        do {
+            for target in try acceptanceTargets(for: delivery) {
+                let record = LiveActivityAcceptanceRecord(delivery: delivery, target: target)
+                _ = try await sendLiveActivityAcceptance(record)
+            }
+        } catch {
+            Self.log.error("Private live-activity acceptance failed: \(String(describing: error), privacy: .public)")
+        }
+    }
+
+    /// Sends one durable acceptance record. V2 returns an outbox acknowledgement;
+    /// legacy clients keep their existing immediate-delivery wire contract.
+    public func acceptanceTargets(
+        for delivery: LiveActivitySyncDelivery
+    ) throws -> [LiveActivityAcceptanceTarget] {
+        let records = try pushTargetStore.records()
+        let purpose: PrivatePushTokenPurpose = delivery.event == .start ? .pushToStart : .activityUpdate
+        let scopedRecords = records.filter {
+            guard $0.supportsLiveActivityV2,
+                  $0.purpose == purpose,
+                  $0.serverId == delivery.projection.hostId else { return false }
+            return true
+        }
+        let targets = scopedRecords.filter {
+            if purpose == .pushToStart { return true }
+            guard let ownership = $0.ownership else { return false }
+            return ownership.bootEpoch == UInt64(delivery.projection.epoch) &&
+                ownership.activityGeneration == delivery.activityGeneration &&
+                ownership.activitySessionId == delivery.projection.sessionId
+        }
+        if !targets.isEmpty { return targets.map(LiveActivityAcceptanceTarget.v2) }
+        guard scopedRecords.isEmpty else {
+            throw LiveActivityTokenBindingError.unknownAuthoritativeScope
+        }
+        guard let legacy = pushTargetStore.load(),
+              let token = legacy.liveActivityToken,
+              !token.isEmpty else { throw PrivateAccountAPIError.invalidResponse }
+        return [.legacy(legacy)]
+    }
+
+    public func sendLiveActivityAcceptance(
+        _ record: LiveActivityAcceptanceRecord
+    ) async throws -> PrivateLiveActivityV2DeliveryAck {
+        let delivery = record.delivery
+        guard let session = accountStore.load(), session.user.subscribed else {
+            throw PrivateAccountAPIError.http(401)
+        }
+        switch record.target {
+        case .legacy(let target):
+            let legacyState = delivery.projection.legacyContentState
+            guard let liveActivityToken = target.liveActivityToken, !liveActivityToken.isEmpty else {
+                throw PrivateAccountAPIError.invalidResponse
+            }
+            let result = try await sessionRefresher.perform(session: session) { accessToken in
+                try await self.api.deliverLiveActivity(
+                    accessToken: accessToken,
+                    event: delivery.event.rawValue,
+                    contentState: legacyState,
+                    timestampSeconds: Int64(legacyState.updatedAt),
+                    liveActivityToken: liveActivityToken,
+                    pushToken: target.pushToken,
+                    pushTokenType: target.pushTokenType,
+                    idempotencyKey: delivery.idempotencyKey
+                )
+            }
+            if result.shouldDropSubscription { pushTargetStore.clear() }
+            guard result.delivered else {
+                throw LiveActivityAcceptanceOutboxError.backendDidNotAccept(
+                    result.errorCode ?? "legacy_rejected"
+                )
+            }
+            return PrivateLiveActivityV2DeliveryAck(
+                id: delivery.idempotencyKey,
+                status: "delivered",
+                attempts: 1,
+                nextAttemptAt: nil
+            )
+        case .v2(let target):
+            let request = PrivateLiveActivityV2DeliveryRequest(delivery: delivery, target: target)
+            let ack = try await sessionRefresher.perform(session: session) { accessToken in
+                try await self.api.deliverLiveActivityV2(
+                    accessToken: accessToken,
+                    request: request,
+                    idempotencyKey: delivery.idempotencyKey
+                )
+            }
+            guard ack.isAccepted else {
+                throw LiveActivityAcceptanceOutboxError.backendDidNotAccept(ack.status)
+            }
+            return ack
         }
     }
 }

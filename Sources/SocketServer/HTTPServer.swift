@@ -133,33 +133,6 @@ public func serverListenerEventPayload(bound: Bool, address: String, port: UInt1
     ]
 }
 
-/// Pure helper: builds the WS `server_close` frame JSON for slow-client evictions.
-/// CONTRACT (UX-001 / :22):
-///   - `reason` is a STABLE machine code iOS can switch on (e.g. "queue_full", "write_failed").
-///   - `message` is a human-localizable string the iOS banner can display verbatim.
-///   - `type` is always "server_close" so iOS can route without inspecting `reason`.
-///   - `action` hints the recovery strategy; current value "reconnect_with_baseline".
-/// Adding `message` is ADDITIVE -- existing `reason` field is preserved so current
-/// iOS parsers that already read `reason` continue working without any client change.
-/// Extracted as a pure nonisolated function for unit-testability: no I/O, no actor.
-public func wsClosePayload(reason: String) -> [String: Any] {
-    let message: String
-    switch reason {
-    case "queue_full":
-        message = "The server dropped this connection because the outbound queue was full. Reconnect with a baseline to resume."
-    case "write_failed":
-        message = "The server could not write to this connection. Reconnect to resume."
-    default:
-        message = "The server closed this connection (\(reason)). Reconnect to resume."
-    }
-    return [
-        "type": "server_close",
-        "reason": reason,
-        "message": message,
-        "action": "reconnect_with_baseline"
-    ]
-}
-
 /// Pure helper: builds the JSON error body for pairing HTTP error responses.
 /// CONTRACT (:23):
 ///   - HTTP status caller must use: 503 for pairing_disabled, 410 for code_expired / code_invalid.
@@ -185,24 +158,65 @@ public func pairingErrorPayload(code: String) -> [String: Any] {
     return ["error": ["code": code, "message": message]]
 }
 
+final class WebSocketLivenessState: @unchecked Sendable {
+    enum Action: Equatable {
+        case none
+        case ping(Data)
+        case timedOut
+    }
+
+    private let lock = NSLock()
+    private let interval: TimeInterval
+    private let timeout: TimeInterval
+    private let nonce: @Sendable () -> Data
+    private var lastProofAt: TimeInterval
+    private var lastPingAt: TimeInterval
+    private var outstandingPing: Data?
+
+    init(
+        now: TimeInterval,
+        interval: TimeInterval,
+        timeout: TimeInterval,
+        nonce: @escaping @Sendable () -> Data = { Data(UUID().uuidString.utf8) }
+    ) {
+        self.interval = interval
+        self.timeout = timeout
+        self.nonce = nonce
+        self.lastProofAt = now
+        self.lastPingAt = now
+    }
+
+    func nextAction(now: TimeInterval) -> Action {
+        lock.lock(); defer { lock.unlock() }
+        if now - lastProofAt >= timeout { return .timedOut }
+        guard outstandingPing == nil, now - lastPingAt >= interval else { return .none }
+        let payload = nonce().prefix(125)
+        let ping = Data(payload)
+        outstandingPing = ping
+        lastPingAt = now
+        return .ping(ping)
+    }
+
+    @discardableResult
+    func acceptPong(_ payload: Data, now: TimeInterval) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard now - lastProofAt < timeout,
+              payload == outstandingPing else { return false }
+        outstandingPing = nil
+        lastProofAt = now
+        lastPingAt = now
+        return true
+    }
+}
+
 public final class DirectHTTPServer: @unchecked Sendable {
     static let maxRequestHeaderBytes = 64 * 1024
     static let maxRequestBodyBytes = 2 * 1024 * 1024
     static let maxClientFramePayloadBytes = 1024 * 1024
     public static let maxWebSocketOutboundQueuedBytes = 1024 * 1024
-    static let wsHeartbeatInterval: TimeInterval = 20
-    static let minimumWebSocketReceiveTimeoutSeconds = 60
-
-    static func webSocketReceiveTimeoutSeconds(
-        requestTimeoutSeconds: Int,
-        heartbeatInterval: TimeInterval
-    ) -> Int {
-        max(
-            requestTimeoutSeconds,
-            minimumWebSocketReceiveTimeoutSeconds,
-            Int(ceil(heartbeatInterval * 3))
-        )
-    }
+    public static let wsHeartbeatInterval: TimeInterval = 5
+    public static let wsHeartbeatTimeout: TimeInterval = 10
+    static let wsSocketReadTimeout: TimeInterval = 30
 
     /// Pure helper: decides whether the `/v1/ws` upgrade must present a valid
     /// bearer token. Mirrors the HTTP `/v1/*` auth gate: loopback-only binds are
@@ -249,11 +263,13 @@ public final class DirectHTTPServer: @unchecked Sendable {
     public let port: UInt16
     public let bindLoopbackOnly: Bool
     public let dispatcher: JSONRPCDispatcher
+    public let commandReceiptMetrics: CommandReceiptMetrics
     public weak var auth: DirectAuthProvider?
     /// Stable, persisted host identity. iOS pins this (RCA-022); it must
     /// survive process restarts or every relaunch looks like a different
     /// Mac and forces a re-pair (GAP-2).
     public let serverId: String
+    public let bootEpoch: UInt64
 
     /// Per-peer brute-force brake for the LAN pairing endpoints. The 6-digit
     /// code is brute-forceable over LAN without this throttle.
@@ -261,21 +277,26 @@ public final class DirectHTTPServer: @unchecked Sendable {
 
     /// Live connection-level metrics surfaced via /v1/health.
     let wsTracker = WSConnectionTracker()
-    private let heartbeatInterval: TimeInterval
+    private let activeWebSocketConnections = ActiveWebSocketConnectionRegistry()
     private let receiveTimeoutSeconds: Int
     private let webSocketOutboundMaxQueuedBytes: Int
 
     private var listenFD: Int32 = -1
     private var running = false
     private var accept: Thread?
+    private let acceptedSockets = AcceptedSocketRegistry()
 
-    public init(port: UInt16 = 18217, loopbackOnly: Bool = true, dispatcher: JSONRPCDispatcher, auth: DirectAuthProvider? = nil, serverId: String = ProcessInfo.processInfo.globallyUniqueString, heartbeatInterval: TimeInterval = 20, clientReceiveTimeoutSeconds: Int = 20, webSocketOutboundMaxQueuedBytes: Int = DirectHTTPServer.maxWebSocketOutboundQueuedBytes) {
+    var acceptedSocketCountForTests: Int { acceptedSockets.count }
+    var afterWelcomeWriteForTests: ((String) -> Void)?
+
+    public init(port: UInt16 = 18217, loopbackOnly: Bool = true, dispatcher: JSONRPCDispatcher, auth: DirectAuthProvider? = nil, serverId: String = ProcessInfo.processInfo.globallyUniqueString, bootEpoch: UInt64, clientReceiveTimeoutSeconds: Int = 20, webSocketOutboundMaxQueuedBytes: Int = DirectHTTPServer.maxWebSocketOutboundQueuedBytes) {
         self.port = port
         self.bindLoopbackOnly = loopbackOnly
         self.dispatcher = dispatcher
+        self.commandReceiptMetrics = dispatcher.commandReceiptMetrics
         self.auth = auth
         self.serverId = serverId
-        self.heartbeatInterval = heartbeatInterval
+        self.bootEpoch = bootEpoch
         self.receiveTimeoutSeconds = max(1, clientReceiveTimeoutSeconds)
         self.webSocketOutboundMaxQueuedBytes = max(1, webSocketOutboundMaxQueuedBytes)
     }
@@ -311,6 +332,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
             close(listenFD); listenFD = -1
             throw POSIXError(.EIO)
         }
+        acceptedSockets.activate()
         running = true
         let t = Thread { [weak self] in self?.acceptLoop() }
         t.name = "RC2.HTTPAccept"
@@ -333,6 +355,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
             close(listenFD)
             listenFD = -1
         }
+        acceptedSockets.shutdownAll()
     }
 
     private func acceptLoop() {
@@ -343,7 +366,15 @@ public final class DirectHTTPServer: @unchecked Sendable {
             if fd < 0 { if !running { return }; continue }
             disableSIGPIPE(fd: fd)
             let peer = Self.peerIP(caddr)
-            DispatchQueue.global().async { [weak self] in self?.handle(fd: fd, peer: peer) }
+            let registry = acceptedSockets
+            guard registry.register(fd) else { continue }
+            DispatchQueue.global().async { [weak self] in
+                guard let self else {
+                    registry.close(fd)
+                    return
+                }
+                self.handle(fd: fd, peer: peer)
+            }
         }
     }
 
@@ -374,7 +405,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
         defer {
             if !handedOff {
                 if let s = subID { EventBus.shared.unsubscribe(s) }
-                close(fd)
+                acceptedSockets.close(fd)
             }
         }
         // Apply a receive timeout so a slow/stuck client cannot block this
@@ -424,6 +455,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
                 headers[k] = v
             }
         }
+        let presentedBearerToken = Self.bearerToken(from: headers)
 
         // Read remaining body bytes if Content-Length declares more
         // than we already have.
@@ -463,22 +495,20 @@ public final class DirectHTTPServer: @unchecked Sendable {
             // trusted) and preserving the loopbackOnly: true test harness.
             if Self.wsUpgradeRequiresToken(loopbackOnly: bindLoopbackOnly, hasAuthProvider: auth != nil),
                let auth = auth {
-                let token = headers["authorization"].flatMap { $0.split(separator: " ").last.map(String.init) } ?? headers["x-rc2-token"]
-                guard let t = token, auth.verify(token: t) else {
+                guard let token = presentedBearerToken, auth.verify(token: token) else {
                     send(fd: fd, status: 401, contentType: "text/plain",
                          body: "unauthorized\n".data(using: .utf8)!,
                          additionalHeaders: ["WWW-Authenticate": wwwAuthenticateHeaderValue(scheme: "Bearer", realm: "RC2")]); return
                 }
             }
+            let webSocketOwnerFingerprint = Self.connectionOwnerFingerprint(
+                token: presentedBearerToken
+            )
             performWSHandshake(fd: fd, key: key)
-            // The request-header timeout is intentionally short, but a live
-            // mobile WebSocket must outlive the iOS 25-second keepalive cadence.
-            // Otherwise the host closes healthy sockets before their next ping.
+            // RFC ping/pong is the liveness authority. A black-holed peer is
+            // closed at the canonical v3 ten-second deadline.
             var wsReceiveTimeout = timeval(
-                tv_sec: Self.webSocketReceiveTimeoutSeconds(
-                    requestTimeoutSeconds: receiveTimeoutSeconds,
-                    heartbeatInterval: heartbeatInterval
-                ),
+                tv_sec: Int(Self.wsSocketReadTimeout),
                 tv_usec: 0
             )
             setsockopt(
@@ -497,10 +527,47 @@ public final class DirectHTTPServer: @unchecked Sendable {
                 guard let self else { return false }
                 return self.sendWSFrame(fd: fd, opcode: opcode, data: data)
             }
+            let connectionId = UUID().uuidString
+            let eventSnapshot = EventBus.shared.snapshotMetadata()
+            let requestedSinceSequence = headers["x-rc2-since-seq"]
+                .flatMap { Int64($0.trimmingCharacters(in: .whitespaces)) } ?? 0
+            let wsSinceSeq = min(max(0, requestedSinceSequence), eventSnapshot.sequence)
+            let sequenceWatermark = ConnectionSequenceWatermark(initialSequence: wsSinceSeq)
+            let welcome = ConnectionTransportFrame.welcome(ConnectionWelcomeFrame(
+                protocolVersion: ConnectionTransportFrame.protocolVersion,
+                type: "welcome",
+                connectionId: connectionId,
+                hostId: serverId,
+                bootEpoch: bootEpoch,
+                serverTimeEpochMs: Int64(Date().timeIntervalSince1970 * 1_000),
+                heartbeatIntervalMs: Int64(Self.wsHeartbeatInterval * 1_000),
+                heartbeatTimeoutMs: Int64(Self.wsHeartbeatTimeout * 1_000),
+                currentSequence: eventSnapshot.sequence,
+                oldestReplaySequence: eventSnapshot.oldestReplaySequence,
+                capabilities: ["events.replay", "jsonrpc.batch", "snapshot.v3"]
+            ))
+            activeWebSocketConnections.insert(
+                connectionId,
+                ownerFingerprint: webSocketOwnerFingerprint,
+                watermark: sequenceWatermark
+            )
+            defer { activeWebSocketConnections.remove(connectionId) }
+            guard let welcomeData = try? welcome.encoded(),
+                  frameWriter.send(opcode: 0x1, data: welcomeData) else {
+                return
+            }
+            afterWelcomeWriteForTests?(connectionId)
             let subIDBox = LockedSubscriberID()
+            let writeFailureClosing = connectionClosingData(
+                connectionId: connectionId,
+                reason: "write_failed",
+                code: 1011,
+                retryable: true,
+                retryAfterMs: 1_000
+            ) ?? Data()
             let outbound = WebSocketOutboundQueue(
                 maxQueuedBytes: webSocketOutboundMaxQueuedBytes,
-                writer: { [weak self] data in
+                applicationWriter: { [weak self] data in
                     guard let self else { return false }
                     return self.sendWSEvent(
                         writer: frameWriter,
@@ -508,38 +575,65 @@ public final class DirectHTTPServer: @unchecked Sendable {
                         compressed: wsCompressionEnabled
                     )
                 },
-                onClose: { [weak self] reason in
-                    // QA-008: structured log on the WS slow-client disconnect
-                    // path so flaky-sync reports are diagnosable beyond the
-                    // single diagnostic.ws_slow_client event.
+                controlWriter: { opcode, data in
+                    frameWriter.send(opcode: opcode, data: data)
+                },
+                writeFailureClosingData: writeFailureClosing,
+                onTerminal: { [weak self] reason in
+                    guard reason == "queue_full" || reason == "write_failed" else { return }
                     NSLog("[RC2.WS] slow-client close: reason=%@ baseline_required=true", reason)
                     if let id = subIDBox.value { EventBus.shared.unsubscribe(id) }
-                    // METRICS: count slow-client drops for /v1/health diagnostics.
                     self?.wsTracker.recordSlowClientDrop()
                     EventBus.shared.publish(kind: "diagnostic.ws_slow_client", payload: .object([
                         "reason": .string(reason),
                         "baseline_required": .bool(true)
                     ]))
-                    // UX-001: tell the client *why* the socket is closing and
-                    // what to do, so it can show a transient banner and
-                    // auto-reconnect with a baseline instead of silently freezing.
-                    // CONTRACT (:22): wsClosePayload keeps stable `reason` + adds
-                    // human-localizable `message` so iOS banner copy does not show
-                    // raw machine tokens. Additive: existing `reason` field preserved.
-                    if let self,
-                       let closeObj = try? JSONSerialization.data(withJSONObject: wsClosePayload(reason: reason)) {
-                        self.sendWSText(writer: frameWriter, data: closeObj)
-                    }
+                },
+                didSendTerminal: { [weak self] in
+                    self?.activeWebSocketConnections.remove(connectionId)
                     shutdown(fd, SHUT_RDWR)
                 }
             )
-            let batcher = WebSocketEventBatcher(enabled: wsFilter == .cellularSafe,
+            let batcher = WebSocketEventBatcher(enabled: false,
                                                 filter: wsFilter,
                                                 // PERF: coalesce per-token agent.item.delta
                                                 // frames on .full connections; non-delta
                                                 // events flush the buffer immediately.
                                                 coalescesStreamingDeltas: wsFilter == .full) { data in
-                _ = outbound.enqueue(data)
+                switch outbound.enqueueApplication(data) {
+                case .accepted:
+                    if case .event(let frame) = try? ConnectionTransportFrame.decodeStrict(data) {
+                        if case .gap(let expected, let received) = sequenceWatermark.recordEnqueuedEvent(
+                            sequence: frame.sequence
+                        ) {
+                            _ = outbound.terminate(
+                                errorData: nil,
+                                closingData: self.connectionClosingData(
+                                    connectionId: connectionId,
+                                    reason: "eventGap_\(expected)_\(received)",
+                                    code: 1012,
+                                    retryable: true,
+                                    retryAfterMs: 0
+                                ),
+                                reason: "event_gap"
+                            )
+                        }
+                    }
+                case .queueFull:
+                    _ = outbound.terminate(
+                        errorData: nil,
+                        closingData: self.connectionClosingData(
+                            connectionId: connectionId,
+                            reason: "queue_full",
+                            code: 1013,
+                            retryable: true,
+                            retryAfterMs: 1_000
+                        ),
+                        reason: "queue_full"
+                    )
+                case .closed:
+                    break
+                }
             }
             // PERF-MAC_SOCKET-:110 -- honor the client's last-seen seq so a
             // reconnect receives only the delta (events after that seq), not the
@@ -548,48 +642,131 @@ public final class DirectHTTPServer: @unchecked Sendable {
             // the first event the client receives is the first it has NOT yet seen.
             // A missing or non-numeric header falls back to 0 (full backlog) so
             // first-connect and legacy clients continue to work correctly.
-            let wsSinceSeq = headers["x-rc2-since-seq"]
-                .flatMap { Int64($0.trimmingCharacters(in: .whitespaces)) } ?? 0
-            let id = EventBus.shared.subscribe(since: wsSinceSeq, filter: wsFilter) { ev in
-                let obj: [String: Any] = [
-                    "seq": ev.seq,
-                    "kind": ev.kind,
-                    "ts": ev.ts,
-                    "payload": Self.jsonValueToAny(ev.payload)
-                ]
-                guard let data = try? JSONSerialization.data(withJSONObject: obj) else { return }
+            let id = EventBus.shared.subscribeDetectingReplayExpiry(
+                since: wsSinceSeq,
+                filter: wsFilter,
+                onReplayExpired: { metadata in
+                    guard let data = self.connectionBaselineRequiredData(
+                        connectionId: connectionId,
+                        requestedAfterSequence: wsSinceSeq,
+                        currentSequence: metadata.sequence
+                    ) else { return }
+                    if outbound.enqueueApplication(data) == .queueFull {
+                        _ = outbound.terminate(
+                            errorData: nil,
+                            closingData: self.connectionClosingData(
+                                connectionId: connectionId,
+                                reason: "queue_full",
+                                code: 1013,
+                                retryable: true,
+                                retryAfterMs: 1_000
+                            ),
+                            reason: "queue_full"
+                        )
+                    }
+                }
+            ) { ev in
+                let frame = ConnectionTransportFrame.event(ConnectionEventFrame(
+                    protocolVersion: ConnectionTransportFrame.protocolVersion,
+                    type: "event",
+                    connectionId: connectionId,
+                    hostId: self.serverId,
+                    bootEpoch: self.bootEpoch,
+                    sequence: ev.seq,
+                    eventId: "\(self.bootEpoch):\(ev.seq)",
+                    occurredAtEpochMs: Int64(ev.ts * 1_000),
+                    kind: ev.kind,
+                    payload: ev.payload
+                ))
+                guard let data = try? frame.encoded() else {
+                    _ = outbound.terminate(
+                        errorData: nil,
+                        closingData: self.connectionClosingData(
+                            connectionId: connectionId,
+                            reason: "invalidEvent",
+                            code: 1011,
+                            retryable: true,
+                            retryAfterMs: 1_000
+                        ),
+                        reason: "invalidEvent"
+                    )
+                    return
+                }
                 batcher.enqueue(event: ev, data: data)
             }
             subIDBox.value = id
             subID = id
-            // UX-003: server-initiated heartbeat so the client can tell
-            // "idle but healthy" from "silently dead socket" and surface an
-            // honest live/stale indicator ("last synced Ns ago"). Seq-less so
-            // it never collides with the ordered event stream.
-            let enqueueHeartbeat = {
-                guard Self.shouldSendHeartbeat(
-                    queued: outbound.queuedByteCount,
-                    max: self.webSocketOutboundMaxQueuedBytes
-                ) else { return }
-                guard let data = try? JSONSerialization.data(withJSONObject: [
-                    "type": "heartbeat",
-                    "ts": Date().timeIntervalSince1970
-                ]) else { return }
-                _ = outbound.enqueue(data)
-            }
-            // Send one frame immediately so iOS can mark the socket live before
-            // the server-side receive timeout races the first periodic heartbeat.
-            enqueueHeartbeat()
-            let heartbeat = DispatchSource.makeTimerSource(queue: DispatchQueue.global())
-            heartbeat.schedule(deadline: .now() + heartbeatInterval, repeating: heartbeatInterval)
-            heartbeat.setEventHandler(handler: enqueueHeartbeat)
-            heartbeat.resume()
             // METRICS: track active client count for /v1/health.
             wsTracker.clientConnected()
+            let liveness = WebSocketLivenessState(
+                now: Date().timeIntervalSinceReferenceDate,
+                interval: Self.wsHeartbeatInterval,
+                timeout: Self.wsHeartbeatTimeout
+            )
+            let heartbeat = DispatchSource.makeTimerSource(queue: DispatchQueue.global())
+            heartbeat.schedule(
+                deadline: .now() + Self.wsHeartbeatInterval,
+                repeating: .milliseconds(250),
+                leeway: .milliseconds(50)
+            )
+            heartbeat.setEventHandler { [weak self] in
+                guard let self else { return }
+                switch liveness.nextAction(now: Date().timeIntervalSinceReferenceDate) {
+                case .none:
+                    break
+                case .ping(let payload):
+                    guard let nonce = String(data: payload, encoding: .utf8),
+                          let heartbeatData = self.connectionHeartbeatData(
+                              connectionId: connectionId,
+                              nonce: nonce,
+                              lastReceivedSequence: sequenceWatermark.value
+                          ) else {
+                        return
+                    }
+                    switch outbound.enqueueApplication(heartbeatData) {
+                    case .accepted:
+                        _ = outbound.enqueueControl(opcode: 0x9, data: payload)
+                    case .queueFull:
+                        _ = outbound.terminate(
+                            errorData: nil,
+                            closingData: self.connectionClosingData(
+                                connectionId: connectionId,
+                                reason: "queue_full",
+                                code: 1013,
+                                retryable: true,
+                                retryAfterMs: 1_000
+                            ),
+                            reason: "queue_full"
+                        )
+                    case .closed:
+                        break
+                    }
+                case .timedOut:
+                    _ = outbound.terminate(
+                        errorData: nil,
+                        closingData: self.connectionClosingData(
+                            connectionId: connectionId,
+                            reason: "heartbeatTimeout",
+                            code: 1012,
+                            retryable: true,
+                            retryAfterMs: 1_000
+                        ),
+                        reason: "heartbeatTimeout"
+                    )
+                }
+            }
+            heartbeat.resume()
             // keep connection open; read incoming frames (ping/pong/close)
-            wsServeLoop(fd: fd, writer: frameWriter)
+            wsServeLoop(
+                fd: fd,
+                connectionId: connectionId,
+                outbound: outbound,
+                liveness: liveness
+            )
             heartbeat.cancel()
-            outbound.drain()
+            batcher.stop()
+            outbound.close()
+            outbound.finish()
             wsTracker.clientDisconnected(queuedBytes: outbound.queuedByteCount)
             return
         }
@@ -611,15 +788,17 @@ public final class DirectHTTPServer: @unchecked Sendable {
         // "Not authorized". It must be exempt like discovery.
         if Self.httpAuthGateRequiresToken(loopbackOnly: bindLoopbackOnly, path: path, hasAuthProvider: auth != nil),
            let auth = auth {
-            let token = headers["authorization"].flatMap { $0.split(separator: " ").last.map(String.init) } ?? headers["x-rc2-token"]
-            if let t = token, auth.verify(token: t) {
+            if let token = presentedBearerToken, auth.verify(token: token) {
                 // ok
             } else {
                 send(fd: fd, status: 401, contentType: "text/plain",
                      body: "unauthorized\n".data(using: .utf8)!,
-                     additionalHeaders: ["WWW-Authenticate": wwwAuthenticateHeaderValue(scheme: "Bearer", realm: "RC2")]); return
+                additionalHeaders: ["WWW-Authenticate": wwwAuthenticateHeaderValue(scheme: "Bearer", realm: "RC2")]); return
             }
         }
+        let requestOwnerFingerprint = Self.connectionOwnerFingerprint(
+            token: presentedBearerToken
+        )
 
         // POST body for pair endpoints; honor Content-Length read above.
         var bodyData = buffer.subdata(in: bodyStartAbsolute..<min(bodyStartAbsolute + contentLength, buffer.endIndex))
@@ -651,6 +830,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
             let retainedBytes = snap.recent.reduce(0) { acc, ev in
                 acc + ((try? JSONEncoder().encode(ev).count) ?? 0)
             }
+            let receiptMetrics = commandReceiptMetrics.snapshot()
             let body: [String: Any] = [
                 "status": "ok",
                 "server_id": serverId,
@@ -665,7 +845,33 @@ public final class DirectHTTPServer: @unchecked Sendable {
                     activeClients: wsTracker.activeClients,
                     totalQueuedBytes: wsTracker.totalQueuedBytes,
                     slowClientDrops: wsTracker.slowClientDrops
-                )
+                ),
+                "command_receipts": [
+                    "claims_total": receiptMetrics.claimsTotal,
+                    "new_claims_total": receiptMetrics.newClaimsTotal,
+                    "claim_failures_total": receiptMetrics.claimFailuresTotal,
+                    "duplicates": [
+                        "in_progress_total": receiptMetrics.duplicatesInProgressTotal,
+                        "committed_total": receiptMetrics.duplicatesCommittedTotal,
+                        "unknown_total": receiptMetrics.duplicatesUnknownTotal
+                    ],
+                    "rejected_claims_total": receiptMetrics.rejectedClaimsTotal,
+                    "unknown_outcomes_total": receiptMetrics.unknownOutcomesTotal,
+                    "claim_latency_ms": [
+                        "count": receiptMetrics.claimLatency.count,
+                        "total": receiptMetrics.claimLatency.totalMilliseconds,
+                        "max": receiptMetrics.claimLatency.maxMilliseconds
+                    ],
+                    "finalization": [
+                        "success_total": receiptMetrics.finalizationSuccessesTotal,
+                        "failure_total": receiptMetrics.finalizationFailuresTotal,
+                        "latency_ms": [
+                            "count": receiptMetrics.finalizationLatency.count,
+                            "total": receiptMetrics.finalizationLatency.totalMilliseconds,
+                            "max": receiptMetrics.finalizationLatency.maxMilliseconds
+                        ]
+                    ]
+                ]
             ]
             sendJSON(fd: fd, status: 200, body: body, acceptEncoding: headers["accept-encoding"])
         case ("POST", "/v1/rpc"):
@@ -683,11 +889,22 @@ public final class DirectHTTPServer: @unchecked Sendable {
             // on this path and is intentionally not touched by the Task.
             handedOff = true
             let ae = headers["accept-encoding"]
+            let registry = acceptedSockets
             Task { [weak self] in
-                guard let self else { close(fd); return }
-                let respData = await self.dispatchRPC(bodyData: bodyData)
+                guard let self else {
+                    registry.close(fd)
+                    return
+                }
+                let respData = await self.dispatchRPC(
+                    bodyData: bodyData,
+                    ownerFingerprint: requestOwnerFingerprint
+                )
+                guard registry.isActive(fd) else {
+                    registry.close(fd)
+                    return
+                }
                 self.send(fd: fd, status: 200, contentType: "application/json", body: respData, acceptEncoding: ae)
-                close(fd)
+                registry.close(fd)
             }
             return
         case ("POST", "/v1/pair"):
@@ -837,15 +1054,278 @@ public final class DirectHTTPServer: @unchecked Sendable {
     /// socket and a real main runloop. PERF-114: the /v1/rpc HTTP handler
     /// now drives this directly from a detached Task, so no global-pool
     /// worker is parked for the RPC's duration.
-    public func dispatchRPC(bodyData: Data) async -> Data {
-        let encoder = JSONEncoder()
-        let decoder = JSONDecoder()
-        guard let req = try? decoder.decode(JSONRPCRequest.self, from: bodyData) else {
-            let resp = JSONRPCResponse(id: nil, error: .parseError)
-            return (try? encoder.encode(resp)) ?? Data("{}".utf8)
+    public func dispatchRPC(
+        bodyData: Data,
+        ownerFingerprint: String? = nil
+    ) async -> Data {
+        let ownerFingerprint = ownerFingerprint
+            ?? Self.connectionOwnerFingerprint(token: nil)
+        let root: Any
+        do {
+            root = try JSONSerialization.jsonObject(with: bodyData, options: [.fragmentsAllowed])
+        } catch {
+            return rpcErrorData(.parseError, id: NSNull())
         }
-        let resp = await dispatcher.dispatch(req)
-        return (try? encoder.encode(resp)) ?? Data("{}".utf8)
+
+        if let batch = root as? [Any] {
+            guard !batch.isEmpty else {
+                return rpcErrorData(.invalidRequest, id: NSNull())
+            }
+            var seenIDs = Set<String>()
+            for item in batch {
+                guard let object = item as? [String: Any],
+                      let (_, key) = strictRPCID(object["id"], keyIsPresent: object.keys.contains("id")) else {
+                    continue
+                }
+                guard seenIDs.insert(key).inserted else {
+                    return rpcErrorData(.invalidRequest, id: NSNull())
+                }
+            }
+            var responses: [[String: Any]] = []
+            responses.reserveCapacity(batch.count)
+            for item in batch {
+                responses.append(await dispatchStrictRPCItem(
+                    item,
+                    ownerFingerprint: ownerFingerprint
+                ))
+            }
+            return rpcJSONData(responses)
+        }
+
+        return rpcJSONData(await dispatchStrictRPCItem(
+            root,
+            ownerFingerprint: ownerFingerprint
+        ))
+    }
+
+    private func dispatchStrictRPCItem(
+        _ value: Any,
+        ownerFingerprint: String
+    ) async -> [String: Any] {
+        guard let object = value as? [String: Any] else {
+            return rpcErrorObject(.invalidRequest, id: NSNull())
+        }
+        let fallbackID = strictRPCID(
+            object["id"],
+            keyIsPresent: object.keys.contains("id")
+        )?.0 ?? NSNull()
+        let expectedKeys: Set<String> = object.keys.contains("params")
+            ? ["jsonrpc", "id", "method", "params"]
+            : ["jsonrpc", "id", "method"]
+        guard Set(object.keys) == expectedKeys,
+              object["jsonrpc"] as? String == "2.0",
+              let method = object["method"] as? String,
+              !method.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              let (wireID, _) = strictRPCID(
+                  object["id"],
+                  keyIsPresent: object.keys.contains("id")
+              ) else {
+            return rpcErrorObject(.invalidRequest, id: fallbackID)
+        }
+
+        var rawParams: [String: Any]?
+        if object.keys.contains("params") {
+            guard let objectParams = object["params"] as? [String: Any] else {
+                return rpcErrorObject(.invalidRequest, id: wireID)
+            }
+            rawParams = objectParams
+        }
+        if method == "sync.snapshot" {
+            guard let rawParams else {
+                return rpcErrorObject(.invalidParams, id: wireID)
+            }
+            return await dispatchSyncSnapshot(
+                rawParams: rawParams,
+                wireID: wireID,
+                ownerFingerprint: ownerFingerprint
+            )
+        }
+        let params = rawParams?.mapValues(JSONValue.from)
+        let requestID: JSONRPCID?
+        switch wireID {
+        case is NSNull: requestID = nil
+        case let value as String: requestID = .string(value)
+        case let value as NSNumber:
+            let number = value.doubleValue
+            if number.rounded(.towardZero) == number,
+               number >= Double(Int.min),
+               number <= Double(Int.max) {
+                requestID = .number(value.intValue)
+            } else {
+                // JSONRPCID is integer-only internally. The dispatcher does not
+                // inspect ids; the exact finite wire number is restored below.
+                requestID = .number(0)
+            }
+        default: return rpcErrorObject(.invalidRequest, id: NSNull())
+        }
+        let request = JSONRPCRequest(
+            jsonrpc: "2.0",
+            id: requestID,
+            method: method,
+            params: params
+        )
+        let mutationContext = MutationRequestContext(
+            ownerFingerprint: ownerFingerprint,
+            hostId: serverId,
+            bootEpoch: bootEpoch,
+            activeConnection: { [activeWebSocketConnections] connectionID, ownerFingerprint in
+                activeWebSocketConnections.watermark(
+                    for: connectionID,
+                    ownerFingerprint: ownerFingerprint
+                ) != nil
+            }
+        )
+        let response = await dispatcher.dispatch(request, mutationContext: mutationContext)
+        guard let encoded = try? JSONEncoder().encode(response),
+              var object = try? JSONSerialization.jsonObject(with: encoded) as? [String: Any] else {
+            return rpcErrorObject(.internalError, id: wireID)
+        }
+        object["id"] = wireID
+        return object
+    }
+
+    private func dispatchSyncSnapshot(
+        rawParams: [String: Any],
+        wireID: Any,
+        ownerFingerprint: String
+    ) async -> [String: Any] {
+        guard Set(rawParams.keys) == [
+            "connectionId", "expectedHostId", "expectedBootEpoch", "supportedStateVersion",
+        ],
+        let connectionID = rawParams["connectionId"] as? String,
+        !connectionID.isEmpty,
+        let expectedHostID = rawParams["expectedHostId"] as? String,
+        expectedHostID == serverId,
+        let expectedBootEpoch = Self.strictUInt64(rawParams["expectedBootEpoch"]),
+        expectedBootEpoch == bootEpoch,
+        let supportedStateVersion = Self.strictInt64(rawParams["supportedStateVersion"]),
+        supportedStateVersion == 3,
+        let watermark = activeWebSocketConnections.watermark(
+            for: connectionID,
+            ownerFingerprint: ownerFingerprint
+        ),
+        watermark.beginSnapshot() else {
+            return rpcErrorObject(.invalidParams, id: wireID)
+        }
+
+        var snapshotAdopted = false
+        defer {
+            if !snapshotAdopted { watermark.cancelSnapshot() }
+        }
+        do {
+            let snapshot = try await dispatcher.readConnectionSnapshot()
+            guard activeWebSocketConnections.watermark(
+                for: connectionID,
+                ownerFingerprint: ownerFingerprint
+            ) === watermark else {
+                return rpcErrorObject(.invalidParams, id: wireID)
+            }
+            let state = snapshot.state.jsonValue(
+                domainRevisions: snapshot.metadata.domainRevisions
+            )
+            let frame = ConnectionTransportFrame.snapshot(ConnectionSnapshotFrame(
+                protocolVersion: ConnectionTransportFrame.protocolVersion,
+                type: "snapshot",
+                connectionId: connectionID,
+                hostId: serverId,
+                bootEpoch: bootEpoch,
+                sequence: snapshot.metadata.sequence,
+                snapshotId: UUID().uuidString,
+                generatedAtEpochMs: Int64(Date().timeIntervalSince1970 * 1_000),
+                stateVersion: 3,
+                state: state
+            ))
+            let data = try frame.encoded()
+            guard let result = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                return rpcErrorObject(.internalError, id: wireID)
+            }
+            switch watermark.adoptSnapshot(sequence: snapshot.metadata.sequence) {
+            case .adopted:
+                snapshotAdopted = true
+            case .gap(let expected, let received):
+                return rpcErrorObject(JSONRPCError(
+                    code: -32010,
+                    message: "Event sequence gap detected; reconnect and request a new baseline.",
+                    data: .object([
+                        "expectedSequence": .number(Double(expected)),
+                        "receivedSequence": .number(Double(received)),
+                    ])
+                ), id: wireID)
+            }
+            return ["jsonrpc": "2.0", "id": wireID, "result": result]
+        } catch let error as JSONRPCError {
+            return rpcErrorObject(error, id: wireID)
+        } catch {
+            return rpcErrorObject(.internalError, id: wireID)
+        }
+    }
+
+    private static func strictInt64(_ value: Any?) -> Int64? {
+        guard let number = value as? NSNumber,
+              CFGetTypeID(number) != CFBooleanGetTypeID(),
+              !CFNumberIsFloatType(number) else {
+            return nil
+        }
+        return Int64(NSDecimalNumber(decimal: number.decimalValue).stringValue)
+    }
+
+    private static func strictUInt64(_ value: Any?) -> UInt64? {
+        guard let number = value as? NSNumber,
+              CFGetTypeID(number) != CFBooleanGetTypeID(),
+              !CFNumberIsFloatType(number) else {
+            return nil
+        }
+        return UInt64(NSDecimalNumber(decimal: number.decimalValue).stringValue)
+    }
+
+    private static func bearerToken(from headers: [String: String]) -> String? {
+        headers["authorization"]
+            .flatMap { $0.split(separator: " ").last.map(String.init) }
+            ?? headers["x-rc2-token"]
+    }
+
+    static func connectionOwnerFingerprint(token: String?) -> String {
+        let material = Data("rc2.connection-owner.v1:\(token ?? "trusted-local")".utf8)
+        return SHA256.hash(data: material)
+            .map { String(format: "%02x", $0) }
+            .joined()
+    }
+
+    private func strictRPCID(_ value: Any?, keyIsPresent: Bool) -> (Any, String)? {
+        guard keyIsPresent else { return nil }
+        if value is NSNull { return (NSNull(), "null") }
+        if let value = value as? String { return (value, "string:\(value)") }
+        guard let number = value as? NSNumber,
+              CFGetTypeID(number) != CFBooleanGetTypeID(),
+              number.doubleValue.isFinite else {
+            return nil
+        }
+        let exactValue = NSDecimalNumber(decimal: number.decimalValue).stringValue
+        return (number, "number:\(exactValue)")
+    }
+
+    private func rpcErrorData(_ error: JSONRPCError, id: Any) -> Data {
+        rpcJSONData(rpcErrorObject(error, id: id))
+    }
+
+    private func rpcErrorObject(_ error: JSONRPCError, id: Any) -> [String: Any] {
+        var errorObject: [String: Any] = [
+            "code": error.code,
+            "message": error.message,
+        ]
+        if let data = error.data {
+            errorObject["data"] = Self.jsonValueToAny(data)
+        }
+        return [
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": errorObject,
+        ]
+    }
+
+    private func rpcJSONData(_ value: Any) -> Data {
+        (try? JSONSerialization.data(withJSONObject: value, options: [.sortedKeys]))
+            ?? Data("{}".utf8)
     }
 
     private func send(fd: Int32, status: Int, contentType: String, body: Data, acceptEncoding: String? = nil, additionalHeaders: [String: String] = [:]) {
@@ -912,13 +1392,6 @@ public final class DirectHTTPServer: @unchecked Sendable {
 
     // MARK: WebSocket
 
-    // Extracted seam for testing: skip the heartbeat when the outbound queue
-    // is at or above half capacity so a backed-up slow client does not
-    // accumulate pending heartbeat frames on top of its real backlog.
-    static func shouldSendHeartbeat(queued: Int, max: Int) -> Bool {
-        queued < max / 2
-    }
-
     private static let wsGUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
     private func performWSHandshake(fd: Int32, key: String) {
@@ -967,7 +1440,12 @@ public final class DirectHTTPServer: @unchecked Sendable {
         return writeAll(fd: fd, data: frame)
     }
 
-    private func wsServeLoop(fd: Int32, writer: WebSocketConnectionWriter) {
+    private func wsServeLoop(
+        fd: Int32,
+        connectionId: String,
+        outbound: WebSocketOutboundQueue,
+        liveness: WebSocketLivenessState
+    ) {
         // PERF-009: keep a contiguous [UInt8] buffer with a read offset
         // instead of Data + removeFirst(consumed). removeFirst is O(n) per
         // frame (shifting the whole buffer), which is quadratic under
@@ -984,18 +1462,79 @@ public final class DirectHTTPServer: @unchecked Sendable {
                 offset += consumed
                 switch frame.opcode {
                 case 0x8: // close
-                    sendCloseFrame(writer: writer); return
+                    _ = outbound.terminate(errorData: nil, closingData: nil, reason: "peerClose")
+                    return
                 case 0x9: // ping -> pong
                     guard frame.payload.count <= 125 else {
-                        sendCloseFrame(writer: writer)
+                        _ = outbound.terminate(
+                            errorData: nil,
+                            closingData: connectionClosingData(
+                                connectionId: connectionId,
+                                reason: "protocolError",
+                                code: 1002,
+                                retryable: false,
+                                retryAfterMs: nil
+                            ),
+                            reason: "protocolError"
+                        )
                         return
                     }
-                    sendPongFrame(writer: writer, payload: frame.payload)
+                    _ = outbound.enqueueControl(opcode: 0xA, data: frame.payload)
                 case 0xA: // pong
+                    _ = liveness.acceptPong(
+                        frame.payload,
+                        now: Date().timeIntervalSinceReferenceDate
+                    )
                     continue
-                case 0x1, 0x2:
-                    continue // client text/binary -- ignore for now
-                default: continue
+                case 0x1:
+                    let code: String
+                    do {
+                        _ = try ConnectionTransportFrame.decodeStrict(frame.payload)
+                        code = "unsupportedMessage"
+                    } catch {
+                        code = "protocolError"
+                    }
+                    _ = outbound.terminate(
+                        errorData: connectionErrorData(connectionId: connectionId, code: code),
+                        closingData: connectionClosingData(
+                            connectionId: connectionId,
+                            reason: "protocolError",
+                            code: 1002,
+                            retryable: false,
+                            retryAfterMs: nil
+                        ),
+                        reason: "protocolError"
+                    )
+                    return
+                case 0x2:
+                    _ = outbound.terminate(
+                        errorData: connectionErrorData(
+                            connectionId: connectionId,
+                            code: "protocolError"
+                        ),
+                        closingData: connectionClosingData(
+                            connectionId: connectionId,
+                            reason: "protocolError",
+                            code: 1002,
+                            retryable: false,
+                            retryAfterMs: nil
+                        ),
+                        reason: "protocolError"
+                    )
+                    return
+                default:
+                    _ = outbound.terminate(
+                        errorData: nil,
+                        closingData: connectionClosingData(
+                            connectionId: connectionId,
+                            reason: "protocolError",
+                            code: 1002,
+                            retryable: false,
+                            retryAfterMs: nil
+                        ),
+                        reason: "protocolError"
+                    )
+                    return
                 }
             }
             if offset > 0 {
@@ -1094,10 +1633,6 @@ public final class DirectHTTPServer: @unchecked Sendable {
         return (WSFrame(opcode: hdr.opcode, payload: Data(payload)), idx + hdr.payloadLen)
     }
 
-    private func sendPongFrame(writer: WebSocketConnectionWriter, payload: Data) {
-        _ = writer.send(opcode: 0xA, data: Data(payload.prefix(125)))
-    }
-
     static func pongFrame(payload: Data) -> Data {
         let safePayload = payload.prefix(125)
         var frame = Data()
@@ -1107,8 +1642,78 @@ public final class DirectHTTPServer: @unchecked Sendable {
         return frame
     }
 
-    private func sendCloseFrame(writer: WebSocketConnectionWriter) {
-        _ = writer.send(opcode: 0x8, data: Data())
+    private func connectionHeartbeatData(
+        connectionId: String,
+        nonce: String,
+        lastReceivedSequence: Int64
+    ) -> Data? {
+        try? ConnectionTransportFrame.heartbeat(ConnectionHeartbeatFrame(
+            protocolVersion: ConnectionTransportFrame.protocolVersion,
+            type: "heartbeat",
+            connectionId: connectionId,
+            hostId: serverId,
+            bootEpoch: bootEpoch,
+            sentAtEpochMs: Int64(Date().timeIntervalSince1970 * 1_000),
+            lastReceivedSequence: lastReceivedSequence,
+            nonce: nonce
+        )).encoded()
+    }
+
+    private func connectionBaselineRequiredData(
+        connectionId: String,
+        requestedAfterSequence: Int64,
+        currentSequence: Int64
+    ) -> Data? {
+        try? ConnectionTransportFrame.baselineRequired(ConnectionBaselineRequiredFrame(
+            protocolVersion: ConnectionTransportFrame.protocolVersion,
+            type: "baselineRequired",
+            connectionId: connectionId,
+            hostId: serverId,
+            bootEpoch: bootEpoch,
+            reason: "replayTruncated",
+            requestedAfterSequence: requestedAfterSequence,
+            currentSequence: currentSequence,
+            snapshotMethod: "sync.snapshot"
+        )).encoded()
+    }
+
+    private func connectionErrorData(
+        connectionId: String,
+        code: String
+    ) -> Data? {
+        let frame = ConnectionTransportFrame.error(ConnectionErrorFrame(
+            protocolVersion: ConnectionTransportFrame.protocolVersion,
+            type: "error",
+            connectionId: connectionId,
+            hostId: serverId,
+            bootEpoch: bootEpoch,
+            code: code,
+            message: "The transport message is not supported by this host.",
+            retryable: false,
+            requestId: nil
+        ))
+        return try? frame.encoded()
+    }
+
+    private func connectionClosingData(
+        connectionId: String,
+        reason: String,
+        code: Int,
+        retryable: Bool,
+        retryAfterMs: Int64?
+    ) -> Data? {
+        let frame = ConnectionTransportFrame.closing(ConnectionClosingFrame(
+            protocolVersion: ConnectionTransportFrame.protocolVersion,
+            type: "closing",
+            connectionId: connectionId,
+            hostId: serverId,
+            bootEpoch: bootEpoch,
+            code: code,
+            reason: reason,
+            retryable: retryable,
+            retryAfterMs: retryAfterMs
+        ))
+        return try? frame.encoded()
     }
 
     private func writeAll(fd: Int32, data: Data) -> Bool {
