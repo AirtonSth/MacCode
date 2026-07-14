@@ -3,6 +3,30 @@ import XCTest
 import CoreModel
 
 final class BootstrapCorruptionRecoveryTests: XCTestCase {
+    func test_runHardensAppSupportAndSQLiteFamilyPermissions() throws {
+        let support = FileManager.default.temporaryDirectory
+            .appendingPathComponent("RC2SecureBootstrap-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: support,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o777]
+        )
+        defer { try? FileManager.default.removeItem(at: support) }
+
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: support.path).run()
+        try SettingsRepository(db: db).set("security.permission_probe", "written")
+
+        XCTAssertEqual(try permissions(at: support.path), 0o700,
+                       "App Support contains credentials and must not be traversable by other users")
+        for suffix in ["", "-wal", "-shm"] {
+            let path = support.appendingPathComponent("remotecode.sqlite").path + suffix
+            XCTAssertTrue(FileManager.default.fileExists(atPath: path),
+                          "the live SQLite \(suffix.isEmpty ? "database" : suffix) file must exist before its mode is asserted")
+            XCTAssertEqual(try permissions(at: path), 0o600,
+                           "the SQLite database family must remain owner-readable and owner-writable only")
+        }
+    }
+
     // The corrupt-backup name helper must move the db AND its -wal/-shm siblings so
     // a half-written WAL cannot be reattached to the fresh DB and re-corrupt it.
     func test_corruptBackupNames_mapsDbWalShmToTimestampedBackups() {
@@ -77,5 +101,10 @@ final class BootstrapCorruptionRecoveryTests: XCTestCase {
             .filter { $0.contains(".corrupt-") }
         XCTAssertTrue(backups.isEmpty,
                       "healthy open path must never create corrupt-backup files")
+    }
+
+    private func permissions(at path: String) throws -> Int {
+        let attributes = try FileManager.default.attributesOfItem(atPath: path)
+        return (attributes[.posixPermissions] as? NSNumber)?.intValue ?? -1
     }
 }

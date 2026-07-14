@@ -263,6 +263,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
     public let port: UInt16
     public let bindLoopbackOnly: Bool
     public let dispatcher: JSONRPCDispatcher
+    public let commandReceiptMetrics: CommandReceiptMetrics
     public weak var auth: DirectAuthProvider?
     /// Stable, persisted host identity. iOS pins this (RCA-022); it must
     /// survive process restarts or every relaunch looks like a different
@@ -291,6 +292,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
         self.port = port
         self.bindLoopbackOnly = loopbackOnly
         self.dispatcher = dispatcher
+        self.commandReceiptMetrics = dispatcher.commandReceiptMetrics
         self.auth = auth
         self.serverId = serverId
         self.bootEpoch = bootEpoch
@@ -826,6 +828,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
             let retainedBytes = snap.recent.reduce(0) { acc, ev in
                 acc + ((try? JSONEncoder().encode(ev).count) ?? 0)
             }
+            let receiptMetrics = commandReceiptMetrics.snapshot()
             let body: [String: Any] = [
                 "status": "ok",
                 "server_id": serverId,
@@ -840,7 +843,33 @@ public final class DirectHTTPServer: @unchecked Sendable {
                     activeClients: wsTracker.activeClients,
                     totalQueuedBytes: wsTracker.totalQueuedBytes,
                     slowClientDrops: wsTracker.slowClientDrops
-                )
+                ),
+                "command_receipts": [
+                    "claims_total": receiptMetrics.claimsTotal,
+                    "new_claims_total": receiptMetrics.newClaimsTotal,
+                    "claim_failures_total": receiptMetrics.claimFailuresTotal,
+                    "duplicates": [
+                        "in_progress_total": receiptMetrics.duplicatesInProgressTotal,
+                        "committed_total": receiptMetrics.duplicatesCommittedTotal,
+                        "unknown_total": receiptMetrics.duplicatesUnknownTotal
+                    ],
+                    "rejected_claims_total": receiptMetrics.rejectedClaimsTotal,
+                    "unknown_outcomes_total": receiptMetrics.unknownOutcomesTotal,
+                    "claim_latency_ms": [
+                        "count": receiptMetrics.claimLatency.count,
+                        "total": receiptMetrics.claimLatency.totalMilliseconds,
+                        "max": receiptMetrics.claimLatency.maxMilliseconds
+                    ],
+                    "finalization": [
+                        "success_total": receiptMetrics.finalizationSuccessesTotal,
+                        "failure_total": receiptMetrics.finalizationFailuresTotal,
+                        "latency_ms": [
+                            "count": receiptMetrics.finalizationLatency.count,
+                            "total": receiptMetrics.finalizationLatency.totalMilliseconds,
+                            "max": receiptMetrics.finalizationLatency.maxMilliseconds
+                        ]
+                    ]
+                ]
             ]
             sendJSON(fd: fd, status: 200, body: body, acceptEncoding: headers["accept-encoding"])
         case ("POST", "/v1/rpc"):

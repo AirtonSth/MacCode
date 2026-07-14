@@ -247,6 +247,10 @@ public protocol LayoutEventSuppressionRouting: AnyObject {
     func withSuppressedLayoutEvents<T>(_ body: () throws -> T) rethrows -> T
 }
 
+/// Marker for domain routers that already publish the canonical notification
+/// projection events. Test/minimal routers omit it and use Dispatcher fallback.
+public protocol NotificationEventPublishingRouting: AnyObject {}
+
 /// Bounded idempotency cache with insertion-order eviction (oldest-first) and TTL.
 /// - `cap`: maximum number of entries before the oldest is dropped.
 /// - `ttl`: seconds after insertion at or beyond which an entry is treated as
@@ -330,6 +334,7 @@ public func coalescePairingRequest(
 @MainActor
 public final class JSONRPCDispatcher {
     let router: CommandRouting
+    public nonisolated let commandReceiptMetrics: CommandReceiptMetrics
     private var volatileCommandReceipts = BoundedReceiptCache()
     @TaskLocal private static var centralMutationExecution = false
     private var volatileUnknownReceipts: [String: (ownerFingerprint: String, paramsHash: String)] = [:]
@@ -451,7 +456,13 @@ public final class JSONRPCDispatcher {
         "agent.attachment.upload",
         "agent.provider.update",
     ]
-    public init(router: CommandRouting) { self.router = router }
+    public init(
+        router: CommandRouting,
+        commandReceiptMetrics: CommandReceiptMetrics = CommandReceiptMetrics()
+    ) {
+        self.router = router
+        self.commandReceiptMetrics = commandReceiptMetrics
+    }
 
     func readConnectionSnapshot() throws -> EventBus.SnapshotBarrierResult<ConnectionSnapshotReadState> {
         guard let snapshotRouter = router as? ConnectionSnapshotRouting else {
@@ -653,6 +664,7 @@ public final class JSONRPCDispatcher {
         let key = "\(req.method):\(identity.clientRequestId)"
         if let unknown = volatileUnknownReceipts[key] {
             if unknown.ownerFingerprint != context.ownerFingerprint {
+                commandReceiptMetrics.recordClaim(.ownerMismatch, latencyMilliseconds: 0)
                 return receiptFailure(
                     id: req.id,
                     code: -32094,
@@ -664,6 +676,7 @@ public final class JSONRPCDispatcher {
                 )
             }
             if unknown.paramsHash != paramsHash {
+                commandReceiptMetrics.recordClaim(.requestMismatch, latencyMilliseconds: 0)
                 return receiptFailure(
                     id: req.id,
                     code: -32093,
@@ -674,6 +687,7 @@ public final class JSONRPCDispatcher {
                     requiresSnapshot: false
                 )
             }
+            commandReceiptMetrics.recordClaim(.unknown, latencyMilliseconds: 0)
             return receiptFailure(
                 id: req.id,
                 code: -32095,
@@ -697,6 +711,7 @@ public final class JSONRPCDispatcher {
         }
 
         let claim: CommandReceiptClaimResult
+        let claimStarted = DispatchTime.now().uptimeNanoseconds
         do {
             claim = try receiptRouter.claimCommandReceipt(
                 method: req.method,
@@ -704,7 +719,14 @@ public final class JSONRPCDispatcher {
                 ownerFingerprint: context.ownerFingerprint,
                 paramsHash: paramsHash
             )
+            commandReceiptMetrics.recordClaim(
+                claim,
+                latencyMilliseconds: Self.elapsedMilliseconds(since: claimStarted)
+            )
         } catch {
+            commandReceiptMetrics.recordClaimFailure(
+                latencyMilliseconds: Self.elapsedMilliseconds(since: claimStarted)
+            )
             return receiptFailure(
                 id: req.id,
                 code: -32091,
@@ -818,6 +840,7 @@ public final class JSONRPCDispatcher {
         }
         guard response.error == nil, let result = response.result else {
             volatileUnknownReceipts[key] = (context.ownerFingerprint, paramsHash)
+            commandReceiptMetrics.recordUnknownOutcome()
             try? receiptRouter.markCommandReceiptUnknown(
                 method: req.method,
                 clientRequestId: identity.clientRequestId,
@@ -834,6 +857,7 @@ public final class JSONRPCDispatcher {
                 requiresSnapshot: true
             )
         }
+        let finalizationStarted = DispatchTime.now().uptimeNanoseconds
         do {
             if let eventSink {
                 let events = try eventSink.seal()
@@ -857,9 +881,18 @@ public final class JSONRPCDispatcher {
                     result: result
                 )
             }
+            commandReceiptMetrics.recordFinalization(
+                success: true,
+                latencyMilliseconds: Self.elapsedMilliseconds(since: finalizationStarted)
+            )
             return response
         } catch {
+            commandReceiptMetrics.recordFinalization(
+                success: false,
+                latencyMilliseconds: Self.elapsedMilliseconds(since: finalizationStarted)
+            )
             volatileUnknownReceipts[key] = (context.ownerFingerprint, paramsHash)
+            commandReceiptMetrics.recordUnknownOutcome()
             try? receiptRouter.markCommandReceiptUnknown(
                 method: req.method,
                 clientRequestId: identity.clientRequestId,
@@ -876,6 +909,11 @@ public final class JSONRPCDispatcher {
                 requiresSnapshot: true
             )
         }
+    }
+
+    private nonisolated static func elapsedMilliseconds(since start: UInt64) -> Double {
+        let end = DispatchTime.now().uptimeNanoseconds
+        return Double(end >= start ? end - start : 0) / 1_000_000
     }
 
     private func commandReceiptStatus(
@@ -2261,11 +2299,13 @@ public final class JSONRPCDispatcher {
                 let body = params["body"]?.stringValue
                 let category = params["category"]?.stringValue
                 let nid = try router.notificationCreate(workspaceId: wid, title: title, body: body, category: category)
-                EventBus.shared.publish(kind: "notification.created", payload: .object([
-                    "id": .string(nid),
-                    "workspace_id": wid.map { .string($0.value.uuidString) } ?? .null,
-                    "title": .string(title)
-                ]))
+                if !(router is NotificationEventPublishingRouting) {
+                    EventBus.shared.publish(kind: "notification.created", payload: .object([
+                        "id": .string(nid),
+                        "workspace_id": wid.map { .string($0.value.uuidString) } ?? .null,
+                        "title": .string(title)
+                    ]))
+                }
                 return .init(id: id, result: .object([
                     "id": .string(nid),
                     "push_policy": .string("background_only")
@@ -2278,16 +2318,20 @@ public final class JSONRPCDispatcher {
             case "notification.mark_read":
                 guard let nid = params["id"]?.stringValue else { throw JSONRPCError.invalidParams }
                 try router.notificationMarkRead(id: nid)
-                EventBus.shared.publish(kind: "notification.read", payload: .object([
-                    "id": .string(nid)
-                ]))
+                if !(router is NotificationEventPublishingRouting) {
+                    EventBus.shared.publish(kind: "notification.read", payload: .object([
+                        "id": .string(nid)
+                    ]))
+                }
                 return .init(id: id, result: .bool(true))
             case "notification.dismiss":
                 guard let nid = params["id"]?.stringValue else { throw JSONRPCError.invalidParams }
                 try router.notificationDismiss(id: nid)
-                EventBus.shared.publish(kind: "notification.dismissed", payload: .object([
-                    "id": .string(nid)
-                ]))
+                if !(router is NotificationEventPublishingRouting) {
+                    EventBus.shared.publish(kind: "notification.dismissed", payload: .object([
+                        "id": .string(nid)
+                    ]))
+                }
                 return .init(id: id, result: .bool(true))
             case "private.push_token.update":
                 guard let pushToken = params["push_token"]?.stringValue,

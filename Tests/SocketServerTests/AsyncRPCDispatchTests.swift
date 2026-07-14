@@ -1,4 +1,5 @@
 import XCTest
+import CoreModel
 @testable import SocketServer
 
 /// PERF-114: the POST /v1/rpc handler no longer parks a global-pool worker
@@ -11,7 +12,9 @@ final class AsyncRPCDispatchTests: XCTestCase {
 
     @MainActor
     private func makeServer() -> DirectHTTPServer {
-        let dispatcher = JSONRPCDispatcher(router: FakeRouter())
+        let router = FakeRouter()
+        router.workspaces = [Workspace.empty(name: "mobile", cwd: "/tmp")]
+        let dispatcher = JSONRPCDispatcher(router: router)
         // Port/loopback are irrelevant here: we never call start(); we drive
         // the pure async seam directly. We just need a constructed server.
         return DirectHTTPServer(port: UInt16.random(in: 33000...44000),
@@ -29,7 +32,7 @@ final class AsyncRPCDispatchTests: XCTestCase {
     func test_dispatchRPC_validRequest_returnsResultEchoingId() async throws {
         let server = makeServer()
         let body = """
-        {"jsonrpc":"2.0","id":"async-seam","method":"workspace.create","params":{"name":"mobile","cwd":"/tmp"}}
+        {"jsonrpc":"2.0","id":"async-seam","method":"workspace.list","params":{}}
         """.data(using: .utf8)!
 
         let respData = await server.dispatchRPC(bodyData: body)
@@ -38,8 +41,8 @@ final class AsyncRPCDispatchTests: XCTestCase {
         XCTAssertEqual(obj?["jsonrpc"] as? String, "2.0")
         XCTAssertEqual(obj?["id"] as? String, "async-seam",
                        "the async seam must echo the request id the client correlates on")
-        let result = obj?["result"] as? [String: Any]
-        XCTAssertEqual(result?["name"] as? String, "mobile",
+        let result = obj?["result"] as? [[String: Any]]
+        XCTAssertEqual(result?.first?["name"] as? String, "mobile",
                        "a valid RPC must reach the same dispatcher the socket uses")
         XCTAssertNil(obj?["error"],
                      "a well-formed request must not produce a JSON-RPC error")
@@ -88,7 +91,7 @@ final class AsyncRPCDispatchTests: XCTestCase {
     @MainActor
     func test_dispatchRPC_nullID_isPreservedInSuccessfulResponse() async throws {
         let server = makeServer()
-        let body = #"{"jsonrpc":"2.0","id":null,"method":"workspace.create","params":{"name":"null-id","cwd":"/tmp"}}"#
+        let body = #"{"jsonrpc":"2.0","id":null,"method":"workspace.list","params":{}}"#
 
         let response = await server.dispatchRPC(bodyData: Data(body.utf8))
         let object = try XCTUnwrap(JSONSerialization.jsonObject(with: response) as? [String: Any])
@@ -103,7 +106,7 @@ final class AsyncRPCDispatchTests: XCTestCase {
     func test_dispatchRPC_fractionalNumericID_roundTripsExactlyAndBooleanIDIsRejected() async throws {
         let server = makeServer()
         let fractional = await server.dispatchRPC(bodyData: Data(
-            #"{"jsonrpc":"2.0","id":1.5,"method":"workspace.create","params":{"name":"fractional","cwd":"/tmp"}}"#.utf8
+            #"{"jsonrpc":"2.0","id":1.5,"method":"workspace.list","params":{}}"#.utf8
         ))
         let fractionalObject = try XCTUnwrap(
             JSONSerialization.jsonObject(with: fractional) as? [String: Any]
@@ -128,9 +131,9 @@ final class AsyncRPCDispatchTests: XCTestCase {
         let server = makeServer()
         let body = #"""
         [
-          {"jsonrpc":"2.0","id":"one","method":"workspace.create","params":{"name":"one","cwd":"/tmp"}},
+          {"jsonrpc":"2.0","id":"one","method":"workspace.list","params":{}},
           {"jsonrpc":"2.0","id":"bad","method":7,"params":{}},
-          {"jsonrpc":"2.0","id":"two","method":"workspace.create","params":{"name":"two","cwd":"/tmp"}}
+          {"jsonrpc":"2.0","id":"two","method":"workspace.list","params":{}}
         ]
         """#
 

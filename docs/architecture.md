@@ -115,6 +115,38 @@ messages strip unresolved handles before persistence/display.
 
 Channels (`debug`, `canary`, `stable`) get their own app-support directory and Unix socket so the user can run them side by side without data contention.
 
+Bootstrap sets the channel App Support directory to `0700` and the live SQLite
+database, WAL, and SHM files to `0600`. Failure to apply those permissions is a
+startup error; the app must not silently continue with credential-bearing state
+readable by another local user.
+
+### Remote mutation receipt retention
+
+Durable remote mutation receipts are the at-most-once authority, not a replay
+cache. Their retention rules are deliberately asymmetric:
+
+- `claimed` rows are never pruned; bootstrap converts interrupted claims to the
+  permanent `unknown` terminal state before command admission.
+- `unknown` rows are permanent tombstones and must never permit re-execution.
+- `committed` rows permanently retain the canonical result required by an exact
+  retry. Retries never depend on retained event payloads.
+- The `events` table retains the newest 5,000 replay payloads. Receipt
+  finalization applies that cap in the same transaction as its event/outcome
+  commit. `command_receipt_events` links are removed only after their event is
+  pruned, so the newest links remain available for ambiguous-commit reread and
+  post-commit fanout.
+
+Consequently, `command_receipts` is a monotonic high-water set in the current
+protocol. This is intentional: strict bounded storage is incompatible with
+permanent at-most-once results for an unlimited request-ID namespace. Do not add
+an age/count delete. A future bounded design requires a persisted receipt epoch,
+atomic epoch retirement, and pre-effect rejection of every stale-epoch request
+with snapshot reconciliation.
+
+`GET /v1/health` exposes aggregate-only receipt counters and claim/finalization
+latency high-water values. It must never expose request IDs, owner fingerprints,
+parameter hashes, raw params, or results.
+
 ## Session restore
 
 On launch:

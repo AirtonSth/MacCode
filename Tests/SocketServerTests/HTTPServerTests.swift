@@ -37,6 +37,44 @@ final class HTTPServerTests: XCTestCase {
     }
 
     @MainActor
+    func test_v1HealthReportsOnlyAggregateCommandReceiptMetrics() throws {
+        let port = UInt16.random(in: 33000...44000)
+        let metrics = CommandReceiptMetrics()
+        metrics.recordClaim(.claimed, latencyMilliseconds: 2)
+        metrics.recordUnknownOutcome()
+        metrics.recordFinalization(success: false, latencyMilliseconds: 3)
+        let dispatcher = JSONRPCDispatcher(router: FakeRouter(), commandReceiptMetrics: metrics)
+        let server = DirectHTTPServer(
+            port: port,
+            loopbackOnly: true,
+            dispatcher: dispatcher,
+            bootEpoch: 1
+        )
+        try server.start()
+        defer { server.stop() }
+        Thread.sleep(forTimeInterval: 0.05)
+
+        let response = expectation(description: "receipt health metrics")
+        URLSession.shared.dataTask(with: URL(string: "http://127.0.0.1:\(port)/v1/health")!) { data, httpResponse, error in
+            XCTAssertNil(error)
+            XCTAssertEqual((httpResponse as? HTTPURLResponse)?.statusCode, 200)
+            let body = (try? JSONSerialization.jsonObject(with: data ?? Data())) as? [String: Any]
+            let receipts = body?["command_receipts"] as? [String: Any]
+            XCTAssertEqual(receipts?["claims_total"] as? Int, 1)
+            XCTAssertEqual(receipts?["new_claims_total"] as? Int, 1)
+            XCTAssertEqual(receipts?["unknown_outcomes_total"] as? Int, 1)
+            let finalization = receipts?["finalization"] as? [String: Any]
+            XCTAssertEqual(finalization?["failure_total"] as? Int, 1)
+            let encoded = String(data: data ?? Data(), encoding: .utf8) ?? ""
+            for forbidden in ["client_request_id", "owner_fingerprint", "params_hash", "result_json"] {
+                XCTAssertFalse(encoded.contains(forbidden), "health metrics must not expose \(forbidden)")
+            }
+            response.fulfill()
+        }.resume()
+        wait(for: [response], timeout: 4)
+    }
+
+    @MainActor
     func test_rpc_route_dispatches_to_desktop_router() throws {
         let port = UInt16.random(in: 33000...44000)
         let router = FakeRouter()

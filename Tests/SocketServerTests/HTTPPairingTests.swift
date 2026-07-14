@@ -104,13 +104,13 @@ final class HTTPPairingTests: XCTestCase {
         let s = DirectHTTPServer(port: UInt16.random(in: 33000...44000), loopbackOnly: true,
                                  dispatcher: dispatcher, auth: FakeAuth(), bootEpoch: 1)
         // No start() needed: dispatchRPC(bodyData:) is a pure in-process call.
-        let body = Data("{\"jsonrpc\":\"2.0\",\"id\":\"warmup\",\"method\":\"workspace.create\",\"params\":{\"name\":\"seam\",\"cwd\":\"/tmp\"}}".utf8)
+        let body = Data("{\"jsonrpc\":\"2.0\",\"id\":\"warmup\",\"method\":\"workspace.list\",\"params\":{}}".utf8)
         let respData = await s.dispatchRPC(bodyData: body)
         let obj = (try? JSONSerialization.jsonObject(with: respData)) as? [String: Any]
         XCTAssertEqual(obj?["id"] as? String, "warmup",
                        "dispatchRPC seam must round-trip the request id to the dispatcher response, proving the seam reaches the router")
         XCTAssertNil(obj?["error"],
-                     "a well-formed workspace.create request through the dispatchRPC seam must not produce an RPC error")
+                     "a read-only request through the dispatchRPC seam must not require remote mutation identity")
     }
 
     @MainActor

@@ -50,7 +50,7 @@ private struct ProviderProbeCapabilities {
 /// Bridges the JSON-RPC dispatcher to the in-process domain state plus the
 /// concrete Surface views. Lives on the main actor because it mutates UI.
 @MainActor
-public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, LayoutEventSuppressionRouting, ConnectionSnapshotRouting, CommandReceiptStateRouting {
+public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, LayoutEventSuppressionRouting, NotificationEventPublishingRouting, ConnectionSnapshotRouting, CommandReceiptStateRouting {
     typealias SSHCommandRunner = @Sendable (String, [String], String?) throws -> (exitCode: Int32, output: String)
 
     private static let minimizedPaneVisibilityThreshold = 0.08

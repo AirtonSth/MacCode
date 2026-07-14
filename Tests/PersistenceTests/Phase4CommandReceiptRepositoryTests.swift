@@ -3,6 +3,80 @@ import XCTest
 import CoreModel
 
 final class Phase4CommandReceiptRepositoryTests: XCTestCase {
+    func test_finalizePrunesOldEventsAndLinksWithoutPruningPermanentReceipts() throws {
+        let db = try SQLiteDB(path: ":memory:")
+        try Schema.migrate(db)
+        let repository = CommandReceiptRepository(db: db, eventRetentionCap: 3)
+
+        XCTAssertEqual(try repository.claim(
+            method: "workspace.close",
+            clientRequestId: "permanent-unknown",
+            ownerFingerprint: "owner-a",
+            paramsHash: "hash-unknown"
+        ), .claimed)
+        try repository.markUnknown(
+            method: "workspace.close",
+            clientRequestId: "permanent-unknown",
+            ownerFingerprint: "owner-a",
+            paramsHash: "hash-unknown"
+        )
+
+        for index in 0..<7 {
+            let requestID = "bounded-\(index)"
+            XCTAssertEqual(try repository.claim(
+                method: "workspace.rename",
+                clientRequestId: requestID,
+                ownerFingerprint: "owner-a",
+                paramsHash: "hash-\(index)"
+            ), .claimed)
+            _ = try repository.finalize(
+                method: "workspace.rename",
+                clientRequestId: requestID,
+                ownerFingerprint: "owner-a",
+                paramsHash: "hash-\(index)",
+                resultJSON: "\(index)",
+                events: [CommandReceiptEventIntent(
+                    kind: "workspace.renamed",
+                    payloadJSON: "{\"index\":\(index)}",
+                    createdAt: Date(timeIntervalSince1970: TimeInterval(index))
+                )]
+            )
+        }
+
+        XCTAssertEqual(try scalar(db, "SELECT COUNT(*) FROM events;"), 3,
+                       "receipt finalization must apply the same retained-event cap as ordinary persistence")
+        XCTAssertEqual(try scalar(db, "SELECT COUNT(*) FROM command_receipt_events;"), 3,
+                       "links to pruned event payloads have no retry role and must be removed")
+        XCTAssertEqual(try scalar(db, """
+            SELECT COUNT(*) FROM command_receipt_events cre
+            WHERE NOT EXISTS (SELECT 1 FROM events e WHERE e.seq = cre.seq);
+            """), 0, "retention must never leave orphan receipt-event links")
+        XCTAssertEqual(try scalar(db, "SELECT COUNT(*) FROM command_receipts;"), 8,
+                       "storage retention must not weaken permanent at-most-once tombstones or committed outcomes")
+        XCTAssertEqual(try repository.claim(
+            method: "workspace.rename",
+            clientRequestId: "bounded-0",
+            ownerFingerprint: "owner-a",
+            paramsHash: "hash-0"
+        ), .committed(resultJSON: "0"))
+        XCTAssertEqual(try repository.status(
+            method: "workspace.close",
+            clientRequestId: "permanent-unknown",
+            ownerFingerprint: "owner-a"
+        ), .unknown)
+
+        let replayedLatest = try repository.finalize(
+            method: "workspace.rename",
+            clientRequestId: "bounded-6",
+            ownerFingerprint: "owner-a",
+            paramsHash: "hash-6",
+            resultJSON: "6",
+            events: []
+        )
+        XCTAssertEqual(replayedLatest.map(\.kind), ["workspace.renamed"],
+                       "the newest link must remain available for ambiguous-commit reread and post-commit fanout")
+    }
+
     func test_claimCommitAndPermanentTerminalStates() throws {
         let db = try SQLiteDB(path: ":memory:")
         try Schema.migrate(db)
@@ -205,5 +279,11 @@ final class Phase4CommandReceiptRepositoryTests: XCTestCase {
             ownerFingerprint: "owner-a",
             paramsHash: "hash-a"
         ), .claimed)
+    }
+
+    private func scalar(_ db: SQLiteDB, _ sql: String) throws -> Int64 {
+        let statement = try db.prepare(sql)
+        XCTAssertTrue(try statement.step())
+        return statement.columnInt64(0)
     }
 }

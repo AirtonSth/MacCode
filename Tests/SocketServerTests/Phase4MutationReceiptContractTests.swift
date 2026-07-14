@@ -1025,13 +1025,20 @@ private final class Phase4LiveServer {
     }
 
     @MainActor
-    static func start(router: CommandRouting, bootEpoch: UInt64) async throws -> Phase4LiveServer {
+    static func start(
+        router: CommandRouting,
+        bootEpoch: UInt64,
+        commandReceiptMetrics: CommandReceiptMetrics = CommandReceiptMetrics()
+    ) async throws -> Phase4LiveServer {
         let port = UInt16.random(in: 33_000...44_000)
         let auth = Phase4MutationAuth(tokens: [ownerToken, otherOwnerToken])
         let server = DirectHTTPServer(
             port: port,
             loopbackOnly: false,
-            dispatcher: JSONRPCDispatcher(router: router),
+            dispatcher: JSONRPCDispatcher(
+                router: router,
+                commandReceiptMetrics: commandReceiptMetrics
+            ),
             auth: auth,
             serverId: hostId,
             bootEpoch: bootEpoch
@@ -2279,12 +2286,17 @@ final class Phase4MutationReceiptContractTests: XCTestCase {
 
     func test_unknownOutcomeIsPermanentAcrossSequentialAndRestartRetries() async throws {
         let router = Phase4ReceiptFakeRouter()
+        let metrics = CommandReceiptMetrics()
         let thread = AgentThread(workspaceId: nil, title: "phase4-unknown", provider: .codex, model: "gpt-5.5")
         router.threadStore = [thread]
         router.effectThenOutcomeUnknown = true
         router.eventClientRequestId = "unknown-outcome"
 
-        let firstServer = try await Phase4LiveServer.start(router: router, bootEpoch: 460)
+        let firstServer = try await Phase4LiveServer.start(
+            router: router,
+            bootEpoch: 460,
+            commandReceiptMetrics: metrics
+        )
         let firstParams = firstServer.mutationParams(
             requestId: "unknown-outcome",
             threadId: thread.id,
@@ -2292,6 +2304,26 @@ final class Phase4MutationReceiptContractTests: XCTestCase {
         )
         let first = try await firstServer.rpc(method: "agent.message.send", params: firstParams)
         let sequential = try await firstServer.rpc(method: "agent.message.send", params: firstParams)
+        let requestMismatch = try await firstServer.rpc(
+            method: "agent.message.send",
+            params: firstServer.mutationParams(
+                requestId: "unknown-outcome",
+                threadId: thread.id,
+                text: "different payload"
+            )
+        )
+        let (otherSocket, otherConnectionId) = try await firstServer.openConnection(
+            token: Phase4LiveServer.otherOwnerToken
+        )
+        defer { otherSocket.cancel(with: .normalClosure, reason: nil) }
+        var otherOwnerParams = firstParams
+        otherOwnerParams["connection_id"] = otherConnectionId
+        let ownerMismatch = try await firstServer.rpc(
+            method: "agent.message.send",
+            params: otherOwnerParams,
+            token: Phase4LiveServer.otherOwnerToken
+        )
+        let metricSnapshot = metrics.snapshot()
         firstServer.stop()
 
         let restarted = try await Phase4LiveServer.start(router: router, bootEpoch: 461)
@@ -2307,7 +2339,12 @@ final class Phase4MutationReceiptContractTests: XCTestCase {
 
         XCTAssertEqual(errorCode(first), commandOutcomeUnknown)
         XCTAssertEqual(errorCode(sequential), commandOutcomeUnknown)
+        XCTAssertEqual(errorCode(requestMismatch), idempotencyRequestMismatch)
+        XCTAssertEqual(errorCode(ownerMismatch), idempotencyOwnerMismatch)
         XCTAssertEqual(errorCode(afterRestart), commandOutcomeUnknown)
+        XCTAssertEqual(metricSnapshot.claimsTotal, 4)
+        XCTAssertEqual(metricSnapshot.duplicatesUnknownTotal, 1)
+        XCTAssertEqual(metricSnapshot.rejectedClaimsTotal, 2)
         XCTAssertEqual(router.sendAgentMessageCallCount, 1,
                        "unknown tombstones must never permit lease takeover or re-execution")
     }

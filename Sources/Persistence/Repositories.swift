@@ -1451,7 +1451,11 @@ public struct PersistedCommandReceiptEvent: Sendable, Equatable {
 
 public final class CommandReceiptRepository {
     let db: SQLiteDB
-    public init(db: SQLiteDB) { self.db = db }
+    private let eventRetentionCap: Int
+    public init(db: SQLiteDB, eventRetentionCap: Int = 5_000) {
+        self.db = db
+        self.eventRetentionCap = max(0, eventRetentionCap)
+    }
 
     /// A process that exits after the durable claim but before finalization
     /// leaves an unprovable outcome. Recovery is permanent and runs before
@@ -1763,6 +1767,12 @@ public final class CommandReceiptRepository {
                 try updateReceipt.bind(5, method)
                 try updateReceipt.bind(6, clientRequestId)
                 _ = try updateReceipt.step()
+                if !persisted.isEmpty {
+                    // The just-finalized events are newest and therefore remain
+                    // available to `persistedEvents` for ambiguous-commit reread.
+                    // Only old replay payloads and their now-useless links prune.
+                    try EventRetentionPolicy.prune(db: db, cap: eventRetentionCap)
+                }
                 return persisted
             }
         }
