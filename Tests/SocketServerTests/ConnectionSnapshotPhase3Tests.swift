@@ -431,6 +431,116 @@ final class ConnectionSnapshotPhase3Tests: XCTestCase {
                        "a rejected snapshot must not advance the connection watermark")
     }
 
+    func test_connectionWatermark_filteredSequenceAdvancesExpectationWithoutAFrame() {
+        let watermark = ConnectionSequenceWatermark(initialSequence: 8)
+
+        watermark.recordFilteredEvent(sequence: 9)
+        XCTAssertEqual(watermark.value, 9,
+                       "a seq dropped by the connection's filter was never sent and must not be awaited")
+        XCTAssertEqual(watermark.recordEnqueuedEvent(sequence: 10), .advanced,
+                       "the first delivered event after a filtered hole must not read as a gap")
+    }
+
+    func test_connectionWatermark_buffersFilteredSequenceRecordedAheadOfBatchedKeptEvent() {
+        // Filtered seqs are recorded synchronously on the EventBus delivery
+        // queue while kept events cross the per-connection batcher hop, so a
+        // filtered N+2 can be recorded before kept N+1.
+        let watermark = ConnectionSequenceWatermark(initialSequence: 8)
+
+        watermark.recordFilteredEvent(sequence: 10)
+        XCTAssertEqual(watermark.value, 8,
+                       "an out-of-order filtered seq must wait for the kept event ahead of it")
+        XCTAssertEqual(watermark.recordEnqueuedEvent(sequence: 9), .advanced)
+        XCTAssertEqual(watermark.value, 10,
+                       "the buffered filtered seq must drain once the kept event advances the watermark")
+        XCTAssertEqual(watermark.recordEnqueuedEvent(sequence: 11), .advanced)
+    }
+
+    func test_connectionWatermark_adoptSnapshotRetainsFilteredSeqAheadOfInFlightKeptEvent() {
+        // Filtered seqs are recorded synchronously on the EventBus delivery
+        // queue, so filtered 11 can land before kept 10 clears the batcher.
+        // A hole below a remaining FILTERED-only seq means a kept event still
+        // in flight, not a lost frame, and must not reject the snapshot.
+        let watermark = ConnectionSequenceWatermark(initialSequence: 8)
+        XCTAssertTrue(watermark.beginSnapshot())
+
+        watermark.recordFilteredEvent(sequence: 11)
+        XCTAssertEqual(watermark.adoptSnapshot(sequence: 9), .adopted(sequence: 9),
+                       "a filtered seq above an in-flight kept event must not read as a gap at adoption")
+
+        XCTAssertEqual(watermark.recordEnqueuedEvent(sequence: 10), .advanced,
+                       "the in-flight kept event lands after adoption and stays contiguous")
+        XCTAssertEqual(watermark.value, 11,
+                       "the retained filtered seq must drain once the kept event advances the watermark")
+        XCTAssertEqual(watermark.recordEnqueuedEvent(sequence: 12), .advanced)
+    }
+
+    func test_connectionWatermark_adoptSnapshotStillFailsLoudWhenKeptSeqProvesGap() {
+        // Kept events cross one serial batcher in seq order, so a hole below a
+        // remaining KEPT seq proves a lost frame; a co-pending filtered seq
+        // further ahead must not mask it.
+        let watermark = ConnectionSequenceWatermark(initialSequence: 8)
+        XCTAssertTrue(watermark.beginSnapshot())
+
+        XCTAssertEqual(watermark.recordEnqueuedEvent(sequence: 12), .bufferedForSnapshot)
+        watermark.recordFilteredEvent(sequence: 14)
+
+        XCTAssertEqual(
+            watermark.adoptSnapshot(sequence: 10),
+            .gap(expected: 11, received: 12)
+        )
+        XCTAssertEqual(watermark.value, 8,
+                       "a rejected snapshot must not advance the connection watermark")
+    }
+
+    func test_connectionWatermark_filteredSeqSurvivesBeginSnapshotIntoTheAdoptionWalk() {
+        // The filter hole is a fact about the live stream, not the snapshot
+        // lifecycle: filtered 10 recorded before sync.snapshot begins must
+        // still count toward adoption, or the walk stops below it and the
+        // next kept event re-reports the filter hole as a gap.
+        let watermark = ConnectionSequenceWatermark(initialSequence: 8)
+
+        watermark.recordFilteredEvent(sequence: 10)
+        XCTAssertTrue(watermark.beginSnapshot())
+        XCTAssertEqual(watermark.adoptSnapshot(sequence: 9), .adopted(sequence: 10),
+                       "the adoption walk must consume a filtered seq recorded before beginSnapshot")
+
+        XCTAssertEqual(watermark.recordEnqueuedEvent(sequence: 9), .coveredBySnapshot,
+                       "the kept event delayed behind adoption is already represented by the snapshot")
+        XCTAssertEqual(watermark.recordEnqueuedEvent(sequence: 11), .advanced)
+    }
+
+    func test_connectionWatermark_filteredSeqSurvivesCancelSnapshot() {
+        // An aborted snapshot drops kept seqs buffered for it (the hole below
+        // them stays unproven), but filtered seqs were never sent at all and
+        // must survive, or the kept event still in flight drains short and the
+        // one after it reads as a spurious gap.
+        let watermark = ConnectionSequenceWatermark(initialSequence: 8)
+
+        watermark.recordFilteredEvent(sequence: 10)
+        XCTAssertTrue(watermark.beginSnapshot())
+        watermark.cancelSnapshot()
+
+        XCTAssertEqual(watermark.recordEnqueuedEvent(sequence: 9), .advanced)
+        XCTAssertEqual(watermark.value, 10,
+                       "the filtered seq must still drain after the snapshot was cancelled")
+        XCTAssertEqual(watermark.recordEnqueuedEvent(sequence: 11), .advanced)
+    }
+
+    func test_connectionWatermark_expiredReplayReanchorAdvancesButNeverRollsBack() {
+        let watermark = ConnectionSequenceWatermark(initialSequence: 0)
+
+        watermark.reanchorForExpiredReplay(sequence: 514)
+        XCTAssertEqual(watermark.value, 514,
+                       "replay expiry re-anchors delivery to the live head; the gap expectation must follow")
+        XCTAssertEqual(watermark.recordEnqueuedEvent(sequence: 515), .advanced,
+                       "the first live event after baselineRequired must not read as a gap")
+
+        watermark.reanchorForExpiredReplay(sequence: 100)
+        XCTAssertEqual(watermark.value, 515,
+                       "re-anchoring must never roll the watermark back behind recorded events")
+    }
+
     func test_domainRevision_classifiesEverySnapshotDomainAndMultiDomainIntent() {
         let cases: [(kind: String, expected: ConnectionDomainRevisions)] = [
             ("workspace.updated", .init(shell: 1, surfaces: 0, agentThreads: 0, browser: 0, files: 0)),

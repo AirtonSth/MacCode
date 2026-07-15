@@ -135,11 +135,13 @@ public func serverListenerEventPayload(bound: Bool, address: String, port: UInt1
 
 /// Pure helper: builds the JSON error body for pairing HTTP error responses.
 /// CONTRACT (:23):
-///   - HTTP status caller must use: 503 for pairing_disabled, 410 for code_expired / code_invalid.
+///   - HTTP status caller must use: 503 for pairing_disabled, 410 for code_expired / code_invalid,
+///     500 for pairing_unavailable.
 ///   - `code` values are PINNED stable machine codes iOS switches on:
-///       "pairing_disabled"  -- auth provider absent or declined to create a request
-///       "code_expired"      -- code was already redeemed or has expired
-///       "code_invalid"      -- code was never valid (not currently emitted; reserved)
+///       "pairing_disabled"    -- auth provider absent (pairing truly off)
+///       "pairing_unavailable" -- auth provider errored internally; retry is the fix
+///       "code_expired"        -- code was already redeemed or has expired
+///       "code_invalid"        -- code was never valid (not currently emitted; reserved)
 ///   - `message` is a human-localizable string safe to show in iOS UI.
 /// Response shape: `{"error":{"code":"<code>","message":"<human>"}}`
 /// Extracted as a pure nonisolated function for unit-testability: no I/O, no actor.
@@ -148,6 +150,8 @@ public func pairingErrorPayload(code: String) -> [String: Any] {
     switch code {
     case "pairing_disabled":
         message = "Pairing is not available on this Mac."
+    case "pairing_unavailable":
+        message = "The Mac could not create the pairing request. Try again."
     case "code_expired":
         message = "The pairing code has expired or was already used."
     case "code_invalid":
@@ -304,6 +308,11 @@ public final class DirectHTTPServer: @unchecked Sendable {
     public func start() throws {
         listenFD = socket(AF_INET, SOCK_STREAM, 0)
         if listenFD < 0 { throw POSIXError(.EIO) }
+        // Close-on-exec: forkpty terminal shells (and any other spawned child)
+        // must not inherit the listener, or an orphaned child keeps port 18217
+        // bound after the app stops and every rebind fails EADDRINUSE while
+        // iOS connects hang in a backlog nobody accepts.
+        _ = fcntl(listenFD, F_SETFD, FD_CLOEXEC)
         var yes: Int32 = 1
         setsockopt(listenFD, SOL_SOCKET, SO_REUSEADDR, &yes, socklen_t(MemoryLayout<Int32>.size))
 
@@ -364,6 +373,9 @@ public final class DirectHTTPServer: @unchecked Sendable {
             var clen = socklen_t(MemoryLayout<sockaddr>.size)
             let fd = Darwin.accept(listenFD, &caddr, &clen)
             if fd < 0 { if !running { return }; continue }
+            // Same close-on-exec rule as the listener: a child spawned while a
+            // request is in flight must not hold the client connection open.
+            _ = fcntl(fd, F_SETFD, FD_CLOEXEC)
             disableSIGPIPE(fd: fd)
             let peer = Self.peerIP(caddr)
             let registry = acceptedSockets
@@ -646,6 +658,13 @@ public final class DirectHTTPServer: @unchecked Sendable {
                 since: wsSinceSeq,
                 filter: wsFilter,
                 onReplayExpired: { metadata in
+                    // The delivery cursor re-anchored to the live head
+                    // (metadata.sequence); the gap watermark must follow BEFORE
+                    // any live event is enqueued, or the first event after
+                    // baselineRequired reads as a gap and closes 1012.
+                    sequenceWatermark.reanchorForExpiredReplay(
+                        sequence: metadata.sequence
+                    )
                     guard let data = self.connectionBaselineRequiredData(
                         connectionId: connectionId,
                         requestedAfterSequence: wsSinceSeq,
@@ -664,6 +683,12 @@ public final class DirectHTTPServer: @unchecked Sendable {
                             reason: "queue_full"
                         )
                     }
+                },
+                onFilteredEvent: { sequence in
+                    // A seq dropped by this connection's negotiated filter is
+                    // not a gap; account for it so the next delivered event
+                    // stays contiguous instead of closing 1012.
+                    sequenceWatermark.recordFilteredEvent(sequence: sequence)
                 }
             ) { ev in
                 let frame = ConnectionTransportFrame.event(ConnectionEventFrame(
@@ -927,9 +952,19 @@ public final class DirectHTTPServer: @unchecked Sendable {
             let clientDeviceID = (obj?["client_device_id"] as? String).flatMap { $0.isEmpty ? nil : $0 }
             guard let r = auth.createPairingRequest(deviceName: deviceName, clientDeviceID: clientDeviceID, privateAccountAccessToken: privateAccountAccessToken) else {
                 pairingThrottle.releaseOutstanding(peer: peer)
-                // CONTRACT (:23): same code here -- auth provider declined to create request.
-                sendJSON(fd: fd, status: 503, body: pairingErrorPayload(code: "pairing_disabled"), acceptEncoding: headers["accept-encoding"]); return
+                // nil means the provider errored internally (LocalAuthAdapter
+                // never "declines"). 500 pairing_unavailable tells iOS to say
+                // "try again" — 503 pairing_disabled sent users to toggle a
+                // Settings switch that was already on (2026-07-14 incident).
+                sendJSON(fd: fd, status: 500, body: pairingErrorPayload(code: "pairing_unavailable"), acceptEncoding: headers["accept-encoding"]); return
             }
+            // Bind the reserved slot to the request id so it is freed exactly
+            // once at terminal status/cancel, or reclaimed after the request's
+            // 300s TTL if the device vanishes mid-pair. Without this, every
+            // completed pairing permanently consumed a slot and the 6th
+            // request from the same peer got 429 until the app restarted.
+            pairingThrottle.bindOutstanding(requestId: r.requestId, peer: peer,
+                                            expiresAt: Date().addingTimeInterval(300))
             sendJSON(fd: fd, status: 200, body: ["request_id": r.requestId, "code": r.code, "expires_in": 300], acceptEncoding: headers["accept-encoding"])
         case ("POST", "/v1/pair/status"):
             guard let auth = auth,
@@ -938,7 +973,15 @@ public final class DirectHTTPServer: @unchecked Sendable {
                 send(fd: fd, status: 400, contentType: "text/plain", body: "bad request\n".data(using: .utf8)!); return
             }
             guard let s = auth.pairingRequestStatus(requestId: requestId) else {
+                // Unknown to the auth provider: nothing left to wait for, so
+                // free the creator's slot too (idempotent no-op otherwise).
+                pairingThrottle.releaseOutstanding(requestId: requestId)
                 send(fd: fd, status: 404, contentType: "text/plain", body: "unknown request\n".data(using: .utf8)!); return
+            }
+            if s.status != "pending" {
+                // Terminal (approved/denied/expired/cancelled): release the
+                // outstanding slot exactly once across repeated polls.
+                pairingThrottle.releaseOutstanding(requestId: requestId)
             }
             var resp: [String: Any] = ["status": s.status]
             if let d = s.deviceId { resp["device_id"] = d }
@@ -958,9 +1001,16 @@ public final class DirectHTTPServer: @unchecked Sendable {
                 send(fd: fd, status: 400, contentType: "text/plain", body: "bad request\n".data(using: .utf8)!); return
             }
             if auth.cancelPairingRequest(requestId: requestId) {
-                pairingThrottle.releaseOutstanding(peer: peer)
+                // Release by request id: frees the CREATOR's slot even when the
+                // cancel arrives from a different peer address (Wi-Fi→cellular
+                // handoff), where the old peer-based release decremented the
+                // wrong peer.
+                pairingThrottle.releaseOutstanding(requestId: requestId)
                 sendJSON(fd: fd, status: 200, body: ["cancelled": true], acceptEncoding: headers["accept-encoding"])
             } else {
+                // Already terminal/unknown: the binding may still be live if no
+                // terminal-status poll ever arrived — release it (idempotent).
+                pairingThrottle.releaseOutstanding(requestId: requestId)
                 send(fd: fd, status: 404, contentType: "text/plain", body: "unknown request\n".data(using: .utf8)!)
             }
         case ("POST", "/v1/pair/redeem"):
@@ -980,7 +1030,9 @@ public final class DirectHTTPServer: @unchecked Sendable {
             }
             if let (deviceId, token) = auth.redeemPairingCode(code, deviceName: name) {
                 pairingThrottle.recordSuccess(peer: peer)
-                pairingThrottle.releaseOutstanding(peer: peer)
+                // No releaseOutstanding here: the QR/redeem flow never reserves
+                // a slot (/v1/pair does), and the count-based release could free
+                // a slot still bound to this peer's live pairing request.
                 sendJSON(fd: fd, status: 200, body: ["device_id": deviceId, "token": token], acceptEncoding: headers["accept-encoding"])
             } else {
                 pairingThrottle.recordFailure(peer: peer)

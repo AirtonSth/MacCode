@@ -76,6 +76,9 @@ public final class EventBus: @unchecked Sendable {
     )
     private struct Subscriber {
         let filter: EventStreamFilter
+        /// Called with the seq of an event this subscriber's filter dropped,
+        /// so per-connection gap detection can account for the hole.
+        let onFilteredEvent: (Int64) -> Void
         let handler: (Event) -> Void
     }
 
@@ -202,7 +205,10 @@ public final class EventBus: @unchecked Sendable {
                 snapshotBarrierLock.unlock()
                 for (event, subscribers) in deliveries {
                     for subscriber in subscribers {
-                        guard let mapped = subscriber.filter.map(event) else { continue }
+                        guard let mapped = subscriber.filter.map(event) else {
+                            subscriber.onFilteredEvent(event.seq)
+                            continue
+                        }
                         subscriber.handler(mapped)
                     }
                 }
@@ -228,7 +234,10 @@ public final class EventBus: @unchecked Sendable {
         lock.unlock()
         snapshotBarrierLock.unlock()
         for s in subs {
-            guard let mapped = s.filter.map(ev) else { continue }
+            guard let mapped = s.filter.map(ev) else {
+                s.onFilteredEvent(ev.seq)
+                continue
+            }
             s.handler(mapped)
         }
         p?(ev)
@@ -296,6 +305,7 @@ public final class EventBus: @unchecked Sendable {
         since: Int64,
         filter: EventStreamFilter = .full,
         onReplayExpired: @escaping (SnapshotMetadata) -> Void,
+        onFilteredEvent: @escaping (Int64) -> Void = { _ in },
         _ handler: @escaping (Event) -> Void
     ) -> UUID {
         let register = { [self] in
@@ -305,15 +315,20 @@ public final class EventBus: @unchecked Sendable {
             let replayExpired = since < replayFloor
             let subscriptionCursor = replayExpired ? lastSeq : since
             let id = UUID()
-            subscribers[id] = Subscriber(filter: filter, handler: handler)
+            subscribers[id] = Subscriber(
+                filter: filter, onFilteredEvent: onFilteredEvent, handler: handler
+            )
             subscribersSnapshot = Array(subscribers.values)
-            let backlog = recent.compactMap { event -> Event? in
-                guard event.seq > subscriptionCursor else { return nil }
-                return filter.map(event)
-            }
+            let backlog = recent.filter { $0.seq > subscriptionCursor }
             lock.unlock()
             if replayExpired { onReplayExpired(metadata) }
-            for event in backlog { handler(event) }
+            for event in backlog {
+                guard let mapped = filter.map(event) else {
+                    onFilteredEvent(event.seq)
+                    continue
+                }
+                handler(mapped)
+            }
             return id
         }
         if DispatchQueue.getSpecific(key: deliveryQueueKey) != nil {
@@ -348,7 +363,9 @@ public final class EventBus: @unchecked Sendable {
     ) -> UUID {
         let id = UUID()
         lock.lock()
-        subscribers[id] = Subscriber(filter: filter, handler: handler)
+        subscribers[id] = Subscriber(
+            filter: filter, onFilteredEvent: { _ in }, handler: handler
+        )
         subscribersSnapshot = Array(subscribers.values)
         let backlog = recent.compactMap { event -> Event? in
             guard event.seq > (since ?? 0) else { return nil }

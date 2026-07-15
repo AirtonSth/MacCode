@@ -471,6 +471,7 @@ public enum Schema {
         SchemaStep(33, """
         ALTER TABLE command_receipts ADD COLUMN event_start_seq INTEGER;
         ALTER TABLE command_receipts ADD COLUMN event_end_seq INTEGER;
+        DELETE FROM events WHERE rowid NOT IN (SELECT MIN(rowid) FROM events GROUP BY seq);
         CREATE UNIQUE INDEX IF NOT EXISTS idx_events_unique_seq ON events(seq);
         CREATE TABLE IF NOT EXISTS event_sequence (
             singleton INTEGER PRIMARY KEY CHECK(singleton = 1),

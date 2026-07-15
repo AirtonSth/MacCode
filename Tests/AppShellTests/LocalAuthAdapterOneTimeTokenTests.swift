@@ -56,14 +56,18 @@ final class LocalAuthAdapterOneTimeTokenTests: XCTestCase {
                      "A denied request must never yield a token  -  yielding one would allow the device to pair despite the user's explicit rejection")
     }
 
-    // MARK: - T017: one-time token delivery (double-poll)
+    // MARK: - T017: token redelivery within the pending TTL (double-poll)
 
-    /// WHY: the pending-token map (`pendingTokens`) in LocalAuthAdapter uses
-    /// `removeValue(forKey:)` so the token is consumed on first retrieval.
-    /// If `removeValue` were replaced by a plain subscript read, the second
-    /// caller would also receive the token, breaking the one-time contract.
-    /// This test encodes that invariant mechanically.
-    func test_approvePairingRequest_tokenDeliveredOnce_nilOnSecondPoll() throws {
+    /// WHY: the HTTP response carrying the token can be lost after the host
+    /// reads it (Wi-Fi→cellular handoff mid-write). A consume-on-first-read
+    /// map stranded the approved device forever on "Approved, but no token
+    /// was returned" — the retry poll got approved + token=nil. The token
+    /// must be redeliverable while the pending TTL lasts; expiry withholding
+    /// stays pinned by LocalAuthAdapterPendingTokenTTLTests. One-shot
+    /// delivery added no security on this plaintext-LAN transport: the token
+    /// itself travels in the first response, and a request_id holder could
+    /// always have won the first-poll race.
+    func test_approvePairingRequest_tokenRedeliveredToRetryPoll_withinTTL() throws {
         let (auth, _) = try makeAuth()
         auth.onPairingRequest = { _ in }   // suppress the modal in tests
 
@@ -81,16 +85,35 @@ final class LocalAuthAdapterOneTimeTokenTests: XCTestCase {
         XCTAssertEqual(first.status, "approved",
                        "Status must be 'approved' after approvePairingRequest  -  the device must see this to proceed")
         XCTAssertNotNil(first.token,
-                        "First poll after approval must yield the one-time token so the device can authenticate future RPC calls")
+                        "First poll after approval must yield the token so the device can authenticate future RPC calls")
 
-        // Second poll  -  must return "approved" (status is persisted) but token must be nil.
+        // Second poll (the device's retry after a lost response) - must
+        // redeliver the SAME token while the pending TTL is live.
         guard let second = auth.pairingRequestStatus(requestId: reqId) else {
             return XCTFail("pairingRequestStatus must still return a row on second poll; returning nil would leave the device in limbo")
         }
         XCTAssertEqual(second.status, "approved",
-                       "Status remains 'approved' on subsequent polls  -  the device may retry once and must not see 'pending'")
-        XCTAssertNil(second.token,
-                     "Token must be nil on second poll  -  the one-time-delivery invariant prevents a race-window attacker from stealing an already-redeemed token")
+                       "Status remains 'approved' on subsequent polls  -  the device may retry and must not see 'pending'")
+        XCTAssertEqual(second.token, first.token,
+                       "A retry poll after a lost response must redeliver the token  -  consuming it on first read strands the approved device with no way to ever receive its credential")
+    }
+
+    /// WHY: redelivery must never resurrect a token for a request the device
+    /// cancelled BEFORE the Mac user approved — cancel drops the RAM-held
+    /// pending token and the store's terminal state wins.
+    func test_cancelBeforeApprove_preventsAnyTokenDelivery() throws {
+        let (auth, _) = try makeAuth()
+        auth.onPairingRequest = { _ in }
+
+        guard let (reqId, _) = auth.createPairingRequest(deviceName: "iPhone-T017c") else {
+            return XCTFail("createPairingRequest must succeed")
+        }
+        XCTAssertTrue(auth.cancelPairingRequest(requestId: reqId))
+        auth.approvePairingRequest(reqId)   // late Mac approve races the cancel
+
+        let after = auth.pairingRequestStatus(requestId: reqId)
+        XCTAssertNil(after?.token,
+                     "a cancelled request must never deliver a token, even if an approve races in afterwards")
     }
 
     // MARK: - T018-guard: unknown requestId returns nil

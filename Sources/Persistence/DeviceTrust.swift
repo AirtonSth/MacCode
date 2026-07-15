@@ -100,6 +100,12 @@ public final class PairingThrottle: @unchecked Sendable {
 
     private let lock = NSLock()
     private var peers: [String: State] = [:]
+    /// Reserved slots bound to their pairing request id, so a slot is
+    /// released exactly once when the request reaches a terminal state
+    /// (approved/denied/expired/cancelled) no matter how many times the
+    /// device polls, and reclaimed by expiry when the device disappears
+    /// mid-pair without ever polling a terminal status.
+    private var boundRequests: [String: (peer: String, expiresAt: Date)] = [:]
 
     public init(freeAttempts: Int = 3,
                 baseBackoff: TimeInterval = 2,
@@ -153,8 +159,11 @@ public final class PairingThrottle: @unchecked Sendable {
 
     /// Reserve one outstanding-request slot for `peer`. Returns false (and
     /// reserves nothing) when the peer is already at `maxOutstandingPerPeer`.
-    public func reserveOutstanding(peer: String) -> Bool {
+    /// Expired bindings are pruned first so abandoned requests (device died
+    /// mid-pair, never polled a terminal status) cannot exhaust the cap.
+    public func reserveOutstanding(peer: String, now: Date = Date()) -> Bool {
         lock.lock(); defer { lock.unlock() }
+        pruneExpiredBindingsLocked(now: now)
         var st = peers[peer] ?? State()
         guard st.outstanding < maxOutstandingPerPeer else { return false }
         st.outstanding += 1
@@ -162,12 +171,45 @@ public final class PairingThrottle: @unchecked Sendable {
         return true
     }
 
-    /// Release one previously-reserved outstanding-request slot (clamped at 0).
+    /// Bind a reserved slot to its pairing request id once the request row
+    /// exists. From then on the slot is released by `releaseOutstanding(requestId:)`
+    /// or by expiry pruning — never by the count-based peer release.
+    public func bindOutstanding(requestId: String, peer: String, expiresAt: Date) {
+        lock.lock(); defer { lock.unlock() }
+        // Re-binding the same id (request reuse) frees the overwritten
+        // binding's slot so the per-peer count stays exact.
+        if let previous = boundRequests.removeValue(forKey: requestId) {
+            releaseSlotLocked(peer: previous.peer)
+        }
+        boundRequests[requestId] = (peer, expiresAt)
+    }
+
+    /// Idempotent release by request id: only the first call for a given id
+    /// frees the slot; repeated terminal-status polls no-op.
+    public func releaseOutstanding(requestId: String) {
+        lock.lock(); defer { lock.unlock() }
+        guard let bound = boundRequests.removeValue(forKey: requestId) else { return }
+        releaseSlotLocked(peer: bound.peer)
+    }
+
+    /// Release one reserved-but-unbound slot (create-request failed before a
+    /// request id existed). Clamped at 0.
     public func releaseOutstanding(peer: String) {
         lock.lock(); defer { lock.unlock() }
+        releaseSlotLocked(peer: peer)
+    }
+
+    private func releaseSlotLocked(peer: String) {
         guard var st = peers[peer] else { return }
         st.outstanding = max(0, st.outstanding - 1)
         peers[peer] = st
+    }
+
+    private func pruneExpiredBindingsLocked(now: Date) {
+        for (id, bound) in boundRequests where bound.expiresAt <= now {
+            boundRequests.removeValue(forKey: id)
+            releaseSlotLocked(peer: bound.peer)
+        }
     }
 }
 
@@ -449,9 +491,14 @@ public final class DeviceTrustRepository {
         let clientDeviceID = st.columnText(6)
         let alwaysAllowPairing = st.columnInt64(7) != 0
         if DeviceTrustRepository.shouldUpdateLastSeen(prev: lastSeen, now: now, threshold: threshold) {
-            let touch = try db.prepare("UPDATE device_trust SET last_seen_at = ? WHERE id = ?;")
-            try touch.bind(1, iso.string(from: now)); try touch.bind(2, id)
-            _ = try touch.step()
+            // Best-effort telemetry: the token already matched above, so a
+            // failed last_seen write (locked/read-only DB) must never
+            // de-authorize a valid device.
+            do {
+                let touch = try db.prepare("UPDATE device_trust SET last_seen_at = ? WHERE id = ?;")
+                try touch.bind(1, iso.string(from: now)); try touch.bind(2, id)
+                _ = try touch.step()
+            } catch {}
         }
         return DeviceTrust(id: id, displayName: name, tokenHash: hash,
                            createdAt: createdAt, lastSeenAt: lastSeen,

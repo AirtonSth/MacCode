@@ -219,6 +219,40 @@ final class RemoteAccessBindConfirmVMTests: XCTestCase {
             "the UI can show an error instead of silently leaving a broken toggle")
     }
 
+    /// WHY: the failed configure armed a supervisor retry that captured
+    /// remoteEnabled=true. Reverting only the stored preference leaves that
+    /// retry live — 1-7s later it can bind 0.0.0.0 and publish Bonjour while
+    /// the toggle says OFF. The revert must re-post rc2RemoteAccessSettingChanged
+    /// so AppDelegate reconfigures the supervisor to the reverted setting and
+    /// cancels the armed retry.
+    func test_serverStartupFailureRevert_reconfiguresSupervisorViaSettingChanged() throws {
+        let vm = try makeVM()
+        vm.remoteAccessEnabled = true
+        try vm.settingsRepo.set("remote_access_enabled", "1")
+        vm._pendingRemoteAccessToggle = true
+
+        var settingChangedPosts = 0
+        let observer = NotificationCenter.default.addObserver(
+            forName: .rc2RemoteAccessSettingChanged, object: nil, queue: .main
+        ) { _ in settingChangedPosts += 1 }
+        defer { NotificationCenter.default.removeObserver(observer) }
+
+        NotificationCenter.default.post(
+            name: AppDelegate.serverStartupFailureNotification,
+            object: nil
+        )
+
+        let exp = expectation(description: "observer Task completes")
+        DispatchQueue.main.async { DispatchQueue.main.async { exp.fulfill() } }
+        waitForExpectations(timeout: 1)
+
+        XCTAssertEqual(settingChangedPosts, 1,
+            "the bind-failure revert must post rc2RemoteAccessSettingChanged exactly once " +
+            "so the supervisor is reconfigured to OFF and its armed remoteEnabled=true retry is cancelled")
+        XCTAssertEqual(try vm.settingsRepo.get("remote_access_enabled"), "0",
+            "the reconfigure must read the already-reverted stored setting")
+    }
+
     // MARK: reload reads real stored preference
 
     /// WHY: reload() reads the stored preference. After a bind failure the stored

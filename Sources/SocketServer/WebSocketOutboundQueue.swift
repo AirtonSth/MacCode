@@ -41,6 +41,13 @@ final class WebSocketOutboundQueue: @unchecked Sendable {
     private let lock = NSLock()
     private var queuedBytes = 0
     private var state: State = .open
+    // Pending frames are buffered here so the serial drain can prioritize
+    // control frames (pong/ping/close) over queued application data. A pong
+    // stuck behind up to 1 MiB of event frames on a slow uplink would miss the
+    // client's pong deadline and kill a healthy connection. Each enqueue still
+    // dispatches exactly one drain token; only the pick order changes.
+    private var pendingApplicationFrames: [Data] = []
+    private var pendingControlFrames: [(opcode: UInt8, data: Data)] = []
     private let applicationWriter: @Sendable (Data) -> Bool
     private let controlWriter: @Sendable (UInt8, Data) -> Bool
     private let writeFailureClosingData: Data
@@ -114,8 +121,9 @@ final class WebSocketOutboundQueue: @unchecked Sendable {
             return .queueFull
         }
         queuedBytes += data.count
+        pendingApplicationFrames.append(data)
         acceptedSubmissionHook()
-        queue.async { [weak self] in self?.writeApplication(data) }
+        queue.async { [weak self] in self?.writeNextPendingFrame() }
         lock.unlock()
         return .accepted
     }
@@ -126,8 +134,9 @@ final class WebSocketOutboundQueue: @unchecked Sendable {
             lock.unlock()
             return .closed
         }
+        pendingControlFrames.append((opcode: opcode, data: data))
         acceptedSubmissionHook()
-        queue.async { [weak self] in self?.writeControl(opcode: opcode, data: data) }
+        queue.async { [weak self] in self?.writeNextPendingFrame() }
         lock.unlock()
         return .accepted
     }
@@ -166,6 +175,27 @@ final class WebSocketOutboundQueue: @unchecked Sendable {
 
     func finish() {
         queue.sync {}
+    }
+
+    /// Runs once per enqueued frame on the serial queue. Control frames are
+    /// drained before pending application frames; an application frame whose
+    /// write already started is never preempted (RFC 6455 frames must not
+    /// interleave), so a pong waits only for the frame in progress.
+    private func writeNextPendingFrame() {
+        lock.lock()
+        if !pendingControlFrames.isEmpty {
+            let control = pendingControlFrames.removeFirst()
+            lock.unlock()
+            writeControl(opcode: control.opcode, data: control.data)
+            return
+        }
+        guard !pendingApplicationFrames.isEmpty else {
+            lock.unlock()
+            return
+        }
+        let data = pendingApplicationFrames.removeFirst()
+        lock.unlock()
+        writeApplication(data)
     }
 
     private func writeApplication(_ data: Data) {
@@ -248,7 +278,15 @@ final class ConnectionSequenceWatermark: @unchecked Sendable {
     private var sequence: Int64
     private var snapshotCoveredThrough: Int64 = 0
     private var snapshotInFlight = false
+    /// Kept events recorded out of order while a snapshot is in flight. Kept
+    /// events cross one serial batcher in seq order, so a hole below a member
+    /// of this set proves a genuinely lost event.
     private var pendingSequences = Set<Int64>()
+    /// Filter-dropped seqs recorded ahead of the kept event below them. These
+    /// are recorded synchronously on the EventBus delivery queue while kept
+    /// events add batcher latency, so a hole below a member of this set only
+    /// means a kept event still in flight — never a lost event.
+    private var filteredPendingSequences = Set<Int64>()
 
     init(initialSequence: Int64) {
         self.sequence = max(0, initialSequence)
@@ -263,8 +301,26 @@ final class ConnectionSequenceWatermark: @unchecked Sendable {
         lock.lock(); defer { lock.unlock() }
         guard !snapshotInFlight else { return false }
         snapshotInFlight = true
+        // Kept seqs only buffer while a snapshot is in flight and every exit
+        // path clears them, so this starts the lifecycle from a clean set.
+        // filteredPendingSequences intentionally survives: a filter hole is a
+        // fact about the live stream, not the snapshot lifecycle. Clearing it
+        // would lose the account of a never-sent seq, and the first kept
+        // event after the hole would re-report it as a gap.
         pendingSequences.removeAll(keepingCapacity: true)
         return true
+    }
+
+    /// Re-anchors the gap expectation when replay expiry re-anchors the
+    /// delivery cursor to the live head. Advance-only, so a snapshot adopted
+    /// concurrently (or live events recorded meanwhile) is never rolled back.
+    func reanchorForExpiredReplay(sequence next: Int64) {
+        lock.lock()
+        if next > sequence {
+            sequence = next
+            drainPendingLocked()
+        }
+        lock.unlock()
     }
 
     func recordEnqueuedEvent(sequence next: Int64) -> ConnectionSequenceRecordResult {
@@ -284,36 +340,69 @@ final class ConnectionSequenceWatermark: @unchecked Sendable {
         return .gap(expected: sequence + 1, received: next)
     }
 
+    /// Accounts for a seq the connection's negotiated filter dropped: the
+    /// event was never sent, so the gap expectation must advance past it
+    /// without a frame. A filtered seq can be recorded ahead of an earlier
+    /// kept event still crossing the batcher, so out-of-order seqs are
+    /// buffered and drained once the kept event advances the watermark. A
+    /// hole the filter cannot account for is left for the next enqueued
+    /// event to report as a gap.
+    func recordFilteredEvent(sequence next: Int64) {
+        lock.lock()
+        if next == sequence + 1 {
+            sequence = next
+            drainPendingLocked()
+        } else if next > sequence, next > snapshotCoveredThrough {
+            filteredPendingSequences.insert(next)
+        }
+        lock.unlock()
+    }
+
     func adoptSnapshot(sequence next: Int64) -> ConnectionSnapshotAdoptionResult {
         lock.lock(); defer { lock.unlock() }
         guard snapshotInFlight else {
             return .gap(expected: sequence + 1, received: next)
         }
         var candidateSequence = max(sequence, next)
-        var remaining = pendingSequences.filter { $0 > candidateSequence }
-        while remaining.remove(candidateSequence + 1) != nil {
+        var remainingKept = pendingSequences.filter { $0 > candidateSequence }
+        var remainingFiltered = filteredPendingSequences.filter { $0 > candidateSequence }
+        while remainingKept.remove(candidateSequence + 1) != nil
+            || remainingFiltered.remove(candidateSequence + 1) != nil {
             candidateSequence += 1
         }
         snapshotInFlight = false
-        if let received = remaining.min() {
+        if let received = remainingKept.min() {
             pendingSequences.removeAll(keepingCapacity: true)
+            filteredPendingSequences.removeAll(keepingCapacity: true)
             return .gap(expected: candidateSequence + 1, received: received)
         }
         sequence = candidateSequence
         snapshotCoveredThrough = max(snapshotCoveredThrough, next)
         pendingSequences.removeAll(keepingCapacity: true)
+        // Remaining filtered seqs above the adopted head are NOT a gap: the
+        // hole below them is a kept event still crossing the batcher, and its
+        // recordEnqueuedEvent will drain them. They must be retained, or that
+        // kept event would re-report the filter hole as a gap.
+        filteredPendingSequences = remainingFiltered
         return .adopted(sequence: sequence)
     }
 
     func cancelSnapshot() {
         lock.lock()
         snapshotInFlight = false
+        // Kept seqs buffered for the abandoned snapshot are dropped: without
+        // an adopted snapshot the hole below them stays uncovered, and the
+        // next kept event fails loud as a gap.
+        // filteredPendingSequences survives: it accounts for seqs that were
+        // never sent, independent of any snapshot; dropping it would turn the
+        // filter hole into a spurious gap once the in-flight kept event lands.
         pendingSequences.removeAll(keepingCapacity: true)
         lock.unlock()
     }
 
     private func drainPendingLocked() {
-        while pendingSequences.remove(sequence + 1) != nil {
+        while pendingSequences.remove(sequence + 1) != nil
+            || filteredPendingSequences.remove(sequence + 1) != nil {
             sequence += 1
         }
     }
