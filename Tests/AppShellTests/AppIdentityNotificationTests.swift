@@ -384,6 +384,8 @@ final class AppIdentityNotificationTests: XCTestCase {
         XCTAssertEqual(state.activeThreadCount, 1)
         XCTAssertEqual(state.updatedAt, 1_800)
         XCTAssertEqual(state.runStartDate, 1_500)
+        XCTAssertEqual(state.petState, "coding")
+        XCTAssertEqual(state.petFrame, 0)
 
         // The wire content-state is decoded by iOS ActivityKit directly into
         // RemoteCodeActivityAttributes.ContentState, so the JSON keys MUST be
@@ -391,7 +393,7 @@ final class AppIdentityNotificationTests: XCTestCase {
         // breaks Live Activity push decode -- this pins the contract.
         let json = try JSONSerialization.jsonObject(with: try JSONEncoder().encode(state)) as? [String: Any]
         XCTAssertEqual(Set((json ?? [:]).keys),
-                       ["title", "statusLine", "preview", "phase", "activeThreadCount", "updatedAt", "runStartDate", "workspaceId", "threadId"],
+                       ["title", "statusLine", "preview", "phase", "activeThreadCount", "updatedAt", "runStartDate", "workspaceId", "threadId", "petState", "petFrame"],
                        "Live Activity push content-state keys must match the on-device ContentState schema both platforms decode")
     }
 
@@ -404,10 +406,14 @@ final class AppIdentityNotificationTests: XCTestCase {
         XCTAssertEqual(completed?.statusLine, "Finished")
         XCTAssertEqual(completed?.activeThreadCount, 0)
         XCTAssertEqual(completed?.preview, "Build fix response is ready.")
+        XCTAssertEqual(completed?.petState, "success")
+        XCTAssertEqual(completed?.petFrame, 0)
 
         let cancelled = PrivateLiveActivitySnapshot.terminal(threadId: "t1", title: "Build fix", phase: .cancelled)
         XCTAssertEqual(cancelled?.phase, "failed",
                        "the on-device ContentState only models running/completed/failed; cancelled maps to failed")
+        XCTAssertEqual(cancelled?.petState, "interrupted",
+                       "a stopped run must preserve the interrupted Pet reaction instead of the generic failed fallback")
     }
 
     func testLiveActivityRunningSnapshotShowsLatestTurnAsMidRunHeartbeat() {

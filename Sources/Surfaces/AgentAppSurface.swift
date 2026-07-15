@@ -4484,10 +4484,14 @@ public struct AgentAppView: View {
             // covers — not every assistant item in the turn. A turn can emit many
             // preamble messages ("State:/Action:/…") before the real answer; those
             // must collapse into the Worked disclosure, leaving only the last
-            // message as the visible answer. When the last item has already been
-            // hidden because it duplicates the persisted answer, no item matches and
-            // every preamble correctly demotes to the work log.
-            return Set([assistantItems.last { assistantText($0.body, matches: final) }?.id].compactMap { $0 })
+            // message as the visible answer. Legacy Grok turns persisted the joined
+            // text phases as `final`; accepting the inverse containment keeps their
+            // last answer visible without changing new turns. When the last item has
+            // already been hidden because it duplicates the persisted answer, no item
+            // matches and every preamble correctly demotes to the work log.
+            return Set([assistantItems.last {
+                assistantText($0.body, matches: final) || assistantText(final, matches: $0.body)
+            }?.id].compactMap { $0 })
         }
         if turn.finalAssistantMessage == nil, let final = assistantItems.last {
             return [final.id]

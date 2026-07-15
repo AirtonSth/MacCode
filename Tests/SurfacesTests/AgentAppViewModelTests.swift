@@ -2215,6 +2215,30 @@ final class AgentAppViewModelTests: XCTestCase {
                        "earlier preamble assistant messages must collapse into the Worked disclosure, not show as the final answer")
     }
 
+    func test_completedLegacyGrokConcatenatedFinalKeepsLastAnswerVisible() {
+        let turn = AssistantTurnSnapshot(
+            turnId: "turn-grok-legacy",
+            items: [
+                AssistantItem(id: "msg-1", turnId: "turn-grok-legacy", type: .assistantMessage, state: .completed, body: "I'll inspect first.", startedAtMs: 1_000, finishedAtMs: 2_000),
+                AssistantItem(id: "msg-2", turnId: "turn-grok-legacy", type: .assistantMessage, state: .completed, body: "Done.", startedAtMs: 2_000, finishedAtMs: 3_000)
+            ],
+            finalAssistantMessage: "I'll inspect first.Done.",
+            finished: true
+        )
+        let renderable = AgentAppView.renderableItems(in: turn)
+
+        XCTAssertEqual(
+            AgentAppView.completedVisibleAssistantItems(in: turn, renderableItems: renderable).map(\.id),
+            ["msg-2"],
+            "legacy Grok concatenated finals must keep the last answer outside the Worked disclosure"
+        )
+        XCTAssertEqual(
+            AgentAppView.completedWorkItems(in: turn, renderableItems: renderable).map(\.id),
+            ["msg-1"],
+            "legacy Grok preambles must remain in the Worked disclosure"
+        )
+    }
+
     func test_persistedLastMessageRendersOnceWhilePreamblesStayInWorkLog() {
         // After the run finishes, the durable persisted answer is the LAST message
         // only. The timeline shows the preambles in the Worked disclosure and the

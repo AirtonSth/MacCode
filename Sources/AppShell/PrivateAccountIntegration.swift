@@ -57,7 +57,7 @@ public struct PrivatePushDeliveryResult: Codable, Equatable, Sendable {
 // `RemoteCodeActivityAttributes.ContentState` via that struct's synthesized
 // `Codable`. The keys below MUST therefore match that struct's stored-property
 // names exactly (title, statusLine, preview, phase, activeThreadCount,
-// updatedAt, runStartDate?, workspaceId?, threadId?). `phase` is the raw
+// updatedAt, runStartDate?, workspaceId?, threadId?, petState?, petFrame?). `phase` is the raw
 // ThreadLiveActivityPhase string ("running" / "completed" / "failed"). This is
 // the single schema both platforms agree on; the older chatId/chatTitle/
 // elapsedSeconds shape (T025) is retired in favour of this one.
@@ -75,6 +75,8 @@ public struct PrivateLiveActivityContentState: Codable, Equatable, Sendable {
     public let runStartDate: Double?
     public let workspaceId: String?
     public let threadId: String?
+    public let petState: String?
+    public let petFrame: Int?
 
     public init(
         title: String,
@@ -85,7 +87,9 @@ public struct PrivateLiveActivityContentState: Codable, Equatable, Sendable {
         updatedAt: Double,
         runStartDate: Double? = nil,
         workspaceId: String? = nil,
-        threadId: String? = nil
+        threadId: String? = nil,
+        petState: String? = nil,
+        petFrame: Int? = nil
     ) {
         self.title = title
         self.statusLine = statusLine
@@ -96,6 +100,8 @@ public struct PrivateLiveActivityContentState: Codable, Equatable, Sendable {
         self.runStartDate = runStartDate
         self.workspaceId = workspaceId
         self.threadId = threadId
+        self.petState = petState
+        self.petFrame = petFrame
     }
 }
 
@@ -112,6 +118,8 @@ public struct PrivateLiveActivitySnapshot: Equatable, Sendable {
     public let runStartDate: Date?
     public let workspaceId: String?
     public let threadId: String?
+    public let petState: String
+    public let petFrame: Int
 
     public init(
         title: String,
@@ -122,7 +130,9 @@ public struct PrivateLiveActivitySnapshot: Equatable, Sendable {
         updatedAt: Date,
         runStartDate: Date? = nil,
         workspaceId: String? = nil,
-        threadId: String? = nil
+        threadId: String? = nil,
+        petState: String? = nil,
+        petFrame: Int = 0
     ) {
         self.title = title
         self.statusLine = statusLine
@@ -133,6 +143,8 @@ public struct PrivateLiveActivitySnapshot: Equatable, Sendable {
         self.runStartDate = runStartDate
         self.workspaceId = workspaceId
         self.threadId = threadId
+        self.petState = petState ?? Self.fallbackPetState(for: phase)
+        self.petFrame = petFrame
     }
 
     /// Pure payload builder (the host-side seam unit-tested in isolation):
@@ -147,7 +159,9 @@ public struct PrivateLiveActivitySnapshot: Equatable, Sendable {
             updatedAt: updatedAt.timeIntervalSince1970,
             runStartDate: runStartDate?.timeIntervalSince1970,
             workspaceId: workspaceId,
-            threadId: threadId
+            threadId: threadId,
+            petState: petState,
+            petFrame: petFrame
         )
     }
 
@@ -176,7 +190,8 @@ public struct PrivateLiveActivitySnapshot: Equatable, Sendable {
             updatedAt: now,
             runStartDate: runStartDate,
             workspaceId: workspaceId,
-            threadId: threadId
+            threadId: threadId,
+            petState: "coding"
         )
     }
 
@@ -193,23 +208,28 @@ public struct PrivateLiveActivitySnapshot: Equatable, Sendable {
         let normalizedTitle = title?.trimmingCharacters(in: .whitespacesAndNewlines)
         let displayTitle = (normalizedTitle?.isEmpty == false) ? normalizedTitle! : "Thread"
         let mappedPhase: String
+        let petState: String
         let statusLine: String
         let previewSuffix: String
         switch phase {
         case .completed:
             mappedPhase = "completed"
+            petState = "success"
             statusLine = "Finished"
             previewSuffix = "response is ready."
         case .cancelled:
             mappedPhase = "failed"
+            petState = "interrupted"
             statusLine = "Stopped"
             previewSuffix = "was stopped."
         case .interrupted:
             mappedPhase = "failed"
+            petState = "interrupted"
             statusLine = "Interrupted"
             previewSuffix = "was interrupted."
         case .failed:
             mappedPhase = "failed"
+            petState = "failed"
             statusLine = "Failed"
             previewSuffix = "ended with an error."
         case .pending, .running:
@@ -223,8 +243,17 @@ public struct PrivateLiveActivitySnapshot: Equatable, Sendable {
             activeThreadCount: 0,
             updatedAt: now,
             workspaceId: nil,
-            threadId: threadId
+            threadId: threadId,
+            petState: petState
         )
+    }
+
+    private static func fallbackPetState(for phase: String) -> String {
+        switch phase {
+        case "completed": return "success"
+        case "failed": return "failed"
+        default: return "coding"
+        }
     }
 }
 
