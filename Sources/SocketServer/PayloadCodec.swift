@@ -150,15 +150,21 @@ public struct PayloadCodec: Sendable, Equatable {
         algorithm: compression_algorithm,
         maximumSize: Int?
     ) throws -> Data {
-        var stream = compression_stream()
+        let chunkSize = 64 * 1024
+        let outputBuffer = UnsafeMutablePointer<UInt8>.allocate(capacity: chunkSize)
+        defer { outputBuffer.deallocate() }
+
+        var stream = compression_stream(
+            dst_ptr: outputBuffer,
+            dst_size: chunkSize,
+            src_ptr: UnsafePointer(outputBuffer),
+            src_size: 0,
+            state: nil
+        )
         guard compression_stream_init(&stream, COMPRESSION_STREAM_DECODE, algorithm) != COMPRESSION_STATUS_ERROR else {
             throw PayloadCodecError.invalidData
         }
         defer { compression_stream_destroy(&stream) }
-
-        let chunkSize = 64 * 1024
-        let outputBuffer = UnsafeMutablePointer<UInt8>.allocate(capacity: chunkSize)
-        defer { outputBuffer.deallocate() }
 
         return try data.withUnsafeBytes { rawBuffer in
             guard let source = rawBuffer.bindMemory(to: UInt8.self).baseAddress else {
