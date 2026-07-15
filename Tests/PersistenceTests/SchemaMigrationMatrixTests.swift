@@ -1,5 +1,6 @@
 import XCTest
 @testable import Persistence
+import CoreModel
 
 /// P1 — Migration-path matrix: historical -> head.
 ///
@@ -271,6 +272,34 @@ final class SchemaMigrationMatrixTests: XCTestCase {
     }
 
     // MARK: - head → head (idempotent re-run)
+
+    func test_v38_to_head_preservesQueuedRowsAndInitializesDispatchState() throws {
+        let db = try SQLiteDB(path: ":memory:")
+        try Schema.migrateSteps(db, Schema.steps.filter { $0.version <= 38 })
+        let thread = AgentThread(title: "queue migration", provider: .codex, model: "gpt")
+        try AgentThreadRepository(db: db).upsert(thread)
+        let messageId = AgentQueuedMessageID()
+        let now = ISO8601DateFormatter().string(from: Date())
+        let insert = try db.prepare("""
+            INSERT INTO agent_queued_messages(
+                id, thread_id, text, attachments_json, interaction_mode, position, created_at, updated_at
+            ) VALUES(?, ?, 'survive', '[]', 'default', 1, ?, ?);
+        """)
+        try insert.bind(1, messageId.value.uuidString)
+        try insert.bind(2, thread.id.value.uuidString)
+        try insert.bind(3, now)
+        try insert.bind(4, now)
+        _ = try insert.step()
+
+        try Schema.migrateSteps(db, Schema.steps)
+
+        let repo = AgentQueuedMessageRepository(db: db)
+        XCTAssertEqual(try repo.get(id: messageId)?.text, "survive")
+        XCTAssertEqual(try repo.dispatch(id: messageId)?.state, .queued,
+                       "v39 must default existing queue rows to claimable queued state without replay metadata")
+        XCTAssertNil(try repo.dispatch(id: messageId)?.runId)
+        XCTAssertEqual(try maxVersion(db), Schema.currentVersion)
+    }
 
     /// WHY: the app may call `Schema.migrate` on every launch. If re-running a
     /// fully-migrated DB threw, every launch after the first would crash. This

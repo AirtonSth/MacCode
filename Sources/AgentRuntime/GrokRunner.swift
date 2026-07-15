@@ -54,7 +54,7 @@ public final class GrokRunner: AgentProviderRunner, @unchecked Sendable {
     }
 
     /// Builds `grok` argv for a one-shot headless turn. Pure + static for tests.
-    public static func buildArgs(_ request: AgentRunRequest) -> [String] {
+    public static func buildArgs(_ request: AgentRunRequest, newSessionId: String? = nil) -> [String] {
         var args: [String] = ["-p", request.providerPrompt, "--output-format", "streaming-json"]
         let model = request.model.trimmingCharacters(in: .whitespacesAndNewlines)
         if !model.isEmpty {
@@ -67,6 +67,8 @@ public final class GrokRunner: AgentProviderRunner, @unchecked Sendable {
         }
         if let ptid = request.providerThreadId, !ptid.isEmpty {
             args.append(contentsOf: ["--resume", ptid])
+        } else if let newSessionId, !newSessionId.isEmpty {
+            args.append(contentsOf: ["--session-id", newSessionId])
         }
         if request.interactionMode == .plan {
             args.append(contentsOf: ["--permission-mode", "plan"])
@@ -117,6 +119,16 @@ public final class GrokRunner: AgentProviderRunner, @unchecked Sendable {
         return true
     }
 
+    static func terminalStatus(
+        cancelledByUser: Bool,
+        terminationReason: Process.TerminationReason,
+        exitStatus: Int32
+    ) -> AgentRunStatus {
+        if cancelledByUser { return .cancelled }
+        if terminationReason == .uncaughtSignal || exitStatus != 0 { return .failed }
+        return .completed
+    }
+
     nonisolated static func missingBinaryMessage(_ binary: String) -> String {
         "\(binary) not found in PATH. Install it with: curl -fsSL https://x.ai/cli/install.sh | bash  " +
         "Searched: ~/.grok/bin, ~/.remote-code/bin, /opt/homebrew/bin, ~/.local/bin. " +
@@ -133,7 +145,10 @@ public final class GrokRunner: AgentProviderRunner, @unchecked Sendable {
             throw AgentRunError.missingBinary(binary)
         }
 
-        let args = Self.buildArgs(request)
+        let preassignedSessionId = request.providerThreadId?.isEmpty == false
+            ? request.providerThreadId
+            : UUID().uuidString.lowercased()
+        let args = Self.buildArgs(request, newSessionId: request.providerThreadId == nil ? preassignedSessionId : nil)
 
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: path)
@@ -145,7 +160,7 @@ public final class GrokRunner: AgentProviderRunner, @unchecked Sendable {
         proc.standardError = stderrPipe
         proc.standardInput = FileHandle.nullDevice
 
-        let parser = GrokParser()
+        let parser = GrokParser(initialSessionId: preassignedSessionId)
         let timeline = TimelineAggregator()
         let outBuf = LineBuffer()
         let stdoutReadLock = NSLock()
@@ -192,12 +207,12 @@ public final class GrokRunner: AgentProviderRunner, @unchecked Sendable {
             stdoutPipe.fileHandleForReading.readabilityHandler = nil
             stderrPipe.fileHandleForReading.readabilityHandler = nil
             stdoutReadLock.lock()
-            let tail = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
+            let tail = BoundedPipeDrain.readRemaining(from: stdoutPipe.fileHandleForReading)
             for line in outBuf.take(tail) + outBuf.flush() {
                 emitLine(line)
             }
             stdoutReadLock.unlock()
-            let stderrTail = stderrPipe.fileHandleForReading.readDataToEndOfFile()
+            let stderrTail = BoundedPipeDrain.readRemaining(from: stderrPipe.fileHandleForReading)
             if !stderrTail.isEmpty,
                let visible = Self.displayableStderr(String(data: stderrTail, encoding: .utf8) ?? "") {
                 onEvent(.event(.providerRuntime(ProviderStderrClassifier.runtimeEvent(
@@ -211,17 +226,25 @@ public final class GrokRunner: AgentProviderRunner, @unchecked Sendable {
                 timeline.apply(ev)
                 onEvent(.event(ev))
             }
-            let status: AgentRunStatus
-            if cancelFlag.isCancelled || p.terminationReason == .uncaughtSignal { status = .cancelled }
-            else if p.terminationStatus == 0 { status = .completed }
-            else { status = .failed }
+            let status = Self.terminalStatus(
+                cancelledByUser: cancelFlag.isCancelled,
+                terminationReason: p.terminationReason,
+                exitStatus: p.terminationStatus
+            )
             let sessionId = timeline.providerThreadId ?? parser.capturedSessionId
+            if status == .failed {
+                let cause = p.terminationReason == .uncaughtSignal
+                    ? "Grok CLI crashed with signal \(p.terminationStatus)"
+                    : "Grok CLI exited with status \(p.terminationStatus)"
+                onEvent(.error(cause))
+            }
             onEvent(.status(status))
             onEvent(.finished(status, finalMessage: timeline.finalAssistantMessage, providerThreadId: sessionId))
         }
 
         do {
             try proc.run()
+            try ProcessSpawnTagger.tagProcess(proc, provider: .grok)
             onEvent(.status(.running))
         } catch {
             onEvent(.error("spawn: \(error.localizedDescription)"))

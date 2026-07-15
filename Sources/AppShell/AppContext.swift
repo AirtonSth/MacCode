@@ -222,12 +222,11 @@ public final class AppContext {
             appSupportDirectory: self.appSupportDirectory
         )
         let codex = CodexAppServerAdapter(binaryNameOverride: try? settingsRepo.get("cli.codex.path"))
+        let configuredClaudeBinary = try? settingsRepo.get("cli.claude.path")
         let claude: AgentProviderAdapter = ProcessInfo.processInfo.environment["RC_CLAUDE_AGENT_SDK_ENABLED"] == "0"
-            ? ClaudeStreamingCLIAdapter(binaryNameOverride: try? settingsRepo.get("cli.claude.path"))
-            : ClaudeAgentSDKBridgeAdapter()
-        let grok = OneShotProviderAdapter(
-            runner: GrokRunner(binaryNameOverride: try? settingsRepo.get("cli.grok.path"))
-        )
+            ? ClaudeStreamingCLIAdapter(binaryNameOverride: configuredClaudeBinary)
+            : ClaudeAgentSDKBridgeAdapter(binaryNameOverride: configuredClaudeBinary)
+        let grok = GrokACPAdapter(binaryNameOverride: try? settingsRepo.get("cli.grok.path"))
         self.coordinator = AgentRunCoordinator(
             runRepo: runRepo, messageRepo: messageRepo, threadRepo: threadRepo,
             providerSessionRepo: providerSessionRuntimeRepo,
@@ -310,7 +309,17 @@ public final class AppContext {
             return .object(payload)
         }
         func messageJSON(_ message: AgentMessage) -> JSONValue {
-            (try? JSONDecoder().decode(JSONValue.self, from: JSONEncoder().encode(message))) ?? .null
+            guard let data = try? JSONEncoder().encode(message),
+                  let decoded = try? JSONDecoder().decode(JSONValue.self, from: data),
+                  case .object(var object) = decoded else {
+                return .null
+            }
+            let references = message.attachments.compactMap(AgentAttachmentReference.init)
+            object["attachments"] = (try? JSONDecoder().decode(
+                JSONValue.self,
+                from: JSONEncoder().encode(references)
+            )) ?? .array([])
+            return .object(object)
         }
         func agentRunPayload(threadId: AgentThreadID, runId: AgentRunID? = nil, status: AgentRunStatus? = nil) -> JSONValue {
             var payload: [String: JSONValue] = ["thread_id": .string(threadId.value.uuidString)]
@@ -523,7 +532,14 @@ public final class AppContext {
             // running/pending before sending, so an unconditional drain is safe
             // and onRunFinished only fires on terminal statuses.
             Task { @MainActor in
-                try? await self.router?.drainNextQueuedAgentMessage(thread: tid)
+                do {
+                    try await self.router?.drainNextQueuedAgentMessage(thread: tid)
+                } catch {
+                    EventBus.shared.publish(kind: "agent.message.queue.failed", payload: .object([
+                        "thread_id": .string(tid.value.uuidString),
+                        "message": .string(String(describing: error))
+                    ]))
+                }
             }
             if let content = RemoteCodeNotificationContent.threadOutcome(
                 threadId: tid.value.uuidString,

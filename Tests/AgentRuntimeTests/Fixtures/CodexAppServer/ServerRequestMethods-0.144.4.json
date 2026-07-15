@@ -1,0 +1,18 @@
+{
+  "generatedBy": "codex-cli 0.144.4 app-server generate-json-schema --experimental",
+  "sourceFile": "ServerRequest.json",
+  "sourceSHA256": "886f30bd882a73600566695e0f08f8a10fcd9897742c4745ecf91710ec256f6a",
+  "oneOf": [
+    { "properties": { "method": { "enum": ["item/commandExecution/requestApproval"] } } },
+    { "properties": { "method": { "enum": ["item/fileChange/requestApproval"] } } },
+    { "properties": { "method": { "enum": ["item/tool/requestUserInput"] } } },
+    { "properties": { "method": { "enum": ["mcpServer/elicitation/request"] } } },
+    { "properties": { "method": { "enum": ["item/permissions/requestApproval"] } } },
+    { "properties": { "method": { "enum": ["item/tool/call"] } } },
+    { "properties": { "method": { "enum": ["account/chatgptAuthTokens/refresh"] } } },
+    { "properties": { "method": { "enum": ["attestation/generate"] } } },
+    { "properties": { "method": { "enum": ["currentTime/read"] } } },
+    { "properties": { "method": { "enum": ["applyPatchApproval"] } } },
+    { "properties": { "method": { "enum": ["execCommandApproval"] } } }
+  ]
+}

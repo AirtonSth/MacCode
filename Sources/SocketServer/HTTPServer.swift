@@ -212,6 +212,9 @@ final class WebSocketLivenessState: @unchecked Sendable {
 public final class DirectHTTPServer: @unchecked Sendable {
     static let maxRequestHeaderBytes = 64 * 1024
     static let maxRequestBodyBytes = 2 * 1024 * 1024
+    /// 25 MiB decoded attachment + base64 expansion + bounded JSON envelope.
+    /// The dispatcher/store still enforce the authoritative decoded-byte cap.
+    static let maxAttachmentUploadRequestBodyBytes = 36 * 1024 * 1024
     static let maxClientFramePayloadBytes = 1024 * 1024
     public static let maxWebSocketOutboundQueuedBytes = 1024 * 1024
     public static let wsHeartbeatInterval: TimeInterval = 5
@@ -241,6 +244,13 @@ public final class DirectHTTPServer: @unchecked Sendable {
     /// socket cannot exercise the non-loopback gate).
     nonisolated static func httpAuthGateRequiresToken(loopbackOnly: Bool, path: String, hasAuthProvider: Bool) -> Bool {
         !loopbackOnly && path.hasPrefix("/v1") && !authExemptV1Paths.contains(path) && hasAuthProvider
+    }
+
+    nonisolated static func isAttachmentUploadRPCEnvelope(_ data: Data) -> Bool {
+        guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return false
+        }
+        return object["method"] as? String == "agent.attachment.upload"
     }
 
     /// Pure helper: search `buf` for the CRLFCRLF header terminator starting
@@ -469,7 +479,27 @@ public final class DirectHTTPServer: @unchecked Sendable {
         } else {
             contentLength = 0
         }
-        guard contentLength <= Self.maxRequestBodyBytes else {
+        let requestedAttachmentUpload = method == "POST"
+            && path == "/v1/rpc"
+            && headers["x-remotecode-attachment-upload"] == "1"
+        let largeBodyAuthorized: Bool
+        if Self.httpAuthGateRequiresToken(
+            loopbackOnly: bindLoopbackOnly,
+            path: path,
+            hasAuthProvider: auth != nil
+        ), let auth {
+            if let presentedBearerToken {
+                largeBodyAuthorized = auth.verify(token: presentedBearerToken)
+            } else {
+                largeBodyAuthorized = false
+            }
+        } else {
+            largeBodyAuthorized = true
+        }
+        let requestBodyLimit = requestedAttachmentUpload && largeBodyAuthorized
+            ? Self.maxAttachmentUploadRequestBodyBytes
+            : Self.maxRequestBodyBytes
+        guard contentLength <= requestBodyLimit else {
             send(fd: fd, status: 413, contentType: "text/plain", body: Data("request body too large\n".utf8))
             return
         }
@@ -804,15 +834,27 @@ public final class DirectHTTPServer: @unchecked Sendable {
         var bodyData = buffer.subdata(in: bodyStartAbsolute..<min(bodyStartAbsolute + contentLength, buffer.endIndex))
         if let contentEncoding = headers["content-encoding"], !contentEncoding.isEmpty {
             do {
-                bodyData = try PayloadCodec.codec(for: contentEncoding).decode(bodyData, expectedSize: nil)
+                bodyData = try PayloadCodec.codec(for: contentEncoding).decode(
+                    bodyData,
+                    expectedSize: nil,
+                    maximumSize: requestBodyLimit
+                )
+            } catch PayloadCodecError.outputTooLarge {
+                send(fd: fd, status: 413, contentType: "text/plain", body: Data("request body too large\n".utf8))
+                return
             } catch {
                 send(fd: fd, status: 400, contentType: "text/plain", body: Data("bad encoded body\n".utf8))
                 return
             }
-            guard bodyData.count <= Self.maxRequestBodyBytes else {
+            guard bodyData.count <= requestBodyLimit else {
                 send(fd: fd, status: 413, contentType: "text/plain", body: Data("request body too large\n".utf8))
                 return
             }
+        }
+        if bodyData.count > Self.maxRequestBodyBytes,
+           (!requestedAttachmentUpload || !Self.isAttachmentUploadRPCEnvelope(bodyData)) {
+            send(fd: fd, status: 413, contentType: "text/plain", body: Data("request body too large\n".utf8))
+            return
         }
 
         switch (method, path) {

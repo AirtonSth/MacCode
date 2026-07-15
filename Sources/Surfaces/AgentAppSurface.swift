@@ -95,6 +95,20 @@ public enum AgentThreadLifecycleEvent {
     case deleted([AgentThreadID])
 }
 
+public enum AgentErrorRecoveryAction: String, Sendable, Equatable {
+    case signIn
+    case retry
+    case startFresh
+
+    public var title: String {
+        switch self {
+        case .signIn: return "Sign in"
+        case .retry: return "Retry"
+        case .startFresh: return "Start fresh"
+        }
+    }
+}
+
 @MainActor
 public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     @Published public var threads: [AgentThread] = []
@@ -181,6 +195,13 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     public var modelListLoader: ((AgentProvider) async throws -> [AgentModelDescriptor])?
     public var providerLaunchConfig: ((AgentProvider, String?) -> (binary: String?, environment: [String: String]))?
     public var providerRecoveryAction: ((AgentProvider, String?) async throws -> String)?
+    /// Opens the provider's interactive login command in a host-owned Terminal.
+    /// The VM never executes provider authentication out of process itself.
+    public var providerSignInAction: ((AgentProvider) throws -> Void)?
+    /// Forces an uncached auth probe after the user completes the interactive
+    /// Terminal flow. A normal snapshot load may still contain a short-lived
+    /// provider-probe cache and cannot prove that login just completed.
+    public var providerAuthenticationRefresher: ((AgentProvider) async -> [AgentProviderSnapshot])?
     public var pullRequestThreadPreparer: ((String, AgentProvider, String, AgentPermissionMode, AgentReasoningEffort, AgentServiceTier, AgentModelSelection?, String?) async throws -> AgentThread)?
     @Published public var providerRecoveryActionRunning = false
     @Published public var providerRecoveryStatusMessage: String?
@@ -191,6 +212,10 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// show a "using built-in defaults" hint and offer a manual refresh.
     @Published public var availableModelsAreFallback: Bool = false
     @Published public var providerSnapshotStatusMessage: String?
+    private var pendingSignInProvider: AgentProvider?
+    private var pendingSignInSnapshotID: String?
+    @Published public private(set) var providerThreadSnapshotStatusMessage: String?
+    @Published public private(set) var providerThreadSnapshotLastConfirmedAt: Date?
     @Published public var pullRequestURL: String = ""
     @Published public var pullRequestPreparing = false
     @Published public var pullRequestStatusMessage: String?
@@ -199,11 +224,18 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     @Published public var selectedCheckpointPath: String?
     @Published public var checkpointDiffPreview: String = ""
     @Published public var checkpointStatusMessage: String?
-    /// B3: file paths attached to the next message (composer chips).
-    @Published public var attachments: [String] = []
+    /// B3: durable, managed attachments attached to the next message.
+    @Published public var attachments: [AgentAttachment] = []
+    private var attachmentInputError: String?
     /// P1: tracks whether the last submitted message included attachments so
     /// retryLastPrompt can warn the user they will not be re-sent.
     @Published public var lastSentAttachmentCount: Int = 0
+    public struct AttachmentRetryConfirmation: Equatable {
+        public let prompt: String
+        public let retryableAttachments: [AgentAttachment]
+        public let unavailableAttachmentNames: [String]
+    }
+    @Published public private(set) var pendingAttachmentRetryConfirmation: AttachmentRetryConfirmation?
     @Published public var queuedMessages: [AgentQueuedMessage] = []
     @Published public var queueStatusMessage: String?
     @Published public var editingQueuedMessage: AgentQueuedMessage?
@@ -235,6 +267,8 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     public let coordinator: AgentRunCoordinator
     public let threadRepo: AgentThreadRepository
     public let messageRepo: AgentMessageRepository
+    public let draftRepo: AgentThreadDraftRepository?
+    public let attachmentStore: AgentAttachmentStore?
     public let queuedMessageRepo: AgentQueuedMessageRepository?
     public let pendingCallbackRepo: ProviderPendingCallbackRepository?
     public let proposedPlanRepo: AgentProposedPlanRepository?
@@ -306,6 +340,8 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         coordinator: AgentRunCoordinator,
         threadRepo: AgentThreadRepository,
         messageRepo: AgentMessageRepository,
+        draftRepo: AgentThreadDraftRepository? = nil,
+        attachmentStore: AgentAttachmentStore? = nil,
         queuedMessageRepo: AgentQueuedMessageRepository? = nil,
         pendingCallbackRepo: ProviderPendingCallbackRepository? = nil,
         proposedPlanRepo: AgentProposedPlanRepository? = nil,
@@ -320,6 +356,8 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         self.coordinator = coordinator
         self.threadRepo = threadRepo
         self.messageRepo = messageRepo
+        self.draftRepo = draftRepo
+        self.attachmentStore = attachmentStore
         self.queuedMessageRepo = queuedMessageRepo
         self.pendingCallbackRepo = pendingCallbackRepo
         self.proposedPlanRepo = proposedPlanRepo
@@ -393,7 +431,12 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     private var runThreads: [AgentRunID: AgentThreadID] = [:]
 
     public func reloadThreads() {
-        threads = (try? threadRepo.list(workspaceId: workspaceID)) ?? []
+        do {
+            threads = try threadRepo.list(workspaceId: workspaceID)
+        } catch {
+            statusMessage = "Could not reload threads: \(error)"
+            return
+        }
         // PERF-MAC_AGENT-009: refresh the thread->workspace cache so didChangeStatus
         // can filter by workspace with an O(1) lookup instead of a DB read.
         for t in threads {
@@ -433,17 +476,32 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         for index in toRepair {
             // Mark as visited regardless of whether a user message exists — a thread
             // with no user messages won't get a better title on the next call either.
-            repairedThreadIds.insert(threads[index].id)
             // F13: fetch only the earliest user message (LIMIT 1) instead of loading
             // the whole thread history + content blobs on the main actor per thread.
-            guard let firstUserMessage = try? messageRepo.firstUserMessage(threadId: threads[index].id) else { continue }
+            let firstUserMessage: AgentMessage
+            do {
+                guard let message = try messageRepo.firstUserMessage(threadId: threads[index].id) else {
+                    repairedThreadIds.insert(threads[index].id)
+                    continue
+                }
+                firstUserMessage = message
+            } catch {
+                statusMessage = "Could not repair thread title: \(error)"
+                continue
+            }
             var thread = threads[index]
             thread.title = AgentThreadTitle.titleFromFirstMessage(firstUserMessage.content)
             // PERSISTENCE-DATA-002: a cosmetic title repair must NOT bump
             // updatedAt — doing so reorders the rail (updated_at is the visible
             // tiebreak) and made repaired threads jump to the top. Preserve the
             // thread's real activity time so only genuine activity reorders it.
-            try? threadRepo.upsert(thread)
+            do {
+                try threadRepo.upsert(thread)
+            } catch {
+                statusMessage = "Could not repair thread title: \(error)"
+                continue
+            }
+            repairedThreadIds.insert(thread.id)
             threads[index] = thread
             // Mirror the repaired title so remote thread lists don't keep
             // showing the placeholder. Loop-safe: repairedThreadIds plus the
@@ -453,9 +511,59 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         }
     }
 
-    /// IMP-MAC_AGENT-011: unsent composer text, keyed by thread, so switching
-    /// threads mid-typing doesn't lose the draft.
-    private var composerDraftsByThread: [AgentThreadID: String] = [:]
+    /// IMP-MAC_AGENT-011: unsent composer state, keyed by thread and persisted
+    /// so text, attachments, and interaction mode survive switching/relaunch.
+    private var composerDraftsByThread: [AgentThreadID: [String: AgentThreadDraft]] = [:]
+    private var providerThreadSnapshotConfirmedAtByThread: [AgentThreadID: Date] = [:]
+
+    private func persistComposerDraft(for threadId: AgentThreadID) {
+        let draft = AgentThreadDraft(
+            threadId: threadId,
+            providerInstanceId: providerInstanceId,
+            text: prompt,
+            attachments: attachments,
+            interactionMode: interactionMode
+        )
+        composerDraftsByThread[threadId, default: [:]][providerInstanceId] = draft
+        do {
+            try draftRepo?.upsert(draft)
+        } catch {
+            statusMessage = "Draft save failed: \(error)"
+        }
+    }
+
+    private func restoreComposerDraft(for thread: AgentThread) {
+        restoreComposerDraft(
+            threadId: thread.id,
+            providerInstanceId: providerInstanceId,
+            fallbackInteractionMode: thread.effectiveInteractionMode
+        )
+    }
+
+    private func restoreComposerDraft(
+        threadId: AgentThreadID,
+        providerInstanceId: String,
+        fallbackInteractionMode: AgentInteractionMode
+    ) {
+        let durable = try? draftRepo?.get(threadId: threadId, providerInstanceId: providerInstanceId)
+        let draft = composerDraftsByThread[threadId]?[providerInstanceId] ?? durable ?? nil
+        prompt = draft?.text ?? ""
+        attachments = draft?.attachments ?? []
+        interactionMode = draft?.interactionMode ?? fallbackInteractionMode
+        if let draft { composerDraftsByThread[threadId, default: [:]][providerInstanceId] = draft }
+    }
+
+    private func clearComposerDraft(threadId: AgentThreadID, providerInstanceId: String) throws {
+        try draftRepo?.delete(threadId: threadId, providerInstanceId: providerInstanceId)
+        clearComposerDraftMemory(threadId: threadId, providerInstanceId: providerInstanceId)
+    }
+
+    private func clearComposerDraftMemory(threadId: AgentThreadID, providerInstanceId: String) {
+        composerDraftsByThread[threadId]?.removeValue(forKey: providerInstanceId)
+        if composerDraftsByThread[threadId]?.isEmpty == true {
+            composerDraftsByThread.removeValue(forKey: threadId)
+        }
+    }
 
     /// PERF: O(1) id -> (turn,item) index over `timeline.turns`, rebuilt once after a
     /// thread's replay. Lets post-replay item-location lookups avoid the O(turns x items)
@@ -475,11 +583,10 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             // IMP-MAC_AGENT-011: stash the leaving thread's draft before swapping,
             // then restore the opened thread's draft (an in-progress prompt on a
             // re-select of the same thread is left untouched).
-            if let previous = selectedThreadId {
-                composerDraftsByThread[previous] = prompt.isEmpty ? nil : prompt
-            }
+            if let previous = selectedThreadId { persistComposerDraft(for: previous) }
             selectedThreadId = id
-            prompt = composerDraftsByThread[id] ?? ""
+            providerThreadSnapshotStatusMessage = nil
+            providerThreadSnapshotLastConfirmedAt = providerThreadSnapshotConfirmedAtByThread[id]
             // F6: the SR1 translation maps are per-thread state. Reset them on a
             // thread switch so they don't accumulate the union of every translated
             // message (and its full original text) across every thread visited this
@@ -506,7 +613,8 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             baseBranch = t.baseBranch ?? gitBranch ?? "main"
             worktreePath = t.worktreePath
             status = t.status
-            if t.status == .running {
+            if isThreadSwitch { restoreComposerDraft(for: t) }
+            if let trackedRunId = trackedRunId(for: id) {
                 // UX-XPLAT-008: use the host's persisted run start time so
                 // "Working for Xs" reflects real elapsed time even after
                 // selectThread is called mid-run (e.g. after app relaunch or
@@ -520,12 +628,13 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 // active run. Without this, switching to an already-running
                 // thread left a stale currentRunId from the previous thread, so
                 // Stop could cancel the wrong thread's run.
-                currentRunId = coordinator.activeRunId(threadId: id)
+                currentRunId = trackedRunId
             } else {
                 currentRunId = nil
                 runStartedAt = nil
             }
         }
+        normalizeInteractionModeForSelectedProvider()
         // UX-MAC_AGENT-CONTINUE: check whether the newly selected thread was
         // interrupted by a relaunch and has a recoverable provider session.
         selectedThreadHasRecoverableContext = coordinator.hasRecoverableContext(threadId: id)
@@ -544,10 +653,6 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         }
         loadAllMessages(id)
         timeline = AssistantTimelineState()
-        // F26: the flag now persists across non-error events (it mirrors the
-        // displayed timeline.error), so reset it whenever the timeline is rebuilt —
-        // the replay below does not restore recoverability for a stale banner.
-        lastErrorRecoverable = false
         let persistedEvents = coordinator.latestStreamEvents(threadId: id)
         // PERF: the provider-thread snapshot read (coordinator.readThread) used to
         // block thread-open for up to a provider round-trip (codex app-server),
@@ -561,25 +666,45 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         for event in persistedReplay {
             timeline.apply(event)
         }
+        lastErrorRecoverable = Self.displayedErrorIsRecoverable(in: persistedReplay)
         refreshSR1TranslationStateFromTimeline()
         // PERF: rebuild the O(1) item index once over the fully-replayed timeline so
         // subsequent item-location lookups skip the O(turns x items) linear scan.
         timelineItemIndex = TimelineItemIndex(turns: timeline.turns)
+        guard Self.shouldReadProviderSnapshot(
+            hasRecoverableContext: selectedThreadHasRecoverableContext
+        ) else { return }
         Task { @MainActor [weak self] in
             guard let self else { return }
-            let snapshot = await self.providerThreadSnapshotEvents(threadId: id)
-            // Drop the result if the user switched threads while we were reading.
-            guard self.selectedThreadId == id, let snapshot else { return }
-            let replayEvents = Self.chooseReplayEvents(
-                persisted: persistedEvents,
-                snapshot: self.mergePersistedContextTelemetry(snapshot: snapshot, persisted: persistedEvents)
-            )
-            self.timeline = AssistantTimelineState()
-            for event in replayEvents {
-                self.timeline.apply(event)
+            do {
+                let snapshot = try await self.providerThreadSnapshotEvents(threadId: id)
+                // Drop the result if the user switched threads while we were reading.
+                guard self.selectedThreadId == id else { return }
+                let confirmedAt = Date()
+                self.providerThreadSnapshotConfirmedAtByThread[id] = confirmedAt
+                self.providerThreadSnapshotLastConfirmedAt = confirmedAt
+                self.providerThreadSnapshotStatusMessage = nil
+                guard !snapshot.isEmpty else { return }
+                let replayEvents = Self.chooseReplayEvents(
+                    persisted: persistedEvents,
+                    snapshot: self.mergePersistedContextTelemetry(snapshot: snapshot, persisted: persistedEvents)
+                )
+                self.timeline = AssistantTimelineState()
+                for event in replayEvents {
+                    self.timeline.apply(event)
+                }
+                self.lastErrorRecoverable = Self.displayedErrorIsRecoverable(in: replayEvents)
+                self.refreshSR1TranslationStateFromTimeline()
+                self.timelineItemIndex = TimelineItemIndex(turns: self.timeline.turns)
+            } catch {
+                guard self.selectedThreadId == id else { return }
+                let threadHasProviderContext = self.threads.first(where: { $0.id == id })?.providerThreadId?.isEmpty == false
+                    || !persistedEvents.isEmpty
+                guard threadHasProviderContext else { return }
+                self.providerThreadSnapshotStatusMessage = Self.providerThreadSnapshotFailureMessage(
+                    lastConfirmedAt: self.providerThreadSnapshotConfirmedAtByThread[id]
+                )
             }
-            self.refreshSR1TranslationStateFromTimeline()
-            self.timelineItemIndex = TimelineItemIndex(turns: self.timeline.turns)
         }
         rehydrateProposedPlans(threadId: id)
         rehydratePendingCallbacks(threadId: id)
@@ -635,6 +760,10 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             return
         }
         queuedMessages = (try? queuedMessageRepo.list(threadId: selectedThreadId)) ?? []
+        if let head = queuedMessages.first,
+           (try? queuedMessageRepo.dispatch(id: head.id)?.state) == .prepared {
+            queueStatusMessage = "Start confirmation is pending. The message was not replayed."
+        }
     }
 
     public func editQueuedMessage(_ message: AgentQueuedMessage) {
@@ -667,6 +796,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
 
     public func forceQueuedMessageNow(_ message: AgentQueuedMessage) async {
         guard let queuedMessageRepo else { return }
+        var claimedLease: AgentQueuedMessageLease?
+        var preparedDispatch: (lease: AgentQueuedMessageLease, runId: AgentRunID)?
+        var providerStartConfirmed = false
         do {
             if selectedThreadCanQueuePrompt {
                 guard try queuedMessageRepo.promoteToFront(id: message.id) != nil else {
@@ -686,28 +818,117 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 coordinator.stopRun(threadId: message.threadId)
                 return
             }
-            guard let queued = try queuedMessageRepo.delete(id: message.id) else {
+            if let dispatch = try queuedMessageRepo.dispatch(id: message.id) {
+                if dispatch.state == .prepared, let runId = dispatch.runId {
+                    if try coordinator.runStatus(runId) != nil {
+                        guard let drained = try queuedMessageRepo.acknowledgePreparedWithRunEvidence(id: message.id, runId: runId) else {
+                            queueStatusMessage = "Queue recovery is already being reconciled."
+                            reloadQueuedMessages()
+                            return
+                        }
+                        queueStatusMessage = nil
+                        reloadQueuedMessages()
+                        onQueuedMessageEvent?(AgentQueueEventKinds.drained, drained)
+                        return
+                    }
+                    reloadQueuedMessages()
+                    queueStatusMessage = "Already processing. Relaunch recovery will reconcile this message if startup was interrupted."
+                    return
+                }
+                if dispatch.state == .dispatched, let runId = dispatch.runId {
+                    guard let drained = try queuedMessageRepo.acknowledgeDispatched(id: message.id, runId: runId) else {
+                        queueStatusMessage = "Queue acknowledgement is already being recovered."
+                        reloadQueuedMessages()
+                        return
+                    }
+                    queueStatusMessage = nil
+                    reloadQueuedMessages()
+                    onQueuedMessageEvent?(AgentQueueEventKinds.drained, drained)
+                    for remaining in queuedMessages {
+                        onQueuedMessageEvent?(AgentQueueEventKinds.updated, remaining)
+                    }
+                    return
+                }
+            }
+            guard let lease = try queuedMessageRepo.claim(id: message.id) else {
                 queueStatusMessage = "Already processing."
                 reloadQueuedMessages()
                 return
             }
+            claimedLease = lease
+            let queued = lease.message
+            let dispatchRunId = AgentRunID(queued.id.value)
+            guard try queuedMessageRepo.prepareDispatch(lease, runId: dispatchRunId) else {
+                _ = try? queuedMessageRepo.release(lease)
+                claimedLease = nil
+                queueStatusMessage = "Already processing."
+                reloadQueuedMessages()
+                return
+            }
+            preparedDispatch = (lease, dispatchRunId)
+            let runId = await startProviderRun(
+                text: queued.text,
+                attached: queued.attachments,
+                recordHistory: false,
+                interactionMode: queued.interactionMode,
+                requestedRunId: dispatchRunId
+            )
+            guard runId != nil else {
+                if (try? coordinator.runStatus(dispatchRunId)) != nil {
+                    if let drained = try queuedMessageRepo.acknowledgePreparedWithRunEvidence(
+                        id: queued.id,
+                        runId: dispatchRunId
+                    ) {
+                        onQueuedMessageEvent?(AgentQueueEventKinds.drained, drained)
+                    }
+                } else {
+                    _ = try queuedMessageRepo.releasePrepared(lease, runId: dispatchRunId)
+                }
+                claimedLease = nil
+                preparedDispatch = nil
+                reloadQueuedMessages()
+                return
+            }
+            providerStartConfirmed = true
+            guard try queuedMessageRepo.markDispatched(lease, runId: dispatchRunId) else {
+                queueStatusMessage = "Provider started; queue acknowledgement needs recovery."
+                reloadQueuedMessages()
+                return
+            }
+            guard let drained = try queuedMessageRepo.acknowledge(lease) else {
+                queueStatusMessage = "Provider started; queue acknowledgement needs recovery."
+                reloadQueuedMessages()
+                return
+            }
+            claimedLease = nil
+            preparedDispatch = nil
             if editingQueuedMessage?.id == message.id {
                 editingQueuedMessage = nil
                 queuedMessageDraft = ""
             }
             queueStatusMessage = nil
             reloadQueuedMessages()
-            onQueuedMessageEvent?(AgentQueueEventKinds.drained, queued)
-            for queued in queuedMessages {
-                onQueuedMessageEvent?(AgentQueueEventKinds.updated, queued)
+            onQueuedMessageEvent?(AgentQueueEventKinds.drained, drained)
+            for remaining in queuedMessages {
+                onQueuedMessageEvent?(AgentQueueEventKinds.updated, remaining)
             }
-            _ = await startProviderRun(
-                text: queued.text,
-                attached: queued.attachments.map(\.path),
-                recordHistory: false,
-                interactionMode: queued.interactionMode
-            )
         } catch {
+            if let preparedDispatch, !providerStartConfirmed {
+                if (try? coordinator.runStatus(preparedDispatch.runId)) != nil {
+                    if let drained = try? queuedMessageRepo.acknowledgePreparedWithRunEvidence(
+                        id: preparedDispatch.lease.message.id,
+                        runId: preparedDispatch.runId
+                    ) {
+                        onQueuedMessageEvent?(AgentQueueEventKinds.drained, drained)
+                    }
+                } else {
+                    _ = try? queuedMessageRepo.releasePrepared(preparedDispatch.lease, runId: preparedDispatch.runId)
+                }
+                reloadQueuedMessages()
+            } else if let claimedLease, preparedDispatch == nil {
+                _ = try? queuedMessageRepo.release(claimedLease)
+                reloadQueuedMessages()
+            }
             queueStatusMessage = "Queue force failed: \(error)"
         }
     }
@@ -811,8 +1032,66 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         }
     }
 
+    nonisolated public static func canRevertCheckpoint(
+        status: AgentTurnCheckpointStatus,
+        capabilities: AgentProviderCapabilities
+    ) -> Bool {
+        status == .ready && capabilities.supportsRollback
+    }
+
+    public var selectedProviderCapabilities: AgentProviderCapabilities {
+        selectedProviderSnapshot?.effectiveCapabilities ?? .conservative
+    }
+
+    public var supportsPlanInteractionForSelectedProvider: Bool {
+        if let snapshot = selectedProviderSnapshot {
+            return snapshot.interactionModes.contains(.plan)
+        }
+        // Startup may briefly precede snapshot discovery. Codex and Claude
+        // have native Plan contracts; Grok stays fail-closed until its ACP
+        // session advertises a Plan mode and discovery can surface it.
+        return provider != .grok
+    }
+
+    public var planInteractionUnavailableReason: String? {
+        guard !supportsPlanInteractionForSelectedProvider else { return nil }
+        return "\(providerDisplayName(provider)) does not support Plan mode for this session."
+    }
+
+    public var supportedPermissionModesForSelectedProvider: [AgentPermissionMode] {
+        if let snapshot = selectedProviderSnapshot {
+            return snapshot.effectivePermissionModes
+        }
+        return provider == .grok ? [.supervised] : AgentPermissionMode.allCases
+    }
+
+    public func permissionModeUnavailableReason(_ mode: AgentPermissionMode) -> String? {
+        guard !supportedPermissionModesForSelectedProvider.contains(mode) else { return nil }
+        let label: String
+        switch mode {
+        case .supervised: label = "Supervised"
+        case .autoAcceptEdits: label = "Auto-edit"
+        case .fullAccess: label = "Full access"
+        }
+        return "\(providerDisplayName(provider)) does not support \(label) for this session."
+    }
+
+    public var threadForkUnavailableReason: String? {
+        guard !selectedProviderCapabilities.supportsFork else { return nil }
+        return "\(providerDisplayName(provider)) does not support provider-side fork for this session."
+    }
+
+    public var checkpointRevertUnavailableReason: String? {
+        guard !selectedProviderCapabilities.supportsRollback else { return nil }
+        return "\(providerDisplayName(provider)) does not support provider-side rollback for this session."
+    }
+
     public func revertSelectedCheckpoint() {
         guard let selectedThreadId, let turnCount = selectedCheckpointTurnCount else { return }
+        guard selectedProviderCapabilities.supportsRollback else {
+            checkpointStatusMessage = checkpointRevertUnavailableReason
+            return
+        }
         Task { @MainActor in
             do {
                 _ = try await coordinator.revertThreadToCheckpoint(threadId: selectedThreadId, checkpointTurnCount: turnCount, cwd: cwd)
@@ -835,11 +1114,27 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         }
     }
 
-    private func providerThreadSnapshotEvents(threadId: AgentThreadID) async -> [AssistantEvent]? {
-        guard let events = try? await coordinator.readThread(threadId: threadId), !events.isEmpty else {
-            return nil
-        }
-        return events
+    private func providerThreadSnapshotEvents(threadId: AgentThreadID) async throws -> [AssistantEvent] {
+        try await coordinator.readThread(threadId: threadId)
+    }
+
+    nonisolated public static func providerThreadSnapshotFailureMessage(lastConfirmedAt: Date?) -> String {
+        let confirmed = lastConfirmedAt.map {
+            $0.formatted(date: .omitted, time: .standard)
+        } ?? "not yet confirmed this session"
+        return "Provider snapshot unavailable. Showing persisted local state; last provider confirmation: \(confirmed)."
+    }
+
+    /// An interrupted session must remain disconnected until the user chooses
+    /// Continue. Auto-recovering it for a background snapshot races the explicit
+    /// resume and can create two app-server clients for one local thread.
+    nonisolated public static func shouldReadProviderSnapshot(hasRecoverableContext: Bool) -> Bool {
+        !hasRecoverableContext
+    }
+
+    public func retryProviderThreadSnapshotRead() {
+        guard let selectedThreadId else { return }
+        selectThread(selectedThreadId, markRead: false)
     }
 
     private func mergePersistedContextTelemetry(snapshot: [AssistantEvent], persisted: [AssistantEvent]) -> [AssistantEvent] {
@@ -1004,14 +1299,14 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     }
 
     /// B7: count of threads with an in-flight run, for the rail header.
-    public var activeThreadCount: Int { threads.filter { $0.status == .running }.count }
+    public var activeThreadCount: Int {
+        threads.filter { isThreadStartingOrRunning($0.id) }.count
+    }
 
     /// Chrome should spin only for work the coordinator/repository still sees
     /// as running. A stale local status must not keep tab/sidebar chrome busy.
     public var hasRunningWorkForChrome: Bool {
-        let activeThreadIds = coordinator.activeThreadIdsSnapshot()
-        if let selectedThreadId, activeThreadIds.contains(selectedThreadId) { return true }
-        return threads.contains { $0.status == .running || activeThreadIds.contains($0.id) }
+        threads.contains { isThreadStartingOrRunning($0.id) }
     }
 
     /// UX-MAC_AGENT-BG-AWAIT: the most recent final answer for the selected
@@ -1091,6 +1386,14 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         timeline.pendingUserInputs.filter { $0.state == .pending }
     }
 
+    public var visiblePendingRequests: [AssistantPendingRequest] {
+        timeline.pendingRequests.filter { $0.state == .pending || $0.state == .stale }
+    }
+
+    public var visiblePendingUserInputs: [AssistantUserInputRequest] {
+        timeline.pendingUserInputs.filter { $0.state == .pending || $0.state == .stale }
+    }
+
     /// Builds the decline payload for a supervised-mode approval decision.
     /// A non-empty reason is included so the agent can steer future requests;
     /// blank/nil reason produces a plain decline with no annotation.
@@ -1101,6 +1404,16 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
 
     public func respondToPendingRequest(_ request: AssistantPendingRequest, response: AgentProviderRequestResponse) {
         guard let threadId = selectedThreadId else { return }
+        respondToPendingRequest(request, response: response, originThreadId: threadId)
+    }
+
+    public func respondToPendingRequest(
+        _ request: AssistantPendingRequest,
+        response: AgentProviderRequestResponse,
+        originThreadId threadId: AgentThreadID
+    ) {
+        guard request.state == .pending else { return }
+        guard threads.contains(where: { $0.id == threadId }) else { return }
         let state: AssistantRequestState
         switch response {
         case .approve, .approveForSession: state = .approved
@@ -1124,27 +1437,47 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             guard let self else { return }
             do {
                 try await self.coordinator.respondToRequest(threadId: threadId, requestId: request.id, response: response)
-                self.timeline.apply(.requestResolved(requestId: request.id, state: state))
                 // QA-MAC_AGENT-010: record approval outcomes for diagnostics.
                 agentSurfaceLog.info("approval.resolved thread=\(threadId.value.uuidString, privacy: .public) request=\(request.id, privacy: .public) state=\(state.rawValue, privacy: .public)")
-                if response == .approveForSession {
-                    self.setPermissionMode(.fullAccess)
+                // Dynamic permission callbacks already carry the provider's
+                // exact requested profile and session scope. Never translate
+                // that narrow grant into the thread-wide Full Access mode.
+                if response == .approveForSession, request.kind != .dynamic {
+                    let thread = self.threads.first { $0.id == threadId }
+                    let snapshot = thread.flatMap { thread in
+                        self.providerSnapshots.first { $0.id == thread.providerInstanceId }
+                            ?? self.providerSnapshots.first { $0.provider == thread.provider }
+                    }
+                    let supported = snapshot?.effectivePermissionModes
+                        ?? (thread?.provider == .grok ? [.supervised] : AgentPermissionMode.allCases)
+                    if supported.contains(.fullAccess) {
+                        self.setPermissionMode(.fullAccess, for: threadId)
+                    }
+                }
+                // The async response belongs to the card's origin thread. A user
+                // can switch threads while it is in flight; never resolve a same-id
+                // callback in the newly selected thread's timeline.
+                if self.selectedThreadId == threadId {
+                    self.timeline.apply(.requestResolved(requestId: request.id, state: state))
                 }
             } catch {
                 // Always retain the stale diagnostic + clear the dead button, but
                 // only surface this error message if it is still the most recent
                 // callback action (no newer action stomped it via a sync write).
-                if issuedSeq == self.callbackActionSeq {
-                    self.timeline.apply(.error(message: "Provider request response failed: \(error)", recoverable: true))
-                    self.lastErrorRecoverable = false
+                if self.selectedThreadId == threadId {
+                    if issuedSeq == self.callbackActionSeq {
+                        self.timeline.apply(.error(message: "Provider request response failed: \(error)", recoverable: true))
+                        self.lastErrorRecoverable = false
+                    }
+                    self.timeline.apply(.requestResolved(requestId: request.id, state: .stale))
                 }
-                self.timeline.apply(.requestResolved(requestId: request.id, state: .stale))
             }
             self.scheduleTimelineUpdateTick()
         }
     }
 
     public func answerPendingUserInput(_ request: AssistantUserInputRequest, answer: String) {
+        guard request.state == .pending else { return }
         guard let threadId = selectedThreadId else { return }
         let trimmed = answer.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
@@ -1153,38 +1486,87 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         // recent) user-input error, preserving most-recent-action-wins ordering.
         clearVisibleErrorForNewUserMessage()
         callbackActionSeq &+= 1
-        userInputSelections[request.id] = nil
-        userInputDrafts[request.id] = nil
+        let stateKey = userInputStateKey(request, threadId: threadId)
+        userInputSelections[stateKey] = nil
+        userInputDrafts[stateKey] = nil
         Task { @MainActor [weak self] in
             guard let self else { return }
             do {
                 try await self.coordinator.respondToUserInput(threadId: threadId, requestId: request.id, text: trimmed)
-                self.timeline.apply(.userInputResolved(requestId: request.id, answer: trimmed))
-            } catch {
-                self.timeline.apply(.error(message: "Provider user-input response failed: \(error)", recoverable: true))
-                if let idx = self.timeline.pendingUserInputs.firstIndex(where: { $0.id == request.id }) {
-                    self.timeline.pendingUserInputs[idx].state = .stale
-                    self.timeline.pendingUserInputs[idx].resolvedAtMs = Int64(Date().timeIntervalSince1970 * 1000)
+                if self.selectedThreadId == threadId {
+                    self.timeline.apply(.userInputResolved(requestId: request.id, answer: trimmed))
                 }
-                // Response-failure, not a prompt failure — no prompt Retry offered.
-                self.lastErrorRecoverable = false
+            } catch {
+                if self.selectedThreadId == threadId {
+                    self.timeline.apply(.error(message: "Provider user-input response failed: \(error)", recoverable: true))
+                    if let idx = self.timeline.pendingUserInputs.firstIndex(where: { $0.id == request.id }) {
+                        self.timeline.pendingUserInputs[idx].state = .stale
+                        self.timeline.pendingUserInputs[idx].resolvedAtMs = Int64(Date().timeIntervalSince1970 * 1000)
+                    }
+                    // Response-failure, not a prompt failure — no prompt Retry offered.
+                    self.lastErrorRecoverable = false
+                }
+            }
+            self.scheduleTimelineUpdateTick()
+        }
+    }
+
+    public func cancelPendingUserInput(_ request: AssistantUserInputRequest) {
+        guard request.state == .pending else { return }
+        if let snapshot = selectedProviderSnapshot,
+           !snapshot.effectiveCapabilities.supportsUserInput {
+            statusMessage = "\(providerDisplayName(provider)) does not support interactive questions for this session."
+            return
+        }
+        guard let threadId = selectedThreadId else { return }
+        clearVisibleErrorForNewUserMessage()
+        callbackActionSeq &+= 1
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                try self.coordinator.cancelUserInput(threadId: threadId, requestId: request.id)
+                if self.selectedThreadId == threadId {
+                    self.timeline.apply(.userInputResolved(requestId: request.id, answer: nil))
+                }
+            } catch {
+                if self.selectedThreadId == threadId {
+                    self.timeline.apply(.error(message: "Provider user-input cancellation failed: \(error)", recoverable: true))
+                    if let index = self.timeline.pendingUserInputs.firstIndex(where: { $0.id == request.id }) {
+                        self.timeline.pendingUserInputs[index].state = .stale
+                        self.timeline.pendingUserInputs[index].resolvedAtMs = Int64(Date().timeIntervalSince1970 * 1000)
+                    }
+                    self.lastErrorRecoverable = false
+                }
             }
             self.scheduleTimelineUpdateTick()
         }
     }
 
     public func toggleUserInputOption(_ option: String, for request: AssistantUserInputRequest) {
-        var selection = userInputSelections[request.id] ?? []
+        let key = userInputStateKey(request)
+        var selection = userInputSelections[key] ?? []
         if selection.contains(option) { selection.remove(option) }
         else { selection.insert(option) }
-        userInputSelections[request.id] = selection
+        userInputSelections[key] = selection
     }
 
     public func selectedUserInputAnswer(for request: AssistantUserInputRequest) -> String {
-        (userInputSelections[request.id] ?? [])
+        (userInputSelections[userInputStateKey(request)] ?? [])
             .filter { request.options.contains($0) }
             .sorted()
             .joined(separator: "\n")
+    }
+
+    /// AG-043: provider request ids are only unique inside one thread. All local
+    /// draft and selection state therefore uses the callback's owning thread plus
+    /// request id, preventing same-id cards in A/B from sharing user input.
+    public func userInputStateKey(
+        _ request: AssistantUserInputRequest,
+        threadId: AgentThreadID? = nil
+    ) -> String {
+        let owner = threadId ?? selectedThreadId
+        let ownerDescription = owner?.value.uuidString ?? "unbound"
+        return "\(ownerDescription)\u{1}\(request.id)"
     }
 
     // MARK: Structured AskUserQuestion cards
@@ -1196,7 +1578,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     // resolves the provider callback once — the Claude SDK expects answers keyed by
     // the question text, with multi-select answers comma-joined.
     public func askUserQuestionKey(_ request: AssistantUserInputRequest, _ question: AssistantUserInputQuestion) -> String {
-        "\(request.id)\u{1}\(question.id)"
+        "\(userInputStateKey(request))\u{1}\(question.id)"
     }
 
     public func askUserQuestionOptionIsSelected(_ option: String, question: AssistantUserInputQuestion, request: AssistantUserInputRequest) -> Bool {
@@ -1306,6 +1688,15 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 let result = await ClaudeRunner().listModelsResult()
                 m = result.models
                 isFallback = result.isFallback
+            } else if provider == .grok {
+                let launchConfig = providerLaunchConfig?(provider, providerInstanceId)
+                let result = await GrokACPAdapter(
+                    binaryNameOverride: launchConfig?.binary,
+                    discoveryCwd: cwd,
+                    discoveryEnvironment: launchConfig?.environment ?? [:]
+                ).listModelsResult()
+                m = result.models
+                isFallback = result.isFallback
             } else {
                 // F33: this is CodexRunner's baked-in list, not live discovery
                 // (live codex models arrive via the provider-snapshot path), so
@@ -1386,7 +1777,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             // replace the VM's own fetch — a snapshot bringing a different
             // list is live discovery, so the warning must clear; an identical
             // list means the fallback was substituted again.
-            if availableModelsAreFallback {
+            if current.modelDiscoverySource != nil {
+                availableModelsAreFallback = current.modelListIsFallback
+            } else if availableModelsAreFallback {
                 availableModelsAreFallback = current.models.map(\.id) == availableModels.map(\.id)
             }
             availableModels = current.models
@@ -1402,6 +1795,16 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 }
             }
             normalizeSelectedModelOptions()
+            normalizeInteractionModeForSelectedProvider()
+        }
+    }
+
+    private func normalizeInteractionModeForSelectedProvider() {
+        if interactionMode == .plan, !supportsPlanInteractionForSelectedProvider {
+            interactionMode = .default
+        }
+        if !supportedPermissionModesForSelectedProvider.contains(permissionMode) {
+            permissionMode = supportedPermissionModesForSelectedProvider.first ?? .supervised
         }
     }
 
@@ -1448,6 +1851,30 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     public var selectedProviderSnapshot: AgentProviderSnapshot? {
         providerSnapshots.first { $0.id == providerInstanceId }
             ?? providerSnapshots.first { $0.provider == provider }
+    }
+
+    public var providerExecutionUnavailableReason: String? {
+        Self.providerExecutionUnavailableReason(for: selectedProviderSnapshot)
+    }
+
+    public var selectedProviderCanRun: Bool {
+        providerExecutionUnavailableReason == nil
+    }
+
+    nonisolated public static func providerExecutionUnavailableReason(
+        for snapshot: AgentProviderSnapshot?
+    ) -> String? {
+        guard let snapshot else { return nil }
+        if !snapshot.enabled || snapshot.status == .disabled {
+            return snapshot.statusDetail ?? "\(snapshot.displayName) is disabled."
+        }
+        if !snapshot.installed || snapshot.status == .unavailable {
+            return snapshot.statusDetail ?? "\(snapshot.displayName) is unavailable."
+        }
+        if snapshot.authenticated == false {
+            return "\(snapshot.displayName) is not authenticated. Sign in to continue."
+        }
+        return nil
     }
 
     public var selectedModelDescriptor: AgentModelDescriptor? {
@@ -1599,16 +2026,30 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
 
     public var providerRecoveryActionTitle: String? {
         guard let snapshot = selectedProviderSnapshot else { return nil }
+        if pendingSignInProvider == snapshot.provider,
+           pendingSignInSnapshotID == snapshot.id,
+           snapshot.authenticated == false {
+            return AgentErrorRecoveryAction.retry.title
+        }
         return Self.providerRecoveryActionTitle(for: snapshot)
     }
 
     public static func providerRecoveryActionTitle(for snapshot: AgentProviderSnapshot) -> String? {
-        snapshot.recoveryActionTitle
+        if snapshot.authenticated == false {
+            return AgentErrorRecoveryAction.signIn.title
+        }
+        return snapshot.recoveryActionTitle
     }
 
     public func performProviderRecoveryAction() async {
         guard let snapshot = selectedProviderSnapshot,
-              let title = Self.providerRecoveryActionTitle(for: snapshot) else { return }
+              let title = providerRecoveryActionTitle else { return }
+        if title == AgentErrorRecoveryAction.retry.title,
+           pendingSignInProvider == snapshot.provider,
+           pendingSignInSnapshotID == snapshot.id {
+            _ = await refreshPendingProviderAuthentication(retryLastPromptWhenAuthenticated: false)
+            return
+        }
         if title.hasPrefix("Update") {
             guard let providerRecoveryAction else {
                 providerRecoveryStatusMessage = "Update unavailable: app router is not ready."
@@ -1626,22 +2067,84 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             }
             return
         }
-        let command: String
         if snapshot.authenticated == false {
-            command = "\(snapshot.provider.rawValue) login"
-        } else {
-            switch snapshot.provider {
-            case .codex:
-                command = "npm install -g @openai/codex"
-            case .claude:
-                command = "npm install -g @anthropic-ai/claude-code"
-            case .grok:
-                command = "curl -fsSL https://x.ai/cli/install.sh | bash"
-            }
+            providerRecoveryActionRunning = true
+            defer { providerRecoveryActionRunning = false }
+            beginProviderSignIn(provider: snapshot.provider, snapshotID: snapshot.id)
+            return
+        }
+        let command: String
+        switch snapshot.provider {
+        case .codex:
+            command = "npm install -g @openai/codex"
+        case .claude:
+            command = "npm install -g @anthropic-ai/claude-code"
+        case .grok:
+            command = "curl -fsSL https://x.ai/cli/install.sh | bash"
         }
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(command, forType: .string)
         providerRecoveryStatusMessage = "Copied: \(command)"
+    }
+
+    private func beginProviderSignIn(provider: AgentProvider, snapshotID: String?) {
+        guard let providerSignInAction else {
+            providerRecoveryStatusMessage = "Sign-in unavailable: app router is not ready."
+            return
+        }
+        do {
+            try providerSignInAction(provider)
+            pendingSignInProvider = provider
+            pendingSignInSnapshotID = snapshotID
+            providerRecoveryStatusMessage = "Opened \(providerDisplayName(provider)) sign-in in Terminal. Complete sign-in there, then choose Retry."
+        } catch {
+            providerRecoveryStatusMessage = "Could not open sign-in Terminal: \(error)"
+        }
+    }
+
+    @discardableResult
+    private func refreshPendingProviderAuthentication(
+        retryLastPromptWhenAuthenticated: Bool
+    ) async -> Bool {
+        guard let pendingSignInProvider else { return false }
+        let snapshots: [AgentProviderSnapshot]
+        if let providerAuthenticationRefresher {
+            snapshots = await providerAuthenticationRefresher(pendingSignInProvider)
+        } else if let providerSnapshotLoader {
+            do {
+                snapshots = try await providerSnapshotLoader()
+            } catch {
+                providerRecoveryStatusMessage = "Could not refresh authentication status: \(error)"
+                return false
+            }
+        } else {
+            await loadProviderSnapshots()
+            snapshots = providerSnapshots
+        }
+        guard !snapshots.isEmpty else {
+            providerRecoveryStatusMessage = "Could not refresh authentication status. Choose Retry to try again."
+            return false
+        }
+        applyProviderSnapshots(snapshots)
+        let refreshed = snapshots.first {
+            if let pendingSignInSnapshotID {
+                return $0.id == pendingSignInSnapshotID
+            }
+            return $0.provider == pendingSignInProvider
+        }
+        guard refreshed?.authenticated == true else {
+            providerRecoveryStatusMessage = "Sign-in is not confirmed yet. Complete it in Terminal, then choose Retry."
+            return false
+        }
+        self.pendingSignInProvider = nil
+        pendingSignInSnapshotID = nil
+        providerRecoveryStatusMessage = retryLastPromptWhenAuthenticated
+            ? "Authentication confirmed. Retrying the request."
+            : "Authentication confirmed. Retry your request when ready."
+        if retryLastPromptWhenAuthenticated {
+            await retryLastPrompt()
+        }
+        return true
     }
 
     public var contextHealthMessage: String? {
@@ -1659,7 +2162,26 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     public var providerLocked: Bool {
         selectedThreadId != nil && messages.contains { $0.role != .system }
     }
-    public var executionLocked: Bool { providerLocked || status == .running }
+    public var selectedThreadRunIsStartingOrRunning: Bool {
+        selectedThreadId.map(isThreadStartingOrRunning) ?? false
+    }
+
+    /// A fresh thread also uses `.pending` as its persisted idle state. A Stop
+    /// affordance therefore needs a run identity, not status alone; otherwise a
+    /// never-started thread is rendered as busy and its first prompt is queued.
+    public func isThreadStartingOrRunning(_ threadId: AgentThreadID) -> Bool {
+        trackedRunId(for: threadId) != nil
+    }
+
+    private func trackedRunId(for threadId: AgentThreadID) -> AgentRunID? {
+        runThreads.first(where: { $0.value == threadId })?.key
+            ?? coordinator.activeRunId(threadId: threadId)
+    }
+    public var executionLocked: Bool { providerLocked || selectedThreadRunIsStartingOrRunning }
+    public var activeRunConfigurationLocked: Bool {
+        selectedThreadRunIsStartingOrRunning
+            || selectedThreadId.map { coordinator.activeThreadIdsSnapshot().contains($0) } == true
+    }
 
     public func setProviderInstance(_ id: String) {
         guard !executionLocked else { return }
@@ -1677,18 +2199,22 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             model = snapshot.models.first?.id ?? model
         }
         normalizeSelectedModelOptions()
+        normalizeInteractionModeForSelectedProvider()
         persistThreadConfig()
     }
 
     public func setProvider(_ newProvider: AgentProvider) {
         guard !executionLocked else { return }
+        if let selectedThreadId { persistComposerDraft(for: selectedThreadId) }
         provider = newProvider
         // Prefer a real snapshot id when snapshots are loaded so Source stays
         // checkmarked after a Source switch (ids are "codex-cli", not "codex").
         if let snap = providerSnapshots.first(where: { $0.provider == newProvider && $0.enabled })
             ?? providerSnapshots.first(where: { $0.provider == newProvider }) {
             providerInstanceId = snap.id
-            if availableModelsAreFallback {
+            if snap.modelDiscoverySource != nil {
+                availableModelsAreFallback = snap.modelListIsFallback
+            } else if availableModelsAreFallback {
                 availableModelsAreFallback = snap.models.map(\.id) == availableModels.map(\.id)
             }
             availableModels = snap.models
@@ -1698,39 +2224,95 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             availableModels = []
             model = ""
         }
+        if let selectedThreadId {
+            restoreComposerDraft(
+                threadId: selectedThreadId,
+                providerInstanceId: providerInstanceId,
+                fallbackInteractionMode: .default
+            )
+        }
         normalizeSelectedModelOptions()
+        normalizeInteractionModeForSelectedProvider()
         persistThreadConfig()
     }
 
     /// Persist the chosen run configuration onto the selected thread so a
     /// resumed run uses the right source, model, permission, and effort.
-    public func persistThreadConfig() {
+    @discardableResult
+    public func persistThreadConfig() -> Bool {
         normalizeSelectedModelOptions()
-        guard let id = selectedThreadId, var t = try? threadRepo.get(id: id) else { return }
-        t.provider = provider
-        t.providerInstanceId = providerInstanceId
-        t.model = model
-        t.permissionMode = permissionMode
-        t.reasoningEffort = reasoningEffort
-        t.serviceTier = serviceTier
-        t.modelSelection = currentModelSelection
-        t.updatedAt = Date()
-        try? threadRepo.upsert(t)
-        if let i = threads.firstIndex(where: { $0.id == id }) {
-            threads[i].provider = provider
-            threads[i].providerInstanceId = providerInstanceId
-            threads[i].model = model
-            threads[i].permissionMode = permissionMode
-            threads[i].reasoningEffort = reasoningEffort
-            threads[i].serviceTier = serviceTier
-            threads[i].modelSelection = currentModelSelection
+        guard let id = selectedThreadId else { return false }
+        do {
+            guard let stored = try threadRepo.get(id: id) else {
+                statusMessage = "Could not save thread configuration: thread not found."
+                return false
+            }
+            var updated = stored
+            updated.provider = provider
+            updated.providerInstanceId = providerInstanceId
+            updated.model = model
+            updated.permissionMode = permissionMode
+            updated.reasoningEffort = reasoningEffort
+            updated.serviceTier = serviceTier
+            updated.modelSelection = currentModelSelection
+            updated.interactionMode = interactionMode
+            updated.updatedAt = Date()
+            try threadRepo.upsert(updated)
+            if let i = threads.firstIndex(where: { $0.id == id }) {
+                threads[i] = updated
+            }
+            persistComposerDraft(for: id)
+            onThreadConfigPersisted?(updated)
+            return true
+        } catch {
+            if let stored = try? threadRepo.get(id: id) { restoreThreadConfiguration(from: stored) }
+            statusMessage = "Could not save thread configuration: \(error)"
+            return false
         }
-        onThreadConfigPersisted?(t)
+    }
+
+    private func restoreThreadConfiguration(from thread: AgentThread) {
+        provider = thread.provider
+        providerInstanceId = thread.providerInstanceId ?? thread.provider.rawValue
+        model = thread.model
+        permissionMode = thread.permissionMode
+        reasoningEffort = thread.reasoningEffort
+        serviceTier = thread.serviceTier
+        interactionMode = thread.effectiveInteractionMode
+        normalizeInteractionModeForSelectedProvider()
+        if let i = threads.firstIndex(where: { $0.id == thread.id }) {
+            threads[i] = thread
+        }
     }
 
     public func setPermissionMode(_ mode: AgentPermissionMode) {
+        guard !activeRunConfigurationLocked else { return }
+        guard supportedPermissionModesForSelectedProvider.contains(mode) else {
+            statusMessage = permissionModeUnavailableReason(mode) ?? "Permission mode is unavailable for this session."
+            return
+        }
         permissionMode = mode
         persistThreadConfig()
+    }
+
+    /// Persist an async callback's permission escalation against the thread that
+    /// owned the card, not whichever thread is selected when the await returns.
+    private func setPermissionMode(_ mode: AgentPermissionMode, for threadId: AgentThreadID) {
+        do {
+            guard var thread = try threadRepo.get(id: threadId) else { return }
+            thread.permissionMode = mode
+            thread.updatedAt = Date()
+            try threadRepo.upsert(thread)
+            if let index = threads.firstIndex(where: { $0.id == threadId }) {
+                threads[index].permissionMode = mode
+            }
+            if selectedThreadId == threadId {
+                permissionMode = mode
+            }
+            onThreadConfigPersisted?(thread)
+        } catch {
+            statusMessage = "Could not save permission mode: \(error)"
+        }
     }
 
     public func setReasoningEffort(_ effort: AgentReasoningEffort) {
@@ -1774,18 +2356,30 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         }
     }
 
-    public func persistThreadExecutionConfig() {
-        guard let id = selectedThreadId, var t = try? threadRepo.get(id: id) else { return }
-        let branch = baseBranch.trimmingCharacters(in: .whitespacesAndNewlines)
-        t.executionMode = executionMode
-        t.baseBranch = executionMode == .worktree ? (branch.isEmpty ? (gitBranch ?? "main") : branch) : nil
-        if executionMode == .local { t.worktreePath = nil }
-        t.updatedAt = Date()
-        try? threadRepo.upsert(t)
-        if let i = threads.firstIndex(where: { $0.id == id }) {
-            threads[i].executionMode = t.executionMode
-            threads[i].baseBranch = t.baseBranch
-            threads[i].worktreePath = t.worktreePath
+    @discardableResult
+    public func persistThreadExecutionConfig() -> Bool {
+        guard let id = selectedThreadId else { return false }
+        do {
+            guard var thread = try threadRepo.get(id: id) else { return false }
+            let branch = baseBranch.trimmingCharacters(in: .whitespacesAndNewlines)
+            thread.executionMode = executionMode
+            thread.baseBranch = executionMode == .worktree ? (branch.isEmpty ? (gitBranch ?? "main") : branch) : nil
+            if executionMode == .local { thread.worktreePath = nil }
+            thread.updatedAt = Date()
+            try threadRepo.upsert(thread)
+            if let i = threads.firstIndex(where: { $0.id == id }) {
+                threads[i] = thread
+            }
+            return true
+        } catch {
+            if let stored = try? threadRepo.get(id: id) {
+                executionMode = stored.executionMode
+                baseBranch = stored.baseBranch ?? gitBranch ?? "main"
+                worktreePath = stored.worktreePath
+                if let i = threads.firstIndex(where: { $0.id == id }) { threads[i] = stored }
+            }
+            statusMessage = "Could not save thread execution settings: \(error)"
+            return false
         }
     }
 
@@ -1820,7 +2414,12 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                             executionMode: executionMode,
                             baseBranch: executionMode == .worktree ? (baseBranch.isEmpty ? (gitBranch ?? "main") : baseBranch) : nil,
                             serviceTier: serviceTier, modelSelection: currentModelSelection)
-        try? threadRepo.upsert(t)
+        do {
+            try threadRepo.upsert(t)
+        } catch {
+            statusMessage = "Could not create thread: \(error)"
+            return
+        }
         reloadThreads()
         onThreadLifecycle?(.created(threads.first(where: { $0.id == t.id }) ?? t))
         selectThread(t.id)
@@ -1859,26 +2458,46 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
 
     public func renameThread(_ id: AgentThreadID, to newTitle: String) {
         let title = newTitle.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !title.isEmpty, var t = try? threadRepo.get(id: id) else { return }
-        t.title = title
-        t.updatedAt = Date()
-        try? threadRepo.upsert(t)
+        guard !title.isEmpty else { return }
+        let t: AgentThread
+        do {
+            guard var stored = try threadRepo.get(id: id) else { return }
+            stored.title = title
+            stored.updatedAt = Date()
+            try threadRepo.upsert(stored)
+            t = stored
+        } catch {
+            statusMessage = "Could not rename thread: \(error)"
+            return
+        }
         reloadThreads()
         onThreadLifecycle?(.updated(threads.first(where: { $0.id == id }) ?? t))
     }
 
     /// A2: set/clear a thread's swatch color (empty string clears).
     public func setThreadColor(_ id: AgentThreadID, _ color: String) {
-        guard var t = try? threadRepo.get(id: id) else { return }
-        t.color = color.isEmpty ? nil : color
-        t.updatedAt = Date()
-        try? threadRepo.upsert(t)
+        let t: AgentThread
+        do {
+            guard var stored = try threadRepo.get(id: id) else { return }
+            stored.color = color.isEmpty ? nil : color
+            stored.updatedAt = Date()
+            try threadRepo.upsert(stored)
+            t = stored
+        } catch {
+            statusMessage = "Could not change thread color: \(error)"
+            return
+        }
         reloadThreads()
         onThreadLifecycle?(.updated(threads.first(where: { $0.id == id }) ?? t))
     }
 
     public func setThreadPinned(_ id: AgentThreadID, _ pinned: Bool) {
-        try? threadRepo.setPinned(id: id, pinned: pinned)
+        do {
+            try threadRepo.setPinned(id: id, pinned: pinned)
+        } catch {
+            statusMessage = "Could not change pinned state: \(error)"
+            return
+        }
         reloadThreads()
         if let updated = threads.first(where: { $0.id == id }) {
             onThreadLifecycle?(.updated(updated))
@@ -1888,7 +2507,12 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     public func reorderThread(_ id: AgentThreadID, before target: AgentThreadID) {
         guard id != target,
               let targetIndex = threads.firstIndex(where: { $0.id == target }) else { return }
-        try? threadRepo.reorder(id: id, position: targetIndex)
+        do {
+            try threadRepo.reorder(id: id, position: targetIndex)
+        } catch {
+            statusMessage = "Could not reorder threads: \(error)"
+            return
+        }
         reloadThreads()
         onThreadLifecycle?(.reordered(workspaceID, threads.map(\.id)))
     }
@@ -1910,6 +2534,8 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         /// and which (if any) thread was selected at delete time so undo can
         /// restore selection too. `count` drives the toast copy.
         public var snapshots: [ThreadSnapshot]
+        public var relationalSnapshot: AgentThreadRelationalSnapshot? = nil
+        public var attachmentGCPinID: String? = nil
         public var capturedAt: Date
         public var previouslySelectedThreadId: AgentThreadID?
 
@@ -1946,33 +2572,55 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// delete, or when the window lapses. Drives the undo toast.
     @Published public private(set) var pendingThreadDeletionUndo: ThreadDeletionUndo?
 
-    public func deleteThread(_ id: AgentThreadID) {
-        let undo = captureThreadDeletionUndo(ids: [id])
-        let wasSelected = selectedThreadId == id
-        try? threadRepo.delete(id: id)
-        evictThreadCaches([id])
-        if wasSelected {
-            selectedThreadId = nil
-        messages = []
-        timeline = AssistantTimelineState()
-        resetTimelineUpdateTick()
-        }
-        reloadThreads()
-        onThreadLifecycle?(.deleted([id]))
-        // If the user deleted the thread they were viewing, reselect a remaining
-        // one (long-standing delete UX). Guarded on `wasSelected` so a surface
-        // that was already on the fresh-composer state is never auto-bound.
-        if wasSelected, selectedThreadId == nil, let next = threads.first {
-            selectThread(next.id)
-        }
-        armThreadDeletionUndo(undo)
+    @discardableResult
+    public func deleteThread(_ id: AgentThreadID) async -> Bool {
+        await deleteThreads([id])
     }
 
-    public func deleteThreads(_ ids: Set<AgentThreadID>) {
-        guard !ids.isEmpty else { return }
-        let undo = captureThreadDeletionUndo(ids: Array(ids))
+    @discardableResult
+    public func deleteThreads(_ ids: Set<AgentThreadID>) async -> Bool {
+        guard !ids.isEmpty else { return true }
+        // AG-002: a thread row owns the provider lifecycle. Do not cascade-delete
+        // its data or evict UI caches until every selected provider has confirmed
+        // terminal state and its process tree is dead.
+        do {
+            for id in ids {
+                try await coordinator.stopAndAwaitTermination(threadId: id)
+            }
+        } catch {
+            timeline.apply(.error(
+                message: "Could not delete thread because its provider is still running: \(error.localizedDescription)",
+                recoverable: true
+            ))
+            lastErrorRecoverable = true
+            scheduleTimelineUpdateTick()
+            return false
+        }
+
+        let previouslySelectedThreadId = selectedThreadId
         let wasSelected = selectedThreadId.map(ids.contains) ?? false
-        try? threadRepo.delete(ids: Array(ids))
+        let capturedAt = currentTime()
+        let attachmentGCPinID = UUID().uuidString.lowercased()
+        let relationalSnapshot: AgentThreadRelationalSnapshot
+        do {
+            relationalSnapshot = try threadRepo.deleteWithRelationalSnapshot(
+                ids: Array(ids),
+                undoGCPin: AgentThreadUndoGCPin(
+                    id: attachmentGCPinID,
+                    expiresAt: capturedAt.addingTimeInterval(Self.threadDeletionUndoWindow)
+                )
+            )
+        } catch {
+            statusMessage = "Could not delete thread data: \(error)"
+            return false
+        }
+        let undo = ThreadDeletionUndo(
+            snapshots: relationalSnapshot.threads.map { .init(thread: $0, messages: []) },
+            relationalSnapshot: relationalSnapshot,
+            attachmentGCPinID: attachmentGCPinID,
+            capturedAt: capturedAt,
+            previouslySelectedThreadId: previouslySelectedThreadId
+        )
         evictThreadCaches(ids)
         if wasSelected {
             self.selectedThreadId = nil
@@ -1988,6 +2636,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             selectThread(next.id)
         }
         armThreadDeletionUndo(undo)
+        return true
     }
 
     /// F9: drop deleted threads' per-thread caches so they don't leak for the life
@@ -2020,29 +2669,14 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     }
     #endif
 
-    /// Snapshot the threads (+ their messages) about to be deleted, BEFORE the
-    /// store removes them. Returns nil if nothing could be captured so the undo
-    /// toast never appears for a no-op.
-    private func captureThreadDeletionUndo(ids: [AgentThreadID]) -> ThreadDeletionUndo? {
-        var snapshots: [ThreadDeletionUndo.ThreadSnapshot] = []
-        for id in ids {
-            guard let thread = try? threadRepo.get(id: id) else { continue }
-            let messages = (try? messageRepo.list(threadId: id)) ?? []
-            snapshots.append(.init(thread: thread, messages: messages))
-        }
-        guard !snapshots.isEmpty else { return nil }
-        return ThreadDeletionUndo(
-            snapshots: snapshots,
-            capturedAt: currentTime(),
-            previouslySelectedThreadId: selectedThreadId
-        )
-    }
-
     /// Publish the snapshot as the active undo affordance and schedule its
     /// expiry. The delete itself already happened; this only controls how long
     /// the user can take it back.
     private func armThreadDeletionUndo(_ undo: ThreadDeletionUndo?) {
         threadDeletionUndoExpiryTask?.cancel()
+        if pendingThreadDeletionUndo?.attachmentGCPinID != undo?.attachmentGCPinID {
+            releaseThreadDeletionUndoGCPin(pendingThreadDeletionUndo)
+        }
         guard let undo else {
             pendingThreadDeletionUndo = nil
             return
@@ -2054,15 +2688,21 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             guard let self, !Task.isCancelled else { return }
             // Only clear the snapshot we armed; a newer delete owns its own.
             if let current = self.pendingThreadDeletionUndo,
-               current.capturedAt == undo.capturedAt,
+               current.attachmentGCPinID == undo.attachmentGCPinID,
                !ThreadDeletionUndo.isWithinUndoWindow(
                    capturedAt: current.capturedAt,
                    now: self.currentTime(),
                    window: window
                ) {
+                self.releaseThreadDeletionUndoGCPin(current)
                 self.pendingThreadDeletionUndo = nil
             }
         }
+    }
+
+    private func releaseThreadDeletionUndoGCPin(_ undo: ThreadDeletionUndo?) {
+        guard let id = undo?.attachmentGCPinID else { return }
+        try? threadRepo.removeUndoGCPin(id: id)
     }
 
     /// UX-XPLAT-DELETE-UNDO: restore the most recently deleted thread(s) from
@@ -2078,17 +2718,28 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                   window: Self.threadDeletionUndoWindow
               ) else {
             // Window lapsed (or nothing to undo): drop the stale snapshot.
+            releaseThreadDeletionUndoGCPin(pendingThreadDeletionUndo)
             pendingThreadDeletionUndo = nil
             threadDeletionUndoExpiryTask?.cancel()
             return false
         }
-        for snapshot in undo.snapshots {
-            let plan = ThreadDeletionUndo.restorePlan(for: snapshot)
-            try? threadRepo.upsert(plan.thread)
-            for message in plan.messagesInAppendOrder {
-                try? messageRepo.append(message)
+        do {
+            if let relationalSnapshot = undo.relationalSnapshot {
+                try threadRepo.restore(relationalSnapshot)
+            } else {
+                for snapshot in undo.snapshots {
+                    let plan = ThreadDeletionUndo.restorePlan(for: snapshot)
+                    try threadRepo.upsert(plan.thread)
+                    for message in plan.messagesInAppendOrder {
+                        try messageRepo.append(message)
+                    }
+                }
             }
+        } catch {
+            statusMessage = "Could not restore deleted thread data: \(error)"
+            return false
         }
+        releaseThreadDeletionUndoGCPin(undo)
         pendingThreadDeletionUndo = nil
         threadDeletionUndoExpiryTask?.cancel()
         reloadThreads()
@@ -2221,31 +2872,46 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     private func systemNote(_ text: String) {
         guard let tid = selectedThreadId else { return }
         let m = AgentMessage(threadId: tid, role: .system, content: text)
-        messages.append(m)
-        try? messageRepo.append(m)
+        do {
+            try messageRepo.append(m)
+            messages.append(m)
+        } catch {
+            statusMessage = "Could not save system note: \(error)"
+        }
     }
 
-    /// `/fork` — branch a new thread from the current one, copying its
-    /// message history, then select it (remotecode.io `/fork` parity).
-    public func forkCurrentThread() {
+    /// `/fork` — create a provider-native branch, copy the visible local
+    /// transcript into it, then select the isolated child thread.
+    public func forkCurrentThread() async {
         guard let tid = selectedThreadId,
               let src = threads.first(where: { $0.id == tid }) else { return }
-        let copy = AgentThread(workspaceId: workspaceID, title: "\(src.title) (fork)",
-                               provider: src.provider, model: src.model,
-                               permissionMode: src.permissionMode, reasoningEffort: src.reasoningEffort,
-                               serviceTier: src.serviceTier)
-        try? threadRepo.upsert(copy)
-        let copyBaseDate = Date()
-        for (index, m) in ((try? messageRepo.list(threadId: tid)) ?? []).enumerated() {
-            try? messageRepo.append(AgentMessage(
-                threadId: copy.id,
-                role: m.role,
-                content: m.content,
-                createdAt: copyBaseDate.addingTimeInterval(Double(index) / 1000)
-            ))
+        guard selectedProviderCapabilities.supportsFork else {
+            systemNote(threadForkUnavailableReason ?? "Provider-side fork is unavailable for this session.")
+            return
         }
-        reloadThreads()
-        selectThread(copy.id)
+        let child = AgentThread(
+            projectId: src.projectId,
+            workspaceId: src.workspaceId ?? workspaceID,
+            title: "\(src.title) (fork)",
+            provider: src.provider,
+            providerInstanceId: src.providerInstanceId,
+            model: src.model,
+            permissionMode: src.permissionMode,
+            reasoningEffort: src.reasoningEffort,
+            executionMode: src.executionMode,
+            baseBranch: src.baseBranch,
+            worktreePath: src.worktreePath,
+            serviceTier: src.serviceTier,
+            modelSelection: src.modelSelection,
+            interactionMode: src.effectiveInteractionMode
+        )
+        do {
+            let forked = try await coordinator.forkThread(sourceThreadId: tid, childThread: child)
+            reloadThreads()
+            selectThread(forked.id)
+        } catch {
+            statusMessage = "Could not fork thread: \(error)"
+        }
     }
 
     /// Intercept only RemoteCode-owned slash commands before they reach the
@@ -2274,7 +2940,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             // the silent switch doesn't look like a bug.
             systemNote("/clear — started a new thread. Previous thread is still in the rail.")
         case "fork":
-            forkCurrentThread()
+            Task { @MainActor in
+                await forkCurrentThread()
+            }
         case "model":
             if !arg.isEmpty, let m = availableModels.first(where: {
                 $0.id.localizedCaseInsensitiveContains(arg) || $0.label.localizedCaseInsensitiveContains(arg)
@@ -2287,6 +2955,10 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 systemNote(names.isEmpty ? "No models loaded yet." : "Models: \(names)")
             }
         case "plan":
+            guard supportsPlanInteractionForSelectedProvider else {
+                systemNote(planInteractionUnavailableReason ?? "Plan mode is unavailable for this session.")
+                return true
+            }
             interactionMode = .plan
             permissionMode = .supervised
             persistThreadConfig()
@@ -2304,17 +2976,51 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     }
 
     public func addAttachments(_ paths: [String]) {
-        for p in paths where !attachments.contains(p) { attachments.append(p) }
+        do {
+            try AgentProviderRunPreflight.validate(
+                snapshot: selectedProviderSnapshot,
+                interactionMode: interactionMode,
+                permissionMode: permissionMode,
+                attachments: []
+            )
+            guard paths.isEmpty || selectedProviderSnapshot?.effectiveCapabilities.supportsAttachments == true else {
+                throw AgentProviderRunPreflightError.attachmentsUnsupported(
+                    selectedProviderSnapshot?.displayName ?? provider.rawValue.capitalized
+                )
+            }
+            let staged = try attachmentStore?.stage(paths: paths) ?? AgentAttachmentResolver.resolve(paths: paths)
+            try AgentProviderRunPreflight.validate(
+                snapshot: selectedProviderSnapshot,
+                interactionMode: interactionMode,
+                permissionMode: permissionMode,
+                attachments: attachments + staged
+            )
+            let deduplicationKey: (AgentAttachment) -> String = { attachment in
+                if let digest = attachment.sha256, !digest.isEmpty { return "sha256:\(digest)" }
+                return attachment.id ?? attachment.path
+            }
+            var known = Set(attachments.map(deduplicationKey))
+            for attachment in staged where known.insert(deduplicationKey(attachment)).inserted {
+                attachments.append(attachment)
+            }
+            attachmentInputError = nil
+            statusMessage = ""
+            if let selectedThreadId { persistComposerDraft(for: selectedThreadId) }
+        } catch {
+            attachmentInputError = String(describing: error)
+            statusMessage = attachmentInputError ?? "Attachment failed."
+        }
     }
     public func insertDroppedFilePaths(_ paths: [String]) {
-        prompt = DroppedFilePaths.appending(DroppedFilePaths.composerInputText(for: paths), to: prompt)
-        promptHistoryCursor = nil
+        addAttachments(paths)
     }
     public func promptWasEdited() {
         promptHistoryCursor = nil
+        if let selectedThreadId { persistComposerDraft(for: selectedThreadId) }
     }
-    public func removeAttachment(_ path: String) {
-        attachments.removeAll { $0 == path }
+    public func removeAttachment(_ attachment: AgentAttachment) {
+        attachments.removeAll { $0 == attachment }
+        if let selectedThreadId { persistComposerDraft(for: selectedThreadId) }
     }
 
     private func clearVisibleErrorForNewUserMessage() {
@@ -2325,12 +3031,23 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     public func send() async {
         let text = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty || !attachments.isEmpty else { return }
+        guard attachmentInputError == nil else { return }
+        guard selectedProviderCanRun else {
+            statusMessage = providerExecutionUnavailableReason ?? "The selected provider is unavailable."
+            return
+        }
         lastSentAttachmentCount = attachments.count
         recordPromptHistory(text)
         clearVisibleErrorForNewUserMessage()
         if let slash = Self.localSlashCommandParts(text),
            (slash.command == "plan" || slash.command == "default"),
            !slash.argument.isEmpty {
+            if slash.command == "plan", !supportsPlanInteractionForSelectedProvider {
+                _ = handleSlashCommand("/plan")
+                prompt = slash.argument
+                if let selectedThreadId { persistComposerDraft(for: selectedThreadId) }
+                return
+            }
             _ = handleSlashCommand("/\(slash.command)")
             if selectedThreadCanQueuePrompt {
                 await enqueuePromptWhileRunning(text: slash.argument, attached: attachments)
@@ -2366,31 +3083,32 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
 
     private var selectedThreadCanQueuePrompt: Bool {
         guard let selectedThreadId else { return false }
-        if status == .running { return true }
+        if selectedThreadRunIsStartingOrRunning { return true }
         if coordinator.activeThreadIdsSnapshot().contains(selectedThreadId) { return true }
         guard let currentRunId,
               let runStatus = try? coordinator.runStatus(currentRunId) else { return false }
         return runStatus == .running || runStatus == .pending
     }
 
-    private func enqueuePromptWhileRunning(text: String, attached: [String]) async {
+    private func enqueuePromptWhileRunning(text: String, attached: [AgentAttachment]) async {
         guard let selectedThreadId, let queuedMessageRepo else { return }
-        let resolvedAttachments: [AgentAttachment]
         do {
-            resolvedAttachments = try AgentAttachmentResolver.resolve(paths: attached)
-        } catch {
-            systemNote(String(describing: error))
-            return
-        }
-        do {
-            let queued = try queuedMessageRepo.enqueue(
+            try AgentProviderRunPreflight.validate(
+                snapshot: selectedProviderSnapshot,
+                interactionMode: interactionMode,
+                permissionMode: permissionMode,
+                attachments: attached
+            )
+            let queued = try queuedMessageRepo.enqueueConsumingDraft(
                 threadId: selectedThreadId,
+                providerInstanceId: providerInstanceId,
                 text: text,
-                attachments: resolvedAttachments,
+                attachments: attached,
                 interactionMode: interactionMode
             )
             prompt = ""
             attachments = []
+            clearComposerDraftMemory(threadId: selectedThreadId, providerInstanceId: providerInstanceId)
             // UX-MAC_AGENT-019: a run is in flight, so this message was queued,
             // not sent now — confirm that explicitly near the composer.
             queueStatusMessage = "Queued — will run after the current turn."
@@ -2404,7 +3122,25 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     }
 
     @discardableResult
-    private func startProviderRun(text: String, attached: [String], recordHistory: Bool, interactionMode: AgentInteractionMode) async -> AgentRunID? {
+    private func startProviderRun(
+        text: String,
+        attached: [AgentAttachment],
+        recordHistory: Bool,
+        interactionMode: AgentInteractionMode,
+        resumeInterrupted: Bool = false,
+        requestedRunId: AgentRunID? = nil
+    ) async -> AgentRunID? {
+        do {
+            try AgentProviderRunPreflight.validate(
+                snapshot: selectedProviderSnapshot,
+                interactionMode: interactionMode,
+                permissionMode: permissionMode,
+                attachments: attached
+            )
+        } catch {
+            statusMessage = String(describing: error)
+            return nil
+        }
         if recordHistory { recordPromptHistory(text) }
         if selectedThreadId == nil {
             createThread(title: "New thread")
@@ -2422,24 +3158,20 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         resetTimelineUpdateTick()
         lastErrorRecoverable = false  // UX-MAC_AGENT-009: clear stale Retry on new run
         selectedThreadHasRecoverableContext = false  // UX-MAC_AGENT-CONTINUE: run started; hide Continue
-        let resolvedAttachments: [AgentAttachment]
-        do {
-            resolvedAttachments = try AgentAttachmentResolver.resolve(paths: attached)
-        } catch {
-            systemNote(String(describing: error))
-            return nil
-        }
-        attachments = []
-        prompt = ""
-        let display = resolvedAttachments.isEmpty ? text
-            : text + "\n\n📎 " + resolvedAttachments.map(\.displayName).joined(separator: ", ")
+        let display = attached.isEmpty ? text
+            : text + "\n\n📎 " + attached.map(\.displayName).joined(separator: ", ")
         // The coordinator is the single writer of run messages — mirror
         // the user message in-memory only (no double-persist).
-        messages.append(AgentMessage(threadId: tid, role: .user, content: AssistantTimelineState.cappedText(display)))
+        let runId = requestedRunId ?? AgentRunID()
+        let durableUserMessageExists = (try? messageRepo.get(id: AgentMessageID(runId.value))) != nil
+        if !resumeInterrupted && !durableUserMessageExists {
+            messages.append(AgentMessage(threadId: tid, role: .user, content: AssistantTimelineState.cappedText(display), attachments: attached))
+        }
         focusTick &+= 1
         persistThreadConfig()
         let launchConfig = providerLaunchConfig?(provider, providerInstanceId)
         let req = AgentRunRequest(
+            runId: runId,
             threadId: tid,
             provider: provider,
             providerInstanceId: providerInstanceId,
@@ -2447,8 +3179,8 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             cwd: cwd,
             prompt: text,
             userMessageContent: display,
-            attachments: resolvedAttachments,
-            providerThreadId: threads.first(where: { $0.id == tid })?.providerThreadId,
+            attachments: attached,
+            providerThreadId: resumeInterrupted ? nil : threads.first(where: { $0.id == tid })?.providerThreadId,
             permissionMode: permissionMode,
             reasoningEffort: reasoningEffort,
             serviceTier: serviceTier,
@@ -2457,7 +3189,39 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             environment: launchConfig?.environment ?? [:]
         )
         do {
-            let runId = try await coordinator.startRun(req)
+            guard var pendingThread = try threadRepo.get(id: tid) else {
+                throw NSError(
+                    domain: "RemoteCode.AgentAppViewModel",
+                    code: 404,
+                    userInfo: [NSLocalizedDescriptionKey: "Thread disappeared before provider start."]
+                )
+            }
+            pendingThread.status = .pending
+            pendingThread.updatedAt = Date()
+            try threadRepo.upsert(pendingThread)
+            if let index = threads.firstIndex(where: { $0.id == tid }) {
+                threads[index] = pendingThread
+            }
+            status = .pending
+            currentRunId = runId
+            runThreads[runId] = tid
+            runStartedAt = nil
+            isStopping = false
+            onRunStateChange?()
+        } catch {
+            statusMessage = "Failed to prepare run: \(error)"
+            status = .failed
+            return nil
+        }
+        do {
+            let runId = try await coordinator.startRun(req, recordUserMessage: !resumeInterrupted)
+            do {
+                try clearComposerDraft(threadId: tid, providerInstanceId: providerInstanceId)
+                attachments = []
+                prompt = ""
+            } catch {
+                statusMessage = "Provider started, but draft cleanup failed: \(error)"
+            }
             let runStatus = (try? coordinator.runStatus(runId)) ?? .running
             await MainActor.run {
                 self.terminalRunIds.remove(runId)
@@ -2481,7 +3245,15 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             }
             return runId
         } catch {
-            await MainActor.run { self.statusMessage = "Failed to start: \(error)"; self.status = .failed }
+            await MainActor.run {
+                self.statusMessage = "Failed to start: \(error)"
+                self.status = .failed
+                self.currentRunId = nil
+                self.runThreads[runId] = nil
+                self.runStartedAt = nil
+                self.reloadThreads()
+                self.onRunStateChange?()
+            }
             return nil
         }
     }
@@ -2500,10 +3272,22 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         let prompt = AgentPlanImplementationPrompt.make(markdown: plan.markdown)
         clearVisibleErrorForNewUserMessage()
         guard await startProviderRun(text: prompt, attached: [], recordHistory: false, interactionMode: .default) != nil else { return }
-        try? proposedPlanRepo?.markImplemented(threadId: sourceThreadId, planId: plan.id, implementationThreadId: targetThreadId)
+        do {
+            try proposedPlanRepo?.markImplemented(threadId: sourceThreadId, planId: plan.id, implementationThreadId: targetThreadId)
+        } catch {
+            statusMessage = "Plan started, but implementation state could not be saved: \(error)"
+            return
+        }
         var implemented = plan
         implemented.implementedAtMs = Int64(Date().timeIntervalSince1970 * 1000)
         timeline.apply(.proposedPlan(implemented))
+    }
+
+    public func rejectLatestPlan() async {
+        guard latestProposedPlan != nil else { return }
+        let prompt = "Reject this proposed plan. Do not implement it. Stay in Plan mode and produce a revised plan before making any workspace changes."
+        clearVisibleErrorForNewUserMessage()
+        _ = await startProviderRun(text: prompt, attached: [], recordHistory: false, interactionMode: .plan)
     }
 
     private func recordPromptHistory(_ text: String) {
@@ -2522,15 +3306,137 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
 
     /// UX-MAC_AGENT-009: re-send the last prompt after a recoverable error
     /// without forcing the user to retype it.
-    /// P1: if the original message included attachments they are NOT re-sent
-    /// (resolver paths may be stale); post a system note so the user sees why.
     public func retryLastPrompt() async {
-        guard let last = promptHistory.last, !last.isEmpty else { return }
-        if lastSentAttachmentCount > 0 {
-            systemNote("Retry: \(lastSentAttachmentCount) attachment(s) from the original message are not re-sent. Re-attach if needed.")
+        let failedMessage = selectedThreadId.flatMap { threadId in
+            try? messageRepo.list(threadId: threadId).last(where: { $0.role == .user })
+        }
+        let last = failedMessage.map(Self.retryPrompt) ?? promptHistory.last
+        guard let last, !last.isEmpty else { return }
+        let persistedAttachments = failedMessage?.attachments ?? []
+        if !persistedAttachments.isEmpty {
+            var retryable: [AgentAttachment] = []
+            var unavailable: [String] = []
+            for attachment in persistedAttachments {
+                do {
+                    guard let attachmentStore else { throw AgentAttachmentResolverError.notReadableFile(attachment.displayName) }
+                    retryable.append(try attachmentStore.validatedForRetry(attachment))
+                } catch {
+                    unavailable.append(attachment.displayName)
+                }
+            }
+            if !unavailable.isEmpty {
+                pendingAttachmentRetryConfirmation = AttachmentRetryConfirmation(
+                    prompt: last,
+                    retryableAttachments: retryable,
+                    unavailableAttachmentNames: unavailable
+                )
+                return
+            }
+            clearVisibleErrorForNewUserMessage()
+            _ = await startProviderRun(text: last, attached: retryable, recordHistory: false, interactionMode: interactionMode)
+            return
+        } else if lastSentAttachmentCount > 0 {
+            pendingAttachmentRetryConfirmation = AttachmentRetryConfirmation(
+                prompt: last,
+                retryableAttachments: [],
+                unavailableAttachmentNames: ["previous attachments"]
+            )
+            return
         }
         clearVisibleErrorForNewUserMessage()
         _ = await startProviderRun(text: last, attached: [], recordHistory: false, interactionMode: interactionMode)
+    }
+
+    public var displayedErrorRecoveryAction: AgentErrorRecoveryAction? {
+        guard let message = timeline.error else { return nil }
+        let action = Self.errorRecoveryAction(
+            provider: provider,
+            message: message,
+            recoverable: lastErrorRecoverable
+        )
+        if action == .signIn, pendingSignInProvider == provider {
+            return .retry
+        }
+        return action
+    }
+
+    nonisolated public static func errorRecoveryAction(
+        provider: AgentProvider,
+        message: String,
+        recoverable: Bool
+    ) -> AgentErrorRecoveryAction? {
+        let normalized = message.lowercased()
+        let resumeInvalidMarkers = [
+            "session not found", "session/load", "invalid session", "invalid resume",
+            "resume cursor", "could not be resumed", "failed to resume", "resume invalid"
+        ]
+        if resumeInvalidMarkers.contains(where: normalized.contains) {
+            return .startFresh
+        }
+        let authMarkers = [
+            "[auth-required]", "401", "403", "unauthorized", "unauthenticated",
+            "authentication", "login required", "sign in required", "token expired",
+            "invalid_api_key", "invalid api key", "forbidden"
+        ]
+        if authMarkers.contains(where: normalized.contains) {
+            return .signIn
+        }
+        let retryMarkers = [
+            "rate limit", "rate_limit", "too many requests", "429", "network",
+            "connection", "timed out", "timeout", "temporarily unavailable",
+            "service unavailable", "502", "503", "504"
+        ]
+        if retryMarkers.contains(where: normalized.contains) || recoverable {
+            return .retry
+        }
+        _ = provider // classification deliberately shares one vocabulary across providers.
+        return nil
+    }
+
+    public func performDisplayedErrorRecoveryAction() async {
+        guard let action = displayedErrorRecoveryAction else { return }
+        switch action {
+        case .retry:
+            if pendingSignInProvider == provider {
+                _ = await refreshPendingProviderAuthentication(retryLastPromptWhenAuthenticated: true)
+                return
+            }
+            await retryLastPrompt()
+        case .startFresh:
+            let failedPrompt = selectedThreadId.flatMap { threadId in
+                try? messageRepo.list(threadId: threadId).last(where: { $0.role == .user })
+            }.map(Self.retryPrompt)
+            createThread(title: "New thread")
+            if let failedPrompt, !failedPrompt.isEmpty {
+                prompt = failedPrompt
+                focusTick &+= 1
+            }
+        case .signIn:
+            beginProviderSignIn(provider: provider, snapshotID: selectedProviderSnapshot?.id)
+        }
+    }
+
+    public func confirmRetryWithoutUnavailableAttachments() async {
+        guard let pending = pendingAttachmentRetryConfirmation else { return }
+        pendingAttachmentRetryConfirmation = nil
+        systemNote("Retry continuing without unavailable attachment(s): \(pending.unavailableAttachmentNames.joined(separator: ", ")).")
+        clearVisibleErrorForNewUserMessage()
+        _ = await startProviderRun(
+            text: pending.prompt,
+            attached: pending.retryableAttachments,
+            recordHistory: false,
+            interactionMode: interactionMode
+        )
+    }
+
+    public func cancelRetryWithoutUnavailableAttachments() {
+        pendingAttachmentRetryConfirmation = nil
+    }
+
+    private static func retryPrompt(_ message: AgentMessage) -> String {
+        guard !message.attachments.isEmpty else { return message.content }
+        let suffix = "\n\n📎 " + message.attachments.map(\.displayName).joined(separator: ", ")
+        return message.content.hasSuffix(suffix) ? String(message.content.dropLast(suffix.count)) : message.content
     }
 
     @discardableResult
@@ -2726,6 +3632,19 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 }
             }
             if finishedTid == self.selectedThreadId {
+                if status == .failed,
+                   self.timeline.error == nil,
+                   let finalMessage,
+                   !finalMessage.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    let recoverable = Self.errorRecoveryAction(
+                        provider: self.provider,
+                        message: finalMessage,
+                        recoverable: false
+                    ) == .retry
+                    self.timeline.apply(.error(message: finalMessage, recoverable: recoverable))
+                    self.lastErrorRecoverable = recoverable
+                    self.scheduleTimelineUpdateTick()
+                }
                 self.status = status
                 self.currentRunId = nil
                 self.runStartedAt = nil
@@ -2805,13 +3724,34 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         hasRecoverableContext && !runActive
     }
 
-    /// Resume a relaunch-interrupted thread by replaying recoverableResumeContext.
-    /// Calls startProviderRun with an empty prompt so the coordinator's existing
-    /// recoverableResumeContext path (AgentRunCoordinator.startRun:163) picks up
-    /// the saved resume cursor without a new user message.
+    /// Recoverability belongs to the currently displayed error. Timeline replay
+    /// retains the last error banner, so relaunch/thread switching must restore
+    /// the matching Retry affordance from the same persisted event stream.
+    nonisolated public static func displayedErrorIsRecoverable(in events: [AssistantEvent]) -> Bool {
+        for event in events.reversed() {
+            if case .error(_, let recoverable) = event { return recoverable }
+        }
+        return false
+    }
+
+    /// Resume a relaunch-interrupted provider context without inventing an empty
+    /// user message. The instruction is provider-only and the coordinator loads
+    /// the durable cursor plus runtime configuration from the interrupted session.
     public func continueInterruptedThread() async {
-        selectedThreadHasRecoverableContext = false
-        _ = await startProviderRun(text: "", attached: [], recordHistory: false, interactionMode: interactionMode)
+        guard let continuingThreadId = selectedThreadId else { return }
+        let hadRecoverableContext = selectedThreadHasRecoverableContext
+        let runId = await startProviderRun(
+            text: "Continue the interrupted turn from the last saved context. Do not repeat completed work.",
+            attached: [],
+            recordHistory: false,
+            interactionMode: interactionMode,
+            resumeInterrupted: true
+        )
+        if runId == nil,
+           selectedThreadId == continuingThreadId,
+           hadRecoverableContext {
+            selectedThreadHasRecoverableContext = true
+        }
     }
 
     // MARK: - Stop button state seam
@@ -2955,7 +3895,12 @@ public enum AgentComposerSuggestions {
             return ranked(snapshot?.skills ?? [], query: query)
                 .prefix(limit)
                 .map {
-                    AgentComposerSuggestion(title: "$\($0)", subtitle: "Codex skill", insertText: "$\($0) ", kind: .skill)
+                    AgentComposerSuggestion(
+                        title: "$\($0)",
+                        subtitle: "\(snapshot?.displayName ?? "Provider") skill",
+                        insertText: "$\($0) ",
+                        kind: .skill
+                    )
                 }
         }
         let providerCommands = snapshot?.slashCommands ?? []
@@ -3250,6 +4195,21 @@ public struct AgentTimelineItemPresentation: Equatable, Sendable {
 
 }
 
+public struct AgentImageViewPresentation: Equatable, Sendable {
+    public let displayName: String
+    public let resourceURL: URL
+
+    public static func make(for item: AssistantItem) -> AgentImageViewPresentation? {
+        guard item.type == .imageView,
+              let path = item.resourcePath?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !path.isEmpty else { return nil }
+        return AgentImageViewPresentation(
+            displayName: URL(fileURLWithPath: path).lastPathComponent,
+            resourceURL: URL(fileURLWithPath: path)
+        )
+    }
+}
+
 // MARK: - ThreadMarkdownFormatter
 
 /// Pure, nonisolated formatter that converts live timeline data (tool-call items
@@ -3342,13 +4302,43 @@ private final class TimelineScrollScheduler {
     var forcePending = false
 }
 
+private struct PendingSessionApprovalConfirmation {
+    let originThreadId: AgentThreadID
+    let request: AssistantPendingRequest
+}
+
 public struct AgentAppView: View {
+    struct QueueStatusBannerPresentation: Equatable {
+        let message: String
+        let offersCopy: Bool
+        let offersRetry: Bool
+    }
+
     private static let threadRailWidthRange: ClosedRange<CGFloat> = 180...360
     private static let threadRailIdealWidth: CGFloat = 220
     private static let conversationMinimumWidth: CGFloat = 560
     private static let planSidebarIdealWidth: CGFloat = 300
     private static let timelineBottomRevealSlack: CGFloat = 4
     private static let scrollDownButtonBottomInset: CGFloat = 22
+    static func visibleStatusMessage(_ raw: String) -> String? {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    static func standaloneQueueStatusMessage(_ message: String?, queuedCount: Int) -> String? {
+        guard queuedCount == 0, let message else { return nil }
+        return visibleStatusMessage(message)
+    }
+
+    static func standaloneQueueStatusBanner(
+        _ message: String?,
+        queuedCount: Int
+    ) -> QueueStatusBannerPresentation? {
+        guard let message = standaloneQueueStatusMessage(message, queuedCount: queuedCount) else {
+            return nil
+        }
+        return QueueStatusBannerPresentation(message: message, offersCopy: true, offersRetry: true)
+    }
     @ObservedObject var vm: AgentAppViewModel
     @State private var renamingThreadId: AgentThreadID?
     @State private var renameText: String = ""
@@ -3381,7 +4371,7 @@ public struct AgentAppView: View {
     @State private var showWorkLog = false
     @State private var expandedCompletedWorkTurns: Set<String> = []
     @State private var queuedMessagePendingCancel: AgentQueuedMessage?
-    @State private var pendingSessionApproval: AssistantPendingRequest?
+    @State private var pendingSessionApproval: PendingSessionApprovalConfirmation?
     @State private var expandedRequestPreviews: Set<String> = []
     @State private var declineReasonDrafts: [String: String] = [:]
     // P1: thread delete confirmation — ids staged here until user confirms.
@@ -3413,6 +4403,22 @@ public struct AgentAppView: View {
         hasOriginalText
             ? "translated from compressed output - View original"
             : "translated from compressed output"
+    }
+
+    static let fullAccessScopeDescription =
+        "The agent runs tools and edits without asking for this thread until you change it."
+
+    static let sessionApprovalHelp =
+        "Auto-approve requests for this thread until you change it"
+
+    static let threadDeletionConfirmationDescription =
+        "Threads are deleted immediately. You can undo for 10 seconds; after that, their history is permanently deleted."
+
+    static let emptyThreadSubtitle =
+        "Send a prompt to start a Codex, Claude, or Grok thread."
+
+    static func attachmentRemovalAccessibilityLabel(path: String) -> String {
+        "Remove attachment \((path as NSString).lastPathComponent)"
     }
 
     /// Pure seam: checkpoint revert always needs a destructive confirmation.
@@ -4132,7 +5138,7 @@ public struct AgentAppView: View {
     /// dependencies (persisted assistant texts + proposed plans). Running/unfinished
     /// turns are computed fresh every pass.
     private func turnRenderInputs(for turn: AssistantTurnSnapshot) -> TurnRenderInputs {
-        let running = vm.status == .running
+        let running = vm.selectedThreadRunIsStartingOrRunning
         guard turn.finished else {
             return computeTurnRenderInputsCounted(turn: turn, running: running)
         }
@@ -4267,7 +5273,7 @@ public struct AgentAppView: View {
             Button("Delete", role: .destructive) { commitPendingDelete() }
             Button("Cancel", role: .cancel) { pendingDeleteThreadIds = [] }
         } message: {
-            Text("Deleted threads and their history cannot be recovered.")
+            Text(Self.threadDeletionConfirmationDescription)
         }
     }
 
@@ -4300,7 +5306,7 @@ public struct AgentAppView: View {
             if vm.threads.isEmpty {
                 DSEmptyState(icon: "bubble.left.and.bubble.right",
                              title: "No threads",
-                             subtitle: "Send a prompt to start a Codex or Claude thread.")
+                             subtitle: Self.emptyThreadSubtitle)
             } else {
                 HStack(spacing: DS.Space.xs) {
                     Image(systemName: "magnifyingglass")
@@ -4366,18 +5372,8 @@ public struct AgentAppView: View {
         } else {
             let selected = vm.selectedThreadId == t.id
             let multiSelected = selectedThreadIds.contains(t.id)
-            let running = AgentThreadRowPresentation.isRunning(
-                threadStatus: t.status,
-                selected: selected,
-                surfaceStatus: vm.status
-            )
-            let showLeadingStatus = AgentThreadRowPresentation.showsLeadingStatus(
-                threadStatus: t.status,
-                selected: selected,
-                surfaceStatus: vm.status,
-                hasUnread: t.hasUnread,
-                pinned: t.pinned
-            )
+            let running = vm.isThreadStartingOrRunning(t.id)
+            let showLeadingStatus = t.pinned || t.status == .failed || !t.hasUnread || running
             Button { selectThreadRow(t) } label: {
                 HStack(spacing: DS.Space.md) {
                     if running {
@@ -4532,6 +5528,22 @@ public struct AgentAppView: View {
             timeline
             backgroundAwaitBanner
             pendingCallbackRows
+            if let message = Self.visibleStatusMessage(vm.statusMessage) {
+                inlineStatusBanner(message, identifier: "agent.status.message")
+            }
+            if let message = vm.providerThreadSnapshotStatusMessage {
+                inlineStatusBanner(message, identifier: "agent.provider.snapshot.stale") {
+                    vm.retryProviderThreadSnapshotRead()
+                }
+            }
+            if let banner = Self.standaloneQueueStatusBanner(vm.queueStatusMessage, queuedCount: vm.queuedMessages.count) {
+                inlineStatusBanner(
+                    banner.message,
+                    identifier: "agent.queue.status",
+                    offersCopy: banner.offersCopy,
+                    retry: banner.offersRetry ? { Task { await vm.send() } } : nil
+                )
+            }
             queuedMessagesSection
             // F1: render the composer inside a scope that observes only the composer
             // text, so a keystroke re-renders the composer subtree and NOT this body
@@ -4540,7 +5552,7 @@ public struct AgentAppView: View {
         }
         .background(DS.Palette.bg)
         // C6: Esc interrupts an in-flight run (remotecode.io parity).
-        .onExitCommand { if vm.status == .running { vm.stop() } }
+        .onExitCommand { if vm.selectedThreadRunIsStartingOrRunning { vm.stop() } }
         // IMP-MAC_AGENT-006: power-user shortcut to cycle reasoning effort
         // without opening the model popover; the composer model pill reflects
         // the new effort immediately. Hidden control carries the shortcut.
@@ -4607,7 +5619,7 @@ public struct AgentAppView: View {
                 Text("Full access is on")
                     .font(DS.Font.caption.weight(.semibold))
                     .foregroundColor(DS.Palette.danger)
-                Text("The agent runs tools and edits without asking for the rest of this session.")
+                Text(Self.fullAccessScopeDescription)
                     .font(DS.Font.caption2)
                     .foregroundColor(DS.Palette.textSecondary)
             }
@@ -4865,14 +5877,14 @@ public struct AgentAppView: View {
                             if vm.messages.isEmpty && vm.timeline.turns.isEmpty && vm.timeline.error == nil {
                                 emptyConversation
                             }
-                            if vm.status == .running { workingStatus }
+                            if vm.selectedThreadRunIsStartingOrRunning { workingStatus }
                             if let err = vm.timeline.error { errorRow(err) }
                             // UX-MAC_AGENT-CONTINUE: show inline Continue only when the
                             // selected thread was interrupted by a relaunch and is not
                             // currently running. One tap replays recoverableResumeContext.
                             if AgentAppViewModel.showsContinueAction(
                                 hasRecoverableContext: vm.selectedThreadHasRecoverableContext,
-                                runActive: vm.status == .running
+                                runActive: vm.selectedThreadRunIsStartingOrRunning
                             ) { interruptedContinueRow }
                             // Scroll-to target only. Bottom detection is handled by the
                             // AppKit TimelineScrollFollower above — NOT by a per-layout
@@ -4953,7 +5965,10 @@ public struct AgentAppView: View {
             // bound their render to a recent tail (visibleTranscriptWindow), so a
             // revealed flag carried into a different long thread would eagerly
             // render its whole history with no user action — reintroducing the hang.
-            .onChange(of: vm.selectedThreadId) { _ in transcriptHistoryRevealCount = 0 }
+            .onChange(of: vm.selectedThreadId) { _ in
+                transcriptHistoryRevealCount = 0
+                pendingSessionApproval = nil
+            }
         }
     }
 
@@ -5005,12 +6020,12 @@ public struct AgentAppView: View {
 
     @ViewBuilder
     private var pendingCallbackRows: some View {
-        if !vm.openPendingRequests.isEmpty || !vm.openPendingUserInputs.isEmpty {
+        if !vm.visiblePendingRequests.isEmpty || !vm.visiblePendingUserInputs.isEmpty {
             VStack(alignment: .leading, spacing: DS.Space.sm) {
-                ForEach(vm.openPendingRequests) { request in
+                ForEach(vm.visiblePendingRequests) { request in
                     pendingRequestRow(request)
                 }
-                ForEach(vm.openPendingUserInputs) { request in
+                ForEach(vm.visiblePendingUserInputs) { request in
                     pendingUserInputRow(request)
                 }
             }
@@ -5020,7 +6035,7 @@ public struct AgentAppView: View {
             .background(DS.Palette.bg)
             .accessibilityIdentifier("agent.pendingCallbacks")
             .confirmationDialog(
-                "Allow this agent to act without approvals for the rest of this session?",
+                "Allow this agent to act without approvals for this thread until you change it?",
                 isPresented: Binding(
                     get: { pendingSessionApproval != nil },
                     set: { if !$0 { pendingSessionApproval = nil } }
@@ -5029,7 +6044,11 @@ public struct AgentAppView: View {
             ) {
                 Button("Allow full access", role: .destructive) {
                     if let pendingSessionApproval {
-                        vm.respondToPendingRequest(pendingSessionApproval, response: .approveForSession)
+                        vm.respondToPendingRequest(
+                            pendingSessionApproval.request,
+                            response: .approveForSession,
+                            originThreadId: pendingSessionApproval.originThreadId
+                        )
                     }
                     pendingSessionApproval = nil
                 }
@@ -5187,10 +6206,19 @@ public struct AgentAppView: View {
                     HStack(spacing: DS.Space.sm) {
                         Button("Approve") { vm.respondToPendingRequest(request, response: .approve) }
                             .buttonStyle(.borderedProminent)
-                        Button("Approve Session") { pendingSessionApproval = request }
-                            .buttonStyle(.bordered)
-                            .tint(DS.Palette.warning)
-                            .help("Auto-approve every request like this for the rest of this session")
+                        if request.allowsSessionApproval {
+                            Button("Approve Session") {
+                                if let originThreadId = vm.selectedThreadId {
+                                    pendingSessionApproval = PendingSessionApprovalConfirmation(
+                                        originThreadId: originThreadId,
+                                        request: request
+                                    )
+                                }
+                            }
+                                .buttonStyle(.bordered)
+                                .tint(DS.Palette.warning)
+                                .help(Self.sessionApprovalHelp)
+                        }
                         Spacer(minLength: DS.Space.md)
                         Button("Decline") { declineReasonDrafts[request.id] = "" }
                             .buttonStyle(.bordered)
@@ -5203,6 +6231,9 @@ public struct AgentAppView: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(DS.Palette.surfaceRaised)
         .clipShape(RoundedRectangle(cornerRadius: DS.Radius.panel, style: .continuous))
+        .disabled(vm.selectedProviderSnapshot.map {
+            !$0.effectiveCapabilities.supportsApprovals
+        } ?? false)
         .accessibilityIdentifier("agent.pendingRequest.\(request.id)")
     }
 
@@ -5307,6 +6338,18 @@ public struct AgentAppView: View {
             } else {
                 legacyUserInputContent(request, stale: stale)
             }
+            if !stale {
+                Button("Cancel question", role: .cancel) {
+                    vm.cancelPendingUserInput(request)
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .disabled(vm.selectedProviderSnapshot.map {
+                    !$0.effectiveCapabilities.supportsUserInput
+                } ?? false)
+                .help("Cancel only this question and keep the provider session available.")
+                .accessibilityIdentifier("agent.pendingUserInput.cancel.\(request.id)")
+            }
         }
         .padding(DS.Space.md)
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -5328,8 +6371,8 @@ public struct AgentAppView: View {
             } else if request.options.isEmpty {
                 VStack(alignment: .leading, spacing: DS.Space.xs) {
                     let draft = Binding(
-                        get: { vm.userInputDrafts[request.id] ?? request.answer ?? "" },
-                        set: { vm.userInputDrafts[request.id] = $0 }
+                        get: { vm.userInputDrafts[vm.userInputStateKey(request)] ?? request.answer ?? "" },
+                        set: { vm.userInputDrafts[vm.userInputStateKey(request)] = $0 }
                     )
                     Group {
                         if request.isSecret {
@@ -5340,15 +6383,15 @@ public struct AgentAppView: View {
                     }
                     .textFieldStyle(.roundedBorder)
                     Button("Answer") {
-                        vm.answerPendingUserInput(request, answer: vm.userInputDrafts[request.id] ?? request.answer ?? "")
+                        vm.answerPendingUserInput(request, answer: vm.userInputDrafts[vm.userInputStateKey(request)] ?? request.answer ?? "")
                     }
-                    .disabled((vm.userInputDrafts[request.id] ?? request.answer ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    .disabled((vm.userInputDrafts[vm.userInputStateKey(request)] ?? request.answer ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                 }
             } else if request.allowsMultipleSelection {
                 VStack(alignment: .leading, spacing: DS.Space.xs) {
                     HStack(spacing: DS.Space.sm) {
                         ForEach(request.options, id: \.self) { option in
-                            let selected = vm.userInputSelections[request.id]?.contains(option) == true
+                            let selected = vm.userInputSelections[vm.userInputStateKey(request)]?.contains(option) == true
                             Button {
                                 vm.toggleUserInputOption(option, for: request)
                             } label: {
@@ -5536,7 +6579,7 @@ public struct AgentAppView: View {
                     // UX-MAC_AGENT-008: inline Stop where the user looks when a
                     // run is taking too long, plus the Esc hint.
                     let inlineState = AgentAppViewModel.stopButtonState(
-                        runActive: vm.status == .running,
+                        runActive: vm.selectedThreadRunIsStartingOrRunning,
                         isStopping: vm.isStopping
                     )
                     Button(inlineState == .stopping ? "Stopping..." : "Stop") { vm.stop() }
@@ -5765,6 +6808,7 @@ public struct AgentAppView: View {
     @ViewBuilder
     private func errorRow(_ err: String) -> some View {
         let recoverable = vm.lastErrorRecoverable
+        let recoveryAction = vm.displayedErrorRecoveryAction
         return VStack(alignment: .leading, spacing: DS.Space.sm) {
             HStack(alignment: .top, spacing: DS.Space.sm) {
                 Image(systemName: recoverable ? "exclamationmark.triangle" : "xmark.octagon")
@@ -5776,17 +6820,49 @@ public struct AgentAppView: View {
                     .lineSpacing(3).textSelection(.enabled)
                 Spacer(minLength: 0)
             }
-            // UX-MAC_AGENT-009: recoverable failures get a Retry of the last
-            // prompt; fatal ones don't.
-            if recoverable {
+            if let recoveryAction {
                 Button {
-                    Task { await vm.retryLastPrompt() }
+                    Task { await vm.performDisplayedErrorRecoveryAction() }
                 } label: {
-                    Label("Retry", systemImage: "arrow.clockwise")
+                    Label(
+                        recoveryAction.title,
+                        systemImage: recoveryAction == .signIn
+                            ? "person.crop.circle.badge.checkmark"
+                            : (recoveryAction == .startFresh ? "plus.message" : "arrow.clockwise")
+                    )
                 }
                 .buttonStyle(.bordered)
                 .controlSize(.small)
-                .accessibilityIdentifier("agent.error.retry")
+                .accessibilityIdentifier(
+                    recoveryAction == .retry
+                        ? "agent.error.retry"
+                        : "agent.error.recovery.\(recoveryAction.rawValue)"
+                )
+                .confirmationDialog(
+                    "Retry without unavailable attachments?",
+                    isPresented: Binding(
+                        get: { vm.pendingAttachmentRetryConfirmation != nil },
+                        set: { if !$0 { vm.cancelRetryWithoutUnavailableAttachments() } }
+                    ),
+                    titleVisibility: .visible
+                ) {
+                    Button("Retry without unavailable attachments", role: .destructive) {
+                        Task { await vm.confirmRetryWithoutUnavailableAttachments() }
+                    }
+                    Button("Cancel", role: .cancel) {
+                        vm.cancelRetryWithoutUnavailableAttachments()
+                    }
+                } message: {
+                    Text(vm.pendingAttachmentRetryConfirmation?.unavailableAttachmentNames.joined(separator: ", ") ?? "")
+                }
+            }
+            if let recoveryStatus = vm.providerRecoveryStatusMessage {
+                Text(recoveryStatus)
+                    .font(DS.Font.caption)
+                    .foregroundColor(recoveryStatus.hasPrefix("Could not") || recoveryStatus.hasPrefix("Sign-in unavailable")
+                        ? DS.Palette.danger
+                        : DS.Palette.textSecondary)
+                    .textSelection(.enabled)
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -6060,7 +7136,9 @@ public struct AgentAppView: View {
                     .foregroundColor(DS.Palette.accent)
                 assistantProse(item.body)
             }
-        case .tool, .commandExecution, .fileChange, .mcpToolCall, .dynamicToolCall, .collabToolCall, .webSearch, .imageView, .review, .contextCompaction, .error:
+        case .imageView:
+            imageViewRow(item)
+        case .tool, .commandExecution, .fileChange, .mcpToolCall, .dynamicToolCall, .collabToolCall, .webSearch, .review, .contextCompaction, .error:
             toolRow(item)
         }
     }
@@ -6101,6 +7179,50 @@ public struct AgentAppView: View {
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .accessibilityIdentifier("agent.reasoning.\(item.id)")
+    }
+
+    @ViewBuilder
+    private func imageViewRow(_ item: AssistantItem) -> some View {
+        let presentation = AgentTimelineItemPresentation.make(for: item)
+        let imagePresentation = AgentImageViewPresentation.make(for: item)
+        VStack(alignment: .leading, spacing: DS.Space.sm) {
+            HStack(spacing: DS.Space.sm) {
+                Image(systemName: presentation.icon)
+                    .font(.system(size: 10))
+                    .foregroundColor(DS.Palette.textSecondary)
+                Text(presentation.label)
+                    .font(DS.Font.mono)
+                    .foregroundColor(DS.Palette.text)
+                    .lineLimit(1)
+                Spacer(minLength: 0)
+            }
+            if let imagePresentation,
+               let image = NSImage(contentsOf: imagePresentation.resourceURL) {
+                Image(nsImage: image)
+                    .resizable()
+                    .scaledToFit()
+                    .frame(maxWidth: 420, maxHeight: 260)
+                    .clipShape(RoundedRectangle(cornerRadius: DS.Radius.panel, style: .continuous))
+                    .accessibilityIdentifier("agent.image.preview.\(item.id)")
+            }
+            if let imagePresentation {
+                HStack(spacing: DS.Space.sm) {
+                    Button("Open") {
+                        NSWorkspace.shared.open(imagePresentation.resourceURL)
+                    }
+                    .accessibilityIdentifier("agent.image.open.\(item.id)")
+                    Button("Reveal") {
+                        NSWorkspace.shared.activateFileViewerSelecting([imagePresentation.resourceURL])
+                    }
+                    .accessibilityIdentifier("agent.image.reveal.\(item.id)")
+                }
+                .buttonStyle(.bordered)
+            }
+        }
+        .padding(DS.Space.sm)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(DS.Palette.surfaceRaised)
+        .clipShape(RoundedRectangle(cornerRadius: DS.Radius.panel, style: .continuous))
     }
 
     @ViewBuilder
@@ -6318,6 +7440,41 @@ public struct AgentAppView: View {
         }
     }
 
+    private func inlineStatusBanner(
+        _ message: String,
+        identifier: String,
+        offersCopy: Bool = true,
+        retry: (() -> Void)? = nil
+    ) -> some View {
+        HStack(alignment: .top, spacing: DS.Space.sm) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .foregroundColor(DS.Palette.danger)
+            Text(message)
+                .font(DS.Font.caption)
+                .foregroundColor(DS.Palette.text)
+                .textSelection(.enabled)
+            Spacer(minLength: 0)
+            if offersCopy {
+                Button("Copy") {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(message, forType: .string)
+                }
+                .buttonStyle(.plain)
+                .accessibilityIdentifier("\(identifier).copy")
+            }
+            if let retry {
+                Button("Retry", action: retry)
+                    .buttonStyle(.plain)
+                    .accessibilityIdentifier("\(identifier).retry")
+            }
+        }
+        .padding(.horizontal, DS.Space.lg)
+        .padding(.vertical, DS.Space.sm)
+        .background(DS.Palette.danger.opacity(0.09))
+        .accessibilityElement(children: .combine)
+        .accessibilityIdentifier(identifier)
+    }
+
     private func queuedMessageRow(_ message: AgentQueuedMessage) -> some View {
         VStack(alignment: .leading, spacing: DS.Space.sm) {
             HStack(alignment: .top, spacing: DS.Space.sm) {
@@ -6424,7 +7581,7 @@ public struct AgentAppView: View {
                 height: $composerEditorHeight,
                 focusTick: vm.focusTick,
                 placeholder: "Ask \(vm.provider.rawValue.capitalized) for changes…",
-                isEnabled: true,
+                isEnabled: vm.selectedProviderCanRun,
                 onSend: { Task { await vm.send() } },
                 onPreviousHistory: { vm.recallPreviousPrompt() },
                 onNextHistory: { vm.recallNextPrompt() },
@@ -6530,7 +7687,7 @@ public struct AgentAppView: View {
             permissionMenu
             executionMenu
             Spacer(minLength: DS.Space.xs)
-            if vm.status == .running {
+            if vm.selectedThreadRunIsStartingOrRunning {
                 Image(systemName: "arrow.triangle.2.circlepath")
                     .font(.system(size: 11, weight: .semibold))
                     .foregroundColor(DS.Palette.textTertiary)
@@ -6555,6 +7712,9 @@ public struct AgentAppView: View {
                 .frame(width: 26, height: 26)
         }
         .buttonStyle(.plain)
+        .disabled(!vm.selectedProviderCanRun || (vm.selectedProviderSnapshot.map {
+            !$0.effectiveCapabilities.supportsAttachments
+        } ?? false))
         .foregroundColor(DS.Palette.textSecondary)
         .help("Attach files").accessibilityLabel("Attach files")
         .accessibilityIdentifier("agent.attach")
@@ -6640,8 +7800,14 @@ public struct AgentAppView: View {
     private var permissionMenu: some View {
         Menu {
             Button("Supervised") { vm.setPermissionMode(.supervised) }
+                .disabled(!vm.supportedPermissionModesForSelectedProvider.contains(.supervised))
+                .help(vm.permissionModeUnavailableReason(.supervised) ?? "Ask before tool actions")
             Button("Auto-edit") { vm.setPermissionMode(.autoAcceptEdits) }
+                .disabled(!vm.supportedPermissionModesForSelectedProvider.contains(.autoAcceptEdits))
+                .help(vm.permissionModeUnavailableReason(.autoAcceptEdits) ?? "Apply edits without asking")
             Button("Full access") { vm.setPermissionMode(.fullAccess) }
+                .disabled(!vm.supportedPermissionModesForSelectedProvider.contains(.fullAccess))
+                .help(vm.permissionModeUnavailableReason(.fullAccess) ?? "Run tools without asking")
         } label: {
             HStack(spacing: DS.Space.xs) {
                 Image(systemName: vm.permissionMode == .fullAccess ? "exclamationmark.shield.fill" : "lock.shield")
@@ -6656,7 +7822,9 @@ public struct AgentAppView: View {
             .clipShape(Capsule())
         }
         .menuStyle(.button).buttonStyle(.plain).menuIndicator(.hidden).fixedSize()
-        .help("Permission mode")
+        .disabled(vm.activeRunConfigurationLocked || !vm.selectedProviderCanRun)
+        .help(vm.providerExecutionUnavailableReason
+            ?? (vm.activeRunConfigurationLocked ? "Permission is fixed for the active run" : "Permission mode"))
         .accessibilityIdentifier("agent.permission.menu")
     }
 
@@ -6710,8 +7878,9 @@ public struct AgentAppView: View {
             .overlay(Capsule().strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline))
         }
         .menuStyle(.button).buttonStyle(.plain).menuIndicator(.hidden).fixedSize()
-        .disabled(vm.executionLocked)
-        .help(vm.executionLocked ? "Execution mode locks after the first message" : "Execution mode")
+        .disabled(vm.executionLocked || !vm.selectedProviderCanRun)
+        .help(vm.providerExecutionUnavailableReason
+            ?? (vm.executionLocked ? "Execution mode locks after the first message" : "Execution mode"))
         .accessibilityIdentifier("agent.execution.menu")
     }
 
@@ -6747,7 +7916,8 @@ public struct AgentAppView: View {
         // failed model-list fetch can be retried without stopping the run.
         // Only mutation rows (set provider/model/effort/tier) are disabled
         // while running; the retry and recovery rows are excluded.
-        let running = vm.status == .running
+        let running = vm.selectedThreadRunIsStartingOrRunning
+        let configurationLocked = running || !vm.selectedProviderCanRun
         return VStack(alignment: .leading, spacing: DS.Space.xs) {
             // UX-MAC_AGENT-016: readable while running; mutation rows disable below.
             if running {
@@ -6769,7 +7939,7 @@ public struct AgentAppView: View {
                         ) {
                             vm.setProviderInstance(snapshot.id)
                         }
-                        .disabled(running)
+                        .disabled(configurationLocked)
                     }
                     compactMenuDivider
                 } else {
@@ -6779,7 +7949,7 @@ public struct AgentAppView: View {
                             vm.setProvider(provider)
                             Task { await vm.loadModels(); await MainActor.run { vm.persistThreadConfig() } }
                         }
-                        .disabled(running)
+                        .disabled(configurationLocked)
                     }
                     compactMenuDivider
                 }
@@ -6850,14 +8020,14 @@ public struct AgentAppView: View {
                         vm.setModel(model.id)
                         showModelOptions = false
                     }
-                    .disabled(running)
+                    .disabled(configurationLocked)
                 }
                 ForEach(visibleCustomModels, id: \.self) { customModel in
                     compactMenuRow(customModel, selected: customModel == vm.model) {
                         vm.setCustomModel(customModel)
                         showModelOptions = false
                     }
-                    .disabled(running)
+                    .disabled(configurationLocked)
                 }
                 if modelOptions.count + customModels.count > 3, !showAllModelOptions {
                     compactMenuRow("More...", selected: false) {
@@ -6872,7 +8042,7 @@ public struct AgentAppView: View {
                             customModelDraft = vm.modelOptionsForSelectedProvider.contains(where: { $0.id == vm.model }) ? "" : vm.model
                             showCustomModelField = true
                         }
-                        .disabled(running)
+                        .disabled(configurationLocked)
                     }
                 }
             }
@@ -6886,7 +8056,7 @@ public struct AgentAppView: View {
                         vm.setReasoningEffort(effort)
                         showModelOptions = false
                     }
-                    .disabled(running)
+                    .disabled(configurationLocked)
                     // F34: bare names don't distinguish Ultracode/Max/Extra
                     // High — say what each level buys before it is selected.
                     .help(effort.pickerHelpText)
@@ -6898,12 +8068,12 @@ public struct AgentAppView: View {
                     vm.setServiceTier(.auto)
                     showModelOptions = false
                 }
-                .disabled(running)
+                .disabled(configurationLocked)
                 compactMenuRow("Fast", selected: vm.serviceTier == .fast) {
                     vm.setServiceTier(.fast)
                     showModelOptions = false
                 }
-                .disabled(running)
+                .disabled(configurationLocked)
             }
             if let providerStatus = vm.providerStatusMessage {
                 compactMenuDivider
@@ -6918,11 +8088,12 @@ public struct AgentAppView: View {
                 }
                 .disabled(vm.providerRecoveryActionRunning)
             }
-            if let actionStatus = vm.providerRecoveryStatusMessage,
-               actionStatus.hasPrefix("Update failed") {
+            if let actionStatus = vm.providerRecoveryStatusMessage {
                 Text(actionStatus)
                     .font(DS.Font.caption)
-                    .foregroundColor(DS.Palette.danger)
+                    .foregroundColor(actionStatus.hasPrefix("Update failed") || actionStatus.hasPrefix("Could not") || actionStatus.hasPrefix("Sign-in unavailable")
+                        ? DS.Palette.danger
+                        : DS.Palette.textSecondary)
             }
         }
         .padding(DS.Space.sm)
@@ -7138,14 +8309,15 @@ public struct AgentAppView: View {
     }
 
     private var sendStopButton: some View {
-        Button {
+        let runActive = vm.selectedThreadRunIsStartingOrRunning
+        return Button {
             Task { await vm.send() }
         } label: {
             ZStack {
                 Circle()
                     .fill(sendIdleDisabled ? DS.Palette.surfaceRaised : DS.Palette.accent)
                     .frame(width: 28, height: 28)
-                Image(systemName: vm.status == .running ? "text.line.first.and.arrowtriangle.forward" : "arrow.up")
+                Image(systemName: runActive ? "text.line.first.and.arrowtriangle.forward" : "arrow.up")
                     .font(.system(size: 11, weight: .bold))
                     .foregroundColor(sendIdleDisabled ? DS.Palette.textTertiary : DS.Palette.onAccent)
             }
@@ -7153,14 +8325,14 @@ public struct AgentAppView: View {
         .buttonStyle(.plain)
         .disabled(sendIdleDisabled)
         .keyboardShortcut(.return, modifiers: [.command])
-        .accessibilityLabel(vm.status == .running ? "Queue message" : "Send")
+        .accessibilityLabel(runActive ? "Queue message" : "Send")
         .accessibilityIdentifier("agent.composer.send")
-        .help(vm.status == .running ? "Queue message for this thread" : "Send prompt")
+        .help(runActive ? "Queue message for this thread" : "Send prompt")
     }
 
     private var stopButton: some View {
         let btnState = AgentAppViewModel.stopButtonState(
-            runActive: vm.status == .running,
+            runActive: vm.selectedThreadRunIsStartingOrRunning,
             isStopping: vm.isStopping
         )
         return Button { vm.stop() } label: {
@@ -7203,18 +8375,18 @@ public struct AgentAppView: View {
     private var attachmentChips: some View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: DS.Space.sm) {
-                ForEach(vm.attachments, id: \.self) { path in
+                ForEach(vm.attachments, id: \.self) { attachment in
                     HStack(spacing: DS.Space.xs) {
                         // P3: render thumbnail for image files; icon+name for others.
-                        attachmentChipLeadingContent(path)
-                        Text((path as NSString).lastPathComponent)
+                        attachmentChipLeadingContent(attachment.path)
+                        Text(attachment.displayName)
                             .font(DS.Font.caption2).lineLimit(1)
-                        Button { vm.removeAttachment(path) } label: {
+                        Button { vm.removeAttachment(attachment) } label: {
                             Image(systemName: "xmark").font(.system(size: 8, weight: .bold))
                         }
                         .buttonStyle(.plain)
-                        .accessibilityLabel("Remove attachment")
-                        .help("Remove attachment")
+                        .accessibilityLabel(Self.attachmentRemovalAccessibilityLabel(path: attachment.displayName))
+                        .help(Self.attachmentRemovalAccessibilityLabel(path: attachment.displayName))
                     }
                     .foregroundColor(DS.Palette.textSecondary)
                     .padding(.horizontal, DS.Space.sm).padding(.vertical, 3)
@@ -7254,7 +8426,8 @@ public struct AgentAppView: View {
     }
 
     private var sendIdleDisabled: Bool {
-        vm.prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && vm.attachments.isEmpty
+        !vm.selectedProviderCanRun
+            || (vm.prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && vm.attachments.isEmpty)
     }
 
     private func selectThreadRow(_ thread: AgentThread) {
@@ -7281,10 +8454,12 @@ public struct AgentAppView: View {
 
     private func deleteThreads(_ ids: Set<AgentThreadID>) {
         guard !ids.isEmpty else { return }
-        vm.deleteThreads(ids)
-        selectedThreadIds.subtract(ids)
-        if let lastSelectedThreadId, ids.contains(lastSelectedThreadId) {
-            self.lastSelectedThreadId = selectedThreadIds.first
+        Task {
+            guard await vm.deleteThreads(ids) else { return }
+            selectedThreadIds.subtract(ids)
+            if let lastSelectedThreadId, ids.contains(lastSelectedThreadId) {
+                self.lastSelectedThreadId = selectedThreadIds.first
+            }
         }
     }
 
@@ -7323,9 +8498,15 @@ public struct AgentAppView: View {
                             Button {
                                 Task { await vm.implementLatestPlan(newThread: false) }
                             } label: {
-                                Label("Implement", systemImage: "play.fill")
+                                Label("Approve", systemImage: "checkmark")
                             }
                             .buttonStyle(.borderedProminent)
+                            Button {
+                                Task { await vm.rejectLatestPlan() }
+                            } label: {
+                                Label("Reject", systemImage: "xmark")
+                            }
+                            .buttonStyle(.bordered)
                             Button {
                                 Task { await vm.implementLatestPlan(newThread: true) }
                             } label: {
@@ -7481,7 +8662,11 @@ public struct AgentAppView: View {
                         } label: {
                             Label("Revert", systemImage: "arrow.uturn.backward")
                         }
-                        .disabled(checkpoint.status != .ready)
+                        .disabled(!AgentAppViewModel.canRevertCheckpoint(
+                            status: checkpoint.status,
+                            capabilities: vm.selectedProviderCapabilities
+                        ))
+                        .help(vm.checkpointRevertUnavailableReason ?? "Restore provider context and workspace files to this checkpoint.")
                         .accessibilityIdentifier("agent.checkpoint.revert")
                     }
                 }
@@ -7605,9 +8790,15 @@ public struct AgentAppView: View {
                     Button {
                         Task { await vm.implementLatestPlan(newThread: false) }
                     } label: {
-                        Label("Implement", systemImage: "play.fill")
+                        Label("Approve", systemImage: "checkmark")
                     }
                     .buttonStyle(.borderedProminent)
+                    Button {
+                        Task { await vm.rejectLatestPlan() }
+                    } label: {
+                        Label("Reject", systemImage: "xmark")
+                    }
+                    .buttonStyle(.bordered)
                     Button {
                         Task { await vm.implementLatestPlan(newThread: true) }
                     } label: {
@@ -8377,7 +9568,8 @@ private struct ElapsedTickSchedule: TimelineSchedule {
 
 enum AgentThreadRowPresentation {
     static func isRunning(threadStatus: AgentRunStatus, selected: Bool, surfaceStatus: AgentRunStatus) -> Bool {
-        threadStatus == .running || (selected && surfaceStatus == .running)
+        AgentThreadStopEligibility.isEligible(threadStatus: threadStatus)
+            || (selected && AgentThreadStopEligibility.isEligible(threadStatus: surfaceStatus))
     }
 
     static func showsLeadingStatus(
@@ -8406,9 +9598,9 @@ enum AgentThreadRowPresentation {
 /// which threadId should be targeted. Extracted as a pure type so it can be
 /// tested without touching any MainActor surface.
 public enum AgentThreadStopEligibility {
-    /// True when the thread has a running status, meaning a stop affordance should be shown.
+    /// True while provider work is starting or running.
     public static func isEligible(threadStatus: AgentRunStatus) -> Bool {
-        threadStatus == .running
+        threadStatus == .pending || threadStatus == .running
     }
 
     /// Returns the threadId to target with stopThread(_:) when eligible, nil otherwise.
@@ -8450,11 +9642,11 @@ public final class AgentAppSurface: NSObject, Surface {
     /// Set by AppCommandRouter immediately after subscribe (mirrors Feed pattern).
     public var onClose: (() -> Void)?
 
-    public init(workspaceID: WorkspaceID, cwd: String, coordinator: AgentRunCoordinator, threadRepo: AgentThreadRepository, messageRepo: AgentMessageRepository, queuedMessageRepo: AgentQueuedMessageRepository? = nil, pendingCallbackRepo: ProviderPendingCallbackRepository? = nil, proposedPlanRepo: AgentProposedPlanRepository? = nil, checkpointRepo: AgentTurnCheckpointRepository? = nil, promptHistoryStore: PromptHistoryStore? = nil, customModelStore: AgentCustomModelStore? = nil, planNotesStore: PlanNotesStore? = nil, title: String = "Agent App", initialThreadId: AgentThreadID? = nil) {
+    public init(workspaceID: WorkspaceID, cwd: String, coordinator: AgentRunCoordinator, threadRepo: AgentThreadRepository, messageRepo: AgentMessageRepository, draftRepo: AgentThreadDraftRepository? = nil, attachmentStore: AgentAttachmentStore? = nil, queuedMessageRepo: AgentQueuedMessageRepository? = nil, pendingCallbackRepo: ProviderPendingCallbackRepository? = nil, proposedPlanRepo: AgentProposedPlanRepository? = nil, checkpointRepo: AgentTurnCheckpointRepository? = nil, promptHistoryStore: PromptHistoryStore? = nil, customModelStore: AgentCustomModelStore? = nil, planNotesStore: PlanNotesStore? = nil, title: String = "Agent App", initialThreadId: AgentThreadID? = nil) {
         var metadata = ["workspace": workspaceID.value.uuidString, "cwd": cwd]
         if let initialThreadId { metadata["selected_thread"] = initialThreadId.value.uuidString }
         self.descriptor = SurfaceDescriptor(type: .agentApp, title: title, iconName: "sparkle", metadata: metadata)
-        self.viewModel = AgentAppViewModel(workspaceID: workspaceID, cwd: cwd, coordinator: coordinator, threadRepo: threadRepo, messageRepo: messageRepo, queuedMessageRepo: queuedMessageRepo, pendingCallbackRepo: pendingCallbackRepo, proposedPlanRepo: proposedPlanRepo, checkpointRepo: checkpointRepo, promptHistoryStore: promptHistoryStore, customModelStore: customModelStore, planNotesStore: planNotesStore, initialThreadId: initialThreadId)
+        self.viewModel = AgentAppViewModel(workspaceID: workspaceID, cwd: cwd, coordinator: coordinator, threadRepo: threadRepo, messageRepo: messageRepo, draftRepo: draftRepo, attachmentStore: attachmentStore, queuedMessageRepo: queuedMessageRepo, pendingCallbackRepo: pendingCallbackRepo, proposedPlanRepo: proposedPlanRepo, checkpointRepo: checkpointRepo, promptHistoryStore: promptHistoryStore, customModelStore: customModelStore, planNotesStore: planNotesStore, initialThreadId: initialThreadId)
         let host = NSHostingView(rootView: AgentAppView(vm: viewModel))
         host.translatesAutoresizingMaskIntoConstraints = false
         let container = NSView()

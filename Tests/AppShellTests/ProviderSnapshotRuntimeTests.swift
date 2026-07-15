@@ -8,10 +8,226 @@ import XCTest
 
 @MainActor
 final class ProviderSnapshotRuntimeTests: XCTestCase {
+    private static let ownershipLedger = FileManager.default.temporaryDirectory
+        .appendingPathComponent("provider-snapshot-tests-\(UUID().uuidString).json")
+
+    override func setUp() {
+        super.setUp()
+        ProviderProcessOwnership.shared.configure(fileURL: Self.ownershipLedger)
+    }
+
     private func closeAndUnregisterAllSurfaces() {
         let surfaces = SurfaceRegistry.shared.all()
         surfaces.forEach { $0.close() }
         surfaces.forEach { SurfaceRegistry.shared.unregister($0.descriptor.id) }
+    }
+
+    func test_claudeLegacyFallbackPresentationFailsClosed() throws {
+        let presentation = ClaudeProviderRuntimePresentation.resolve(
+            agentSDKEnabled: false,
+            probeAdvisory: "Update available."
+        )
+
+        XCTAssertEqual(presentation.interactionModes, [.default])
+        XCTAssertEqual(presentation.permissionModes, [.supervised])
+        let capabilities = try XCTUnwrap(presentation.capabilities)
+        XCTAssertFalse(capabilities.supportsAttachments)
+        XCTAssertFalse(capabilities.supportsApprovals)
+        XCTAssertFalse(capabilities.supportsUserInput)
+        XCTAssertTrue(capabilities.supportsStreaming,
+                      "the legacy CLI still streams assistant text even though agent tools are disabled")
+        XCTAssertTrue(presentation.advisory?.contains("Degraded text-only fallback") == true)
+        XCTAssertTrue(presentation.advisory?.contains("Update available.") == true,
+                      "degraded-state copy must preserve an independent CLI update warning")
+    }
+
+    func test_grokSkillsRootUsesGrokHomeAsTheConfigRoot() {
+        XCTAssertEqual(
+            AppCommandRouter.providerSkillsRoot(
+                provider: .grok,
+                environment: ["GROK_HOME": "/opt/team-grok", "HOME": "/Users/example"],
+                defaultHome: "/Users/fallback"
+            ).path,
+            "/opt/team-grok/skills",
+            "GROK_HOME already names the Grok config root; appending .grok again makes configured skills unreachable"
+        )
+    }
+
+    func test_grokSkillsRootFallsBackToHomeDotGrok() {
+        XCTAssertEqual(
+            AppCommandRouter.providerSkillsRoot(
+                provider: .grok,
+                environment: ["HOME": "/Users/example"],
+                defaultHome: "/Users/fallback"
+            ).path,
+            "/Users/example/.grok/skills",
+            "without GROK_HOME, Grok skills must follow the CLI default under HOME/.grok/skills"
+        )
+    }
+
+    func test_providerSnapshotsAdvertiseForkOnlyWhenExactProviderProtocolProbesPass() async throws {
+        // WHY: generic provider capabilities or the presence of thread/fork are
+        // insufficient. The selected Codex executable must prove marker, list,
+        // parent-attribution, and delete compensation schema before UI exposure.
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let ctx = try AppContext(channel: .debug, appSupportOverride: root.path)
+        let router = AppCommandRouter(context: ctx)
+        ctx.router = router
+
+        var probedBinary = ""
+        var probedEnvironment: [String: String] = [:]
+        router.codexForkProtocolSupportProbe = { binary, environment in
+            probedBinary = binary
+            probedEnvironment = environment
+            return true
+        }
+        router.claudeForkProtocolSupportProbe = { true }
+        let supported = await router.listAgentProviderSnapshots()
+        let codex = try XCTUnwrap(supported.first { $0.provider == .codex })
+        XCTAssertTrue(codex.effectiveCapabilities.supportsFork)
+        XCTAssertTrue(codex.slashCommands.contains("/fork"))
+        XCTAssertEqual(probedBinary, codex.binaryPath ?? "",
+                       "fork support must be probed against the exact executable advertised by the snapshot")
+        XCTAssertEqual(probedEnvironment, [:])
+        let claude = try XCTUnwrap(supported.first { $0.provider == .claude })
+        XCTAssertTrue(claude.effectiveCapabilities.supportsFork,
+                      "Claude fork is exposed only after the pinned bridge and installed SDK declaration probe succeeds")
+        XCTAssertFalse(try XCTUnwrap(supported.first { $0.provider == .grok }).effectiveCapabilities.supportsFork)
+
+        router.codexForkProtocolSupportProbe = { _, _ in false }
+        router.claudeForkProtocolSupportProbe = { false }
+        let unsupported = await router.listAgentProviderSnapshots()
+        let oldCodex = try XCTUnwrap(unsupported.first { $0.provider == .codex })
+        XCTAssertFalse(oldCodex.effectiveCapabilities.supportsFork,
+                       "older or partial Codex schemas must fail closed")
+        XCTAssertFalse(oldCodex.slashCommands.contains("/fork"))
+        let oldClaude = try XCTUnwrap(unsupported.first { $0.provider == .claude })
+        XCTAssertFalse(oldClaude.effectiveCapabilities.supportsFork,
+                       "missing or mismatched Claude SDK fork declarations must fail closed")
+    }
+
+    func test_grokProviderSnapshotAndComposerDiscoverPhysicalSkillUnderGrokHome() async throws {
+        // WHY: GROK_HOME already is Grok's config root. A path-only assertion
+        // misses regressions where discovery or composer plumbing still reads
+        // GROK_HOME/.grok/skills or labels a Grok skill as Codex-owned.
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let grokHome = dir.appendingPathComponent("grok-home", isDirectory: true)
+        let skillDir = grokHome.appendingPathComponent("skills/team-research", isDirectory: true)
+        let wrongSkillDir = grokHome.appendingPathComponent(".grok/skills/wrong-root", isDirectory: true)
+        try FileManager.default.createDirectory(at: skillDir, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: wrongSkillDir, withIntermediateDirectories: true)
+        try "# Team Research\n".write(to: skillDir.appendingPathComponent("SKILL.md"), atomically: true, encoding: .utf8)
+        try "# Wrong Root\n".write(to: wrongSkillDir.appendingPathComponent("SKILL.md"), atomically: true, encoding: .utf8)
+
+        let fakeGrok = dir.appendingPathComponent("fake-grok")
+        try #"""
+        #!/bin/sh
+        if [ "$1" = "--version" ]; then
+          printf 'grok-test 0.2.101\n'
+          exit 0
+        fi
+        if [ "$1" = "models" ]; then
+          printf 'You are logged in with test\n'
+          exit 0
+        fi
+        if [ "$1" = "agent" ] && [ "$2" = "stdio" ]; then
+          while IFS= read -r line; do
+            id=$(printf '%s' "$line" | sed -E 's/.*"id":([0-9]+).*/\1/')
+            if printf '%s' "$line" | grep -q '"method":"initialize"'; then
+              printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentCapabilities":{"loadSession":true,"promptCapabilities":{"embeddedContext":true}}}}\n' "$id"
+            elif printf '%s' "$line" | grep -q '"method":"session.*new"'; then
+              printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"skills-session","models":{"currentModelId":"grok-4.5","availableModels":[{"modelId":"grok-4.5","name":"Grok 4.5"}]}}}\n' "$id"
+            fi
+          done
+          exit 0
+        fi
+        exit 1
+        """#.write(to: fakeGrok, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: fakeGrok.path)
+
+        let ctx = try AppContext(channel: .debug, appSupportOverride: dir.appendingPathComponent("support").path)
+        let router = AppCommandRouter(context: ctx)
+        ctx.router = router
+        try ctx.settingsRepo.set("agent.provider.instances", """
+        [
+          {
+            "id": "grok-team",
+            "provider": "grok",
+            "displayName": "Grok Team",
+            "binaryPath": "\(fakeGrok.path)",
+            "homePath": "\(grokHome.path)",
+            "enabled": true
+          }
+        ]
+        """)
+
+        let snapshots = await router.listAgentProviderSnapshots()
+        let grok = try XCTUnwrap(snapshots.first { $0.id == "grok-team" })
+        XCTAssertEqual(grok.environmentKeys, ["GROK_HOME"])
+        XCTAssertEqual(grok.skills, ["team-research"],
+                       "only <GROK_HOME>/skills must feed Grok composer skills")
+
+        let suggestions = AgentComposerSuggestions.suggestions(
+            for: "$team-r",
+            snapshot: grok,
+            localSlashCommands: []
+        )
+        XCTAssertEqual(suggestions.map(\.insertText), ["$team-research "])
+        XCTAssertEqual(suggestions.first?.subtitle, "Grok Team skill")
+    }
+
+    func test_grokProviderSnapshotUsesACPNegotiatedModesAndCapabilities() async throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let fakeGrok = dir.appendingPathComponent("fake-grok")
+        try #"""
+        #!/bin/sh
+        if [ "$1" = "--version" ]; then
+          printf 'grok 9.9.9\n'
+          exit 0
+        fi
+        if [ "$1" = "models" ]; then
+          printf 'You are logged in with test\n'
+          exit 0
+        fi
+        if [ "$1" = "agent" ] && [ "$2" = "stdio" ]; then
+          while IFS= read -r line; do
+            id=$(printf '%s' "$line" | sed -E 's/.*"id":([0-9]+).*/\1/')
+            if printf '%s' "$line" | grep -q '"method":"initialize"'; then
+              printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentCapabilities":{"loadSession":true,"promptCapabilities":{"image":false,"audio":false,"embeddedContext":true},"sessionCapabilities":{}}}}\n' "$id"
+            elif printf '%s' "$line" | grep -q '"method":"session.*new"'; then
+              printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"snapshot-session","models":{"currentModelId":"grok-negotiated","availableModels":[{"modelId":"grok-negotiated","name":"Grok Negotiated"}]},"modes":{"currentModeId":"default","availableModes":[{"id":"default","name":"Default"},{"id":"plan","name":"Plan"},{"id":"bypassPermissions","name":"Full access"}]}}}\n' "$id"
+            fi
+          done
+          exit 0
+        fi
+        exit 1
+        """#.write(to: fakeGrok, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: fakeGrok.path)
+
+        let ctx = try AppContext(channel: .debug, appSupportOverride: dir.appendingPathComponent("support").path)
+        let router = AppCommandRouter(context: ctx)
+        ctx.router = router
+        try ctx.settingsRepo.set("cli.grok.path", fakeGrok.path)
+
+        let snapshots = await router.listAgentProviderSnapshots()
+        let grok = try XCTUnwrap(snapshots.first { $0.provider == .grok })
+
+        XCTAssertEqual(grok.models.map(\.id), ["grok-negotiated"])
+        XCTAssertEqual(grok.interactionModes, [.default, .plan])
+        XCTAssertEqual(grok.effectivePermissionModes, [.supervised, .fullAccess])
+        XCTAssertTrue(grok.effectiveCapabilities.supportsPlanReview)
+        XCTAssertTrue(grok.effectiveCapabilities.supportsAttachments)
+        XCTAssertTrue(grok.effectiveCapabilities.supportsApprovals)
+        XCTAssertFalse(grok.effectiveCapabilities.supportsUserInput)
+        XCTAssertTrue(grok.slashCommands.contains("/plan"))
+        XCTAssertEqual(grok.modelDiscoverySource, .live)
+        XCTAssertFalse(grok.modelListIsFallback)
+        XCTAssertNotNil(grok.modelDiscoveryCacheKey,
+                        "the snapshot must retain the opaque binary/account discovery identity")
     }
 
     func test_providerSnapshotsUseConfiguredBinaryAndExposeVersion() async throws {
@@ -241,6 +457,9 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
         let snapshots = await router.listAgentProviderSnapshots()
         let claude = try XCTUnwrap(snapshots.first { $0.id == "claude-team" })
 
+        XCTAssertEqual(claude.binaryPath, fakeClaude.path)
+        XCTAssertEqual(claude.version, "claude-test 2.1.0",
+                       "the provider card must publish the version from the exact Claude executable configured for SDK query execution")
         XCTAssertEqual(claude.skills, ["team-plan"],
                        "provider snapshots must discover Claude skills from the selected HOME/.claude/skills so Claude composer suggestions do not show Codex-home skills")
     }
@@ -726,6 +945,46 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
                        "stopped runs must update persisted thread status so macOS and iOS leave running state")
     }
 
+    func test_terminalPersistenceRetainsRunBoundQueueRecoveryEvidence() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let workspaceDir = root.appendingPathComponent("workspace", isDirectory: true)
+        try FileManager.default.createDirectory(at: workspaceDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        defer { closeAndUnregisterAllSurfaces() }
+
+        let ctx = try AppContext(channel: .debug, appSupportOverride: root.appendingPathComponent("support").path)
+        let router = AppCommandRouter(context: ctx)
+        ctx.router = router
+        ctx.coordinator.replaceProvider(.codex, runner: RequestCaptureRunner(provider: .codex))
+        let workspace = try router.createWorkspace(name: "terminal-run-evidence", cwd: workspaceDir.path)
+        let thread = try router.createAgentThread(
+            workspace: workspace.id,
+            title: "terminal run evidence",
+            provider: .codex,
+            model: "gpt-5.5",
+            permissionMode: .supervised,
+            reasoningEffort: .medium
+        )
+
+        let result = try await router.sendAgentMessage(
+            thread: thread.id,
+            text: "finish immediately",
+            provider: nil,
+            model: nil,
+            permissionMode: nil,
+            reasoningEffort: nil
+        )
+        let runId = try XCTUnwrap(result.runId)
+        let deadline = Date().addingTimeInterval(2)
+        while try ctx.runRepo.get(id: runId)?.status != .completed, Date() < deadline {
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+
+        XCTAssertEqual(try ctx.providerSessionRuntimeRepo.get(threadId: thread.id)?.lastRunId, runId,
+                       "terminal persistence must not erase the run id required to reconcile a prepared queue row after a crash")
+        XCTAssertEqual(try ctx.providerSessionRuntimeRepo.get(threadId: thread.id)?.lastEventKind, "run.finished")
+    }
+
     func test_sendAgentMessageStartsPendingNewThreadInsteadOfQueueing() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         let workspaceDir = root.appendingPathComponent("workspace", isDirectory: true)
@@ -760,6 +1019,320 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
         XCTAssertEqual(try ctx.queuedMessageRepo.list(threadId: thread.id), [],
                        "the first prompt in a new iOS thread must not be stored as an editable follow-up queue item")
         XCTAssertEqual(runner.lastRequest?.prompt, "count to 10")
+    }
+
+    func test_drainQueue_startFailureAcknowledgesIntentAfterDurableFailedRunWithoutReplay() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let workspaceDir = root.appendingPathComponent("workspace", isDirectory: true)
+        try FileManager.default.createDirectory(at: workspaceDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        defer { closeAndUnregisterAllSurfaces() }
+
+        let ctx = try AppContext(channel: .debug, appSupportOverride: root.appendingPathComponent("support").path)
+        let router = AppCommandRouter(context: ctx)
+        ctx.router = router
+        let workspace = try router.createWorkspace(name: "queue-retry", cwd: workspaceDir.path)
+        var thread = try router.createAgentThread(workspace: workspace.id, title: "queue", provider: .codex, model: "gpt-5.5", permissionMode: .supervised, reasoningEffort: .medium)
+        thread.status = .failed
+        try ctx.threadRepo.upsert(thread)
+        let queued = try ctx.queuedMessageRepo.enqueue(threadId: thread.id, text: "retry exactly once", attachments: [], interactionMode: .default)
+        let failing = ThrowingStartRunner(provider: .codex)
+        ctx.coordinator.replaceProvider(.codex, runner: failing)
+
+        do {
+            try await router.drainNextQueuedAgentMessage(thread: thread.id)
+            XCTFail("provider start must fail")
+        } catch {}
+
+        XCTAssertTrue(try ctx.queuedMessageRepo.list(threadId: thread.id).isEmpty,
+                      "once the deterministic failed run is durable, the queue intent is redundant and must be acknowledged without provider replay")
+        XCTAssertEqual(try ctx.messageRepo.list(threadId: thread.id).filter { $0.role == .user }.count, 1)
+        let failedRun = try XCTUnwrap(ctx.runRepo.get(id: AgentRunID(queued.id.value)))
+        XCTAssertEqual(failedRun.status, .failed,
+                       "the visible failed run must own Retry/Continue after the queue intent is acknowledged")
+        XCTAssertEqual(
+            try ctx.providerSessionRuntimeRepo.get(threadId: thread.id)?.lastRunId,
+            failedRun.id,
+            "start-failure persistence must retain the run-bound evidence needed if the host crashes before queue acknowledgement"
+        )
+        XCTAssertEqual(failing.startCount, 1,
+                       "onRunFinished queue draining must not replay a provider start already represented by the deterministic failed run")
+    }
+
+    func test_forceQueue_startFailureLeavesOnlyDurableFailedRunRecoverySurface() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let workspaceDir = root.appendingPathComponent("workspace", isDirectory: true)
+        try FileManager.default.createDirectory(at: workspaceDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        defer { closeAndUnregisterAllSurfaces() }
+        let ctx = try AppContext(channel: .debug, appSupportOverride: root.appendingPathComponent("support").path)
+        let router = AppCommandRouter(context: ctx)
+        ctx.router = router
+        let workspace = try router.createWorkspace(name: "queue-force-retry", cwd: workspaceDir.path)
+        var thread = try router.createAgentThread(workspace: workspace.id, title: "queue", provider: .codex, model: "gpt-5.5", permissionMode: .supervised, reasoningEffort: .medium)
+        thread.status = .failed
+        try ctx.threadRepo.upsert(thread)
+        let queued = try ctx.queuedMessageRepo.enqueue(threadId: thread.id, text: "one recovery surface", attachments: [], interactionMode: .default)
+        let failing = ThrowingStartRunner(provider: .codex)
+        ctx.coordinator.replaceProvider(.codex, runner: failing)
+
+        do {
+            _ = try await router.forceAgentQueuedMessageNow(id: queued.id)
+            XCTFail("provider start must fail")
+        } catch {}
+
+        XCTAssertTrue(try ctx.queuedMessageRepo.list(threadId: thread.id).isEmpty,
+                      "Force must acknowledge the redundant queue row after the deterministic failed run is durable")
+        XCTAssertEqual(try ctx.messageRepo.list(threadId: thread.id).filter { $0.role == .user }.count, 1)
+        XCTAssertEqual(try ctx.runRepo.get(id: AgentRunID(queued.id.value))?.status, .failed)
+        XCTAssertEqual(failing.startCount, 1)
+    }
+
+    func test_drainQueue_relaunchAcknowledgesDispatchedHeadWithoutProviderReplay() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let workspaceDir = root.appendingPathComponent("workspace", isDirectory: true)
+        try FileManager.default.createDirectory(at: workspaceDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        defer { closeAndUnregisterAllSurfaces() }
+        let ctx = try AppContext(channel: .debug, appSupportOverride: root.appendingPathComponent("support").path)
+        let router = AppCommandRouter(context: ctx)
+        ctx.router = router
+        let runner = RequestCaptureRunner(provider: .codex)
+        ctx.coordinator.replaceProvider(.codex, runner: runner)
+        let workspace = try router.createWorkspace(name: "queue-relaunch", cwd: workspaceDir.path)
+        var thread = try router.createAgentThread(workspace: workspace.id, title: "queue", provider: .codex, model: "gpt-5.5", permissionMode: .supervised, reasoningEffort: .medium)
+        thread.status = .completed
+        try ctx.threadRepo.upsert(thread)
+        let queued = try ctx.queuedMessageRepo.enqueue(threadId: thread.id, text: "already dispatched", attachments: [], interactionMode: .default)
+        let lease = try XCTUnwrap(ctx.queuedMessageRepo.claim(id: queued.id, leaseId: "dead-process"))
+        let runId = AgentRunID(queued.id.value)
+        XCTAssertTrue(try ctx.queuedMessageRepo.prepareDispatch(lease, runId: runId))
+        XCTAssertTrue(try ctx.queuedMessageRepo.markDispatched(lease, runId: runId))
+
+        try await router.drainNextQueuedAgentMessage(thread: thread.id)
+
+        XCTAssertNil(runner.lastRequest,
+                     "relaunch recovery must acknowledge durable dispatched proof without invoking the provider")
+        XCTAssertNil(try ctx.queuedMessageRepo.get(id: queued.id))
+    }
+
+    func test_drainQueue_relaunchRequeuesPreparedHeadWhenNoRunExistsAndStartsExactlyOnce() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let workspaceDir = root.appendingPathComponent("workspace", isDirectory: true)
+        try FileManager.default.createDirectory(at: workspaceDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        defer { closeAndUnregisterAllSurfaces() }
+        let ctx = try AppContext(channel: .debug, appSupportOverride: root.appendingPathComponent("support").path)
+        let router = AppCommandRouter(context: ctx)
+        ctx.router = router
+        let runner = RequestCaptureRunner(provider: .codex)
+        ctx.coordinator.replaceProvider(.codex, runner: runner)
+        let workspace = try router.createWorkspace(name: "queue-ambiguous", cwd: workspaceDir.path)
+        var thread = try router.createAgentThread(workspace: workspace.id, title: "queue", provider: .codex, model: "gpt-5.5", permissionMode: .supervised, reasoningEffort: .medium)
+        thread.status = .completed
+        try ctx.threadRepo.upsert(thread)
+        let head = try ctx.queuedMessageRepo.enqueue(threadId: thread.id, text: "ambiguous", attachments: [], interactionMode: .default)
+        _ = try ctx.queuedMessageRepo.enqueue(threadId: thread.id, text: "later", attachments: [], interactionMode: .default)
+        let lease = try XCTUnwrap(ctx.queuedMessageRepo.claim(id: head.id, leaseId: "dead-process"))
+        XCTAssertTrue(try ctx.queuedMessageRepo.prepareDispatch(lease, runId: AgentRunID(head.id.value)))
+
+        await router.reconcileQueuedAgentMessagesOnLaunch()
+
+        XCTAssertEqual(runner.lastRequest?.runId.value, head.id.value,
+                       "absence of the deterministic run row proves provider start was never reached and permits one retry")
+        XCTAssertEqual(try ctx.queuedMessageRepo.list(threadId: thread.id).map(\.text), ["later"],
+                       "safe relaunch recovery must drain the original head without skipping the later row")
+    }
+
+    func test_drainQueue_relaunchKeepsPreparedHeadWhenProviderStartWasNeverConfirmed() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let workspaceDir = root.appendingPathComponent("workspace", isDirectory: true)
+        try FileManager.default.createDirectory(at: workspaceDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        defer { closeAndUnregisterAllSurfaces() }
+        let ctx = try AppContext(channel: .debug, appSupportOverride: root.appendingPathComponent("support").path)
+        let router = AppCommandRouter(context: ctx)
+        ctx.router = router
+        let runner = RequestCaptureRunner(provider: .codex)
+        ctx.coordinator.replaceProvider(.codex, runner: runner)
+        let workspace = try router.createWorkspace(name: "queue-pending-start", cwd: workspaceDir.path)
+        var thread = try router.createAgentThread(workspace: workspace.id, title: "queue", provider: .codex, model: "gpt-5.5", permissionMode: .supervised, reasoningEffort: .medium)
+        thread.status = .interrupted
+        try ctx.threadRepo.upsert(thread)
+        let queued = try ctx.queuedMessageRepo.enqueue(threadId: thread.id, text: "must remain visible", attachments: [], interactionMode: .default)
+        let lease = try XCTUnwrap(ctx.queuedMessageRepo.claim(id: queued.id, leaseId: "dead-process"))
+        let runId = AgentRunID(queued.id.value)
+        XCTAssertTrue(try ctx.queuedMessageRepo.prepareDispatch(lease, runId: runId))
+        try ctx.runRepo.upsert(AgentRun(id: runId, threadId: thread.id, provider: .codex, model: "gpt-5.5", status: .pending))
+        try ctx.providerSessionRuntimeRepo.upsert(ProviderSessionRuntime(
+            threadId: thread.id,
+            provider: .codex,
+            status: .pending,
+            lastRunId: runId,
+            lastEventKind: "run.pending"
+        ))
+
+        do {
+            try await router.drainNextQueuedAgentMessage(
+                thread: thread.id,
+                recoverPreparedFromPriorProcess: true
+            )
+            XCTFail("launch recovery must fail loud while provider acceptance is unconfirmed")
+        } catch let error as JSONRPCError {
+            XCTAssertTrue(error.message.contains("remains queued"),
+                          "launch recovery must explain that the protected message was preserved")
+        } catch {
+            XCTFail("launch recovery returned an unexpected error: \(error)")
+        }
+
+        XCTAssertEqual(try ctx.queuedMessageRepo.get(id: queued.id)?.text, "must remain visible",
+                       "a pre-provider crash must preserve the only actionable queue intent")
+        XCTAssertEqual(try ctx.queuedMessageRepo.dispatch(id: queued.id)?.state, .prepared,
+                       "ambiguous launch recovery must not make the message claimable or replay it")
+        XCTAssertNil(runner.lastRequest,
+                     "launch recovery must not replay a prepared message with ambiguous provider state")
+    }
+
+    func test_forceQueuedMessageKeepsPreparedHeadWhenProviderStartWasNeverConfirmed() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let workspaceDir = root.appendingPathComponent("workspace", isDirectory: true)
+        try FileManager.default.createDirectory(at: workspaceDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        defer { closeAndUnregisterAllSurfaces() }
+        let ctx = try AppContext(channel: .debug, appSupportOverride: root.appendingPathComponent("support").path)
+        let router = AppCommandRouter(context: ctx)
+        ctx.router = router
+        let runner = RequestCaptureRunner(provider: .codex)
+        ctx.coordinator.replaceProvider(.codex, runner: runner)
+        let workspace = try router.createWorkspace(name: "queue-force-pending-start", cwd: workspaceDir.path)
+        var thread = try router.createAgentThread(workspace: workspace.id, title: "queue", provider: .codex, model: "gpt-5.5", permissionMode: .supervised, reasoningEffort: .medium)
+        thread.status = .interrupted
+        try ctx.threadRepo.upsert(thread)
+        let queued = try ctx.queuedMessageRepo.enqueue(threadId: thread.id, text: "do not force replay", attachments: [], interactionMode: .default)
+        let lease = try XCTUnwrap(ctx.queuedMessageRepo.claim(id: queued.id, leaseId: "dead-process"))
+        let runId = AgentRunID(queued.id.value)
+        XCTAssertTrue(try ctx.queuedMessageRepo.prepareDispatch(lease, runId: runId))
+        try ctx.runRepo.upsert(AgentRun(id: runId, threadId: thread.id, provider: .codex, model: "gpt-5.5", status: .pending))
+        try ctx.providerSessionRuntimeRepo.upsert(ProviderSessionRuntime(
+            threadId: thread.id,
+            provider: .codex,
+            status: .pending,
+            lastRunId: runId,
+            lastEventKind: "run.pending"
+        ))
+
+        do {
+            _ = try await router.forceAgentQueuedMessageNow(id: queued.id)
+            XCTFail("Force must fail loud while provider acceptance is unconfirmed")
+        } catch let error as JSONRPCError {
+            XCTAssertTrue(error.message.contains("remains queued"),
+                          "Force must explain that the protected message was preserved")
+        } catch {
+            XCTFail("Force returned an unexpected error: \(error)")
+        }
+
+        XCTAssertEqual(try ctx.queuedMessageRepo.get(id: queued.id)?.text, "do not force replay",
+                       "Force must not delete a queue intent that the provider may never have seen")
+        XCTAssertEqual(try ctx.queuedMessageRepo.dispatch(id: queued.id)?.state, .prepared)
+        XCTAssertNil(runner.lastRequest,
+                     "Force must not replay an ambiguous prepared dispatch")
+    }
+
+    func test_drainQueue_relaunchAcknowledgesPreparedHeadWithExistingRunWithoutProviderReplay() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let workspaceDir = root.appendingPathComponent("workspace", isDirectory: true)
+        try FileManager.default.createDirectory(at: workspaceDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        defer { closeAndUnregisterAllSurfaces() }
+        let ctx = try AppContext(channel: .debug, appSupportOverride: root.appendingPathComponent("support").path)
+        let router = AppCommandRouter(context: ctx)
+        ctx.router = router
+        let runner = RequestCaptureRunner(provider: .codex)
+        ctx.coordinator.replaceProvider(.codex, runner: runner)
+        let workspace = try router.createWorkspace(name: "queue-existing-run", cwd: workspaceDir.path)
+        var thread = try router.createAgentThread(workspace: workspace.id, title: "queue", provider: .codex, model: "gpt-5.5", permissionMode: .supervised, reasoningEffort: .medium)
+        thread.status = .failed
+        try ctx.threadRepo.upsert(thread)
+        let queued = try ctx.queuedMessageRepo.enqueue(threadId: thread.id, text: "already represented by run", attachments: [], interactionMode: .default)
+        let lease = try XCTUnwrap(ctx.queuedMessageRepo.claim(id: queued.id, leaseId: "dead-process"))
+        let runId = AgentRunID(queued.id.value)
+        XCTAssertTrue(try ctx.queuedMessageRepo.prepareDispatch(lease, runId: runId))
+        var failedRun = AgentRun(id: runId, threadId: thread.id, provider: .codex, model: "gpt-5.5", status: .failed)
+        failedRun.finishedAt = Date()
+        failedRun.errorMessage = "provider start outcome retained"
+        try ctx.runRepo.upsert(failedRun)
+        try ctx.providerSessionRuntimeRepo.upsert(ProviderSessionRuntime(
+            threadId: thread.id,
+            provider: .codex,
+            status: .failed,
+            lastRunId: runId,
+            lastEventKind: "run.started"
+        ))
+
+        try await router.drainNextQueuedAgentMessage(thread: thread.id)
+
+        XCTAssertNil(runner.lastRequest,
+                     "a durable matching run owns Retry/Continue; launch recovery must never invoke the provider again")
+        XCTAssertNil(try ctx.queuedMessageRepo.get(id: queued.id),
+                     "the redundant prepared queue intent must be acknowledged instead of poisoning the queue head")
+        XCTAssertEqual(try ctx.runRepo.get(id: runId)?.status, .failed,
+                       "queue acknowledgement must preserve the visible run recovery record")
+    }
+
+    func test_drainQueueDoesNotUseLaterRunSessionEvidenceForPreparedEarlierRun() async throws {
+        // WHY: provider-session diagnostics are thread-scoped. Without the
+        // matching run id, a later turn's run.started can silently delete an
+        // earlier prompt that crashed before provider acceptance.
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let workspaceDir = root.appendingPathComponent("workspace", isDirectory: true)
+        try FileManager.default.createDirectory(at: workspaceDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        defer { closeAndUnregisterAllSurfaces() }
+        let ctx = try AppContext(channel: .debug, appSupportOverride: root.appendingPathComponent("support").path)
+        let router = AppCommandRouter(context: ctx)
+        ctx.router = router
+        let workspace = try router.createWorkspace(name: "queue-run-evidence", cwd: workspaceDir.path)
+        var thread = try router.createAgentThread(workspace: workspace.id, title: "queue", provider: .codex, model: "gpt-5.5", permissionMode: .supervised, reasoningEffort: .medium)
+        thread.status = .interrupted
+        try ctx.threadRepo.upsert(thread)
+        let queued = try ctx.queuedMessageRepo.enqueue(threadId: thread.id, text: "run A must remain", attachments: [], interactionMode: .default)
+        let lease = try XCTUnwrap(ctx.queuedMessageRepo.claim(id: queued.id, leaseId: "dead-process"))
+        let runA = AgentRunID(queued.id.value)
+        let runB = AgentRunID()
+        XCTAssertTrue(try ctx.queuedMessageRepo.prepareDispatch(lease, runId: runA))
+        try ctx.runRepo.upsert(AgentRun(id: runA, threadId: thread.id, provider: .codex, model: "gpt-5.5", status: .pending))
+        var completedB = AgentRun(id: runB, threadId: thread.id, provider: .codex, model: "gpt-5.5", status: .completed)
+        completedB.finishedAt = Date()
+        try ctx.runRepo.upsert(completedB)
+        try ctx.providerSessionRuntimeRepo.upsert(ProviderSessionRuntime(
+            threadId: thread.id,
+            provider: .codex,
+            status: .completed,
+            lastRunId: runB,
+            lastEventKind: "run.started"
+        ))
+
+        do {
+            try await router.drainNextQueuedAgentMessage(thread: thread.id)
+            XCTFail("later run evidence must not acknowledge the earlier prepared prompt")
+        } catch let error as JSONRPCError {
+            XCTAssertTrue(error.message.contains("remains queued"))
+        }
+        XCTAssertEqual(try ctx.queuedMessageRepo.get(id: queued.id)?.text, "run A must remain")
+        XCTAssertEqual(try ctx.queuedMessageRepo.dispatch(id: queued.id)?.state, .prepared)
+    }
+}
+
+private final class ThrowingStartRunner: AgentProviderRunner, @unchecked Sendable {
+    let provider: AgentProvider
+    private let lock = NSLock()
+    private var starts = 0
+    init(provider: AgentProvider) { self.provider = provider }
+    var startCount: Int { lock.withLock { starts } }
+    func listModels() async -> [AgentModelDescriptor] { [] }
+    func startRun(_ request: AgentRunRequest, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) async throws -> AgentRunHandle {
+        lock.withLock { starts += 1 }
+        throw AgentRunError.spawnFailed("intentional queue-start failure")
     }
 }
 

@@ -204,6 +204,35 @@ final class PersistenceTests: XCTestCase {
                        "completed sessions with a resume cursor must be classified as recoverable, not silently lost")
     }
 
+    func test_interruptedProviderSessionWithCursorIsRecoverableButCancelledSessionIsStopped() throws {
+        let tmp = NSTemporaryDirectory() + "RC2InterruptedRecovery-" + UUID().uuidString
+        defer { try? FileManager.default.removeItem(atPath: tmp) }
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let thread = AgentThread(title: "resume after relaunch", provider: .codex, model: "gpt-5.5")
+        try AgentThreadRepository(db: db).upsert(thread)
+        let repo = ProviderSessionRuntimeRepository(db: db)
+        let session = ProviderSessionRuntime(
+            threadId: thread.id,
+            provider: .codex,
+            status: .interrupted,
+            resumeCursor: "codex-resume-cursor"
+        )
+        try repo.upsert(session)
+
+        guard case .recoverable(let recovered) = try repo.recoveryState(threadId: thread.id) else {
+            return XCTFail("a launch-interrupted provider session with a cursor must expose Continue instead of becoming an unreachable stopped session")
+        }
+        XCTAssertEqual(recovered.status, .interrupted)
+        XCTAssertEqual(recovered.resumeCursor, "codex-resume-cursor")
+
+        try repo.markStopped(threadId: thread.id)
+        guard case .stopped(let stopped) = try repo.recoveryState(threadId: thread.id) else {
+            return XCTFail("an intentional stop must remain stopped even when the old provider cursor is retained")
+        }
+        XCTAssertEqual(stopped.status, .cancelled)
+        XCTAssertEqual(stopped.resumeCursor, "codex-resume-cursor")
+    }
+
     func test_proposedPlan_roundtripsIndependentlyFromMessagesAcrossBootstrapRestart() throws {
         let tmp = NSTemporaryDirectory() + "RC2ProposedPlan-" + UUID().uuidString
         defer { try? FileManager.default.removeItem(atPath: tmp) }

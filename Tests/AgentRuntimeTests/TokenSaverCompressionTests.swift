@@ -572,6 +572,10 @@ final class TokenSaverCompressionTests: XCTestCase {
             XCTAssertEqual(provider, .codex)
             XCTAssertEqual(threadId, thread.id)
             XCTAssertTrue(SR1ResponseDetector.isSR1(response))
+            // Force the provider terminal callback to arrive while stream
+            // humanization is still in flight. The translated delta must cross
+            // the same durability barrier before terminal cleanup.
+            try? await Task.sleep(nanoseconds: 50_000_000)
             return "Recebi o pedido em /distill e vou criar um jogo Snake HTML mínimo em /tmp."
         }
 

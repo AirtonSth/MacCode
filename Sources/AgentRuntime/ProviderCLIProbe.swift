@@ -47,7 +47,7 @@ public enum ProviderCLIProbe {
         public let stderr: String
     }
 
-    private struct CommandResult {
+    struct CommandResult {
         let status: Int32
         let stdout: String
         let stderr: String
@@ -141,7 +141,7 @@ public enum ProviderCLIProbe {
         return UpdateResult(ok: result.status == 0, status: result.status, stdout: result.stdout, stderr: result.stderr)
     }
 
-    private static func run(binaryPath: String, arguments: [String], environment: [String: String], timeoutSeconds: TimeInterval) -> CommandResult? {
+    static func run(binaryPath: String, arguments: [String], environment: [String: String], timeoutSeconds: TimeInterval) -> CommandResult? {
         let trimmed = binaryPath.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }
         guard FileManager.default.isExecutableFile(atPath: trimmed) else { return nil }

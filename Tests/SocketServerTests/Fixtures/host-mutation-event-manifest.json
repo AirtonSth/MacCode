@@ -105,6 +105,7 @@
     {"method": "agent.plan.notes.save", "family": "agent-execution", "risk": "lowMutation", "eventKinds": ["agent.plan.notes.updated"], "readbackMethods": ["agent.plan.notes.get"]},
     {"method": "agent.checkpoint.revert", "family": "agent-execution", "risk": "destructive", "eventKinds": ["agent.checkpoint.reverted"], "readbackMethods": ["agent.checkpoint.list"]},
     {"method": "agent.attachment.upload", "family": "agent-execution", "risk": "lowMutation", "eventKinds": ["agent.attachment.uploaded"], "readbackMethods": ["fs.workspace.list"]},
+    {"method": "agent.attachment.import", "family": "agent-execution", "risk": "lowMutation", "eventKinds": ["agent.attachment.uploaded"], "readbackMethods": ["agent.message.list"]},
     {"method": "agent.provider.update", "family": "agent-execution", "risk": "destructive", "eventKinds": ["agent.provider.updated"], "readbackMethods": ["agent.state.current"]},
 
     {"method": "fs.workspace.create_file", "family": "files", "risk": "lowMutation", "eventKinds": ["fs.workspace.changed"], "readbackMethods": ["fs.workspace.list", "fs.workspace.read"]},

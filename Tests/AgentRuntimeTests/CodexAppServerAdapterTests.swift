@@ -2,7 +2,198 @@ import XCTest
 import CoreModel
 @testable import AgentRuntime
 
-final class CodexAppServerAdapterTests: XCTestCase {
+final class CodexAppServerAdapterTests: ProviderProcessTestCase {
+    func test_forkProtocolSchemaSupportFailsClosedWhenRequiredMarkerFieldDisappears() throws {
+        // WHY: thread/fork is crash-safe only while the installed app-server can
+        // persist our deterministic marker, list it with its parent, and delete
+        // a duplicate/orphan during compensation. A partial/older schema must
+        // disable the feature instead of making a best-effort provider mutation.
+        let schemaDirectory = try makeCodexForkSchemaProjection()
+        defer { try? FileManager.default.removeItem(at: schemaDirectory) }
+
+        XCTAssertTrue(CodexForkProtocolSupport.inspect(schemaDirectory: schemaDirectory).isSupported)
+
+        let forkParamsURL = schemaDirectory.appendingPathComponent("v2/ThreadForkParams.json")
+        var forkParams = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(contentsOf: forkParamsURL)) as? [String: Any]
+        )
+        var properties = try XCTUnwrap(forkParams["properties"] as? [String: Any])
+        properties.removeValue(forKey: "threadSource")
+        forkParams["properties"] = properties
+        try JSONSerialization.data(withJSONObject: forkParams, options: [.sortedKeys])
+            .write(to: forkParamsURL)
+
+        let unsupported = CodexForkProtocolSupport.inspect(schemaDirectory: schemaDirectory)
+        XCTAssertFalse(unsupported.isSupported,
+                       "a Codex release without threadSource cannot reconcile a lost fork response and must fail closed")
+    }
+
+    func test_currentServerRequestInventoryMatchesGeneratedCodexSchema_0_144_4() throws {
+        // WHY: a hand-copied expectation can drift in lockstep with the switch.
+        // Read the checked-in projection generated from ServerRequest.json so a
+        // schema upgrade introduces a failing ownership decision by default.
+        let fixture = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .appendingPathComponent("Fixtures/CodexAppServer/ServerRequestMethods-0.144.4.json")
+        let data = try Data(contentsOf: fixture)
+        let schema = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        XCTAssertEqual(schema["generatedBy"] as? String,
+                       "codex-cli 0.144.4 app-server generate-json-schema --experimental")
+        let variants = try XCTUnwrap(schema["oneOf"] as? [[String: Any]])
+        let schemaMethods = Set(variants.compactMap { variant -> String? in
+            let properties = variant["properties"] as? [String: Any]
+            let method = properties?["method"] as? [String: Any]
+            return (method?["enum"] as? [String])?.first
+        })
+
+        XCTAssertEqual(schemaMethods.count, variants.count,
+                       "every generated ServerRequest variant must expose exactly one method discriminator")
+        XCTAssertEqual(CodexAppServerAdapter.currentServerRequestMethods, schemaMethods,
+                       "upgrading the Codex app-server schema must force an explicit ownership decision for every server request")
+    }
+
+    func test_installedCodexServerRequestSchemaMatchesExplicitAdapterInventory() throws {
+        guard ProcessInfo.processInfo.environment["RC_REAL_CODEX_SCHEMA_GATE"] == "1" else {
+            throw XCTSkip("Set RC_REAL_CODEX_SCHEMA_GATE=1 for the installed Codex release-schema gate.")
+        }
+        guard let codex = ProcessLocator.resolve("codex") else {
+            throw XCTSkip("codex binary is not available on PATH")
+        }
+        let output = FileManager.default.temporaryDirectory
+            .appendingPathComponent("rc-codex-schema-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: output, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: output) }
+
+        let version = try runCodex(codex, arguments: ["--version"])
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        XCTAssertEqual(version, "codex-cli 0.144.4",
+                       "the checked-in projection must be regenerated deliberately when the release Codex version changes")
+        _ = try runCodex(codex, arguments: [
+            "app-server", "generate-json-schema", "--experimental", "--out", output.path
+        ])
+        let schemaURL = output.appendingPathComponent("ServerRequest.json")
+        let data = try Data(contentsOf: schemaURL)
+        let schema = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        let variants = try XCTUnwrap(schema["oneOf"] as? [[String: Any]])
+        let installedMethods = Set(variants.compactMap { variant -> String? in
+            let properties = variant["properties"] as? [String: Any]
+            let method = properties?["method"] as? [String: Any]
+            return (method?["enum"] as? [String])?.first
+        })
+
+        XCTAssertEqual(installedMethods.count, variants.count,
+                       "every installed ServerRequest variant must expose one method discriminator")
+        XCTAssertEqual(CodexAppServerAdapter.currentServerRequestMethods, installedMethods,
+                       "every installed server request must have an explicit ownership decision before release")
+
+        let elicitationData = try Data(contentsOf: output.appendingPathComponent("McpServerElicitationRequestResponse.json"))
+        let elicitationSchema = try XCTUnwrap(JSONSerialization.jsonObject(with: elicitationData) as? [String: Any])
+        XCTAssertEqual(elicitationSchema["required"] as? [String], ["action"])
+        let elicitationDefinitions = try XCTUnwrap(elicitationSchema["definitions"] as? [String: Any])
+        let elicitationAction = try XCTUnwrap(elicitationDefinitions["McpServerElicitationAction"] as? [String: Any])
+        XCTAssertEqual(elicitationAction["enum"] as? [String], ["accept", "decline", "cancel"],
+                       "MCP elicitation response handling must track the installed action contract")
+
+        let permissionsData = try Data(contentsOf: output.appendingPathComponent("PermissionsRequestApprovalResponse.json"))
+        let permissionsSchema = try XCTUnwrap(JSONSerialization.jsonObject(with: permissionsData) as? [String: Any])
+        XCTAssertEqual(permissionsSchema["required"] as? [String], ["permissions"])
+        let permissionDefinitions = try XCTUnwrap(permissionsSchema["definitions"] as? [String: Any])
+        let permissionScope = try XCTUnwrap(permissionDefinitions["PermissionGrantScope"] as? [String: Any])
+        XCTAssertEqual(permissionScope["enum"] as? [String], ["turn", "session"],
+                       "dynamic permission approval must use the provider-native scope contract")
+
+        XCTAssertTrue(CodexForkProtocolSupport.inspect(schemaDirectory: output).isSupported,
+                      "the installed Codex release must prove thread/fork marker, list reconciliation, and delete compensation before fork is exposed")
+    }
+
+    func test_realCodexForkRetainsParentContextAndCleansProviderThreads() async throws {
+        guard ProcessInfo.processInfo.environment["RC_REAL_CODEX_FORK_GATE"] == "1" else {
+            throw XCTSkip("Set RC_REAL_CODEX_FORK_GATE=1 for the authenticated native-fork context gate.")
+        }
+        guard let codex = ProcessLocator.resolve("codex") else {
+            throw XCTSkip("codex binary is not available on PATH")
+        }
+        guard ProviderCLIProbe.authenticated(provider: .codex, binaryPath: codex) == true else {
+            throw XCTSkip("installed Codex is not authenticated")
+        }
+
+        let adapter = CodexAppServerAdapter(binaryNameOverride: codex)
+        let models = await adapter.listModels()
+        guard let model = models.first?.id else {
+            throw XCTSkip("installed Codex app-server returned no live model")
+        }
+        let phrase = "RCFORK\(UUID().uuidString.replacingOccurrences(of: "-", with: "").prefix(12))"
+        let marker = "remotecode-thread-fork:\(UUID().uuidString.lowercased())"
+        let parentLocalId = AgentThreadID()
+        let childLocalId = AgentThreadID()
+        var providerThreadIds: [String] = []
+
+        do {
+            let parentSink = EventSink()
+            _ = try await adapter.sendTurn(AgentRunRequest(
+                threadId: parentLocalId,
+                provider: .codex,
+                model: model,
+                cwd: FileManager.default.temporaryDirectory.path,
+                prompt: "Remember this exact phrase for the next turn: \(phrase). Reply only READY.",
+                permissionMode: .supervised
+            )) { event in Task { await parentSink.record(event) } }
+            let parentFinish = try await waitForFinish(in: parentSink, timeout: 120)
+            XCTAssertEqual(parentFinish.0, .completed)
+            let parentProviderId = try XCTUnwrap(parentFinish.2)
+            providerThreadIds.append(parentProviderId)
+
+            let request = AgentProviderForkRequest(
+                sourceThreadId: parentLocalId,
+                childThreadId: childLocalId,
+                idempotencyKey: marker,
+                workingDirectory: FileManager.default.temporaryDirectory.path
+            )
+            let childProviderId = try await adapter.forkThread(request)
+            providerThreadIds.append(childProviderId)
+
+            let childSink = EventSink()
+            _ = try await adapter.sendTurn(AgentRunRequest(
+                threadId: childLocalId,
+                provider: .codex,
+                model: model,
+                cwd: FileManager.default.temporaryDirectory.path,
+                prompt: "What exact phrase did I ask you to remember? Reply only with that phrase.",
+                providerThreadId: childProviderId,
+                permissionMode: .supervised
+            )) { event in Task { await childSink.record(event) } }
+            let childFinish = try await waitForFinish(in: childSink, timeout: 120)
+            XCTAssertEqual(childFinish.0, .completed)
+            XCTAssertEqual(childFinish.1?.trimmingCharacters(in: .whitespacesAndNewlines), phrase,
+                           "the provider-native child must answer from the parent's forked context, not a copied/local-only transcript")
+        } catch {
+            adapter.stopAll()
+            _ = await deleteRealCodexThreads(providerThreadIds, binary: codex)
+            throw error
+        }
+
+        adapter.stopAll()
+        let cleanupFailures = await deleteRealCodexThreads(providerThreadIds, binary: codex)
+        XCTAssertTrue(cleanupFailures.isEmpty,
+                      "real fork proof must delete every provider thread it created: \(cleanupFailures)")
+    }
+
+    private func runCodex(_ executable: String, arguments: [String]) throws -> String {
+        let process = Process()
+        let stdout = Pipe()
+        let stderr = Pipe()
+        process.executableURL = URL(fileURLWithPath: executable)
+        process.arguments = arguments
+        process.standardOutput = stdout
+        process.standardError = stderr
+        try process.run()
+        process.waitUntilExit()
+        let output = String(decoding: stdout.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+        let errors = String(decoding: stderr.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+        XCTAssertEqual(process.terminationStatus, 0, "codex \(arguments.joined(separator: " ")) failed: \(errors)")
+        return output
+    }
+
     func test_adapterRunsCodexTurnThroughAppServerSessionAndFinishesFromNotifications() async throws {
         let client = MockCodexAppServerClient()
         let adapter = CodexAppServerAdapter { _, notificationHandler, _ in
@@ -57,6 +248,51 @@ final class CodexAppServerAdapterTests: XCTestCase {
         XCTAssertTrue(events.contains { if case .threadStarted(_, let providerThreadId) = $0 { return providerThreadId == "codex-thread-1" } else { return false } })
         XCTAssertTrue(events.contains { if case .itemDelta(_, let body, _, _) = $0 { return body == "hello from app-server" } else { return false } })
         XCTAssertTrue(events.contains { if case .providerRuntime(let event) = $0 { return event.source == "codex.app-server" && event.method == "turn/completed" } else { return false } })
+    }
+
+    func test_followUpTurnReusesLiveAppServerClientInsteadOfResumingInSecondProcess() async throws {
+        let client = MockCodexAppServerClient(autoComplete: false)
+        let factoryCallCount = LockedCounter()
+        let adapter = CodexAppServerAdapter { _, notificationHandler, _ in
+            factoryCallCount.increment()
+            client.notificationHandler = notificationHandler
+            return client
+        }
+        let threadId = AgentThreadID()
+        let sink = EventSink()
+
+        _ = try await adapter.sendTurn(AgentRunRequest(
+            threadId: threadId,
+            provider: .codex,
+            model: "gpt-5.5",
+            cwd: "/tmp/remotecode-app-server-adapter",
+            prompt: "first"
+        )) { event in
+            Task { await sink.record(event) }
+        }
+        client.notificationHandler?("turn/completed", [
+            "threadId": "codex-thread-1",
+            "turnId": "turn-1",
+            "finalMessage": "first done"
+        ])
+
+        _ = try await adapter.sendTurn(AgentRunRequest(
+            threadId: threadId,
+            provider: .codex,
+            model: "gpt-5.5",
+            cwd: "/tmp/remotecode-app-server-adapter",
+            prompt: "second",
+            providerThreadId: "codex-thread-1"
+        )) { event in
+            Task { await sink.record(event) }
+        }
+
+        XCTAssertEqual(factoryCallCount.value, 1,
+                       "a follow-up turn must remain on the live app-server process so its notifications stay attached to the Agent App")
+        XCTAssertEqual(client.openedRequests.count, 1,
+                       "thread/resume is restart recovery, not the normal same-process follow-up path")
+        XCTAssertEqual(client.startedTurns.map(\.request.prompt), ["first", "second"])
+        XCTAssertFalse(client.didStop)
     }
 
     func test_activeThreadStatusDefersFinishAfterTurnCompletedUntilIdle() async throws {
@@ -137,7 +373,7 @@ final class CodexAppServerAdapterTests: XCTestCase {
     }
 
     func test_adapterInterruptUsesActiveAppServerTurn() async throws {
-        let client = MockCodexAppServerClient(autoComplete: false)
+        let client = MockCodexAppServerClient(autoComplete: false, interruptDelayNanoseconds: 200_000_000)
         let adapter = CodexAppServerAdapter { _, notificationHandler, _ in
             client.notificationHandler = notificationHandler
             return client
@@ -165,6 +401,11 @@ final class CodexAppServerAdapterTests: XCTestCase {
 
         handle.cancel()
 
+        try await Task.sleep(nanoseconds: 50_000_000)
+        let prematureStatus = await sink.status()
+        XCTAssertNil(prematureStatus,
+                     "Stop must not publish a terminal cancelled state before the native turn/interrupt RPC settles")
+
         let deadline = Date().addingTimeInterval(3)
         while Date() < deadline {
             if !client.interruptedTurns.isEmpty, await sink.status() == .cancelled { break }
@@ -177,6 +418,34 @@ final class CodexAppServerAdapterTests: XCTestCase {
                        "Codex app-server cancellation must finish the local run so macOS and iOS do not stay running forever")
         XCTAssertTrue(client.didStop,
                       "Codex app-server cancellation must stop the provider process tree after interrupting the active turn")
+    }
+
+    func test_startTurnFailureStopsAndRemovesRecordedSession() async throws {
+        let client = MockCodexAppServerClient(
+            autoComplete: false,
+            startTurnError: NSError(domain: "CodexStart", code: 1)
+        )
+        let adapter = CodexAppServerAdapter { _, notificationHandler, _ in
+            client.notificationHandler = notificationHandler
+            return client
+        }
+        let threadId = AgentThreadID()
+
+        do {
+            _ = try await adapter.sendTurn(AgentRunRequest(
+                threadId: threadId,
+                provider: .codex,
+                model: "gpt-5.5",
+                cwd: "/tmp/remotecode-app-server-adapter",
+                prompt: "fail start"
+            )) { _ in }
+            XCTFail("startTurn failure must propagate")
+        } catch {
+            XCTAssertFalse(adapter.hasSession(threadId: threadId),
+                           "a session recorded before startTurn must be removed when startTurn fails")
+            XCTAssertTrue(client.didStop,
+                          "a failed startTurn must stop the app-server process instead of leaking it")
+        }
     }
 
     func test_sendTurn_rejectsConcurrentInFlightTurn() async throws {
@@ -238,6 +507,197 @@ final class CodexAppServerAdapterTests: XCTestCase {
             try await Task.sleep(nanoseconds: 20_000_000)
         }
         XCTFail("Codex app-server process exit must finish the local run instead of leaving Agent App running forever")
+    }
+
+    func test_adapterForksNativeProviderSessionWithoutReusingParentIdentity() async throws {
+        let client = MockCodexAppServerClient(supportsForkReconciliation: true)
+        let adapter = CodexAppServerAdapter(
+            clientFactory: { _, notificationHandler, _ in
+                client.notificationHandler = notificationHandler
+                return client
+            },
+            forkProtocolSupportOverride: client.forkProtocolSupport
+        )
+        let parentThreadId = AgentThreadID()
+        let sink = EventSink()
+        _ = try await adapter.sendTurn(AgentRunRequest(
+            threadId: parentThreadId,
+            provider: .codex,
+            model: "gpt-5.5",
+            cwd: "/tmp/remotecode-app-server-adapter",
+            prompt: "establish parent context",
+            providerThreadId: "codex-parent"
+        )) { event in
+            Task { await sink.record(event) }
+        }
+        let finishDeadline = Date().addingTimeInterval(3)
+        while await sink.finish == nil, Date() < finishDeadline {
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        let parentFinish = await sink.finish
+        XCTAssertEqual(parentFinish?.0, .completed)
+
+        let childProviderThreadId = try await adapter.forkThread(AgentProviderForkRequest(
+            sourceThreadId: parentThreadId,
+            childThreadId: AgentThreadID(),
+            idempotencyKey: "remotecode-thread-fork:adapter-native-child",
+            workingDirectory: "/tmp/remotecode-app-server-adapter"
+        ))
+        client.notificationHandler?("thread/started", ["thread": ["id": childProviderThreadId]])
+        client.notificationHandler?("thread/status/changed", [
+            "threadId": childProviderThreadId,
+            "status": ["type": "active"]
+        ])
+        try await Task.sleep(nanoseconds: 20_000_000)
+
+        XCTAssertEqual(childProviderThreadId, "codex-child")
+        XCTAssertEqual(client.forkedThreadIds, ["codex-parent"],
+                       "native fork must branch from the provider parent instead of copying only local transcript rows")
+        XCTAssertNotEqual(childProviderThreadId, client.forkedThreadIds.first,
+                          "the child must receive a distinct provider identity so later parent and child turns remain isolated")
+        let events = await sink.snapshot()
+        XCTAssertFalse(events.contains {
+            if case .threadStarted(_, let providerThreadId) = $0 {
+                return providerThreadId == childProviderThreadId
+            }
+            return false
+        }, "a fork-created child notification on the parent client must not overwrite the parent's persisted identity")
+        _ = try await adapter.sendTurn(AgentRunRequest(
+            threadId: parentThreadId,
+            provider: .codex,
+            model: "gpt-5.5",
+            cwd: "/tmp/remotecode-app-server-adapter",
+            prompt: "parent follow-up",
+            providerThreadId: "codex-parent"
+        )) { _ in }
+    }
+
+    func test_keyedForkRetryReusesMarkerAndNeverCreatesSecondProviderChild() async throws {
+        let client = MockCodexAppServerClient(supportsForkReconciliation: true)
+        let adapter = CodexAppServerAdapter(
+            clientFactory: { _, notificationHandler, _ in
+                client.notificationHandler = notificationHandler
+                return client
+            },
+            forkProtocolSupportOverride: client.forkProtocolSupport
+        )
+        let parentThreadId = AgentThreadID()
+        let sink = EventSink()
+        _ = try await adapter.sendTurn(AgentRunRequest(
+            threadId: parentThreadId,
+            provider: .codex,
+            model: "gpt-test",
+            cwd: "/tmp/remotecode-app-server-adapter",
+            prompt: "establish parent",
+            providerThreadId: "codex-parent"
+        )) { event in Task { await sink.record(event) } }
+        let finishDeadline = Date().addingTimeInterval(3)
+        while await sink.finish == nil, Date() < finishDeadline {
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        let parentFinish = await sink.finish
+        XCTAssertEqual(parentFinish?.0, .completed)
+        let request = AgentProviderForkRequest(
+            sourceThreadId: parentThreadId,
+            childThreadId: AgentThreadID(),
+            idempotencyKey: "remotecode-thread-fork:stable-child",
+            workingDirectory: "/tmp/remotecode-app-server-adapter"
+        )
+
+        let first = try await adapter.forkThread(request)
+        let retried = try await adapter.forkThread(request)
+
+        XCTAssertEqual(retried, first)
+        XCTAssertEqual(client.typedForkMarkers, [request.idempotencyKey],
+                       "a lost local response must be reconciled by threadSource before another thread/fork is sent")
+        XCTAssertEqual(client.providerChildren.count, 1)
+        XCTAssertEqual(adapter.forkSafety(threadId: parentThreadId),
+                       .keyedIdempotent(compensationSupported: true))
+    }
+
+    func test_duplicateForkMarkerIsDeletedAndFailsLoudBeforeLocalCommit() async throws {
+        let client = MockCodexAppServerClient(supportsForkReconciliation: true)
+        let marker = "remotecode-thread-fork:duplicate-child"
+        client.seedProviderChild(id: "duplicate-a", parentId: "codex-parent", marker: marker, createdAt: 1)
+        client.seedProviderChild(id: "duplicate-b", parentId: "codex-parent", marker: marker, createdAt: 2)
+        let adapter = CodexAppServerAdapter(
+            clientFactory: { _, notificationHandler, _ in
+                client.notificationHandler = notificationHandler
+                return client
+            },
+            forkProtocolSupportOverride: client.forkProtocolSupport
+        )
+        let parentThreadId = AgentThreadID()
+        let sink = EventSink()
+        _ = try await adapter.sendTurn(AgentRunRequest(
+            threadId: parentThreadId,
+            provider: .codex,
+            model: "gpt-test",
+            cwd: "/tmp/remotecode-app-server-adapter",
+            prompt: "establish parent",
+            providerThreadId: "codex-parent"
+        )) { event in Task { await sink.record(event) } }
+        let finishDeadline = Date().addingTimeInterval(3)
+        while await sink.finish == nil, Date() < finishDeadline {
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        let parentFinish = await sink.finish
+        XCTAssertEqual(parentFinish?.0, .completed)
+
+        do {
+            _ = try await adapter.forkThread(AgentProviderForkRequest(
+                sourceThreadId: parentThreadId,
+                childThreadId: AgentThreadID(),
+                idempotencyKey: marker
+            ))
+            XCTFail("duplicate provider children must not be collapsed silently")
+        } catch let error as CodexForkReconciliationError {
+            XCTAssertTrue(error.description.contains("marker conflict was cleaned"))
+        }
+        XCTAssertEqual(Set(client.deletedThreadIds), Set(["duplicate-a", "duplicate-b"]))
+        XCTAssertTrue(client.providerChildren.isEmpty)
+        XCTAssertTrue(client.typedForkMarkers.isEmpty,
+                      "cleanup must finish before any replacement fork can be attempted")
+    }
+
+    func test_forkCompensationIsIdempotentAcrossLostDeleteResponseRetry() async throws {
+        let client = MockCodexAppServerClient(supportsForkReconciliation: true)
+        let adapter = CodexAppServerAdapter(
+            clientFactory: { _, notificationHandler, _ in
+                client.notificationHandler = notificationHandler
+                return client
+            },
+            forkProtocolSupportOverride: client.forkProtocolSupport
+        )
+        let parentThreadId = AgentThreadID()
+        let sink = EventSink()
+        _ = try await adapter.sendTurn(AgentRunRequest(
+            threadId: parentThreadId,
+            provider: .codex,
+            model: "gpt-test",
+            cwd: "/tmp/remotecode-app-server-adapter",
+            prompt: "establish parent",
+            providerThreadId: "codex-parent"
+        )) { event in Task { await sink.record(event) } }
+        let finishDeadline = Date().addingTimeInterval(3)
+        while await sink.finish == nil, Date() < finishDeadline {
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        let parentFinish = await sink.finish
+        XCTAssertEqual(parentFinish?.0, .completed)
+        let request = AgentProviderForkRequest(
+            sourceThreadId: parentThreadId,
+            childThreadId: AgentThreadID(),
+            idempotencyKey: "remotecode-thread-fork:compensated-child"
+        )
+        let child = try await adapter.forkThread(request)
+
+        try await adapter.compensateFork(request, providerChildThreadId: child)
+        try await adapter.compensateFork(request, providerChildThreadId: child)
+
+        XCTAssertEqual(client.deletedThreadIds, [child],
+                       "retry after successful delete must resolve from absence without sending a second mutation")
+        XCTAssertTrue(client.providerChildren.isEmpty)
     }
 
     func test_adapterRollbackUsesCompletedTurnHistoryInsteadOfParsingTurnIdDigits() async throws {
@@ -320,6 +780,17 @@ final class CodexAppServerAdapterTests: XCTestCase {
         }
         XCTAssertEqual(client.rolledBackTurns.first?.providerThreadId, "codex-thread-recovered")
         XCTAssertEqual(client.rolledBackTurns.first?.numTurns, 1)
+
+        _ = try await adapter.sendTurn(AgentRunRequest(
+            threadId: threadId,
+            provider: .codex,
+            model: "gpt-5.5",
+            cwd: "/tmp/remotecode-app-server-adapter",
+            prompt: "continue recovered context",
+            providerThreadId: "codex-thread-recovered"
+        )) { _ in }
+        XCTAssertEqual(client.startedTurns.last?.providerThreadId, "codex-thread-recovered",
+                       "a passive relaunch recovery must allow Continue on the same provider context")
     }
 
     func test_adapterRecoveryRestoresActiveTurnForInterrupt() async throws {
@@ -410,6 +881,199 @@ final class CodexAppServerAdapterTests: XCTestCase {
         XCTAssertEqual(openedRequests.map(\.id), [request.id])
     }
 
+    func test_approveForSessionSettingsFailureSettlesProviderContinuation() async throws {
+        let client = MockCodexAppServerClient(
+            autoComplete: false,
+            updateSettingsError: NSError(domain: "CodexSettings", code: 1)
+        )
+        let adapter = CodexAppServerAdapter { _, notificationHandler, serverRequestHandler in
+            client.notificationHandler = notificationHandler
+            client.serverRequestHandler = serverRequestHandler
+            return client
+        }
+        let threadId = AgentThreadID()
+        let sink = EventSink()
+        _ = try await adapter.sendTurn(AgentRunRequest(
+            threadId: threadId, provider: .codex, model: "gpt-5.5",
+            cwd: "/tmp/remotecode-app-server-adapter", prompt: "needs approval"
+        )) { event in Task { await sink.record(event) } }
+
+        let responseTask = Task {
+            try await client.serverRequestHandler?("item/commandExecution/requestApproval", [
+                "turnId": "turn-app-server-1", "itemId": "cmd-settings", "command": "swift test"
+            ])
+        }
+        let request = try await waitForApproval(in: sink)
+
+        do {
+            try await adapter.respondToRequest(threadId: threadId, requestId: request.id, response: .approveForSession)
+            XCTFail("settings promotion failure must be surfaced")
+        } catch { }
+        do {
+            _ = try await responseTask.value
+            XCTFail("the provider continuation must settle with an error when session settings promotion fails")
+        } catch { }
+    }
+
+    func test_currentPermissionsRequestIsExplicitlyBridged() async throws {
+        let client = MockCodexAppServerClient(autoComplete: false)
+        let adapter = CodexAppServerAdapter { _, notificationHandler, serverRequestHandler in
+            client.notificationHandler = notificationHandler
+            client.serverRequestHandler = serverRequestHandler
+            return client
+        }
+        let threadId = AgentThreadID()
+        let sink = EventSink()
+        _ = try await adapter.sendTurn(AgentRunRequest(
+            threadId: threadId, provider: .codex, model: "gpt-5.5",
+            cwd: "/tmp/remotecode-app-server-adapter", prompt: "permission"
+        )) { event in Task { await sink.record(event) } }
+
+        let responseTask = Task {
+            try await client.serverRequestHandler?("item/permissions/requestApproval", [
+                "turnId": "turn-app-server-1",
+                "itemId": "permission-1",
+                "reason": "Use network",
+                "permissions": ["network": ["enabled": true]]
+            ])
+        }
+        let request = try await waitForApproval(in: sink)
+        XCTAssertEqual(request.kind, .dynamic)
+        try await adapter.respondToRequest(threadId: threadId, requestId: request.id, response: .decline(nil))
+        let rawResponse = try await responseTask.value
+        let response = try XCTUnwrap(rawResponse as? [String: Any])
+        XCTAssertNil(response["decision"], "Codex 0.144.4 rejects the legacy decision shape")
+        XCTAssertEqual(response["scope"] as? String, "turn")
+        XCTAssertEqual((response["permissions"] as? [String: Any])?.count, 0,
+                       "decline grants an empty permission profile")
+    }
+
+    func test_currentPermissionsApprovalGrantsExactlyRequestedProfileAndNativeSessionScope() async throws {
+        let client = MockCodexAppServerClient(autoComplete: false)
+        let adapter = CodexAppServerAdapter { _, notificationHandler, serverRequestHandler in
+            client.notificationHandler = notificationHandler
+            client.serverRequestHandler = serverRequestHandler
+            return client
+        }
+        let threadId = AgentThreadID()
+        let sink = EventSink()
+        _ = try await adapter.sendTurn(AgentRunRequest(
+            threadId: threadId, provider: .codex, model: "gpt-5.5",
+            cwd: "/tmp/remotecode-app-server-adapter", prompt: "permission"
+        )) { event in Task { await sink.record(event) } }
+
+        let requested: [String: Any] = [
+            "network": ["enabled": true],
+            "fileSystem": ["write": ["/tmp/fixture"]]
+        ]
+        let responseTask = Task {
+            try await client.serverRequestHandler?("item/permissions/requestApproval", [
+                "threadId": "codex-thread-1",
+                "turnId": "turn-app-server-1",
+                "itemId": "permission-session",
+                "startedAtMs": 1,
+                "cwd": "/tmp/remotecode-app-server-adapter",
+                "permissions": requested
+            ])
+        }
+        let request = try await waitForApproval(in: sink)
+        try await adapter.respondToRequest(
+            threadId: threadId,
+            requestId: request.id,
+            response: .approveForSession
+        )
+
+        let rawResponse = try await responseTask.value
+        let response = try XCTUnwrap(rawResponse as? [String: Any])
+        XCTAssertEqual(response["scope"] as? String, "session")
+        let granted = try XCTUnwrap(response["permissions"] as? [String: Any])
+        XCTAssertEqual(Set(granted.keys), Set(requested.keys))
+        XCTAssertEqual((granted["network"] as? [String: Any])?["enabled"] as? Bool, true)
+        XCTAssertEqual((granted["fileSystem"] as? [String: Any])?["write"] as? [String], ["/tmp/fixture"],
+                       "approval must grant exactly the requested profile")
+        XCTAssertTrue(client.updatedThreadSettings.isEmpty,
+                      "dynamic permission scope must not silently promote the whole thread to full access")
+    }
+
+    func test_mcpFormElicitationReturnsSchemaTypedActionAndContent() async throws {
+        let client = MockCodexAppServerClient(autoComplete: false)
+        let adapter = CodexAppServerAdapter { _, notificationHandler, serverRequestHandler in
+            client.notificationHandler = notificationHandler
+            client.serverRequestHandler = serverRequestHandler
+            return client
+        }
+        let threadId = AgentThreadID()
+        let sink = EventSink()
+        _ = try await adapter.sendTurn(AgentRunRequest(
+            threadId: threadId, provider: .codex, model: "gpt-5.5",
+            cwd: "/tmp/remotecode-app-server-adapter", prompt: "typed elicitation"
+        )) { event in Task { await sink.record(event) } }
+
+        let responseTask = Task {
+            try await client.serverRequestHandler?("mcpServer/elicitation/request", [
+                "message": "Configure deployment",
+                "mode": "form",
+                "requestedSchema": [
+                    "type": "object",
+                    "required": ["environment", "replicas", "dryRun"],
+                    "properties": [
+                        "environment": ["type": "string", "title": "Environment", "enum": ["staging", "production"]],
+                        "replicas": ["type": "integer", "title": "Replicas"],
+                        "dryRun": ["type": "boolean", "title": "Dry run"]
+                    ]
+                ]
+            ])
+        }
+        let request = try await waitForUserInput(in: sink)
+        XCTAssertEqual(request.prompt, "Configure deployment")
+        XCTAssertEqual(Set(request.questions.map(\.id)), Set(["environment", "replicas", "dryRun"]))
+
+        try adapter.respondToUserInput(
+            threadId: threadId,
+            requestId: request.id,
+            text: #"{"environment":"staging","replicas":3,"dryRun":true}"#
+        )
+        let rawResponse = try await responseTask.value
+        let response = try XCTUnwrap(rawResponse as? [String: Any])
+        XCTAssertEqual(response["action"] as? String, "accept")
+        XCTAssertNil(response["answers"], "MCP elicitation does not accept request_user_input answers")
+        let content = try XCTUnwrap(response["content"] as? [String: Any])
+        XCTAssertEqual(content["environment"] as? String, "staging")
+        XCTAssertEqual(content["replicas"] as? Int, 3)
+        XCTAssertEqual(content["dryRun"] as? Bool, true)
+    }
+
+    func test_mcpFormElicitationCancelReturnsActionWithoutContent() async throws {
+        let client = MockCodexAppServerClient(autoComplete: false)
+        let adapter = CodexAppServerAdapter { _, notificationHandler, serverRequestHandler in
+            client.notificationHandler = notificationHandler
+            client.serverRequestHandler = serverRequestHandler
+            return client
+        }
+        let threadId = AgentThreadID()
+        let sink = EventSink()
+        _ = try await adapter.sendTurn(AgentRunRequest(
+            threadId: threadId, provider: .codex, model: "gpt-5.5",
+            cwd: "/tmp/remotecode-app-server-adapter", prompt: "cancel elicitation"
+        )) { event in Task { await sink.record(event) } }
+        let responseTask = Task {
+            try await client.serverRequestHandler?("mcpServer/elicitation/request", [
+                "message": "Enter value",
+                "mode": "form",
+                "requestedSchema": [
+                    "type": "object",
+                    "properties": ["value": ["type": "string"]]
+                ]
+            ])
+        }
+        let request = try await waitForUserInput(in: sink)
+        try adapter.cancelUserInput(threadId: threadId, requestId: request.id)
+        let rawResponse = try await responseTask.value
+        let response = try XCTUnwrap(rawResponse as? [String: Any])
+        XCTAssertEqual(response["action"] as? String, "cancel")
+        XCTAssertNil(response["content"])
+    }
+
     func test_adapterHandlesDottedAppServerRequestAliases() async throws {
         let client = MockCodexAppServerClient(autoComplete: false)
         let adapter = CodexAppServerAdapter { _, notificationHandler, serverRequestHandler in
@@ -449,6 +1113,52 @@ final class CodexAppServerAdapterTests: XCTestCase {
         let response = try XCTUnwrap(rawResponse as? [String: Any])
         XCTAssertNotNil(response["answers"],
                         "dotted app-server request aliases must still route through pending UI callbacks; otherwise the provider turn can freeze waiting for input")
+    }
+
+    func test_cancelUserInputResolvesOnlyCallbackAndKeepsCodexSession() async throws {
+        let client = MockCodexAppServerClient(autoComplete: false)
+        let adapter = CodexAppServerAdapter { _, notificationHandler, serverRequestHandler in
+            client.notificationHandler = notificationHandler
+            client.serverRequestHandler = serverRequestHandler
+            return client
+        }
+        let threadId = AgentThreadID()
+        let sink = EventSink()
+        _ = try await adapter.sendTurn(AgentRunRequest(
+            threadId: threadId,
+            provider: .codex,
+            model: "gpt-5.5",
+            cwd: "/tmp/remotecode-app-server-adapter",
+            prompt: "ask then continue"
+        )) { event in Task { await sink.record(event) } }
+
+        let responseTask = Task {
+            try await client.serverRequestHandler?("item/tool/requestUserInput", [
+                "threadId": "codex-thread-1",
+                "turnId": "turn-app-server-1",
+                "itemId": "question-cancel",
+                "questions": [["id": "choice", "question": "Choose?"]]
+            ])
+        }
+        let request = try await waitForUserInput(in: sink)
+
+        try adapter.cancelUserInput(threadId: threadId, requestId: request.id)
+        let rawResponse = try await responseTask.value
+        let response = try XCTUnwrap(rawResponse as? [String: Any])
+        XCTAssertEqual((response["answers"] as? [String: Any])?.count, 0,
+                       "Codex cancellation must resolve this callback with no fabricated answer")
+        XCTAssertTrue(adapter.hasSession(threadId: threadId),
+                      "cancelling a question must preserve the provider session and context")
+        XCTAssertFalse(client.didStop,
+                       "question cancellation must not stop the Codex app-server process")
+        let events = await sink.snapshot()
+        XCTAssertTrue(events.contains {
+            if case .userInputResolved(let id, let answer) = $0 {
+                return id == request.id && answer == nil
+            }
+            return false
+        })
+        try adapter.stopSession(threadId: threadId)
     }
 
     func test_adapterMapsNestedApprovalPayloadIntoReadableRequestDetail() async throws {
@@ -625,6 +1335,7 @@ final class CodexAppServerAdapterTests: XCTestCase {
                         "id": "confirm",
                         "header": "Confirm",
                         "question": "Proceed?",
+                        "allowsMultipleSelection": true,
                         "options": [
                             ["label": "yes", "description": "Proceed"],
                             ["label": "no", "description": "Stop"]
@@ -636,16 +1347,21 @@ final class CodexAppServerAdapterTests: XCTestCase {
         let request = try await waitForUserInput(in: sink)
         XCTAssertEqual(request.prompt, "Branch: Which branch?\nConfirm: Proceed?")
         XCTAssertEqual(request.options, ["yes", "no"])
+        XCTAssertEqual(request.questions.map(\.id), ["branch", "confirm"])
+        XCTAssertEqual(request.questions.map(\.prompt), ["Which branch?", "Proceed?"])
+        XCTAssertEqual(request.questions[1].options.map(\.label), ["yes", "no"])
+        XCTAssertEqual(request.questions.map(\.allowsMultipleSelection), [false, true])
 
-        try adapter.respondToUserInput(threadId: threadId, requestId: request.id, text: """
-        branch: release/next
-        confirm: yes
-        """)
+        try adapter.respondToUserInput(
+            threadId: threadId,
+            requestId: request.id,
+            text: #"{"Which branch?":"release/next","Proceed?":["yes","no"]}"#
+        )
         let rawResponse = try await responseTask.value
         let response = try XCTUnwrap(rawResponse as? [String: Any])
         let answers = try XCTUnwrap(response["answers"] as? [String: [String: [String]]])
         XCTAssertEqual(answers["branch"]?["answers"], ["release/next"])
-        XCTAssertEqual(answers["confirm"]?["answers"], ["yes"])
+        XCTAssertEqual(answers["confirm"]?["answers"], ["yes", "no"])
     }
 
     func test_adapterMapsNestedMultiSelectUserInputPayloadToCodexAnswers() async throws {
@@ -839,6 +1555,59 @@ final class CodexAppServerAdapterTests: XCTestCase {
             XCTAssertTrue(runtime.payloadJSON.contains("\"future\""),
                           "unsupported app-server server requests must preserve their raw payload instead of disappearing before failure")
         }
+    }
+
+    func test_authFailurePublishesSignInActionMetadata() async throws {
+        let client = MockCodexAppServerClient(autoComplete: false)
+        let adapter = CodexAppServerAdapter { _, notificationHandler, _ in
+            client.notificationHandler = notificationHandler
+            return client
+        }
+        let threadId = AgentThreadID()
+        let sink = EventSink()
+        _ = try await adapter.sendTurn(AgentRunRequest(
+            threadId: threadId, provider: .codex, model: "gpt-5.5",
+            cwd: "/tmp/remotecode-app-server-adapter", prompt: "auth"
+        )) { event in Task { await sink.record(event) } }
+
+        client.notificationHandler?("turn/failed", [
+            "turnId": "turn-app-server-1",
+            "error": ["code": "token_expired", "message": "Login required"]
+        ])
+
+        let runtime = try await waitForRuntimeEvent(in: sink, method: "remotecode/authRequired")
+        XCTAssertTrue(runtime.payloadJSON.contains("Sign in"))
+        XCTAssertTrue(runtime.payloadJSON.contains("codex login"))
+    }
+
+    func test_imageViewSnapshotUsesBasenameAndNeverExposesAbsolutePath() async throws {
+        let client = MockCodexAppServerClient(autoComplete: false)
+        client.readResponse = ["thread": ["id": "codex-thread-image", "turns": [[
+            "id": "turn-image", "status": "completed", "items": [[
+                "id": "image-1", "type": "imageView", "path": "/Users/private/work/generated.png"
+            ]]
+        ]]]]
+        let adapter = CodexAppServerAdapter { _, notificationHandler, serverRequestHandler in
+            client.notificationHandler = notificationHandler
+            client.serverRequestHandler = serverRequestHandler
+            return client
+        }
+        let threadId = AgentThreadID()
+        _ = try await adapter.sendTurn(AgentRunRequest(
+            threadId: threadId, provider: .codex, model: "gpt-5.5",
+            cwd: "/tmp/remotecode-app-server-adapter", prompt: "read image"
+        )) { _ in }
+
+        let events = try await adapter.readThread(threadId: threadId)
+        let item = try XCTUnwrap(events.compactMap { event -> AssistantItem? in
+            if case .itemStarted(let item) = event, item.id == "image-1" { return item }
+            return nil
+        }.first)
+        XCTAssertEqual(item.summary, "generated.png")
+        XCTAssertEqual(item.resourcePath, "/Users/private/work/generated.png",
+                       "the full path must remain private action metadata for Open/Reveal, not transcript text")
+        XCTAssertFalse(item.body.contains("/Users/private"))
+        XCTAssertFalse(item.output?.contains("/Users/private") == true)
     }
 
     func test_readThreadMapsAppServerSnapshotIntoAssistantEvents() async throws {
@@ -2042,6 +2811,21 @@ final class CodexAppServerAdapterTests: XCTestCase {
 // path is synchronous). The actor-based EventSink records through unordered
 // Tasks, which cannot back ordering-sensitive assertions such as
 // "the LAST goal update wins".
+private final class LockedCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage = 0
+
+    func increment() {
+        lock.lock(); defer { lock.unlock() }
+        storage += 1
+    }
+
+    var value: Int {
+        lock.lock(); defer { lock.unlock() }
+        return storage
+    }
+}
+
 private final class OrderedEventLog: @unchecked Sendable {
     private let lock = NSLock()
     private var events: [AssistantEvent] = []
@@ -2076,6 +2860,47 @@ private actor EventSink {
     }
 }
 
+private func waitForFinish(
+    in sink: EventSink,
+    timeout: TimeInterval
+) async throws -> (AgentRunStatus, String?, String?) {
+    let deadline = Date().addingTimeInterval(timeout)
+    while Date() < deadline {
+        if let finish = await sink.finish { return finish }
+        try await Task.sleep(nanoseconds: 20_000_000)
+    }
+    throw CodexAdapterTestWaitError.timedOut("provider finish")
+}
+
+private func deleteRealCodexThreads(_ threadIds: [String], binary: String) async -> [String] {
+    guard !threadIds.isEmpty else { return [] }
+    let client: CodexAppServerClient
+    do {
+        client = try CodexAppServerClient(
+            binary: binary,
+            arguments: ["app-server"],
+            cwd: FileManager.default.temporaryDirectory.path
+        )
+        _ = try await client.initialize()
+    } catch {
+        return ["maintenance client: \(error)"]
+    }
+    defer { client.stop() }
+    var failures: [String] = []
+    for threadId in threadIds.reversed() {
+        do {
+            try await client.deleteThread(providerThreadId: threadId)
+        } catch {
+            failures.append("\(threadId): \(error)")
+        }
+    }
+    return failures
+}
+
+private enum CodexAdapterTestWaitError: Error {
+    case timedOut(String)
+}
+
 private func waitForApproval(in sink: EventSink) async throws -> AssistantPendingRequest {
     let deadline = Date().addingTimeInterval(3)
     while Date() < deadline {
@@ -2088,7 +2913,7 @@ private func waitForApproval(in sink: EventSink) async throws -> AssistantPendin
         }
         try await Task.sleep(nanoseconds: 20_000_000)
     }
-    throw XCTSkip("Timed out waiting for approval request")
+    throw CodexAdapterTestWaitError.timedOut("approval request")
 }
 
 private func waitForUserInput(in sink: EventSink) async throws -> AssistantUserInputRequest {
@@ -2103,7 +2928,7 @@ private func waitForUserInput(in sink: EventSink) async throws -> AssistantUserI
         }
         try await Task.sleep(nanoseconds: 20_000_000)
     }
-    throw XCTSkip("Timed out waiting for user-input request")
+    throw CodexAdapterTestWaitError.timedOut("user-input request")
 }
 
 private func waitForProposedPlan(in sink: EventSink) async throws -> AssistantProposedPlan {
@@ -2118,7 +2943,7 @@ private func waitForProposedPlan(in sink: EventSink) async throws -> AssistantPr
         }
         try await Task.sleep(nanoseconds: 20_000_000)
     }
-    throw XCTSkip("Timed out waiting for proposed plan")
+    throw CodexAdapterTestWaitError.timedOut("proposed plan")
 }
 
 private func waitForActivePlan(in sink: EventSink) async throws -> AssistantActivePlan {
@@ -2133,7 +2958,7 @@ private func waitForActivePlan(in sink: EventSink) async throws -> AssistantActi
         }
         try await Task.sleep(nanoseconds: 20_000_000)
     }
-    throw XCTSkip("Timed out waiting for active plan")
+    throw CodexAdapterTestWaitError.timedOut("active plan")
 }
 
 private func waitForRuntimeEvent(in sink: EventSink, method: String) async throws -> ProviderRuntimeEvent {
@@ -2148,7 +2973,7 @@ private func waitForRuntimeEvent(in sink: EventSink, method: String) async throw
         }
         try await Task.sleep(nanoseconds: 20_000_000)
     }
-    throw XCTSkip("Timed out waiting for runtime event")
+    throw CodexAdapterTestWaitError.timedOut("runtime event \(method)")
 }
 
 private func waitForTokenUsage(in sink: EventSink) async throws -> AssistantTokenUsage {
@@ -2163,7 +2988,7 @@ private func waitForTokenUsage(in sink: EventSink) async throws -> AssistantToke
         }
         try await Task.sleep(nanoseconds: 20_000_000)
     }
-    throw XCTSkip("Timed out waiting for token usage")
+    throw CodexAdapterTestWaitError.timedOut("token usage")
 }
 
 private func waitForContextCompaction(in sink: EventSink) async throws -> String? {
@@ -2178,7 +3003,7 @@ private func waitForContextCompaction(in sink: EventSink) async throws -> String
         }
         try await Task.sleep(nanoseconds: 20_000_000)
     }
-    throw XCTSkip("Timed out waiting for context compaction")
+    throw CodexAdapterTestWaitError.timedOut("context compaction")
 }
 
 private func waitForEvents(in sink: EventSink, matching predicate: @escaping ([AssistantEvent]) -> Bool) async throws -> [AssistantEvent] {
@@ -2190,7 +3015,7 @@ private func waitForEvents(in sink: EventSink, matching predicate: @escaping ([A
         }
         try await Task.sleep(nanoseconds: 20_000_000)
     }
-    throw XCTSkip("Timed out waiting for expected events")
+    throw CodexAdapterTestWaitError.timedOut("expected events")
 }
 
 private func waitForItemCompleted(in sink: EventSink, itemId: String) async throws -> AssistantItemState {
@@ -2205,7 +3030,7 @@ private func waitForItemCompleted(in sink: EventSink, itemId: String) async thro
         }
         try await Task.sleep(nanoseconds: 20_000_000)
     }
-    throw XCTSkip("Timed out waiting for item completion")
+    throw CodexAdapterTestWaitError.timedOut("item completion \(itemId)")
 }
 
 private final class MockCodexAppServerClient: CodexAppServerControlling, @unchecked Sendable {
@@ -2233,19 +3058,39 @@ private final class MockCodexAppServerClient: CodexAppServerControlling, @unchec
     var notificationHandler: CodexAppServerClient.NotificationHandler?
     var serverRequestHandler: CodexAppServerClient.ServerRequestHandler?
     var terminationHandler: (@Sendable (Error) -> Void)?
+    let forkProtocolSupport: CodexForkProtocolSupport
     var readResponse: CodexAppServerClient.JSONObject = ["thread": ["id": "codex-thread-1", "turns": []]]
     let autoComplete: Bool
+    let interruptDelayNanoseconds: UInt64
+    let startTurnError: Error?
+    let updateSettingsError: Error?
     private let lock = NSLock()
     private var _didStop = false
     private var _openedRequests: [AgentRunRequest] = []
     private var _startedTurns: [StartedTurn] = []
     private var _interruptedTurns: [InterruptedTurn] = []
+    private var _forkedThreadIds: [String] = []
+    private var _typedForkMarkers: [String] = []
+    private var _providerChildren: [CodexAppServerThreadSummary] = []
+    private var _deletedThreadIds: [String] = []
     private var _rolledBackTurns: [RolledBackTurn] = []
     private var _readCalls: [ReadCall] = []
     private var _updatedThreadSettings: [UpdatedThreadSettings] = []
 
-    init(autoComplete: Bool = true) {
+    init(
+        autoComplete: Bool = true,
+        interruptDelayNanoseconds: UInt64 = 0,
+        startTurnError: Error? = nil,
+        updateSettingsError: Error? = nil,
+        supportsForkReconciliation: Bool = false
+    ) {
         self.autoComplete = autoComplete
+        self.interruptDelayNanoseconds = interruptDelayNanoseconds
+        self.startTurnError = startTurnError
+        self.updateSettingsError = updateSettingsError
+        self.forkProtocolSupport = supportsForkReconciliation
+            ? CodexForkProtocolSupport(isSupported: true, reason: "test schema")
+            : .unsupported
     }
 
     var openedRequests: [AgentRunRequest] {
@@ -2266,6 +3111,36 @@ private final class MockCodexAppServerClient: CodexAppServerControlling, @unchec
     var rolledBackTurns: [RolledBackTurn] {
         lock.lock(); defer { lock.unlock() }
         return _rolledBackTurns
+    }
+
+    var forkedThreadIds: [String] {
+        lock.lock(); defer { lock.unlock() }
+        return _forkedThreadIds
+    }
+
+    var typedForkMarkers: [String] {
+        lock.lock(); defer { lock.unlock() }
+        return _typedForkMarkers
+    }
+
+    var providerChildren: [CodexAppServerThreadSummary] {
+        lock.lock(); defer { lock.unlock() }
+        return _providerChildren
+    }
+
+    var deletedThreadIds: [String] {
+        lock.lock(); defer { lock.unlock() }
+        return _deletedThreadIds
+    }
+
+    func seedProviderChild(id: String, parentId: String, marker: String, createdAt: Int64) {
+        lock.lock(); defer { lock.unlock() }
+        _providerChildren.append(CodexAppServerThreadSummary(
+            id: id,
+            forkedFromId: parentId,
+            threadSource: marker,
+            createdAt: createdAt
+        ))
     }
 
     var readCalls: [ReadCall] {
@@ -2299,6 +3174,7 @@ private final class MockCodexAppServerClient: CodexAppServerControlling, @unchec
 
     func startTurn(providerThreadId: String, for request: AgentRunRequest) async throws -> CodexAppServerClient.JSONObject {
         recordStarted(StartedTurn(providerThreadId: providerThreadId, request: request))
+        if let startTurnError { throw startTurnError }
         if autoComplete {
             Task {
                 notificationHandler?("item/agentMessage/delta", [
@@ -2317,6 +3193,9 @@ private final class MockCodexAppServerClient: CodexAppServerControlling, @unchec
     }
 
     func interruptTurn(providerThreadId: String, turnId: String) async throws {
+        if interruptDelayNanoseconds > 0 {
+            try await Task.sleep(nanoseconds: interruptDelayNanoseconds)
+        }
         recordInterrupted(InterruptedTurn(providerThreadId: providerThreadId, turnId: turnId))
     }
 
@@ -2325,12 +3204,60 @@ private final class MockCodexAppServerClient: CodexAppServerControlling, @unchec
         return readResponse
     }
 
+    func forkThread(providerThreadId: String, lastTurnId: String?) async throws -> String {
+        withLock {
+            _forkedThreadIds.append(providerThreadId)
+            return "codex-child"
+        }
+    }
+
+    func forkThread(
+        providerThreadId: String,
+        lastTurnId: String?,
+        threadSource: String
+    ) async throws -> CodexAppServerThreadSummary {
+        withLock {
+            _forkedThreadIds.append(providerThreadId)
+            _typedForkMarkers.append(threadSource)
+            let child = CodexAppServerThreadSummary(
+                id: _providerChildren.isEmpty ? "codex-child" : "codex-child-\(_providerChildren.count + 1)",
+                forkedFromId: providerThreadId,
+                threadSource: threadSource,
+                createdAt: Int64(_providerChildren.count + 1)
+            )
+            _providerChildren.append(child)
+            return child
+        }
+    }
+
+    func listThreads(cursor: String?, archived: Bool) async throws -> CodexAppServerThreadPage {
+        withLock {
+            guard !archived else {
+                return CodexAppServerThreadPage(threads: [], nextCursor: nil)
+            }
+            let offset = cursor.flatMap(Int.init) ?? 0
+            guard offset < _providerChildren.count else {
+                return CodexAppServerThreadPage(threads: [], nextCursor: nil)
+            }
+            let next = offset + 1 < _providerChildren.count ? String(offset + 1) : nil
+            return CodexAppServerThreadPage(threads: [_providerChildren[offset]], nextCursor: next)
+        }
+    }
+
+    func deleteThread(providerThreadId: String) async throws {
+        withLock {
+            _deletedThreadIds.append(providerThreadId)
+            _providerChildren.removeAll { $0.id == providerThreadId }
+        }
+    }
+
     func rollbackThread(providerThreadId: String, numTurns: Int) async throws -> CodexAppServerClient.JSONObject {
         recordRolledBack(RolledBackTurn(providerThreadId: providerThreadId, numTurns: numTurns))
         return ["thread": ["id": providerThreadId, "turns": []]]
     }
 
     func updateThreadSettings(providerThreadId: String, permissionMode: AgentPermissionMode) async throws {
+        if let updateSettingsError { throw updateSettingsError }
         recordUpdatedThreadSettings(UpdatedThreadSettings(providerThreadId: providerThreadId, permissionMode: permissionMode))
     }
 
@@ -2375,4 +3302,81 @@ private final class MockCodexAppServerClient: CodexAppServerControlling, @unchec
         _readCalls.append(call)
         lock.unlock()
     }
+
+    private func withLock<T>(_ body: () throws -> T) rethrows -> T {
+        lock.lock(); defer { lock.unlock() }
+        return try body()
+    }
+}
+
+private func makeCodexForkSchemaProjection() throws -> URL {
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("remotecode-codex-fork-schema-\(UUID().uuidString)", isDirectory: true)
+    let v2 = root.appendingPathComponent("v2", isDirectory: true)
+    try FileManager.default.createDirectory(at: v2, withIntermediateDirectories: true)
+
+    let clientRequest: [String: Any] = [
+        "oneOf": ["thread/fork", "thread/list", "thread/delete"].map { method in
+            ["properties": ["method": ["enum": [method]]]]
+        }
+    ]
+    let threadSource: [String: Any] = ["anyOf": [
+        ["$ref": "#/definitions/ThreadSource"],
+        ["type": "null"]
+    ]]
+    let threadProperties: [String: Any] = [
+        "id": ["type": "string"],
+        "forkedFromId": ["type": ["string", "null"]],
+        "threadSource": threadSource,
+        "createdAt": ["type": "integer"]
+    ]
+    let threadDefinitions: [String: Any] = [
+        "Thread": [
+            "required": ["id", "createdAt"],
+            "properties": threadProperties
+        ],
+        "ThreadSource": ["type": "string"]
+    ]
+    let documents: [(String, [String: Any])] = [
+        ("../ClientRequest.json", clientRequest),
+        ("ThreadForkParams.json", [
+            "required": ["threadId"],
+            "properties": [
+                "threadId": ["type": "string"],
+                "threadSource": threadSource
+            ],
+            "definitions": ["ThreadSource": ["type": "string"]]
+        ]),
+        ("ThreadForkResponse.json", [
+            "required": ["thread"],
+            "properties": ["thread": ["$ref": "#/definitions/Thread"]],
+            "definitions": threadDefinitions
+        ]),
+        ("ThreadListParams.json", [
+            "properties": [
+                "cursor": ["type": ["string", "null"]],
+                "archived": ["type": ["boolean", "null"]]
+            ]
+        ]),
+        ("ThreadListResponse.json", [
+            "required": ["data"],
+            "properties": [
+                "data": ["type": "array", "items": ["$ref": "#/definitions/Thread"]],
+                "nextCursor": ["type": ["string", "null"]]
+            ],
+            "definitions": threadDefinitions
+        ]),
+        ("ThreadDeleteParams.json", [
+            "required": ["threadId"],
+            "properties": ["threadId": ["type": "string"]]
+        ]),
+        ("ThreadDeleteResponse.json", ["type": "object"])
+    ]
+
+    for (relativePath, document) in documents {
+        let url = v2.appendingPathComponent(relativePath).standardizedFileURL
+        let data = try JSONSerialization.data(withJSONObject: document, options: [.sortedKeys])
+        try data.write(to: url)
+    }
+    return root
 }

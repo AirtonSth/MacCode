@@ -1,8 +1,93 @@
 import XCTest
 import CoreModel
+import Darwin
 @testable import AgentRuntime
 
-final class CodexAppServerClientTests: XCTestCase {
+final class CodexAppServerClientTests: ProviderProcessTestCase {
+    func test_rpcDeadlineFailsAndStopsSilentAppServer() async throws {
+        let script = try makeSilentAppServerPeer()
+        let client = try CodexAppServerClient(
+            binary: script,
+            arguments: [],
+            cwd: FileManager.default.temporaryDirectory.path,
+            requestTimeout: 0.05
+        )
+        defer { client.stop() }
+        let pid = try silentPeerPID(for: script)
+        let startedAt = Date()
+
+        do {
+            let _: [String: Any] = try await client.requestJSONObject(method: "test/neverRespond")
+            XCTFail("a silent app-server RPC must fail within its configured deadline")
+        } catch let error as CodexAppServerError {
+            guard case .requestTimedOut(let method, _) = error else {
+                return XCTFail("expected requestTimedOut, got \(error)")
+            }
+            XCTAssertEqual(method, "test/neverRespond")
+            XCTAssertLessThan(Date().timeIntervalSince(startedAt), 1,
+                              "all app-server RPCs must have a real bounded deadline")
+            XCTAssertTrue(waitForProcessDeath(pid),
+                          "a timed-out RPC must kill the desynchronized app-server peer")
+        }
+    }
+
+    func test_everyProductionRPCUsesTheDeadlineAndKillsItsSilentPeer() async throws {
+        let cwd = FileManager.default.temporaryDirectory.path
+        let startRequest = AgentRunRequest(
+            threadId: AgentThreadID(),
+            provider: .codex,
+            model: "test-model",
+            cwd: cwd,
+            prompt: "deadline"
+        )
+        let resumeRequest = AgentRunRequest(
+            threadId: AgentThreadID(),
+            provider: .codex,
+            model: "test-model",
+            cwd: cwd,
+            prompt: "deadline",
+            providerThreadId: "provider-thread"
+        )
+        let operations: [(method: String, invoke: (CodexAppServerClient) async throws -> Void)] = [
+            ("initialize", { _ = try await $0.initialize() }),
+            ("model/list", { _ = try await $0.listModels() }),
+            ("thread/start", { _ = try await $0.openThread(for: startRequest) }),
+            ("thread/resume", { _ = try await $0.openThread(for: resumeRequest) }),
+            ("turn/start", { _ = try await $0.startTurn(providerThreadId: "provider-thread", for: startRequest) }),
+            ("turn/interrupt", { try await $0.interruptTurn(providerThreadId: "provider-thread", turnId: "turn") }),
+            ("thread/read", { _ = try await $0.readThread(providerThreadId: "provider-thread") }),
+            ("thread/fork", { _ = try await $0.forkThread(providerThreadId: "provider-thread") }),
+            ("thread/rollback", { _ = try await $0.rollbackThread(providerThreadId: "provider-thread", numTurns: 1) }),
+            ("thread/settings/update", { try await $0.updateThreadSettings(providerThreadId: "provider-thread", permissionMode: .fullAccess) })
+        ]
+
+        for operation in operations {
+            let script = try makeSilentAppServerPeer()
+            let client = try CodexAppServerClient(
+                binary: script,
+                arguments: [],
+                cwd: cwd,
+                requestTimeout: 0.03
+            )
+            let pid = try silentPeerPID(for: script)
+            let startedAt = Date()
+            do {
+                try await operation.invoke(client)
+                XCTFail("\(operation.method) must not outlive its deadline")
+            } catch let error as CodexAppServerError {
+                guard case .requestTimedOut(let method, _) = error else {
+                    client.stop()
+                    return XCTFail("\(operation.method) expected requestTimedOut, got \(error)")
+                }
+                XCTAssertEqual(method, operation.method)
+                XCTAssertLessThan(Date().timeIntervalSince(startedAt), 1)
+                XCTAssertTrue(waitForProcessDeath(pid),
+                              "\(operation.method) timeout must kill its app-server peer")
+            }
+            client.stop()
+        }
+    }
+
     func test_appServerClientInitializesAndRoutesServerMessagesWithoutJsonrpcField() async throws {
         let script = try makeFakeAppServerPeer()
         let notifications = LockedPairs()
@@ -116,6 +201,67 @@ final class CodexAppServerClientTests: XCTestCase {
         XCTAssertEqual(params["sandbox"] as? String, "danger-full-access")
     }
 
+    func test_forkThread_usesNativeProviderBranchAndReturnsChildThreadId() async throws {
+        let script = try makeFakeAppServerPeer()
+        let client = try CodexAppServerClient(
+            binary: script,
+            arguments: [],
+            cwd: FileManager.default.temporaryDirectory.path
+        )
+        defer { client.stop() }
+
+        _ = try await client.initialize()
+        let childProviderThreadId = try await client.forkThread(
+            providerThreadId: "parent-thread",
+            lastTurnId: "turn-2"
+        )
+
+        XCTAssertEqual(childProviderThreadId, "forked-parent-thread-through-turn-2",
+                       "thread/fork must send the exact parent threadId and optional lastTurnId, then decode result.thread.id")
+    }
+
+    func test_keyedForkListAndDeletePreserveExactReconciliationIdentity() async throws {
+        let script = try makeFakeAppServerPeer()
+        let client = try CodexAppServerClient(
+            binary: script,
+            arguments: [],
+            cwd: FileManager.default.temporaryDirectory.path,
+            forkProtocolSupportOverride: CodexForkProtocolSupport(
+                isSupported: true,
+                reason: "test schema"
+            )
+        )
+        defer { client.stop() }
+        _ = try await client.initialize()
+
+        let marker = "remotecode-thread-fork:child-a"
+        let first = try await client.forkThread(
+            providerThreadId: "parent-thread",
+            lastTurnId: nil,
+            threadSource: marker
+        )
+        _ = try await client.forkThread(
+            providerThreadId: "other-parent",
+            lastTurnId: nil,
+            threadSource: "other-marker"
+        )
+
+        XCTAssertEqual(first.forkedFromId, "parent-thread")
+        XCTAssertEqual(first.threadSource, marker,
+                       "the provider response must echo the exact durable marker before RemoteCode accepts the child identity")
+        let firstPage = try await client.listThreads(cursor: nil, archived: false)
+        XCTAssertEqual(firstPage.threads.map(\.threadSource), [marker])
+        let secondPage = try await client.listThreads(cursor: firstPage.nextCursor, archived: false)
+        XCTAssertEqual(secondPage.threads.map(\.threadSource), ["other-marker"],
+                       "thread/list pagination must expose every candidate so a retry cannot miss an older provider child")
+        XCTAssertNil(secondPage.nextCursor)
+
+        try await client.deleteThread(providerThreadId: first.id)
+        let remaining = try await client.listThreads(cursor: nil, archived: false)
+        XCTAssertFalse(remaining.threads.contains { $0.id == first.id },
+                       "thread/delete must remove the exact compensated provider child")
+    }
+
     func test_modelListDiscoversReasoningFastTierAndContextWindowFromAppServer() async throws {
         let script = try makeFakeAppServerPeer()
         let client = try CodexAppServerClient(
@@ -199,8 +345,9 @@ final class CodexAppServerClientTests: XCTestCase {
         XCTAssertEqual(input.count, 3, "app-server turns must send image attachments and file mentions through native protocol input items")
         XCTAssertEqual(input[0]["type"] as? String, "text")
         XCTAssertEqual(input[0]["text"] as? String, "draft a plan")
-        XCTAssertEqual(input[1]["type"] as? String, "image")
-        XCTAssertEqual(input[1]["url"] as? String, "file:///tmp/screenshot.png")
+        XCTAssertEqual(input[1]["type"] as? String, "localImage")
+        XCTAssertEqual(input[1]["path"] as? String, "/tmp/screenshot.png")
+        XCTAssertNil(input[1]["url"], "local images must use the app-server localImage/path contract, never a file:// remote-image URL")
         XCTAssertEqual(input[2]["type"] as? String, "mention")
         XCTAssertEqual(input[2]["name"] as? String, "notes.txt")
         XCTAssertEqual(input[2]["path"] as? String, "/tmp/notes.txt")
@@ -385,6 +532,29 @@ final class CodexAppServerClientTests: XCTestCase {
         }
     }
 
+    func test_notificationAfterProcessExitThrowsTypedErrorInsteadOfWritingClosedStdin() async throws {
+        // WHY: a provider can die between RPCs. The next host notification must
+        // fail at the adapter boundary instead of raising SIGPIPE or hanging.
+        let script = try makeInitializingThenExitingAppServerPeer()
+        let terminated = expectation(description: "app-server terminated")
+        let client = try CodexAppServerClient(
+            binary: script,
+            arguments: [],
+            cwd: FileManager.default.temporaryDirectory.path
+        )
+        client.terminationHandler = { _ in terminated.fulfill() }
+        defer { client.stop() }
+
+        _ = try await client.initialize()
+        await fulfillment(of: [terminated], timeout: 3)
+
+        XCTAssertThrowsError(try client.notify(method: "host/after_exit")) { error in
+            guard case CodexAppServerError.processExited = error else {
+                return XCTFail("expected typed processExited, got \(error)")
+            }
+        }
+    }
+
     private func collaborationSettings(from response: [String: Any]) throws -> [String: Any] {
         let params = try XCTUnwrap(response["lastParams"] as? [String: Any])
         let collaboration = try XCTUnwrap(params["collaborationMode"] as? [String: Any])
@@ -402,6 +572,7 @@ final class CodexAppServerClientTests: XCTestCase {
         import sys
 
         last_thread_settings_update = {}
+        forked_threads = []
         for line in sys.stdin:
             msg = json.loads(line)
             method = msg.get("method")
@@ -464,6 +635,40 @@ final class CodexAppServerClientTests: XCTestCase {
                         "message": "thread not found"
                     }
                 }), flush=True)
+            elif method == "thread/fork":
+                params = msg.get("params", {})
+                thread = {
+                    "id": "forked-" + params.get("threadId", "missing") + "-through-" + params.get("lastTurnId", "all"),
+                    "forkedFromId": params.get("threadId"),
+                    "threadSource": params.get("threadSource"),
+                    "createdAt": len(forked_threads) + 1,
+                    "turns": [],
+                    "status": {"state": "idle", "activeFlags": []}
+                }
+                forked_threads.append(thread)
+                print(json.dumps({
+                    "id": msg["id"],
+                    "result": {
+                        "thread": thread
+                    }
+                }), flush=True)
+            elif method == "thread/list":
+                params = msg.get("params", {})
+                if params.get("archived"):
+                    page = []
+                    next_cursor = None
+                else:
+                    offset = int(params.get("cursor", "0"))
+                    page = forked_threads[offset:offset + 1]
+                    next_cursor = str(offset + 1) if offset + 1 < len(forked_threads) else None
+                print(json.dumps({
+                    "id": msg["id"],
+                    "result": {"data": page, "nextCursor": next_cursor}
+                }), flush=True)
+            elif method == "thread/delete":
+                thread_id = msg.get("params", {}).get("threadId")
+                forked_threads[:] = [thread for thread in forked_threads if thread.get("id") != thread_id]
+                print(json.dumps({"id": msg["id"], "result": {}}), flush=True)
             elif method == "model/list":
                 cursor = msg.get("params", {}).get("cursor")
                 if cursor == "page-2":
@@ -627,6 +832,68 @@ final class CodexAppServerClientTests: XCTestCase {
         try source.write(to: script, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: script.path)
         return script.path
+    }
+
+    private func makeInitializingThenExitingAppServerPeer() throws -> String {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("remotecode-codex-app-server-tests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let script = dir.appendingPathComponent("initializing-then-exiting-codex-app-server.py")
+        let source = #"""
+        #!/usr/bin/env python3
+        import json, sys
+
+        request = json.loads(sys.stdin.readline())
+        print(json.dumps({"id": request["id"], "result": {"userAgent": "closed-stdin-peer"}}), flush=True)
+        sys.stdin.readline()
+        sys.exit(0)
+        """#
+        try source.write(to: script, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: script.path)
+        return script.path
+    }
+
+    private func makeSilentAppServerPeer() throws -> String {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("remotecode-codex-app-server-tests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let script = dir.appendingPathComponent("silent-codex-app-server.py")
+        let source = """
+        #!/usr/bin/env python3
+        import os, pathlib, sys
+
+        pathlib.Path(__file__ + '.pid').write_text(str(os.getpid()))
+
+        for _ in sys.stdin:
+            pass
+        """
+        try source.write(to: script, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: script.path)
+        return script.path
+    }
+
+    private func silentPeerPID(for script: String) throws -> pid_t {
+        let pidFile = script + ".pid"
+        let deadline = Date().addingTimeInterval(1)
+        while Date() < deadline {
+            if let text = try? String(contentsOfFile: pidFile, encoding: .utf8),
+               let value = pid_t(text.trimmingCharacters(in: .whitespacesAndNewlines)) {
+                return value
+            }
+            Thread.sleep(forTimeInterval: 0.005)
+        }
+        throw NSError(domain: "CodexAppServerClientTests", code: 1, userInfo: [
+            NSLocalizedDescriptionKey: "silent peer did not persist its PID"
+        ])
+    }
+
+    private func waitForProcessDeath(_ pid: pid_t) -> Bool {
+        let deadline = Date().addingTimeInterval(1)
+        while Date() < deadline {
+            if Darwin.kill(pid, 0) != 0, errno == ESRCH { return true }
+            Thread.sleep(forTimeInterval: 0.005)
+        }
+        return Darwin.kill(pid, 0) != 0 && errno == ESRCH
     }
 }
 

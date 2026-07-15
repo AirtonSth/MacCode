@@ -260,13 +260,62 @@ final class AgentRunCoordinatorStopLifecycleTests: XCTestCase {
         // error must be in the persisted stream, or the user sees a 'Failed' chip
         // with no explanation anywhere.
         let replayed = coordinator.latestStreamEvents(threadId: thread.id)
-        let errorMessages: [String] = replayed.compactMap {
-            if case .error(let message, _) = $0 { return message }
+        let persistedErrors: [(String, Bool)] = replayed.compactMap {
+            if case .error(let message, let recoverable) = $0 { return (message, recoverable) }
             return nil
         }
-        XCTAssertTrue(errorMessages.contains("Invalid API key"),
+        XCTAssertTrue(persistedErrors.contains { $0.0 == "Invalid API key" },
                       "runner-level .error events must be persisted as stream events so replay after a " +
-                      "thread switch or relaunch restores WHY the run failed (F22); got: \(errorMessages)")
+                      "thread switch or relaunch restores WHY the run failed (F22); got: \(persistedErrors)")
+        XCTAssertTrue(persistedErrors.contains { $0.0 == "Invalid API key" && $0.1 },
+                      "an unexpected provider crash with a durable resume cursor must expose recovery after relaunch")
+    }
+
+    func test_pendingAndRegisteredStopRaceIsSafeAcrossOneThousandInterleavings() async throws {
+        let (threadRepo, messageRepo, runRepo, sessionRepo, tmp) = try makeRepos("stop-race-1000")
+        let runner = PendingStopStressRunner()
+        let coordinator = AgentRunCoordinator(
+            runRepo: runRepo,
+            messageRepo: messageRepo,
+            threadRepo: threadRepo,
+            providerSessionRepo: sessionRepo,
+            providers: [.codex: runner]
+        )
+        var threadIds: [AgentThreadID] = []
+
+        for iteration in 0..<1_000 {
+            let ordinal = iteration + 1
+            let thread = AgentThread(title: "stop-race-\(ordinal)", provider: .codex, model: "fake-model")
+            try threadRepo.upsert(thread)
+            threadIds.append(thread.id)
+            let request = AgentRunRequest(
+                threadId: thread.id,
+                provider: .codex,
+                model: "fake-model",
+                cwd: tmp,
+                prompt: "iteration \(ordinal)"
+            )
+
+            if iteration.isMultiple(of: 2) {
+                let start = Task { try await coordinator.startRun(request) }
+                await waitUntil { runner.enteredCount >= ordinal }
+                coordinator.stopRun(threadId: thread.id)
+                runner.releaseThrough(ordinal)
+                _ = try await start.value
+            } else {
+                runner.releaseThrough(ordinal)
+                _ = try await coordinator.startRun(request)
+                coordinator.stopRun(threadId: thread.id)
+            }
+        }
+
+        await waitUntil { runner.cancelledCount == 1_000 }
+        XCTAssertEqual(runner.cancelledCount, 1_000,
+                       "every Stop must cancel exactly one provider handle before or after registration")
+        XCTAssertTrue(coordinator.activeThreadIdsSnapshot().isEmpty,
+                      "no cancelled race iteration may leave a hidden active run")
+        XCTAssertTrue(try threadIds.allSatisfy { try threadRepo.get(id: $0)?.status == .cancelled },
+                      "every pending/running stop must persist a terminal cancelled thread")
     }
 
     // MARK: - F37: user run invalidates a scheduled auto-continuation
@@ -339,5 +388,136 @@ final class AgentRunCoordinatorStopLifecycleTests: XCTestCase {
                        "full-access turn built from the OLD run's metadata (F37); prompts: \(runner.prompts)")
         XCTAssertEqual(runner.prompts, ["stall", "drop that, summarize instead"],
                        "only the two user runs may have reached the provider")
+    }
+
+    // MARK: - AG-002: stop and await provider termination
+
+    private final class DelayedCancelFinishRunner: AgentProviderRunner, @unchecked Sendable {
+        let provider: AgentProvider = .codex
+        let finishDelayNanoseconds: UInt64?
+
+        init(finishDelayNanoseconds: UInt64?) {
+            self.finishDelayNanoseconds = finishDelayNanoseconds
+        }
+
+        func listModels() async -> [AgentModelDescriptor] { [] }
+
+        func startRun(
+            _ request: AgentRunRequest,
+            onEvent: @escaping @Sendable (AgentRunEvent) -> Void
+        ) async throws -> AgentRunHandle {
+            let providerThreadId = UUID().uuidString
+            onEvent(.status(.running))
+            return AgentRunHandle(runId: request.runId, process: nil) { [finishDelayNanoseconds] in
+                guard let finishDelayNanoseconds else { return }
+                Task.detached {
+                    try? await Task.sleep(nanoseconds: finishDelayNanoseconds)
+                    onEvent(.finished(.cancelled, finalMessage: nil, providerThreadId: providerThreadId))
+                }
+            }
+        }
+    }
+
+    func test_stopAndAwaitTermination_waitsForProviderTerminalAndLeavesNoSession() async throws {
+        let (threadRepo, messageRepo, runRepo, sessionRepo, tmp) = try makeRepos("stop-await")
+        let thread = AgentThread(title: "await stop", provider: .codex, model: "fake-model")
+        try threadRepo.upsert(thread)
+        let coordinator = AgentRunCoordinator(
+            runRepo: runRepo,
+            messageRepo: messageRepo,
+            threadRepo: threadRepo,
+            providerSessionRepo: sessionRepo,
+            providers: [.codex: DelayedCancelFinishRunner(finishDelayNanoseconds: 150_000_000)]
+        )
+        let recorder = LifecycleRecorder()
+        coordinator.addObserver(recorder)
+        coordinator.onRunFinished = { tid, _, status in
+            recorder.recordRunFinished(threadId: tid, status: status)
+        }
+        _ = try await coordinator.startRun(AgentRunRequest(
+            threadId: thread.id,
+            provider: .codex,
+            model: "fake-model",
+            cwd: tmp,
+            prompt: "long task"
+        ))
+
+        let startedAt = Date()
+        try await coordinator.stopAndAwaitTermination(threadId: thread.id)
+
+        XCTAssertGreaterThanOrEqual(
+            Date().timeIntervalSince(startedAt),
+            0.12,
+            "delete safety must await the provider terminal callback, not only the immediate cancelled DB status"
+        )
+        XCTAssertEqual(recorder.runFinishedCallbacks.count, 1,
+                       "one stop-and-await request must publish exactly one terminal lifecycle callback")
+        XCTAssertFalse(coordinator.hasProviderSession(threadId: thread.id),
+                       "successful termination confirmation requires the provider session and its child work to be gone")
+    }
+
+    func test_stopAndAwaitTermination_hardTimeoutFailsLoud() async throws {
+        let (threadRepo, messageRepo, runRepo, sessionRepo, tmp) = try makeRepos("stop-await-timeout")
+        let thread = AgentThread(title: "stuck stop", provider: .codex, model: "fake-model")
+        try threadRepo.upsert(thread)
+        let coordinator = AgentRunCoordinator(
+            runRepo: runRepo,
+            messageRepo: messageRepo,
+            threadRepo: threadRepo,
+            providerSessionRepo: sessionRepo,
+            providers: [.codex: DelayedCancelFinishRunner(finishDelayNanoseconds: nil)]
+        )
+        coordinator.gracefulStopTimeout = 0.05
+        coordinator.hardStopTimeout = 0.15
+        _ = try await coordinator.startRun(AgentRunRequest(
+            threadId: thread.id,
+            provider: .codex,
+            model: "fake-model",
+            cwd: tmp,
+            prompt: "never exits"
+        ))
+
+        do {
+            try await coordinator.stopAndAwaitTermination(threadId: thread.id)
+            XCTFail("a provider that never confirms terminal state must fail after the hard timeout")
+        } catch {
+            XCTAssertTrue(String(describing: error).contains("did not terminate"))
+        }
+    }
+}
+
+private final class PendingStopStressRunner: AgentProviderRunner, @unchecked Sendable {
+    let provider: AgentProvider = .codex
+    private let lock = NSLock()
+    private var entered = 0
+    private var released = 0
+    private var cancelled = 0
+
+    var enteredCount: Int { lock.withLock { entered } }
+    var cancelledCount: Int { lock.withLock { cancelled } }
+
+    func listModels() async -> [AgentModelDescriptor] { [] }
+
+    func releaseThrough(_ ordinal: Int) {
+        lock.withLock { released = max(released, ordinal) }
+    }
+
+    func startRun(
+        _ request: AgentRunRequest,
+        onEvent: @escaping @Sendable (AgentRunEvent) -> Void
+    ) async throws -> AgentRunHandle {
+        let ordinal = lock.withLock { () -> Int in
+            entered += 1
+            return entered
+        }
+        onEvent(.status(.running))
+        while lock.withLock({ released < ordinal }) {
+            await Task.yield()
+        }
+        return AgentRunHandle(runId: request.runId, process: nil) { [weak self] in
+            guard let self else { return }
+            self.lock.withLock { self.cancelled += 1 }
+            onEvent(.finished(.cancelled, finalMessage: nil, providerThreadId: nil))
+        }
     }
 }

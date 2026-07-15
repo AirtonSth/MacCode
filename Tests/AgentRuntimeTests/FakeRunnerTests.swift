@@ -691,8 +691,10 @@ final class FakeRunnerTests: XCTestCase {
                                                            model: "gpt-5.5",
                                                            cwd: tmp,
                                                            prompt: "first"))
-        let firstProviderThreadId = try await waitForProviderThreadId(threadRepo: threadRepo,
-                                                                      threadId: thread.id)
+        let firstProviderThreadId = try await waitForCompletedProviderSession(
+            sessionRepo: sessionRepo,
+            threadId: thread.id
+        )
         _ = try await coordinator.startRun(AgentRunRequest(threadId: thread.id,
                                                            provider: .codex,
                                                            model: "gpt-5.5",
@@ -824,7 +826,6 @@ final class FakeRunnerTests: XCTestCase {
                                               messageRepo: messageRepo,
                                               threadRepo: threadRepo,
                                               providerAdapters: [.claude: adapter])
-
         coordinator.stopRun(threadId: thread.id)
 
         XCTAssertEqual(adapter.stopSessionCallCount, 1,
@@ -1028,6 +1029,59 @@ final class FakeRunnerTests: XCTestCase {
         XCTAssertTrue((try sessionRepo.get(threadId: thread.id)?.lastErrorMessage ?? "").contains("simulated provider startup failure"))
     }
 
+    func test_continueStartFailurePreservesInterruptedSessionForRetry() async throws {
+        let tmp = NSTemporaryDirectory() + "rc2-coordinator-continue-start-failure-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let sessionRepo = ProviderSessionRuntimeRepository(db: db)
+        var thread = AgentThread(title: "continue after auth", provider: .codex, model: "gpt-5.5")
+        thread.status = .interrupted
+        thread.providerThreadId = "codex-resume-cursor"
+        try threadRepo.upsert(thread)
+        try sessionRepo.upsert(ProviderSessionRuntime(
+            threadId: thread.id,
+            provider: .codex,
+            status: .interrupted,
+            resumeCursor: "codex-resume-cursor",
+            cwd: tmp,
+            model: "gpt-5.5"
+        ))
+        let coordinator = AgentRunCoordinator(
+            runRepo: runRepo,
+            messageRepo: messageRepo,
+            threadRepo: threadRepo,
+            providerSessionRepo: sessionRepo,
+            providerAdapters: [.codex: FailingProviderAdapter(provider: .codex)]
+        )
+        let runId = AgentRunID()
+
+        do {
+            _ = try await coordinator.startRun(AgentRunRequest(
+                runId: runId,
+                threadId: thread.id,
+                provider: .codex,
+                model: "gpt-5.5",
+                cwd: tmp,
+                prompt: "Continue the interrupted turn from the last saved context."
+            ), recordUserMessage: false)
+            XCTFail("a failed provider recovery must be surfaced")
+        } catch {
+            // Expected. The durable cursor must remain retryable below.
+        }
+
+        XCTAssertEqual(try runRepo.get(id: runId)?.status, .failed,
+                       "the failed Continue attempt itself must terminate")
+        XCTAssertEqual(try threadRepo.get(id: thread.id)?.status, .interrupted,
+                       "a transient Continue start failure must not erase the thread's interrupted state")
+        XCTAssertEqual(try sessionRepo.get(threadId: thread.id)?.status, .interrupted)
+        XCTAssertTrue(coordinator.hasRecoverableContext(threadId: thread.id),
+                      "the original provider cursor must remain available for another Continue attempt")
+        XCTAssertTrue(try messageRepo.list(threadId: thread.id).isEmpty,
+                      "a failed provider-only Continue must not invent a user message")
+    }
+
     func test_interruptedProviderSessionWithoutResumeCursorStartsFreshTurn() async throws {
         let tmp = NSTemporaryDirectory() + "rc2-coordinator-interrupted-fresh-start-" + UUID().uuidString
         let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
@@ -1061,6 +1115,65 @@ final class FakeRunnerTests: XCTestCase {
                        "an interrupted Codex thread with no persisted provider cursor must start a clean app-server session instead of blocking retry")
         XCTAssertEqual(try messageRepo.list(threadId: thread.id).last?.content, "retry",
                        "retry after interrupted startup must persist the user's new prompt")
+    }
+
+    func test_continueInterruptedSessionRestoresRuntimeContextWithoutPersistingSyntheticUserMessage() async throws {
+        let tmp = NSTemporaryDirectory() + "rc2-coordinator-interrupted-continue-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let sessionRepo = ProviderSessionRuntimeRepository(db: db)
+        var thread = AgentThread(title: "continue", provider: .claude, model: "claude-sonnet")
+        thread.status = .interrupted
+        thread.providerThreadId = "claude-session-1"
+        try threadRepo.upsert(thread)
+        try sessionRepo.upsert(ProviderSessionRuntime(
+            threadId: thread.id,
+            provider: .claude,
+            status: .interrupted,
+            resumeCursor: "claude-session-1",
+            cwd: tmp,
+            model: "claude-sonnet",
+            serviceTier: .fast,
+            runtimeMode: .autoAcceptEdits,
+            runtimePayloadJSON: #"{"interactionMode":"plan"}"#
+        ))
+        let adapter = SpyProviderAdapter(provider: .claude)
+        let coordinator = AgentRunCoordinator(
+            runRepo: runRepo,
+            messageRepo: messageRepo,
+            threadRepo: threadRepo,
+            providerSessionRepo: sessionRepo,
+            providerAdapters: [.claude: adapter]
+        )
+        let providerOnlyInstruction = "Continue the interrupted turn from the last saved context."
+
+        _ = try await coordinator.startRun(AgentRunRequest(
+            threadId: thread.id,
+            provider: .claude,
+            model: "ignored-model",
+            cwd: tmp,
+            prompt: providerOnlyInstruction,
+            providerThreadId: nil,
+            permissionMode: .supervised,
+            serviceTier: .auto,
+            interactionMode: .default
+        ), recordUserMessage: false)
+
+        await waitForAdapterSend(adapter)
+        XCTAssertEqual(adapter.lastProviderThreadId, "claude-session-1",
+                       "Continue must recover the durable provider cursor after relaunch")
+        XCTAssertEqual(adapter.lastPermissionMode, .autoAcceptEdits,
+                       "Continue must restore the interrupted session authority instead of current composer defaults")
+        XCTAssertEqual(adapter.lastServiceTier, .fast,
+                       "Continue must restore provider runtime configuration from the interrupted session")
+        XCTAssertEqual(adapter.lastInteractionMode, .plan,
+                       "Continue must restore the mode used by the interrupted turn")
+        XCTAssertEqual(adapter.lastPrompt, providerOnlyInstruction,
+                       "Continue must send a non-empty provider instruction so Claude never receives an empty turn")
+        XCTAssertTrue(try messageRepo.list(threadId: thread.id).isEmpty,
+                      "the provider-only recovery instruction must not appear as an invented user message")
     }
 
     func test_coordinatorRoutesApprovalAndUserInputResponsesThroughProviderAdapter() async throws {
@@ -1218,6 +1331,7 @@ final class FakeRunnerTests: XCTestCase {
                                               messageRepo: messageRepo,
                                               threadRepo: threadRepo,
                                               providerAdapters: [.claude: adapter])
+        coordinator.gracefulStopTimeout = 0.05
 
         _ = try await coordinator.startRun(AgentRunRequest(threadId: thread.id,
                                                            provider: .claude,
@@ -1227,8 +1341,13 @@ final class FakeRunnerTests: XCTestCase {
         await waitForAdapterSend(adapter)
         coordinator.stopRun(threadId: thread.id)
 
+        XCTAssertEqual(adapter.interruptTurnCallCount, 1,
+                       "Claude Stop must deliver the provider-native interrupt before closing its live transport")
+        XCTAssertEqual(adapter.cancelCount, 0,
+                       "Claude Stop must keep the transport open during the bounded provider acknowledgement window")
+        try await Task.sleep(nanoseconds: 150_000_000)
         XCTAssertEqual(adapter.cancelCount, 1,
-                       "Claude interrupt/stop must cancel the active provider handle so long-running sessions do not keep working after user stop")
+                       "an unacknowledged Claude interrupt must cancel the active provider handle after the bounded grace period")
     }
 
     func test_stopRunInterruptsActiveProviderAdapterForCodexAndClaude() async throws {
@@ -1253,6 +1372,7 @@ final class FakeRunnerTests: XCTestCase {
                                                   messageRepo: messageRepo,
                                                   threadRepo: threadRepo,
                                                   providerAdapters: [provider: adapter])
+            coordinator.gracefulStopTimeout = 0.05
 
             _ = try await coordinator.startRun(AgentRunRequest(threadId: thread.id,
                                                                provider: provider,
@@ -1262,10 +1382,13 @@ final class FakeRunnerTests: XCTestCase {
             await waitForAdapterSend(adapter)
             coordinator.stopRun(threadId: thread.id)
 
-            XCTAssertEqual(adapter.cancelCount, 1,
-                           "Stop Chat must cancel the active \(provider.rawValue) run handle")
             XCTAssertEqual(adapter.interruptTurnCallCount, 1,
-                           "Stop Chat must also call the \(provider.rawValue) adapter interrupt path so provider-native work aborts even when the handle is incomplete")
+                           "Stop Chat must first call the \(provider.rawValue) adapter interrupt path so provider-native work can abort cleanly")
+            XCTAssertEqual(adapter.cancelCount, 0,
+                           "Stop Chat must preserve the \(provider.rawValue) transport during the bounded acknowledgement window")
+            try await Task.sleep(nanoseconds: 150_000_000)
+            XCTAssertEqual(adapter.cancelCount, 1,
+                           "an unacknowledged \(provider.rawValue) interrupt must cancel the active run handle after the bounded grace period")
         }
     }
 
@@ -1281,11 +1404,11 @@ final class FakeRunnerTests: XCTestCase {
             providerAdapters: [.codex: codex, .claude: claude]
         )
 
-        coordinator.stopAllProviderSessions()
+        coordinator.stopAllProviderSessionsForAppTermination()
 
-        XCTAssertTrue(codex.stopAllCalled,
+        XCTAssertTrue(codex.stopAllForAppTerminationCalled,
                       "app shutdown must terminate Codex provider runtimes instead of leaving orphan app-server processes")
-        XCTAssertTrue(claude.stopAllCalled,
+        XCTAssertTrue(claude.stopAllForAppTerminationCalled,
                       "app shutdown must terminate Claude provider runtimes instead of leaving orphan bridge processes")
     }
 
@@ -1361,6 +1484,24 @@ final class FakeRunnerTests: XCTestCase {
             try? await Task.sleep(nanoseconds: 20_000_000)
         }
         XCTFail("timed out waiting for persisted provider thread id")
+        return ""
+    }
+
+    private func waitForCompletedProviderSession(
+        sessionRepo: ProviderSessionRuntimeRepository,
+        threadId: AgentThreadID
+    ) async throws -> String {
+        let deadline = Date().addingTimeInterval(3)
+        while Date() < deadline {
+            if let session = try sessionRepo.get(threadId: threadId),
+               session.status == .completed,
+               let providerThreadId = session.resumeCursor,
+               !providerThreadId.isEmpty {
+                return providerThreadId
+            }
+            try? await Task.sleep(nanoseconds: 20_000_000)
+        }
+        XCTFail("timed out waiting for completed provider session with resume cursor")
         return ""
     }
 
@@ -1474,6 +1615,7 @@ private final class SpyProviderAdapter: AgentProviderAdapter, @unchecked Sendabl
     private var _sendTurnCount = 0
     private var _cancelCount = 0
     private var _stopAllCalled = false
+    private var _stopAllForAppTerminationCalled = false
     private var _lastPrompt: String?
     private var _lastProviderThreadId: String?
     private var _lastPermissionMode: AgentPermissionMode?
@@ -1499,6 +1641,10 @@ private final class SpyProviderAdapter: AgentProviderAdapter, @unchecked Sendabl
     var stopAllCalled: Bool {
         lock.lock(); defer { lock.unlock() }
         return _stopAllCalled
+    }
+    var stopAllForAppTerminationCalled: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return _stopAllForAppTerminationCalled
     }
     var lastPrompt: String? {
         lock.lock(); defer { lock.unlock() }
@@ -1624,6 +1770,11 @@ private final class SpyProviderAdapter: AgentProviderAdapter, @unchecked Sendabl
     func stopAll() {
         lock.lock()
         _stopAllCalled = true
+        lock.unlock()
+    }
+    func stopAllForAppTermination() {
+        lock.lock()
+        _stopAllForAppTerminationCalled = true
         lock.unlock()
     }
     func streamEvents(threadId: AgentThreadID, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) throws {}

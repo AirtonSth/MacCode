@@ -64,44 +64,180 @@ public enum AgentAttachmentKind: String, Codable, Sendable, Equatable, Hashable 
     case image
 }
 
+public struct AgentProviderCapabilities: Codable, Sendable, Equatable {
+    public let supportsAttachments: Bool
+    public let supportedAttachmentKinds: [AgentAttachmentKind]
+    public let supportedAttachmentMediaTypes: [String]
+    public let supportsApprovals: Bool
+    public let supportsUserInput: Bool
+    public let supportsStreaming: Bool
+    public let supportsFork: Bool
+    public let supportsRollback: Bool
+    public let supportsPlanReview: Bool
+
+    public init(
+        supportsAttachments: Bool = false,
+        supportedAttachmentKinds: [AgentAttachmentKind] = [],
+        supportedAttachmentMediaTypes: [String] = [],
+        supportsApprovals: Bool = false,
+        supportsUserInput: Bool = false,
+        supportsStreaming: Bool = false,
+        supportsFork: Bool = false,
+        supportsRollback: Bool = false,
+        supportsPlanReview: Bool = false
+    ) {
+        self.supportsAttachments = supportsAttachments
+        self.supportedAttachmentKinds = supportedAttachmentKinds
+        self.supportedAttachmentMediaTypes = supportedAttachmentMediaTypes
+        self.supportsApprovals = supportsApprovals
+        self.supportsUserInput = supportsUserInput
+        self.supportsStreaming = supportsStreaming
+        self.supportsFork = supportsFork
+        self.supportsRollback = supportsRollback
+        self.supportsPlanReview = supportsPlanReview
+    }
+
+    public static let conservative = AgentProviderCapabilities()
+
+    private enum CodingKeys: String, CodingKey {
+        case supportsAttachments, supportedAttachmentKinds, supportedAttachmentMediaTypes
+        case supportsApprovals, supportsUserInput, supportsStreaming
+        case supportsFork, supportsRollback, supportsPlanReview
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        supportsAttachments = try container.decodeIfPresent(Bool.self, forKey: .supportsAttachments) ?? false
+        supportedAttachmentKinds = try container.decodeIfPresent([AgentAttachmentKind].self, forKey: .supportedAttachmentKinds) ?? []
+        supportedAttachmentMediaTypes = try container.decodeIfPresent([String].self, forKey: .supportedAttachmentMediaTypes) ?? []
+        supportsApprovals = try container.decodeIfPresent(Bool.self, forKey: .supportsApprovals) ?? false
+        supportsUserInput = try container.decodeIfPresent(Bool.self, forKey: .supportsUserInput) ?? false
+        supportsStreaming = try container.decodeIfPresent(Bool.self, forKey: .supportsStreaming) ?? false
+        supportsFork = try container.decodeIfPresent(Bool.self, forKey: .supportsFork) ?? false
+        supportsRollback = try container.decodeIfPresent(Bool.self, forKey: .supportsRollback) ?? false
+        supportsPlanReview = try container.decodeIfPresent(Bool.self, forKey: .supportsPlanReview) ?? false
+    }
+}
+
 public struct AgentAttachment: Codable, Sendable, Equatable, Hashable {
+    public let id: String?
     public let path: String
     public let displayName: String
     public let kind: AgentAttachmentKind
     public let mimeType: String?
+    public let sha256: String?
+    public let sizeBytes: Int?
 
-    public init(path: String, displayName: String? = nil, kind: AgentAttachmentKind, mimeType: String? = nil) {
+    public init(
+        id: String? = nil,
+        path: String,
+        displayName: String? = nil,
+        kind: AgentAttachmentKind,
+        mimeType: String? = nil,
+        sha256: String? = nil,
+        sizeBytes: Int? = nil
+    ) {
+        self.id = id
         self.path = path
         self.displayName = displayName ?? URL(fileURLWithPath: path).lastPathComponent
         self.kind = kind
         self.mimeType = mimeType
+        self.sha256 = sha256
+        self.sizeBytes = sizeBytes
+    }
+}
+
+/// Path-free attachment metadata safe to expose to paired clients. `id` is an
+/// opaque host-owned attachment-reference identifier; clients must return it unchanged and
+/// never receive or manufacture the provider-visible host path.
+public struct AgentAttachmentReference: Codable, Sendable, Equatable, Hashable {
+    public let id: String
+    public let displayName: String
+    public let kind: AgentAttachmentKind
+    public let mimeType: String?
+    public let sha256: String
+    public let sizeBytes: Int
+
+    public init(
+        id: String,
+        displayName: String,
+        kind: AgentAttachmentKind,
+        mimeType: String?,
+        sha256: String,
+        sizeBytes: Int
+    ) {
+        self.id = id
+        self.displayName = displayName
+        self.kind = kind
+        self.mimeType = mimeType
+        self.sha256 = sha256
+        self.sizeBytes = sizeBytes
+    }
+
+    public init?(_ attachment: AgentAttachment) {
+        guard let id = attachment.id ?? attachment.sha256,
+              let sha256 = attachment.sha256 ?? Self.legacyDigest(id),
+              let sizeBytes = attachment.sizeBytes else { return nil }
+        self.init(
+            id: id,
+            displayName: attachment.displayName,
+            kind: attachment.kind,
+            mimeType: attachment.mimeType,
+            sha256: sha256,
+            sizeBytes: sizeBytes
+        )
+    }
+
+    private static func legacyDigest(_ value: String) -> String? {
+        let normalized = value.lowercased()
+        guard normalized.count == 64,
+              normalized.allSatisfy(\.isHexDigit) else { return nil }
+        return normalized
     }
 }
 
 public struct AgentAttachmentUploadResult: Codable, Sendable, Equatable {
-    public let path: String
+    public let id: String
     public let displayName: String
     public let kind: AgentAttachmentKind
     public let mimeType: String?
+    public let sha256: String
     public let sizeBytes: Int
 
-    public init(path: String, displayName: String, kind: AgentAttachmentKind, mimeType: String?, sizeBytes: Int) {
-        self.path = path
+    public init(id: String, displayName: String, kind: AgentAttachmentKind, mimeType: String?, sha256: String, sizeBytes: Int) {
+        self.id = id
         self.displayName = displayName
         self.kind = kind
         self.mimeType = mimeType
+        self.sha256 = sha256
         self.sizeBytes = sizeBytes
+    }
+
+    public init(_ reference: AgentAttachmentReference) {
+        self.init(
+            id: reference.id,
+            displayName: reference.displayName,
+            kind: reference.kind,
+            mimeType: reference.mimeType,
+            sha256: reference.sha256,
+            sizeBytes: reference.sizeBytes
+        )
     }
 }
 
 public enum AgentAttachmentResolverError: Error, CustomStringConvertible, Equatable {
     case notFound(String)
     case notReadableFile(String)
+    case exceedsMaximumSize(String, Int)
+    case malformedReference(String)
 
     public var description: String {
         switch self {
         case .notFound(let path): return "Attachment not found: \(path)"
         case .notReadableFile(let path): return "Attachment is not a readable file: \(path)"
+        case .exceedsMaximumSize(let name, let maximumBytes):
+            return "Attachment exceeds the \(maximumBytes)-byte limit: \(name)"
+        case .malformedReference(let value): return "Malformed attachment reference: \(value)"
         }
     }
 }
@@ -145,6 +281,10 @@ public enum AgentAttachmentResolver {
         case "webp": return "image/webp"
         case "svg": return "image/svg+xml"
         case "avif": return "image/avif"
+        case "txt", "log", "csv", "swift", "m", "mm", "h", "c", "cc", "cpp", "js", "ts", "tsx", "jsx", "css", "html", "xml", "yaml", "yml": return "text/plain"
+        case "md", "markdown": return "text/markdown"
+        case "json": return "application/json"
+        case "pdf": return "application/pdf"
         default: return nil
         }
     }
@@ -366,6 +506,11 @@ public enum AgentProviderSnapshotStatus: String, Codable, Sendable {
     case disabled
 }
 
+public enum AgentModelDiscoverySource: String, Codable, Sendable {
+    case live
+    case builtInFallback
+}
+
 public struct AgentProviderSnapshot: Codable, Sendable, Equatable, Identifiable {
     public let id: String
     public let provider: AgentProvider
@@ -374,6 +519,7 @@ public struct AgentProviderSnapshot: Codable, Sendable, Equatable, Identifiable 
     public let accentColor: String
     public let continuationGroup: String
     public let interactionModes: [AgentInteractionMode]
+    public let permissionModes: [AgentPermissionMode]?
     public let enabled: Bool
     public let installed: Bool
     public let version: String?
@@ -390,6 +536,22 @@ public struct AgentProviderSnapshot: Codable, Sendable, Equatable, Identifiable 
     public let skills: [String]
     public let advisory: String?
     public let updateState: String?
+    public let capabilities: AgentProviderCapabilities?
+    public let modelDiscoverySource: AgentModelDiscoverySource?
+    /// Opaque cache identity. It contains no raw environment values or account data.
+    public let modelDiscoveryCacheKey: String?
+
+    public var effectiveCapabilities: AgentProviderCapabilities {
+        capabilities ?? .conservative
+    }
+
+    public var effectivePermissionModes: [AgentPermissionMode] {
+        permissionModes ?? [.supervised]
+    }
+
+    public var modelListIsFallback: Bool {
+        modelDiscoverySource == .builtInFallback
+    }
 
     public var accountSummary: String? {
         let label = accountLabel?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
@@ -421,6 +583,7 @@ public struct AgentProviderSnapshot: Codable, Sendable, Equatable, Identifiable 
         accentColor: String,
         continuationGroup: String,
         interactionModes: [AgentInteractionMode],
+        permissionModes: [AgentPermissionMode]? = nil,
         enabled: Bool,
         installed: Bool,
         version: String? = nil,
@@ -436,7 +599,10 @@ public struct AgentProviderSnapshot: Codable, Sendable, Equatable, Identifiable 
         slashCommands: [String],
         skills: [String] = [],
         advisory: String? = nil,
-        updateState: String? = nil
+        updateState: String? = nil,
+        capabilities: AgentProviderCapabilities? = nil,
+        modelDiscoverySource: AgentModelDiscoverySource? = nil,
+        modelDiscoveryCacheKey: String? = nil
     ) {
         self.id = id
         self.provider = provider
@@ -445,6 +611,7 @@ public struct AgentProviderSnapshot: Codable, Sendable, Equatable, Identifiable 
         self.accentColor = accentColor
         self.continuationGroup = continuationGroup
         self.interactionModes = interactionModes
+        self.permissionModes = permissionModes
         self.enabled = enabled
         self.installed = installed
         self.version = version
@@ -461,14 +628,121 @@ public struct AgentProviderSnapshot: Codable, Sendable, Equatable, Identifiable 
         self.skills = skills
         self.advisory = advisory
         self.updateState = updateState
+        self.capabilities = capabilities
+        self.modelDiscoverySource = modelDiscoverySource
+        self.modelDiscoveryCacheKey = modelDiscoveryCacheKey
+    }
+}
+
+public enum AgentProviderRunPreflightError: Error, CustomStringConvertible, Equatable {
+    case missingSnapshot
+    case disabled(String)
+    case unavailable(String)
+    case unauthenticated(String)
+    case unsupportedInteractionMode(String, AgentInteractionMode)
+    case unsupportedPermissionMode(String, AgentPermissionMode)
+    case attachmentsUnsupported(String)
+    case attachmentKindUnsupported(String, AgentAttachmentKind)
+    case attachmentMediaTypeUnsupported(String, String)
+
+    public var description: String {
+        switch self {
+        case .missingSnapshot:
+            return "Provider capabilities are not loaded yet."
+        case .disabled(let provider):
+            return "\(provider) is disabled."
+        case .unavailable(let provider):
+            return "\(provider) is unavailable."
+        case .unauthenticated(let provider):
+            return "\(provider) is not authenticated. Sign in to continue."
+        case .unsupportedInteractionMode(let provider, let mode):
+            return "\(provider) does not support \(mode.rawValue) mode for this session."
+        case .unsupportedPermissionMode(let provider, let mode):
+            return "\(provider) does not support \(mode.rawValue) permission for this session."
+        case .attachmentsUnsupported(let provider):
+            return "\(provider) does not support attachments for this session."
+        case .attachmentKindUnsupported(let provider, let kind):
+            return "\(provider) does not support \(kind.rawValue) attachments for this session."
+        case .attachmentMediaTypeUnsupported(let provider, let mediaType):
+            return "\(provider) does not support attachment media type \(mediaType)."
+        }
+    }
+}
+
+/// Single fail-closed provider gate shared by desktop and mirror execution.
+/// This must run before a draft, queue, user message, thread, or run is mutated.
+public enum AgentProviderRunPreflight {
+    public static func validate(
+        snapshot: AgentProviderSnapshot?,
+        interactionMode: AgentInteractionMode,
+        permissionMode: AgentPermissionMode,
+        attachments: [AgentAttachment]
+    ) throws {
+        guard let snapshot else { throw AgentProviderRunPreflightError.missingSnapshot }
+        let name = snapshot.displayName
+        guard snapshot.enabled, snapshot.status != .disabled else {
+            throw AgentProviderRunPreflightError.disabled(name)
+        }
+        guard snapshot.installed, snapshot.status != .unavailable else {
+            throw AgentProviderRunPreflightError.unavailable(name)
+        }
+        guard snapshot.authenticated != false else {
+            throw AgentProviderRunPreflightError.unauthenticated(name)
+        }
+        guard snapshot.interactionModes.contains(interactionMode) else {
+            throw AgentProviderRunPreflightError.unsupportedInteractionMode(name, interactionMode)
+        }
+        guard snapshot.effectivePermissionModes.contains(permissionMode) else {
+            throw AgentProviderRunPreflightError.unsupportedPermissionMode(name, permissionMode)
+        }
+        guard attachments.isEmpty || snapshot.effectiveCapabilities.supportsAttachments else {
+            throw AgentProviderRunPreflightError.attachmentsUnsupported(name)
+        }
+        let capabilities = snapshot.effectiveCapabilities
+        let supportedMediaTypes = Set(capabilities.supportedAttachmentMediaTypes.map(normalizedMediaType))
+        for attachment in attachments {
+            guard capabilities.supportedAttachmentKinds.contains(attachment.kind) else {
+                throw AgentProviderRunPreflightError.attachmentKindUnsupported(name, attachment.kind)
+            }
+            let mediaType = normalizedMediaType(attachment.mimeType ?? "")
+            guard !mediaType.isEmpty,
+                  supportedMediaTypes.contains(mediaType) ||
+                    (attachment.kind == .file && supportedMediaTypes.contains("*/*")) else {
+                throw AgentProviderRunPreflightError.attachmentMediaTypeUnsupported(
+                    name,
+                    mediaType.isEmpty ? "unknown" : mediaType
+                )
+            }
+        }
+    }
+
+    private static func normalizedMediaType(_ raw: String) -> String {
+        raw.split(separator: ";", maxSplits: 1).first?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased() ?? ""
     }
 }
 
 public enum AgentProviderSnapshotFactory {
-    public static func snapshot(provider: AgentProvider, models: [AgentModelDescriptor], binaryPath: String? = nil, version: String? = nil, authenticated: Bool? = nil, accountLabel: String? = nil, accountAuthMethod: String? = nil, updateState: String? = nil, advisory: String? = nil, slashCommands: [String] = [], skills: [String] = [], id: String? = nil, displayName: String? = nil, accentColor: String? = nil, enabled: Bool = true, homePath: String? = nil, environmentKeys: [String] = []) -> AgentProviderSnapshot {
+    public static func snapshot(provider: AgentProvider, models: [AgentModelDescriptor], binaryPath: String? = nil, version: String? = nil, authenticated: Bool? = nil, accountLabel: String? = nil, accountAuthMethod: String? = nil, updateState: String? = nil, advisory: String? = nil, slashCommands: [String] = [], skills: [String] = [], id: String? = nil, displayName: String? = nil, accentColor: String? = nil, enabled: Bool = true, homePath: String? = nil, environmentKeys: [String] = [], interactionModesOverride: [AgentInteractionMode]? = nil, permissionModesOverride: [AgentPermissionMode]? = nil, capabilitiesOverride: AgentProviderCapabilities? = nil, modelDiscoverySource: AgentModelDiscoverySource? = nil, modelDiscoveryCacheKey: String? = nil) -> AgentProviderSnapshot {
         let installed = binaryPath.map { !$0.isEmpty } ?? !models.isEmpty
         switch provider {
         case .codex:
+            let codexCapabilities = capabilitiesOverride ?? AgentProviderCapabilities(
+                supportsAttachments: true,
+                supportedAttachmentKinds: [.file, .image],
+                supportedAttachmentMediaTypes: ["*/*", "image/jpeg", "image/png", "image/gif", "image/webp"],
+                supportsApprovals: true,
+                supportsUserInput: true,
+                supportsStreaming: true,
+                // The current app-server `thread/fork` schema has no client
+                // idempotency key. `thread/delete` cannot close the crash window
+                // between provider creation and local persistence, so the
+                // feature must remain hidden until the provider contract changes.
+                supportsFork: false,
+                supportsRollback: true,
+                supportsPlanReview: true
+            )
             let status: AgentProviderSnapshotStatus = enabled
                 ? (!installed || models.isEmpty ? .unavailable : (authenticated == false || updateState == "update_available" ? .warning : .available))
                 : .disabled
@@ -489,6 +763,7 @@ public enum AgentProviderSnapshotFactory {
                 accentColor: accentColor ?? "#2F80ED",
                 continuationGroup: "openai-codex",
                 interactionModes: [.default, .plan],
+                permissionModes: AgentPermissionMode.allCases,
                 enabled: enabled,
                 installed: installed,
                 version: version,
@@ -501,14 +776,18 @@ public enum AgentProviderSnapshotFactory {
                 homePath: homePath?.isEmpty == false ? homePath : nil,
                 environmentKeys: environmentKeys,
                 models: models,
-                slashCommands: uniqueSlashCommands(defaults: ["/clear", "/default", "/model", "/plan", "/status", "/fork", "/goal"], probed: slashCommands),
+                slashCommands: uniqueSlashCommands(defaults: ["/clear", "/default", "/model", "/plan", "/status", "/goal"], probed: slashCommands)
+                    .filter { $0 != "/fork" || codexCapabilities.supportsFork },
                 skills: unique(skills),
                 advisory: advisory,
-                updateState: updateState
+                updateState: updateState,
+                capabilities: codexCapabilities,
+                modelDiscoverySource: modelDiscoverySource,
+                modelDiscoveryCacheKey: modelDiscoveryCacheKey
             )
         case .claude:
             let status: AgentProviderSnapshotStatus = enabled
-                ? (!installed || models.isEmpty ? .unavailable : (authenticated == false || updateState == "update_available" ? .warning : .available))
+                ? (!installed || models.isEmpty ? .unavailable : (authenticated == false || updateState == "update_available" || capabilitiesOverride != nil ? .warning : .available))
                 : .disabled
             let statusDetail = Self.statusDetail(
                 providerName: "Claude",
@@ -526,7 +805,8 @@ public enum AgentProviderSnapshotFactory {
                 displayName: displayName ?? "Claude",
                 accentColor: accentColor ?? "#D97706",
                 continuationGroup: "anthropic-claude",
-                interactionModes: [.default, .plan],
+                interactionModes: interactionModesOverride ?? [.default, .plan],
+                permissionModes: permissionModesOverride ?? AgentPermissionMode.allCases,
                 enabled: enabled,
                 installed: installed,
                 version: version,
@@ -539,10 +819,26 @@ public enum AgentProviderSnapshotFactory {
                 homePath: homePath?.isEmpty == false ? homePath : nil,
                 environmentKeys: environmentKeys,
                 models: models,
-                slashCommands: uniqueSlashCommands(defaults: ["/clear", "/default", "/model", "/plan", "/status", "/fork"], probed: slashCommands),
+                slashCommands: uniqueSlashCommands(
+                    defaults: (interactionModesOverride ?? [.default, .plan]).contains(.plan)
+                        ? ["/clear", "/default", "/model", "/plan", "/status", "/fork"]
+                        : ["/clear", "/default", "/model", "/status"],
+                    probed: slashCommands
+                ),
                 skills: unique(skills),
                 advisory: advisory,
-                updateState: updateState
+                updateState: updateState,
+                capabilities: capabilitiesOverride ?? AgentProviderCapabilities(
+                    supportsAttachments: true,
+                    supportedAttachmentKinds: [.image],
+                    supportedAttachmentMediaTypes: ["image/jpeg", "image/png", "image/gif", "image/webp"],
+                    supportsApprovals: true,
+                    supportsUserInput: true,
+                    supportsStreaming: true,
+                    supportsPlanReview: true
+                ),
+                modelDiscoverySource: modelDiscoverySource,
+                modelDiscoveryCacheKey: modelDiscoveryCacheKey
             )
         case .grok:
             let status: AgentProviderSnapshotStatus = enabled
@@ -564,7 +860,8 @@ public enum AgentProviderSnapshotFactory {
                 displayName: displayName ?? "Grok",
                 accentColor: accentColor ?? "#1DA1F2",
                 continuationGroup: "xai-grok",
-                interactionModes: [.default, .plan],
+                interactionModes: interactionModesOverride ?? [.default],
+                permissionModes: permissionModesOverride ?? [.supervised],
                 enabled: enabled,
                 installed: installed,
                 version: version,
@@ -577,10 +874,18 @@ public enum AgentProviderSnapshotFactory {
                 homePath: homePath?.isEmpty == false ? homePath : nil,
                 environmentKeys: environmentKeys,
                 models: models,
-                slashCommands: uniqueSlashCommands(defaults: ["/clear", "/default", "/model", "/plan", "/status", "/fork"], probed: slashCommands),
+                slashCommands: uniqueSlashCommands(
+                    defaults: (interactionModesOverride ?? [.default]).contains(.plan)
+                        ? ["/clear", "/default", "/model", "/plan", "/status"]
+                        : ["/clear", "/default", "/model", "/status"],
+                    probed: slashCommands
+                ),
                 skills: unique(skills),
                 advisory: advisory,
-                updateState: updateState
+                updateState: updateState,
+                capabilities: capabilitiesOverride ?? .conservative,
+                modelDiscoverySource: modelDiscoverySource,
+                modelDiscoveryCacheKey: modelDiscoveryCacheKey
             )
         }
     }
@@ -591,6 +896,7 @@ public enum AgentProviderSnapshotFactory {
         guard hasModels else { return "\(providerName) CLI models are unavailable." }
         if authenticated == false { return "\(providerName) CLI is not authenticated." }
         if updateState == "update_available" { return advisory ?? "\(providerName) CLI update is available." }
+        if let advisory, !advisory.isEmpty { return advisory }
         return nil
     }
 
@@ -634,6 +940,12 @@ public struct AgentThread: Codable, Sendable, Equatable, Identifiable {
     public var worktreePath: String?
     public var serviceTier: AgentServiceTier
     public var modelSelection: AgentModelSelection
+    /// Optional only for backward-compatible decoding of pre-v34 wire snapshots.
+    public var interactionMode: AgentInteractionMode?
+
+    public var effectiveInteractionMode: AgentInteractionMode {
+        interactionMode ?? .default
+    }
 
     public init(
         id: AgentThreadID = AgentThreadID(),
@@ -659,7 +971,8 @@ public struct AgentThread: Codable, Sendable, Equatable, Identifiable {
         baseBranch: String? = nil,
         worktreePath: String? = nil,
         serviceTier: AgentServiceTier = .auto,
-        modelSelection: AgentModelSelection? = nil
+        modelSelection: AgentModelSelection? = nil,
+        interactionMode: AgentInteractionMode = .default
     ) {
         self.id = id
         self.projectId = projectId
@@ -690,6 +1003,7 @@ public struct AgentThread: Codable, Sendable, Equatable, Identifiable {
             reasoningEffort: reasoningEffort,
             serviceTier: serviceTier
         )
+        self.interactionMode = interactionMode
     }
 }
 
@@ -816,19 +1130,46 @@ public struct AgentMessage: Codable, Sendable, Equatable, Identifiable {
     public let role: AgentMessageRole
     public var content: String
     public let createdAt: Date
+    public let attachments: [AgentAttachment]
 
     public init(
         id: AgentMessageID = AgentMessageID(),
         threadId: AgentThreadID,
         role: AgentMessageRole,
         content: String,
-        createdAt: Date = Date()
+        createdAt: Date = Date(),
+        attachments: [AgentAttachment] = []
     ) {
         self.id = id
         self.threadId = threadId
         self.role = role
         self.content = content
         self.createdAt = createdAt
+        self.attachments = attachments
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id, threadId, role, content, createdAt, attachments
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(AgentMessageID.self, forKey: .id)
+        threadId = try container.decode(AgentThreadID.self, forKey: .threadId)
+        role = try container.decode(AgentMessageRole.self, forKey: .role)
+        content = try container.decode(String.self, forKey: .content)
+        createdAt = try container.decode(Date.self, forKey: .createdAt)
+        attachments = try container.decodeIfPresent([AgentAttachment].self, forKey: .attachments) ?? []
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(id, forKey: .id)
+        try container.encode(threadId, forKey: .threadId)
+        try container.encode(role, forKey: .role)
+        try container.encode(content, forKey: .content)
+        try container.encode(createdAt, forKey: .createdAt)
+        try container.encode(attachments, forKey: .attachments)
     }
 }
 
@@ -861,6 +1202,31 @@ public struct AgentMessagePage: Codable, Sendable, Equatable {
         self.hasMoreNewer = hasMoreNewer
         self.nextBefore = nextBefore
         self.nextAfter = nextAfter
+    }
+}
+
+public struct AgentThreadDraft: Codable, Sendable, Equatable {
+    public let threadId: AgentThreadID
+    public var providerInstanceId: String
+    public var text: String
+    public var attachments: [AgentAttachment]
+    public var interactionMode: AgentInteractionMode
+    public var updatedAt: Date
+
+    public init(
+        threadId: AgentThreadID,
+        providerInstanceId: String,
+        text: String,
+        attachments: [AgentAttachment] = [],
+        interactionMode: AgentInteractionMode = .default,
+        updatedAt: Date = Date()
+    ) {
+        self.threadId = threadId
+        self.providerInstanceId = providerInstanceId
+        self.text = text
+        self.attachments = attachments
+        self.interactionMode = interactionMode
+        self.updatedAt = updatedAt
     }
 }
 
@@ -952,6 +1318,7 @@ public struct ProviderSessionRuntime: Codable, Sendable, Equatable {
     public var model: String?
     public var serviceTier: AgentServiceTier
     public var runtimeMode: AgentPermissionMode
+    public var lastRunId: AgentRunID?
     public var lastEventKind: String?
     public var lastErrorMessage: String?
     public var runtimePayloadJSON: String?
@@ -969,6 +1336,7 @@ public struct ProviderSessionRuntime: Codable, Sendable, Equatable {
         model: String? = nil,
         serviceTier: AgentServiceTier = .auto,
         runtimeMode: AgentPermissionMode = .supervised,
+        lastRunId: AgentRunID? = nil,
         lastEventKind: String? = nil,
         lastErrorMessage: String? = nil,
         runtimePayloadJSON: String? = nil,
@@ -985,6 +1353,7 @@ public struct ProviderSessionRuntime: Codable, Sendable, Equatable {
         self.model = model
         self.serviceTier = serviceTier
         self.runtimeMode = runtimeMode
+        self.lastRunId = lastRunId
         self.lastEventKind = lastEventKind
         self.lastErrorMessage = lastErrorMessage
         self.runtimePayloadJSON = runtimePayloadJSON

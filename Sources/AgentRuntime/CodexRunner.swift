@@ -193,7 +193,7 @@ public final class CodexRunner: AgentProviderRunner, @unchecked Sendable {
             // and EOF via the handler — drain them explicitly, then flush
             // the final unterminated line. Without this the closing
             // `turn.completed` (and the answer) is regularly lost.
-            let tail = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
+            let tail = BoundedPipeDrain.readRemaining(from: stdoutPipe.fileHandleForReading)
             for line in outBuf.take(tail) + outBuf.flush() {
                 emitLine(line)
             }
@@ -208,6 +208,7 @@ public final class CodexRunner: AgentProviderRunner, @unchecked Sendable {
 
         do {
             try proc.run()
+            try ProcessSpawnTagger.tagProcess(proc, provider: .codex)
             onEvent(.status(.running))
         } catch {
             onEvent(.error("spawn: \(error.localizedDescription)"))

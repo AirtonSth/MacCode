@@ -197,10 +197,15 @@ final class SplitLayoutRuntimeTests: XCTestCase {
         Self.retainedWindowControllers.append(first)
         first.window.setContentSize(NSSize(width: 1200, height: 800))
         drainMainQueue()
+        first.window.contentView?.layoutSubtreeIfNeeded()
         let split = try XCTUnwrap(findRootSplit(first.window.contentView!))
         split.setPosition(360, ofDividerAt: 0)
         split.layoutSubtreeIfNeeded()
         drainMainQueue(seconds: 0.35)
+        XCTAssertEqual(split.subviews.first?.frame.width ?? 0, 360, accuracy: 2,
+                       "the first window must finish the user resize before persistence is evaluated")
+        XCTAssertEqual(MainWindowController.storedSidebarWidth(context: ctx), 360, accuracy: 2,
+                       "the debounced width must be durable before a replacement window reads it")
 
         let second = MainWindowController(context: ctx, router: router)
         Self.retainedWindowControllers.append(second)

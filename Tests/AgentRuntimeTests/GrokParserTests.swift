@@ -154,6 +154,20 @@ final class GrokParserTests: XCTestCase {
                        "late thoughts must not concatenate into the first Thought block above the answer")
     }
 
+    func test_finalMessageUsesOnlyLastAssistantTextPhase() {
+        let parser = GrokParser(initialSessionId: "preassigned")
+        var events: [AssistantEvent] = []
+        events += parser.parseLine(#"{"type":"text","data":"preface"}"#)
+        events += parser.parseLine(#"{"type":"thought","data":"more work"}"#)
+        events += parser.parseLine(#"{"type":"text","data":"final answer"}"#)
+        events += parser.parseLine(#"{"type":"end","stopReason":"EndTurn"}"#)
+        XCTAssertTrue(events.contains {
+            if case .turnCompleted(_, let final) = $0 { return final == "final answer" }
+            return false
+        })
+        XCTAssertEqual(parser.capturedSessionId, "preassigned")
+    }
+
     func test_toolCallClosesOpenReasoning() {
         let parser = GrokParser()
         var events: [AssistantEvent] = []

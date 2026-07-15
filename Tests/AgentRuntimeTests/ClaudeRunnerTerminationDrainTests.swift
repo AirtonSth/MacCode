@@ -14,7 +14,7 @@ import CoreModel
 ///    lines. Both readers are now serialized on one lock taken before the fd
 ///    read, so a burst that straddles process exit arrives complete and in
 ///    order (under TSan the pre-fix race is flagged directly).
-final class ClaudeRunnerTerminationDrainTests: XCTestCase {
+final class ClaudeRunnerTerminationDrainTests: ProviderProcessTestCase {
 
     // WHY: when the CLI dies immediately, the stderr tail is the ONLY carrier
     // of the failure reason; if the exit path drops it the user sees a bare

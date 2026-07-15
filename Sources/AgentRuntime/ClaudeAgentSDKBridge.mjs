@@ -1,4 +1,5 @@
 import { createSdkMcpServer, query, tool } from '@anthropic-ai/claude-agent-sdk';
+import * as claudeSDK from '@anthropic-ai/claude-agent-sdk';
 import { z } from 'zod';
 import { execFile, execFileSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
@@ -9,12 +10,28 @@ import { promisify } from 'node:util';
 import readline from 'node:readline';
 
 const execFileAsync = promisify(execFile);
+const BRIDGE_PROTOCOL_VERSION = 3;
+
+function loadedSDKVersion() {
+  try {
+    const packageURL = new URL('./node_modules/@anthropic-ai/claude-agent-sdk/package.json', import.meta.url);
+    const manifest = JSON.parse(fs.readFileSync(packageURL, 'utf8'));
+    return typeof manifest.version === 'string' && manifest.version ? manifest.version : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+const SDK_VERSION = loadedSDKVersion();
 
 const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
 
 let queue = [];
 let waiters = [];
 let activeQuery = null;
+let awaitingPlanReviewInterrupt = false;
+let bridgeConfigured = false;
+let handshakePublished = false;
 let current = {
   cwd: process.cwd(),
   model: undefined,
@@ -26,6 +43,7 @@ let current = {
   effort: undefined,
   settings: undefined,
   systemPrompt: undefined,
+  claudeExecutablePath: undefined,
 };
 const pendingPermissions = new Map();
 const pendingUserInputs = new Map();
@@ -230,12 +248,8 @@ function bridgeUserInputRequest(request) {
     requested_schema: request.requestedSchema,
   });
   return new Promise((resolve) => {
-    pendingUserInputs.set(requestId, resolve);
+    pendingUserInputs.set(requestId, { resolve, requestedSchema: request.requestedSchema });
   });
-}
-
-function isExitPlanMode(toolName) {
-  return String(toolName || '').replace(/[_-]/g, '').toLowerCase() === 'exitplanmode';
 }
 
 function isAskUserQuestion(toolName) {
@@ -258,8 +272,8 @@ function askUserQuestionPrompt(input) {
 // Map the host's answer back into the canUseTool PermissionResult the SDK expects.
 // Answers are keyed by question text; multi-select answers are comma-joined. A
 // non-JSON answer is treated as a freeform `response` (the SDK's "Other" path).
-// Cancellation is not handled here — it flows through drainPendingCallbacks on
-// interrupt/close, which denies the pending tool.
+// Request-scoped cancellation is handled by user_input_cancel. Whole-turn
+// interrupt/close still flows through drainPendingCallbacks.
 function askUserQuestionResult(command, input) {
   const updatedInput = { ...(input || {}) };
   if (command.answers && typeof command.answers === 'object') {
@@ -279,23 +293,6 @@ function askUserQuestionResult(command, input) {
     updatedInput.answers = {};
   }
   return { behavior: 'allow', updatedInput, toolUseID: command.request_id };
-}
-
-function emitPlanToolUse(toolName, input, toolUseID) {
-  const requestId = toolUseID || `plan-${Date.now()}`;
-  emit({
-    type: 'assistant',
-    message: {
-      id: requestId,
-      content: [{
-        type: 'tool_use',
-        id: requestId,
-        name: toolName || 'ExitPlanMode',
-        input: input || {},
-      }],
-    },
-    session_id: current.sessionId,
-  });
 }
 
 function attachmentBlock(attachment) {
@@ -374,6 +371,7 @@ function ensureQuery() {
     options: {
       cwd: current.cwd,
       model: current.model,
+      pathToClaudeCodeExecutable: current.claudeExecutablePath,
       resume: current.resume,
       resumeSessionAt: current.resumeSessionAt,
       sessionId: current.resume ? undefined : current.sessionId,
@@ -397,22 +395,12 @@ function ensureQuery() {
       allowDangerouslySkipPermissions: current.permissionMode === 'bypassPermissions',
       env: current.env,
       hooks: tokenSaverHooks(),
-      // Partial assistant snapshots can contain evolving thinking blocks. Replaying
-      // those snapshots into the next Anthropic request can trip the API's
-      // "thinking blocks must remain unchanged" validation.
-      includePartialMessages: false,
+      // Forward SDK partial messages for live UI progress. ClaudeParser deduplicates
+      // the later whole assistant message, so partial delivery does not duplicate it.
+      includePartialMessages: true,
       includeHookEvents: true,
       canUseTool: async (toolName, input, options) => {
         const requestId = options.toolUseID || `permission-${Date.now()}`;
-        if (current.permissionMode === 'plan' && isExitPlanMode(toolName)) {
-          emitPlanToolUse(toolName, input, requestId);
-          return {
-            behavior: 'deny',
-            message: 'RemoteCode captured the proposed plan. Stop now and wait for the user to approve implementation.',
-            interrupt: true,
-            toolUseID: requestId,
-          };
-        }
         // AskUserQuestion is an interactive question, not a permission gate: route
         // it as a structured user_input_request (never an Approve/Decline card) and
         // return the user's choice as the canUseTool result. This also keeps it
@@ -440,7 +428,7 @@ function ensureQuery() {
           display_name: options.displayName,
         });
         return await new Promise((resolve) => {
-          pendingPermissions.set(requestId, resolve);
+          pendingPermissions.set(requestId, { resolve, input: structuredClone(input || {}) });
         });
       },
       onElicitation: async (request) => {
@@ -456,10 +444,49 @@ function ensureQuery() {
         if (message && typeof message.session_id === 'string' && message.session_id) {
           current.resume = message.session_id;
         }
+        if (awaitingPlanReviewInterrupt && message?.type === 'result') {
+          awaitingPlanReviewInterrupt = false;
+          emit({
+            ...message,
+            subtype: 'success',
+            is_error: false,
+            result: 'Plan ready for review',
+            errors: [],
+          });
+          continue;
+        }
         emit(message);
+        // ExitPlanMode approval changes the SDK's internal mode and otherwise
+        // continues directly into implementation in the same provider turn.
+        // The host needs the real ExitPlanModeOutput first, then a separate
+        // explicit Implement action. Interrupt immediately after emitting that
+        // output so no workspace mutation can race ahead of the review UI.
+        const toolResult = message && typeof message.tool_use_result === 'object'
+          ? message.tool_use_result
+          : null;
+        if (current.permissionMode === 'plan'
+            && toolResult
+            && Object.prototype.hasOwnProperty.call(toolResult, 'plan')
+            && typeof toolResult.isAgent === 'boolean'
+            && activeQuery?.interrupt) {
+          awaitingPlanReviewInterrupt = true;
+          await activeQuery.interrupt();
+        }
       }
     } catch (error) {
-      emit({ type: 'sdk_error', message: String(error?.message || error) });
+      if (awaitingPlanReviewInterrupt) {
+        awaitingPlanReviewInterrupt = false;
+        emit({
+          type: 'result',
+          subtype: 'success',
+          is_error: false,
+          result: 'Plan ready for review',
+          errors: [],
+          session_id: current.resume,
+        });
+      } else {
+        emit({ type: 'sdk_error', message: String(error?.message || error) });
+      }
       // The query is dead: settle in-flight callbacks and reset the stream
       // state so the host (which treats sdk_error as terminal for the run)
       // can start a fresh query on the next rc_turn instead of feeding a
@@ -534,21 +561,21 @@ function drainPendingCallbacks() {
     ask.resolve({ behavior: 'deny', message: 'cancelled', interrupt: true, toolUseID: id });
   }
   pendingAskUserQuestions.clear();
-  for (const [id, resolve] of pendingPermissions) {
-    resolve({ behavior: 'deny', message: 'cancelled', interrupt: true, toolUseID: id });
+  for (const [id, pending] of pendingPermissions) {
+    pending.resolve({ behavior: 'deny', message: 'cancelled', interrupt: true, toolUseID: id });
   }
   pendingPermissions.clear();
-  for (const [, resolve] of pendingUserInputs) {
-    resolve({ action: 'cancel' });
+  for (const [, pending] of pendingUserInputs) {
+    pending.resolve({ action: 'cancel' });
   }
   pendingUserInputs.clear();
 }
 
-function permissionResult(command) {
+function permissionResult(command, pending) {
   switch (command.decision) {
     case 'approve':
     case 'approve_for_session':
-      return { behavior: 'allow', updatedInput: command.updated_input || {}, toolUseID: command.request_id };
+      return { behavior: 'allow', updatedInput: command.updated_input || pending.input, toolUseID: command.request_id };
     case 'cancel':
       return { behavior: 'deny', message: 'cancelled', interrupt: true, toolUseID: command.request_id };
     case 'decline':
@@ -557,7 +584,7 @@ function permissionResult(command) {
   }
 }
 
-function userInputResult(command) {
+function userInputResult(command, requestedSchema) {
   switch (command.decision) {
     case 'cancel':
     case 'cancelled':
@@ -567,8 +594,27 @@ function userInputResult(command) {
       return { action: 'decline' };
     case 'accept':
     default:
-      return { action: 'accept', content: { answer: command.text || '' } };
+      return {
+        action: 'accept',
+        content: (command.content && typeof command.content === 'object')
+          ? command.content
+          : elicitationContent(command.text || '', requestedSchema),
+      };
   }
+}
+
+function elicitationContent(text, requestedSchema) {
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    parsed = undefined;
+  }
+  if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return parsed;
+  const properties = requestedSchema && requestedSchema.properties;
+  const names = properties && typeof properties === 'object' ? Object.keys(properties) : [];
+  if (names.length === 1) return { [names[0]]: text };
+  return { answer: text };
 }
 
 let pendingCommandText = '';
@@ -605,6 +651,24 @@ for await (const line of rl) {
   const command = parseCommandLine(line);
   if (!command) continue;
   if (command.type === 'rc_configure') {
+    const hostProtocolVersion = Number(command.bridge_protocol_version);
+    const expectedSDKVersion = String(command.expected_sdk_version || '');
+    if (hostProtocolVersion !== BRIDGE_PROTOCOL_VERSION) {
+      bridgeConfigured = false;
+      emit({
+        type: 'sdk_error',
+        message: `Claude Agent SDK bridge protocol mismatch: host=${hostProtocolVersion || 'missing'} bridge=${BRIDGE_PROTOCOL_VERSION}`,
+      });
+      continue;
+    }
+    if (!SDK_VERSION || !expectedSDKVersion || SDK_VERSION !== expectedSDKVersion) {
+      bridgeConfigured = false;
+      emit({
+        type: 'sdk_error',
+        message: `Claude Agent SDK version mismatch: host=${expectedSDKVersion || 'missing'} bridge=${SDK_VERSION || 'unknown'}`,
+      });
+      continue;
+    }
     current = {
       cwd: command.cwd || current.cwd,
       model: command.model || current.model,
@@ -616,10 +680,85 @@ for await (const line of rl) {
       effort: command.effort || undefined,
       settings: command.settings || undefined,
       systemPrompt: command.system_prompt || undefined,
+      claudeExecutablePath: command.claude_executable_path || undefined,
     };
+    bridgeConfigured = true;
+    handshakePublished = false;
   } else if (command.type === 'rc_turn') {
+    if (!bridgeConfigured) {
+      emit({ type: 'sdk_error', message: 'Claude Agent SDK bridge rejected turn before a valid rc_configure handshake' });
+      continue;
+    }
+    if (!handshakePublished) {
+      emit({
+        type: 'system',
+        subtype: 'rc_bridge_ready',
+        session_id: current.sessionId,
+        bridge_protocol_version: BRIDGE_PROTOCOL_VERSION,
+        sdk_version: SDK_VERSION,
+        claude_runtime_configured: Boolean(current.claudeExecutablePath),
+      });
+      handshakePublished = true;
+    }
     pushPrompt(command.prompt || '', command.attachments || []);
     ensureQuery();
+  } else if (command.type === 'rc_list_sessions') {
+    if (!bridgeConfigured) {
+      emit({ type: 'sdk_error', message: 'Claude Agent SDK bridge rejected session list before a valid rc_configure handshake' });
+      continue;
+    }
+    const requestId = String(command.request_id || '');
+    try {
+      if (typeof claudeSDK.listSessions !== 'function') throw new Error('Claude Agent SDK listSessions API is unavailable');
+      const sessions = await claudeSDK.listSessions();
+      emit({
+        type: 'system',
+        subtype: 'rc_list_sessions_result',
+        request_id: requestId,
+        sessions: sessions.map((session) => ({
+          session_id: session.sessionId,
+          custom_title: session.customTitle || '',
+        })),
+      });
+    } catch (error) {
+      emit({ type: 'sdk_error', subtype: 'rc_session_operation_error', request_id: requestId, message: String(error?.message || error) });
+    }
+  } else if (command.type === 'rc_fork_session') {
+    if (!bridgeConfigured) {
+      emit({ type: 'sdk_error', message: 'Claude Agent SDK bridge rejected session fork before a valid rc_configure handshake' });
+      continue;
+    }
+    const requestId = String(command.request_id || '');
+    try {
+      if (typeof claudeSDK.forkSession !== 'function') throw new Error('Claude Agent SDK forkSession API is unavailable');
+      const sourceSessionId = String(command.source_session_id || '');
+      const title = String(command.title || '');
+      if (!sourceSessionId || !title) throw new Error('Claude Agent SDK fork requires source_session_id and title');
+      const result = await claudeSDK.forkSession(sourceSessionId, { title });
+      emit({
+        type: 'system',
+        subtype: 'rc_fork_session_result',
+        request_id: requestId,
+        session_id: result.sessionId,
+      });
+    } catch (error) {
+      emit({ type: 'sdk_error', subtype: 'rc_session_operation_error', request_id: requestId, message: String(error?.message || error) });
+    }
+  } else if (command.type === 'rc_delete_session') {
+    if (!bridgeConfigured) {
+      emit({ type: 'sdk_error', message: 'Claude Agent SDK bridge rejected session delete before a valid rc_configure handshake' });
+      continue;
+    }
+    const requestId = String(command.request_id || '');
+    try {
+      if (typeof claudeSDK.deleteSession !== 'function') throw new Error('Claude Agent SDK deleteSession API is unavailable');
+      const sessionId = String(command.session_id || '');
+      if (!sessionId) throw new Error('Claude Agent SDK delete requires session_id');
+      await claudeSDK.deleteSession(sessionId);
+      emit({ type: 'system', subtype: 'rc_delete_session_result', request_id: requestId, session_id: sessionId });
+    } catch (error) {
+      emit({ type: 'sdk_error', subtype: 'rc_session_operation_error', request_id: requestId, message: String(error?.message || error) });
+    }
   } else if (command.type === 'rc_set_model') {
     current.model = command.model || undefined;
     if (activeQuery?.setModel) await activeQuery.setModel(current.model);
@@ -629,10 +768,10 @@ for await (const line of rl) {
     if (activeQuery?.setPermissionMode) await activeQuery.setPermissionMode(current.permissionMode);
     emit({ type: 'system', subtype: 'rc_permission_set', permissionMode: current.permissionMode, session_id: command.session_id });
   } else if (command.type === 'permission_response') {
-    const resolver = pendingPermissions.get(command.request_id);
-    if (resolver) {
+    const pending = pendingPermissions.get(command.request_id);
+    if (pending) {
       pendingPermissions.delete(command.request_id);
-      resolver(permissionResult(command));
+      pending.resolve(permissionResult(command, pending));
     }
   } else if (command.type === 'user_input_response') {
     const ask = pendingAskUserQuestions.get(command.request_id);
@@ -640,10 +779,22 @@ for await (const line of rl) {
       pendingAskUserQuestions.delete(command.request_id);
       ask.resolve(askUserQuestionResult(command, ask.input));
     } else {
-      const resolver = pendingUserInputs.get(command.request_id);
-      if (resolver) {
+      const pending = pendingUserInputs.get(command.request_id);
+      if (pending) {
         pendingUserInputs.delete(command.request_id);
-        resolver(userInputResult(command));
+        pending.resolve(userInputResult(command, pending.requestedSchema));
+      }
+    }
+  } else if (command.type === 'user_input_cancel') {
+    const ask = pendingAskUserQuestions.get(command.request_id);
+    if (ask) {
+      pendingAskUserQuestions.delete(command.request_id);
+      ask.resolve({ behavior: 'deny', message: 'cancelled', toolUseID: command.request_id });
+    } else {
+      const pending = pendingUserInputs.get(command.request_id);
+      if (pending) {
+        pendingUserInputs.delete(command.request_id);
+        pending.resolve({ action: 'cancel' });
       }
     }
   } else if (command.type === 'rc_interrupt') {

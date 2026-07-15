@@ -9,7 +9,7 @@ public struct SchemaStep {
 }
 
 public enum Schema {
-    public static let currentVersion: Int = 33
+    public static let currentVersion: Int = 41
 
     public static let steps: [SchemaStep] = [
         SchemaStep(1, """
@@ -491,6 +491,91 @@ public enum Schema {
                 REFERENCES command_receipts(method, client_request_id)
                 ON DELETE CASCADE
         );
+        """),
+        SchemaStep(34, """
+        ALTER TABLE agent_threads
+        ADD COLUMN interaction_mode TEXT NOT NULL DEFAULT 'default';
+        """),
+        SchemaStep(35, """
+        ALTER TABLE agent_messages
+        ADD COLUMN attachments_json TEXT NOT NULL DEFAULT '[]';
+        """),
+        SchemaStep(36, """
+        CREATE TABLE IF NOT EXISTS agent_thread_drafts (
+            thread_id TEXT PRIMARY KEY,
+            provider_instance_id TEXT NOT NULL,
+            text TEXT NOT NULL DEFAULT '',
+            attachments_json TEXT NOT NULL DEFAULT '[]',
+            interaction_mode TEXT NOT NULL DEFAULT 'default',
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY(thread_id) REFERENCES agent_threads(id) ON DELETE CASCADE
+        );
+        """),
+        SchemaStep(37, """
+        ALTER TABLE agent_queued_messages ADD COLUMN lease_id TEXT;
+        ALTER TABLE agent_queued_messages ADD COLUMN lease_started_at TEXT;
+        CREATE INDEX IF NOT EXISTS idx_agent_queued_messages_lease
+        ON agent_queued_messages(thread_id, lease_id, lease_started_at, position, created_at);
+        """),
+        SchemaStep(38, """
+        CREATE TABLE agent_thread_drafts_v38 (
+            thread_id TEXT NOT NULL,
+            provider_instance_id TEXT NOT NULL,
+            text TEXT NOT NULL DEFAULT '',
+            attachments_json TEXT NOT NULL DEFAULT '[]',
+            interaction_mode TEXT NOT NULL DEFAULT 'default',
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY(thread_id, provider_instance_id),
+            FOREIGN KEY(thread_id) REFERENCES agent_threads(id) ON DELETE CASCADE
+        );
+        INSERT INTO agent_thread_drafts_v38(
+            thread_id, provider_instance_id, text, attachments_json, interaction_mode, updated_at
+        )
+        SELECT thread_id, provider_instance_id, text, attachments_json, interaction_mode, updated_at
+        FROM agent_thread_drafts;
+        DROP TABLE agent_thread_drafts;
+        ALTER TABLE agent_thread_drafts_v38 RENAME TO agent_thread_drafts;
+        """),
+        SchemaStep(39, """
+        ALTER TABLE agent_queued_messages
+        ADD COLUMN dispatch_state TEXT NOT NULL DEFAULT 'queued';
+        ALTER TABLE agent_queued_messages
+        ADD COLUMN dispatch_run_id TEXT;
+        ALTER TABLE agent_queued_messages
+        ADD COLUMN dispatch_updated_at TEXT;
+        CREATE INDEX IF NOT EXISTS idx_agent_queued_messages_dispatch
+        ON agent_queued_messages(thread_id, dispatch_state, position, created_at);
+        """),
+        SchemaStep(40, """
+        CREATE TABLE IF NOT EXISTS agent_thread_fork_intents (
+            child_thread_id TEXT PRIMARY KEY,
+            source_thread_id TEXT NOT NULL,
+            provider TEXT NOT NULL,
+            idempotency_key TEXT NOT NULL UNIQUE,
+            state TEXT NOT NULL,
+            child_thread_json TEXT NOT NULL,
+            source_messages_json TEXT NOT NULL,
+            provider_child_thread_id TEXT,
+            last_error TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_agent_thread_fork_intents_state
+        ON agent_thread_fork_intents(state, updated_at);
+        """),
+        SchemaStep(41, """
+        ALTER TABLE provider_session_runtime ADD COLUMN last_run_id TEXT;
+        """),
+        SchemaStep(42, """
+        CREATE TABLE IF NOT EXISTS agent_thread_undo_gc_pins (
+            owner_id TEXT PRIMARY KEY,
+            attachments_json TEXT NOT NULL DEFAULT '[]',
+            opaque_payload TEXT NOT NULL DEFAULT '',
+            expires_at TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_agent_thread_undo_gc_pins_expiry
+        ON agent_thread_undo_gc_pins(expires_at);
         """)
     ]
 
@@ -531,6 +616,9 @@ public enum Schema {
                 current = Int(stmt.columnInt64(0))
             }
         }
+        // Finalize the schema-version read before a pending migration rebuilds
+        // or drops a table. An active sqlite statement holds a schema read lock.
+        stmt.reset()
         let pending = steps.filter { $0.version > current }
         for step in pending.sorted(by: { $0.version < $1.version }) {
             try db.transaction {

@@ -74,6 +74,7 @@ public protocol CommandRouting: AnyObject {
     func configureAgentThreadExecution(thread: AgentThreadID, executionMode: AgentExecutionMode, baseBranch: String?) throws -> AgentThread
     func prepareAgentThreadForPullRequest(workspace: WorkspaceID, url: String, provider: AgentProvider, model: String, permissionMode: AgentPermissionMode, reasoningEffort: AgentReasoningEffort, serviceTier: AgentServiceTier, modelSelection: AgentModelSelection?, providerInstanceId: String?) throws -> AgentThread
     func uploadAgentAttachment(workspace: WorkspaceID, filename: String, mimeType: String?, dataBase64: String) throws -> AgentAttachmentUploadResult
+    func importAgentAttachment(workspace: WorkspaceID, relativePath: String) throws -> AgentAttachmentUploadResult
     func selectAgentThread(thread: AgentThreadID, surfaceID: SurfaceID?) throws
     func listAgentMessages(thread: AgentThreadID, limit: Int) throws -> [AgentMessage]
     func listAgentMessagesPage(thread: AgentThreadID, limit: Int, before: AgentMessageCursor?, after: AgentMessageCursor?) throws -> AgentMessagePage
@@ -83,7 +84,7 @@ public protocol CommandRouting: AnyObject {
     func threadIdsWithMessages() throws -> Set<AgentThreadID>
     func getAgentMessage(id: AgentMessageID) throws -> AgentMessage?
     func listAgentQueuedMessages(thread: AgentThreadID) throws -> [AgentQueuedMessage]
-    func updateAgentQueuedMessage(id: AgentQueuedMessageID, text: String, attachments: [AgentAttachment]) throws -> AgentQueuedMessage
+    func updateAgentQueuedMessage(id: AgentQueuedMessageID, text: String, attachments: [AgentAttachment]) async throws -> AgentQueuedMessage
     func cancelAgentQueuedMessage(id: AgentQueuedMessageID) throws -> AgentQueuedMessage
     func forceAgentQueuedMessageNow(id: AgentQueuedMessageID) async throws -> AgentMessageSendResult
     /// Moves a queued message to `position` (0-based target index) within its
@@ -113,8 +114,8 @@ public protocol CommandRouting: AnyObject {
     /// the coordinator replays the saved resume cursor without a new user
     /// message. Returns the new run id when one started.
     func continueAgentRun(thread: AgentThreadID) async throws -> AgentRunID?
-    func deleteAgentThread(thread: AgentThreadID) throws
-    func deleteAgentThreads(_ threads: [AgentThreadID]) throws
+    func deleteAgentThread(thread: AgentThreadID) async throws
+    func deleteAgentThreads(_ threads: [AgentThreadID]) async throws
     func renameAgentThread(thread: AgentThreadID, title: String) throws -> AgentThread
     func setAgentThreadPinned(thread: AgentThreadID, pinned: Bool) throws -> AgentThread
     func setAgentThreadColor(thread: AgentThreadID, color: String) throws -> AgentThread
@@ -437,6 +438,7 @@ public final class JSONRPCDispatcher {
         "agent.plan.notes.save",
         "agent.checkpoint.revert",
         "agent.attachment.upload",
+        "agent.attachment.import",
         "agent.provider.update",
     ]
     private nonisolated static let canonicalImmediateEventMethods: Set<String> = [
@@ -454,6 +456,7 @@ public final class JSONRPCDispatcher {
         "agent.plan.notes.save",
         "agent.checkpoint.revert",
         "agent.attachment.upload",
+        "agent.attachment.import",
         "agent.provider.update",
     ]
     public init(
@@ -564,11 +567,13 @@ public final class JSONRPCDispatcher {
                 payload["turn_id"] = object["turnId"] ?? object["turn_id"]
                 payload["checkpoint_ref"] = object["checkpointRef"] ?? object["checkpoint_ref"]
             }
-        case "agent.attachment.upload":
+        case "agent.attachment.upload", "agent.attachment.import":
             kind = "agent.attachment.uploaded"
             payload["workspace_id"] = string("workspace_id")
             if let object = result.objectValue {
+                payload["id"] = object["id"]
                 payload["display_name"] = object["displayName"] ?? object["display_name"]
+                payload["sha256"] = object["sha256"]
                 payload["size_bytes"] = object["sizeBytes"] ?? object["size_bytes"]
             }
         case "agent.provider.update":
@@ -1690,11 +1695,24 @@ public final class JSONRPCDispatcher {
                 let uploaded = try router.uploadAgentAttachment(workspace: wid, filename: filename, mimeType: params["mime_type"]?.stringValue ?? params["mimeType"]?.stringValue, dataBase64: dataBase64)
                 EventBus.shared.publish(kind: "agent.attachment.uploaded", payload: .object([
                     "workspace_id": .string(wid.value.uuidString),
-                    "path": .string(uploaded.path),
+                    "id": .string(uploaded.id),
                     "display_name": .string(uploaded.displayName),
+                    "sha256": .string(uploaded.sha256),
                     "size_bytes": .number(Double(uploaded.sizeBytes))
                 ]))
                 return .init(id: id, result: encode(uploaded))
+            case "agent.attachment.import":
+                guard let wid = params["workspace_id"]?.stringValue.flatMap(UUID.init).map(WorkspaceID.init),
+                      let relativePath = params["relative_path"]?.stringValue else { throw JSONRPCError.invalidParams }
+                let imported = try router.importAgentAttachment(workspace: wid, relativePath: relativePath)
+                EventBus.shared.publish(kind: "agent.attachment.uploaded", payload: .object([
+                    "workspace_id": .string(wid.value.uuidString),
+                    "id": .string(imported.id),
+                    "display_name": .string(imported.displayName),
+                    "sha256": .string(imported.sha256),
+                    "size_bytes": .number(Double(imported.sizeBytes))
+                ]))
+                return .init(id: id, result: encode(imported))
             case "agent.thread.select":
                 guard let tid = params["thread_id"]?.stringValue.flatMap(UUID.init).map(AgentThreadID.init) else { throw JSONRPCError.invalidParams }
                 let selectSurfaceID = (params["surface_id"]?.stringValue ?? params["surfaceId"]?.stringValue).flatMap(UUID.init).map(SurfaceID.init)
@@ -1716,14 +1734,14 @@ public final class JSONRPCDispatcher {
                 let serviceTier = modelSelection?.serviceTier ?? params["service_tier"]?.stringValue.flatMap(AgentServiceTier.init)
                 let interactionMode = params["interaction_mode"]?.stringValue.flatMap(AgentInteractionMode.init)
                 let providerInstanceId = params["provider_instance_id"]?.stringValue ?? params["providerInstanceId"]?.stringValue
-                let attachments = agentAttachments(from: params["attachments"])
+                let attachments = try agentAttachments(from: params["attachments"])
                 let sendResult = try await router.sendAgentMessage(thread: tid, text: text, provider: provider, model: model, permissionMode: permission, reasoningEffort: reasoning, serviceTier: serviceTier, interactionMode: interactionMode, modelSelection: modelSelection, providerInstanceId: providerInstanceId, attachments: attachments)
                 let result = messageSendResultPayload(sendResult)
                 recordCommandReceipt(method: req.method, clientRequestId: receiptKey, result: result)
                 return .init(id: id, result: result)
             case "agent.message.queue.list":
                 guard let tid = params["thread_id"]?.stringValue.flatMap(UUID.init).map(AgentThreadID.init) else { throw JSONRPCError.invalidParams }
-                return .init(id: id, result: encode(try router.listAgentQueuedMessages(thread: tid)))
+                return .init(id: id, result: .array(try router.listAgentQueuedMessages(thread: tid).map(queuedMessagePayload)))
             case "agent.message.queue.update":
                 guard let qid = params["queued_message_id"]?.stringValue.flatMap(UUID.init).map(AgentQueuedMessageID.init)
                         ?? params["id"]?.stringValue.flatMap(UUID.init).map(AgentQueuedMessageID.init),
@@ -1732,7 +1750,7 @@ public final class JSONRPCDispatcher {
                 if let (_, cached) = commandReceipt(method: req.method, params: params) {
                     return .init(id: id, result: cached)
                 }
-                let updated = try router.updateAgentQueuedMessage(id: qid, text: text, attachments: agentAttachments(from: params["attachments"]))
+                let updated = try await router.updateAgentQueuedMessage(id: qid, text: text, attachments: try agentAttachments(from: params["attachments"]))
                 let result = queuedMessagePayload(updated)
                 recordCommandReceipt(method: req.method, clientRequestId: receiptKey, result: result)
                 return .init(id: id, result: result)
@@ -1861,11 +1879,11 @@ public final class JSONRPCDispatcher {
                     )
                     return .init(id: id, result: messagePagePayload(page))
                 }
-                return .init(id: id, result: encode(try router.listAgentMessages(thread: tid, limit: limit)))
+                return .init(id: id, result: .array(try router.listAgentMessages(thread: tid, limit: limit).map(messagePayload)))
             case "agent.message.get":
                 guard let mid = params["message_id"]?.stringValue.flatMap(UUID.init).map(AgentMessageID.init) else { throw JSONRPCError.invalidParams }
                 guard let message = try router.getAgentMessage(id: mid) else { throw JSONRPCError.invalidParams }
-                return .init(id: id, result: encode(message))
+                return .init(id: id, result: messagePayload(message))
             case "agent.run.stop":
                 guard let tid = params["thread_id"]?.stringValue.flatMap(UUID.init).map(AgentThreadID.init) else { throw JSONRPCError.invalidParams }
                 let receiptKey = params["client_request_id"]?.stringValue
@@ -1988,7 +2006,7 @@ public final class JSONRPCDispatcher {
                 if let (_, cached) = commandReceipt(method: req.method, params: params) {
                     return .init(id: id, result: cached)
                 }
-                try router.deleteAgentThread(thread: tid)
+                try await router.deleteAgentThread(thread: tid)
                 EventBus.shared.publish(kind: "agent.thread.deleted", payload: .object(["thread_id": .string(tid.value.uuidString)]))
                 let result = JSONValue.bool(true)
                 recordCommandReceipt(method: req.method, clientRequestId: receiptKey, result: result)
@@ -2001,7 +2019,7 @@ public final class JSONRPCDispatcher {
                 if let (_, cached) = commandReceipt(method: req.method, params: params) {
                     return .init(id: id, result: cached)
                 }
-                try router.deleteAgentThreads(tids)
+                try await router.deleteAgentThreads(tids)
                 EventBus.shared.publish(kind: "agent.thread.deleted_many", payload: .object([
                     "thread_ids": .array(tids.map { .string($0.value.uuidString) })
                 ]))
@@ -2809,6 +2827,8 @@ public final class JSONRPCDispatcher {
         object["execution_mode"] = .string(thread.executionMode.rawValue)
         object["base_branch"] = thread.baseBranch.map { .string($0) } ?? .null
         object["worktree_path"] = thread.worktreePath.map { .string($0) } ?? .null
+        object["interaction_mode"] = .string(thread.effectiveInteractionMode.rawValue)
+        object["interactionMode"] = .string(thread.effectiveInteractionMode.rawValue)
         let locked = providerLocked(thread)
         object["providerLocked"] = .bool(locked)
         object["provider_locked"] = .bool(locked)
@@ -2828,6 +2848,8 @@ public final class JSONRPCDispatcher {
         object["execution_mode"] = .string(thread.executionMode.rawValue)
         object["base_branch"] = thread.baseBranch.map { .string($0) } ?? .null
         object["worktree_path"] = thread.worktreePath.map { .string($0) } ?? .null
+        object["interaction_mode"] = .string(thread.effectiveInteractionMode.rawValue)
+        object["interactionMode"] = .string(thread.effectiveInteractionMode.rawValue)
         let locked = lockedThreads.contains(thread.id)
         object["providerLocked"] = .bool(locked)
         object["provider_locked"] = .bool(locked)
@@ -2870,7 +2892,7 @@ public final class JSONRPCDispatcher {
         object["threadId"] = .string(message.threadId.value.uuidString)
         object["interaction_mode"] = .string(message.interactionMode.rawValue)
         object["interactionMode"] = .string(message.interactionMode.rawValue)
-        object["attachments"] = encode(message.attachments)
+        object["attachments"] = attachmentPayload(message.attachments)
         object["position"] = .number(Double(message.position))
         object["created_at"] = .string(iso8601(message.createdAt))
         object["updated_at"] = .string(iso8601(message.updatedAt))
@@ -2898,7 +2920,7 @@ public final class JSONRPCDispatcher {
 
     private func messagePagePayload(_ page: AgentMessagePage) -> JSONValue {
         var object: [String: JSONValue] = [
-            "messages": encode(page.messages),
+            "messages": .array(page.messages.map(messagePayload)),
             "has_more_older": .bool(page.hasMoreOlder),
             "hasMoreOlder": .bool(page.hasMoreOlder),
             "has_more_newer": .bool(page.hasMoreNewer),
@@ -2950,18 +2972,50 @@ public final class JSONRPCDispatcher {
         )
     }
 
-    private func agentAttachments(from value: JSONValue?) -> [AgentAttachment] {
-        guard case .array(let values) = value else { return [] }
-        return values.compactMap { value -> AgentAttachment? in
+    private func agentAttachments(from value: JSONValue?) throws -> [AgentAttachment] {
+        guard let value else { return [] }
+        guard case .array(let values) = value else { throw JSONRPCError.invalidParams }
+        return try values.map { value -> AgentAttachment in
             guard case .object(let object) = value,
-                  let path = object["path"]?.stringValue,
-                  !path.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
-            let kindRaw = object["kind"]?.stringValue ?? "file"
-            let kind = AgentAttachmentKind(rawValue: kindRaw) ?? .file
-            let displayName = object["displayName"]?.stringValue ?? object["display_name"]?.stringValue
+                  object["path"] == nil,
+                  let id = object["id"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+                  id.count == 64,
+                  id.allSatisfy({ $0.isHexDigit }) else { throw JSONRPCError.invalidParams }
+            let kind: AgentAttachmentKind
+            if let raw = object["kind"]?.stringValue {
+                guard let parsed = AgentAttachmentKind(rawValue: raw) else { throw JSONRPCError.invalidParams }
+                kind = parsed
+            } else {
+                kind = .file
+            }
+            let displayName = object["displayName"]?.stringValue
+                ?? object["display_name"]?.stringValue
+                ?? id
             let mimeType = object["mimeType"]?.stringValue ?? object["mime_type"]?.stringValue
-            return AgentAttachment(path: path, displayName: displayName, kind: kind, mimeType: mimeType)
+            let sha256 = object["sha256"]?.stringValue
+            let sizeBytes = object["sizeBytes"]?.intValue ?? object["size_bytes"]?.intValue
+            return AgentAttachment(
+                id: id,
+                path: "",
+                displayName: displayName,
+                kind: kind,
+                mimeType: mimeType,
+                sha256: sha256,
+                sizeBytes: sizeBytes
+            )
         }
+    }
+
+    private func attachmentPayload(_ attachments: [AgentAttachment]) -> JSONValue {
+        .array(attachments.compactMap { attachment in
+            AgentAttachmentReference(attachment).map(encode)
+        })
+    }
+
+    private func messagePayload(_ message: AgentMessage) -> JSONValue {
+        guard case .object(var object) = encode(message) else { return .null }
+        object["attachments"] = attachmentPayload(message.attachments)
+        return .object(object)
     }
 
     private func gitDeliveryCopy(from params: [String: JSONValue]) -> GitDeliveryCopy? {
@@ -2996,7 +3050,9 @@ public final class JSONRPCDispatcher {
             "reasoning_effort": .string(thread.reasoningEffort.rawValue),
             "service_tier": .string(thread.serviceTier.rawValue),
             "model_selection": encode(thread.modelSelection),
-            "execution_mode": .string(thread.executionMode.rawValue)
+            "execution_mode": .string(thread.executionMode.rawValue),
+            "interaction_mode": .string(thread.effectiveInteractionMode.rawValue),
+            "interactionMode": .string(thread.effectiveInteractionMode.rawValue)
         ]
         payload["base_branch"] = thread.baseBranch.map { .string($0) } ?? .null
         payload["worktree_path"] = thread.worktreePath.map { .string($0) } ?? .null

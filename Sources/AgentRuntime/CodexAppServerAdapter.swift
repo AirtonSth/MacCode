@@ -3,17 +3,63 @@ import CoreModel
 
 public protocol CodexAppServerControlling: AnyObject, Sendable {
     var terminationHandler: (@Sendable (Error) -> Void)? { get set }
+    var forkProtocolSupport: CodexForkProtocolSupport { get }
     func initialize(clientName: String, clientTitle: String, clientVersion: String) async throws -> CodexAppServerInitializeResult
     func openThread(for request: AgentRunRequest) async throws -> CodexAppServerThreadOpenResult
     func startTurn(providerThreadId: String, for request: AgentRunRequest) async throws -> CodexAppServerClient.JSONObject
     func interruptTurn(providerThreadId: String, turnId: String) async throws
     func readThread(providerThreadId: String, includeTurns: Bool) async throws -> CodexAppServerClient.JSONObject
+    func forkThread(providerThreadId: String, lastTurnId: String?) async throws -> String
+    func forkThread(providerThreadId: String, lastTurnId: String?, threadSource: String) async throws -> CodexAppServerThreadSummary
+    func listThreads(cursor: String?, archived: Bool) async throws -> CodexAppServerThreadPage
+    func deleteThread(providerThreadId: String) async throws
     func rollbackThread(providerThreadId: String, numTurns: Int) async throws -> CodexAppServerClient.JSONObject
     func updateThreadSettings(providerThreadId: String, permissionMode: AgentPermissionMode) async throws
     func stop()
+    func stopImmediatelyForAppTermination()
+}
+
+public extension CodexAppServerControlling {
+    var forkProtocolSupport: CodexForkProtocolSupport { .unsupported }
+
+    func forkThread(providerThreadId: String, lastTurnId: String?, threadSource: String) async throws -> CodexAppServerThreadSummary {
+        throw AgentProviderAdapterError.unsupported("Codex keyed fork RPC")
+    }
+
+    func listThreads(cursor: String?, archived: Bool) async throws -> CodexAppServerThreadPage {
+        throw AgentProviderAdapterError.unsupported("Codex thread/list reconciliation RPC")
+    }
+
+    func deleteThread(providerThreadId: String) async throws {
+        throw AgentProviderAdapterError.unsupported("Codex thread/delete compensation RPC")
+    }
+
+    func stopImmediatelyForAppTermination() {
+        stop()
+    }
 }
 
 extension CodexAppServerClient: CodexAppServerControlling {}
+
+public enum CodexForkReconciliationError: Error, CustomStringConvertible {
+    case markerConflictCleaned(marker: String, childIds: [String])
+    case duplicateCleanupFailed(marker: String, details: String)
+    case forkResponseMismatch(childId: String)
+    case paginationCycle
+
+    public var description: String {
+        switch self {
+        case .markerConflictCleaned(let marker, let childIds):
+            return "Codex fork marker conflict was cleaned for \(marker): \(childIds.joined(separator: ", "))"
+        case .duplicateCleanupFailed(let marker, let details):
+            return "Codex fork marker cleanup failed for \(marker): \(details)"
+        case .forkResponseMismatch(let childId):
+            return "Codex fork response did not preserve parent/marker identity for \(childId)"
+        case .paginationCycle:
+            return "Codex thread/list repeated a cursor during fork reconciliation"
+        }
+    }
+}
 
 public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Sendable {
     public let provider: AgentProvider = .codex
@@ -63,6 +109,12 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         let turnId: String?
         let itemId: String?
         let kind: AssistantRequestKind
+        let responseKind: PendingApprovalResponseKind
+    }
+
+    private enum PendingApprovalResponseKind {
+        case legacyDecision
+        case permissions(requested: [String: Any])
     }
 
     private struct PendingUserInput {
@@ -70,11 +122,37 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         let turnId: String?
         let itemId: String?
         let questionIds: [String]
+        let questionPromptsById: [String: String]
         let multiSelectQuestionIds: Set<String>
+        let responseKind: PendingUserInputResponseKind
     }
+
+    private enum PendingUserInputResponseKind {
+        case toolRequest
+        case mcpElicitation(requestedSchema: [String: Any]?)
+    }
+
+    /// Server-to-client methods in the Codex 0.144.4 app-server schema. Keep the
+    /// inventory explicit so a protocol upgrade cannot silently fall through as
+    /// an unknown callback with no ownership decision.
+    static let currentServerRequestMethods: Set<String> = [
+        "item/commandExecution/requestApproval",
+        "item/fileChange/requestApproval",
+        "item/tool/requestUserInput",
+        "mcpServer/elicitation/request",
+        "item/permissions/requestApproval",
+        "item/tool/call",
+        "account/chatgptAuthTokens/refresh",
+        "attestation/generate",
+        "currentTime/read",
+        "applyPatchApproval",
+        "execCommandApproval"
+    ]
 
     private let binaryNameOverride: String?
     private let clientFactory: ClientFactory
+    private let usesCustomClientFactory: Bool
+    private let forkProtocolSupportOverride: CodexForkProtocolSupport?
     private let lock = NSLock()
     private var sessions: [AgentThreadID: Session] = [:]
     // QA-011: blocking-bridge timeouts are injectable so tests can drive the
@@ -96,8 +174,11 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
                 openTimeout: TimeInterval = 10,
                 rollbackTimeout: TimeInterval = 30,
                 modelCacheTTL: TimeInterval = 300,
-                modelListDiscovery: (@Sendable () async -> [AgentModelDescriptor])? = nil) {
+                modelListDiscovery: (@Sendable () async -> [AgentModelDescriptor])? = nil,
+                forkProtocolSupportOverride: CodexForkProtocolSupport? = nil) {
         self.binaryNameOverride = binaryNameOverride
+        self.usesCustomClientFactory = clientFactory != nil
+        self.forkProtocolSupportOverride = forkProtocolSupportOverride
         self.openTimeout = openTimeout
         self.rollbackTimeout = rollbackTimeout
         self.modelCacheTTL = modelCacheTTL
@@ -126,6 +207,31 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
                 serverRequestHandler: serverRequestHandler
             )
         }
+    }
+
+    public var forkSafety: AgentProviderForkSafety {
+        safety(for: configuredForkProtocolSupport())
+    }
+
+    public func forkSafety(threadId: AgentThreadID) -> AgentProviderForkSafety {
+        if let session = sessionSnapshot(threadId: threadId) {
+            return safety(for: session.client.forkProtocolSupport)
+        }
+        return forkSafety
+    }
+
+    private func configuredForkProtocolSupport() -> CodexForkProtocolSupport {
+        if let forkProtocolSupportOverride {
+            return forkProtocolSupportOverride
+        }
+        guard !usesCustomClientFactory else { return .unsupported }
+        return CodexForkProtocolSupport.probe(binary: binaryNameOverride ?? "codex")
+    }
+
+    private func safety(for support: CodexForkProtocolSupport) -> AgentProviderForkSafety {
+        support.isSupported
+            ? .keyedIdempotent(compensationSupported: true)
+            : .unsupported
     }
 
     public func listModels() async -> [AgentModelDescriptor] {
@@ -202,30 +308,65 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         // and misrouting the prior turn's events.
         lock.lock()
         let session = sessions[request.threadId]
-        let hasInFlightTurn = session?.activeTurnId != nil
+        let hasInFlightTurn = session?.status == .running
+            || session?.activeTurnId != nil
             || session?.pendingFinish != nil
             || Self.isActiveThreadStatus(session?.threadStatusType)
+        let reusableSession: (client: CodexAppServerControlling, providerThreadId: String)?
+        if var existing = session, !hasInFlightTurn {
+            existing.status = .running
+            existing.onEvent = onEvent
+            existing.interactionMode = request.interactionMode
+            existing.permissionMode = request.permissionMode
+            sessions[request.threadId] = existing
+            reusableSession = (existing.client, existing.providerThreadId)
+        } else {
+            reusableSession = nil
+        }
         lock.unlock()
         if hasInFlightTurn {
             throw AgentProviderAdapterError.unsupported("Codex session already has an in-flight turn")
         }
-        let client = try clientFor(request: request, onEvent: onEvent)
+
+        let client: CodexAppServerControlling
+        let providerThreadId: String
+        let resumeFellBackToStart: Bool
+        if let reusableSession {
+            client = reusableSession.client
+            providerThreadId = reusableSession.providerThreadId
+            resumeFellBackToStart = false
+        } else {
+            client = try clientFor(request: request, onEvent: onEvent)
+            client.terminationHandler = { [weak self] error in
+                self?.handleClientTermination(threadId: request.threadId, error: error)
+            }
+            _ = try await client.initialize(clientName: "remotecode", clientTitle: "RemoteCode", clientVersion: "0.0.0")
+            let opened = try await client.openThread(for: request)
+            providerThreadId = opened.providerThreadId
+            resumeFellBackToStart = opened.resumeFellBackToStart
+            recordSession(threadId: request.threadId, client: client, providerThreadId: providerThreadId, interactionMode: request.interactionMode, onEvent: onEvent, permissionMode: request.permissionMode)
+        }
         client.terminationHandler = { [weak self] error in
             self?.handleClientTermination(threadId: request.threadId, error: error)
         }
-        _ = try await client.initialize(clientName: "remotecode", clientTitle: "RemoteCode", clientVersion: "0.0.0")
-        let opened = try await client.openThread(for: request)
-        recordSession(threadId: request.threadId, client: client, providerThreadId: opened.providerThreadId, interactionMode: request.interactionMode, onEvent: onEvent, permissionMode: request.permissionMode)
         onEvent(.status(.running))
-        onEvent(.event(.threadStarted(threadId: opened.providerThreadId, providerThreadId: opened.providerThreadId)))
-        if opened.resumeFellBackToStart {
+        onEvent(.event(.threadStarted(threadId: providerThreadId, providerThreadId: providerThreadId)))
+        if resumeFellBackToStart {
             onEvent(.event(.error(message: "Previous session could not be resumed; starting a new session.", recoverable: true)))
         }
 
-        let turn = try await client.startTurn(providerThreadId: opened.providerThreadId, for: request)
-        if let turnId = Self.turnId(from: turn), !turnId.isEmpty {
-            setActiveTurn(threadId: request.threadId, turnId: turnId)
-            onEvent(.event(.turnStarted(turnId: turnId)))
+        do {
+            let turn = try await client.startTurn(providerThreadId: providerThreadId, for: request)
+            if let turnId = Self.turnId(from: turn), !turnId.isEmpty {
+                setActiveTurn(threadId: request.threadId, turnId: turnId)
+                onEvent(.event(.turnStarted(turnId: turnId)))
+            }
+        } catch {
+            if let failedSession = removeSession(threadId: request.threadId) {
+                settlePendingCallbacks(session: failedSession)
+                failedSession.client.stop()
+            }
+            throw error
         }
 
         return AgentRunHandle(runId: request.runId, process: nil) { [weak self] in
@@ -256,21 +397,36 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         case .cancel:
             state = .cancelled
         }
-        var payload: [String: Any] = [
-            "requestId": requestId,
-            "decision": Self.codexDecision(response)
-        ]
+        var payload: [String: Any] = ["requestId": requestId]
         if let turnId = pending.turnId { payload["turnId"] = turnId }
         if let itemId = pending.itemId { payload["itemId"] = itemId }
+        let providerResponse: [String: Any]
+        switch pending.responseKind {
+        case .legacyDecision:
+            payload["decision"] = Self.codexDecision(response)
+            if response == .approveForSession {
+                do {
+                    try await promoteSessionPermission(threadId: threadId, to: .fullAccess)
+                    setSessionPermissionMode(threadId: threadId, permissionMode: .fullAccess)
+                } catch {
+                    pending.continuation.resume(throwing: error)
+                    emit([
+                        runtimeEvent(method: "item/requestApproval/decisionFailed", payload: payload),
+                        .requestResolved(requestId: requestId, state: .declined)
+                    ], threadId: threadId)
+                    throw error
+                }
+            }
+            providerResponse = ["decision": Self.codexDecision(response)]
+        case .permissions(let requested):
+            providerResponse = Self.permissionsApprovalResponse(requested: requested, response: response)
+            payload.merge(providerResponse) { _, new in new }
+        }
         emit([
             runtimeEvent(method: "item/requestApproval/decision", payload: payload),
             .requestResolved(requestId: requestId, state: state)
         ], threadId: threadId)
-        if response == .approveForSession {
-            setSessionPermissionMode(threadId: threadId, permissionMode: .fullAccess)
-            try await promoteSessionPermission(threadId: threadId, to: .fullAccess)
-        }
-        pending.continuation.resume(returning: ["decision": Self.codexDecision(response)])
+        pending.continuation.resume(returning: providerResponse)
     }
 
     public func respondToUserInput(threadId: AgentThreadID, requestId: String, text: String) throws {
@@ -281,22 +437,64 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         guard let pending = removePendingUserInput(threadId: threadId, requestId: requestId) else {
             throw AgentProviderAdapterError.sessionNotFound(threadId)
         }
-        let answers = Self.codexAnswers(
-            questionIds: pending.questionIds,
-            multiSelectQuestionIds: pending.multiSelectQuestionIds,
-            text: verbatimText
-        )
-        var payload: [String: Any] = [
-            "requestId": requestId,
-            "answers": answers
-        ]
+        let providerResponse: [String: Any]
+        switch pending.responseKind {
+        case .toolRequest:
+            providerResponse = ["answers": Self.codexAnswers(
+                questionIds: pending.questionIds,
+                questionPromptsById: pending.questionPromptsById,
+                multiSelectQuestionIds: pending.multiSelectQuestionIds,
+                text: verbatimText
+            )]
+        case .mcpElicitation(let requestedSchema):
+            do {
+                providerResponse = [
+                    "action": "accept",
+                    "content": try Self.mcpElicitationContent(
+                        requestedSchema: requestedSchema,
+                        questionIds: pending.questionIds,
+                        text: verbatimText
+                    )
+                ]
+            } catch {
+                recordPendingUserInput(threadId: threadId, requestId: requestId, pending: pending)
+                throw error
+            }
+        }
+        var payload: [String: Any] = ["requestId": requestId]
+        payload.merge(providerResponse) { _, new in new }
         if let turnId = pending.turnId { payload["turnId"] = turnId }
         if let itemId = pending.itemId { payload["itemId"] = itemId }
         emit([
             runtimeEvent(method: "item/tool/requestUserInput/answered", payload: payload),
             .userInputResolved(requestId: requestId, answer: verbatimText)
         ], threadId: threadId)
-        pending.continuation.resume(returning: ["answers": answers])
+        pending.continuation.resume(returning: providerResponse)
+    }
+
+    public func cancelUserInput(threadId: AgentThreadID, requestId: String) throws {
+        guard let pending = removePendingUserInput(threadId: threadId, requestId: requestId) else {
+            throw AgentProviderAdapterError.sessionNotFound(threadId)
+        }
+        let providerResponse: [String: Any]
+        switch pending.responseKind {
+        case .toolRequest:
+            providerResponse = ["answers": [String: Any]()]
+        case .mcpElicitation:
+            providerResponse = ["action": "cancel"]
+        }
+        var payload: [String: Any] = ["requestId": requestId]
+        payload.merge(providerResponse) { _, new in new }
+        if let turnId = pending.turnId { payload["turnId"] = turnId }
+        if let itemId = pending.itemId { payload["itemId"] = itemId }
+        emit([
+            runtimeEvent(method: "item/tool/requestUserInput/cancelled", payload: payload),
+            .userInputResolved(requestId: requestId, answer: nil)
+        ], threadId: threadId)
+        // Codex's requestUserInput response has no dedicated cancel variant.
+        // Empty answers resolve only this callback and leave the app-server
+        // thread/session alive for the model to choose its next step.
+        pending.continuation.resume(returning: providerResponse)
     }
 
     public func stopSession(threadId: AgentThreadID) throws {
@@ -315,8 +513,17 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         do {
             _ = try await client.initialize(clientName: "remotecode", clientTitle: "RemoteCode", clientVersion: "0.0.0")
             let opened = try await client.openThread(for: request)
-            recordSession(threadId: request.threadId, client: client, providerThreadId: opened.providerThreadId, interactionMode: request.interactionMode, onEvent: onEvent, permissionMode: request.permissionMode)
-            if let activeTurnId = Self.recoveryActiveTurnId(from: request.extraArgs) {
+            let activeTurnId = Self.recoveryActiveTurnId(from: request.extraArgs)
+            recordSession(
+                threadId: request.threadId,
+                client: client,
+                providerThreadId: opened.providerThreadId,
+                interactionMode: request.interactionMode,
+                onEvent: onEvent,
+                permissionMode: request.permissionMode,
+                status: activeTurnId == nil ? .completed : .running
+            )
+            if let activeTurnId {
                 setActiveTurn(threadId: request.threadId, turnId: activeTurnId)
             }
             onEvent(.event(.threadStarted(threadId: opened.providerThreadId, providerThreadId: opened.providerThreadId)))
@@ -347,6 +554,194 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         return Self.events(fromThreadReadResponse: response, providerThreadId: snapshot.providerThreadId)
     }
 
+    public func forkThread(threadId: AgentThreadID) async throws -> String {
+        throw AgentProviderAdapterError.unsupported(
+            "unkeyed Codex fork is unsafe; use the durable AgentProviderForkRequest path"
+        )
+    }
+
+    public func forkThread(_ request: AgentProviderForkRequest) async throws -> String {
+        guard let snapshot = sessionSnapshot(threadId: request.sourceThreadId) else {
+            throw AgentProviderAdapterError.sessionNotFound(request.sourceThreadId)
+        }
+        guard forkSafety(threadId: request.sourceThreadId).supportsDurableFork else {
+            throw AgentProviderAdapterError.unsupported("Codex fork reconciliation schema is unavailable")
+        }
+        if let expectedSourceId = request.sourceProviderThreadId,
+           !expectedSourceId.isEmpty,
+           expectedSourceId != snapshot.providerThreadId {
+            throw AgentProviderAdapterError.unsupported("Codex app-server recovered the wrong parent thread for fork")
+        }
+        guard snapshot.activeTurnId == nil,
+              snapshot.pendingFinish == nil,
+              !Self.isActiveThreadStatus(snapshot.threadStatusType) else {
+            throw AgentProviderAdapterError.unsupported("Codex app-server cannot fork while the parent turn is active")
+        }
+
+        let existing = try await forkMarkerMatches(
+            client: snapshot.client,
+            marker: request.idempotencyKey
+        )
+        if !existing.isEmpty {
+            let matchingParent = existing.filter { $0.forkedFromId == snapshot.providerThreadId }
+            if existing.count == 1, let child = matchingParent.first {
+                guard child.id != snapshot.providerThreadId else {
+                    throw AgentProviderAdapterError.unsupported("Codex fork reconciliation returned the parent identity")
+                }
+                return child.id
+            }
+            try await cleanForkMarkerConflict(
+                existing,
+                marker: request.idempotencyKey,
+                protectedThreadId: snapshot.providerThreadId,
+                client: snapshot.client
+            )
+            throw CodexForkReconciliationError.markerConflictCleaned(
+                marker: request.idempotencyKey,
+                childIds: existing.map(\.id).sorted()
+            )
+        }
+
+        let created = try await snapshot.client.forkThread(
+            providerThreadId: snapshot.providerThreadId,
+            lastTurnId: nil,
+            threadSource: request.idempotencyKey
+        )
+        guard created.id != snapshot.providerThreadId,
+              created.forkedFromId == snapshot.providerThreadId,
+              created.threadSource == request.idempotencyKey else {
+            guard created.id != snapshot.providerThreadId else {
+                throw CodexForkReconciliationError.forkResponseMismatch(childId: created.id)
+            }
+            do {
+                try await snapshot.client.deleteThread(providerThreadId: created.id)
+            } catch {
+                throw CodexForkReconciliationError.duplicateCleanupFailed(
+                    marker: request.idempotencyKey,
+                    details: "invalid child \(created.id) could not be deleted: \(error)"
+                )
+            }
+            throw CodexForkReconciliationError.forkResponseMismatch(childId: created.id)
+        }
+        return created.id
+    }
+
+    public func compensateFork(
+        _ request: AgentProviderForkRequest,
+        providerChildThreadId: String
+    ) async throws {
+        let client: CodexAppServerControlling
+        let ownsClient: Bool
+        if let snapshot = sessionSnapshot(threadId: request.sourceThreadId) {
+            client = snapshot.client
+            ownsClient = false
+        } else {
+            let maintenanceRequest = AgentRunRequest(
+                threadId: request.sourceThreadId,
+                provider: .codex,
+                model: "",
+                cwd: request.workingDirectory ?? FileManager.default.currentDirectoryPath,
+                prompt: ""
+            )
+            let maintenanceClient = try clientFactory(
+                maintenanceRequest,
+                { _, _ in },
+                { method, _ in
+                    throw AgentProviderAdapterError.unsupported(
+                        "unexpected Codex maintenance callback during \(method)"
+                    )
+                }
+            )
+            do {
+                _ = try await maintenanceClient.initialize(
+                    clientName: "remotecode",
+                    clientTitle: "RemoteCode",
+                    clientVersion: "0.0.0"
+                )
+            } catch {
+                maintenanceClient.stop()
+                throw error
+            }
+            client = maintenanceClient
+            ownsClient = true
+        }
+        defer {
+            if ownsClient { client.stop() }
+        }
+        guard client.forkProtocolSupport.isSupported else {
+            throw AgentProviderAdapterError.unsupported("Codex fork compensation schema is unavailable")
+        }
+
+        let matches = try await forkMarkerMatches(client: client, marker: request.idempotencyKey)
+            .filter { $0.id != request.sourceProviderThreadId }
+        guard !matches.isEmpty else {
+            // Absence is the success state. This makes a retry after a lost
+            // thread/delete response safe without depending on provider error text.
+            return
+        }
+        let ordered = matches.sorted { lhs, rhs in
+            lhs.createdAt == rhs.createdAt ? lhs.id < rhs.id : lhs.createdAt < rhs.createdAt
+        }
+        do {
+            for child in ordered {
+                try await client.deleteThread(providerThreadId: child.id)
+            }
+        } catch {
+            throw CodexForkReconciliationError.duplicateCleanupFailed(
+                marker: request.idempotencyKey,
+                details: "compensation for \(providerChildThreadId) failed: \(error)"
+            )
+        }
+    }
+
+    private func forkMarkerMatches(
+        client: CodexAppServerControlling,
+        marker: String
+    ) async throws -> [CodexAppServerThreadSummary] {
+        var matches: [String: CodexAppServerThreadSummary] = [:]
+        for archived in [false, true] {
+            var cursor: String?
+            var seenCursors: Set<String> = []
+            repeat {
+                let page = try await client.listThreads(cursor: cursor, archived: archived)
+                for thread in page.threads where thread.threadSource == marker {
+                    matches[thread.id] = thread
+                }
+                guard let nextCursor = page.nextCursor, !nextCursor.isEmpty else {
+                    cursor = nil
+                    continue
+                }
+                guard seenCursors.insert(nextCursor).inserted else {
+                    throw CodexForkReconciliationError.paginationCycle
+                }
+                cursor = nextCursor
+            } while cursor != nil
+        }
+        return Array(matches.values)
+    }
+
+    private func cleanForkMarkerConflict(
+        _ children: [CodexAppServerThreadSummary],
+        marker: String,
+        protectedThreadId: String,
+        client: CodexAppServerControlling
+    ) async throws {
+        var failures: [String] = []
+        for child in children.sorted(by: { $0.id < $1.id }) where child.id != protectedThreadId {
+            do {
+                try await client.deleteThread(providerThreadId: child.id)
+            } catch {
+                failures.append("\(child.id): \(error)")
+            }
+        }
+        if !failures.isEmpty {
+            throw CodexForkReconciliationError.duplicateCleanupFailed(
+                marker: marker,
+                details: failures.joined(separator: "; ")
+            )
+        }
+    }
+
     public func rollbackThread(threadId: AgentThreadID, toTurnId: String) async throws {
         guard var snapshot = sessionSnapshot(threadId: threadId) else {
             throw AgentProviderAdapterError.sessionNotFound(threadId)
@@ -375,6 +770,17 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         stoppedSessions.forEach { session in
             settlePendingCallbacks(session: session)
             session.client.stop()
+        }
+    }
+
+    public func stopAllForAppTermination() {
+        lock.lock()
+        let stoppedSessions = Array(sessions.values)
+        sessions.removeAll()
+        lock.unlock()
+        stoppedSessions.forEach { session in
+            settlePendingCallbacks(session: session)
+            session.client.stopImmediatelyForAppTermination()
         }
     }
 
@@ -412,8 +818,17 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
             return try await awaitApproval(method: method, payload: payload, threadId: threadId, kind: .fileRead)
         case "item/fileChange/requestApproval", "item.fileChange.requestApproval":
             return try await awaitApproval(method: method, payload: payload, threadId: threadId, kind: .fileChange)
-        case "item/tool/requestUserInput", "item.tool.requestUserInput":
+        case "item/permissions/requestApproval", "item.permissions.requestApproval":
+            return try await awaitApproval(method: method, payload: payload, threadId: threadId, kind: .dynamic)
+        case "applyPatchApproval":
+            return try await awaitApproval(method: method, payload: payload, threadId: threadId, kind: .applyPatch)
+        case "execCommandApproval":
+            return try await awaitApproval(method: method, payload: payload, threadId: threadId, kind: .exec)
+        case "item/tool/requestUserInput", "item.tool.requestUserInput", "mcpServer/elicitation/request":
             return try await awaitUserInput(method: method, payload: payload, threadId: threadId)
+        case "item/tool/call", "account/chatgptAuthTokens/refresh", "attestation/generate", "currentTime/read":
+            emit([runtimeEvent(method: method, payload: payload)], threadId: threadId)
+            throw AgentProviderAdapterError.unsupported("Recognized Codex app-server request is not supported by this client: \(method)")
         default:
             emit([runtimeEvent(method: method, payload: payload)], threadId: threadId)
             throw AgentProviderAdapterError.unsupported("Unhandled Codex app-server request: \(method)")
@@ -421,8 +836,19 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
     }
 
     private func awaitApproval(method: String, payload: [String: Any], threadId: AgentThreadID, kind: AssistantRequestKind) async throws -> Any? {
+        let isPermissionsRequest = method == "item/permissions/requestApproval"
+            || method == "item.permissions.requestApproval"
+        let requestedPermissions = payload["permissions"] as? [String: Any]
+        if isPermissionsRequest, requestedPermissions == nil {
+            throw AgentProviderAdapterError.unsupported(
+                "Codex permissions request omitted its required permission profile"
+            )
+        }
         if sessionPermissionMode(threadId: threadId) == .fullAccess {
             emit([runtimeEvent(method: method, payload: payload)], threadId: threadId)
+            if isPermissionsRequest, let requestedPermissions {
+                return ["permissions": requestedPermissions, "scope": "session"]
+            }
             return ["decision": "acceptForSession"]
         }
         let requestId = UUID().uuidString
@@ -439,7 +865,10 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
                 continuation: continuation,
                 turnId: turnId,
                 itemId: itemId,
-                kind: kind
+                kind: kind,
+                responseKind: isPermissionsRequest
+                    ? .permissions(requested: requestedPermissions ?? [:])
+                    : .legacyDecision
             ))
             emit([
                 runtimeEvent(method: method, payload: payload),
@@ -463,6 +892,8 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
     }
 
     private func awaitUserInput(method: String, payload: [String: Any], threadId: AgentThreadID) async throws -> Any? {
+        let isMcpElicitation = method == "mcpServer/elicitation/request"
+        let requestedSchema = payload["requestedSchema"] as? [String: Any]
         let requestId = UUID().uuidString
         let turnId = string(payload, "turnId")
             ?? string(payload, "turn_id")
@@ -471,9 +902,15 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         let itemId = string(payload, "itemId")
             ?? string(payload, "item_id")
             ?? Self.nestedString(payload, objectKey: "item", field: "id")
-        let questions = Self.userInputQuestions(from: payload)
+        let questions = isMcpElicitation
+            ? Self.mcpElicitationQuestions(from: requestedSchema)
+            : Self.userInputQuestions(from: payload)
+        let structuredQuestions = Self.structuredUserInputQuestions(from: questions)
         let questionIds = questions.compactMap { string($0, "id") }
-        let prompt = Self.userInputPrompt(from: questions)
+        let effectiveQuestionIds = questionIds.isEmpty ? [requestId] : questionIds
+        let prompt = isMcpElicitation
+            ? (string(payload, "message") ?? Self.userInputPrompt(from: questions))
+            : Self.userInputPrompt(from: questions)
         let options = Self.userInputOptions(from: questions)
         let allowsMultipleSelection = Self.userInputAllowsMultipleSelection(payload: payload, questions: questions)
         let isSecret = Self.userInputIsSecret(questions)
@@ -483,8 +920,19 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
                 continuation: continuation,
                 turnId: turnId,
                 itemId: itemId,
-                questionIds: questionIds.isEmpty ? [requestId] : questionIds,
-                multiSelectQuestionIds: allowsMultipleSelection ? Set(questionIds.isEmpty ? [requestId] : questionIds) : []
+                questionIds: effectiveQuestionIds,
+                questionPromptsById: Dictionary(uniqueKeysWithValues: questions.compactMap { question in
+                    guard let id = string(question, "id"), let prompt = string(question, "question") else { return nil }
+                    return (id, prompt)
+                }),
+                multiSelectQuestionIds: Self.userInputMultiSelectQuestionIds(
+                    questions: questions,
+                    fallbackQuestionIds: effectiveQuestionIds,
+                    aggregateAllowsMultipleSelection: allowsMultipleSelection
+                ),
+                responseKind: isMcpElicitation
+                    ? .mcpElicitation(requestedSchema: requestedSchema)
+                    : .toolRequest
             ))
             emit([
                 runtimeEvent(method: method, payload: payload),
@@ -495,6 +943,7 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
                     options: options,
                     allowsMultipleSelection: allowsMultipleSelection,
                     isSecret: isSecret,
+                    questions: structuredQuestions,
                     createdAtMs: now
                 ))
             ], threadId: threadId)
@@ -503,6 +952,16 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
 
     private func handleNotification(method: String, params: Any?, threadId: AgentThreadID) {
         let payload = params as? [String: Any] ?? [:]
+        let notificationProviderThreadId = string(payload, "threadId")
+            ?? (payload["thread"] as? [String: Any]).flatMap { string($0, "id") }
+        if let notificationProviderThreadId,
+           let sessionProviderThreadId = providerThreadId(threadId: threadId),
+           notificationProviderThreadId != sessionProviderThreadId {
+            // A provider-native fork is announced on the parent's app-server
+            // transport. Do not route child lifecycle events through the parent
+            // local session; that would corrupt its identity or leave it active.
+            return
+        }
         var events: [AssistantEvent] = [runtimeEvent(method: method, payload: payload)]
         var finished: AgentRunEvent?
         let now = Int64(Date().timeIntervalSince1970 * 1000)
@@ -952,6 +1411,9 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
             let message = string(error, "message") ?? string(payload, "message") ?? Self.jsonString(error) ?? "Codex turn failed"
             let outcome = Self.classifyFatalOutcome(eventKind: "turn/failed", willRetry: false, errorCode: Self.errorCode(from: payload, error: error)) ?? .failed(isAuth: false)
             events.append(.error(message: message, recoverable: false))
+            if case .failed(let isAuth) = outcome, isAuth {
+                events.append(runtimeEvent(method: "remotecode/authRequired", payload: Self.authActionMetadata))
+            }
             finished = Self.failedEvent(for: outcome, message: message, providerThreadId: providerThreadId(threadId: threadId))
             markFinished(threadId: threadId, status: .failed, turnId: turnId.isEmpty ? nil : turnId)
         default:
@@ -1028,15 +1490,29 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         let onEvent = session.onEvent
         for (requestId, pending) in session.pendingApprovals {
             onEvent?(.event(.requestResolved(requestId: requestId, state: .cancelled)))
-            pending.continuation.resume(returning: ["decision": "cancel"])
+            switch pending.responseKind {
+            case .legacyDecision:
+                pending.continuation.resume(returning: ["decision": "cancel"])
+            case .permissions:
+                pending.continuation.resume(returning: [
+                    "permissions": [String: Any](),
+                    "scope": "turn"
+                ])
+            }
         }
         for (requestId, pending) in session.pendingUserInputs {
             onEvent?(.event(.userInputResolved(requestId: requestId, answer: nil)))
-            pending.continuation.resume(returning: ["answers": Self.codexAnswers(
-                questionIds: pending.questionIds,
-                multiSelectQuestionIds: pending.multiSelectQuestionIds,
-                text: ""
-            )])
+            switch pending.responseKind {
+            case .toolRequest:
+                pending.continuation.resume(returning: ["answers": Self.codexAnswers(
+                    questionIds: pending.questionIds,
+                    questionPromptsById: pending.questionPromptsById,
+                    multiSelectQuestionIds: pending.multiSelectQuestionIds,
+                    text: ""
+                )])
+            case .mcpElicitation:
+                pending.continuation.resume(returning: ["action": "cancel"])
+            }
         }
     }
 
@@ -1048,12 +1524,14 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
             Task {
                 try? await session.client.interruptTurn(providerThreadId: session.providerThreadId, turnId: turnId)
                 session.client.stop()
+                session.onEvent?(.status(.cancelled))
+                session.onEvent?(.finished(.cancelled, finalMessage: nil, providerThreadId: session.providerThreadId))
             }
         } else {
             session.client.stop()
+            session.onEvent?(.status(.cancelled))
+            session.onEvent?(.finished(.cancelled, finalMessage: nil, providerThreadId: session.providerThreadId))
         }
-        session.onEvent?(.status(.cancelled))
-        session.onEvent?(.finished(.cancelled, finalMessage: nil, providerThreadId: session.providerThreadId))
     }
 
     private func handleClientTermination(threadId: AgentThreadID, error: Error) {
@@ -1070,7 +1548,15 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         session.onEvent?(.finished(.failed, finalMessage: nil, providerThreadId: session.providerThreadId))
     }
 
-    private func recordSession(threadId: AgentThreadID, client: CodexAppServerControlling, providerThreadId: String, interactionMode: AgentInteractionMode, onEvent: @escaping @Sendable (AgentRunEvent) -> Void, permissionMode: AgentPermissionMode) {
+    private func recordSession(
+        threadId: AgentThreadID,
+        client: CodexAppServerControlling,
+        providerThreadId: String,
+        interactionMode: AgentInteractionMode,
+        onEvent: @escaping @Sendable (AgentRunEvent) -> Void,
+        permissionMode: AgentPermissionMode,
+        status: AgentRunStatus = .running
+    ) {
         lock.lock()
         sessions[threadId] = Session(
             client: client,
@@ -1078,7 +1564,7 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
             activeTurnId: nil,
             threadStatusType: nil,
             pendingFinish: nil,
-            status: .running,
+            status: status,
             onEvent: onEvent,
             interactionMode: interactionMode,
             finalAssistantMessage: "",
@@ -1115,7 +1601,9 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
 
     private func setActiveTurn(threadId: AgentThreadID, turnId: String) {
         lock.lock()
-        sessions[threadId]?.activeTurnId = turnId
+        if sessions[threadId]?.completedTurnIds.contains(turnId) == false {
+            sessions[threadId]?.activeTurnId = turnId
+        }
         lock.unlock()
     }
 
@@ -1290,6 +1778,24 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         }
     }
 
+    /// Codex 0.144.4 dynamic-permission callbacks do not accept the legacy
+    /// `{decision}` shape. Grant exactly the profile the provider requested;
+    /// decline/cancel return an empty profile rather than widening the thread to
+    /// full-access. Session approval is expressed by the protocol's own scope.
+    private static func permissionsApprovalResponse(
+        requested: [String: Any],
+        response: AgentProviderRequestResponse
+    ) -> [String: Any] {
+        switch response {
+        case .approve:
+            return ["permissions": requested, "scope": "turn"]
+        case .approveForSession:
+            return ["permissions": requested, "scope": "session"]
+        case .decline, .cancel:
+            return ["permissions": [String: Any](), "scope": "turn"]
+        }
+    }
+
     private static func approvalTitle(for kind: AssistantRequestKind) -> String {
         switch kind {
         case .fileRead:
@@ -1305,14 +1811,31 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
 
     private static func codexAnswers(
         questionIds: [String],
+        questionPromptsById: [String: String] = [:],
         multiSelectQuestionIds: Set<String> = [],
         text: String
     ) -> [String: [String: [String]]] {
-        let answersById = splitUserInputAnswers(questionIds: questionIds, text: text)
+        let structured = structuredAnswers(text)
+        let answersById = structured.isEmpty
+            ? splitUserInputAnswers(questionIds: questionIds, text: text)
+            : Dictionary(uniqueKeysWithValues: questionIds.compactMap { id in
+                let answer = structured[id] ?? questionPromptsById[id].flatMap { structured[$0] }
+                return answer.map { (id, $0) }
+            })
         return Dictionary(uniqueKeysWithValues: questionIds.map { id in
             let answer = answersById[id] ?? text
             return (id, ["answers": multiSelectQuestionIds.contains(id) ? splitMultiSelectAnswer(answer) : [answer]])
         })
+    }
+
+    private static func structuredAnswers(_ text: String) -> [String: String] {
+        guard let data = text.data(using: .utf8),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return [:] }
+        return object.compactMapValues { value in
+            if let string = value as? String { return string }
+            if let strings = value as? [String] { return strings.joined(separator: ", ") }
+            return nil
+        }
     }
 
     private static func splitMultiSelectAnswer(_ text: String) -> [String] {
@@ -1481,6 +2004,11 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
     }
 
     static let authFailureMarker = "[auth-required]"
+    static let authActionMetadata: [String: Any] = [
+        "kind": "signIn",
+        "title": "Sign in",
+        "command": "codex login"
+    ]
 
     static func isAuthErrorCode(_ errorCode: String?) -> Bool {
         guard let errorCode else { return false }
@@ -1509,6 +2037,103 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
                 .joined(separator: ": ")
         }
         return prompts.isEmpty ? "Provider requested input." : prompts.joined(separator: "\n")
+    }
+
+    private static func mcpElicitationQuestions(from requestedSchema: [String: Any]?) -> [[String: Any]] {
+        guard let properties = requestedSchema?["properties"] as? [String: Any] else { return [] }
+        return properties.keys.sorted().compactMap { name in
+            guard let schema = properties[name] as? [String: Any] else { return nil }
+            let title = string(schema, "title") ?? name
+            let description = string(schema, "description") ?? title
+            var question: [String: Any] = [
+                "id": name,
+                "header": title,
+                "question": description
+            ]
+            if let values = schema["enum"] as? [Any] {
+                question["options"] = values.map { value in
+                    ["label": String(describing: value), "description": String(describing: value)]
+                }
+            } else if string(schema, "type") == "boolean" {
+                question["options"] = [
+                    ["label": "true", "description": "Yes"],
+                    ["label": "false", "description": "No"]
+                ]
+            }
+            if let format = string(schema, "format") {
+                question["inputType"] = format
+            }
+            return question
+        }
+    }
+
+    private static func mcpElicitationContent(
+        requestedSchema: [String: Any]?,
+        questionIds: [String],
+        text: String
+    ) throws -> [String: Any] {
+        let structured: [String: Any] = {
+            guard let data = text.data(using: .utf8),
+                  let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                return [:]
+            }
+            return object
+        }()
+        guard let properties = requestedSchema?["properties"] as? [String: Any],
+              !properties.isEmpty else {
+            return structured.isEmpty ? ["answer": text] : structured
+        }
+        var content: [String: Any] = [:]
+        for name in questionIds {
+            guard let property = properties[name] as? [String: Any] else { continue }
+            let raw: Any?
+            if let structuredValue = structured[name] {
+                raw = structuredValue
+            } else if questionIds.count == 1 {
+                raw = text
+            } else {
+                raw = nil
+            }
+            guard let raw, let value = mcpElicitationValue(raw, type: string(property, "type")) else { continue }
+            if let allowed = property["enum"] as? [Any],
+               !allowed.contains(where: { String(describing: $0) == String(describing: value) }) {
+                continue
+            }
+            content[name] = value
+        }
+        let required = requestedSchema?["required"] as? [String] ?? []
+        if let missing = required.first(where: { content[$0] == nil }) {
+            throw AgentProviderAdapterError.unsupported(
+                "MCP elicitation requires a valid value for \(missing)"
+            )
+        }
+        return content
+    }
+
+    private static func mcpElicitationValue(_ raw: Any, type: String?) -> Any? {
+        switch type {
+        case "boolean":
+            if let value = raw as? Bool { return value }
+            switch String(describing: raw).trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+            case "true", "yes", "1": return true
+            case "false", "no", "0": return false
+            default: return nil
+            }
+        case "integer":
+            if let value = raw as? Int { return value }
+            if let value = raw as? NSNumber { return value.intValue }
+            return Int(String(describing: raw).trimmingCharacters(in: .whitespacesAndNewlines))
+        case "number":
+            if let value = raw as? NSNumber { return value.doubleValue }
+            return Double(String(describing: raw).trimmingCharacters(in: .whitespacesAndNewlines))
+        case "array":
+            if let value = raw as? [Any] { return value }
+            return String(describing: raw).split(separator: ",").map {
+                String($0).trimmingCharacters(in: .whitespacesAndNewlines)
+            }.filter { !$0.isEmpty }
+        default:
+            return raw is String ? raw : String(describing: raw)
+        }
     }
 
     private static func userInputQuestions(from payload: [String: Any]) -> [[String: Any]] {
@@ -1552,10 +2177,42 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         return false
     }
 
+    private static func userInputMultiSelectQuestionIds(
+        questions: [[String: Any]],
+        fallbackQuestionIds: [String],
+        aggregateAllowsMultipleSelection: Bool
+    ) -> Set<String> {
+        let keys = ["allowsMultipleSelection", "allowsMultiple", "multiple", "multiSelect", "allows_multiple_selection", "allows_multiple", "multi_select"]
+        let explicit = Set(questions.compactMap { question -> String? in
+            guard keys.contains(where: { boolValue(question[$0]) == true }) else { return nil }
+            return string(question, "id")
+        })
+        if !explicit.isEmpty { return explicit }
+        return aggregateAllowsMultipleSelection ? Set(fallbackQuestionIds) : []
+    }
+
     private static func userInputOptions(from questions: [[String: Any]]) -> [String] {
         questions.flatMap { question -> [String] in
             guard let options = question["options"] as? [[String: Any]] else { return [] }
             return options.compactMap { $0["label"] as? String }
+        }
+    }
+
+    private static func structuredUserInputQuestions(from questions: [[String: Any]]) -> [AssistantUserInputQuestion] {
+        questions.enumerated().compactMap { index, question in
+            guard let prompt = string(question, "question")?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !prompt.isEmpty else { return nil }
+            let options = (question["options"] as? [[String: Any]] ?? []).compactMap { option -> AssistantUserInputOption? in
+                guard let label = string(option, "label") else { return nil }
+                return AssistantUserInputOption(label: label, detail: string(option, "description"))
+            }
+            return AssistantUserInputQuestion(
+                id: string(question, "id") ?? "question-\(index)",
+                prompt: prompt,
+                header: string(question, "header"),
+                options: options,
+                allowsMultipleSelection: userInputAllowsMultipleSelection(payload: question, questions: [question])
+            )
         }
     }
 
@@ -1675,6 +2332,7 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
                 type: itemType,
                 state: state == .completed ? .streaming : state,
                 summary: summary,
+                resourcePath: itemType == .imageView ? string(item, "path") : nil,
                 startedAtMs: startedAtMs
             ))
         ]
@@ -1778,7 +2436,7 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         case "webSearch", "web_search_call", "tool_search_call", "tool_search_output", "search", "open_page", "find_in_page":
             return string(item, "query") ?? string(item, "url") ?? string(item, "status") ?? "Web search"
         case "imageView":
-            return string(item, "path")
+            return string(item, "path").map { ($0 as NSString).lastPathComponent } ?? "Image"
         case "imageGeneration", "image_generation_call", "input_image":
             return string(item, "status") ?? "Image generation"
         case "enteredReviewMode", "exitedReviewMode":
@@ -1821,7 +2479,7 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         case "webSearch", "web_search_call", "tool_search_call", "tool_search_output", "search", "open_page", "find_in_page":
             return jsonString(item["action"]) ?? stringBodyFallback(for: item)
         case "imageView":
-            return string(item, "path") ?? stringBodyFallback(for: item)
+            return nil
         case "imageGeneration", "image_generation_call", "input_image":
             return string(item, "result") ?? stringBodyFallback(for: item)
         case "enteredReviewMode", "exitedReviewMode":

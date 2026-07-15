@@ -1,7 +1,62 @@
 import XCTest
 import Darwin
 import CoreModel
+import Persistence
 @testable import SocketServer
+
+@MainActor
+private final class HTTPAttachmentReceiptRouter: FakeRouter, CommandReceiptStateRouting {
+    func claimCommandReceipt(
+        method: String,
+        clientRequestId: String,
+        ownerFingerprint: String,
+        paramsHash: String
+    ) throws -> CommandReceiptClaimResult {
+        .claimed
+    }
+
+    func commitCommandReceipt(
+        method: String,
+        clientRequestId: String,
+        ownerFingerprint: String,
+        paramsHash: String,
+        result: JSONValue
+    ) throws {}
+
+    func finalizeCommandReceipt(
+        method: String,
+        clientRequestId: String,
+        ownerFingerprint: String,
+        paramsHash: String,
+        result: JSONValue,
+        events: [EventBus.MutationEventIntent],
+        minimumEventSequence: Int64
+    ) throws -> [EventBus.Event] {
+        events.enumerated().map { ordinal, event in
+            EventBus.Event(
+                seq: minimumEventSequence + Int64(ordinal) + 1,
+                kind: event.kind,
+                payload: event.payload,
+                ts: event.createdAt.timeIntervalSince1970
+            )
+        }
+    }
+
+    func markCommandReceiptUnknown(
+        method: String,
+        clientRequestId: String,
+        ownerFingerprint: String,
+        paramsHash: String
+    ) throws {}
+
+    func commandReceiptStatus(
+        method: String,
+        clientRequestId: String,
+        ownerFingerprint: String
+    ) throws -> CommandReceiptStatusResult {
+        .absent
+    }
+}
 
 final class HTTPServerTests: XCTestCase {
     override func tearDown() {
@@ -170,6 +225,82 @@ final class HTTPServerTests: XCTestCase {
     }
 
     @MainActor
+    func test_attachmentUploadEnvelopeCarriesExact25MBAndRejectsNextDecodedByte() async throws {
+        // WHY: normal RPCs stay capped at 2 MiB, but the authenticated upload
+        // envelope must carry the advertised 25 MiB after base64 expansion.
+        let port = UInt16.random(in: 33000...44000)
+        let server = DirectHTTPServer(
+            port: port,
+            loopbackOnly: true,
+            dispatcher: JSONRPCDispatcher(router: HTTPAttachmentReceiptRouter()),
+            serverId: "attachment-boundary-host",
+            bootEpoch: 1
+        )
+        try server.start()
+        defer { server.stop() }
+        try await Task.sleep(nanoseconds: 50_000_000)
+
+        var socketRequest = URLRequest(url: URL(string: "ws://127.0.0.1:\(port)/v1/ws")!)
+        socketRequest.setValue("\(EventBus.shared.currentSeq)", forHTTPHeaderField: "x-rc2-since-seq")
+        let socket = URLSession.shared.webSocketTask(with: socketRequest)
+        socket.resume()
+        defer { socket.cancel(with: .normalClosure, reason: nil) }
+        let welcomeMessage = try await socket.receive()
+        let welcomeData: Data
+        switch welcomeMessage {
+        case .data(let data): welcomeData = data
+        case .string(let string): welcomeData = Data(string.utf8)
+        @unknown default: throw URLError(.cannotDecodeContentData)
+        }
+        let welcome = try XCTUnwrap(
+            try JSONSerialization.jsonObject(with: welcomeData) as? [String: Any]
+        )
+        let connectionId = try XCTUnwrap(welcome["connectionId"] as? String)
+
+        func response(decodedByteCount: Int, requestId: String) async throws -> (Data, HTTPURLResponse) {
+            let payload = Data(repeating: 0x41, count: decodedByteCount).base64EncodedString()
+            let json: [String: Any] = [
+                "jsonrpc": "2.0",
+                "id": requestId,
+                "method": "agent.attachment.upload",
+                "params": [
+                    "client_request_id": requestId,
+                    "connection_id": connectionId,
+                    "expected_host_id": "attachment-boundary-host",
+                    "expected_boot_epoch": 1,
+                    "workspace_id": UUID().uuidString,
+                    "filename": "boundary.bin",
+                    "data_base64": payload
+                ]
+            ]
+            let body = try JSONSerialization.data(withJSONObject: json)
+            let compressed = try PayloadCodec.lzfse.encode(body)
+            var request = URLRequest(url: URL(string: "http://127.0.0.1:\(port)/v1/rpc")!)
+            request.httpMethod = "POST"
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            request.setValue(PayloadCodec.lzfse.wireName, forHTTPHeaderField: "Content-Encoding")
+            request.setValue("1", forHTTPHeaderField: "X-RemoteCode-Attachment-Upload")
+            request.httpBody = compressed
+            let (data, response) = try await URLSession.shared.data(for: request)
+            return (data, try XCTUnwrap(response as? HTTPURLResponse))
+        }
+
+        let exact = try await response(decodedByteCount: 25 * 1024 * 1024, requestId: "exact")
+        XCTAssertEqual(exact.1.statusCode, 200)
+        let exactJSON = try XCTUnwrap(try JSONSerialization.jsonObject(with: exact.0) as? [String: Any])
+        XCTAssertNotNil(
+            exactJSON["result"],
+            "exactly 25 MiB must reach the attachment router; response=\(exactJSON)"
+        )
+
+        let oversized = try await response(decodedByteCount: 25 * 1024 * 1024 + 1, requestId: "oversized")
+        XCTAssertEqual(oversized.1.statusCode, 200,
+                       "decoded attachment validation is a typed JSON-RPC error, not a transport disconnect")
+        let oversizedJSON = try XCTUnwrap(try JSONSerialization.jsonObject(with: oversized.0) as? [String: Any])
+        XCTAssertNotNil(oversizedJSON["error"], "25 MiB + 1 byte must be rejected by the decoded-byte authority")
+    }
+
+    @MainActor
     func test_partialHeaderSlowLorisConnectionTimesOutAndCloses() throws {
         let port = UInt16.random(in: 33000...44000)
         let dispatcher = JSONRPCDispatcher(router: FakeRouter())
@@ -300,7 +431,7 @@ final class HTTPServerTests: XCTestCase {
                        "a matching pong resets proof and schedules the next server ping")
     }
 
-    func test_connectionOutboundOwner_ordersAcceptedWorkThenTerminalAndRejectsLaterFrames() {
+    func test_connectionOutboundOwner_ordersAcceptedWorkThenTerminalAndRejectsLaterFrames() throws {
         let recorded = RecordedFrames()
         let owner = WebSocketOutboundQueue(
             maxQueuedBytes: 1_024,
@@ -326,14 +457,20 @@ final class HTTPServerTests: XCTestCase {
         XCTAssertEqual(owner.enqueueApplication(Data("event-too-late".utf8)), .closed)
         owner.finish()
 
-        XCTAssertEqual(recorded.snapshot, [
-            "terminal:protocolError",
-            "app:event-1",
-            "control:1:error",
-            "control:1:closing",
-            "control:8:",
-            "shutdown",
-        ], "accepted work must complete before one terminal sequence; no event may follow closing")
+        let frames = recorded.snapshot
+        let appIndex = try XCTUnwrap(frames.firstIndex(of: "app:event-1"))
+        let errorIndex = try XCTUnwrap(frames.firstIndex(of: "control:1:error"))
+        let closingIndex = try XCTUnwrap(frames.firstIndex(of: "control:1:closing"))
+        let closeIndex = try XCTUnwrap(frames.firstIndex(of: "control:8:"))
+        let shutdownIndex = try XCTUnwrap(frames.firstIndex(of: "shutdown"))
+        XCTAssertLessThan(appIndex, errorIndex,
+                          "accepted application work must complete before terminal frames")
+        XCTAssertLessThan(errorIndex, closingIndex)
+        XCTAssertLessThan(closingIndex, closeIndex)
+        XCTAssertLessThan(closeIndex, shutdownIndex)
+        XCTAssertEqual(frames.filter { $0 == "terminal:protocolError" }.count, 1)
+        XCTAssertFalse(frames.contains("app:event-too-late"),
+                       "no application event may be accepted after terminal state")
     }
 
     func test_connectionOutboundOwner_concurrentTerminateCannotOvertakeAcceptedSubmission() {

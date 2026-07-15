@@ -8,6 +8,7 @@ public enum CodexAppServerError: Error, CustomStringConvertible {
     case rpcError(code: Int?, message: String)
     case processExited(stderrTail: String)
     case responseTypeMismatch
+    case requestTimedOut(method: String, timeout: TimeInterval)
 
     public var description: String {
         switch self {
@@ -20,6 +21,8 @@ public enum CodexAppServerError: Error, CustomStringConvertible {
                 ? "Codex app-server process exited"
                 : "Codex app-server process exited: \(stderrTail)"
         case .responseTypeMismatch: return "Codex app-server response had an unexpected shape"
+        case .requestTimedOut(let method, let timeout):
+            return "Codex app-server RPC \(method) timed out after \(timeout)s"
         }
     }
 }
@@ -43,6 +46,30 @@ public struct CodexAppServerThreadOpenResult {
         self.providerThreadId = providerThreadId
         self.response = response
         self.resumeFellBackToStart = resumeFellBackToStart
+    }
+}
+
+public struct CodexAppServerThreadSummary: Sendable, Equatable {
+    public let id: String
+    public let forkedFromId: String?
+    public let threadSource: String?
+    public let createdAt: Int64
+
+    public init(id: String, forkedFromId: String?, threadSource: String?, createdAt: Int64) {
+        self.id = id
+        self.forkedFromId = forkedFromId
+        self.threadSource = threadSource
+        self.createdAt = createdAt
+    }
+}
+
+public struct CodexAppServerThreadPage: Sendable, Equatable {
+    public let threads: [CodexAppServerThreadSummary]
+    public let nextCursor: String?
+
+    public init(threads: [CodexAppServerThreadSummary], nextCursor: String?) {
+        self.threads = threads
+        self.nextCursor = nextCursor
     }
 }
 
@@ -103,6 +130,8 @@ public final class CodexAppServerClient: @unchecked Sendable {
     private var notificationHandler: NotificationHandler?
     private var serverRequestHandler: ServerRequestHandler?
     private var stderrBuffer = Data()
+    private let requestTimeout: TimeInterval
+    public let forkProtocolSupport: CodexForkProtocolSupport
     // Only the stderr tail is ever surfaced (termination diagnostics), so cap
     // the buffer instead of growing it for the app-server's whole lifetime.
     private static let stderrTailByteLimit = 8_192
@@ -114,7 +143,9 @@ public final class CodexAppServerClient: @unchecked Sendable {
         cwd: String,
         environment: [String: String] = [:],
         notificationHandler: NotificationHandler? = nil,
-        serverRequestHandler: ServerRequestHandler? = nil
+        serverRequestHandler: ServerRequestHandler? = nil,
+        requestTimeout: TimeInterval = 30,
+        forkProtocolSupportOverride: CodexForkProtocolSupport? = nil
     ) throws {
         let resolvedBinary = binary.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "codex" : binary
         guard let path = ProcessLocator.resolve(resolvedBinary) else {
@@ -127,6 +158,19 @@ public final class CodexAppServerClient: @unchecked Sendable {
         self.stderrPipe = Pipe()
         self.notificationHandler = notificationHandler
         self.serverRequestHandler = serverRequestHandler
+        self.requestTimeout = max(0.001, requestTimeout)
+        if let forkProtocolSupportOverride {
+            self.forkProtocolSupport = forkProtocolSupportOverride
+        } else if arguments == ["app-server"] {
+            self.forkProtocolSupport = CodexForkProtocolSupport.probe(
+                binary: path,
+                environment: environment
+            )
+        } else {
+            // Test peers and nonstandard command surfaces do not prove the
+            // production schema contract merely by implementing thread/fork.
+            self.forkProtocolSupport = .unsupported
+        }
 
         process.executableURL = URL(fileURLWithPath: path)
         process.arguments = arguments
@@ -166,6 +210,7 @@ public final class CodexAppServerClient: @unchecked Sendable {
 
         do {
             try process.run()
+            try ProcessSpawnTagger.tagProcess(process, provider: .codex)
         } catch {
             throw CodexAppServerError.spawnFailed(error.localizedDescription)
         }
@@ -275,6 +320,61 @@ public final class CodexAppServerClient: @unchecked Sendable {
         )
     }
 
+    public func forkThread(providerThreadId: String, lastTurnId: String? = nil) async throws -> String {
+        var params: JSONObject = ["threadId": providerThreadId]
+        if let lastTurnId, !lastTurnId.isEmpty {
+            params["lastTurnId"] = lastTurnId
+        }
+        let response = try await requestJSONObject(method: "thread/fork", params: params)
+        return try Self.threadId(from: response)
+    }
+
+    public func forkThread(
+        providerThreadId: String,
+        lastTurnId: String? = nil,
+        threadSource: String
+    ) async throws -> CodexAppServerThreadSummary {
+        var params: JSONObject = [
+            "threadId": providerThreadId,
+            "threadSource": threadSource
+        ]
+        if let lastTurnId, !lastTurnId.isEmpty {
+            params["lastTurnId"] = lastTurnId
+        }
+        let response = try await requestJSONObject(method: "thread/fork", params: params)
+        guard let thread = response["thread"] as? JSONObject else {
+            throw CodexAppServerError.responseTypeMismatch
+        }
+        return try Self.threadSummary(from: thread)
+    }
+
+    public func listThreads(cursor: String? = nil, archived: Bool = false) async throws -> CodexAppServerThreadPage {
+        var params: JSONObject = [
+            "limit": 100,
+            "sortKey": "created_at",
+            "sortDirection": "asc",
+            "archived": archived
+        ]
+        if let cursor, !cursor.isEmpty {
+            params["cursor"] = cursor
+        }
+        let response = try await requestJSONObject(method: "thread/list", params: params)
+        guard let data = response["data"] as? [JSONObject] else {
+            throw CodexAppServerError.responseTypeMismatch
+        }
+        return CodexAppServerThreadPage(
+            threads: try data.map(Self.threadSummary(from:)),
+            nextCursor: response["nextCursor"] as? String
+        )
+    }
+
+    public func deleteThread(providerThreadId: String) async throws {
+        _ = try await requestJSONObject(
+            method: "thread/delete",
+            params: ["threadId": providerThreadId]
+        )
+    }
+
     public func rollbackThread(providerThreadId: String, numTurns: Int) async throws -> JSONObject {
         try await requestJSONObject(
             method: "thread/rollback",
@@ -311,6 +411,43 @@ public final class CodexAppServerClient: @unchecked Sendable {
         failPending(CodexAppServerError.processExited(stderrTail: ""))
     }
 
+    public func stopImmediatelyForAppTermination() {
+        stdoutPipe.fileHandleForReading.readabilityHandler = nil
+        stderrPipe.fileHandleForReading.readabilityHandler = nil
+        if process.isRunning {
+            ProcessTerminator.terminateTreeImmediately(process)
+        }
+        failPending(CodexAppServerError.processExited(stderrTail: ""))
+    }
+
+    private static func threadSummary(from object: JSONObject) throws -> CodexAppServerThreadSummary {
+        guard let id = object["id"] as? String,
+              !id.isEmpty,
+              let createdAt = integer(object["createdAt"]) else {
+            throw CodexAppServerError.responseTypeMismatch
+        }
+        if let forkedFromId = object["forkedFromId"], !(forkedFromId is NSNull), !(forkedFromId is String) {
+            throw CodexAppServerError.responseTypeMismatch
+        }
+        if let threadSource = object["threadSource"], !(threadSource is NSNull), !(threadSource is String) {
+            throw CodexAppServerError.responseTypeMismatch
+        }
+        return CodexAppServerThreadSummary(
+            id: id,
+            forkedFromId: object["forkedFromId"] as? String,
+            threadSource: object["threadSource"] as? String,
+            createdAt: createdAt
+        )
+    }
+
+    private static func integer(_ value: Any?) -> Int64? {
+        guard let number = value as? NSNumber,
+              String(cString: number.objCType) != "c" else {
+            return nil
+        }
+        return number.int64Value
+    }
+
     /// Surfaces WHY the app-server died: drains any stderr bytes the async
     /// readability handler has not consumed yet, then snapshots the buffered
     /// tail so the termination error carries the crash/exit reason instead of
@@ -319,7 +456,7 @@ public final class CodexAppServerClient: @unchecked Sendable {
     private func drainedStderrTail() -> String {
         let handle = stderrPipe.fileHandleForReading
         handle.readabilityHandler = nil
-        let remaining = handle.readDataToEndOfFile()
+        let remaining = BoundedPipeDrain.readRemaining(from: handle)
         return parseQueue.sync {
             if !remaining.isEmpty {
                 stderrBuffer.append(remaining)
@@ -353,6 +490,16 @@ public final class CodexAppServerClient: @unchecked Sendable {
                 try write(payload)
             } catch {
                 completePending(id: id, result: .failure(error))
+            }
+
+            DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + requestTimeout) { [weak self] in
+                guard let self else { return }
+                let error = CodexAppServerError.requestTimedOut(method: method, timeout: self.requestTimeout)
+                if self.completePending(id: id, result: .failure(error)) {
+                    // A timed-out JSON-RPC connection has unknown protocol state.
+                    // Stop the peer so later calls cannot be written to a desynchronized session.
+                    self.stop()
+                }
             }
         }
     }
@@ -412,11 +559,13 @@ public final class CodexAppServerClient: @unchecked Sendable {
         }
     }
 
-    private func completePending(id: Int, result: Result<Any?, Error>) {
+    @discardableResult
+    private func completePending(id: Int, result: Result<Any?, Error>) -> Bool {
         lock.lock()
         let pendingRequest = pending.removeValue(forKey: id)
         lock.unlock()
         pendingRequest?.resume(result)
+        return pendingRequest != nil
     }
 
     private func failPending(_ error: Error) {
@@ -465,8 +614,8 @@ public final class CodexAppServerClient: @unchecked Sendable {
         }
         for attachment in request.attachments where attachment.kind == .image {
             input.append([
-                "type": "image",
-                "url": URL(fileURLWithPath: attachment.path).absoluteString
+                "type": "localImage",
+                "path": attachment.path
             ])
         }
         for attachment in request.attachments where attachment.kind == .file {

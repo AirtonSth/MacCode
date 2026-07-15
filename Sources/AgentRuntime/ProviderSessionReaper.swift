@@ -45,7 +45,7 @@ public final class ProviderSessionReaper {
                 skipped.append(session.threadId)
                 continue
             }
-            try sessionRepo.markStopped(threadId: session.threadId)
+            try sessionRepo.markStopped(threadId: session.threadId, status: .interrupted)
             if try staleOpenCallbacks(threadId: session.threadId) {
                 staledCallbacks.append(session.threadId)
             }

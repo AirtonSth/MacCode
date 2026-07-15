@@ -190,10 +190,27 @@ final class ClaudeParserCLITests: XCTestCase {
         XCTAssertEqual(request?.questions.last?.options.map(\.label), ["macOS", "iPadOS"])
     }
 
+    func test_askUserQuestionStreamingAndWholeAssistantEchoEmitOneStructuredRequest() {
+        let parser = ClaudeParser()
+        var events: [AssistantEvent] = []
+        events += parser.parseLine(#"{"type":"system","subtype":"init","session_id":"ask-dedup-session"}"#)
+        events += parser.parseLine(#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"ask-dedup","name":"AskUserQuestion","input":{"questions":[{"question":"Pick one","header":"Gate","options":[{"label":"A"},{"label":"B"}],"multiSelect":false}]}}]}}"#)
+        events += parser.parseLine(#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"ask-dedup","name":"AskUserQuestion","input":{"questions":[{"question":"Pick one","header":"Gate","options":[{"label":"A"},{"label":"B"}],"multiSelect":false}]}}]}}"#)
+
+        let requests = events.compactMap { event -> AssistantUserInputRequest? in
+            if case .userInputRequested(let request) = event { return request }
+            return nil
+        }
+        XCTAssertEqual(requests.count, 1,
+                       "streaming and whole assistant echoes describe one AskUserQuestion and must render one structured event")
+        XCTAssertEqual(requests.first?.id, "ask-dedup")
+    }
+
     func test_exitPlanModeTool_becomesStructuredProposedPlan() {
         let evs = collect([
             #"{"type":"system","subtype":"init","session_id":"s6"}"#,
-            #"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"plan-1","name":"ExitPlanMode","input":{"plan":"1. Inspect\n2. Patch\n3. Test"}}]}}"#,
+            #"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"plan-1","name":"ExitPlanMode","input":{"allowedPrompts":[]}}]}}"#,
+            #"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"plan-1","content":{"plan":"1. Inspect\n2. Patch\n3. Test","filePath":"/tmp/plan.md","isAgent":false}}]}}"#,
             #"{"type":"result","subtype":"success","result":"plan ready"}"#
         ])
 
@@ -204,7 +221,23 @@ final class ClaudeParserCLITests: XCTestCase {
 
         XCTAssertEqual(plan?.id, "plan-1")
         XCTAssertEqual(plan?.markdown, "1. Inspect\n2. Patch\n3. Test",
-                       "Claude ExitPlanMode must create a persisted proposed-plan artifact that can be implemented later")
+                       "Claude ExitPlanMode must use the real SDK tool output; its input contains allowedPrompts, not plan markdown")
+    }
+
+    func test_exitPlanModeUsesSDKTopLevelToolResultContract() {
+        let evs = collect([
+            #"{"type":"system","subtype":"init","session_id":"s6-real"}"#,
+            ##"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"plan-real","name":"ExitPlanMode","input":{"plan":"# Review me","planFilePath":"/tmp/plan.md"}}]}}"##,
+            ##"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"plan-real","content":"User has approved your plan."}]},"tool_use_result":{"plan":"# Review me","filePath":"/tmp/plan.md","isAgent":false}}"##
+        ])
+
+        let plans = evs.compactMap { event -> AssistantProposedPlan? in
+            if case .proposedPlan(let plan) = event { return plan }
+            return nil
+        }
+        XCTAssertEqual(plans.count, 1)
+        XCTAssertEqual(plans.first?.markdown, "# Review me",
+                       "the installed SDK carries ExitPlanModeOutput at top level, while message.content is only approval prose")
     }
 
     func test_streamingAskUserQuestionTool_becomesStructuredUserInputRequest() {
@@ -234,8 +267,9 @@ final class ClaudeParserCLITests: XCTestCase {
             #"{"type":"system","subtype":"init","session_id":"s8"}"#,
             #"{"type":"message_start","message":{"id":"m8"}}"#,
             #"{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"plan-stream","name":"ExitPlanMode"}}"#,
-            #"{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"plan\":\"1. Inspect\\n2. Patch\\n3. Test\"}"}}"#,
+            #"{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"allowedPrompts\":[]}"}}"#,
             #"{"type":"content_block_stop","index":0}"#,
+            #"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"plan-stream","content":"{\"plan\":\"1. Inspect\\n2. Patch\\n3. Test\",\"filePath\":\"/tmp/plan.md\"}"}]}}"#,
             #"{"type":"result","subtype":"success","result":"plan ready"}"#
         ])
 
@@ -424,5 +458,23 @@ final class ClaudeParserCLITests: XCTestCase {
         // block must still render exactly once.
         XCTAssertEqual(emittedAssistantDeltas, blocks,
             "distinct assistant blocks must each render once; dedup must suppress only true duplicates")
+    }
+
+    func test_sdkElicitationPreservesObjectPropertyNamesTypesAndSecretPresentation() throws {
+        let parser = ClaudeParser()
+        let events = parser.parseLine(#"{"type":"user_input_request","request_id":"elicitation-typed","prompt":"Configure deployment","requested_schema":{"type":"object","required":["environment","replicas","dryRun","token"],"properties":{"environment":{"type":"string","title":"Environment","enum":["staging","production"]},"replicas":{"type":"integer","title":"Replicas"},"dryRun":{"type":"boolean","title":"Dry run"},"token":{"type":"string","title":"Token","format":"password"}}}}"#)
+        let request = try XCTUnwrap(events.compactMap { event -> AssistantUserInputRequest? in
+            if case .userInputRequested(let request) = event { return request }
+            return nil
+        }.first)
+
+        XCTAssertEqual(request.prompt, "Configure deployment")
+        XCTAssertEqual(Set(request.questions.map(\.id)), Set(["environment", "replicas", "dryRun", "token"]),
+                       "schema property names are the provider response keys and must survive parsing")
+        XCTAssertEqual(request.questions.first(where: { $0.id == "environment" })?.options.map(\.label),
+                       ["staging", "production"])
+        XCTAssertEqual(request.questions.first(where: { $0.id == "dryRun" })?.options.map(\.label),
+                       ["true", "false"])
+        XCTAssertTrue(request.isSecret, "a password schema must render masked input")
     }
 }

@@ -2,7 +2,7 @@ import XCTest
 import CoreModel
 @testable import AgentRuntime
 
-final class ClaudeStreamingCLIAdapterConcurrencyTests: XCTestCase {
+final class ClaudeStreamingCLIAdapterConcurrencyTests: ProviderProcessTestCase {
     func test_streamEventsAndSessionQueriesStayRaceFreeDuringStreamingTurn() async throws {
         let tmp = URL(fileURLWithPath: NSTemporaryDirectory())
             .appendingPathComponent("rc2-claude-streaming-concurrency-\(UUID().uuidString)", isDirectory: true)

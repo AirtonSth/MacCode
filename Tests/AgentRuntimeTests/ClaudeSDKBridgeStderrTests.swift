@@ -15,7 +15,7 @@ import CoreModel
 ///    readabilityHandler at termination does not wait for an in-flight callback,
 ///    so the bytes could sit undrained in the pipe and the failure reason was
 ///    lost. finishTerminated must drain the stderr tail like it drains stdout.
-final class ClaudeSDKBridgeStderrTests: XCTestCase {
+final class ClaudeSDKBridgeStderrTests: ProviderProcessTestCase {
 
     // WHY: benign Node runtime noise must never render as a fatal agent error
     // during a run that is succeeding.
@@ -67,6 +67,29 @@ final class ClaudeSDKBridgeStderrTests: XCTestCase {
             sink.errorMessages().contains { $0.contains("[claude sdk stderr]") && $0.contains("Invalid API key") }
         }
         try await Self.waitUntil("run finished") { sink.finishedStatus() != nil }
+        XCTAssertEqual(sink.finishedStatus(), .failed,
+                       "an Agent SDK bridge crash is a provider failure, not a user cancellation")
+    }
+
+    func test_bridgeSIGABRTIsFailedWithActionableCrashDiagnostic() async throws {
+        guard ProcessLocator.resolve("node") != nil else { throw XCTSkip("node not available") }
+        let tmp = try Self.makeTempDir(prefix: "rc2-sdk-sigabrt")
+        let bridge = tmp.appendingPathComponent("fake-sdk-bridge.mjs")
+        try Self.bridgeSource(onTurn: """
+            process.kill(process.pid, 'SIGABRT');
+        """).write(to: bridge, atomically: true, encoding: .utf8)
+
+        let adapter = ClaudeAgentSDKBridgeAdapter(bridgeScriptPath: bridge.path)
+        let threadId = AgentThreadID()
+        let sink = LockedEventSink()
+        _ = try await adapter.sendTurn(Self.request(threadId: threadId, cwd: tmp.path)) { sink.record($0) }
+        defer { try? adapter.stopSession(threadId: threadId) }
+
+        try await Self.waitUntil("SIGABRT terminal") { sink.finishedStatus() != nil }
+        XCTAssertEqual(sink.finishedStatus(), .failed,
+                       "a real Agent SDK bridge SIGABRT must never be labelled Cancelled")
+        XCTAssertTrue(sink.errorMessages().contains { $0.localizedCaseInsensitiveContains("crashed with signal 6") },
+                      "SIGABRT must explain the process crash so the failed run has an actionable Retry reason")
     }
 
     // MARK: - Helpers

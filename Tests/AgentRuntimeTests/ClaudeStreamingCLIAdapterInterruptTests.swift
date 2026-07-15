@@ -5,7 +5,7 @@ import CoreModel
 /// Tests for the graceful-interrupt path in ClaudeStreamingCLIAdapter.
 /// P2 requirement: on interrupt, send a stream-json control message first;
 /// only fall back to process kill when that fails.
-final class ClaudeStreamingCLIAdapterInterruptTests: XCTestCase {
+final class ClaudeStreamingCLIAdapterInterruptTests: ProviderProcessTestCase {
 
     // MARK: - Pure builder tests (no process, no I/O)
 
@@ -73,26 +73,26 @@ final class ClaudeStreamingCLIAdapterInterruptTests: XCTestCase {
 
     // MARK: - Fallback path test (process + real pipe)
 
-    /// When the process has already exited (process.isRunning == false),
-    /// GuardedStdinWrite.classify returns .sessionNotFound immediately and the
-    /// graceful write fails. interruptTurn must then fall back to stopSession,
-    /// which removes the session. The session must be absent afterward.
-    func test_interruptTurn_fallsBackToKillWhenProcessDead() async throws {
+    /// When the provider closes stdin while its process remains alive, the
+    /// graceful interrupt write receives EPIPE. interruptTurn must fall back to
+    /// stopSession, which removes the session without crashing the app.
+    func test_interruptTurn_fallsBackToKillWhenProviderClosesStdin() async throws {
         let tmp = URL(fileURLWithPath: NSTemporaryDirectory())
             .appendingPathComponent("rc2-claude-interrupt-fallback-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
         let script = tmp.appendingPathComponent("fake-claude")
 
-        // Script exits immediately without ever completing a turn, so
-        // finishTerminated fires and the process is dead by the time the test
-        // calls interruptTurn. The session is kept alive in the adapter only
-        // until stopSession/stopAll removes it; finishTerminated itself removes
-        // the session, so the test asserts absence regardless of which path ran.
+        let stdinClosed = tmp.appendingPathComponent("stdin-closed")
+        // Accept the initial prompt, then close stdin while staying alive. This
+        // deterministically exercises the adapter's EPIPE fallback boundary.
         try """
         #!/usr/bin/env python3
-        import json, sys
+        import json, os, pathlib, sys, time
         print(json.dumps({"type":"system","subtype":"init","session_id":"interrupt-fallback-session"}), flush=True)
-        sys.exit(0)
+        sys.stdin.readline()
+        os.close(0)
+        pathlib.Path(\"\(stdinClosed.path)\").touch()
+        time.sleep(5)
         """.write(to: script, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: script.path)
 
@@ -109,18 +109,19 @@ final class ClaudeStreamingCLIAdapterInterruptTests: XCTestCase {
             Task { await sink.record(event) }
         }
 
-        // Wait for finishTerminated to fire (process exits almost immediately).
+        // Wait until the fake provider confirms stdin is closed but the warm
+        // session is still registered.
         let deadline = Date().addingTimeInterval(3)
-        while Date() < deadline && adapter.hasSession(threadId: threadId) {
+        while Date() < deadline && !FileManager.default.fileExists(atPath: stdinClosed.path) {
             try? await Task.sleep(nanoseconds: 20_000_000)
         }
+        XCTAssertTrue(FileManager.default.fileExists(atPath: stdinClosed.path))
+        XCTAssertTrue(adapter.hasSession(threadId: threadId))
 
-        // Session should be gone once the process exits; verify the fallback
-        // code path is reachable by asserting the session is absent. Whether
-        // interruptTurn ran the graceful path or the kill fallback, the result
-        // is the same: no live session remains.
+        try adapter.interruptTurn(threadId: threadId)
+
         XCTAssertFalse(adapter.hasSession(threadId: threadId),
-                       "after the Claude process exits, the session must be removed — interruptTurn fallback path (process kill) must leave no dangling session")
+                       "closed stdin must trigger the kill fallback and remove the session")
     }
 }
 

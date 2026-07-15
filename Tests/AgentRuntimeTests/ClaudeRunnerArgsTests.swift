@@ -37,6 +37,21 @@ final class ClaudeRunnerArgsTests: XCTestCase {
                        "new durable Claude sessions must use a stable provider session id for restart diagnostics")
         XCTAssertFalse(a.contains("hello world"),
                        "stream-json sessions must send user turns over stdin, not bake the first prompt into argv")
+        XCTAssertFalse(zip(a, a.dropFirst()).contains { $0 == "--tools" && $1.isEmpty },
+                       "the streaming fallback must not silently disable Claude tools and degrade into chat-only mode")
+    }
+
+    func test_uncaughtSignalIsFailureUnlessCancellationWasRequested() {
+        XCTAssertEqual(
+            ClaudeRunner.terminalStatus(cancelRequested: false, terminationReason: .uncaughtSignal, terminationStatus: 9),
+            .failed,
+            "a provider crash must remain a failure instead of being mislabeled as user cancellation"
+        )
+        XCTAssertEqual(
+            ClaudeRunner.terminalStatus(cancelRequested: true, terminationReason: .uncaughtSignal, terminationStatus: 9),
+            .cancelled,
+            "an uncaught signal caused by an explicit stop remains cancellation"
+        )
     }
 
     func test_streamingSessionResumeUsesProviderThreadId() {

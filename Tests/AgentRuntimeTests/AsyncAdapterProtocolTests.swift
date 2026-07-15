@@ -27,6 +27,7 @@ final class AsyncAdapterProtocolTests: XCTestCase {
     /// continuation so suspension (not blocking) can be observed.
     private final class FakeAdapter: AgentProviderAdapter, @unchecked Sendable {
         let provider: AgentProvider = .codex
+        let forkSafety: AgentProviderForkSafety = .keyedIdempotent(compensationSupported: true)
 
         // Call-order log (serialized via lock).
         private let lock = NSLock()
@@ -35,6 +36,7 @@ final class AsyncAdapterProtocolTests: XCTestCase {
 
         // Forwarding-test fixtures.
         var readThreadResult: [AssistantEvent] = []
+        var forkThreadResult = "provider-child"
         var rollbackError: Error?
         var respondError: Error?
 
@@ -80,6 +82,18 @@ final class AsyncAdapterProtocolTests: XCTestCase {
             log("rollbackThread")
             if let rollbackError { throw rollbackError }
         }
+
+        func forkThread(threadId: AgentThreadID) async throws -> String {
+            log("forkThread")
+            return forkThreadResult
+        }
+
+        func forkThread(_ request: AgentProviderForkRequest) async throws -> String {
+            log("forkThread")
+            return forkThreadResult
+        }
+
+        func compensateFork(_ request: AgentProviderForkRequest, providerChildThreadId: String) async throws {}
 
         func respondToRequest(threadId: AgentThreadID, requestId: String, response: AgentProviderRequestResponse) async throws {
             log("respondToRequest")
@@ -161,6 +175,141 @@ final class AsyncAdapterProtocolTests: XCTestCase {
             XCTAssertEqual(error, TestError(tag: "rollback"))
         }
         XCTAssertEqual(adapter.calls, ["rollbackThread"])
+    }
+
+    func test_forkThread_persistsDistinctChildProviderContextWithoutMutatingParent() async throws {
+        let tmp = NSTemporaryDirectory() + "rc2-native-fork-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let sessionRepo = ProviderSessionRuntimeRepository(db: db)
+        let parent = AgentThread(
+            workspaceId: WorkspaceID(),
+            title: "parent",
+            provider: .codex,
+            providerInstanceId: "codex-work",
+            model: "fake-model",
+            providerThreadId: "provider-parent",
+            permissionMode: .fullAccess,
+            reasoningEffort: .high,
+            executionMode: .worktree,
+            baseBranch: "main",
+            worktreePath: tmp,
+            serviceTier: .fast,
+            interactionMode: .plan
+        )
+        let child = AgentThread(
+            workspaceId: parent.workspaceId,
+            title: "child",
+            provider: .codex,
+            providerInstanceId: parent.providerInstanceId,
+            model: "fake-model",
+            permissionMode: parent.permissionMode,
+            reasoningEffort: parent.reasoningEffort,
+            executionMode: parent.executionMode,
+            baseBranch: parent.baseBranch,
+            worktreePath: parent.worktreePath,
+            serviceTier: parent.serviceTier,
+            modelSelection: parent.modelSelection,
+            interactionMode: parent.effectiveInteractionMode
+        )
+        let attachment = AgentAttachment(
+            path: "/tmp/identity-proof.png",
+            displayName: "identity-proof.png",
+            kind: .image,
+            mimeType: "image/png"
+        )
+        try threadRepo.upsert(parent)
+        try messageRepo.append(AgentMessage(threadId: parent.id, role: .user, content: "q1", attachments: [attachment]))
+        try messageRepo.append(AgentMessage(threadId: parent.id, role: .assistant, content: "a1"))
+        try sessionRepo.upsert(ProviderSessionRuntime(
+            threadId: parent.id,
+            provider: .codex,
+            status: .completed,
+            resumeCursor: "provider-parent",
+            cwd: tmp,
+            model: "fake-model"
+        ))
+        let adapter = FakeAdapter()
+        adapter.forkThreadResult = "provider-child"
+        let coordinator = AgentRunCoordinator(
+            runRepo: runRepo,
+            messageRepo: messageRepo,
+            threadRepo: threadRepo,
+            providerSessionRepo: sessionRepo,
+            providerAdapters: [.codex: adapter]
+        )
+
+        let forked = try await coordinator.forkThread(sourceThreadId: parent.id, childThread: child)
+
+        XCTAssertEqual(adapter.calls, ["forkThread"])
+        XCTAssertEqual(forked.providerThreadId, "provider-child")
+        XCTAssertEqual(try threadRepo.get(id: child.id)?.providerThreadId, "provider-child")
+        XCTAssertEqual(try sessionRepo.get(threadId: child.id)?.resumeCursor, "provider-child",
+                       "the first dependent child question must resume the provider-native branch")
+        let copied = try messageRepo.list(threadId: child.id)
+        XCTAssertEqual(copied.map(\.content), ["q1", "a1"],
+                       "the child graph must atomically include the complete visible parent transcript")
+        XCTAssertEqual(copied.first?.attachments, [attachment],
+                       "fork must preserve attachment identity metadata exactly, not rebuild or detach it")
+        XCTAssertEqual(try threadRepo.get(id: child.id)?.permissionMode, parent.permissionMode)
+        XCTAssertEqual(try threadRepo.get(id: child.id)?.executionMode, parent.executionMode)
+        XCTAssertEqual(try threadRepo.get(id: child.id)?.effectiveInteractionMode, parent.effectiveInteractionMode)
+        XCTAssertEqual(try threadRepo.get(id: parent.id)?.providerThreadId, "provider-parent")
+        XCTAssertEqual(try sessionRepo.get(threadId: parent.id)?.resumeCursor, "provider-parent",
+                       "forking must not redirect later parent turns into the child session")
+    }
+
+    func test_forkThread_sessionWriteFailureRollsBackEntireLocalChildGraph() async throws {
+        let tmp = NSTemporaryDirectory() + "rc2-native-fork-atomic-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let sessionRepo = ProviderSessionRuntimeRepository(db: db)
+        let parent = AgentThread(title: "parent", provider: .codex, model: "fake-model", providerThreadId: "provider-parent")
+        let child = AgentThread(title: "child", provider: .codex, model: "fake-model")
+        try threadRepo.upsert(parent)
+        try messageRepo.append(AgentMessage(threadId: parent.id, role: .user, content: "must copy"))
+        try sessionRepo.upsert(ProviderSessionRuntime(
+            threadId: parent.id,
+            provider: .codex,
+            status: .completed,
+            resumeCursor: "provider-parent",
+            cwd: tmp,
+            model: "fake-model"
+        ))
+        try db.execute("""
+            CREATE TRIGGER fail_child_session
+            BEFORE INSERT ON provider_session_runtime
+            WHEN NEW.thread_id = '\(child.id.value.uuidString)'
+            BEGIN SELECT RAISE(ABORT, 'injected child session failure'); END;
+            """)
+        let adapter = FakeAdapter()
+        adapter.forkThreadResult = "provider-child"
+        let coordinator = AgentRunCoordinator(
+            runRepo: AgentRunRepository(db: db),
+            messageRepo: messageRepo,
+            threadRepo: threadRepo,
+            providerSessionRepo: sessionRepo,
+            providerAdapters: [.codex: adapter]
+        )
+
+        do {
+            _ = try await coordinator.forkThread(sourceThreadId: parent.id, childThread: child)
+            XCTFail("fault injection after child/thread transcript writes must fail the fork")
+        } catch {
+            XCTAssertTrue(String(describing: error).contains("injected child session failure"))
+        }
+
+        XCTAssertNil(try threadRepo.get(id: child.id),
+                     "any child graph write failure must roll back the child thread row")
+        XCTAssertTrue(try messageRepo.list(threadId: child.id).isEmpty,
+                      "any child graph write failure must roll back copied messages and attachment references")
+        XCTAssertNil(try sessionRepo.get(threadId: child.id),
+                     "any child graph write failure must leave no child provider-session row")
+        XCTAssertEqual(try threadRepo.get(id: parent.id)?.providerThreadId, "provider-parent",
+                       "local rollback must not mutate the parent graph")
     }
 
     func test_respondToRequest_propagatesAdapterError() async throws {

@@ -550,14 +550,14 @@ private final class Phase4ReceiptFakeRouter: FakeRouter, CommandReceiptStateRout
         try await super.rollbackAgentThread(thread: thread, toTurnId: toTurnId)
     }
 
-    override func deleteAgentThread(thread: AgentThreadID) throws {
+    override func deleteAgentThread(thread: AgentThreadID) async throws {
         synchronousBatchEffectCallCount += 1
-        try super.deleteAgentThread(thread: thread)
+        try await super.deleteAgentThread(thread: thread)
     }
 
-    override func deleteAgentThreads(_ threads: [AgentThreadID]) throws {
+    override func deleteAgentThreads(_ threads: [AgentThreadID]) async throws {
         synchronousBatchEffectCallCount += 1
-        try super.deleteAgentThreads(threads)
+        try await super.deleteAgentThreads(threads)
     }
 
     override func renameAgentThread(thread: AgentThreadID, title: String) throws -> AgentThread {
@@ -834,7 +834,7 @@ private final class Phase4ReceiptFakeRouter: FakeRouter, CommandReceiptStateRout
         id: AgentQueuedMessageID,
         text: String,
         attachments: [AgentAttachment]
-    ) throws -> AgentQueuedMessage {
+    ) async throws -> AgentQueuedMessage {
         synchronousBatchEffectCallCount += 1
         return AgentQueuedMessage(id: id, threadId: AgentThreadID(), text: text, attachments: attachments)
     }
@@ -944,12 +944,30 @@ private final class Phase4ReceiptFakeRouter: FakeRouter, CommandReceiptStateRout
         dataBase64: String
     ) throws -> AgentAttachmentUploadResult {
         synchronousBatchEffectCallCount += 1
+        let id = String(repeating: "c", count: 64)
         return AgentAttachmentUploadResult(
-            path: "/tmp/secret-phase4-attachment/\(filename)",
+            id: id,
             displayName: filename,
             kind: .file,
             mimeType: mimeType,
+            sha256: id,
             sizeBytes: Data(base64Encoded: dataBase64)?.count ?? 0
+        )
+    }
+
+    override func importAgentAttachment(
+        workspace: WorkspaceID,
+        relativePath: String
+    ) throws -> AgentAttachmentUploadResult {
+        synchronousBatchEffectCallCount += 1
+        let id = String(repeating: "d", count: 64)
+        return AgentAttachmentUploadResult(
+            id: id,
+            displayName: URL(fileURLWithPath: relativePath).lastPathComponent,
+            kind: .file,
+            mimeType: "text/plain",
+            sha256: id,
+            sizeBytes: 7
         )
     }
 
@@ -1137,7 +1155,7 @@ final class Phase4MutationReceiptContractTests: XCTestCase {
     func test_canonicalManifestExactlyMatchesDispatcherMutationCatalog() throws {
         let canonical = try canonicalMutationMethods()
 
-        XCTAssertEqual(canonical.count, 98)
+        XCTAssertEqual(canonical.count, 99)
         XCTAssertEqual(JSONRPCDispatcher.hostMutationMethods, canonical,
                        "every and only canonical host mutators must enter the Phase 4 gate")
     }
@@ -2061,6 +2079,7 @@ final class Phase4MutationReceiptContractTests: XCTestCase {
             ("agent.plan.notes.save", ["thread_id": threadID, "notes": "secret-phase4-notes"], "agent.plan.notes.updated"),
             ("agent.checkpoint.revert", ["thread_id": threadID, "turn_count": 1], "agent.checkpoint.reverted"),
             ("agent.attachment.upload", ["workspace_id": workspaceID, "filename": "phase4.txt", "data_base64": attachmentData], "agent.attachment.uploaded"),
+            ("agent.attachment.import", ["workspace_id": workspaceID, "relative_path": "docs/phase4.txt"], "agent.attachment.uploaded"),
             ("agent.provider.update", ["provider": "codex"], "agent.provider.updated"),
         ]
 

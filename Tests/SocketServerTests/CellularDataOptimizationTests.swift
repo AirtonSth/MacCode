@@ -117,6 +117,14 @@ final class CellularDataOptimizationTests: XCTestCase {
 
         XCTAssertEqual((badResponse as? HTTPURLResponse)?.statusCode, 400,
                        "corrupt compressed bodies must fail loudly instead of reaching RPC dispatch")
+
+        request.httpBody = try PayloadCodec.lzfse.encode(
+            Data(repeating: 0x41, count: DirectHTTPServer.maxRequestBodyBytes + 1)
+        )
+        let (_, oversizedResponse) = try await URLSession.shared.data(for: request)
+
+        XCTAssertEqual((oversizedResponse as? HTTPURLResponse)?.statusCode, 413,
+                       "compressed expansion past the request limit must stop with payload-too-large")
     }
 
     @MainActor

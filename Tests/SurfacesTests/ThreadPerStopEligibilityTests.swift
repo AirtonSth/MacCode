@@ -6,9 +6,9 @@ import CoreModel
 /// in the thread rail. The helper is pure (no MainActor, no UI types), so these
 /// tests run without the surface and are not annotated @MainActor.
 ///
-/// Business rule: a stop affordance must appear if and only if the thread is
-/// currently running. Targeting any other status would do nothing (coordinator
-/// no-op on a finished thread) or confuse users with a stop button on an idle thread.
+/// Business rule: a stop affordance must appear while a run is pending or
+/// running. Pending work is cancellable before the provider handle is registered;
+/// finished work must never expose a phantom stop action.
 final class ThreadPerStopEligibilityTests: XCTestCase {
 
     // MARK: - isEligible
@@ -22,11 +22,13 @@ final class ThreadPerStopEligibilityTests: XCTestCase {
         )
     }
 
-    func test_isEligible_pending_returnsFalse() {
-        // Pending means the run has not started yet; no process to kill.
-        XCTAssertFalse(
+    func test_isEligible_pending_returnsTrue() {
+        // The coordinator retains a pending stop and applies it as soon as the
+        // provider handle is registered. Hiding Stop here makes that safety seam
+        // unreachable during slow provider startup.
+        XCTAssertTrue(
             AgentThreadStopEligibility.isEligible(threadStatus: .pending),
-            "a pending thread has no active process to stop"
+            "a pending run must be cancellable before provider startup completes"
         )
     }
 
@@ -91,6 +93,24 @@ final class ThreadPerStopEligibilityTests: XCTestCase {
         XCTAssertNil(
             AgentThreadStopEligibility.targetThreadId(thread: thread),
             "targetThreadId must return nil for non-running threads to prevent phantom stop actions"
+        )
+    }
+
+    func test_targetThreadId_pendingThread_returnsItsOwnId() {
+        let id = AgentThreadID()
+        let thread = AgentThread(
+            id: id,
+            workspaceId: WorkspaceID(),
+            title: "provider starting",
+            provider: .codex,
+            model: "gpt-4o",
+            status: .pending
+        )
+
+        XCTAssertEqual(
+            AgentThreadStopEligibility.targetThreadId(thread: thread),
+            id,
+            "pending cancellation must target the row's thread even before a provider process exists"
         )
     }
 }

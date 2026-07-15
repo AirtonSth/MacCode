@@ -2,7 +2,7 @@ import XCTest
 import CoreModel
 @testable import AgentRuntime
 
-final class ClaudeStreamingCLIAdapterTests: XCTestCase {
+final class ClaudeStreamingCLIAdapterTests: ProviderProcessTestCase {
     func test_adapterSendsMultipleTurnsThroughOneStreamingProcess() async throws {
         let tmp = URL(fileURLWithPath: NSTemporaryDirectory())
             .appendingPathComponent("rc2-claude-streaming-adapter-\(UUID().uuidString)", isDirectory: true)
@@ -102,6 +102,102 @@ final class ClaudeStreamingCLIAdapterTests: XCTestCase {
         let events = await sink.snapshot()
         XCTAssertTrue(Self.assistantTexts(in: events).contains("STREAM_ONLY_FINAL"),
                       "Claude streaming adapter must finalize buffered assistant text on EOF so the user sees a response even when result is missing")
+    }
+
+    func test_streamingCLIUnexpectedProcessExitIsFailureNotCancellation() async throws {
+        let tmp = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("rc2-claude-streaming-crash-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
+        let script = tmp.appendingPathComponent("fake-claude")
+        try """
+        #!/usr/bin/env python3
+        import json, os, signal, sys
+        print(json.dumps({"type":"system","subtype":"init","session_id":"stream-crash-session"}), flush=True)
+        for line in sys.stdin:
+            if line.strip():
+                os.kill(os.getpid(), signal.SIGABRT)
+        """.write(to: script, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: script.path)
+
+        let adapter = ClaudeStreamingCLIAdapter(binaryNameOverride: script.path)
+        let sink = EventSink()
+        _ = try await adapter.sendTurn(AgentRunRequest(
+            threadId: AgentThreadID(), provider: .claude,
+            model: "claude-haiku-4-5-20251001", cwd: tmp.path, prompt: "crash"
+        )) { event in Task { await sink.record(event) } }
+
+        let deadline = Date().addingTimeInterval(3)
+        var status: AgentRunStatus?
+        while Date() < deadline && status == nil {
+            status = await sink.snapshot().compactMap { event -> AgentRunStatus? in
+                if case .finished(let value, _, _) = event { return value }
+                return nil
+            }.first
+            try? await Task.sleep(nanoseconds: 20_000_000)
+        }
+        XCTAssertEqual(status, .failed,
+                       "an unexpected Claude CLI exit is a provider failure; only an explicit interrupt may finish as cancelled")
+        let errors = await sink.snapshot().compactMap { event -> String? in
+            if case .error(let message) = event { return message }
+            return nil
+        }
+        XCTAssertTrue(errors.contains { $0.localizedCaseInsensitiveContains("crashed with signal 6") },
+                      "SIGABRT must leave an actionable crash diagnostic for Retry; errors=\(errors)")
+    }
+
+    func test_agentSDKHandleCancelWritesInterruptBeforeHardClose() async throws {
+        let tmp = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("rc2-claude-sdk-cancel-order-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
+        let bridge = tmp.appendingPathComponent("fake-sdk-bridge.mjs")
+        let log = tmp.appendingPathComponent("commands.jsonl")
+        try """
+        import fs from 'node:fs';
+        import readline from 'node:readline';
+        const log = process.argv[2];
+        const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
+        for await (const line of rl) {
+          if (!line.trim()) continue;
+          const cmd = JSON.parse(line);
+          fs.appendFileSync(log, JSON.stringify(cmd) + '\\n');
+          if (cmd.type === 'rc_configure') process.stdout.write(JSON.stringify({ type: 'system', subtype: 'init', session_id: 'cancel-order' }) + '\\n');
+          if (cmd.type === 'rc_close') process.exit(0);
+        }
+        """.write(to: bridge, atomically: true, encoding: .utf8)
+
+        let adapter = ClaudeAgentSDKBridgeAdapter(bridgeScriptPath: bridge.path, interruptGracePeriod: 0.05)
+        let threadId = AgentThreadID()
+        let handle = try await adapter.sendTurn(AgentRunRequest(
+            threadId: threadId, provider: .claude,
+            model: "claude-haiku-4-5-20251001", cwd: tmp.path, prompt: "wait",
+            extraArgs: [log.path]
+        )) { _ in }
+        let readyDeadline = Date().addingTimeInterval(3)
+        var preCancelCommands = ""
+        while Date() < readyDeadline {
+            preCancelCommands = (try? String(contentsOf: log, encoding: .utf8)) ?? ""
+            if preCancelCommands.contains(#""type":"rc_turn""#) { break }
+            try? await Task.sleep(nanoseconds: 20_000_000)
+        }
+        XCTAssertTrue(preCancelCommands.contains(#""type":"rc_turn""#),
+                      "the fake bridge must be reading commands before cancellation ordering is measured")
+        handle.cancel()
+
+        let deadline = Date().addingTimeInterval(3)
+        while Date() < deadline && adapter.hasSession(threadId: threadId) {
+            try? await Task.sleep(nanoseconds: 20_000_000)
+        }
+        var commands = ""
+        let closeDeadline = Date().addingTimeInterval(3)
+        while Date() < closeDeadline {
+            commands = (try? String(contentsOf: log, encoding: .utf8)) ?? ""
+            if commands.contains(#""type":"rc_close""#) { break }
+            try? await Task.sleep(nanoseconds: 20_000_000)
+        }
+        let interrupt = try XCTUnwrap(commands.range(of: #""type":"rc_interrupt""#))
+        let close = try XCTUnwrap(commands.range(of: #""type":"rc_close""#))
+        XCTAssertLessThan(interrupt.lowerBound, close.lowerBound,
+                          "cancel must ask the SDK query to interrupt before the grace timeout hard-closes its bridge")
     }
 
     func test_recoverableRateLimitTelemetryDoesNotFailSuccessfulStreamingTurn() async throws {
@@ -813,11 +909,39 @@ final class ClaudeStreamingCLIAdapterTests: XCTestCase {
             cwd: tmp.path,
             prompt: "first",
             attachments: [AgentAttachment(path: tmp.appendingPathComponent("note.txt").path, displayName: "note.txt", kind: .file, mimeType: "text/plain")],
+            providerBinary: "/usr/bin/true",
             extraArgs: [commandLog.path]
         )) { event in
             Task { await first.record(event) }
         }
         try await waitForFinish(in: first, expected: "SDK_REPLY_1")
+
+        for mimeType in ["image/png", "image/jpeg", "image/gif", "image/webp"] {
+            XCTAssertNoThrow(try ClaudeAgentSDKBridgeAdapter.validateAttachments([
+                AgentAttachment(path: tmp.appendingPathComponent("supported-image").path, kind: .image, mimeType: mimeType)
+            ]), "the Claude SDK contract explicitly accepts \(mimeType)")
+        }
+        for mimeType in ["image/heic", "image/bmp", "image/tiff", "image/avif"] {
+            do {
+                _ = try await adapter.sendTurn(AgentRunRequest(
+                    threadId: threadId,
+                    provider: .claude,
+                    model: "claude-haiku-4-5-20251001",
+                    cwd: tmp.path,
+                    prompt: "must be rejected before reaching the warm session",
+                    attachments: [AgentAttachment(path: tmp.appendingPathComponent("unsupported-image").path, kind: .image, mimeType: mimeType)],
+                    providerThreadId: "sdk-session-1",
+                    providerBinary: "/usr/bin/true",
+                    extraArgs: [commandLog.path]
+                )) { _ in }
+                XCTFail("unsupported Claude image MIME \(mimeType) must fail before writing to the bridge")
+            } catch let AgentProviderAdapterError.unsupported(message) {
+                XCTAssertTrue(message.contains(mimeType))
+            }
+            XCTAssertTrue(adapter.hasSession(threadId: threadId),
+                          "rejecting \(mimeType) must not destroy the existing warm Claude session")
+            XCTAssertEqual(adapter.listSessions().first?.providerThreadId, "sdk-session-1")
+        }
 
         let second = EventSink()
         _ = try await adapter.sendTurn(AgentRunRequest(
@@ -826,9 +950,11 @@ final class ClaudeStreamingCLIAdapterTests: XCTestCase {
             model: "claude-sonnet-4-6",
             cwd: tmp.path,
             prompt: "second",
+            attachments: [AgentAttachment(path: tmp.appendingPathComponent("accepted.png").path, kind: .image, mimeType: "image/png")],
             providerThreadId: "sdk-session-1",
             permissionMode: .fullAccess,
             interactionMode: .plan,
+            providerBinary: "/usr/bin/true",
             extraArgs: [commandLog.path]
         )) { event in
             Task { await second.record(event) }
@@ -844,6 +970,8 @@ final class ClaudeStreamingCLIAdapterTests: XCTestCase {
                       "Claude SDK bridge must use native setPermissionMode control when interaction or permission mode changes")
         XCTAssertTrue(commands.contains(#""attachments":[{"#) && commands.contains(#""path":"#) && commands.contains("note.txt"),
                       "Claude SDK bridge must send structured attachment metadata to the SDK bridge instead of flattening attachments into the prompt")
+        XCTAssertTrue(commands.contains(#""claude_executable_path":"/usr/bin/true""#),
+                      "the SDK bridge must run the exact provider binary selected by the app instead of a second hidden Claude runtime")
         XCTAssertEqual(adapter.listSessions().first?.providerThreadId, "sdk-session-1")
         let sdkReadTurns = try await adapter.readThread(threadId: threadId).compactMap(Self.completedTurnId)
         XCTAssertEqual(sdkReadTurns.count, 2)
@@ -1250,6 +1378,65 @@ final class ClaudeStreamingCLIAdapterTests: XCTestCase {
         try adapter.stopSession(threadId: threadId)
     }
 
+    func test_agentSDKBridgeAdapterCancelsQuestionWithoutStoppingSession() async throws {
+        let tmp = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("rc2-claude-sdk-cancel-input-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
+        let bridge = tmp.appendingPathComponent("fake-sdk-bridge.mjs")
+        let commandLog = tmp.appendingPathComponent("commands.jsonl")
+        try """
+        import fs from 'node:fs';
+        import readline from 'node:readline';
+        const log = process.argv[2];
+        const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
+        function write(obj) { process.stdout.write(JSON.stringify(obj) + '\\n'); }
+        function record(obj) { fs.appendFileSync(log, JSON.stringify(obj) + '\\n'); }
+        for await (const line of rl) {
+          if (!line.trim()) continue;
+          const cmd = JSON.parse(line); record(cmd);
+          if (cmd.type === 'rc_configure') write({ type: 'system', subtype: 'init', session_id: 'sdk-cancel-session' });
+          else if (cmd.type === 'rc_turn') write({ type: 'user_input_request', request_id: 'sdk-cancel-input', prompt: 'Choose', options: ['a'], session_id: 'sdk-cancel-session' });
+          else if (cmd.type === 'rc_interrupt') write({ type: 'result', subtype: 'success', is_error: false, result: 'cancelled question', session_id: 'sdk-cancel-session' });
+          else if (cmd.type === 'rc_close') process.exit(0);
+        }
+        """.write(to: bridge, atomically: true, encoding: .utf8)
+
+        let adapter = ClaudeAgentSDKBridgeAdapter(bridgeScriptPath: bridge.path)
+        let threadId = AgentThreadID()
+        let sink = EventSink()
+        _ = try await adapter.sendTurn(AgentRunRequest(
+            threadId: threadId,
+            provider: .claude,
+            model: "claude-haiku-4-5-20251001",
+            cwd: tmp.path,
+            prompt: "needs native input",
+            extraArgs: [commandLog.path]
+        )) { event in Task { await sink.record(event) } }
+
+        try await waitForUserInput(in: sink, requestId: "sdk-cancel-input")
+        try adapter.cancelUserInput(threadId: threadId, requestId: "sdk-cancel-input")
+        try await waitForUserInputResolution(in: sink, requestId: "sdk-cancel-input")
+
+        XCTAssertTrue(adapter.hasSession(threadId: threadId),
+                      "AskUser cancellation must leave the warm Claude SDK session registered")
+        var commands = ""
+        let commandDeadline = Date().addingTimeInterval(2)
+        repeat {
+            commands = (try? String(contentsOf: commandLog, encoding: .utf8)) ?? ""
+            if commands.contains(#""type":"user_input_cancel""#) { break }
+            try await Task.sleep(nanoseconds: 10_000_000)
+        } while Date() < commandDeadline
+        XCTAssertTrue(commands.contains(#""type":"user_input_cancel""#),
+                      "the bridge must cancel only the matching pending AskUser callback")
+        XCTAssertTrue(commands.contains(#""request_id":"sdk-cancel-input""#),
+                      "request-scoped cancellation must preserve the exact AskUser request identity")
+        XCTAssertFalse(commands.contains(#""type":"rc_interrupt""#),
+                       "question cancellation must not interrupt the whole provider turn")
+        XCTAssertFalse(commands.contains(#""type":"rc_close""#),
+                       "question cancellation must not close the provider session")
+        try adapter.stopSession(threadId: threadId)
+    }
+
     func test_agentSDKBridgeAdapterStopSettlesPendingCallbacks() async throws {
         let tmp = URL(fileURLWithPath: NSTemporaryDirectory())
             .appendingPathComponent("rc2-claude-sdk-stop-callback-\(UUID().uuidString)", isDirectory: true)
@@ -1369,7 +1556,7 @@ final class ClaudeStreamingCLIAdapterTests: XCTestCase {
         try adapter.stopSession(threadId: threadId)
     }
 
-    func test_agentSDKBridgeSourceDisablesPartialAssistantSnapshots() throws {
+    func test_agentSDKBridgeSourceEnablesPartialAssistantSnapshots() throws {
         let packageRoot = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
             .deletingLastPathComponent()
@@ -1377,10 +1564,59 @@ final class ClaudeStreamingCLIAdapterTests: XCTestCase {
         let bridge = packageRoot.appendingPathComponent("Sources/AgentRuntime/ClaudeAgentSDKBridge.mjs")
         let source = try String(contentsOf: bridge, encoding: .utf8)
 
-        XCTAssertTrue(source.contains("includePartialMessages: false"),
-                      "Claude SDK partial assistant snapshots must stay disabled so thinking blocks are not replayed in a mutated form on the next provider request")
-        XCTAssertFalse(source.contains("includePartialMessages: true"),
-                       "turning partial snapshots back on can reproduce Anthropic 400 errors for thinking/redacted_thinking continuations")
+        XCTAssertTrue(source.contains("includePartialMessages: true"),
+                      "Claude must stream partial SDK messages so the Agent App shows progress before the final response")
+        XCTAssertFalse(source.contains("includePartialMessages: false"),
+                       "disabling partial messages regresses live streaming to final-message-only output")
+    }
+
+    func test_agentSDKBridgeSourcePreservesApprovedToolInputAndUsesConfiguredRuntime() throws {
+        let packageRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let bridge = packageRoot.appendingPathComponent("Sources/AgentRuntime/ClaudeAgentSDKBridge.mjs")
+        let source = try String(contentsOf: bridge, encoding: .utf8)
+
+        XCTAssertTrue(source.contains("pendingPermissions.set(requestId, { resolve, input") ,
+                      "permission callbacks must retain the provider's original tool input")
+        XCTAssertTrue(source.contains("updatedInput: command.updated_input || pending.input"),
+                      "approval without an override must deep-preserve the provider tool input")
+        XCTAssertTrue(source.contains("pathToClaudeCodeExecutable: current.claudeExecutablePath"),
+                      "the SDK query must execute the same configured Claude runtime selected by the app")
+    }
+
+    func test_agentSDKBridgeRejectsUnsupportedImageBeforeStartingTurn() async throws {
+        let tmp = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("rc2-claude-sdk-unsupported-image-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
+        let bridge = tmp.appendingPathComponent("fake-sdk-bridge.mjs")
+        try """
+        import readline from 'node:readline';
+        const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
+        for await (const line of rl) {
+          const cmd = JSON.parse(line);
+          if (cmd.type === 'rc_close') process.exit(0);
+        }
+        """.write(to: bridge, atomically: true, encoding: .utf8)
+
+        let adapter = ClaudeAgentSDKBridgeAdapter(bridgeScriptPath: bridge.path)
+        let threadId = AgentThreadID()
+        do {
+            _ = try await adapter.sendTurn(AgentRunRequest(
+                threadId: threadId,
+                provider: .claude,
+                model: "claude-haiku-4-5-20251001",
+                cwd: tmp.path,
+                prompt: "inspect",
+                attachments: [AgentAttachment(path: "/tmp/image.svg", kind: .image, mimeType: "image/svg+xml")]
+            )) { _ in }
+            XCTFail("unsupported Claude image MIME must be rejected before the bridge query starts")
+        } catch let AgentProviderAdapterError.unsupported(message) {
+            XCTAssertTrue(message.contains("image/svg+xml"))
+        }
+        XCTAssertFalse(adapter.hasSession(threadId: threadId),
+                       "attachment validation failure must not leave a registered half-started session")
     }
 
     func test_agentSDKBridgeSourceWiresPostToolUseTokenSaverHook() throws {
@@ -1468,7 +1704,7 @@ final class ClaudeStreamingCLIAdapterTests: XCTestCase {
 
         let sdkModule = tmp.appendingPathComponent("node_modules/@anthropic-ai/claude-agent-sdk", isDirectory: true)
         try FileManager.default.createDirectory(at: sdkModule, withIntermediateDirectories: true)
-        try #"{"type":"module","main":"index.js"}"#.write(to: sdkModule.appendingPathComponent("package.json"), atomically: true, encoding: .utf8)
+        try #"{"type":"module","main":"index.js","version":"0.3.157"}"#.write(to: sdkModule.appendingPathComponent("package.json"), atomically: true, encoding: .utf8)
         try """
         export function createSdkMcpServer() {
           return { instance: { server: {} } };
@@ -1507,6 +1743,8 @@ final class ClaudeStreamingCLIAdapterTests: XCTestCase {
         process.standardError = stderr
         try process.run()
 
+        let configure = #"{"type":"rc_configure","bridge_protocol_version":\#(ClaudeAgentSDKBridgeAdapter.bridgeProtocolVersion),"expected_sdk_version":"0.3.157","session_id":"split-session"}"# + "\n"
+        stdin.fileHandleForWriting.write(Data(configure.utf8))
         let splitCommand = """
         {"type":"rc_turn","prompt":"line one
 
@@ -1537,7 +1775,7 @@ final class ClaudeStreamingCLIAdapterTests: XCTestCase {
         guard let node = ProcessLocator.resolve("node") else { throw XCTSkip("node not available") }
         let session = try AskUserQuestionBridgeSession(node: node, packageRoot: AskUserQuestionBridgeSession.packageRoot())
 
-        try session.send(["type": "rc_configure", "permission_mode": "full_access", "session_id": "fake-aq"])
+        try session.send(["type": "rc_configure", "bridge_protocol_version": ClaudeAgentSDKBridgeAdapter.bridgeProtocolVersion, "expected_sdk_version": "0.3.157", "permission_mode": "full_access", "session_id": "fake-aq"])
         try session.send(["type": "rc_turn", "prompt": "decide the path"])
 
         XCTAssertTrue(session.waitFor("\"type\":\"user_input_request\""),
@@ -1573,7 +1811,7 @@ final class ClaudeStreamingCLIAdapterTests: XCTestCase {
         guard let node = ProcessLocator.resolve("node") else { throw XCTSkip("node not available") }
         let session = try AskUserQuestionBridgeSession(node: node, packageRoot: AskUserQuestionBridgeSession.packageRoot())
 
-        try session.send(["type": "rc_configure", "permission_mode": "full_access", "session_id": "fake-aq"])
+        try session.send(["type": "rc_configure", "bridge_protocol_version": ClaudeAgentSDKBridgeAdapter.bridgeProtocolVersion, "expected_sdk_version": "0.3.157", "permission_mode": "full_access", "session_id": "fake-aq"])
         try session.send(["type": "rc_turn", "prompt": "decide the path"])
         XCTAssertTrue(session.waitFor("\"type\":\"user_input_request\""),
                       "the question must be pending before we interrupt")
@@ -1761,7 +1999,7 @@ private final class AskUserQuestionBridgeSession {
         )
         let sdkModule = tmp.appendingPathComponent("node_modules/@anthropic-ai/claude-agent-sdk", isDirectory: true)
         try FileManager.default.createDirectory(at: sdkModule, withIntermediateDirectories: true)
-        try #"{"type":"module","main":"index.js"}"#.write(to: sdkModule.appendingPathComponent("package.json"), atomically: true, encoding: .utf8)
+        try #"{"type":"module","main":"index.js","version":"0.3.157"}"#.write(to: sdkModule.appendingPathComponent("package.json"), atomically: true, encoding: .utf8)
         try """
         export function createSdkMcpServer() { return { instance: { server: {} } }; }
         export function tool(name, description, schema, handler) { return { name, description, schema, handler }; }

@@ -32,13 +32,15 @@ public struct AssistantItem: Codable, Sendable, Equatable, Identifiable {
     public var summary: String?
     public var body: String
     public var output: String?
+    /// Private action target. Normal transcript rendering must show only a safe display name.
+    public var resourcePath: String?
     public var progress: Double?
     public var startedAtMs: Int64
     public var finishedAtMs: Int64?
 
-    public init(id: String, turnId: String, type: AssistantItemType, state: AssistantItemState = .streaming, summary: String? = nil, body: String = "", output: String? = nil, progress: Double? = nil, startedAtMs: Int64, finishedAtMs: Int64? = nil) {
+    public init(id: String, turnId: String, type: AssistantItemType, state: AssistantItemState = .streaming, summary: String? = nil, body: String = "", output: String? = nil, resourcePath: String? = nil, progress: Double? = nil, startedAtMs: Int64, finishedAtMs: Int64? = nil) {
         self.id = id; self.turnId = turnId; self.type = type; self.state = state
-        self.summary = summary; self.body = body; self.output = output; self.progress = progress
+        self.summary = summary; self.body = body; self.output = output; self.resourcePath = resourcePath; self.progress = progress
         self.startedAtMs = startedAtMs; self.finishedAtMs = finishedAtMs
     }
 }
@@ -87,8 +89,13 @@ public struct AssistantPendingRequest: Codable, Sendable, Equatable, Identifiabl
     public var state: AssistantRequestState
     public var createdAtMs: Int64
     public var resolvedAtMs: Int64?
+    public var supportsSessionApproval: Bool?
 
-    public init(id: String, turnId: String?, kind: AssistantRequestKind, title: String, detail: String? = nil, state: AssistantRequestState = .pending, createdAtMs: Int64, resolvedAtMs: Int64? = nil) {
+    public var allowsSessionApproval: Bool {
+        supportsSessionApproval ?? true
+    }
+
+    public init(id: String, turnId: String?, kind: AssistantRequestKind, title: String, detail: String? = nil, state: AssistantRequestState = .pending, createdAtMs: Int64, resolvedAtMs: Int64? = nil, supportsSessionApproval: Bool? = nil) {
         self.id = id
         self.turnId = turnId
         self.kind = kind
@@ -97,6 +104,7 @@ public struct AssistantPendingRequest: Codable, Sendable, Equatable, Identifiabl
         self.state = state
         self.createdAtMs = createdAtMs
         self.resolvedAtMs = resolvedAtMs
+        self.supportsSessionApproval = supportsSessionApproval
     }
 }
 

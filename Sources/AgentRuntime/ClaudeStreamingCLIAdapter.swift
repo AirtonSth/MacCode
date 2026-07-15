@@ -28,6 +28,7 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
         var pendingRequestIds = Set<String>()
         var pendingUserInputIds = Set<String>()
         var environment: [String: String] = [:]
+        var cancellationRequested = false
         // PERF-008 / F4: signature of the last emitted snapshot state (the state
         // fields only, reason excluded) so identical snapshots fired by
         // high-frequency tool deltas are coalesced. F4 computes this directly from
@@ -61,16 +62,18 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
     private let binaryNameOverride: String?
     private let maxReadableEvents: Int
     private let transcriptStore: ClaudeTranscriptStore
+    private let interruptGracePeriod: TimeInterval
     private let lock = NSLock()
     private var sessions: [AgentThreadID: Session] = [:]
     // UX-RESUME: set of thread IDs whose last session was killed by interruptTurn.
     // Cleared when sendTurn begins a new session for that thread. Guarded by `lock`.
     private var interruptedThreadIds: Set<AgentThreadID> = []
 
-    public init(binaryNameOverride: String? = nil, maxReadableEvents: Int = 5_000, transcriptStore: ClaudeTranscriptStore = ClaudeTranscriptStore()) {
+    public init(binaryNameOverride: String? = nil, maxReadableEvents: Int = 5_000, transcriptStore: ClaudeTranscriptStore = ClaudeTranscriptStore(), interruptGracePeriod: TimeInterval = 2) {
         self.binaryNameOverride = binaryNameOverride
         self.maxReadableEvents = max(1, maxReadableEvents)
         self.transcriptStore = transcriptStore
+        self.interruptGracePeriod = max(0, interruptGracePeriod)
     }
 
     public func listModels() async -> [AgentModelDescriptor] {
@@ -92,6 +95,7 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
         session.inFlightRunId = request.runId
         session.sawError = false
         session.status = .running
+        session.cancellationRequested = false
         // UX-RESUME: consume the interrupted flag for this thread so the
         // emission below fires exactly once per respawn, not on every turn.
         let wasInterrupted = interruptedThreadIds.remove(request.threadId) != nil
@@ -113,9 +117,20 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
             onEvent(.event(resuming))
         }
         onEvent(.status(.running))
-        try sendPrompt(request.providerPrompt, to: session)
+        do {
+            try sendPrompt(request.providerPrompt, to: session)
+        } catch {
+            lock.lock()
+            if session.inFlightRunId == request.runId {
+                session.inFlightRunId = nil
+                session.onEvent = nil
+                session.status = .failed
+            }
+            lock.unlock()
+            throw error
+        }
         return AgentRunHandle(runId: request.runId, process: session.process) { [weak self] in
-            try? self?.stopSession(threadId: request.threadId)
+            try? self?.interruptTurn(threadId: request.threadId)
         }
     }
 
@@ -126,6 +141,7 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
         // on this thread knows to emit a "resuming session..." signal.
         if session != nil {
             interruptedThreadIds.insert(threadId)
+            session?.cancellationRequested = true
         }
         lock.unlock()
         guard let session else { throw AgentProviderAdapterError.sessionNotFound(threadId) }
@@ -142,6 +158,14 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
         }
         if !didSend {
             try stopSession(threadId: threadId)
+            return
+        }
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + interruptGracePeriod) { [weak self, weak session] in
+            guard let self, let session else { return }
+            self.lock.lock()
+            let stillRunning = self.sessions[threadId] === session && session.inFlightRunId != nil
+            self.lock.unlock()
+            if stillRunning { try? self.stopSession(threadId: threadId) }
         }
     }
 
@@ -174,13 +198,14 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
             lock.unlock()
             throw AgentProviderAdapterError.sessionNotFound(threadId)
         }
-        guard session.pendingRequestIds.remove(requestId) != nil else {
+        guard session.pendingRequestIds.contains(requestId) else {
             lock.unlock()
             throw AgentProviderAdapterError.unsupported("Claude streaming request not found: \(requestId)")
         }
         lock.unlock()
 
         try sendPermissionResponse(requestId: requestId, response: response, to: session)
+        lock.lock(); session.pendingRequestIds.remove(requestId); lock.unlock()
         let resolved = AssistantEvent.requestResolved(requestId: requestId, state: Self.requestState(for: response))
         record(resolved, session: session)
         emit(.event(resolved), session: session)
@@ -192,21 +217,50 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
             lock.unlock()
             throw AgentProviderAdapterError.sessionNotFound(threadId)
         }
-        guard session.pendingUserInputIds.remove(requestId) != nil else {
+        guard session.pendingUserInputIds.contains(requestId) else {
             lock.unlock()
             throw AgentProviderAdapterError.unsupported("Claude streaming user input request not found: \(requestId)")
         }
         lock.unlock()
 
+        try sendPrompt(text, to: session)
+        lock.lock(); session.pendingUserInputIds.remove(requestId); lock.unlock()
         let resolved = AssistantEvent.userInputResolved(requestId: requestId, answer: text)
         record(resolved, session: session)
-        try sendPrompt(text, to: session)
+        emit(.event(resolved), session: session)
+    }
+
+    public func cancelUserInput(threadId: AgentThreadID, requestId: String) throws {
+        lock.lock()
+        guard let session = sessions[threadId] else {
+            lock.unlock()
+            throw AgentProviderAdapterError.sessionNotFound(threadId)
+        }
+        guard session.pendingUserInputIds.contains(requestId) else {
+            lock.unlock()
+            throw AgentProviderAdapterError.unsupported("Claude streaming user input request not found: \(requestId)")
+        }
+        lock.unlock()
+
+        let line = Self.controlInterruptLine()
+        try session.writeQueue.sync {
+            try GuardedStdinWrite.write(
+                line,
+                to: session.stdinPipe.fileHandleForWriting,
+                process: session.process,
+                notFound: { AgentProviderAdapterError.sessionNotFound(session.threadId) }
+            )
+        }
+        lock.lock(); session.pendingUserInputIds.remove(requestId); lock.unlock()
+        let resolved = AssistantEvent.userInputResolved(requestId: requestId, answer: nil)
+        record(resolved, session: session)
         emit(.event(resolved), session: session)
     }
 
     public func stopSession(threadId: AgentThreadID) throws {
         lock.lock()
         let session = sessions.removeValue(forKey: threadId)
+        session?.cancellationRequested = true
         lock.unlock()
         guard let session else { throw AgentProviderAdapterError.sessionNotFound(threadId) }
         terminate(session: session, status: .cancelled)
@@ -285,6 +339,14 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
         sessions.removeAll()
         lock.unlock()
         active.forEach { terminate(session: $0, status: .cancelled) }
+    }
+
+    public func stopAllForAppTermination() {
+        lock.lock()
+        let active = Array(sessions.values)
+        sessions.removeAll()
+        lock.unlock()
+        active.forEach { terminateImmediatelyForAppTermination(session: $0) }
     }
 
     public func streamEvents(threadId: AgentThreadID, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) throws {
@@ -371,6 +433,7 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
 
         do {
             try process.run()
+            try ProcessSpawnTagger.tagProcess(process, provider: .claude)
         } catch {
             throw AgentRunError.spawnFailed(error.localizedDescription)
         }
@@ -485,7 +548,7 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
                     emitSessionSnapshot(session: session, reason: "turn_completed")
                 }
                 lock.lock()
-                let status: AgentRunStatus = session.sawError ? .failed : .completed
+                let status: AgentRunStatus = session.cancellationRequested ? .cancelled : (session.sawError ? .failed : .completed)
                 session.status = status
                 let providerThreadId = session.providerThreadId
                 lock.unlock()
@@ -518,7 +581,7 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
     private func finishTerminated(_ session: Session) {
         session.stdoutPipe.fileHandleForReading.readabilityHandler = nil
         session.stderrPipe.fileHandleForReading.readabilityHandler = nil
-        let tail = session.stdoutPipe.fileHandleForReading.readDataToEndOfFile()
+        let tail = BoundedPipeDrain.readRemaining(from: session.stdoutPipe.fileHandleForReading)
         for line in session.lineBuffer.take(tail) + session.lineBuffer.flush() {
             handleLine(line, session: session)
         }
@@ -532,14 +595,24 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
         }
         let shouldFinish = session.inFlightRunId != nil
         session.inFlightRunId = nil
-        session.status = .cancelled
+        let status: AgentRunStatus = session.cancellationRequested ? .cancelled : .failed
+        session.status = status
         let onEvent = session.onEvent
         let providerThreadId = session.providerThreadId
         session.onEvent = nil
         lock.unlock()
         if shouldFinish {
-            onEvent?(.status(.cancelled))
-            onEvent?(.finished(.cancelled, finalMessage: nil, providerThreadId: providerThreadId))
+            if !session.cancellationRequested {
+                let diagnostic: String
+                if session.process.terminationReason == .uncaughtSignal {
+                    diagnostic = "Claude CLI crashed with signal \(session.process.terminationStatus)."
+                } else {
+                    diagnostic = "Claude CLI exited with status \(session.process.terminationStatus)."
+                }
+                onEvent?(.error(diagnostic))
+            }
+            onEvent?(.status(status))
+            onEvent?(.finished(status, finalMessage: nil, providerThreadId: providerThreadId))
         }
     }
 
@@ -558,7 +631,7 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
         emitSessionSnapshot(session: session, reason: "turn_completed")
 
         lock.lock()
-        let status: AgentRunStatus = session.sawError ? .failed : .completed
+        let status: AgentRunStatus = session.cancellationRequested ? .cancelled : (session.sawError ? .failed : .completed)
         session.status = status
         let providerThreadId = session.providerThreadId
         lock.unlock()
@@ -577,6 +650,7 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
     private func terminate(session: Session, status: AgentRunStatus) {
         lock.lock()
         session.status = status
+        if status == .cancelled { session.cancellationRequested = true }
         lock.unlock()
         settlePendingRequests(session)
         settlePendingUserInputs(session)
@@ -584,6 +658,20 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
         session.stderrPipe.fileHandleForReading.readabilityHandler = nil
         if session.process.isRunning {
             ProcessTerminator.terminateTree(session.process)
+        }
+    }
+
+    private func terminateImmediatelyForAppTermination(session: Session) {
+        lock.lock()
+        session.status = .cancelled
+        session.cancellationRequested = true
+        lock.unlock()
+        settlePendingRequests(session)
+        settlePendingUserInputs(session)
+        session.stdoutPipe.fileHandleForReading.readabilityHandler = nil
+        session.stderrPipe.fileHandleForReading.readabilityHandler = nil
+        if session.process.isRunning {
+            ProcessTerminator.terminateTreeImmediately(session.process)
         }
     }
 

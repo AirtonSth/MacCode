@@ -48,6 +48,26 @@ final class PayloadCodecLZFSETests: XCTestCase {
         XCTAssertEqual(restored, data)
     }
 
+    func test_decodeRejectsCompressedExpansionPastMaximum() throws {
+        // WHY: request-body guards must stop decompression bombs before the
+        // full expanded payload is materialized in memory.
+        let maximum = 128 * 1024
+        let payload = Data(repeating: 0x41, count: maximum + 1)
+
+        for codec in [PayloadCodec.lzfse, PayloadCodec.gzip] {
+            let compressed = try codec.encode(payload)
+            XCTAssertThrowsError(
+                try codec.decode(compressed, expectedSize: nil, maximumSize: maximum),
+                "\(codec.wireName) must enforce the decoded byte ceiling"
+            ) { error in
+                XCTAssertEqual(
+                    error as? PayloadCodecError,
+                    .outputTooLarge(maximum: maximum)
+                )
+            }
+        }
+    }
+
     // MARK: selectResponseCodec - threshold logic
 
     func test_selectResponseCodec_belowThreshold_returnsNil() {

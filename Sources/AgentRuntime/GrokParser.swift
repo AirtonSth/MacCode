@@ -16,7 +16,9 @@ import CoreModel
 ///
 /// Maps into the shared AssistantEvent model used by Agent App.
 public final class GrokParser {
-    public init() {}
+    public init(initialSessionId: String? = nil) {
+        sessionId = initialSessionId?.isEmpty == false ? initialSessionId : nil
+    }
 
     private var sessionId: String?
     private var threadEmitted = false
@@ -52,6 +54,7 @@ public final class GrokParser {
             // Terminal UX: a new thought phase after answer/tool text is a *new*
             // Thinking… row (chronological), not more tokens on the first Thought
             // block sitting above the message.
+            if assistantItemId != nil { assembledAssistantBody = "" }
             closeAssistantItem(&out)
             let itemId = openReasoningItem(&out, now: now)
             out.append(.itemDelta(itemId: itemId, bodyAppend: chunk, outputAppend: nil, summary: nil))
@@ -105,6 +108,7 @@ public final class GrokParser {
         case "tool_call", "tool_use", "tool":
             ensureTurn(&out)
             // Tools break a thought phase (same as the Grok TUI timeline order).
+            if assistantItemId != nil { assembledAssistantBody = "" }
             closeReasoningItem(&out)
             closeAssistantItem(&out)
             let name = (obj["name"] as? String)

@@ -84,6 +84,15 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
     }
 
     public func applicationDidFinishLaunching(_ notification: Notification) {
+        let appSupportDirectory = AppPaths.appSupportDirectory(
+            for: channel,
+            override: appSupportOverride
+        )
+        ProviderProcessOwnership.shared.configure(
+            fileURL: appSupportDirectory
+                .appendingPathComponent("diagnostics", isDirectory: true)
+                .appendingPathComponent("provider-process-ownership.json", isDirectory: false)
+        )
         do {
             context = try AppContext(channel: channel, dbPathOverride: dbOverride, appSupportOverride: appSupportOverride)
         } catch {
@@ -293,6 +302,9 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         // Rebuild Surface objects from restored layout descriptors, then drop
         // the restoring affordance and render the real layout.
         router?.reinstantiateRestoredSurfaces()
+        Task { @MainActor [weak self] in
+            await self?.router?.reconcileQueuedAgentMessagesOnLaunch()
+        }
         windowController?.markRestorationComplete()
     }
 
@@ -371,7 +383,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
     }
 
     private func stopLiveRuntimesForAppTermination() {
-        context?.coordinator.stopAllProviderSessions()
+        context?.coordinator.stopAllProviderSessionsForAppTermination()
         for surface in SurfaceRegistry.shared.all() {
             surface.close()
         }
@@ -405,6 +417,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
     }
 
     private func logDiagnosticsHeartbeat(reason: String) {
+        terminateOrphanedProviderRuntimes(reason: "periodic")
         AppDiagnostics.heartbeat(
             reason: reason,
             activeAgentThreads: context?.coordinator.activeThreadIdsSnapshot().count ?? 0,
@@ -430,9 +443,17 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
     }
 
     private func terminateOrphanedProviderRuntimes(reason: String) {
-        let result = ProviderProcessSweeper.terminateOrphanedProviderRuntimes()
-        guard !result.orphanRootPIDs.isEmpty || !result.failedPIDs.isEmpty else { return }
-        appLifecycleLog.info("provider.orphan_sweep reason=\(reason, privacy: .public) roots=\(result.orphanRootPIDs.count, privacy: .public) terminated=\(result.terminatedPIDs.count, privacy: .public) failed=\(result.failedPIDs.count, privacy: .public)")
+        do {
+            let result = try ProviderProcessSweeper.terminatePersistedOrphanedProviderRuntimes(
+                minAge: reason == "launch" ? 0 : ProcessSpawnTagger.defaultMinAge
+            )
+            guard !result.orphanRootPIDs.isEmpty || !result.failedPIDs.isEmpty else { return }
+            appLifecycleLog.info("provider.orphan_sweep reason=\(reason, privacy: .public) roots=\(result.orphanRootPIDs.count, privacy: .public) terminated=\(result.terminatedPIDs.count, privacy: .public) failed=\(result.failedPIDs.count, privacy: .public)")
+        } catch {
+            // The ledger remains intact. Surface the failed audit instead of
+            // reporting the indistinguishable all-clear result used previously.
+            appLifecycleLog.fault("provider.orphan_sweep_failed reason=\(reason, privacy: .public) error=\(error.localizedDescription, privacy: .public)")
+        }
     }
 
     public func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {

@@ -23,6 +23,11 @@ public final class SQLiteDB {
     fileprivate var handle: OpaquePointer?
     public let path: String
     private let queue = DispatchQueue(label: "RemoteCode.SQLiteDB")
+    // Repository methods historically prepare and step statements off `queue`.
+    // This recursive gate therefore spans every transaction and every statement
+    // step, preventing a bare repository writer from entering a maintenance
+    // transaction between its durable-reference scan and reversible-row delete.
+    private let operationLock = NSRecursiveLock()
     // Marks `queue` so cachedStatement() can detect when it is running inside a
     // `performSync` block (and may therefore safely reuse a shared cached stmt).
     private static let queueKey = DispatchSpecificKey<UInt8>()
@@ -44,6 +49,13 @@ public final class SQLiteDB {
     // is bounded by the number of distinct query strings in the Persistence module
     // (~40-50 distinct strings), so unbounded growth is not a practical risk.
     private var stmtCache: [String: OpaquePointer] = [:]
+    var beforeStatementStepForTesting: ((String) -> Void)?
+
+    func withSerializedOperation<T>(_ block: () throws -> T) rethrows -> T {
+        operationLock.lock()
+        defer { operationLock.unlock() }
+        return try block()
+    }
 
     private func resetCachedStatements() {
         for statement in stmtCache.values {
@@ -75,13 +87,13 @@ public final class SQLiteDB {
                 // Reset: rewinds the VM + wipes bindings before each reuse.
                 sqlite3_reset(cached)
                 sqlite3_clear_bindings(cached)
-                return SQLiteStatement(handle: cached, db: self, owned: false)
+                return SQLiteStatement(handle: cached, db: self, sql: sql, owned: false)
             }
             let stmt = try compileStatement(sql)
             stmtCache[sql] = stmt
-            return SQLiteStatement(handle: stmt, db: self, owned: false)
+            return SQLiteStatement(handle: stmt, db: self, sql: sql, owned: false)
         }
-        return SQLiteStatement(handle: try compileStatement(sql), db: self, owned: true)
+        return SQLiteStatement(handle: try compileStatement(sql), db: self, sql: sql, owned: true)
     }
 
     private func compileStatement(_ sql: String) throws -> OpaquePointer {
@@ -128,11 +140,13 @@ public final class SQLiteDB {
     }
 
     public func execute(_ sql: String) throws {
-        if DispatchQueue.getSpecific(key: Self.queueKey) != nil {
-            try executeDirect(sql)
-            return
+        try withSerializedOperation {
+            if DispatchQueue.getSpecific(key: Self.queueKey) != nil {
+                try executeDirect(sql)
+                return
+            }
+            try queue.sync { try executeDirect(sql) }
         }
-        try queue.sync { try executeDirect(sql) }
     }
 
     private func executeDirect(_ sql: String) throws {
@@ -154,11 +168,16 @@ public final class SQLiteDB {
     }
 
     public func performSync<T>(_ block: (SQLiteDB) throws -> T) rethrows -> T {
-        try queue.sync {
-            // Early-returned SELECTs must not retain a WAL read snapshot after
-            // the serialized operation ends, including when the block throws.
-            defer { resetCachedStatements() }
-            return try block(self)
+        try withSerializedOperation {
+            if DispatchQueue.getSpecific(key: Self.queueKey) != nil {
+                return try block(self)
+            }
+            return try queue.sync {
+                // Early-returned SELECTs must not retain a WAL read snapshot after
+                // the serialized operation ends, including when the block throws.
+                defer { resetCachedStatements() }
+                return try block(self)
+            }
         }
     }
 
@@ -173,18 +192,20 @@ public final class SQLiteDB {
         // `performSync`) or by the caller's own concurrency domain.  This is the
         // same contract the original `prepare` imposed (it accessed `handle`
         // directly without a queue).
-        try cachedStatement(sql: sql)
+        try withSerializedOperation { try cachedStatement(sql: sql) }
     }
 
     public func transaction<T>(_ block: () throws -> T) throws -> T {
-        try execute("BEGIN IMMEDIATE;")
-        do {
-            let r = try block()
-            try execute("COMMIT;")
-            return r
-        } catch {
-            try? execute("ROLLBACK;")
-            throw error
+        try withSerializedOperation {
+            try execute("BEGIN IMMEDIATE;")
+            do {
+                let r = try block()
+                try execute("COMMIT;")
+                return r
+            } catch {
+                try? execute("ROLLBACK;")
+                throw error
+            }
         }
     }
 
@@ -199,13 +220,15 @@ public final class SQLiteStatement {
     // when verifying the statement cache returns the same compiled pointer.
     let handle: OpaquePointer
     fileprivate weak var db: SQLiteDB?
+    private let sql: String
     // When `owned` is false the handle belongs to the SQLiteDB statement cache
     // and must NOT be finalised here; the cache finalises it in SQLiteDB.deinit.
     private let owned: Bool
 
-    init(handle: OpaquePointer, db: SQLiteDB, owned: Bool = true) {
+    init(handle: OpaquePointer, db: SQLiteDB, sql: String, owned: Bool = true) {
         self.handle = handle
         self.db = db
+        self.sql = sql
         self.owned = owned
     }
 
@@ -249,11 +272,14 @@ public final class SQLiteStatement {
     }
 
     public func step() throws -> Bool {
-        let rc = sqlite3_step(handle)
-        if rc == SQLITE_ROW { return true }
-        if rc == SQLITE_DONE { return false }
-        let msg = db.map { $0.lastErrorMessage() } ?? "step \(rc)"
-        throw SQLiteError.step(msg)
+        guard let db else { throw SQLiteError.step("database closed") }
+        return try db.withSerializedOperation {
+            db.beforeStatementStepForTesting?(sql)
+            let rc = sqlite3_step(handle)
+            if rc == SQLITE_ROW { return true }
+            if rc == SQLITE_DONE { return false }
+            throw SQLiteError.step(db.lastErrorMessage())
+        }
     }
 
     public func reset() {

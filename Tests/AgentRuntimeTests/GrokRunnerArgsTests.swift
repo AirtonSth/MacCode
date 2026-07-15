@@ -96,6 +96,18 @@ final class GrokRunnerArgsTests: XCTestCase {
                        "follow-up turns must resume the same Grok session for multi-turn context")
     }
 
+    func test_newSessionIdIsChosenBeforeSpawn() {
+        let sessionId = "11111111-2222-3333-4444-555555555555"
+        let args = GrokRunner.buildArgs(req(), newSessionId: sessionId)
+        XCTAssertEqual(args[args.index(after: args.firstIndex(of: "--session-id")!)], sessionId,
+                       "AG-011: a first turn must have recoverable identity before any stdout/end event")
+    }
+
+    func test_terminalSignalWithoutUserCancelIsFailed() {
+        XCTAssertEqual(GrokRunner.terminalStatus(cancelledByUser: false, terminationReason: .uncaughtSignal, exitStatus: 6), .failed)
+        XCTAssertEqual(GrokRunner.terminalStatus(cancelledByUser: true, terminationReason: .uncaughtSignal, exitStatus: 15), .cancelled)
+    }
+
     func test_emptyModelOmitsModelFlag() {
         let a = GrokRunner.buildArgs(req(model: ""))
         XCTAssertNil(a.firstIndex(of: "--model"),

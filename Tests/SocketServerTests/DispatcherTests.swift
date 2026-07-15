@@ -235,9 +235,14 @@ class FakeRouter: CommandRouting, TerminalCommandRouting {
         return thread
     }
     func uploadAgentAttachment(workspace: WorkspaceID, filename: String, mimeType: String?, dataBase64: String) throws -> AgentAttachmentUploadResult {
-        guard let data = Data(base64Encoded: dataBase64) else { throw JSONRPCError.invalidParams }
-        let path = "/tmp/remotecode-attachments/\(filename)"
-        return AgentAttachmentUploadResult(path: path, displayName: filename, kind: filename.hasSuffix(".png") ? .image : .file, mimeType: mimeType, sizeBytes: data.count)
+        guard let data = Data(base64Encoded: dataBase64), !data.isEmpty,
+              data.count <= 25 * 1024 * 1024 else { throw JSONRPCError.invalidParams }
+        let digest = String(repeating: "a", count: 64)
+        return AgentAttachmentUploadResult(id: UUID().uuidString.lowercased(), displayName: filename, kind: filename.hasSuffix(".png") ? .image : .file, mimeType: mimeType, sha256: digest, sizeBytes: data.count)
+    }
+    func importAgentAttachment(workspace: WorkspaceID, relativePath: String) throws -> AgentAttachmentUploadResult {
+        let id = String(repeating: "b", count: 64)
+        return AgentAttachmentUploadResult(id: id, displayName: URL(fileURLWithPath: relativePath).lastPathComponent, kind: .file, mimeType: "text/plain", sha256: id, sizeBytes: 7)
     }
     var selectedThread: AgentThreadID?
     var lastSelectSurfaceID: SurfaceID?
@@ -295,7 +300,7 @@ class FakeRouter: CommandRouting, TerminalCommandRouting {
     func listAgentQueuedMessages(thread: AgentThreadID) throws -> [AgentQueuedMessage] {
         queuedMessageStore.filter { $0.threadId == thread }.sorted { $0.position < $1.position }
     }
-    func updateAgentQueuedMessage(id: AgentQueuedMessageID, text: String, attachments: [AgentAttachment]) throws -> AgentQueuedMessage {
+    func updateAgentQueuedMessage(id: AgentQueuedMessageID, text: String, attachments: [AgentAttachment]) async throws -> AgentQueuedMessage {
         guard let idx = queuedMessageStore.firstIndex(where: { $0.id == id }) else { throw JSONRPCError.invalidParams }
         queuedMessageStore[idx].text = text
         queuedMessageStore[idx].attachments = attachments
@@ -497,11 +502,11 @@ class FakeRouter: CommandRouting, TerminalCommandRouting {
     var reorderAgentThreadCallCount = 0
     var renameAgentThreadCallCount = 0
     var markAgentThreadReadCallCount = 0
-    func deleteAgentThread(thread: AgentThreadID) throws {
+    func deleteAgentThread(thread: AgentThreadID) async throws {
         deleteAgentThreadCallCount += 1
         threadStore.removeAll { $0.id == thread }
     }
-    func deleteAgentThreads(_ threads: [AgentThreadID]) throws {
+    func deleteAgentThreads(_ threads: [AgentThreadID]) async throws {
         deleteAgentThreadsCallCount += 1
         threadStore.removeAll { threads.contains($0.id) }
     }
@@ -1206,7 +1211,7 @@ final class DispatcherTests: XCTestCase {
     }
 
     @MainActor
-    func test_agentAttachmentUploadRoutesImportedMobileFileToHostPath() async throws {
+    func test_agentAttachmentUploadReturnsOpaqueHostOwnedReferenceWithoutPath() async throws {
         let router = FakeRouter()
         let d = JSONRPCDispatcher(router: router)
         let wid = JSONValue.string(UUID().uuidString)
@@ -1218,12 +1223,43 @@ final class DispatcherTests: XCTestCase {
             "data_base64": .string(Data("image-bytes".utf8).base64EncodedString())
         ]))
 
-        guard case .object(let obj)? = uploaded.result else { return XCTFail("agent.attachment.upload must return a host attachment path") }
-        XCTAssertEqual(obj["path"], .string("/tmp/remotecode-attachments/screen.png"))
+        guard case .object(let obj)? = uploaded.result else { return XCTFail("agent.attachment.upload must return an opaque attachment reference") }
+        XCTAssertNil(obj["path"])
+        let attachmentId = try XCTUnwrap(obj["id"]?.stringValue)
+        XCTAssertNotNil(UUID(uuidString: attachmentId))
+        XCTAssertNotEqual(obj["id"], obj["sha256"],
+                          "opaque reference identity must not collapse into the shared content digest")
+        XCTAssertEqual(obj["sha256"], .string(String(repeating: "a", count: 64)))
         XCTAssertEqual(obj["displayName"], .string("screen.png"))
         XCTAssertEqual(obj["kind"], .string("image"),
                        "iOS local imports must become host-readable structured attachments before agent.message.send")
         XCTAssertEqual(obj["sizeBytes"], .number(11))
+    }
+
+    @MainActor
+    func test_agentMessageSendRejectsArbitraryClientHostPathBeforeRouterMutation() async throws {
+        let router = FakeRouter()
+        let thread = AgentThread(workspaceId: WorkspaceID(), title: "safe", provider: .codex, model: "gpt-5.5")
+        router.threadStore = [thread]
+        let response = await JSONRPCDispatcher(router: router).dispatch(JSONRPCRequest(
+            jsonrpc: "2.0",
+            id: .number(1),
+            method: "agent.message.send",
+            params: [
+                "thread_id": .string(thread.id.value.uuidString),
+                "text": .string("do not read arbitrary path"),
+                "attachments": .array([.object([
+                    "id": .string(String(repeating: "a", count: 64)),
+                    "path": .string("/Users/private/secret.txt"),
+                    "kind": .string("file"),
+                    "mime_type": .string("text/plain")
+                ])])
+            ]
+        ))
+
+        XCTAssertEqual(response.error?.code, -32602)
+        XCTAssertEqual(router.sendAgentMessageCallCount, 0,
+                       "path authority must fail before any router or durable mutation")
     }
 
     @MainActor
@@ -1586,15 +1622,20 @@ final class DispatcherTests: XCTestCase {
             "interaction_mode": .string("plan"),
             "attachments": .array([
                 .object([
-                    "path": .string("/tmp/screen.png"),
+                    "id": .string(String(repeating: "1", count: 64)),
                     "display_name": .string("screen.png"),
                     "kind": .string("image"),
-                    "mime_type": .string("image/png")
+                    "mime_type": .string("image/png"),
+                    "sha256": .string(String(repeating: "1", count: 64)),
+                    "size_bytes": .number(12)
                 ]),
                 .object([
-                    "path": .string("/tmp/notes.txt"),
+                    "id": .string(String(repeating: "2", count: 64)),
                     "displayName": .string("notes.txt"),
-                    "kind": .string("file")
+                    "kind": .string("file"),
+                    "mime_type": .string("text/plain"),
+                    "sha256": .string(String(repeating: "2", count: 64)),
+                    "size_bytes": .number(8)
                 ])
             ])
         ]))
@@ -1611,8 +1652,10 @@ final class DispatcherTests: XCTestCase {
                        "send must use the thread's persisted service tier when no override is sent")
         XCTAssertEqual(router.lastSendInteractionMode, .plan,
                        "mobile /plan must reach the provider runtime as interaction_mode, not only local UI text")
-        XCTAssertEqual(router.lastSendAttachments.map(\.path), ["/tmp/screen.png", "/tmp/notes.txt"],
-                       "mobile attachments must reach the host as structured metadata instead of being folded into prompt text")
+        XCTAssertEqual(router.lastSendAttachments.map(\.id), [String(repeating: "1", count: 64), String(repeating: "2", count: 64)],
+                       "mobile attachments must reach the host only as opaque host-owned ids")
+        XCTAssertTrue(router.lastSendAttachments.allSatisfy(\.path.isEmpty),
+                      "the mirror contract must not accept or synthesize host paths")
         XCTAssertEqual(router.lastSendAttachments.first?.kind, .image)
         XCTAssertEqual(router.lastSendAttachments.first?.mimeType, "image/png")
     }
@@ -2302,7 +2345,7 @@ final class DispatcherTests: XCTestCase {
     func test_agentThreadListKeepsFullTitleAndAddsDisplayTitleForMirrors() async throws {
         let router = FakeRouter()
         let fullTitle = "git add commit and push all repos here with this long exact wording"
-        let thread = AgentThread(workspaceId: nil, title: fullTitle, provider: .claude, model: "fake-model")
+        let thread = AgentThread(workspaceId: nil, title: fullTitle, provider: .claude, model: "fake-model", interactionMode: .plan)
         router.threadStore = [thread]
         router.messageStore = [AgentMessage(threadId: thread.id, role: .user, content: "start")]
         let runId = AgentRunID(UUID(uuidString: "00000000-0000-0000-0000-000000000123")!)
@@ -2323,6 +2366,8 @@ final class DispatcherTests: XCTestCase {
         XCTAssertEqual(first["providerLocked"], .bool(true),
                        "iOS mirrors must know when to hide the source picker for existing threads")
         XCTAssertEqual(first["provider_locked"], .bool(true))
+        XCTAssertEqual(first["interaction_mode"], .string("plan"),
+                       "iOS must restore the host-owned per-thread interaction mode after selection or relaunch")
         XCTAssertEqual(first["active_run_id"], .string(runId.value.uuidString))
         XCTAssertEqual(first["active_run_started_at_ms"], .number(1_700_000_000_125),
                        "iOS rebaseline must retain the Mac-owned elapsed-run clock")

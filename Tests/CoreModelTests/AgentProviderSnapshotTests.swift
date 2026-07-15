@@ -2,6 +2,29 @@ import XCTest
 @testable import CoreModel
 
 final class AgentProviderSnapshotTests: XCTestCase {
+    func test_grokSnapshotUsesNegotiatedInteractionModesWhenProvided() {
+        let capabilities = AgentProviderCapabilities(
+            supportsAttachments: true,
+            supportedAttachmentKinds: [.file],
+            supportsApprovals: true,
+            supportsStreaming: true,
+            supportsPlanReview: true
+        )
+        let snapshot = AgentProviderSnapshotFactory.snapshot(
+            provider: .grok,
+            models: [AgentModelDescriptor(id: "grok-live", label: "Grok Live", provider: .grok)],
+            binaryPath: "/tmp/grok",
+            interactionModesOverride: [.default, .plan],
+            permissionModesOverride: [.supervised],
+            capabilitiesOverride: capabilities
+        )
+
+        XCTAssertEqual(snapshot.interactionModes, [.default, .plan])
+        XCTAssertEqual(snapshot.effectivePermissionModes, [.supervised])
+        XCTAssertEqual(snapshot.effectiveCapabilities, capabilities)
+        XCTAssertTrue(snapshot.slashCommands.contains("/plan"))
+    }
+
     func test_modelDescriptorDefaultsRemainBackwardCompatible() throws {
         let json = """
         {"id":"gpt-5.5","label":"GPT-5.5","provider":"codex","supportsReasoning":true}
@@ -14,6 +37,16 @@ final class AgentProviderSnapshotTests: XCTestCase {
         XCTAssertFalse(descriptor.supportsServiceTier)
         XCTAssertFalse(descriptor.supportsCustomModel)
         XCTAssertNil(descriptor.contextWindowTokens)
+    }
+
+    func test_providerCapabilitiesDecodeMissingNewFlagsFailClosed() throws {
+        let json = #"{"supportsAttachments":true,"supportedAttachmentKinds":["file"],"supportedAttachmentMediaTypes":["text/plain"],"supportsApprovals":true,"supportsUserInput":false,"supportsStreaming":true,"supportsFork":false,"supportsRollback":false}"#.data(using: .utf8)!
+
+        let capabilities = try JSONDecoder().decode(AgentProviderCapabilities.self, from: json)
+
+        XCTAssertTrue(capabilities.supportsAttachments)
+        XCTAssertFalse(capabilities.supportsPlanReview,
+                       "older cached provider snapshots must not gain Plan review capability during decode")
     }
 
     func test_providerSnapshotReportsMissingBinaryEvenWhenStaticModelsExist() {
@@ -134,5 +167,99 @@ final class AgentProviderSnapshotTests: XCTestCase {
         let snapshot = try JSONDecoder().decode(AgentProviderSnapshot.self, from: snapshotJSON)
         XCTAssertEqual(snapshot.provider, .grok)
         XCTAssertEqual(snapshot.driverKind, .grokCLI)
+    }
+
+    func test_legacyProviderSnapshotDefaultsToNoUnprovenInteractiveCapabilities() throws {
+        let json = """
+        {"id":"legacy-grok","provider":"grok","driverKind":"grok_cli","displayName":"Grok",
+         "accentColor":"#1DA1F2","continuationGroup":"xai-grok","interactionModes":["default","plan"],
+         "enabled":true,"installed":true,"status":"available","environmentKeys":[],
+         "models":[],"slashCommands":["/plan","/fork"],"skills":[]}
+        """.data(using: .utf8)!
+
+        let snapshot = try JSONDecoder().decode(AgentProviderSnapshot.self, from: json)
+
+        XCTAssertEqual(snapshot.effectiveCapabilities, .conservative,
+                       "older snapshots must fail closed instead of exposing attachments, approvals, questions, fork, rollback, or plan review without proof")
+    }
+
+    func test_factoryPublishesProviderSpecificCapabilityTruth() {
+        let codex = AgentProviderSnapshotFactory.snapshot(
+            provider: .codex,
+            models: [AgentModelDescriptor(id: "gpt-5.5", label: "GPT-5.5", provider: .codex)],
+            binaryPath: "/usr/local/bin/codex"
+        )
+        let claude = AgentProviderSnapshotFactory.snapshot(
+            provider: .claude,
+            models: [AgentModelDescriptor(id: "claude-opus-4-7", label: "Claude", provider: .claude)],
+            binaryPath: "/usr/local/bin/claude"
+        )
+        let grok = AgentProviderSnapshotFactory.snapshot(
+            provider: .grok,
+            models: [AgentModelDescriptor(id: "grok-4.5", label: "Grok", provider: .grok)],
+            binaryPath: "/usr/local/bin/grok"
+        )
+
+        XCTAssertTrue(codex.effectiveCapabilities.supportsAttachments)
+        XCTAssertTrue(codex.effectiveCapabilities.supportsApprovals)
+        XCTAssertTrue(codex.effectiveCapabilities.supportsUserInput)
+        XCTAssertTrue(codex.effectiveCapabilities.supportsStreaming)
+        XCTAssertFalse(codex.effectiveCapabilities.supportsFork,
+                       "Codex thread/fork has no provider idempotency key, so crash-safe local/provider commit cannot be promised")
+        XCTAssertFalse(codex.slashCommands.contains("/fork"),
+                       "an unsafe provider fork must not remain advertised as a callable slash command")
+        XCTAssertTrue(codex.effectiveCapabilities.supportsRollback)
+        XCTAssertFalse(codex.effectiveCapabilities.supportedAttachmentMediaTypes.isEmpty)
+
+        XCTAssertTrue(claude.effectiveCapabilities.supportsAttachments)
+        XCTAssertTrue(claude.effectiveCapabilities.supportsApprovals)
+        XCTAssertTrue(claude.effectiveCapabilities.supportsUserInput)
+        XCTAssertFalse(claude.effectiveCapabilities.supportsFork,
+                       "the current Claude bridge must not promise native fork before a provider contract proves it")
+        XCTAssertEqual(
+            Set(claude.effectiveCapabilities.supportedAttachmentMediaTypes),
+            Set(["image/jpeg", "image/png", "image/gif", "image/webp"]),
+            "Claude attachment gating must match the SDK bridge formats exactly"
+        )
+
+        XCTAssertEqual(grok.effectiveCapabilities, .conservative,
+                       "a failed or absent Grok ACP discovery must fail closed instead of inventing capabilities")
+        XCTAssertFalse(grok.interactionModes.contains(.plan),
+                       "Grok Plan must stay hidden until plan review and continuation are implemented")
+        XCTAssertFalse(grok.slashCommands.contains("/fork"),
+                       "Grok fork must stay hidden until the provider creates a real forked session")
+    }
+
+    func test_claudeSnapshotPublishesExplicitDegradedTextOnlyContract() {
+        let degraded = AgentProviderCapabilities(
+            supportsAttachments: false,
+            supportedAttachmentKinds: [],
+            supportedAttachmentMediaTypes: [],
+            supportsApprovals: false,
+            supportsUserInput: false,
+            supportsStreaming: true,
+            supportsFork: false,
+            supportsRollback: false,
+            supportsPlanReview: false
+        )
+
+        let snapshot = AgentProviderSnapshotFactory.snapshot(
+            provider: .claude,
+            models: [AgentModelDescriptor(id: "sonnet", label: "Sonnet", provider: .claude)],
+            binaryPath: "/usr/local/bin/claude",
+            advisory: "Degraded text-only fallback: Claude Agent SDK is disabled.",
+            interactionModesOverride: [.default],
+            permissionModesOverride: [.supervised],
+            capabilitiesOverride: degraded
+        )
+
+        XCTAssertEqual(snapshot.status, .warning,
+                       "a text-only fallback must never look equivalent to the full Claude Agent SDK runtime")
+        XCTAssertEqual(snapshot.interactionModes, [.default])
+        XCTAssertEqual(snapshot.permissionModes, [.supervised])
+        XCTAssertEqual(snapshot.effectiveCapabilities, degraded)
+        XCTAssertFalse(snapshot.slashCommands.contains("/plan"),
+                       "the degraded text-only fallback must not advertise a plan workflow that depends on agent tools")
+        XCTAssertEqual(snapshot.statusDetail, "Degraded text-only fallback: Claude Agent SDK is disabled.")
     }
 }

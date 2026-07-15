@@ -58,7 +58,7 @@ final class MirrorEventSnapshotTests: XCTestCase {
         }, "a successful mirror snapshot must expose the same durable completed turn that macOS restores")
     }
 
-    func testSnapshotRejectsWatermarkAfterAStreamEventFlushWasLost() async throws {
+    func testSnapshotRetriesRetainedStreamEventsBeforeCertifyingWatermark() async throws {
         let appSupport = NSTemporaryDirectory() + "rc2-mirror-snapshot-" + UUID().uuidString
         defer { try? FileManager.default.removeItem(atPath: appSupport) }
         let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: appSupport).run()
@@ -80,6 +80,8 @@ final class MirrorEventSnapshotTests: XCTestCase {
             threadRepo: threadRepo,
             providers: [.codex: FakeProviderRunner(scenario: .simpleAssistant(reply: "OK"))]
         )
+        let persistenceIssue = PersistenceIssueBox()
+        coordinator.onPersistenceIssue = { _, _, _ in persistenceIssue.record() }
         let runId = try await coordinator.startRun(AgentRunRequest(
             threadId: thread.id,
             provider: .codex,
@@ -88,19 +90,26 @@ final class MirrorEventSnapshotTests: XCTestCase {
             prompt: "test mirror persistence failure"
         ))
 
-        let didFinish = try await waitForRunToFinish(runId, in: runRepo)
-        XCTAssertTrue(
-            didFinish,
-            "the fake run must reach its terminal flush"
-        )
+        let issueDeadline = Date().addingTimeInterval(2)
+        while !persistenceIssue.observed, Date() < issueDeadline {
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        XCTAssertTrue(persistenceIssue.observed, "the trigger must reach the terminal durability barrier")
+        XCTAssertNil(try runRepo.get(id: runId)?.finishedAt,
+                     "terminal state must remain pending while its retained stream batch cannot commit")
         XCTAssertEqual(try runRepo.countStreamEvents(threadId: thread.id), 0,
                        "the trigger must reproduce a stream-event persistence loss before the snapshot read")
         try db.execute("DROP TRIGGER fail_mirror_stream_insert;")
 
-        XCTAssertThrowsError(
-            try coordinator.withMirrorEventSnapshot(threadId: thread.id) { $0 },
-            "the host must not attach a newer EventBus watermark to a snapshot known to have lost an AssistantEvent"
-        )
+        let events = try coordinator.withMirrorEventSnapshot(threadId: thread.id) { $0 }
+        let didFinish = try await waitForRunToFinish(runId, in: runRepo)
+        XCTAssertTrue(didFinish, "the retained terminal event must finish after the snapshot barrier commits its batch")
+        XCTAssertTrue(events.contains { event in
+            if case .turnCompleted = event { return true }
+            return false
+        }, "the snapshot barrier must retry the retained batch before certifying a watermark")
+        XCTAssertGreaterThan(try runRepo.countStreamEvents(threadId: thread.id), 0,
+                             "a transient SQLite failure must retain every event until a later snapshot barrier commits it")
     }
 
     func testTerminalFlushCannotCrossAnAtomicSnapshotLock() async throws {
@@ -384,6 +393,14 @@ final class MirrorEventSnapshotTests: XCTestCase {
         )
         runner.finishRetry()
     }
+}
+
+private final class PersistenceIssueBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = false
+
+    var observed: Bool { lock.withLock { value } }
+    func record() { lock.withLock { value = true } }
 }
 
 private final class ControlledMirrorRunner: AgentProviderRunner, @unchecked Sendable {

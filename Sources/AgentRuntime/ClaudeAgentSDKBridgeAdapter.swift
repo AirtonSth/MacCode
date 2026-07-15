@@ -1,8 +1,37 @@
 import Foundation
 import CoreModel
 
+struct ClaudeSDKSessionRecord: Sendable, Equatable {
+    let sessionId: String
+    let customTitle: String?
+}
+
+protocol ClaudeSDKSessionMutating: Sendable {
+    func listSessions() async throws -> [ClaudeSDKSessionRecord]
+    func forkSession(sourceSessionId: String, title: String) async throws -> String
+    func deleteSession(sessionId: String) async throws
+}
+
+enum ClaudeForkReconciliationError: Error, Equatable, CustomStringConvertible {
+    case markerConflictCleaned(marker: String, childIds: [String])
+    case invalidForkResult(childId: String)
+    case cleanupFailed(marker: String, details: String)
+
+    var description: String {
+        switch self {
+        case .markerConflictCleaned(let marker, let childIds):
+            return "Claude fork marker conflict was cleaned for \(marker): \(childIds.joined(separator: ", "))"
+        case .invalidForkResult(let childId):
+            return "Claude native fork returned an invalid child session: \(childId)"
+        case .cleanupFailed(let marker, let details):
+            return "Claude fork cleanup failed for \(marker): \(details)"
+        }
+    }
+}
+
 public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked Sendable {
     static let defaultSDKPackageSpec = "@anthropic-ai/claude-agent-sdk@0.3.157"
+    static let bridgeProtocolVersion = 3
 
     private final class Session: @unchecked Sendable {
         let threadId: AgentThreadID
@@ -33,6 +62,9 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
         var pendingRequestIds = Set<String>()
         var pendingUserInputIds = Set<String>()
         var bridgeUserInputIds = Set<String>()
+        var bridgeUserInputSchemas: [String: [String: Any]] = [:]
+        var cancellationRequested = false
+        let claudeExecutablePath: String?
 
         init(threadId: AgentThreadID,
              process: Process,
@@ -43,7 +75,8 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
              permissionMode: AgentPermissionMode,
              interactionMode: AgentInteractionMode,
              reasoningEffort: AgentReasoningEffort?,
-             providerThreadId: String?) {
+             providerThreadId: String?,
+             claudeExecutablePath: String?) {
             self.threadId = threadId
             self.process = process
             self.stdinPipe = stdinPipe
@@ -54,29 +87,243 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
             self.interactionMode = interactionMode
             self.reasoningEffort = reasoningEffort
             self.providerThreadId = providerThreadId
+            self.claudeExecutablePath = claudeExecutablePath
         }
     }
 
     public let provider: AgentProvider = .claude
     private let nodeBinary: String
     private let bridgeScriptPath: String
+    private let binaryNameOverride: String?
     private let maxReadableEvents: Int
+    private let interruptGracePeriod: TimeInterval
+    private let sessionMutator: ClaudeSDKSessionMutating?
     private let lock = NSLock()
+    private let cancellationQueue = DispatchQueue(
+        label: "io.remotecode.agent.claude-sdk-cancellation",
+        qos: .userInitiated
+    )
+    private let bridgeCloseGracePeriod: TimeInterval = 0.25
     private var sessions: [AgentThreadID: Session] = [:]
     private var recoveredEvents: [AgentThreadID: [AssistantEvent]] = [:]
     private var rollbackResumeSessionAt: [AgentThreadID: String] = [:]
     private var rollbackProviderThreadIds: [AgentThreadID: String] = [:]
 
-    public init(nodeBinary: String = "node", bridgeScriptPath: String? = nil, maxReadableEvents: Int = 5_000) {
+    public convenience init(
+        nodeBinary: String = "node",
+        bridgeScriptPath: String? = nil,
+        binaryNameOverride: String? = nil,
+        maxReadableEvents: Int = 5_000,
+        interruptGracePeriod: TimeInterval = 2
+    ) {
+        self.init(
+            nodeBinary: nodeBinary,
+            bridgeScriptPath: bridgeScriptPath,
+            binaryNameOverride: binaryNameOverride,
+            maxReadableEvents: maxReadableEvents,
+            interruptGracePeriod: interruptGracePeriod,
+            sessionMutator: nil
+        )
+    }
+
+    init(
+        nodeBinary: String = "node",
+        bridgeScriptPath: String? = nil,
+        binaryNameOverride: String? = nil,
+        maxReadableEvents: Int = 5_000,
+        interruptGracePeriod: TimeInterval = 2,
+        sessionMutator: ClaudeSDKSessionMutating?
+    ) {
         self.nodeBinary = nodeBinary
         self.bridgeScriptPath = bridgeScriptPath
             ?? ProcessInfo.processInfo.environment["RC_CLAUDE_AGENT_SDK_BRIDGE"]
             ?? URL(fileURLWithPath: #filePath).deletingLastPathComponent().appendingPathComponent("ClaudeAgentSDKBridge.mjs").path
+        self.binaryNameOverride = binaryNameOverride
         self.maxReadableEvents = max(1, maxReadableEvents)
+        self.interruptGracePeriod = max(0, interruptGracePeriod)
+        self.sessionMutator = sessionMutator
     }
 
     public func listModels() async -> [AgentModelDescriptor] {
         await ClaudeRunner().listModels()
+    }
+
+    public var forkSafety: AgentProviderForkSafety {
+        guard sessionMutator != nil || Self.installedForkProtocolSupported(bridgeScriptPath: bridgeScriptPath) else {
+            return .unsupported
+        }
+        return .keyedIdempotent(compensationSupported: true)
+    }
+
+    public func forkSafety(threadId: AgentThreadID) -> AgentProviderForkSafety {
+        forkSafety
+    }
+
+    public func forkThread(threadId: AgentThreadID) async throws -> String {
+        throw AgentProviderAdapterError.unsupported(
+            "unkeyed Claude fork is unsafe; use the durable AgentProviderForkRequest path"
+        )
+    }
+
+    public func forkThread(_ request: AgentProviderForkRequest) async throws -> String {
+        guard forkSafety(threadId: request.sourceThreadId).supportsDurableFork else {
+            throw AgentProviderAdapterError.unsupported("Claude SDK fork reconciliation contract is unavailable")
+        }
+        let (sourceSessionId, hasActiveTurn) = forkSourceSnapshot(threadId: request.sourceThreadId)
+        guard let sourceSessionId, !sourceSessionId.isEmpty else {
+            throw AgentProviderAdapterError.sessionNotFound(request.sourceThreadId)
+        }
+        if let expectedSourceId = request.sourceProviderThreadId,
+           !expectedSourceId.isEmpty,
+           expectedSourceId != sourceSessionId {
+            throw AgentProviderAdapterError.unsupported("Claude SDK recovered the wrong parent session for fork")
+        }
+        guard !hasActiveTurn else {
+            throw AgentProviderAdapterError.unsupported("Claude SDK cannot fork while the parent turn is active")
+        }
+
+        let marker = Self.forkMarker(for: request)
+        let existing = try await forkMarkerMatches(marker)
+        if !existing.isEmpty {
+            if existing.count == 1, let child = existing.first, child.sessionId != sourceSessionId {
+                return child.sessionId
+            }
+            try await cleanForkMarkerConflict(existing, marker: marker, protectedSessionId: sourceSessionId)
+            throw ClaudeForkReconciliationError.markerConflictCleaned(
+                marker: marker,
+                childIds: existing.map(\.sessionId).sorted()
+            )
+        }
+
+        let childId = try await nativeForkSession(sourceSessionId: sourceSessionId, title: marker)
+        guard !childId.isEmpty, childId != sourceSessionId else {
+            throw ClaudeForkReconciliationError.invalidForkResult(childId: childId)
+        }
+        let reconciled = try await forkMarkerMatches(marker)
+        guard reconciled.count == 1, reconciled.first?.sessionId == childId else {
+            var cleanupTargets = reconciled
+            if !cleanupTargets.contains(where: { $0.sessionId == childId }) {
+                cleanupTargets.append(ClaudeSDKSessionRecord(sessionId: childId, customTitle: marker))
+            }
+            try await cleanForkMarkerConflict(cleanupTargets, marker: marker, protectedSessionId: sourceSessionId)
+            throw ClaudeForkReconciliationError.invalidForkResult(childId: childId)
+        }
+        return childId
+    }
+
+    public func compensateFork(
+        _ request: AgentProviderForkRequest,
+        providerChildThreadId: String
+    ) async throws {
+        guard forkSafety(threadId: request.sourceThreadId).supportsCompensation else {
+            throw AgentProviderAdapterError.unsupported("Claude SDK fork compensation contract is unavailable")
+        }
+        let sessions = try await nativeListSessions()
+        let marker = Self.forkMarker(for: request)
+        var targets = sessions.filter {
+            $0.customTitle == marker && $0.sessionId != request.sourceProviderThreadId
+        }
+        if targets.isEmpty,
+           let recorded = sessions.first(where: { $0.sessionId == providerChildThreadId }) {
+            targets = [recorded]
+        }
+        for target in targets {
+            do {
+                try await nativeDeleteSession(sessionId: target.sessionId)
+            } catch {
+                throw ClaudeForkReconciliationError.cleanupFailed(
+                    marker: marker,
+                    details: "session \(target.sessionId) could not be deleted: \(error)"
+                )
+            }
+        }
+    }
+
+    private static func forkMarker(for request: AgentProviderForkRequest) -> String {
+        "RemoteCode fork \(request.idempotencyKey)"
+    }
+
+    private func forkSourceSnapshot(threadId: AgentThreadID) -> (sessionId: String?, hasActiveTurn: Bool) {
+        lock.lock(); defer { lock.unlock() }
+        let session = sessions[threadId]
+        return (session?.providerThreadId, session?.inFlightRunId != nil)
+    }
+
+    public static func installedForkProtocolSupported(bridgeScriptPath: String? = nil) -> Bool {
+        let configuredBridge = bridgeScriptPath
+            ?? ProcessInfo.processInfo.environment["RC_CLAUDE_AGENT_SDK_BRIDGE"]
+            ?? URL(fileURLWithPath: #filePath).deletingLastPathComponent().appendingPathComponent("ClaudeAgentSDKBridge.mjs").path
+        guard bridgeSupportsNativeSessionMutation(at: configuredBridge) else { return false }
+        let bridgeURL = URL(fileURLWithPath: configuredBridge)
+        let localSDK = bridgeURL.deletingLastPathComponent()
+            .appendingPathComponent("node_modules/@anthropic-ai/claude-agent-sdk", isDirectory: true)
+        if FileManager.default.fileExists(atPath: localSDK.appendingPathComponent("package.json").path) {
+            return installedSDKForkContract(at: localSDK)
+        }
+
+        let cacheRoot: URL
+        if let override = ProcessInfo.processInfo.environment["RC_CLAUDE_AGENT_SDK_CACHE"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+           !override.isEmpty {
+            cacheRoot = URL(fileURLWithPath: (override as NSString).expandingTildeInPath, isDirectory: true)
+        } else {
+            let root = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+                ?? URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+            cacheRoot = root
+                .appendingPathComponent("RemoteCode", isDirectory: true)
+                .appendingPathComponent("AgentRuntime", isDirectory: true)
+                .appendingPathComponent("ClaudeAgentSDKBridge", isDirectory: true)
+        }
+        return installedSDKForkContract(
+            at: cacheRoot.appendingPathComponent("node_modules/@anthropic-ai/claude-agent-sdk", isDirectory: true)
+        )
+    }
+
+    private static func bridgeSupportsNativeSessionMutation(at path: String) -> Bool {
+        guard pinnedNPMVersion(in: sdkPackageSpec()) == "0.3.157",
+              let source = try? String(contentsOfFile: path, encoding: .utf8) else {
+            return false
+        }
+        return source.contains("const BRIDGE_PROTOCOL_VERSION = 3")
+            && source.contains("claudeSDK.forkSession")
+            && source.contains("claudeSDK.listSessions")
+            && source.contains("claudeSDK.deleteSession")
+    }
+
+    private static func installedSDKForkContract(at sdkDirectory: URL) -> Bool {
+        guard installedSDKPackage(
+            at: sdkDirectory.appendingPathComponent("package.json"),
+            matches: sdkPackageSpec()
+        ), let declarations = try? String(
+            contentsOf: sdkDirectory.appendingPathComponent("sdk.d.ts"),
+            encoding: .utf8
+        ) else {
+            return false
+        }
+        return declarations.contains("function forkSession")
+            && declarations.contains("function listSessions")
+            && declarations.contains("function deleteSession")
+    }
+
+    private func forkMarkerMatches(_ marker: String) async throws -> [ClaudeSDKSessionRecord] {
+        try await nativeListSessions().filter { $0.customTitle == marker }
+    }
+
+    private func cleanForkMarkerConflict(
+        _ sessions: [ClaudeSDKSessionRecord],
+        marker: String,
+        protectedSessionId: String
+    ) async throws {
+        for session in sessions where session.sessionId != protectedSessionId {
+            do {
+                try await nativeDeleteSession(sessionId: session.sessionId)
+            } catch {
+                throw ClaudeForkReconciliationError.cleanupFailed(
+                    marker: marker,
+                    details: "session \(session.sessionId) could not be deleted: \(error)"
+                )
+            }
+        }
     }
 
     public func startSession(_ request: AgentRunRequest, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) async throws -> AgentRunHandle {
@@ -84,6 +331,7 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
     }
 
     public func sendTurn(_ request: AgentRunRequest, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) async throws -> AgentRunHandle {
+        try Self.validateAttachments(request.attachments)
         let session = try await sessionForAsync(request, provisioningCallback: onEvent)
         lock.lock()
         if session.inFlightRunId != nil {
@@ -94,26 +342,56 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
         session.inFlightRunId = request.runId
         session.sawError = false
         session.status = .running
+        session.cancellationRequested = false
         lock.unlock()
 
         onEvent(.status(.running))
-        try write([
-            "type": "rc_turn",
-            "prompt": request.providerPrompt,
-            "attachments": Self.attachmentPayload(request.attachments),
-            "session_id": session.providerThreadId ?? request.threadId.value.uuidString
-        ], to: session)
+        do {
+            try write([
+                "type": "rc_turn",
+                "prompt": request.providerPrompt,
+                "attachments": Self.attachmentPayload(request.attachments),
+                "session_id": session.providerThreadId ?? request.threadId.value.uuidString
+            ], to: session)
+        } catch {
+            lock.lock()
+            if session.inFlightRunId == request.runId {
+                session.inFlightRunId = nil
+                session.onEvent = nil
+                session.status = .failed
+            }
+            lock.unlock()
+            invalidateSessionAfterControlWriteFailure(session)
+            throw error
+        }
         return AgentRunHandle(runId: request.runId, process: session.process) { [weak self] in
-            try? self?.stopSession(threadId: request.threadId)
+            try? self?.requestCancellation(threadId: request.threadId)
         }
     }
 
     public func interruptTurn(threadId: AgentThreadID) throws {
+        try requestCancellation(threadId: threadId)
+    }
+
+    private func requestCancellation(threadId: AgentThreadID) throws {
         lock.lock()
         let session = sessions[threadId]
+        session?.cancellationRequested = true
         lock.unlock()
         guard let session else { throw AgentProviderAdapterError.sessionNotFound(threadId) }
-        try write(["type": "rc_interrupt"], to: session)
+        do {
+            try write(["type": "rc_interrupt"], to: session)
+        } catch {
+            try? stopSession(threadId: threadId)
+            throw error
+        }
+        cancellationQueue.asyncAfter(deadline: .now() + interruptGracePeriod) { [weak self, weak session] in
+            guard let self, let session else { return }
+            self.lock.lock()
+            let stillRunning = self.sessions[threadId] === session && session.inFlightRunId != nil
+            self.lock.unlock()
+            if stillRunning { try? self.stopSession(threadId: threadId) }
+        }
     }
 
     public func respondToRequest(threadId: AgentThreadID, requestId: String, response: AgentProviderRequestResponse) async throws {
@@ -122,7 +400,7 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
             lock.unlock()
             throw AgentProviderAdapterError.sessionNotFound(threadId)
         }
-        guard session.pendingRequestIds.remove(requestId) != nil else {
+        guard session.pendingRequestIds.contains(requestId) else {
             lock.unlock()
             throw AgentProviderAdapterError.unsupported("Claude Agent SDK request not found: \(requestId)")
         }
@@ -135,7 +413,13 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
         if case .decline(let reason) = response, let reason, !reason.isEmpty {
             payload["message"] = reason
         }
-        try write(payload, to: session)
+        do {
+            try write(payload, to: session)
+        } catch {
+            invalidateSessionAfterControlWriteFailure(session)
+            throw error
+        }
+        lock.lock(); session.pendingRequestIds.remove(requestId); lock.unlock()
         let resolved = AssistantEvent.requestResolved(requestId: requestId, state: Self.requestState(for: response))
         record(resolved, session: session)
         emit(.event(resolved), session: session)
@@ -151,25 +435,75 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
             lock.unlock()
             throw AgentProviderAdapterError.sessionNotFound(threadId)
         }
-        guard session.pendingUserInputIds.remove(requestId) != nil else {
+        guard session.pendingUserInputIds.contains(requestId) else {
             lock.unlock()
             throw AgentProviderAdapterError.unsupported("Claude Agent SDK user input request not found: \(requestId)")
         }
-        let usesBridgeCallback = session.bridgeUserInputIds.remove(requestId) != nil
+        let usesBridgeCallback = session.bridgeUserInputIds.contains(requestId)
+        let requestedSchema = session.bridgeUserInputSchemas[requestId]
+        lock.unlock()
+        let bridgeContent = usesBridgeCallback
+            ? try Self.elicitationContent(text: verbatimText, requestedSchema: requestedSchema)
+            : nil
+        do {
+            if let bridgeContent {
+                try write([
+                    "type": "user_input_response",
+                    "request_id": requestId,
+                    "text": verbatimText,
+                    "content": bridgeContent
+                ], to: session)
+            } else {
+                try write(["type": "rc_turn", "prompt": outboundText], to: session)
+            }
+        } catch {
+            invalidateSessionAfterControlWriteFailure(session)
+            throw error
+        }
+        lock.lock()
+        session.pendingUserInputIds.remove(requestId)
+        session.bridgeUserInputIds.remove(requestId)
+        session.bridgeUserInputSchemas.removeValue(forKey: requestId)
         lock.unlock()
         let resolved = AssistantEvent.userInputResolved(requestId: requestId, answer: verbatimText)
         record(resolved, session: session)
-        if usesBridgeCallback {
-            try write(["type": "user_input_response", "request_id": requestId, "text": verbatimText], to: session)
-        } else {
-            try write(["type": "rc_turn", "prompt": outboundText], to: session)
+        emit(.event(resolved), session: session)
+    }
+
+    public func cancelUserInput(threadId: AgentThreadID, requestId: String) throws {
+        lock.lock()
+        guard let session = sessions[threadId] else {
+            lock.unlock()
+            throw AgentProviderAdapterError.sessionNotFound(threadId)
         }
+        guard session.pendingUserInputIds.contains(requestId) else {
+            lock.unlock()
+            throw AgentProviderAdapterError.unsupported("Claude Agent SDK user input request not found: \(requestId)")
+        }
+        lock.unlock()
+
+        // Question cancellation is request-scoped. rc_interrupt is reserved for
+        // cancelling the whole active turn and draining every pending callback.
+        do {
+            try write(["type": "user_input_cancel", "request_id": requestId], to: session)
+        } catch {
+            invalidateSessionAfterControlWriteFailure(session)
+            throw error
+        }
+        lock.lock()
+        session.pendingUserInputIds.remove(requestId)
+        session.bridgeUserInputIds.remove(requestId)
+        session.bridgeUserInputSchemas.removeValue(forKey: requestId)
+        lock.unlock()
+        let resolved = AssistantEvent.userInputResolved(requestId: requestId, answer: nil)
+        record(resolved, session: session)
         emit(.event(resolved), session: session)
     }
 
     public func stopSession(threadId: AgentThreadID) throws {
         lock.lock()
         let session = sessions.removeValue(forKey: threadId)
+        session?.cancellationRequested = true
         recoveredEvents.removeValue(forKey: threadId)
         rollbackResumeSessionAt.removeValue(forKey: threadId)
         rollbackProviderThreadIds.removeValue(forKey: threadId)
@@ -258,6 +592,17 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
         active.forEach(terminate)
     }
 
+    public func stopAllForAppTermination() {
+        lock.lock()
+        let active = Array(sessions.values)
+        sessions.removeAll()
+        recoveredEvents.removeAll()
+        rollbackResumeSessionAt.removeAll()
+        rollbackProviderThreadIds.removeAll()
+        lock.unlock()
+        active.forEach(terminateImmediatelyForAppTermination)
+    }
+
     public func streamEvents(threadId: AgentThreadID, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) throws {
         lock.lock()
         guard let session = sessions[threadId] else {
@@ -271,6 +616,7 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
     // Async path used by sendTurn and recoverSession (via Task+semaphore) — no Thread.sleep, no cooperative-pool pinning.
     private func sessionForAsync(_ request: AgentRunRequest,
                                  provisioningCallback: (@Sendable (AgentRunEvent) -> Void)?) async throws -> Session {
+        let claudeExecutablePath = try resolveClaudeExecutable(request.providerBinary)
         lock.lock()
         if let existing = sessions[request.threadId] {
             // Model/permission changes switch live over the bridge (rc_set_model /
@@ -279,10 +625,15 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
             // switch: respawn with resume, mirroring ClaudeStreamingCLIAdapter.canReuse.
             // An in-flight turn keeps the session (sendTurn rejects it right after,
             // exactly as before; recoverSession just re-attaches).
-            if existing.reasoningEffort == request.reasoningEffort || existing.inFlightRunId != nil {
+            if (existing.reasoningEffort == request.reasoningEffort && existing.claudeExecutablePath == claudeExecutablePath) || existing.inFlightRunId != nil {
                 lock.unlock()
-                try applyRuntimeSwitchIfNeeded(existing, request: request)
-                return existing
+                do {
+                    try applyRuntimeSwitchIfNeeded(existing, request: request)
+                    return existing
+                } catch {
+                    invalidateSessionAfterControlWriteFailure(existing)
+                    throw error
+                }
             }
             // Stash the live session id as the resume cursor for the respawn:
             // configurePayload/effectiveProviderThreadId consult this map whenever
@@ -306,6 +657,118 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
         return try spawnSession(request, bridgeScriptPath: bridgeScriptPath)
     }
 
+    private func nativeListSessions() async throws -> [ClaudeSDKSessionRecord] {
+        if let sessionMutator {
+            return try await sessionMutator.listSessions()
+        }
+        let response = try await executeSessionMutation([
+            "type": "rc_list_sessions"
+        ], expectedSubtype: "rc_list_sessions_result")
+        let sessions = response["sessions"] as? [[String: Any]] ?? []
+        return sessions.compactMap { session in
+            guard let sessionId = session["session_id"] as? String, !sessionId.isEmpty else { return nil }
+            let title = (session["custom_title"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+            return ClaudeSDKSessionRecord(sessionId: sessionId, customTitle: title)
+        }
+    }
+
+    private func nativeForkSession(sourceSessionId: String, title: String) async throws -> String {
+        if let sessionMutator {
+            return try await sessionMutator.forkSession(sourceSessionId: sourceSessionId, title: title)
+        }
+        let response = try await executeSessionMutation([
+            "type": "rc_fork_session",
+            "source_session_id": sourceSessionId,
+            "title": title
+        ], expectedSubtype: "rc_fork_session_result")
+        guard let sessionId = response["session_id"] as? String, !sessionId.isEmpty else {
+            throw AgentProviderAdapterError.unsupported("Claude SDK fork response omitted session_id")
+        }
+        return sessionId
+    }
+
+    private func nativeDeleteSession(sessionId: String) async throws {
+        if let sessionMutator {
+            try await sessionMutator.deleteSession(sessionId: sessionId)
+            return
+        }
+        _ = try await executeSessionMutation([
+            "type": "rc_delete_session",
+            "session_id": sessionId
+        ], expectedSubtype: "rc_delete_session_result")
+    }
+
+    private func executeSessionMutation(
+        _ operation: [String: Any],
+        expectedSubtype: String
+    ) async throws -> [String: Any] {
+        let script = try await resolvedBridgeScriptPath()
+        guard Self.bridgeSupportsNativeSessionMutation(at: script) else {
+            throw AgentProviderAdapterError.unsupported("Claude SDK bridge session mutation schema is unavailable")
+        }
+        guard let node = ProcessLocator.resolve(nodeBinary) else {
+            throw AgentRunError.missingBinary(nodeBinary)
+        }
+        let requestId = UUID().uuidString
+        var operation = operation
+        operation["request_id"] = requestId
+        var configure: [String: Any] = [
+            "type": "rc_configure",
+            "bridge_protocol_version": Self.bridgeProtocolVersion,
+            "session_id": UUID().uuidString
+        ]
+        if let expectedSDKVersion = Self.pinnedNPMVersion(in: Self.sdkPackageSpec()) {
+            configure["expected_sdk_version"] = expectedSDKVersion
+        }
+        let input = try [configure, operation].map { object -> Data in
+            var data = try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
+            data.append(0x0A)
+            return data
+        }.reduce(into: Data()) { $0.append($1) }
+
+        let process = Process()
+        let stdinPipe = Pipe()
+        let stdoutPipe = Pipe()
+        let stderrPipe = Pipe()
+        process.executableURL = URL(fileURLWithPath: node)
+        process.arguments = [script]
+        process.environment = CodexRunner.processEnvironment(overrides: [:], provider: .claude)
+        process.standardInput = stdinPipe
+        process.standardOutput = stdoutPipe
+        process.standardError = stderrPipe
+        do {
+            try process.run()
+            try stdinPipe.fileHandleForWriting.write(contentsOf: input)
+            try stdinPipe.fileHandleForWriting.close()
+        } catch {
+            if process.isRunning { process.terminate() }
+            throw AgentRunError.spawnFailed(error.localizedDescription)
+        }
+        let stdout = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
+        let stderr = stderrPipe.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+
+        let lines = String(decoding: stdout, as: UTF8.self).split(whereSeparator: \.isNewline)
+        for line in lines {
+            guard let data = String(line).data(using: .utf8),
+                  let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { continue }
+            if object["request_id"] as? String == requestId,
+               object["type"] as? String == "sdk_error" {
+                throw AgentProviderAdapterError.unsupported(
+                    "Claude SDK session mutation failed: \(object["message"] as? String ?? "unknown error")"
+                )
+            }
+            if object["request_id"] as? String == requestId,
+               object["subtype"] as? String == expectedSubtype {
+                return object
+            }
+        }
+        let stderrText = String(decoding: stderr, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+        throw AgentProviderAdapterError.unsupported(
+            "Claude SDK bridge did not return \(expectedSubtype) (exit \(process.terminationStatus))\(stderrText.isEmpty ? "" : ": \(stderrText)")"
+        )
+    }
+
     // Shared session spawn logic — validates binary, wires pipes, starts process, registers session.
     private func spawnSession(_ request: AgentRunRequest, bridgeScriptPath: String) throws -> Session {
         guard FileManager.default.isReadableFile(atPath: bridgeScriptPath) else {
@@ -327,6 +790,7 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
         process.standardError = stderrPipe
 
         let effectiveProviderThreadId = effectiveProviderThreadId(for: request)
+        let claudeExecutablePath = try resolveClaudeExecutable(request.providerBinary)
         let session = Session(threadId: request.threadId,
                               process: process,
                               stdinPipe: stdinPipe,
@@ -336,7 +800,8 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
                               permissionMode: request.permissionMode,
                               interactionMode: request.interactionMode,
                               reasoningEffort: request.reasoningEffort,
-                              providerThreadId: effectiveProviderThreadId)
+                              providerThreadId: effectiveProviderThreadId,
+                              claudeExecutablePath: claudeExecutablePath)
         stdoutPipe.fileHandleForReading.readabilityHandler = { [weak self, weak session] handle in
             guard let self, let session else { return }
             session.stdoutReadLock.lock()
@@ -359,13 +824,22 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
         }
         do {
             try process.run()
+            try ProcessSpawnTagger.tagProcess(process, provider: .claude)
         } catch {
             throw AgentRunError.spawnFailed(error.localizedDescription)
         }
         lock.lock()
         sessions[request.threadId] = session
         lock.unlock()
-        try write(configurePayload(for: request), to: session)
+        do {
+            try write(configurePayload(for: request, claudeExecutablePath: claudeExecutablePath), to: session)
+        } catch {
+            lock.lock()
+            if sessions[request.threadId] === session { sessions.removeValue(forKey: request.threadId) }
+            lock.unlock()
+            terminate(session)
+            throw error
+        }
         return session
     }
 
@@ -513,7 +987,7 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
     // yielding "install failed: " with no explanation.
     static func npmInstallFailureText(buffered: LockedDataBuffer, outputPipe: Pipe) -> String {
         var data = buffered.value
-        data.append(outputPipe.fileHandleForReading.readDataToEndOfFile())
+        data.append(BoundedPipeDrain.readRemaining(from: outputPipe.fileHandleForReading))
         return String(data: data, encoding: .utf8) ?? ""
     }
 
@@ -619,7 +1093,27 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
         }
     }
 
-    private func configurePayload(for request: AgentRunRequest) -> [String: Any] {
+    private static let supportedImageMIMETypes: Set<String> = ["image/jpeg", "image/png", "image/gif", "image/webp"]
+
+    static func validateAttachments(_ attachments: [AgentAttachment]) throws {
+        for attachment in attachments where attachment.kind == .image {
+            let mime = attachment.mimeType ?? ""
+            guard supportedImageMIMETypes.contains(mime) else {
+                throw AgentProviderAdapterError.unsupported("Unsupported Claude image attachment type: \(mime.isEmpty ? "unknown" : mime)")
+            }
+        }
+    }
+
+    private func resolveClaudeExecutable(_ requested: String?) throws -> String? {
+        let requested = requested?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let fallback = binaryNameOverride?.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let configured = requested?.isEmpty == false ? requested : fallback,
+              !configured.isEmpty else { return nil }
+        guard let resolved = ProcessLocator.resolve(configured) else { throw AgentRunError.missingBinary(configured) }
+        return resolved
+    }
+
+    private func configurePayload(for request: AgentRunRequest, claudeExecutablePath: String?) -> [String: Any] {
         let resumeSessionAt: String?
         let providerThreadId: String?
         lock.lock()
@@ -628,6 +1122,7 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
         lock.unlock()
         var payload: [String: Any] = [
             "type": "rc_configure",
+            "bridge_protocol_version": Self.bridgeProtocolVersion,
             "cwd": request.cwd,
             "model": request.model,
             "permission_mode": request.permissionMode.rawValue,
@@ -636,8 +1131,14 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
             "session_id": request.threadId.value.uuidString,
             "environment": request.environment
         ]
+        if let expectedSDKVersion = Self.pinnedNPMVersion(in: Self.sdkPackageSpec()) {
+            payload["expected_sdk_version"] = expectedSDKVersion
+        }
         if let resumeSessionAt, !resumeSessionAt.isEmpty {
             payload["resume_session_at"] = resumeSessionAt
+        }
+        if let claudeExecutablePath {
+            payload["claude_executable_path"] = claudeExecutablePath
         }
         // Effort + ultracode settings reuse ClaudeRunner's canonical CLI mapping
         // (ultracode → xhigh effort + {"ultracode":true,"enableWorkflows":true},
@@ -678,7 +1179,10 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
     }
 
     private func handleLine(_ line: String, session: Session) {
-        let bridgeUserInputRequestId = Self.bridgeUserInputRequestId(in: line)
+        let bridgeUserInputRequest = Self.bridgeUserInputRequest(in: line)
+        let isSDKError = line.data(using: .utf8)
+            .flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }?["type"] as? String == "sdk_error"
+        if isSDKError { session.sawError = true }
         if let runtimeEvent = ProviderRuntimeEvent.fromJSONLine(line, provider: .claude, source: "claude.agent-sdk") {
             let event = AssistantEvent.providerRuntime(runtimeEvent)
             record(event, session: session)
@@ -686,6 +1190,23 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
         }
         let parsed = session.parser.parseLine(line)
         for event in parsed {
+            // The SDK emits AskUserQuestion as an assistant tool block before
+            // canUseTool has registered its callback. The bridge then emits the
+            // authoritative user_input_request after registration. Publishing the
+            // earlier parser event creates duplicate cards and lets an immediate
+            // response race ahead of the callback map.
+            if case .userInputRequested = event, bridgeUserInputRequest == nil {
+                continue
+            }
+            if case .userInputRequested(let request) = event {
+                lock.lock()
+                session.pendingUserInputIds.insert(request.id)
+                session.bridgeUserInputIds.insert(request.id)
+                if let schema = bridgeUserInputRequest?.requestedSchema {
+                    session.bridgeUserInputSchemas[request.id] = schema
+                }
+                lock.unlock()
+            }
             record(event, session: session)
             emit(.event(event), session: session)
             if case .error(_, let recoverable) = event, !recoverable { session.sawError = true }
@@ -697,13 +1218,7 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
                 lock.lock(); session.activeTurnId = turnId; lock.unlock()
                 emitSessionSnapshot(session: session, reason: "turn_started")
             }
-            if case .userInputRequested(let request) = event {
-                lock.lock()
-                session.pendingUserInputIds.insert(request.id)
-                if bridgeUserInputRequestId == request.id {
-                    session.bridgeUserInputIds.insert(request.id)
-                }
-                lock.unlock()
+            if case .userInputRequested = event {
                 emitSessionSnapshot(session: session, reason: "user_input_requested")
             }
             if case .requestOpened(let request) = event {
@@ -720,7 +1235,7 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
                 session.activeTurnId = nil
                 lock.unlock()
                 emitSessionSnapshot(session: session, reason: "turn_completed")
-                let status: AgentRunStatus = session.sawError ? .failed : .completed
+                let status: AgentRunStatus = session.cancellationRequested ? .cancelled : (session.sawError ? .failed : .completed)
                 emit(.status(status), session: session)
                 emit(.finished(status, finalMessage: finalMessage, providerThreadId: session.providerThreadId), session: session)
                 lock.lock()
@@ -731,6 +1246,7 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
                 session.pendingRequestIds.removeAll()
                 session.pendingUserInputIds.removeAll()
                 session.bridgeUserInputIds.removeAll()
+                session.bridgeUserInputSchemas.removeAll()
                 lock.unlock()
             }
         }
@@ -760,7 +1276,7 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
         // still be reading/parsing — the lock keeps LineBuffer access and fd
         // read order serialized so no final line is split or reordered.
         session.stdoutReadLock.lock()
-        let tail = session.stdoutPipe.fileHandleForReading.readDataToEndOfFile()
+        let tail = BoundedPipeDrain.readRemaining(from: session.stdoutPipe.fileHandleForReading)
         for line in session.lineBuffer.take(tail) + session.lineBuffer.flush() {
             handleLine(line, session: session)
         }
@@ -769,7 +1285,7 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
         // (missing module, ESM syntax error, auth failure) writes the only
         // explanation to stderr, and the async handler can lose the race with
         // the teardown above, leaving the bytes undelivered in the pipe.
-        let stderrTail = session.stderrPipe.fileHandleForReading.readDataToEndOfFile()
+        let stderrTail = BoundedPipeDrain.readRemaining(from: session.stderrPipe.fileHandleForReading)
         if !stderrTail.isEmpty {
             handleStderr(stderrTail, session: session)
         }
@@ -782,12 +1298,22 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
         let shouldFinish = session.inFlightRunId != nil
         let callback = session.onEvent
         session.inFlightRunId = nil
-        session.status = .cancelled
+        let status: AgentRunStatus = session.cancellationRequested ? .cancelled : .failed
+        session.status = status
         session.onEvent = nil
         lock.unlock()
         if shouldFinish {
-            callback?(.status(.cancelled))
-            callback?(.finished(.cancelled, finalMessage: nil, providerThreadId: session.providerThreadId))
+            if !session.cancellationRequested {
+                let diagnostic: String
+                if session.process.terminationReason == .uncaughtSignal {
+                    diagnostic = "Claude Agent SDK bridge crashed with signal \(session.process.terminationStatus)."
+                } else {
+                    diagnostic = "Claude Agent SDK bridge exited with status \(session.process.terminationStatus)."
+                }
+                callback?(.error(diagnostic))
+            }
+            callback?(.status(status))
+            callback?(.finished(status, finalMessage: nil, providerThreadId: session.providerThreadId))
         }
     }
 
@@ -802,7 +1328,7 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
         lock.unlock()
         emitSessionSnapshot(session: session, reason: "turn_completed")
 
-        let status: AgentRunStatus = session.sawError ? .failed : .completed
+        let status: AgentRunStatus = session.cancellationRequested ? .cancelled : (session.sawError ? .failed : .completed)
         emit(.status(status), session: session)
         emit(.finished(status, finalMessage: finalMessage, providerThreadId: session.providerThreadId), session: session)
 
@@ -814,6 +1340,7 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
         session.pendingRequestIds.removeAll()
         session.pendingUserInputIds.removeAll()
         session.bridgeUserInputIds.removeAll()
+        session.bridgeUserInputSchemas.removeAll()
         lock.unlock()
     }
 
@@ -824,8 +1351,34 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
         session.stdoutPipe.fileHandleForReading.readabilityHandler = nil
         session.stderrPipe.fileHandleForReading.readabilityHandler = nil
         if session.process.isRunning {
-            ProcessTerminator.terminateTree(session.process)
+            let deadline = Date().addingTimeInterval(bridgeCloseGracePeriod)
+            while session.process.isRunning, Date() < deadline {
+                Thread.sleep(forTimeInterval: 0.01)
+            }
+            if session.process.isRunning {
+                ProcessTerminator.terminateTree(session.process)
+            }
         }
+    }
+
+    private func terminateImmediatelyForAppTermination(_ session: Session) {
+        try? write(["type": "rc_close"], to: session)
+        settlePendingRequests(session)
+        settlePendingUserInputs(session)
+        session.stdoutPipe.fileHandleForReading.readabilityHandler = nil
+        session.stderrPipe.fileHandleForReading.readabilityHandler = nil
+        if session.process.isRunning {
+            ProcessTerminator.terminateTreeImmediately(session.process)
+        }
+    }
+
+    private func invalidateSessionAfterControlWriteFailure(_ session: Session) {
+        lock.lock()
+        let ownsSession = sessions[session.threadId] === session
+        if ownsSession { sessions.removeValue(forKey: session.threadId) }
+        lock.unlock()
+        guard ownsSession else { return }
+        terminate(session)
     }
 
     private func settlePendingRequests(_ session: Session) {
@@ -848,6 +1401,7 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
         let requestIds = Array(session.pendingUserInputIds)
         session.pendingUserInputIds.removeAll()
         session.bridgeUserInputIds.removeAll()
+        session.bridgeUserInputSchemas.removeAll()
         lock.unlock()
         for requestId in requestIds {
             let resolved = AssistantEvent.userInputResolved(requestId: requestId, answer: nil)
@@ -916,13 +1470,89 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
         ))), session: session)
     }
 
-    private static func bridgeUserInputRequestId(in line: String) -> String? {
+    private static func bridgeUserInputRequest(
+        in line: String
+    ) -> (id: String, requestedSchema: [String: Any]?)? {
         guard let data = line.trimmingCharacters(in: .whitespacesAndNewlines).data(using: .utf8),
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               (obj["type"] as? String) == "user_input_request" else {
             return nil
         }
-        return obj["request_id"] as? String ?? obj["id"] as? String ?? obj["elicitation_id"] as? String
+        guard let id = obj["request_id"] as? String
+            ?? obj["id"] as? String
+            ?? obj["elicitation_id"] as? String else { return nil }
+        return (id, obj["requested_schema"] as? [String: Any])
+    }
+
+    private static func elicitationContent(
+        text: String,
+        requestedSchema: [String: Any]?
+    ) throws -> [String: Any] {
+        let structured: [String: Any] = {
+            guard let data = text.data(using: .utf8),
+                  let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                return [:]
+            }
+            return object
+        }()
+        guard let properties = requestedSchema?["properties"] as? [String: Any],
+              !properties.isEmpty else {
+            return structured.isEmpty ? ["answer": text] : structured
+        }
+
+        var content: [String: Any] = [:]
+        let names = properties.keys.sorted()
+        for name in names {
+            guard let property = properties[name] as? [String: Any] else { continue }
+            let raw: Any?
+            if let structuredValue = structured[name] {
+                raw = structuredValue
+            } else if names.count == 1 {
+                raw = text
+            } else {
+                raw = nil
+            }
+            guard let raw,
+                  let value = elicitationValue(raw, type: property["type"] as? String) else { continue }
+            if let allowed = property["enum"] as? [Any],
+               !allowed.contains(where: { String(describing: $0) == String(describing: value) }) {
+                continue
+            }
+            content[name] = value
+        }
+        let required = requestedSchema?["required"] as? [String] ?? []
+        if let missing = required.first(where: { content[$0] == nil }) {
+            throw AgentProviderAdapterError.unsupported(
+                "Claude elicitation requires a valid value for \(missing)"
+            )
+        }
+        return content
+    }
+
+    private static func elicitationValue(_ raw: Any, type: String?) -> Any? {
+        switch type {
+        case "boolean":
+            if let value = raw as? Bool { return value }
+            switch String(describing: raw).trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+            case "true", "yes", "1": return true
+            case "false", "no", "0": return false
+            default: return nil
+            }
+        case "integer":
+            if let value = raw as? Int { return value }
+            if let value = raw as? NSNumber { return value.intValue }
+            return Int(String(describing: raw).trimmingCharacters(in: .whitespacesAndNewlines))
+        case "number":
+            if let value = raw as? NSNumber { return value.doubleValue }
+            return Double(String(describing: raw).trimmingCharacters(in: .whitespacesAndNewlines))
+        case "array":
+            if let value = raw as? [Any] { return value }
+            return String(describing: raw).split(separator: ",").map {
+                String($0).trimmingCharacters(in: .whitespacesAndNewlines)
+            }.filter { !$0.isEmpty }
+        default:
+            return raw is String ? raw : String(describing: raw)
+        }
     }
 
     private static func permissionDecision(for response: AgentProviderRequestResponse) -> String {

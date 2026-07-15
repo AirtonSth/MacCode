@@ -171,13 +171,13 @@ final class MainWindowControllerRebuildCountTests: XCTestCase {
         let (_, router, wc) = try makeController(prefix: "rename")
         let ws = try router.createWorkspace(name: "original", cwd: NSTemporaryDirectory())
         wc.refreshFromState()
-        drainMainQueue()
+        wc.flushPendingRefresh()
 
         let countBefore = wc.rebuildCount
 
         try router.renameWorkspace(ws.id, "renamed")
         wc.refreshFromState()
-        drainMainQueue()
+        wc.flushPendingRefresh()
 
         XCTAssertEqual(wc.rebuildCount, countBefore,
             "renaming a workspace (title-only change) must NOT increment rebuildCount -- " +

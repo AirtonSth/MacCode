@@ -61,6 +61,7 @@ public enum HostMutationContract {
     agent.plan.notes.save
     agent.checkpoint.revert
     agent.attachment.upload
+    agent.attachment.import
     agent.provider.update
     fs.workspace.create_file
     fs.workspace.delete
@@ -294,6 +295,7 @@ public enum HostMutationContract {
         case "agent.plan.notes.save": return [.uuid("thread_id"), .string("notes")]
         case "agent.checkpoint.revert": return [.uuid("thread_id"), .firstPresentInt(["turn_count", "checkpoint_turn_count"])]
         case "agent.attachment.upload": return [.uuid("workspace_id"), .string("filename"), .anyString(["data_base64", "dataBase64"])]
+        case "agent.attachment.import": return [.uuid("workspace_id"), .string("relative_path", nonempty: true)]
         case "fs.workspace.create_file": return [.uuid("workspace_id"), .string("path")]
         case "fs.workspace.delete": return [.uuid("workspace_id")]
         case "fs.workspace.rename": return [.uuid("workspace_id"), .string("path"), .string("new_name")]
@@ -539,6 +541,7 @@ public struct MutationRequestContext: @unchecked Sendable {
     }
 }
 
+@MainActor
 public protocol CommandReceiptStateRouting: AnyObject {
     func claimCommandReceipt(
         method: String,

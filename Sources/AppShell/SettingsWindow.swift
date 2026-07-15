@@ -225,6 +225,7 @@ public final class SettingsViewModel: ObservableObject {
     public let settingsStore: SettingsStore
     public let customModelStore: AgentCustomModelStore
     public let context: AppContext
+    private let storageBudgetManager: LocalStorageBudgetManager
     private let privateAccountAPI: PrivateAccountAPI
     private let privateAccountStore: PrivateAccountSessionStore
     private let openURL: @MainActor (URL) -> Void
@@ -302,6 +303,9 @@ public final class SettingsViewModel: ObservableObject {
     /// permission changes made in System Settings between open/close cycles.
     /// `.notDetermined` is the safe default before the first async probe.
     @Published public var notificationAuthStatus: UNAuthorizationStatus = .notDetermined
+    @Published public var storageSnapshot: LocalStorageSnapshot?
+    @Published public var storageOperationStatus: String?
+    @Published public var storageOperationInProgress = false
 
     /// True only when an updater is configured (Sparkle feed present). The
     /// Settings "App Updates" row is hidden otherwise so unsigned/dev builds
@@ -368,6 +372,10 @@ public final class SettingsViewModel: ObservableObject {
         self.trustRepo = DeviceTrustRepository(db: context.db)
         self.settingsStore = SettingsStore(db: context.db)
         self.customModelStore = AgentCustomModelStore(repo: context.settingsRepo)
+        self.storageBudgetManager = LocalStorageBudgetManager(
+            db: context.db,
+            attachmentRoot: context.appSupportDirectory.appendingPathComponent("agent-attachments", isDirectory: true)
+        )
         self.privateAccountStore = PrivateAccountSessionStore(repo: context.settingsRepo)
         self.updateAvailability = updater?.availability ?? .unknown
         reload()
@@ -460,6 +468,43 @@ public final class SettingsViewModel: ObservableObject {
                 }
             }
         })
+    }
+
+    public func refreshStorageUsage() async {
+        guard !storageOperationInProgress else { return }
+        storageOperationInProgress = true
+        defer { storageOperationInProgress = false }
+        let manager = storageBudgetManager
+        do {
+            storageSnapshot = try await Task.detached(priority: .utility) {
+                try manager.snapshot()
+            }.value
+        } catch {
+            storageOperationStatus = "Storage usage could not be read: \(String(describing: error))"
+        }
+    }
+
+    public func cleanUpExpiredStorage(compact: Bool = true) async {
+        guard !storageOperationInProgress else { return }
+        storageOperationInProgress = true
+        defer { storageOperationInProgress = false }
+        let manager = storageBudgetManager
+        do {
+            let result = try await Task.detached(priority: .utility) {
+                try manager.cleanupExpired(compact: compact)
+            }.value
+            storageSnapshot = result.snapshot
+            let removed = result.removedRows.values.reduce(0, +)
+            if result.compacted {
+                storageOperationStatus = "Removed \(removed) expired item\(removed == 1 ? "" : "s") and compacted the database."
+            } else if let reason = result.compactionSkippedReason {
+                storageOperationStatus = "Removed \(removed) expired item\(removed == 1 ? "" : "s"). \(reason.message)"
+            } else {
+                storageOperationStatus = "Removed \(removed) expired item\(removed == 1 ? "" : "s")."
+            }
+        } catch {
+            storageOperationStatus = "Storage cleanup failed: \(String(describing: error))"
+        }
     }
 
     deinit {
@@ -928,12 +973,15 @@ public final class SettingsViewModel: ObservableObject {
             if ProcessInfo.processInfo.environment["RC_CLAUDE_AGENT_SDK_ENABLED"] == "0" {
                 context.coordinator.replaceProviderAdapter(.claude, adapter: ClaudeStreamingCLIAdapter(binaryNameOverride: trimmed.isEmpty ? nil : trimmed))
             } else {
-                context.coordinator.replaceProviderAdapter(.claude, adapter: ClaudeAgentSDKBridgeAdapter())
+                context.coordinator.replaceProviderAdapter(
+                    .claude,
+                    adapter: ClaudeAgentSDKBridgeAdapter(binaryNameOverride: trimmed.isEmpty ? nil : trimmed)
+                )
             }
         case .grok:
             context.coordinator.replaceProviderAdapter(
                 .grok,
-                adapter: OneShotProviderAdapter(runner: GrokRunner(binaryNameOverride: trimmed.isEmpty ? nil : trimmed))
+                adapter: GrokACPAdapter(binaryNameOverride: trimmed.isEmpty ? nil : trimmed)
             )
         }
     }
@@ -1129,6 +1177,7 @@ public struct SettingsView: View {
                     tokenSaverSection
                     keybindingsSection
                     advancedSection
+                    storageSection
                     customModelsSection
                     trustedDevicesSection
                     diagnosticsSection
@@ -1142,6 +1191,7 @@ public struct SettingsView: View {
         .frame(minWidth: 620, maxWidth: .infinity, minHeight: 480)
         .background(DS.Palette.bg)
         .task { await vm.refreshNotificationStatus() }
+        .task { await vm.refreshStorageUsage() }
         .onAppear {
             codexPathDraft = vm.codexPath
             claudePathDraft = vm.claudePath
@@ -1498,6 +1548,84 @@ public struct SettingsView: View {
                 .foregroundColor(DS.Palette.textTertiary)
         }
         .dsPanel(padding: DS.Space.lg)
+    }
+
+    private var storageSection: some View {
+        VStack(alignment: .leading, spacing: DS.Space.md) {
+            DSSectionHeaderG("Storage")
+            if let snapshot = vm.storageSnapshot {
+                settingRow("Local database") {
+                    Text(Self.storageByteLabel(snapshot.databaseBytes))
+                        .font(DS.Font.body)
+                        .foregroundColor(DS.Palette.textSecondary)
+                        .accessibilityIdentifier("settings.storage.databaseBytes")
+                }
+                ForEach(snapshot.classes, id: \.storageClass) { usage in
+                    VStack(alignment: .leading, spacing: DS.Space.xs) {
+                        HStack {
+                            Text(usage.storageClass.displayName)
+                                .font(DS.Font.body)
+                                .foregroundColor(DS.Palette.text)
+                            Spacer()
+                            Text("\(Self.storageByteLabel(usage.payloadBytes)) of \(Self.storageByteLabel(usage.payloadQuotaBytes)) payload budget")
+                                .font(DS.Font.caption)
+                                .foregroundColor(usage.payloadBytes > usage.payloadQuotaBytes ? DS.Palette.danger : DS.Palette.textSecondary)
+                        }
+                        Text("\(usage.rowCount) items · \(usage.retentionDays)-day retention")
+                            .font(DS.Font.caption)
+                            .foregroundColor(DS.Palette.textTertiary)
+                    }
+                    .accessibilityIdentifier("settings.storage.class.\(usage.storageClass.rawValue)")
+                }
+                if snapshot.reclaimableBytes > 0 {
+                    Text("\(Self.storageByteLabel(snapshot.reclaimableBytes)) can be reclaimed by database compaction.")
+                        .font(DS.Font.caption)
+                        .foregroundColor(DS.Palette.textTertiary)
+                }
+            } else {
+                Text(vm.storageOperationInProgress ? "Reading local storage…" : "Storage usage is unavailable.")
+                    .font(DS.Font.caption)
+                    .foregroundColor(DS.Palette.textTertiary)
+            }
+
+            HStack(spacing: DS.Space.sm) {
+                Button("Refresh") {
+                    Task { await vm.refreshStorageUsage() }
+                }
+                .buttonStyle(DSSecondaryButtonStyle())
+                .disabled(vm.storageOperationInProgress)
+                .accessibilityIdentifier("settings.storage.refresh")
+
+                Button("Clean Up Expired Data") {
+                    Task { await vm.cleanUpExpiredStorage() }
+                }
+                .buttonStyle(DSSecondaryButtonStyle())
+                .disabled(vm.storageOperationInProgress)
+                .accessibilityIdentifier("settings.storage.cleanup")
+
+                if vm.storageOperationInProgress {
+                    ProgressView()
+                        .controlSize(.small)
+                        .accessibilityLabel("Storage operation in progress")
+                }
+            }
+            Text("Cleanup removes only diagnostics and unreferenced local payloads older than 30 days. Referenced attachments and recoverable [[rc:handle]] originals are preserved.")
+                .font(DS.Font.caption)
+                .foregroundColor(DS.Palette.textTertiary)
+                .fixedSize(horizontal: false, vertical: true)
+            if let status = vm.storageOperationStatus {
+                Text(status)
+                    .font(DS.Font.caption)
+                    .foregroundColor(status.hasPrefix("Storage cleanup failed") ? DS.Palette.danger : DS.Palette.textSecondary)
+                    .accessibilityIdentifier("settings.storage.status")
+            }
+        }
+        .dsPanel(padding: DS.Space.lg)
+        .accessibilityIdentifier("settings.section.storage")
+    }
+
+    private static func storageByteLabel(_ bytes: Int64) -> String {
+        ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)
     }
 
     private var customModelsSection: some View {

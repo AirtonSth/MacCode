@@ -113,7 +113,6 @@ public final class ClaudeRunner: AgentProviderRunner, @unchecked Sendable {
             case .fullAccess: args.append(contentsOf: ["--permission-mode", "bypassPermissions"])
             }
         }
-        args.append(contentsOf: ["--tools", ""])
         // UX-MAC_AGENT-BG-AWAIT: always make the agent self-declare a background-await
         // stall with `awaitingMarker` so the host recovers it regardless of phrasing
         // (independent of Token Saver). Token Saver parity rides in the same flag: when
@@ -213,7 +212,7 @@ public final class ClaudeRunner: AgentProviderRunner, @unchecked Sendable {
             // Under the lock: an in-flight readabilityHandler callback may
             // still be reading/parsing concurrently.
             stdoutReadLock.lock()
-            let tail = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
+            let tail = BoundedPipeDrain.readRemaining(from: stdoutPipe.fileHandleForReading)
             for line in outBuf.take(tail) + outBuf.flush() {
                 emitLine(line)
             }
@@ -222,7 +221,7 @@ public final class ClaudeRunner: AgentProviderRunner, @unchecked Sendable {
             // (auth error, crash banner) writes the only explanation to
             // stderr, and the async handler can lose the race with the
             // teardown above, leaving the bytes undelivered in the pipe.
-            let stderrTail = stderrPipe.fileHandleForReading.readDataToEndOfFile()
+            let stderrTail = BoundedPipeDrain.readRemaining(from: stderrPipe.fileHandleForReading)
             if !stderrTail.isEmpty,
                let visible = Self.displayableStderr(String(data: stderrTail, encoding: .utf8) ?? "") {
                 onEvent(.event(.providerRuntime(ProviderStderrClassifier.runtimeEvent(
@@ -236,16 +235,18 @@ public final class ClaudeRunner: AgentProviderRunner, @unchecked Sendable {
                 timeline.apply(ev)
                 onEvent(.event(ev))
             }
-            let status: AgentRunStatus
-            if cancelFlag.isCancelled || p.terminationReason == .uncaughtSignal { status = .cancelled }
-            else if p.terminationStatus == 0 { status = .completed }
-            else { status = .failed }
+            let status = Self.terminalStatus(
+                cancelRequested: cancelFlag.isCancelled,
+                terminationReason: p.terminationReason,
+                terminationStatus: p.terminationStatus
+            )
             onEvent(.status(status))
             onEvent(.finished(status, finalMessage: timeline.finalAssistantMessage, providerThreadId: timeline.providerThreadId))
         }
 
         do {
             try proc.run()
+            try ProcessSpawnTagger.tagProcess(proc, provider: .claude)
             onEvent(.status(.running))
         } catch {
             onEvent(.error("spawn: \(error.localizedDescription)"))
@@ -261,6 +262,15 @@ public final class ClaudeRunner: AgentProviderRunner, @unchecked Sendable {
 
     public static func shouldDisplayStderr(_ raw: String) -> Bool {
         displayableStderr(raw) != nil
+    }
+
+    nonisolated static func terminalStatus(
+        cancelRequested: Bool,
+        terminationReason: Process.TerminationReason,
+        terminationStatus: Int32
+    ) -> AgentRunStatus {
+        if cancelRequested { return .cancelled }
+        return terminationReason == .exit && terminationStatus == 0 ? .completed : .failed
     }
 
     public static func displayableStderr(_ raw: String) -> String? {

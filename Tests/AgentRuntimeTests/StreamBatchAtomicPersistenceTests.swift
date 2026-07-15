@@ -1,0 +1,635 @@
+import XCTest
+@testable import AgentRuntime
+import CoreModel
+import Persistence
+
+final class StreamBatchAtomicPersistenceTests: XCTestCase {
+    func test_partialBatchFailureRollsBackAndRetryPersistsEveryEventExactlyOnce() async throws {
+        let fixture = try await makeFixture(name: "partial")
+        defer { fixture.cleanup() }
+
+        try fixture.db.execute("""
+            CREATE TRIGGER fail_third_stream_event
+            BEFORE INSERT ON agent_stream_events
+            WHEN NEW.seq = 3
+            BEGIN
+                SELECT RAISE(ABORT, 'forced partial batch failure');
+            END;
+            """)
+
+        fixture.runner.emitItemStarts(count: 16)
+
+        XCTAssertEqual(
+            try persistedSequences(db: fixture.db, runId: fixture.runId),
+            [],
+            "a failed stream batch must roll back earlier rows instead of exposing a durable prefix"
+        )
+
+        try fixture.db.execute("DROP TRIGGER fail_third_stream_event;")
+        let replay = try fixture.coordinator.withMirrorEventSnapshot(threadId: fixture.thread.id) { $0 }
+
+        XCTAssertEqual(itemStartIDs(replay), (1...16).map { "item-\($0)" })
+        XCTAssertEqual(try persistedSequences(db: fixture.db, runId: fixture.runId), Array(1...16))
+
+        _ = try fixture.coordinator.withMirrorEventSnapshot(threadId: fixture.thread.id) { $0 }
+        XCTAssertEqual(
+            try persistedSequences(db: fixture.db, runId: fixture.runId),
+            Array(1...16),
+            "retrying the durability barrier must not duplicate an already committed batch"
+        )
+    }
+
+    func test_sqliteBusyBeyondTimeoutRetainsBatchForOrderedExactlyOnceRetry() async throws {
+        let fixture = try await makeFixture(name: "busy")
+        defer { fixture.cleanup() }
+        let locker = try SQLiteDB(path: fixture.databasePath)
+        let lockAcquired = DispatchSemaphore(value: 0)
+        let releaseLock = DispatchSemaphore(value: 0)
+        let writerLock = Task.detached {
+            try locker.transaction {
+                lockAcquired.signal()
+                releaseLock.wait()
+            }
+        }
+        XCTAssertEqual(lockAcquired.wait(timeout: .now() + 1), .success)
+
+        let emit = Task.detached {
+            fixture.runner.emitItemStarts(count: 16)
+        }
+        await emit.value
+
+        XCTAssertEqual(
+            try persistedSequences(db: fixture.db, runId: fixture.runId),
+            [],
+            "a writer lock held beyond SQLite's busy timeout must leave the complete batch pending"
+        )
+
+        releaseLock.signal()
+        try await writerLock.value
+        let replay = try fixture.coordinator.withMirrorEventSnapshot(threadId: fixture.thread.id) { $0 }
+
+        XCTAssertEqual(itemStartIDs(replay), (1...16).map { "item-\($0)" })
+        XCTAssertEqual(try persistedSequences(db: fixture.db, runId: fixture.runId), Array(1...16))
+
+        _ = try fixture.coordinator.withMirrorEventSnapshot(threadId: fixture.thread.id) { $0 }
+        XCTAssertEqual(
+            try persistedSequences(db: fixture.db, runId: fixture.runId),
+            Array(1...16),
+            "a successful retry after SQLITE_BUSY must persist each sequence exactly once"
+        )
+    }
+
+    func test_providerTerminalWaitsForBusyRetryAndCommitsEventsAndTerminalStateTogether() async throws {
+        let fixture = try await makeFixture(name: "busy-terminal")
+        defer { fixture.cleanup() }
+        fixture.runner.emitItemStarts(count: 1)
+        let locker = try SQLiteDB(path: fixture.databasePath)
+        let lockAcquired = DispatchSemaphore(value: 0)
+        let releaseLock = DispatchSemaphore(value: 0)
+        let writerLock = Task.detached {
+            try locker.transaction {
+                lockAcquired.signal()
+                releaseLock.wait()
+            }
+        }
+        XCTAssertEqual(lockAcquired.wait(timeout: .now() + 1), .success)
+
+        let finishReturned = DispatchSemaphore(value: 0)
+        let finish = Task.detached {
+            fixture.runner.finishCompleted()
+            finishReturned.signal()
+        }
+        try await Task.sleep(nanoseconds: 5_200_000_000)
+        XCTAssertEqual(finishReturned.wait(timeout: .now() + 0.1), .timedOut,
+                       "provider completion must not publish terminal state after the first SQLITE_BUSY timeout while its event batch is still pending")
+
+        releaseLock.signal()
+        try await writerLock.value
+        await finish.value
+
+        XCTAssertEqual(try persistedSequences(db: fixture.db, runId: fixture.runId), [1],
+                       "the retrying terminal barrier must commit the buffered provider event exactly once")
+        XCTAssertEqual(try persistedStatus(db: fixture.db, table: "agent_runs", id: fixture.runId.value.uuidString), AgentRunStatus.completed.rawValue)
+        XCTAssertEqual(try persistedStatus(db: fixture.db, table: "agent_threads", id: fixture.thread.id.value.uuidString), AgentRunStatus.completed.rawValue)
+    }
+
+    func test_providerTerminalRemainsPendingWhenWriterLockOutlivesEveryImmediateRetry() async throws {
+        let fixture = try await makeFixture(name: "busy-terminal-long")
+        defer { fixture.cleanup() }
+        try fixture.db.execute("PRAGMA busy_timeout=50;")
+        fixture.runner.emitItemStarts(count: 1)
+        let finishBox = TerminalFinishBox()
+        fixture.coordinator.onRunFinished = { _, _, _ in finishBox.record() }
+
+        let locker = try SQLiteDB(path: fixture.databasePath)
+        let lockAcquired = DispatchSemaphore(value: 0)
+        let releaseLock = DispatchSemaphore(value: 0)
+        let writerLock = Task.detached {
+            try locker.transaction {
+                lockAcquired.signal()
+                releaseLock.wait()
+            }
+        }
+        XCTAssertEqual(lockAcquired.wait(timeout: .now() + 1), .success)
+
+        fixture.runner.finishCompleted()
+        try await Task.sleep(nanoseconds: 700_000_000)
+
+        XCTAssertEqual(finishBox.count, 0,
+                       "terminal publication must remain pending after every immediate SQLITE_BUSY retry while the stream batch is uncommitted")
+        XCTAssertEqual(try persistedStatus(db: fixture.db, table: "agent_runs", id: fixture.runId.value.uuidString), AgentRunStatus.running.rawValue)
+        XCTAssertEqual(try persistedSequences(db: fixture.db, runId: fixture.runId), [])
+
+        releaseLock.signal()
+        try await writerLock.value
+        let deadline = Date().addingTimeInterval(3)
+        while finishBox.count == 0, Date() < deadline {
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+
+        XCTAssertEqual(finishBox.count, 1,
+                       "the retained terminal event must publish exactly once after the durability barrier commits")
+        XCTAssertEqual(try persistedSequences(db: fixture.db, runId: fixture.runId), [1])
+        XCTAssertEqual(try persistedStatus(db: fixture.db, table: "agent_runs", id: fixture.runId.value.uuidString), AgentRunStatus.completed.rawValue)
+        XCTAssertEqual(try persistedStatus(db: fixture.db, table: "agent_threads", id: fixture.thread.id.value.uuidString), AgentRunStatus.completed.rawValue)
+    }
+
+    func test_stopCannotOvertakeTerminalWaitingForDurabilityBarrier() async throws {
+        let fixture = try await makeFixture(name: "busy-terminal-stop")
+        defer { fixture.cleanup() }
+        try fixture.db.execute("PRAGMA busy_timeout=50;")
+        fixture.runner.emitItemStarts(count: 1)
+        let finishBox = TerminalFinishBox()
+        fixture.coordinator.onRunFinished = { _, _, status in finishBox.record(status) }
+
+        let locker = try SQLiteDB(path: fixture.databasePath)
+        let lockAcquired = DispatchSemaphore(value: 0)
+        let releaseLock = DispatchSemaphore(value: 0)
+        let writerLock = Task.detached {
+            try locker.transaction {
+                lockAcquired.signal()
+                releaseLock.wait()
+            }
+        }
+        XCTAssertEqual(lockAcquired.wait(timeout: .now() + 1), .success)
+
+        fixture.runner.finishCompleted()
+        try await Task.sleep(nanoseconds: 300_000_000)
+        fixture.coordinator.stopRun(threadId: fixture.thread.id)
+        try await Task.sleep(nanoseconds: 300_000_000)
+
+        XCTAssertEqual(finishBox.statuses, [],
+                       "Stop must not publish cancellation while the provider terminal waits for its stream commit")
+        XCTAssertEqual(try persistedStatus(db: fixture.db, table: "agent_runs", id: fixture.runId.value.uuidString), AgentRunStatus.running.rawValue)
+        XCTAssertEqual(try persistedStatus(db: fixture.db, table: "agent_threads", id: fixture.thread.id.value.uuidString), AgentRunStatus.running.rawValue)
+        XCTAssertEqual(try persistedSequences(db: fixture.db, runId: fixture.runId), [])
+
+        releaseLock.signal()
+        try await writerLock.value
+        let deadline = Date().addingTimeInterval(3)
+        while finishBox.statuses.isEmpty, Date() < deadline {
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+
+        XCTAssertEqual(finishBox.statuses, [.completed],
+                       "the original provider terminal must win exactly once after the stream commit")
+        XCTAssertEqual(try persistedSequences(db: fixture.db, runId: fixture.runId), [1])
+        XCTAssertEqual(try persistedStatus(db: fixture.db, table: "agent_runs", id: fixture.runId.value.uuidString), AgentRunStatus.completed.rawValue)
+        XCTAssertEqual(try persistedStatus(db: fixture.db, table: "agent_threads", id: fixture.thread.id.value.uuidString), AgentRunStatus.completed.rawValue)
+    }
+
+    func test_stopFirstWaitsForDurabilityBarrierAndPublishesCancellationExactlyOnce() async throws {
+        let fixture = try await makeFixture(name: "busy-stop-first")
+        defer { fixture.cleanup() }
+        try fixture.db.execute("PRAGMA busy_timeout=50;")
+        fixture.runner.emitItemStarts(count: 1)
+        let finishBox = TerminalFinishBox()
+        fixture.coordinator.onRunFinished = { _, _, status in finishBox.record(status) }
+
+        let locker = try SQLiteDB(path: fixture.databasePath)
+        let lockAcquired = DispatchSemaphore(value: 0)
+        let releaseLock = DispatchSemaphore(value: 0)
+        let writerLock = Task.detached {
+            try locker.transaction {
+                lockAcquired.signal()
+                releaseLock.wait()
+            }
+        }
+        XCTAssertEqual(lockAcquired.wait(timeout: .now() + 1), .success)
+
+        fixture.coordinator.stopRun(threadId: fixture.thread.id)
+        try await Task.sleep(nanoseconds: 300_000_000)
+
+        XCTAssertEqual(finishBox.statuses, [],
+                       "a user Stop must not publish cancellation before its buffered provider events are durable")
+        XCTAssertEqual(try persistedStatus(db: fixture.db, table: "agent_runs", id: fixture.runId.value.uuidString), AgentRunStatus.running.rawValue)
+        XCTAssertEqual(try persistedStatus(db: fixture.db, table: "agent_threads", id: fixture.thread.id.value.uuidString), AgentRunStatus.running.rawValue)
+        XCTAssertEqual(try persistedSequences(db: fixture.db, runId: fixture.runId), [])
+
+        releaseLock.signal()
+        try await writerLock.value
+        let deadline = Date().addingTimeInterval(3)
+        while finishBox.statuses.isEmpty, Date() < deadline {
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+
+        XCTAssertEqual(finishBox.statuses, [.cancelled],
+                       "the retained Stop terminal must publish exactly once after its stream tail commits")
+        XCTAssertEqual(try persistedSequences(db: fixture.db, runId: fixture.runId), [1])
+        XCTAssertEqual(try persistedStatus(db: fixture.db, table: "agent_runs", id: fixture.runId.value.uuidString), AgentRunStatus.cancelled.rawValue)
+        XCTAssertEqual(try persistedStatus(db: fixture.db, table: "agent_threads", id: fixture.thread.id.value.uuidString), AgentRunStatus.cancelled.rawValue)
+    }
+
+    func test_terminalGraphFailureAtEveryRequiredWriteRollsBackAndRetriesExactlyOnce() async throws {
+        let faultStages: [(name: String, operation: String, table: String, condition: String)] = [
+            ("assistant", "INSERT", "agent_messages", "NEW.role = 'assistant'"),
+            ("run", "UPDATE", "agent_runs", "NEW.status = 'completed'"),
+            ("thread", "UPDATE", "agent_threads", "NEW.status = 'completed'"),
+            ("session", "UPDATE", "provider_session_runtime", "NEW.status = 'completed'")
+        ]
+
+        for stage in faultStages {
+            let fixture = try await makeFixture(name: "terminal-graph-\(stage.name)")
+            defer { fixture.cleanup() }
+            let finishBox = TerminalFinishBox()
+            let messageBox = AppendedMessageBox()
+            fixture.coordinator.onRunFinished = { _, _, status in finishBox.record(status) }
+            fixture.coordinator.onMessageAppended = { message in messageBox.record(message) }
+
+            try fixture.db.execute("""
+                CREATE TRIGGER fail_terminal_\(stage.name)
+                BEFORE \(stage.operation) ON \(stage.table)
+                WHEN \(stage.condition)
+                BEGIN
+                    SELECT RAISE(ABORT, 'forced terminal \(stage.name) failure');
+                END;
+            """)
+
+            fixture.runner.finishCompleted()
+            try await Task.sleep(nanoseconds: 150_000_000)
+
+            XCTAssertEqual(finishBox.count, 0,
+                           "\(stage.name): terminal fanout must wait for the complete graph")
+            XCTAssertEqual(try persistedStatus(db: fixture.db, table: "agent_runs", id: fixture.runId.value.uuidString), AgentRunStatus.running.rawValue)
+            XCTAssertEqual(try persistedStatus(db: fixture.db, table: "agent_threads", id: fixture.thread.id.value.uuidString), AgentRunStatus.running.rawValue)
+            XCTAssertEqual(try fixture.sessionRepo.get(threadId: fixture.thread.id)?.status, .running)
+            XCTAssertTrue(try fixture.messageRepo.list(threadId: fixture.thread.id).filter { $0.role == .assistant }.isEmpty,
+                          "\(stage.name): no assistant row may escape a rolled-back terminal graph")
+            XCTAssertEqual(messageBox.assistantMessages.count, 0,
+                           "\(stage.name): an uncommitted assistant must not publish")
+
+            try fixture.db.execute("DROP TRIGGER fail_terminal_\(stage.name);")
+            await waitForTerminal(finishBox)
+
+            XCTAssertEqual(finishBox.statuses, [.completed],
+                           "\(stage.name): the retained terminal must fan out once after retry")
+            XCTAssertEqual(try persistedStatus(db: fixture.db, table: "agent_runs", id: fixture.runId.value.uuidString), AgentRunStatus.completed.rawValue)
+            XCTAssertEqual(try persistedStatus(db: fixture.db, table: "agent_threads", id: fixture.thread.id.value.uuidString), AgentRunStatus.completed.rawValue)
+            XCTAssertEqual(try fixture.sessionRepo.get(threadId: fixture.thread.id)?.status, .completed)
+            XCTAssertEqual(try fixture.messageRepo.list(threadId: fixture.thread.id).filter { $0.role == .assistant && $0.content == "done" }.count, 1,
+                           "\(stage.name): retry must persist the final assistant exactly once")
+            XCTAssertEqual(messageBox.assistantMessages.filter { $0.content == "done" }.count, 1)
+            try await Task.sleep(nanoseconds: 250_000_000)
+            XCTAssertEqual(finishBox.count, 1,
+                           "\(stage.name): a stale retry must not duplicate terminal fanout")
+        }
+    }
+
+    func test_identicalFinalRepliesFromDistinctRunsRemainDistinctMessages() async throws {
+        let fixture = try await makeFixture(name: "terminal-identical-replies")
+        defer { fixture.cleanup() }
+        let finishBox = TerminalFinishBox()
+        fixture.coordinator.onRunFinished = { _, _, status in finishBox.record(status) }
+
+        fixture.runner.finishCompleted()
+        await waitForTerminal(finishBox)
+
+        _ = try await fixture.coordinator.startRun(AgentRunRequest(
+            threadId: fixture.thread.id,
+            provider: .codex,
+            model: "fake-model",
+            cwd: fixture.root.path,
+            prompt: "return the same final reply again"
+        ))
+        fixture.runner.finishCompleted()
+        let deadline = Date().addingTimeInterval(3)
+        while finishBox.count < 2, Date() < deadline {
+            try? await Task.sleep(nanoseconds: 20_000_000)
+        }
+
+        let replies = try fixture.messageRepo.list(threadId: fixture.thread.id)
+            .filter { $0.role == .assistant && $0.content == "done" }
+        XCTAssertEqual(replies.count, 2,
+                       "content equality across distinct runs is legitimate and must not be deduplicated")
+        XCTAssertEqual(Set(replies.map(\.id)).count, 2,
+                       "each run intent owns a distinct deterministic assistant identity")
+        XCTAssertEqual(finishBox.statuses, [.completed, .completed])
+    }
+
+    func test_failedTurnCompletedAssistantAppendDoesNotPoisonTerminalRetryMemo() async throws {
+        let fixture = try await makeFixture(name: "terminal-assistant-memo")
+        defer { fixture.cleanup() }
+        let finishBox = TerminalFinishBox()
+        let messageBox = AppendedMessageBox()
+        fixture.coordinator.onRunFinished = { _, _, status in finishBox.record(status) }
+        fixture.coordinator.onMessageAppended = { message in messageBox.record(message) }
+
+        try fixture.db.execute("""
+            CREATE TRIGGER fail_turn_completed_assistant
+            BEFORE INSERT ON agent_messages
+            WHEN NEW.role = 'assistant'
+            BEGIN
+                SELECT RAISE(ABORT, 'forced turn-completed assistant failure');
+            END;
+        """)
+        fixture.runner.emitTurnCompleted(finalMessage: "done")
+
+        XCTAssertTrue(try fixture.messageRepo.list(threadId: fixture.thread.id).filter { $0.role == .assistant }.isEmpty)
+        XCTAssertTrue(messageBox.assistantMessages.isEmpty,
+                      "an assistant append that did not commit must not publish or seed successful dedup state")
+
+        try fixture.db.execute("DROP TRIGGER fail_turn_completed_assistant;")
+        fixture.runner.finishCompleted()
+        await waitForTerminal(finishBox)
+
+        XCTAssertEqual(try fixture.messageRepo.list(threadId: fixture.thread.id).filter { $0.role == .assistant && $0.content == "done" }.count, 1,
+                       "terminal commit must retry the same final text after the earlier append failure")
+        XCTAssertEqual(messageBox.assistantMessages.filter { $0.content == "done" }.count, 1)
+        XCTAssertEqual(finishBox.statuses, [.completed])
+    }
+
+    func test_startFailureGraphFailureAtEveryWriteRollsBackAndRetriesBeforePublication() async throws {
+        let faultStages: [(name: String, operation: String, table: String, condition: String)] = [
+            ("run", "UPDATE", "agent_runs", "NEW.status = 'failed'"),
+            ("thread", "UPDATE", "agent_threads", "NEW.status = 'failed'"),
+            ("session", "UPDATE", "provider_session_runtime", "NEW.status = 'failed'"),
+            ("event", "INSERT", "agent_stream_events", "NEW.event_kind LIKE 'error%'")
+        ]
+
+        for stage in faultStages {
+            let root = URL(fileURLWithPath: NSTemporaryDirectory())
+                .appendingPathComponent("rc-start-failure-graph-\(stage.name)-\(UUID().uuidString)", isDirectory: true)
+            defer { try? FileManager.default.removeItem(at: root) }
+            try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+            let db = try SQLiteDB(path: root.appendingPathComponent("remotecode.sqlite").path)
+            try Schema.migrate(db)
+            let threadRepo = AgentThreadRepository(db: db)
+            let messageRepo = AgentMessageRepository(db: db)
+            let runRepo = AgentRunRepository(db: db)
+            let sessionRepo = ProviderSessionRuntimeRepository(db: db)
+            let thread = AgentThread(title: "start failure graph", provider: .codex, model: "fake-model")
+            try threadRepo.upsert(thread)
+            let runner = FailingStreamBatchStartRunner()
+            let coordinator = AgentRunCoordinator(
+                runRepo: runRepo,
+                messageRepo: messageRepo,
+                threadRepo: threadRepo,
+                providerSessionRepo: sessionRepo,
+                providers: [.codex: runner]
+            )
+            let finishBox = TerminalFinishBox()
+            let eventBox = AssistantEventBox()
+            coordinator.onRunFinished = { _, _, status in finishBox.record(status) }
+            coordinator.onAssistantEvent = { event, _, _ in eventBox.record(event) }
+            let runId = AgentRunID()
+
+            try db.execute("""
+                CREATE TRIGGER fail_start_\(stage.name)
+                BEFORE \(stage.operation) ON \(stage.table)
+                WHEN \(stage.condition)
+                BEGIN
+                    SELECT RAISE(ABORT, 'forced start \(stage.name) failure');
+                END;
+            """)
+
+            do {
+                _ = try await coordinator.startRun(AgentRunRequest(
+                    runId: runId,
+                    threadId: thread.id,
+                    provider: .codex,
+                    model: "fake-model",
+                    cwd: root.path,
+                    prompt: "fail before accepting the turn"
+                ))
+                XCTFail("the provider must reject start")
+            } catch {
+                // Expected provider rejection. The durable transition retries below.
+            }
+            try await Task.sleep(nanoseconds: 150_000_000)
+
+            XCTAssertEqual(finishBox.count, 0,
+                           "\(stage.name): failed start must not drain/fan out before commit")
+            XCTAssertEqual(eventBox.errorCount, 0,
+                           "\(stage.name): failed start error must not publish before its snapshot row commits")
+            XCTAssertEqual(try runRepo.get(id: runId)?.status, .pending,
+                           "provider rejection before a handle exists must retain the pre-start state")
+            XCTAssertEqual(try threadRepo.get(id: thread.id)?.status, .pending)
+            XCTAssertEqual(try sessionRepo.get(threadId: thread.id)?.status, .pending)
+            XCTAssertEqual(try runRepo.countStreamEvents(threadId: thread.id), 0)
+            do {
+                _ = try await coordinator.startRun(AgentRunRequest(
+                    threadId: thread.id,
+                    provider: .codex,
+                    model: "fake-model",
+                    cwd: root.path,
+                    prompt: "must not overtake retained failure"
+                ))
+                XCTFail("a second provider start must remain gated by the retained terminal intent")
+            } catch {
+                // Expected durability gate. The provider must not be called again.
+            }
+            XCTAssertEqual(runner.startCount, 1,
+                           "\(stage.name): no second provider start/queue drain may overtake the uncommitted failure graph")
+
+            try db.execute("DROP TRIGGER fail_start_\(stage.name);")
+            await waitForTerminal(finishBox)
+
+            XCTAssertEqual(finishBox.statuses, [.failed])
+            XCTAssertEqual(eventBox.errorCount, 1)
+            XCTAssertEqual(try runRepo.get(id: runId)?.status, .failed)
+            XCTAssertEqual(try threadRepo.get(id: thread.id)?.status, .failed)
+            XCTAssertEqual(try sessionRepo.get(threadId: thread.id)?.status, .failed)
+            XCTAssertEqual(try runRepo.countStreamEvents(threadId: thread.id), 1)
+            try await Task.sleep(nanoseconds: 250_000_000)
+            XCTAssertEqual(finishBox.count, 1,
+                           "\(stage.name): a committed start failure must not fan out twice")
+            XCTAssertEqual(eventBox.errorCount, 1)
+        }
+    }
+
+    private func waitForTerminal(_ box: TerminalFinishBox, timeout: TimeInterval = 3) async {
+        let deadline = Date().addingTimeInterval(timeout)
+        while box.count == 0, Date() < deadline {
+            try? await Task.sleep(nanoseconds: 20_000_000)
+        }
+    }
+
+    private func makeFixture(name: String) async throws -> Fixture {
+        let root = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("rc-stream-batch-\(name)-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let databasePath = root.appendingPathComponent("remotecode.sqlite").path
+        let db = try SQLiteDB(path: databasePath)
+        try Schema.migrate(db)
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let sessionRepo = ProviderSessionRuntimeRepository(db: db)
+        let thread = AgentThread(title: "atomic stream", provider: .codex, model: "fake-model")
+        try threadRepo.upsert(thread)
+        let runner = ControlledStreamBatchRunner()
+        let coordinator = AgentRunCoordinator(
+            runRepo: runRepo,
+            messageRepo: messageRepo,
+            threadRepo: threadRepo,
+            providerSessionRepo: sessionRepo,
+            providers: [.codex: runner]
+        )
+        let runId = try await coordinator.startRun(AgentRunRequest(
+            threadId: thread.id,
+            provider: .codex,
+            model: "fake-model",
+            cwd: root.path,
+            prompt: "exercise atomic stream persistence"
+        ))
+        return Fixture(
+            root: root,
+            databasePath: databasePath,
+            db: db,
+            thread: thread,
+            runId: runId,
+            messageRepo: messageRepo,
+            sessionRepo: sessionRepo,
+            runner: runner,
+            coordinator: coordinator
+        )
+    }
+
+    private func persistedSequences(db: SQLiteDB, runId: AgentRunID) throws -> [Int] {
+        let statement = try db.prepare("SELECT seq FROM agent_stream_events WHERE run_id = ? ORDER BY seq ASC;")
+        try statement.bind(1, runId.value.uuidString)
+        var values: [Int] = []
+        while try statement.step() {
+            values.append(Int(statement.columnInt64(0)))
+        }
+        return values
+    }
+
+    private func persistedStatus(db: SQLiteDB, table: String, id: String) throws -> String? {
+        let statement = try db.prepare("SELECT status FROM \(table) WHERE id = ?;")
+        try statement.bind(1, id)
+        guard try statement.step() else { return nil }
+        return statement.columnText(0)
+    }
+
+    private func itemStartIDs(_ events: [AssistantEvent]) -> [String] {
+        events.compactMap { event in
+            guard case .itemStarted(let item) = event else { return nil }
+            return item.id
+        }
+    }
+}
+
+private final class TerminalFinishBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var values: [AgentRunStatus] = []
+
+    var count: Int { lock.withLock { values.count } }
+    var statuses: [AgentRunStatus] { lock.withLock { values } }
+    func record(_ status: AgentRunStatus = .completed) { lock.withLock { values.append(status) } }
+}
+
+private final class AppendedMessageBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var values: [AgentMessage] = []
+
+    var assistantMessages: [AgentMessage] { lock.withLock { values.filter { $0.role == .assistant } } }
+    func record(_ message: AgentMessage) { lock.withLock { values.append(message) } }
+}
+
+private final class AssistantEventBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var values: [AssistantEvent] = []
+
+    var errorCount: Int {
+        lock.withLock { values.filter { if case .error = $0 { return true }; return false }.count }
+    }
+    func record(_ event: AssistantEvent) { lock.withLock { values.append(event) } }
+}
+
+private struct Fixture {
+    let root: URL
+    let databasePath: String
+    let db: SQLiteDB
+    let thread: AgentThread
+    let runId: AgentRunID
+    let messageRepo: AgentMessageRepository
+    let sessionRepo: ProviderSessionRuntimeRepository
+    let runner: ControlledStreamBatchRunner
+    let coordinator: AgentRunCoordinator
+
+    func cleanup() {
+        try? FileManager.default.removeItem(at: root)
+    }
+}
+
+private final class ControlledStreamBatchRunner: AgentProviderRunner, @unchecked Sendable {
+    let provider: AgentProvider = .codex
+    private let lock = NSLock()
+    private var callback: (@Sendable (AgentRunEvent) -> Void)?
+
+    func listModels() async -> [AgentModelDescriptor] { [] }
+
+    func startRun(
+        _ request: AgentRunRequest,
+        onEvent: @escaping @Sendable (AgentRunEvent) -> Void
+    ) async throws -> AgentRunHandle {
+        lock.withLock {
+            callback = onEvent
+        }
+        return AgentRunHandle(runId: request.runId, process: nil) {}
+    }
+
+    func emitItemStarts(count: Int) {
+        lock.lock()
+        let callback = callback
+        lock.unlock()
+        for index in 1...count {
+            callback?(.event(.itemStarted(item: AssistantItem(
+                id: "item-\(index)",
+                turnId: "turn-1",
+                type: .assistantMessage,
+                state: .streaming,
+                body: "",
+                startedAtMs: Int64(index)
+            ))))
+        }
+    }
+
+    func finishCompleted() {
+        lock.withLock { callback }?(.finished(.completed, finalMessage: "done", providerThreadId: "provider-thread"))
+    }
+
+    func emitTurnCompleted(finalMessage: String) {
+        lock.withLock { callback }?(.event(.turnCompleted(turnId: "turn-1", finalMessage: finalMessage)))
+    }
+}
+
+private struct ForcedStreamBatchStartFailure: Error, CustomStringConvertible {
+    var description: String { "forced provider start failure" }
+}
+
+private final class FailingStreamBatchStartRunner: AgentProviderRunner, @unchecked Sendable {
+    let provider: AgentProvider = .codex
+    private let lock = NSLock()
+    private var starts = 0
+    var startCount: Int { lock.withLock { starts } }
+    func listModels() async -> [AgentModelDescriptor] { [] }
+    func startRun(
+        _ request: AgentRunRequest,
+        onEvent: @escaping @Sendable (AgentRunEvent) -> Void
+    ) async throws -> AgentRunHandle {
+        lock.withLock { starts += 1 }
+        throw ForcedStreamBatchStartFailure()
+    }
+}

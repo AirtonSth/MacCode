@@ -4,6 +4,7 @@ import XCTest
 @testable import Surfaces
 import Persistence
 import SocketServer
+import AgentRuntime
 
 @MainActor
 final class PaneActionTests: XCTestCase {
@@ -187,19 +188,28 @@ final class PaneActionTests: XCTestCase {
                       "workspace row rendering must read the router's busy metadata, not only live SurfaceRegistry state")
     }
 
-    func test_agentSurfaceBusyRollsUpRunningThreadForTabSpinner() throws {
+    func test_agentSurfaceBusyRollsUpRunningThreadForTabSpinner() async throws {
         let (ctx, router) = try makeContext()
         let ws = try router.createWorkspace(name: "tab-busy", cwd: NSTemporaryDirectory())
         let desc = try router.createSurface(workspace: ws.id, type: .agentApp, paneID: nil, title: "Agent App")
         let agent = try XCTUnwrap(SurfaceRegistry.shared.surface(desc.id) as? AgentAppSurface)
-        var thread = AgentThread(workspaceId: ws.id, title: "Long task", provider: .codex, model: "gpt-5.5")
-        thread.status = .running
+        let thread = AgentThread(workspaceId: ws.id, title: "Long task", provider: .codex, model: "gpt-5.5")
         try ctx.threadRepo.upsert(thread)
+        ctx.coordinator.replaceProvider(.codex, runner: PaneBlockingRunner())
+
+        _ = try await ctx.coordinator.startRun(AgentRunRequest(
+            threadId: thread.id,
+            provider: .codex,
+            model: "gpt-5.5",
+            cwd: NSTemporaryDirectory(),
+            prompt: "keep tab busy"
+        ))
 
         agent.viewModel.reloadThreads()
 
         XCTAssertTrue(agent.isBusy,
-                      "the tab strip reads AgentAppSurface.isBusy, so running threads must turn the Agent App tab into a spinner")
+                      "the tab strip must spin only while the coordinator owns a real active run identity")
+        ctx.coordinator.stopRun(threadId: thread.id)
     }
 
     func test_sshSurfaceCreatesSavedHostSidebarInsteadOfDisconnectedTerminalPlaceholder() throws {
@@ -925,7 +935,7 @@ final class PaneActionTests: XCTestCase {
         let (ctx, router) = try makeContext()
         _ = try router.createWorkspace(name: "visible", cwd: NSTemporaryDirectory())
         let controller = MainWindowController(context: ctx, router: router)
-        drainMainQueue()
+        controller.flushPendingRefresh()
         controller.window.contentView?.layoutSubtreeIfNeeded()
 
         let content = try XCTUnwrap(controller.window.contentView)
@@ -1404,6 +1414,23 @@ final class PaneActionTests: XCTestCase {
             PaneTabsView.isSurfaceBusy(desc, router: router),
             "per-tab original must also report busy when a running thread exists"
         )
+    }
+}
+
+private final class PaneBlockingRunner: AgentProviderRunner, @unchecked Sendable {
+    let provider: AgentProvider = .codex
+
+    func listModels() async -> [AgentModelDescriptor] { [] }
+
+    func startRun(
+        _ request: AgentRunRequest,
+        onEvent: @escaping @Sendable (AgentRunEvent) -> Void
+    ) async throws -> AgentRunHandle {
+        onEvent(.status(.running))
+        return AgentRunHandle(runId: request.runId, process: nil) {
+            onEvent(.status(.cancelled))
+            onEvent(.finished(.cancelled, finalMessage: nil, providerThreadId: nil))
+        }
     }
 }
 

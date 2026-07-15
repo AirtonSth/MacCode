@@ -5,15 +5,62 @@ import CoreModel
 // MARK: - Spawn tagging
 
 /// Immutable record written when a provider process is spawned.
-/// The pgid is set to the child pid via setpgid(0,0) so the periodic
-/// sweeper can identify and reap the process-group by its leader pid.
-public struct SpawnedProcessTag: Sendable, Equatable {
+/// `pgid` retains the historical field name; it stores the exact provider root
+/// PID. The persistent ownership sweep reconstructs its current descendant tree.
+public struct ProviderProcessStartIdentity: Codable, Sendable, Equatable {
+    public let seconds: UInt64
+    public let microseconds: UInt64
+
+    public init(seconds: UInt64, microseconds: UInt64) {
+        self.seconds = seconds
+        self.microseconds = microseconds
+    }
+
+    public static func read(pid: pid_t) -> ProviderProcessStartIdentity? {
+        var info = proc_bsdinfo()
+        let size = Int32(MemoryLayout<proc_bsdinfo>.size)
+        guard proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, size) == size,
+              info.pbi_start_tvsec > 0 else {
+            return nil
+        }
+        return ProviderProcessStartIdentity(
+            seconds: info.pbi_start_tvsec,
+            microseconds: info.pbi_start_tvusec
+        )
+    }
+}
+
+public struct SpawnedProcessTag: Codable, Sendable, Equatable {
     public let pgid: pid_t
     public let spawnedAt: Date
+    public let ownerPID: pid_t
+    public let ownerStartIdentity: ProviderProcessStartIdentity?
+    public let provider: AgentProvider?
+    public let executablePath: String
+    public let startIdentity: ProviderProcessStartIdentity?
+    /// Present only when the spawned root was verified as the leader of its own
+    /// process group. The leader start identity above anchors that group to the
+    /// exact provider lifetime recorded at spawn.
+    public let isolatedProcessGroup: pid_t?
 
-    public init(pgid: pid_t, spawnedAt: Date) {
+    public init(
+        pgid: pid_t,
+        spawnedAt: Date,
+        ownerPID: pid_t = ProcessInfo.processInfo.processIdentifier,
+        ownerStartIdentity: ProviderProcessStartIdentity? = nil,
+        provider: AgentProvider? = nil,
+        executablePath: String = "",
+        startIdentity: ProviderProcessStartIdentity? = nil,
+        isolatedProcessGroup: pid_t? = nil
+    ) {
         self.pgid = pgid
         self.spawnedAt = spawnedAt
+        self.ownerPID = ownerPID
+        self.ownerStartIdentity = ownerStartIdentity
+        self.provider = provider
+        self.executablePath = executablePath
+        self.startIdentity = startIdentity
+        self.isolatedProcessGroup = isolatedProcessGroup
     }
 }
 
@@ -23,16 +70,76 @@ public enum ProcessSpawnTagger {
     /// Default minimum age before a tagged process is eligible for reap.
     public static let defaultMinAge: TimeInterval = 30.0
 
-    /// Call immediately after `proc.run()` to tag the child as a new
-    /// process-group leader (setpgid(pid, 0) == setpgid(pid, pid)).
-    /// Returns a tag on success, nil if the call fails (e.g. ESRCH race).
+    /// Call immediately after `process.run()` to persist exact ownership.
+    /// Foundation exposes no pre-exec group hook, so the post-spawn `setpgid`
+    /// attempt is accepted only when the kernel immediately certifies the root
+    /// as its own group leader. Failure kills the tree before any ledger row is
+    /// written; availability never overrides complete crash-recovery ownership.
     @discardableResult
-    public static func tagProcess(_ process: Process, now: Date = Date()) -> SpawnedProcessTag? {
+    public static func tagProcess(
+        _ process: Process,
+        provider: AgentProvider? = nil,
+        now: Date = Date()
+    ) throws -> SpawnedProcessTag {
         let pid = process.processIdentifier
-        guard pid > 0 else { return nil }
-        let rc = Darwin.setpgid(pid, 0)
-        guard rc == 0 || errno == EPERM else { return nil }
-        return SpawnedProcessTag(pgid: pid, spawnedAt: now)
+        guard pid > 0,
+              let startIdentity = ProviderProcessStartIdentity.read(pid: pid) else {
+            ProcessTerminator.terminateTreeImmediately(process)
+            throw ProviderProcessOwnershipError.startIdentityUnavailable(pid)
+        }
+        let ownerPID = ProcessInfo.processInfo.processIdentifier
+        guard let ownerStartIdentity = ProviderProcessStartIdentity.read(pid: ownerPID) else {
+            ProcessTerminator.terminateTreeImmediately(process)
+            throw ProviderProcessOwnershipError.startIdentityUnavailable(ownerPID)
+        }
+        guard let executablePath = ProviderProcessExecutablePath.read(pid: pid) else {
+            ProcessTerminator.terminateTreeImmediately(process)
+            throw ProviderProcessOwnershipError.executablePathUnavailable(pid)
+        }
+        let processGroup: pid_t
+        do {
+            processGroup = try certifyIsolatedProcessGroup(
+                pid: pid,
+                setProcessGroup: { Darwin.setpgid($0, 0) },
+                processGroup: Darwin.getpgid
+            )
+        } catch {
+            ProcessTerminator.terminateTreeImmediately(process)
+            throw error
+        }
+        let tag = SpawnedProcessTag(
+            pgid: pid,
+            spawnedAt: now,
+            ownerPID: ownerPID,
+            ownerStartIdentity: ownerStartIdentity,
+            provider: provider,
+            executablePath: executablePath,
+            startIdentity: startIdentity,
+            isolatedProcessGroup: processGroup
+        )
+        do {
+            try ProviderProcessOwnership.shared.record(tag)
+        } catch {
+            // A provider without a durable ownership row cannot be certified for
+            // cleanup after a host crash. Fail the spawn and synchronously reap
+            // the process instead of creating unowned background work.
+            ProcessTerminator.terminateTreeImmediately(process)
+            throw error
+        }
+        return tag
+    }
+
+    static func certifyIsolatedProcessGroup(
+        pid: pid_t,
+        setProcessGroup: (pid_t) -> Int32,
+        processGroup: (pid_t) -> pid_t
+    ) throws -> pid_t {
+        _ = setProcessGroup(pid)
+        let group = processGroup(pid)
+        guard group == pid else {
+            throw ProviderProcessOwnershipError.isolatedProcessGroupUnavailable(pid)
+        }
+        return group
     }
 
     /// Pure eligibility decision: a tagged process is reapable when
@@ -97,8 +204,55 @@ public enum AgentProviderAdapterError: Error, CustomStringConvertible {
     }
 }
 
+/// Provider-side fork is only safe to expose when repeating the same request
+/// key is guaranteed to return the same provider child. Without that contract,
+/// a crash after the provider response but before the local SQLite commit can
+/// orphan one child and create another on retry.
+public enum AgentProviderForkSafety: Sendable, Equatable {
+    case unsupported
+    case keyedIdempotent(compensationSupported: Bool)
+
+    public var supportsDurableFork: Bool {
+        if case .keyedIdempotent(let compensationSupported) = self {
+            return compensationSupported
+        }
+        return false
+    }
+
+    public var supportsCompensation: Bool {
+        if case .keyedIdempotent(let compensationSupported) = self {
+            return compensationSupported
+        }
+        return false
+    }
+}
+
+public struct AgentProviderForkRequest: Sendable, Equatable {
+    public let sourceThreadId: AgentThreadID
+    public let childThreadId: AgentThreadID
+    public let idempotencyKey: String
+    public let workingDirectory: String?
+    public let sourceProviderThreadId: String?
+
+    public init(
+        sourceThreadId: AgentThreadID,
+        childThreadId: AgentThreadID,
+        idempotencyKey: String,
+        workingDirectory: String? = nil,
+        sourceProviderThreadId: String? = nil
+    ) {
+        self.sourceThreadId = sourceThreadId
+        self.childThreadId = childThreadId
+        self.idempotencyKey = idempotencyKey
+        self.workingDirectory = workingDirectory
+        self.sourceProviderThreadId = sourceProviderThreadId
+    }
+}
+
 public protocol AgentProviderAdapter: AnyObject {
     var provider: AgentProvider { get }
+    var forkSafety: AgentProviderForkSafety { get }
+    func forkSafety(threadId: AgentThreadID) -> AgentProviderForkSafety
     func listModels() async -> [AgentModelDescriptor]
     func startSession(_ request: AgentRunRequest, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) async throws -> AgentRunHandle
     func sendTurn(_ request: AgentRunRequest, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) async throws -> AgentRunHandle
@@ -106,19 +260,50 @@ public protocol AgentProviderAdapter: AnyObject {
     func respondToRequest(threadId: AgentThreadID, requestId: String, response: AgentProviderRequestResponse) async throws
     func respondToUserInput(threadId: AgentThreadID, requestId: String, text: String) throws
     func respondToUserInput(threadId: AgentThreadID, requestId: String, verbatimText: String, outboundText: String) throws
+    func cancelUserInput(threadId: AgentThreadID, requestId: String) throws
     func stopSession(threadId: AgentThreadID) throws
     func recoverSession(_ request: AgentRunRequest, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) async throws
     func listSessions() -> [AgentProviderSessionSummary]
     func hasSession(threadId: AgentThreadID) -> Bool
     func readThread(threadId: AgentThreadID) async throws -> [AssistantEvent]
+    func forkThread(threadId: AgentThreadID) async throws -> String
+    func forkThread(_ request: AgentProviderForkRequest) async throws -> String
+    func compensateFork(_ request: AgentProviderForkRequest, providerChildThreadId: String) async throws
     func rollbackThread(threadId: AgentThreadID, toTurnId: String) async throws
     func stopAll()
+    func stopAllForAppTermination()
     func streamEvents(threadId: AgentThreadID, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) throws
 }
 
 public extension AgentProviderAdapter {
+    var forkSafety: AgentProviderForkSafety { .unsupported }
+
+    func forkSafety(threadId: AgentThreadID) -> AgentProviderForkSafety {
+        forkSafety
+    }
+
     func respondToUserInput(threadId: AgentThreadID, requestId: String, verbatimText: String, outboundText: String) throws {
         try respondToUserInput(threadId: threadId, requestId: requestId, text: verbatimText)
+    }
+
+    func cancelUserInput(threadId: AgentThreadID, requestId: String) throws {
+        throw AgentProviderAdapterError.unsupported("User input cancellation is not available for this provider session.")
+    }
+
+    func forkThread(threadId: AgentThreadID) async throws -> String {
+        throw AgentProviderAdapterError.unsupported("provider-native fork")
+    }
+
+    func forkThread(_ request: AgentProviderForkRequest) async throws -> String {
+        throw AgentProviderAdapterError.unsupported("crash-safe keyed provider fork")
+    }
+
+    func compensateFork(_ request: AgentProviderForkRequest, providerChildThreadId: String) async throws {
+        throw AgentProviderAdapterError.unsupported("idempotent provider fork compensation")
+    }
+
+    func stopAllForAppTermination() {
+        stopAll()
     }
 }
 
@@ -293,6 +478,20 @@ enum ProcessTerminator {
         }
     }
 
+    /// App termination cannot rely on the deferred escalation above: the app
+    /// process may exit before its asyncAfter block runs, leaving a provider
+    /// child alive for the next launch to rejoin. Preserve TERM-before-KILL,
+    /// but deliver both phases synchronously without sleeping on the main actor.
+    static func terminateTreeImmediately(_ process: Process) {
+        let pids = processTreePIDs(root: process.processIdentifier)
+        for step in terminationPlan(pids: pids, isAlive: { _ in true }, graceElapsed: false) {
+            kill(step.pid, step.signal)
+        }
+        for pid in pids {
+            kill(pid, SIGKILL)
+        }
+    }
+
     // Pure helper: builds the signal plan for a set of pids.
     // graceElapsed == false  -> phase 1: SIGTERM every pid.
     // graceElapsed == true   -> phase 2: SIGKILL only pids still alive (skip dead).
@@ -322,6 +521,88 @@ enum ProcessTerminator {
     // `internal` (not `private`) so tests can call it directly to verify provider wiring.
     static func processTreePIDs(root: Int32) -> [Int32] {
         childPIDProvider.directChildren(of: root).flatMap(processTreePIDs(root:)) + [root]
+    }
+
+    /// Tracks a provider tree across repeated teardown polls. `knownPIDs`
+    /// retains children after reparenting; an isolated process group catches a
+    /// child that forks during the root's TERM trap before the next tree scan.
+    struct TreeTracker {
+        let root: pid_t
+        let isolatedProcessGroup: pid_t?
+        private(set) var startIdentities: [pid_t: ProviderProcessStartIdentity] = [:]
+
+        init(root: pid_t) {
+            self.root = root
+            let group = Darwin.getpgid(root)
+            self.isolatedProcessGroup = group == root ? group : nil
+            refresh()
+        }
+
+        init(
+            root: pid_t,
+            isolatedProcessGroup: pid_t?,
+            initialPIDs: [pid_t],
+            identity: (pid_t) -> ProviderProcessStartIdentity?
+        ) {
+            self.root = root
+            self.isolatedProcessGroup = isolatedProcessGroup
+            for pid in initialPIDs {
+                if let value = identity(pid) { startIdentities[pid] = value }
+            }
+        }
+
+        mutating func refresh() {
+            refresh(
+                descendants: { ProcessTerminator.processTreePIDs(root: $0) },
+                processGroupMembers: ProcessTerminator.processGroupPIDs,
+                identity: { ProviderProcessStartIdentity.read(pid: $0) }
+            )
+        }
+
+        mutating func refresh(
+            descendants: (pid_t) -> [pid_t],
+            processGroupMembers: (pid_t) -> [pid_t],
+            identity: (pid_t) -> ProviderProcessStartIdentity?
+        ) {
+            var candidates = descendants(root)
+            if let isolatedProcessGroup {
+                candidates.append(contentsOf: processGroupMembers(isolatedProcessGroup))
+            }
+            candidates.append(root)
+            for pid in Set(candidates) where pid > 0 && pid != ProcessInfo.processInfo.processIdentifier {
+                if startIdentities[pid] == nil, let value = identity(pid) {
+                    startIdentities[pid] = value
+                }
+            }
+        }
+
+        func survivingPIDs(
+            identity: (pid_t) -> ProviderProcessStartIdentity? = {
+                ProviderProcessStartIdentity.read(pid: $0)
+            }
+        ) -> [pid_t] {
+            startIdentities.compactMap { pid, expected in
+                identity(pid) == expected ? pid : nil
+            }.sorted()
+        }
+
+        func signalSurvivors(_ signal: Int32) {
+            for pid in survivingPIDs().reversed() {
+                _ = Darwin.kill(pid, signal)
+            }
+        }
+    }
+
+    static func processGroupPIDs(_ group: pid_t) -> [pid_t] {
+        guard group > 0 else { return [] }
+        let estimatedCount = max(1, Int(proc_listallpids(nil, 0)))
+        var pids = [pid_t](repeating: 0, count: estimatedCount * 2)
+        let count = proc_listallpids(
+            &pids,
+            Int32(pids.count * MemoryLayout<pid_t>.size)
+        )
+        guard count > 0 else { return [] }
+        return pids.prefix(Int(count)).filter { $0 > 0 && Darwin.getpgid($0) == group }
     }
 
     // MARK: - Child-PID provider seam

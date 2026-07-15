@@ -84,6 +84,7 @@ final class DegradedFixtureTests: XCTestCase {
         XCTAssertTrue(try preSt.step())
         XCTAssertEqual(Int(preSt.columnInt64(0)), 13,
             "pre-condition: fixture DB must be at schema v13 before the forward migration runs")
+        preSt.reset()
 
         // Forward migrate to currentVersion.
         try Schema.migrate(built.db)

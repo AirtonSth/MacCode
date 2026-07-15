@@ -47,6 +47,20 @@ final class AgentAppPerfBundleTests: XCTestCase {
             workspaceID: workspaceID, cwd: tmp,
             coordinator: coord, threadRepo: threadRepo, messageRepo: messageRepo
         )
+        vm.providerSnapshots = [
+            AgentProviderSnapshotFactory.snapshot(
+                provider: .codex,
+                models: [AgentModelDescriptor(id: "gpt-5.5", label: "GPT-5.5", provider: .codex)],
+                binaryPath: "/usr/bin/true",
+                authenticated: true
+            ),
+            AgentProviderSnapshotFactory.snapshot(
+                provider: .claude,
+                models: [AgentModelDescriptor(id: "claude-sonnet-4-6", label: "Claude Sonnet 4.6", provider: .claude)],
+                binaryPath: "/usr/bin/true",
+                authenticated: true
+            )
+        ]
         return (vm, threadRepo)
     }
 

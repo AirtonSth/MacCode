@@ -17,6 +17,38 @@ import AgentRuntime
 ///  UX-SR1-BADGE — showsTranslatedBadge: true=>true, false=>false
 @MainActor
 final class AgentAppUXGapsTests: XCTestCase {
+    func test_imageViewPresentationUsesBasenameAndKeepsPrivateActionURL() throws {
+        let item = AssistantItem(
+            id: "generated-image",
+            turnId: "turn-1",
+            type: .imageView,
+            state: .completed,
+            summary: "generated.png",
+            resourcePath: "/Users/private/work/generated.png",
+            startedAtMs: 1,
+            finishedAtMs: 2
+        )
+
+        let presentation = try XCTUnwrap(AgentImageViewPresentation.make(for: item))
+        XCTAssertEqual(presentation.displayName, "generated.png")
+        XCTAssertEqual(presentation.resourceURL.path, "/Users/private/work/generated.png")
+        let timeline = AgentTimelineItemPresentation.make(for: item)
+        XCTAssertFalse(timeline.label.contains("/Users/private"),
+                       "normal transcript text must never expose the private image path")
+        XCTAssertFalse(timeline.detail?.contains("/Users/private") == true)
+    }
+
+    func test_statusAndEmptyQueueErrorsRemainRenderEligible() {
+        XCTAssertEqual(AgentAppView.visibleStatusMessage("  Disk full while saving draft.  "),
+                       "Disk full while saving draft.",
+                       "the primary status channel must produce visible banner text")
+        XCTAssertNil(AgentAppView.visibleStatusMessage("   "))
+        XCTAssertEqual(AgentAppView.standaloneQueueStatusMessage("Queue send failed: disk full", queuedCount: 0),
+                       "Queue send failed: disk full",
+                       "the first queue insertion error must remain visible even when no row exists")
+        XCTAssertNil(AgentAppView.standaloneQueueStatusMessage("Queued", queuedCount: 1),
+                     "non-empty queues render their status inside the queue section, not twice")
+    }
 
     // MARK: - Helpers
 
@@ -50,7 +82,7 @@ final class AgentAppUXGapsTests: XCTestCase {
 
     // MARK: - P1: retry warns when original message had attachments
 
-    func test_retryLastPrompt_postsSystemNoteWhenOriginalHadAttachments() async throws {
+    func test_retryLastPrompt_requiresConfirmationBeforeDroppingLegacyAttachments() async throws {
         let tmp = NSTemporaryDirectory() + "rc2-uxgaps-retry-" + UUID().uuidString
         let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
         let threadRepo  = AgentThreadRepository(db: db)
@@ -79,12 +111,16 @@ final class AgentAppUXGapsTests: XCTestCase {
 
         await vm.retryLastPrompt()
 
+        XCTAssertEqual(vm.pendingAttachmentRetryConfirmation?.unavailableAttachmentNames, ["previous attachments"],
+                       "legacy attachment metadata must pause retry instead of silently dropping the original files")
+        XCTAssertFalse(vm.messages.contains { $0.role == .system && $0.content.contains("attachment") },
+                       "the omission note must not claim a retry happened before the user confirms it")
+
+        await vm.confirmRetryWithoutUnavailableAttachments()
+
         let systemNote = vm.messages.first { $0.role == .system && $0.content.contains("attachment") }
         XCTAssertNotNil(systemNote,
-                        "retryLastPrompt must post a system note warning about dropped attachments when lastSentAttachmentCount > 0")
-        let noteContent = systemNote?.content ?? ""
-        XCTAssert(noteContent.contains("2"),
-                  "system note must mention the attachment count; got: \"\(noteContent)\"")
+                        "the transcript must record the attachment omission after the user explicitly confirms it")
     }
 
     func test_retryLastPrompt_noNoteWhenNoAttachments() async throws {
@@ -313,6 +349,45 @@ final class AgentAppUXGapsTests: XCTestCase {
             message,
             "Prompt history could not be saved: disk full.",
             "Prompt-history write failures must produce user-visible status copy instead of being swallowed"
+        )
+    }
+
+    func test_fullAccessScopeCopy_matchesPersistedThreadSetting() {
+        XCTAssertEqual(
+            AgentAppView.fullAccessScopeDescription,
+            "The agent runs tools and edits without asking for this thread until you change it.",
+            "full-access copy must describe the persisted thread scope instead of promising a process session scope"
+        )
+        XCTAssertEqual(
+            AgentAppView.sessionApprovalHelp,
+            "Auto-approve requests for this thread until you change it",
+            "Approve Session help must describe the same persisted thread scope as the resulting setting"
+        )
+    }
+
+    func test_threadDeletionConfirmationCopy_matchesImmediateUndoWindow() {
+        XCTAssertEqual(
+            AgentAppView.threadDeletionConfirmationDescription,
+            "Threads are deleted immediately. You can undo for 10 seconds; after that, their history is permanently deleted.",
+            "delete confirmation must disclose the real immediate delete, brief Undo, and permanent expiry behavior"
+        )
+        XCTAssertEqual(AgentAppViewModel.threadDeletionUndoWindow, 10,
+                       "the disclosed Undo duration must stay aligned with the runtime window")
+    }
+
+    func test_emptyThreadCopy_namesEverySupportedProvider() {
+        XCTAssertEqual(
+            AgentAppView.emptyThreadSubtitle,
+            "Send a prompt to start a Codex, Claude, or Grok thread.",
+            "the empty state must not hide Grok from the supported-provider set"
+        )
+    }
+
+    func test_attachmentRemovalAccessibilityLabel_includesFilename() {
+        XCTAssertEqual(
+            AgentAppView.attachmentRemovalAccessibilityLabel(path: "/private/tmp/quarterly-plan.pdf"),
+            "Remove attachment quarterly-plan.pdf",
+            "VoiceOver users must know which attachment each remove button targets"
         )
     }
 }

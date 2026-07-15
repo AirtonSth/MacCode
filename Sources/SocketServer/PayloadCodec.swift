@@ -1,7 +1,9 @@
 import Foundation
+import Compression
 
 public enum PayloadCodecError: Error, Equatable {
     case invalidData
+    case outputTooLarge(maximum: Int)
     case sizeMismatch(expected: Int, actual: Int)
     case unsupported(String)
 }
@@ -32,21 +34,31 @@ public struct PayloadCodec: Sendable, Equatable {
         }
     }
 
-    public func decode(_ data: Data, expectedSize: Int?) throws -> Data {
+    public func decode(
+        _ data: Data,
+        expectedSize: Int?,
+        maximumSize: Int? = nil
+    ) throws -> Data {
+        if let maximumSize, let expectedSize, expectedSize > maximumSize {
+            throw PayloadCodecError.outputTooLarge(maximum: maximumSize)
+        }
         let decoded: Data
         switch wireName {
         case Self.identity.wireName:
             decoded = data
         case Self.gzip.wireName:
-            decoded = try Self.decodeGzip(data)
+            decoded = try Self.decodeGzip(data, maximumSize: maximumSize)
         case Self.lzfse.wireName:
-            do {
-                decoded = try (data as NSData).decompressed(using: .lzfse) as Data
-            } catch {
-                throw PayloadCodecError.invalidData
-            }
+            decoded = try Self.decodeCompressed(
+                data,
+                algorithm: COMPRESSION_LZFSE,
+                maximumSize: maximumSize
+            )
         default:
             throw PayloadCodecError.unsupported(wireName)
+        }
+        if let maximumSize, decoded.count > maximumSize {
+            throw PayloadCodecError.outputTooLarge(maximum: maximumSize)
         }
         if let expectedSize, decoded.count != expectedSize {
             throw PayloadCodecError.sizeMismatch(expected: expectedSize, actual: decoded.count)
@@ -101,7 +113,7 @@ public struct PayloadCodec: Sendable, Equatable {
         return out
     }
 
-    private static func decodeGzip(_ data: Data) throws -> Data {
+    private static func decodeGzip(_ data: Data, maximumSize: Int?) throws -> Data {
         guard data.count >= 18,
               data[0] == 0x1f,
               data[1] == 0x8b,
@@ -125,11 +137,65 @@ public struct PayloadCodec: Sendable, Equatable {
         }
         if flags & 0x02 != 0 { index += 2 }
         guard index <= data.count - 8 else { throw PayloadCodecError.invalidData }
-        do {
-            let body = Data(data[index..<(data.count - 8)])
-            return try (body as NSData).decompressed(using: .zlib) as Data
-        } catch {
+        let body = Data(data[index..<(data.count - 8)])
+        return try decodeCompressed(
+            body,
+            algorithm: COMPRESSION_ZLIB,
+            maximumSize: maximumSize
+        )
+    }
+
+    private static func decodeCompressed(
+        _ data: Data,
+        algorithm: compression_algorithm,
+        maximumSize: Int?
+    ) throws -> Data {
+        var stream = compression_stream()
+        guard compression_stream_init(&stream, COMPRESSION_STREAM_DECODE, algorithm) != COMPRESSION_STATUS_ERROR else {
             throw PayloadCodecError.invalidData
+        }
+        defer { compression_stream_destroy(&stream) }
+
+        let chunkSize = 64 * 1024
+        let outputBuffer = UnsafeMutablePointer<UInt8>.allocate(capacity: chunkSize)
+        defer { outputBuffer.deallocate() }
+
+        return try data.withUnsafeBytes { rawBuffer in
+            guard let source = rawBuffer.bindMemory(to: UInt8.self).baseAddress else {
+                throw PayloadCodecError.invalidData
+            }
+            stream.src_ptr = source
+            stream.src_size = data.count
+            var output = Data()
+
+            while true {
+                stream.dst_ptr = outputBuffer
+                stream.dst_size = chunkSize
+                let sourceSizeBefore = stream.src_size
+                let status = compression_stream_process(
+                    &stream,
+                    Int32(COMPRESSION_STREAM_FINALIZE.rawValue)
+                )
+                let produced = chunkSize - stream.dst_size
+                if produced > 0 {
+                    if let maximumSize,
+                       (produced > maximumSize || output.count > maximumSize - produced) {
+                        throw PayloadCodecError.outputTooLarge(maximum: maximumSize)
+                    }
+                    output.append(outputBuffer, count: produced)
+                }
+
+                switch status {
+                case COMPRESSION_STATUS_END:
+                    return output
+                case COMPRESSION_STATUS_OK:
+                    guard produced > 0 || stream.src_size < sourceSizeBefore else {
+                        throw PayloadCodecError.invalidData
+                    }
+                default:
+                    throw PayloadCodecError.invalidData
+                }
+            }
         }
     }
 

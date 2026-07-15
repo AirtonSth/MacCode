@@ -66,4 +66,20 @@ final class AgentProviderRunnerTerminateTreeTests: XCTestCase {
                        "SIGTERM must be delivered synchronously — a cooperative process has to exit " +
                        "well before the 5s grace window, otherwise graceful shutdown was deferred too")
     }
+
+    func test_terminateTreeImmediatelyKillsTermIgnoringProviderBeforeAppCanExit() throws {
+        let proc = try spawnShell("trap '' TERM; while :; do sleep 0.1; done")
+        defer { kill(proc.processIdentifier, SIGKILL) }
+        Thread.sleep(forTimeInterval: 0.3)
+
+        let started = Date()
+        ProcessTerminator.terminateTreeImmediately(proc)
+        let elapsed = Date().timeIntervalSince(started)
+
+        XCTAssertLessThan(elapsed, 0.5,
+                          "app termination must synchronously deliver final signals without sleeping on the main actor")
+        waitUntilExited(proc, timeout: 2)
+        XCTAssertFalse(proc.isRunning,
+                       "a provider that ignores SIGTERM must be dead before a fast relaunch can rejoin its stale process")
+    }
 }

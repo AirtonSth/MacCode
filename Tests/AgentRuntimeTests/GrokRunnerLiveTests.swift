@@ -4,7 +4,224 @@ import CoreModel
 
 /// Live smoke against the real `grok` binary when present and authenticated.
 /// Skips cleanly when the binary or auth is unavailable.
-final class GrokRunnerLiveTests: XCTestCase {
+final class GrokRunnerLiveTests: ProviderProcessTestCase {
+
+    func test_realGrokACPDiscoveryPublishesNegotiatedCapabilitiesOnly() async throws {
+        guard let path = ProcessLocator.resolve("grok") else {
+            throw XCTSkip("grok binary not on PATH; skip native ACP discovery")
+        }
+        let discovery = await GrokACPAdapter(
+            binaryNameOverride: path,
+            discoveryCwd: FileManager.default.temporaryDirectory.path,
+            modelCacheTTL: 0
+        ).discoveryResult()
+
+        XCTAssertFalse(discovery.isFallback, "authenticated ACP discovery must not silently use static models")
+        XCTAssertFalse(discovery.models.isEmpty)
+        XCTAssertTrue(discovery.permissionModes.contains(.supervised))
+        XCTAssertEqual(
+            discovery.capabilities.supportsPlanReview,
+            discovery.interactionModes.contains(.plan),
+            "the provider card and /plan gate must derive from the same negotiated session mode state"
+        )
+    }
+
+    func test_realGrokACPEmbeddedAttachmentAndStreaming() async throws {
+        guard let path = ProcessLocator.resolve("grok") else {
+            throw XCTSkip("grok binary not on PATH; skip native ACP canary")
+        }
+        let cwd = FileManager.default.temporaryDirectory
+            .appendingPathComponent("grok-acp-live-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: cwd, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: cwd) }
+        let attachment = cwd.appendingPathComponent("known.txt")
+        let nonce = "ACP_FILE_42A7"
+        try Data(nonce.utf8).write(to: attachment)
+
+        let adapter = GrokACPAdapter(binaryNameOverride: path)
+        defer { adapter.stopAll() }
+        let request = AgentRunRequest(
+            threadId: AgentThreadID(),
+            provider: .grok,
+            model: "grok-4.5",
+            cwd: cwd.path,
+            prompt: "Read the embedded attachment and reply with exactly its content, nothing else.",
+            attachments: [AgentAttachment(path: attachment.path, kind: .file, mimeType: "text/plain")],
+            permissionMode: .supervised,
+            providerBinary: path
+        )
+        let box = EventBox()
+        do {
+            _ = try await adapter.startSession(request) { box.append($0) }
+        } catch {
+            let text = String(describing: error)
+            if text.localizedCaseInsensitiveContains("auth") || text.localizedCaseInsensitiveContains("login") {
+                throw XCTSkip("grok present but not authenticated: \(text)")
+            }
+            throw error
+        }
+        try await box.waitFinished(timeout: 90)
+        let finished = try XCTUnwrap(box.finished, "native Grok ACP canary must finish within 90s")
+        if finished.status == .failed {
+            let errors = box.errors.joined(separator: "\n")
+            if errors.localizedCaseInsensitiveContains("auth") || errors.localizedCaseInsensitiveContains("login") {
+                throw XCTSkip("grok present but not authenticated: \(errors)")
+            }
+            XCTFail("native Grok ACP failed: \(errors)")
+            return
+        }
+        XCTAssertEqual(finished.status, .completed)
+        XCTAssertNotNil(finished.providerThreadId)
+        XCTAssertTrue((finished.finalMessage ?? box.assistantText).contains(nonce),
+                      "real ACP response must depend on embedded attachment bytes")
+    }
+
+    func test_realGrokACPToolCallAppearsInTimelineAndChangesWorkspace() async throws {
+        guard let path = ProcessLocator.resolve("grok") else {
+            throw XCTSkip("grok binary not on PATH; skip native ACP tool canary")
+        }
+        let cwd = FileManager.default.temporaryDirectory
+            .appendingPathComponent("grok-acp-tool-live-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: cwd, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: cwd) }
+        let output = cwd.appendingPathComponent("tool-proof.txt")
+        let nonce = "RC_GROK_ACP_TOOL_42A7"
+
+        let adapter = GrokACPAdapter(binaryNameOverride: path)
+        defer { adapter.stopAll() }
+        let request = AgentRunRequest(
+            threadId: AgentThreadID(),
+            provider: .grok,
+            model: "grok-4.5",
+            cwd: cwd.path,
+            prompt: "Use a shell tool to write exactly \(nonce) into tool-proof.txt, then reply exactly \(nonce).",
+            permissionMode: .supervised,
+            providerBinary: path
+        )
+        let box = EventBox()
+        do {
+            _ = try await adapter.startSession(request) { event in
+                box.append(event)
+                if case .event(.requestOpened(let pending)) = event {
+                    Task {
+                        try? await adapter.respondToRequest(
+                            threadId: request.threadId,
+                            requestId: pending.id,
+                            response: .approve
+                        )
+                    }
+                }
+            }
+        } catch {
+            let text = String(describing: error)
+            if text.localizedCaseInsensitiveContains("auth") || text.localizedCaseInsensitiveContains("login") {
+                throw XCTSkip("grok present but not authenticated: \(text)")
+            }
+            throw error
+        }
+        try await box.waitFinished(timeout: 90)
+        let finished = try XCTUnwrap(box.finished, "native Grok ACP tool canary must finish within 90s")
+        XCTAssertEqual(finished.status, .completed, "real Grok ACP tool turn failed: \(box.errors)")
+        XCTAssertEqual(try String(contentsOf: output, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines), nonce,
+                       "the real tool call must produce the requested workspace mutation")
+        XCTAssertTrue(box.events.contains { event in
+            guard case .event(.itemStarted(let item)) = event else { return false }
+            return item.type == .tool || item.type == .commandExecution
+        }, "a real Grok ACP tool_call must render as timeline work instead of remaining invisible")
+    }
+
+    func test_realGrokACPPlanReviewResumesIntoImplementation() async throws {
+        guard let path = ProcessLocator.resolve("grok") else {
+            throw XCTSkip("grok binary not on PATH; skip native ACP plan review")
+        }
+        let cwd = FileManager.default.temporaryDirectory
+            .appendingPathComponent("grok-acp-plan-live-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: cwd, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: cwd) }
+        let output = cwd.appendingPathComponent("plan-proof.txt")
+        let nonce = "RC_GROK_PLAN_42A7"
+        let threadId = AgentThreadID()
+        let adapter = GrokACPAdapter(binaryNameOverride: path)
+        defer { adapter.stopAll() }
+        let planRequest = AgentRunRequest(
+            threadId: threadId,
+            provider: .grok,
+            model: "grok-4.5",
+            cwd: cwd.path,
+            prompt: "Propose a short two-step plan to create plan-proof.txt containing \(nonce). Do not execute it yet.",
+            permissionMode: .supervised,
+            interactionMode: .plan,
+            providerBinary: path
+        )
+
+        let discovery = await adapter.discoveryResult()
+        if !discovery.capabilities.supportsPlanReview {
+            XCTAssertFalse(discovery.interactionModes.contains(.plan),
+                           "Plan must stay capability-gated when the live ACP session does not advertise modes")
+            do {
+                _ = try await adapter.startSession(planRequest) { _ in }
+                XCTFail("a live ACP session without Plan capability must reject Plan before provider execution")
+            } catch let error as AgentProviderAdapterError {
+                guard case .unsupported(let message) = error else {
+                    return XCTFail("expected an explicit unsupported result, got \(error)")
+                }
+                XCTAssertTrue(message.contains("did not advertise Plan mode"))
+            }
+            XCTAssertFalse(FileManager.default.fileExists(atPath: output.path),
+                           "an unsupported Plan request must not mutate the workspace")
+            return
+        }
+
+        let planBox = EventBox()
+        do {
+            _ = try await adapter.startSession(planRequest) { planBox.append($0) }
+        } catch {
+            let text = String(describing: error)
+            if text.localizedCaseInsensitiveContains("auth") || text.localizedCaseInsensitiveContains("login") {
+                throw XCTSkip("grok present but not authenticated: \(text)")
+            }
+            throw error
+        }
+        try await planBox.waitFinished(timeout: 90)
+        let planned = try XCTUnwrap(planBox.finished, "real Grok Plan turn must finish within 90s")
+        XCTAssertEqual(planned.status, .completed, "real Grok Plan failed: \(planBox.errors)")
+        XCTAssertTrue(planBox.hasProposedPlan,
+                      "the negotiated ACP Plan mode must publish a proposedPlan event for sidebar review")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: output.path),
+                       "Plan mode must not execute the proposed workspace mutation before approval")
+        let providerThreadId = try XCTUnwrap(planned.providerThreadId)
+
+        let implementationBox = EventBox()
+        _ = try await adapter.sendTurn(AgentRunRequest(
+            threadId: threadId,
+            provider: .grok,
+            model: "grok-4.5",
+            cwd: cwd.path,
+            prompt: "The plan is approved. Implement it now and write exactly \(nonce) to plan-proof.txt.",
+            providerThreadId: providerThreadId,
+            permissionMode: .supervised,
+            interactionMode: .default,
+            providerBinary: path
+        )) { event in
+            implementationBox.append(event)
+            if case .event(.requestOpened(let pending)) = event {
+                Task {
+                    try? await adapter.respondToRequest(
+                        threadId: threadId,
+                        requestId: pending.id,
+                        response: .approve
+                    )
+                }
+            }
+        }
+        try await implementationBox.waitFinished(timeout: 90)
+        let implemented = try XCTUnwrap(implementationBox.finished)
+        XCTAssertEqual(implemented.status, .completed, "approved Grok plan implementation failed: \(implementationBox.errors)")
+        XCTAssertEqual(implemented.providerThreadId, providerThreadId,
+                       "plan review and implementation must retain one provider session")
+        XCTAssertEqual(try String(contentsOf: output, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines), nonce,
+                       "approved plan implementation must produce the requested real workspace change")
+    }
 
     func test_realGrokOneShotProducesAssistantTextAndSessionId() async throws {
         guard let path = ProcessLocator.resolve("grok") else {
@@ -88,10 +305,15 @@ final class GrokRunnerLiveTests: XCTestCase {
         handle.cancel()
         try await box.waitFinished(timeout: 30)
         let finished = try XCTUnwrap(box.finished, "cancel must produce a finished event")
-        XCTAssertTrue(
-            finished.status == .cancelled || finished.status == .completed || finished.status == .failed,
-            "stop path must not hang the host; got \(finished.status)"
-        )
+        if finished.status == .failed {
+            let errors = box.errors.joined(separator: "\n")
+            if errors.localizedCaseInsensitiveContains("auth")
+                || errors.localizedCaseInsensitiveContains("login") {
+                throw XCTSkip("grok present but not authenticated: \(errors)")
+            }
+        }
+        XCTAssertEqual(finished.status, .cancelled,
+                       "a real user stop must end as cancelled, not merely any terminal state; errors=\(box.errors)")
     }
 
     func test_realGrokMultiTurnResumeKeepsSession() async throws {
@@ -125,7 +347,8 @@ final class GrokRunnerLiveTests: XCTestCase {
             if errs.localizedCaseInsensitiveContains("auth") || errs.localizedCaseInsensitiveContains("login") {
                 throw XCTSkip("grok not authenticated: \(errs)")
             }
-            throw XCTSkip("turn1 incomplete: \(String(describing: box1.finished)) errs=\(errs)")
+            XCTFail("real Grok turn 1 must complete with a resumable session; got \(String(describing: box1.finished)) errors=\(errs)")
+            return
         }
 
         // Turn 2 with resume
@@ -158,6 +381,15 @@ private final class EventBox: @unchecked Sendable {
     private(set) var finished: (status: AgentRunStatus, finalMessage: String?, providerThreadId: String?)?
     private(set) var errors: [String] = []
     private(set) var assistantText = ""
+
+    var hasProposedPlan: Bool {
+        lock.withLock {
+            events.contains { event in
+                if case .event(.proposedPlan) = event { return true }
+                return false
+            }
+        }
+    }
 
     func append(_ event: AgentRunEvent) {
         lock.lock(); defer { lock.unlock() }

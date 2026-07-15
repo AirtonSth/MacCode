@@ -2,6 +2,7 @@ import XCTest
 @testable import Surfaces
 import AgentRuntime
 import CoreModel
+import Persistence
 
 /// Tests for UX-MAC_AGENT-CONTINUE: showsContinueAction seam.
 ///
@@ -13,6 +14,7 @@ import CoreModel
 ///   true  when the thread has a recoverable context AND no run is active
 ///   false when the run is already active (Continue would start a duplicate run)
 ///   false when there is no recoverable context (nothing to resume)
+@MainActor
 final class AgentAppContinueActionTests: XCTestCase {
 
     // MARK: - showsContinueAction seam
@@ -52,6 +54,216 @@ final class AgentAppContinueActionTests: XCTestCase {
         XCTAssertFalse(
             AgentAppViewModel.showsContinueAction(hasRecoverableContext: false, runActive: true),
             "Continue must be hidden when there is no recoverable context and a run is active"
+        )
+    }
+
+    func test_interruptedRecoverableThreadDefersProviderSnapshotUntilContinueOwnsRecovery() {
+        XCTAssertFalse(AgentAppViewModel.shouldReadProviderSnapshot(hasRecoverableContext: true),
+                       "an interrupted thread must not race background snapshot recovery against Continue")
+        XCTAssertTrue(AgentAppViewModel.shouldReadProviderSnapshot(hasRecoverableContext: false),
+                      "normal live and completed threads must keep provider snapshot refresh")
+    }
+
+    func test_displayedErrorRecoverabilityRestoresRetryFromPersistedReplay() {
+        let replay: [AssistantEvent] = [
+            .turnStarted(turnId: "turn-1"),
+            .error(message: "temporary network failure", recoverable: true),
+            .providerRuntime(ProviderRuntimeEvent(
+                id: "runtime-after-error",
+                provider: .claude,
+                source: "claude.agent-sdk",
+                method: "status",
+                payloadJSON: "{}",
+                receivedAtMs: 1
+            ))
+        ]
+
+        XCTAssertTrue(AgentAppViewModel.displayedErrorIsRecoverable(in: replay),
+                      "thread switching and relaunch must restore Retry from the recoverable error that still owns the displayed banner")
+        XCTAssertFalse(AgentAppViewModel.displayedErrorIsRecoverable(in: replay + [
+            .error(message: "fatal", recoverable: false)
+        ]), "a later fatal error replaces the banner and must hide Retry")
+    }
+
+    func test_unavailableProviderDoesNotConsumeContinueRecoveryAction() async throws {
+        let fixture = try makeRecoverableContinueFixture(runner: FakeProviderRunner(provider: .codex))
+        fixture.vm.providerSnapshots = [providerSnapshot(status: .unavailable, installed: false)]
+
+        XCTAssertTrue(fixture.vm.selectedThreadHasRecoverableContext)
+        await fixture.vm.continueInterruptedThread()
+
+        XCTAssertTrue(fixture.vm.selectedThreadHasRecoverableContext,
+                      "an unavailable provider guard must leave Continue visible for the same interrupted thread")
+        XCTAssertTrue(fixture.coordinator.hasRecoverableContext(threadId: fixture.threadId),
+                      "a UI availability failure must not consume the durable provider cursor")
+        XCTAssertTrue(fixture.vm.statusMessage.contains("unavailable"))
+    }
+
+    func test_throwingProviderStartDoesNotConsumeContinueRecoveryAction() async throws {
+        let fixture = try makeRecoverableContinueFixture(runner: ContinueStartFailingRunner())
+        fixture.vm.providerSnapshots = [providerSnapshot(status: .available, installed: true)]
+
+        await fixture.vm.continueInterruptedThread()
+
+        XCTAssertTrue(fixture.vm.selectedThreadHasRecoverableContext,
+                      "a transient provider start failure must restore Continue on the same selected thread")
+        XCTAssertTrue(fixture.coordinator.hasRecoverableContext(threadId: fixture.threadId),
+                      "the failed attempt must preserve the durable cursor for a later retry")
+        XCTAssertTrue(fixture.vm.statusMessage.contains("Failed to start"))
+    }
+
+    func test_checkpointRevertRequiresNegotiatedProviderRollbackCapability() {
+        XCTAssertFalse(AgentAppViewModel.canRevertCheckpoint(
+            status: .ready,
+            capabilities: .conservative
+        ), "Grok and unknown provider contracts must not expose a Revert action that the adapter will reject")
+        XCTAssertTrue(AgentAppViewModel.canRevertCheckpoint(
+            status: .ready,
+            capabilities: AgentProviderCapabilities(supportsRollback: true)
+        ))
+        XCTAssertFalse(AgentAppViewModel.canRevertCheckpoint(
+            status: .error,
+            capabilities: AgentProviderCapabilities(supportsRollback: true)
+        ), "provider capability cannot make a failed checkpoint restorable")
+    }
+
+    func test_providerSnapshotFailureMessageDeclaresStaleStateAndLastConfirmation() {
+        let message = AgentAppViewModel.providerThreadSnapshotFailureMessage(
+            lastConfirmedAt: Date(timeIntervalSince1970: 1_700_000_000)
+        )
+        XCTAssertTrue(message.contains("Provider snapshot unavailable"))
+        XCTAssertTrue(message.contains("Showing persisted local state"),
+                      "a readThread failure must not silently present local replay as provider-confirmed current state")
+        XCTAssertFalse(message.contains("not yet confirmed"),
+                       "a known confirmation timestamp must be rendered instead of erased")
+        XCTAssertTrue(AgentAppViewModel.providerThreadSnapshotFailureMessage(lastConfirmedAt: nil)
+            .contains("not yet confirmed this session"))
+    }
+
+    func test_readThreadFailureSurfacesStaleStateAndRetryInsteadOfFailingSilently() async throws {
+        let tmp = NSTemporaryDirectory() + "rc2-provider-snapshot-failure-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let workspaceID = WorkspaceID()
+        let thread = AgentThread(
+            workspaceId: workspaceID,
+            title: "provider context",
+            provider: .codex,
+            model: "gpt-5.5",
+            providerThreadId: "codex-thread-stale"
+        )
+        try threadRepo.upsert(thread)
+        let coordinator = AgentRunCoordinator(
+            runRepo: runRepo,
+            messageRepo: messageRepo,
+            threadRepo: threadRepo,
+            providers: [.codex: FakeProviderRunner(provider: .codex)]
+        )
+        let vm = AgentAppViewModel(
+            workspaceID: workspaceID,
+            cwd: tmp,
+            coordinator: coordinator,
+            threadRepo: threadRepo,
+            messageRepo: messageRepo,
+            initialThreadId: thread.id
+        )
+
+        let deadline = Date().addingTimeInterval(2)
+        while vm.providerThreadSnapshotStatusMessage == nil, Date() < deadline {
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+
+        XCTAssertTrue(vm.providerThreadSnapshotStatusMessage?.contains("Showing persisted local state") == true,
+                      "readThread failure must render explicit stale state with a Retry action")
+        XCTAssertNil(vm.providerThreadSnapshotLastConfirmedAt,
+                     "a failed provider read must not invent a confirmation timestamp")
+    }
+
+    private func makeRecoverableContinueFixture(
+        runner: AgentProviderRunner
+    ) throws -> (vm: AgentAppViewModel, coordinator: AgentRunCoordinator, threadId: AgentThreadID) {
+        let tmp = NSTemporaryDirectory() + "rc2-continue-action-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let sessionRepo = ProviderSessionRuntimeRepository(db: db)
+        let workspaceID = WorkspaceID()
+        var thread = AgentThread(
+            workspaceId: workspaceID,
+            title: "recoverable",
+            provider: .codex,
+            model: "gpt-5.5",
+            providerThreadId: "codex-recovery-cursor"
+        )
+        thread.status = .interrupted
+        try threadRepo.upsert(thread)
+        try sessionRepo.upsert(ProviderSessionRuntime(
+            threadId: thread.id,
+            provider: .codex,
+            status: .interrupted,
+            resumeCursor: "codex-recovery-cursor",
+            cwd: tmp,
+            model: "gpt-5.5"
+        ))
+        let coordinator = AgentRunCoordinator(
+            runRepo: runRepo,
+            messageRepo: messageRepo,
+            threadRepo: threadRepo,
+            providerSessionRepo: sessionRepo,
+            providers: [.codex: runner]
+        )
+        let vm = AgentAppViewModel(
+            workspaceID: workspaceID,
+            cwd: tmp,
+            coordinator: coordinator,
+            threadRepo: threadRepo,
+            messageRepo: messageRepo,
+            initialThreadId: thread.id
+        )
+        return (vm, coordinator, thread.id)
+    }
+
+    private func providerSnapshot(
+        status: AgentProviderSnapshotStatus,
+        installed: Bool
+    ) -> AgentProviderSnapshot {
+        AgentProviderSnapshot(
+            id: AgentProvider.codex.rawValue,
+            provider: .codex,
+            driverKind: .codexCLI,
+            displayName: "Codex",
+            accentColor: "#2F80ED",
+            continuationGroup: "codex",
+            interactionModes: [.default, .plan],
+            permissionModes: [.supervised],
+            enabled: true,
+            installed: installed,
+            status: status,
+            statusDetail: status == .unavailable ? "Codex is unavailable." : nil,
+            authenticated: true,
+            models: [AgentModelDescriptor(id: "gpt-5.5", label: "GPT-5.5", provider: .codex)],
+            slashCommands: [],
+            capabilities: AgentProviderCapabilities(supportsStreaming: true)
+        )
+    }
+}
+
+private final class ContinueStartFailingRunner: AgentProviderRunner, @unchecked Sendable {
+    let provider: AgentProvider = .codex
+
+    func listModels() async -> [AgentModelDescriptor] { [] }
+
+    func startRun(
+        _ request: AgentRunRequest,
+        onEvent: @escaping @Sendable (AgentRunEvent) -> Void
+    ) async throws -> AgentRunHandle {
+        throw NSError(
+            domain: "RemoteCode.ContinueStartFailingRunner",
+            code: 1,
+            userInfo: [NSLocalizedDescriptionKey: "simulated transient provider start failure"]
         )
     }
 }

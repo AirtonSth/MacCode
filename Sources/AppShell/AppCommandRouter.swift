@@ -47,6 +47,42 @@ private struct ProviderProbeCapabilities {
     var capturedAt: Date
 }
 
+struct ClaudeProviderRuntimePresentation: Equatable {
+    let advisory: String?
+    let interactionModes: [AgentInteractionMode]?
+    let permissionModes: [AgentPermissionMode]?
+    let capabilities: AgentProviderCapabilities?
+
+    static func resolve(agentSDKEnabled: Bool, probeAdvisory: String?) -> Self {
+        guard !agentSDKEnabled else {
+            return Self(advisory: probeAdvisory, interactionModes: nil, permissionModes: nil, capabilities: nil)
+        }
+        let degraded = "Degraded text-only fallback: Claude Agent SDK is disabled."
+        let advisory: String
+        if let probeAdvisory, !probeAdvisory.isEmpty {
+            advisory = "\(degraded) \(probeAdvisory)"
+        } else {
+            advisory = degraded
+        }
+        return Self(
+            advisory: advisory,
+            interactionModes: [.default],
+            permissionModes: [.supervised],
+            capabilities: AgentProviderCapabilities(
+                supportsAttachments: false,
+                supportedAttachmentKinds: [],
+                supportedAttachmentMediaTypes: [],
+                supportsApprovals: false,
+                supportsUserInput: false,
+                supportsStreaming: true,
+                supportsFork: false,
+                supportsRollback: false,
+                supportsPlanReview: false
+            )
+        )
+    }
+}
+
 /// Bridges the JSON-RPC dispatcher to the in-process domain state plus the
 /// concrete Surface views. Lives on the main actor because it mutates UI.
 @MainActor
@@ -58,6 +94,13 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     public weak var context: AppContext?
     public weak var windowController: MainWindowController?
     var destinationWindowIsKeyForTests: ((NSWindow) -> Bool)?
+    var providerSignInTerminalInputSenderForTests: ((SurfaceID, String) -> TerminalInputStatus)?
+    var codexForkProtocolSupportProbe: (String, [String: String]) -> Bool = { binary, environment in
+        CodexForkProtocolSupport.probe(binary: binary, environment: environment).isSupported
+    }
+    var claudeForkProtocolSupportProbe: () -> Bool = {
+        ClaudeAgentSDKBridgeAdapter.installedForkProtocolSupported()
+    }
     private let sshPasswordStore: SSHPasswordStoring
     private let sshCommandRunner: SSHCommandRunner
     private var providerProbeCache: [ProviderProbeCacheKey: ProviderProbeCapabilities] = [:]
@@ -167,7 +210,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             "queued_message_id": .string(message.id.value.uuidString),
             "thread_id": .string(message.threadId.value.uuidString),
             "text": .string(message.text),
-            "attachments": jsonValue(message.attachments),
+            "attachments": jsonValue(message.attachments.compactMap(AgentAttachmentReference.init)),
             "interaction_mode": .string(message.interactionMode.rawValue),
             "position": .number(Double(message.position)),
             "created_at": .string(ISO8601DateFormatter().string(from: message.createdAt)),
@@ -289,6 +332,13 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                             guard let self else { throw JSONRPCError(code: -32000, message: "App router is not ready.") }
                             let result = try await self.updateAgentProvider(provider: provider, providerInstanceId: instanceId)
                             return result.objectValue?["stdout"]?.stringValue ?? ""
+                        }
+                        agent.viewModel.providerSignInAction = { [weak self] provider in
+                            guard let self else { throw JSONRPCError(code: -32000, message: "App router is not ready.") }
+                            try self.openProviderSignInTerminal(workspace: wid, provider: provider)
+                        }
+                        agent.viewModel.providerAuthenticationRefresher = { [weak self] provider in
+                            await self?.refreshAgentProviderAuthentication(provider) ?? []
                         }
                         agent.viewModel.pullRequestThreadPreparer = { [weak self] url, provider, model, permission, reasoning, serviceTier, modelSelection, providerInstanceId in
                             guard let self else { throw JSONRPCError(code: -32000, message: "App router is not ready.") }
@@ -881,6 +931,50 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         reconcileSurfaceVisibility()
         publishSurfaceCreated(workspace: workspace, surface: desc)
         return desc
+    }
+
+    /// Opens provider authentication in RemoteCode's integrated Terminal.
+    /// Authentication CLIs are interactive; they must not run through a hidden
+    /// Process or be reduced to a clipboard instruction.
+    @discardableResult
+    func openProviderSignInTerminal(
+        workspace: WorkspaceID,
+        provider: AgentProvider
+    ) throws -> SurfaceDescriptor {
+        let descriptor = try createSurface(
+            workspace: workspace,
+            type: .terminal,
+            paneID: nil,
+            title: "Sign in: \(provider.rawValue.capitalized)"
+        )
+        try focusSurface(workspace: workspace, surface: descriptor.id)
+        let input = Self.providerSignInTerminalInput(for: provider)
+        let status: TerminalInputStatus
+        if let providerSignInTerminalInputSenderForTests {
+            status = providerSignInTerminalInputSenderForTests(descriptor.id, input)
+        } else if let terminal = SurfaceRegistry.shared.surface(descriptor.id) as? TerminalSurface {
+            status = terminal.sendTextStatus(input)
+        } else {
+            status = .surfaceNotFound
+        }
+        guard status == .accepted else {
+            throw JSONRPCError(
+                code: -32000,
+                message: "Sign-in Terminal rejected input: \(status.rawValue)."
+            )
+        }
+        return descriptor
+    }
+
+    static func providerSignInTerminalInput(for provider: AgentProvider) -> String {
+        switch provider {
+        case .codex:
+            return "codex login\n"
+        case .claude:
+            return "claude auth login\n"
+        case .grok:
+            return "grok login\n"
+        }
     }
 
     public func ensureGitSurface(workspace: WorkspaceID) throws -> SurfaceDescriptor {
@@ -1718,9 +1812,22 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         return try ctx.queuedMessageRepo.list(threadId: thread)
     }
 
-    public func updateAgentQueuedMessage(id: AgentQueuedMessageID, text: String, attachments: [AgentAttachment]) throws -> AgentQueuedMessage {
+    public func updateAgentQueuedMessage(id: AgentQueuedMessageID, text: String, attachments: [AgentAttachment]) async throws -> AgentQueuedMessage {
         guard let ctx = context,
-              let updated = try ctx.queuedMessageRepo.update(id: id, text: text, attachments: attachments) else {
+              let queued = try ctx.queuedMessageRepo.get(id: id),
+              let thread = try ctx.threadRepo.get(id: queued.threadId) else {
+            throw JSONRPCError.invalidParams
+        }
+        let resolved = try resolveInboundAgentAttachments(attachments)
+        try await preflightAgentRun(
+            thread: thread,
+            provider: nil,
+            providerInstanceId: nil,
+            permissionMode: thread.permissionMode,
+            interactionMode: queued.interactionMode,
+            attachments: resolved
+        )
+        guard let updated = try ctx.queuedMessageRepo.update(id: id, text: text, attachments: resolved) else {
             throw JSONRPCError.invalidParams
         }
         publishQueuedMessage(kind: "agent.message.queue.updated", updated)
@@ -1761,25 +1868,80 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             ctx.coordinator.stopRun(threadId: queued.threadId)
             return AgentMessageSendResult(status: .queued, queuedMessage: promoted)
         }
-        _ = try ctx.queuedMessageRepo.delete(id: queued.id)
-        publishQueuedMessage(kind: "agent.message.queue.drained", queued)
-        for message in try ctx.queuedMessageRepo.list(threadId: queued.threadId) {
-            publishQueuedMessage(kind: "agent.message.queue.updated", message)
+        if let dispatch = try ctx.queuedMessageRepo.dispatch(id: queued.id) {
+            if dispatch.state == .prepared, let runId = dispatch.runId {
+                if try preparedQueueRunHasProviderEvidence(threadId: queued.threadId, runId: runId) {
+                    guard let drained = try ctx.queuedMessageRepo.acknowledgePreparedWithRunEvidence(id: queued.id, runId: runId) else {
+                        throw JSONRPCError(code: -32000, message: "Queued message recovery is already being reconciled.")
+                    }
+                    publishQueuedMessage(kind: "agent.message.queue.drained", drained)
+                    refreshAgentSurfaces(thread: queued.threadId)
+                    return AgentMessageSendResult(status: .started, runId: runId)
+                }
+                throw unconfirmedQueuedMessageStartError()
+            }
+            if dispatch.state == .dispatched, let runId = dispatch.runId {
+                guard let drained = try ctx.queuedMessageRepo.acknowledgeDispatched(id: queued.id, runId: runId) else {
+                    throw JSONRPCError(code: -32000, message: "Queued message acknowledgement is already being recovered.")
+                }
+                publishQueuedMessage(kind: "agent.message.queue.drained", drained)
+                refreshAgentSurfaces(thread: queued.threadId)
+                return AgentMessageSendResult(status: .started, runId: runId)
+            }
         }
-        refreshAgentSurfaces(thread: queued.threadId)
-        return try await sendAgentMessage(
-            thread: queued.threadId,
-            text: queued.text,
-            provider: nil,
-            model: nil,
-            permissionMode: nil,
-            reasoningEffort: nil,
-            serviceTier: nil,
-            interactionMode: queued.interactionMode,
-            modelSelection: nil,
-            providerInstanceId: nil,
-            attachments: queued.attachments
-        )
+        guard let lease = try ctx.queuedMessageRepo.claim(id: queued.id) else {
+            throw JSONRPCError(code: -32000, message: "Queued message is already processing.")
+        }
+        let dispatchRunId = AgentRunID(queued.id.value)
+        guard try ctx.queuedMessageRepo.prepareDispatch(lease, runId: dispatchRunId) else {
+            _ = try? ctx.queuedMessageRepo.release(lease)
+            throw JSONRPCError(code: -32000, message: "Queued message dispatch could not be prepared.")
+        }
+        var providerStartConfirmed = false
+        do {
+            let result = try await sendAgentMessage(
+                thread: queued.threadId,
+                text: queued.text,
+                provider: nil,
+                model: nil,
+                permissionMode: nil,
+                reasoningEffort: nil,
+                serviceTier: nil,
+                interactionMode: queued.interactionMode,
+                modelSelection: nil,
+                providerInstanceId: nil,
+                attachments: queued.attachments,
+                queueMessageId: queued.id
+            )
+            providerStartConfirmed = true
+            guard try ctx.queuedMessageRepo.markDispatched(lease, runId: dispatchRunId) else {
+                throw JSONRPCError(code: -32000, message: "Provider started; queue acknowledgement needs recovery.")
+            }
+            guard let drained = try ctx.queuedMessageRepo.acknowledge(lease) else {
+                throw JSONRPCError(code: -32000, message: "Queued message lease changed before start acknowledgement.")
+            }
+            publishQueuedMessage(kind: "agent.message.queue.drained", drained)
+            for message in try ctx.queuedMessageRepo.list(threadId: queued.threadId) {
+                publishQueuedMessage(kind: "agent.message.queue.updated", message)
+            }
+            refreshAgentSurfaces(thread: queued.threadId)
+            return result
+        } catch {
+            if !providerStartConfirmed {
+                if (try? ctx.runRepo.get(id: dispatchRunId)) != nil {
+                    if let drained = try? ctx.queuedMessageRepo.acknowledgePreparedWithRunEvidence(
+                        id: queued.id,
+                        runId: dispatchRunId
+                    ) {
+                        publishQueuedMessage(kind: "agent.message.queue.drained", drained)
+                    }
+                } else {
+                    _ = try? ctx.queuedMessageRepo.releasePrepared(lease, runId: dispatchRunId)
+                }
+            }
+            refreshAgentSurfaces(thread: queued.threadId)
+            throw error
+        }
     }
 
     /// Mirror-path equivalent of AgentAppViewModel.reorderQueuedMessage: moves
@@ -1823,13 +1985,75 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     }
 
     public func sendAgentMessage(thread: AgentThreadID, text: String, provider: AgentProvider?, model: String?, permissionMode: AgentPermissionMode?, reasoningEffort: AgentReasoningEffort?, serviceTier: AgentServiceTier? = nil, interactionMode: AgentInteractionMode? = nil, modelSelection: AgentModelSelection? = nil, providerInstanceId: String? = nil, attachments: [AgentAttachment] = []) async throws -> AgentMessageSendResult {
+        try await sendAgentMessage(
+            thread: thread,
+            text: text,
+            provider: provider,
+            model: model,
+            permissionMode: permissionMode,
+            reasoningEffort: reasoningEffort,
+            serviceTier: serviceTier,
+            interactionMode: interactionMode,
+            modelSelection: modelSelection,
+            providerInstanceId: providerInstanceId,
+            attachments: attachments,
+            queueMessageId: nil
+        )
+    }
+
+    private func preflightAgentRun(
+        thread: AgentThread,
+        provider: AgentProvider?,
+        providerInstanceId: String?,
+        permissionMode: AgentPermissionMode,
+        interactionMode: AgentInteractionMode,
+        attachments: [AgentAttachment]
+    ) async throws {
+        let desiredProvider = provider ?? thread.provider
+        let desiredInstance = providerInstanceId
+            ?? (desiredProvider == thread.provider ? thread.providerInstanceId : nil)
+        let snapshots = await listAgentProviderSnapshots()
+        let snapshot: AgentProviderSnapshot?
+        if let desiredInstance {
+            snapshot = snapshots.first { $0.id == desiredInstance && $0.provider == desiredProvider }
+                ?? (desiredInstance == desiredProvider.rawValue
+                    ? snapshots.first { $0.provider == desiredProvider }
+                    : nil)
+        } else {
+            snapshot = snapshots.first { $0.provider == desiredProvider }
+        }
+        do {
+            try AgentProviderRunPreflight.validate(
+                snapshot: snapshot,
+                interactionMode: interactionMode,
+                permissionMode: permissionMode,
+                attachments: attachments
+            )
+        } catch {
+            throw JSONRPCError(code: -32013, message: String(describing: error))
+        }
+    }
+
+    private func sendAgentMessage(thread: AgentThreadID, text: String, provider: AgentProvider?, model: String?, permissionMode: AgentPermissionMode?, reasoningEffort: AgentReasoningEffort?, serviceTier: AgentServiceTier?, interactionMode: AgentInteractionMode?, modelSelection: AgentModelSelection?, providerInstanceId: String?, attachments: [AgentAttachment], queueMessageId: AgentQueuedMessageID?) async throws -> AgentMessageSendResult {
         guard let ctx = context else { throw LayoutError.workspaceNotFound }
-        if let existing = try ctx.threadRepo.get(id: thread),
-           existing.status == .running {
+        guard let existing = try ctx.threadRepo.get(id: thread) else { throw LayoutError.workspaceNotFound }
+        let resolvedAttachments = try resolveInboundAgentAttachments(attachments)
+        try await preflightAgentRun(
+            thread: existing,
+            provider: modelSelection?.provider ?? provider,
+            providerInstanceId: providerInstanceId,
+            permissionMode: permissionMode ?? existing.permissionMode,
+            interactionMode: interactionMode ?? .default,
+            attachments: resolvedAttachments
+        )
+        if existing.status == .running {
+            if queueMessageId != nil {
+                throw JSONRPCError(code: -32000, message: "Thread became active before queued dispatch started.")
+            }
             let queued = try ctx.queuedMessageRepo.enqueue(
                 threadId: thread,
                 text: text,
-                attachments: attachments,
+                attachments: resolvedAttachments,
                 interactionMode: interactionMode ?? .default
             )
             publishQueuedMessage(kind: "agent.message.queued", queued)
@@ -1867,13 +2091,14 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         let m = t.model
         let cwd = try prepareAgentExecutionCwd(thread: &t)
         let req = AgentRunRequest(
+            runId: queueMessageId.map { AgentRunID($0.value) } ?? AgentRunID(),
             threadId: thread,
             provider: prov,
             providerInstanceId: t.providerInstanceId,
             model: m,
             cwd: cwd,
             prompt: text,
-            attachments: attachments,
+            attachments: resolvedAttachments,
             providerThreadId: t.providerThreadId,
             permissionMode: t.permissionMode,
             reasoningEffort: t.reasoningEffort,
@@ -1893,27 +2118,148 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         return AgentMessageSendResult(status: .started, runId: runId)
     }
 
-    public func drainNextQueuedAgentMessage(thread: AgentThreadID) async throws {
+    public func drainNextQueuedAgentMessage(
+        thread: AgentThreadID,
+        recoverPreparedFromPriorProcess: Bool = false
+    ) async throws {
         guard let ctx = context,
-              let queued = try ctx.queuedMessageRepo.first(threadId: thread),
               let threadState = try ctx.threadRepo.get(id: thread),
               threadState.status != .running,
               threadState.status != .pending else { return }
-        _ = try ctx.queuedMessageRepo.delete(id: queued.id)
-        publishQueuedMessage(kind: "agent.message.queue.drained", queued)
-        refreshAgentSurfaces(thread: thread)
-        _ = try await sendAgentMessage(
-            thread: thread,
-            text: queued.text,
-            provider: nil,
-            model: nil,
-            permissionMode: nil,
-            reasoningEffort: nil,
-            serviceTier: nil,
-            interactionMode: queued.interactionMode,
-            modelSelection: nil,
-            providerInstanceId: nil,
-            attachments: queued.attachments
+        if let head = try ctx.queuedMessageRepo.first(threadId: thread),
+           let dispatch = try ctx.queuedMessageRepo.dispatch(id: head.id),
+           dispatch.state == .prepared,
+           let runId = dispatch.runId {
+            if let existingRun = try ctx.runRepo.get(id: runId) {
+                guard try preparedQueueRunHasProviderEvidence(threadId: thread, runId: runId) else {
+                    throw unconfirmedQueuedMessageStartError()
+                }
+                if let recovered = try ctx.queuedMessageRepo.acknowledgePreparedWithRunEvidence(id: head.id, runId: runId) {
+                    publishQueuedMessage(kind: "agent.message.queue.drained", recovered)
+                    refreshAgentSurfaces(thread: thread)
+                }
+                if existingRun.status == .running || existingRun.status == .pending {
+                    return
+                }
+            }
+            if try ctx.runRepo.get(id: runId) == nil {
+                guard recoverPreparedFromPriorProcess else { return }
+                guard try ctx.queuedMessageRepo.recoverPreparedBeforeProviderStart(id: head.id, runId: runId) != nil else {
+                    throw JSONRPCError(code: -32000, message: "Queued message recovery is already being reconciled.")
+                }
+                publishQueuedMessage(kind: "agent.message.queue.updated", head)
+                refreshAgentSurfaces(thread: thread)
+            }
+        }
+        if let recovered = try ctx.queuedMessageRepo.acknowledgeFirstDispatched(threadId: thread) {
+            publishQueuedMessage(kind: "agent.message.queue.drained", recovered)
+            refreshAgentSurfaces(thread: thread)
+        }
+        guard let lease = try ctx.queuedMessageRepo.claimFirst(threadId: thread) else { return }
+        let queued = lease.message
+        let dispatchRunId = AgentRunID(queued.id.value)
+        guard try ctx.queuedMessageRepo.prepareDispatch(lease, runId: dispatchRunId) else {
+            _ = try? ctx.queuedMessageRepo.release(lease)
+            throw JSONRPCError(code: -32000, message: "Queued message dispatch could not be prepared.")
+        }
+        var providerStartConfirmed = false
+        do {
+            _ = try await sendAgentMessage(
+                thread: thread,
+                text: queued.text,
+                provider: nil,
+                model: nil,
+                permissionMode: nil,
+                reasoningEffort: nil,
+                serviceTier: nil,
+                interactionMode: queued.interactionMode,
+                modelSelection: nil,
+                providerInstanceId: nil,
+                attachments: queued.attachments,
+                queueMessageId: queued.id
+            )
+            providerStartConfirmed = true
+            guard try ctx.queuedMessageRepo.markDispatched(lease, runId: dispatchRunId) else {
+                throw JSONRPCError(code: -32000, message: "Provider started; queue acknowledgement needs recovery.")
+            }
+            guard let drained = try ctx.queuedMessageRepo.acknowledge(lease) else {
+                throw JSONRPCError(code: -32000, message: "Queued message lease changed before start acknowledgement.")
+            }
+            publishQueuedMessage(kind: "agent.message.queue.drained", drained)
+            refreshAgentSurfaces(thread: thread)
+        } catch {
+            if !providerStartConfirmed {
+                if (try? ctx.runRepo.get(id: dispatchRunId)) != nil {
+                    if let drained = try? ctx.queuedMessageRepo.acknowledgePreparedWithRunEvidence(
+                        id: queued.id,
+                        runId: dispatchRunId
+                    ) {
+                        publishQueuedMessage(kind: "agent.message.queue.drained", drained)
+                    }
+                } else {
+                    _ = try? ctx.queuedMessageRepo.releasePrepared(lease, runId: dispatchRunId)
+                }
+            }
+            refreshAgentSurfaces(thread: thread)
+            throw error
+        }
+    }
+
+    /// Relaunch recovery for queue rows left between durable prepare and provider
+    /// start acknowledgement. Each head is reconciled before normal drain: no run
+    /// row means safe CAS requeue; an existing deterministic run means ack-only,
+    /// never provider replay.
+    public func reconcileQueuedAgentMessagesOnLaunch() async {
+        guard let ctx = context else { return }
+        let threadIds: [AgentThreadID]
+        do {
+            threadIds = try ctx.queuedMessageRepo.threadIdsWithQueuedMessages()
+        } catch {
+            EventBus.shared.publish(kind: "agent.message.queue.failed", payload: .object([
+                "message": .string("Queue launch recovery failed: \(error)")
+            ]))
+            return
+        }
+        for threadId in threadIds {
+            do {
+                try await drainNextQueuedAgentMessage(
+                    thread: threadId,
+                    recoverPreparedFromPriorProcess: true
+                )
+            } catch {
+                EventBus.shared.publish(kind: "agent.message.queue.failed", payload: .object([
+                    "thread_id": .string(threadId.value.uuidString),
+                    "message": .string("Queue launch recovery failed: \(error)")
+                ]))
+            }
+        }
+    }
+
+    /// A run row is written before `runner.sendTurn`, so it cannot by itself
+    /// prove that the provider accepted a prepared queue dispatch. The provider
+    /// session stays at `run.pending` until that boundary advances. Missing or
+    /// still-pending session evidence must preserve the queue row to avoid both
+    /// silent loss and an unsafe replay after relaunch.
+    private func preparedQueueRunHasProviderEvidence(
+        threadId: AgentThreadID,
+        runId: AgentRunID
+    ) throws -> Bool {
+        guard let ctx = context,
+              try ctx.runRepo.get(id: runId) != nil,
+              let session = try ctx.providerSessionRuntimeRepo.get(threadId: threadId),
+              session.lastRunId == runId,
+              let lastEventKind = session.lastEventKind?
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+              !lastEventKind.isEmpty else {
+            return false
+        }
+        return lastEventKind != "run.pending"
+    }
+
+    private func unconfirmedQueuedMessageStartError() -> JSONRPCError {
+        JSONRPCError(
+            code: -32000,
+            message: "Provider start is unconfirmed. The message remains queued to prevent loss or duplicate execution."
         )
     }
 
@@ -1990,7 +2336,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         guard let runId = sendResult.runId else {
             throw JSONRPCError(code: -32032, message: "Plan implementation was queued because the thread is already running.")
         }
-        try? ctx.proposedPlanRepo.markImplemented(threadId: thread, planId: planId, implementationThreadId: implementationThread.id)
+        try ctx.proposedPlanRepo.markImplemented(threadId: thread, planId: planId, implementationThreadId: implementationThread.id)
         return (runId, implementationThread.id)
     }
 
@@ -2324,13 +2670,17 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         return result.runId
     }
 
-    public func deleteAgentThread(thread: AgentThreadID) throws {
+    public func deleteAgentThread(thread: AgentThreadID) async throws {
         guard let ctx = context else { throw LayoutError.workspaceNotFound }
+        try await ctx.coordinator.stopAndAwaitTermination(threadId: thread)
         try ctx.threadRepo.delete(id: thread)
     }
 
-    public func deleteAgentThreads(_ threads: [AgentThreadID]) throws {
+    public func deleteAgentThreads(_ threads: [AgentThreadID]) async throws {
         guard let ctx = context else { throw LayoutError.workspaceNotFound }
+        for thread in threads {
+            try await ctx.coordinator.stopAndAwaitTermination(threadId: thread)
+        }
         try ctx.threadRepo.delete(ids: threads)
     }
 
@@ -2415,9 +2765,17 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         case .claude:
             runner = ClaudeRunner(binaryNameOverride: binary)
         case .grok:
-            runner = GrokRunner(binaryNameOverride: binary)
+            return await GrokACPAdapter(binaryNameOverride: binary).listModels()
         }
         return await runner.listModels()
+    }
+
+    func refreshAgentProviderAuthentication(_ provider: AgentProvider) async -> [AgentProviderSnapshot] {
+        let staleKeys = providerProbeCache.keys.filter { $0.provider == provider }
+        for key in staleKeys {
+            providerProbeCache.removeValue(forKey: key)
+        }
+        return await listAgentProviderSnapshots()
     }
 
     public func listAgentProviderSnapshots() async -> [AgentProviderSnapshot] {
@@ -2429,12 +2787,39 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 let binaryPath = ProcessLocator.resolve(binary) ?? ""
                 let env = providerEnvironment(provider: instance.provider, instanceId: instance.id)
                 let capabilities = providerProbeCapabilities(provider: instance.provider, binaryPath: binaryPath, environment: env)
-                let models = await listAgentModels(
+                let claudeRuntime = instance.provider == .claude
+                    ? ClaudeProviderRuntimePresentation.resolve(
+                        agentSDKEnabled: ProcessInfo.processInfo.environment["RC_CLAUDE_AGENT_SDK_ENABLED"] != "0",
+                        probeAdvisory: capabilities.advisory
+                    )
+                    : nil
+                let grokDiscovery = instance.provider == .grok
+                    ? await GrokACPAdapter(
+                        binaryNameOverride: binaryPath.isEmpty ? binary : binaryPath,
+                        discoveryCwd: FileManager.default.currentDirectoryPath,
+                        discoveryEnvironment: env
+                    ).discoveryResult()
+                    : nil
+                let models: [AgentModelDescriptor]
+                if let grokDiscovery {
+                    models = grokDiscovery.models
+                } else {
+                    models = await listAgentModels(
+                        provider: instance.provider,
+                        installedVersion: capabilities.version,
+                        binaryPath: binaryPath,
+                        environment: env
+                    )
+                }
+                let runtimeCapabilities = providerRuntimeCapabilities(
                     provider: instance.provider,
-                    installedVersion: capabilities.version,
                     binaryPath: binaryPath,
-                    environment: env
+                    environment: env,
+                    claudePresentation: claudeRuntime,
+                    grokCapabilities: grokDiscovery?.capabilities
                 )
+                let runtimeSlashCommands = capabilities.slashCommands
+                    + (runtimeCapabilities?.supportsFork == true ? ["/fork"] : [])
                 snapshots.append(AgentProviderSnapshotFactory.snapshot(
                     provider: instance.provider,
                     models: models,
@@ -2444,8 +2829,8 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                     accountLabel: capabilities.accountLabel,
                     accountAuthMethod: capabilities.accountAuthMethod,
                     updateState: capabilities.updateState,
-                    advisory: capabilities.advisory,
-                    slashCommands: capabilities.slashCommands,
+                    advisory: claudeRuntime?.advisory ?? capabilities.advisory,
+                    slashCommands: runtimeSlashCommands,
                     skills: capabilities.skills,
                     id: instance.id,
                     displayName: instance.displayName,
@@ -2456,7 +2841,12 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                     // REMOTE_CODE_INSTANCE). REMOTE_CODE_AGENT_PROVIDER is a constant attribution
                     // tag (same for every instance of a provider), not isolation — exclude it
                     // from the snapshot while it remains in the actual run environment.
-                    environmentKeys: env.keys.filter { $0 != "REMOTE_CODE_AGENT_PROVIDER" }.sorted()
+                    environmentKeys: env.keys.filter { $0 != "REMOTE_CODE_AGENT_PROVIDER" }.sorted(),
+                    interactionModesOverride: grokDiscovery?.interactionModes ?? claudeRuntime?.interactionModes,
+                    permissionModesOverride: grokDiscovery?.permissionModes ?? claudeRuntime?.permissionModes,
+                    capabilitiesOverride: runtimeCapabilities,
+                    modelDiscoverySource: grokDiscovery.map { $0.isFallback ? .builtInFallback : .live },
+                    modelDiscoveryCacheKey: grokDiscovery?.discoveryCacheKey
                 ))
             }
             return snapshots
@@ -2465,12 +2855,38 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             let binary = configuredProviderBinary(provider) ?? provider.rawValue
             let binaryPath = ProcessLocator.resolve(binary) ?? ""
             let capabilities = providerProbeCapabilities(provider: provider, binaryPath: binaryPath, environment: [:])
-            let models = await listAgentModels(
+            let claudeRuntime = provider == .claude
+                ? ClaudeProviderRuntimePresentation.resolve(
+                    agentSDKEnabled: ProcessInfo.processInfo.environment["RC_CLAUDE_AGENT_SDK_ENABLED"] != "0",
+                    probeAdvisory: capabilities.advisory
+                )
+                : nil
+            let grokDiscovery = provider == .grok
+                ? await GrokACPAdapter(
+                    binaryNameOverride: binaryPath.isEmpty ? binary : binaryPath,
+                    discoveryCwd: FileManager.default.currentDirectoryPath
+                ).discoveryResult()
+                : nil
+            let models: [AgentModelDescriptor]
+            if let grokDiscovery {
+                models = grokDiscovery.models
+            } else {
+                models = await listAgentModels(
+                    provider: provider,
+                    installedVersion: capabilities.version,
+                    binaryPath: binaryPath,
+                    environment: [:]
+                )
+            }
+            let runtimeCapabilities = providerRuntimeCapabilities(
                 provider: provider,
-                installedVersion: capabilities.version,
                 binaryPath: binaryPath,
-                environment: [:]
+                environment: [:],
+                claudePresentation: claudeRuntime,
+                grokCapabilities: grokDiscovery?.capabilities
             )
+            let runtimeSlashCommands = capabilities.slashCommands
+                + (runtimeCapabilities?.supportsFork == true ? ["/fork"] : [])
             snapshots.append(AgentProviderSnapshotFactory.snapshot(
                 provider: provider,
                 models: models,
@@ -2480,12 +2896,62 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 accountLabel: capabilities.accountLabel,
                 accountAuthMethod: capabilities.accountAuthMethod,
                 updateState: capabilities.updateState,
-                advisory: capabilities.advisory,
-                slashCommands: capabilities.slashCommands,
-                skills: capabilities.skills
+                advisory: claudeRuntime?.advisory ?? capabilities.advisory,
+                slashCommands: runtimeSlashCommands,
+                skills: capabilities.skills,
+                interactionModesOverride: grokDiscovery?.interactionModes ?? claudeRuntime?.interactionModes,
+                permissionModesOverride: grokDiscovery?.permissionModes ?? claudeRuntime?.permissionModes,
+                capabilitiesOverride: runtimeCapabilities,
+                modelDiscoverySource: grokDiscovery.map { $0.isFallback ? .builtInFallback : .live },
+                modelDiscoveryCacheKey: grokDiscovery?.discoveryCacheKey
             ))
         }
         return snapshots
+    }
+
+    private func providerRuntimeCapabilities(
+        provider: AgentProvider,
+        binaryPath: String,
+        environment: [String: String],
+        claudePresentation: ClaudeProviderRuntimePresentation?,
+        grokCapabilities: AgentProviderCapabilities?
+    ) -> AgentProviderCapabilities? {
+        switch provider {
+        case .codex:
+            return codexRuntimeCapabilities(binaryPath: binaryPath, environment: environment)
+        case .claude:
+            if let degraded = claudePresentation?.capabilities { return degraded }
+            return AgentProviderCapabilities(
+                supportsAttachments: true,
+                supportedAttachmentKinds: [.image],
+                supportedAttachmentMediaTypes: ["image/jpeg", "image/png", "image/gif", "image/webp"],
+                supportsApprovals: true,
+                supportsUserInput: true,
+                supportsStreaming: true,
+                supportsFork: claudeForkProtocolSupportProbe(),
+                supportsRollback: false,
+                supportsPlanReview: true
+            )
+        case .grok:
+            return grokCapabilities
+        }
+    }
+
+    private func codexRuntimeCapabilities(
+        binaryPath: String,
+        environment: [String: String]
+    ) -> AgentProviderCapabilities {
+        AgentProviderCapabilities(
+            supportsAttachments: true,
+            supportedAttachmentKinds: [.file, .image],
+            supportedAttachmentMediaTypes: ["*/*", "image/jpeg", "image/png", "image/gif", "image/webp"],
+            supportsApprovals: true,
+            supportsUserInput: true,
+            supportsStreaming: true,
+            supportsFork: codexForkProtocolSupportProbe(binaryPath, environment),
+            supportsRollback: true,
+            supportsPlanReview: true
+        )
     }
 
     private func listAgentModels(
@@ -2537,27 +3003,33 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     }
 
     private func providerSkills(provider: AgentProvider, environment: [String: String]) -> [String] {
-        let home: String
+        Self.discoverSkillNames(in: Self.providerSkillsRoot(
+            provider: provider,
+            environment: environment,
+            defaultHome: FileManager.default.homeDirectoryForCurrentUser.path
+        ))
+    }
+
+    static func providerSkillsRoot(
+        provider: AgentProvider,
+        environment: [String: String],
+        defaultHome: String
+    ) -> URL {
         switch provider {
         case .codex:
-            home = environment["CODEX_HOME"] ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".codex").path
+            let root = environment["CODEX_HOME"]
+                ?? URL(fileURLWithPath: defaultHome, isDirectory: true).appendingPathComponent(".codex", isDirectory: true).path
+            return URL(fileURLWithPath: root, isDirectory: true).appendingPathComponent("skills", isDirectory: true)
         case .claude:
-            home = environment["HOME"] ?? FileManager.default.homeDirectoryForCurrentUser.path
+            let home = environment["HOME"] ?? defaultHome
+            return URL(fileURLWithPath: home, isDirectory: true).appendingPathComponent(".claude/skills", isDirectory: true)
         case .grok:
-            home = environment["GROK_HOME"]
-                ?? environment["HOME"]
-                ?? FileManager.default.homeDirectoryForCurrentUser.path
+            if let root = environment["GROK_HOME"], !root.isEmpty {
+                return URL(fileURLWithPath: root, isDirectory: true).appendingPathComponent("skills", isDirectory: true)
+            }
+            let home = environment["HOME"] ?? defaultHome
+            return URL(fileURLWithPath: home, isDirectory: true).appendingPathComponent(".grok/skills", isDirectory: true)
         }
-        let skillsRoot: URL
-        switch provider {
-        case .codex:
-            skillsRoot = URL(fileURLWithPath: home, isDirectory: true).appendingPathComponent("skills", isDirectory: true)
-        case .claude:
-            skillsRoot = URL(fileURLWithPath: home, isDirectory: true).appendingPathComponent(".claude/skills", isDirectory: true)
-        case .grok:
-            skillsRoot = URL(fileURLWithPath: home, isDirectory: true).appendingPathComponent(".grok/skills", isDirectory: true)
-        }
-        return Self.discoverSkillNames(in: skillsRoot)
     }
 
     private static func discoverSkillNames(in root: URL) -> [String] {
@@ -2673,7 +3145,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             case .claude:
                 env["HOME"] = env["HOME"] ?? home
             case .grok:
-                env["HOME"] = env["HOME"] ?? home
+                env["GROK_HOME"] = env["GROK_HOME"] ?? home
             }
         }
         // VITAL for the savings report: tag the agent's environment with the provider so the
@@ -2772,19 +3244,114 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     }
 
     public func uploadAgentAttachment(workspace: WorkspaceID, filename: String, mimeType: String?, dataBase64: String) throws -> AgentAttachmentUploadResult {
+        guard let decodedSize = Self.decodedBase64Size(dataBase64),
+              decodedSize <= AgentAttachmentStore.maximumSizeBytes else {
+            throw JSONRPCError(code: -32602, message: "Attachment exceeds the 25 MB limit or has invalid data.")
+        }
         guard let data = Data(base64Encoded: dataBase64), !data.isEmpty else {
             throw JSONRPCError(code: -32602, message: "Invalid attachment data.")
         }
-        let root = URL(fileURLWithPath: try workspaceCwd(workspace)).standardizedFileURL
-        let dir = root.appendingPathComponent(".remotecode", isDirectory: true)
-            .appendingPathComponent("attachments", isDirectory: true)
-        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let safeName = Self.safeAttachmentFilename(filename)
-        let fileURL = dir.appendingPathComponent("\(UUID().uuidString)-\(safeName)", isDirectory: false)
-        try data.write(to: fileURL, options: [.atomic])
-        let ext = fileURL.pathExtension.lowercased()
-        let kind: AgentAttachmentKind = ["png", "jpg", "jpeg", "gif", "bmp", "tif", "tiff", "heic", "webp", "svg", "avif"].contains(ext) ? .image : .file
-        return AgentAttachmentUploadResult(path: fileURL.path, displayName: safeName, kind: kind, mimeType: mimeType, sizeBytes: data.count)
+        let metadata = try Self.uploadAttachmentMetadata(filename: safeName, mimeType: mimeType)
+        let attachment = try agentAttachmentStore().stage(
+            data: data,
+            displayName: safeName,
+            kind: metadata.kind,
+            mimeType: metadata.mimeType
+        )
+        guard let reference = AgentAttachmentReference(attachment) else {
+            throw JSONRPCError(code: -32000, message: "Attachment staging produced incomplete metadata.")
+        }
+        return AgentAttachmentUploadResult(reference)
+    }
+
+    public func importAgentAttachment(workspace: WorkspaceID, relativePath: String) throws -> AgentAttachmentUploadResult {
+        let raw = relativePath.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !raw.isEmpty, !raw.hasPrefix("/"), !raw.split(separator: "/").contains("..") else {
+            throw JSONRPCError(code: -32602, message: "Attachment import path must be workspace-relative.")
+        }
+        let root = URL(fileURLWithPath: try workspaceCwd(workspace))
+            .standardizedFileURL.resolvingSymlinksInPath()
+        let target = root.appendingPathComponent(raw)
+            .standardizedFileURL.resolvingSymlinksInPath()
+        let prefix = root.path.hasSuffix("/") ? root.path : root.path + "/"
+        var isDirectory: ObjCBool = false
+        guard target.path.hasPrefix(prefix),
+              FileManager.default.fileExists(atPath: target.path, isDirectory: &isDirectory),
+              !isDirectory.boolValue,
+              FileManager.default.isReadableFile(atPath: target.path) else {
+            throw JSONRPCError(code: -32602, message: "Attachment import target is not a readable workspace file.")
+        }
+        let attributes = try? FileManager.default.attributesOfItem(atPath: target.path)
+        if let size = (attributes?[.size] as? NSNumber)?.int64Value,
+           size > Int64(AgentAttachmentStore.maximumSizeBytes) {
+            throw JSONRPCError(code: -32602, message: "Attachment exceeds the 25 MB limit.")
+        }
+        let attachment = try agentAttachmentStore().stage(path: target.path)
+        guard let reference = AgentAttachmentReference(attachment) else {
+            throw JSONRPCError(code: -32000, message: "Attachment import produced incomplete metadata.")
+        }
+        return AgentAttachmentUploadResult(reference)
+    }
+
+    private func agentAttachmentStore() throws -> AgentAttachmentStore {
+        guard let context else { throw LayoutError.workspaceNotFound }
+        return AgentAttachmentStore(
+            root: context.appSupportDirectory.appendingPathComponent("agent-attachments", isDirectory: true)
+        )
+    }
+
+    private static func decodedBase64Size(_ value: String) -> Int? {
+        let bytes = value.utf8
+        let count = bytes.count
+        guard count > 0, count.isMultiple(of: 4) else { return nil }
+        let maximumEncodedCount = ((AgentAttachmentStore.maximumSizeBytes + 2) / 3) * 4
+        guard count <= maximumEncodedCount else { return nil }
+        var padding = 0
+        if bytes.last == 61 { padding += 1 }
+        if count > 1, bytes[bytes.index(bytes.endIndex, offsetBy: -2)] == 61 { padding += 1 }
+        return (count / 4) * 3 - padding
+    }
+
+    private func resolveInboundAgentAttachments(_ attachments: [AgentAttachment]) throws -> [AgentAttachment] {
+        try attachments.map { attachment in
+            if attachment.path.isEmpty {
+                return try agentAttachmentStore().resolveClientReference(attachment)
+            }
+            return try agentAttachmentStore().validatedForRetry(attachment)
+        }
+    }
+
+    private static func uploadAttachmentMetadata(filename: String, mimeType: String?) throws -> (kind: AgentAttachmentKind, mimeType: String?) {
+        let ext = URL(fileURLWithPath: filename).pathExtension.lowercased()
+        let imageExtensions = Set(["png", "jpg", "jpeg", "gif", "bmp", "tif", "tiff", "heic", "webp", "svg", "avif"])
+        let inferredImage = imageExtensions.contains(ext)
+        let normalized = mimeType?.split(separator: ";", maxSplits: 1).first.map(String.init)?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if let normalized,
+           normalized.range(of: #"^[a-z0-9][a-z0-9!#$&^_.+-]*/[a-z0-9][a-z0-9!#$&^_.+-]*$"#, options: .regularExpression) == nil {
+            throw JSONRPCError(code: -32602, message: "Invalid attachment media type.")
+        }
+        let declaredImage = normalized?.hasPrefix("image/") == true
+        guard normalized == nil || inferredImage == declaredImage else {
+            throw JSONRPCError(code: -32602, message: "Attachment filename and media type disagree.")
+        }
+        let inferredMIME: String?
+        switch ext {
+        case "png": inferredMIME = "image/png"
+        case "jpg", "jpeg": inferredMIME = "image/jpeg"
+        case "gif": inferredMIME = "image/gif"
+        case "webp": inferredMIME = "image/webp"
+        case "md", "markdown": inferredMIME = "text/markdown"
+        case "json": inferredMIME = "application/json"
+        case "txt", "log", "csv": inferredMIME = "text/plain"
+        case "pdf": inferredMIME = "application/pdf"
+        default: inferredMIME = nil
+        }
+        guard normalized == nil || inferredMIME == nil || normalized == inferredMIME else {
+            throw JSONRPCError(code: -32602, message: "Attachment filename and media type disagree.")
+        }
+        return (inferredImage ? .image : .file, normalized ?? inferredMIME)
     }
 
     private static func safeAttachmentFilename(_ filename: String) -> String {
@@ -3359,7 +3926,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 surface = configureBrowserSurface(BrowserSurface(workspaceID: workspace, initialURL: nil, title: baseTitle))
             case .agentApp:
                 guard let ctx = context else { return descriptor }
-                let agent = AgentAppSurface(workspaceID: workspace, cwd: cwd, coordinator: ctx.coordinator, threadRepo: ctx.threadRepo, messageRepo: ctx.messageRepo, queuedMessageRepo: ctx.queuedMessageRepo, pendingCallbackRepo: ctx.providerPendingCallbackRepo, proposedPlanRepo: ctx.proposedPlanRepo, checkpointRepo: ctx.turnCheckpointRepo, promptHistoryStore: PromptHistoryStore(db: ctx.db), customModelStore: AgentCustomModelStore(repo: ctx.settingsRepo), planNotesStore: PlanNotesStore(db: ctx.db), title: baseTitle, initialThreadId: initialThreadId)
+                let agent = AgentAppSurface(workspaceID: workspace, cwd: cwd, coordinator: ctx.coordinator, threadRepo: ctx.threadRepo, messageRepo: ctx.messageRepo, draftRepo: AgentThreadDraftRepository(db: ctx.db), attachmentStore: AgentAttachmentStore(root: ctx.appSupportDirectory.appendingPathComponent("agent-attachments", isDirectory: true)), queuedMessageRepo: ctx.queuedMessageRepo, pendingCallbackRepo: ctx.providerPendingCallbackRepo, proposedPlanRepo: ctx.proposedPlanRepo, checkpointRepo: ctx.turnCheckpointRepo, promptHistoryStore: PromptHistoryStore(db: ctx.db), customModelStore: AgentCustomModelStore(repo: ctx.settingsRepo), planNotesStore: PlanNotesStore(db: ctx.db), title: baseTitle, initialThreadId: initialThreadId)
                 // Per-surface thread binding: persist this surface's selected
                 // thread into its descriptor metadata so app restart restores it.
                 agent.viewModel.onSelectedThreadChanged = { [weak self, weak agent] threadID in
@@ -3395,6 +3962,13 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                     guard let self else { throw JSONRPCError(code: -32000, message: "App router is not ready.") }
                     let result = try await self.updateAgentProvider(provider: provider, providerInstanceId: instanceId)
                     return result.objectValue?["stdout"]?.stringValue ?? ""
+                }
+                agent.viewModel.providerSignInAction = { [weak self] provider in
+                    guard let self else { throw JSONRPCError(code: -32000, message: "App router is not ready.") }
+                    try self.openProviderSignInTerminal(workspace: workspace, provider: provider)
+                }
+                agent.viewModel.providerAuthenticationRefresher = { [weak self] provider in
+                    await self?.refreshAgentProviderAuthentication(provider) ?? []
                 }
                 agent.viewModel.pullRequestThreadPreparer = { [weak self] url, provider, model, permission, reasoning, serviceTier, modelSelection, providerInstanceId in
                     guard let self else { throw JSONRPCError(code: -32000, message: "App router is not ready.") }

@@ -87,6 +87,12 @@ final class CheckpointRevertUndoToastTests: XCTestCase {
                                    coordinator: coordinator, threadRepo: threadRepo,
                                    messageRepo: messageRepo, checkpointRepo: checkpointRepo)
         vm.selectThread(thread.id)
+        vm.providerSnapshots = [
+            AgentProviderSnapshotFactory.snapshot(
+                provider: .codex,
+                models: [AgentModelDescriptor(id: "fake-model", label: "Fake model", provider: .codex)]
+            )
+        ]
         vm.selectedCheckpointTurnCount = 1
         return (vm, thread.id, repoDir, appSupport)
     }

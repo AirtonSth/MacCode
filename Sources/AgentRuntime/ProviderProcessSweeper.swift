@@ -144,7 +144,7 @@ public enum ProviderProcessSweeper {
             || isCodexAppServerRuntime(process.command)
     }
 
-    private static func descendants(
+    static func descendants(
         of pid: Int32,
         in processes: [ProviderRuntimeProcess]
     ) -> [Int32] {
@@ -181,7 +181,11 @@ public enum ProviderProcessSweeper {
         return name == "RemoteCodeDistillService"
     }
 
-    private static func psRows() -> [ProviderRuntimeProcess] {
+    static func psRows() -> [ProviderRuntimeProcess] {
+        (try? psRowsThrowing()) ?? []
+    }
+
+    public static func psRowsThrowing() throws -> [ProviderRuntimeProcess] {
         let process = Process()
         let output = Pipe()
         process.executableURL = URL(fileURLWithPath: "/bin/ps")
@@ -191,10 +195,15 @@ public enum ProviderProcessSweeper {
         do {
             try process.run()
         } catch {
-            return []
+            throw ProviderProcessOwnershipError.processListFailed(error.localizedDescription)
         }
         let data = output.fileHandleForReading.readDataToEndOfFile()
         process.waitUntilExit()
+        guard process.terminationReason == .exit, process.terminationStatus == 0 else {
+            throw ProviderProcessOwnershipError.processListFailed(
+                "ps exited with status \(process.terminationStatus)"
+            )
+        }
         let text = String(data: data, encoding: .utf8) ?? ""
         return text
             .split(whereSeparator: \.isNewline)

@@ -23,6 +23,8 @@ public final class ClaudeParser {
     private var indexToType: [Int: AssistantItemType] = [:]
     private var indexToToolName: [Int: String] = [:]
     private var indexToToolInputJSON: [Int: String] = [:]
+    private var exitPlanToolIds = Set<String>()
+    private var emittedStructuredUserInputRequestIds = Set<String>()
     private var indexToAssistantBody: [Int: String] = [:]
     private var assembledAssistantBody: String = ""
     // PERF: whole-message assistant-text dedup (parseLine case "assistant") used to
@@ -122,6 +124,7 @@ public final class ClaudeParser {
             let summary = itemType == .tool ? (block["name"] as? String) : nil
             if itemType == .tool {
                 indexToToolName[index] = summary
+                if Self.isExitPlanMode(summary) { exitPlanToolIds.insert(itemId) }
                 if let input = block["input"],
                    let data = try? JSONSerialization.data(withJSONObject: input),
                    let inputString = String(data: data, encoding: .utf8) {
@@ -226,6 +229,7 @@ public final class ClaudeParser {
                     out.append(.itemCompleted(itemId: itemId, finalState: .completed))
                 case "tool_use":
                     let name = block["name"] as? String
+                    if Self.isExitPlanMode(name) { exitPlanToolIds.insert(itemId) }
                     let input = (try? JSONSerialization.data(withJSONObject: block["input"] ?? [:]))
                         .flatMap { String(data: $0, encoding: .utf8) }
                     let structuredEvents = structuredClaudeToolEvents(
@@ -241,8 +245,14 @@ public final class ClaudeParser {
                 case "tool_result":
                     let payload = block["content"]
                     let s = (payload as? String) ?? ((try? JSONSerialization.data(withJSONObject: payload ?? [:])).flatMap { String(data: $0, encoding: .utf8) }) ?? ""
-                    out.append(.itemStarted(item: AssistantItem(id: itemId, turnId: turnId, type: .tool, state: .completed, summary: "result", body: "", output: s, startedAtMs: now)))
-                    out.append(.itemCompleted(itemId: itemId, finalState: .completed))
+                    let toolUseId = stringValue(block["tool_use_id"]) ?? itemId
+                    out.append(.itemStarted(item: AssistantItem(id: toolUseId, turnId: turnId, type: .tool, state: .completed, summary: "result", body: "", output: s, startedAtMs: now)))
+                    out.append(.itemCompleted(itemId: toolUseId, finalState: .completed))
+                    if exitPlanToolIds.remove(toolUseId) != nil,
+                       let markdown = planMarkdown(from: obj["tool_use_result"] ?? payload),
+                       !markdown.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        out.append(.proposedPlan(AssistantProposedPlan(id: toolUseId, turnId: turnId, markdown: markdown)))
+                    }
                 default:
                     break
                 }
@@ -268,6 +278,7 @@ public final class ClaudeParser {
                 currentTurnId = nil
                 resetAssistantBodyDedupState()
                 indexToAssistantBody = [:]
+                exitPlanToolIds.removeAll()
             }
         case "error":
             let msg = (obj["error"] as? [String: Any])?["message"] as? String ?? "claude error"
@@ -277,13 +288,14 @@ public final class ClaudeParser {
             // (ClaudeAgentSDKBridge.mjs): the query died mid-run and no `result`
             // will ever follow, so the turn must be completed here — otherwise
             // the adapter never emits .finished and the run hangs in 'running'.
-            out.append(.error(message: stringValue(obj["message"]) ?? "Claude Agent SDK error", recoverable: false))
+            out.append(.error(message: stringValue(obj["message"]) ?? "Claude Agent SDK error", recoverable: true))
             ensureTurn(&out)
             if let tid = currentTurnId {
                 out.append(.turnCompleted(turnId: tid, finalMessage: nil))
                 currentTurnId = nil
                 resetAssistantBodyDedupState()
                 indexToAssistantBody = [:]
+                exitPlanToolIds.removeAll()
             }
         case "plan_update", "update_plan":
             if let plan = activePlan(from: obj, now: now) {
@@ -342,6 +354,14 @@ public final class ClaudeParser {
                 out.append(.tokenUsage(usage))
             }
             return out
+        case "rc_bridge_ready":
+            return [.providerRuntime(ProviderRuntimeEvent(
+                provider: .claude,
+                source: "claude.agent-sdk",
+                method: "runtime.handshake",
+                payloadJSON: jsonString(obj) ?? "{}",
+                receivedAtMs: now
+            ))]
         case "status":
             return completedRuntimeItem(
                 id: stringValue(obj["id"]) ?? "claude-status-\(now)",
@@ -593,6 +613,21 @@ public final class ClaudeParser {
             ?? stringValue(obj["title"])
             ?? stringValue(obj["description"])
             ?? "Input required"
+        let schemaQuestions = schemaUserInputQuestions(schema)
+        if !schemaQuestions.isEmpty {
+            return AssistantUserInputRequest(
+                id: id,
+                turnId: stringValue(obj["turn_id"]) ?? currentTurnId ?? id,
+                prompt: prompt,
+                options: schemaQuestions.count == 1 ? schemaQuestions[0].options.map(\.label) : [],
+                allowsMultipleSelection: schemaQuestions.count == 1
+                    ? schemaQuestions[0].allowsMultipleSelection
+                    : false,
+                isSecret: schemaContainsSecret(schema),
+                questions: schemaQuestions,
+                createdAtMs: now
+            )
+        }
         let options = optionValues(obj["options"] ?? obj["choices"] ?? schema?["enum"])
         return AssistantUserInputRequest(
             id: id,
@@ -644,18 +679,38 @@ public final class ClaudeParser {
         guard let tool = name?.lowercased() else { return [] }
         let input = input ?? [:]
         if tool == "askuserquestion" || tool == "ask_user_question" || tool == "ask_user" {
-            return [.userInputRequested(askUserQuestionRequest(toolId: toolId, input: input, turnId: turnId, now: now))]
+            return deduplicatedStructuredUserInputRequest(
+                askUserQuestionRequest(toolId: toolId, input: input, turnId: turnId, now: now)
+            )
         }
         if tool == "exitplanmode" || tool == "exit_plan_mode" {
-            let markdown = stringValue(input["plan"])
-                ?? stringValue(input["markdown"])
-                ?? stringValue(input["plan_markdown"])
-                ?? stringValue(input["content"])
-                ?? ""
-            guard !markdown.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return [] }
-            return [.proposedPlan(AssistantProposedPlan(id: toolId, turnId: turnId, markdown: markdown))]
+            return []
         }
         return []
+    }
+
+    private static func isExitPlanMode(_ name: String?) -> Bool {
+        name?.replacingOccurrences(of: "_", with: "").replacingOccurrences(of: "-", with: "").lowercased() == "exitplanmode"
+    }
+
+    private func planMarkdown(from payload: Any?) -> String? {
+        if let object = payload as? [String: Any] {
+            return stringValue(object["plan"])
+                ?? stringValue(object["markdown"])
+                ?? stringValue(object["planMarkdown"])
+        }
+        if let blocks = payload as? [[String: Any]] {
+            for block in blocks {
+                if let plan = planMarkdown(from: block) { return plan }
+                if let nested = planMarkdown(from: block["content"]) { return nested }
+                if let text = block["text"] as? String, let plan = planMarkdown(from: text) { return plan }
+            }
+            return nil
+        }
+        guard let text = payload as? String else { return nil }
+        guard let data = text.data(using: .utf8),
+              let decoded = try? JSONSerialization.jsonObject(with: data) else { return nil }
+        return planMarkdown(from: decoded)
     }
 
     private func parseToolInput(_ raw: String?) -> [String: Any] {
@@ -802,6 +857,12 @@ public final class ClaudeParser {
         assembledAssistantBodyCompact = ""
         emittedAssistantBodyNormalizedKeys = []
         emittedAssistantBodyCompactKeys = []
+        emittedStructuredUserInputRequestIds = []
+    }
+
+    private func deduplicatedStructuredUserInputRequest(_ request: AssistantUserInputRequest) -> [AssistantEvent] {
+        guard emittedStructuredUserInputRequestIds.insert(request.id).inserted else { return [] }
+        return [.userInputRequested(request)]
     }
 
     #if DEBUG
@@ -908,6 +969,42 @@ public final class ClaudeParser {
         }
     }
 
+    private func schemaUserInputQuestions(_ schema: [String: Any]?) -> [AssistantUserInputQuestion] {
+        guard let properties = schema?["properties"] as? [String: Any] else { return [] }
+        return properties.keys.sorted().compactMap { name in
+            guard let property = properties[name] as? [String: Any] else { return nil }
+            let title = stringValue(property["title"]) ?? name
+            let prompt = stringValue(property["description"]) ?? title
+            let options: [AssistantUserInputOption]
+            if let values = property["enum"] as? [Any] {
+                options = values.map { AssistantUserInputOption(label: String(describing: $0)) }
+            } else if stringValue(property["type"]) == "boolean" {
+                options = [
+                    AssistantUserInputOption(label: "true", detail: "Yes"),
+                    AssistantUserInputOption(label: "false", detail: "No")
+                ]
+            } else {
+                options = []
+            }
+            return AssistantUserInputQuestion(
+                id: name,
+                prompt: prompt,
+                header: title == prompt ? nil : title,
+                options: options,
+                allowsMultipleSelection: stringValue(property["type"]) == "array"
+            )
+        }
+    }
+
+    private func schemaContainsSecret(_ schema: [String: Any]?) -> Bool {
+        guard let properties = schema?["properties"] as? [String: Any] else { return false }
+        return properties.values.contains { value in
+            guard let property = value as? [String: Any] else { return false }
+            let format = stringValue(property["format"])?.lowercased() ?? ""
+            return format.contains("password") || format.contains("secret") || format.contains("token")
+        }
+    }
+
     private func userInputOptions(_ value: Any?) -> [AssistantUserInputOption] {
         if let strings = value as? [String] {
             return strings.map { AssistantUserInputOption(label: $0) }
@@ -981,6 +1078,7 @@ public final class ClaudeParser {
         currentTurnId = nil
         resetAssistantBodyDedupState()
         indexToAssistantBody = [:]
+        exitPlanToolIds.removeAll()
         return [.turnCompleted(turnId: tid, finalMessage: final)]
     }
 

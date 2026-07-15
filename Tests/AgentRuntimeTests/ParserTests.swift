@@ -249,41 +249,41 @@ final class ClaudeParserTests: XCTestCase {
                        "Claude plan_update events must use the same active-plan contract as Codex")
     }
 
-    // MARK: - T021: input_json_delta reassembly drives ExitPlanMode plan extraction
+    // MARK: - T021: ExitPlanMode plan extraction uses the real tool output
 
     /// WHY (MAC-AGENT-RUNTIME-T021): The Anthropic API sends tool input as a
-    /// stream of input_json_delta fragments. ClaudeParser must concatenate all
-    /// partial_json fragments before content_block_stop and then parse the
-    /// assembled JSON as the tool input. Without this, ExitPlanMode invocations
-    /// (and any other tool) arrive with empty input, so the plan is never
-    /// extracted and the iOS / macOS plan-review flow is never triggered.
-    func test_inputJsonDeltaFragments_assembleAndDriveExitPlanModeProposedPlan() {
+    /// stream of input_json_delta fragments, but ExitPlanModeInput contains only
+    /// allowedPrompts. The plan markdown is returned later in ExitPlanModeOutput.
+    /// Reading `input.plan` fabricates a schema field and loses real SDK plans.
+    func test_exitPlanModeUsesRealToolResultAfterFragmentedInput() {
         let p = ClaudeParser()
         // System init so threadEmitted is set and turn id is allocated.
         _ = p.parseLine(#"{"type":"system","subtype":"init","session_id":"sess-t021"}"#)
         _ = p.parseLine(#"{"type":"message_start","message":{"id":"msg-t021"}}"#)
         // Tool use block start for ExitPlanMode (no pre-loaded input; input arrives via deltas).
         _ = p.parseLine(#"{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"tool-t021","name":"exit_plan_mode"}}"#)
-        // Three input_json_delta fragments that together form {"plan":"Inspect then Patch"}.
+        // Three input_json_delta fragments that together form {"allowedPrompts":[]}.
         // Each partial_json value is a raw fragment (byte slice) of the final JSON.
         // Fragment 1 outer partial_json = {"plan":"Inspect (quotes inside escaped as \")
-        _ = p.parseLine(#"{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"plan\":\"Inspect"}}"#)
+        _ = p.parseLine(#"{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"allowed"}}"#)
         // Fragment 2 outer partial_json = " then " (no special chars).
-        _ = p.parseLine(#"{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":" then "}}"#)
+        _ = p.parseLine(#"{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"Prompts\":"}}"#)
         // Fragment 3 outer partial_json = Patch"} (closing the inner JSON string+object).
-        _ = p.parseLine(#"{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"Patch\"}"}}"#)
-        // content_block_stop triggers parseToolInput and structuredClaudeToolEvents.
+        _ = p.parseLine(#"{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"[]}"}}"#)
         let stopEvs = p.parseLine(#"{"type":"content_block_stop","index":0}"#)
+        XCTAssertFalse(stopEvs.contains { if case .proposedPlan = $0 { return true }; return false },
+                       "ExitPlanMode input must not be mistaken for the plan output")
 
-        let plans = stopEvs.compactMap { ev -> AssistantProposedPlan? in
+        let outputEvs = p.parseLine(#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tool-t021","content":{"plan":"Inspect then Patch","filePath":"/tmp/plan.md"}}]}}"#)
+
+        let plans = outputEvs.compactMap { ev -> AssistantProposedPlan? in
             if case .proposedPlan(let plan) = ev { return plan }
             return nil
         }
         XCTAssertEqual(plans.count, 1,
-                       "T021: content_block_stop after 3 input_json_delta fragments must produce exactly one proposedPlan event")
+                       "T021: the matching ExitPlanMode tool_result must produce exactly one proposedPlan event")
         XCTAssertEqual(plans.first?.markdown, "Inspect then Patch",
-                       "T021: assembled input_json_delta fragments must parse as the ExitPlanMode plan markdown; " +
-                       "a mismatch means fragments were not concatenated before parsing")
+                       "T021: plan markdown must come from the real ExitPlanModeOutput fixture")
     }
 
     // MARK: - T022: result{is_error:true} error message fallback chain

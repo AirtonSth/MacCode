@@ -42,11 +42,11 @@ final class WorkspaceEditTests: XCTestCase {
         XCTAssertNil(ctx.state.workspaces[ws.id]?.metadata["description"])
     }
 
-    func test_agentAttachmentUploadWritesMobileImportIntoWorkspace() throws {
+    func test_agentAttachmentUploadReturnsOpaqueReferenceAndStoresExactBytesOutsideWorkspace() throws {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent("RC2AttachmentUpload-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: dir) }
-        let (_, router) = try make()
+        let (ctx, router) = try make()
         let ws = try router.createWorkspace(name: "w", cwd: dir.path)
 
         let uploaded = try router.uploadAgentAttachment(
@@ -56,11 +56,108 @@ final class WorkspaceEditTests: XCTestCase {
             dataBase64: Data("hello from ios".utf8).base64EncodedString()
         )
 
-        XCTAssertTrue(uploaded.path.hasPrefix(dir.appendingPathComponent(".remotecode/attachments").path),
-                      "iOS imports must be copied into the host workspace before they are sent as provider attachments")
+        XCTAssertNotEqual(uploaded.id, uploaded.sha256)
+        XCTAssertNotNil(UUID(uuidString: uploaded.id),
+                        "the client receives a per-reference opaque id, not the shared content digest")
+        XCTAssertEqual(uploaded.sha256.count, 64)
         XCTAssertEqual(uploaded.displayName, "mobile note.txt")
         XCTAssertEqual(uploaded.sizeBytes, 14)
-        XCTAssertEqual(try String(contentsOfFile: uploaded.path), "hello from ios")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: dir.appendingPathComponent(".remotecode/attachments").path),
+                       "mobile uploads must not write a client-addressable path into the workspace")
+        let resolved = try AgentAttachmentStore(
+            root: ctx.appSupportDirectory.appendingPathComponent("agent-attachments", isDirectory: true)
+        ).resolveClientReference(AgentAttachment(
+            id: uploaded.id,
+            path: "",
+            displayName: uploaded.displayName,
+            kind: uploaded.kind,
+            mimeType: uploaded.mimeType,
+            sha256: uploaded.sha256,
+            sizeBytes: uploaded.sizeBytes
+        ))
+        XCTAssertEqual(try String(contentsOfFile: resolved.path), "hello from ios")
+    }
+
+    func test_agentAttachmentUploadRejects25MBPlusOneBeforeStaging() throws {
+        // WHY: the host cannot trust a paired client to apply its UI-side cap.
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("RC2AttachmentUploadLimit-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let (ctx, router) = try make()
+        let ws = try router.createWorkspace(name: "w", cwd: dir.path)
+        let oversized = Data(
+            repeating: 0x41,
+            count: AgentAttachmentStore.maximumSizeBytes + 1
+        ).base64EncodedString()
+
+        XCTAssertThrowsError(try router.uploadAgentAttachment(
+            workspace: ws.id,
+            filename: "oversized.bin",
+            mimeType: "application/octet-stream",
+            dataBase64: oversized
+        )) { error in
+            XCTAssertTrue(String(describing: error).contains("25 MB"))
+        }
+        let attachmentRoot = ctx.appSupportDirectory
+            .appendingPathComponent("agent-attachments", isDirectory: true)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: attachmentRoot.path),
+                       "oversized base64 must be rejected before host storage is created")
+    }
+
+    func test_agentAttachmentImportAllowsOnlyReadableWorkspaceRelativeFile() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("RC2AttachmentImport-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let (ctx, router) = try make()
+        let ws = try router.createWorkspace(name: "w", cwd: dir.path)
+        try "workspace bytes".write(to: dir.appendingPathComponent("notes.txt"), atomically: true, encoding: .utf8)
+
+        let imported = try router.importAgentAttachment(workspace: ws.id, relativePath: "notes.txt")
+
+        XCTAssertEqual(imported.displayName, "notes.txt")
+        XCTAssertEqual(imported.mimeType, "text/plain")
+        XCTAssertThrowsError(try router.importAgentAttachment(workspace: ws.id, relativePath: "/etc/passwd"))
+        XCTAssertThrowsError(try router.importAgentAttachment(workspace: ws.id, relativePath: "../outside.txt"))
+        let resolved = try AgentAttachmentStore(
+            root: ctx.appSupportDirectory.appendingPathComponent("agent-attachments", isDirectory: true)
+        ).resolveClientReference(AgentAttachment(
+            id: imported.id,
+            path: "",
+            displayName: imported.displayName,
+            kind: imported.kind,
+            mimeType: imported.mimeType,
+            sha256: imported.sha256,
+            sizeBytes: imported.sizeBytes
+        ))
+        XCTAssertEqual(try String(contentsOfFile: resolved.path), "workspace bytes")
+    }
+
+    func test_agentAttachmentImportRejects25MBPlusOneBeforeReadingFile() throws {
+        // WHY: a workspace file can bypass the mobile upload route, so import
+        // needs the same host-authoritative byte ceiling before Data(contentsOf:).
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("RC2AttachmentImportLimit-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let oversized = dir.appendingPathComponent("oversized.dat")
+        XCTAssertTrue(FileManager.default.createFile(atPath: oversized.path, contents: nil))
+        let handle = try FileHandle(forWritingTo: oversized)
+        try handle.truncate(atOffset: UInt64(AgentAttachmentStore.maximumSizeBytes + 1))
+        try handle.close()
+        let (ctx, router) = try make()
+        let ws = try router.createWorkspace(name: "w", cwd: dir.path)
+
+        XCTAssertThrowsError(try router.importAgentAttachment(
+            workspace: ws.id,
+            relativePath: "oversized.dat"
+        )) { error in
+            XCTAssertTrue(String(describing: error).contains("25 MB"))
+        }
+        let attachmentRoot = ctx.appSupportDirectory
+            .appendingPathComponent("agent-attachments", isDirectory: true)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: attachmentRoot.path),
+                       "oversized import must be rejected before host storage is created")
     }
 
     func test_workspacePinAndDragOrder_useSharedWindowOrder() throws {
