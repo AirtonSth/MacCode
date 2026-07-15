@@ -120,12 +120,21 @@ public final class Bootstrap {
     }
 
     nonisolated private static func isCorruptionFailure(_ error: Error) -> Bool {
-        switch error {
-        case is SQLiteError, is SchemaError:
-            return true
-        default:
-            return false
-        }
+        // Quarantine + recreate destroys device_trust tokens and the server
+        // identity, so only genuine file-corruption signatures may trigger it.
+        // Everything else (locked DB, failed migration step, full disk, missing
+        // permissions, schema newer than this build) must propagate loudly
+        // instead of silently wiping every paired device.
+        guard let sqliteError = error as? SQLiteError else { return false }
+        let message = sqliteError.description.lowercased()
+        return message.contains("malformed")
+            || message.contains("not a database")
+            || message.contains("corrupt")
+            // Header schema-format number (offset 44) damaged: open succeeds
+            // lazily, the first schema read fails SQLITE_ERROR with exactly
+            // this text. No supported SQLite writes a format > 4, so this is
+            // a pure corruption signature with no false-positive risk.
+            || message.contains("unsupported file format")
     }
 
     private func initDefaults(db: SQLiteDB) throws {

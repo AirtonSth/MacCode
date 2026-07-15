@@ -413,6 +413,64 @@ final class WebSocketIntegrationTests: XCTestCase {
         XCTFail("live queue_full path must send a typed closing frame before shutting down the socket")
     }
 
+    /// WHY: a fresh app launch sends x-rc2-since-seq=0, which is expired whenever
+    /// the retained ring no longer reaches back to seq 0 (common: 512-event ring).
+    /// Replay expiry re-anchors the delivery cursor to the live head, but the
+    /// connection gap watermark must be re-anchored too -- otherwise the FIRST
+    /// live event after baselineRequired reads as a gap and the server closes
+    /// 1012 eventGap, and every reconnect repeats the loop.
+    func testReplayExpiryDoesNotGapCloseFirstLiveEventAfterBaselineRequired() async throws {
+        let (server, port) = try startServer()
+        defer { server.stop() }
+        try await Task.sleep(nanoseconds: 80_000_000)
+
+        // Roll the shared retained ring past its 512-event capacity so the
+        // replay floor sits above 0 and since-seq=0 is deterministically expired.
+        let fillerKind = uniqueEventKind("test.ws.replay_roll")
+        for _ in 0..<513 {
+            EventBus.shared.publish(kind: fillerKind, payload: .object([:]))
+        }
+
+        let task = wsTask(port: port, sinceSeq: 0)
+        defer { task.cancel(with: .normalClosure, reason: nil) }
+        try await Task.sleep(nanoseconds: 150_000_000)   // let the upgrade + subscribe complete
+
+        let liveKind = uniqueEventKind("test.ws.after_expiry")
+        EventBus.shared.publish(kind: liveKind, payload: .object(["live": .bool(true)]))
+
+        // The client must see baselineRequired BEFORE the live event, and the
+        // live event must NOT be followed by a 1012 eventGap close.
+        var sawBaselineRequired = false
+        var sawLiveEvent = false
+        for _ in 0..<50 {
+            let message: URLSessionWebSocketTask.Message
+            do {
+                message = try await receiveWithTimeout(task, seconds: 1)
+            } catch is TimeoutError where sawLiveEvent {
+                return   // quiet socket after the live event: no gap close
+            }
+            let obj = try object(from: message)
+            if obj["type"] as? String == "heartbeat" { continue }
+            if obj["type"] as? String == "baselineRequired" {
+                XCTAssertFalse(sawLiveEvent,
+                               "baselineRequired must precede the first live event")
+                sawBaselineRequired = true
+                continue
+            }
+            if obj["type"] as? String == "closing" {
+                XCTFail("replay expiry must re-anchor the gap watermark; connection closed with reason=\(obj["reason"] ?? "?") code=\(obj["code"] ?? "?") instead of staying open after the live event")
+                return
+            }
+            if obj["kind"] as? String == liveKind {
+                XCTAssertTrue(sawBaselineRequired,
+                              "the live event must arrive after baselineRequired")
+                sawLiveEvent = true
+            }
+        }
+        XCTAssertTrue(sawBaselineRequired, "expired since-seq=0 must produce a baselineRequired frame")
+        XCTAssertTrue(sawLiveEvent, "the first live event must be delivered on the still-open connection")
+    }
+
     func testCompressionNegotiationDeliversDecodableEnvelope() async throws {
         let (server, port) = try startServer()
         defer { server.stop() }
@@ -503,6 +561,63 @@ final class WebSocketIntegrationTests: XCTestCase {
             }
         }
         XCTFail("did not receive the critical event the cellular-safe filter should keep")
+    }
+
+    /// WHY: the cellular-safe filter drops diagnostic.*/metrics.* events
+    /// server-side, so a filtered connection legitimately skips seqs. The gap
+    /// watermark must account for filter-dropped seqs -- otherwise the next
+    /// delivered event reads as a gap and the server closes 1012, and the host
+    /// publishes diagnostic.ws_slow_client precisely under cellular load, so a
+    /// filtered connection can dead-loop.
+    func testFilteredDiagnosticSequenceHoleDoesNotGapCloseCellularSafeConnection() async throws {
+        let (server, port) = try startServer()
+        defer { server.stop() }
+        try await Task.sleep(nanoseconds: 80_000_000)
+
+        var req = URLRequest(url: URL(string: "ws://127.0.0.1:\(port)/v1/ws")!)
+        let baseline = EventBus.shared.currentSeq
+        req.setValue("\(baseline)", forHTTPHeaderField: "x-rc2-since-seq")
+        req.setValue("cellular-safe", forHTTPHeaderField: "x-rc2-ws-filter")
+        let task = URLSession.shared.webSocketTask(with: req)
+        task.resume()
+        defer { task.cancel(with: .normalClosure, reason: nil) }
+        try await Task.sleep(nanoseconds: 150_000_000)
+
+        // Contiguous publishes where the middle seq is dropped by the filter.
+        let firstKind = uniqueEventKind("test.ws.kept_before_hole")
+        let droppedKind = uniqueEventKind("diagnostic.hole")
+        let secondKind = uniqueEventKind("test.ws.kept_after_hole")
+        EventBus.shared.publish(kind: firstKind, payload: .object(["k": .number(1)]))
+        EventBus.shared.publish(kind: droppedKind, payload: .object(["d": .bool(true)]))
+        EventBus.shared.publish(kind: secondKind, payload: .object(["k": .number(3)]))
+
+        var sawFirst = false
+        var sawSecond = false
+        for _ in 0..<50 {
+            let message: URLSessionWebSocketTask.Message
+            do {
+                message = try await receiveWithTimeout(task, seconds: 1)
+            } catch is TimeoutError where sawSecond {
+                return   // quiet socket after the post-hole event: no gap close
+            }
+            let obj = try object(from: message)
+            if obj["type"] as? String == "heartbeat" { continue }
+            if obj["type"] as? String == "closing" {
+                XCTFail("a seq dropped by the cellular-safe filter is not a gap; connection closed with reason=\(obj["reason"] ?? "?") code=\(obj["code"] ?? "?")")
+                return
+            }
+            switch obj["kind"] as? String {
+            case firstKind?: sawFirst = true
+            case secondKind?:
+                XCTAssertTrue(sawFirst, "kept events must arrive in seq order across the filtered hole")
+                sawSecond = true
+            case droppedKind?:
+                XCTFail("the cellular-safe filter must drop diagnostic.* events server-side; one was delivered")
+                return
+            default: continue
+            }
+        }
+        XCTAssertTrue(sawSecond, "the event after the filtered hole must be delivered on the still-open connection")
     }
 
     func testHandshakeThenDeliversPublishedEvent() async throws {

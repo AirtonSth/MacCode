@@ -14,6 +14,7 @@ final class HTTPPairingCancelTests: XCTestCase {
     /// terminal-state contract.
     final class FakeAuth: DirectAuthProvider {
         private var requests: [String: String] = [:]   // id -> status
+        private var nextRequestNumber = 1
         var cancelCalls: [String] = []
 
         func verify(token: String) -> Bool { token == "valid-token" }
@@ -23,7 +24,9 @@ final class HTTPPairingCancelTests: XCTestCase {
             createPairingRequest(deviceName: deviceName, privateAccountAccessToken: nil)
         }
         func createPairingRequest(deviceName: String, privateAccountAccessToken: String?) -> (requestId: String, code: String)? {
-            let id = "req-1"
+            // Unique ids so slot-accounting tests can hold several requests
+            // outstanding at once, like distinct real pairing attempts.
+            let id = "req-\(nextRequestNumber)"; nextRequestNumber += 1
             requests[id] = "pending"
             return (id, "424242")
         }
@@ -143,6 +146,33 @@ final class HTTPPairingCancelTests: XCTestCase {
 
         let cancel = postStatus("\(base)/v1/pair/cancel", ["request_id": "does-not-exist"])
         XCTAssertEqual(cancel.status, 404)
+    }
+
+    /// WHY: cancel must free the creator's outstanding-request slot
+    /// (maxOutstandingPerPeer = 5), or a device that abandons pairing sheets
+    /// a few times is refused with 429 until the Mac app restarts. Pins the
+    /// release-by-request-id side effect of POST /v1/pair/cancel end to end.
+    @MainActor
+    func test_cancelReleasesOutstandingSlot_restoresCapacity() throws {
+        let port = UInt16.random(in: 33000...44000)
+        let auth = FakeAuth()
+        let s = DirectHTTPServer(port: port, loopbackOnly: true,
+                                 dispatcher: JSONRPCDispatcher(router: FakeRouter()), auth: auth, bootEpoch: 1)
+        try s.start(); defer { s.stop() }
+        let base = "http://127.0.0.1:\(port)"
+        waitReady(base)   // consumes 1 slot (its warm POST creates a request)
+
+        // Fill the remaining 4 of maxOutstandingPerPeer = 5.
+        var lastRid = ""
+        for _ in 0..<4 {
+            lastRid = try XCTUnwrap(postStatus("\(base)/v1/pair", ["device_name": "phone"]).json?["request_id"] as? String)
+        }
+        XCTAssertEqual(postStatus("\(base)/v1/pair", ["device_name": "phone"]).status, 429,
+                       "at the cap the next request must be refused")
+
+        XCTAssertEqual(postStatus("\(base)/v1/pair/cancel", ["request_id": lastRid]).status, 200)
+        XCTAssertEqual(postStatus("\(base)/v1/pair", ["device_name": "phone"]).status, 200,
+                       "cancelling an outstanding request must restore capacity for a new one")
     }
 
     /// WHY: with no auth provider configured pairing is disabled; cancel must

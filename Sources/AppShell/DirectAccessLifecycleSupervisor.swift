@@ -24,6 +24,13 @@ final class DirectAccessLifecycleSupervisor {
     private var state: State = .stopped
     private var retryIndex = 0
     private var cancelRetry: RetryCancellation?
+    /// Monotonic guard for armed retries: the default scheduler hops
+    /// DispatchWorkItem → Task, and a cancel between those hops is lost —
+    /// the stale Task would still run start(remoteEnabled:) after the user
+    /// toggled remote access off (or the Mac slept). Every cancel/re-arm
+    /// bumps the generation; a retry whose captured generation is stale
+    /// must no-op.
+    private var retryGeneration: UInt64 = 0
 
     init(
         startServer: @escaping (Bool) throws -> Void,
@@ -94,8 +101,9 @@ final class DirectAccessLifecycleSupervisor {
         let delay = retryDelays[retryIndex]
         retryIndex += 1
         retryLogger(retryIndex, delay, error)
+        let generation = retryGeneration
         cancelRetry = scheduleRetry(delay) { [weak self] in
-            guard let self else { return }
+            guard let self, self.retryGeneration == generation else { return }
             self.cancelRetry = nil
             do {
                 try self.start(remoteEnabled: remoteEnabled)
@@ -107,6 +115,7 @@ final class DirectAccessLifecycleSupervisor {
     }
 
     private func cancelPendingRetry() {
+        retryGeneration &+= 1
         cancelRetry?()
         cancelRetry = nil
     }

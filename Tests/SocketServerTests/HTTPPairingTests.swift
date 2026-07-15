@@ -8,6 +8,7 @@ final class HTTPPairingTests: XCTestCase {
     final class FakeAuth: DirectAuthProvider {
         var devices: [(String, String)] = []
         var autoApprove = true
+        var failCreatePairingRequest = false
         var lastPrivateAccountAccessToken: String?
         var lastClientDeviceID: String?
         private var requests: [String: (code: String, status: String, token: String?, deviceId: String?)] = [:]
@@ -28,6 +29,7 @@ final class HTTPPairingTests: XCTestCase {
         func createPairingRequest(deviceName: String, clientDeviceID: String?, privateAccountAccessToken: String?) -> (requestId: String, code: String)? {
             lastClientDeviceID = clientDeviceID
             lastPrivateAccountAccessToken = privateAccountAccessToken
+            if failCreatePairingRequest { return nil }
             let id = "req-1", code = "424242"
             requests[id] = (code, "pending", nil, nil)
             return (id, code)
@@ -37,7 +39,9 @@ final class HTTPPairingTests: XCTestCase {
             if r.status == "pending" {
                 if autoApprove {
                     devices.append(("dev-1", "phone"))
-                    requests[requestId] = (r.code, "approved", nil, "dev-1")  // token delivered once
+                    // Token stays deliverable on retry polls (mirrors
+                    // LocalAuthAdapter's TTL-bounded redelivery).
+                    requests[requestId] = (r.code, "approved", "valid-token", "dev-1")
                     return ("approved", "dev-1", "valid-token")
                 } else {
                     requests[requestId] = (r.code, "denied", nil, nil)
@@ -114,7 +118,7 @@ final class HTTPPairingTests: XCTestCase {
     }
 
     @MainActor
-    func test_requestApproveFlow_yieldsTokenOnce() throws {
+    func test_requestApproveFlow_yieldsToken_andRedeliversOnRetryPoll() throws {
         let port = UInt16.random(in: 33000...44000)
         let auth = FakeAuth()
         let s = DirectHTTPServer(port: port, loopbackOnly: true,
@@ -132,10 +136,59 @@ final class HTTPPairingTests: XCTestCase {
         XCTAssertEqual(s1?["status"] as? String, "approved")
         XCTAssertEqual(s1?["token"] as? String, "valid-token")
 
-        // Token is delivered exactly once; a second poll has no token.
+        // A retry poll (lost first response) must redeliver the token —
+        // consuming it on first read stranded approved devices forever.
         let s2 = post("\(base)/v1/pair/status", ["request_id": rid])
         XCTAssertEqual(s2?["status"] as? String, "approved")
-        XCTAssertNil(s2?["token"])
+        XCTAssertEqual(s2?["token"] as? String, "valid-token",
+                       "a lost 200 must not consume the token; the device's retry poll is its only recovery path")
+    }
+
+    // WHY: an internal provider error must not masquerade as "pairing is
+    // disabled" — that sends the user to toggle a Settings switch that is
+    // already on (2026-07-14 incident). The wire code must distinguish
+    // pairing_unavailable (retry) from pairing_disabled (setting off).
+    @MainActor
+    func test_pairRequestProviderError_answersPairingUnavailable_notDisabled() throws {
+        let port = UInt16.random(in: 33000...44000)
+        let auth = FakeAuth(); auth.failCreatePairingRequest = true
+        let s = DirectHTTPServer(port: port, loopbackOnly: true,
+                                 dispatcher: JSONRPCDispatcher(router: FakeRouter()), auth: auth, bootEpoch: 1)
+        try s.start(); defer { s.stop() }
+        let base = "http://127.0.0.1:\(port)"
+        waitReady(base)
+
+        let resp = post("\(base)/v1/pair", ["device_name": "phone"])
+        let error = resp?["error"] as? [String: Any]
+        XCTAssertEqual(error?["code"] as? String, "pairing_unavailable",
+                       "provider error must answer pairing_unavailable so iOS says 'try again', never pairing_disabled")
+    }
+
+    // WHY: each POST /v1/pair reserves an outstanding-request slot
+    // (maxOutstandingPerPeer = 5). The slot must be freed when the request
+    // reaches a terminal status, or a phone that re-pairs a few times (the
+    // "Not authorized → re-pair" recovery loop of 2026-07-14) is refused with
+    // 429 until the Mac app restarts. Six full request→approve cycles from
+    // the same peer must therefore all succeed.
+    @MainActor
+    func test_repeatedRequestApproveCycles_doNotExhaustOutstandingCap() throws {
+        let port = UInt16.random(in: 33000...44000)
+        let auth = FakeAuth()
+        let s = DirectHTTPServer(port: port, loopbackOnly: true,
+                                 dispatcher: JSONRPCDispatcher(router: FakeRouter()), auth: auth, bootEpoch: 1)
+        try s.start(); defer { s.stop() }
+        let base = "http://127.0.0.1:\(port)"
+        waitReady(base)
+
+        for cycle in 1...6 {
+            let pair = post("\(base)/v1/pair", ["device_name": "phone"])
+            let rid = pair?["request_id"] as? String
+            XCTAssertNotNil(rid,
+                "pairing cycle #\(cycle) must be accepted — completed pairings must release their outstanding slot")
+            guard let rid else { break }
+            let st = post("\(base)/v1/pair/status", ["request_id": rid])
+            XCTAssertEqual(st?["status"] as? String, "approved")
+        }
     }
 
     @MainActor
