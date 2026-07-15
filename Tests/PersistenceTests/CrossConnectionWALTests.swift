@@ -71,6 +71,90 @@ final class CrossConnectionWALTests: XCTestCase {
             "all 120 rows from both connections must persist and be visible")
     }
 
+    func test_validDeviceAuthorizationSurvivesCachedReadAndSidecarCommit() throws {
+        let path = makeFilePath()
+        let appConnection = try SQLiteDB(path: path)
+        try Schema.migrate(appConnection)
+        let sidecarConnection = try SQLiteDB(path: path)
+        let trustRepository = DeviceTrustRepository(db: appConnection)
+        let pairingCode = try trustRepository.createPairingCode()
+        let pairedDevice = try XCTUnwrap(
+            trustRepository.redeemPairingCode(pairingCode.code, deviceName: "Test iPhone")
+        )
+
+        try appConnection.performSync { db in
+            let statement = try db.prepare("SELECT MAX(version) FROM schema_meta;")
+            XCTAssertTrue(try statement.step())
+            XCTAssertGreaterThan(statement.columnInt64(0), 0)
+        }
+
+        try NotificationRepository(db: sidecarConnection).insert(
+            AppNotification(id: "sidecar-auth-write", title: "Token Saver", category: "wal")
+        )
+
+        let verifiedDevice = try trustRepository.verify(
+            token: pairedDevice.token,
+            threshold: 0,
+            now: Date().addingTimeInterval(1)
+        )
+
+        XCTAssertEqual(verifiedDevice?.id, pairedDevice.0.id,
+            "a valid iPhone token must not become unauthorized after a sidecar commit")
+    }
+
+    func test_pairingWriteSucceedsAfterCachedReadAndSidecarCommit() throws {
+        let path = makeFilePath()
+        let appConnection = try SQLiteDB(path: path)
+        try Schema.migrate(appConnection)
+        let sidecarConnection = try SQLiteDB(path: path)
+
+        try appConnection.performSync { db in
+            let statement = try db.prepare("SELECT MAX(version) FROM schema_meta;")
+            XCTAssertTrue(try statement.step())
+            XCTAssertGreaterThan(statement.columnInt64(0), 0)
+            // Intentionally stop after the first row. `performSync` owns the
+            // lifecycle of this cached statement and must release its WAL read
+            // snapshot before another connection commits.
+        }
+
+        try NotificationRepository(db: sidecarConnection).insert(
+            AppNotification(id: "sidecar-write", title: "Token Saver", category: "wal")
+        )
+
+        let pairing = try DeviceTrustRepository(db: appConnection)
+            .createPairingRequest(deviceName: "Test iPhone", clientDeviceID: "ios-test-device")
+
+        XCTAssertEqual(pairing.deviceName, "Test iPhone",
+            "a sidecar commit after an early cached read must not lock the Mac pairing INSERT")
+    }
+
+    func test_pairingWriteSucceedsWhenCachedReadOperationThrowsBeforeSidecarCommit() throws {
+        struct IntentionalStop: Error {}
+
+        let path = makeFilePath()
+        let appConnection = try SQLiteDB(path: path)
+        try Schema.migrate(appConnection)
+        let sidecarConnection = try SQLiteDB(path: path)
+
+        XCTAssertThrowsError(try appConnection.performSync { db in
+            let statement = try db.prepare("SELECT MAX(version) FROM schema_meta;")
+            XCTAssertTrue(try statement.step())
+            throw IntentionalStop()
+        }) { error in
+            XCTAssertTrue(error is IntentionalStop)
+        }
+
+        try NotificationRepository(db: sidecarConnection).insert(
+            AppNotification(id: "sidecar-write-after-error", title: "Token Saver", category: "wal")
+        )
+
+        let pairing = try DeviceTrustRepository(db: appConnection)
+            .createPairingRequest(deviceName: "Test iPhone")
+
+        XCTAssertEqual(pairing.deviceName, "Test iPhone",
+            "an interrupted cached read must release its snapshot before pairing resumes")
+    }
+
     func test_reversibleContentStoreVisibleAcrossConnections() throws {
         let path = makeFilePath()
         let connA = try SQLiteDB(path: path)
