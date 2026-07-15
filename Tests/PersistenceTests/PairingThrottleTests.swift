@@ -101,4 +101,53 @@ final class PairingThrottleTests: XCTestCase {
         XCTAssertTrue(th.reserveOutstanding(peer: "b"),
                       "a separate peer must get its own outstanding budget")
     }
+
+    // WHY: the normal pairing lifecycle is reserve → bind → terminal status.
+    // If a completed pairing did not free its slot, a phone re-pairing a few
+    // times (the "Not authorized → re-pair" recovery loop) would hit the cap
+    // and get 429 until the Mac app restarts — pairing must stay repeatable.
+    func test_completedPairings_doNotExhaustCap() {
+        let th = PairingThrottle(maxOutstandingPerPeer: 2)
+        for i in 0..<5 {
+            XCTAssertTrue(th.reserveOutstanding(peer: "phone", now: t0),
+                          "pairing #\(i + 1) must not be blocked by earlier completed pairings")
+            th.bindOutstanding(requestId: "req-\(i)", peer: "phone", expiresAt: t0.addingTimeInterval(300))
+            th.releaseOutstanding(requestId: "req-\(i)")   // terminal status observed
+        }
+    }
+
+    // WHY: the device polls /v1/pair/status repeatedly after the request is
+    // decided. Only the FIRST terminal observation may free the slot —
+    // repeated releases for the same request id must not free slots that
+    // belong to the peer's other outstanding requests (cap bypass).
+    func test_releaseByRequestId_isIdempotent() {
+        let th = PairingThrottle(maxOutstandingPerPeer: 2)
+        XCTAssertTrue(th.reserveOutstanding(peer: "a", now: t0))
+        th.bindOutstanding(requestId: "r1", peer: "a", expiresAt: t0.addingTimeInterval(300))
+        XCTAssertTrue(th.reserveOutstanding(peer: "a", now: t0))
+        th.bindOutstanding(requestId: "r2", peer: "a", expiresAt: t0.addingTimeInterval(300))
+
+        th.releaseOutstanding(requestId: "r1")
+        th.releaseOutstanding(requestId: "r1")   // repeated terminal poll
+        th.releaseOutstanding(requestId: "r1")
+
+        XCTAssertTrue(th.reserveOutstanding(peer: "a", now: t0),
+                      "exactly one slot was freed, so exactly one reserve must succeed")
+        XCTAssertFalse(th.reserveOutstanding(peer: "a", now: t0),
+                       "repeated releases of the same request id must not free r2's slot")
+    }
+
+    // WHY: a phone that dies mid-pair never polls a terminal status and never
+    // cancels. Its slot must come back on its own once the request's TTL
+    // passes, or abandoned requests permanently shrink the peer's budget.
+    func test_abandonedBinding_isReclaimedAfterExpiry() {
+        let th = PairingThrottle(maxOutstandingPerPeer: 1)
+        XCTAssertTrue(th.reserveOutstanding(peer: "a", now: t0))
+        th.bindOutstanding(requestId: "r1", peer: "a", expiresAt: t0.addingTimeInterval(300))
+
+        XCTAssertFalse(th.reserveOutstanding(peer: "a", now: t0.addingTimeInterval(299)),
+                       "before the TTL the slot is still held")
+        XCTAssertTrue(th.reserveOutstanding(peer: "a", now: t0.addingTimeInterval(300)),
+                      "after the TTL the abandoned slot must be reclaimed")
+    }
 }

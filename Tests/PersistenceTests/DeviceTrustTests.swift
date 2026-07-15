@@ -25,6 +25,31 @@ final class DeviceTrustTests: XCTestCase {
         XCTAssertNil(result)
     }
 
+    // WHY: verify() bumps last_seen_at as telemetry inside the auth path. On
+    // 2026-07-14 a locked DB made that WRITE throw while the token row was
+    // perfectly valid, and every paired iPhone got 401 "Not authorized" until
+    // it re-paired. Authorization must be decided by the SELECT alone; the
+    // last_seen write is best-effort.
+    func test_verify_staysAuthorized_whenLastSeenWriteFails() throws {
+        let tmp = NSTemporaryDirectory() + UUID().uuidString
+        defer { try? FileManager.default.removeItem(atPath: tmp) }
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let repo = DeviceTrustRepository(db: db)
+        let code = try repo.createPairingCode()
+        let result = try XCTUnwrap(try repo.redeemPairingCode(code.code, deviceName: "phone"))
+
+        // Make every write on this connection fail (reads keep working),
+        // simulating the locked-database window.
+        try db.execute("PRAGMA query_only=ON;")
+        defer { try? db.execute("PRAGMA query_only=OFF;") }
+
+        let verified = try repo.verify(token: result.token,
+                                       threshold: 0,
+                                       now: Date().addingTimeInterval(120))
+        XCTAssertEqual(verified?.id, result.0.id,
+                       "a valid token must stay authorized when only the last_seen telemetry write fails")
+    }
+
     func test_revokedDevice_failsVerify() throws {
         let tmp = NSTemporaryDirectory() + UUID().uuidString
         defer { try? FileManager.default.removeItem(atPath: tmp) }

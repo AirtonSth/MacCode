@@ -930,6 +930,13 @@ public final class DirectHTTPServer: @unchecked Sendable {
                 // CONTRACT (:23): same code here -- auth provider declined to create request.
                 sendJSON(fd: fd, status: 503, body: pairingErrorPayload(code: "pairing_disabled"), acceptEncoding: headers["accept-encoding"]); return
             }
+            // Bind the reserved slot to the request id so it is freed exactly
+            // once at terminal status/cancel, or reclaimed after the request's
+            // 300s TTL if the device vanishes mid-pair. Without this, every
+            // completed pairing permanently consumed a slot and the 6th
+            // request from the same peer got 429 until the app restarted.
+            pairingThrottle.bindOutstanding(requestId: r.requestId, peer: peer,
+                                            expiresAt: Date().addingTimeInterval(300))
             sendJSON(fd: fd, status: 200, body: ["request_id": r.requestId, "code": r.code, "expires_in": 300], acceptEncoding: headers["accept-encoding"])
         case ("POST", "/v1/pair/status"):
             guard let auth = auth,
@@ -938,7 +945,15 @@ public final class DirectHTTPServer: @unchecked Sendable {
                 send(fd: fd, status: 400, contentType: "text/plain", body: "bad request\n".data(using: .utf8)!); return
             }
             guard let s = auth.pairingRequestStatus(requestId: requestId) else {
+                // Unknown to the auth provider: nothing left to wait for, so
+                // free the creator's slot too (idempotent no-op otherwise).
+                pairingThrottle.releaseOutstanding(requestId: requestId)
                 send(fd: fd, status: 404, contentType: "text/plain", body: "unknown request\n".data(using: .utf8)!); return
+            }
+            if s.status != "pending" {
+                // Terminal (approved/denied/expired/cancelled): release the
+                // outstanding slot exactly once across repeated polls.
+                pairingThrottle.releaseOutstanding(requestId: requestId)
             }
             var resp: [String: Any] = ["status": s.status]
             if let d = s.deviceId { resp["device_id"] = d }
@@ -958,9 +973,16 @@ public final class DirectHTTPServer: @unchecked Sendable {
                 send(fd: fd, status: 400, contentType: "text/plain", body: "bad request\n".data(using: .utf8)!); return
             }
             if auth.cancelPairingRequest(requestId: requestId) {
-                pairingThrottle.releaseOutstanding(peer: peer)
+                // Release by request id: frees the CREATOR's slot even when the
+                // cancel arrives from a different peer address (Wi-Fi→cellular
+                // handoff), where the old peer-based release decremented the
+                // wrong peer.
+                pairingThrottle.releaseOutstanding(requestId: requestId)
                 sendJSON(fd: fd, status: 200, body: ["cancelled": true], acceptEncoding: headers["accept-encoding"])
             } else {
+                // Already terminal/unknown: the binding may still be live if no
+                // terminal-status poll ever arrived — release it (idempotent).
+                pairingThrottle.releaseOutstanding(requestId: requestId)
                 send(fd: fd, status: 404, contentType: "text/plain", body: "unknown request\n".data(using: .utf8)!)
             }
         case ("POST", "/v1/pair/redeem"):
@@ -980,7 +1002,9 @@ public final class DirectHTTPServer: @unchecked Sendable {
             }
             if let (deviceId, token) = auth.redeemPairingCode(code, deviceName: name) {
                 pairingThrottle.recordSuccess(peer: peer)
-                pairingThrottle.releaseOutstanding(peer: peer)
+                // No releaseOutstanding here: the QR/redeem flow never reserves
+                // a slot (/v1/pair does), and the count-based release could free
+                // a slot still bound to this peer's live pairing request.
                 sendJSON(fd: fd, status: 200, body: ["device_id": deviceId, "token": token], acceptEncoding: headers["accept-encoding"])
             } else {
                 pairingThrottle.recordFailure(peer: peer)

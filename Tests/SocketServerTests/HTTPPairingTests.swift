@@ -138,6 +138,33 @@ final class HTTPPairingTests: XCTestCase {
         XCTAssertNil(s2?["token"])
     }
 
+    // WHY: each POST /v1/pair reserves an outstanding-request slot
+    // (maxOutstandingPerPeer = 5). The slot must be freed when the request
+    // reaches a terminal status, or a phone that re-pairs a few times (the
+    // "Not authorized → re-pair" recovery loop of 2026-07-14) is refused with
+    // 429 until the Mac app restarts. Six full request→approve cycles from
+    // the same peer must therefore all succeed.
+    @MainActor
+    func test_repeatedRequestApproveCycles_doNotExhaustOutstandingCap() throws {
+        let port = UInt16.random(in: 33000...44000)
+        let auth = FakeAuth()
+        let s = DirectHTTPServer(port: port, loopbackOnly: true,
+                                 dispatcher: JSONRPCDispatcher(router: FakeRouter()), auth: auth, bootEpoch: 1)
+        try s.start(); defer { s.stop() }
+        let base = "http://127.0.0.1:\(port)"
+        waitReady(base)
+
+        for cycle in 1...6 {
+            let pair = post("\(base)/v1/pair", ["device_name": "phone"])
+            let rid = pair?["request_id"] as? String
+            XCTAssertNotNil(rid,
+                "pairing cycle #\(cycle) must be accepted — completed pairings must release their outstanding slot")
+            guard let rid else { break }
+            let st = post("\(base)/v1/pair/status", ["request_id": rid])
+            XCTAssertEqual(st?["status"] as? String, "approved")
+        }
+    }
+
     @MainActor
     func test_pairRequestPassesPrivateAccountTokenToAuthProvider() throws {
         let port = UInt16.random(in: 33000...44000)
