@@ -278,7 +278,15 @@ final class ConnectionSequenceWatermark: @unchecked Sendable {
     private var sequence: Int64
     private var snapshotCoveredThrough: Int64 = 0
     private var snapshotInFlight = false
+    /// Kept events recorded out of order while a snapshot is in flight. Kept
+    /// events cross one serial batcher in seq order, so a hole below a member
+    /// of this set proves a genuinely lost event.
     private var pendingSequences = Set<Int64>()
+    /// Filter-dropped seqs recorded ahead of the kept event below them. These
+    /// are recorded synchronously on the EventBus delivery queue while kept
+    /// events add batcher latency, so a hole below a member of this set only
+    /// means a kept event still in flight — never a lost event.
+    private var filteredPendingSequences = Set<Int64>()
 
     init(initialSequence: Int64) {
         self.sequence = max(0, initialSequence)
@@ -293,6 +301,12 @@ final class ConnectionSequenceWatermark: @unchecked Sendable {
         lock.lock(); defer { lock.unlock() }
         guard !snapshotInFlight else { return false }
         snapshotInFlight = true
+        // Kept seqs only buffer while a snapshot is in flight and every exit
+        // path clears them, so this starts the lifecycle from a clean set.
+        // filteredPendingSequences intentionally survives: a filter hole is a
+        // fact about the live stream, not the snapshot lifecycle. Clearing it
+        // would lose the account of a never-sent seq, and the first kept
+        // event after the hole would re-report it as a gap.
         pendingSequences.removeAll(keepingCapacity: true)
         return true
     }
@@ -339,7 +353,7 @@ final class ConnectionSequenceWatermark: @unchecked Sendable {
             sequence = next
             drainPendingLocked()
         } else if next > sequence, next > snapshotCoveredThrough {
-            pendingSequences.insert(next)
+            filteredPendingSequences.insert(next)
         }
         lock.unlock()
     }
@@ -350,30 +364,45 @@ final class ConnectionSequenceWatermark: @unchecked Sendable {
             return .gap(expected: sequence + 1, received: next)
         }
         var candidateSequence = max(sequence, next)
-        var remaining = pendingSequences.filter { $0 > candidateSequence }
-        while remaining.remove(candidateSequence + 1) != nil {
+        var remainingKept = pendingSequences.filter { $0 > candidateSequence }
+        var remainingFiltered = filteredPendingSequences.filter { $0 > candidateSequence }
+        while remainingKept.remove(candidateSequence + 1) != nil
+            || remainingFiltered.remove(candidateSequence + 1) != nil {
             candidateSequence += 1
         }
         snapshotInFlight = false
-        if let received = remaining.min() {
+        if let received = remainingKept.min() {
             pendingSequences.removeAll(keepingCapacity: true)
+            filteredPendingSequences.removeAll(keepingCapacity: true)
             return .gap(expected: candidateSequence + 1, received: received)
         }
         sequence = candidateSequence
         snapshotCoveredThrough = max(snapshotCoveredThrough, next)
         pendingSequences.removeAll(keepingCapacity: true)
+        // Remaining filtered seqs above the adopted head are NOT a gap: the
+        // hole below them is a kept event still crossing the batcher, and its
+        // recordEnqueuedEvent will drain them. They must be retained, or that
+        // kept event would re-report the filter hole as a gap.
+        filteredPendingSequences = remainingFiltered
         return .adopted(sequence: sequence)
     }
 
     func cancelSnapshot() {
         lock.lock()
         snapshotInFlight = false
+        // Kept seqs buffered for the abandoned snapshot are dropped: without
+        // an adopted snapshot the hole below them stays uncovered, and the
+        // next kept event fails loud as a gap.
+        // filteredPendingSequences survives: it accounts for seqs that were
+        // never sent, independent of any snapshot; dropping it would turn the
+        // filter hole into a spurious gap once the in-flight kept event lands.
         pendingSequences.removeAll(keepingCapacity: true)
         lock.unlock()
     }
 
     private func drainPendingLocked() {
-        while pendingSequences.remove(sequence + 1) != nil {
+        while pendingSequences.remove(sequence + 1) != nil
+            || filteredPendingSequences.remove(sequence + 1) != nil {
             sequence += 1
         }
     }

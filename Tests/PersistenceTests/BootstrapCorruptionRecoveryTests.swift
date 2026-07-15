@@ -85,6 +85,36 @@ final class BootstrapCorruptionRecoveryTests: XCTestCase {
                        "recovered fresh DB must run initDefaults so the app boots into a known-safe state")
     }
 
+    // WHY: a damaged schema-format number (header offset 44) opens lazily and
+    // only fails at the first schema read with SQLITE_ERROR "unsupported file
+    // format" — a genuine corruption signature the narrowed classifier must
+    // still recover from, or the app fails bootstrap identically on every
+    // launch with no self-heal and no quarantine backup.
+    func test_run_unsupportedFileFormatHeader_recoversLikeCorruption() throws {
+        let tmp = NSTemporaryDirectory() + "RC2BadFormat-" + UUID().uuidString
+        try FileManager.default.createDirectory(atPath: tmp, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(atPath: tmp) }
+        let dbPath = (tmp as NSString).appendingPathComponent("remotecode.sqlite")
+
+        try autoreleasepool {
+            _ = try Bootstrap(channel: .debug, dbPathOverride: dbPath).run()
+        }
+
+        // Corrupt ONLY the schema-format number (bytes 44-47): magic string,
+        // page size, and read-version stay valid, so sqlite3_open succeeds.
+        let handle = try FileHandle(forWritingTo: URL(fileURLWithPath: dbPath))
+        try handle.seek(toOffset: 44)
+        try handle.write(contentsOf: Data([0x00, 0x00, 0x00, 0xFF]))
+        try handle.close()
+
+        let (report, db) = try Bootstrap(channel: .debug, dbPathOverride: dbPath).run()
+        XCTAssertTrue(report.recoveredFromCorruption,
+                      "an unsupported-file-format header is corruption and must quarantine + recreate, not fail every launch")
+        let version = try db.prepare("SELECT MAX(version) FROM schema_meta;")
+        XCTAssertTrue(try version.step())
+        XCTAssertEqual(Int(version.columnInt64(0)), Schema.currentVersion)
+    }
+
     // WHY: quarantine+recreate wipes device_trust (every paired iPhone gets
     // 401 "Not authorized") and the server identity. Only genuine corruption
     // may pay that price. A write failure that is NOT corruption — here a

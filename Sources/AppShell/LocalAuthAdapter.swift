@@ -183,7 +183,15 @@ public final class LocalAuthAdapter: DirectAuthProvider {
             pendingTokens = LocalAuthAdapter.sweepExpiredPendingTokens(
                 pendingTokens, now: now, ttl: LocalAuthAdapter.pendingTokenTTL
             )
-            let pending = pendingTokens.removeValue(forKey: requestId)
+            // Read WITHOUT consuming: the HTTP response carrying the token can
+            // be lost after this call (Wi-Fi→cellular handoff mid-write), and a
+            // consumed token would strand the approved device on "Approved, but
+            // no token was returned" forever. Redelivery is bounded by the TTL
+            // sweep above and by cancel; one-shot delivery added no security on
+            // this plaintext-LAN transport — the token itself travels in the
+            // first response, and a request_id holder could always have won the
+            // first-poll race.
+            let pending = pendingTokens[requestId]
             pendingLock.unlock()
             // Deliver the token only when it has not already expired.
             let liveToken: String? = pending.flatMap { entry in

@@ -130,6 +130,11 @@ public final class Bootstrap {
         return message.contains("malformed")
             || message.contains("not a database")
             || message.contains("corrupt")
+            // Header schema-format number (offset 44) damaged: open succeeds
+            // lazily, the first schema read fails SQLITE_ERROR with exactly
+            // this text. No supported SQLite writes a format > 4, so this is
+            // a pure corruption signature with no false-positive risk.
+            || message.contains("unsupported file format")
     }
 
     private func initDefaults(db: SQLiteDB) throws {

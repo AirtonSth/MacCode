@@ -73,6 +73,50 @@ final class DirectAccessLifecycleSupervisorTests: XCTestCase {
         XCTAssertEqual(delays, [0.25], "successful retry must stop the backoff chain")
     }
 
+    /// WHY: the default scheduler hops DispatchWorkItem → Task; a cancel that
+    /// lands between those hops cannot stop the already-created Task. Without
+    /// a generation guard the stale retry runs start(remoteEnabled: true)
+    /// AFTER the user toggled remote access off — binding 0.0.0.0 and
+    /// publishing Bonjour while Settings shows OFF. The injected scheduler
+    /// here returns a no-op cancellation to model exactly that lost cancel:
+    /// the action still fires and must no-op on its own.
+    func test_staleRetryAfterLostCancel_doesNotStartServer() throws {
+        var shouldFail = true
+        var starts = 0
+        var publishes = 0
+        var scheduled: [@MainActor () -> Void] = []
+        let supervisor = DirectAccessLifecycleSupervisor(
+            startServer: { _ in
+                starts += 1
+                if shouldFail { throw TestError.bindFailed }
+            },
+            stopServer: {},
+            publishBonjour: { publishes += 1 },
+            stopBonjour: {},
+            retryDelays: [0.25],
+            scheduleRetry: { _, action in
+                scheduled.append(action)
+                return {}   // cancellation is LOST (work item already executed)
+            }
+        )
+
+        XCTAssertThrowsError(try supervisor.configure(remoteEnabled: true))
+        XCTAssertEqual(scheduled.count, 1, "failed bind must arm one retry")
+
+        // User toggles remote access OFF before the armed retry fires.
+        shouldFail = false
+        try supervisor.configure(remoteEnabled: false)
+        let startsAfterToggleOff = starts
+
+        // The stale retry's action still runs (its cancel was lost).
+        scheduled.removeFirst()()
+
+        XCTAssertEqual(starts, startsAfterToggleOff,
+                       "a stale retry must no-op after a newer configure — not bind 0.0.0.0 behind an OFF toggle")
+        XCTAssertEqual(publishes, 0,
+                       "Bonjour must never be published by a retry the user's toggle-off superseded")
+    }
+
     func test_reconfigure_cancelsPendingRetry() throws {
         var shouldFail = true
         var cancellations = 0

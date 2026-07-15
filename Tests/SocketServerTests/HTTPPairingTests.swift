@@ -39,7 +39,9 @@ final class HTTPPairingTests: XCTestCase {
             if r.status == "pending" {
                 if autoApprove {
                     devices.append(("dev-1", "phone"))
-                    requests[requestId] = (r.code, "approved", nil, "dev-1")  // token delivered once
+                    // Token stays deliverable on retry polls (mirrors
+                    // LocalAuthAdapter's TTL-bounded redelivery).
+                    requests[requestId] = (r.code, "approved", "valid-token", "dev-1")
                     return ("approved", "dev-1", "valid-token")
                 } else {
                     requests[requestId] = (r.code, "denied", nil, nil)
@@ -116,7 +118,7 @@ final class HTTPPairingTests: XCTestCase {
     }
 
     @MainActor
-    func test_requestApproveFlow_yieldsTokenOnce() throws {
+    func test_requestApproveFlow_yieldsToken_andRedeliversOnRetryPoll() throws {
         let port = UInt16.random(in: 33000...44000)
         let auth = FakeAuth()
         let s = DirectHTTPServer(port: port, loopbackOnly: true,
@@ -134,10 +136,12 @@ final class HTTPPairingTests: XCTestCase {
         XCTAssertEqual(s1?["status"] as? String, "approved")
         XCTAssertEqual(s1?["token"] as? String, "valid-token")
 
-        // Token is delivered exactly once; a second poll has no token.
+        // A retry poll (lost first response) must redeliver the token —
+        // consuming it on first read stranded approved devices forever.
         let s2 = post("\(base)/v1/pair/status", ["request_id": rid])
         XCTAssertEqual(s2?["status"] as? String, "approved")
-        XCTAssertNil(s2?["token"])
+        XCTAssertEqual(s2?["token"] as? String, "valid-token",
+                       "a lost 200 must not consume the token; the device's retry poll is its only recovery path")
     }
 
     // WHY: an internal provider error must not masquerade as "pairing is
