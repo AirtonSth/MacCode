@@ -85,6 +85,75 @@ final class BootstrapCorruptionRecoveryTests: XCTestCase {
                        "recovered fresh DB must run initDefaults so the app boots into a known-safe state")
     }
 
+    // WHY: quarantine+recreate wipes device_trust (every paired iPhone gets
+    // 401 "Not authorized") and the server identity. Only genuine corruption
+    // may pay that price. A write failure that is NOT corruption — here a
+    // read-only DB file, the same class as a locked DB or a failed migration
+    // step — must propagate as an error and leave the healthy data untouched.
+    func test_run_nonCorruptionFailure_doesNotWipeHealthyDatabase() throws {
+        let tmp = NSTemporaryDirectory() + "RC2ReadonlyBoot-" + UUID().uuidString
+        try FileManager.default.createDirectory(atPath: tmp, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(atPath: tmp) }
+        let dbPath = (tmp as NSString).appendingPathComponent("remotecode.sqlite")
+
+        // Healthy DB with a paired device the wipe would destroy. Scoped so
+        // the connection deinits (closes) before the file goes read-only.
+        try autoreleasepool {
+            let (_, db) = try Bootstrap(channel: .debug, dbPathOverride: dbPath).run()
+            let repo = DeviceTrustRepository(db: db)
+            let code = try repo.createPairingCode()
+            _ = try XCTUnwrap(try repo.redeemPairingCode(code.code, deviceName: "phone"))
+        }
+
+        try FileManager.default.setAttributes([.posixPermissions: NSNumber(value: 0o400)],
+                                              ofItemAtPath: dbPath)
+        defer { try? FileManager.default.setAttributes([.posixPermissions: NSNumber(value: 0o600)],
+                                                       ofItemAtPath: dbPath) }
+
+        XCTAssertThrowsError(try Bootstrap(channel: .debug, dbPathOverride: dbPath).run(),
+                             "a non-corruption open/write failure must fail loudly, not silently recreate")
+
+        let backups = try FileManager.default.contentsOfDirectory(atPath: tmp)
+            .filter { $0.contains(".corrupt-") }
+        XCTAssertTrue(backups.isEmpty,
+                      "healthy data must never be quarantined for a non-corruption failure")
+
+        try FileManager.default.setAttributes([.posixPermissions: NSNumber(value: 0o600)],
+                                              ofItemAtPath: dbPath)
+        let (report, reopened) = try Bootstrap(channel: .debug, dbPathOverride: dbPath).run()
+        XCTAssertFalse(report.recoveredFromCorruption)
+        XCTAssertEqual(try DeviceTrustRepository(db: reopened).list().count, 1,
+                       "the paired device must survive the failed launch untouched")
+    }
+
+    // WHY: legacy (pre-33) builds could write duplicate event seq rows. The
+    // step-33 UNIQUE index would then fail the whole migration on upgrade —
+    // and a failed migration must never cost the user their paired devices.
+    // The real step-33 SQL must dedupe first (keeping the oldest row per seq)
+    // so the index always builds.
+    func test_schemaStep33_dedupesLegacyDuplicateSeqRows() throws {
+        let tmp = NSTemporaryDirectory() + "RC2Step33-" + UUID().uuidString + ".sqlite"
+        defer { try? FileManager.default.removeItem(atPath: tmp) }
+        let db = try SQLiteDB(path: tmp)
+
+        // Minimal legacy shape: the tables step 33 touches, with duplicates.
+        let legacy = SchemaStep(1, """
+        CREATE TABLE events (seq INTEGER, kind TEXT);
+        CREATE TABLE command_receipts (method TEXT NOT NULL, client_request_id TEXT NOT NULL,
+                                       PRIMARY KEY(method, client_request_id));
+        INSERT INTO events(seq, kind) VALUES (1, 'old-a'), (2, 'old-b'), (2, 'dup-newer'), (3, 'old-c');
+        """)
+        let step33 = try XCTUnwrap(Schema.steps.first { $0.version == 33 },
+                                   "production must keep a step 33 for this scenario")
+        try Schema.migrateSteps(db, [legacy, step33])
+
+        let rows = try db.prepare("SELECT seq, kind FROM events ORDER BY seq;")
+        var kept: [String] = []
+        while try rows.step() { kept.append(rows.columnText(1) ?? "") }
+        XCTAssertEqual(kept, ["old-a", "old-b", "old-c"],
+                       "step 33 must keep the oldest row per seq and drop later duplicates so the UNIQUE index builds")
+    }
+
     // The normal (healthy) open path must be untouched: no backup files, no
     // corruption flag, and firstRun semantics preserved.
     func test_run_healthyDatabase_doesNotTriggerCorruptionPath() throws {

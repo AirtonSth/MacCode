@@ -8,6 +8,7 @@ final class HTTPPairingTests: XCTestCase {
     final class FakeAuth: DirectAuthProvider {
         var devices: [(String, String)] = []
         var autoApprove = true
+        var failCreatePairingRequest = false
         var lastPrivateAccountAccessToken: String?
         var lastClientDeviceID: String?
         private var requests: [String: (code: String, status: String, token: String?, deviceId: String?)] = [:]
@@ -28,6 +29,7 @@ final class HTTPPairingTests: XCTestCase {
         func createPairingRequest(deviceName: String, clientDeviceID: String?, privateAccountAccessToken: String?) -> (requestId: String, code: String)? {
             lastClientDeviceID = clientDeviceID
             lastPrivateAccountAccessToken = privateAccountAccessToken
+            if failCreatePairingRequest { return nil }
             let id = "req-1", code = "424242"
             requests[id] = (code, "pending", nil, nil)
             return (id, code)
@@ -136,6 +138,26 @@ final class HTTPPairingTests: XCTestCase {
         let s2 = post("\(base)/v1/pair/status", ["request_id": rid])
         XCTAssertEqual(s2?["status"] as? String, "approved")
         XCTAssertNil(s2?["token"])
+    }
+
+    // WHY: an internal provider error must not masquerade as "pairing is
+    // disabled" — that sends the user to toggle a Settings switch that is
+    // already on (2026-07-14 incident). The wire code must distinguish
+    // pairing_unavailable (retry) from pairing_disabled (setting off).
+    @MainActor
+    func test_pairRequestProviderError_answersPairingUnavailable_notDisabled() throws {
+        let port = UInt16.random(in: 33000...44000)
+        let auth = FakeAuth(); auth.failCreatePairingRequest = true
+        let s = DirectHTTPServer(port: port, loopbackOnly: true,
+                                 dispatcher: JSONRPCDispatcher(router: FakeRouter()), auth: auth, bootEpoch: 1)
+        try s.start(); defer { s.stop() }
+        let base = "http://127.0.0.1:\(port)"
+        waitReady(base)
+
+        let resp = post("\(base)/v1/pair", ["device_name": "phone"])
+        let error = resp?["error"] as? [String: Any]
+        XCTAssertEqual(error?["code"] as? String, "pairing_unavailable",
+                       "provider error must answer pairing_unavailable so iOS says 'try again', never pairing_disabled")
     }
 
     // WHY: each POST /v1/pair reserves an outstanding-request slot

@@ -440,6 +440,14 @@ public final class SettingsViewModel: ObservableObject {
 	                }
 	                self.remoteAccessEnabled = false
 	                self.remoteAccessBindFailedReason = reason
+	                // Re-drive AppDelegate's configure with the reverted (off)
+	                // setting: the failed configure armed a supervisor retry that
+	                // captured remoteEnabled=true, and without this post a later
+	                // retry success would bind 0.0.0.0 + publish Bonjour while the
+	                // toggle and stored setting say remote access is OFF.
+	                self._postingRemoteAccess = true
+	                NotificationCenter.default.post(name: .rc2RemoteAccessSettingChanged, object: nil)
+	                self._postingRemoteAccess = false
 	            }
         })
         // General startup-failure surfacing (:214): always refresh the list when
