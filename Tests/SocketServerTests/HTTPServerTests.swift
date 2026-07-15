@@ -347,6 +347,52 @@ final class HTTPServerTests: XCTestCase {
         )
     }
 
+    /// WHY: iOS pings every 5s and kills the connection when the pong misses its
+    /// 2s deadline. On a slow uplink the outbound queue can hold up to 1 MiB of
+    /// event data ahead of the pong; strict FIFO would starve the pong behind
+    /// healthy-but-slow event writes and the client would drop a live connection.
+    /// Control frames must overtake application frames that have not started
+    /// writing (an in-progress frame is never preempted per RFC 6455).
+    func test_connectionOutboundOwner_pongOvertakesQueuedApplicationFramesOnStalledWriter() {
+        let recorded = RecordedFrames()
+        let firstWriteEntered = DispatchSemaphore(value: 0)
+        let releaseFirstWrite = DispatchSemaphore(value: 0)
+        let owner = WebSocketOutboundQueue(
+            maxQueuedBytes: 1_024,
+            applicationWriter: { data in
+                recorded.append("app:\(String(decoding: data, as: UTF8.self))")
+                if data == Data("event-1".utf8) {
+                    firstWriteEntered.signal()
+                    _ = releaseFirstWrite.wait(timeout: .now() + 2)
+                }
+                return true
+            },
+            controlWriter: { opcode, data in
+                recorded.append("control:\(opcode):\(String(decoding: data, as: UTF8.self))")
+                return true
+            },
+            writeFailureClosingData: Data(),
+            onTerminal: { _ in },
+            didSendTerminal: {}
+        )
+
+        XCTAssertEqual(owner.enqueueApplication(Data("event-1".utf8)), .accepted)
+        XCTAssertEqual(firstWriteEntered.wait(timeout: .now() + 2), .success,
+                       "the first application frame must be mid-write before the queue backs up")
+        XCTAssertEqual(owner.enqueueApplication(Data("event-2".utf8)), .accepted)
+        XCTAssertEqual(owner.enqueueApplication(Data("event-3".utf8)), .accepted)
+        XCTAssertEqual(owner.enqueueControl(opcode: 0xA, data: Data("pong".utf8)), .accepted)
+        releaseFirstWrite.signal()
+        owner.finish()
+
+        XCTAssertEqual(recorded.snapshot, [
+            "app:event-1",
+            "control:10:pong",
+            "app:event-2",
+            "app:event-3",
+        ], "a pong must be written before queued application frames that have not started, or the client's 2s pong deadline starves behind event data")
+    }
+
     // MARK: - Auth-gate coverage (T010-T012, T006) — loopbackOnly: false
 
     /// Minimal auth provider used only by the auth-gate tests below.

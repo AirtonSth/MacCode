@@ -41,6 +41,13 @@ final class WebSocketOutboundQueue: @unchecked Sendable {
     private let lock = NSLock()
     private var queuedBytes = 0
     private var state: State = .open
+    // Pending frames are buffered here so the serial drain can prioritize
+    // control frames (pong/ping/close) over queued application data. A pong
+    // stuck behind up to 1 MiB of event frames on a slow uplink would miss the
+    // client's pong deadline and kill a healthy connection. Each enqueue still
+    // dispatches exactly one drain token; only the pick order changes.
+    private var pendingApplicationFrames: [Data] = []
+    private var pendingControlFrames: [(opcode: UInt8, data: Data)] = []
     private let applicationWriter: @Sendable (Data) -> Bool
     private let controlWriter: @Sendable (UInt8, Data) -> Bool
     private let writeFailureClosingData: Data
@@ -114,8 +121,9 @@ final class WebSocketOutboundQueue: @unchecked Sendable {
             return .queueFull
         }
         queuedBytes += data.count
+        pendingApplicationFrames.append(data)
         acceptedSubmissionHook()
-        queue.async { [weak self] in self?.writeApplication(data) }
+        queue.async { [weak self] in self?.writeNextPendingFrame() }
         lock.unlock()
         return .accepted
     }
@@ -126,8 +134,9 @@ final class WebSocketOutboundQueue: @unchecked Sendable {
             lock.unlock()
             return .closed
         }
+        pendingControlFrames.append((opcode: opcode, data: data))
         acceptedSubmissionHook()
-        queue.async { [weak self] in self?.writeControl(opcode: opcode, data: data) }
+        queue.async { [weak self] in self?.writeNextPendingFrame() }
         lock.unlock()
         return .accepted
     }
@@ -166,6 +175,27 @@ final class WebSocketOutboundQueue: @unchecked Sendable {
 
     func finish() {
         queue.sync {}
+    }
+
+    /// Runs once per enqueued frame on the serial queue. Control frames are
+    /// drained before pending application frames; an application frame whose
+    /// write already started is never preempted (RFC 6455 frames must not
+    /// interleave), so a pong waits only for the frame in progress.
+    private func writeNextPendingFrame() {
+        lock.lock()
+        if !pendingControlFrames.isEmpty {
+            let control = pendingControlFrames.removeFirst()
+            lock.unlock()
+            writeControl(opcode: control.opcode, data: control.data)
+            return
+        }
+        guard !pendingApplicationFrames.isEmpty else {
+            lock.unlock()
+            return
+        }
+        let data = pendingApplicationFrames.removeFirst()
+        lock.unlock()
+        writeApplication(data)
     }
 
     private func writeApplication(_ data: Data) {
@@ -267,6 +297,18 @@ final class ConnectionSequenceWatermark: @unchecked Sendable {
         return true
     }
 
+    /// Re-anchors the gap expectation when replay expiry re-anchors the
+    /// delivery cursor to the live head. Advance-only, so a snapshot adopted
+    /// concurrently (or live events recorded meanwhile) is never rolled back.
+    func reanchorForExpiredReplay(sequence next: Int64) {
+        lock.lock()
+        if next > sequence {
+            sequence = next
+            drainPendingLocked()
+        }
+        lock.unlock()
+    }
+
     func recordEnqueuedEvent(sequence next: Int64) -> ConnectionSequenceRecordResult {
         lock.lock(); defer { lock.unlock() }
         if next == sequence + 1 {
@@ -282,6 +324,24 @@ final class ConnectionSequenceWatermark: @unchecked Sendable {
             return .bufferedForSnapshot
         }
         return .gap(expected: sequence + 1, received: next)
+    }
+
+    /// Accounts for a seq the connection's negotiated filter dropped: the
+    /// event was never sent, so the gap expectation must advance past it
+    /// without a frame. A filtered seq can be recorded ahead of an earlier
+    /// kept event still crossing the batcher, so out-of-order seqs are
+    /// buffered and drained once the kept event advances the watermark. A
+    /// hole the filter cannot account for is left for the next enqueued
+    /// event to report as a gap.
+    func recordFilteredEvent(sequence next: Int64) {
+        lock.lock()
+        if next == sequence + 1 {
+            sequence = next
+            drainPendingLocked()
+        } else if next > sequence, next > snapshotCoveredThrough {
+            pendingSequences.insert(next)
+        }
+        lock.unlock()
     }
 
     func adoptSnapshot(sequence next: Int64) -> ConnectionSnapshotAdoptionResult {

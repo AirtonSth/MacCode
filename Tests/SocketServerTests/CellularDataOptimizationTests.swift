@@ -162,6 +162,39 @@ final class CellularDataOptimizationTests: XCTestCase {
                        "cellular-safe WS filtering may summarize passive terminal output and drop diagnostics while visible state and critical events pass")
     }
 
+    /// WHY: the cellular-safe filter legitimately skips seqs (diagnostic.*),
+    /// and the host publishes diagnostic.ws_slow_client exactly under cellular
+    /// load. A filter-dropped seq must advance the connection gap watermark
+    /// without a frame, or the next delivered event reads as a gap, the server
+    /// closes 1012, and the filtered client dead-loops on reconnect.
+    func testCellularSafeFilteredSequenceHoleIsAccountedInsteadOfGapClosing() {
+        let bus = EventBus()
+        let watermark = ConnectionSequenceWatermark(initialSequence: 0)
+        var delivered: [Int64] = []
+        var gaps: [ConnectionSequenceRecordResult] = []
+        _ = bus.subscribeDetectingReplayExpiry(
+            since: 0,
+            filter: .cellularSafe,
+            onReplayExpired: { _ in XCTFail("a fresh bus must not report replay expiry") },
+            onFilteredEvent: { watermark.recordFilteredEvent(sequence: $0) }
+        ) { event in
+            let result = watermark.recordEnqueuedEvent(sequence: event.seq)
+            if result != .advanced { gaps.append(result) }
+            delivered.append(event.seq)
+        }
+
+        bus.publish(kind: "workspace.updated", payload: .object([:]))
+        bus.publish(kind: "diagnostic.ws_slow_client", payload: .object([:]))
+        bus.publish(kind: "workspace.updated", payload: .object([:]))
+
+        XCTAssertEqual(delivered, [1, 3],
+                       "the filter must drop only the diagnostic seq while both critical events pass")
+        XCTAssertEqual(gaps, [],
+                       "a seq dropped by the connection's own filter is not a gap and must not trigger a 1012 close")
+        XCTAssertEqual(watermark.value, 3,
+                       "the watermark must account for the filtered seq so later events stay contiguous")
+    }
+
     func testCellularSafeOutputSummaryKeepsSeqAndGeometry() {
         let source = EventBus.Event(seq: 1, kind: "surface.output", payload: .object([
             "surface_id": .string("s1"),

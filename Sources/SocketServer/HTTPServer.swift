@@ -658,6 +658,13 @@ public final class DirectHTTPServer: @unchecked Sendable {
                 since: wsSinceSeq,
                 filter: wsFilter,
                 onReplayExpired: { metadata in
+                    // The delivery cursor re-anchored to the live head
+                    // (metadata.sequence); the gap watermark must follow BEFORE
+                    // any live event is enqueued, or the first event after
+                    // baselineRequired reads as a gap and closes 1012.
+                    sequenceWatermark.reanchorForExpiredReplay(
+                        sequence: metadata.sequence
+                    )
                     guard let data = self.connectionBaselineRequiredData(
                         connectionId: connectionId,
                         requestedAfterSequence: wsSinceSeq,
@@ -676,6 +683,12 @@ public final class DirectHTTPServer: @unchecked Sendable {
                             reason: "queue_full"
                         )
                     }
+                },
+                onFilteredEvent: { sequence in
+                    // A seq dropped by this connection's negotiated filter is
+                    // not a gap; account for it so the next delivered event
+                    // stays contiguous instead of closing 1012.
+                    sequenceWatermark.recordFilteredEvent(sequence: sequence)
                 }
             ) { ev in
                 let frame = ConnectionTransportFrame.event(ConnectionEventFrame(

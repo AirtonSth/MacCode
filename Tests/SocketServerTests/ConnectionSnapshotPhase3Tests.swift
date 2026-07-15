@@ -431,6 +431,45 @@ final class ConnectionSnapshotPhase3Tests: XCTestCase {
                        "a rejected snapshot must not advance the connection watermark")
     }
 
+    func test_connectionWatermark_filteredSequenceAdvancesExpectationWithoutAFrame() {
+        let watermark = ConnectionSequenceWatermark(initialSequence: 8)
+
+        watermark.recordFilteredEvent(sequence: 9)
+        XCTAssertEqual(watermark.value, 9,
+                       "a seq dropped by the connection's filter was never sent and must not be awaited")
+        XCTAssertEqual(watermark.recordEnqueuedEvent(sequence: 10), .advanced,
+                       "the first delivered event after a filtered hole must not read as a gap")
+    }
+
+    func test_connectionWatermark_buffersFilteredSequenceRecordedAheadOfBatchedKeptEvent() {
+        // Filtered seqs are recorded synchronously on the EventBus delivery
+        // queue while kept events cross the per-connection batcher hop, so a
+        // filtered N+2 can be recorded before kept N+1.
+        let watermark = ConnectionSequenceWatermark(initialSequence: 8)
+
+        watermark.recordFilteredEvent(sequence: 10)
+        XCTAssertEqual(watermark.value, 8,
+                       "an out-of-order filtered seq must wait for the kept event ahead of it")
+        XCTAssertEqual(watermark.recordEnqueuedEvent(sequence: 9), .advanced)
+        XCTAssertEqual(watermark.value, 10,
+                       "the buffered filtered seq must drain once the kept event advances the watermark")
+        XCTAssertEqual(watermark.recordEnqueuedEvent(sequence: 11), .advanced)
+    }
+
+    func test_connectionWatermark_expiredReplayReanchorAdvancesButNeverRollsBack() {
+        let watermark = ConnectionSequenceWatermark(initialSequence: 0)
+
+        watermark.reanchorForExpiredReplay(sequence: 514)
+        XCTAssertEqual(watermark.value, 514,
+                       "replay expiry re-anchors delivery to the live head; the gap expectation must follow")
+        XCTAssertEqual(watermark.recordEnqueuedEvent(sequence: 515), .advanced,
+                       "the first live event after baselineRequired must not read as a gap")
+
+        watermark.reanchorForExpiredReplay(sequence: 100)
+        XCTAssertEqual(watermark.value, 515,
+                       "re-anchoring must never roll the watermark back behind recorded events")
+    }
+
     func test_domainRevision_classifiesEverySnapshotDomainAndMultiDomainIntent() {
         let cases: [(kind: String, expected: ConnectionDomainRevisions)] = [
             ("workspace.updated", .init(shell: 1, surfaces: 0, agentThreads: 0, browser: 0, files: 0)),
