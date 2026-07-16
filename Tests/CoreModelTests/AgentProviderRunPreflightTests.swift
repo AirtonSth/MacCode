@@ -49,6 +49,48 @@ final class AgentProviderRunPreflightTests: XCTestCase {
         XCTAssertThrowsError(try AgentProviderRunPreflight.validate(snapshot: snapshot(authenticated: false, capabilities: capabilities), interactionMode: .default, permissionMode: .supervised, attachments: []))
     }
 
+    /// WHY: host preflight and the composer must resolve "grok" vs "grok-cli"
+    /// and stale instance ids to the live provider row instead of missingSnapshot.
+    func test_snapshotSelectionFallsBackToProviderWhenInstanceIdIsStaleOrRawValue() {
+        let grok = AgentProviderSnapshotFactory.snapshot(
+            provider: .grok,
+            models: [AgentModelDescriptor(id: "grok-4.5", label: "Grok 4.5", provider: .grok)],
+            binaryPath: "/usr/bin/true",
+            id: "grok-cli"
+        )
+        let codex = AgentProviderSnapshotFactory.snapshot(
+            provider: .codex,
+            models: [AgentModelDescriptor(id: "gpt-5.5", label: "GPT-5.5", provider: .codex)],
+            binaryPath: "/usr/bin/true",
+            id: "codex-cli"
+        )
+        let snapshots = [codex, grok]
+
+        XCTAssertEqual(
+            AgentProviderSnapshotSelection.resolve(snapshots: snapshots, provider: .grok, instanceId: "grok-cli")?.id,
+            "grok-cli"
+        )
+        XCTAssertEqual(
+            AgentProviderSnapshotSelection.resolve(snapshots: snapshots, provider: .grok, instanceId: "grok")?.id,
+            "grok-cli",
+            "raw provider value must fall back to the live grok snapshot id"
+        )
+        XCTAssertEqual(
+            AgentProviderSnapshotSelection.resolve(snapshots: snapshots, provider: .grok, instanceId: "stale-instance")?.id,
+            "grok-cli",
+            "stale instance ids must not produce missingSnapshot when a same-provider snapshot exists"
+        )
+        XCTAssertEqual(
+            AgentProviderSnapshotSelection.resolve(snapshots: snapshots, provider: .grok, instanceId: "codex-cli")?.id,
+            "grok-cli",
+            "must never return another provider's instance for a Grok preflight"
+        )
+        XCTAssertNil(
+            AgentProviderSnapshotSelection.resolve(snapshots: [codex], provider: .grok, instanceId: "grok-cli"),
+            "must not invent a Grok snapshot from another provider's list"
+        )
+    }
+
     func test_preflightRejectsUnsupportedPlanAndPermissionBeforeExecution() {
         let candidate = snapshot(
             interactionModes: [.default],

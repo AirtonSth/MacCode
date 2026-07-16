@@ -669,6 +669,23 @@ public enum AgentProviderRunPreflightError: Error, CustomStringConvertible, Equa
     }
 }
 
+/// Shared snapshot pick for host preflight and surface selection.
+/// Prefer exact instance+provider, then same-provider fallback (covers
+/// raw "grok" vs "grok-cli" and stale instance ids without cross-provider bleed).
+public enum AgentProviderSnapshotSelection {
+    public static func resolve(
+        snapshots: [AgentProviderSnapshot],
+        provider: AgentProvider,
+        instanceId: String?
+    ) -> AgentProviderSnapshot? {
+        if let instanceId,
+           let exact = snapshots.first(where: { $0.id == instanceId && $0.provider == provider }) {
+            return exact
+        }
+        return snapshots.first(where: { $0.provider == provider })
+    }
+}
+
 /// Single fail-closed provider gate shared by desktop and mirror execution.
 /// This must run before a draft, queue, user message, thread, or run is mutated.
 public enum AgentProviderRunPreflight {
