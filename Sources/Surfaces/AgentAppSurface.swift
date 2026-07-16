@@ -1062,7 +1062,10 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         if let snapshot = selectedProviderSnapshot {
             return snapshot.effectivePermissionModes
         }
-        return provider == .grok ? [.supervised] : AgentPermissionMode.allCases
+        // Pre-discovery: Grok CLI/ACP supports the full permission set even when
+        // session/new omits modes. Keep parity with Codex/Claude until a snapshot
+        // narrows the negotiated subset.
+        return AgentPermissionMode.allCases
     }
 
     public func permissionModeUnavailableReason(_ mode: AgentPermissionMode) -> String? {
@@ -1449,7 +1452,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                             ?? self.providerSnapshots.first { $0.provider == thread.provider }
                     }
                     let supported = snapshot?.effectivePermissionModes
-                        ?? (thread?.provider == .grok ? [.supervised] : AgentPermissionMode.allCases)
+                        ?? AgentPermissionMode.allCases
                     if supported.contains(.fullAccess) {
                         self.setPermissionMode(.fullAccess, for: threadId)
                     }

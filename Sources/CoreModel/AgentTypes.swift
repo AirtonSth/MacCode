@@ -861,7 +861,10 @@ public enum AgentProviderSnapshotFactory {
                 accentColor: accentColor ?? "#1DA1F2",
                 continuationGroup: "xai-grok",
                 interactionModes: interactionModesOverride ?? [.default],
-                permissionModes: permissionModesOverride ?? [.supervised],
+                // Grok CLI accepts default / acceptEdits / bypassPermissions even when
+                // ACP session/new omits modes.advertisement. Default open so Full access
+                // is selectable before discovery; discovery may still narrow the set.
+                permissionModes: permissionModesOverride ?? AgentPermissionMode.allCases,
                 enabled: enabled,
                 installed: installed,
                 version: version,

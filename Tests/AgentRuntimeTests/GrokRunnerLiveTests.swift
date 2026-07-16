@@ -19,6 +19,10 @@ final class GrokRunnerLiveTests: ProviderProcessTestCase {
         XCTAssertFalse(discovery.isFallback, "authenticated ACP discovery must not silently use static models")
         XCTAssertFalse(discovery.models.isEmpty)
         XCTAssertTrue(discovery.permissionModes.contains(.supervised))
+        XCTAssertTrue(
+            discovery.permissionModes.contains(.fullAccess),
+            "live Grok omits modes advertisement but Full access must remain selectable via set_mode"
+        )
         XCTAssertEqual(
             discovery.capabilities.supportsPlanReview,
             discovery.interactionModes.contains(.plan),

@@ -25,6 +25,18 @@ final class AgentProviderSnapshotTests: XCTestCase {
         XCTAssertTrue(snapshot.slashCommands.contains("/plan"))
     }
 
+    func test_grokSnapshotDefaultsExposeFullAccessWithoutDiscoveryOverride() {
+        let snapshot = AgentProviderSnapshotFactory.snapshot(
+            provider: .grok,
+            models: [AgentModelDescriptor(id: "grok-4.5", label: "Grok 4.5", provider: .grok)],
+            binaryPath: "/tmp/grok"
+        )
+
+        XCTAssertEqual(snapshot.effectivePermissionModes, AgentPermissionMode.allCases,
+                       "pre-discovery Grok snapshots must keep Full access selectable")
+        XCTAssertTrue(snapshot.effectivePermissionModes.contains(.fullAccess))
+    }
+
     func test_modelDescriptorDefaultsRemainBackwardCompatible() throws {
         let json = """
         {"id":"gpt-5.5","label":"GPT-5.5","provider":"codex","supportsReasoning":true}

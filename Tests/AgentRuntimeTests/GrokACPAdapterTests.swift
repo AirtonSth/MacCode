@@ -172,6 +172,23 @@ final class GrokACPAdapterTests: ProviderProcessTestCase {
         XCTAssertEqual(result.models.map(\.id), ["account-live-model"])
     }
 
+    func test_discoveryWithoutModeAdvertisementExposesFullPermissionSet() async throws {
+        // Live Grok 0.2.x session/new often omits modes.availableModes while still
+        // accepting session/set_mode for default / acceptEdits / bypassPermissions.
+        let peer = try FakeGrokACPPeer(mode: .discovery)
+        defer { peer.remove() }
+        let adapter = GrokACPAdapter(binaryNameOverride: peer.path)
+
+        let discovery = await adapter.discoveryResult()
+
+        XCTAssertFalse(discovery.isFallback)
+        XCTAssertEqual(discovery.permissionModes, AgentPermissionMode.allCases,
+                       "omitted mode advertisement must not lock Full access out of the picker")
+        XCTAssertTrue(discovery.permissionModes.contains(.fullAccess))
+        XCTAssertEqual(discovery.interactionModes, [.default],
+                       "Plan stays fail-closed until ACP advertises a plan mode id")
+    }
+
     func test_authenticatedDiscoverySurfacesOnlyNegotiatedPlanCapability() async throws {
         let peer = try FakeGrokACPPeer(mode: .plan)
         defer { peer.remove() }
@@ -181,11 +198,60 @@ final class GrokACPAdapterTests: ProviderProcessTestCase {
 
         XCTAssertFalse(discovery.isFallback)
         XCTAssertEqual(discovery.interactionModes, [.default, .plan])
-        XCTAssertEqual(discovery.permissionModes, [.supervised])
+        XCTAssertEqual(discovery.permissionModes, [.supervised],
+                       "when modes are advertised without bypassPermissions, Full access stays closed")
         XCTAssertTrue(discovery.capabilities.supportsPlanReview)
         XCTAssertTrue(discovery.capabilities.supportsAttachments)
         XCTAssertTrue(discovery.capabilities.supportsApprovals)
         XCTAssertFalse(discovery.capabilities.supportsUserInput)
+    }
+
+    func test_fullAccessAppliesViaSetModeWhenModesOmitted() async throws {
+        let peer = try FakeGrokACPPeer(mode: .permission)
+        defer { peer.remove() }
+        let adapter = GrokACPAdapter(binaryNameOverride: peer.path)
+        let request = makeRequest(permissionMode: .fullAccess)
+        let box = GrokACPEventBox()
+
+        _ = try await adapter.startSession(request) { box.append($0) }
+        let pending = try await box.waitForRequest(timeout: 3)
+        try await adapter.respondToRequest(
+            threadId: request.threadId,
+            requestId: pending.id,
+            response: .approve
+        )
+        let finished = try await box.waitFinished(timeout: 3)
+        XCTAssertEqual(finished.status, .completed,
+                       "Full access must start a usable session when ACP omits mode advertisement")
+    }
+
+    func test_permissionModeResolutionAllowsKnownWireIDsWithoutAdvertisement() throws {
+        XCTAssertEqual(
+            try GrokACPAdapter.resolvedPermissionModeID(for: .fullAccess, availableModeIDs: []),
+            "bypassPermissions"
+        )
+        XCTAssertEqual(
+            try GrokACPAdapter.resolvedPermissionModeID(for: .autoAcceptEdits, availableModeIDs: []),
+            "acceptEdits"
+        )
+        XCTAssertEqual(
+            GrokACPAdapter.permissionModes(from: []),
+            AgentPermissionMode.allCases
+        )
+        XCTAssertEqual(
+            GrokACPAdapter.permissionModes(from: ["default", "plan"]),
+            [.supervised]
+        )
+        XCTAssertEqual(
+            GrokACPAdapter.permissionModes(from: ["default", "acceptEdits", "bypassPermissions"]),
+            [.supervised, .autoAcceptEdits, .fullAccess]
+        )
+        XCTAssertThrowsError(
+            try GrokACPAdapter.resolvedPermissionModeID(
+                for: .fullAccess,
+                availableModeIDs: ["default", "plan"]
+            )
+        )
     }
 
     func test_discoveryFailureLabelsStaticFallback() async {
@@ -330,11 +396,12 @@ final class GrokACPAdapterTests: ProviderProcessTestCase {
     private func makeRequest(
         threadId: AgentThreadID? = nil,
         providerThreadId: String? = nil,
+        permissionMode: AgentPermissionMode = .supervised,
         interactionMode: AgentInteractionMode = .default
     ) -> AgentRunRequest {
         AgentRunRequest(
             threadId: threadId ?? AgentThreadID(), provider: .grok, model: "account-live-model", cwd: "/tmp",
-            prompt: "hello", providerThreadId: providerThreadId, permissionMode: .supervised,
+            prompt: "hello", providerThreadId: providerThreadId, permissionMode: permissionMode,
             interactionMode: interactionMode
         )
     }

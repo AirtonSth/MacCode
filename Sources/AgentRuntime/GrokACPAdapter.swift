@@ -144,13 +144,18 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
             let initialized = try await client.initialize()
             let opened = try await client.newSession(cwd: discoveryCwd)
             let discovered = initialized.models.isEmpty ? opened.models : initialized.models
-            let interactionModes: [AgentInteractionMode] = opened.planModeId != nil
-                ? [.default, .plan]
-                : [.default]
-            var permissionModes: [AgentPermissionMode] = [.supervised]
             let modeIDs = Set(opened.availableModes.map(\.id))
-            if modeIDs.contains(Self.mode(for: .autoAcceptEdits)) { permissionModes.append(.autoAcceptEdits) }
-            if modeIDs.contains(Self.mode(for: .fullAccess)) { permissionModes.append(.fullAccess) }
+            // Live Grok 0.2.x often omits `modes.availableModes` from session/new
+            // while still accepting session/set_mode for the CLI wire IDs
+            // (default / acceptEdits / bypassPermissions / plan). When modes are
+            // advertised, only expose the negotiated subset.
+            let interactionModes: [AgentInteractionMode]
+            if modeIDs.isEmpty {
+                interactionModes = [.default]
+            } else {
+                interactionModes = opened.planModeId != nil ? [.default, .plan] : [.default]
+            }
+            let permissionModes = Self.permissionModes(from: modeIDs)
             var attachmentKinds: [AgentAttachmentKind] = []
             if initialized.embeddedContext { attachmentKinds.append(.file) }
             if initialized.image { attachmentKinds.append(.image) }
@@ -169,14 +174,14 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
                 supportsStreaming: true,
                 supportsFork: false,
                 supportsRollback: false,
-                supportsPlanReview: opened.planModeId != nil
+                supportsPlanReview: interactionModes.contains(.plan)
             )
             result = discovered.isEmpty
                 ? GrokACPDiscoveryResult(
                     models: GrokRunner.listModels(installedVersion: nil),
                     isFallback: true,
                     interactionModes: [.default],
-                    permissionModes: [.supervised],
+                    permissionModes: Self.defaultPermissionModes,
                     capabilities: .conservative,
                     discoveryCacheKey: cacheKey
                 )
@@ -193,7 +198,7 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
                 models: GrokRunner.listModels(installedVersion: nil),
                 isFallback: true,
                 interactionModes: [.default],
-                permissionModes: [.supervised],
+                permissionModes: Self.defaultPermissionModes,
                 capabilities: .conservative,
                 discoveryCacheKey: cacheKey
             )
@@ -533,13 +538,10 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
                 }
                 requestedMode = planModeID
             } else {
-                let permissionMode = Self.mode(for: request.permissionMode)
-                requestedMode = session.availableModeIDs.contains(permissionMode) ? permissionMode : nil
-                if request.permissionMode != .supervised, requestedMode == nil {
-                    throw AgentProviderAdapterError.unsupported(
-                        "Grok ACP did not advertise the \(request.permissionMode.rawValue) permission mode for this session"
-                    )
-                }
+                requestedMode = try Self.resolvedPermissionModeID(
+                    for: request.permissionMode,
+                    availableModeIDs: session.availableModeIDs
+                )
             }
             if let requestedMode, requestedMode != session.mode {
                 try await session.client.setMode(sessionId: session.providerThreadId, modeId: requestedMode)
@@ -707,12 +709,53 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
         }
     }
 
+    /// CLI/ACP wire values accepted by Grok Build (`--permission-mode` / session/set_mode).
+    static let defaultPermissionModes: [AgentPermissionMode] = AgentPermissionMode.allCases
+
     private static func mode(for permission: AgentPermissionMode) -> String {
         switch permission {
         case .supervised: return "default"
         case .autoAcceptEdits: return "acceptEdits"
         case .fullAccess: return "bypassPermissions"
         }
+    }
+
+    /// Map advertised ACP mode IDs to RemoteCode permission modes.
+    /// Empty advertisement (live Grok 0.2.x) means the known CLI set is usable.
+    static func permissionModes(from availableModeIDs: Set<String>) -> [AgentPermissionMode] {
+        if availableModeIDs.isEmpty {
+            return defaultPermissionModes
+        }
+        var modes: [AgentPermissionMode] = [.supervised]
+        if availableModeIDs.contains(mode(for: .autoAcceptEdits)) {
+            modes.append(.autoAcceptEdits)
+        }
+        if availableModeIDs.contains(mode(for: .fullAccess)) {
+            modes.append(.fullAccess)
+        }
+        return modes
+    }
+
+    /// Resolve a permission mode to an ACP mode ID for session/set_mode.
+    /// When the session omits availableModes, still apply the known wire ID —
+    /// live Grok accepts set_mode without advertising the catalog.
+    static func resolvedPermissionModeID(
+        for permission: AgentPermissionMode,
+        availableModeIDs: Set<String>
+    ) throws -> String? {
+        let wireID = mode(for: permission)
+        if availableModeIDs.isEmpty {
+            return wireID
+        }
+        if availableModeIDs.contains(wireID) {
+            return wireID
+        }
+        if permission == .supervised {
+            return nil
+        }
+        throw AgentProviderAdapterError.unsupported(
+            "Grok ACP did not advertise the \(permission.rawValue) permission mode for this session"
+        )
     }
 
     private static func runtimeEvent(method: String, payload: Any?) -> AssistantEvent {
