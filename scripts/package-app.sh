@@ -169,6 +169,16 @@ cat > "$STAGING_APP/Contents/Info.plist" <<EOF
   <key>NSPrincipalClass</key><string>NSApplication</string>
   <key>NSSupportsAutomaticTermination</key><false/>
   <key>NSSupportsSuddenTermination</key><false/>
+  <key>NSNetworkVolumesUsageDescription</key>
+  <string>RemoteCode needs access to project folders on network volumes so agents, terminals, and file tools can read and edit your code.</string>
+  <key>NSRemovableVolumesUsageDescription</key>
+  <string>RemoteCode needs access to project folders on removable volumes so agents, terminals, and file tools can read and edit your code.</string>
+  <key>NSDesktopFolderUsageDescription</key>
+  <string>RemoteCode needs access to folders on your Desktop when you open them as workspaces.</string>
+  <key>NSDocumentsFolderUsageDescription</key>
+  <string>RemoteCode needs access to folders in Documents when you open them as workspaces.</string>
+  <key>NSDownloadsFolderUsageDescription</key>
+  <string>RemoteCode needs access to folders in Downloads when you open them as workspaces.</string>
   <key>LSEnvironment</key>
   <dict>
     <key>RC2_CHANNEL</key><string>${RC2_CHANNEL_VALUE}</string>
@@ -184,7 +194,15 @@ printf 'APPL????' > "$STAGING_APP/Contents/PkgInfo"
 if command -v xattr >/dev/null 2>&1; then
   xattr -cr "$STAGING_APP" || true
 fi
-codesign --force --deep --sign - --timestamp=none "$STAGING_APP"
+# Default is ad-hoc (`-`). Prefer a stable identity for daily local builds so
+# macOS TCC "Allow" grants survive rebuilds: export RC2_CODESIGN_IDENTITY="Apple Development: …"
+# Release DMGs re-sign with Developer ID in package-dmg.sh regardless.
+CODESIGN_IDENTITY="${RC2_CODESIGN_IDENTITY:--}"
+if [ "$CODESIGN_IDENTITY" = "-" ]; then
+  codesign --force --deep --sign - --timestamp=none "$STAGING_APP"
+else
+  codesign --force --deep --sign "$CODESIGN_IDENTITY" --timestamp=none "$STAGING_APP"
+fi
 codesign --verify --deep --strict --verbose=2 "$STAGING_APP"
 
 rm -rf "$APP_PATH"
