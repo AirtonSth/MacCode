@@ -194,16 +194,39 @@ printf 'APPL????' > "$STAGING_APP/Contents/PkgInfo"
 if command -v xattr >/dev/null 2>&1; then
   xattr -cr "$STAGING_APP" || true
 fi
-# Default is ad-hoc (`-`). Prefer a stable identity for daily local builds so
-# macOS TCC "Allow" grants survive rebuilds: export RC2_CODESIGN_IDENTITY="Apple Development: …"
+# Prefer a stable Apple Development identity so macOS TCC "Allow" grants for
+# Network Volumes / Desktop / Documents / Downloads survive rebuilds.
+# Ad-hoc (`-`) re-binds TCC to a new CDHash whenever the app payload changes.
+# Resolution rules live in resolve-codesign-identity.sh (unit-tested):
+#   - RC2_CODESIGN_IDENTITY set → use it (`-` forces ad-hoc)
+#   - else unique "Apple Development: …" CN → auto-pick
+#   - else ad-hoc with a loud warning
 # Release DMGs re-sign with Developer ID in package-dmg.sh regardless.
-CODESIGN_IDENTITY="${RC2_CODESIGN_IDENTITY:--}"
+CODESIGN_RESOLVER="$(cd "$(dirname "$0")" && pwd)/resolve-codesign-identity.sh"
+if [ ! -x "$CODESIGN_RESOLVER" ]; then
+  chmod +x "$CODESIGN_RESOLVER" 2>/dev/null || true
+fi
+CODESIGN_IDENTITY="$("$CODESIGN_RESOLVER")"
 if [ "$CODESIGN_IDENTITY" = "-" ]; then
+  echo "[package] WARNING: signing ad-hoc. Network volume / folder TCC prompts can return after every rebuild." >&2
+  echo "[package] Fix: export RC2_CODESIGN_IDENTITY=\"Apple Development: Your Name (TEAMID)\"  # or install one unique Apple Development cert" >&2
   codesign --force --deep --sign - --timestamp=none "$STAGING_APP"
 else
+  echo "[package] signing with durable identity: $CODESIGN_IDENTITY" >&2
   codesign --force --deep --sign "$CODESIGN_IDENTITY" --timestamp=none "$STAGING_APP"
 fi
 codesign --verify --deep --strict --verbose=2 "$STAGING_APP"
+# Surface identity summary so a packaging log proves TCC durability class.
+if command -v codesign >/dev/null 2>&1; then
+  SIGN_META="$(codesign -dv --verbose=4 "$STAGING_APP" 2>&1 || true)"
+  SIGN_TEAM="$(printf '%s\n' "$SIGN_META" | awk -F= '/^TeamIdentifier=/{print $2; exit}')"
+  SIGN_FLAGS="$(printf '%s\n' "$SIGN_META" | awk -F'[()]' '/flags=/{print $2; exit}')"
+  if printf '%s\n' "$SIGN_FLAGS" | grep -q adhoc || [ "${SIGN_TEAM:-not set}" = "not set" ]; then
+    echo "[package] codesign team=none class=adhoc (TCC grants will not survive rebuilds)" >&2
+  else
+    echo "[package] codesign team=${SIGN_TEAM} class=durable flags=${SIGN_FLAGS:-none}" >&2
+  fi
+fi
 
 rm -rf "$APP_PATH"
 mkdir -p "$APP_PARENT"
