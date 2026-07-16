@@ -273,7 +273,48 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         // what lands here. Hopping back through the main queue yields one runloop
         // turn for the frame before the PTY spawns / process scan begin.
         DispatchQueue.main.async { [weak self] in
+            // Explain folder TCC before restored surfaces/PTYs touch protected paths.
+            self?.presentHostFileAccessOnboardingIfNeeded()
             self?.runDeferredStartup()
+        }
+    }
+
+    /// One-time explanation for Files and Folders TCC. macOS cannot grant all
+    /// folder permissions in one API call. Every alert button marks onboarding
+    /// *handled* (not “permissions granted”) so launch never nags in a loop.
+    func presentHostFileAccessOnboardingIfNeeded() {
+        guard let context else { return }
+        let repo = SettingsRepository(db: context.db)
+        guard HostFileAccessOnboarding.shouldPresent(
+            handled: HostFileAccessOnboarding.isHandled(repo: repo)
+        ) else { return }
+
+        let alert = NSAlert()
+        alert.messageText = HostFileAccessCopy.onboardingTitle
+        alert.informativeText = HostFileAccessCopy.onboardingMessage
+        if let warning = HostCodeSignatureReader.current().adHocWarning {
+            alert.informativeText += "\n\n" + warning
+        }
+        alert.alertStyle = .informational
+        alert.addButton(withTitle: "Continue")
+        alert.addButton(withTitle: "Open System Settings")
+        alert.addButton(withTitle: "Not Now")
+        let response = alert.runModal()
+        do {
+            try HostFileAccessOnboarding.handleAlertResponse(
+                response,
+                markHandled: { try HostFileAccessOnboarding.markHandled(repo: repo) },
+                openSystemSettings: {
+                    NSWorkspace.shared.open(HostFileAccessSystemSettings.filesAndFoldersURL)
+                },
+                checkFolderAccess: {
+                    _ = HostFileAccessProber.probeStandardTargets()
+                }
+            )
+        } catch {
+            appLifecycleLog.error(
+                "host_file_access.onboarding_persist_failed error=\(error.localizedDescription, privacy: .public)"
+            )
         }
     }
 

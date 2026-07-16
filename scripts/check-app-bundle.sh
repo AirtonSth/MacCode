@@ -86,6 +86,23 @@ fi
 [ -n "$(plist_get CFBundleIdentifier)" ] && note "CFBundleIdentifier present" || fail "CFBundleIdentifier is empty"
 [ -n "$(plist_get CFBundleShortVersionString)" ] && note "CFBundleShortVersionString present" || fail "CFBundleShortVersionString is empty"
 
+# 4b. Files and Folders TCC purpose strings (package-app.sh must ship these so
+# macOS can show durable, honest grant dialogs for Desktop/Documents/Downloads/
+# network volumes/removable volumes).
+for privacy_key in \
+  NSNetworkVolumesUsageDescription \
+  NSRemovableVolumesUsageDescription \
+  NSDesktopFolderUsageDescription \
+  NSDocumentsFolderUsageDescription \
+  NSDownloadsFolderUsageDescription
+do
+  if [ -n "$(plist_get "$privacy_key")" ]; then
+    note "$privacy_key present"
+  else
+    fail "$privacy_key is missing or empty (TCC purpose string required)"
+  fi
+done
+
 # 5. PkgInfo must be EXACTLY the 8 bytes "APPL????" (the QA-mac:70 bug class: a
 #    heredoc trailing newline made it 9 bytes, which some validators reject).
 if [ ! -f "$PKGINFO" ]; then

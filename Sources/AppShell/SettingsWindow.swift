@@ -715,6 +715,45 @@ public final class SettingsViewModel: ObservableObject {
         postPetSettingsDidChange()
     }
 
+    /// Latest host file-access probe results (Settings privacy section).
+    @Published public var hostFileAccessProbeResults: [HostFileAccessProbeResult] = []
+    /// Code signature identity for the running process (TCC durability).
+    @Published public var hostCodeSignatureIdentity: HostCodeSignatureIdentity =
+        HostCodeSignatureReader.current()
+    /// True after the user handled (not necessarily granted) folder-access onboarding.
+    @Published public var hostFileAccessOnboardingCompleted: Bool = false
+    /// Optional probe injection for unit tests (avoids real filesystem/TCC).
+    var hostFileAccessProbeRunner: (() -> [HostFileAccessProbeResult])?
+
+    /// Refresh signing identity + onboarding flag for the Files & Folders section.
+    public func refreshHostFileAccessState() {
+        hostCodeSignatureIdentity = HostCodeSignatureReader.current()
+        hostFileAccessOnboardingCompleted = HostFileAccessOnboarding.isHandled(repo: settingsRepo)
+    }
+
+    /// Touches standard protected folders so any *pending* TCC dialog can appear.
+    /// Does not reopen a prior Don’t Allow — System Settings is required for that.
+    /// Marks onboarding handled after the attempt.
+    public func requestHostFileAccess() {
+        let runner = hostFileAccessProbeRunner ?? { HostFileAccessProber.probeStandardTargets() }
+        hostFileAccessProbeResults = runner()
+        do {
+            try HostFileAccessOnboarding.markHandled(repo: settingsRepo)
+            hostFileAccessOnboardingCompleted = true
+        } catch {
+            recordSettingsWriteError(error)
+        }
+    }
+
+    public func openHostFilesAndFoldersSettings() {
+        // Classic deep link remains the most reliable across macOS 14+.
+        openURL(HostFileAccessSystemSettings.filesAndFoldersURL)
+    }
+
+    public func openHostFullDiskAccessSettings() {
+        openURL(HostFileAccessSystemSettings.fullDiskAccessURL)
+    }
+
     private func postPetSettingsDidChange() {
         NotificationCenter.default.post(name: .petSettingsDidChange, object: nil)
     }
@@ -1177,6 +1216,7 @@ public struct SettingsView: View {
                     remoteAccessSection
                         .background(routeAnchor(.general))
                         .accessibilityIdentifier("settings.section.general")
+                    hostFileAccessSection
                     diffDefaultsSection
                     terminalSection
                     sidebarSection
@@ -1204,6 +1244,7 @@ public struct SettingsView: View {
             codexPathDraft = vm.codexPath
             claudePathDraft = vm.claudePath
             grokPathDraft = vm.grokPath
+            vm.refreshHostFileAccessState()
         }
         .onChange(of: vm.codexPath) { codexPathDraft = $0 }
         .onChange(of: vm.claudePath) { claudePathDraft = $0 }
@@ -1229,6 +1270,53 @@ public struct SettingsView: View {
                 .accessibilityLabel(label)
         }
         .padding(.vertical, DS.Space.sm)
+    }
+
+    private var hostFileAccessSection: some View {
+        VStack(alignment: .leading, spacing: DS.Space.md) {
+            DSSectionHeaderG(HostFileAccessCopy.settingsSectionTitle)
+            Text(HostFileAccessCopy.settingsExplanation)
+                .font(DS.Font.caption)
+                .foregroundColor(DS.Palette.textSecondary)
+                .fixedSize(horizontal: false, vertical: true)
+                .accessibilityIdentifier("settings.hostFileAccess.explanation")
+            if let warning = vm.hostCodeSignatureIdentity.adHocWarning {
+                Text(warning)
+                    .font(DS.Font.caption)
+                    .foregroundColor(DS.Palette.danger)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .accessibilityIdentifier("settings.hostFileAccess.adHocWarning")
+            }
+            HStack(spacing: DS.Space.sm) {
+                Button(HostFileAccessCopy.requestAccessButton) {
+                    vm.requestHostFileAccess()
+                }
+                .buttonStyle(DSSecondaryButtonStyle())
+                .accessibilityIdentifier("settings.hostFileAccess.request")
+                Button(HostFileAccessCopy.openFilesAndFoldersButton) {
+                    vm.openHostFilesAndFoldersSettings()
+                }
+                .buttonStyle(DSSecondaryButtonStyle())
+                .accessibilityIdentifier("settings.hostFileAccess.openFilesAndFolders")
+            }
+            Button(HostFileAccessCopy.openFullDiskAccessButton) {
+                vm.openHostFullDiskAccessSettings()
+            }
+            .buttonStyle(DSSecondaryButtonStyle())
+            .accessibilityIdentifier("settings.hostFileAccess.openFullDiskAccess")
+            if !vm.hostFileAccessProbeResults.isEmpty {
+                VStack(alignment: .leading, spacing: DS.Space.xs) {
+                    ForEach(vm.hostFileAccessProbeResults, id: \.target) { result in
+                        Text("\(result.target.title): \(result.outcome.rawValue)")
+                            .font(DS.Font.caption)
+                            .foregroundColor(DS.Palette.textSecondary)
+                            .accessibilityIdentifier("settings.hostFileAccess.result.\(result.target.rawValue)")
+                    }
+                }
+                .accessibilityIdentifier("settings.hostFileAccess.results")
+            }
+        }
+        .accessibilityIdentifier("settings.section.hostFileAccess")
     }
 
     private var remoteAccessSection: some View {
