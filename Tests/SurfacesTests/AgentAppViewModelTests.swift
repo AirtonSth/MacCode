@@ -5355,6 +5355,123 @@ final class AgentAppViewModelTests: XCTestCase {
                      "the plan card must remain actionable when its durable implemented state did not commit")
     }
 
+    func test_fullAccessSuppressesProposedPlanReviewAndAutoImplements() async throws {
+        let tmp = NSTemporaryDirectory() + "rc2-vm-agent-plan-fullaccess-auto-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let queuedRepo = AgentQueuedMessageRepository(db: db)
+        let proposedPlanRepo = AgentProposedPlanRepository(db: db)
+        let runner = SlowStartRunner()
+        let coordinator = AgentRunCoordinator(
+            runRepo: AgentRunRepository(db: db),
+            messageRepo: messageRepo,
+            threadRepo: threadRepo,
+            providers: [.codex: runner]
+        )
+        let workspaceID = WorkspaceID()
+        var thread = AgentThread(
+            workspaceId: workspaceID,
+            title: "full-access-plan",
+            provider: .codex,
+            model: "gpt-5.5",
+            permissionMode: .fullAccess
+        )
+        try threadRepo.upsert(thread)
+        let vm = AgentAppViewModel(
+            workspaceID: workspaceID,
+            cwd: tmp,
+            coordinator: coordinator,
+            threadRepo: threadRepo,
+            messageRepo: messageRepo,
+            queuedMessageRepo: queuedRepo,
+            proposedPlanRepo: proposedPlanRepo,
+            promptHistoryStore: PromptHistoryStore(db: db)
+        )
+        installRunnableProviderFixtures(on: vm)
+        vm.selectThread(thread.id)
+        vm.permissionMode = .fullAccess
+        XCTAssertTrue(vm.suppressesProposedPlanReview,
+                      "full access must suppress plan Approve/Reject review")
+
+        // Start a long turn so auto-implement must queue rather than fail in-flight.
+        vm.prompt = "plan while autonomous"
+        Task { await vm.send() }
+        await waitAsync("active run under full access") {
+            vm.status == .running && vm.currentRunId != nil
+        }
+
+        vm.timeline.apply(.proposedPlan(AssistantProposedPlan(
+            id: "auto-plan-1",
+            turnId: "turn-1",
+            markdown: "1. Inspect\n2. Patch"
+        )))
+        try proposedPlanRepo.upsert(
+            threadId: thread.id,
+            plan: AssistantProposedPlan(id: "auto-plan-1", turnId: "turn-1", markdown: "1. Inspect\n2. Patch")
+        )
+        XCTAssertNil(vm.reviewableProposedPlan,
+                     "full access must not expose a reviewable proposed plan card")
+        vm.scheduleFullAccessPlanAutoImplementIfNeeded()
+
+        await waitAsync("auto-implement queues the plan prompt") {
+            ((try? queuedRepo.list(threadId: thread.id)) ?? []).contains {
+                $0.text.contains("Implement this proposed plan now")
+            }
+        }
+        let queued = try queuedRepo.list(threadId: thread.id)
+        XCTAssertEqual(queued.count, 1)
+        XCTAssertEqual(queued[0].interactionMode, .default)
+        XCTAssertTrue(vm.queueStatusMessage?.contains("Queued") == true)
+        XCTAssertFalse(vm.statusMessage.contains("in-flight"))
+        // Dedup: second schedule must not enqueue again.
+        vm.scheduleFullAccessPlanAutoImplementIfNeeded()
+        XCTAssertEqual(try queuedRepo.list(threadId: thread.id).count, 1,
+                       "auto-implement must not double-queue the same plan")
+        vm.stop()
+        await waitAsync("slow run stops") { runner.cancelled }
+    }
+
+    func test_supervisedKeepsProposedPlanReviewable() throws {
+        let tmp = NSTemporaryDirectory() + "rc2-vm-agent-plan-supervised-review-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let proposedPlanRepo = AgentProposedPlanRepository(db: db)
+        let workspaceID = WorkspaceID()
+        let thread = AgentThread(
+            workspaceId: workspaceID,
+            title: "supervised-plan",
+            provider: .codex,
+            model: "gpt-5.5",
+            permissionMode: .supervised
+        )
+        try threadRepo.upsert(thread)
+        try proposedPlanRepo.upsert(
+            threadId: thread.id,
+            plan: AssistantProposedPlan(id: "sup-plan", turnId: "t1", markdown: "1. Review me")
+        )
+        let vm = AgentAppViewModel(
+            workspaceID: workspaceID,
+            cwd: tmp,
+            coordinator: AgentRunCoordinator(
+                runRepo: AgentRunRepository(db: db),
+                messageRepo: messageRepo,
+                threadRepo: threadRepo,
+                providers: [.codex: FakeProviderRunner(provider: .codex)]
+            ),
+            threadRepo: threadRepo,
+            messageRepo: messageRepo,
+            proposedPlanRepo: proposedPlanRepo
+        )
+        installRunnableProviderFixtures(on: vm)
+        vm.selectThread(thread.id)
+        vm.permissionMode = .supervised
+        XCTAssertFalse(vm.suppressesProposedPlanReview)
+        XCTAssertNotNil(vm.reviewableProposedPlan)
+        XCTAssertTrue(vm.reviewableProposedPlan?.showsImplementationActions == true)
+    }
+
     func test_implementLatestPlanQueuesWhileProviderTurnIsRunning() async throws {
         let tmp = NSTemporaryDirectory() + "rc2-vm-agent-plan-implement-queue-" + UUID().uuidString
         let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
