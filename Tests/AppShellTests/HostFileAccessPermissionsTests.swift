@@ -93,12 +93,8 @@ final class HostFileAccessPermissionsTests: XCTestCase {
     func test_probeStandardTargetsSkipsVolumesWhenNoneMounted() {
         // Inject empty volume root resolution via a fileManager that reports no children.
         final class EmptyVolumesFM: FileManager, @unchecked Sendable {
-            override func contentsOfDirectory(
-                at url: URL,
-                includingPropertiesForKeys keys: [URLResourceKey]?,
-                options mask: FileManager.DirectoryEnumerationOptions = []
-            ) throws -> [URL] {
-                if url.path == "/Volumes" { return [] }
+            override func contentsOfDirectory(atPath path: String) throws -> [String] {
+                if path == "/Volumes" { return [] }
                 return []
             }
         }
@@ -111,6 +107,74 @@ final class HostFileAccessPermissionsTests: XCTestCase {
         )
         XCTAssertEqual(results.map(\.target), [.desktop, .documents, .downloads],
                        "Without a mounted child, volume probe must be skipped so we never claim networkVolumes:readable for /Volumes alone")
+    }
+
+    func test_probeStandardTargetsDefaultsExcludeVolumes() {
+        // WHY: default includeVolumes must be false so onboarding Continue / Settings
+        // "Check folder access" never force the Network Volumes system dialog.
+        let results = HostFileAccessProber.probeStandardTargets(
+            home: URL(fileURLWithPath: "/Users/example", isDirectory: true),
+            contentsOfDirectory: { _ in [] }
+        )
+        XCTAssertFalse(results.map(\.target).contains(.networkVolumes))
+        XCTAssertEqual(results.map(\.target), [.desktop, .documents, .downloads])
+    }
+
+    func test_networkClassPathMatching() {
+        let mounts = ["/Users/example/OrbStack", "/Volumes/Share"]
+        XCTAssertTrue(HostVolumeMountTable.isNetworkClassPath("/Users/example/OrbStack", mounts: mounts))
+        XCTAssertTrue(HostVolumeMountTable.isNetworkClassPath("/Users/example/OrbStack/vm", mounts: mounts))
+        XCTAssertFalse(HostVolumeMountTable.isNetworkClassPath("/Users/example/dev", mounts: mounts))
+        XCTAssertFalse(HostVolumeMountTable.isNetworkClassPath("/Users/example/OrbStackBackup", mounts: mounts))
+    }
+
+    func test_safeDirectoryListingSkipsStatOnNetworkMountChildren() throws {
+        // WHY: Prefetching resource keys on ~/OrbStack is what triggers the
+        // Network Volumes TCC dialog when home is listed.
+        final class RecordingFM: FileManager, @unchecked Sendable {
+            var statted: [String] = []
+            override func contentsOfDirectory(atPath path: String) throws -> [String] {
+                XCTAssertEqual(path, "/Users/example")
+                return ["dev", "OrbStack", "Documents"]
+            }
+            override func fileExists(atPath path: String, isDirectory: UnsafeMutablePointer<ObjCBool>?) -> Bool {
+                statted.append(path)
+                if path.hasSuffix("OrbStack") {
+                    XCTFail("must not stat network mount child \(path)")
+                }
+                isDirectory?.pointee = true
+                return true
+            }
+            override func attributesOfItem(atPath path: String) throws -> [FileAttributeKey: Any] {
+                statted.append("attrs:\(path)")
+                return [.type: FileAttributeType.typeDirectory]
+            }
+        }
+        let fm = RecordingFM()
+        let entries = try HostSafeDirectoryListing.list(
+            path: "/Users/example",
+            fileManager: fm,
+            networkMounts: ["/Users/example/OrbStack"]
+        )
+        XCTAssertEqual(Set(entries.map(\.name)), Set(["dev", "OrbStack", "Documents"]))
+        let orb = entries.first { $0.name == "OrbStack" }
+        XCTAssertEqual(orb?.isNetworkVolume, true)
+        XCTAssertEqual(orb?.isDirectory, true)
+        XCTAssertFalse(fm.statted.contains { $0.contains("OrbStack") })
+    }
+
+    func test_nonLocalMountPathsUsesInjectedMountTable() {
+        let paths = HostVolumeMountTable.nonLocalMountPaths {
+            [
+                (on: "/", type: "apfs", isLocal: true),
+                (on: "/Users/example/OrbStack", type: "nfs", isLocal: false),
+                (on: "/System/Volumes/Data/home", type: "autofs", isLocal: false),
+            ]
+        }
+        XCTAssertEqual(Set(paths), Set([
+            "/Users/example/OrbStack",
+            "/System/Volumes/Data/home",
+        ]))
     }
 
     func test_onboardingShouldPresentOnlyWhenUnhandled() {
