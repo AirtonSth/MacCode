@@ -5355,6 +5355,124 @@ final class AgentAppViewModelTests: XCTestCase {
                      "the plan card must remain actionable when its durable implemented state did not commit")
     }
 
+    func test_implementLatestPlanQueuesWhileProviderTurnIsRunning() async throws {
+        let tmp = NSTemporaryDirectory() + "rc2-vm-agent-plan-implement-queue-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let queuedRepo = AgentQueuedMessageRepository(db: db)
+        let proposedPlanRepo = AgentProposedPlanRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let runner = SlowStartRunner()
+        let coordinator = AgentRunCoordinator(
+            runRepo: runRepo,
+            messageRepo: messageRepo,
+            threadRepo: threadRepo,
+            providers: [.codex: runner]
+        )
+        let workspaceID = WorkspaceID()
+        let thread = AgentThread(workspaceId: workspaceID, title: "plan-busy", provider: .codex, model: "gpt-5.5")
+        try threadRepo.upsert(thread)
+        try proposedPlanRepo.upsert(
+            threadId: thread.id,
+            plan: AssistantProposedPlan(id: "plan-queue", turnId: "turn-plan", markdown: "1. Inspect\n2. Patch")
+        )
+        let vm = AgentAppViewModel(
+            workspaceID: workspaceID,
+            cwd: tmp,
+            coordinator: coordinator,
+            threadRepo: threadRepo,
+            messageRepo: messageRepo,
+            queuedMessageRepo: queuedRepo,
+            proposedPlanRepo: proposedPlanRepo,
+            promptHistoryStore: PromptHistoryStore(db: db)
+        )
+        installRunnableProviderFixtures(on: vm)
+        vm.selectThread(thread.id)
+
+        vm.prompt = "produce plan while running"
+        Task { await vm.send() }
+        await waitAsync("plan thread becomes a real active run") {
+            vm.status == .running && vm.currentRunId != nil
+        }
+
+        await vm.implementLatestPlan()
+
+        let queued = try queuedRepo.list(threadId: thread.id)
+        XCTAssertEqual(queued.count, 1,
+                       "Approve must queue implementation while the plan-producing turn is still open")
+        XCTAssertTrue(queued[0].text.contains("Implement this proposed plan now"),
+                      "queued follow-up must be the plan implementation prompt, not a silent no-op")
+        XCTAssertEqual(queued[0].interactionMode, .default,
+                       "Approve must leave Plan mode when the queued turn eventually starts")
+        XCTAssertTrue(vm.queueStatusMessage?.contains("Queued") == true,
+                      "user must see that Approve was accepted into the queue instead of a hard start failure")
+        XCTAssertFalse(vm.statusMessage.contains("in-flight"),
+                       "Approve while running must not surface the adapter concurrent-turn error")
+        let stored = try XCTUnwrap(proposedPlanRepo.list(threadId: thread.id).first { $0.plan.id == "plan-queue" })
+        XCTAssertNotNil(stored.plan.implementedAtMs,
+                        "user intent to implement is durable once Approve queues successfully")
+        XCTAssertEqual(runner.prompts, ["produce plan while running"],
+                       "Approve must not open a concurrent provider turn while one is already in flight")
+        vm.stop()
+        await waitAsync("slow run can still be stopped after plan Approve queueing") {
+            runner.cancelled
+        }
+    }
+
+    func test_rejectLatestPlanQueuesWhileProviderTurnIsRunning() async throws {
+        let tmp = NSTemporaryDirectory() + "rc2-vm-agent-plan-reject-queue-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let queuedRepo = AgentQueuedMessageRepository(db: db)
+        let proposedPlanRepo = AgentProposedPlanRepository(db: db)
+        let runner = SlowStartRunner()
+        let coordinator = AgentRunCoordinator(
+            runRepo: AgentRunRepository(db: db),
+            messageRepo: messageRepo,
+            threadRepo: threadRepo,
+            providers: [.codex: runner]
+        )
+        let workspaceID = WorkspaceID()
+        let thread = AgentThread(workspaceId: workspaceID, title: "plan-reject", provider: .codex, model: "gpt-5.5")
+        try threadRepo.upsert(thread)
+        try proposedPlanRepo.upsert(
+            threadId: thread.id,
+            plan: AssistantProposedPlan(id: "plan-reject", turnId: "turn-plan", markdown: "1. Inspect")
+        )
+        let vm = AgentAppViewModel(
+            workspaceID: workspaceID,
+            cwd: tmp,
+            coordinator: coordinator,
+            threadRepo: threadRepo,
+            messageRepo: messageRepo,
+            queuedMessageRepo: queuedRepo,
+            proposedPlanRepo: proposedPlanRepo,
+            promptHistoryStore: PromptHistoryStore(db: db)
+        )
+        installRunnableProviderFixtures(on: vm)
+        vm.selectThread(thread.id)
+
+        vm.prompt = "plan still open"
+        Task { await vm.send() }
+        await waitAsync("reject path waits for active run") {
+            vm.status == .running && vm.currentRunId != nil
+        }
+
+        await vm.rejectLatestPlan()
+
+        let queued = try queuedRepo.list(threadId: thread.id)
+        XCTAssertEqual(queued.count, 1)
+        XCTAssertTrue(queued[0].text.contains("Reject this proposed plan"))
+        XCTAssertEqual(queued[0].interactionMode, .plan,
+                       "Reject must keep Plan mode for the revised-plan turn")
+        XCTAssertNil(try proposedPlanRepo.list(threadId: thread.id).first?.plan.implementedAtMs,
+                     "Reject must not mark the plan implemented")
+        vm.stop()
+        await waitAsync("slow run stops after reject queueing") { runner.cancelled }
+    }
+
     func test_sendKeepsVisibleDraftAndReportsFailureWhenDurableDraftDeletionFails() async throws {
         let tmp = NSTemporaryDirectory() + "rc2-vm-agent-draft-delete-failure-" + UUID().uuidString
         let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()

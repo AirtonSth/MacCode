@@ -3093,12 +3093,17 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         return runStatus == .running || runStatus == .pending
     }
 
-    private func enqueuePromptWhileRunning(text: String, attached: [AgentAttachment]) async {
-        guard let selectedThreadId, let queuedMessageRepo else { return }
+    private func enqueuePromptWhileRunning(
+        text: String,
+        attached: [AgentAttachment],
+        interactionMode: AgentInteractionMode? = nil
+    ) async -> Bool {
+        guard let selectedThreadId, let queuedMessageRepo else { return false }
+        let mode = interactionMode ?? self.interactionMode
         do {
             try AgentProviderRunPreflight.validate(
                 snapshot: selectedProviderSnapshot,
-                interactionMode: interactionMode,
+                interactionMode: mode,
                 permissionMode: permissionMode,
                 attachments: attached
             )
@@ -3107,7 +3112,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 providerInstanceId: providerInstanceId,
                 text: text,
                 attachments: attached,
-                interactionMode: interactionMode
+                interactionMode: mode
             )
             prompt = ""
             attachments = []
@@ -3119,8 +3124,10 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             // QA-MAC_AGENT-010: track queue depth for diagnostics.
             agentSurfaceLog.info("queue.enqueued thread=\(selectedThreadId.value.uuidString, privacy: .public) depth=\(self.queuedMessages.count, privacy: .public)")
             onQueuedMessageEvent?(AgentQueueEventKinds.queued, queued)
+            return true
         } catch {
             queueStatusMessage = "Queue send failed: \(error)"
+            return false
         }
     }
 
@@ -3274,7 +3281,33 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         }
         let prompt = AgentPlanImplementationPrompt.make(markdown: plan.markdown)
         clearVisibleErrorForNewUserMessage()
+        // Same-thread Approve must not open a concurrent provider turn. Grok/Codex/Claude
+        // adapters reject second prompts while inFlight; queue like send() and drain after.
+        if !newThread && selectedThreadCanQueuePrompt {
+            guard await enqueuePromptWhileRunning(text: prompt, attached: [], interactionMode: .default) else { return }
+            markLatestPlanImplemented(sourceThreadId: sourceThreadId, plan: plan, targetThreadId: targetThreadId)
+            return
+        }
         guard await startProviderRun(text: prompt, attached: [], recordHistory: false, interactionMode: .default) != nil else { return }
+        markLatestPlanImplemented(sourceThreadId: sourceThreadId, plan: plan, targetThreadId: targetThreadId)
+    }
+
+    public func rejectLatestPlan() async {
+        guard latestProposedPlan != nil else { return }
+        let prompt = "Reject this proposed plan. Do not implement it. Stay in Plan mode and produce a revised plan before making any workspace changes."
+        clearVisibleErrorForNewUserMessage()
+        if selectedThreadCanQueuePrompt {
+            _ = await enqueuePromptWhileRunning(text: prompt, attached: [], interactionMode: .plan)
+            return
+        }
+        _ = await startProviderRun(text: prompt, attached: [], recordHistory: false, interactionMode: .plan)
+    }
+
+    private func markLatestPlanImplemented(
+        sourceThreadId: AgentThreadID,
+        plan: AssistantProposedPlan,
+        targetThreadId: AgentThreadID
+    ) {
         do {
             try proposedPlanRepo?.markImplemented(threadId: sourceThreadId, planId: plan.id, implementationThreadId: targetThreadId)
         } catch {
@@ -3284,13 +3317,6 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         var implemented = plan
         implemented.implementedAtMs = Int64(Date().timeIntervalSince1970 * 1000)
         timeline.apply(.proposedPlan(implemented))
-    }
-
-    public func rejectLatestPlan() async {
-        guard latestProposedPlan != nil else { return }
-        let prompt = "Reject this proposed plan. Do not implement it. Stay in Plan mode and produce a revised plan before making any workspace changes."
-        clearVisibleErrorForNewUserMessage()
-        _ = await startProviderRun(text: prompt, attached: [], recordHistory: false, interactionMode: .plan)
     }
 
     private func recordPromptHistory(_ text: String) {

@@ -393,6 +393,54 @@ final class GrokACPAdapterTests: ProviderProcessTestCase {
                        "Plan review must reuse one authenticated Grok ACP process instead of starting unrelated one-shot runs")
     }
 
+    func test_sendTurnRejectsTrueConcurrentPromptButAllowsFollowUpAfterFinish() async throws {
+        let peer = try FakeGrokACPPeer(mode: .permission)
+        defer { peer.remove() }
+        let adapter = GrokACPAdapter(binaryNameOverride: peer.path)
+        let request = makeRequest(permissionMode: .supervised)
+        let first = GrokACPEventBox()
+
+        _ = try await adapter.startSession(request) { first.append($0) }
+        // Permission peer leaves the first prompt open until approved.
+        let pending = try await first.waitForRequest(timeout: 3)
+
+        do {
+            _ = try await adapter.sendTurn(makeRequest(
+                threadId: request.threadId,
+                providerThreadId: "session-fixed",
+                permissionMode: .fullAccess
+            )) { _ in }
+            XCTFail("a second prompt while the first is open must fail closed")
+        } catch {
+            XCTAssertTrue(String(describing: error).contains("in-flight prompt"),
+                          "true concurrent turns must keep the existing in-flight guard")
+        }
+
+        try await adapter.respondToRequest(
+            threadId: request.threadId,
+            requestId: pending.id,
+            response: .approve
+        )
+        _ = try await first.waitFinished(timeout: 3)
+
+        let second = GrokACPEventBox()
+        _ = try await adapter.sendTurn(makeRequest(
+            threadId: request.threadId,
+            providerThreadId: "session-fixed",
+            permissionMode: .fullAccess
+        )) { second.append($0) }
+        // Second turn also hits permission peer; approve and finish.
+        let pending2 = try await second.waitForRequest(timeout: 3)
+        try await adapter.respondToRequest(
+            threadId: request.threadId,
+            requestId: pending2.id,
+            response: .approve
+        )
+        let finished = try await second.waitFinished(timeout: 3)
+        XCTAssertEqual(finished.status, .completed,
+                       "after the prior turn ends, Approve/follow-up must reuse the session")
+    }
+
     private func makeRequest(
         threadId: AgentThreadID? = nil,
         providerThreadId: String? = nil,

@@ -2333,8 +2333,16 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             providerInstanceId: source.providerInstanceId,
             attachments: []
         )
-        guard let runId = sendResult.runId else {
-            throw JSONRPCError(code: -32032, message: "Plan implementation was queued because the thread is already running.")
+        // Same-thread implement while a turn is live queues (sendAgentMessage). Treat that
+        // as success: durable plan mark + track the queued message id as the future run id
+        // (queue drain uses AgentRunID(queued.id.value)).
+        let runId: AgentRunID
+        if let started = sendResult.runId {
+            runId = started
+        } else if sendResult.status == .queued, let queued = sendResult.queuedMessage {
+            runId = AgentRunID(queued.id.value)
+        } else {
+            throw JSONRPCError(code: -32032, message: "Plan implementation could not start or queue.")
         }
         try ctx.proposedPlanRepo.markImplemented(threadId: thread, planId: planId, implementationThreadId: implementationThread.id)
         return (runId, implementationThread.id)
