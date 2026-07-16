@@ -2013,15 +2013,14 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         let desiredInstance = providerInstanceId
             ?? (desiredProvider == thread.provider ? thread.providerInstanceId : nil)
         let snapshots = await listAgentProviderSnapshots()
-        let snapshot: AgentProviderSnapshot?
-        if let desiredInstance {
-            snapshot = snapshots.first { $0.id == desiredInstance && $0.provider == desiredProvider }
-                ?? (desiredInstance == desiredProvider.rawValue
-                    ? snapshots.first { $0.provider == desiredProvider }
-                    : nil)
-        } else {
-            snapshot = snapshots.first { $0.provider == desiredProvider }
-        }
+        // Match AgentAppViewModel.selectedProviderSnapshot: prefer exact
+        // instance+provider, then same provider. Do not fail closed on
+        // "grok-cli" vs "grok" / stale instance ids when a live snapshot exists.
+        let snapshot = AgentProviderSnapshotSelection.resolve(
+            snapshots: snapshots,
+            provider: desiredProvider,
+            instanceId: desiredInstance
+        )
         do {
             try AgentProviderRunPreflight.validate(
                 snapshot: snapshot,

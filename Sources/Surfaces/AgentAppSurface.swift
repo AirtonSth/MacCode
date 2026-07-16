@@ -1776,24 +1776,21 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             if let providerSnapshotLoader {
                 snapshots = try await providerSnapshotLoader()
             } else {
-                var local: [AgentProviderSnapshot] = []
-                for provider in AgentProvider.allCases {
-                    let runner: AgentProviderRunner = provider == .codex ? CodexRunner() : ClaudeRunner()
-                    local.append(AgentProviderSnapshotFactory.snapshot(
-                        provider: provider,
-                        models: await runner.listModels(),
-                        binaryPath: ProcessLocator.resolve(provider.rawValue) ?? ""
-                    ))
-                }
-                snapshots = local
+                snapshots = await Self.localFallbackProviderSnapshots()
             }
             await MainActor.run {
                 self.providerSnapshotStatusMessage = nil
                 self.applyProviderSnapshots(snapshots)
             }
         } catch {
+            // Fail open for composer usability: keep a resolved binary fallback so
+            // send is not stuck on missingSnapshot after a transient probe failure.
+            let fallback = await Self.localFallbackProviderSnapshots()
             await MainActor.run {
                 self.providerSnapshotStatusMessage = "Provider snapshot failed. Retry from the model menu."
+                if self.providerSnapshots.isEmpty {
+                    self.applyProviderSnapshots(fallback)
+                }
             }
         }
     }
@@ -1875,12 +1872,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     private func seedProviderSnapshotsForStartup() {
         guard providerSnapshots.isEmpty else { return }
         Task {
-            let codexModels = await CodexRunner().listModels()
-            let fallback = [
-                AgentProviderSnapshotFactory.snapshot(provider: .codex, models: codexModels, binaryPath: ""),
-                AgentProviderSnapshotFactory.snapshot(provider: .claude, models: ClaudeRunner.listModels(installedVersion: nil), binaryPath: ""),
-                AgentProviderSnapshotFactory.snapshot(provider: .grok, models: GrokRunner.listModels(installedVersion: nil), binaryPath: "")
-            ]
+            let fallback = await Self.localFallbackProviderSnapshots()
             await MainActor.run {
                 guard self.providerSnapshots.isEmpty else { return }
                 self.applyProviderSnapshots(fallback)
@@ -1888,9 +1880,36 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         }
     }
 
+    /// Local, process-locator-backed rows used for startup and load-failure
+    /// recovery. Prefer real binary paths so Grok/Codex are not marked
+    /// unavailable solely because seed used an empty path.
+    nonisolated public static func localFallbackProviderSnapshots() async -> [AgentProviderSnapshot] {
+        var rows: [AgentProviderSnapshot] = []
+        for provider in AgentProvider.allCases {
+            let models: [AgentModelDescriptor]
+            switch provider {
+            case .codex:
+                models = await CodexRunner().listModels()
+            case .claude:
+                models = ClaudeRunner.listModels(installedVersion: nil)
+            case .grok:
+                models = GrokRunner.listModels(installedVersion: nil)
+            }
+            rows.append(AgentProviderSnapshotFactory.snapshot(
+                provider: provider,
+                models: models,
+                binaryPath: ProcessLocator.resolve(provider.rawValue) ?? ""
+            ))
+        }
+        return rows
+    }
+
     public var selectedProviderSnapshot: AgentProviderSnapshot? {
-        providerSnapshots.first { $0.id == providerInstanceId }
-            ?? providerSnapshots.first { $0.provider == provider }
+        AgentProviderSnapshotSelection.resolve(
+            snapshots: providerSnapshots,
+            provider: provider,
+            instanceId: providerInstanceId
+        )
     }
 
     public var providerExecutionUnavailableReason: String? {
@@ -1904,7 +1923,12 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     nonisolated public static func providerExecutionUnavailableReason(
         for snapshot: AgentProviderSnapshot?
     ) -> String? {
-        guard let snapshot else { return nil }
+        // Match iOS fail-closed: nil snapshot must not look runnable. The old
+        // `return nil` here let send reach preflight and surface
+        // "Provider capabilities are not loaded yet." only after the user tried.
+        guard let snapshot else {
+            return AgentProviderRunPreflightError.missingSnapshot.description
+        }
         if !snapshot.enabled || snapshot.status == .disabled {
             return snapshot.statusDetail ?? "\(snapshot.displayName) is disabled."
         }
@@ -3075,6 +3099,11 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         let text = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty || !attachments.isEmpty else { return }
         guard attachmentInputError == nil else { return }
+        // Snapshots can still be empty on first send (seed/load race). Load once
+        // before the fail-closed gate so a ready Grok/Codex install is not blocked.
+        if selectedProviderSnapshot == nil {
+            await loadProviderSnapshots()
+        }
         guard selectedProviderCanRun else {
             statusMessage = providerExecutionUnavailableReason ?? "The selected provider is unavailable."
             return

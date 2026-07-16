@@ -513,7 +513,38 @@ final class AgentAppViewModelTests: XCTestCase {
 
         XCTAssertEqual(vm.providerSnapshotStatusMessage, "Provider snapshot failed. Retry from the model menu.",
                        "provider/model snapshot fetch failures must be visible so the user can distinguish stale local models from a loaded provider list")
-        XCTAssertTrue(vm.providerSnapshots.isEmpty)
+        // Fail open for composer usability: seed a local fallback so send is not
+        // stuck on missingSnapshot after a transient probe failure.
+        XCTAssertFalse(vm.providerSnapshots.isEmpty,
+                       "snapshot load failure must still seed local provider rows so Full access/Grok is not permanently blocked")
+        XCTAssertNotNil(vm.providerSnapshots.first(where: { $0.provider == .grok }),
+                        "fallback seed must include Grok, not only Codex/Claude")
+    }
+
+    /// WHY: nil snapshot used to look runnable (canRun true), so send hit
+    /// preflight and only then showed "Provider capabilities are not loaded yet."
+    func test_nilProviderSnapshotFailsClosedBeforeSend() async throws {
+        let adapter = CapturingProviderAdapter(provider: .grok)
+        let (vm, _) = try makeVM(adapter: adapter)
+        vm.provider = .grok
+        vm.providerInstanceId = "grok"
+        vm.providerSnapshots = []
+        vm.providerSnapshotLoader = { [] }
+        vm.prompt = "should not send without capabilities"
+
+        XCTAssertEqual(
+            AgentAppViewModel.providerExecutionUnavailableReason(for: nil),
+            AgentProviderRunPreflightError.missingSnapshot.description,
+            "nil snapshot must fail closed with the same user-facing capabilities message as preflight"
+        )
+        XCTAssertFalse(vm.selectedProviderCanRun)
+
+        await vm.send()
+
+        // send reloads snapshots; empty loader still leaves canRun false if no row.
+        XCTAssertTrue(adapter.sentTurns.isEmpty,
+                      "send must not start a provider turn while capabilities are unloaded")
+        XCTAssertEqual(vm.statusMessage, AgentProviderRunPreflightError.missingSnapshot.description)
     }
 
     func test_executionModeControlsPersistBeforeConversationAndLockAfterStart() throws {
