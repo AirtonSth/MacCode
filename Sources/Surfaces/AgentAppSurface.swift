@@ -1388,8 +1388,19 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     public func scheduleFullAccessPlanAutoImplementIfNeeded() {
         guard suppressesProposedPlanReview else { return }
         guard let plan = latestProposedPlan, plan.showsImplementationActions else { return }
-        guard fullAccessAutoImplementPlanIds.insert(plan.id).inserted else { return }
-        Task { await self.implementLatestPlan(newThread: false) }
+        // Dedupe concurrent flush+finish schedules only after a successful start/queue
+        // (failed enqueue must remain retryable).
+        guard !fullAccessAutoImplementPlanIds.contains(plan.id) else { return }
+        fullAccessAutoImplementPlanIds.insert(plan.id)
+        Task {
+            await self.implementLatestPlan(newThread: false)
+            // implementLatestPlan marks implemented only on success; release the
+            // latch so a later finish/reopen can retry a failed admission.
+            if self.latestProposedPlan?.id == plan.id,
+               self.latestProposedPlan?.showsImplementationActions == true {
+                self.fullAccessAutoImplementPlanIds.remove(plan.id)
+            }
+        }
     }
 
     @discardableResult
