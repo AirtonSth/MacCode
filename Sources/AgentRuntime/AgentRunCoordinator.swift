@@ -527,8 +527,18 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             activeRunMetadata[runId] = (effectiveRequest.provider, effectiveRequest.providerInstanceId, effectiveRequest.model, effectiveRequest.cwd, effectiveRequest.serviceTier, effectiveRequest.permissionMode, effectiveRequest.interactionMode, adapterKey, binaryIdentity)
             // A runner may emit synchronously before sendTurn returns. Preserve
             // the sequence already assigned to those buffered events instead of
-            // resetting it and reusing seq 1 for a different event.
-            if seq[runId] == nil { seq[runId] = 0 }
+            // resetting it and reusing seq 1 for a different event. Also seed
+            // from durable rows so a recovered process cannot collide with
+            // already-committed (run_id, seq) identities.
+            if seq[runId] == nil {
+                let durableHigh = (try? runRepo.maxStreamEventSeq(runId: runId)) ?? 0
+                var high = durableHigh
+                if pendingStreamRunIds[effectiveRequest.threadId] == runId,
+                   let batch = pendingStreamWrites[effectiveRequest.threadId] {
+                    high = max(high, batch.highestSeq)
+                }
+                seq[runId] = high
+            }
             shouldCancel = pendingThreadStops.remove(effectiveRequest.threadId) != nil
             activeProjection = activeRunProjectionLocked()
         } else {
@@ -863,7 +873,14 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             bufferedProviderTextItems.removeValue(forKey: runId)
             activeDistillOutputRuns.remove(runId)
             finishingRuns.remove(runId)
-            seq.removeValue(forKey: runId)
+            // Do not clear seq while a failed flush still owns a retryable batch.
+            // Clearing here reissued seq 1 for late Grok ACP events (e.g.
+            // prompt_complete after servers_updated) and blocked the next start.
+            if streamFlushError == nil {
+                seq.removeValue(forKey: runId)
+            } else {
+                clearStreamSequenceIfReleasedLocked(runId: runId, threadId: threadId)
+            }
             pendingThreadStops.remove(threadId)
         }
         if streamFlushError == nil {
@@ -1049,8 +1066,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         }
 
         lock.lock()
-        let eventSequence = (seq[runId] ?? 0) + 1
-        seq[runId] = eventSequence
+        let eventSequence = allocateStreamSequenceLocked(runId: runId, threadId: request.threadId)
         pendingStartFailures[runId] = PendingStartFailure(
             request: request,
             adapterKey: adapterKey,
@@ -1906,8 +1922,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                 )
             }
             lock.lock()
-            let s = (seq[runId] ?? 0) + 1
-            seq[runId] = s
+            let s = allocateStreamSequenceLocked(runId: runId, threadId: threadId)
             lock.unlock()
             let data: Data?
             do {
@@ -2222,7 +2237,6 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             pendingTerminalEvents.removeValue(forKey: runId)
             terminalRetryScheduled.remove(runId)
             pendingThreadStops.remove(threadId)
-            seq.removeValue(forKey: runId)
             // PERF-MAC_AGENT-005: flush a final prune at run end so events queued
             // since the last cadence-prune don't linger unbounded.
             let pendingPrune = streamFlushError == nil && (streamEventsSincePrune[threadId] ?? 0) > 0
@@ -2234,6 +2248,9 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                 pendingStreamRunIds.removeValue(forKey: threadId)
                 pendingStreamPrunes.remove(threadId)
                 lastStreamFlushMs.removeValue(forKey: threadId)
+                seq.removeValue(forKey: runId)
+            } else {
+                clearStreamSequenceIfReleasedLocked(runId: runId, threadId: threadId)
             }
             // PERF-MAC_AGENT-008: thread closed -> evict the dedup cache entry so
             // finished threads do not retain their final-answer text indefinitely.
@@ -2509,7 +2526,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         lock.lock()
         pendingStartFailures.removeValue(forKey: runId)
         startFailureRetryScheduled.remove(runId)
-        seq.removeValue(forKey: runId)
+        clearStreamSequenceIfReleasedLocked(runId: runId, threadId: pending.request.threadId)
         lock.unlock()
 
         if !pending.otherRunActive {
@@ -2973,6 +2990,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
 
         var isEmpty: Bool { items.isEmpty }
         var count: Int { items.count }
+        var highestSeq: Int { items.map(\.seq).max() ?? 0 }
 
         mutating func append(_ item: StreamWriteItem) {
             items.append(item)
@@ -3003,6 +3021,34 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             items.removeAll(keepingCapacity: true)
             return snapshot
         }
+    }
+
+    /// Next durable stream sequence for `runId`.
+    ///
+    /// Must be called with `lock` held. Uses the higher of the in-memory counter
+    /// and any still-buffered seq for this run so a stop/cancel that retained a
+    /// failed flush cannot reissue seq 1 for a different event kind (which
+    /// `persistStreamEventIdempotently` rejects as a conflicting identity).
+    private func allocateStreamSequenceLocked(runId: AgentRunID, threadId: AgentThreadID) -> Int {
+        var high = seq[runId] ?? 0
+        if pendingStreamRunIds[threadId] == runId,
+           let batch = pendingStreamWrites[threadId] {
+            high = max(high, batch.highestSeq)
+        }
+        let next = high + 1
+        seq[runId] = next
+        return next
+    }
+
+    /// Drop in-memory sequence only when this run no longer owns a retryable
+    /// stream buffer. Must be called with `lock` held.
+    private func clearStreamSequenceIfReleasedLocked(runId: AgentRunID, threadId: AgentThreadID) {
+        if pendingStreamRunIds[threadId] == runId,
+           let batch = pendingStreamWrites[threadId],
+           !batch.isEmpty {
+            return
+        }
+        seq.removeValue(forKey: runId)
     }
 
     // PERF-MAC_AGENT-008: the lastPersistedAssistantContent dedup cache stores one
@@ -3220,8 +3266,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         defer { mirrorEventLock.unlock() }
 
         lock.lock()
-        let eventSequence = (seq[runId] ?? 0) + 1
-        seq[runId] = eventSequence
+        let eventSequence = allocateStreamSequenceLocked(runId: runId, threadId: threadId)
         lock.unlock()
 
         let data: Data

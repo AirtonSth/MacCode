@@ -198,6 +198,72 @@ final class StreamBatchAtomicPersistenceTests: XCTestCase {
         XCTAssertEqual(try persistedStatus(db: fixture.db, table: "agent_threads", id: fixture.thread.id.value.uuidString), AgentRunStatus.completed.rawValue)
     }
 
+    func test_failedStopFlushDoesNotReuseSeq1ForLateProviderRuntimeAndAllowsNextStart() async throws {
+        // WHY: stop used to clear seq[runId] even when flushPendingStreamWrites
+        // failed and the pending batch was retained. A late Grok ACP notification
+        // (prompt_complete after servers_updated) then reissued seq 1 with a
+        // different kind. persistStreamEventIdempotently rejected the conflict and
+        // the user's next message failed with "Failed to start".
+        let fixture = try await makeFixture(name: "seq-reuse-after-stop")
+        defer { fixture.cleanup() }
+        try fixture.db.execute("PRAGMA busy_timeout=50;")
+
+        fixture.runner.emitProviderRuntime(method: "_x.ai/mcp/servers_updated")
+
+        let locker = try SQLiteDB(path: fixture.databasePath)
+        let lockAcquired = DispatchSemaphore(value: 0)
+        let releaseLock = DispatchSemaphore(value: 0)
+        let writerLock = Task.detached {
+            try locker.transaction {
+                lockAcquired.signal()
+                releaseLock.wait()
+            }
+        }
+        XCTAssertEqual(lockAcquired.wait(timeout: .now() + 1), .success)
+
+        fixture.coordinator.stopRun(threadId: fixture.thread.id)
+        // Late provider notification after stop ownership was torn down but while
+        // the failed flush still owns a retryable batch for the same runId.
+        fixture.runner.emitProviderRuntime(method: "_x.ai/session/prompt_complete")
+        try await Task.sleep(nanoseconds: 150_000_000)
+
+        releaseLock.signal()
+        try await writerLock.value
+
+        let deadline = Date().addingTimeInterval(3)
+        var sequences: [Int] = []
+        while Date() < deadline {
+            sequences = try persistedSequences(db: fixture.db, runId: fixture.runId)
+            if sequences.count >= 2 { break }
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        XCTAssertEqual(
+            sequences,
+            [1, 2],
+            "late post-stop events must continue the stream sequence instead of colliding on seq 1"
+        )
+        let kinds = try persistedKinds(db: fixture.db, runId: fixture.runId)
+        XCTAssertEqual(kinds.count, 2)
+        XCTAssertNotEqual(kinds[0], kinds[1], "seq 1 and seq 2 must retain distinct event identities")
+
+        // The next user turn must not be blocked by a conflicting prior batch.
+        let secondRunId = try await fixture.coordinator.startRun(AgentRunRequest(
+            threadId: fixture.thread.id,
+            provider: .codex,
+            model: "fake-model",
+            cwd: fixture.root.path,
+            prompt: "second user message after stream conflict regression"
+        ))
+        XCTAssertNotEqual(secondRunId, fixture.runId)
+        fixture.runner.finishCompleted()
+        try await Task.sleep(nanoseconds: 200_000_000)
+        XCTAssertEqual(
+            try persistedStatus(db: fixture.db, table: "agent_runs", id: secondRunId.value.uuidString),
+            AgentRunStatus.completed.rawValue,
+            "second start must complete after the prior run's stream identities stayed consistent"
+        )
+    }
+
     func test_stopFirstWaitsForDurabilityBarrierAndPublishesCancellationExactlyOnce() async throws {
         let fixture = try await makeFixture(name: "busy-stop-first")
         defer { fixture.cleanup() }
@@ -515,6 +581,20 @@ final class StreamBatchAtomicPersistenceTests: XCTestCase {
         return values
     }
 
+    private func persistedKinds(db: SQLiteDB, runId: AgentRunID) throws -> [String] {
+        let statement = try db.prepare(
+            "SELECT event_kind FROM agent_stream_events WHERE run_id = ? ORDER BY seq ASC;"
+        )
+        try statement.bind(1, runId.value.uuidString)
+        var values: [String] = []
+        while try statement.step() {
+            if let kind = statement.columnText(0) {
+                values.append(kind)
+            }
+        }
+        return values
+    }
+
     private func persistedStatus(db: SQLiteDB, table: String, id: String) throws -> String? {
         let statement = try db.prepare("SELECT status FROM \(table) WHERE id = ?;")
         try statement.bind(1, id)
@@ -604,6 +684,19 @@ private final class ControlledStreamBatchRunner: AgentProviderRunner, @unchecked
                 startedAtMs: Int64(index)
             ))))
         }
+    }
+
+    func emitProviderRuntime(method: String) {
+        lock.lock()
+        let callback = callback
+        lock.unlock()
+        callback?(.event(.providerRuntime(ProviderRuntimeEvent(
+            provider: .grok,
+            source: "grok.acp",
+            method: method,
+            payloadJSON: #"{"method":"\#(method)"}"#,
+            receivedAtMs: Int64(Date().timeIntervalSince1970 * 1000)
+        ))))
     }
 
     func finishCompleted() {
