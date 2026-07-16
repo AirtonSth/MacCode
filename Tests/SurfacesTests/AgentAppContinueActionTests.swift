@@ -85,6 +85,55 @@ final class AgentAppContinueActionTests: XCTestCase {
         ]), "a later fatal error replaces the banner and must hide Retry")
     }
 
+    /// WHY: recoveryState maps completed+cursor to recoverable for multi-turn
+    /// startRun, but that must not drive the app-restart Continue banner when
+    /// the thread was left interrupted and the session already finished.
+    func test_interruptedThreadWithCompletedSessionDoesNotShowContinue() throws {
+        let tmp = NSTemporaryDirectory() + "rc2-continue-interrupted-completed-session-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let sessionRepo = ProviderSessionRuntimeRepository(db: db)
+        let workspaceID = WorkspaceID()
+        var thread = AgentThread(
+            workspaceId: workspaceID,
+            title: "thread interrupted session done",
+            provider: .codex,
+            model: "gpt-5.5",
+            providerThreadId: "codex-cursor"
+        )
+        thread.status = .interrupted
+        try threadRepo.upsert(thread)
+        try sessionRepo.upsert(ProviderSessionRuntime(
+            threadId: thread.id,
+            provider: .codex,
+            status: .completed,
+            resumeCursor: "codex-cursor",
+            cwd: tmp,
+            model: "gpt-5.5"
+        ))
+        let coordinator = AgentRunCoordinator(
+            runRepo: runRepo,
+            messageRepo: messageRepo,
+            threadRepo: threadRepo,
+            providerSessionRepo: sessionRepo,
+            providers: [.codex: FakeProviderRunner(provider: .codex)]
+        )
+        let vm = AgentAppViewModel(
+            workspaceID: workspaceID,
+            cwd: tmp,
+            coordinator: coordinator,
+            threadRepo: threadRepo,
+            messageRepo: messageRepo,
+            initialThreadId: thread.id
+        )
+
+        XCTAssertFalse(coordinator.hasRecoverableContext(threadId: thread.id),
+                       "completed provider sessions must not arm Continue even when the thread row is still interrupted")
+        XCTAssertFalse(vm.selectedThreadHasRecoverableContext)
+    }
+
     /// WHY: pet open / thread switch must not show "interrupted by an app restart"
     /// for finished work. Live data had many completed threads with stale
     /// interrupted provider sessions still holding a resume cursor; Continue is

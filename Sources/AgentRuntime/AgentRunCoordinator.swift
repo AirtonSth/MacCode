@@ -1476,9 +1476,11 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             return false
         }
         guard let repo = providerSessionRepo else { return false }
+        // recoveryState treats completed+cursor as recoverable for multi-turn
+        // startRun resume. Continue is only for relaunch-interrupted sessions.
         switch (try? repo.recoveryState(threadId: threadId)) ?? .unrecoverable("no repo") {
-        case .recoverable:
-            return true
+        case .recoverable(let session):
+            return session.status == .interrupted
         default:
             return false
         }
