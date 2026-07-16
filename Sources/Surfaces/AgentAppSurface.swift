@@ -205,6 +205,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     public var pullRequestThreadPreparer: ((String, AgentProvider, String, AgentPermissionMode, AgentReasoningEffort, AgentServiceTier, AgentModelSelection?, String?) async throws -> AgentThread)?
     @Published public var providerRecoveryActionRunning = false
     @Published public var providerRecoveryStatusMessage: String?
+    @Published private var dismissedProviderStatusSignature: String?
     @Published public var modelListLoading = false
     @Published public var modelListStatusMessage: String?
     /// True when the current Claude model list is the static built-in fallback
@@ -2079,7 +2080,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
 
     public var providerStatusMessage: String? {
         guard let snapshot = selectedProviderSnapshot, snapshot.status != .available else { return nil }
-        return snapshot.statusDetail ?? "\(snapshot.displayName) is \(snapshot.status.rawValue)."
+        let message = snapshot.statusDetail ?? "\(snapshot.displayName) is \(snapshot.status.rawValue)."
+        let signature = "\(snapshot.id)|\(snapshot.status.rawValue)|\(message)"
+        return signature == dismissedProviderStatusSignature ? nil : message
     }
 
     public var providerAccountStatusMessage: String? {
@@ -3079,7 +3082,10 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         }
     }
     public func insertDroppedFilePaths(_ paths: [String]) {
-        addAttachments(paths)
+        let insertion = DroppedFilePaths.composerInputText(for: paths)
+        prompt = DroppedFilePaths.appending(insertion, to: prompt)
+        promptWasEdited()
+        focusTick &+= 1
     }
     public func promptWasEdited() {
         promptHistoryCursor = nil
@@ -3091,14 +3097,58 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     }
 
     private func clearVisibleErrorForNewUserMessage() {
+        dismissDisplayedError()
+        dismissStatusMessage()
+    }
+
+    public func dismissDisplayedError() {
         timeline.clearError()
         lastErrorRecoverable = false
+        pendingAttachmentRetryConfirmation = nil
+    }
+
+    public func dismissStatusMessage() {
+        statusMessage = ""
+        attachmentInputError = nil
+    }
+
+    public func dismissQueueStatusMessage() {
+        queueStatusMessage = nil
+    }
+
+    public func dismissProviderThreadSnapshotStatusMessage() {
+        providerThreadSnapshotStatusMessage = nil
+    }
+
+    public func dismissModelListStatusMessage() {
+        modelListStatusMessage = nil
+    }
+
+    public func dismissProviderSnapshotStatusMessage() {
+        providerSnapshotStatusMessage = nil
+    }
+
+    public func dismissProviderRecoveryStatusMessage() {
+        providerRecoveryStatusMessage = nil
+    }
+
+    public func dismissPullRequestStatusMessage() {
+        pullRequestStatusMessage = nil
+    }
+
+    public func dismissCheckpointStatusMessage() {
+        checkpointStatusMessage = nil
+    }
+
+    public func dismissProviderStatusMessage() {
+        guard let snapshot = selectedProviderSnapshot, snapshot.status != .available else { return }
+        let message = snapshot.statusDetail ?? "\(snapshot.displayName) is \(snapshot.status.rawValue)."
+        dismissedProviderStatusSignature = "\(snapshot.id)|\(snapshot.status.rawValue)|\(message)"
     }
 
     public func send() async {
         let text = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty || !attachments.isEmpty else { return }
-        guard attachmentInputError == nil else { return }
         // Snapshots can still be empty on first send (seed/load race). Load once
         // before the fail-closed gate so a ready Grok/Codex install is not blocked.
         if selectedProviderSnapshot == nil {
@@ -5640,17 +5690,25 @@ public struct AgentAppView: View {
             backgroundAwaitBanner
             pendingCallbackRows
             if let message = Self.visibleStatusMessage(vm.statusMessage) {
-                inlineStatusBanner(message, identifier: "agent.status.message")
+                inlineStatusBanner(
+                    message,
+                    identifier: "agent.status.message",
+                    dismiss: { vm.dismissStatusMessage() }
+                )
             }
             if let message = vm.providerThreadSnapshotStatusMessage {
-                inlineStatusBanner(message, identifier: "agent.provider.snapshot.stale") {
-                    vm.retryProviderThreadSnapshotRead()
-                }
+                inlineStatusBanner(
+                    message,
+                    identifier: "agent.provider.snapshot.stale",
+                    dismiss: { vm.dismissProviderThreadSnapshotStatusMessage() },
+                    retry: { vm.retryProviderThreadSnapshotRead() }
+                )
             }
             if let banner = Self.standaloneQueueStatusBanner(vm.queueStatusMessage, queuedCount: vm.queuedMessages.count) {
                 inlineStatusBanner(
                     banner.message,
                     identifier: "agent.queue.status",
+                    dismiss: { vm.dismissQueueStatusMessage() },
                     offersCopy: banner.offersCopy,
                     retry: banner.offersRetry ? { Task { await vm.send() } } : nil
                 )
@@ -6930,6 +6988,15 @@ public struct AgentAppView: View {
                     .foregroundColor(recoverable ? DS.Palette.warning : DS.Palette.danger)
                     .lineSpacing(3).textSelection(.enabled)
                 Spacer(minLength: 0)
+                Button { vm.dismissDisplayedError() } label: {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 9, weight: .bold))
+                }
+                .buttonStyle(.plain)
+                .foregroundColor(DS.Palette.textTertiary)
+                .accessibilityLabel("Dismiss error")
+                .accessibilityIdentifier("agent.error.dismiss")
+                .help("Dismiss error")
             }
             if let recoveryAction {
                 Button {
@@ -6968,12 +7035,14 @@ public struct AgentAppView: View {
                 }
             }
             if let recoveryStatus = vm.providerRecoveryStatusMessage {
-                Text(recoveryStatus)
-                    .font(DS.Font.caption)
-                    .foregroundColor(recoveryStatus.hasPrefix("Could not") || recoveryStatus.hasPrefix("Sign-in unavailable")
+                dismissibleStatusRow(
+                    recoveryStatus,
+                    identifier: "agent.error.recovery.status.dismiss",
+                    color: recoveryStatus.hasPrefix("Could not") || recoveryStatus.hasPrefix("Sign-in unavailable")
                         ? DS.Palette.danger
-                        : DS.Palette.textSecondary)
-                    .textSelection(.enabled)
+                        : DS.Palette.textSecondary,
+                    dismiss: { vm.dismissProviderRecoveryStatusMessage() }
+                )
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -7523,9 +7592,21 @@ public struct AgentAppView: View {
                 }
                 .accessibilityIdentifier("agent.queued.header")
                 if let message = vm.queueStatusMessage {
-                    Text(message)
-                        .font(DS.Font.caption)
-                        .foregroundColor(message.contains("failed") ? DS.Palette.danger : DS.Palette.textSecondary)
+                    HStack(spacing: DS.Space.sm) {
+                        Text(message)
+                            .font(DS.Font.caption)
+                            .foregroundColor(message.contains("failed") ? DS.Palette.danger : DS.Palette.textSecondary)
+                        Spacer(minLength: 0)
+                        Button { vm.dismissQueueStatusMessage() } label: {
+                            Image(systemName: "xmark")
+                                .font(.system(size: 8, weight: .bold))
+                        }
+                        .buttonStyle(.plain)
+                        .foregroundColor(DS.Palette.textTertiary)
+                        .accessibilityLabel("Dismiss queue status")
+                        .accessibilityIdentifier("agent.queue.status.inline.dismiss")
+                        .help("Dismiss")
+                    }
                 }
                 ForEach(vm.queuedMessages, id: \.id) { message in
                     queuedMessageRow(message)
@@ -7558,6 +7639,7 @@ public struct AgentAppView: View {
     private func inlineStatusBanner(
         _ message: String,
         identifier: String,
+        dismiss: @escaping () -> Void,
         offersCopy: Bool = true,
         retry: (() -> Void)? = nil
     ) -> some View {
@@ -7582,12 +7664,45 @@ public struct AgentAppView: View {
                     .buttonStyle(.plain)
                     .accessibilityIdentifier("\(identifier).retry")
             }
+            Button(action: dismiss) {
+                Image(systemName: "xmark")
+                    .font(.system(size: 9, weight: .bold))
+            }
+            .buttonStyle(.plain)
+            .foregroundColor(DS.Palette.textTertiary)
+            .accessibilityLabel("Dismiss error")
+            .accessibilityIdentifier("\(identifier).dismiss")
+            .help("Dismiss error")
         }
         .padding(.horizontal, DS.Space.lg)
         .padding(.vertical, DS.Space.sm)
         .background(DS.Palette.danger.opacity(0.09))
         .accessibilityElement(children: .combine)
         .accessibilityIdentifier(identifier)
+    }
+
+    private func dismissibleStatusRow(
+        _ message: String,
+        identifier: String,
+        color: Color,
+        dismiss: @escaping () -> Void
+    ) -> some View {
+        HStack(alignment: .top, spacing: DS.Space.sm) {
+            Text(message)
+                .font(DS.Font.caption)
+                .foregroundColor(color)
+                .fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: 0)
+            Button(action: dismiss) {
+                Image(systemName: "xmark")
+                    .font(.system(size: 8, weight: .bold))
+            }
+            .buttonStyle(.plain)
+            .foregroundColor(DS.Palette.textTertiary)
+            .accessibilityLabel("Dismiss error")
+            .accessibilityIdentifier(identifier)
+            .help("Dismiss error")
+        }
     }
 
     private func queuedMessageRow(_ message: AgentQueuedMessage) -> some View {
@@ -7953,9 +8068,12 @@ public struct AgentAppView: View {
             .disabled(vm.pullRequestPreparing || vm.pullRequestURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || vm.executionLocked)
             if let message = vm.pullRequestStatusMessage {
                 Divider()
-                Text(message)
-                    .font(DS.Font.caption)
-                    .foregroundColor(message.hasPrefix("PR preparation failed") ? DS.Palette.danger : DS.Palette.textSecondary)
+                dismissibleStatusRow(
+                    message,
+                    identifier: "agent.pr.status.dismiss",
+                    color: message.hasPrefix("PR preparation failed") ? DS.Palette.danger : DS.Palette.textSecondary,
+                    dismiss: { vm.dismissPullRequestStatusMessage() }
+                )
             }
             Divider()
             Picker("Execution", selection: $vm.executionMode) {
@@ -8095,14 +8213,20 @@ public struct AgentAppView: View {
                 .disabled(vm.modelListLoading)
             }
             if let modelListStatus = vm.modelListStatusMessage {
-                Text(modelListStatus)
-                    .font(DS.Font.caption)
-                    .foregroundColor(DS.Palette.danger)
+                dismissibleStatusRow(
+                    modelListStatus,
+                    identifier: "agent.modelList.status.dismiss",
+                    color: DS.Palette.danger,
+                    dismiss: { vm.dismissModelListStatusMessage() }
+                )
             }
             if let providerSnapshotStatus = vm.providerSnapshotStatusMessage {
-                Text(providerSnapshotStatus)
-                    .font(DS.Font.caption)
-                    .foregroundColor(DS.Palette.danger)
+                dismissibleStatusRow(
+                    providerSnapshotStatus,
+                    identifier: "agent.providerSnapshot.status.dismiss",
+                    color: DS.Palette.danger,
+                    dismiss: { vm.dismissProviderSnapshotStatusMessage() }
+                )
             }
             if !modelOptions.isEmpty || !customModels.isEmpty {
                 compactMenuSection("Model")
@@ -8192,10 +8316,12 @@ public struct AgentAppView: View {
             }
             if let providerStatus = vm.providerStatusMessage {
                 compactMenuDivider
-                Text(providerStatus)
-                    .font(DS.Font.caption)
-                    .foregroundColor(DS.Palette.danger)
-                    .fixedSize(horizontal: true, vertical: false)
+                dismissibleStatusRow(
+                    providerStatus,
+                    identifier: "agent.provider.status.dismiss",
+                    color: DS.Palette.danger,
+                    dismiss: { vm.dismissProviderStatusMessage() }
+                )
             }
             if let actionTitle = vm.providerRecoveryActionTitle {
                 compactMenuRow(vm.providerRecoveryActionRunning ? "Working..." : actionTitle, selected: false) {
@@ -8204,11 +8330,14 @@ public struct AgentAppView: View {
                 .disabled(vm.providerRecoveryActionRunning)
             }
             if let actionStatus = vm.providerRecoveryStatusMessage {
-                Text(actionStatus)
-                    .font(DS.Font.caption)
-                    .foregroundColor(actionStatus.hasPrefix("Update failed") || actionStatus.hasPrefix("Could not") || actionStatus.hasPrefix("Sign-in unavailable")
+                dismissibleStatusRow(
+                    actionStatus,
+                    identifier: "agent.providerRecovery.status.dismiss",
+                    color: actionStatus.hasPrefix("Update failed") || actionStatus.hasPrefix("Could not") || actionStatus.hasPrefix("Sign-in unavailable")
                         ? DS.Palette.danger
-                        : DS.Palette.textSecondary)
+                        : DS.Palette.textSecondary,
+                    dismiss: { vm.dismissProviderRecoveryStatusMessage() }
+                )
             }
         }
         .padding(DS.Space.sm)
@@ -8527,14 +8656,14 @@ public struct AgentAppView: View {
     }
 
     // IMP-MAC_AGENT-010: resolve dropped item providers to file paths and
-    // attach them to the next message. Returns true if any provider is a file.
+    // insert them as ordinary composer text. Returns true if any provider is a file.
     private func loadDroppedFileAttachments(from providers: [NSItemProvider]) -> Bool {
         let fileProviders = providers.filter { $0.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) }
         guard !fileProviders.isEmpty else { return false }
         for provider in fileProviders {
             _ = provider.loadObject(ofClass: URL.self) { url, _ in
                 guard let url, url.isFileURL else { return }
-                DispatchQueue.main.async { vm.addAttachments([url.path]) }
+                DispatchQueue.main.async { vm.insertDroppedFilePaths([url.path]) }
             }
         }
         return true
@@ -8764,9 +8893,12 @@ public struct AgentAppView: View {
                     .accessibilityIdentifier("agent.checkpoint.diff")
                     HStack {
                         if let message = vm.checkpointStatusMessage {
-                            Text(message)
-                                .font(DS.Font.caption)
-                                .foregroundColor(message.hasPrefix("Revert failed") ? DS.Palette.danger : DS.Palette.textSecondary)
+                            dismissibleStatusRow(
+                                message,
+                                identifier: "agent.checkpoint.status.dismiss",
+                                color: message.hasPrefix("Revert failed") ? DS.Palette.danger : DS.Palette.textSecondary,
+                                dismiss: { vm.dismissCheckpointStatusMessage() }
+                            )
                         }
                         Spacer()
                         // UX-XPLAT-007: stage the revert for confirmation instead

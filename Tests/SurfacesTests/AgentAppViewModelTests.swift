@@ -4109,7 +4109,7 @@ final class AgentAppViewModelTests: XCTestCase {
         XCTAssertEqual(vm.attachments.map(\.displayName), ["b.txt"])
     }
 
-    func test_droppedFilePaths_attachWithoutInsertingPrivatePathsIntoPrompt() throws {
+    func test_droppedFilePaths_insertPathsIntoPromptWithoutCreatingAttachments() throws {
         let (vm, _) = try makeVM()
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("rc-attachment-drop-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
@@ -4121,10 +4121,89 @@ final class AgentAppViewModelTests: XCTestCase {
 
         vm.insertDroppedFilePaths([plain.path, spaced.path])
 
-        XCTAssertEqual(vm.prompt, "review",
-                       "drop and paste must never insert absolute private paths into visible composer text")
-        XCTAssertEqual(vm.attachments.map(\.displayName), ["plain.txt", "has space.txt"],
-                       "drop and paste must use the same structured attachment flow as the picker")
+        XCTAssertEqual(vm.prompt, "review \(plain.path) \(spaced.path)",
+                       "drop and paste must insert file paths as ordinary composer text so every provider can receive them")
+        XCTAssertTrue(vm.attachments.isEmpty,
+                      "drop and paste must not create provider-specific attachments")
+    }
+
+    func test_attachmentCapabilityErrorDoesNotBlockLaterTextSend() async throws {
+        let runner = CapturingProviderRunner(provider: .grok)
+        let (vm, _) = try makeVM(provider: runner)
+        vm.coordinator.replaceProvider(.grok, runner: runner)
+        vm.createThread(title: "send after attachment error")
+        vm.provider = .grok
+        vm.providerSnapshots = [AgentProviderSnapshot(
+            id: "grok-no-attachments",
+            provider: .grok,
+            driverKind: .grokCLI,
+            displayName: "Grok",
+            accentColor: "#000000",
+            continuationGroup: "grok",
+            interactionModes: [.default],
+            permissionModes: [.supervised],
+            enabled: true,
+            installed: true,
+            status: .available,
+            authenticated: true,
+            models: [AgentModelDescriptor(id: "grok-4", label: "Grok 4", provider: .grok)],
+            slashCommands: [],
+            capabilities: .conservative
+        )]
+        vm.providerInstanceId = "grok-no-attachments"
+        vm.model = "grok-4"
+        vm.permissionMode = .supervised
+
+        vm.addAttachments(["/tmp/unsupported.png"])
+        vm.prompt = "send this text"
+        await vm.send()
+
+        XCTAssertEqual(runner.prompts, ["send this text"],
+                       "a previous attachment error must never block a later ordinary text message")
+        XCTAssertTrue(vm.statusMessage.isEmpty,
+                      "a successful new send must clear the obsolete attachment error")
+    }
+
+    func test_errorDismissActionsClearEachVisibleErrorChannel() throws {
+        let (vm, _) = try makeVM()
+        vm.timeline.apply(.error(message: "provider failed", recoverable: true))
+        vm.statusMessage = "attachment failed"
+        vm.queueStatusMessage = "queue failed"
+        vm.modelListStatusMessage = "model load failed"
+        vm.providerSnapshotStatusMessage = "provider load failed"
+        vm.providerRecoveryStatusMessage = "provider recovery failed"
+        vm.pullRequestStatusMessage = "PR preparation failed"
+        vm.checkpointStatusMessage = "Revert failed"
+        let unavailable = AgentProviderSnapshotFactory.snapshot(
+            provider: .codex,
+            models: [AgentModelDescriptor(id: "gpt-5.5", label: "GPT-5.5", provider: .codex)],
+            binaryPath: ""
+        )
+        vm.providerSnapshots = [unavailable]
+        vm.providerInstanceId = unavailable.id
+        XCTAssertNotNil(vm.providerStatusMessage,
+                        "an unavailable selected provider must expose its error before dismissal")
+
+        vm.dismissDisplayedError()
+        vm.dismissStatusMessage()
+        vm.dismissQueueStatusMessage()
+        vm.dismissModelListStatusMessage()
+        vm.dismissProviderSnapshotStatusMessage()
+        vm.dismissProviderRecoveryStatusMessage()
+        vm.dismissPullRequestStatusMessage()
+        vm.dismissCheckpointStatusMessage()
+        vm.dismissProviderStatusMessage()
+
+        XCTAssertNil(vm.timeline.error, "the transcript error X must remove the visible error row")
+        XCTAssertFalse(vm.lastErrorRecoverable, "dismissing the transcript error must remove its stale retry state")
+        XCTAssertTrue(vm.statusMessage.isEmpty, "the status banner X must remove the visible status error")
+        XCTAssertNil(vm.queueStatusMessage, "the queue banner X must remove the visible queue error")
+        XCTAssertNil(vm.modelListStatusMessage, "the model-menu error X must clear its status")
+        XCTAssertNil(vm.providerSnapshotStatusMessage, "the provider-load error X must clear its status")
+        XCTAssertNil(vm.providerRecoveryStatusMessage, "the provider-recovery error X must clear its status")
+        XCTAssertNil(vm.pullRequestStatusMessage, "the PR-menu error X must clear its status")
+        XCTAssertNil(vm.checkpointStatusMessage, "the checkpoint error X must clear its status")
+        XCTAssertNil(vm.providerStatusMessage, "the selected-provider error X must hide the derived status")
     }
 
     func test_send_withAttachments_composesPromptAndClears() async throws {
@@ -4160,7 +4239,7 @@ final class AgentAppViewModelTests: XCTestCase {
                       "the transcript shows a friendly attachment summary, not raw paths")
     }
 
-    func test_send_withMissingAttachmentFailsLoudAndDoesNotStartRun() async throws {
+    func test_send_withMissingAttachmentErrorStillSendsOrdinaryTextWithoutAttachment() async throws {
         let runner = CapturingProviderRunner(provider: .codex)
         let (vm, _) = try makeVM(provider: runner)
         vm.createThread(title: "t")
@@ -4169,12 +4248,14 @@ final class AgentAppViewModelTests: XCTestCase {
 
         await vm.send()
 
-        XCTAssertTrue(runner.prompts.isEmpty,
-                      "missing attachments must fail before provider spawn instead of sending a bad path")
-        XCTAssertTrue(vm.statusMessage.contains("Attachment not found"),
-                      "attachment resolution errors must be visible before provider spawn")
-        XCTAssertEqual(vm.prompt, "review",
-                       "failed attachment validation must keep the user's draft so they can fix the file path and retry")
+        XCTAssertEqual(runner.prompts, ["review"],
+                       "a missing attachment error must not block the user's ordinary text message")
+        XCTAssertEqual(runner.attachments.last, [],
+                       "the provider must receive no attachment rather than the invalid path")
+        XCTAssertTrue(vm.statusMessage.isEmpty,
+                      "the successful text send must clear the obsolete attachment error")
+        XCTAssertTrue(vm.prompt.isEmpty,
+                      "the text draft must clear after its successful send")
         XCTAssertTrue(vm.attachments.isEmpty,
                       "an invalid path must never become a misleading successful attachment chip")
     }
