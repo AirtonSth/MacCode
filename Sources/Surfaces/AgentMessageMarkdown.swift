@@ -53,6 +53,76 @@ enum AgentMessageMarkdown {
         return result
     }
 
+    static func selectionGroups(from blocks: [AgentMessageMarkdownBlock]) -> [[AgentMessageMarkdownBlock]] {
+        var groups: [[AgentMessageMarkdownBlock]] = []
+        var prose: [AgentMessageMarkdownBlock] = []
+
+        func flushProse() {
+            guard !prose.isEmpty else { return }
+            groups.append(prose)
+            prose.removeAll(keepingCapacity: true)
+        }
+
+        for block in blocks {
+            switch block.kind {
+            case .code, .table:
+                flushProse()
+                groups.append([block])
+            default:
+                prose.append(block)
+            }
+        }
+        flushProse()
+        return groups
+    }
+
+    static func selectableProse(from blocks: [AgentMessageMarkdownBlock], compact: Bool) -> AttributedString {
+        var result = AttributedString()
+        for (index, block) in blocks.enumerated() {
+            if index > 0 { result.append(AttributedString("\n")) }
+
+            let source: String
+            let size: CGFloat
+            let weight: Font.Weight
+            let color: Color
+            switch block.kind {
+            case .paragraph:
+                source = block.text
+                size = 13
+                weight = .regular
+                color = DS.Palette.text
+            case .heading(let level):
+                source = block.text
+                size = compact ? 13 : (level == 1 ? 18 : level == 2 ? 15 : 13)
+                weight = .semibold
+                color = DS.Palette.text
+            case .bullet(let indent):
+                source = String(repeating: "  ", count: indent) + "• " + block.text
+                size = 13
+                weight = .regular
+                color = DS.Palette.text
+            case .numbered(let number, let indent):
+                source = String(repeating: "  ", count: indent) + "\(number). " + block.text
+                size = 13
+                weight = .regular
+                color = DS.Palette.text
+            case .blockquote:
+                source = "▌ " + block.text
+                size = 13
+                weight = .regular
+                color = DS.Palette.textSecondary
+            case .code, .table:
+                continue
+            }
+
+            var line = attributedInline(source)
+            line.font = .system(size: size, weight: weight)
+            line.foregroundColor = color
+            result.append(line)
+        }
+        return result
+    }
+
     private static func computeBlocks(from text: String) -> [AgentMessageMarkdownBlock] {
         #if DEBUG
         blocksComputeCountForTesting &+= 1
@@ -458,13 +528,30 @@ struct AgentMessageMarkdownView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: compact ? DS.Space.sm : DS.Space.md) {
-            ForEach(Array(AgentMessageMarkdown.blocks(from: text).enumerated()), id: \.offset) { index, block in
-                blockView(block, index: index)
+            ForEach(Array(AgentMessageMarkdown.selectionGroups(from: AgentMessageMarkdown.blocks(from: text)).enumerated()), id: \.offset) { index, group in
+                if group.count == 1, let block = group.first, isIsolatedBlock(block) {
+                    blockView(block, index: index)
+                } else {
+                    AgentLinkedAttributedText(
+                        attributed: AgentMessageMarkdown.selectableProse(from: group, compact: compact),
+                        font: .systemFont(ofSize: 13),
+                        textColor: DS.NS.text,
+                        lineFragmentPadding: 0,
+                        lineSpacing: compact ? 3 : 5
+                    )
+                }
             }
         }
         // Selection lives inside AgentLinkedInlineText (NSTextView). Applying
         // SwiftUI `.textSelection` here would put an I-beam over the whole block
         // and hide the pointing-hand cursor on split-opening links.
+    }
+
+    private func isIsolatedBlock(_ block: AgentMessageMarkdownBlock) -> Bool {
+        switch block.kind {
+        case .code, .table: return true
+        default: return false
+        }
     }
 
     /// Inline markdown that opens Files/Browser splits on link click and shows

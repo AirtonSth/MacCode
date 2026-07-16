@@ -78,4 +78,30 @@ final class AgentMessageMarkdownTests: XCTestCase {
                        "AttributedString(markdown:) is the expensive per-cell call; identical text must run it once")
         XCTAssertEqual(first, second, "cached attributed inline must equal a fresh parse")
     }
+
+    func test_selectionGroups_keepAdjacentProseInOneSelectableSurface() {
+        let blocks = AgentMessageMarkdown.blocks(from: """
+        First paragraph.
+
+        ## Heading
+
+        - first bullet
+        - second bullet
+
+        | Before | After |
+        | --- | --- |
+        | One | Two |
+
+        Final paragraph.
+        """)
+
+        let groups = AgentMessageMarkdown.selectionGroups(from: blocks)
+
+        XCTAssertEqual(groups.map(\.count), [4, 1, 1],
+                       "adjacent prose must share one AppKit text surface so a drag can select across paragraph, heading, and list lines; tables remain isolated")
+        XCTAssertEqual(groups[0].map(\.text), [
+            "First paragraph.", "Heading", "first bullet", "second bullet",
+        ])
+        XCTAssertEqual(groups[2][0].text, "Final paragraph.")
+    }
 }
