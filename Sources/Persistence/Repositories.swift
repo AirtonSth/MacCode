@@ -1688,6 +1688,17 @@ public final class AgentRunRepository {
         _ = try st.step()
     }
 
+    /// Highest durable sequence already committed for `runId`, or `0` when none.
+    /// Used to seed in-memory allocation after process relaunch or ownership repair
+    /// so a retry cannot reuse seq 1 for a different event kind.
+    public func maxStreamEventSeq(runId: AgentRunID) throws -> Int {
+        let st = try db.prepare(
+            "SELECT COALESCE(MAX(seq), 0) FROM agent_stream_events WHERE run_id = ?;"
+        )
+        try st.bind(1, runId.value.uuidString)
+        return (try st.step()) ? Int(st.columnInt64(0)) : 0
+    }
+
     /// One ordered mirror write. A provider runtime event shares the transaction
     /// with its AssistantEvent row so retries cannot expose a partial pair.
     public struct StreamWriteIntent: Sendable {
