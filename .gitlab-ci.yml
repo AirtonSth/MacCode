@@ -237,12 +237,15 @@ package_bundle_check:
         - Sources/**/*
         - Package.swift
         - scripts/package-app.sh
+        - scripts/resolve-codesign-identity.sh
+        - scripts/test-resolve-codesign-identity.sh
         - scripts/check-app-bundle.sh
         - .gitlab-ci.yml
     - if: '$CI_PIPELINE_SOURCE == "web"'
       when: manual
       allow_failure: true
   script:
+    - bash scripts/test-resolve-codesign-identity.sh
     - xcodebuild -downloadComponent MetalToolchain
     - RC2_CONFIG=debug bash scripts/package-app.sh
     - bash scripts/check-app-bundle.sh dist/RemoteCode.app
