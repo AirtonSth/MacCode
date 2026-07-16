@@ -4334,11 +4334,13 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         guard fm.fileExists(atPath: path, isDirectory: &isDir), isDir.boolValue else {
             throw JSONRPCError(code: -32602, message: "not a directory", data: .string(path))
         }
-        let urls = try fm.contentsOfDirectory(at: URL(fileURLWithPath: path), includingPropertiesForKeys: [.isDirectoryKey, .fileSizeKey, .contentModificationDateKey], options: [.skipsPackageDescendants])
+        // Avoid prefetching resource keys on network-mount children of a local
+        // parent (e.g. ~/OrbStack NFS) — that re-triggers Network Volumes TCC.
+        let listed = try HostSafeDirectoryListing.list(path: path, fileManager: fm)
         var entries: [JSONValue] = []
         if let parent = makeParentEntry(for: path) { entries.append(parent) }
-        let children = urls.map { url -> JSONValue in
-            makeLocalEntry(url)
+        let children = listed.map { entry -> JSONValue in
+            makeLocalEntry(from: entry)
         }.sorted(by: sortSSHEntries)
         return .object([
             "path": .string(path),
@@ -4369,6 +4371,24 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             "name": .string(url.lastPathComponent),
             "path": .string(url.path),
             "kind": .string(isDirectory ? "directory" : "file"),
+            "size": .string(size),
+            "file_type": .string(type),
+            "modified": .string(modified)
+        ])
+    }
+
+    /// Listing entry that never requires a second resourceValues pass (and never
+    /// forces Network Volumes TCC for opaque NFS mount children of a local parent).
+    private func makeLocalEntry(from entry: HostSafeDirectoryListing.Entry) -> JSONValue {
+        let size = entry.isDirectory ? "" : "\(entry.fileSize ?? 0)"
+        let modified = entry.contentModificationDate.map(Self.shortDateFormatter.string(from:)) ?? ""
+        let type = entry.isDirectory
+            ? (entry.isNetworkVolume ? "Network volume" : "File folder")
+            : fileType(for: entry.name)
+        return .object([
+            "name": .string(entry.name),
+            "path": .string(entry.path),
+            "kind": .string(entry.isDirectory ? "directory" : "file"),
             "size": .string(size),
             "file_type": .string(type),
             "modified": .string(modified)

@@ -2,6 +2,7 @@ import Foundation
 import CryptoKit
 import UniformTypeIdentifiers
 import CoreModel
+import Persistence
 
 public enum WorkspaceFileLimits {
     public static let sampleBytes = 64 * 1024
@@ -38,12 +39,18 @@ public struct WorkspaceFileService: Sendable {
         guard FileManager.default.fileExists(atPath: directory.path, isDirectory: &isDir), isDir.boolValue else {
             throw JSONRPCError(code: -32602, message: "not a directory", data: .string(directory.path))
         }
-        let keys: [URLResourceKey] = [.isDirectoryKey, .isSymbolicLinkKey, .fileSizeKey, .contentModificationDateKey]
-        let children = try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: keys)
-        let entries = children.map { child -> (Bool, String, JSONValue) in
-            let values = try? child.resourceValues(forKeys: Set(keys))
-            let isDirectory = values?.isDirectory == true
-            return (isDirectory, child.lastPathComponent, .object(entryJSON(root: rootURL, url: child, values: values)))
+        // Prefer name-only listing that skips stat on network-mount children of a
+        // local parent (home workspaces + OrbStack NFS must not force TCC prompts).
+        let listed = try HostSafeDirectoryListing.list(path: directory.path)
+        let entries = listed.map { entry -> (Bool, String, JSONValue) in
+            let child = URL(fileURLWithPath: entry.path, isDirectory: entry.isDirectory)
+            var values: URLResourceValues?
+            if !entry.isNetworkVolume {
+                values = try? child.resourceValues(forKeys: [
+                    .isDirectoryKey, .isSymbolicLinkKey, .fileSizeKey, .contentModificationDateKey,
+                ])
+            }
+            return (entry.isDirectory, entry.name, .object(entryJSON(root: rootURL, url: child, values: values)))
         }
         .sorted { lhs, rhs in
             if lhs.0 != rhs.0 { return lhs.0 && !rhs.0 }

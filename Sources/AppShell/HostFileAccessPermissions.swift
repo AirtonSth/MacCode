@@ -3,6 +3,10 @@ import AppKit
 import Security
 import Persistence
 
+// HostVolumeMountTable + HostSafeDirectoryListing live in Persistence so
+// SocketServer can list home without touching NFS mounts (OrbStack) and without
+// a circular AppShell dependency.
+
 // MARK: - Purpose strings (must match scripts/package-app.sh Info.plist)
 
 /// Privacy purpose strings for macOS Files and Folders TCC services.
@@ -169,19 +173,20 @@ public enum HostFileAccessProbeTarget: String, CaseIterable, Sendable {
 
     /// First non-root entry under /Volumes (external/network mounts). Nil when
     /// only the boot volume (or nothing) is present.
+    ///
+    /// Uses name-only enumeration + root-volume path compare so we do not
+    /// prefetch resource keys that can trip Network Volumes TCC early.
     public static func firstMountedVolumeURL(
         volumesRoot: URL = URL(fileURLWithPath: "/Volumes", isDirectory: true),
         fileManager: FileManager = .default
     ) -> URL? {
-        let children = (try? fileManager.contentsOfDirectory(
-            at: volumesRoot,
-            includingPropertiesForKeys: [.isDirectoryKey, .volumeIsRootFileSystemKey],
-            options: [.skipsHiddenFiles]
-        )) ?? []
-        for child in children {
-            let isRoot = (try? child.resourceValues(forKeys: [.volumeIsRootFileSystemKey]).volumeIsRootFileSystem) == true
-            if isRoot { continue }
-            return child
+        let rootPath = volumesRoot.path
+        let names = (try? fileManager.contentsOfDirectory(atPath: rootPath)) ?? []
+        let bootRoots: Set<String> = ["Macintosh HD", "Macintosh HD - Data"]
+        for name in names {
+            if name.hasPrefix(".") { continue }
+            if bootRoots.contains(name) { continue }
+            return volumesRoot.appendingPathComponent(name, isDirectory: true)
         }
         return nil
     }
@@ -254,8 +259,12 @@ public enum HostFileAccessProber {
 
     /// Probes home protected folders. Optionally probes a real mounted volume
     /// child when one exists (network/removable TCC is mount-path based).
+    ///
+    /// `includeVolumes` defaults to **false**: probing a network volume forces
+    /// the system Allow dialog and is only appropriate when the user explicitly
+    /// asks (Settings opt-in). Desktop/Documents/Downloads cover normal workspaces.
     public static func probeStandardTargets(
-        includeVolumes: Bool = true,
+        includeVolumes: Bool = false,
         home: URL = FileManager.default.homeDirectoryForCurrentUser,
         volumesRoot: URL = URL(fileURLWithPath: "/Volumes", isDirectory: true),
         fileManager: FileManager = .default,
