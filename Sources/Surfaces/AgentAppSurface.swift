@@ -7396,6 +7396,7 @@ public struct AgentAppView: View {
                                 .foregroundColor(DS.Palette.textTertiary)
                         }
                         .buttonStyle(.plain)
+                        .dsPointingHandCursor()
                         .help("Open in split panel")
                         .accessibilityIdentifier("agent.tool.openInSplit.\(item.id)")
                     }

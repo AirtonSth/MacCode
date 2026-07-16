@@ -462,19 +462,37 @@ struct AgentMessageMarkdownView: View {
                 blockView(block, index: index)
             }
         }
-        .textSelection(.enabled)
+        // Selection lives inside AgentLinkedInlineText (NSTextView). Applying
+        // SwiftUI `.textSelection` here would put an I-beam over the whole block
+        // and hide the pointing-hand cursor on split-opening links.
+    }
+
+    /// Inline markdown that opens Files/Browser splits on link click and shows
+    /// the pointing-hand cursor over those links (AppKit NSTextView).
+    @ViewBuilder
+    private func linkedInline(
+        _ source: String,
+        size: CGFloat = 13,
+        weight: NSFont.Weight = .regular,
+        color: NSColor = DS.NS.text,
+        lineSpacing: CGFloat = 5
+    ) -> some View {
+        AgentLinkedInlineText(
+            text: source,
+            fontSize: size,
+            fontWeight: weight,
+            textColor: color,
+            lineSpacing: compact ? min(lineSpacing, 3) : lineSpacing
+        )
     }
 
     @ViewBuilder
     private func blockView(_ block: AgentMessageMarkdownBlock, index: Int) -> some View {
         switch block.kind {
         case .paragraph:
-            Text(AgentMessageMarkdown.attributedInline(block.text))
-                .font(DS.Font.body)
-                .lineSpacing(compact ? 3 : 5)
+            linkedInline(block.text, lineSpacing: compact ? 3 : 5)
         case .heading(let level):
-            Text(AgentMessageMarkdown.attributedInline(block.text))
-                .font(headingFont(level))
+            linkedInline(block.text, size: headingSize(level), weight: .semibold, lineSpacing: 2)
                 .padding(.top, compact ? 0 : DS.Space.xs)
         case .bullet(let indent):
             HStack(alignment: .firstTextBaseline, spacing: DS.Space.sm) {
@@ -482,9 +500,7 @@ struct AgentMessageMarkdownView: View {
                     .font(.system(size: 4, weight: .semibold))
                     .foregroundColor(DS.Palette.textTertiary)
                     .padding(.top, 6)
-                Text(AgentMessageMarkdown.attributedInline(block.text))
-                    .font(DS.Font.body)
-                    .lineSpacing(compact ? 3 : 5)
+                linkedInline(block.text, lineSpacing: compact ? 3 : 5)
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
             .padding(.leading, CGFloat(indent) * 16)
@@ -493,9 +509,7 @@ struct AgentMessageMarkdownView: View {
                 Text("\(number).")
                     .font(DS.Font.monoSmall)
                     .foregroundColor(DS.Palette.textSecondary)
-                Text(AgentMessageMarkdown.attributedInline(block.text))
-                    .font(DS.Font.body)
-                    .lineSpacing(compact ? 3 : 5)
+                linkedInline(block.text, lineSpacing: compact ? 3 : 5)
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
             .padding(.leading, CGFloat(indent) * 16)
@@ -504,8 +518,7 @@ struct AgentMessageMarkdownView: View {
                 // Header row
                 HStack(spacing: 0) {
                     ForEach(Array(headers.enumerated()), id: \.offset) { _, header in
-                        Text(AgentMessageMarkdown.attributedInline(header))
-                            .font(DS.Font.bodyStrong)
+                        linkedInline(header, weight: .semibold, lineSpacing: 2)
                             .padding(.horizontal, DS.Space.sm)
                             .padding(.vertical, DS.Space.xs)
                             .frame(maxWidth: .infinity, alignment: .leading)
@@ -517,8 +530,7 @@ struct AgentMessageMarkdownView: View {
                 ForEach(Array(rows.enumerated()), id: \.offset) { rowIndex, row in
                     HStack(spacing: 0) {
                         ForEach(Array(row.enumerated()), id: \.offset) { colIndex, cell in
-                            Text(AgentMessageMarkdown.attributedInline(cell))
-                                .font(DS.Font.body)
+                            linkedInline(cell, lineSpacing: 2)
                                 .padding(.horizontal, DS.Space.sm)
                                 .padding(.vertical, DS.Space.xs)
                                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -542,10 +554,7 @@ struct AgentMessageMarkdownView: View {
                 RoundedRectangle(cornerRadius: 2, style: .continuous)
                     .fill(DS.Palette.accent.opacity(0.5))
                     .frame(width: 3)
-                Text(AgentMessageMarkdown.attributedInline(block.text))
-                    .font(DS.Font.body)
-                    .foregroundColor(DS.Palette.textSecondary)
-                    .lineSpacing(compact ? 3 : 5)
+                linkedInline(block.text, color: DS.NS.textSecondary, lineSpacing: compact ? 3 : 5)
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
             .padding(.leading, DS.Space.xs)
@@ -599,11 +608,12 @@ struct AgentMessageMarkdownView: View {
         }
     }
 
-    private func headingFont(_ level: Int) -> Font {
+    private func headingSize(_ level: Int) -> CGFloat {
+        if compact { return 13 }
         switch level {
-        case 1: return compact ? DS.Font.bodyStrong : DS.Font.title2
-        case 2: return compact ? DS.Font.bodyStrong : DS.Font.title3
-        default: return DS.Font.bodyStrong
+        case 1: return 18
+        case 2: return 15
+        default: return 13
         }
     }
 }
