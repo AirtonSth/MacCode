@@ -711,6 +711,8 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         reloadCheckpoints()
         suppressPersistedFinalDuplicatedByTimeline()
         resetTimelineUpdateTick()
+        // Full access: reopened threads with an unimplemented plan must auto-run, not ask.
+        scheduleFullAccessPlanAutoImplementIfNeeded()
         // Restore persisted plan notes for the opened thread. A failed read must
         // not masquerade as absent notes and then overwrite the durable value.
         do {
@@ -1364,6 +1366,41 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     }
     public var latestProposedPlan: AssistantProposedPlan? {
         timeline.proposedPlans.last { !$0.markdown.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+    }
+
+    /// Full access is an autonomous mode: tools and plan implementation run without
+    /// a human review gate. Proposed-plan Approve/Reject must not appear.
+    public var suppressesProposedPlanReview: Bool {
+        permissionMode == .fullAccess
+    }
+
+    /// Proposed plan cards that still need a human decision (supervised / auto-edits).
+    public var reviewableProposedPlan: AssistantProposedPlan? {
+        guard !suppressesProposedPlanReview else { return nil }
+        return latestProposedPlan
+    }
+
+    /// Plan IDs already scheduled for full-access auto-implement (dedupe flush + finish).
+    private var fullAccessAutoImplementPlanIds: Set<String> = []
+
+    /// Under full access, auto-implement the latest unimplemented proposed plan
+    /// (queue if a turn is still open — never ask the user to Approve).
+    public func scheduleFullAccessPlanAutoImplementIfNeeded() {
+        guard suppressesProposedPlanReview else { return }
+        guard let plan = latestProposedPlan, plan.showsImplementationActions else { return }
+        // Dedupe concurrent flush+finish schedules only after a successful start/queue
+        // (failed enqueue must remain retryable).
+        guard !fullAccessAutoImplementPlanIds.contains(plan.id) else { return }
+        fullAccessAutoImplementPlanIds.insert(plan.id)
+        Task {
+            await self.implementLatestPlan(newThread: false)
+            // implementLatestPlan marks implemented only on success; release the
+            // latch so a later finish/reopen can retry a failed admission.
+            if self.latestProposedPlan?.id == plan.id,
+               self.latestProposedPlan?.showsImplementationActions == true {
+                self.fullAccessAutoImplementPlanIds.remove(plan.id)
+            }
+        }
     }
 
     @discardableResult
@@ -2296,6 +2333,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         }
         permissionMode = mode
         persistThreadConfig()
+        if mode == .fullAccess {
+            scheduleFullAccessPlanAutoImplementIfNeeded()
+        }
     }
 
     /// Persist an async callback's permission escalation against the thread that
@@ -3613,6 +3653,11 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         self.timeline = nextTimeline
         self.refreshSR1TranslationStateFromTimeline()
         self.scheduleTimelineUpdateTick()
+        // Full access auto-approves plans: if a proposed plan arrived mid-stream,
+        // queue/start implementation without surfacing Approve/Reject.
+        if pending.contains(where: { if case .proposedPlan = $0.event { return true }; return false }) {
+            scheduleFullAccessPlanAutoImplementIfNeeded()
+        }
     }
 
     nonisolated public func runCoordinator(_ c: AgentRunCoordinator, didReceive event: AssistantEvent, run: AgentRunID, threadId: AgentThreadID) {
@@ -3683,6 +3728,10 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             self.loadGitBranchThrottled()   // the run may have changed the tree
             if status == .completed {
                 self.onRunCompleted?()
+                // Plan may have landed only as the turn ended; full access must still auto-implement.
+                if finishedTid == self.selectedThreadId {
+                    self.scheduleFullAccessPlanAutoImplementIfNeeded()
+                }
             }
             self.onRunStateChange?()
         }
@@ -4435,7 +4484,7 @@ public struct AgentAppView: View {
     }
 
     static let fullAccessScopeDescription =
-        "The agent runs tools and edits without asking for this thread until you change it."
+        "The agent runs tools, edits, and proposed plans without asking for this thread until you change it."
 
     static let sessionApprovalHelp =
         "Auto-approve requests for this thread until you change it"
@@ -7085,8 +7134,11 @@ public struct AgentAppView: View {
                     }
                 }
             }
-            ForEach(inputs.turnPlans) { plan in
-                proposedPlanRow(plan)
+            // Full access: no plan review card — plans auto-implement without Approve.
+            if !vm.suppressesProposedPlanReview {
+                ForEach(inputs.turnPlans) { plan in
+                    proposedPlanRow(plan)
+                }
             }
             if turn.finished {
                 ForEach(blocks) { block in
@@ -8517,7 +8569,7 @@ public struct AgentAppView: View {
                 activePlanSidebarCard(plan)
                 Rectangle().fill(DS.Palette.line).frame(height: DS.Border.hairline)
             }
-            if let proposedPlan = vm.latestProposedPlan {
+            if let proposedPlan = vm.reviewableProposedPlan {
                 let plan = proposedPlanExpanded ? proposedPlan.markdown : proposedPlan.collapsedPreview
                 VStack(alignment: .leading, spacing: DS.Space.xs) {
                     Text("PROPOSED BY AGENT")
@@ -8588,7 +8640,7 @@ public struct AgentAppView: View {
             }
             // UX-MAC_AGENT-014: when the panel has no plan/checkpoints yet, the
             // bare Notes editor reads as broken — explain what fills this panel.
-            if vm.activePlan == nil, vm.latestProposedPlan == nil, vm.checkpoints.isEmpty {
+            if vm.activePlan == nil, vm.reviewableProposedPlan == nil, vm.checkpoints.isEmpty {
                 Text("The agent's plan and turn checkpoints appear here.")
                     .font(DS.Font.caption)
                     .foregroundColor(DS.Palette.textTertiary)
