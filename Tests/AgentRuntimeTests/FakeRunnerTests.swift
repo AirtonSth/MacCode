@@ -997,6 +997,46 @@ final class FakeRunnerTests: XCTestCase {
                        "provider recovery state must not keep a dead Codex app-server session active after launch")
     }
 
+    /// WHY: if a turn already finished (thread completed) but the provider
+    /// session row was still running, launch must not invent an interrupt.
+    /// That mismatch made pet-open show "This thread was interrupted by an app
+    /// restart" on finished Grok/Codex threads.
+    func test_reconcileOnLaunchAlignsStaleRunningSessionToCompletedThread() throws {
+        let tmp = NSTemporaryDirectory() + "rc2-coordinator-launch-completed-session-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let sessionRepo = ProviderSessionRuntimeRepository(db: db)
+        var thread = AgentThread(title: "already done", provider: .grok, model: "grok-4.5", providerThreadId: "cursor-1")
+        thread.status = .completed
+        try threadRepo.upsert(thread)
+        try sessionRepo.upsert(ProviderSessionRuntime(
+            threadId: thread.id,
+            provider: .grok,
+            status: .running,
+            resumeCursor: "cursor-1",
+            cwd: tmp,
+            model: "grok-4.5"
+        ))
+        let coordinator = AgentRunCoordinator(
+            runRepo: runRepo,
+            messageRepo: messageRepo,
+            threadRepo: threadRepo,
+            providerSessionRepo: sessionRepo,
+            providerAdapters: [.grok: SpyProviderAdapter(provider: .grok)]
+        )
+
+        try coordinator.reconcileOnLaunch()
+
+        XCTAssertEqual(try threadRepo.get(id: thread.id)?.status, .completed,
+                       "launch must not rewrite a completed thread into interrupted")
+        XCTAssertEqual(try sessionRepo.get(threadId: thread.id)?.status, .completed,
+                       "stale running sessions on completed threads must heal to completed, not interrupted")
+        XCTAssertFalse(coordinator.hasRecoverableContext(threadId: thread.id),
+                       "finished work must not expose the Continue affordance after launch reconciliation")
+    }
+
     func test_startRunFailureMarksThreadAndSessionFailedInsteadOfLeavingRunningSpinner() async throws {
         let tmp = NSTemporaryDirectory() + "rc2-coordinator-start-failure-" + UUID().uuidString
         let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()

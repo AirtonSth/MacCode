@@ -85,6 +85,64 @@ final class AgentAppContinueActionTests: XCTestCase {
         ]), "a later fatal error replaces the banner and must hide Retry")
     }
 
+    /// WHY: pet open / thread switch must not show "interrupted by an app restart"
+    /// for finished work. Live data had many completed threads with stale
+    /// interrupted provider sessions still holding a resume cursor; Continue is
+    /// only for relaunch-interrupted threads.
+    func test_completedThreadWithStaleInterruptedSessionDoesNotShowContinue() throws {
+        let tmp = NSTemporaryDirectory() + "rc2-continue-completed-stale-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let sessionRepo = ProviderSessionRuntimeRepository(db: db)
+        let workspaceID = WorkspaceID()
+        var thread = AgentThread(
+            workspaceId: workspaceID,
+            title: "finished work",
+            provider: .grok,
+            model: "grok-4.5",
+            providerThreadId: "grok-session-cursor"
+        )
+        thread.status = .completed
+        try threadRepo.upsert(thread)
+        try sessionRepo.upsert(ProviderSessionRuntime(
+            threadId: thread.id,
+            provider: .grok,
+            status: .interrupted,
+            resumeCursor: "grok-session-cursor",
+            cwd: tmp,
+            model: "grok-4.5"
+        ))
+        let coordinator = AgentRunCoordinator(
+            runRepo: runRepo,
+            messageRepo: messageRepo,
+            threadRepo: threadRepo,
+            providerSessionRepo: sessionRepo,
+            providers: [.grok: FakeProviderRunner(provider: .grok)]
+        )
+        let vm = AgentAppViewModel(
+            workspaceID: workspaceID,
+            cwd: tmp,
+            coordinator: coordinator,
+            threadRepo: threadRepo,
+            messageRepo: messageRepo,
+            initialThreadId: thread.id
+        )
+
+        XCTAssertFalse(coordinator.hasRecoverableContext(threadId: thread.id),
+                       "a completed thread must not be treated as relaunch-recoverable just because a stale session row is interrupted")
+        XCTAssertFalse(vm.selectedThreadHasRecoverableContext,
+                       "opening a finished thread (e.g. via pet) must not show the app-restart Continue banner")
+        XCTAssertFalse(
+            AgentAppViewModel.showsContinueAction(
+                hasRecoverableContext: vm.selectedThreadHasRecoverableContext,
+                runActive: false
+            ),
+            "Continue UI must stay hidden for completed threads"
+        )
+    }
+
     func test_unavailableProviderDoesNotConsumeContinueRecoveryAction() async throws {
         let fixture = try makeRecoverableContinueFixture(runner: FakeProviderRunner(provider: .codex))
         fixture.vm.providerSnapshots = [providerSnapshot(status: .unavailable, installed: false)]

@@ -265,7 +265,18 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         if let providerSessionRepo {
             let future = Date.distantFuture
             for session in try providerSessionRepo.list(status: .running, updatedBefore: future) {
-                try providerSessionRepo.markStopped(threadId: session.threadId, status: .interrupted, at: now)
+                // A stale running session on an already-terminal thread is not a
+                // relaunch interrupt. Align the session to the thread so pet/open
+                // does not show "interrupted by an app restart" for finished work.
+                let sessionStatus: AgentRunStatus
+                if let thread = try? threadRepo.get(id: session.threadId),
+                   Self.isTerminalThreadStatus(thread.status),
+                   thread.status != .interrupted {
+                    sessionStatus = thread.status
+                } else {
+                    sessionStatus = .interrupted
+                }
+                try providerSessionRepo.markStopped(threadId: session.threadId, status: sessionStatus, at: now)
             }
         }
         onActiveRunProjectionChanged?(ActiveRunProjection(runs: []), .launchReconciliation)
@@ -1451,17 +1462,34 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         })
     }
 
-    /// Returns true when the thread has a recoverable provider session (was
-    /// interrupted by relaunch and can be resumed via startRun). Used by the
-    /// surface to decide whether to show the inline Continue action.
+    /// Returns true when the thread was relaunch-interrupted and still has a
+    /// recoverable provider session that the inline Continue action can resume.
     /// WHY: coordinator owns providerSessionRepo; surface should not reach
     /// through to the repo directly.
+    ///
+    /// Completed/cancelled/failed threads must never surface Continue even when
+    /// a stale session row still has a resume cursor or an `interrupted` status
+    /// left behind by launch reconciliation of a leftover running session.
     public func hasRecoverableContext(threadId: AgentThreadID) -> Bool {
+        guard let thread = try? threadRepo.get(id: threadId),
+              thread.status == .interrupted else {
+            return false
+        }
         guard let repo = providerSessionRepo else { return false }
         switch (try? repo.recoveryState(threadId: threadId)) ?? .unrecoverable("no repo") {
         case .recoverable:
             return true
         default:
+            return false
+        }
+    }
+
+    /// Terminal thread statuses that are not relaunch-interrupt recovery targets.
+    nonisolated static func isTerminalThreadStatus(_ status: AgentRunStatus) -> Bool {
+        switch status {
+        case .completed, .failed, .cancelled, .interrupted:
+            return true
+        case .pending, .running:
             return false
         }
     }
