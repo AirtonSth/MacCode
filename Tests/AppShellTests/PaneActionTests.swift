@@ -97,13 +97,15 @@ final class PaneActionTests: XCTestCase {
         return try XCTUnwrap(ws.layout.find(paneID: paneID))
     }
 
-    func test_newWorkspace_opensTerminalByDefault_andAddCreatesAnother() throws {
+    func test_newWorkspace_opensAgentAppByDefault_andAddCreatesAnother() throws {
         let (ctx, router) = try makeContext()
         let ws = try router.createWorkspace(name: "w", cwd: NSTemporaryDirectory())
-        // A new workspace opens with a terminal by default.
+        // A new workspace opens with Agent App as the default selected tab.
         guard case .pane(let pane) = ws.layout else { return XCTFail("expected single pane") }
         XCTAssertEqual(pane.surfaces.count, 1)
-        XCTAssertEqual(pane.surfaces.first?.type, .terminal)
+        XCTAssertEqual(pane.surfaces.first?.type, .agentApp)
+        XCTAssertEqual(pane.selectedSurfaceID, pane.surfaces.first?.id)
+        XCTAssertEqual(pane.surfaces.first?.title, "Agent App")
 
         let ptv = PaneTabsView(pane: pane, router: router)
         let desc = ptv.performAdd(.terminal, title: "terminal")
@@ -112,7 +114,7 @@ final class PaneActionTests: XCTestCase {
         let updated = ctx.state.workspaces[ws.id]!
         guard case .pane(let p2) = updated.layout else { return XCTFail() }
         XCTAssertEqual(p2.surfaces.count, 2)
-        XCTAssertTrue(p2.surfaces.allSatisfy { $0.type == .terminal })
+        XCTAssertEqual(p2.surfaces.map(\.type), [.agentApp, .terminal])
         XCTAssertNotNil(SurfaceRegistry.shared.surface(p2.surfaces[0].id))
         XCTAssertNotNil(SurfaceRegistry.shared.surface(p2.surfaces[1].id))
     }
@@ -143,7 +145,9 @@ final class PaneActionTests: XCTestCase {
         let (_, router) = try makeContext()
         let ws = try router.createWorkspace(name: "preview-memory", cwd: NSTemporaryDirectory())
         guard case .pane(let initialPane) = ws.layout,
-              let terminalID = initialPane.surfaces.first?.id else { return XCTFail("expected default terminal") }
+              let defaultSurfaceID = initialPane.surfaces.first?.id else {
+            return XCTFail("expected default Agent App surface")
+        }
         let file = URL(fileURLWithPath: NSTemporaryDirectory())
             .appendingPathComponent("rc2-preview-memory-\(UUID().uuidString).txt")
         try String(repeating: "preview\n", count: 200).write(to: file, atomically: true, encoding: .utf8)
@@ -153,7 +157,7 @@ final class PaneActionTests: XCTestCase {
         let preview = try XCTUnwrap(SurfaceRegistry.shared.surface(previewDesc.id) as? FilePreviewSurface)
         XCTAssertFalse(preview.view.subviews.isEmpty, "selected preview tab should render the file while visible")
 
-        try router.focusSurface(workspace: ws.id, surface: terminalID)
+        try router.focusSurface(workspace: ws.id, surface: defaultSurfaceID)
 
         XCTAssertTrue(preview.view.subviews.isEmpty,
                       "switching away must unload heavyweight preview views so hidden tabs do not retain image/PDF/text content")
@@ -590,16 +594,16 @@ final class PaneActionTests: XCTestCase {
         let (ctx, router) = try makeContext()
         let ws = try router.createWorkspace(name: "s", cwd: NSTemporaryDirectory())
         guard case .pane(let pane0) = ws.layout else { return XCTFail() }
-        let termID = pane0.surfaces.first!.id              // default terminal
+        let defaultSurfaceID = pane0.surfaces.first!.id    // default Agent App
         let v = PaneTabsView(pane: pane0, router: router)
-        let agent = v.performAdd(.agentApp, title: "Agent App")!
+        let browser = v.performAdd(.browser, title: "Browser")!
         // Adding selects the new tab.
         guard case .pane(let p1) = ctx.state.workspaces[ws.id]!.layout else { return XCTFail() }
-        XCTAssertEqual(p1.selectedSurfaceID, agent.id)
-        // Clicking the terminal tab must switch the selection back.
-        try router.focusSurface(workspace: ws.id, surface: termID)
+        XCTAssertEqual(p1.selectedSurfaceID, browser.id)
+        // Clicking the default tab must switch the selection back.
+        try router.focusSurface(workspace: ws.id, surface: defaultSurfaceID)
         guard case .pane(let p2) = ctx.state.workspaces[ws.id]!.layout else { return XCTFail() }
-        XCTAssertEqual(p2.selectedSurfaceID, termID,
+        XCTAssertEqual(p2.selectedSurfaceID, defaultSurfaceID,
                        "focusing another tab must change the visible surface")
     }
 
@@ -607,10 +611,10 @@ final class PaneActionTests: XCTestCase {
         let (ctx, router) = try makeContext()
         let ws = try router.createWorkspace(name: "ios-visible-tab", cwd: NSTemporaryDirectory())
         guard case .pane(let pane0) = ws.layout else { return XCTFail() }
-        let termID = pane0.surfaces.first!.id
+        let defaultSurfaceID = pane0.surfaces.first!.id
         let view = PaneTabsView(pane: pane0, router: router)
         _ = view.performAdd(.browser, title: "Browser")
-        try router.focusSurface(workspace: ws.id, surface: termID)
+        try router.focusSurface(workspace: ws.id, surface: defaultSurfaceID)
         let selected = try XCTUnwrap(ctx.state.workspaces[ws.id]?.layout.find(paneID: pane0.id)?.selectedSurfaceID)
 
         let pane = try XCTUnwrap(try router.paneList(workspace: ws.id).first { $0["kind"]?.stringValue == "pane" })
@@ -660,7 +664,7 @@ final class PaneActionTests: XCTestCase {
         let (ctx, router) = try makeContext()
         let ws = try router.createWorkspace(name: "drag-split-right", cwd: NSTemporaryDirectory())
         guard case .pane(let pane0) = ws.layout else { return XCTFail() }
-        let terminal = pane0.surfaces.first!.id
+        let defaultSurfaceID = pane0.surfaces.first!.id
         let view = PaneTabsView(pane: pane0, router: router)
         let browser = try XCTUnwrap(view.performAdd(.browser, title: "browser"))
 
@@ -674,7 +678,7 @@ final class PaneActionTests: XCTestCase {
         }
         XCTAssertEqual(split.orientation, .horizontal)
         XCTAssertEqual(split.children.count, 2)
-        XCTAssertEqual(split.children.first?.find(paneID: pane1.id)?.surfaces.map(\.id), [terminal],
+        XCTAssertEqual(split.children.first?.find(paneID: pane1.id)?.surfaces.map(\.id), [defaultSurfaceID],
                        "the source pane should keep the remaining tabs after the dragged tab is split out")
         XCTAssertEqual(split.children.last?.paneIDs().compactMap { split.children.last?.find(paneID: $0)?.surfaces.first?.id }, [browser.id],
                        "the dragged tab should become the selected surface of the new side pane")
@@ -703,25 +707,25 @@ final class PaneActionTests: XCTestCase {
         let (ctx, router) = try makeContext()
         let ws = try router.createWorkspace(name: "drag-split-other-pane-down", cwd: NSTemporaryDirectory())
         guard case .pane(let pane0) = ws.layout else { return XCTFail() }
-        let terminal = pane0.surfaces.first!.id
+        let defaultSurfaceID = pane0.surfaces.first!.id
         let view = PaneTabsView(pane: pane0, router: router)
-        let agent = try XCTUnwrap(view.performSplit(.right, type: .agentApp, title: "Agent App"))
+        let browser = try XCTUnwrap(view.performSplit(.right, type: .browser, title: "browser"))
 
         let splitWorkspace = ctx.state.workspaces[ws.id]!
         let sourcePaneID = try XCTUnwrap(splitWorkspace.layout.paneIDs().first {
-            splitWorkspace.layout.find(paneID: $0)?.surfaces.contains(where: { $0.id == agent.id }) == true
+            splitWorkspace.layout.find(paneID: $0)?.surfaces.contains(where: { $0.id == browser.id }) == true
         })
         let dragView = PaneTabsView(pane: try XCTUnwrap(splitWorkspace.layout.find(paneID: sourcePaneID)), router: router)
 
-        XCTAssertTrue(dragView.performSplitSurface(agent.id, targetPane: pane0.id, direction: .down),
+        XCTAssertTrue(dragView.performSplitSurface(browser.id, targetPane: pane0.id, direction: .down),
                       "dragging a tab onto another pane's lower drop zone must split that target pane vertically")
 
         guard case .split(let split) = ctx.state.workspaces[ws.id]!.layout else {
             return XCTFail("expected a vertical split after dragging a tab into another pane")
         }
         XCTAssertEqual(split.orientation, .vertical)
-        XCTAssertEqual(split.children.first?.paneIDs().compactMap { split.children.first?.find(paneID: $0)?.surfaces.first?.id }, [terminal])
-        XCTAssertEqual(split.children.last?.paneIDs().compactMap { split.children.last?.find(paneID: $0)?.surfaces.first?.id }, [agent.id])
+        XCTAssertEqual(split.children.first?.paneIDs().compactMap { split.children.first?.find(paneID: $0)?.surfaces.first?.id }, [defaultSurfaceID])
+        XCTAssertEqual(split.children.last?.paneIDs().compactMap { split.children.last?.find(paneID: $0)?.surfaces.first?.id }, [browser.id])
     }
 
     func test_performSplitSurface_singleTabDoesNotCreateEmptyPane() throws {
@@ -743,7 +747,7 @@ final class PaneActionTests: XCTestCase {
         let (ctx, router) = try makeContext()
         let ws = try router.createWorkspace(name: "c", cwd: NSTemporaryDirectory())
         guard case .pane(let pane) = ws.layout else { return XCTFail() }
-        // Workspace already has a default terminal (1); add two more (3).
+        // Workspace already has a default Agent App tab (1); add two more (3).
         let v = PaneTabsView(pane: pane, router: router)
         let a = v.performAdd(.terminal, title: "t")
         _ = v.performAdd(.browser, title: "b")
@@ -1093,7 +1097,9 @@ final class PaneActionTests: XCTestCase {
                       "a workspace-only window needs an explicit return path to the sidebar")
         XCTAssertFalse(tooltips.contains("Toggle sidebar"),
                        "workspace-only windows open without a sidebar, so the header button must not be the sidebar toggle")
-        XCTAssertNil(allSubviews(of: content).first { $0 is NSSplitView },
+        // Agent App embeds its own HSplitView; only the window chrome must stay
+        // free of the main sidebar NSSplitView (a direct content child).
+        XCTAssertNil(content.subviews.first { $0 is NSSplitView },
                      "the new workspace window should not include the main sidebar split view")
     }
 
