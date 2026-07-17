@@ -7910,6 +7910,9 @@ public struct AgentAppView: View {
     private var compactComposerToolbar: some View {
         HStack(spacing: DS.Space.sm) {
             attachmentButton
+            // Account/source capsule sits left of the model pill so personal vs
+            // work ChatGPT/Claude identities are visible before model/effort.
+            sourceMenu
             modelMenu
             permissionMenu
             executionMenu
@@ -8114,6 +8117,126 @@ public struct AgentAppView: View {
         .accessibilityIdentifier("agent.execution.menu")
     }
 
+    /// Dedicated account/source capsule to the left of the model pill.
+    /// Reuses provider snapshots + `setProviderInstance` so personal/work
+    /// identities stay the single selection authority (not a second state).
+    private var sourceMenu: some View {
+        let interactive = AgentSourceCapsulePresentation.isInteractive(
+            enabledSourceCount: sourceMenuEntries.count,
+            providerLocked: vm.providerLocked,
+            runLocked: vm.selectedThreadRunIsStartingOrRunning || !vm.selectedProviderCanRun
+        )
+        let label = sourceCapsuleLabel
+        let helpText = sourceCapsuleHelpText(interactive: interactive)
+        return Group {
+            if interactive {
+                Menu {
+                    ForEach(sourceMenuEntries, id: \.id) { entry in
+                        Button {
+                            selectSourceMenuEntry(entry)
+                        } label: {
+                            HStack {
+                                if entry.isSelected {
+                                    Image(systemName: "checkmark")
+                                }
+                                Text(entry.title)
+                            }
+                        }
+                    }
+                } label: {
+                    sourceCapsuleLabelView(
+                        label: label,
+                        showChevron: true,
+                        locked: false
+                    )
+                }
+                .menuStyle(.button)
+                .buttonStyle(.plain)
+                .menuIndicator(.hidden)
+                .fixedSize()
+            } else {
+                sourceCapsuleLabelView(
+                    label: label,
+                    showChevron: false,
+                    locked: vm.providerLocked
+                )
+            }
+        }
+        .disabled(vm.selectedThreadRunIsStartingOrRunning || !vm.selectedProviderCanRun)
+        .help(helpText)
+        .accessibilityLabel("Account \(label)")
+        .accessibilityIdentifier("agent.source.menu")
+    }
+
+    private var sourceCapsuleLabel: String {
+        AgentSourceCapsulePresentation.capsuleLabel(
+            selected: vm.selectedProviderSnapshot,
+            fallbackProvider: vm.provider,
+            fallbackInstanceId: vm.providerInstanceId,
+            snapshots: vm.providerSnapshots
+        )
+    }
+
+    private var sourceMenuEntries: [AgentSourceCapsulePresentation.MenuEntry] {
+        AgentSourceCapsulePresentation.menuEntries(
+            snapshots: vm.providerSnapshots,
+            selectedSnapshotId: vm.selectedProviderSnapshot?.id,
+            selectedProvider: vm.provider,
+            providerDisplayName: { vm.providerDisplayName($0) }
+        )
+    }
+
+    private func selectSourceMenuEntry(_ entry: AgentSourceCapsulePresentation.MenuEntry) {
+        if vm.providerSnapshots.contains(where: { $0.id == entry.id }) {
+            vm.setProviderInstance(entry.id)
+            return
+        }
+        if let provider = AgentProvider(rawValue: entry.id) {
+            vm.setProvider(provider)
+            Task {
+                await vm.loadModels()
+                await MainActor.run { vm.persistThreadConfig() }
+            }
+        }
+    }
+
+    private func sourceCapsuleHelpText(interactive: Bool) -> String {
+        if let reason = vm.providerExecutionUnavailableReason {
+            return reason
+        }
+        if vm.selectedThreadRunIsStartingOrRunning {
+            return "Account is fixed while a run is active"
+        }
+        if vm.providerLocked {
+            return "Account is fixed after the first message. Start a new thread to use a different account."
+        }
+        if !interactive {
+            return "Account / source for this agent run"
+        }
+        return "Choose which ChatGPT / Claude / Grok account runs this thread"
+    }
+
+    private func sourceCapsuleLabelView(label: String, showChevron: Bool, locked: Bool) -> some View {
+        HStack(spacing: DS.Space.xs) {
+            Image(systemName: locked ? "lock.fill" : "person.crop.circle")
+                .font(.system(size: 10))
+            Text(label)
+                .font(DS.Font.caption.weight(.medium))
+                .lineLimit(1)
+                .truncationMode(.tail)
+            if showChevron {
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 7, weight: .semibold))
+            }
+        }
+        .fixedSize()
+        .foregroundColor(DS.Palette.textSecondary)
+        .padding(.horizontal, DS.Space.sm).padding(.vertical, DS.Space.xs)
+        .background(DS.Palette.surfaceRaised)
+        .clipShape(Capsule())
+        .overlay(Capsule().strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline))
+    }
+
     private var modelMenu: some View {
         Button {
             showModelOptions.toggle()
@@ -8138,7 +8261,9 @@ public struct AgentAppView: View {
                 customModelDraft = ""
             }
         }
-        .help(vm.providerLocked ? "Model · reasoning effort · service tier" : "Provider · model · reasoning effort · service tier")
+        // Source/account selection lives on the dedicated left capsule so the
+        // model popover stays model/effort/tier only.
+        .help("Model · reasoning effort · service tier")
     }
 
     private var modelOptionsPopover: some View {
@@ -8155,41 +8280,6 @@ public struct AgentAppView: View {
                     .font(DS.Font.caption2)
                     .foregroundColor(DS.Palette.textTertiary)
                     .fixedSize(horizontal: true, vertical: false)
-            }
-            if !vm.providerLocked {
-                if !vm.providerSnapshots.isEmpty {
-                    compactMenuSection("Source")
-                    ForEach(vm.providerSnapshots.filter(\.enabled), id: \.id) { snapshot in
-                        // Resolve via selectedProviderSnapshot so a stale
-                        // providerInstanceId ("codex" vs "codex-cli") still
-                        // marks exactly one Source row.
-                        compactMenuRow(
-                            snapshot.displayName,
-                            selected: snapshot.id == vm.selectedProviderSnapshot?.id
-                        ) {
-                            vm.setProviderInstance(snapshot.id)
-                        }
-                        .disabled(configurationLocked)
-                    }
-                    compactMenuDivider
-                } else {
-                    compactMenuSection("Source")
-                    ForEach(AgentProvider.allCases, id: \.self) { provider in
-                        compactMenuRow(vm.providerDisplayName(provider), selected: provider == vm.provider) {
-                            vm.setProvider(provider)
-                            Task { await vm.loadModels(); await MainActor.run { vm.persistThreadConfig() } }
-                        }
-                        .disabled(configurationLocked)
-                    }
-                    compactMenuDivider
-                }
-            } else {
-                // UX-MAC_AGENT-003: the source is fixed after the first
-                // message. Show a disabled row that names the locked source so
-                // the picker doesn't simply vanish with no explanation.
-                compactMenuSection("Source")
-                lockedSourceRow
-                compactMenuDivider
             }
             let modelOptions = vm.modelOptionsForSelectedProvider
             let customModels = vm.customModelsForSelectedProvider
@@ -8414,28 +8504,6 @@ public struct AgentAppView: View {
             .frame(width: compactModelMenuWidth)
     }
 
-    // UX-MAC_AGENT-003: disabled row explaining why the source can't change.
-    private var lockedSourceRow: some View {
-        let name = vm.providerSnapshots.isEmpty
-            ? vm.providerDisplayName(vm.provider)
-            : vm.providerInstanceDisplayName(vm.providerInstanceId)
-        return HStack(spacing: DS.Space.sm) {
-            Image(systemName: "lock.fill")
-                .font(.system(size: 10, weight: .semibold))
-                .frame(width: 12)
-                .foregroundColor(DS.Palette.textTertiary)
-            Text("\(name) (locked after first message)")
-                .font(DS.Font.caption)
-                .foregroundColor(DS.Palette.textSecondary)
-                .lineLimit(1)
-            Spacer(minLength: 0)
-        }
-        .padding(.horizontal, DS.Space.xs)
-        .padding(.vertical, DS.Space.xs)
-        .frame(width: compactModelMenuWidth, alignment: .leading)
-        .help("The source is fixed once a thread has a conversation. Start a new thread to use a different source.")
-    }
-
     // UX-MAC_AGENT-013: inline custom-model field, no blocking modal. Validates
     // non-empty (trimmed) before saving; Esc/blur-style Cancel dismisses it.
     private var customModelInlineField: some View {
@@ -8481,14 +8549,9 @@ public struct AgentAppView: View {
     private let modelMenuWidthCache = ModelMenuWidthCache()
 
     private var compactModelMenuWidth: CGFloat {
+        // Source/account titles moved to the dedicated capsule; this width is
+        // only for model/effort/tier rows inside the model popover.
         var titles: [String] = []
-        if !vm.providerLocked {
-            if !vm.providerSnapshots.isEmpty {
-                titles.append(contentsOf: vm.providerSnapshots.filter(\.enabled).map(\.displayName))
-            } else {
-                titles.append(contentsOf: AgentProvider.allCases.map { vm.providerDisplayName($0) })
-            }
-        }
         let modelOptions = vm.modelOptionsForSelectedProvider
         let customModels = vm.customModelsForSelectedProvider
         let visibleModelCount = showAllModelOptions ? modelOptions.count : min(3, modelOptions.count)
@@ -9806,6 +9869,121 @@ private struct ElapsedTickSchedule: TimelineSchedule {
             next = current.addingTimeInterval(step)
             return current
         }
+    }
+}
+
+/// Pure presentation rules for the composer account/source capsule.
+/// Extracted so personal/work label, lock, and menu identity can be unit-tested
+/// without mounting the Agent App surface.
+public enum AgentSourceCapsulePresentation {
+    public struct MenuEntry: Equatable, Sendable {
+        public let id: String
+        public let title: String
+        public let isSelected: Bool
+
+        public init(id: String, title: String, isSelected: Bool) {
+            self.id = id
+            self.title = title
+            self.isSelected = isSelected
+        }
+    }
+
+    /// Interactive only when the user can actually switch accounts: more than
+    /// one eligible source, thread still unlocked, and no active run block.
+    public static func isInteractive(
+        enabledSourceCount: Int,
+        providerLocked: Bool,
+        runLocked: Bool
+    ) -> Bool {
+        enabledSourceCount > 1 && !providerLocked && !runLocked
+    }
+
+    /// Visible capsule label. Prefer configured displayName, then accountLabel,
+    /// then provider/instance fallback. Never invent "Personal"/"Work" from paths.
+    public static func capsuleLabel(
+        selected: AgentProviderSnapshot?,
+        fallbackProvider: AgentProvider,
+        fallbackInstanceId: String,
+        snapshots: [AgentProviderSnapshot]
+    ) -> String {
+        let base = primaryLabel(
+            selected: selected,
+            fallbackProvider: fallbackProvider,
+            fallbackInstanceId: fallbackInstanceId
+        )
+        let enabled = snapshots.filter(\.enabled)
+        guard enabled.count > 1 else { return base }
+        let collisions = enabled.filter {
+            primaryLabel(selected: $0, fallbackProvider: $0.provider, fallbackInstanceId: $0.id) == base
+        }
+        guard collisions.count > 1, let selected else { return base }
+        let providerToken = selected.provider.rawValue.capitalized
+        if base.localizedCaseInsensitiveContains(providerToken) {
+            // Same provider + same display name → keep id so work/personal
+            // clones remain distinguishable without guessing from HOME.
+            return "\(base) · \(selected.id)"
+        }
+        return "\(providerToken) · \(base)"
+    }
+
+    public static func menuEntries(
+        snapshots: [AgentProviderSnapshot],
+        selectedSnapshotId: String?,
+        selectedProvider: AgentProvider,
+        providerDisplayName: (AgentProvider) -> String
+    ) -> [MenuEntry] {
+        if !snapshots.isEmpty {
+            let enabled = snapshots.filter(\.enabled)
+            // Always surface the currently selected snapshot even if disabled so
+            // a locked/missing instance is not silently rewritten in the menu.
+            let rows: [AgentProviderSnapshot]
+            if let selectedSnapshotId,
+               let selected = snapshots.first(where: { $0.id == selectedSnapshotId }),
+               !enabled.contains(where: { $0.id == selected.id }) {
+                rows = enabled + [selected]
+            } else {
+                rows = enabled
+            }
+            return rows.map { snapshot in
+                let title = capsuleLabel(
+                    selected: snapshot,
+                    fallbackProvider: snapshot.provider,
+                    fallbackInstanceId: snapshot.id,
+                    snapshots: snapshots
+                )
+                return MenuEntry(
+                    id: snapshot.id,
+                    title: title,
+                    isSelected: snapshot.id == selectedSnapshotId
+                )
+            }
+        }
+        return AgentProvider.allCases.map { provider in
+            MenuEntry(
+                id: provider.rawValue,
+                title: providerDisplayName(provider),
+                isSelected: provider == selectedProvider
+            )
+        }
+    }
+
+    private static func primaryLabel(
+        selected: AgentProviderSnapshot?,
+        fallbackProvider: AgentProvider,
+        fallbackInstanceId: String
+    ) -> String {
+        if let selected {
+            let displayName = selected.displayName.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !displayName.isEmpty { return displayName }
+            let account = selected.accountLabel?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            if !account.isEmpty { return account }
+            return selected.provider.rawValue.capitalized
+        }
+        let instance = fallbackInstanceId.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !instance.isEmpty, instance != fallbackProvider.rawValue {
+            return instance
+        }
+        return fallbackProvider.rawValue.capitalized
     }
 }
 

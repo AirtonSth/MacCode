@@ -678,8 +678,11 @@ public enum AgentProviderSnapshotSelection {
         provider: AgentProvider,
         instanceId: String?
     ) -> AgentProviderSnapshot? {
+        // Prefer exact instance id first. Provider instances are globally unique
+        // (personal/work homes), and the account capsule + model list must follow
+        // the selected id even when provider enum state is briefly stale.
         if let instanceId,
-           let exact = snapshots.first(where: { $0.id == instanceId && $0.provider == provider }) {
+           let exact = snapshots.first(where: { $0.id == instanceId }) {
             return exact
         }
         return snapshots.first(where: { $0.provider == provider })
