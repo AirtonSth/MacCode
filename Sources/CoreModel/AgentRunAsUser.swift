@@ -35,6 +35,45 @@ public struct AgentRunAsUser: Codable, Sendable, Equatable, Hashable, Identifiab
         self.fullName = fullName
     }
 
+    private enum CodingKeys: String, CodingKey {
+        case generatedUID, generated_uid
+        case shortName, short_name
+        case uid, gid
+        case homePath, home_path
+        case fullName, full_name
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        generatedUID = (try? c.decode(String.self, forKey: .generatedUID))
+            ?? (try? c.decode(String.self, forKey: .generated_uid))
+            ?? ""
+        shortName = (try? c.decode(String.self, forKey: .shortName))
+            ?? (try? c.decode(String.self, forKey: .short_name))
+            ?? ""
+        uid = (try? c.decode(UInt32.self, forKey: .uid)) ?? 0
+        gid = (try? c.decode(UInt32.self, forKey: .gid)) ?? 0
+        homePath = (try? c.decode(String.self, forKey: .homePath))
+            ?? (try? c.decode(String.self, forKey: .home_path))
+            ?? ""
+        fullName = (try? c.decode(String.self, forKey: .fullName))
+            ?? (try? c.decode(String.self, forKey: .full_name))
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(generatedUID, forKey: .generatedUID)
+        try c.encode(generatedUID, forKey: .generated_uid)
+        try c.encode(shortName, forKey: .shortName)
+        try c.encode(shortName, forKey: .short_name)
+        try c.encode(UInt32(uid), forKey: .uid)
+        try c.encode(UInt32(gid), forKey: .gid)
+        try c.encode(homePath, forKey: .homePath)
+        try c.encode(homePath, forKey: .home_path)
+        try c.encodeIfPresent(fullName, forKey: .fullName)
+        try c.encodeIfPresent(fullName, forKey: .full_name)
+    }
+
     public var displayName: String {
         let full = fullName?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         if !full.isEmpty { return full }

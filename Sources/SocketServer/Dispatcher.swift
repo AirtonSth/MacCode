@@ -69,8 +69,9 @@ public protocol CommandRouting: AnyObject {
     // agent
     func openAgentApp(workspace: WorkspaceID) throws -> SurfaceDescriptor
     func listAgentThreads(workspace: WorkspaceID?) throws -> [AgentThread]
-    func createAgentThread(workspace: WorkspaceID?, title: String, provider: AgentProvider, model: String, permissionMode: AgentPermissionMode, reasoningEffort: AgentReasoningEffort, serviceTier: AgentServiceTier, modelSelection: AgentModelSelection?, providerInstanceId: String?, surfaceID: SurfaceID?) throws -> AgentThread
-    func configureAgentThread(thread: AgentThreadID, provider: AgentProvider?, model: String?, permissionMode: AgentPermissionMode?, reasoningEffort: AgentReasoningEffort?, serviceTier: AgentServiceTier?, modelSelection: AgentModelSelection?, providerInstanceId: String?) throws -> AgentThread
+    func createAgentThread(workspace: WorkspaceID?, title: String, provider: AgentProvider, model: String, permissionMode: AgentPermissionMode, reasoningEffort: AgentReasoningEffort, serviceTier: AgentServiceTier, modelSelection: AgentModelSelection?, providerInstanceId: String?, runAsUser: AgentRunAsUser?, surfaceID: SurfaceID?) throws -> AgentThread
+    func configureAgentThread(thread: AgentThreadID, provider: AgentProvider?, model: String?, permissionMode: AgentPermissionMode?, reasoningEffort: AgentReasoningEffort?, serviceTier: AgentServiceTier?, modelSelection: AgentModelSelection?, providerInstanceId: String?, runAsUser: AgentRunAsUser?) throws -> AgentThread
+    func listAgentRunAsUsers() throws -> [AgentRunAsUser]
     func configureAgentThreadExecution(thread: AgentThreadID, executionMode: AgentExecutionMode, baseBranch: String?) throws -> AgentThread
     func prepareAgentThreadForPullRequest(workspace: WorkspaceID, url: String, provider: AgentProvider, model: String, permissionMode: AgentPermissionMode, reasoningEffort: AgentReasoningEffort, serviceTier: AgentServiceTier, modelSelection: AgentModelSelection?, providerInstanceId: String?) throws -> AgentThread
     func uploadAgentAttachment(workspace: WorkspaceID, filename: String, mimeType: String?, dataBase64: String) throws -> AgentAttachmentUploadResult
@@ -1635,8 +1636,9 @@ public final class JSONRPCDispatcher {
                 let reasoning = modelSelection?.reasoningEffort ?? params["reasoning_effort"]?.stringValue.flatMap(AgentReasoningEffort.init) ?? .medium
                 let serviceTier = modelSelection?.serviceTier ?? params["service_tier"]?.stringValue.flatMap(AgentServiceTier.init) ?? .auto
                 let providerInstanceId = params["provider_instance_id"]?.stringValue ?? params["providerInstanceId"]?.stringValue
+                let runAsUser = decodeRunAsUser(from: params["run_as_user"] ?? params["runAsUser"])
                 let createSurfaceID = (params["surface_id"]?.stringValue ?? params["surfaceId"]?.stringValue).flatMap(UUID.init).map(SurfaceID.init)
-                let t = try router.createAgentThread(workspace: wid, title: title, provider: provider, model: model, permissionMode: permission, reasoningEffort: reasoning, serviceTier: serviceTier, modelSelection: modelSelection, providerInstanceId: providerInstanceId, surfaceID: createSurfaceID)
+                let t = try router.createAgentThread(workspace: wid, title: title, provider: provider, model: model, permissionMode: permission, reasoningEffort: reasoning, serviceTier: serviceTier, modelSelection: modelSelection, providerInstanceId: providerInstanceId, runAsUser: runAsUser, surfaceID: createSurfaceID)
                 EventBus.shared.publish(kind: "agent.thread.created", payload: threadPayload(t))
                 return .init(id: id, result: encodeThread(t))
             case "agent.thread.configure":
@@ -1648,7 +1650,8 @@ public final class JSONRPCDispatcher {
                 let reasoning = modelSelection?.reasoningEffort ?? params["reasoning_effort"]?.stringValue.flatMap(AgentReasoningEffort.init)
                 let serviceTier = modelSelection?.serviceTier ?? params["service_tier"]?.stringValue.flatMap(AgentServiceTier.init)
                 let providerInstanceId = params["provider_instance_id"]?.stringValue ?? params["providerInstanceId"]?.stringValue
-                let t = try router.configureAgentThread(thread: tid, provider: provider, model: model, permissionMode: permission, reasoningEffort: reasoning, serviceTier: serviceTier, modelSelection: modelSelection, providerInstanceId: providerInstanceId)
+                let runAsUser = decodeRunAsUser(from: params["run_as_user"] ?? params["runAsUser"])
+                let t = try router.configureAgentThread(thread: tid, provider: provider, model: model, permissionMode: permission, reasoningEffort: reasoning, serviceTier: serviceTier, modelSelection: modelSelection, providerInstanceId: providerInstanceId, runAsUser: runAsUser)
                 var payload: [String: JSONValue] = [
                     "thread_id": .string(t.id.value.uuidString),
                     "workspace_id": t.workspaceId.map { .string($0.value.uuidString) } ?? .null,
@@ -1661,6 +1664,8 @@ public final class JSONRPCDispatcher {
                 payload["reasoning_effort"] = .string(t.reasoningEffort.rawValue)
                 payload["service_tier"] = .string(t.serviceTier.rawValue)
                 payload["model_selection"] = encode(t.modelSelection)
+                payload["run_as_user"] = encodeRunAsUser(t.runAsUser)
+                payload["runAsUser"] = encodeRunAsUser(t.runAsUser)
                 payload["provider_locked"] = .bool(providerLocked(t))
                 payload["providerLocked"] = .bool(providerLocked(t))
                 EventBus.shared.publish(kind: "agent.thread.updated", payload: .object(payload))
@@ -2215,6 +2220,8 @@ public final class JSONRPCDispatcher {
                 return .init(id: id, result: encode(models))
             case "agent.providers.list":
                 return .init(id: id, result: encode(await router.listAgentProviderSnapshots()))
+            case "agent.run_as_users.list":
+                return .init(id: id, result: encode(try router.listAgentRunAsUsers()))
             case "agent.provider.update":
                 let provider = AgentProvider(rawValue: params["provider"]?.stringValue ?? "codex") ?? .codex
                 let instanceId = params["provider_instance_id"]?.stringValue ?? params["providerInstanceId"]?.stringValue
@@ -2624,7 +2631,7 @@ public final class JSONRPCDispatcher {
         "agent.thread.read", "agent.checkpoint.list", "agent.checkpoint.diff",
         "git.status", "git.branches", "git.log", "git.diff", "git.pull_request_url", "git.delivery_plan",
         "project.scripts",
-        "agent.models.list", "agent.providers.list", "agent.state.current", "agent.prompt_history",
+        "agent.models.list", "agent.providers.list", "agent.run_as_users.list", "agent.state.current", "agent.prompt_history",
         "browser.url.get", "browser.snapshot", "browser.wait",
         "notification.list",
         "pane.list", "pane.surfaces", "mirror.snapshot",
@@ -2824,6 +2831,8 @@ public final class JSONRPCDispatcher {
         object["worktree_path"] = thread.worktreePath.map { .string($0) } ?? .null
         object["interaction_mode"] = .string(thread.effectiveInteractionMode.rawValue)
         object["interactionMode"] = .string(thread.effectiveInteractionMode.rawValue)
+        object["run_as_user"] = encodeRunAsUser(thread.runAsUser)
+        object["runAsUser"] = encodeRunAsUser(thread.runAsUser)
         let locked = providerLocked(thread)
         object["providerLocked"] = .bool(locked)
         object["provider_locked"] = .bool(locked)
@@ -2845,11 +2854,28 @@ public final class JSONRPCDispatcher {
         object["worktree_path"] = thread.worktreePath.map { .string($0) } ?? .null
         object["interaction_mode"] = .string(thread.effectiveInteractionMode.rawValue)
         object["interactionMode"] = .string(thread.effectiveInteractionMode.rawValue)
+        object["run_as_user"] = encodeRunAsUser(thread.runAsUser)
+        object["runAsUser"] = encodeRunAsUser(thread.runAsUser)
         let locked = lockedThreads.contains(thread.id)
         object["providerLocked"] = .bool(locked)
         object["provider_locked"] = .bool(locked)
         appendActiveRun(to: &object, thread: thread.id)
         return .object(object)
+    }
+
+    private func encodeRunAsUser(_ user: AgentRunAsUser?) -> JSONValue {
+        guard let user else { return .null }
+        return encode(user)
+    }
+
+    private func decodeRunAsUser(from value: JSONValue?) -> AgentRunAsUser? {
+        guard let value else { return nil }
+        if case .null = value { return nil }
+        guard let data = try? _encoder.encode(value),
+              let user = try? _decoder.decode(AgentRunAsUser.self, from: data) else {
+            return nil
+        }
+        return user
     }
 
     private func appendActiveRun(
@@ -3047,7 +3073,9 @@ public final class JSONRPCDispatcher {
             "model_selection": encode(thread.modelSelection),
             "execution_mode": .string(thread.executionMode.rawValue),
             "interaction_mode": .string(thread.effectiveInteractionMode.rawValue),
-            "interactionMode": .string(thread.effectiveInteractionMode.rawValue)
+            "interactionMode": .string(thread.effectiveInteractionMode.rawValue),
+            "run_as_user": encodeRunAsUser(thread.runAsUser),
+            "runAsUser": encodeRunAsUser(thread.runAsUser)
         ]
         payload["base_branch"] = thread.baseBranch.map { .string($0) } ?? .null
         payload["worktree_path"] = thread.worktreePath.map { .string($0) } ?? .null
