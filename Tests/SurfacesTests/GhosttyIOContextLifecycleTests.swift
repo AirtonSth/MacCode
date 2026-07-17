@@ -82,4 +82,33 @@ final class GhosttyIOContextLifecycleTests: XCTestCase {
         // anchor: the actual defence is that setup() is only called from init.
         _ = view.frame
     }
+
+    func test_preAttachOutputOverflowUsesBatchedCompactionAndBoundedStorage() {
+        // WHY: long output before AppKit attaches a live Ghostty surface must
+        // not copy the full 4 MiB tail for every small chunk above the cap.
+        let view = GhosttyTerminalView(frame: .zero)
+        let chunk = Data(repeating: 0x41, count: 4 * 1024)
+        let chunkCount = 20_000
+
+        for _ in 0..<chunkCount {
+            view.processOutput(chunk)
+        }
+
+        let diagnostics = view.pendingOutputDiagnosticsForTesting
+        let totalBytes = chunk.count * chunkCount
+        let cap = 4 * 1024 * 1024
+        XCTAssertEqual(diagnostics.logicalBytes, cap)
+        XCTAssertEqual(view.droppedOutputBytes, totalBytes - cap)
+        XCTAssertLessThanOrEqual(
+            diagnostics.storageBytes,
+            cap + (1024 * 1024),
+            "physical storage must stay within one compaction batch of the logical cap"
+        )
+        XCTAssertGreaterThan(diagnostics.compactions, 0)
+        XCTAssertLessThan(
+            diagnostics.compactions,
+            chunkCount / 100,
+            "overflow must compact in batches instead of copying on every chunk"
+        )
+    }
 }

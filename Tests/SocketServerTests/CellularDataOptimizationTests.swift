@@ -222,6 +222,25 @@ final class CellularDataOptimizationTests: XCTestCase {
         XCTAssertEqual(payload?["cols"], .number(120))
     }
 
+    func testCellularSafeGeometryOnlyOutputRemainsLossless() {
+        // WHY: an idle resize contains no dropped terminal bytes. Mapping it to
+        // a partial summary makes iOS request full history and show a false
+        // partial-state warning for every window resize.
+        let source = EventBus.Event(seq: 1, kind: "surface.output", payload: .object([
+            "surface_id": .string("s1"),
+            "seq": .number(43),
+            "rows": .number(40),
+            "cols": .number(132)
+        ]), ts: 0)
+
+        let mapped = EventStreamFilter.cellularSafe.map(source)
+
+        XCTAssertEqual(mapped?.kind, source.kind)
+        XCTAssertEqual(mapped?.seq, source.seq)
+        XCTAssertEqual(mapped?.payload, source.payload)
+        XCTAssertNil(mapped?.payload.objectValue?["base64"])
+    }
+
     func testCellularWebSocketBatcherCoalescesTerminalSummariesPerSurface() {
         let sent = LockedStrings()
         let batcher = WebSocketEventBatcher(enabled: true, filter: .cellularSafe, delay: 10) { data in

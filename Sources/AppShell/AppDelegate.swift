@@ -12,6 +12,45 @@ import os
 private let appLifecycleLog = Logger(subsystem: "io.remotecode.app", category: "lifecycle")
 
 @MainActor
+func flushPersistedTerminalHistoryForRegisteredSurfaces(
+    timeout: TimeInterval = 2
+) async -> Bool {
+    let barriers = SurfaceRegistry.shared.all().compactMap {
+        ($0 as? TerminalRuntimeRoutingSurface)?.routedFlushPersistedHistoryBarrier()
+    }
+    let deadline = DispatchTime.now() + max(0, timeout)
+    var completed = true
+    for barrier in barriers {
+        completed = await barrier.waitAsync(until: deadline) && completed
+    }
+    return completed
+}
+
+/// Starts every surface disposition before waiting, so many open terminals share
+/// one app-exit deadline. Non-terminal surfaces use the default implementation,
+/// which preserves their normal close behavior.
+@MainActor
+@discardableResult
+func closeSurfacesForApplicationTermination(
+    _ surfaces: [Surface],
+    timeout: TimeInterval = 2
+) -> Bool {
+    var barriers = surfaces.compactMap { $0.closeForApplicationTermination() }
+    if let pendingHistoryDelete = TerminalSurface.pendingHistoryDeleteBarrier() {
+        barriers.append(pendingHistoryDelete)
+    }
+    if let unboundProcessDisposition = TerminalSurface.activeProcessDispositionBarrier() {
+        barriers.append(unboundProcessDisposition)
+    }
+    let deadline = DispatchTime.now() + max(0, timeout)
+    var completed = true
+    for barrier in barriers {
+        completed = barrier.waitForApplicationTermination(until: deadline) && completed
+    }
+    return completed
+}
+
+@MainActor
 public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     public var context: AppContext!
     public var router: AppCommandRouter!
@@ -206,6 +245,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         // hop to main for AppKit. The device polls /v1/pair/status mean-
         // while, so the server never blocks on the user's decision.
         auth.onPairingRequest = { [weak self] prompt in
+            NSLog("pairing.prompt.received request_id=%@", prompt.requestId)
             DispatchQueue.main.async { self?.presentPairingPrompt(prompt) }
         }
         // The device can cancel its own outstanding request (POST
@@ -418,15 +458,13 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
 
     private func persistRestorableStateBeforeUpdate() {
         context?.saveSnapshot()
-        for surface in SurfaceRegistry.shared.all() {
-            (surface as? TerminalSurface)?.flushPersistedHistory()
-        }
     }
 
     private func stopLiveRuntimesForAppTermination() {
         context?.coordinator.stopAllProviderSessionsForAppTermination()
-        for surface in SurfaceRegistry.shared.all() {
-            surface.close()
+        let completed = closeSurfacesForApplicationTermination(SurfaceRegistry.shared.all())
+        if !completed {
+            appLifecycleLog.error("app.will_terminate terminal_disposition=incomplete")
         }
     }
 
@@ -965,13 +1003,32 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
     /// Replaces the blocking runModal so the main run loop is never stalled.
     /// Auto-dismisses when the TTL expires; the user can Approve or Deny at
     /// any point before expiry. Once dismissed (any path) the timer is cancelled.
-    private var pairingSheet: NSPanel?
+    var pairingSheet: NSPanel?
     private var pairingSheetTimer: Timer?
     private var pairingCountdownLabel: NSTextField?
     private var pairingAlwaysAllowCheckbox: NSButton?
     private var pairingPromptPending: PairingPrompt?
 
-    private func presentPairingPrompt(_ prompt: PairingPrompt) {
+    static let pairingPanelStyleMask: NSWindow.StyleMask = [.titled]
+
+    static func configurePairingPanel(_ panel: NSPanel) {
+        panel.title = "Pairing Request"
+        panel.isMovableByWindowBackground = true
+        panel.level = .modalPanel
+        panel.collectionBehavior.insert(.moveToActiveSpace)
+        panel.hidesOnDeactivate = false
+    }
+
+    static func pairingPanelFrame(panelSize: NSSize, visibleFrame: NSRect) -> NSRect {
+        NSRect(
+            x: visibleFrame.midX - panelSize.width / 2,
+            y: visibleFrame.midY - panelSize.height / 2,
+            width: panelSize.width,
+            height: panelSize.height
+        )
+    }
+
+    func presentPairingPrompt(_ prompt: PairingPrompt) {
         // Only one pairing sheet at a time. If a new request arrives while one
         // is open, deny the pending one first to avoid leaking approval state.
         if let pending = pairingPromptPending {
@@ -983,13 +1040,11 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         let ttl = prompt.expiresAt.timeIntervalSince(prompt.createdAt)
         let panel = NSPanel(
             contentRect: NSRect(x: 0, y: 0, width: 400, height: 290),
-            styleMask: [.titled, .nonactivatingPanel],
+            styleMask: Self.pairingPanelStyleMask,
             backing: .buffered,
-            defer: true
+            defer: false
         )
-        panel.title = "Pairing Request"
-        panel.isMovableByWindowBackground = true
-        panel.level = .modalPanel
+        Self.configurePairingPanel(panel)
 
         let content = NSView(frame: NSRect(x: 0, y: 0, width: 400, height: 290))
 
@@ -1079,9 +1134,25 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
             }
         }
 
+        let anchorWindow = keyWindowProviderForTests?() ?? NSApp.keyWindow ?? windowController?.window
+        if let visibleFrame = (anchorWindow?.screen ?? NSScreen.main)?.visibleFrame {
+            panel.setFrame(
+                Self.pairingPanelFrame(panelSize: panel.frame.size, visibleFrame: visibleFrame),
+                display: false
+            )
+        } else {
+            panel.center()
+        }
+
         NSApp.activate(ignoringOtherApps: true)
-        panel.center()
         panel.orderFrontRegardless()
+        panel.makeKeyAndOrderFront(nil)
+        NSLog(
+            "pairing.prompt.presented request_id=%@ visible=%d key=%d",
+            prompt.requestId,
+            panel.isVisible ? 1 : 0,
+            panel.isKeyWindow ? 1 : 0
+        )
     }
 
     private func updatePairingCountdown(prompt: PairingPrompt, ttl: TimeInterval) {
@@ -1092,15 +1163,22 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
 
     @objc private func pairingApprove() {
         guard let prompt = pairingPromptPending else { return }
+        let alwaysAllowPairing = pairingAlwaysAllowCheckbox?.state == .on
+        NSLog(
+            "pairing.prompt.approved request_id=%@ always_allow=%d",
+            prompt.requestId,
+            alwaysAllowPairing ? 1 : 0
+        )
         localAuth?.approvePairingRequest(
             prompt.requestId,
-            alwaysAllowPairing: pairingAlwaysAllowCheckbox?.state == .on
+            alwaysAllowPairing: alwaysAllowPairing
         )
         dismissPairingSheet()
     }
 
     @objc private func pairingDeny() {
         guard let prompt = pairingPromptPending else { return }
+        NSLog("pairing.prompt.denied request_id=%@", prompt.requestId)
         localAuth?.denyPairingRequest(prompt.requestId)
         dismissPairingSheet()
     }
@@ -1113,14 +1191,16 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         dismissPairingSheet()
     }
 
-    private func dismissPairingSheet() {
+    func dismissPairingSheet() {
+        let requestId = pairingPromptPending?.requestId ?? "none"
         pairingSheetTimer?.invalidate()
         pairingSheetTimer = nil
-        pairingSheet?.orderOut(nil)
+        pairingSheet?.close()
         pairingSheet = nil
         pairingCountdownLabel = nil
         pairingAlwaysAllowCheckbox = nil
         pairingPromptPending = nil
+        NSLog("pairing.prompt.dismissed request_id=%@", requestId)
     }
 
     private func applyKeybindingOverride(to item: NSMenuItem, command: String) {

@@ -569,30 +569,133 @@ public enum TerminalCopyOnSelect {
 
 // MARK: - TerminalSurface
 
+private final class TerminalReaderMainHandoffHook: @unchecked Sendable {
+    private let lock = NSLock()
+    private var action: (@Sendable () -> Void)?
+
+    func set(_ action: (@Sendable () -> Void)?) {
+        lock.lock()
+        self.action = action
+        lock.unlock()
+    }
+
+    func fire() {
+        lock.lock()
+        let action = action
+        lock.unlock()
+        action?()
+    }
+}
+
+private final class TerminalReaderWillPublishHook: @unchecked Sendable {
+    private let lock = NSLock()
+    private var action: (@Sendable (Data) -> Void)?
+
+    func set(_ action: (@Sendable (Data) -> Void)?) {
+        lock.lock()
+        self.action = action
+        lock.unlock()
+    }
+
+    func fire(_ data: Data) {
+        lock.lock()
+        let action = action
+        lock.unlock()
+        action?(data)
+    }
+}
+
 /// PTY-backed shell surface. Spawns the user's shell via `forkpty(3)`
 /// and renders its output through `ANSIRenderer`. The terminal view is
 /// directly interactive — no separate input field (cmux model).
 @MainActor
-public final class TerminalSurface: NSObject, Surface {
+public final class TerminalSurface: NSObject, Surface, TerminalHistoryCoordinatorDelegate {
     public enum Launch {
         case shell(cwd: String)
         case ssh(profile: SSHHostProfile, cwd: String)
         case sshPlaceholder(cwd: String)
     }
 
+    /// Includes disposition work whose immediate owner no longer has a surface
+    /// (for example, PTY preparation that failed after fork). App termination
+    /// waits this registry in addition to registered surface barriers.
+    public static func activeProcessDispositionBarrier() -> SurfaceTerminationBarrier? {
+        let works = TerminalPTYProcessRuntime.activeApplicationTerminationWorksSnapshot()
+        guard !works.isEmpty else { return nil }
+        return SurfaceTerminationBarrier(
+            groups: works.map(\.group),
+            completionChecks: works.map(\.succeeded)
+        )
+    }
+
+    public static func pendingHistoryDeleteBarrier() -> SurfaceTerminationBarrier? {
+        TerminalHistoryCoordinator.pendingFinalDeleteBarrier()
+    }
+
+    /// Rehydrates metadata-only final-delete tombstones at process launch.
+    /// The registry owns repository/ID state only; no Surface is retained.
+    @discardableResult
+    public static func replayPendingHistoryDeletes(
+        repository: TerminalOutputRepository
+    ) -> SurfaceTerminationBarrier? {
+        TerminalHistoryCoordinator.replayPendingFinalDeletes(repository: repository)
+    }
+
+    /// Starts an unconditional history delete for wrappers that no longer own
+    /// a TerminalSurface. The global registry keeps only repository/ID state so
+    /// a failed cleanup remains retryable without retaining the closed wrapper.
+    @discardableResult
+    public static func scheduleOwnerlessHistoryDelete(
+        repository: TerminalOutputRepository,
+        surfaceID: String
+    ) -> SurfaceTerminationBarrier {
+        TerminalHistoryCoordinator.scheduleOwnerlessFinalDelete(
+            repository: repository,
+            surfaceID: surfaceID
+        )
+    }
+
+    /// Clears a reusable stable-ID terminal without granting an old runtime an
+    /// unconditional final-delete right over a future writer generation.
+    @discardableResult
+    public static func scheduleOwnerlessHistoryClearForReuse(
+        repository: TerminalOutputRepository,
+        surfaceID: String
+    ) -> SurfaceTerminationBarrier {
+        TerminalHistoryCoordinator.scheduleOwnerlessClearForReuse(
+            repository: repository,
+            surfaceID: surfaceID
+        )
+    }
+
     public private(set) var descriptor: SurfaceDescriptor
     public let view: NSView
     private let ghosttyView: GhosttyTerminalView
     private var masterFD: Int32 = -1
+    private var masterFDLease: TerminalFileDescriptorLease?
     private var childPID: pid_t = -1
+    private var childReapInFlightPID: pid_t?
+    private var childReapForegroundGroup: TerminalPTYProcessRuntime.CapturedForegroundProcessGroup?
+    private var lastCapturedForegroundGroup: TerminalPTYProcessRuntime.CapturedForegroundProcessGroup?
     private var processAlive = false
     private var exitStatus: Int32?
     private var terminationSignal: Int32?
     private var terminalDeadReason: String?
+    private var didAppendProcessExitedBanner = false
     private var lastOutputAt: Date?
     private var inputPump: TerminalInputPump?
     private var readSource: DispatchSourceRead?
-    private let renderer = ANSIRenderer(
+    private var applicationTerminationBarrier: SurfaceTerminationBarrier?
+    private var runtimeRestartRequiredHistoryBarrier: SurfaceTerminationBarrier?
+    private var runtimeDispositionBarrierFactoryForTesting:
+        ((pid_t) -> SurfaceTerminationBarrier)?
+    private let readerWillPublishHook = TerminalReaderWillPublishHook()
+    private let readerMainHandoffHook = TerminalReaderMainHandoffHook()
+    private let readerHandoffState = TerminalReaderHandoffState()
+    private let childReapCompletionHook = TerminalReaderMainHandoffHook()
+    private var processTreeSignalCountForTesting = 0
+    private var publishesRuntimeHealth = true
+    private var renderer = ANSIRenderer(
         rows: TerminalViewportGeometry.fallbackSize.rows,
         cols: TerminalViewportGeometry.fallbackSize.cols
     )
@@ -601,17 +704,12 @@ public final class TerminalSurface: NSObject, Surface {
     private var didSendSavedSSHPassword = false
     private var passwordPromptCount = 0
     private var awaitingSSHFirstOutput = false
-    private var isVisible = true
-    private let historyRepo: TerminalOutputRepository?
+    private var isVisible = false
+    private let historyCoordinator: TerminalHistoryCoordinator
     private let outputBus: SurfaceOutputBus
-    private let historyWorkspaceID: String
-    private let historyQueue = DispatchQueue(label: "rc2.terminal.history", qos: .utility)
-    private var pendingHistoryData = Data()
-    private var historyFlushScheduled = false
     private var isClosing = false
-    private var nextHistoryChunkIndex: Int64 = 1
-    private var historyWriteFailures = 0
     private var outputPartial = false
+    private var outputPartialReason: String?
     private var outputPendingBytes = 0
     // Raw bytes received while the renderer was suppressed (isVisible=false).
     // Replayed into renderer.feed on didBecomeVisible so the ANSI snapshot is
@@ -620,8 +718,10 @@ public final class TerminalSurface: NSObject, Surface {
     private var hiddenRendererBufferOverflowed = false
     private var totalOutputBytes = 0
     private var outputBytesAtLastTelemetry = 0
+    private var maxPTYReadBatchBytesObserved = 0
+    private var maxPTYReadCallsObserved = 0
     private var lastOutputTelemetryAt = Date.distantPast
-    private var readerAllowsRender = true
+    private var readerAllowsRender = false
     /// Set while a deferred audit-#3 stuck-hidden self-heal is pending, so output
     /// arriving every few ms during the desync doesn't schedule (or log) it repeatedly.
     private var stuckHiddenHealScheduled = false
@@ -660,8 +760,13 @@ public final class TerminalSurface: NSObject, Surface {
         case bytes(Data)
         case resize(rows: Int, cols: Int)
     }
+    static let maxPendingRendererEvents = 4_096
     private var pendingRendererEvents: [PendingRendererEvent] = []
     private var pendingRendererByteCount = 0
+
+    static func pendingRendererBufferExceeded(byteCount: Int, eventCount: Int) -> Bool {
+        byteCount > maxHiddenRendererBufferBytes || eventCount > maxPendingRendererEvents
+    }
 
     /// Replays recorded renderer events into `target` in order. This is the SAME
     /// code path the production flush (`ensureRendererCurrent`) uses, exposed as a
@@ -691,9 +796,6 @@ public final class TerminalSurface: NSObject, Surface {
     private var cachedTextSnapshot: (rendererVersion: UInt64, viewportText: String?, stateSignature: String, value: TerminalTextSnapshot)?
     private var parkingWindow: NSWindow?
     private var parkingConstraints: [NSLayoutConstraint] = []
-    private var needsHistoryReplay = false
-    /// Guards against a second concurrent history read while one is outstanding (F4).
-    private var historyReplayInFlight = false
     private var restartBannerButton: NSButton?
 
     /// Bell preferences, configurable by the user. Defaults to silent (no sound,
@@ -709,6 +811,8 @@ public final class TerminalSurface: NSObject, Surface {
     /// dead-terminal banner. The caller (AppCommandRouter) replaces this
     /// surface with a fresh one in the same pane and cwd.
     public var onRestartRequested: (() -> Void)?
+    /// Called after Ghostty accepts a new OSC terminal title.
+    public var onTitleChange: ((String) -> Void)?
     private static let hiddenBacklogQuietDelay: TimeInterval = 0.25
     /// Absolute cap on how long the hidden-backlog drain may keep re-arming before it
     /// force-completes, even under a never-quiet stream (#5). Bounds the frozen frame.
@@ -717,7 +821,8 @@ public final class TerminalSurface: NSObject, Surface {
     private static let busyStatePollInterval: TimeInterval = 0.25
     private static let outputTelemetryByteInterval = 8 * 1024 * 1024
     private static let outputTelemetryTimeInterval: TimeInterval = 60
-    private nonisolated static let maxHistoryChunkBytes = 64 * 1024
+    private nonisolated static let maxPTYReadEventBytes = 256 * 1024
+    private nonisolated static let maxPTYReadCallsPerEvent = 64
     // Maximum bytes buffered for hidden-renderer heal. Chosen large enough to
     // cover realistic hidden bursts (build output, long completions) while
     // bounding memory. Bytes beyond this cap are NOT fed to the renderer on
@@ -729,19 +834,245 @@ public final class TerminalSurface: NSObject, Surface {
     }
 
     public var isBusy: Bool {
-        Self.isTerminalJobBusy(
+        let foregroundProcessGroup = foregroundProcessGroup()
+        guard Self.isTerminalJobBusy(
             processAlive: processAlive,
             shellPID: childPID,
-            foregroundProcessGroup: foregroundProcessGroup()
-        )
+            foregroundProcessGroup: foregroundProcessGroup
+        ), let capturedForegroundGroup = lastCapturedForegroundGroup else {
+            return false
+        }
+        return capturedForegroundGroup.pgid == foregroundProcessGroup
+            && capturedForegroundGroup.sessionID == childPID
     }
 
     var ownsTerminalFocusForTesting: Bool {
         view.window?.firstResponder === ghosttyView
     }
 
+    private var historyOutstandingBytes: Int {
+        historyCoordinator.outstandingBytes
+    }
+
+    private var historyWriteFailures: Int {
+        historyCoordinator.writeFailures
+    }
+
+    var historyOutstandingBytesForTesting: Int {
+        historyCoordinator.outstandingBytes
+    }
+
+    var ptyReadDiagnosticsForTesting: (maxBatchBytes: Int, maxReadCalls: Int) {
+        (maxPTYReadBatchBytesObserved, maxPTYReadCallsObserved)
+    }
+
+    var foregroundProcessGroupForTesting: pid_t? {
+        foregroundProcessGroup()
+    }
+
+    var capturedForegroundProcessGroupForTesting: TerminalPTYProcessRuntime.CapturedForegroundProcessGroup? {
+        lastCapturedForegroundGroup
+    }
+
+    var historyReplayInFlightForTesting: Bool {
+        historyCoordinator.replayInFlight
+    }
+
+    var historyPreparationStateForTesting: TerminalHistoryCoordinator.PreparationState {
+        historyCoordinator.preparationStateForTesting
+    }
+
+    var historyLiveClearInFlightForTesting: Bool {
+        historyCoordinator.liveClearInFlightForTesting
+    }
+
+    var historyWriterGenerationForTesting: String? {
+        historyCoordinator.writerGenerationForTesting
+    }
+
+    var terminalDeadReasonForTesting: String? { terminalDeadReason }
+    var inputPumpConfiguredForTesting: Bool { inputPump != nil }
+    func drainInputPumpForTesting() { inputPump?.drain() }
+    var readerConfiguredForTesting: Bool { readSource != nil }
+    var childPIDForTesting: pid_t { childPID }
+    var masterFDForTesting: Int32 { masterFD }
+    var processTreeSignalCountForTestingValue: Int { processTreeSignalCountForTesting }
+
+    var readerAllowsRenderForTesting: Bool {
+        readerAllowsRender
+    }
+
+    func setReaderWillEnterMainHandoffForTesting(_ action: (@Sendable () -> Void)?) {
+        readerMainHandoffHook.set(action)
+    }
+
+    func setReaderWillPublishForTesting(_ action: (@Sendable (Data) -> Void)?) {
+        readerWillPublishHook.set(action)
+    }
+
+    func setBeforeLiveHistoryClearForTesting(_ action: (@Sendable () -> Void)?) {
+        historyCoordinator.beforeLiveClearForTesting = action
+    }
+
+    func setChildReapCompletionForTesting(_ action: (@Sendable () -> Void)?) {
+        childReapCompletionHook.set(action)
+    }
+
+    func beginChildReapForTesting(pid: pid_t, sendInitialHangup: Bool) {
+        beginBoundedChildReap(
+            pid: pid,
+            foregroundPGID: nil,
+            sendInitialHangup: sendInitialHangup
+        )
+    }
+
+    func setRuntimeDispositionBarrierFactoryForTesting(
+        _ factory: ((pid_t) -> SurfaceTerminationBarrier)?
+    ) {
+        runtimeDispositionBarrierFactoryForTesting = factory
+    }
+
+    var ghosttyScrollbackTextForTesting: String? {
+        ghosttyView.readScrollbackText()
+    }
+
     public convenience init(workspaceID: WorkspaceID, cwd: String, title: String = "terminal") throws {
         try self.init(workspaceID: workspaceID, title: title, launch: .shell(cwd: cwd))
+    }
+
+    nonisolated static func shouldYieldPTYReadEvent(
+        bytesRead: Int,
+        readCalls: Int,
+        maxBytes: Int,
+        maxReadCalls: Int
+    ) -> Bool {
+        bytesRead >= maxBytes || readCalls >= maxReadCalls
+    }
+
+    nonisolated static func shouldAcceptHistoryBacklog(
+        queuedBytes: Int,
+        incomingBytes: Int,
+        maxQueuedBytes: Int
+    ) -> Bool {
+        TerminalHistoryCoordinator.shouldAcceptBacklog(
+            queuedBytes: queuedBytes,
+            incomingBytes: incomingBytes,
+            maxQueuedBytes: maxQueuedBytes
+        )
+    }
+
+    private nonisolated static func spawnPTY(
+        cwd: String,
+        launch: Launch,
+        workspaceID: WorkspaceID,
+        surfaceID: SurfaceID,
+        suspendedBeforeExec: Bool = false
+    ) -> (pid: pid_t, masterFD: Int32) {
+        let parent = ProcessInfo.processInfo.environment
+        let executable: String
+        let arguments: [String]
+        switch launch {
+        case .shell:
+            executable = TerminalStartupEnvironment.shellPath(from: parent)
+            arguments = ["-" + (executable as NSString).lastPathComponent]
+        case .ssh(let profile, _):
+            executable = "/usr/bin/ssh"
+            arguments = ["ssh"] + SSHCommandBuilder.sshArguments(for: profile)
+        case .sshPlaceholder:
+            executable = "/usr/bin/false"
+            arguments = ["false"]
+        }
+        let environment = TerminalStartupEnvironment(
+            parent: parent,
+            workspaceID: workspaceID,
+            surfaceID: surfaceID
+        ).mergedEnvironment(parent: parent)
+        return TerminalPTYProcessRuntime.spawn(
+            cwd: cwd,
+            executable: executable,
+            arguments: arguments,
+            environment: environment,
+            suspendedBeforeExec: suspendedBeforeExec
+        )
+    }
+
+    /// Spawns and configures the replacement PTY while the current terminal is
+    /// still interactive. No reader/history/output path starts until the owner
+    /// consumes this runtime after crossing the restart teardown boundary.
+    public static func prepareShellRuntimeForRestart(
+        workspaceID: WorkspaceID,
+        cwd: String,
+        surfaceID: SurfaceID,
+        closeOnExecEnabler: ((Int32) -> Bool)? = nil,
+        nonBlockingEnabler: ((Int32) -> Bool)? = nil,
+        onFailureCleanup: ((pid_t, SurfaceTerminationBarrier) -> Void)? = nil
+    ) -> TerminalPreparedPTYRuntime? {
+        prepareRuntimeForReplacement(
+            workspaceID: workspaceID,
+            cwd: cwd,
+            launch: .shell(cwd: cwd),
+            surfaceID: surfaceID,
+            closeOnExecEnabler: closeOnExecEnabler,
+            nonBlockingEnabler: nonBlockingEnabler,
+            onFailureCleanup: onFailureCleanup
+        )
+    }
+
+    public static func prepareRuntimeForReplacement(
+        workspaceID: WorkspaceID,
+        cwd: String,
+        launch: Launch,
+        surfaceID: SurfaceID,
+        closeOnExecEnabler: ((Int32) -> Bool)? = nil,
+        nonBlockingEnabler: ((Int32) -> Bool)? = nil,
+        onFailureCleanup: ((pid_t, SurfaceTerminationBarrier) -> Void)? = nil
+    ) -> TerminalPreparedPTYRuntime? {
+        let suspendedBeforeExec: Bool
+        if case .sshPlaceholder = launch {
+            // The immediate-exit fixture remains unsuspended so the production
+            // pre-attach liveness gate keeps covering an exited prepared child.
+            suspendedBeforeExec = false
+        } else {
+            suspendedBeforeExec = true
+        }
+        let spawn = spawnPTY(
+            cwd: cwd,
+            launch: launch,
+            workspaceID: workspaceID,
+            surfaceID: surfaceID,
+            suspendedBeforeExec: suspendedBeforeExec
+        )
+        guard spawn.pid > 0, spawn.masterFD >= 0 else {
+            let failureErrno = errno
+            terminalLog.error("terminal.restart_prepare_spawn_failed surface=\(surfaceID.value.uuidString, privacy: .public) errno=\(failureErrno, privacy: .public)")
+            return nil
+        }
+
+        let lease = TerminalFileDescriptorLease(fd: spawn.masterFD)
+        let closeOnExecSucceeded =
+            (closeOnExecEnabler ?? TerminalFileDescriptorFlags.enableCloseOnExec)(spawn.masterFD)
+        let nonBlockingSucceeded = closeOnExecSucceeded
+            && (nonBlockingEnabler ?? TerminalFileDescriptorFlags.enableNonBlocking)(spawn.masterFD)
+        guard closeOnExecSucceeded, nonBlockingSucceeded else {
+            let failureErrno = errno
+            terminalLog.error("terminal.restart_prepare_flags_failed surface=\(surfaceID.value.uuidString, privacy: .public) pid=\(spawn.pid, privacy: .public) errno=\(failureErrno, privacy: .public)")
+            let prepared = TerminalPreparedPTYRuntime(
+                pid: spawn.pid,
+                masterFD: spawn.masterFD,
+                lease: lease,
+                suspended: suspendedBeforeExec
+            )
+            if let cleanup = prepared.discard() {
+                onFailureCleanup?(spawn.pid, cleanup)
+            }
+            return nil
+        }
+        return TerminalPreparedPTYRuntime(
+            pid: spawn.pid,
+            masterFD: spawn.masterFD,
+            lease: lease,
+            suspended: suspendedBeforeExec
+        )
     }
 
     public init(
@@ -749,14 +1080,18 @@ public final class TerminalSurface: NSObject, Surface {
         title: String,
         launch: Launch,
         restoredSurfaceID: SurfaceID? = nil,
+        assignedSurfaceID: SurfaceID? = nil,
         historyRepo: TerminalOutputRepository? = nil,
         settingsRepo: (any SettingsWriteRepository)? = nil,
         terminalFontSize: Double = TerminalFontSizeSetting.defaultSize,
-        outputBus: SurfaceOutputBus = .shared
+        outputBus: SurfaceOutputBus = .shared,
+        preservedDescriptor: SurfaceDescriptor? = nil,
+        closeOnExecEnabler: ((Int32) -> Bool)? = nil,
+        nonBlockingEnabler: ((Int32) -> Bool)? = nil,
+        nonBlockingFailureBarrierFactory: ((pid_t) -> SurfaceTerminationBarrier)? = nil,
+        preparedRuntime: TerminalPreparedPTYRuntime? = nil
     ) throws {
-        self.historyRepo = historyRepo
         self.outputBus = outputBus
-        self.historyWorkspaceID = workspaceID.value.uuidString
         let cwd: String
         let type: SurfaceType
         var metadata: [String: String]
@@ -789,12 +1124,26 @@ public final class TerminalSurface: NSObject, Surface {
                 "ssh_status": "disconnected"
             ]
         }
-        self.descriptor = SurfaceDescriptor(
-            id: restoredSurfaceID ?? SurfaceID(),
+        let generatedDescriptor = SurfaceDescriptor(
+            id: restoredSurfaceID ?? assignedSurfaceID ?? SurfaceID(),
             type: type,
             title: title,
             iconName: type == .ssh ? "network" : "terminal",
             metadata: metadata
+        )
+        if let preservedDescriptor {
+            precondition(
+                preservedDescriptor.type == type,
+                "a restarted terminal must preserve a descriptor of the same surface type"
+            )
+            self.descriptor = preservedDescriptor
+        } else {
+            self.descriptor = generatedDescriptor
+        }
+        self.historyCoordinator = TerminalHistoryCoordinator(
+            repository: historyRepo,
+            surfaceID: descriptor.id.value.uuidString,
+            workspaceID: workspaceID.value.uuidString
         )
 
         // Match cmux/Ghostty's defensive startup sizing: begin with a
@@ -828,18 +1177,25 @@ public final class TerminalSurface: NSObject, Surface {
         self.view = container
 
         super.init()
-        if let historyRepo {
-            nextHistoryChunkIndex = (try? historyRepo.nextChunkIndex(surfaceID: descriptor.id.value.uuidString)) ?? 1
-            needsHistoryReplay = restoredSurfaceID != nil
-        }
+        historyCoordinator.delegate = self
+        let startsVisible = restoredSurfaceID == nil
+        isVisible = startsVisible
+        readerAllowsRender = startsVisible
+        terminalView.setOcclusion(visible: startsVisible)
+        historyCoordinator.prepare(restored: restoredSurfaceID != nil)
 
         terminalView.onInputData = { [weak self] data in
             guard let self else { return }
             let status = self.writeToPTY(data)
-            if status == .processExited, !self.didBeepForDeadInput {
+            if status != .accepted, !self.didBeepForDeadInput {
                 self.didBeepForDeadInput = true
                 NSSound.beep()
             }
+        }
+        terminalView.onTitleChange = { [weak self] title in
+            guard let self, self.descriptor.title != title else { return }
+            self.descriptor.title = title
+            self.onTitleChange?(title)
         }
         // Audit #4: let the view distinguish a legitimate teardown from a stray close
         // of a still-visible instance. A deallocated owner reports "closing" (true).
@@ -871,6 +1227,7 @@ public final class TerminalSurface: NSObject, Surface {
             self?.handleContainerWindowChanged(window)
         }
         applyTerminalSize(TerminalViewportGeometry.fallbackSize, sendToPTY: false, force: true)
+        replayPersistedHistoryIfNeeded()
 
         if case .sshPlaceholder = launch {
             appendString("[ssh disconnected]\nSelect a saved SSH host or add a new one to connect.\n")
@@ -879,52 +1236,106 @@ public final class TerminalSurface: NSObject, Surface {
             return
         }
 
-        var amaster: Int32 = -1
-        let pid = rc2_forkpty(&amaster)
-        if pid < 0 {
-            appendString("[forkpty failed: \(String(cString: strerror(errno)))]\n")
-            terminalDeadReason = "fork_failed"
-            terminalLog.error("terminal.spawn_failed surface=\(self.descriptor.id.value.uuidString, privacy: .public) errno=\(errno, privacy: .public)")
-            publishRuntimeHealth()
-            return
-        }
-        if pid == 0 {
-            _ = chdir(cwd)
-            TerminalStartupEnvironment(workspaceID: workspaceID, surfaceID: descriptor.id).applyToCurrentProcess()
-            switch launch {
-            case .shell:
-                let shell = TerminalStartupEnvironment.shellPath()
-                let shellName = (shell as NSString).lastPathComponent
-                shell.withCString { sPath in
-                    ("-" + shellName).withCString { argv0 in
-                        let argv: [UnsafeMutablePointer<CChar>?] = [strdup(argv0), nil]
-                        _ = execv(sPath, argv)
-                    }
-                }
-            case .sshPlaceholder:
-                _exit(0)
-            case .ssh(let profile, _):
-                let args = ["ssh"] + SSHCommandBuilder.sshArguments(for: profile)
-                "/usr/bin/ssh".withCString { sPath in
-                    let argv = args.map { strdup($0) } + [nil]
-                    argv.withUnsafeBufferPointer { ptr in
-                        _ = execv(sPath, ptr.baseAddress)
-                    }
-                }
+        let pid: pid_t
+        let amaster: Int32
+        let masterFDLease: TerminalFileDescriptorLease
+        let descriptorFlagsAlreadyConfigured: Bool
+        let preparedRuntimeWasSuspended: Bool
+        if let preparedRuntime {
+            let prepared = preparedRuntime.takeOwnership()
+            pid = prepared.pid
+            amaster = prepared.masterFD
+            masterFDLease = prepared.lease
+            descriptorFlagsAlreadyConfigured = true
+            preparedRuntimeWasSuspended = prepared.wasSuspended
+        } else {
+            let spawn = Self.spawnPTY(
+                cwd: cwd,
+                launch: launch,
+                workspaceID: workspaceID,
+                surfaceID: descriptor.id
+            )
+            pid = spawn.pid
+            amaster = spawn.masterFD
+            if pid < 0 {
+                appendString("[forkpty failed: \(String(cString: strerror(errno)))]\n")
+                terminalDeadReason = "fork_failed"
+                terminalLog.error("terminal.spawn_failed surface=\(self.descriptor.id.value.uuidString, privacy: .public) errno=\(errno, privacy: .public)")
+                publishRuntimeHealth()
+                return
             }
-            _exit(127)
+            masterFDLease = TerminalFileDescriptorLease(fd: amaster)
+            descriptorFlagsAlreadyConfigured = false
+            preparedRuntimeWasSuspended = false
         }
         self.masterFD = amaster
+        self.masterFDLease = masterFDLease
         self.childPID = pid
+        self.childReapForegroundGroup = nil
+        self.lastCapturedForegroundGroup = nil
+        self.applicationTerminationBarrier = nil
         self.processAlive = true
         self.exitStatus = nil
         self.terminationSignal = nil
         self.terminalDeadReason = nil
+        self.didAppendProcessExitedBanner = false
         self.lastOutputAt = Date()
-        if !TerminalFileDescriptorFlags.enableNonBlocking(amaster) {
-            NSLog("RemoteCode terminal failed to enable nonblocking PTY input: %@", String(cString: strerror(errno)))
+        let closeOnExecSucceeded = descriptorFlagsAlreadyConfigured
+            || (closeOnExecEnabler ?? TerminalFileDescriptorFlags.enableCloseOnExec)(amaster)
+        let nonBlockingSucceeded = descriptorFlagsAlreadyConfigured
+            || (closeOnExecSucceeded
+                && (nonBlockingEnabler ?? TerminalFileDescriptorFlags.enableNonBlocking)(amaster))
+        let preparedResumeSucceeded = !preparedRuntimeWasSuspended
+            || TerminalPTYProcessRuntime.resumeOwnedLiveChild(pid: pid)
+        if !closeOnExecSucceeded || !nonBlockingSucceeded || !preparedResumeSucceeded {
+            let failure = String(cString: strerror(errno))
+            let failureReason: String
+            if !closeOnExecSucceeded {
+                failureReason = "pty_cloexec_failed"
+            } else if !nonBlockingSucceeded {
+                failureReason = "pty_nonblocking_failed"
+            } else {
+                failureReason = "prepared_runtime_resume_failed"
+            }
+            terminalLog.error("terminal.flags_failed surface=\(self.descriptor.id.value.uuidString, privacy: .public) pid=\(pid, privacy: .public) reason=\(failureReason, privacy: .public) error=\(failure, privacy: .public)")
+            masterFDLease.close()
+            self.masterFD = -1
+            self.masterFDLease = nil
+            self.processAlive = false
+            self.terminalDeadReason = failureReason
+            let dispositionBarrier: SurfaceTerminationBarrier
+            if let nonBlockingFailureBarrierFactory {
+                dispositionBarrier = nonBlockingFailureBarrierFactory(pid)
+            } else {
+                let work = TerminalPTYProcessRuntime.beginApplicationTerminationDisposition(
+                    pid: pid,
+                    foregroundGroup: nil
+                )
+                dispositionBarrier = SurfaceTerminationBarrier(
+                    groups: [work.group],
+                    completionChecks: [work.succeeded]
+                )
+            }
+            self.applicationTerminationBarrier = dispositionBarrier
+            DispatchQueue.global(qos: .utility).async { [weak self] in
+                let succeeded = dispositionBarrier.wait(until: .distantFuture)
+                DispatchQueue.main.async { [weak self] in
+                    guard let self, self.childPID == pid else { return }
+                    if succeeded {
+                        self.childPID = -1
+                        self.childReapInFlightPID = nil
+                    } else {
+                        self.terminalDeadReason = "process_reap_timeout"
+                        terminalLog.error("terminal.reap_timeout surface=\(self.descriptor.id.value.uuidString, privacy: .public) pid=\(pid, privacy: .public) reason=nonblocking_setup_failed")
+                    }
+                    self.publishRuntimeHealth()
+                }
+            }
+            appendString("[PTY descriptor setup failed; shell stopped]\r\n")
+            publishRuntimeHealth()
+            return
         }
-        configureInputPump(fd: amaster)
+        configureInputPump(lease: masterFDLease)
         applyTerminalSize(terminalSize, sendToPTY: true, force: true)
         startReader()
         terminalLog.info("terminal.spawned surface=\(self.descriptor.id.value.uuidString, privacy: .public) type=\(self.descriptor.type.rawValue, privacy: .public) pid=\(pid, privacy: .public) rows=\(self.terminalSize.rows, privacy: .public) cols=\(self.terminalSize.cols, privacy: .public)")
@@ -948,8 +1359,15 @@ public final class TerminalSurface: NSObject, Surface {
             renderer.resize(rows: size.rows, cols: size.cols)
         } else {
             pendingRendererEvents.append(.resize(rows: size.rows, cols: size.cols))
+            if Self.pendingRendererBufferExceeded(
+                byteCount: pendingRendererByteCount,
+                eventCount: pendingRendererEvents.count
+            ) {
+                ensureRendererCurrent()
+            }
         }
         rendererMutationCount &+= 1
+        outputBus.emitGeometry(descriptor.id, rows: size.rows, cols: size.cols)
         if sendToPTY, masterFD >= 0 {
             _ = rc2_set_winsize(masterFD, Int32(size.rows), Int32(size.cols))
         }
@@ -957,23 +1375,43 @@ public final class TerminalSurface: NSObject, Surface {
 
     private func startReader() {
         let fd = masterFD
-        let src = DispatchSource.makeReadSource(fileDescriptor: fd, queue: .global())
+        guard let lease = masterFDLease else { return }
+        let queue = DispatchQueue(
+            label: "rc2.terminal.pty-reader.\(descriptor.id.value.uuidString)",
+            qos: .userInitiated
+        )
+        let src = DispatchSource.makeReadSource(fileDescriptor: fd, queue: queue)
         readSource = src
         // The read source owns the fd. It is closed here — on the source's own
         // queue, after the final event handler returns — so the main thread never
         // closes masterFD out from under an in-flight background read() (data race
-        // + closed-fd / fd-reuse hazard). close()/handlePTYEOF only cancel().
-        src.setCancelHandler { Darwin.close(fd) }
+        // + closed-fd / fd-reuse hazard). Normal close/EOF only cancel; the
+        // app-termination path may close the same lease synchronously because
+        // reader and writer syscalls are serialized by its lock.
+        src.setCancelHandler { lease.close() }
+        let readerMainHandoffHook = self.readerMainHandoffHook
+        let readerHandoffState = self.readerHandoffState
+        let readerWillPublishHook = self.readerWillPublishHook
         var buf = [UInt8](repeating: 0, count: 4096)
         src.setEventHandler { [weak self] in
-            guard let self else { return }
+            guard let self, readerHandoffState.beginReadEvent() else { return }
             var output = Data()
             var shouldClose = false
+            var readCalls = 0
 
             while true {
-                let n = read(fd, &buf, buf.count)
+                let n = buf.withUnsafeMutableBytes { lease.read(into: $0) }
                 if n > 0 {
                     output.append(contentsOf: buf[0..<Int(n)])
+                    readCalls += 1
+                    if Self.shouldYieldPTYReadEvent(
+                        bytesRead: output.count,
+                        readCalls: readCalls,
+                        maxBytes: Self.maxPTYReadEventBytes,
+                        maxReadCalls: Self.maxPTYReadCallsPerEvent
+                    ) {
+                        break
+                    }
                     continue
                 }
                 if n == 0 {
@@ -990,14 +1428,37 @@ public final class TerminalSurface: NSObject, Surface {
                 break
             }
 
-            if !output.isEmpty {
-                let data = output
-                // Read readerAllowsRender on main (where it is written); sampling it
-                // on this background queue is a data race.
-                DispatchQueue.main.async { self.appendDataAsync(data, renderAllowedAtRead: self.readerAllowsRender) }
-            }
-            if shouldClose {
-                DispatchQueue.main.async { self.handlePTYEOF() }
+            readerWillPublishHook.fire(output)
+            let batchID = readerHandoffState.publish(
+                data: output,
+                shouldClose: shouldClose,
+                readCalls: readCalls
+            )
+            guard let batchID else { return }
+            // A synchronous, bounded handoff is intentional backpressure: at
+            // most one 256 KiB event per terminal can wait on the main actor.
+            // The batch is first placed in an ownership mailbox so quit can
+            // claim bytes already read before finalizing durable history.
+            readerMainHandoffHook.fire()
+            DispatchQueue.main.sync {
+                guard let batch = readerHandoffState.claim(batchID) else { return }
+                if !batch.data.isEmpty {
+                    self.maxPTYReadBatchBytesObserved = max(
+                        self.maxPTYReadBatchBytesObserved,
+                        batch.data.count
+                    )
+                    self.maxPTYReadCallsObserved = max(
+                        self.maxPTYReadCallsObserved,
+                        batch.readCalls
+                    )
+                    self.appendDataAsync(
+                        batch.data,
+                        renderAllowedAtRead: self.readerAllowsRender
+                    )
+                }
+                if batch.shouldClose {
+                    self.handlePTYEOF()
+                }
             }
         }
         src.resume()
@@ -1005,25 +1466,100 @@ public final class TerminalSurface: NSObject, Surface {
 
     private func handlePTYEOF() {
         terminalLog.info("terminal.pty_eof surface=\(self.descriptor.id.value.uuidString, privacy: .public) pid=\(self.childPID, privacy: .public)")
+        let foregroundPGID = foregroundProcessGroup()
         readSource?.cancel()   // cancel handler closes the fd on the source's queue
         readSource = nil
         masterFD = -1
-        let status = reapChildIfExited()
-        markTerminalDead(reason: "process_exited", exitStatus: status)
+        let pid = childPID
+        markTerminalDead(reason: "process_exited", exitStatus: nil, appendExitBanner: false)
+        if pid > 0 {
+            beginBoundedChildReap(
+                pid: pid,
+                foregroundPGID: foregroundPGID,
+                sendInitialHangup: false
+            )
+        }
     }
 
-    private func reapChildIfExited() -> Int32? {
-        guard childPID > 0 else { return exitStatus }
-        var status: Int32 = 0
-        if waitpid(childPID, &status, WNOHANG) == childPID {
-            childPID = -1
-            return status
+    private func beginBoundedChildReap(
+        pid: pid_t,
+        foregroundPGID: pid_t?,
+        sendInitialHangup: Bool
+    ) {
+        guard pid > 0 else { return }
+        let foregroundGroup = resolvedForegroundGroupForReap(pid: pid, foregroundPGID: foregroundPGID)
+        childReapForegroundGroup = foregroundGroup
+        lastCapturedForegroundGroup = nil
+        if childReapInFlightPID == pid {
+            // The serial reaper already owns escalation. It may have consumed
+            // waitpid while its MainActor completion is still queued; signalling
+            // the stale numeric PID here can hit an unrelated reused process.
+            return
         }
-        return nil
+        childReapInFlightPID = pid
+        if sendInitialHangup {
+            processTreeSignalCountForTesting += 1
+            TerminalPTYProcessRuntime.signalProcessTree(
+                pid: pid,
+                foregroundGroup: foregroundGroup,
+                signal: SIGHUP
+            )
+        }
+        TerminalPTYProcessRuntime.reapWithEscalation(
+            pid: pid,
+            foregroundGroup: foregroundGroup,
+            initialHangupAlreadySent: sendInitialHangup
+        ) { [weak self] result in
+            self?.childReapCompletionHook.fire()
+            DispatchQueue.main.async {
+                guard let self, self.childReapInFlightPID == pid else { return }
+                self.childReapInFlightPID = nil
+                self.childReapForegroundGroup = nil
+                guard self.childPID == pid else { return }
+                if result.shellReaped {
+                    self.childPID = -1
+                }
+                if result.timedOut {
+                    self.terminalDeadReason = "process_reap_timeout"
+                    terminalLog.error("terminal.reap_timeout surface=\(self.descriptor.id.value.uuidString, privacy: .public) pid=\(pid, privacy: .public) foregroundGroupRemaining=\(result.foregroundGroupRemaining, privacy: .public)")
+                }
+                if let status = result.status {
+                    self.exitStatus = status
+                    if (status & 0x7F) != 0 {
+                        self.terminationSignal = status & 0x7F
+                    }
+                }
+                self.appendProcessExitedBannerIfNeeded(rawStatus: result.status)
+                self.publishRuntimeHealth()
+            }
+        }
+    }
+
+    private func resolvedForegroundGroupForReap(
+        pid: pid_t,
+        foregroundPGID: pid_t?
+    ) -> TerminalPTYProcessRuntime.CapturedForegroundProcessGroup? {
+        if let freshlyCaptured = TerminalPTYProcessRuntime.captureForegroundProcessGroup(
+            pgid: foregroundPGID,
+            shellPID: pid
+        ) {
+            return freshlyCaptured
+        }
+        if let activeReapGroup = childReapForegroundGroup,
+           activeReapGroup.sessionID == pid,
+           foregroundPGID == nil || foregroundPGID == activeReapGroup.pgid {
+            return activeReapGroup
+        }
+        return lastCapturedForegroundGroup.flatMap { captured in
+            captured.sessionID == pid && (foregroundPGID == nil || foregroundPGID == captured.pgid)
+                ? captured
+                : nil
+        }
     }
 
     private func appendDataAsync(_ data: Data, renderAllowedAtRead: Bool) {
         guard !isClosing else { return }
+        recordHistoryReplayLiveData(data)
         // Audit #3: if output is arriving while we believe the surface is hidden but
         // its view is demonstrably on a key, on-screen window, the visibility reconcile
         // desynced (a missed/incorrect setVisibleSurfaceIDs) and readerAllowsRender +
@@ -1083,7 +1619,10 @@ public final class TerminalSurface: NSObject, Surface {
             // Cap the pending buffer to bound memory during long visible bursts.
             // Unlike the hidden path we FORCE-FLUSH (never drop) so the visible
             // snapshot stays COMPLETE.
-            if pendingRendererByteCount > Self.maxHiddenRendererBufferBytes {
+            if Self.pendingRendererBufferExceeded(
+                byteCount: pendingRendererByteCount,
+                eventCount: pendingRendererEvents.count
+            ) {
                 ensureRendererCurrent()
             }
         } else {
@@ -1113,11 +1652,18 @@ public final class TerminalSurface: NSObject, Surface {
             ghosttyView.processOutput(data, render: false)
             continueHiddenBacklogDrainIfNeeded()
         }
+        if ghosttyView.droppedOutputBytes > 0 {
+            outputPartial = true
+            if outputPartialReason == nil || outputPartialReason == "history_replay_failed" {
+                outputPartialReason = "ghostty_buffer_cap"
+            }
+        }
         scheduleBusyStateRefresh()
     }
 
     private func appendString(_ raw: String) {
         guard let data = raw.data(using: .utf8) else { return }
+        recordHistoryReplayLiveData(data)
         enqueueHistory(data)
         recordOutputTelemetry(bytes: data.count)
         // Route through the same ordered pending buffer (PERF-136) so an injected
@@ -1125,7 +1671,10 @@ public final class TerminalSurface: NSObject, Surface {
         pendingRendererEvents.append(.bytes(data))
         pendingRendererByteCount += data.count
         rendererMutationCount &+= 1
-        if pendingRendererByteCount > Self.maxHiddenRendererBufferBytes {
+        if Self.pendingRendererBufferExceeded(
+            byteCount: pendingRendererByteCount,
+            eventCount: pendingRendererEvents.count
+        ) {
             ensureRendererCurrent()
         }
         lastOutputAt = Date()
@@ -1169,49 +1718,139 @@ public final class TerminalSurface: NSObject, Surface {
     /// sequence ready for `resetSurfaceOutput`. Pure so it can be unit-tested
     /// without AppKit or a live Ghostty surface.
     nonisolated static func assembleReplayPayload(from chunkData: [Data]) -> Data {
-        chunkData.reduce(into: Data()) { $0.append($1) }
+        TerminalHistoryCoordinator.assembleReplayPayload(from: chunkData)
     }
 
     private func replayPersistedHistoryIfNeeded() {
-        guard needsHistoryReplay, !historyReplayInFlight, let historyRepo else { return }
-        // F4: do NOT clear needsHistoryReplay here. The flag is consumed only once the
-        // replay actually lands (or we confirm there is genuinely nothing to replay).
-        // A transient read failure — or a teardown that drops the reset — would
-        // otherwise permanently clear the flag and leave the terminal blank with no
-        // recovery. Keeping it true lets the next window attach/reparent (this
-        // method's caller, handleContainerWindowChanged) retry. The in-flight guard
-        // prevents a second concurrent read while one is outstanding.
-        historyReplayInFlight = true
-        let surfaceID = descriptor.id.value.uuidString
-        historyQueue.async { [weak self] in
-            var readFailed = false
-            let window: TerminalOutputWindow?
-            do {
-                window = try historyRepo.readWindow(surfaceID: surfaceID)
-            } catch {
-                NSLog("RemoteCode terminal history restore failed surface=%@ error=%@", surfaceID, String(describing: error))
-                window = nil
-                readFailed = true
+        historyCoordinator.replayIfNeeded()
+    }
+
+    private func recordHistoryReplayLiveData(_ data: Data) {
+        historyCoordinator.recordLiveReplayData(
+            data,
+            maxBytes: Self.maxHiddenRendererBufferBytes
+        )
+    }
+
+    var terminalHistoryIsClosing: Bool {
+        isClosing
+    }
+
+    func terminalHistoryCoordinator(
+        _ coordinator: TerminalHistoryCoordinator,
+        didEncounter issue: TerminalHistoryCoordinator.Issue
+    ) {
+        switch issue {
+        case .backlogCap(let outstandingBytes, let incomingBytes):
+            outputPartial = true
+            outputPartialReason = "history_backlog_cap"
+            terminalLog.error("terminal.history_backlog_capped surface=\(self.descriptor.id.value.uuidString, privacy: .public) outstandingBytes=\(outstandingBytes, privacy: .public) incomingBytes=\(incomingBytes, privacy: .public)")
+            publishRuntimeHealth()
+        case .persistenceFailure:
+            let partialStateChanged = !outputPartial || outputPartialReason == nil
+            outputPartial = true
+            if outputPartialReason == nil || outputPartialReason == "history_replay_failed" {
+                outputPartialReason = "history_persistence_failed"
             }
-            let payload: Data = (window.map { !$0.chunks.isEmpty } ?? false)
-                ? TerminalSurface.assembleReplayPayload(from: window!.chunks.map(\.data))
-                : Data()
-            DispatchQueue.main.async { [weak self] in
-                guard let self else { return }
-                self.historyReplayInFlight = false
-                guard !self.isClosing else { return }
-                if readFailed {
-                    // Leave needsHistoryReplay == true: the next window attach retries.
-                    return
-                }
-                if !payload.isEmpty {
-                    self.ghosttyView.resetSurfaceOutput(payload)
-                }
-                // Read succeeded (empty history is a valid "nothing to replay" state):
-                // consume the flag so the same history is never replayed twice.
-                self.needsHistoryReplay = false
+            if partialStateChanged {
+                publishRuntimeHealth()
             }
+        case .persistenceRecovered:
+            // A successful later append does not restore bytes lost by the
+            // earlier failed append. The durable gap clears only with the
+            // user's explicit clear/delete action.
+            return
+        case .retentionCap:
+            let partialStateChanged = !outputPartial || outputPartialReason == nil
+            outputPartial = true
+            if outputPartialReason == nil || outputPartialReason == "history_replay_failed" {
+                outputPartialReason = "history_retention_cap"
+            }
+            if partialStateChanged {
+                publishRuntimeHealth()
+            }
+        case .retentionMaintenanceFailure:
+            let partialStateChanged = !outputPartial || outputPartialReason == nil
+            outputPartial = true
+            if outputPartialReason == nil || outputPartialReason == "history_replay_failed" {
+                outputPartialReason = "history_retention_maintenance_failed"
+            }
+            if partialStateChanged {
+                publishRuntimeHealth()
+            }
+        case .retentionMaintenanceRecovered:
+            guard outputPartialReason == "history_retention_maintenance_failed" else { return }
+            outputPartial = false
+            outputPartialReason = nil
+            publishRuntimeHealth()
+        case .replayReadFailure:
+            let partialStateChanged = !outputPartial || outputPartialReason == nil
+            outputPartial = true
+            outputPartialReason = outputPartialReason ?? "history_replay_failed"
+            if partialStateChanged {
+                publishRuntimeHealth()
+            }
+        case .replayReadRecovered:
+            guard outputPartialReason == "history_replay_failed" else { return }
+            outputPartial = false
+            outputPartialReason = nil
+            publishRuntimeHealth()
+        case .replayLiveCap:
+            // Live bytes are already present in both renderers. A reset from the
+            // capped replay buffer would erase the newest rendered tail.
+            let partialStateChanged = !outputPartial || outputPartialReason == nil
+            outputPartial = true
+            if outputPartialReason == nil || outputPartialReason == "history_replay_failed" {
+                outputPartialReason = "history_replay_live_cap"
+            }
+            if partialStateChanged {
+                publishRuntimeHealth()
+            }
+        case .durablePartial(let reason):
+            let partialStateChanged = !outputPartial || outputPartialReason == nil
+            outputPartial = true
+            if outputPartialReason == nil || outputPartialReason == "history_replay_failed" {
+                outputPartialReason = reason
+            }
+            if partialStateChanged {
+                publishRuntimeHealth()
+            }
+        case .liveClearCompleted(let outputIsPartial):
+            if !outputIsPartial {
+                outputPartial = false
+                outputPartialReason = nil
+            }
+            cachedTextSnapshot = nil
+            publishRuntimeHealth()
+        case .liveClearFailed:
+            outputPartial = true
+            outputPartialReason = "history_clear_failed"
+            cachedTextSnapshot = nil
+            publishRuntimeHealth()
+        case .staleWriterGeneration:
+            outputPartial = true
+            if outputPartialReason == nil || outputPartialReason == "history_replay_failed" {
+                outputPartialReason = "history_writer_stale"
+            }
+            cachedTextSnapshot = nil
+            publishRuntimeHealth()
         }
+    }
+
+    func terminalHistoryCoordinator(
+        _ coordinator: TerminalHistoryCoordinator,
+        didPrepareReplay canonical: Data
+    ) {
+        guard !canonical.isEmpty else { return }
+        renderer = ANSIRenderer(rows: terminalSize.rows, cols: terminalSize.cols)
+        renderer.feed(canonical)
+        pendingRendererEvents.removeAll(keepingCapacity: true)
+        pendingRendererByteCount = 0
+        hiddenRendererBuffer = Data()
+        hiddenRendererBufferOverflowed = false
+        rendererMutationCount &+= 1
+        cachedTextSnapshot = nil
+        ghosttyView.resetSurfaceOutput(canonical)
     }
 
     public func appendSystemText(_ raw: String) {
@@ -1300,16 +1939,9 @@ public final class TerminalSurface: NSObject, Surface {
         return status
     }
 
-    private func configureInputPump(fd: Int32) {
+    private func configureInputPump(lease: TerminalFileDescriptorLease) {
         let pump = TerminalInputPump(writer: { data, offset in
-            data.withUnsafeBytes { ptr in
-                guard let base = ptr.baseAddress else { return .wrote(0) }
-                let n = Darwin.write(fd, base.advanced(by: offset), data.count - offset)
-                if n > 0 { return .wrote(n) }
-                if n < 0, errno == EINTR { return .interrupted }
-                if n < 0, errno == EAGAIN || errno == EWOULDBLOCK { return .wouldBlock }
-                return .failed(errno)
-            }
+            lease.write(data, offset: offset)
         })
         attachInputPumpCallbacks(pump)
         inputPump = pump
@@ -1347,6 +1979,7 @@ public final class TerminalSurface: NSObject, Surface {
             DispatchQueue.main.async {
                 guard let self, !self.isClosing else { return }
                 terminalLog.info("terminal.input_resumed surface=\(self.descriptor.id.value.uuidString, privacy: .public) pid=\(self.childPID, privacy: .public)")
+                self.didBeepForDeadInput = false
                 self.publishRuntimeHealth()
             }
         }
@@ -1372,6 +2005,7 @@ public final class TerminalSurface: NSObject, Surface {
             terminalDeadReason: terminalDeadReason,
             lastOutputAt: lastOutputAt,
             outputPartial: outputPartial,
+            outputPartialReason: outputPartialReason,
             outputPendingBytes: outputPendingBytes,
             historyWriteFailures: historyWriteFailures,
             droppedOutputBytes: ghosttyView.droppedOutputBytes,
@@ -1379,6 +2013,17 @@ public final class TerminalSurface: NSObject, Surface {
             cols: terminalSize.cols,
             renderDiagnostics: renderDiagnostics()
         )
+    }
+
+    /// Final ownership gate used immediately before a prepared replacement is
+    /// registered under an existing surface ID. Boolean runtime state alone is
+    /// insufficient because a child may have exited after forkpty succeeded.
+    public func runtimeProcessIsOwnedAndAliveForRestartCommit() -> Bool {
+        guard processAlive,
+              childPID > 0,
+              masterFD >= 0,
+              terminalDeadReason == nil else { return false }
+        return TerminalPTYProcessRuntime.ownsLiveChild(pid: childPID)
     }
 
     static func isTerminalJobBusy(
@@ -1397,7 +2042,16 @@ public final class TerminalSurface: NSObject, Surface {
     private func foregroundProcessGroup() -> Int32? {
         guard masterFD >= 0 else { return nil }
         let group = tcgetpgrp(masterFD)
-        return group > 0 ? group : nil
+        guard group > 0 else { return nil }
+        if group == childPID {
+            lastCapturedForegroundGroup = nil
+        } else if let captured = TerminalPTYProcessRuntime.captureForegroundProcessGroup(
+            pgid: group,
+            shellPID: childPID
+        ) {
+            lastCapturedForegroundGroup = captured
+        }
+        return group
     }
 
     public func readTextSnapshot() -> TerminalTextSnapshot {
@@ -1416,7 +2070,8 @@ public final class TerminalSurface: NSObject, Surface {
             outputPartial: outputPartial,
             outputPendingBytes: outputPendingBytes,
             historyWriteFailures: historyWriteFailures,
-            diagnostics: diagnostics
+            diagnostics: diagnostics,
+            outputPartialReason: outputPartialReason
         )
         if !isVisible && outputPendingBytes > 0 {
             // Hidden-output fallback: only the renderer is authoritative here.
@@ -1438,7 +2093,7 @@ public final class TerminalSurface: NSObject, Surface {
                 complete: false,
                 source: "ansi_fallback",
                 timestamp: Date(),
-                partialReason: outputPartial ? "hidden_output_cap" : "hidden_output_pending",
+                partialReason: outputPartialReason ?? (outputPartial ? "hidden_output_cap" : "hidden_output_pending"),
                 pendingBytes: outputPendingBytes,
                 rows: terminalSize.rows,
                 cols: terminalSize.cols,
@@ -1475,7 +2130,8 @@ public final class TerminalSurface: NSObject, Surface {
                 outputPartial: outputPartial,
                 outputPendingBytes: outputPendingBytes,
                 historyWriteFailures: historyWriteFailures,
-                renderBlockedReason: diagnostics.blockedReason
+                renderBlockedReason: diagnostics.blockedReason,
+                outputPartialReason: outputPartialReason
             )
             if Self.shouldPreferRendererSnapshotForReadText(viewportText: text, rendererText: rendererText) {
                 snap = TerminalTextSnapshot(
@@ -1511,7 +2167,7 @@ public final class TerminalSurface: NSObject, Surface {
                 complete: false,
                 source: "ansi_fallback",
                 timestamp: Date(),
-                partialReason: "ghostty_unavailable",
+                partialReason: outputPartialReason ?? "ghostty_unavailable",
                 pendingBytes: outputPendingBytes,
                 rows: terminalSize.rows,
                 cols: terminalSize.cols,
@@ -1583,7 +2239,8 @@ public final class TerminalSurface: NSObject, Surface {
         outputPartial: Bool,
         outputPendingBytes: Int,
         historyWriteFailures: Int,
-        diagnostics: TerminalRenderDiagnostics
+        diagnostics: TerminalRenderDiagnostics,
+        outputPartialReason: String? = nil
     ) -> String {
         // Fold EVERY render-diagnostics field the snapshot embeds (not just
         // blockedReason/canRender) so a change in any of them — e.g. `parked` flipping
@@ -1591,10 +2248,17 @@ public final class TerminalSurface: NSObject, Surface {
         // cache and the mirror never receives a snapshot with a stale diagnostics field.
         let d = diagnostics
         let diag = "\(d.logicalVisible ? 1 : 0)\(d.registryVisible ? 1 : 0)\(d.drainingHiddenBacklog ? 1 : 0)\(d.windowAttached ? 1 : 0)\(d.parked ? 1 : 0)\(d.hasUsableBounds ? 1 : 0)\(d.hiddenAncestor ? 1 : 0)"
-        return "\(outputPartial)|\(outputPendingBytes)|\(historyWriteFailures)|\(diag)|\(d.blockedReason ?? "")"
+        return "\(outputPartial)|\(outputPendingBytes)|\(historyWriteFailures)|\(outputPartialReason ?? "")|\(diag)|\(d.blockedReason ?? "")"
     }
 
-    static func readTextPartialReason(outputPartial: Bool, outputPendingBytes: Int, historyWriteFailures: Int, renderBlockedReason: String? = nil) -> String? {
+    static func readTextPartialReason(
+        outputPartial: Bool,
+        outputPendingBytes: Int,
+        historyWriteFailures: Int,
+        renderBlockedReason: String? = nil,
+        outputPartialReason: String? = nil
+    ) -> String? {
+        if let outputPartialReason { return outputPartialReason }
         if outputPartial { return "hidden_output_cap" }
         if outputPendingBytes > 0 { return "hidden_output_pending" }
         if historyWriteFailures > 0 { return "history_persistence_failed" }
@@ -1604,31 +2268,27 @@ public final class TerminalSurface: NSObject, Surface {
 
     /// The reason a history flush is requested.
     ///
-    /// This is a pure, nonisolated enum used by `flushShouldWait(reason:)` so
-    /// the wait-vs-async decision can be unit-tested without AppKit or a live
-    /// TerminalSurface instance.
-    enum FlushReason {
+    /// History disposition is always asynchronous. App termination and runtime
+    /// replacement join its barrier against one caller-owned deadline.
+    enum FlushReason: Equatable {
         /// The user closed a tab (or the surface is being torn down mid-session).
         /// A slow disk must not stall the main thread — flush asynchronously.
         case tabClose
         /// The app is about to terminate (applicationWillTerminate).
-        /// Data must not be lost on quit — flush synchronously as a barrier.
+        /// Data must not be lost on quit — join the global history barrier.
         case appTermination
+        /// A dead shell is being replaced behind the same stable surface ID.
+        case runtimeRestart
     }
 
-    /// Returns whether a history flush for `reason` must block (wait: true) or
-    /// can run asynchronously (wait: false).
-    ///
-    /// This seam is `nonisolated static` so it is testable without AppKit,
-    /// @MainActor, or a live surface.
+    /// Compatibility seam proving no close path performs a per-surface
+    /// synchronous SQLite wait on the main actor.
     nonisolated static func flushShouldWait(reason: FlushReason) -> Bool {
-        switch reason {
-        case .tabClose:       return false   // async: no UI stall on tab close
-        case .appTermination: return true    // sync barrier: no history loss on quit
-        }
+        false
     }
 
     private func publishRuntimeHealth() {
+        guard publishesRuntimeHealth else { return }
         SurfaceRuntimeBus.shared.emit(descriptor.id, runtimeHealth())
     }
 
@@ -1670,7 +2330,7 @@ public final class TerminalSurface: NSObject, Surface {
         outputBytesAtLastTelemetry = totalOutputBytes
         lastOutputTelemetryAt = now
         let diagnostics = renderDiagnostics()
-        terminalLog.info("terminal.output_health surface=\(self.descriptor.id.value.uuidString, privacy: .public) pid=\(self.childPID, privacy: .public) totalBytes=\(self.totalOutputBytes, privacy: .public) pendingBytes=\(self.outputPendingBytes, privacy: .public) droppedBytes=\(self.ghosttyView.droppedOutputBytes, privacy: .public) historyFailures=\(self.historyWriteFailures, privacy: .public) canRender=\(diagnostics.canRender, privacy: .public) blocked=\(diagnostics.blockedReason ?? "none", privacy: .public)")
+        terminalLog.info("terminal.output_health surface=\(self.descriptor.id.value.uuidString, privacy: .public) pid=\(self.childPID, privacy: .public) totalBytes=\(self.totalOutputBytes, privacy: .public) pendingBytes=\(self.outputPendingBytes, privacy: .public) droppedBytes=\(self.ghosttyView.droppedOutputBytes, privacy: .public) historyOutstandingBytes=\(self.historyOutstandingBytes, privacy: .public) historyFailures=\(self.historyWriteFailures, privacy: .public) maxReadBatchBytes=\(self.maxPTYReadBatchBytesObserved, privacy: .public) maxReadCalls=\(self.maxPTYReadCallsObserved, privacy: .public) canRender=\(diagnostics.canRender, privacy: .public) blocked=\(diagnostics.blockedReason ?? "none", privacy: .public)")
     }
 
     func handleBell() {
@@ -1703,7 +2363,11 @@ public final class TerminalSurface: NSObject, Surface {
         CATransaction.commit()
     }
 
-    private func markTerminalDead(reason: String, exitStatus: Int32?) {
+    private func markTerminalDead(
+        reason: String,
+        exitStatus: Int32?,
+        appendExitBanner: Bool = true
+    ) {
         guard processAlive || terminalDeadReason == nil else { return }
         let wasAlive = processAlive
         processAlive = false
@@ -1714,11 +2378,17 @@ public final class TerminalSurface: NSObject, Surface {
         terminalDeadReason = reason
         inputPump?.stop(reason: .processExited)
         terminalLog.info("terminal.dead surface=\(self.descriptor.id.value.uuidString, privacy: .public) reason=\(reason, privacy: .public) rawStatus=\(self.exitStatus ?? -1, privacy: .public) signal=\(self.terminationSignal ?? -1, privacy: .public) totalBytes=\(self.totalOutputBytes, privacy: .public) pendingBytes=\(self.outputPendingBytes, privacy: .public) droppedBytes=\(self.ghosttyView.droppedOutputBytes, privacy: .public) historyFailures=\(self.historyWriteFailures, privacy: .public)")
-        if wasAlive, !isClosing {
-            appendString("\r\n" + Self.processExitedBanner(rawStatus: exitStatus) + "\r\n")
-            showRestartBannerIfEligible()
+        if wasAlive, appendExitBanner {
+            appendProcessExitedBannerIfNeeded(rawStatus: exitStatus)
         }
         publishRuntimeHealth()
+    }
+
+    private func appendProcessExitedBannerIfNeeded(rawStatus: Int32?) {
+        guard !didAppendProcessExitedBanner, !isClosing else { return }
+        didAppendProcessExitedBanner = true
+        appendString("\r\n" + Self.processExitedBanner(rawStatus: rawStatus) + "\r\n")
+        showRestartBannerIfEligible()
     }
 
     private static func processExitedBanner(rawStatus: Int32?) -> String {
@@ -1876,6 +2546,12 @@ public final class TerminalSurface: NSObject, Surface {
             renderer.feed(replay)
             rendererMutationCount &+= 1
         }
+        if healOverflowed {
+            outputPartial = true
+            if outputPartialReason == nil || outputPartialReason == "history_replay_failed" {
+                outputPartialReason = "hidden_output_cap"
+            }
+        }
         readerAllowsRender = true
         ghosttyView.setOcclusion(visible: true)
         let hadHiddenOutput = outputPendingBytes > 0
@@ -1972,35 +2648,323 @@ public final class TerminalSurface: NSObject, Surface {
     }
 
     public func close() {
-        guard !isClosing else { return }
+        _ = close(deletePersistedHistory: false, removeOutputBusState: true, reason: .tabClose)
+    }
+
+    public func closeForApplicationTermination() -> SurfaceTerminationBarrier? {
+        close(deletePersistedHistory: false, removeOutputBusState: true, reason: .appTermination)
+    }
+
+    /// Stops the old runtime without deleting its durable history or resetting
+    /// its mirror cursor. The replacement may spawn only after this combined
+    /// history + process barrier succeeds.
+    public func closeForRuntimeRestart() -> SurfaceTerminationBarrier? {
+        close(deletePersistedHistory: false, removeOutputBusState: false, reason: .runtimeRestart)
+    }
+
+    public func requiredHistoryBarrierForRuntimeRestart() -> SurfaceTerminationBarrier? {
+        runtimeRestartRequiredHistoryBarrier
+    }
+
+    /// Non-destructive restart gate. A caller may time out and leave this
+    /// runtime fully interactive while the serial history writer continues to
+    /// drain. Only a successful gate authorizes PTY/Ghostty teardown.
+    public func runtimeRestartHistoryPreflightBarrier() -> SurfaceTerminationBarrier {
+        historyCoordinator.flushBarrier()
+    }
+
+    /// Continues ownership-safe cleanup after an irreversible restart close
+    /// whose fast disposition could not prove completion. The replacement may
+    /// still take over the stable surface ID; this old runtime keeps no UI role.
+    @discardableResult
+    public func continueCleanupAfterFailedRuntimeRestart() -> SurfaceTerminationBarrier? {
+        let pid = childPID
+        guard pid > 0 else { return nil }
+        let work = TerminalPTYProcessRuntime.beginApplicationTerminationDisposition(
+            pid: pid,
+            foregroundGroup: childReapForegroundGroup
+        )
+        let barrier = SurfaceTerminationBarrier(
+            groups: [work.group],
+            completionChecks: [work.succeeded]
+        )
+        applicationTerminationBarrier = barrier
+        childReapInFlightPID = pid
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let succeeded = barrier.wait(until: .distantFuture)
+            self?.childReapCompletionHook.fire()
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.childPID == pid else { return }
+                self.childReapInFlightPID = nil
+                self.childReapForegroundGroup = nil
+                if succeeded {
+                    self.childPID = -1
+                } else {
+                    self.terminalDeadReason = "process_reap_timeout"
+                    terminalLog.error("terminal.reap_timeout surface=\(self.descriptor.id.value.uuidString, privacy: .public) pid=\(pid, privacy: .public) reason=runtime_restart_fallback")
+                }
+                self.publishRuntimeHealth()
+            }
+        }
+        return barrier
+    }
+
+    public func markRuntimeRestartDispositionIncomplete() {
+        outputPartial = true
+        outputPartialReason = "runtime_restart_disposition_incomplete"
+        publishRuntimeHealth()
+    }
+
+    public func markRuntimeRestartHistoryIncomplete() {
+        outputPartial = true
+        outputPartialReason = "runtime_restart_history_incomplete"
+        publishRuntimeHealth()
+    }
+
+    public func markRuntimeRestartRecoveryExhausted() {
+        outputPartial = true
+        outputPartialReason = "runtime_restart_recovery_exhausted"
+        publishRuntimeHealth()
+    }
+
+    public func refreshRestartActionForCurrentHealth() {
+        if processAlive {
+            removeRestartBanner()
+        } else {
+            showRestartBannerIfEligible()
+        }
+    }
+
+    /// Stops a retired runtime from publishing stale dead health after another
+    /// runtime commits behind the same stable surface ID.
+    public func relinquishRuntimeHealthOwnershipForReplacement() {
+        publishesRuntimeHealth = false
+    }
+
+    /// Tears down one runtime that is being replaced behind the same registered
+    /// surface ID. The mirror cursor must survive so the next runtime continues
+    /// with a strictly greater sequence instead of being rejected as stale by iOS.
+    @discardableResult
+    public func closePreservingOutputBusState(timeout: TimeInterval = 2) -> Bool {
+        let barrier = close(
+            deletePersistedHistory: false,
+            removeOutputBusState: false,
+            reason: .runtimeRestart
+        )
+        guard let barrier else { return true }
+        return barrier.wait(until: .now() + max(0, timeout))
+    }
+
+    public func closeAndDeletePersistedHistory() {
+        _ = close(deletePersistedHistory: true, removeOutputBusState: true, reason: .tabClose)
+    }
+
+    private func close(
+        deletePersistedHistory: Bool,
+        removeOutputBusState: Bool,
+        reason: FlushReason
+    ) -> SurfaceTerminationBarrier? {
+        guard !isClosing else {
+            if reason == .tabClose {
+                publishesRuntimeHealth = false
+            }
+            if deletePersistedHistory {
+                historyCoordinator.discardAndDeletePersistedHistory()
+            }
+            switch reason {
+            case .appTermination, .runtimeRestart:
+                return applicationTerminationBarrier
+            case .tabClose:
+                return nil
+            }
+        }
         isClosing = true
+        let deferredHistoryState = TerminalDeferredTerminationState()
+        let readerClosingSnapshot = readerHandoffState.beginClosing {
+            if reason == .appTermination {
+                deferredHistoryState.complete(success: true)
+            } else {
+                DispatchQueue.main.async { [weak self, deferredHistoryState] in
+                    guard let self else {
+                        deferredHistoryState.complete(success: false)
+                        return
+                    }
+                    self.completeDeferredReaderClose(
+                        state: deferredHistoryState,
+                        deletePersistedHistory: deletePersistedHistory,
+                        emitOutput: !removeOutputBusState
+                    )
+                }
+            }
+        }
         removeRestartBanner()
         closeParkingWindowIfNeeded()
-        // Async flush: pendingHistoryData is captured by value inside the
-        // DispatchWorkItem, so the bytes survive surface teardown. The
-        // historyQueue retains the work item until it completes — no data loss.
-        // App-quit uses flushPersistedHistory() (wait: true) as the barrier.
-        flushHistory(wait: Self.flushShouldWait(reason: .tabClose))
+        let foregroundPGID = foregroundProcessGroup()
+        let pid = childPID
+        let foregroundGroup = pid > 0
+            ? resolvedForegroundGroupForReap(pid: pid, foregroundPGID: foregroundPGID)
+            : nil
+        childReapForegroundGroup = foregroundGroup
+        lastCapturedForegroundGroup = nil
+        inputPump?.stop(reason: .processExited)
         readSource?.cancel()
         readSource = nil
-        inputPump?.stop(reason: .processExited)
-        if childPID > 0 {
-            let pid = childPID
-            childPID = -1
+        if reason == .appTermination || reason == .runtimeRestart {
+            // Reader and writer both use the lease lock, so app termination can
+            // close the PTY synchronously without waiting for a reader that may
+            // itself be blocked on the main-actor handoff.
+            masterFDLease?.close()
+        }
+        appendClosingReaderBatches(
+            readerClosingSnapshot.batches,
+            emitOutput: !removeOutputBusState
+        )
+        let historyBarrier: SurfaceTerminationBarrier?
+        if deletePersistedHistory {
+            historyCoordinator.discardAndDeletePersistedHistory()
+            if !readerClosingSnapshot.awaitsPublication {
+                deferredHistoryState.complete(success: true)
+            }
+            historyBarrier = nil
+        } else if readerClosingSnapshot.awaitsPublication {
+            if reason == .appTermination {
+                historyBarrier = deferredHistoryState.applicationTerminationBarrier {
+                    [weak self] deadline in
+                    guard let self else { return false }
+                    return self.completeDeferredReaderCloseForApplicationTermination(
+                        deadline: deadline
+                    )
+                }
+            } else {
+                historyBarrier = deferredHistoryState.barrier()
+            }
+        } else {
+            deferredHistoryState.complete(success: true)
+            historyBarrier = historyCoordinator.flushBarrier(
+                finalizing: true,
+                retryTimeout: 2
+            )
+        }
+        if pid > 0 {
             processAlive = false
             terminalDeadReason = terminalDeadReason ?? "closed"
             terminalLog.info("terminal.close surface=\(self.descriptor.id.value.uuidString, privacy: .public) pid=\(pid, privacy: .public)")
-            kill(pid, SIGHUP)
-            DispatchQueue.global(qos: .utility).async {
-                var status: Int32 = 0
-                _ = waitpid(pid, &status, 0)
+            if reason == .tabClose {
+                beginBoundedChildReap(
+                    pid: pid,
+                    foregroundPGID: foregroundPGID,
+                    sendInitialHangup: true
+                )
             }
         }
-        // fd is closed by the read source's cancel handler (see startReader),
-        // after the last in-flight read completes — not directly on main.
+        // Normal close leaves fd disposal to the read-source cancel handler.
+        // App termination already closed the lock-serialized lease above.
         masterFD = -1
         ghosttyView.closeSurface()
+        if removeOutputBusState {
+            outputBus.remove(surfaceId: descriptor.id)
+        }
         publishRuntimeHealth()
+        if reason == .tabClose {
+            publishesRuntimeHealth = false
+        }
+        if reason == .appTermination || reason == .runtimeRestart {
+            if reason == .runtimeRestart {
+                runtimeRestartRequiredHistoryBarrier = historyBarrier
+            }
+            return runtimeDispositionBarrier(
+                pid: pid,
+                historyBarrier: historyBarrier
+            )
+        }
+        return nil
+    }
+
+    private func appendClosingReaderBatches(
+        _ batches: [TerminalReaderHandoffState.Batch],
+        emitOutput: Bool
+    ) {
+        for batch in batches where !batch.data.isEmpty {
+            maxPTYReadBatchBytesObserved = max(
+                maxPTYReadBatchBytesObserved,
+                batch.data.count
+            )
+            maxPTYReadCallsObserved = max(
+                maxPTYReadCallsObserved,
+                batch.readCalls
+            )
+            historyCoordinator.enqueue(batch.data)
+            recordOutputTelemetry(bytes: batch.data.count)
+            lastOutputAt = Date()
+            descriptor.hasUnreadActivity = true
+            if emitOutput {
+                outputBus.emit(descriptor.id, batch.data)
+            }
+        }
+    }
+
+    private func completeDeferredReaderClose(
+        state: TerminalDeferredTerminationState,
+        deletePersistedHistory: Bool,
+        emitOutput: Bool
+    ) {
+        let batches = readerHandoffState.drainPublished()
+        guard !deletePersistedHistory else {
+            state.complete(success: true)
+            return
+        }
+        appendClosingReaderBatches(batches, emitOutput: emitOutput)
+        let historyBarrier = historyCoordinator.flushBarrier(
+            finalizing: true,
+            retryTimeout: 2
+        )
+        DispatchQueue.global(qos: .utility).async {
+            state.complete(success: historyBarrier.wait(until: .distantFuture))
+        }
+    }
+
+    private func completeDeferredReaderCloseForApplicationTermination(
+        deadline: DispatchTime
+    ) -> Bool {
+        appendClosingReaderBatches(
+            readerHandoffState.drainPublished(),
+            emitOutput: false
+        )
+        return historyCoordinator.flushBarrier(
+            finalizing: true,
+            retryTimeout: 2
+        ).wait(until: deadline)
+    }
+
+    private func runtimeDispositionBarrier(
+        pid: pid_t,
+        historyBarrier: SurfaceTerminationBarrier?
+    ) -> SurfaceTerminationBarrier? {
+        var barriers: [SurfaceTerminationBarrier] = []
+        if let applicationTerminationBarrier {
+            barriers.append(applicationTerminationBarrier)
+        }
+        if let historyBarrier {
+            barriers.append(historyBarrier)
+        }
+        if applicationTerminationBarrier == nil, pid > 0 {
+            if let runtimeDispositionBarrierFactoryForTesting {
+                barriers.append(runtimeDispositionBarrierFactoryForTesting(pid))
+            } else {
+                let work = TerminalPTYProcessRuntime.beginApplicationTerminationDisposition(
+                    pid: pid,
+                    foregroundGroup: childReapForegroundGroup
+                )
+                barriers.append(SurfaceTerminationBarrier(
+                    groups: [work.group],
+                    completionChecks: [work.succeeded]
+                ))
+            }
+        }
+        guard !barriers.isEmpty else { return nil }
+        let barrier = SurfaceTerminationBarrier(combining: barriers)
+        applicationTerminationBarrier = barrier
+        return barrier
     }
 
     private func scheduleParkingIfDetached() {
@@ -2054,62 +3018,44 @@ public final class TerminalSurface: NSObject, Surface {
     }
 
     public func flushPersistedHistory() {
-        flushHistory(wait: true)
+        // The production coordinator completes ready-state flushes on its serial
+        // writer queue. Never pump AppKit here: nested RunLoop execution cannot
+        // drain Swift MainActor tasks and permits unrelated UI reentrancy.
+        _ = historyCoordinator.flushBarrier().wait(until: .now() + 2)
+    }
+
+    public func flushPersistedHistoryBarrier() -> SurfaceTerminationBarrier {
+        historyCoordinator.flushBarrier()
+    }
+
+    public func flushPersistedHistoryAsync(timeout: TimeInterval = 2) async -> Bool {
+        await historyCoordinator.flushBarrier().waitAsync(
+            until: .now() + max(0, timeout)
+        )
+    }
+
+    /// Drops pending history and deletes durable chunks under the surface ID.
+    /// In-flight writer items drain first; delete runs last on the same queue so
+    /// a blocked pre-clear insert cannot repopulate after clear_history.
+    public func clearPersistedHistory() {
+        historyCoordinator.clearPersistedHistory()
+    }
+
+    public func readPersistedHistory(
+        beforeChunkID: Int64?,
+        maxBytes: Int,
+        timeout: TimeInterval = 2
+    ) async throws -> TerminalOutputWindow {
+        try await historyCoordinator.readPersistedWindow(
+            beforeChunkID: beforeChunkID,
+            maxBytes: maxBytes,
+            timeout: timeout
+        )
     }
 
     private func enqueueHistory(_ data: Data) {
-        guard !isClosing, historyRepo != nil, !data.isEmpty else { return }
-        pendingHistoryData.append(data)
-        if pendingHistoryData.count >= Self.maxHistoryChunkBytes {
-            flushHistory(wait: false)
-        } else {
-            scheduleHistoryFlush()
-        }
-    }
-
-    private func scheduleHistoryFlush() {
-        guard !historyFlushScheduled else { return }
-        historyFlushScheduled = true
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
-            self?.historyFlushScheduled = false
-            self?.flushHistory(wait: false)
-        }
-    }
-
-    private func flushHistory(wait: Bool) {
-        guard let historyRepo, !pendingHistoryData.isEmpty else {
-            if wait {
-                historyQueue.sync {}
-            }
-            return
-        }
-        // Hand ownership of the accumulated buffer to the write item instead of
-        // copying it out and clearing in place: with copy-on-write, reassigning
-        // a fresh empty Data lets the write item keep the only reference, so the
-        // >64KB burst is moved rather than duplicated (PERF-007).
-        let data = pendingHistoryData
-        pendingHistoryData = Data()
-        let surfaceID = descriptor.id.value.uuidString
-        let workspaceID = historyWorkspaceID
-        let chunkIndex = nextHistoryChunkIndex
-        nextHistoryChunkIndex += 1
-        let write = DispatchWorkItem {
-            do {
-                try historyRepo.append(surfaceID: surfaceID, workspaceID: workspaceID, chunkIndex: chunkIndex, data: data)
-            } catch {
-                DispatchQueue.main.async { [weak self] in
-                    self?.historyWriteFailures += 1
-                    self?.outputPartial = true
-                    self?.publishRuntimeHealth()
-                }
-                NSLog("RemoteCode terminal history write failed surface=%@ chunk=%lld error=%@", surfaceID, chunkIndex, String(describing: error))
-            }
-        }
-        if wait {
-            historyQueue.sync(execute: write)
-        } else {
-            historyQueue.async(execute: write)
-        }
+        guard !isClosing else { return }
+        historyCoordinator.enqueue(data)
     }
 
     /// Exports the full scrollback (including ANSI sequences when format is

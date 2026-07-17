@@ -116,6 +116,7 @@ build_canary() {
       RC2_CHANNEL=canary \
       RC2_CONFIG="${RC2_CANARY_CONFIG:-debug}" \
       RC2_PACKAGE_APP_OUTPUT="$packaged_app" \
+      RC2_REPLACE_RUNNING_APP=0 \
       "$PACKAGE_SCRIPT"
   )
 

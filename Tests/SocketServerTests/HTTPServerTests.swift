@@ -530,6 +530,142 @@ final class HTTPServerTests: XCTestCase {
         ], "a pong must be written before queued application frames that have not started, or the client's 2s pong deadline starves behind event data")
     }
 
+    /// WHY: both WebSocket frame classes can hold 4,096 frames. Array.removeFirst
+    /// shifts every remaining element per drain and turns that bounded backlog
+    /// into quadratic CPU work. A head-indexed FIFO must preserve order while
+    /// compacting storage only a bounded number of times, then remain reusable.
+    func test_webSocketFrameFIFO_drains100kInOrderWithAmortizedCompactionAndReusableStorage() {
+        var fifo = WebSocketFrameFIFO<Int>()
+        let frameCount = 100_000
+
+        for frame in 0..<frameCount {
+            fifo.append(frame)
+        }
+        XCTAssertEqual(fifo.diagnostics.queuedCount, frameCount)
+        XCTAssertEqual(fifo.diagnostics.storageCount, frameCount)
+
+        var expected = 0
+        while expected < frameCount / 2, let frame = fifo.popFirst() {
+            guard frame == expected else {
+                XCTFail("FIFO reordered frame \(frame); expected \(expected)")
+                break
+            }
+            expected += 1
+        }
+        XCTAssertEqual(expected, frameCount / 2)
+        XCTAssertEqual(fifo.diagnostics.queuedCount, frameCount / 2)
+        XCTAssertEqual(fifo.diagnostics.storageCount, frameCount / 2,
+                       "consumed slots must compact instead of retaining peak storage")
+        XCTAssertEqual(fifo.diagnostics.headIndex, 0)
+        XCTAssertEqual(fifo.diagnostics.compactionCount, 1)
+
+        while let frame = fifo.popFirst() {
+            guard frame == expected else {
+                XCTFail("FIFO reordered frame \(frame); expected \(expected)")
+                break
+            }
+            expected += 1
+        }
+
+        XCTAssertEqual(expected, frameCount)
+        XCTAssertEqual(fifo.diagnostics.queuedCount, 0)
+        XCTAssertEqual(fifo.diagnostics.storageCount, 0,
+                       "drained storage must not stack stale frame references")
+        XCTAssertEqual(fifo.diagnostics.headIndex, 0)
+        XCTAssertGreaterThan(fifo.diagnostics.compactionCount, 0)
+        XCTAssertLessThan(fifo.diagnostics.compactionCount, 64,
+                          "compaction must be amortized, never one Array shift per frame")
+
+        for frame in 0..<4_096 {
+            fifo.append(frame)
+        }
+        for expected in 0..<4_096 {
+            XCTAssertEqual(fifo.popFirst(), expected)
+        }
+        XCTAssertEqual(fifo.diagnostics.queuedCount, 0)
+        XCTAssertEqual(fifo.diagnostics.storageCount, 0,
+                       "a reused queue must release every drained storage slot")
+    }
+
+    func test_connectionOutboundOwner_writeFailureClosesOnceAndClearsQueueAccounting() {
+        let recorded = RecordedFrames()
+        let owner = WebSocketOutboundQueue(
+            maxQueuedBytes: 1_024,
+            applicationWriter: { data in
+                recorded.append("app:\(String(decoding: data, as: UTF8.self))")
+                return false
+            },
+            controlWriter: { opcode, data in
+                recorded.append("control:\(opcode):\(String(decoding: data, as: UTF8.self))")
+                return true
+            },
+            writeFailureClosingData: Data("write-failure".utf8),
+            onTerminal: { reason in recorded.append("terminal:\(reason)") },
+            didSendTerminal: { recorded.append("shutdown") }
+        )
+
+        XCTAssertEqual(owner.enqueueApplication(Data("event".utf8)), .accepted)
+        owner.finish()
+
+        XCTAssertEqual(recorded.snapshot, [
+            "app:event",
+            "terminal:write_failed",
+            "control:1:write-failure",
+            "control:8:",
+            "shutdown",
+        ])
+        XCTAssertEqual(owner.queuedByteCount, 0)
+        XCTAssertEqual(owner.queuedFrameCountForTests, 0)
+        XCTAssertEqual(owner.enqueueApplication(Data("too-late".utf8)), .closed)
+    }
+
+    func test_connectionOutboundOwner_controlFloodSharesByteAndFrameBudget() {
+        // WHY: a slow client can keep the control writer blocked while sending
+        // pings. Control frames must share both queue budgets with application
+        // frames or Data plus one dispatch closure per ping grows indefinitely.
+        let recorded = RecordedFrames()
+        let firstWriteEntered = DispatchSemaphore(value: 0)
+        let releaseFirstWrite = DispatchSemaphore(value: 0)
+        let owner = WebSocketOutboundQueue(
+            maxQueuedBytes: 16,
+            maxQueuedFrames: 4,
+            applicationWriter: { _ in true },
+            controlWriter: { opcode, data in
+                recorded.append("control:\(opcode):\(String(decoding: data, as: UTF8.self))")
+                if opcode == 0x9, data == Data("ping".utf8) {
+                    firstWriteEntered.signal()
+                    _ = releaseFirstWrite.wait(timeout: .now() + 2)
+                }
+                return true
+            },
+            writeFailureClosingData: Data(),
+            onTerminal: { reason in recorded.append("terminal:\(reason)") },
+            didSendTerminal: { recorded.append("shutdown") }
+        )
+
+        XCTAssertEqual(owner.enqueueControl(opcode: 0x9, data: Data("ping".utf8)), .accepted)
+        XCTAssertEqual(firstWriteEntered.wait(timeout: .now() + 2), .success)
+        for _ in 0..<3 {
+            XCTAssertEqual(owner.enqueueControl(opcode: 0xA, data: Data("pong".utf8)), .accepted)
+        }
+        XCTAssertEqual(owner.queuedByteCount, 16)
+        XCTAssertEqual(owner.queuedFrameCountForTests, 4)
+
+        XCTAssertEqual(owner.enqueueControl(opcode: 0xA, data: Data("full".utf8)), .queueFull)
+        XCTAssertEqual(owner.enqueueControl(opcode: 0xA, data: Data()), .closed)
+        XCTAssertEqual(recorded.snapshot.filter { $0 == "terminal:queue_full" }.count, 1)
+        XCTAssertLessThanOrEqual(owner.queuedByteCount, 16)
+        XCTAssertLessThanOrEqual(owner.queuedFrameCountForTests, 4)
+
+        releaseFirstWrite.signal()
+        owner.finish()
+
+        XCTAssertEqual(owner.queuedByteCount, 0)
+        XCTAssertEqual(owner.queuedFrameCountForTests, 0)
+        XCTAssertEqual(recorded.snapshot.filter { $0 == "terminal:queue_full" }.count, 1)
+        XCTAssertEqual(recorded.snapshot.filter { $0 == "shutdown" }.count, 1)
+    }
+
     // MARK: - Auth-gate coverage (T010-T012, T006) — loopbackOnly: false
 
     /// Minimal auth provider used only by the auth-gate tests below.

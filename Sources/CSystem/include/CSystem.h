@@ -17,6 +17,26 @@ extern "C" {
 /// sets errno.
 pid_t rc2_forkpty(int *amaster);
 
+/// Spawns `path` behind a new PTY. All argv/env storage must be prepared by the
+/// caller before entry. The post-fork child performs only async-signal-safe
+/// operations before `execve(2)`.
+pid_t rc2_spawnpty_exec(
+    int *amaster,
+    const char *cwd,
+    const char *path,
+    char *const argv[],
+    char *const envp[]);
+
+/// Spawns the PTY child and has it stop itself after forkpty setup but before
+/// chdir/exec. The parent consumes the SIGSTOP notification before returning,
+/// so the caller owns a stable, non-running child ready for later SIGCONT.
+pid_t rc2_spawnpty_exec_suspended(
+    int *amaster,
+    const char *cwd,
+    const char *path,
+    char *const argv[],
+    char *const envp[]);
+
 /// Sets the controlling terminal window size on the pty master fd.
 /// Returns 0 on success or -1 on error (errno is set).
 int rc2_set_winsize(int fd, int rows, int cols);

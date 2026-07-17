@@ -60,6 +60,81 @@ final class TerminalInputPumpTests: XCTestCase {
         }
     }
 
+    private final class IncrementalRetryWriter: @unchecked Sendable {
+        private let lock = NSLock()
+        private var attemptsByOffset: [Int: Int] = [:]
+        private var output = Data()
+        let first: Data
+
+        init(first: Data) {
+            self.first = first
+        }
+
+        func write(_ data: Data, offset: Int) -> TerminalWriteResult {
+            lock.lock()
+            defer { lock.unlock() }
+            if data == first {
+                let attempts = (attemptsByOffset[offset] ?? 0) + 1
+                attemptsByOffset[offset] = attempts
+                guard attempts >= 2 else { return .wouldBlock }
+                attemptsByOffset[offset] = 0
+                output.append(data[offset])
+                return .wrote(1)
+            }
+            output.append(data.dropFirst(offset))
+            return .wrote(data.count - offset)
+        }
+
+        var text: String {
+            lock.lock()
+            defer { lock.unlock() }
+            return String(decoding: output, as: UTF8.self)
+        }
+    }
+
+    private final class BlockedTinyChunkWriter: @unchecked Sendable {
+        private let lock = NSLock()
+        private let firstWriteGate = DispatchSemaphore(value: 0)
+        private var firstWrite = true
+        private var draining = false
+        private var output = Data()
+        let firstWriteEntered = DispatchSemaphore(value: 0)
+
+        func write(_ data: Data, offset: Int) -> TerminalWriteResult {
+            lock.lock()
+            let shouldBlockFirst = firstWrite
+            if shouldBlockFirst { firstWrite = false }
+            let canDrain = draining
+            lock.unlock()
+
+            if shouldBlockFirst {
+                firstWriteEntered.signal()
+                firstWriteGate.wait()
+                return .wouldBlock
+            }
+            guard canDrain else { return .wouldBlock }
+
+            lock.lock()
+            output.append(data.dropFirst(offset))
+            lock.unlock()
+            return .wrote(data.count - offset)
+        }
+
+        func releaseFirstWrite() { firstWriteGate.signal() }
+
+        func startDraining() {
+            lock.lock()
+            draining = true
+            lock.unlock()
+        }
+
+        var bytes: Data {
+            lock.lock()
+            defer { lock.unlock() }
+            return output
+        }
+    }
+
     // MARK: - Pure budget seam
 
     func test_shouldAbortWouldBlock_falseBeforeBudget_trueAtOrPastBudget() {
@@ -192,6 +267,125 @@ final class TerminalInputPumpTests: XCTestCase {
         XCTAssertEqual(pump.queuedByteCount, 0)
     }
 
+    func test_repeatedPartialStallsCannotLetLaterChunkOvertakeHeadSuffix() {
+        // WHY: each delayed retry re-enters the serial queue behind already
+        // accepted chunks. Without an explicit FIFO head, a later chunk can
+        // write between suffix retries and corrupt terminal command order.
+        let first = Data("first\n".utf8)
+        let second = Data("second\n".utf8)
+        let writer = IncrementalRetryWriter(first: first)
+        let pump = TerminalInputPump(
+            retryDelay: 100,
+            maxWouldBlockWaitMicros: 100,
+            writer: { data, offset in writer.write(data, offset: offset) }
+        )
+
+        XCTAssertEqual(pump.enqueue(first), .accepted)
+        XCTAssertEqual(pump.enqueue(second), .accepted)
+        let deadline = Date().addingTimeInterval(2)
+        while Date() < deadline, pump.queuedByteCount > 0 {
+            usleep(10_000)
+            pump.drain()
+        }
+
+        XCTAssertEqual(
+            writer.text,
+            "first\nsecond\n",
+            "later accepted bytes must remain behind every retry of the FIFO head"
+        )
+        XCTAssertEqual(pump.queuedByteCount, 0)
+        XCTAssertTrue(pump.inputAccepting)
+    }
+
+    func test_manyTinyBlockedChunksKeepMetadataBoundedAndRecoverInExactFIFOOrder() {
+        // WHY: a byte-at-a-time producer can fill the 1 MiB byte budget with one
+        // million queued IDs and retry closures. Bound item metadata separately
+        // from bytes, and prove the accepted prefix still recovers in exact order.
+        let itemLimit = 256
+        let writer = BlockedTinyChunkWriter()
+        let stalled = DispatchSemaphore(value: 0)
+        let pump = TerminalInputPump(
+            maxQueuedBytes: 1024 * 1024,
+            maxQueuedItems: itemLimit,
+            retryDelay: 100,
+            maxWouldBlockWaitMicros: 100,
+            writer: { data, offset in writer.write(data, offset: offset) }
+        )
+        pump.onInputStalled = { _ in stalled.signal() }
+
+        var expected = Data()
+        let first = Data([0])
+        XCTAssertEqual(pump.enqueue(first), .accepted)
+        expected.append(first)
+        XCTAssertEqual(writer.firstWriteEntered.wait(timeout: .now() + 1), .success)
+
+        var queueFullCount = 0
+        for index in 1..<10_000 {
+            let byte = Data([UInt8(index % 251)])
+            switch pump.enqueue(byte) {
+            case .accepted:
+                expected.append(byte)
+            case .queueFull:
+                queueFullCount += 1
+            default:
+                XCTFail("blocked preaccepted tiny chunks may only be accepted or rejected as queue_full")
+            }
+        }
+
+        let peak = pump.pendingChunkMetadataForTesting
+        XCTAssertEqual(peak.active, itemLimit)
+        XCTAssertLessThanOrEqual(peak.storage, itemLimit,
+                                 "metadata storage must stay bounded while the head writer is blocked")
+        XCTAssertGreaterThan(queueFullCount, 0,
+                             "the independent item cap must engage before one-byte chunks exhaust the byte budget")
+
+        writer.releaseFirstWrite()
+        XCTAssertEqual(stalled.wait(timeout: .now() + 1), .success)
+        let recoveryStarted = Date()
+        writer.startDraining()
+        let deadline = Date().addingTimeInterval(2)
+        while Date() < deadline, pump.queuedByteCount > 0 {
+            usleep(5_000)
+            pump.drain()
+        }
+
+        XCTAssertEqual(writer.bytes, expected,
+                       "every accepted one-byte chunk must recover in exact FIFO order")
+        XCTAssertEqual(pump.queuedByteCount, 0)
+        let final = pump.pendingChunkMetadataForTesting
+        XCTAssertEqual(final.active, 0)
+        XCTAssertLessThanOrEqual(final.storage, itemLimit + 255,
+                                 "head-index compaction must keep backing metadata bounded")
+        XCTAssertLessThan(Date().timeIntervalSince(recoveryStarted), 2,
+                          "bounded metadata must not trade memory safety for unbounded recovery latency")
+        XCTAssertTrue(pump.inputAccepting)
+    }
+
+    func test_nonHeadChunksDoNotCreateRecurringRetryTimers() {
+        // WHY: only the FIFO head can make progress. Giving every accepted
+        // non-head chunk its own backoff loop turns one blocked PTY into hundreds
+        // of recurring queue callbacks even though none of them may write.
+        let itemLimit = 64
+        let pump = TerminalInputPump(
+            maxQueuedItems: itemLimit,
+            retryDelay: 20_000,
+            maxWouldBlockWaitMicros: 1,
+            writer: { _, _ in .wouldBlock }
+        )
+
+        for _ in 0..<itemLimit {
+            XCTAssertEqual(pump.enqueue(Data([0x41])), .accepted)
+        }
+        pump.drain()
+
+        XCTAssertEqual(
+            pump.scheduledRetryCountForTesting,
+            1,
+            "one blocked FIFO head may own one retry; non-head chunks must wait for an explicit head handoff"
+        )
+        pump.stop()
+    }
+
     func test_resumeWaitsForAllAcceptedBacklogBeforeReopeningInput() {
         let mode = WriterMode()
         let written = WrittenLog()
@@ -285,5 +479,141 @@ final class TerminalInputPumpTests: XCTestCase {
             "progress between blocks resets the budget, so the whole chunk is delivered")
         XCTAssertFalse(stalled.isSet,
             "intermittent backpressure with forward progress must NOT trip the stall")
+    }
+
+    func test_closedDescriptorLeaseCannotWriteAfterFileDescriptorReuse() throws {
+        var pipeFDs: [Int32] = [0, 0]
+        XCTAssertEqual(pipe(&pipeFDs), 0)
+        defer { Darwin.close(pipeFDs[0]) }
+        let originalWriteFD = pipeFDs[1]
+        let lease = TerminalFileDescriptorLease(fd: originalWriteFD)
+
+        lease.close()
+        let replacement = open("/dev/null", O_WRONLY)
+        XCTAssertGreaterThanOrEqual(replacement, 0)
+        let reusedFD: Int32
+        if replacement == originalWriteFD {
+            reusedFD = replacement
+        } else {
+            XCTAssertEqual(dup2(replacement, originalWriteFD), originalWriteFD)
+            Darwin.close(replacement)
+            reusedFD = originalWriteFD
+        }
+        defer { Darwin.close(reusedFD) }
+
+        XCTAssertEqual(
+            lease.write(Data("must-not-escape".utf8), offset: 0),
+            .failed(EBADF),
+            "a stopped terminal must never write accepted bytes into a later terminal or file that reused its numeric fd"
+        )
+    }
+
+    func test_stalledRetryStoppedBeforeCloseCannotEscapeIntoReusedDescriptor() throws {
+        var pipeFDs: [Int32] = [0, 0]
+        XCTAssertEqual(pipe(&pipeFDs), 0)
+        let originalReadFD = pipeFDs[0]
+        let originalWriteFD = pipeFDs[1]
+        XCTAssertTrue(TerminalFileDescriptorFlags.enableNonBlocking(originalWriteFD))
+        try fillPipeUntilWouldBlock(writeFD: originalWriteFD)
+
+        let lease = TerminalFileDescriptorLease(fd: originalWriteFD)
+        let stalled = DispatchSemaphore(value: 0)
+        let payload = Data("must-not-reach-reused-fd".utf8)
+        let pump = TerminalInputPump(
+            retryDelay: 1_000,
+            maxWouldBlockWaitMicros: 1_000,
+            writer: { data, offset in lease.write(data, offset: offset) }
+        )
+        pump.onInputStalled = { _ in stalled.signal() }
+
+        XCTAssertEqual(pump.enqueue(payload), .accepted)
+        XCTAssertEqual(
+            stalled.wait(timeout: .now() + 1),
+            .success,
+            "a genuinely full nonblocking pipe must drive the production retry path into input_stalled"
+        )
+
+        pump.stop(reason: .processExited)
+        lease.close()
+        Darwin.close(originalReadFD)
+
+        let replacement = try makeSocketPairReusing(fd: originalWriteFD)
+        defer {
+            Darwin.close(replacement.reusedFD)
+            Darwin.close(replacement.peerFD)
+        }
+        let sentinel = Data("replacement-owner-only".utf8)
+        let sent = sentinel.withUnsafeBytes { pointer in
+            Darwin.write(replacement.reusedFD, pointer.baseAddress, sentinel.count)
+        }
+        XCTAssertEqual(sent, sentinel.count)
+
+        usleep(250_000)
+        pump.drain()
+        XCTAssertEqual(
+            pump.queuedByteCount,
+            0,
+            "a retry that wakes after stop must discard its queue accounting without invoking the writer"
+        )
+        XCTAssertEqual(
+            try readAvailableData(from: replacement.peerFD),
+            sentinel,
+            "no accepted byte from the stopped terminal may escape into a new resource that reused its numeric fd"
+        )
+    }
+
+    private func fillPipeUntilWouldBlock(writeFD: Int32) throws {
+        let chunk = Data(repeating: 0xA5, count: 16 * 1024)
+        while true {
+            let count = chunk.withUnsafeBytes { pointer in
+                Darwin.write(writeFD, pointer.baseAddress, chunk.count)
+            }
+            if count > 0 { continue }
+            if count < 0, errno == EINTR { continue }
+            if count < 0, errno == EAGAIN || errno == EWOULDBLOCK { return }
+            throw NSError(
+                domain: NSPOSIXErrorDomain,
+                code: Int(errno),
+                userInfo: [NSLocalizedDescriptionKey: "failed while filling test pipe"]
+            )
+        }
+    }
+
+    private func makeSocketPairReusing(fd targetFD: Int32) throws -> (reusedFD: Int32, peerFD: Int32) {
+        var sockets: [Int32] = [0, 0]
+        guard socketpair(AF_UNIX, SOCK_STREAM, 0, &sockets) == 0 else {
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
+        }
+        if sockets[0] == targetFD {
+            return (sockets[0], sockets[1])
+        }
+        if sockets[1] == targetFD {
+            return (sockets[1], sockets[0])
+        }
+        guard dup2(sockets[0], targetFD) == targetFD else {
+            let savedErrno = errno
+            Darwin.close(sockets[0])
+            Darwin.close(sockets[1])
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(savedErrno))
+        }
+        Darwin.close(sockets[0])
+        return (targetFD, sockets[1])
+    }
+
+    private func readAvailableData(from fd: Int32) throws -> Data {
+        XCTAssertTrue(TerminalFileDescriptorFlags.enableNonBlocking(fd))
+        var result = Data()
+        var buffer = [UInt8](repeating: 0, count: 1024)
+        while true {
+            let count = Darwin.read(fd, &buffer, buffer.count)
+            if count > 0 {
+                result.append(contentsOf: buffer[0..<Int(count)])
+                continue
+            }
+            if count < 0, errno == EINTR { continue }
+            if count < 0, errno == EAGAIN || errno == EWOULDBLOCK { return result }
+            if count == 0 { return result }
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
+        }
     }
 }

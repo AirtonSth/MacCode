@@ -40,23 +40,25 @@ final class TerminalFlushHistorySeamTests: XCTestCase {
         )
     }
 
-    func test_appTermination_waits() {
-        // WHY: applicationWillTerminate has a short OS-granted window before the
-        // process is killed. A synchronous flush is the only guarantee that
-        // unflushed history bytes land in SQLite before exit.
-        XCTAssertTrue(
+    func test_appTermination_is_async_and_joins_global_barrier() {
+        // WHY: per-surface history disposition is always async. App quit durability
+        // comes from collecting SurfaceTerminationBarrier values and waiting on
+        // one shared deadline in closeSurfacesForApplicationTermination — not from
+        // a per-surface historyQueue.sync on the main actor.
+        XCTAssertFalse(
             TerminalSurface.flushShouldWait(reason: .appTermination),
-            "app-termination flush must be sync (wait=true) so the OS does not kill the process with unflushed history in the queue"
+            "app-termination must not perform a per-surface synchronous SQLite wait on the main actor"
         )
     }
 
-    func test_tabClose_and_appTermination_differ() {
-        // WHY: the two paths must have opposite wait semantics; if they ever
-        // collapsed to the same value the split would be silently broken.
-        XCTAssertNotEqual(
+    func test_tabClose_and_appTermination_share_async_disposition() {
+        // WHY: both close reasons enqueue history work and return a joinable
+        // barrier. Diverging wait semantics here would reintroduce main-thread
+        // stalls on tab close or drop the shared quit barrier contract.
+        XCTAssertEqual(
             TerminalSurface.flushShouldWait(reason: .tabClose),
             TerminalSurface.flushShouldWait(reason: .appTermination),
-            "tabClose and appTermination must have opposite wait semantics — same value means one path is wrong"
+            "tabClose and appTermination both use async disposition joined by barriers"
         )
     }
 

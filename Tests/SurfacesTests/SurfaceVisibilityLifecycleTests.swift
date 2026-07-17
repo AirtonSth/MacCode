@@ -25,8 +25,8 @@ final class SurfaceVisibilityLifecycleTests: XCTestCase {
 
         XCTAssertEqual(surface.visibleCount, 1,
                        "selected terminal surfaces must not receive duplicate visible transitions during repeated workspace refreshes")
-        XCTAssertEqual(surface.hiddenCount, 0,
-                       "unchanged visible sets must not hide the active terminal")
+        XCTAssertEqual(surface.hiddenCount, 1,
+                       "registration must synchronize a new surface to the registry's initially-hidden truth exactly once")
     }
 
     func test_setVisibleSurfaceIDsHidesOldSurfaceAndShowsNewSurfaceOnce() {
@@ -39,11 +39,21 @@ final class SurfaceVisibilityLifecycleTests: XCTestCase {
         SurfaceRegistry.shared.setVisibleSurfaceIDs([second.descriptor.id])
 
         XCTAssertEqual(first.visibleCount, 1)
-        XCTAssertEqual(first.hiddenCount, 1,
+        XCTAssertEqual(first.hiddenCount, 2,
                        "switching tabs must hide the previous terminal exactly once")
         XCTAssertEqual(second.visibleCount, 1,
                        "switching tabs must show the newly selected terminal exactly once")
-        XCTAssertEqual(second.hiddenCount, 0)
+        XCTAssertEqual(second.hiddenCount, 1)
+    }
+
+    func test_registerSynchronizesSurfaceWhenVisibleSetAlreadyContainsItsID() {
+        let surface = FakeSurface()
+        SurfaceRegistry.shared.setVisibleSurfaceIDs([surface.descriptor.id])
+
+        register(surface)
+
+        XCTAssertEqual(surface.visibleCount, 1)
+        XCTAssertEqual(surface.hiddenCount, 0)
     }
 
     private func register(_ surface: FakeSurface) {
