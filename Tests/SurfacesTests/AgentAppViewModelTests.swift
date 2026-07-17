@@ -5544,6 +5544,70 @@ final class AgentAppViewModelTests: XCTestCase {
         await waitAsync("slow run stops") { runner.cancelled }
     }
 
+    /// WHY: Pet / sidebar reopen calls selectThread. Full-access auto-implement
+    /// must not fire on mere view open — that auto-sends "Implement this proposed
+    /// plan now..." when the user only wanted to open Agent App.
+    func test_selectThread_doesNotAutoImplementUnimplementedPlanUnderFullAccess() async throws {
+        let tmp = NSTemporaryDirectory() + "rc2-vm-agent-plan-select-no-auto-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let queuedRepo = AgentQueuedMessageRepository(db: db)
+        let proposedPlanRepo = AgentProposedPlanRepository(db: db)
+        let runner = CapturingProviderRunner(provider: .codex)
+        let coordinator = AgentRunCoordinator(
+            runRepo: AgentRunRepository(db: db),
+            messageRepo: messageRepo,
+            threadRepo: threadRepo,
+            providers: [.codex: runner]
+        )
+        let workspaceID = WorkspaceID()
+        let thread = AgentThread(
+            workspaceId: workspaceID,
+            title: "reopen-full-access",
+            provider: .codex,
+            model: "gpt-5.5",
+            permissionMode: .fullAccess
+        )
+        try threadRepo.upsert(thread)
+        try proposedPlanRepo.upsert(
+            threadId: thread.id,
+            plan: AssistantProposedPlan(
+                id: "reopen-plan",
+                turnId: "turn-1",
+                markdown: "1. [completed] Phase\n2. [completed] Phase"
+            )
+        )
+        let vm = AgentAppViewModel(
+            workspaceID: workspaceID,
+            cwd: tmp,
+            coordinator: coordinator,
+            threadRepo: threadRepo,
+            messageRepo: messageRepo,
+            queuedMessageRepo: queuedRepo,
+            proposedPlanRepo: proposedPlanRepo,
+            promptHistoryStore: PromptHistoryStore(db: db)
+        )
+        installRunnableProviderFixtures(on: vm)
+
+        // Pet / openAgentThread path: selectThread rehydrates plans but must not send.
+        vm.selectThread(thread.id)
+        try await Task.sleep(nanoseconds: 200_000_000)
+
+        XCTAssertEqual(runner.prompts.count, 0,
+                       "reopening a full-access thread must not auto-start implement-plan")
+        XCTAssertEqual(try queuedRepo.list(threadId: thread.id).count, 0,
+                       "reopening must not queue Implement this proposed plan now")
+        XCTAssertFalse(
+            runner.prompts.contains(where: { $0.contains("Implement this proposed plan now") }),
+            "pet/open path must never inject the implement-plan prompt"
+        )
+        XCTAssertNotNil(vm.latestProposedPlan,
+                        "the proposed plan must still be visible after reopen")
+        XCTAssertTrue(vm.latestProposedPlan?.showsImplementationActions == true,
+                      "unimplemented plan stays reviewable for explicit Approve/auto paths")
+    }
+
     func test_supervisedKeepsProposedPlanReviewable() throws {
         let tmp = NSTemporaryDirectory() + "rc2-vm-agent-plan-supervised-review-" + UUID().uuidString
         let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
