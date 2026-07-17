@@ -703,6 +703,13 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
 
     private func emit(_ event: AssistantEvent, session: Session) {
         lock.lock()
+        // Drop late ACP noise after the turn terminal was published. Post-finish
+        // events were re-entering the coordinator with a cleared seq counter and
+        // colliding on durable seq 1 (servers_updated vs turnStarted).
+        if session.turnTerminalEmitted {
+            lock.unlock()
+            return
+        }
         session.history.append(event)
         let callback = session.onEvent
         lock.unlock()

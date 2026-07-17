@@ -268,6 +268,36 @@ final class GrokACPProtocolTests: XCTestCase {
                        "full-access permission mode must not mint proposedPlan from live plan progress")
     }
 
+    /// WHY: double finish (prompt complete + process exit) used to call ensureTurn
+    /// after turnId was cleared, minting a second turnStarted that collided with
+    /// durable seq 1 (often pre-turn servers_updated) once the coordinator cleared seq.
+    func test_mapperFinishTurnIsIdempotentAndDoesNotReopenTurnStarted() {
+        let mapper = GrokACPEventMapper(sessionId: "grok-finish-once")
+        let started = mapper.beginTurn()
+        XCTAssertEqual(started.filter { if case .turnStarted = $0 { return true }; return false }.count, 1)
+        let firstFinish = mapper.finishTurn(stopReason: "end_turn", usage: nil)
+        XCTAssertEqual(firstFinish.filter { if case .turnCompleted = $0 { return true }; return false }.count, 1)
+        let secondFinish = mapper.finishTurn(stopReason: "end_turn", usage: nil)
+        XCTAssertTrue(secondFinish.isEmpty,
+                      "second finishTurn must be a no-op")
+        XCTAssertFalse(secondFinish.contains { if case .turnStarted = $0 { return true }; return false },
+                       "second finish must not mint a new turnStarted")
+    }
+
+    func test_mapperIgnoresSessionUpdatesAfterFinishWithoutNewTurnStarted() {
+        let mapper = GrokACPEventMapper(sessionId: "grok-late-update")
+        _ = mapper.beginTurn()
+        _ = mapper.finishTurn(stopReason: "end_turn", usage: nil)
+        let late = mapper.consumeSessionUpdate([
+            "sessionUpdate": "agent_message_chunk",
+            "content": ["type": "text", "text": "late"]
+        ])
+        XCTAssertFalse(late.contains { if case .turnStarted = $0 { return true }; return false },
+                       "post-finish session updates must not reopen a turn")
+        XCTAssertFalse(late.contains { if case .itemDelta = $0 { return true }; return false },
+                       "post-finish content chunks must be dropped until the next beginTurn")
+    }
+
     func test_mapperTracksCommandsModeModelsAndUsage() {
         let mapper = GrokACPEventMapper(sessionId: "s")
         _ = mapper.consumeSessionUpdate(["sessionUpdate": "available_commands_update", "availableCommands": [["name": "compact", "description": "Compress"]]])

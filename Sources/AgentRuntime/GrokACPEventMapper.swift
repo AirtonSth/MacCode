@@ -57,6 +57,12 @@ public final class GrokACPEventMapper: @unchecked Sendable {
             return []
         }
         ensureThread(&events)
+        // After finishTurn, turnId is nil and finished is true. ensureTurn would
+        // mint a fresh turnStarted; if the coordinator already cleared seq for the
+        // run, that collides with durable seq 1 (often pre-turn servers_updated).
+        if finished {
+            return events
+        }
         ensureTurn(&events)
         let now = Self.now
         guard let kind = update["sessionUpdate"] as? String else { return events }
@@ -169,13 +175,21 @@ public final class GrokACPEventMapper: @unchecked Sendable {
         lock.lock(); defer { lock.unlock() }
         var events: [AssistantEvent] = []
         ensureThread(&events)
-        ensureTurn(&events)
+        // Idempotent: a second finish (prompt complete + process exit race) must
+        // not call ensureTurn after turnId was cleared — that re-opens turnStarted.
+        if finished {
+            return events
+        }
+        if turnId == nil {
+            // Error path: complete a turn that never received beginTurn.
+            ensureTurn(&events)
+        }
         if let usage, let parsed = Self.usage(usage) {
             latestUsage = parsed
             events.append(.tokenUsage(parsed))
         }
         closeOpenItems(&events)
-        guard let turnId, !finished else { return events }
+        guard let turnId else { return events }
         finished = true
         finalAssistantMessage = currentAssistantPhase.isEmpty ? nil : currentAssistantPhase
         events.append(.turnCompleted(turnId: turnId, finalMessage: finalAssistantMessage))

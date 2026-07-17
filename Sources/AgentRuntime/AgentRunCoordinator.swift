@@ -3059,12 +3059,19 @@ public final class AgentRunCoordinator: @unchecked Sendable {
 
     /// Next durable stream sequence for `runId`.
     ///
-    /// Must be called with `lock` held. Uses the higher of the in-memory counter
-    /// and any still-buffered seq for this run so a stop/cancel that retained a
-    /// failed flush cannot reissue seq 1 for a different event kind (which
+    /// Must be called with `lock` held. Uses the higher of the in-memory counter,
+    /// any still-buffered seq for this run, and durable MAX(seq) when the
+    /// in-memory counter was cleared (finish/stop) so a late Grok event cannot
+    /// reissue seq 1 for a different event kind (which
     /// `persistStreamEventIdempotently` rejects as a conflicting identity).
     private func allocateStreamSequenceLocked(runId: AgentRunID, threadId: AgentThreadID) -> Int {
         var high = seq[runId] ?? 0
+        if seq[runId] == nil {
+            // Finish/stop clear `seq` while durable rows remain. Re-seed before
+            // the next allocate so late providerRuntime/turnStarted cannot steal
+            // an already-committed identity.
+            high = max(high, (try? runRepo.maxStreamEventSeq(runId: runId)) ?? 0)
+        }
         if pendingStreamRunIds[threadId] == runId,
            let batch = pendingStreamWrites[threadId] {
             high = max(high, batch.highestSeq)
