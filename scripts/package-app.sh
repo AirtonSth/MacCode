@@ -128,6 +128,10 @@ if [ ! -d "$APP_SHELL_RESOURCES" ]; then
   echo "missing $APP_SHELL_RESOURCES" >&2
   exit 1
 fi
+# Canonical location only. Do NOT copy resource bundles to the .app root:
+# codesign rejects that as "unsealed contents present in the bundle root".
+# SPM's generated Bundle.module looks at the app root and fatalErrors — never
+# call Bundle.module from app code; use AppShellResourceBundle instead.
 cp -R "$APP_SHELL_RESOURCES" "$STAGING_APP/Contents/Resources/RemoteCode_AppShell.bundle"
 if [ -f "Resources/AppIcon.icns" ]; then
   cp "Resources/AppIcon.icns" "$STAGING_APP/Contents/Resources/AppIcon.icns"
@@ -199,6 +203,19 @@ printf 'APPL????' > "$STAGING_APP/Contents/PkgInfo"
 if command -v xattr >/dev/null 2>&1; then
   xattr -cr "$STAGING_APP" || true
 fi
+
+# Fail closed on resource layout before signing. Catches the Bundle.module /
+# Contents/Resources launch-crash class (pet atlas missing from either path).
+CHECK_APP_BUNDLE="$(cd "$(dirname "$0")" && pwd)/check-app-bundle.sh"
+if [ ! -x "$CHECK_APP_BUNDLE" ]; then
+  chmod +x "$CHECK_APP_BUNDLE" 2>/dev/null || true
+fi
+if [ ! -x "$CHECK_APP_BUNDLE" ]; then
+  echo "missing executable $CHECK_APP_BUNDLE" >&2
+  exit 1
+fi
+"$CHECK_APP_BUNDLE" "$STAGING_APP"
+
 # Prefer a stable Apple Development identity so macOS TCC "Allow" grants for
 # Network Volumes / Desktop / Documents / Downloads survive rebuilds.
 # Ad-hoc (`-`) re-binds TCC to a new CDHash whenever the app payload changes.
