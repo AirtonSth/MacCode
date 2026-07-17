@@ -295,6 +295,88 @@ final class AppIdentityNotificationTests: XCTestCase {
                        "the Mac must retain the paired iOS APNS target before it can ask private.remotecode.io to deliver alerts")
     }
 
+    func testPrivatePushTargetSavePreservesLiveActivityTokenWhenAlertReregistersWithoutIt() throws {
+        let dir = NSTemporaryDirectory() + "RC2PushTokenPreserve-" + UUID().uuidString
+        let ctx = try AppContext(channel: .debug, appSupportOverride: dir)
+        let store = PrivatePushTargetStore(repo: ctx.settingsRepo)
+
+        store.save(
+            pushToken: "apns-token",
+            pushTokenType: "apns",
+            liveActivityToken: "start-token",
+            deviceId: "device-1"
+        )
+        // iOS often re-registers the alert APNs token alone (Mac update / phone
+        // wake). That must not erase the push-to-start Live Activity token.
+        store.save(
+            pushToken: "apns-token-rotated",
+            pushTokenType: "apns",
+            liveActivityToken: nil,
+            deviceId: "device-1"
+        )
+
+        let stored = try XCTUnwrap(store.load())
+        XCTAssertEqual(stored.pushToken, "apns-token-rotated")
+        XCTAssertEqual(stored.liveActivityToken, "start-token",
+                       "nil liveActivityToken on alert re-register must preserve the stored start token across Mac updates")
+        XCTAssertEqual(stored.deviceId, "device-1")
+    }
+
+    func testPushToStartTokenSurvivesHostRebindAfterMacRelaunchWithoutDuplicatingRows() throws {
+        let dir = NSTemporaryDirectory() + "RC2PushTokenRebind-" + UUID().uuidString
+        let ctx = try AppContext(channel: .debug, appSupportOverride: dir)
+        let store = PrivatePushTargetStore(repo: ctx.settingsRepo)
+
+        try store.upsert(PrivatePushTargetRecord(
+            deviceId: "device-1",
+            serverId: "old-server-id",
+            purpose: .pushToStart,
+            environment: .sandbox,
+            token: "start-token",
+            activityGeneration: 1,
+            bootEpoch: 3,
+            activitySessionId: "old-server-id:3:1",
+            contractVersion: 2,
+            capabilities: ["live_activity_v2"]
+        ))
+        try store.upsert(PrivatePushTargetRecord(
+            deviceId: "device-1",
+            serverId: "old-server-id",
+            purpose: .alert,
+            environment: .sandbox,
+            token: "alert-token"
+        ))
+
+        let rebound = try store.rebindDurableTokens(toHostServerId: "fresh-server-id")
+        let records = try store.records()
+
+        XCTAssertEqual(rebound.count, 1)
+        XCTAssertEqual(rebound.first?.token, "start-token")
+        XCTAssertEqual(rebound.first?.serverId, "fresh-server-id")
+        XCTAssertEqual(Set(records.map(\.purpose)), [.alert, .pushToStart])
+        XCTAssertTrue(records.allSatisfy { $0.serverId == "fresh-server-id" })
+        XCTAssertTrue(records.allSatisfy { $0.bootEpoch == nil && $0.activitySessionId == nil },
+                      "durable tokens must not stay pinned to a dead boot epoch after Mac update")
+
+        // Second rebind / re-register with a new generation must replace, not stack.
+        try store.upsert(PrivatePushTargetRecord(
+            deviceId: "device-1",
+            serverId: "fresh-server-id",
+            purpose: .pushToStart,
+            environment: .sandbox,
+            token: "start-token-rotated",
+            activityGeneration: 99,
+            bootEpoch: 12,
+            activitySessionId: "fresh-server-id:12:99",
+            contractVersion: 2,
+            capabilities: ["live_activity_v2"]
+        ))
+        let afterUpsert = try store.records().filter { $0.purpose == .pushToStart }
+        XCTAssertEqual(afterUpsert.count, 1,
+                       "push-to-start identity must exclude boot epoch so Mac updates do not orphan tokens")
+        XCTAssertEqual(afterUpsert.first?.token, "start-token-rotated")
+    }
+
     func testUpdateTokenRPCAckReturnsMacAuthoritativeOwnershipInSnakeCase() throws {
         let dir = NSTemporaryDirectory() + "RC2LiveActivityOwnershipAck-" + UUID().uuidString
         let ctx = try AppContext(channel: .debug, appSupportOverride: dir)

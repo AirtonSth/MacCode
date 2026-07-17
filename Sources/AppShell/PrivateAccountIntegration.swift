@@ -759,10 +759,27 @@ public final class PrivatePushTargetStore: @unchecked Sendable {
         return try? decoder.decode(PrivatePushTarget.self, from: data)
     }
 
+    /// Persists the legacy single-device push target used by alert + Live Activity
+    /// delivery. **Never clobbers a stored Live Activity token with nil/empty** —
+    /// iOS often re-registers APNs alert tokens without re-sending the push-to-
+    /// start token (especially after a Mac app update when the phone stays idle).
     public func save(pushToken: String, pushTokenType: String, liveActivityToken: String?, deviceId: String?) {
+        let previous = load()
+        let resolvedLiveActivityToken: String?
+        if let liveActivityToken, !liveActivityToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            resolvedLiveActivityToken = liveActivityToken
+        } else {
+            resolvedLiveActivityToken = previous?.liveActivityToken
+        }
+        let resolvedDeviceId: String?
+        if let deviceId, !deviceId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            resolvedDeviceId = deviceId
+        } else {
+            resolvedDeviceId = previous?.deviceId
+        }
         let target = PrivatePushTarget(
-            deviceId: deviceId,
-            liveActivityToken: liveActivityToken,
+            deviceId: resolvedDeviceId,
+            liveActivityToken: resolvedLiveActivityToken,
             pushToken: pushToken,
             pushTokenType: pushTokenType,
             updatedAt: Date()
@@ -774,6 +791,46 @@ public final class PrivatePushTargetStore: @unchecked Sendable {
 
     public func clear() {
         try? repo.set(key, "")
+    }
+
+    /// After a Mac relaunch/update, rebind durable alert + push-to-start records
+    /// to the current host `serverId` so Live Activity start pushes still find a
+    /// target without requiring the user to open iOS first. Activity-update
+    /// tokens stay untouched (they are scoped to a specific activity generation).
+    @discardableResult
+    public func rebindDurableTokens(toHostServerId serverId: String) throws -> [PrivatePushTargetRecord] {
+        try lock.withLock {
+            let previous = try loadRecordsUnlocked()
+            var rebound: [PrivatePushTargetRecord] = []
+            var next: [PrivatePushTargetRecord] = []
+            for record in previous {
+                switch record.purpose {
+                case .alert, .pushToStart:
+                    let updated = PrivatePushTargetRecord(
+                        deviceId: record.deviceId,
+                        serverId: serverId,
+                        purpose: record.purpose,
+                        environment: record.environment,
+                        token: record.token,
+                        activityGeneration: record.activityGeneration,
+                        activityId: record.activityId,
+                        bootEpoch: nil,
+                        activitySessionId: nil,
+                        contractVersion: record.contractVersion,
+                        capabilities: record.capabilities,
+                        updatedAt: record.updatedAt
+                    )
+                    next.append(updated)
+                    if record.purpose == .pushToStart, updated.supportsLiveActivityV2 {
+                        rebound.append(updated)
+                    }
+                case .activityUpdate:
+                    next.append(record)
+                }
+            }
+            try saveRecordsUnlocked(next)
+            return rebound
+        }
     }
 
     public func records() throws -> [PrivatePushTargetRecord] {
@@ -824,15 +881,16 @@ public final class PrivatePushTargetStore: @unchecked Sendable {
         try repo.set(recordsKey, json)
     }
 
+    /// Durable identity for upsert. Deliberately excludes `bootEpoch`,
+    /// `activityGeneration`, and `activitySessionId` so a Mac relaunch/update
+    /// (which advances boot epoch) **replaces** the stored token instead of
+    /// stacking orphaned rows that break `acceptanceTargets` filters.
     private static func sameIdentity(_ lhs: PrivatePushTargetRecord, _ rhs: PrivatePushTargetRecord) -> Bool {
         lhs.deviceId == rhs.deviceId &&
         lhs.serverId == rhs.serverId &&
         lhs.purpose == rhs.purpose &&
         lhs.environment == rhs.environment &&
-        lhs.activityGeneration == rhs.activityGeneration &&
-        lhs.activityId == rhs.activityId &&
-        lhs.bootEpoch == rhs.bootEpoch &&
-        lhs.activitySessionId == rhs.activitySessionId
+        (lhs.purpose != .activityUpdate || lhs.activityId == rhs.activityId)
     }
 }
 
