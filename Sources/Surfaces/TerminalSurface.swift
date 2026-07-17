@@ -2102,7 +2102,12 @@ public final class TerminalSurface: NSObject, Surface, TerminalHistoryCoordinato
                ) {
                 return cached.value
             }
-            let complete = Self.readTextComplete(
+            // Match the visible path: complete requires canRender. Hidden always
+            // blocks render (logical_hidden), so complete stays false even after
+            // the ANSI mirror is healed. Otherwise idle hidden reads (pending=0)
+            // report complete=true with partial_reason=logical_hidden while the
+            // wire maps partial=!complete — dishonest to surface.read_text.
+            let complete = diagnostics.canRender && Self.readTextComplete(
                 outputPartial: outputPartial,
                 outputPendingBytes: outputPendingBytes,
                 historyWriteFailures: historyWriteFailures
