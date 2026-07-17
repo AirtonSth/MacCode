@@ -69,4 +69,16 @@ final class AgentLinkedInlineTextTests: XCTestCase {
         XCTAssertEqual(resolved, "Package.swift",
                        "click routing still needs remotecode-file query path after AppKit conversion")
     }
+
+    func test_applyTextStorage_preservesMultilineSelectionForIdenticalContent() {
+        let textView = IntrinsicHeightTextView(usingTextLayoutManager: false)
+        let value = NSAttributedString(string: "first line\nsecond line\nthird line")
+        AgentLinkedInlineTextRepresentable.applyTextStorage(value, to: textView)
+        textView.setSelectedRange(NSRange(location: 0, length: value.length))
+
+        AgentLinkedInlineTextRepresentable.applyTextStorage(value, to: textView)
+
+        XCTAssertEqual(textView.selectedRange(), NSRange(location: 0, length: value.length),
+                       "routine SwiftUI updates with unchanged text must not collapse an in-progress multiline transcript selection")
+    }
 }

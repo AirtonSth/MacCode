@@ -7114,12 +7114,10 @@ public struct AgentAppView: View {
             HStack(spacing: 0) {
                 Spacer(minLength: 32)
                 VStack(alignment: .trailing, spacing: DS.Space.xs) {
-                    Text(displayText)
-                        .font(DS.Font.body)
-                        .foregroundColor(DS.Palette.text)
-                        .textSelection(.enabled)
-                        .lineLimit(messageExpanded ? nil : 28)
-                        .truncationMode(.tail)
+                    AgentSelectablePlainText(
+                        text: displayText,
+                        maximumNumberOfLines: messageExpanded ? nil : 28
+                    )
                         .padding(.horizontal, 22)
                         .padding(.vertical, 14)
                         .background(DS.Palette.surface)
@@ -7811,7 +7809,6 @@ public struct AgentAppView: View {
                 height: $composerEditorHeight,
                 focusTick: vm.focusTick,
                 placeholder: "Ask \(vm.provider.rawValue.capitalized) for changes…",
-                isEnabled: vm.selectedProviderCanRun,
                 onSend: { Task { await vm.send() } },
                 onPreviousHistory: { vm.recallPreviousPrompt() },
                 onNextHistory: { vm.recallNextPrompt() },
@@ -8670,8 +8667,7 @@ public struct AgentAppView: View {
     }
 
     private var sendIdleDisabled: Bool {
-        !vm.selectedProviderCanRun
-            || (vm.prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && vm.attachments.isEmpty)
+        vm.prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && vm.attachments.isEmpty
     }
 
     private func selectThreadRow(_ thread: AgentThread) {
@@ -9385,7 +9381,6 @@ private struct PromptComposerEditor: NSViewRepresentable {
     @Binding var height: CGFloat
     let focusTick: Int
     let placeholder: String
-    let isEnabled: Bool
     let onSend: () -> Void
     let onPreviousHistory: () -> Bool
     let onNextHistory: () -> Bool
@@ -9414,6 +9409,8 @@ private struct PromptComposerEditor: NSViewRepresentable {
         let textView = PromptComposerTextView()
         textView.registerForDraggedTypes(DroppedFilePaths.pasteboardTypes)
         textView.isRichText = false
+        textView.isEditable = true
+        textView.isSelectable = true
         textView.isAutomaticQuoteSubstitutionEnabled = false
         textView.isAutomaticDashSubstitutionEnabled = false
         textView.isAutomaticTextReplacementEnabled = false
@@ -9464,7 +9461,6 @@ private struct PromptComposerEditor: NSViewRepresentable {
         textView.onPopupNavDown = onPopupNavDown
         textView.onPopupApply = onPopupApply
         textView.onPopupDismiss = onPopupDismiss
-        textView.isEditable = isEnabled
         textView.placeholderString = placeholder
         // Do not clobber an in-progress dead-key / IME composition: replacing
         // `string` while marked text is active aborts accents (ç/á/é) and CJK.
@@ -9473,7 +9469,7 @@ private struct PromptComposerEditor: NSViewRepresentable {
         }
         context.coordinator.recalculateHeight()
         scroll.hasVerticalScroller = height >= Self.maxHeight
-        if isEnabled, context.coordinator.appliedFocusTick != focusTick {
+        if context.coordinator.appliedFocusTick != focusTick {
             context.coordinator.appliedFocusTick = focusTick
             DispatchQueue.main.async {
                 guard let window = textView.window, window.firstResponder !== textView else { return }

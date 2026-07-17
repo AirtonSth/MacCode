@@ -58,18 +58,14 @@ struct AgentLinkedInlineText: View {
     /// Extra spacing between lines (points), matching SwiftUI `.lineSpacing`.
     var lineSpacing: CGFloat = 0
 
-    @Environment(\.openURL) private var openURL
-
     var body: some View {
-        AgentLinkedInlineTextRepresentable(
+        AgentLinkedAttributedText(
             attributed: AgentMessageMarkdown.attributedInline(text),
             font: Self.nsFont(size: fontSize, weight: fontWeight, monospaced: monospaced),
             textColor: textColor,
             lineFragmentPadding: lineFragmentPadding,
-            lineSpacing: lineSpacing,
-            openURL: openURL
+            lineSpacing: lineSpacing
         )
-        .fixedSize(horizontal: false, vertical: true)
     }
 
     static func nsFont(size: CGFloat, weight: NSFont.Weight, monospaced: Bool) -> NSFont {
@@ -80,6 +76,49 @@ struct AgentLinkedInlineText: View {
     }
 }
 
+struct AgentSelectablePlainText: View {
+    let text: String
+    var fontSize: CGFloat = 13
+    var textColor: NSColor = DS.NS.text
+    var lineSpacing: CGFloat = 0
+    var maximumNumberOfLines: Int? = nil
+
+    var body: some View {
+        AgentLinkedAttributedText(
+            attributed: AttributedString(text),
+            font: .systemFont(ofSize: fontSize),
+            textColor: textColor,
+            lineFragmentPadding: 0,
+            lineSpacing: lineSpacing,
+            maximumNumberOfLines: maximumNumberOfLines
+        )
+    }
+}
+
+struct AgentLinkedAttributedText: View {
+    let attributed: AttributedString
+    let font: NSFont
+    let textColor: NSColor
+    let lineFragmentPadding: CGFloat
+    let lineSpacing: CGFloat
+    var maximumNumberOfLines: Int? = nil
+
+    @Environment(\.openURL) private var openURL
+
+    var body: some View {
+        AgentLinkedInlineTextRepresentable(
+            attributed: attributed,
+            font: font,
+            textColor: textColor,
+            lineFragmentPadding: lineFragmentPadding,
+            lineSpacing: lineSpacing,
+            maximumNumberOfLines: maximumNumberOfLines,
+            openURL: openURL
+        )
+        .fixedSize(horizontal: false, vertical: true)
+    }
+}
+
 /// Internal so unit tests can assert link runs carry pointingHand after conversion.
 struct AgentLinkedInlineTextRepresentable: NSViewRepresentable {
     let attributed: AttributedString
@@ -87,6 +126,7 @@ struct AgentLinkedInlineTextRepresentable: NSViewRepresentable {
     let textColor: NSColor
     let lineFragmentPadding: CGFloat
     let lineSpacing: CGFloat
+    var maximumNumberOfLines: Int? = nil
     let openURL: OpenURLAction
 
     func makeCoordinator() -> Coordinator {
@@ -136,25 +176,28 @@ struct AgentLinkedInlineTextRepresentable: NSViewRepresentable {
     }
 
     private func apply(to tv: IntrinsicHeightTextView, context: Context) {
+        tv.textContainer?.maximumNumberOfLines = maximumNumberOfLines ?? 0
+        tv.textContainer?.lineBreakMode = maximumNumberOfLines == nil ? .byWordWrapping : .byTruncatingTail
         let ns = Self.makeNSAttributedString(
             attributed: attributed,
             font: font,
             textColor: textColor,
             lineSpacing: lineSpacing
         )
-        let current = tv.textStorage?.string ?? ""
-        let next = ns.string
-        // Avoid resetting selection on pure re-layouts of identical content.
-        if current != next || tv.textStorage?.length != ns.length {
-            tv.textStorage?.setAttributedString(ns)
-        } else {
-            // Font/color may still change without string change.
-            tv.textStorage?.setAttributedString(ns)
-        }
+        Self.applyTextStorage(ns, to: tv)
         tv.font = font
         tv.textColor = textColor
         tv.invalidateIntrinsicContentSize()
         tv.needsLayout = true
+    }
+
+    static func applyTextStorage(_ next: NSAttributedString, to textView: NSTextView) {
+        guard textView.textStorage?.isEqual(to: next) != true else { return }
+        let selection = textView.selectedRange()
+        textView.textStorage?.setAttributedString(next)
+        let location = min(selection.location, next.length)
+        let length = min(selection.length, next.length - location)
+        textView.setSelectedRange(NSRange(location: location, length: length))
     }
 
     static func makeNSAttributedString(
