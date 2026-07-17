@@ -1,4 +1,5 @@
 import Foundation
+import CoreModel
 
 public enum PetAttentionOutcome: Sendable, Equatable {
     case completed
@@ -27,15 +28,30 @@ public enum PetAttentionKind: Sendable, Equatable {
 public struct PetAttentionContext: Sendable, Equatable {
     public let workspaceName: String?
     public let providerName: String?
+    /// Agent thread display title (user-visible label). Credentials are redacted.
+    public let threadTitle: String?
+    /// Fixed human label for approval/request kind (never raw command text).
+    public let actionLabel: String?
+    /// Preformatted elapsed label for in-flight runs (e.g. "2m").
+    public let elapsedLabel: String?
 
-    public init(workspaceName: String? = nil, providerName: String? = nil) {
+    public init(
+        workspaceName: String? = nil,
+        providerName: String? = nil,
+        threadTitle: String? = nil,
+        actionLabel: String? = nil,
+        elapsedLabel: String? = nil
+    ) {
         self.workspaceName = workspaceName
         self.providerName = providerName
+        self.threadTitle = threadTitle
+        self.actionLabel = actionLabel
+        self.elapsedLabel = elapsedLabel
     }
 }
 
 /// Raw provider/operation text may be supplied by integration code for diagnostics,
-/// but is deliberately ignored by `PetAttentionPresentation.safe`.
+/// but is deliberately ignored by `PetAttentionPresentation.safe` (not used as primary title).
 public struct PetAttentionRawContent: Sendable, Equatable {
     public let title: String?
     public let detail: String?
@@ -55,13 +71,19 @@ public struct PetAttentionPresentation: Sendable, Equatable {
         self.detail = detail
     }
 
+    /// Secondary line format: `workspace - provider - thread title - elapsed`
+    /// (missing parts omitted).
+    public static let detailSeparator = " - "
+
     public static func safe(
         kind: PetAttentionKind,
         context: PetAttentionContext = PetAttentionContext(),
         untrusted: PetAttentionRawContent? = nil
     ) -> PetAttentionPresentation {
-        // Explicitly discard prompts, commands, paths, tokens, and provider detail.
-        // The fixed copy below is the privacy boundary for the always-on-top window.
+        // Primary title stays fixed (outcome / action type only). Untrusted provider
+        // prompts/commands never become the headline. Workspace, provider, thread
+        // title, and elapsed appear only on the secondary line after credential
+        // redaction + length caps.
         _ = untrusted
 
         let title: String
@@ -70,7 +92,12 @@ public struct PetAttentionPresentation: Sendable, Equatable {
         case .agentOutcome(.failed): title = "Agent run failed"
         case .agentOutcome(.interrupted): title = "Agent run interrupted"
         case .agentRunning: title = "Agent run in progress"
-        case .approval: title = "Approval required"
+        case .approval:
+            if let action = PetAttentionRedactor.safeContextLabel(context.actionLabel) {
+                title = "Approve: \(action)"
+            } else {
+                title = "Approval required"
+            }
         case .question(isSecret: false): title = "Input requested"
         case .question(isSecret: true): title = "Secret input requested"
         case .fileConflict: title = "File conflict needs review"
@@ -84,12 +111,57 @@ public struct PetAttentionPresentation: Sendable, Equatable {
         case .serverListenerFailed: title = "Remote Code listener needs attention"
         }
 
-        let contextParts = [context.workspaceName, context.providerName]
-            .compactMap(PetAttentionRedactor.safeContextLabel)
+        let displayThreadTitle = Self.safeThreadTitle(context.threadTitle)
+        let contextParts = [
+            context.workspaceName,
+            context.providerName,
+            displayThreadTitle,
+            context.elapsedLabel
+        ].compactMap(PetAttentionRedactor.safeContextLabel)
         return PetAttentionPresentation(
             title: title,
-            detail: contextParts.isEmpty ? nil : contextParts.joined(separator: " · ")
+            detail: contextParts.isEmpty ? nil : contextParts.joined(separator: detailSeparator)
         )
+    }
+
+    /// Truncates for row density and drops placeholder thread names.
+    public static func safeThreadTitle(_ raw: String?) -> String? {
+        guard let raw else { return nil }
+        guard !AgentThreadTitle.isPlaceholder(raw) else { return nil }
+        return AgentThreadTitle.display(raw)
+    }
+}
+
+public enum PetApprovalActionLabel {
+    /// Fixed copy for pending-request kinds. Never returns command text or paths.
+    public static func label(for kind: AssistantRequestKind) -> String {
+        switch kind {
+        case .commandExecution, .exec: return "Run command"
+        case .applyPatch: return "Apply patch"
+        case .fileChange: return "Edit file"
+        case .fileRead: return "Read file"
+        case .toolUserInput: return "Tool input"
+        case .authTokensRefresh: return "Refresh auth"
+        case .dynamic: return "Tool"
+        }
+    }
+}
+
+public enum PetElapsedFormatter {
+    /// Compact elapsed for always-on-top rows. Nil when start is in the future or invalid.
+    public static func label(from startedAt: Date, now: Date = Date()) -> String? {
+        let seconds = Int(now.timeIntervalSince(startedAt))
+        guard seconds >= 0 else { return nil }
+        if seconds < 60 { return "\(max(seconds, 0))s" }
+        let minutes = seconds / 60
+        if minutes < 60 { return "\(minutes)m" }
+        let hours = minutes / 60
+        let remMinutes = minutes % 60
+        if hours < 48 {
+            return remMinutes == 0 ? "\(hours)h" : "\(hours)h \(remMinutes)m"
+        }
+        let days = hours / 24
+        return "\(days)d"
     }
 }
 

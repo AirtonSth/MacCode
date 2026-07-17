@@ -102,6 +102,7 @@ public struct PetAttentionItem: Sendable, Equatable, Identifiable {
     public let kind: PetAttentionItemKind
     public let title: String
     public let detail: String?
+    public let workspaceName: String?
     public let createdAt: Date
     public let route: PetAttentionRoute
     public let source: PetAttentionSource
@@ -111,6 +112,7 @@ public struct PetAttentionItem: Sendable, Equatable, Identifiable {
         kind: PetAttentionItemKind,
         title: String,
         detail: String?,
+        workspaceName: String? = nil,
         createdAt: Date,
         route: PetAttentionRoute,
         source: PetAttentionSource
@@ -119,6 +121,7 @@ public struct PetAttentionItem: Sendable, Equatable, Identifiable {
         self.kind = kind
         self.title = title
         self.detail = detail
+        self.workspaceName = workspaceName
         self.createdAt = createdAt
         self.route = route
         self.source = source
@@ -139,26 +142,39 @@ public struct PetAttentionSnapshot: Sendable, Equatable {
     public var count: Int { items.count }
 }
 
-/// In-flight agent thread row for the pet popover. Titles are fixed privacy-safe
-/// copy; membership is supplied by the live active-run projection, not thread
-/// status rows that can lag after crashes.
+/// In-flight agent thread row for the pet popover. Primary title is fixed
+/// privacy-safe copy; secondary detail shows workspace, provider, thread
+/// title (redacted), and optional elapsed. Membership comes from the live
+/// active-run projection.
 public struct PetActiveThreadItem: Sendable, Equatable, Identifiable {
     public let id: String
     public let threadID: AgentThreadID
     public let title: String
     public let detail: String?
+    public let workspaceName: String?
     public let route: PetAttentionRoute
 
     public init(
         threadID: AgentThreadID,
         workspaceID: WorkspaceID?,
-        providerName: String?
+        workspaceName: String? = nil,
+        providerName: String? = nil,
+        threadTitle: String? = nil,
+        startedAt: Date? = nil,
+        now: Date = Date()
     ) {
         self.id = "active:\(threadID.value.uuidString)"
         self.threadID = threadID
+        self.workspaceName = workspaceName
+        let elapsed = startedAt.flatMap { PetElapsedFormatter.label(from: $0, now: now) }
         let presentation = PetAttentionPresentation.safe(
             kind: .agentRunning,
-            context: PetAttentionContext(providerName: providerName)
+            context: PetAttentionContext(
+                workspaceName: workspaceName,
+                providerName: providerName,
+                threadTitle: threadTitle,
+                elapsedLabel: elapsed
+            )
         )
         self.title = presentation.title
         self.detail = presentation.detail
@@ -167,9 +183,18 @@ public struct PetActiveThreadItem: Sendable, Equatable, Identifiable {
 }
 
 public enum PetActiveThreadProjector {
+    public typealias ThreadMeta = (
+        workspaceID: WorkspaceID?,
+        workspaceName: String?,
+        providerName: String?,
+        threadTitle: String?,
+        startedAt: Date?
+    )
+
     public static func items(
         threadIDs: [AgentThreadID],
-        lookup: (AgentThreadID) -> (workspaceID: WorkspaceID?, providerName: String?)?
+        now: Date = Date(),
+        lookup: (AgentThreadID) -> ThreadMeta?
     ) -> [PetActiveThreadItem] {
         let unique = Array(Set(threadIDs)).sorted {
             $0.value.uuidString < $1.value.uuidString
@@ -179,7 +204,11 @@ public enum PetActiveThreadProjector {
             return PetActiveThreadItem(
                 threadID: threadID,
                 workspaceID: meta?.workspaceID,
-                providerName: meta?.providerName
+                workspaceName: meta?.workspaceName,
+                providerName: meta?.providerName,
+                threadTitle: meta?.threadTitle,
+                startedAt: meta?.startedAt,
+                now: now
             )
         }
     }
@@ -189,6 +218,56 @@ public enum PetActiveThreadProjector {
         case .codex: return "Codex"
         case .claude: return "Claude"
         case .grok: return "Grok"
+        }
+    }
+}
+
+/// Groups popover rows under workspace headers while preserving relative order.
+public enum PetPopoverGrouping {
+    public static let unknownWorkspaceName = "Other"
+
+    public struct Group<Item: Identifiable>: Identifiable {
+        public let id: String
+        public let name: String
+        public let items: [Item]
+
+        public init(name: String, items: [Item]) {
+            self.id = name
+            self.name = name
+            self.items = items
+        }
+    }
+
+    public static func active(_ items: [PetActiveThreadItem]) -> [Group<PetActiveThreadItem>] {
+        group(items) { $0.workspaceName }
+    }
+
+    public static func attention(_ items: [PetAttentionItem]) -> [Group<PetAttentionItem>] {
+        group(items) { $0.workspaceName }
+    }
+
+    private static func group<Item: Identifiable>(
+        _ items: [Item],
+        name: (Item) -> String?
+    ) -> [Group<Item>] {
+        var order: [String] = []
+        var buckets: [String: [Item]] = [:]
+        for item in items {
+            let key = PetAttentionRedactor.safeContextLabel(name(item)) ?? unknownWorkspaceName
+            if buckets[key] == nil {
+                order.append(key)
+                buckets[key] = []
+            }
+            buckets[key, default: []].append(item)
+        }
+        // Stable: named workspaces alphabetically, "Other" last, items keep input order.
+        let named = order.filter { $0 != unknownWorkspaceName }.sorted {
+            $0.localizedCaseInsensitiveCompare($1) == .orderedAscending
+        }
+        let keys = named + (order.contains(unknownWorkspaceName) ? [unknownWorkspaceName] : [])
+        return keys.compactMap { key in
+            guard let groupItems = buckets[key], !groupItems.isEmpty else { return nil }
+            return Group(name: key, items: groupItems)
         }
     }
 }

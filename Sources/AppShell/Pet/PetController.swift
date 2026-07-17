@@ -86,7 +86,10 @@ public final class PetController {
             callbackRepository: context.providerPendingCallbackRepo,
             notificationRepository: NotificationRepository(db: context.db),
             markAgentThreadRead: { try router.markAgentThreadRead(thread: $0) },
-            markNotificationRead: { try router.notificationMarkRead(id: $0) }
+            markNotificationRead: { try router.notificationMarkRead(id: $0) },
+            workspaceNameProvider: { [weak context] workspaceID in
+                context?.state.workspaces[workspaceID]?.name
+            }
         )
         self.notificationRecorder = PetTerminalNotificationRecorder(
             repository: NotificationRepository(db: context.db)
@@ -642,17 +645,34 @@ public final class PetController {
     }
 
     private func applyActiveRunProjection(_ projection: ActiveRunProjection) {
-        applyActiveThreadIDs(projection.runs.map(\.threadId))
+        var startedByThread: [AgentThreadID: Date] = [:]
+        for run in projection.runs {
+            guard let startedAt = try? context.runRepo.get(id: run.runId)?.startedAt else { continue }
+            if let existing = startedByThread[run.threadId] {
+                startedByThread[run.threadId] = min(existing, startedAt)
+            } else {
+                startedByThread[run.threadId] = startedAt
+            }
+        }
+        applyActiveThreadIDs(projection.runs.map(\.threadId), startedByThread: startedByThread)
     }
 
-    private func applyActiveThreadIDs(_ threadIDs: [AgentThreadID]) {
+    private func applyActiveThreadIDs(
+        _ threadIDs: [AgentThreadID],
+        startedByThread: [AgentThreadID: Date] = [:]
+    ) {
         let items = PetActiveThreadProjector.items(threadIDs: threadIDs) { [weak self] threadID in
-            guard let thread = try? self?.context.threadRepo.get(id: threadID) else {
+            guard let self,
+                  let thread = try? self.context.threadRepo.get(id: threadID) else {
                 return nil
             }
+            let workspaceName = thread.workspaceId.flatMap { self.context.state.workspaces[$0]?.name }
             return (
                 workspaceID: thread.workspaceId,
-                providerName: PetActiveThreadProjector.providerLabel(thread.provider)
+                workspaceName: workspaceName,
+                providerName: PetActiveThreadProjector.providerLabel(thread.provider),
+                threadTitle: thread.title,
+                startedAt: startedByThread[threadID]
             )
         }
         model.apply(activeThreads: items)

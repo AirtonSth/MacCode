@@ -1,5 +1,6 @@
 import XCTest
 @testable import AppShell
+import CoreModel
 
 final class PetAttentionPresentationTests: XCTestCase {
     func test_badgeHidesAtZeroCapsAtNinetyNinePlusAndHonorsSetting() {
@@ -82,9 +83,9 @@ final class PetAttentionPresentationTests: XCTestCase {
         )
 
         XCTAssertEqual(approval.title, "Approval required")
-        XCTAssertEqual(approval.detail, "Remote Code · Codex")
+        XCTAssertEqual(approval.detail, "Remote Code - Codex")
         XCTAssertEqual(secretQuestion.title, "Secret input requested")
-        XCTAssertEqual(secretQuestion.detail, "Remote Code · Codex")
+        XCTAssertEqual(secretQuestion.detail, "Remote Code - Codex")
         for output in [approval.title, approval.detail, secretQuestion.title, secretQuestion.detail].compactMap({ $0 }) {
             XCTAssertFalse(output.contains("rm -rf"))
             XCTAssertFalse(output.contains("/Users/"))
@@ -172,5 +173,133 @@ final class PetAttentionPresentationTests: XCTestCase {
             ).detail,
             "Workspace"
         )
+    }
+
+    func test_agentRunDetailJoinsWorkspaceProviderAndThreadTitle() {
+        let presentation = PetAttentionPresentation.safe(
+            kind: .agentRunning,
+            context: PetAttentionContext(
+                workspaceName: "star",
+                providerName: "Grok",
+                threadTitle: "make title for pet notifications"
+            )
+        )
+        XCTAssertEqual(presentation.title, "Agent run in progress")
+        XCTAssertEqual(
+            presentation.detail,
+            "star - Grok - \(AgentThreadTitle.display("make title for pet notifications"))"
+        )
+
+        let completed = PetAttentionPresentation.safe(
+            kind: .agentOutcome(.completed),
+            context: PetAttentionContext(
+                workspaceName: "star",
+                providerName: "Grok",
+                threadTitle: "make title…"
+            )
+        )
+        XCTAssertEqual(completed.title, "Agent run completed")
+        XCTAssertEqual(completed.detail, "star - Grok - make title…")
+
+        let providerOnly = PetAttentionPresentation.safe(
+            kind: .agentRunning,
+            context: PetAttentionContext(providerName: "Grok")
+        )
+        XCTAssertEqual(providerOnly.detail, "Grok")
+
+        let redacted = PetAttentionPresentation.safe(
+            kind: .agentRunning,
+            context: PetAttentionContext(
+                workspaceName: "star",
+                providerName: "Grok",
+                threadTitle: "fix auth password=hunter2"
+            )
+        )
+        XCTAssertEqual(redacted.detail, "star - Grok - fix auth password=[redacted]")
+        XCTAssertFalse(redacted.detail?.contains("hunter2") == true)
+
+        let placeholderOmitted = PetAttentionPresentation.safe(
+            kind: .agentRunning,
+            context: PetAttentionContext(
+                workspaceName: "star",
+                providerName: "Grok",
+                threadTitle: AgentThreadTitle.defaultTitle
+            )
+        )
+        XCTAssertEqual(placeholderOmitted.detail, "star - Grok")
+    }
+
+    func test_approvalTitlesUseFixedActionLabelsNotRawCommands() {
+        let approve = PetAttentionPresentation.safe(
+            kind: .approval,
+            context: PetAttentionContext(
+                workspaceName: "star",
+                providerName: "Grok",
+                threadTitle: "ship labels",
+                actionLabel: PetApprovalActionLabel.label(for: .commandExecution)
+            ),
+            untrusted: PetAttentionRawContent(
+                title: "Run rm -rf /Users/private",
+                detail: "password=hunter2"
+            )
+        )
+        XCTAssertEqual(approve.title, "Approve: Run command")
+        XCTAssertEqual(approve.detail, "star - Grok - ship labels")
+        XCTAssertFalse(approve.title.contains("rm -rf"))
+        XCTAssertFalse(approve.detail?.contains("hunter2") == true)
+
+        XCTAssertEqual(PetApprovalActionLabel.label(for: .fileChange), "Edit file")
+        XCTAssertEqual(PetApprovalActionLabel.label(for: .applyPatch), "Apply patch")
+        XCTAssertEqual(PetApprovalActionLabel.label(for: .fileRead), "Read file")
+    }
+
+    func test_elapsedFormatterAndRunningDetailAppendElapsed() {
+        let start = Date(timeIntervalSince1970: 1_000)
+        XCTAssertEqual(PetElapsedFormatter.label(from: start, now: start.addingTimeInterval(12)), "12s")
+        XCTAssertEqual(PetElapsedFormatter.label(from: start, now: start.addingTimeInterval(125)), "2m")
+        XCTAssertEqual(PetElapsedFormatter.label(from: start, now: start.addingTimeInterval(3_700)), "1h 1m")
+        XCTAssertNil(PetElapsedFormatter.label(from: start, now: start.addingTimeInterval(-5)))
+
+        let running = PetAttentionPresentation.safe(
+            kind: .agentRunning,
+            context: PetAttentionContext(
+                workspaceName: "star",
+                providerName: "Grok",
+                threadTitle: "labels",
+                elapsedLabel: "2m"
+            )
+        )
+        XCTAssertEqual(running.detail, "star - Grok - labels - 2m")
+    }
+
+    func test_popoverGroupsByWorkspaceAlphabeticallyWithOtherLast() {
+        let a = PetActiveThreadItem(
+            threadID: AgentThreadID(UUID(uuidString: "AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA")!),
+            workspaceID: nil,
+            workspaceName: "zeta",
+            providerName: "Grok",
+            threadTitle: "z"
+        )
+        let b = PetActiveThreadItem(
+            threadID: AgentThreadID(UUID(uuidString: "BBBBBBBB-BBBB-BBBB-BBBB-BBBBBBBBBBBB")!),
+            workspaceID: nil,
+            workspaceName: "alpha",
+            providerName: "Grok",
+            threadTitle: "a"
+        )
+        let c = PetActiveThreadItem(
+            threadID: AgentThreadID(UUID(uuidString: "CCCCCCCC-CCCC-CCCC-CCCC-CCCCCCCCCCCC")!),
+            workspaceID: nil,
+            workspaceName: nil,
+            providerName: "Claude",
+            threadTitle: "other"
+        )
+        let groups = PetPopoverGrouping.active([a, b, c])
+        XCTAssertEqual(groups.map(\.name), ["alpha", "zeta", "Other"])
+        XCTAssertEqual(groups.map { $0.items.map(\.threadID) }, [
+            [b.threadID],
+            [a.threadID],
+            [c.threadID]
+        ])
     }
 }

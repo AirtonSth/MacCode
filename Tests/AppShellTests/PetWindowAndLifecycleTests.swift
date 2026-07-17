@@ -254,20 +254,30 @@ final class PetWindowAndLifecycleTests: XCTestCase {
         let secretTitle = "Run rm -rf /Users/private token=secret-token"
 
         let projected = PetActiveThreadProjector.items(
-            threadIDs: [threadA, threadA, threadB]
+            threadIDs: [threadA, threadA, threadB],
+            now: Date(timeIntervalSince1970: 1_000)
         ) { id in
             (
                 workspaceID: WorkspaceID(UUID(uuidString: "CCCCCCCC-CCCC-CCCC-CCCC-CCCCCCCCCCCC")!),
-                providerName: id == threadA ? "Codex" : "Claude"
+                workspaceName: "star",
+                providerName: id == threadA ? "Codex" : "Claude",
+                threadTitle: id == threadA ? "make title for agent run" : secretTitle,
+                startedAt: id == threadA ? Date(timeIntervalSince1970: 880) : nil
             )
         }
 
         XCTAssertEqual(projected.count, 2, "Duplicate run IDs for one thread must count once.")
         XCTAssertEqual(projected.map(\.title), ["Agent run in progress", "Agent run in progress"])
-        XCTAssertEqual(projected.map(\.detail), ["Codex", "Claude"])
+        XCTAssertEqual(
+            projected.map(\.detail),
+            [
+                "star - Codex - make title for agent run - 2m",
+                "star - Claude - \(AgentThreadTitle.display(secretTitle))"
+            ]
+        )
         for item in projected {
             XCTAssertFalse(item.title.contains(secretTitle))
-            XCTAssertFalse(item.detail?.contains(secretTitle) == true)
+            XCTAssertFalse(item.detail?.contains("secret-token") == true)
             XCTAssertFalse(item.id.contains("secret"))
         }
 
@@ -383,7 +393,7 @@ final class PetWindowAndLifecycleTests: XCTestCase {
         XCTAssertTrue(thread.hasUnread, "Runtime observation must not clear attention without a verified route.")
     }
 
-    func test_controllerProjectsActiveThreadsFromAuthoritativeProjectionWithoutLeakingTitles() async throws {
+    func test_controllerProjectsActiveThreadsWithWorkspaceProviderAndRedactedTitle() async throws {
         let directory = NSTemporaryDirectory() + "RC2PetActiveThreads-\(UUID().uuidString)"
         let context = try AppContext(channel: .debug, appSupportOverride: directory)
         let router = AppCommandRouter(context: context)
@@ -440,10 +450,14 @@ final class PetWindowAndLifecycleTests: XCTestCase {
         )
         let row = try XCTUnwrap(controller.modelForTests.activeThreads.first)
         XCTAssertEqual(row.title, "Agent run in progress")
-        XCTAssertEqual(row.detail, "Codex")
+        // Display truncation + redaction keep credentials out of the always-on-top row.
+        XCTAssertEqual(
+            row.detail,
+            "Pet - Codex - \(AgentThreadTitle.display(secretTitle))"
+        )
         XCTAssertFalse(row.title.contains("rm -rf"))
         XCTAssertFalse(row.detail?.contains("secret-token") == true)
-        XCTAssertFalse(controller.modelForTests.accessibilityValue.contains(secretTitle))
+        XCTAssertFalse(controller.modelForTests.accessibilityValue.contains("secret-token"))
 
         context.coordinator.onActiveRunProjectionChanged?(
             ActiveRunProjection(runs: []),
