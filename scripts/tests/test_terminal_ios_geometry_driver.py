@@ -535,7 +535,8 @@ class TerminalIOSGeometryDriverProofContractTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
-        self.sync_dir = Path(self.temporary.name)
+        # matching_identity canonicalizes canary roots; fixtures must too.
+        self.sync_dir = Path(self.temporary.name).resolve(strict=True)
         self.args = SimpleNamespace(
             host="127.0.0.1",
             port=28_217,
@@ -626,13 +627,52 @@ class TerminalIOSGeometryDriverProofContractTests(unittest.TestCase):
         with self.assertRaisesRegex(DRIVER.Failure, "fixed_grid or flow"):
             DRIVER.expected_renderer_ax_role("automatic")
 
-    def test_output_request_rejects_ax_role_from_another_renderer(self):
-        # WHY: auto-detecting a convenient AX node could silently run the
-        # fixed-grid proof while claiming flow, or vice versa.
-        self.args.startup_timeout_seconds = 0.1
-        nonce = "A" * 32
+    def test_cli_requires_exact_renderer_mode(self):
+        # WHY: missing or invented modes would let the iOS side measure a
+        # different renderer than the macOS driver prepared.
+        base = [
+            str(SCRIPT),
+            "--sync-dir",
+            str(self.sync_dir),
+            "--host",
+            "127.0.0.1",
+            "--port",
+            "28217",
+            "--run-id",
+            "unit-run",
+            "--profile",
+            "unit-profile",
+            "--canary-root",
+            str(self.sync_dir),
+            "--canary-pid",
+            "91337",
+            "--workspace-id",
+            "11111111-1111-4111-8111-111111111111",
+            "--surface-id",
+            "22222222-2222-4222-8222-222222222222",
+            "--split-id",
+            "33333333-3333-4333-8333-333333333333",
+            "--validate-only",
+        ]
+        with mock.patch.object(sys, "argv", base), self.assertRaises(SystemExit):
+            DRIVER.parse_args()
+        with mock.patch.object(
+            sys,
+            "argv",
+            base + ["--renderer-mode", "automatic"],
+        ), self.assertRaises(SystemExit):
+            DRIVER.parse_args()
+        with mock.patch.object(
+            sys,
+            "argv",
+            base + ["--renderer-mode", "fixed_grid"],
+        ):
+            parsed = DRIVER.parse_args()
+        self.assertEqual(parsed.renderer_mode, "fixed_grid")
+
+    def _output_request(self, *, renderer_mode, ax_role_before, nonce="A" * 32):
         value = DRIVER.expected_mirror_value(nonce, "output", 0)
-        request = {
+        return {
             "mode": DRIVER.HOST_MIRROR_MODE,
             "runID": self.args.run_id,
             "nonce": nonce,
@@ -649,11 +689,22 @@ class TerminalIOSGeometryDriverProofContractTests(unittest.TestCase):
             "value": value,
             "rows": 40,
             "cols": 120,
-            "rendererMode": "fixed_grid",
-            "axRoleBefore": "Other",
+            "rendererMode": renderer_mode,
+            "axRoleBefore": ax_role_before,
             "createdAtEpochMs": DRIVER.epoch_milliseconds(),
             "deadlineEpochMs": DRIVER.epoch_milliseconds() + 1_000,
         }
+
+    def test_output_request_rejects_ax_role_from_another_renderer(self):
+        # WHY: auto-detecting a convenient AX node could silently run the
+        # fixed-grid proof while claiming flow, or vice versa.
+        self.args.startup_timeout_seconds = 0.1
+        nonce = "A" * 32
+        request = self._output_request(
+            renderer_mode="fixed_grid",
+            ax_role_before="Other",
+            nonce=nonce,
+        )
         DRIVER.atomic_write_json(
             DRIVER.mirror_protocol_path(
                 self.sync_dir, nonce, "output", 0, "request"
@@ -663,6 +714,91 @@ class TerminalIOSGeometryDriverProofContractTests(unittest.TestCase):
 
         with self.assertRaisesRegex(DRIVER.Failure, "AX role"):
             DRIVER.wait_for_mirror_request(self.args, nonce, "output", 0)
+
+    def test_output_request_rejects_cross_mode_renderer_artifact(self):
+        # WHY: a flow-prepared host must not accept fixed_grid request files.
+        self.args.startup_timeout_seconds = 0.1
+        self.args.renderer_mode = "flow"
+        nonce = "B" * 32
+        request = self._output_request(
+            renderer_mode="fixed_grid",
+            ax_role_before="StaticText",
+            nonce=nonce,
+        )
+        DRIVER.atomic_write_json(
+            DRIVER.mirror_protocol_path(
+                self.sync_dir, nonce, "output", 0, "request"
+            ),
+            request,
+        )
+
+        with self.assertRaisesRegex(DRIVER.Failure, "renderer mode"):
+            DRIVER.wait_for_mirror_request(self.args, nonce, "output", 0)
+
+    def test_flow_cleanup_runs_after_protocol_failure(self):
+        # WHY: nested-shell flow setup must not leave the canary dirty when the
+        # formal sample loop fails after setup succeeds.
+        controller = mock.Mock()
+        controller.ensure_ready.return_value = {
+            "connection_id": "connection-1",
+            "host_id": "host-1",
+            "boot_epoch": 7,
+        }
+        layout = {
+            "orientation": "horizontal",
+            "ratios": [0.5, 0.5],
+            "target_pane_id": "pane-1",
+        }
+        calibration = {
+            "orientation": "horizontal",
+            "targetPaneID": "pane-1",
+            "originalRatios": [0.5, 0.5],
+            "calibrationRatios": [0.54, 0.46],
+            "restoredRatios": [0.5, 0.5],
+            "originalRows": 40,
+            "originalCols": 120,
+            "calibratedRows": 40,
+            "calibratedCols": 126,
+            "restoredRows": 40,
+            "restoredCols": 120,
+            "ratioDelta": 0.04,
+        }
+        self.args.renderer_mode = "flow"
+        with mock.patch.object(DRIVER, "require_terminal_geometry_environment"), \
+             mock.patch.object(DRIVER, "verify_canary_identity"), \
+             mock.patch.object(
+                 DRIVER,
+                 "prepare_flow_renderer",
+                 return_value={
+                     "flow_setup_applied": True,
+                     "flow_setup_rpc_completed_at_epoch_ms": 1,
+                     "flow_setup_verified_at_epoch_ms": 2,
+                 },
+             ) as prepare_flow, \
+             mock.patch.object(
+                 DRIVER,
+                 "cleanup_flow_renderer",
+                 return_value={
+                     "flow_cleanup_verified": True,
+                     "flow_cleanup_rpc_completed_at_epoch_ms": 3,
+                     "flow_cleanup_verified_at_epoch_ms": 4,
+                 },
+             ) as cleanup_flow, \
+             mock.patch.object(DRIVER, "RemoteMutationController", return_value=controller), \
+             mock.patch.object(DRIVER, "pane_layout", return_value=layout), \
+             mock.patch.object(DRIVER, "terminal_geometry", return_value=(40, 120)), \
+             mock.patch.object(DRIVER, "calibrate_and_restore_layout", return_value=calibration), \
+             mock.patch.object(
+                 DRIVER,
+                 "run_protocol_with_controller",
+                 side_effect=DRIVER.Failure("sample loop failed"),
+             ):
+            with self.assertRaisesRegex(DRIVER.Failure, "sample loop failed"):
+                DRIVER.run_protocol(self.args)
+
+        prepare_flow.assert_called_once()
+        cleanup_flow.assert_called_once_with(self.args, controller)
+        controller.close.assert_called_once()
 
     def test_flow_setup_and_cleanup_use_exact_nested_shell_contract(self):
         # WHY: flow must be intentional and reversible; fixed-grid proof data
