@@ -122,14 +122,20 @@ fi
 # 6. The pet art must ship inside the real AppShell resource bundle. SwiftPM tests
 # can resolve Bundle.module even when the packaging script forgets to copy it, so
 # this structural check protects the distributable .app boundary.
+#
+# Canonical path used by AppShellResourceBundle:
+#   Contents/Resources/RemoteCode_AppShell.bundle
+# Do NOT require an app-root copy: codesign rejects unsealed root contents, and
+# production code must not use SPM Bundle.module (it fatalErrors for customers).
 PET_DIR="$APP/Contents/Resources/RemoteCode_AppShell.bundle/Pet"
 PET_ATLAS="$PET_DIR/remote-code-black-cat-atlas.png"
 PET_MANIFEST="$PET_DIR/remote-code-black-cat-atlas-v3.json"
 PET_MICRO_MANIFEST="$PET_DIR/remote-code-black-cat-idle-microactions.json"
 PET_EXPECTED_RESOURCE_COUNT=40
 if [ ! -d "$PET_DIR" ]; then
-  fail "missing AppShell pet resources at $PET_DIR"
+  fail "missing AppShell pet resources at $PET_DIR (launch crash class without AppShellResourceBundle)"
 else
+  note "AppShell resource bundle present under Contents/Resources"
   [ -f "$PET_ATLAS" ] || fail "missing pet atlas"
   if [ -f "$PET_ATLAS" ]; then
     PET_WIDTH="$(sips -g pixelWidth "$PET_ATLAS" 2>/dev/null | awk '/pixelWidth:/ { print $2 }')"
@@ -172,6 +178,14 @@ else
     fail "pet resource set must contain $PET_EXPECTED_RESOURCE_COUNT files (got $PET_RESOURCE_COUNT)"
   fi
 fi
+
+# 6b. Forbid app-root resource bundles (codesign: "unsealed contents present
+# in the bundle root"). Packaging must never reintroduce them.
+for root_bundle in RemoteCode_AppShell.bundle RemoteCode_Surfaces.bundle; do
+  if [ -e "$APP/$root_bundle" ]; then
+    fail "forbidden unsealed app-root bundle $APP/$root_bundle (breaks codesign; use Contents/Resources only)"
+  fi
+done
 
 if [ "$fails" -ne 0 ]; then
   echo "FAIL: $fails structural check(s) failed for $APP" >&2

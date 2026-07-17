@@ -187,8 +187,12 @@ final class PetAtlas {
 
     static func bundled() throws -> PetAtlas {
         let name = "remote-code-black-cat-atlas-v3"
-        guard let manifestURL = Bundle.module.url(forResource: name, withExtension: "json", subdirectory: "Pet")
-                ?? Bundle.module.url(forResource: name, withExtension: "json") else {
+        // WHY: never use SPM `Bundle.module` here — its static accessor
+        // fatalErrors when the package layout is Contents/Resources (shipped
+        // apps) and only a developer .build path remains. See AppShellResourceBundle.
+        let resources = try AppShellResourceBundle.bundle()
+        guard let manifestURL = resources.url(forResource: name, withExtension: "json", subdirectory: "Pet")
+                ?? resources.url(forResource: name, withExtension: "json") else {
             throw PetAtlasError.missingResource("\(name).json")
         }
         return try PetAtlas(manifestURL: manifestURL)
