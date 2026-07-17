@@ -667,9 +667,9 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         guard let ctx = context else { throw NSError(domain: "rc2", code: 0) }
         try ctx.apply(.createWorkspace(name: name, cwd: cwd, initial: nil))
         guard let id = ctx.state.window.selectedWorkspaceID else { throw LayoutError.workspaceNotFound }
-        // A new workspace opens with a terminal by default (cmux model).
-        let term = makeSurface(type: .terminal, title: defaultTitle(for: .terminal), workspace: id, cwd: cwd)
-        try ctx.apply(.addSurface(id, paneID: nil, descriptor: term))
+        // A new workspace opens with Agent App as the default selected tab.
+        let agent = makeSurface(type: .agentApp, title: defaultTitle(for: .agentApp), workspace: id, cwd: cwd)
+        try ctx.apply(.addSurface(id, paneID: nil, descriptor: agent))
         guard let ws = ctx.state.workspaces[id] else { throw LayoutError.workspaceNotFound }
         windowController?.refreshFromState()
         reconcileSurfaceVisibility()

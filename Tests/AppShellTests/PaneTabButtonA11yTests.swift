@@ -105,10 +105,10 @@ final class PaneTabButtonA11yViewTests: XCTestCase {
         let tab = try XCTUnwrap(makeTabButton(router: router, pane: pane))
 
         let label = tab.accessibilityLabel() ?? ""
-        // The default terminal tab title is "Terminal" (set by createWorkspace).
+        // The default tab title is "Agent App" (set by createWorkspace).
         XCTAssertFalse(label.isEmpty,
                        "PaneTabButton must expose a non-empty a11y label so VoiceOver can identify the tab")
-        XCTAssertTrue(label.lowercased().contains("terminal"),
+        XCTAssertTrue(label.lowercased().contains("agent app"),
                       "a11y label must contain the surface title so VoiceOver reads the correct tab name")
     }
 

@@ -46,11 +46,14 @@ final class TerminalOutputDeleteOnCloseTests: XCTestCase {
         let (ctx, router) = try makeContext()
         let ws = try router.createWorkspace(name: "w", cwd: NSTemporaryDirectory())
 
-        // The workspace opens with one terminal surface by default.
-        guard case .pane(let pane) = ctx.state.workspaces[ws.id]?.layout,
-              let descriptor = pane.surfaces.first else {
-            return XCTFail("expected initial terminal surface")
-        }
+        // Terminal history cleanup is type-specific; create an explicit terminal
+        // tab rather than relying on the default Agent App surface.
+        let descriptor = try router.createSurface(
+            workspace: ws.id,
+            type: .terminal,
+            paneID: nil,
+            title: "history-terminal"
+        )
         let surfaceID = descriptor.id.value.uuidString
         let repo = ctx.terminalOutputRepo
 
@@ -71,10 +74,12 @@ final class TerminalOutputDeleteOnCloseTests: XCTestCase {
         let (ctx, router) = try makeContext()
         let ws = try router.createWorkspace(name: "w", cwd: NSTemporaryDirectory())
 
-        guard case .pane(let pane) = ctx.state.workspaces[ws.id]?.layout,
-              let descriptor = pane.surfaces.first else {
-            return XCTFail("expected initial terminal surface")
-        }
+        let descriptor = try router.createSurface(
+            workspace: ws.id,
+            type: .terminal,
+            paneID: nil,
+            title: "clear-history-terminal"
+        )
         let surfaceID = descriptor.id.value.uuidString
         let repo = ctx.terminalOutputRepo
 
