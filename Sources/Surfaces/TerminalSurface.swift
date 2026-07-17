@@ -711,11 +711,17 @@ public final class TerminalSurface: NSObject, Surface, TerminalHistoryCoordinato
     private var outputPartial = false
     private var outputPartialReason: String?
     private var outputPendingBytes = 0
-    // Raw bytes received while the renderer was suppressed (isVisible=false).
-    // Replayed into renderer.feed on didBecomeVisible so the ANSI snapshot is
-    // complete even if the surface was never rendered while hidden.
+    // Legacy heal buffer retained for the pure heal-plan seam / reveal path.
+    // Live hidden output no longer grows this toward 4 MiB permanently: the
+    // mirror uses the same force-flushed pendingRendererEvents path as visible
+    // surfaces (capped ANSI ring). We still track overflow against the 4 MiB
+    // recoverability budget so partial truth stays honest.
     private var hiddenRendererBuffer = Data()
     private var hiddenRendererBufferOverflowed = false
+    /// Bytes accepted on the hidden mirror path since the last hide transition.
+    /// Caps recoverability accounting at `maxHiddenRendererBufferBytes` without
+    /// pinning a permanent second raw copy alongside Ghostty scrollback.
+    private var hiddenMirrorAcceptedBytes = 0
     private var totalOutputBytes = 0
     private var outputBytesAtLastTelemetry = 0
     private var maxPTYReadBatchBytesObserved = 0
@@ -765,7 +771,10 @@ public final class TerminalSurface: NSObject, Surface, TerminalHistoryCoordinato
     private var pendingRendererByteCount = 0
 
     static func pendingRendererBufferExceeded(byteCount: Int, eventCount: Int) -> Bool {
-        byteCount > maxHiddenRendererBufferBytes || eventCount > maxPendingRendererEvents
+        // Inclusive bounds: a queue at exactly 4 MiB / 4096 events must flush.
+        // Using `>` allowed a permanent 4 MiB-1 raw pin (and 3 MiB after a
+        // 5 MiB flush with 1 MiB chunks) under continuous producers.
+        byteCount >= maxHiddenRendererBufferBytes || eventCount >= maxPendingRendererEvents
     }
 
     /// Replays recorded renderer events into `target` in order. This is the SAME
@@ -903,9 +912,24 @@ public final class TerminalSurface: NSObject, Surface, TerminalHistoryCoordinato
     }
 
     /// Inject bytes on the live PTY reader path so tests can exercise hidden
-    /// `hiddenRendererBuffer` / pending accounting without `forkpty` (sandbox).
+    /// mirror pending/force-flush accounting without `forkpty` (sandbox).
     func injectReaderOutputForTesting(_ data: Data) {
         appendDataAsync(data, renderAllowedAtRead: readerAllowsRender)
+    }
+
+    /// Raw mirror-side retention (pending force-flush queue + legacy heal buffer).
+    /// Used by retention tests to prove continuous hidden producers do not pin
+    /// a second permanent raw copy alongside Ghostty / history.
+    var hiddenMirrorRetainedRawBytesForTesting: Int {
+        pendingRendererByteCount + hiddenRendererBuffer.count
+    }
+
+    var hiddenMirrorAcceptedBytesForTesting: Int {
+        hiddenMirrorAcceptedBytes
+    }
+
+    var hiddenRendererBufferOverflowedForTesting: Bool {
+        hiddenRendererBufferOverflowed
     }
 
     func setReaderWillEnterMainHandoffForTesting(_ action: (@Sendable () -> Void)?) {
@@ -1617,39 +1641,32 @@ public final class TerminalSurface: NSObject, Surface, TerminalHistoryCoordinato
         if BellDetector.containsStandaloneBEL(data) { handleBell() }
         // HC-1: stream raw PTY output to the mirror in real time.
         outputBus.emit(descriptor.id, data)
-        if renderAllowedAtRead {
-            // Defer the mirror-renderer feed (PERF-136): record the bytes instead
-            // of emulating them now. rendererMutationCount must still advance so a
-            // cached snapshot built before this chunk is invalidated. The replay on
-            // the next snapshot read is byte-identical to feeding here.
-            pendingRendererEvents.append(.bytes(data))
-            pendingRendererByteCount += data.count
-            rendererMutationCount &+= 1
-            // Cap the pending buffer to bound memory during long visible bursts.
-            // Unlike the hidden path we FORCE-FLUSH (never drop) so the visible
-            // snapshot stays COMPLETE.
-            if Self.pendingRendererBufferExceeded(
-                byteCount: pendingRendererByteCount,
-                eventCount: pendingRendererEvents.count
-            ) {
-                ensureRendererCurrent()
-            }
-        } else {
-            // Surface is hidden: buffer bytes so the renderer can be healed on
-            // reveal. Cap the buffer to avoid unbounded growth during long hidden
-            // sessions; bytes beyond the cap are silently dropped (the snapshot
-            // will remain complete=false, which is already correct behavior).
-            if !hiddenRendererBufferOverflowed {
-                let remaining = Self.maxHiddenRendererBufferBytes - hiddenRendererBuffer.count
-                if remaining >= data.count {
-                    hiddenRendererBuffer.append(data)
-                } else if remaining > 0 {
-                    hiddenRendererBuffer.append(data.prefix(remaining))
-                    hiddenRendererBufferOverflowed = true
-                } else {
-                    hiddenRendererBufferOverflowed = true
+        // PERF-136 (visible + hidden): record mirror feed/resize into the ordered
+        // pending queue and force-flush into the capped ANSI ring. A separate
+        // permanent raw `hiddenRendererBuffer` grew for the entire hidden lifetime
+        // (up to 4 MiB per terminal) under multi-terminal soak workloads — dual
+        // retention beside Ghostty scrollback — so pre-gate RSS never plateaued.
+        // Force-flush keeps recoverability of recent transcript in the ANSI ring
+        // (same as visible) and tracks the 4 MiB budget only for partial truth.
+        pendingRendererEvents.append(.bytes(data))
+        pendingRendererByteCount += data.count
+        rendererMutationCount &+= 1
+        if !renderAllowedAtRead {
+            hiddenMirrorAcceptedBytes += data.count
+            if hiddenMirrorAcceptedBytes > Self.maxHiddenRendererBufferBytes,
+               !hiddenRendererBufferOverflowed {
+                hiddenRendererBufferOverflowed = true
+                outputPartial = true
+                if outputPartialReason == nil || outputPartialReason == "history_replay_failed" {
+                    outputPartialReason = "hidden_output_cap"
                 }
             }
+        }
+        if Self.pendingRendererBufferExceeded(
+            byteCount: pendingRendererByteCount,
+            eventCount: pendingRendererEvents.count
+        ) {
+            ensureRendererCurrent()
         }
         if renderAllowedAtRead, renderDiagnostics().canRender {
             ghosttyView.processOutput(data)
@@ -1857,6 +1874,7 @@ public final class TerminalSurface: NSObject, Surface, TerminalHistoryCoordinato
         pendingRendererByteCount = 0
         hiddenRendererBuffer = Data()
         hiddenRendererBufferOverflowed = false
+        hiddenMirrorAcceptedBytes = 0
         rendererMutationCount &+= 1
         cachedTextSnapshot = nil
         ghosttyView.resetSurfaceOutput(canonical)
@@ -2068,10 +2086,10 @@ public final class TerminalSurface: NSObject, Surface, TerminalHistoryCoordinato
         // (PERF-136), before the cache check, so rendererMutationCount and the
         // renderer's actual state agree for every read site below.
         ensureRendererCurrent()
-        // Hidden PTY bytes land in `hiddenRendererBuffer`, not `renderer`/`pendingRendererEvents`.
-        // Heal the mirror before any snapshot read so surface.read_text returns the
-        // authoritative transcript while still hidden (release-soak aux markers),
-        // not a blank Ghostty parked grid or an unfed ANSIRenderer.
+        // Hidden PTY bytes also land in `pendingRendererEvents` (force-flushed into
+        // the ANSI ring). Drain any residual pending/legacy heal buffer so
+        // surface.read_text returns the authoritative transcript while still
+        // hidden (release-soak aux markers).
         if !isVisible {
             applyHiddenRendererHealIfNeeded()
         }
@@ -2575,13 +2593,16 @@ public final class TerminalSurface: NSObject, Surface, TerminalHistoryCoordinato
         // heal feeds directly into `renderer`, so the heal bytes stay ordered after
         // them. didBecomeHidden already flushes, so this is normally a no-op.
         ensureRendererCurrent()
-        // Heal the renderer BEFORE setting readerAllowsRender=true.
-        // Once readerAllowsRender flips, appendDataAsync feeds live bytes
-        // directly into renderer.feed; replaying the buffer first ensures
-        // the renderer sees bytes in chronological order with no gap and no
-        // double-feed (buffer is cleared here, live path is not yet active).
-        // Same heal as readTextSnapshot uses while still hidden.
+        // Drain pending mirror events (and any legacy heal buffer) BEFORE
+        // readerAllowsRender flips so live visible bytes cannot reorder ahead.
         applyHiddenRendererHealIfNeeded()
+        if hiddenRendererBufferOverflowed {
+            outputPartial = true
+            if outputPartialReason == nil || outputPartialReason == "history_replay_failed" {
+                outputPartialReason = "hidden_output_cap"
+            }
+        }
+        hiddenMirrorAcceptedBytes = 0
         readerAllowsRender = true
         ghosttyView.setOcclusion(visible: true)
         let hadHiddenOutput = outputPendingBytes > 0
@@ -2639,20 +2660,18 @@ public final class TerminalSurface: NSObject, Surface, TerminalHistoryCoordinato
     public func didBecomeHidden() {
         guard isVisible else { return }
         // Flush any deferred visible feed/resize events (PERF-136) into `renderer`
-        // BEFORE switching to the hidden path. Otherwise bytes buffered during the
-        // hidden period (hiddenRendererBuffer, fed directly into `renderer` on
-        // reveal) would land ahead of these still-pending earlier visible bytes,
-        // reordering the mirror stream.
+        // BEFORE switching to the hidden path so later hidden pending events stay
+        // ordered after the visible prefix.
         ensureRendererCurrent()
         isVisible = false
         readerAllowsRender = false
         stuckHiddenHealScheduled = false
         isDrainingHiddenBacklog = false
         hiddenBacklogDrainDeadline = nil
-        // Clear any renderer buffer from a prior hidden session so bytes from
-        // one hidden period do not bleed into the next.
+        // Fresh hidden period: clear legacy heal buffer and recoverability budget.
         hiddenRendererBuffer = Data()
         hiddenRendererBufferOverflowed = false
+        hiddenMirrorAcceptedBytes = 0
         ghosttyView.setOcclusion(visible: false)
         scheduleParkingIfDetached()
     }
