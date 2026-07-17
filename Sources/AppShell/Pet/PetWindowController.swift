@@ -222,9 +222,15 @@ private struct PetAttentionPopoverView: View {
             } else {
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 0) {
-                        activeSection(Array(model.activeThreads.prefix(50)))
-                        attentionSection("Needs you", items: Array(model.needsYouItems.prefix(50)))
-                        attentionSection("Completed", items: Array(model.completedItems.prefix(50)))
+                        activeGroupedSection(Array(model.activeThreads.prefix(50)))
+                        attentionGroupedSection(
+                            "Needs you",
+                            items: Array(model.needsYouItems.prefix(50))
+                        )
+                        attentionGroupedSection(
+                            "Completed",
+                            items: Array(model.completedItems.prefix(50))
+                        )
                     }
                 }
                 .frame(maxHeight: 390)
@@ -265,90 +271,141 @@ private struct PetAttentionPopoverView: View {
     }
 
     @ViewBuilder
-    private func activeSection(_ items: [PetActiveThreadItem]) -> some View {
+    private func activeGroupedSection(_ items: [PetActiveThreadItem]) -> some View {
         if !items.isEmpty {
-            Text("Active")
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(.secondary)
-                .padding(.horizontal, 18)
-                .padding(.top, 14)
-                .padding(.bottom, 6)
-                .accessibilityAddTraits(.isHeader)
-                .accessibilityIdentifier("pet.section.active")
-            ForEach(items) { item in
-                HStack(spacing: 12) {
-                    Image(systemName: "arrow.triangle.2.circlepath")
-                        .foregroundStyle(Color.blue)
-                        .accessibilityHidden(true)
-                    VStack(alignment: .leading, spacing: 3) {
-                        Text(item.title)
-                            .font(.headline)
-                            .foregroundStyle(.primary)
-                        if let detail = item.detail {
-                            Text(detail)
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                                .fixedSize(horizontal: false, vertical: true)
-                        }
-                    }
-                    Spacer(minLength: 8)
-                    Button("Open") { onOpenActive(item) }
-                        .buttonStyle(.bordered)
-                        .controlSize(.small)
-                        .frame(minWidth: 44, minHeight: 44)
-                        .accessibilityIdentifier("pet.activeRow.\(PetAccessibilityIdentifier.row(item.id)).open")
+            sectionHeader("Active", identifier: "pet.section.active")
+            let groups = PetPopoverGrouping.active(items)
+            let showWorkspaceHeaders = groups.count > 1
+                || groups.first?.name != PetPopoverGrouping.unknownWorkspaceName
+            ForEach(groups) { group in
+                if showWorkspaceHeaders {
+                    workspaceHeader(group.name, prefix: "pet.workspace.active")
                 }
-                .padding(.horizontal, 18)
-                .padding(.vertical, 8)
-                .frame(minHeight: 52)
-                .accessibilityElement(children: .contain)
-                .accessibilityLabel("Active, \(item.title)")
-                .accessibilityIdentifier("pet.activeRow.\(PetAccessibilityIdentifier.row(item.id))")
+                ForEach(group.items) { item in
+                    activeRow(item)
+                }
             }
         }
     }
 
     @ViewBuilder
-    private func attentionSection(_ title: String, items: [PetAttentionItem]) -> some View {
+    private func attentionGroupedSection(_ title: String, items: [PetAttentionItem]) -> some View {
         if !items.isEmpty {
-            Text(title)
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(.secondary)
-                .padding(.horizontal, 18)
-                .padding(.top, 14)
-                .padding(.bottom, 6)
-            ForEach(items) { item in
-                let status = PetAttentionVisualStatus.resolve(item.kind)
-                HStack(spacing: 12) {
-                    Image(systemName: status.systemImage)
-                        .foregroundStyle(status.color)
-                        .accessibilityHidden(true)
-                    VStack(alignment: .leading, spacing: 3) {
-                        Text(item.title)
-                            .font(.headline)
-                            .foregroundStyle(.primary)
-                        if let detail = item.detail {
-                            Text(detail)
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                                .fixedSize(horizontal: false, vertical: true)
-                        }
-                    }
-                    Spacer(minLength: 8)
-                    Button(item.kind.needsUserAction ? "Review" : "Open") { onOpen(item) }
-                        .buttonStyle(.bordered)
-                        .controlSize(.small)
-                        .frame(minWidth: 44, minHeight: 44)
-                        .accessibilityIdentifier("pet.row.\(PetAccessibilityIdentifier.row(item.id)).open")
+            sectionHeader(title, identifier: nil)
+            let groups = PetPopoverGrouping.attention(items)
+            let showWorkspaceHeaders = groups.count > 1
+                || groups.first?.name != PetPopoverGrouping.unknownWorkspaceName
+            ForEach(groups) { group in
+                if showWorkspaceHeaders {
+                    workspaceHeader(group.name, prefix: "pet.workspace.attention")
                 }
-                .padding(.horizontal, 18)
-                .padding(.vertical, 8)
-                .frame(minHeight: 52)
-                .accessibilityElement(children: .contain)
-                .accessibilityLabel("\(status.accessibilityLabel), \(item.title)")
-                .accessibilityIdentifier("pet.row.\(PetAccessibilityIdentifier.row(item.id))")
+                ForEach(group.items) { item in
+                    attentionRow(item)
+                }
             }
         }
+    }
+
+    private func sectionHeader(_ title: String, identifier: String?) -> some View {
+        Text(title)
+            .font(.caption.weight(.semibold))
+            .foregroundStyle(.secondary)
+            .padding(.horizontal, 18)
+            .padding(.top, 14)
+            .padding(.bottom, 6)
+            .accessibilityAddTraits(.isHeader)
+            .accessibilityIdentifier(identifier ?? "pet.section.\(title)")
+    }
+
+    private func workspaceHeader(_ name: String, prefix: String) -> some View {
+        Text(name)
+            .font(.caption2.weight(.semibold))
+            .foregroundStyle(.secondary)
+            .padding(.horizontal, 18)
+            .padding(.top, 8)
+            .padding(.bottom, 2)
+            .accessibilityAddTraits(.isHeader)
+            .accessibilityIdentifier("\(prefix).\(PetAccessibilityIdentifier.row(name))")
+    }
+
+    private func activeRow(_ item: PetActiveThreadItem) -> some View {
+        HStack(spacing: 12) {
+            Image(systemName: "arrow.triangle.2.circlepath")
+                .foregroundStyle(Color.blue)
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 3) {
+                Text(item.title)
+                    .font(.headline)
+                    .foregroundStyle(.primary)
+                    .lineLimit(1)
+                if let detail = item.detail {
+                    Text(detail)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                        .truncationMode(.tail)
+                        .help(detail)
+                }
+            }
+            Spacer(minLength: 8)
+            Button("Open") { onOpenActive(item) }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .frame(minWidth: 44, minHeight: 44)
+                .accessibilityIdentifier("pet.activeRow.\(PetAccessibilityIdentifier.row(item.id)).open")
+        }
+        .padding(.horizontal, 18)
+        .padding(.vertical, 8)
+        .frame(minHeight: 52)
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel(Self.rowAccessibilityLabel(status: "Active", title: item.title, detail: item.detail))
+        .accessibilityIdentifier("pet.activeRow.\(PetAccessibilityIdentifier.row(item.id))")
+    }
+
+    private func attentionRow(_ item: PetAttentionItem) -> some View {
+        let status = PetAttentionVisualStatus.resolve(item.kind)
+        return HStack(spacing: 12) {
+            Image(systemName: status.systemImage)
+                .foregroundStyle(status.color)
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 3) {
+                Text(item.title)
+                    .font(.headline)
+                    .foregroundStyle(.primary)
+                    .lineLimit(1)
+                if let detail = item.detail {
+                    Text(detail)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                        .truncationMode(.tail)
+                        .help(detail)
+                }
+            }
+            Spacer(minLength: 8)
+            Button(item.kind.needsUserAction ? "Review" : "Open") { onOpen(item) }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .frame(minWidth: 44, minHeight: 44)
+                .accessibilityIdentifier("pet.row.\(PetAccessibilityIdentifier.row(item.id)).open")
+        }
+        .padding(.horizontal, 18)
+        .padding(.vertical, 8)
+        .frame(minHeight: 52)
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel(Self.rowAccessibilityLabel(
+            status: status.accessibilityLabel,
+            title: item.title,
+            detail: item.detail
+        ))
+        .accessibilityIdentifier("pet.row.\(PetAccessibilityIdentifier.row(item.id))")
+    }
+
+    private static func rowAccessibilityLabel(status: String, title: String, detail: String?) -> String {
+        if let detail, !detail.isEmpty {
+            return "\(status), \(title), \(detail)"
+        }
+        return "\(status), \(title)"
     }
 }
 

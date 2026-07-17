@@ -27,7 +27,8 @@ final class PetAttentionStoreTests: XCTestCase {
             store: PetAttentionStore(
                 threadRepository: threads,
                 callbackRepository: callbacks,
-                notificationRepository: notifications
+                notificationRepository: notifications,
+                workspaceNameProvider: { _ in "star" }
             )
         )
     }
@@ -112,11 +113,16 @@ final class PetAttentionStoreTests: XCTestCase {
         XCTAssertEqual(first.count, 3)
         XCTAssertEqual(first.items.map(\.classification), [.needsYou, .completed, .completed])
         XCTAssertEqual(first.items.map(\.title), [
-            "Approval required",
+            "Approve: Run command",
             "Agent run failed",
             "Git delivery failed"
         ])
-        XCTAssertEqual(first.items.map(\.detail), ["Codex", "Codex", nil])
+        XCTAssertEqual(first.items.map(\.detail), [
+            "star - Codex - \(AgentThreadTitle.display("Run rm -rf /Users/private token=secret"))",
+            "star - Codex - raw prompt must stay private",
+            nil
+        ])
+        XCTAssertEqual(first.items.map(\.workspaceName), ["star", "star", "star"])
         XCTAssertTrue(first.items[0].id.contains("approval-1"))
         XCTAssertTrue(first.items[1].id.contains(failed.id.value.uuidString))
         XCTAssertEqual(first.items[2].id, "notification:git-1")
@@ -125,9 +131,12 @@ final class PetAttentionStoreTests: XCTestCase {
         XCTAssertFalse(first.items.contains { $0.id.contains("not-whitelisted") })
 
         let visibleCopy = first.items.flatMap { [$0.title, $0.detail].compactMap { $0 } }.joined(separator: " ")
-        for secret in ["rm -rf", "/Users/", "secret-token", "hunter2", "raw prompt"] {
-            XCTAssertFalse(visibleCopy.contains(secret), "Pet rows must never expose raw persisted content.")
+        // Credentials stay redacted; workspace + truncated thread title are intentionally visible.
+        for secret in ["secret-token", "hunter2", "token=secret", "Bearer secret"] {
+            XCTAssertFalse(visibleCopy.contains(secret), "Pet rows must never expose credentials.")
         }
+        XCTAssertTrue(visibleCopy.contains("star - Codex"))
+        XCTAssertTrue(visibleCopy.contains("Approve: Run command"))
 
         guard case .agentThread(let threadID, let routeWorkspaceID) = first.items[0].route else {
             return XCTFail("Callback must route to its exact agent thread.")
@@ -267,7 +276,8 @@ final class PetAttentionStoreTests: XCTestCase {
         XCTAssertEqual(item.kind, .callback(.question, isStale: true))
         XCTAssertEqual(item.classification, .needsYou)
         XCTAssertEqual(item.title, "Input request expired")
-        XCTAssertEqual(item.detail, "Claude")
+        XCTAssertEqual(item.detail, "star - Claude - raw prompt must stay private")
+        XCTAssertEqual(item.workspaceName, "star")
     }
 
     func test_openAndMarkRead_mutatesOnlyAfterRouteVerificationAndNeverResolvesCallback() throws {

@@ -8,13 +8,15 @@ public final class PetAttentionStore {
     private let notificationRepository: NotificationRepository
     private let markAgentThreadReadMutation: (AgentThreadID) throws -> Void
     private let markNotificationReadMutation: (String) throws -> Void
+    private let workspaceNameProvider: (WorkspaceID) -> String?
 
     public init(
         threadRepository: AgentThreadRepository,
         callbackRepository: ProviderPendingCallbackRepository,
         notificationRepository: NotificationRepository,
         markAgentThreadRead: ((AgentThreadID) throws -> Void)? = nil,
-        markNotificationRead: ((String) throws -> Void)? = nil
+        markNotificationRead: ((String) throws -> Void)? = nil,
+        workspaceNameProvider: ((WorkspaceID) -> String?)? = nil
     ) {
         self.threadRepository = threadRepository
         self.callbackRepository = callbackRepository
@@ -27,6 +29,7 @@ public final class PetAttentionStore {
         self.markNotificationReadMutation = markNotificationRead ?? { id in
             try notificationRepository.markRead(id: id)
         }
+        self.workspaceNameProvider = workspaceNameProvider ?? { _ in nil }
     }
 
     public func refresh(filter: PetAttentionFilter = .all) throws -> PetAttentionSnapshot {
@@ -36,13 +39,13 @@ public final class PetAttentionStore {
         let blockedThreadIDs = Set(callbacks.map(\.threadId))
 
         let callbackItems = callbacks.map { callback in
-            Self.callbackItem(callback, thread: threadsByID[callback.threadId])
+            callbackItem(callback, thread: threadsByID[callback.threadId])
         }
         let threadItems = threads
             .filter { $0.hasUnread && !blockedThreadIDs.contains($0.id) }
-            .compactMap(Self.threadItem)
+            .compactMap(threadItem)
         let notificationItems = try notificationRepository.list(unreadOnly: true)
-            .compactMap(Self.notificationItem)
+            .compactMap(notificationItem)
 
         let allItems = (callbackItems + threadItems + notificationItems)
             .sorted(by: Self.attentionOrder)
@@ -104,36 +107,60 @@ public final class PetAttentionStore {
             marked += 1
         }
         for notification in try notificationRepository.list(unreadOnly: true)
-            where Self.notificationItem(notification)?.classification == .completed {
+            where notificationItem(notification)?.classification == .completed {
             try markNotificationReadMutation(notification.id)
             marked += 1
         }
         return marked
     }
 
-    private static func callbackItem(
+    private func workspaceName(for workspaceID: WorkspaceID?) -> String? {
+        workspaceID.flatMap(workspaceNameProvider)
+    }
+
+    private func attentionContext(
+        for thread: AgentThread?,
+        actionLabel: String? = nil
+    ) -> PetAttentionContext {
+        guard let thread else {
+            return PetAttentionContext(actionLabel: actionLabel)
+        }
+        return PetAttentionContext(
+            workspaceName: workspaceName(for: thread.workspaceId),
+            providerName: Self.providerLabel(thread.provider),
+            threadTitle: thread.title,
+            actionLabel: actionLabel
+        )
+    }
+
+    private func callbackItem(
         _ callback: ProviderPendingCallback,
         thread: AgentThread?
     ) -> PetAttentionItem {
         let kind: PetAttentionCallbackKind = callback.kind == .approval ? .approval : .question
         let isStale = callback.state == .stale
-        let context = PetAttentionContext(providerName: thread.map { providerLabel($0.provider) })
+        let actionLabel = kind == .approval ? Self.approvalActionLabel(from: callback) : nil
+        let context = attentionContext(for: thread, actionLabel: actionLabel)
+        let presentation = PetAttentionPresentation.safe(
+            kind: kind == .approval ? .approval : .question(isSecret: false),
+            context: context
+        )
         let title: String
         if isStale {
-            title = kind == .approval ? "Approval expired" : "Input request expired"
+            if kind == .approval, let action = actionLabel {
+                title = "Approval expired: \(action)"
+            } else {
+                title = kind == .approval ? "Approval expired" : "Input request expired"
+            }
         } else {
-            title = kind == .approval
-                ? PetAttentionPresentation.safe(kind: .approval).title
-                : PetAttentionPresentation.safe(kind: .question(isSecret: false)).title
+            title = presentation.title
         }
         return PetAttentionItem(
             id: "callback:\(callback.threadId.value.uuidString):\(kind.rawValue):\(callback.requestId)",
             kind: .callback(kind, isStale: isStale),
             title: title,
-            detail: PetAttentionPresentation.safe(
-                kind: kind == .approval ? .approval : .question(isSecret: false),
-                context: context
-            ).detail,
+            detail: presentation.detail,
+            workspaceName: context.workspaceName,
             createdAt: callback.createdAt,
             route: .agentThread(threadID: callback.threadId, workspaceID: thread?.workspaceId),
             source: .callback(
@@ -144,24 +171,26 @@ public final class PetAttentionStore {
         )
     }
 
-    private static func threadItem(_ thread: AgentThread) -> PetAttentionItem? {
-        guard let outcome = outcome(for: thread.status) else { return nil }
+    private func threadItem(_ thread: AgentThread) -> PetAttentionItem? {
+        guard let outcome = Self.outcome(for: thread.status) else { return nil }
+        let context = attentionContext(for: thread)
         let presentation = PetAttentionPresentation.safe(
             kind: .agentOutcome(outcome),
-            context: PetAttentionContext(providerName: providerLabel(thread.provider))
+            context: context
         )
         return PetAttentionItem(
             id: "thread:\(thread.id.value.uuidString)",
             kind: .agentOutcome(outcome),
             title: presentation.title,
             detail: presentation.detail,
+            workspaceName: context.workspaceName,
             createdAt: thread.updatedAt,
             route: .agentThread(threadID: thread.id, workspaceID: thread.workspaceId),
             source: .agentThread(threadID: thread.id)
         )
     }
 
-    private static func notificationItem(_ notification: AppNotification) -> PetAttentionItem? {
+    private func notificationItem(_ notification: AppNotification) -> PetAttentionItem? {
         guard let rawCategory = notification.category,
               let category = PetNotificationCategory(rawValue: rawCategory) else { return nil }
         let presentation = category.presentation
@@ -190,10 +219,20 @@ public final class PetAttentionStore {
             kind: .notification(category),
             title: presentation.title,
             detail: presentation.detail,
+            workspaceName: workspaceName(for: notification.workspaceId),
             createdAt: notification.createdAt,
             route: route,
             source: .notification(id: notification.id)
         )
+    }
+
+    /// Decodes structured pending-request kind only; never surfaces title/detail payloads.
+    private static func approvalActionLabel(from callback: ProviderPendingCallback) -> String? {
+        guard callback.kind == .approval,
+              let data = callback.payloadJSON.data(using: .utf8),
+              let request = try? JSONDecoder().decode(AssistantPendingRequest.self, from: data)
+        else { return nil }
+        return PetApprovalActionLabel.label(for: request.kind)
     }
 
     private static func outcome(for status: AgentRunStatus) -> PetAttentionOutcome? {
