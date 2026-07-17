@@ -153,15 +153,19 @@ class FakeRouter: CommandRouting, TerminalCommandRouting {
         }
     }
     var lastCreateSurfaceID: SurfaceID?
-    func createAgentThread(workspace: WorkspaceID?, title: String, provider: AgentProvider, model: String, permissionMode: AgentPermissionMode, reasoningEffort: AgentReasoningEffort, serviceTier: AgentServiceTier, modelSelection: AgentModelSelection?, providerInstanceId: String?, surfaceID: SurfaceID?) throws -> AgentThread {
+    func createAgentThread(workspace: WorkspaceID?, title: String, provider: AgentProvider, model: String, permissionMode: AgentPermissionMode, reasoningEffort: AgentReasoningEffort, serviceTier: AgentServiceTier, modelSelection: AgentModelSelection?, providerInstanceId: String?, runAsUser: AgentRunAsUser?, surfaceID: SurfaceID?) throws -> AgentThread {
         lastCreateSurfaceID = surfaceID
         let thread = AgentThread(workspaceId: workspace, title: title, provider: provider,
                                  providerInstanceId: providerInstanceId,
                                  model: model,
                                  permissionMode: permissionMode, reasoningEffort: reasoningEffort,
-                                 serviceTier: serviceTier, modelSelection: modelSelection)
+                                 serviceTier: serviceTier, modelSelection: modelSelection,
+                                 runAsUser: runAsUser)
         threadStore.append(thread)
         return thread
+    }
+    func listAgentRunAsUsers() throws -> [AgentRunAsUser] {
+        [AgentRunAsUser.current()]
     }
     var lastSendPermission: AgentPermissionMode?
     var lastSendReasoning: AgentReasoningEffort?
@@ -190,7 +194,7 @@ class FakeRouter: CommandRouting, TerminalCommandRouting {
     var checkpointStore: [AgentTurnCheckpointSummary] = []
     var messageStore: [AgentMessage] = []
     var queuedMessageStore: [AgentQueuedMessage] = []
-    func configureAgentThread(thread: AgentThreadID, provider: AgentProvider?, model: String?, permissionMode: AgentPermissionMode?, reasoningEffort: AgentReasoningEffort?, serviceTier: AgentServiceTier?, modelSelection: AgentModelSelection?, providerInstanceId: String?) throws -> AgentThread {
+    func configureAgentThread(thread: AgentThreadID, provider: AgentProvider?, model: String?, permissionMode: AgentPermissionMode?, reasoningEffort: AgentReasoningEffort?, serviceTier: AgentServiceTier?, modelSelection: AgentModelSelection?, providerInstanceId: String?, runAsUser: AgentRunAsUser?) throws -> AgentThread {
         guard let idx = threadStore.firstIndex(where: { $0.id == thread }) else { throw JSONRPCError.invalidParams }
         if let provider, provider != threadStore[idx].provider {
             threadStore[idx].provider = provider
@@ -209,6 +213,7 @@ class FakeRouter: CommandRouting, TerminalCommandRouting {
         if let reasoningEffort { threadStore[idx].reasoningEffort = reasoningEffort }
         if let serviceTier { threadStore[idx].serviceTier = serviceTier }
         if let modelSelection { threadStore[idx].modelSelection = modelSelection }
+        if let runAsUser { threadStore[idx].runAsUser = runAsUser }
         return threadStore[idx]
     }
     func configureAgentThreadExecution(thread: AgentThreadID, executionMode: AgentExecutionMode, baseBranch: String?) throws -> AgentThread {
@@ -347,7 +352,7 @@ class FakeRouter: CommandRouting, TerminalCommandRouting {
         lastSendText = text
         lastSendInteractionMode = interactionMode
         lastSendAttachments = attachments
-        _ = try configureAgentThread(thread: thread, provider: provider, model: model, permissionMode: permissionMode, reasoningEffort: reasoningEffort, serviceTier: serviceTier, modelSelection: modelSelection, providerInstanceId: providerInstanceId)
+        _ = try configureAgentThread(thread: thread, provider: provider, model: model, permissionMode: permissionMode, reasoningEffort: reasoningEffort, serviceTier: serviceTier, modelSelection: modelSelection, providerInstanceId: providerInstanceId, runAsUser: nil)
         lastSendPermission = threadStore.first(where: { $0.id == thread })?.permissionMode
         lastSendReasoning = threadStore.first(where: { $0.id == thread })?.reasoningEffort
         lastSendServiceTier = threadStore.first(where: { $0.id == thread })?.serviceTier
@@ -370,6 +375,7 @@ class FakeRouter: CommandRouting, TerminalCommandRouting {
                                            serviceTier: serviceTier ?? .auto,
                                            modelSelection: modelSelection,
                                            providerInstanceId: nil,
+                                           runAsUser: nil,
                                            surfaceID: nil)
         } else {
             guard let existing = threadStore.first(where: { $0.id == thread }) else { throw JSONRPCError.invalidParams }

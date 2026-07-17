@@ -717,8 +717,10 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         reloadCheckpoints()
         suppressPersistedFinalDuplicatedByTimeline()
         resetTimelineUpdateTick()
-        // Full access: reopened threads with an unimplemented plan must auto-run, not ask.
-        scheduleFullAccessPlanAutoImplementIfNeeded()
+        // Do NOT auto-implement on select/reopen (pet, sidebar, restore). Opening a
+        // thread is a view action — Full Access only auto-implements when a plan
+        // arrives mid-stream, a run finishes with a pending plan, or the user
+        // switches into full access on an already-open thread.
         // Restore persisted plan notes for the opened thread. A failed read must
         // not masquerade as absent notes and then overwrite the durable value.
         do {
