@@ -1617,14 +1617,16 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         return try ctx.threadRepo.list(workspaceId: workspace)
     }
 
-    public func createAgentThread(workspace: WorkspaceID?, title: String, provider: AgentProvider, model: String, permissionMode: AgentPermissionMode, reasoningEffort: AgentReasoningEffort, serviceTier: AgentServiceTier = .auto, modelSelection: AgentModelSelection? = nil, providerInstanceId: String? = nil, surfaceID: SurfaceID? = nil) throws -> AgentThread {
+    public func createAgentThread(workspace: WorkspaceID?, title: String, provider: AgentProvider, model: String, permissionMode: AgentPermissionMode, reasoningEffort: AgentReasoningEffort, serviceTier: AgentServiceTier = .auto, modelSelection: AgentModelSelection? = nil, providerInstanceId: String? = nil, runAsUser: AgentRunAsUser? = nil, surfaceID: SurfaceID? = nil) throws -> AgentThread {
         guard let ctx = context else { throw LayoutError.workspaceNotFound }
+        let resolvedRunAs = resolveRunAsUser(runAsUser)
         let t = AgentThread(workspaceId: workspace, title: title, provider: provider,
                             providerInstanceId: normalizedProviderInstanceId(provider: provider, requested: providerInstanceId),
                             model: model,
                             permissionMode: permissionMode, reasoningEffort: reasoningEffort,
                             serviceTier: serviceTier,
-                            modelSelection: modelSelection ?? AgentModelSelection(provider: provider, modelId: model, reasoningEffort: reasoningEffort, serviceTier: serviceTier))
+                            modelSelection: modelSelection ?? AgentModelSelection(provider: provider, modelId: model, reasoningEffort: reasoningEffort, serviceTier: serviceTier),
+                            runAsUser: resolvedRunAs)
         try ctx.threadRepo.upsert(t)
         // Only bind/select the new thread on the requesting surface (if any).
         // Without a surfaceID this just refreshes rails — a thread created from
@@ -1633,7 +1635,25 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         return t
     }
 
-    public func configureAgentThread(thread: AgentThreadID, provider: AgentProvider?, model: String?, permissionMode: AgentPermissionMode?, reasoningEffort: AgentReasoningEffort?, serviceTier: AgentServiceTier? = nil, modelSelection: AgentModelSelection? = nil, providerInstanceId: String? = nil) throws -> AgentThread {
+    public func listAgentRunAsUsers() throws -> [AgentRunAsUser] {
+        MacOSLocalUserCatalog.listEligibleUsers()
+    }
+
+    private func resolveRunAsUser(_ requested: AgentRunAsUser?) -> AgentRunAsUser? {
+        guard let requested else { return AgentRunAsUser.current() }
+        if let live = MacOSLocalUserCatalog.resolve(shortName: requested.shortName) {
+            return live
+        }
+        if let live = MacOSLocalUserCatalog.resolve(
+            generatedUID: requested.generatedUID,
+            shortNameSnapshot: requested.shortName
+        ) {
+            return live
+        }
+        return requested
+    }
+
+    public func configureAgentThread(thread: AgentThreadID, provider: AgentProvider?, model: String?, permissionMode: AgentPermissionMode?, reasoningEffort: AgentReasoningEffort?, serviceTier: AgentServiceTier? = nil, modelSelection: AgentModelSelection? = nil, providerInstanceId: String? = nil, runAsUser: AgentRunAsUser? = nil) throws -> AgentThread {
         guard let ctx = context else { throw LayoutError.workspaceNotFound }
         guard var t = try ctx.threadRepo.get(id: thread) else { throw LayoutError.workspaceNotFound }
         let started = !((try? ctx.messageRepo.listRecent(threadId: thread, limit: 1)) ?? []).isEmpty
@@ -1658,6 +1678,16 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 }
                 t.providerInstanceId = normalized
                 t.providerThreadId = nil
+            }
+        }
+        if let runAsUser {
+            let resolved = resolveRunAsUser(runAsUser)
+            if resolved?.uid != t.runAsUser?.uid || resolved?.shortName != t.runAsUser?.shortName {
+                guard !started else {
+                    throw JSONRPCError(code: -32014,
+                        message: "macOS run-as user is locked once the thread has started.")
+                }
+                t.runAsUser = resolved
             }
         }
         if let model, model != t.model {
@@ -1694,6 +1724,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 if let permissionMode { agent.viewModel.permissionMode = permissionMode }
                 if let reasoningEffort { agent.viewModel.reasoningEffort = reasoningEffort }
                 if let serviceTier { agent.viewModel.serviceTier = serviceTier }
+                if let runAsUser = t.runAsUser { agent.viewModel.runAsUser = runAsUser }
             }
             agent.viewModel.reloadThreads()
         }

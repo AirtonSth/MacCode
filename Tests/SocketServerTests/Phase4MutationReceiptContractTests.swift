@@ -500,6 +500,7 @@ private final class Phase4ReceiptFakeRouter: FakeRouter, CommandReceiptStateRout
         serviceTier: AgentServiceTier,
         modelSelection: AgentModelSelection?,
         providerInstanceId: String?,
+        runAsUser: AgentRunAsUser?,
         surfaceID: SurfaceID?
     ) throws -> AgentThread {
         synchronousBatchEffectCallCount += 1
@@ -513,6 +514,7 @@ private final class Phase4ReceiptFakeRouter: FakeRouter, CommandReceiptStateRout
             serviceTier: serviceTier,
             modelSelection: modelSelection,
             providerInstanceId: providerInstanceId,
+            runAsUser: runAsUser,
             surfaceID: surfaceID
         )
     }
@@ -588,7 +590,8 @@ private final class Phase4ReceiptFakeRouter: FakeRouter, CommandReceiptStateRout
         reasoningEffort: AgentReasoningEffort?,
         serviceTier: AgentServiceTier?,
         modelSelection: AgentModelSelection?,
-        providerInstanceId: String?
+        providerInstanceId: String?,
+        runAsUser: AgentRunAsUser?
     ) throws -> AgentThread {
         synchronousBatchEffectCallCount += 1
         return try super.configureAgentThread(
@@ -599,7 +602,8 @@ private final class Phase4ReceiptFakeRouter: FakeRouter, CommandReceiptStateRout
             reasoningEffort: reasoningEffort,
             serviceTier: serviceTier,
             modelSelection: modelSelection,
-            providerInstanceId: providerInstanceId
+            providerInstanceId: providerInstanceId,
+            runAsUser: runAsUser
         )
     }
 
