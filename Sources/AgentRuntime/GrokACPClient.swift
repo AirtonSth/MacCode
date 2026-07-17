@@ -197,6 +197,26 @@ public enum GrokACPRequestID: Hashable, Sendable {
     }
 }
 
+/// Grok agent stdio 0.2.x advertises `promptCapabilities.image=false` but still
+/// accepts `type=image` prompt blocks end-to-end (live canary on 0.2.103).
+/// Use one effective gate for both capability advertisement and prompt embedding
+/// so iOS Camera/Photos stay aligned with the wire path.
+public enum GrokACPImageCompatibility {
+    public static let supportedImageMediaTypes = [
+        "image/jpeg", "image/png", "image/gif", "image/webp"
+    ]
+
+    /// Prefer the negotiated flag; for known-compatible agent versions override
+    /// a false advertisement. Unknown versions fail closed when not advertised.
+    public static func effectiveImageEnabled(advertised: Bool, agentVersion: String?) -> Bool {
+        if advertised { return true }
+        let version = agentVersion?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !version.isEmpty else { return false }
+        // Verified family: 0.2.x accepts image blocks despite image=false.
+        return version.hasPrefix("0.2.")
+    }
+}
+
 public struct GrokACPInitializeResult: Sendable, Equatable {
     public let protocolVersion: Int
     public let loadSession: Bool
@@ -515,8 +535,13 @@ public final class GrokACPClient: @unchecked Sendable {
         for attachment in request.attachments {
             switch attachment.kind {
             case .image:
-                guard capabilities.image else {
-                    throw GrokACPError.unsupported("Grok ACP \(capabilities.agentVersion ?? "v1") does not negotiate image prompts")
+                guard GrokACPImageCompatibility.effectiveImageEnabled(
+                    advertised: capabilities.image,
+                    agentVersion: capabilities.agentVersion
+                ) else {
+                    throw GrokACPError.unsupported(
+                        "Grok ACP \(capabilities.agentVersion ?? "v1") does not support image prompts"
+                    )
                 }
                 let data = try Data(contentsOf: URL(fileURLWithPath: attachment.path))
                 blocks.append([

@@ -202,6 +202,9 @@ final class GrokACPAdapterTests: ProviderProcessTestCase {
                        "when modes are advertised without bypassPermissions, Full access stays closed")
         XCTAssertTrue(discovery.capabilities.supportsPlanReview)
         XCTAssertTrue(discovery.capabilities.supportsAttachments)
+        XCTAssertTrue(discovery.capabilities.supportedAttachmentKinds.contains(.image),
+                      "0.2.x must advertise image so iOS Camera/Photos are not Unavailable")
+        XCTAssertTrue(discovery.capabilities.supportedAttachmentMediaTypes.contains("image/jpeg"))
         XCTAssertTrue(discovery.capabilities.supportsApprovals)
         XCTAssertFalse(discovery.capabilities.supportsUserInput)
     }

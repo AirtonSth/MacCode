@@ -12,6 +12,17 @@ final class GrokACPProtocolTests: XCTestCase {
         XCTAssertNil(capabilities?["fs"], "filesystem must stay unadvertised until read/write requests are implemented")
     }
 
+    func test_imageCompatibilityOverridesFalseAdvertisementOnlyOnVerifiedVersions() {
+        XCTAssertTrue(GrokACPImageCompatibility.effectiveImageEnabled(advertised: true, agentVersion: nil))
+        XCTAssertTrue(GrokACPImageCompatibility.effectiveImageEnabled(advertised: false, agentVersion: "0.2.103"),
+                      "0.2.x is verified to accept type=image blocks despite image=false")
+        XCTAssertTrue(GrokACPImageCompatibility.effectiveImageEnabled(advertised: false, agentVersion: "0.2.101"))
+        XCTAssertFalse(GrokACPImageCompatibility.effectiveImageEnabled(advertised: false, agentVersion: nil),
+                       "unknown agent version must fail closed when image is not advertised")
+        XCTAssertFalse(GrokACPImageCompatibility.effectiveImageEnabled(advertised: false, agentVersion: "0.3.0"),
+                       "unverified major/minor must not inherit the 0.2.x override")
+    }
+
     func test_initializeParsesReal02101Capabilities() throws {
         let fixture: [String: Any] = [
             "protocolVersion": 1,
@@ -160,7 +171,7 @@ final class GrokACPProtocolTests: XCTestCase {
         XCTAssertEqual(result.availableModes.map(\.name), ["Default", "Plan"])
     }
 
-    func test_promptEmbedsFileBytesAndRejectsUnnegotiatedImages() throws {
+    func test_promptEmbedsFileBytesAndImageBytesEvenWhenImageCapabilityFalse() throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: root) }
@@ -180,14 +191,40 @@ final class GrokACPProtocolTests: XCTestCase {
         XCTAssertEqual(resource["text"] as? String, "known-sha-input")
         XCTAssertEqual(resource["mimeType"] as? String, "text/plain")
 
+        // Live Grok 0.2.x advertises image=false but accepts type=image blocks.
+        // RemoteCode must still embed camera/photos so iOS attach is not a dead end.
+        let imagePath = root.appendingPathComponent("shot.png")
+        try Data([0x89, 0x50, 0x4E, 0x47]).write(to: imagePath)
         let imageRequest = AgentRunRequest(
             threadId: AgentThreadID(), provider: .grok, model: "grok-4.5", cwd: root.path,
-            prompt: "inspect", attachments: [AgentAttachment(path: note.path, kind: .image, mimeType: "image/png")]
+            prompt: "inspect", attachments: [AgentAttachment(path: imagePath.path, kind: .image, mimeType: "image/png")]
         )
+        let imageBlocks = try GrokACPClient.promptBlocks(
+            for: imageRequest,
+            capabilities: .init(
+                protocolVersion: 1,
+                loadSession: true,
+                embeddedContext: true,
+                image: false,
+                agentVersion: "0.2.103"
+            )
+        )
+        let imageBlock = try XCTUnwrap(imageBlocks.last)
+        XCTAssertEqual(imageBlock["type"] as? String, "image",
+                       "image attachments must embed on verified 0.2.x even when image=false")
+        XCTAssertEqual(imageBlock["mimeType"] as? String, "image/png")
+        XCTAssertFalse((imageBlock["data"] as? String ?? "").isEmpty)
+
         XCTAssertThrowsError(try GrokACPClient.promptBlocks(
             for: imageRequest,
-            capabilities: .init(protocolVersion: 1, loadSession: true, embeddedContext: true, image: false)
-        ))
+            capabilities: .init(
+                protocolVersion: 1,
+                loadSession: true,
+                embeddedContext: true,
+                image: false,
+                agentVersion: "0.3.0"
+            )
+        ), "unverified agent versions must still reject images when advertisement is false")
     }
 
     func test_mapperStreamsThoughtTextToolsPlanAndKeepsLastTextPhaseFinal() {

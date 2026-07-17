@@ -156,14 +156,22 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
                 interactionModes = opened.planModeId != nil ? [.default, .plan] : [.default]
             }
             let permissionModes = Self.permissionModes(from: modeIDs)
+            // Attachment kinds for iOS/macOS pickers.
+            // Grok 0.2.x reports promptCapabilities.image=false while still accepting
+            // type=image blocks (live semantic canary). Advertise the effective
+            // capability so Camera/Photos are not marked Unavailable on the mirror.
             var attachmentKinds: [AgentAttachmentKind] = []
             if initialized.embeddedContext { attachmentKinds.append(.file) }
-            if initialized.image { attachmentKinds.append(.image) }
+            let imageEnabled = GrokACPImageCompatibility.effectiveImageEnabled(
+                advertised: initialized.image,
+                agentVersion: initialized.agentVersion
+            )
+            if imageEnabled { attachmentKinds.append(.image) }
             var mediaTypes = initialized.embeddedContext
                 ? ["text/plain", "text/markdown", "application/json"]
                 : []
-            if initialized.image {
-                mediaTypes.append(contentsOf: ["image/jpeg", "image/png", "image/gif", "image/webp"])
+            if imageEnabled {
+                mediaTypes.append(contentsOf: GrokACPImageCompatibility.supportedImageMediaTypes)
             }
             let capabilities = AgentProviderCapabilities(
                 supportsAttachments: !attachmentKinds.isEmpty,
