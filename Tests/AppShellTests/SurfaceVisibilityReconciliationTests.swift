@@ -116,12 +116,23 @@ final class SurfaceVisibilityReconciliationTests: XCTestCase {
         )
 
         let marker = "RC2_FRESH_BACKGROUND_\(UUID().uuidString)"
-        terminal.appendSystemText(marker + "\n")
+        // Real PTY reader path (not appendSystemText): hidden bytes go to
+        // hiddenRendererBuffer and used to leave read_text blank until reveal.
+        terminal.injectReaderOutputForTesting(Data((marker + "\n").utf8))
         XCTAssertGreaterThan(
             terminal.runtimeHealth().outputPendingBytes,
             0,
             "hidden fresh output must stay explicitly pending instead of painting a background Ghostty surface"
         )
+
+        // Authoritative transcript must be readable while still hidden — soak
+        // setup polls RC2_AUX_*_READY on non-selected workspaces via surface.read_text.
+        XCTAssertTrue(
+            terminal.readTextSnapshot().text.contains(marker),
+            "surface.read_text on a hidden background terminal must return buffered output before workspace select/reveal"
+        )
+        XCTAssertFalse(SurfaceRegistry.shared.isVisible(descriptor.id))
+        XCTAssertFalse(terminal.readerAllowsRenderForTesting)
 
         try router.selectWorkspace(backgroundWorkspace.id)
 
