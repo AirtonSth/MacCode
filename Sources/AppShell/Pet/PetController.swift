@@ -528,9 +528,20 @@ public final class PetController {
                 playCompanionCue(cue)
             }
             if snapshot.count == 0 { scheduleIdleTimeout() }
+            publishLiveActivitySurface()
         } catch {
             model.routeError = "Ready items could not be loaded."
         }
+    }
+
+    /// Push pet-identical copy to the remote Live Activity (active + needs you + completed).
+    private func publishLiveActivitySurface() {
+        let input = PetLiveActivityCopy.Input(
+            active: model.activeThreads,
+            needsYou: model.needsYouItems,
+            completed: model.completedItems
+        )
+        context.liveActivitySyncCoordinator.submitSurface(PetLiveActivityCopy.make(input))
     }
 
     private func attentionHydration(from snapshot: PetAttentionSnapshot) -> PetAttentionHydration {
@@ -676,6 +687,7 @@ public final class PetController {
             )
         }
         model.apply(activeThreads: items)
+        publishLiveActivitySurface()
     }
 
     private func verifyAndOpen(_ route: PetAttentionRoute) throws -> Bool {

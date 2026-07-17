@@ -250,6 +250,9 @@ public final class LiveActivitySyncCoordinator: @unchecked Sendable {
     private enum Command: @unchecked Sendable {
         case registerToken(PrivatePushTargetRecord)
         case projection(ActiveRunProjection, LiveActivitySyncCause, Date)
+        /// Pet-surface copy (active ∪ needs-you ∪ completed). Nil ends attention-
+        /// only cards; run projection can still keep the activity alive.
+        case surface(PetLiveActivityCopy.Output?, Date)
         case heartbeat(Date)
         case flush(CheckedContinuation<Void, Never>)
     }
@@ -286,8 +289,41 @@ public final class LiveActivitySyncCoordinator: @unchecked Sendable {
         self.continuation = capturedContinuation!
         self.worker = Task {
             var latest = ActiveRunProjection(runs: [])
+            var surface: PetLiveActivityCopy.Output?
+            var wasPresent = false
             var activityGeneration = initialActivityGeneration
             var stateRevision: UInt64 = 0
+
+            func presentNow() -> Bool {
+                surface != nil || latest.activeRunCount > 0
+            }
+
+            func emit(
+                event: PrivateLiveActivityEvent,
+                cause: LiveActivitySyncCause,
+                now: Date
+            ) async {
+                stateRevision &+= 1
+                if event == .start {
+                    stateRevision = 1
+                }
+                let delivery = Self.delivery(
+                    projection: latest,
+                    surface: surface,
+                    cause: cause,
+                    event: event,
+                    serverId: serverId,
+                    bootEpoch: bootEpoch,
+                    activityGeneration: activityGeneration,
+                    stateRevision: stateRevision,
+                    now: now
+                )
+                do {
+                    try await deliver(delivery)
+                } catch {
+                    onDeliveryError(error, delivery)
+                }
+            }
 
             for await command in stream {
                 switch command {
@@ -298,55 +334,55 @@ public final class LiveActivitySyncCoordinator: @unchecked Sendable {
                         onTokenRegistrationError(error, target)
                     }
                 case .projection(let projection, let cause, let now):
-                    let previousCount = latest.activeRunCount
                     latest = projection
-                    let event: PrivateLiveActivityEvent
                     if cause == .launchReconciliation {
-                        event = .end
-                    } else if previousCount == 0, projection.activeRunCount > 0 {
+                        surface = nil
+                        wasPresent = false
+                        activityGeneration &+= 1
+                        tokenScopeBinder.recordGeneration(activityGeneration)
+                        stateRevision = 0
+                        await emit(event: .end, cause: cause, now: now)
+                        continue
+                    }
+                    let nowPresent = presentNow()
+                    let event: PrivateLiveActivityEvent
+                    if !wasPresent, nowPresent {
                         activityGeneration &+= 1
                         tokenScopeBinder.recordGeneration(activityGeneration)
                         stateRevision = 0
                         event = .start
-                    } else if projection.activeRunCount == 0 {
+                    } else if wasPresent, !nowPresent {
                         event = .end
-                    } else {
+                    } else if nowPresent {
                         event = .update
+                    } else {
+                        wasPresent = nowPresent
+                        continue
                     }
-                    stateRevision &+= 1
-                    let delivery = Self.delivery(
-                        projection: projection,
-                        cause: cause,
-                        event: event,
-                        serverId: serverId,
-                        bootEpoch: bootEpoch,
-                        activityGeneration: activityGeneration,
-                        stateRevision: stateRevision,
-                        now: now
-                    )
-                    do {
-                        try await deliver(delivery)
-                    } catch {
-                        onDeliveryError(error, delivery)
+                    wasPresent = nowPresent
+                    await emit(event: event, cause: cause, now: now)
+                case .surface(let content, let now):
+                    surface = content
+                    let nowPresent = presentNow()
+                    let event: PrivateLiveActivityEvent
+                    if !wasPresent, nowPresent {
+                        activityGeneration &+= 1
+                        tokenScopeBinder.recordGeneration(activityGeneration)
+                        stateRevision = 0
+                        event = .start
+                    } else if wasPresent, !nowPresent {
+                        event = .end
+                    } else if nowPresent {
+                        event = .update
+                    } else {
+                        wasPresent = nowPresent
+                        continue
                     }
+                    wasPresent = nowPresent
+                    await emit(event: event, cause: .changed, now: now)
                 case .heartbeat(let now):
-                    guard latest.activeRunCount > 0 else { continue }
-                    stateRevision &+= 1
-                    let delivery = Self.delivery(
-                        projection: latest,
-                        cause: .changed,
-                        event: .update,
-                        serverId: serverId,
-                        bootEpoch: bootEpoch,
-                        activityGeneration: activityGeneration,
-                        stateRevision: stateRevision,
-                        now: now
-                    )
-                    do {
-                        try await deliver(delivery)
-                    } catch {
-                        onDeliveryError(error, delivery)
-                    }
+                    guard presentNow() else { continue }
+                    await emit(event: .update, cause: .changed, now: now)
                 case .flush(let barrier):
                     barrier.resume()
                 }
@@ -375,6 +411,11 @@ public final class LiveActivitySyncCoordinator: @unchecked Sendable {
         continuation.yield(.projection(projection, cause, now))
     }
 
+    /// Publish pet-identical Live Activity copy (active + needs-you + completed).
+    public func submitSurface(_ content: PetLiveActivityCopy.Output?, now: Date = Date()) {
+        continuation.yield(.surface(content, now))
+    }
+
     @discardableResult
     public func submitTokenRegistration(_ target: PrivatePushTargetRecord) throws -> PrivatePushTargetRecord {
         let bound = try tokenScopeBinder.bind(target)
@@ -394,6 +435,7 @@ public final class LiveActivitySyncCoordinator: @unchecked Sendable {
 
     private static func delivery(
         projection: ActiveRunProjection,
+        surface: PetLiveActivityCopy.Output?,
         cause: LiveActivitySyncCause,
         event: PrivateLiveActivityEvent,
         serverId: String,
@@ -402,37 +444,53 @@ public final class LiveActivitySyncCoordinator: @unchecked Sendable {
         stateRevision: UInt64,
         now: Date
     ) -> LiveActivitySyncDelivery {
-        let phase: PrivateLiveActivityProjectionPhase
-        if projection.activeRunCount > 0 {
-            phase = .running
-        } else if case .finished(.completed) = cause {
-            phase = .completed
-        } else {
-            phase = .failed
-        }
-        let count = projection.activeRunCount
-        let primaryThreadId = count == 1
-            ? projection.runs.first?.threadId.value.uuidString
-            : nil
         let sessionId = "\(serverId):\(bootEpoch):\(activityGeneration)"
-        // Text-only multi overview for push-to-device when iOS is not connected.
-        // Single-run keeps a short status; multi uses count as the headline so
-        // the Lock Screen card matches the iOS aggregate copy shape.
         let title: String
         let statusLine: String
         let preview: String
-        if count <= 0 {
+        let phase: PrivateLiveActivityProjectionPhase
+        let count: Int
+        let threadId: String?
+        let workspaceId: String?
+        let runStartDate: Double?
+
+        if let surface {
+            title = surface.title
+            statusLine = surface.statusLine
+            preview = surface.preview
+            phase = surface.phase
+            count = surface.activeThreadCount
+            threadId = surface.threadId
+            workspaceId = surface.workspaceId
+            runStartDate = surface.runStartDate.map { $0.timeIntervalSince1970 }
+        } else if projection.activeRunCount > 0 {
+            phase = .running
+            count = projection.activeRunCount
+            threadId = count == 1 ? projection.runs.first?.threadId.value.uuidString : nil
+            workspaceId = nil
+            runStartDate = nil
+            if count == 1 {
+                title = "RemoteCode"
+                statusLine = "1 active run"
+                preview = "RemoteCode"
+            } else {
+                title = "\(count) active runs"
+                statusLine = "\(count) active runs"
+                preview = "\(count) agents running"
+            }
+        } else {
+            if case .finished(.completed) = cause {
+                phase = .completed
+            } else {
+                phase = .failed
+            }
+            count = 0
+            threadId = nil
+            workspaceId = nil
+            runStartDate = nil
             title = "RemoteCode"
             statusLine = phase == .completed ? "Finished" : "Failed"
             preview = "RemoteCode"
-        } else if count == 1 {
-            title = "RemoteCode"
-            statusLine = "1 active run"
-            preview = "RemoteCode"
-        } else {
-            title = "\(count) active runs"
-            statusLine = "\(count) active runs"
-            preview = "\(count) agents running"
         }
         let contentState = PrivateLiveActivityProjectionV2(
             title: title,
@@ -441,7 +499,9 @@ public final class LiveActivitySyncCoordinator: @unchecked Sendable {
             phase: phase,
             activeThreadCount: count,
             updatedAt: Double(Int64(now.timeIntervalSince1970)),
-            threadId: primaryThreadId,
+            runStartDate: runStartDate,
+            workspaceId: workspaceId,
+            threadId: threadId,
             sessionId: sessionId,
             hostId: serverId,
             epoch: String(bootEpoch),
