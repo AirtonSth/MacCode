@@ -257,6 +257,11 @@ public final class LiveActivitySyncCoordinator: @unchecked Sendable {
     private let continuation: AsyncStream<Command>.Continuation
     private let tokenScopeBinder: LiveActivityTokenScopeBinder
     private var worker: Task<Void, Never>?
+    private var heartbeatTask: Task<Void, Never>?
+
+    /// Keep remote Live Activities under ActivityKit stale budget while runs are
+    /// active — even when no turn.completed event arrives for a long stretch.
+    public static let heartbeatIntervalNanoseconds: UInt64 = 30_000_000_000
 
     public init(
         serverId: String,
@@ -266,7 +271,8 @@ public final class LiveActivitySyncCoordinator: @unchecked Sendable {
         registerToken: @escaping TokenRegistration = { _ in },
         onTokenRegistrationError: @escaping TokenRegistrationError = { _, _ in },
         onDeliveryError: @escaping DeliveryError = { _, _ in },
-        deliver: @escaping Delivery
+        deliver: @escaping Delivery,
+        heartbeatIntervalNanoseconds: UInt64 = LiveActivitySyncCoordinator.heartbeatIntervalNanoseconds
     ) {
         let tokenScopeBinder = LiveActivityTokenScopeBinder(
             serverId: serverId,
@@ -346,11 +352,23 @@ public final class LiveActivitySyncCoordinator: @unchecked Sendable {
                 }
             }
         }
+        // Always-on keep-alive while any run is active (idle heartbeats are no-ops).
+        self.heartbeatTask = Task { [weak self] in
+            while !Task.isCancelled {
+                do {
+                    try await Task.sleep(nanoseconds: heartbeatIntervalNanoseconds)
+                } catch {
+                    break
+                }
+                self?.submitHeartbeat()
+            }
+        }
     }
 
     deinit {
         continuation.finish()
         worker?.cancel()
+        heartbeatTask?.cancel()
     }
 
     public func submit(_ projection: ActiveRunProjection, cause: LiveActivitySyncCause, now: Date = Date()) {

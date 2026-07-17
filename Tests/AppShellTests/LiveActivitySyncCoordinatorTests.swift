@@ -32,7 +32,8 @@ final class LiveActivitySyncCoordinatorTests: XCTestCase {
             serverId: "server-1",
             bootEpoch: 12,
             initialActivityGeneration: 40,
-            deliver: { delivery in await recorder.append(delivery) }
+            deliver: { delivery in await recorder.append(delivery) },
+            heartbeatIntervalNanoseconds: 60_000_000_000_000 // effectively disabled for this unit test
         )
         let first = ("10000000-0000-0000-0000-000000000001", "20000000-0000-0000-0000-000000000002")
         let second = ("10000000-0000-0000-0000-000000000002", "20000000-0000-0000-0000-000000000001")
@@ -75,7 +76,8 @@ final class LiveActivitySyncCoordinatorTests: XCTestCase {
         let recorder = DeliveryRecorder()
         let sync = LiveActivitySyncCoordinator(
             serverId: "server-1", bootEpoch: 7, initialActivityGeneration: 2,
-            deliver: { delivery in await recorder.append(delivery) }
+            deliver: { delivery in await recorder.append(delivery) },
+            heartbeatIntervalNanoseconds: 60_000_000_000_000
         )
         let run = ("10000000-0000-0000-0000-000000000001", "20000000-0000-0000-0000-000000000001")
         sync.submit(active([run]), cause: .started, now: Date(timeIntervalSince1970: 200))
@@ -91,7 +93,8 @@ final class LiveActivitySyncCoordinatorTests: XCTestCase {
         let recorder = DeliveryRecorder()
         let sync = LiveActivitySyncCoordinator(
             serverId: "server-1", bootEpoch: 9, initialActivityGeneration: 5,
-            deliver: { delivery in await recorder.append(delivery) }
+            deliver: { delivery in await recorder.append(delivery) },
+            heartbeatIntervalNanoseconds: 60_000_000_000_000
         )
         sync.submit(active([]), cause: .launchReconciliation, now: Date(timeIntervalSince1970: 300))
         await sync.flush()
@@ -123,7 +126,8 @@ final class LiveActivitySyncCoordinatorTests: XCTestCase {
             serverId: "server-1",
             bootEpoch: 2,
             registerToken: { target in recorder.append("register:\(target.token)") },
-            deliver: { delivery in recorder.append("deliver:\(delivery.event.rawValue)") }
+            deliver: { delivery in recorder.append("deliver:\(delivery.event.rawValue)") },
+            heartbeatIntervalNanoseconds: 60_000_000_000_000
         )
         let old = PrivatePushTargetRecord(
             deviceId: "device-1", serverId: "server-1", purpose: .pushToStart,
@@ -365,7 +369,8 @@ final class LiveActivitySyncCoordinatorTests: XCTestCase {
             bootEpoch: 9,
             initialActivityGeneration: 4,
             registerToken: { registrations.append($0) },
-            deliver: { _ in }
+            deliver: { _ in },
+            heartbeatIntervalNanoseconds: 60_000_000_000_000
         )
         let run = ("10000000-0000-0000-0000-000000000001", "20000000-0000-0000-0000-000000000001")
         sync.submit(active([run]), cause: .started)
@@ -397,7 +402,8 @@ final class LiveActivitySyncCoordinatorTests: XCTestCase {
     func testLateOldActivityTokenRetainsOldOwnershipAfterNewGeneration() async throws {
         let sync = LiveActivitySyncCoordinator(
             serverId: "server-1", bootEpoch: 9, initialActivityGeneration: 4,
-            registerToken: { _ in }, deliver: { _ in }
+            registerToken: { _ in }, deliver: { _ in },
+            heartbeatIntervalNanoseconds: 60_000_000_000_000
         )
         let run = ("10000000-0000-0000-0000-000000000001", "20000000-0000-0000-0000-000000000001")
         sync.submit(active([run]), cause: .started)
@@ -439,7 +445,8 @@ final class LiveActivitySyncCoordinatorTests: XCTestCase {
             serverId: "server-1",
             bootEpoch: 3,
             onDeliveryError: { error, delivery in errors.append(error, delivery: delivery) },
-            deliver: { _ in throw OutboxTestError.persistence }
+            deliver: { _ in throw OutboxTestError.persistence },
+            heartbeatIntervalNanoseconds: 60_000_000_000_000
         )
         let run = ("10000000-0000-0000-0000-000000000001", "20000000-0000-0000-0000-000000000001")
 
@@ -681,8 +688,35 @@ final class LiveActivitySyncCoordinatorTests: XCTestCase {
 
         XCTAssertEqual(try bridge.acceptanceTargets(for: oldEnd), [.v2(old)])
         let unknown = makeDelivery(event: .end, generation: 10, revision: 1)
-        XCTAssertThrowsError(try bridge.acceptanceTargets(for: unknown),
-                             "a missing typed ownership must not fall through to the newest legacy token")
+        // Fail-open: prefer the newest activity_update token over throwing and
+        // blocking delivery when boot/session ownership no longer matches.
+        XCTAssertEqual(try bridge.acceptanceTargets(for: unknown), [.v2(newest)],
+                       "stale ownership must fall back to the newest activity_update token, not hard-fail")
+    }
+
+    func testAcceptanceTargetsFallsBackToPushToStartWhenNoUpdateToken() throws {
+        let tmp = NSTemporaryDirectory() + "rc2-private-target-start-fallback-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let settings = SettingsRepository(db: db)
+        let targetStore = PrivatePushTargetStore(repo: settings)
+        let start = PrivatePushTargetRecord(
+            deviceId: "device-1", serverId: "server-1", purpose: .pushToStart,
+            environment: .sandbox, token: "start-token",
+            contractVersion: 2, capabilities: ["live_activity_v2"]
+        )
+        try targetStore.upsert(start)
+        let bridge = PrivateNotificationBridge(
+            accountStore: PrivateAccountSessionStore(repo: settings),
+            pushTargetStore: targetStore
+        )
+        let update = makeDelivery(event: .update, generation: 1, revision: 2)
+        XCTAssertEqual(try bridge.acceptanceTargets(for: update), [.v2(start)],
+                       "with iOS closed there is often only a push-to-start token; updates must still deliver")
+
+        let record = LiveActivityAcceptanceRecord(delivery: update, target: .v2(start))
+        let effective = PrivateNotificationBridge.effectiveDelivery(for: record)
+        XCTAssertEqual(effective.event, .start,
+                       "update via push-to-start is remapped to start so ActivityKit can show content")
     }
 
     func testV2CapabilityIsDisabledByDefault() {
