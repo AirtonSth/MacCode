@@ -234,6 +234,35 @@ final class TerminalSurfaceTeardownLeakTests: XCTestCase {
         XCTAssertTrue(waitForWaitpidOwnershipToBeConsumed(shellPID, timeout: 1))
     }
 
+    func test_beginChildReapRegistersJoinableWorkAndClearsInFlightOwnership() throws {
+        // WHY: tab close / EOF reapers must appear in activeProcessDispositionBarrier
+        // after SurfaceRegistry unregister so applicationWillTerminate can join them.
+        // Completing the reaper must clear childReapInFlightPID and set the
+        // reaped sentinel (-1); a stuck in-flight flag blocks later fallbacks.
+        let surface = try makeDeterministicReaperSurface(title: "reaper-joinable-work")
+        let shellPID = try XCTUnwrap(surface.runtimeHealth().childPID)
+        let reaperFinished = DispatchSemaphore(value: 0)
+        surface.setChildReapCompletionForTesting {
+            reaperFinished.signal()
+        }
+        defer { surface.close() }
+
+        surface.beginChildReapForTesting(pid: shellPID, sendInitialHangup: true)
+        XCTAssertNotNil(
+            TerminalSurface.activeProcessDispositionBarrier(),
+            "beginChildReap must register joinable reaper work for app-exit aggregation"
+        )
+        XCTAssertEqual(reaperFinished.wait(timeout: .now() + 3), .success)
+        XCTAssertTrue(waitForReaperCompletion(surface, timeout: 1))
+        XCTAssertTrue(waitForWaitpidOwnershipToBeConsumed(shellPID, timeout: 1))
+        XCTAssertEqual(
+            surface.childPIDForTesting,
+            -1,
+            "successful reap uses the reaped sentinel (-1), not a nil optional"
+        )
+        XCTAssertNil(surface.runtimeHealth().childPID)
+    }
+
     func test_nonblockingSetupFailureNeverStartsIOAndReapsOwnedChild() throws {
         // WHY: a blocking PTY can deadlock both the input pump and reader. The
         // spawn must be aborted before either worker exists, and the owned child
@@ -554,6 +583,51 @@ final class TerminalSurfaceTeardownLeakTests: XCTestCase {
         XCTAssertEqual(Darwin.waitpid(child.pid, &status, WNOHANG), -1)
         XCTAssertEqual(errno, ECHILD,
                        "completion is legal only after waitpid consumed the child or proved ECHILD")
+    }
+
+    func test_tabCloseRegistersDispositionJoinableByApplicationTermination() throws {
+        // WHY: permanentlyCloseRuntimeSurface unregisters immediately after tab
+        // close. applicationWillTerminate only joins registered surfaces plus
+        // TerminalSurface.activeProcessDispositionBarrier(). A tab-close reaper
+        // that is not registered as joinable work leaves still-owned PTY children
+        // outside the quit barrier after unregister.
+        let surface = try makeDeterministicReaperSurface(title: "tab-close-disposition-visible")
+        let shellPID = try XCTUnwrap(surface.runtimeHealth().childPID)
+        XCTAssertEqual(
+            surface.sendTextStatus(
+                "/bin/sh -c 'trap \"\" HUP TERM; while :; do /bin/sleep 30; done'\n"
+            ),
+            .accepted
+        )
+        try waitForBusy(surface)
+        let foregroundGroup = try capturedForegroundGroup(surface: surface, shellPID: shellPID)
+        defer {
+            if TerminalPTYProcessRuntime.currentValidation(of: foregroundGroup) == .active {
+                _ = Darwin.kill(-foregroundGroup.pgid, SIGKILL)
+            }
+            _ = Darwin.kill(shellPID, SIGKILL)
+            var status: Int32 = 0
+            _ = Darwin.waitpid(shellPID, &status, WNOHANG)
+        }
+
+        surface.close()
+
+        let barrier = try XCTUnwrap(
+            TerminalSurface.activeProcessDispositionBarrier(),
+            "tab close must publish joinable reaper work so app exit can wait after surface unregister"
+        )
+        XCTAssertTrue(
+            barrier.wait(until: .now() + 2),
+            "the registered tab-close reaper must reap a HUP/TERM-resistant tree within the app-exit window"
+        )
+        XCTAssertEqual(
+            TerminalPTYProcessRuntime.currentValidation(of: foregroundGroup),
+            .gone,
+            "tab-close reaper must clear the captured foreground group, not only the shell"
+        )
+        XCTAssertTrue(waitForWaitpidOwnershipToBeConsumed(shellPID, timeout: 0.2))
+        XCTAssertTrue(waitForReaperCompletion(surface, timeout: 1))
+        XCTAssertEqual(surface.childPIDForTesting, -1)
     }
 
     func test_applicationTerminationBarrierKillsAndReapsHUPTERMResistantProcessTree() throws {
@@ -1035,7 +1109,7 @@ final class TerminalSurfaceTeardownLeakTests: XCTestCase {
             + "masterFD=\(masterFD) fdFlags=\(descriptorFlags) statusFlags=\(statusFlags) "
             + "foregroundPGID=\(foregroundGroup) pump=\(surface.inputPumpConfiguredForTesting) "
             + "reader=\(surface.readerConfiguredForTesting) activeDispositions="
-            + "\(TerminalPTYProcessRuntime.activeApplicationTerminationWorksSnapshot().count) "
+            + "\(TerminalPTYProcessRuntime.activeProcessDispositionWorksSnapshot().count) "
             + "executableArgs=\(processCommandLine(pid: childPID)) snapshotTail=\(snapshotTail)"
     }
 

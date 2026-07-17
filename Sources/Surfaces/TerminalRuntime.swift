@@ -194,6 +194,10 @@ enum TerminalPTYProcessRuntime {
     /// ownership away from the normal asynchronous reaper during disposition.
     private static var applicationTerminationPIDs = Set<pid_t>()
     private static var activeApplicationTerminationWorks: [pid_t: ApplicationTerminationWork] = [:]
+    /// Joinable tab-close / EOF reapers. Unrelated to app-termination ownership;
+    /// app quit aggregates these so work started before SurfaceRegistry unregister
+    /// remains waitable without replacing the normal reaper path.
+    private static var activeChildReapWorks: [pid_t: ApplicationTerminationWork] = [:]
 
     static func spawn(
         cwd: String,
@@ -478,6 +482,18 @@ enum TerminalPTYProcessRuntime {
         completion: @escaping @Sendable (ChildReapResult) -> Void
     ) {
         let startedAt = DispatchTime.now().uptimeNanoseconds
+        let group = DispatchGroup()
+        let resultBox = ApplicationTerminationResult()
+        let work = ApplicationTerminationWork(
+            group: group,
+            succeeded: { resultBox.read() }
+        )
+        group.enter()
+        childReapQueue.sync {
+            // Surface in-flight ownership must keep one reaper per PID. A second
+            // start overwrites the join handle; only the map owner is aggregated.
+            activeChildReapWorks[pid] = work
+        }
         childReapQueue.async {
             var state = ChildReapState(sentHangup: initialHangupAlreadySent)
             if let foregroundGroup {
@@ -491,7 +507,15 @@ enum TerminalPTYProcessRuntime {
                 foregroundGroup: foregroundGroup,
                 startedAt: startedAt,
                 state: state,
-                completion: completion
+                completion: { result in
+                    // pollChildReap always completes on childReapQueue.
+                    if activeChildReapWorks[pid]?.group === work.group {
+                        activeChildReapWorks.removeValue(forKey: pid)
+                    }
+                    resultBox.complete(result.shellReaped)
+                    group.leave()
+                    completion(result)
+                }
             )
         }
     }
@@ -512,6 +536,15 @@ enum TerminalPTYProcessRuntime {
     static func activeApplicationTerminationWorksSnapshot() -> [ApplicationTerminationWork] {
         childReapQueue.sync {
             Array(activeApplicationTerminationWorks.values)
+        }
+    }
+
+    /// App-termination disposition works plus in-flight tab-close/EOF reapers.
+    /// Used by applicationWillTerminate after surfaces may already be unregistered.
+    static func activeProcessDispositionWorksSnapshot() -> [ApplicationTerminationWork] {
+        childReapQueue.sync {
+            Array(activeApplicationTerminationWorks.values)
+                + Array(activeChildReapWorks.values)
         }
     }
 

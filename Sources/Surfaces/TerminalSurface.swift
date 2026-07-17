@@ -620,7 +620,7 @@ public final class TerminalSurface: NSObject, Surface, TerminalHistoryCoordinato
     /// (for example, PTY preparation that failed after fork). App termination
     /// waits this registry in addition to registered surface barriers.
     public static func activeProcessDispositionBarrier() -> SurfaceTerminationBarrier? {
-        let works = TerminalPTYProcessRuntime.activeApplicationTerminationWorksSnapshot()
+        let works = TerminalPTYProcessRuntime.activeProcessDispositionWorksSnapshot()
         guard !works.isEmpty else { return nil }
         return SurfaceTerminationBarrier(
             groups: works.map(\.group),
@@ -1511,6 +1511,9 @@ public final class TerminalSurface: NSObject, Surface, TerminalHistoryCoordinato
                 signal: SIGHUP
             )
         }
+        // Tab close / EOF keep the normal reaper (status, banner, escalation timing).
+        // reapWithEscalation registers joinable work so applicationWillTerminate can
+        // wait via activeProcessDispositionBarrier after SurfaceRegistry unregister.
         TerminalPTYProcessRuntime.reapWithEscalation(
             pid: pid,
             foregroundGroup: foregroundGroup,
