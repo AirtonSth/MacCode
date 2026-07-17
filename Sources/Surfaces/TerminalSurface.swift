@@ -902,6 +902,12 @@ public final class TerminalSurface: NSObject, Surface, TerminalHistoryCoordinato
         readerAllowsRender
     }
 
+    /// Inject bytes on the live PTY reader path so tests can exercise hidden
+    /// `hiddenRendererBuffer` / pending accounting without `forkpty` (sandbox).
+    func injectReaderOutputForTesting(_ data: Data) {
+        appendDataAsync(data, renderAllowedAtRead: readerAllowsRender)
+    }
+
     func setReaderWillEnterMainHandoffForTesting(_ action: (@Sendable () -> Void)?) {
         readerMainHandoffHook.set(action)
     }
@@ -2059,6 +2065,13 @@ public final class TerminalSurface: NSObject, Surface, TerminalHistoryCoordinato
         // (PERF-136), before the cache check, so rendererMutationCount and the
         // renderer's actual state agree for every read site below.
         ensureRendererCurrent()
+        // Hidden PTY bytes land in `hiddenRendererBuffer`, not `renderer`/`pendingRendererEvents`.
+        // Heal the mirror before any snapshot read so surface.read_text returns the
+        // authoritative transcript while still hidden (release-soak aux markers),
+        // not a blank Ghostty parked grid or an unfed ANSIRenderer.
+        if !isVisible {
+            applyHiddenRendererHealIfNeeded()
+        }
         let diagnostics = renderDiagnostics()
         // F1: the cache key must also cover the volatile state the snapshot EMBEDS
         // (render-diagnostics, pending/partial/history-failure flags). rendererVersion
@@ -2073,8 +2086,10 @@ public final class TerminalSurface: NSObject, Surface, TerminalHistoryCoordinato
             diagnostics: diagnostics,
             outputPartialReason: outputPartialReason
         )
-        if !isVisible && outputPendingBytes > 0 {
-            // Hidden-output fallback: only the renderer is authoritative here.
+        if !isVisible {
+            // Hidden surfaces: Ghostty may be parked/occluded with a blank multi-row
+            // viewport even after pending drains. The healed ANSI renderer is the
+            // authoritative transcript for surface.read_text / iOS mirrors.
             // The viewport key in this branch is always nil (we skip ghostty read).
             if let cached = cachedTextSnapshot,
                Self.snapshotCacheValid(
@@ -2087,13 +2102,25 @@ public final class TerminalSurface: NSObject, Surface, TerminalHistoryCoordinato
                ) {
                 return cached.value
             }
+            let complete = Self.readTextComplete(
+                outputPartial: outputPartial,
+                outputPendingBytes: outputPendingBytes,
+                historyWriteFailures: historyWriteFailures
+            )
+            let partialReason = Self.readTextPartialReason(
+                outputPartial: outputPartial,
+                outputPendingBytes: outputPendingBytes,
+                historyWriteFailures: historyWriteFailures,
+                renderBlockedReason: diagnostics.blockedReason,
+                outputPartialReason: outputPartialReason
+            )
             var snap = TerminalTextSnapshot(
                 text: renderer.snapshot().string,
                 ansiText: renderer.ansiSnapshot(includeScrollback: true),
-                complete: false,
+                complete: complete,
                 source: "ansi_fallback",
                 timestamp: Date(),
-                partialReason: outputPartialReason ?? (outputPartial ? "hidden_output_cap" : "hidden_output_pending"),
+                partialReason: partialReason,
                 pendingBytes: outputPendingBytes,
                 rows: terminalSize.rows,
                 cols: terminalSize.cols,
@@ -2440,9 +2467,16 @@ public final class TerminalSurface: NSObject, Surface, TerminalHistoryCoordinato
     }
 
     static func shouldPreferRendererSnapshotForReadText(viewportText: String, rendererText: String) -> Bool {
-        guard rendererText.contains(where: { $0.isNewline }),
-              rendererText.count > viewportText.count else { return false }
-        return visibleLineCount(viewportText) <= 1
+        // Prefer the ANSI mirror when Ghostty's viewport has collapsed to empty or a
+        // single visible line (stale prompt / blank multi-row parked grid) while the
+        // renderer still holds more visible transcript. Compare visible line counts —
+        // not raw string length — so a blank 43-row grid of newlines cannot outrank a
+        // shorter marker-bearing renderer snapshot (release-soak aux ready markers).
+        let viewportVisible = visibleLineCount(viewportText)
+        let rendererVisible = visibleLineCount(rendererText)
+        guard viewportVisible <= 1 else { return false }
+        guard rendererVisible > viewportVisible else { return false }
+        return rendererText.contains(where: { $0.isNewline }) || viewportVisible == 0
     }
 
     private static func visibleLineCount(_ text: String) -> Int {
@@ -2538,20 +2572,8 @@ public final class TerminalSurface: NSObject, Surface, TerminalHistoryCoordinato
         // directly into renderer.feed; replaying the buffer first ensures
         // the renderer sees bytes in chronological order with no gap and no
         // double-feed (buffer is cleared here, live path is not yet active).
-        let healBuffer = hiddenRendererBuffer
-        let healOverflowed = hiddenRendererBufferOverflowed
-        hiddenRendererBuffer = Data()
-        hiddenRendererBufferOverflowed = false
-        if let replay = Self.hiddenRendererHealPlan(buffer: healBuffer, overflowed: healOverflowed) {
-            renderer.feed(replay)
-            rendererMutationCount &+= 1
-        }
-        if healOverflowed {
-            outputPartial = true
-            if outputPartialReason == nil || outputPartialReason == "history_replay_failed" {
-                outputPartialReason = "hidden_output_cap"
-            }
-        }
+        // Same heal as readTextSnapshot uses while still hidden.
+        applyHiddenRendererHealIfNeeded()
         readerAllowsRender = true
         ghosttyView.setOcclusion(visible: true)
         let hadHiddenOutput = outputPendingBytes > 0
@@ -2566,6 +2588,37 @@ public final class TerminalSurface: NSObject, Surface, TerminalHistoryCoordinato
         // (UX-013).
         ghosttyView.forceRefresh()
         scheduleVisibleRefresh()
+    }
+
+    /// Replays bytes buffered while `isVisible == false` into the ANSI mirror
+    /// renderer and clears the buffer so a later reveal cannot double-feed.
+    /// Called from `readTextSnapshot` (while still hidden) and `didBecomeVisible`.
+    private func applyHiddenRendererHealIfNeeded() {
+        let healBuffer = hiddenRendererBuffer
+        let healOverflowed = hiddenRendererBufferOverflowed
+        guard let replay = Self.hiddenRendererHealPlan(buffer: healBuffer, overflowed: healOverflowed) else {
+            // Empty buffer: still clear a degenerate overflow latch if set.
+            if healOverflowed {
+                hiddenRendererBufferOverflowed = false
+                outputPartial = true
+                if outputPartialReason == nil || outputPartialReason == "history_replay_failed" {
+                    outputPartialReason = "hidden_output_cap"
+                }
+            }
+            return
+        }
+        hiddenRendererBuffer = Data()
+        hiddenRendererBufferOverflowed = false
+        renderer.feed(replay)
+        rendererMutationCount &+= 1
+        // Invalidate any snapshot built before this heal.
+        cachedTextSnapshot = nil
+        if healOverflowed {
+            outputPartial = true
+            if outputPartialReason == nil || outputPartialReason == "history_replay_failed" {
+                outputPartialReason = "hidden_output_cap"
+            }
+        }
     }
 
     private func scheduleVisibleRefresh() {
