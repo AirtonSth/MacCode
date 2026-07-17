@@ -4974,6 +4974,9 @@ public struct AgentAppView: View {
     }
 
     static let userMessagePreviewCharacterLimit = 1_200
+    /// Max width for user prompt bubbles. Short text hugs content; long text wraps here.
+    /// Kept well under the old 600pt hard fill so chat bubbles stay compact.
+    static let userMessageBubbleMaxWidth: CGFloat = 420
     nonisolated static let runningTranscriptContextSlack: TimeInterval = 2
     // PERF-MAC_AGENT-023: idle/completed threads render their transcript in an
     // eager (non-Lazy) VStack, so a very long thread re-builds and re-lays-out the
@@ -7148,17 +7151,26 @@ public struct AgentAppView: View {
             let lineCount = displayText.components(separatedBy: "\n").count
             let showExpandToggle = !messageExpanded && lineCount > 28
             HStack(spacing: 0) {
-                Spacer(minLength: 32)
+                Spacer(minLength: 48)
                 VStack(alignment: .trailing, spacing: DS.Space.xs) {
-                    AgentSelectablePlainText(
-                        text: displayText,
-                        maximumNumberOfLines: messageExpanded ? nil : 28
-                    )
-                        .padding(.horizontal, 22)
-                        .padding(.vertical, 14)
+                    // WHY: Use SwiftUI Text (not AgentSelectablePlainText / NSTextView).
+                    // IntrinsicHeightTextView reports no horizontal intrinsic size, so
+                    // short prompts like "oi" expanded to the full maxWidth bubble.
+                    // Order matters: maxWidth on the text first so long prompts wrap
+                    // during ideal-size measurement; fixedSize then hugs short ones.
+                    Text(displayText)
+                        .font(.system(size: 13))
+                        .foregroundColor(DS.Palette.text)
+                        .multilineTextAlignment(.leading)
+                        .textSelection(.enabled)
+                        .lineLimit(messageExpanded ? nil : 28)
+                        .frame(maxWidth: Self.userMessageBubbleMaxWidth - (DS.Space.xl * 2),
+                               alignment: .leading)
+                        .padding(.horizontal, DS.Space.xl)
+                        .padding(.vertical, DS.Space.lg)
                         .background(DS.Palette.surface)
                         .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
-                        .frame(maxWidth: 600, alignment: .trailing)
+                        .fixedSize(horizontal: true, vertical: false)
                         .accessibilityIdentifier("agent.userMessageBubble")
                     if showExpandToggle {
                         Button {
