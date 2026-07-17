@@ -449,6 +449,42 @@ def file_descriptor_count(pid):
     return sum(1 for line in result.stdout.splitlines() if line.startswith("f"))
 
 
+def file_descriptor_type_counts(pid):
+    """Count open FDs by lsof type only (no paths/names; diagnostic-only)."""
+    result = subprocess.run(
+        ["/usr/sbin/lsof", "-nP", "-a", "-p", str(pid), "-Fft"],
+        text=True,
+        capture_output=True,
+    )
+    if result.returncode != 0:
+        raise Failure("could not sample app file descriptor types")
+    counts = {}
+    current_type = None
+    for line in result.stdout.splitlines():
+        if not line:
+            continue
+        code, value = line[0], line[1:]
+        if code == "f":
+            if current_type is not None:
+                counts[current_type] = counts.get(current_type, 0) + 1
+            current_type = "unknown"
+        elif code == "t" and current_type is not None:
+            current_type = value or "unknown"
+    if current_type is not None:
+        counts[current_type] = counts.get(current_type, 0) + 1
+    return {key: counts[key] for key in sorted(counts)}
+
+
+def file_descriptor_type_delta(before, after):
+    keys = set(before or {}) | set(after or {})
+    delta = {}
+    for key in sorted(keys):
+        change = int((after or {}).get(key, 0)) - int((before or {}).get(key, 0))
+        if change:
+            delta[key] = change
+    return delta
+
+
 def child_process_count(pid):
     result = subprocess.run(["ps", "-axo", "pid=,ppid="], text=True, capture_output=True)
     if result.returncode != 0:
@@ -902,11 +938,6 @@ def open_websocket(since_seq=None, receive_buffer_size=None, stream_filter=None)
     return sock, bytearray(initial_frame_bytes)
 
 
-def open_slow_ws():
-    sock, _ = open_websocket(receive_buffer_size=1024)
-    return sock
-
-
 def decode_websocket_frame(buffer):
     if len(buffer) < 2:
         return None
@@ -1105,6 +1136,156 @@ def open_mutation_control():
         raise
 
 
+class SlowWebSocketConnection:
+    """Long-lived slow-event client used by the release soak.
+
+    Stays registered through welcome + server-side client accounting by answering
+    WebSocket pings while setup runs. After enter_slow_mode(), the reader stops
+    draining so the server outbound path can back up under load. Does not log
+    frame payloads.
+    """
+
+    def __init__(self, sock, buffer, welcome):
+        connection_id = welcome.get("connectionId")
+        if not isinstance(connection_id, str) or not connection_id:
+            raise Failure("slow websocket welcome is missing connectionId")
+        self.sock = sock
+        self.buffer = buffer
+        self.connection_id = connection_id
+        self.welcome = welcome
+        self.stop_event = threading.Event()
+        self.slow_mode = threading.Event()
+        self.failure = None
+        self.failure_lock = threading.Lock()
+        self.thread = threading.Thread(
+            target=self._drain,
+            name="terminal-e2e-slow-ws",
+            daemon=True,
+        )
+
+    def start(self):
+        self.thread.start()
+        return self
+
+    def _record_failure(self, message):
+        with self.failure_lock:
+            if self.failure is None:
+                self.failure = message
+
+    def _drain(self):
+        try:
+            while not self.stop_event.is_set():
+                if self.slow_mode.is_set():
+                    # Keep the TCP peer open without draining so the server can
+                    # observe queue_full/write_failed under workload pressure.
+                    self.stop_event.wait(0.25)
+                    continue
+                frame = decode_websocket_frame(self.buffer)
+                if frame is None:
+                    self.sock.settimeout(1)
+                    try:
+                        chunk = self.sock.recv(64 * 1024)
+                    except socket.timeout:
+                        continue
+                    except OSError:
+                        if self.stop_event.is_set() or self.slow_mode.is_set():
+                            return
+                        raise
+                    if not chunk:
+                        raise Failure("slow websocket closed before slow mode")
+                    self.buffer.extend(chunk)
+                    continue
+                opcode, payload = frame
+                if opcode == 0x8:
+                    raise Failure("slow websocket sent close frame before slow mode")
+                if opcode == 0x9:
+                    send_masked_websocket_frame(self.sock, 0xA, payload)
+        except Exception as exc:
+            if not self.stop_event.is_set() and not self.slow_mode.is_set():
+                self._record_failure(str(exc))
+
+    def enter_slow_mode(self):
+        self.assert_active()
+        self.slow_mode.set()
+
+    def assert_active(self):
+        with self.failure_lock:
+            failure = self.failure
+        if failure is not None:
+            raise Failure(f"slow websocket failed: {failure}")
+        if self.slow_mode.is_set():
+            return
+        if not self.thread.is_alive():
+            raise Failure("slow websocket reader is not active")
+
+    def close(self):
+        self.stop_event.set()
+        self.slow_mode.set()
+        try:
+            self.sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+        self.thread.join(timeout=2)
+        if self.thread.is_alive():
+            raise Failure("slow websocket reader did not stop")
+
+
+def open_slow_ws():
+    sock, buffer = open_websocket(receive_buffer_size=1024)
+    try:
+        welcome = wait_for_websocket_json(
+            sock,
+            buffer,
+            lambda value: value.get("type") == "welcome",
+        )
+        return SlowWebSocketConnection(sock, buffer, welcome).start()
+    except Exception:
+        sock.close()
+        raise
+
+
+def host_connection_metrics():
+    req = urllib.request.Request(f"{BASE}/v1/health", method="GET")
+    with urllib.request.urlopen(req, timeout=5) as response:
+        payload = json.loads(response.read())
+    if not isinstance(payload, dict):
+        raise Failure("/v1/health returned a non-object payload")
+    connections = payload.get("connections")
+    if not isinstance(connections, dict):
+        raise Failure("/v1/health is missing connections metrics")
+    try:
+        active_clients = int(connections.get("active_clients"))
+        total_queued_bytes = int(connections.get("total_queued_bytes") or 0)
+        slow_client_drops = int(connections.get("slow_client_drops") or 0)
+    except (TypeError, ValueError) as exc:
+        raise Failure(f"/v1/health connections metrics are invalid: {connections}") from exc
+    return {
+        "active_clients": active_clients,
+        "total_queued_bytes": total_queued_bytes,
+        "slow_client_drops": slow_client_drops,
+    }
+
+
+def wait_for_active_websocket_clients(expected, timeout=15):
+    if expected < 1:
+        raise Failure("expected active websocket client count must be at least 1")
+    deadline = time.monotonic() + timeout
+    last = None
+    while time.monotonic() < deadline:
+        last = host_connection_metrics()
+        if last["active_clients"] >= expected:
+            return last
+        time.sleep(0.05)
+    raise Failure(
+        f"expected at least {expected} active websocket client(s) before resource baseline; "
+        f"last={last}"
+    )
+
+
 def recent(max_bytes=512):
     return rpc("events.recent", {"since_seq": 0, "max_bytes": max_bytes})
 
@@ -1116,6 +1297,17 @@ def observe_slow_ws_disconnect(stats):
     )
     stats["dropped_event_count"] = max(stats["dropped_event_count"], slow_count)
     stats["slow_ws_disconnect_seen"] = stats["slow_ws_disconnect_seen"] or slow_count > 0
+    try:
+        metrics = host_connection_metrics()
+        stats["max_slow_client_drops"] = max(
+            int(stats.get("max_slow_client_drops") or 0),
+            int(metrics["slow_client_drops"]),
+        )
+        if metrics["slow_client_drops"] > 0:
+            stats["slow_ws_disconnect_seen"] = True
+    except Exception:
+        # Diagnostic only; events.recent remains the primary evidence path.
+        pass
 
 
 def workload_duration_seconds():
@@ -1306,6 +1498,11 @@ def main():
         "slow_ws_reconnect_seen": False,
         "slow_ws_welcome_seen": False,
         "slow_ws_live_event_seen": False,
+        "slow_ws_slow_mode_entered": False,
+        "connected_clients_ready": False,
+        "pre_baseline_active_clients": None,
+        "pre_baseline_fd_type_counts": None,
+        "max_slow_client_drops": 0,
         "baseline_required_seen": False,
         "baseline_converged_after_reconnect": False,
         "hidden_partial_seen": False,
@@ -1402,12 +1599,19 @@ def main():
         mutation_control = open_mutation_control()
         _MUTATION_CONTROL = mutation_control
         slow_sock = open_slow_ws()
+        stats["slow_ws_welcome_seen"] = True
+        # Fail fast once both long-lived clients are welcome-ready and
+        # server-registered. The soak FD baseline is gated again below.
+        wait_for_active_websocket_clients(2)
+        stats["connected_clients_ready"] = True
         wait_for_canary_duration(
             pid,
             canary_root,
             CLIENT_WARMUP_SECONDS,
             "connected-client warmup",
         )
+        mutation_control.assert_active()
+        slow_sock.assert_active()
         stats["client_warmup_completed"] = True
         wait_for_canary_duration(
             pid,
@@ -1505,6 +1709,20 @@ def main():
             "workload stabilization",
         )
         stats["workload_stabilization_completed"] = True
+
+        # Re-verify long-lived clients immediately before the first soak sample
+        # (resource baseline). Fail setup rather than measuring an incomplete
+        # baseline or retaking the baseline after growth is observed.
+        mutation_control.assert_active()
+        slow_sock.assert_active()
+        ready_metrics = wait_for_active_websocket_clients(2)
+        stats["pre_baseline_active_clients"] = ready_metrics["active_clients"]
+        stats["pre_baseline_fd_type_counts"] = file_descriptor_type_counts(pid)
+        stats["connected_clients_ready"] = True
+        # Stop draining only after readiness is proven so the soak baseline
+        # includes the intended slow-client socket FD.
+        slow_sock.enter_slow_mode()
+        stats["slow_ws_slow_mode_entered"] = True
 
         stats["soak_started_monotonic"] = time.monotonic()
         soak_deadline = stats["soak_started_monotonic"] + RUN_SECONDS
@@ -1652,13 +1870,19 @@ def main():
             raise Failure("slow websocket diagnostic was not observed")
         if stats["slow_ws_disconnect_seen"]:
             reconnect_cursor = int(recent(max_bytes=256 * 1024).get("last_seq", 0))
-            slow_sock.close()
-            slow_sock, reconnect_buffer = open_websocket(
+            previous_slow = slow_sock
+            slow_sock = None
+            if previous_slow is not None:
+                previous_slow.close()
+            reconnect_sock, reconnect_buffer = open_websocket(
                 since_seq=reconnect_cursor,
                 receive_buffer_size=256 * 1024,
             )
+            # Raw reconnect socket (not SlowWebSocketConnection). Assign only
+            # after open so finally cleanup owns it if welcome/live waits fail.
+            slow_sock = reconnect_sock
             wait_for_websocket_json(
-                slow_sock,
+                reconnect_sock,
                 reconnect_buffer,
                 lambda value: (
                     value.get("type") == "welcome"
@@ -1668,7 +1892,7 @@ def main():
             stats["slow_ws_welcome_seen"] = True
             rpc("workspace.select", {"id": hidden_wid})
             wait_for_websocket_json(
-                slow_sock,
+                reconnect_sock,
                 reconnect_buffer,
                 lambda value: (
                     value.get("type") == "event"
@@ -1760,10 +1984,23 @@ def main():
     except Exception as exc:
         stats["status"] = "FAIL"
         stats["error"] = str(exc)
-        stats["failure_diagnostics"] = {
+        failure_diagnostics = {
             "primary": capture_terminal_diagnostics(primary_sid),
             "hidden": capture_terminal_diagnostics(hidden_sid),
         }
+        try:
+            if stats.get("canary_pid"):
+                current_types = file_descriptor_type_counts(stats["canary_pid"])
+                failure_diagnostics["fd_type_counts"] = current_types
+                failure_diagnostics["fd_type_delta_from_pre_baseline"] = (
+                    file_descriptor_type_delta(
+                        stats.get("pre_baseline_fd_type_counts"),
+                        current_types,
+                    )
+                )
+        except Exception as diagnostic_exc:
+            failure_diagnostics["fd_type_error"] = str(diagnostic_exc)
+        stats["failure_diagnostics"] = failure_diagnostics
         update_memory_evidence(stats)
         stats["duration_seconds"] = int(time.time() - start)
         print(json.dumps(public_stats(stats), sort_keys=True), file=sys.stderr)
