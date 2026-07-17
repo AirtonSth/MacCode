@@ -139,6 +139,60 @@ public struct PetAttentionSnapshot: Sendable, Equatable {
     public var count: Int { items.count }
 }
 
+/// In-flight agent thread row for the pet popover. Titles are fixed privacy-safe
+/// copy; membership is supplied by the live active-run projection, not thread
+/// status rows that can lag after crashes.
+public struct PetActiveThreadItem: Sendable, Equatable, Identifiable {
+    public let id: String
+    public let threadID: AgentThreadID
+    public let title: String
+    public let detail: String?
+    public let route: PetAttentionRoute
+
+    public init(
+        threadID: AgentThreadID,
+        workspaceID: WorkspaceID?,
+        providerName: String?
+    ) {
+        self.id = "active:\(threadID.value.uuidString)"
+        self.threadID = threadID
+        let presentation = PetAttentionPresentation.safe(
+            kind: .agentRunning,
+            context: PetAttentionContext(providerName: providerName)
+        )
+        self.title = presentation.title
+        self.detail = presentation.detail
+        self.route = .agentThread(threadID: threadID, workspaceID: workspaceID)
+    }
+}
+
+public enum PetActiveThreadProjector {
+    public static func items(
+        threadIDs: [AgentThreadID],
+        lookup: (AgentThreadID) -> (workspaceID: WorkspaceID?, providerName: String?)?
+    ) -> [PetActiveThreadItem] {
+        let unique = Array(Set(threadIDs)).sorted {
+            $0.value.uuidString < $1.value.uuidString
+        }
+        return unique.map { threadID in
+            let meta = lookup(threadID)
+            return PetActiveThreadItem(
+                threadID: threadID,
+                workspaceID: meta?.workspaceID,
+                providerName: meta?.providerName
+            )
+        }
+    }
+
+    public static func providerLabel(_ provider: AgentProvider) -> String {
+        switch provider {
+        case .codex: return "Codex"
+        case .claude: return "Claude"
+        case .grok: return "Grok"
+        }
+    }
+}
+
 public enum PetAttentionMarkResult: Sendable, Equatable {
     case marked
     case retainedBlocker

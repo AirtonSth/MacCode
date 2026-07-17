@@ -1,6 +1,7 @@
 import AppKit
 import XCTest
 @testable import AppShell
+import AgentRuntime
 import CoreModel
 import Persistence
 import SocketServer
@@ -246,6 +247,87 @@ final class PetWindowAndLifecycleTests: XCTestCase {
         XCTAssertNil(model.badgeText)
     }
 
+    func test_viewModelFormatsBlueActiveBadgeAndKeepsItIndependentOfReadyCounterSetting() {
+        let model = PetViewModel(settings: AppSettings(petEnabled: true))
+        let threadA = AgentThreadID(UUID(uuidString: "AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA")!)
+        let threadB = AgentThreadID(UUID(uuidString: "BBBBBBBB-BBBB-BBBB-BBBB-BBBBBBBBBBBB")!)
+        let secretTitle = "Run rm -rf /Users/private token=secret-token"
+
+        let projected = PetActiveThreadProjector.items(
+            threadIDs: [threadA, threadA, threadB]
+        ) { id in
+            (
+                workspaceID: WorkspaceID(UUID(uuidString: "CCCCCCCC-CCCC-CCCC-CCCC-CCCCCCCCCCCC")!),
+                providerName: id == threadA ? "Codex" : "Claude"
+            )
+        }
+
+        XCTAssertEqual(projected.count, 2, "Duplicate run IDs for one thread must count once.")
+        XCTAssertEqual(projected.map(\.title), ["Agent run in progress", "Agent run in progress"])
+        XCTAssertEqual(projected.map(\.detail), ["Codex", "Claude"])
+        for item in projected {
+            XCTAssertFalse(item.title.contains(secretTitle))
+            XCTAssertFalse(item.detail?.contains(secretTitle) == true)
+            XCTAssertFalse(item.id.contains("secret"))
+        }
+
+        model.apply(activeThreads: projected)
+        XCTAssertEqual(model.activeBadgeText, "2")
+        XCTAssertEqual(model.activeThreadCount, 2)
+        XCTAssertEqual(
+            model.accessibilityValue,
+            "2 active agent threads"
+        )
+        XCTAssertFalse(model.isPopoverEmpty)
+
+        model.apply(settings: AppSettings(petEnabled: true, petReadyCounterEnabled: false))
+        XCTAssertEqual(
+            model.activeBadgeText,
+            "2",
+            "Active blue badge must remain visible when the red ready counter is disabled."
+        )
+        XCTAssertNil(model.badgeText)
+
+        let attention = PetAttentionItem(
+            id: "callback-1",
+            kind: .callback(.approval, isStale: false),
+            title: "Approval required",
+            detail: nil,
+            createdAt: Date(),
+            route: .settings(.general),
+            source: .notification(id: "callback-1")
+        )
+        model.apply(snapshot: PetAttentionSnapshot(items: [attention]))
+        XCTAssertEqual(
+            model.accessibilityValue,
+            "2 active agent threads. 1 item needs attention"
+        )
+
+        model.apply(activeThreads: [])
+        XCTAssertNil(model.activeBadgeText)
+        XCTAssertEqual(model.accessibilityValue, "1 item needs attention")
+        XCTAssertFalse(model.isPopoverEmpty)
+
+        model.apply(snapshot: PetAttentionSnapshot(items: []))
+        XCTAssertTrue(model.isPopoverEmpty)
+        XCTAssertEqual(model.accessibilityValue, "No items need attention")
+    }
+
+    func test_activeThreadProjectorKeepsAuthoritativeMembershipWhenMetadataIsMissing() {
+        let threadID = AgentThreadID(UUID(uuidString: "DDDDDDDD-DDDD-DDDD-DDDD-DDDDDDDDDDDD")!)
+        let items = PetActiveThreadProjector.items(threadIDs: [threadID]) { _ in nil }
+        XCTAssertEqual(items.count, 1)
+        XCTAssertEqual(items[0].threadID, threadID)
+        XCTAssertEqual(items[0].title, "Agent run in progress")
+        XCTAssertNil(items[0].detail)
+        if case .agentThread(let routedID, let workspaceID) = items[0].route {
+            XCTAssertEqual(routedID, threadID)
+            XCTAssertNil(workspaceID)
+        } else {
+            XCTFail("Active rows must route to their agent thread.")
+        }
+    }
+
     func test_placementStoreRoundTripsAndResetsNormalizedDisplayPosition() throws {
         let db = try database()
         let store = PetPlacementStore(repository: SettingsRepository(db: db))
@@ -299,6 +381,77 @@ final class PetWindowAndLifecycleTests: XCTestCase {
 
         thread = try XCTUnwrap(context.threadRepo.get(id: thread.id))
         XCTAssertTrue(thread.hasUnread, "Runtime observation must not clear attention without a verified route.")
+    }
+
+    func test_controllerProjectsActiveThreadsFromAuthoritativeProjectionWithoutLeakingTitles() async throws {
+        let directory = NSTemporaryDirectory() + "RC2PetActiveThreads-\(UUID().uuidString)"
+        let context = try AppContext(channel: .debug, appSupportOverride: directory)
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let workspace = try router.createWorkspace(name: "Pet", cwd: NSTemporaryDirectory())
+        let secretTitle = "Run rm -rf /Users/private Authorization: Bearer secret-token"
+        let thread = AgentThread(
+            workspaceId: workspace.id,
+            title: secretTitle,
+            provider: .codex,
+            model: "test",
+            status: .running,
+            hasUnread: false
+        )
+        try context.threadRepo.upsert(thread)
+        SettingsStore(db: context.db).save(AppSettings(petEnabled: true, petReadyCounterEnabled: false))
+
+        var previousHandlerInvocations = 0
+        let previous = context.coordinator.onActiveRunProjectionChanged
+        context.coordinator.onActiveRunProjectionChanged = { projection, cause in
+            previous?(projection, cause)
+            previousHandlerInvocations += 1
+        }
+
+        let controller = try PetController(context: context, router: router, openSettings: { _ in false })
+        controller.start()
+        defer { controller.stop() }
+
+        XCTAssertEqual(controller.modelForTests.activeThreadCount, 0)
+        XCTAssertNil(controller.modelForTests.activeBadgeText)
+
+        let runID = AgentRunID()
+        let projection = ActiveRunProjection(runs: [
+            .init(threadId: thread.id, runId: runID),
+            .init(threadId: thread.id, runId: AgentRunID())
+        ])
+        context.coordinator.onActiveRunProjectionChanged?(projection, .started)
+        try await Task.sleep(nanoseconds: 30_000_000)
+
+        XCTAssertEqual(
+            previousHandlerInvocations,
+            1,
+            "Pet must chain the existing ActiveRunProjection observer, not replace it."
+        )
+        XCTAssertEqual(
+            controller.modelForTests.activeThreadCount,
+            1,
+            "Multiple run IDs for one thread still count as one active thread."
+        )
+        XCTAssertEqual(controller.modelForTests.activeBadgeText, "1")
+        XCTAssertNil(
+            controller.modelForTests.badgeText,
+            "Red ready badge remains gated by petReadyCounterEnabled and independent of active runs."
+        )
+        let row = try XCTUnwrap(controller.modelForTests.activeThreads.first)
+        XCTAssertEqual(row.title, "Agent run in progress")
+        XCTAssertEqual(row.detail, "Codex")
+        XCTAssertFalse(row.title.contains("rm -rf"))
+        XCTAssertFalse(row.detail?.contains("secret-token") == true)
+        XCTAssertFalse(controller.modelForTests.accessibilityValue.contains(secretTitle))
+
+        context.coordinator.onActiveRunProjectionChanged?(
+            ActiveRunProjection(runs: []),
+            .finished(.completed)
+        )
+        try await Task.sleep(nanoseconds: 30_000_000)
+        XCTAssertEqual(controller.modelForTests.activeThreadCount, 0)
+        XCTAssertNil(controller.modelForTests.activeBadgeText)
     }
 
     func test_controllerHydratesPersistentAttentionKindsBeforeRendering() throws {

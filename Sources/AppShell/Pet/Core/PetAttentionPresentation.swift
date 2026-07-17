@@ -13,6 +13,7 @@ public enum PetAttentionOperationOutcome: Sendable, Equatable {
 
 public enum PetAttentionKind: Sendable, Equatable {
     case agentOutcome(PetAttentionOutcome)
+    case agentRunning
     case approval
     case question(isSecret: Bool)
     case fileConflict
@@ -68,6 +69,7 @@ public struct PetAttentionPresentation: Sendable, Equatable {
         case .agentOutcome(.completed): title = "Agent run completed"
         case .agentOutcome(.failed): title = "Agent run failed"
         case .agentOutcome(.interrupted): title = "Agent run interrupted"
+        case .agentRunning: title = "Agent run in progress"
         case .approval: title = "Approval required"
         case .question(isSecret: false): title = "Input requested"
         case .question(isSecret: true): title = "Secret input requested"
@@ -103,6 +105,30 @@ public enum PetAttentionCountFormatter {
         case 1: return "1 item needs attention"
         case let count: return "\(count) items need attention"
         }
+    }
+}
+
+/// Blue pet badge for in-flight agent threads. Always enabled when count > 0;
+/// membership must come from the live active-run projection, not DB status.
+public enum PetActiveThreadCountFormatter {
+    public static func badgeText(count: Int) -> String? {
+        PetAttentionCountFormatter.badgeText(count: count, isEnabled: true)
+    }
+
+    public static func accessibilityValue(count: Int) -> String {
+        switch max(0, count) {
+        case 0: return "No active agent threads"
+        case 1: return "1 active agent thread"
+        case let count: return "\(count) active agent threads"
+        }
+    }
+
+    public static func combinedAccessibilityValue(activeCount: Int, attentionCount: Int) -> String {
+        let active = accessibilityValue(count: activeCount)
+        let attention = PetAttentionCountFormatter.accessibilityValue(count: attentionCount)
+        if max(0, activeCount) == 0 { return attention }
+        if max(0, attentionCount) == 0 { return active }
+        return "\(active). \(attention)"
     }
 }
 
