@@ -392,16 +392,36 @@ public final class LiveActivitySyncCoordinator: @unchecked Sendable {
         } else {
             phase = .failed
         }
-        let primaryThreadId = projection.activeRunCount == 1
+        let count = projection.activeRunCount
+        let primaryThreadId = count == 1
             ? projection.runs.first?.threadId.value.uuidString
             : nil
         let sessionId = "\(serverId):\(bootEpoch):\(activityGeneration)"
+        // Text-only multi overview for push-to-device when iOS is not connected.
+        // Single-run keeps a short status; multi uses count as the headline so
+        // the Lock Screen card matches the iOS aggregate copy shape.
+        let title: String
+        let statusLine: String
+        let preview: String
+        if count <= 0 {
+            title = "RemoteCode"
+            statusLine = phase == .completed ? "Finished" : "Failed"
+            preview = "RemoteCode"
+        } else if count == 1 {
+            title = "RemoteCode"
+            statusLine = "1 active run"
+            preview = "RemoteCode"
+        } else {
+            title = "\(count) active runs"
+            statusLine = "\(count) active runs"
+            preview = "\(count) agents running"
+        }
         let contentState = PrivateLiveActivityProjectionV2(
-            statusLine: projection.activeRunCount == 1
-                ? "1 active run"
-                : "\(projection.activeRunCount) active runs",
+            title: title,
+            statusLine: statusLine,
+            preview: preview,
             phase: phase,
-            activeThreadCount: projection.activeRunCount,
+            activeThreadCount: count,
             updatedAt: Double(Int64(now.timeIntervalSince1970)),
             threadId: primaryThreadId,
             sessionId: sessionId,
