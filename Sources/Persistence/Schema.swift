@@ -9,7 +9,7 @@ public struct SchemaStep {
 }
 
 public enum Schema {
-    public static let currentVersion: Int = 41
+    public static let currentVersion: Int = 43
 
     public static let steps: [SchemaStep] = [
         SchemaStep(1, """
@@ -577,6 +577,10 @@ public enum Schema {
         );
         CREATE INDEX IF NOT EXISTS idx_agent_thread_undo_gc_pins_expiry
         ON agent_thread_undo_gc_pins(expires_at);
+        """),
+        SchemaStep(43, """
+        ALTER TABLE agent_threads
+        ADD COLUMN run_as_user_json TEXT;
         """)
     ]
 

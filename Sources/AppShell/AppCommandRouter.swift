@@ -2104,7 +2104,8 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             serviceTier: t.serviceTier,
             interactionMode: interactionMode ?? .default,
             providerBinary: providerBinary(provider: prov, instanceId: t.providerInstanceId),
-            environment: providerEnvironment(provider: prov, instanceId: t.providerInstanceId)
+            environment: providerEnvironment(provider: prov, instanceId: t.providerInstanceId),
+            runAsUser: t.runAsUser
         )
         let runId = try await ctx.coordinator.startRun(req)
         // HC-5 (R1): a message sent from the mobile mirror must be

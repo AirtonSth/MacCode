@@ -9,6 +9,7 @@ let package = Package(
     products: [
         .executable(name: "RemoteCode", targets: ["AppShell"]),
         .executable(name: "RemoteCodeDistillService", targets: ["RemoteCodeDistillService"]),
+        .executable(name: "RemoteCodeRunAsUserHelper", targets: ["RemoteCodeRunAsUserHelper"]),
         .executable(name: "LifecycleSignalProbe", targets: ["LifecycleSignalProbe"]),
         .executable(name: "rc2", targets: ["RC2CLI"]),
         .library(name: "CoreModel", targets: ["CoreModel"]),
@@ -78,6 +79,10 @@ let package = Package(
             name: "RemoteCodeDistillService",
             dependencies: ["DistillCore", "AgentRuntime", "Persistence"],
             path: "Sources/RemoteCodeDistillService"
+        ),
+        .executableTarget(
+            name: "RemoteCodeRunAsUserHelper",
+            path: "Sources/RemoteCodeRunAsUserHelper"
         ),
         .executableTarget(
             name: "LifecycleSignalProbe",

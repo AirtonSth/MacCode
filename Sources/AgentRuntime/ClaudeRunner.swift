@@ -147,12 +147,24 @@ public final class ClaudeRunner: AgentProviderRunner, @unchecked Sendable {
         }
 
         let args = Self.buildArgs(request)
+        let environment = CodexRunner.processEnvironment(overrides: request.environment, provider: .claude)
+        let launchPlan: RunAsUserProcessBootstrap.LaunchPlan
+        do {
+            launchPlan = try RunAsUserProcessBootstrap.plan(
+                executablePath: path,
+                arguments: args,
+                environment: environment,
+                currentDirectory: request.cwd,
+                runAsUser: request.runAsUser
+            )
+        } catch {
+            onEvent(.error(error.localizedDescription))
+            onEvent(.finished(.failed, finalMessage: nil, providerThreadId: nil))
+            throw AgentRunError.spawnFailed(error.localizedDescription)
+        }
 
         let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: path)
-        proc.arguments = args
-        proc.currentDirectoryURL = URL(fileURLWithPath: request.cwd)
-        proc.environment = CodexRunner.processEnvironment(overrides: request.environment, provider: .claude)
+        RunAsUserProcessBootstrap.apply(launchPlan, to: proc)
         let stdoutPipe = Pipe(), stderrPipe = Pipe()
         proc.standardOutput = stdoutPipe
         proc.standardError = stderrPipe

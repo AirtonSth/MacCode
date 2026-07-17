@@ -63,11 +63,13 @@ swift build -c "$CONFIG"
 BIN="$BIN_DIR/RemoteCode"
 CLI="$BIN_DIR/rc2"
 DISTILL_SERVICE="$BIN_DIR/RemoteCodeDistillService"
+RUN_AS_USER_HELPER="$BIN_DIR/RemoteCodeRunAsUserHelper"
 MLX_METALLIB="$BIN_DIR/mlx.metallib"
 SURFACES_RESOURCES="$BIN_DIR/RemoteCode_Surfaces.bundle"
 APP_SHELL_RESOURCES="$BIN_DIR/RemoteCode_AppShell.bundle"
 if [ ! -x "$BIN" ]; then echo "missing $BIN"; exit 1; fi
 if [ ! -x "$DISTILL_SERVICE" ]; then echo "missing $DISTILL_SERVICE"; exit 1; fi
+if [ ! -x "$RUN_AS_USER_HELPER" ]; then echo "missing $RUN_AS_USER_HELPER"; exit 1; fi
 scripts/build-mlx-metallib.sh "$MLX_METALLIB"
 if [ ! -f "$MLX_METALLIB" ]; then echo "missing $MLX_METALLIB"; exit 1; fi
 
@@ -112,6 +114,9 @@ mkdir -p "$STAGING_APP/Contents/Frameworks"
 
 cp "$BIN" "$STAGING_APP/Contents/MacOS/RemoteCode"
 cp "$DISTILL_SERVICE" "$STAGING_APP/Contents/MacOS/RemoteCodeDistillService"
+# Privileged trampoline for sudo -u style agent execution. Not setuid in the
+# bundle; install to /Library/PrivilegedHelperTools with root ownership for use.
+cp "$RUN_AS_USER_HELPER" "$STAGING_APP/Contents/MacOS/RemoteCodeRunAsUserHelper"
 cp "$MLX_METALLIB" "$STAGING_APP/Contents/MacOS/mlx.metallib"
 if [ -x "$CLI" ]; then
   cp "$CLI" "$STAGING_APP/Contents/MacOS/rc2"
