@@ -458,6 +458,9 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
                 opened = try await client.newSession(cwd: request.cwd)
             }
             let mapper = GrokACPEventMapper(sessionId: opened.sessionId)
+            // Seed mode so plan session updates can tell live progress from Plan review.
+            mapper.setCurrentModeId(opened.currentModeId)
+            mapper.setPlanReviewModeId(opened.planModeId)
             let session = Session(
                 threadId: request.threadId,
                 providerThreadId: opened.sessionId,
@@ -545,7 +548,11 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
             }
             if let requestedMode, requestedMode != session.mode {
                 try await session.client.setMode(sessionId: session.providerThreadId, modeId: requestedMode)
-                synchronized { session.mode = requestedMode }
+                synchronized {
+                    session.mode = requestedMode
+                    // Keep mapper mode in sync even when the peer omits current_mode_update.
+                    session.mapper.setCurrentModeId(requestedMode)
+                }
             }
             for event in session.mapper.beginTurn() { emit(event, session: session) }
             onEvent(.status(.running))
@@ -696,6 +703,13 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
 
     private func emit(_ event: AssistantEvent, session: Session) {
         lock.lock()
+        // Drop late ACP noise after the turn terminal was published. Post-finish
+        // events were re-entering the coordinator with a cleared seq counter and
+        // colliding on durable seq 1 (servers_updated vs turnStarted).
+        if session.turnTerminalEmitted {
+            lock.unlock()
+            return
+        }
         session.history.append(event)
         let callback = session.onEvent
         lock.unlock()

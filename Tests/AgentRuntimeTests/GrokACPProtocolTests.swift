@@ -202,11 +202,100 @@ final class GrokACPProtocolTests: XCTestCase {
         events += mapper.consumeSessionUpdate(["sessionUpdate": "agent_message_chunk", "content": ["type": "text", "text": "final answer"]])
         events += mapper.finishTurn(stopReason: "end_turn", usage: nil)
 
-        XCTAssertTrue(events.contains { if case .proposedPlan(let plan) = $0 { return plan.markdown.contains("Inspect") }; return false })
+        // Default/full-access turns: ACP plan entries are live progress, not Approve gates.
+        XCTAssertTrue(events.contains {
+            if case .activePlanUpdated(let plan) = $0 {
+                return plan.steps.map(\.title) == ["Inspect", "Patch"]
+                    && plan.steps.map(\.status) == [.completed, .pending]
+            }
+            return false
+        }, "Grok plan session updates must map to active plan progress")
+        XCTAssertFalse(events.contains { if case .proposedPlan = $0 { return true }; return false },
+                       "live plan progress must not become proposedPlan (full access would auto-queue Implement)")
         XCTAssertTrue(events.contains { if case .itemStarted(let item) = $0 { return item.id == "tool-1" && item.type == .tool }; return false })
         XCTAssertTrue(events.contains { if case .itemCompleted("tool-1", .completed) = $0 { return true }; return false })
         XCTAssertTrue(events.contains { if case .turnCompleted(_, let final) = $0 { return final == "final answer" }; return false },
                       "AG-057: only the last assistant text phase is the final answer")
+    }
+
+    func test_mapperPlanModeEmitsReviewableProposedPlanAndActiveProgress() {
+        let mapper = GrokACPEventMapper(sessionId: "grok-plan-mode")
+        mapper.setPlanReviewModeId("plan")
+        mapper.setCurrentModeId("plan")
+        let events = mapper.consumeSessionUpdate([
+            "sessionUpdate": "plan",
+            "entries": [
+                ["content": "Inspect", "status": "completed"],
+                ["content": "Patch", "status": "pending"]
+            ]
+        ])
+        XCTAssertTrue(events.contains {
+            if case .activePlanUpdated(let plan) = $0 {
+                return plan.steps.count == 2 && plan.steps[1].status == .pending
+            }
+            return false
+        }, "Plan mode still surfaces active step progress")
+        XCTAssertTrue(events.contains {
+            if case .proposedPlan(let plan) = $0 {
+                return plan.markdown.contains("Inspect") && plan.markdown.contains("Patch")
+            }
+            return false
+        }, "Plan interaction mode must still publish a reviewable proposed plan")
+    }
+
+    func test_mapperNegotiatedPlanModeIdEmitsProposedPlan() {
+        let mapper = GrokACPEventMapper(sessionId: "grok-plan-alias")
+        mapper.setPlanReviewModeId("architect")
+        mapper.setCurrentModeId("architect")
+        let events = mapper.consumeSessionUpdate([
+            "sessionUpdate": "plan",
+            "entries": [["content": "Step A", "status": "pending"]]
+        ])
+        XCTAssertTrue(events.contains { if case .proposedPlan = $0 { return true }; return false },
+                      "negotiated Plan mode id must mint a reviewable proposed plan")
+    }
+
+    func test_mapperFullAccessPermissionModeDoesNotEmitProposedPlan() {
+        let mapper = GrokACPEventMapper(sessionId: "grok-bypass")
+        // Wire permission mode id — must not be confused with Plan interaction mode.
+        mapper.setCurrentModeId("bypassPermissions")
+        let events = mapper.consumeSessionUpdate([
+            "sessionUpdate": "plan",
+            "entries": [["content": "Already implementing", "status": "in_progress"]]
+        ])
+        XCTAssertTrue(events.contains { if case .activePlanUpdated = $0 { return true }; return false })
+        XCTAssertFalse(events.contains { if case .proposedPlan = $0 { return true }; return false },
+                       "full-access permission mode must not mint proposedPlan from live plan progress")
+    }
+
+    /// WHY: double finish (prompt complete + process exit) used to call ensureTurn
+    /// after turnId was cleared, minting a second turnStarted that collided with
+    /// durable seq 1 (often pre-turn servers_updated) once the coordinator cleared seq.
+    func test_mapperFinishTurnIsIdempotentAndDoesNotReopenTurnStarted() {
+        let mapper = GrokACPEventMapper(sessionId: "grok-finish-once")
+        let started = mapper.beginTurn()
+        XCTAssertEqual(started.filter { if case .turnStarted = $0 { return true }; return false }.count, 1)
+        let firstFinish = mapper.finishTurn(stopReason: "end_turn", usage: nil)
+        XCTAssertEqual(firstFinish.filter { if case .turnCompleted = $0 { return true }; return false }.count, 1)
+        let secondFinish = mapper.finishTurn(stopReason: "end_turn", usage: nil)
+        XCTAssertTrue(secondFinish.isEmpty,
+                      "second finishTurn must be a no-op")
+        XCTAssertFalse(secondFinish.contains { if case .turnStarted = $0 { return true }; return false },
+                       "second finish must not mint a new turnStarted")
+    }
+
+    func test_mapperIgnoresSessionUpdatesAfterFinishWithoutNewTurnStarted() {
+        let mapper = GrokACPEventMapper(sessionId: "grok-late-update")
+        _ = mapper.beginTurn()
+        _ = mapper.finishTurn(stopReason: "end_turn", usage: nil)
+        let late = mapper.consumeSessionUpdate([
+            "sessionUpdate": "agent_message_chunk",
+            "content": ["type": "text", "text": "late"]
+        ])
+        XCTAssertFalse(late.contains { if case .turnStarted = $0 { return true }; return false },
+                       "post-finish session updates must not reopen a turn")
+        XCTAssertFalse(late.contains { if case .itemDelta = $0 { return true }; return false },
+                       "post-finish content chunks must be dropped until the next beginTurn")
     }
 
     func test_mapperTracksCommandsModeModelsAndUsage() {

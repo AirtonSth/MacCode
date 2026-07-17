@@ -264,6 +264,56 @@ final class StreamBatchAtomicPersistenceTests: XCTestCase {
         )
     }
 
+    func test_lateTurnStartedAfterFinishDoesNotCollideWithServersUpdatedAtSeq1() async throws {
+        // WHY: Grok often persists `_x.ai/mcp/servers_updated` as seq 1 before
+        // turnStarted. After a successful finish cleared seq[runId], a spurious
+        // post-finish turnStarted reallocated seq 1 and hit:
+        // Conflicting stream event identity (... existing servers_updated, retry turnStarted).
+        let fixture = try await makeFixture(name: "seq-reuse-after-finish-turnstarted")
+        defer { fixture.cleanup() }
+        let finishBox = TerminalFinishBox()
+        let issueBox = PersistenceIssueBox()
+        fixture.coordinator.onRunFinished = { _, _, status in finishBox.record(status) }
+        fixture.coordinator.onPersistenceIssue = { message, _, _ in issueBox.record(message) }
+
+        fixture.runner.emitProviderRuntime(method: "_x.ai/mcp/servers_updated")
+        fixture.runner.emitTurnStarted(turnId: "turn-live")
+        // Force batch commit before finish so seq 1 is durable (time/count cadence alone may not fire).
+        _ = try fixture.coordinator.withMirrorEventSnapshot(threadId: fixture.thread.id) { $0 }
+
+        let kindsBeforeFinish = try persistedKinds(db: fixture.db, runId: fixture.runId)
+        XCTAssertTrue(kindsBeforeFinish.contains { $0.contains("servers_updated") },
+                      "precondition: servers_updated must occupy an early durable seq")
+        XCTAssertTrue(kindsBeforeFinish.contains { $0.hasPrefix("turnStarted") },
+                      "precondition: live turnStarted must also be durable")
+        let seq1Before = try persistedKind(db: fixture.db, runId: fixture.runId, seq: 1)
+        XCTAssertTrue(seq1Before?.contains("servers_updated") == true,
+                      "precondition: seq 1 must be servers_updated for this regression (got \(seq1Before ?? "nil"))")
+
+        fixture.runner.finishCompleted()
+        await waitForTerminal(finishBox)
+        XCTAssertEqual(finishBox.statuses, [.completed])
+
+        // Simulate a post-finish ensureTurn reopen / late mapper event on the same run.
+        fixture.runner.emitTurnStarted(turnId: "turn-spurious-after-finish")
+        // Force the durability barrier so a buffered late event is committed or rejected.
+        _ = try fixture.coordinator.withMirrorEventSnapshot(threadId: fixture.thread.id) { $0 }
+
+        let issues = issueBox.messages
+        XCTAssertFalse(
+            issues.contains { $0.contains("Conflicting stream event identity") },
+            "late turnStarted after finish must not collide with durable seq 1: \(issues)"
+        )
+        let seq1After = try persistedKind(db: fixture.db, runId: fixture.runId, seq: 1)
+        XCTAssertEqual(
+            seq1After, seq1Before,
+            "seq 1 identity must stay exactly as committed before finish (no late turnStarted steal)"
+        )
+        let sequences = try persistedSequences(db: fixture.db, runId: fixture.runId)
+        XCTAssertEqual(sequences, Array(1...sequences.count),
+                       "stream sequences must remain contiguous without holes from a failed conflict")
+    }
+
     func test_stopFirstWaitsForDurabilityBarrierAndPublishesCancellationExactlyOnce() async throws {
         let fixture = try await makeFixture(name: "busy-stop-first")
         defer { fixture.cleanup() }
@@ -595,6 +645,16 @@ final class StreamBatchAtomicPersistenceTests: XCTestCase {
         return values
     }
 
+    private func persistedKind(db: SQLiteDB, runId: AgentRunID, seq: Int) throws -> String? {
+        let statement = try db.prepare(
+            "SELECT event_kind FROM agent_stream_events WHERE run_id = ? AND seq = ? LIMIT 1;"
+        )
+        try statement.bind(1, runId.value.uuidString)
+        try statement.bind(2, Int64(seq))
+        guard try statement.step() else { return nil }
+        return statement.columnText(0)
+    }
+
     private func persistedStatus(db: SQLiteDB, table: String, id: String) throws -> String? {
         let statement = try db.prepare("SELECT status FROM \(table) WHERE id = ?;")
         try statement.bind(1, id)
@@ -617,6 +677,14 @@ private final class TerminalFinishBox: @unchecked Sendable {
     var count: Int { lock.withLock { values.count } }
     var statuses: [AgentRunStatus] { lock.withLock { values } }
     func record(_ status: AgentRunStatus = .completed) { lock.withLock { values.append(status) } }
+}
+
+private final class PersistenceIssueBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var values: [String] = []
+
+    var messages: [String] { lock.withLock { values } }
+    func record(_ message: String) { lock.withLock { values.append(message) } }
 }
 
 private final class AppendedMessageBox: @unchecked Sendable {
@@ -697,6 +765,13 @@ private final class ControlledStreamBatchRunner: AgentProviderRunner, @unchecked
             payloadJSON: #"{"method":"\#(method)"}"#,
             receivedAtMs: Int64(Date().timeIntervalSince1970 * 1000)
         ))))
+    }
+
+    func emitTurnStarted(turnId: String) {
+        lock.lock()
+        let callback = callback
+        lock.unlock()
+        callback?(.event(.turnStarted(turnId: turnId)))
     }
 
     func finishCompleted() {

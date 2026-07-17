@@ -5,6 +5,8 @@ public final class GrokACPEventMapper: @unchecked Sendable {
     public let sessionId: String
     public private(set) var availableCommands: [GrokACPAvailableCommand] = []
     public private(set) var currentModeId: String?
+    /// Negotiated Plan interaction mode id (may differ from the literal `"plan"`).
+    public private(set) var planReviewModeId: String?
     public private(set) var latestUsage: AssistantTokenUsage?
     public private(set) var finalAssistantMessage: String?
 
@@ -18,6 +20,18 @@ public final class GrokACPEventMapper: @unchecked Sendable {
     private let lock = NSLock()
 
     public init(sessionId: String) { self.sessionId = sessionId }
+
+    /// Seed or refresh the ACP mode so plan session updates can distinguish
+    /// live progress (default/full-access) from Plan-mode review artifacts.
+    public func setCurrentModeId(_ modeId: String?) {
+        lock.lock(); defer { lock.unlock() }
+        currentModeId = modeId
+    }
+
+    public func setPlanReviewModeId(_ modeId: String?) {
+        lock.lock(); defer { lock.unlock() }
+        planReviewModeId = modeId
+    }
 
     public func beginTurn() -> [AssistantEvent] {
         lock.lock(); defer { lock.unlock() }
@@ -43,6 +57,12 @@ public final class GrokACPEventMapper: @unchecked Sendable {
             return []
         }
         ensureThread(&events)
+        // After finishTurn, turnId is nil and finished is true. ensureTurn would
+        // mint a fresh turnStarted; if the coordinator already cleared seq for the
+        // run, that collides with durable seq 1 (often pre-turn servers_updated).
+        if finished {
+            return events
+        }
         ensureTurn(&events)
         let now = Self.now
         guard let kind = update["sessionUpdate"] as? String else { return events }
@@ -92,18 +112,37 @@ public final class GrokACPEventMapper: @unchecked Sendable {
             }
 
         case "plan":
+            // ACP `plan` entries are live work-plan progress (statused steps),
+            // matching Codex/Claude plan_update → activePlanUpdated. Emitting
+            // proposedPlan for every update makes Full access auto-queue
+            // "Implement this proposed plan now" while Grok is already working.
             let entries = update["entries"] as? [[String: Any]] ?? []
-            let markdown = entries.enumerated().compactMap { index, entry -> String? in
-                guard let content = entry["content"] as? String, !content.isEmpty else { return nil }
-                let status = entry["status"] as? String ?? "pending"
-                return "\(index + 1). [\(status)] \(content)"
-            }.joined(separator: "\n")
-            if !markdown.isEmpty {
-                events.append(.proposedPlan(AssistantProposedPlan(
-                    id: "grok-plan-\(turnId ?? UUID().uuidString)",
-                    turnId: turnId,
-                    markdown: markdown
+            let steps = entries.enumerated().compactMap { index, entry -> AssistantPlanStep? in
+                guard let content = entry["content"] as? String else { return nil }
+                let trimmed = content.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !trimmed.isEmpty else { return nil }
+                let statusRaw = entry["status"] as? String ?? "pending"
+                let status = AssistantPlanStepStatus(rawValue: statusRaw)
+                    ?? (statusRaw == "inProgress" ? .inProgress : .pending)
+                return AssistantPlanStep(id: "\(index)-\(trimmed)", title: trimmed, status: status)
+            }
+            if !steps.isEmpty {
+                events.append(.activePlanUpdated(AssistantActivePlan(
+                    steps: steps,
+                    updatedAtMs: now
                 )))
+                // Plan interaction mode still needs a reviewable proposed plan
+                // for Approve / full-access auto-implement after the plan turn.
+                if Self.isPlanReviewMode(currentModeId, planReviewModeId: planReviewModeId) {
+                    let markdown = steps.enumerated().map { index, step in
+                        "\(index + 1). [\(step.status.rawValue)] \(step.title)"
+                    }.joined(separator: "\n")
+                    events.append(.proposedPlan(AssistantProposedPlan(
+                        id: "grok-plan-\(turnId ?? UUID().uuidString)",
+                        turnId: turnId,
+                        markdown: markdown
+                    )))
+                }
             }
 
         case "usage_update":
@@ -136,13 +175,21 @@ public final class GrokACPEventMapper: @unchecked Sendable {
         lock.lock(); defer { lock.unlock() }
         var events: [AssistantEvent] = []
         ensureThread(&events)
-        ensureTurn(&events)
+        // Idempotent: a second finish (prompt complete + process exit race) must
+        // not call ensureTurn after turnId was cleared — that re-opens turnStarted.
+        if finished {
+            return events
+        }
+        if turnId == nil {
+            // Error path: complete a turn that never received beginTurn.
+            ensureTurn(&events)
+        }
         if let usage, let parsed = Self.usage(usage) {
             latestUsage = parsed
             events.append(.tokenUsage(parsed))
         }
         closeOpenItems(&events)
-        guard let turnId, !finished else { return events }
+        guard let turnId else { return events }
         finished = true
         finalAssistantMessage = currentAssistantPhase.isEmpty ? nil : currentAssistantPhase
         events.append(.turnCompleted(turnId: turnId, finalMessage: finalAssistantMessage))
@@ -204,6 +251,19 @@ public final class GrokACPEventMapper: @unchecked Sendable {
     }
 
     private static var now: Int64 { Int64(Date().timeIntervalSince1970 * 1000) }
+
+    /// ACP Plan interaction mode only — not permission modes like bypassPermissions.
+    private static func isPlanReviewMode(_ modeId: String?, planReviewModeId: String?) -> Bool {
+        guard let modeId else { return false }
+        let normalized = modeId.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalized.isEmpty else { return false }
+        if let planReviewModeId,
+           planReviewModeId.trimmingCharacters(in: .whitespacesAndNewlines).caseInsensitiveCompare(normalized) == .orderedSame {
+            return true
+        }
+        // Fallback when the peer advertises the common wire id without catalog seed.
+        return normalized.caseInsensitiveCompare("plan") == .orderedSame
+    }
 
     private static func contentText(_ value: Any?) -> String {
         if let string = value as? String { return string }
