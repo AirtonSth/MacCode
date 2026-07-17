@@ -579,11 +579,19 @@ public enum EventStreamFilter: Sendable, Equatable {
         case .cellularSafe:
             let classification = EventStreamClassification.classify(kind: event.kind)
             if event.kind == "surface.output" {
+                if Self.isGeometryOnlyTerminalOutput(event) {
+                    return event
+                }
                 return Self.terminalOutputSummary(from: event)
             }
             guard classification.reducerRequired || classification.priority == .critical else { return nil }
             return event
         }
+    }
+
+    private static func isGeometryOnlyTerminalOutput(_ event: EventBus.Event) -> Bool {
+        guard case .object(let payload) = event.payload else { return false }
+        return payload["base64"] == nil && payload["rows"] != nil && payload["cols"] != nil
     }
 
     private static func terminalOutputSummary(from event: EventBus.Event) -> EventBus.Event? {

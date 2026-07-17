@@ -702,11 +702,13 @@ final class GhosttyTerminalView: NSView {
     /// Exposed for lifecycle tests only — do not use in production code paths.
     var ioContextIsPinned: Bool { ioContextRetain != nil }
     private var pendingOutput = Data()
-    private var outputFlushScheduled = false
+    private var pendingOutputHead = 0
+    private var pendingOutputCompactions = 0
+    private var scheduledOutputFlushGeneration: Int?
     private var lastPixelSize = NSSize(width: 0, height: 0)
     private var lastScale = NSSize(width: 0, height: 0)
     private var renderGeneration = 0
-    private var visibleInUI = true
+    private var visibleInUI = false
     /// Accumulated font zoom step delta for this surface (1 step = 1 pt).
     /// Persisted to and restored from the KV settings store keyed by workspace.
     private var zoomDelta: Int = 0
@@ -725,6 +727,31 @@ final class GhosttyTerminalView: NSView {
     /// operation; exposed via runtime health so tests/telemetry catch the drop
     /// path being hit (QA-006, guards PERF-009).
     var droppedOutputBytes = 0
+
+    var pendingOutputDiagnosticsForTesting: (
+        logicalBytes: Int,
+        storageBytes: Int,
+        compactions: Int
+    ) {
+        (pendingOutputByteCount, pendingOutput.count, pendingOutputCompactions)
+    }
+
+    private var pendingOutputByteCount: Int {
+        max(0, pendingOutput.count - pendingOutputHead)
+    }
+
+    private var hasPendingOutput: Bool {
+        pendingOutputByteCount > 0
+    }
+
+    /// Runtime-test diagnostics for the detach race. These expose state only;
+    /// production behavior remains driven by `scheduleOutputFlush()`.
+    var outputFlushGenerationForTesting: (scheduled: Int?, current: Int) {
+        (scheduledOutputFlushGeneration, renderGeneration)
+    }
+
+    var isRenderableForTesting: Bool { isRenderable }
+    var hasLiveSurfaceForTesting: Bool { surfaceSlot.isLive }
 
     /// Find-in-scrollback (Cmd+F) overlay state. The bar is lazily built on first
     /// open. `findMatchCount`/`findCurrentMatch` are the navigation cursor over
@@ -759,8 +786,15 @@ final class GhosttyTerminalView: NSView {
     private static let voValueChangedInterval: TimeInterval = 0.5
 
     private static let immediateOutputFlushBytes = 64 * 1024
-    private static let maxPendingOutputBytes = 1024 * 1024
+    private static let maxPendingOutputBytes = 4 * 1024 * 1024
     private static let outputFlushDelay: TimeInterval = 0.02
+
+    nonisolated static func hasCurrentOutputFlush(
+        scheduledGeneration: Int?,
+        currentGeneration: Int
+    ) -> Bool {
+        scheduledGeneration == currentGeneration
+    }
 
     // MARK: - Theme palette seam
 
@@ -965,12 +999,14 @@ final class GhosttyTerminalView: NSView {
             NSLog("RemoteCode terminal closeSurface() on a still-mounted view (window+superview present, owner not closing) — audit #4 watch")
         }
         renderGeneration &+= 1
+        scheduledOutputFlushGeneration = nil
         surfaceClosed = true
         if let surface = surfaceSlot.removeForClose() {
             ghostty_surface_free(surface)
         }
         surfaceSlot.markClosed()
         pendingOutput.removeAll(keepingCapacity: false)
+        pendingOutputHead = 0
     }
 
     func resetSurfaceOutput(_ data: Data) {
@@ -978,22 +1014,26 @@ final class GhosttyTerminalView: NSView {
         // Intentional re-creation: allow ensureSurface() to build a fresh surface.
         surfaceClosed = false
         processOutput(data)
+        // `processOutput` intentionally buffers when no live C surface exists.
+        // A mounted view cannot wait for a later read/refresh to recreate it:
+        // restored idle tabs would remain blank indefinitely. Recreate now when
+        // AppKit already provides a valid host; pre-attach views keep buffering.
+        if window != nil, bounds.width > 0, bounds.height > 0 {
+            ensureSurface()
+        }
     }
 
     func processOutput(_ data: Data, render: Bool = true) {
         guard !data.isEmpty else { return }
-        if !render {
-            if let surface = surfaceSlot.liveSurface() {
-                processOutputImmediately(data, to: surface, render: false)
-            }
-            return
-        }
-        guard isRenderable else { return }
         appendPendingOutput(data)
         guard let surface = surfaceSlot.liveSurface() else {
             return
         }
-        if pendingOutput.count >= Self.immediateOutputFlushBytes {
+        guard render, isRenderable else {
+            flushPendingOutput(to: surface, render: false)
+            return
+        }
+        if pendingOutputByteCount >= Self.immediateOutputFlushBytes {
             flushPendingOutput(to: surface, render: true)
         } else {
             scheduleOutputFlush()
@@ -1002,7 +1042,7 @@ final class GhosttyTerminalView: NSView {
 
     private func appendPendingOutput(_ data: Data) {
         pendingOutput.append(data)
-        guard pendingOutput.count > Self.maxPendingOutputBytes else { return }
+        guard pendingOutputByteCount > Self.maxPendingOutputBytes else { return }
         // Never drop from the front while a live surface exists: that splits ANSI
         // escape sequences mid-stream and garbles rendering (PERF-009). Flush the
         // backlog synchronously to the live surface (Ghostty owns scrollback)
@@ -1013,33 +1053,55 @@ final class GhosttyTerminalView: NSView {
         }
         // No surface to flush to yet (truly unrenderable): bound memory as a last
         // resort by discarding the oldest bytes.
-        let dropped = pendingOutput.count - Self.maxPendingOutputBytes
+        let dropped = pendingOutputByteCount - Self.maxPendingOutputBytes
         droppedOutputBytes += dropped
-        pendingOutput.removeFirst(dropped)
+        pendingOutputHead += dropped
+        compactPendingOutputIfNeeded()
+    }
+
+    /// A front removal for every small chunk above the cap copies the full
+    /// 4 MiB tail repeatedly. Keep a logical head and compact in 1 MiB batches
+    /// so both physical storage and copy frequency remain bounded.
+    private func compactPendingOutputIfNeeded() {
+        let compactThreshold = 1024 * 1024
+        guard pendingOutputHead >= compactThreshold else { return }
+        pendingOutput = Data(pendingOutput[pendingOutputHead...])
+        pendingOutputHead = 0
+        pendingOutputCompactions += 1
     }
 
     private func scheduleOutputFlush() {
-        guard !outputFlushScheduled else { return }
-        outputFlushScheduled = true
         let generation = renderGeneration
+        guard !Self.hasCurrentOutputFlush(
+            scheduledGeneration: scheduledOutputFlushGeneration,
+            currentGeneration: generation
+        ) else { return }
+        scheduledOutputFlushGeneration = generation
         DispatchQueue.main.asyncAfter(deadline: .now() + Self.outputFlushDelay) { [weak self] in
-            guard let self, generation == self.renderGeneration else { return }
+            guard let self, self.scheduledOutputFlushGeneration == generation else { return }
+            self.scheduledOutputFlushGeneration = nil
+            guard generation == self.renderGeneration else {
+                if self.hasPendingOutput { self.scheduleOutputFlush() }
+                return
+            }
             self.flushPendingOutput()
         }
     }
 
     private func flushPendingOutput() {
-        outputFlushScheduled = false
-        guard isRenderable else { return }
+        scheduledOutputFlushGeneration = nil
         ensureSurface()
         guard let surface = surfaceSlot.liveSurface() else { return }
-        flushPendingOutput(to: surface, render: true)
+        flushPendingOutput(to: surface, render: isRenderable)
     }
 
     private func flushPendingOutput(to surface: ghostty_surface_t, render: Bool) {
-        guard !pendingOutput.isEmpty else { return }
-        let output = pendingOutput
+        guard hasPendingOutput else { return }
+        let output = pendingOutputHead == 0
+            ? pendingOutput
+            : Data(pendingOutput[pendingOutputHead...])
         pendingOutput.removeAll(keepingCapacity: true)
+        pendingOutputHead = 0
         processOutputImmediately(output, to: surface, render: render)
     }
 
@@ -1183,8 +1245,6 @@ final class GhosttyTerminalView: NSView {
             // discard when there is no surface to flush into.
             if let surface = surfaceSlot.liveSurface() {
                 flushPendingOutput(to: surface, render: false)
-            } else {
-                pendingOutput.removeAll(keepingCapacity: false)
             }
         }
         // Drive Ghostty's occlusion from the *full* render gate, not raw tab
@@ -1256,7 +1316,7 @@ final class GhosttyTerminalView: NSView {
         // to apply; flushing it already renders the fresh frame. With nothing
         // pending, read the existing frame's text directly to avoid a redundant
         // GPU/main-thread render on every mirror poll (PERF-005).
-        if pendingOutput.isEmpty == false {
+        if hasPendingOutput {
             flushPendingOutput(to: surface, render: isRenderable)
         }
 

@@ -428,6 +428,56 @@ final class OperationSourceEventTests: XCTestCase {
         ), "A terminal death may be consumed only once.")
     }
 
+    func test_projectScriptRegistryDefersProvisionalEOFUntilReaperPublishesExitStatus() throws {
+        // WHY: PTY EOF is observed before the asynchronous, ownership-safe
+        // reaper obtains waitpid status. Consuming that provisional health
+        // would permanently publish a false failure with no exit code.
+        let workspaceID = WorkspaceID()
+        let surfaceID = SurfaceID()
+        let registry = ProjectScriptRunRegistry(now: { Date(timeIntervalSince1970: 10) })
+        registry.register(workspaceID: workspaceID, surfaceID: surfaceID, name: "completed")
+
+        func deadHealth(childPID: Int32?, exitStatus: Int32?) -> TerminalRuntimeHealth {
+            TerminalRuntimeHealth(
+                processAlive: false,
+                childPID: childPID,
+                exitStatus: exitStatus,
+                terminationSignal: nil,
+                ptyOpen: false,
+                inputAccepting: false,
+                terminalDeadReason: "process_exited",
+                lastOutputAt: nil,
+                outputPartial: false,
+                outputPendingBytes: 0,
+                historyWriteFailures: 0,
+                rows: 24,
+                cols: 80
+            )
+        }
+
+        XCTAssertNil(
+            registry.consumeTerminalDeath(
+                surfaceID: surfaceID,
+                health: deadHealth(childPID: 12_345, exitStatus: nil)
+            ),
+            "EOF without wait status must preserve the run for the ownership-safe reaper"
+        )
+
+        let outcome = try XCTUnwrap(registry.consumeTerminalDeath(
+            surfaceID: surfaceID,
+            health: deadHealth(childPID: nil, exitStatus: 0)
+        ))
+        XCTAssertEqual(outcome.result, "success")
+        XCTAssertEqual(outcome.exitCode, 0)
+        XCTAssertNil(
+            registry.consumeTerminalDeath(
+                surfaceID: surfaceID,
+                health: deadHealth(childPID: nil, exitStatus: 0)
+            ),
+            "the authoritative reaper outcome must remain one-shot"
+        )
+    }
+
     func test_sshTransferPreservesEventNamesAndAddsSafeCorrelatedOutcomes() throws {
         for item in [
             (exitCode: Int32(0), direction: "upload", terminalKind: "ssh.transfer.completed", result: "success"),

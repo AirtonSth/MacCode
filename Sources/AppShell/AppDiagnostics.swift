@@ -32,6 +32,21 @@ enum AppDiagnostics {
         let orphanCount: Int
     }
 
+    @MainActor
+    static func aggregateSurfaceSnapshot(_ surfaces: [any Surface]) -> SurfaceSnapshot {
+        let terminalHealth = surfaces.compactMap {
+            ($0 as? TerminalRuntimeRoutingSurface)?.routedRuntimeHealth()
+        }
+        return SurfaceSnapshot(
+            surfaceCount: surfaces.count,
+            terminalCount: terminalHealth.count,
+            runningTerminals: terminalHealth.filter(\.processAlive).count,
+            pendingBytes: terminalHealth.reduce(0) { $0 + $1.outputPendingBytes },
+            droppedBytes: terminalHealth.reduce(0) { $0 + $1.droppedOutputBytes },
+            historyFailures: terminalHealth.reduce(0) { $0 + $1.historyWriteFailures }
+        )
+    }
+
     /// Aggregates process stats from a list of processes.
     /// This is the pure helper that runs off the main thread in `heartbeat`.
     nonisolated static func aggregateProviderStats(
@@ -91,15 +106,7 @@ enum AppDiagnostics {
     ) {
         // Snapshot main-actor surface state before leaving the actor.
         let surfaces = SurfaceRegistry.shared.all()
-        let terminalHealth = surfaces.compactMap { ($0 as? TerminalSurface)?.runtimeHealth() }
-        let snapshot = SurfaceSnapshot(
-            surfaceCount: surfaces.count,
-            terminalCount: terminalHealth.count,
-            runningTerminals: terminalHealth.filter(\.processAlive).count,
-            pendingBytes: terminalHealth.reduce(0) { $0 + $1.outputPendingBytes },
-            droppedBytes: terminalHealth.reduce(0) { $0 + $1.droppedOutputBytes },
-            historyFailures: terminalHealth.reduce(0) { $0 + $1.historyWriteFailures }
-        )
+        let snapshot = aggregateSurfaceSnapshot(surfaces)
         // Cheap mach call; no I/O — sample here while still on the main actor.
         let rssKB = currentProcessFootprintKB()
         let pid = ProcessInfo.processInfo.processIdentifier

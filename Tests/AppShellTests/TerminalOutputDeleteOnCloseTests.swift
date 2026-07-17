@@ -31,6 +31,21 @@ final class TerminalOutputDeleteOnCloseTests: XCTestCase {
         }
     }
 
+    private func waitForTotalBytes(
+        _ expected: Int,
+        repo: TerminalOutputRepository,
+        surfaceID: String,
+        timeout: TimeInterval = 2
+    ) throws -> Int {
+        let deadline = Date().addingTimeInterval(timeout)
+        var bytes = try repo.totalBytes(surfaceID: surfaceID)
+        while bytes != expected, Date() < deadline {
+            RunLoop.current.run(until: Date().addingTimeInterval(0.01))
+            bytes = try repo.totalBytes(surfaceID: surfaceID)
+        }
+        return bytes
+    }
+
     override func tearDown() {
         let surfaces = SurfaceRegistry.shared.all()
         surfaces.forEach { $0.close() }
@@ -60,8 +75,391 @@ final class TerminalOutputDeleteOnCloseTests: XCTestCase {
 
         try router.closeSurface(workspace: ws.id, surface: descriptor.id)
 
-        XCTAssertEqual(try repo.totalBytes(surfaceID: surfaceID), 0,
+        XCTAssertEqual(try waitForTotalBytes(0, repo: repo, surfaceID: surfaceID), 0,
                        "closeSurface must delete all terminal_output_chunks for the closed surface")
+    }
+
+    func test_closeConnectedSSHSurfaceDeletesOuterIDHistoryAfterEmbeddedWriter() async throws {
+        // WHY: SSHSurface owns an unregistered TerminalSurface. Closing only the
+        // outer object must still serialize final deletion behind that inner writer.
+        let (ctx, router) = try makeContext()
+        let workspace = try router.createWorkspace(name: "ssh", cwd: NSTemporaryDirectory())
+        let descriptor = try router.createSurface(
+            workspace: workspace.id,
+            type: .ssh,
+            paneID: nil,
+            title: "ssh"
+        )
+        let ssh = try XCTUnwrap(SurfaceRegistry.shared.surface(descriptor.id) as? SSHSurface)
+        await ssh.connectImmediatelyForTesting(
+            SSHHostProfile(label: "Local refusal", destination: "127.0.0.1", port: 1)
+        )
+
+        try seedChunks(
+            repo: ctx.terminalOutputRepo,
+            surfaceID: descriptor.id.value.uuidString
+        )
+        ssh.appendSystemText(String(repeating: "x", count: 70 * 1024))
+
+        try router.closeSurface(workspace: workspace.id, surface: descriptor.id)
+
+        XCTAssertEqual(
+            try waitForTotalBytes(
+                0,
+                repo: ctx.terminalOutputRepo,
+                surfaceID: descriptor.id.value.uuidString
+            ),
+            0,
+            "closing the registered SSH wrapper must leave no history rows that its embedded writer can resurrect"
+        )
+    }
+
+    func test_appTerminationJoinsUnregisteredTabDeleteAndRetriesLockedSQLiteUntilRowsAndSidecarAreGone() async throws {
+        // WHY: closeSurface unregisters the tab immediately. If its queued final
+        // DELETE hits a transient SQLite lock, application termination can no
+        // longer discover the surface and exits with orphan rows plus its C80
+        // failure anchor unless the delete owns a process-global barrier.
+        let (context, router) = try makeContext()
+        try context.db.execute("PRAGMA busy_timeout=25;")
+        let workspace = try router.createWorkspace(name: "pending delete", cwd: NSTemporaryDirectory())
+        guard case .pane(let pane) = context.state.workspaces[workspace.id]?.layout,
+              let descriptor = pane.surfaces.first,
+              let surface = SurfaceRegistry.shared.surface(descriptor.id) as? TerminalSurface else {
+            return XCTFail("expected initial terminal surface")
+        }
+        let readyDeadline = Date().addingTimeInterval(2)
+        while surface.historyWriterGenerationForTesting == nil, Date() < readyDeadline {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        let writerGeneration = try XCTUnwrap(surface.historyWriterGenerationForTesting)
+        let surfaceID = descriptor.id.value.uuidString
+        try seedChunks(repo: context.terminalOutputRepo, surfaceID: surfaceID)
+        try context.terminalOutputRepo.recordFailureAnchor(
+            surfaceID: surfaceID,
+            writerGeneration: writerGeneration,
+            reason: "delete_pending_fixture",
+            minimumNextChunkIndex: 1
+        )
+        XCTAssertFalse(try context.terminalOutputRepo.failureAnchors(surfaceID: surfaceID).isEmpty)
+
+        let lockDatabase = try SQLiteDB(path: context.db.path)
+        try lockDatabase.execute("BEGIN IMMEDIATE;")
+        let lockBox = SendableSQLiteBox(lockDatabase)
+        try router.closeSurface(workspace: workspace.id, surface: descriptor.id)
+        XCTAssertNil(SurfaceRegistry.shared.surface(descriptor.id), "fixture must remove the surface before quit")
+        let lockReleased = DispatchSemaphore(value: 0)
+        DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 0.15) {
+            try? lockBox.database.execute("ROLLBACK;")
+            lockReleased.signal()
+        }
+
+        let completed = closeSurfacesForApplicationTermination([], timeout: 2)
+
+        XCTAssertTrue(completed, "quit must join the ownerless final-delete barrier")
+        XCTAssertEqual(
+            lockReleased.wait(timeout: .now()),
+            .success,
+            "the real quit helper must not return before the locked ownerless delete can resume"
+        )
+        XCTAssertEqual(
+            try context.terminalOutputRepo.totalBytes(surfaceID: surfaceID),
+            0,
+            "the retried final DELETE must remove all SQLite history rows before quit returns"
+        )
+        XCTAssertTrue(
+            try context.terminalOutputRepo.failureAnchors(surfaceID: surfaceID).isEmpty,
+            "confirmed final deletion must also clear every C80 sidecar anchor"
+        )
+    }
+
+    func test_appTerminationJoinsUnregisteredDeleteAlreadyQueuedBehindLiveClear() async throws {
+        // WHY: close can arrive while a reusable clear owns the serial writer.
+        // The surface is then unregistered before clear completion. Final delete
+        // must already be globally joinable and must not depend on a later weak
+        // MainActor callback retaining the retired coordinator.
+        let (context, router) = try makeContext()
+        let workspace = try router.createWorkspace(
+            name: "pending delete behind clear",
+            cwd: NSTemporaryDirectory()
+        )
+        guard case .pane(let pane) = context.state.workspaces[workspace.id]?.layout,
+              let descriptor = pane.surfaces.first,
+              let surface = SurfaceRegistry.shared.surface(descriptor.id) as? TerminalSurface else {
+            return XCTFail("expected initial terminal surface")
+        }
+        let readyDeadline = Date().addingTimeInterval(2)
+        while surface.historyWriterGenerationForTesting == nil, Date() < readyDeadline {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        let writerGeneration = try XCTUnwrap(surface.historyWriterGenerationForTesting)
+        let surfaceID = descriptor.id.value.uuidString
+        try seedChunks(repo: context.terminalOutputRepo, surfaceID: surfaceID)
+        try context.terminalOutputRepo.recordFailureAnchor(
+            surfaceID: surfaceID,
+            writerGeneration: writerGeneration,
+            reason: "delete_behind_clear_fixture",
+            minimumNextChunkIndex: 1
+        )
+
+        let clearStarted = DispatchSemaphore(value: 0)
+        let allowClear = DispatchSemaphore(value: 0)
+        let clearReleased = DispatchSemaphore(value: 0)
+        surface.setBeforeLiveHistoryClearForTesting {
+            clearStarted.signal()
+            _ = allowClear.wait(timeout: .now() + 3)
+            clearReleased.signal()
+        }
+        router.surfaceClearHistory(surface: descriptor.id)
+        XCTAssertEqual(clearStarted.wait(timeout: .now() + 2), .success)
+
+        try router.closeSurface(workspace: workspace.id, surface: descriptor.id)
+        XCTAssertNil(SurfaceRegistry.shared.surface(descriptor.id))
+        DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 0.15) {
+            allowClear.signal()
+        }
+
+        let completed = closeSurfacesForApplicationTermination([], timeout: 2)
+
+        XCTAssertTrue(completed, "quit must join a final delete queued behind live clear")
+        XCTAssertEqual(
+            clearReleased.wait(timeout: .now()),
+            .success,
+            "quit must not return before the blocked serial history queue resumes"
+        )
+        XCTAssertEqual(try context.terminalOutputRepo.totalBytes(surfaceID: surfaceID), 0)
+        XCTAssertTrue(try context.terminalOutputRepo.failureAnchors(surfaceID: surfaceID).isEmpty)
+    }
+
+    func test_failedFinalDeleteRemainsGloballyRetryableAfterFastWindow() async throws {
+        // WHY: the first app-close observation may hit the coordinator's
+        // bounded two-second SQLite window. Dropping that failed disposition
+        // makes a later real quit report success while rows and C80 metadata
+        // remain orphaned after the tab has already been unregistered.
+        let (context, router) = try makeContext()
+        try context.db.execute("PRAGMA busy_timeout=25;")
+        let workspace = try router.createWorkspace(
+            name: "retained failed delete",
+            cwd: NSTemporaryDirectory()
+        )
+        guard case .pane(let pane) = context.state.workspaces[workspace.id]?.layout,
+              let descriptor = pane.surfaces.first,
+              let surface = SurfaceRegistry.shared.surface(descriptor.id) as? TerminalSurface else {
+            return XCTFail("expected initial terminal surface")
+        }
+        let readyDeadline = Date().addingTimeInterval(2)
+        while surface.historyWriterGenerationForTesting == nil, Date() < readyDeadline {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        let writerGeneration = try XCTUnwrap(surface.historyWriterGenerationForTesting)
+        let surfaceID = descriptor.id.value.uuidString
+        try seedChunks(repo: context.terminalOutputRepo, surfaceID: surfaceID)
+        try context.terminalOutputRepo.recordFailureAnchor(
+            surfaceID: surfaceID,
+            writerGeneration: writerGeneration,
+            reason: "retained_failed_delete_fixture",
+            minimumNextChunkIndex: 1
+        )
+
+        let lockDatabase = try SQLiteDB(path: context.db.path)
+        try lockDatabase.execute("BEGIN IMMEDIATE;")
+        let lockBox = SendableSQLiteBox(lockDatabase)
+        try router.closeSurface(workspace: workspace.id, surface: descriptor.id)
+        XCTAssertNil(SurfaceRegistry.shared.surface(descriptor.id))
+
+        XCTAssertFalse(
+            closeSurfacesForApplicationTermination([], timeout: 3),
+            "the first bounded disposition must report the persistent lock"
+        )
+        XCTAssertGreaterThan(try context.terminalOutputRepo.totalBytes(surfaceID: surfaceID), 0)
+        XCTAssertFalse(try context.terminalOutputRepo.failureAnchors(surfaceID: surfaceID).isEmpty)
+
+        let lockReleased = DispatchSemaphore(value: 0)
+        DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 0.15) {
+            try? lockBox.database.execute("ROLLBACK;")
+            lockReleased.signal()
+        }
+        XCTAssertTrue(
+            closeSurfacesForApplicationTermination([], timeout: 2),
+            "a later quit pass must retry the retained disposition after unlock"
+        )
+        XCTAssertEqual(lockReleased.wait(timeout: .now()), .success)
+        XCTAssertEqual(try context.terminalOutputRepo.totalBytes(surfaceID: surfaceID), 0)
+        XCTAssertTrue(try context.terminalOutputRepo.failureAnchors(surfaceID: surfaceID).isEmpty)
+    }
+
+    func test_pendingDeleteRegistrySaturationNeverDropsThe513thDurableDelete() throws {
+        // WHY: the registry cap is a worker bound, not permission to forget a
+        // closed tab. Every overflow disposition must remain durably owned and
+        // become joinable after the first 512 locked attempts drain.
+        let (context, _) = try makeContext()
+        try context.db.execute("PRAGMA busy_timeout=25;")
+        let surfaceIDs = (0...512).map { _ in SurfaceID().value.uuidString }
+        for surfaceID in surfaceIDs {
+            try context.terminalOutputRepo.append(
+                surfaceID: surfaceID,
+                workspaceID: nil,
+                chunkIndex: 1,
+                data: Data("pending-delete".utf8)
+            )
+        }
+
+        let registeredSurfaceCount = SurfaceRegistry.shared.all().count
+        let lockDatabase = try SQLiteDB(path: context.db.path)
+        try lockDatabase.execute("BEGIN IMMEDIATE;")
+        for surfaceID in surfaceIDs {
+            TerminalSurface.scheduleOwnerlessHistoryDelete(
+                repository: context.terminalOutputRepo,
+                surfaceID: surfaceID
+            )
+        }
+        try lockDatabase.execute("ROLLBACK;")
+
+        XCTAssertTrue(
+            closeSurfacesForApplicationTermination([], timeout: 10),
+            "quit must join durable overflow after worker slots become available"
+        )
+        for surfaceID in surfaceIDs {
+            XCTAssertEqual(
+                try context.terminalOutputRepo.totalBytes(surfaceID: surfaceID),
+                0,
+                "every accepted close, including number 513, must delete its SQLite history"
+            )
+        }
+        XCTAssertEqual(
+            SurfaceRegistry.shared.all().count,
+            registeredSurfaceCount,
+            "pending delete ownership must not retain or create Surface instances"
+        )
+    }
+
+    func test_pendingDeleteReplaysAfterProcessMemoryLossWithoutDeletingSuccessor() async throws {
+        // WHY: a real quit can exhaust its two-second lock window after the tab
+        // already left the layout. Process memory then disappears, so only a
+        // durable tombstone can finish cleanup on the next launch.
+        let appSupport = NSTemporaryDirectory()
+            + "RC2TermDeleteRelaunch-" + UUID().uuidString
+        var context: AppContext? = try AppContext(
+            channel: .debug,
+            appSupportOverride: appSupport
+        )
+        try context?.db.execute("PRAGMA busy_timeout=25;")
+        let databasePath = try XCTUnwrap(context?.db.path)
+        var router: AppCommandRouter? = AppCommandRouter(context: try XCTUnwrap(context))
+        context?.router = router
+        let workspace = try XCTUnwrap(router).createWorkspace(
+            name: "durable pending delete",
+            cwd: NSTemporaryDirectory()
+        )
+        guard case .pane(let pane) = context?.state.workspaces[workspace.id]?.layout,
+              let firstDescriptor = pane.surfaces.first else {
+            return XCTFail("expected first terminal")
+        }
+        let secondDescriptor = try XCTUnwrap(router).createSurface(
+            workspace: workspace.id,
+            type: .terminal,
+            paneID: nil,
+            title: "successor guard"
+        )
+        var firstSurface = SurfaceRegistry.shared.surface(firstDescriptor.id) as? TerminalSurface
+        var secondSurface = SurfaceRegistry.shared.surface(secondDescriptor.id) as? TerminalSurface
+        let readyDeadline = Date().addingTimeInterval(3)
+        while (firstSurface?.historyWriterGenerationForTesting == nil
+                || secondSurface?.historyWriterGenerationForTesting == nil),
+              Date() < readyDeadline {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        let firstGeneration = try XCTUnwrap(firstSurface?.historyWriterGenerationForTesting)
+        let secondGeneration = try XCTUnwrap(secondSurface?.historyWriterGenerationForTesting)
+        let firstID = firstDescriptor.id.value.uuidString
+        let secondID = secondDescriptor.id.value.uuidString
+        let repository = try XCTUnwrap(context?.terminalOutputRepo)
+        try seedChunks(repo: repository, surfaceID: firstID)
+        try seedChunks(repo: repository, surfaceID: secondID)
+        for (surfaceID, generation) in [
+            (firstID, firstGeneration),
+            (secondID, secondGeneration),
+        ] {
+            try repository.recordFailureAnchor(
+                surfaceID: surfaceID,
+                writerGeneration: generation,
+                reason: "process_exit_pending_delete",
+                minimumNextChunkIndex: 1
+            )
+        }
+
+        let lockDatabase = try SQLiteDB(path: databasePath)
+        try lockDatabase.execute("BEGIN IMMEDIATE;")
+        try XCTUnwrap(router).closeSurface(
+            workspace: workspace.id,
+            surface: firstDescriptor.id
+        )
+        try XCTUnwrap(router).closeSurface(
+            workspace: workspace.id,
+            surface: secondDescriptor.id
+        )
+        XCTAssertFalse(
+            closeSurfacesForApplicationTermination([], timeout: 3),
+            "fixture must exhaust the real quit deadline while SQLite is locked"
+        )
+
+        TerminalHistoryCoordinator.resetPendingFinalDeleteMemoryForTesting()
+        firstSurface = nil
+        secondSurface = nil
+        context?.router = nil
+        router = nil
+        context = nil
+        try lockDatabase.execute("ROLLBACK;")
+
+        let successorDatabase = try SQLiteDB(path: databasePath)
+        let successorRepository = TerminalOutputRepository(db: successorDatabase)
+        let successorGeneration = try successorRepository.clearForReuse(
+            surfaceID: secondID,
+            expectedWriterGeneration: secondGeneration
+        )
+        let successorMarker = Data("SUCCESSOR_MUST_SURVIVE".utf8)
+        try successorRepository.append(
+            surfaceID: secondID,
+            workspaceID: workspace.id.value.uuidString,
+            chunkIndex: 1,
+            data: successorMarker
+        )
+
+        let relaunchedContext = try AppContext(
+            channel: .debug,
+            dbPathOverride: databasePath,
+            appSupportOverride: appSupport
+        )
+        let replayDeadline = Date().addingTimeInterval(5)
+        while Date() < replayDeadline {
+            if try relaunchedContext.terminalOutputRepo.totalBytes(surfaceID: firstID) == 0,
+               try relaunchedContext.terminalOutputRepo.failureAnchors(surfaceID: firstID).isEmpty,
+               try relaunchedContext.terminalOutputRepo.failureAnchors(surfaceID: secondID).isEmpty {
+                break
+            }
+            try await Task.sleep(nanoseconds: 25_000_000)
+        }
+
+        XCTAssertEqual(
+            try relaunchedContext.terminalOutputRepo.totalBytes(surfaceID: firstID),
+            0,
+            "launch replay must finish the ownerless delete after RAM state disappeared"
+        )
+        XCTAssertTrue(
+            try relaunchedContext.terminalOutputRepo.failureAnchors(surfaceID: firstID).isEmpty
+        )
+        XCTAssertTrue(
+            try relaunchedContext.terminalOutputRepo.failureAnchors(surfaceID: secondID).isEmpty,
+            "stale delete replay must clean only its retired generation metadata"
+        )
+        let successorPreparation = try relaunchedContext.terminalOutputRepo.prepareHistory(
+            surfaceID: secondID
+        )
+        XCTAssertEqual(successorPreparation.writerGeneration, successorGeneration)
+        XCTAssertTrue(
+            try relaunchedContext.terminalOutputRepo.readWindow(surfaceID: secondID).text
+                .contains(String(decoding: successorMarker, as: UTF8.self)),
+            "relaunch replay must never delete a newer writer generation"
+        )
     }
 
     func test_surfaceClearHistory_deletesTerminalChunksForLiveSurface() throws {
@@ -84,8 +482,16 @@ final class TerminalOutputDeleteOnCloseTests: XCTestCase {
 
         router.surfaceClearHistory(surface: descriptor.id)
 
-        XCTAssertEqual(try repo.totalBytes(surfaceID: surfaceID), 0,
-                       "surfaceClearHistory must delete persisted terminal_output_chunks for the live surface")
+        let deadline = Date().addingTimeInterval(2)
+        var persisted = try repo.readWindow(surfaceID: surfaceID).text
+        while persisted.contains("chunk0"), Date() < deadline {
+            RunLoop.current.run(until: Date().addingTimeInterval(0.01))
+            persisted = try repo.readWindow(surfaceID: surfaceID).text
+        }
+        XCTAssertFalse(
+            persisted.contains("chunk0"),
+            "surfaceClearHistory must remove the pre-clear prefix while the reusable live writer may persist newer shell output"
+        )
     }
 
     // MARK: - closeSurface does not delete chunks for other surfaces
@@ -113,7 +519,7 @@ final class TerminalOutputDeleteOnCloseTests: XCTestCase {
         // Close only the first surface.
         try router.closeSurface(workspace: ws.id, surface: desc1.id)
 
-        XCTAssertEqual(try repo.totalBytes(surfaceID: sid1), 0,
+        XCTAssertEqual(try waitForTotalBytes(0, repo: repo, surfaceID: sid1), 0,
                        "closed surface chunks must be deleted")
         XCTAssertGreaterThan(try repo.totalBytes(surfaceID: sid2), 0,
                              "live surface chunks must not be deleted when a different surface is closed")
@@ -144,9 +550,9 @@ final class TerminalOutputDeleteOnCloseTests: XCTestCase {
 
         try router.closeWorkspace(ws.id)
 
-        XCTAssertEqual(try repo.totalBytes(surfaceID: sid1), 0,
+        XCTAssertEqual(try waitForTotalBytes(0, repo: repo, surfaceID: sid1), 0,
                        "closeWorkspace must delete chunks for every surface it contained")
-        XCTAssertEqual(try repo.totalBytes(surfaceID: sid2), 0,
+        XCTAssertEqual(try waitForTotalBytes(0, repo: repo, surfaceID: sid2), 0,
                        "closeWorkspace must delete chunks for every surface it contained")
     }
 
@@ -178,7 +584,15 @@ final class TerminalOutputDeleteOnCloseTests: XCTestCase {
 
         XCTAssertGreaterThan(try repo.totalBytes(surfaceID: sid1), 0,
                              "ws1 surface chunks must survive when ws2 is closed")
-        XCTAssertEqual(try repo.totalBytes(surfaceID: sid2), 0,
+        XCTAssertEqual(try waitForTotalBytes(0, repo: repo, surfaceID: sid2), 0,
                        "ws2 surface chunks must be deleted when ws2 is closed")
+    }
+}
+
+private final class SendableSQLiteBox: @unchecked Sendable {
+    let database: SQLiteDB
+
+    init(_ database: SQLiteDB) {
+        self.database = database
     }
 }

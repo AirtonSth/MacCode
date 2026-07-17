@@ -214,6 +214,12 @@ final class WebSocketLivenessState: @unchecked Sendable {
 }
 
 public final class DirectHTTPServer: @unchecked Sendable {
+    enum ConnectionReadWaitStageForTesting: Hashable, Sendable {
+        case header(bufferedBytes: Int)
+        case body(bufferedBytes: Int, expectedBytes: Int)
+        case webSocket
+    }
+
     static let maxRequestHeaderBytes = 64 * 1024
     static let maxRequestBodyBytes = 2 * 1024 * 1024
     /// 25 MiB decoded attachment + base64 expansion + bounded JSON envelope.
@@ -296,12 +302,14 @@ public final class DirectHTTPServer: @unchecked Sendable {
     private let webSocketOutboundMaxQueuedBytes: Int
 
     private var listenFD: Int32 = -1
-    private var running = false
     private var accept: Thread?
     private let acceptedSockets = AcceptedSocketRegistry()
 
+    static let maximumAcceptedConnections = AcceptedSocketRegistry.defaultMaximumDescriptors
     var acceptedSocketCountForTests: Int { acceptedSockets.count }
     var afterWelcomeWriteForTests: ((String) -> Void)?
+    var acceptedFDObserverForTesting: (@Sendable (Int32) -> Void)?
+    var connectionReadWaitObserverForTesting: (@Sendable (Int32, ConnectionReadWaitStageForTesting) -> Void)?
 
     public init(port: UInt16 = 18217, loopbackOnly: Bool = true, dispatcher: JSONRPCDispatcher, auth: DirectAuthProvider? = nil, serverId: String = ProcessInfo.processInfo.globallyUniqueString, bootEpoch: UInt64, clientReceiveTimeoutSeconds: Int = 20, webSocketOutboundMaxQueuedBytes: Int = DirectHTTPServer.maxWebSocketOutboundQueuedBytes) {
         self.port = port
@@ -322,7 +330,12 @@ public final class DirectHTTPServer: @unchecked Sendable {
         // must not inherit the listener, or an orphaned child keeps port 18217
         // bound after the app stops and every rebind fails EADDRINUSE while
         // iOS connects hang in a backlog nobody accepts.
-        _ = fcntl(listenFD, F_SETFD, FD_CLOEXEC)
+        guard Self.enableCloseOnExec(listenFD) else {
+            let savedErrno = errno
+            close(listenFD)
+            listenFD = -1
+            throw POSIXError(POSIXErrorCode(rawValue: savedErrno) ?? .EIO)
+        }
         var yes: Int32 = 1
         setsockopt(listenFD, SOL_SOCKET, SO_REUSEADDR, &yes, socklen_t(MemoryLayout<Int32>.size))
 
@@ -335,7 +348,8 @@ public final class DirectHTTPServer: @unchecked Sendable {
             ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { Darwin.bind(listenFD, $0, addrLen) }
         }
         if rc < 0 {
-            let msg = String(cString: strerror(errno))
+            let savedErrno = errno
+            let msg = String(cString: strerror(savedErrno))
             close(listenFD); listenFD = -1
             let bindAddr = bindLoopbackOnly ? "127.0.0.1" : "0.0.0.0"
             let failPayload = serverListenerEventPayload(bound: false, address: bindAddr, port: port)
@@ -345,15 +359,21 @@ public final class DirectHTTPServer: @unchecked Sendable {
                 if let s = v as? String { return .string(s) }
                 return .string("\(v)")
             }))
-            throw NSError(domain: "RC2.HTTP", code: Int(errno), userInfo: [NSLocalizedDescriptionKey: msg])
+            throw NSError(domain: "RC2.HTTP", code: Int(savedErrno), userInfo: [NSLocalizedDescriptionKey: msg])
         }
         if Darwin.listen(listenFD, 32) < 0 {
+            let savedErrno = errno
             close(listenFD); listenFD = -1
-            throw POSIXError(.EIO)
+            throw POSIXError(POSIXErrorCode(rawValue: savedErrno) ?? .EIO)
         }
-        acceptedSockets.activate()
-        running = true
-        let t = Thread { [weak self] in self?.acceptLoop() }
+        let acceptanceGeneration = acceptedSockets.activate()
+        let listenerDescriptor = listenFD
+        let t = Thread { [weak self] in
+            self?.acceptLoop(
+                listenerDescriptor: listenerDescriptor,
+                acceptanceGeneration: acceptanceGeneration
+            )
+        }
         t.name = "RC2.HTTPAccept"
         t.start()
         accept = t
@@ -368,28 +388,55 @@ public final class DirectHTTPServer: @unchecked Sendable {
     }
 
     public func stop() {
-        running = false
+        // Gate accepted ownership before closing the listener. A concurrent
+        // accept may still return, but its generation-aware registration will
+        // reject and close the descriptor instead of reviving it on restart.
+        acceptedSockets.shutdownAll()
         if listenFD >= 0 {
             shutdown(listenFD, SHUT_RDWR)
             close(listenFD)
             listenFD = -1
         }
-        acceptedSockets.shutdownAll()
     }
 
-    private func acceptLoop() {
-        while running {
+    private func acceptLoop(listenerDescriptor: Int32, acceptanceGeneration: UInt64) {
+        let registry = acceptedSockets
+        while registry.isAccepting(generation: acceptanceGeneration) {
             var caddr = sockaddr()
             var clen = socklen_t(MemoryLayout<sockaddr>.size)
-            let fd = Darwin.accept(listenFD, &caddr, &clen)
-            if fd < 0 { if !running { return }; continue }
+            let fd = Darwin.accept(listenerDescriptor, &caddr, &clen)
+            if fd < 0 {
+                if !registry.isAccepting(generation: acceptanceGeneration) { return }
+                continue
+            }
             // Same close-on-exec rule as the listener: a child spawned while a
             // request is in flight must not hold the client connection open.
-            _ = fcntl(fd, F_SETFD, FD_CLOEXEC)
+            guard Self.enableCloseOnExec(fd) else {
+                let savedErrno = errno
+                shutdown(fd, SHUT_RDWR)
+                close(fd)
+                EventBus.shared.publish(kind: "diagnostic.http_cloexec_failed", payload: .object([
+                    "errno": .number(Double(savedErrno))
+                ]))
+                continue
+            }
             disableSIGPIPE(fd: fd)
+            switch registry.register(fd, generation: acceptanceGeneration) {
+            case .accepted:
+                break
+            case .inactive:
+                continue
+            case let .atCapacity(active, limit, shouldPublishDiagnostic):
+                if shouldPublishDiagnostic {
+                    EventBus.shared.publish(kind: "diagnostic.http_connection_limit", payload: .object([
+                        "active_connections": .number(Double(active)),
+                        "maximum_connections": .number(Double(limit))
+                    ]))
+                }
+                continue
+            }
             let peer = Self.peerIP(caddr)
-            let registry = acceptedSockets
-            guard registry.register(fd) else { continue }
+            acceptedFDObserverForTesting?(fd)
             DispatchQueue.global().async { [weak self] in
                 guard let self else {
                     registry.close(fd)
@@ -403,6 +450,28 @@ public final class DirectHTTPServer: @unchecked Sendable {
     private func disableSIGPIPE(fd: Int32) {
         var yes: Int32 = 1
         setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &yes, socklen_t(MemoryLayout<Int32>.size))
+    }
+
+    @discardableResult
+    static func enableCloseOnExec(
+        _ fd: Int32,
+        getFlags: (Int32) -> Int32 = { fcntl($0, F_GETFD) },
+        setFlags: (Int32, Int32) -> Int32 = { fcntl($0, F_SETFD, $1) }
+    ) -> Bool {
+        guard fd >= 0 else { return false }
+        let flags = getFlags(fd)
+        guard flags >= 0 else { return false }
+        guard flags & FD_CLOEXEC == 0 else { return true }
+        return setFlags(fd, flags | FD_CLOEXEC) == 0
+    }
+
+    @inline(__always)
+    static func readRetryingInterrupts(_ operation: () -> Int) -> Int {
+        while true {
+            let count = operation()
+            if count < 0, errno == EINTR { continue }
+            return count
+        }
     }
 
     /// Numeric source IP of an accepted connection, used as the throttle key.
@@ -445,9 +514,11 @@ public final class DirectHTTPServer: @unchecked Sendable {
         // the start of the next would be invisible to the scanner.
         var headerSearchOffset = 0
         let terminatorLength = 4 // "\r\n\r\n"
-        while running {
+        while acceptedSockets.isActive(fd) {
             let prevCount = buffer.count
-            let n = read(fd, &tmp, tmp.count)
+            let n = Self.readRetryingInterrupts {
+                Darwin.read(fd, &tmp, tmp.count)
+            }
             if n <= 0 { return }
             buffer.append(tmp, count: n)
             if buffer.count > Self.maxRequestHeaderBytes {
@@ -456,7 +527,12 @@ public final class DirectHTTPServer: @unchecked Sendable {
             }
             headerSearchOffset = max(0, prevCount - (terminatorLength - 1))
             if Self.nextHeaderTerminatorRange(in: buffer, from: headerSearchOffset) != nil { break }
+            connectionReadWaitObserverForTesting?(
+                fd,
+                .header(bufferedBytes: buffer.count)
+            )
         }
+        guard acceptedSockets.isActive(fd) else { return }
         guard let headerEnd = Self.nextHeaderTerminatorRange(in: buffer, from: 0) else { return }
         let headerData = buffer.subdata(in: buffer.startIndex..<headerEnd.lowerBound)
         guard let headerStr = String(data: headerData, encoding: .utf8) else { return }
@@ -517,12 +593,19 @@ public final class DirectHTTPServer: @unchecked Sendable {
         }
         let bodyStartAbsolute = headerEnd.upperBound
         var bodyHave = buffer.count - bodyStartAbsolute
-        while running, bodyHave < contentLength {
-            let n = read(fd, &tmp, tmp.count)
+        while acceptedSockets.isActive(fd), bodyHave < contentLength {
+            connectionReadWaitObserverForTesting?(
+                fd,
+                .body(bufferedBytes: bodyHave, expectedBytes: contentLength)
+            )
+            let n = Self.readRetryingInterrupts {
+                Darwin.read(fd, &tmp, tmp.count)
+            }
             if n <= 0 { break }
             buffer.append(tmp, count: n)
             bodyHave += n
         }
+        guard bodyHave >= contentLength, acceptedSockets.isActive(fd) else { return }
 
         // WebSocket upgrade
         if method == "GET", path == "/v1/ws",
@@ -1548,8 +1631,11 @@ public final class DirectHTTPServer: @unchecked Sendable {
         var buf = [UInt8]()
         var offset = 0
         var tmp = [UInt8](repeating: 0, count: 4096)
-        while running {
-            let n = read(fd, &tmp, tmp.count)
+        while acceptedSockets.isActive(fd) {
+            connectionReadWaitObserverForTesting?(fd, .webSocket)
+            let n = Self.readRetryingInterrupts {
+                Darwin.read(fd, &tmp, tmp.count)
+            }
             if n <= 0 { return }
             buf.append(contentsOf: tmp[0..<n])
             while let (frame, consumed) = parseClientFrame(buf, from: offset) {

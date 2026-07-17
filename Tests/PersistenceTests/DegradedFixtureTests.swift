@@ -174,4 +174,39 @@ final class DegradedFixtureTests: XCTestCase {
         XCTAssertEqual(try repo.totalBytes(surfaceID: surfaceID), 0,
             "after deleting orphaned chunks the surface must report 0 bytes so storage is fully reclaimed")
     }
+
+    /// WHY: old builds accepted opaque surface identifiers in SQLite. Cleanup
+    /// must bind even path-like legacy IDs as SQL values, without ever turning
+    /// them into a failure-ledger path or weakening the ledger's UUID guard.
+    func test_pathLikeLegacyOrphan_isPrunedWithoutFilesystemSideEffects() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("RC2LegacyOrphanTraversal-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let database = try SQLiteDB(path: directory.appendingPathComponent("history.sqlite").path)
+        try Schema.migrate(database)
+        let repository = TerminalOutputRepository(db: database)
+        let legacyID = "../../legacy-orphan"
+        try repository.append(
+            surfaceID: legacyID,
+            workspaceID: nil,
+            chunkIndex: 1,
+            data: Data("legacy".utf8)
+        )
+        let ledgerRoot = try XCTUnwrap(repository.failureLedgerRootURLForTesting)
+
+        XCTAssertNoThrow(try repository.delete(surfaceID: legacyID))
+        XCTAssertEqual(try repository.totalBytes(surfaceID: legacyID), 0)
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: ledgerRoot.path),
+            "legacy SQL cleanup must not create a tombstone or failure-ledger directory"
+        )
+        XCTAssertFalse(
+            FileManager.default.fileExists(
+                atPath: directory.deletingLastPathComponent()
+                    .appendingPathComponent("legacy-orphan").path
+            ),
+            "a path-like legacy identifier must never escape the database directory"
+        )
+    }
 }

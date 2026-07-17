@@ -11,6 +11,67 @@ import os
 // diagnosed from logs instead of the short in-memory log (QA-MAC_SSH-006).
 private let sshLog = Logger(subsystem: "io.remotecode.appshell", category: "ssh")
 
+/// Internal bridge for registered surfaces backed by a terminal runtime. The
+/// router and app-termination barrier use this instead of assuming that every
+/// terminal is itself the registered Surface object.
+@MainActor
+protocol TerminalRuntimeRoutingSurface: AnyObject {
+    func routedSendTextStatus(_ text: String) -> TerminalInputStatus
+    func routedTextSnapshot() -> TerminalTextSnapshot?
+    func routedRuntimeHealth() -> TerminalRuntimeHealth?
+    func routedFlushPersistedHistory()
+    func routedFlushPersistedHistoryBarrier() -> SurfaceTerminationBarrier?
+    func routedClearPersistedHistory()
+    func routedReadPersistedHistory(
+        beforeChunkID: Int64?,
+        maxBytes: Int,
+        timeout: TimeInterval
+    ) async throws -> TerminalOutputWindow
+    func routedRepairTerminalFocus(reason: String)
+}
+
+extension TerminalSurface: TerminalRuntimeRoutingSurface {
+    func routedSendTextStatus(_ text: String) -> TerminalInputStatus {
+        sendTextStatus(text)
+    }
+
+    func routedTextSnapshot() -> TerminalTextSnapshot? {
+        readTextSnapshot()
+    }
+
+    func routedRuntimeHealth() -> TerminalRuntimeHealth? {
+        runtimeHealth()
+    }
+
+    func routedFlushPersistedHistory() {
+        flushPersistedHistory()
+    }
+
+    func routedFlushPersistedHistoryBarrier() -> SurfaceTerminationBarrier? {
+        flushPersistedHistoryBarrier()
+    }
+
+    func routedClearPersistedHistory() {
+        clearPersistedHistory()
+    }
+
+    func routedReadPersistedHistory(
+        beforeChunkID: Int64?,
+        maxBytes: Int,
+        timeout: TimeInterval
+    ) async throws -> TerminalOutputWindow {
+        try await readPersistedHistory(
+            beforeChunkID: beforeChunkID,
+            maxBytes: maxBytes,
+            timeout: timeout
+        )
+    }
+
+    func routedRepairTerminalFocus(reason: String) {
+        repairTerminalFocus(reason: reason)
+    }
+}
+
 @MainActor
 protocol SSHTransferSurface: Surface {
     var sshTransferProfile: SSHHostProfile? { get }
@@ -18,11 +79,13 @@ protocol SSHTransferSurface: Surface {
 }
 
 @MainActor
-final class SSHSurface: NSObject, SSHTransferSurface {
+final class SSHSurface: NSObject, SSHTransferSurface, TerminalRuntimeRoutingSurface {
     private let workspaceID: WorkspaceID
     private let cwd: String
     private weak var router: AppCommandRouter?
     private let settingsRepo: (any SettingsWriteRepository)?
+    private let historyRepo: TerminalOutputRepository?
+    private let outputBus: SurfaceOutputBus
     private let terminalFontSize: Double
     private let terminalContainer = NSView()
     private let hostResizeHandle = DSResizeHandleView(axis: .vertical)
@@ -34,6 +97,34 @@ final class SSHSurface: NSObject, SSHTransferSurface {
     private var dragStartSidebarWidth: CGFloat?
     private var dragStartTransferWidth: CGFloat?
     private var terminal: TerminalSurface?
+    private var isVisible = true
+    private var shouldReplayHistoryOnNextConnect: Bool
+    private struct ConnectionRequest {
+        let host: SSHHostProfile
+        let generation: UInt64
+    }
+    private struct RetirementOutcome {
+        let groupsCompleted: Bool
+        let dispositionCompleted: Bool
+
+        static let complete = RetirementOutcome(
+            groupsCompleted: true,
+            dispositionCompleted: true
+        )
+    }
+    private var connectionGeneration: UInt64 = 0
+    private var pendingConnection: ConnectionRequest?
+    private var connectionWorker: Task<Void, Never>?
+    private var retirementBarriers: [UUID: SurfaceTerminationBarrier] = [:]
+    private var retiringTerminals: [UUID: TerminalSurface] = [:]
+    var retiredHistoryDeleteAttemptForTesting: (@Sendable () -> Void)?
+    private var inFlightPreparedRuntime: TerminalPreparedPTYRuntime?
+#if DEBUG
+    private var lastPreparationFailurePIDForTesting: pid_t?
+#endif
+#if DEBUG
+    private(set) var terminalFocusRepairForwardCountForTesting = 0
+#endif
     private var sessionAliveTimer: DispatchSourceTimer?
     private var activeTransferCount = 0
     // Path-pairs the user cancelled while in flight. The router runs scp
@@ -46,6 +137,14 @@ final class SSHSurface: NSObject, SSHTransferSurface {
     var identityFilePickerForTesting: (() -> String?)? {
         didSet { viewModel.identityFilePicker = identityFilePickerForTesting }
     }
+    var terminalReplacementRuntimePreparerForTesting: ((
+        WorkspaceID,
+        String,
+        TerminalSurface.Launch,
+        SurfaceID
+    ) -> TerminalPreparedPTYRuntime?)?
+    var terminalReplacementCloseOnExecEnablerForTesting: ((Int32) -> Bool)?
+    var terminalReplacementNonBlockingEnablerForTesting: ((Int32) -> Bool)?
     static let hostSidebarWidthDefaultsKey = "ssh.hosts.sidebar.width.v1"
     static let transferSidebarWidthDefaultsKey = "ssh.files.sidebar.width.v1"
     static let transferSidebarExpandedDefaultsKey = "ssh.files.sidebar.expanded.v1"
@@ -56,13 +155,27 @@ final class SSHSurface: NSObject, SSHTransferSurface {
 
     var sshTransferProfile: SSHHostProfile? { viewModel.selectedHost }
 
-    init(workspaceID: WorkspaceID, cwd: String, title: String, router: AppCommandRouter?, settingsRepo: (any SettingsWriteRepository)? = nil, terminalFontSize: Double = TerminalFontSizeSetting.defaultSize) throws {
+    init(
+        workspaceID: WorkspaceID,
+        cwd: String,
+        title: String,
+        router: AppCommandRouter?,
+        restoredSurfaceID: SurfaceID? = nil,
+        historyRepo: TerminalOutputRepository? = nil,
+        settingsRepo: (any SettingsWriteRepository)? = nil,
+        terminalFontSize: Double = TerminalFontSizeSetting.defaultSize,
+        outputBus: SurfaceOutputBus = .shared
+    ) throws {
         self.workspaceID = workspaceID
         self.cwd = cwd
         self.router = router
+        self.historyRepo = historyRepo
         self.settingsRepo = settingsRepo
+        self.outputBus = outputBus
         self.terminalFontSize = terminalFontSize
+        self.shouldReplayHistoryOnNextConnect = restoredSurfaceID != nil
         self.descriptor = SurfaceDescriptor(
+            id: restoredSurfaceID ?? SurfaceID(),
             type: .ssh,
             title: title,
             iconName: "network",
@@ -320,9 +433,10 @@ final class SSHSurface: NSObject, SSHTransferSurface {
         do {
             try router?.sshHostDelete(host.id, workspace: workspaceID)
             if viewModel.selectedHost?.id == host.id {
+                invalidateConnectionRequests()
+                cancelInFlightPreparedRuntimeAndTrack()
                 stopSessionAliveTimer()
-                terminal?.close()
-                terminal = nil
+                retireCurrentTerminalWithoutWaiting()
                 descriptor.metadata["ssh_status"] = "disconnected"
                 viewModel.selectedHost = nil
                 viewModel.status = "Disconnected"
@@ -342,23 +456,202 @@ final class SSHSurface: NSObject, SSHTransferSurface {
         // frame. Phase 2 (.connecting) runs after Task.yield() hands control back
         // to the runloop, guaranteeing the "Connecting…" text paints before the
         // keychain read + forkpty stall (PERF-SSH-001 / UX-MAC_SSH-002).
+        enqueueConnection(host)
+    }
+
+    @discardableResult
+    private func enqueueConnection(_ host: SSHHostProfile) -> UInt64 {
+        connectionGeneration &+= 1
+        let generation = connectionGeneration
+        pendingConnection = ConnectionRequest(host: host, generation: generation)
         viewModel.status = "Connecting\u{2026}"  // U+2026 HORIZONTAL ELLIPSIS
         viewModel.error = nil
-        Task { @MainActor [weak self] in
+        guard connectionWorker == nil else { return generation }
+        connectionWorker = Task { @MainActor [weak self] in
             await Task.yield()   // let SwiftUI paint the "Connecting…" label
-            self?.performConnect(host)
+            await self?.drainConnectionRequests()
+        }
+        return generation
+    }
+
+    private func drainConnectionRequests() async {
+        while let request = pendingConnection {
+            pendingConnection = nil
+            await performConnect(request.host, generation: request.generation)
+        }
+        connectionWorker = nil
+    }
+
+    private func invalidateConnectionRequests() {
+        connectionGeneration &+= 1
+        pendingConnection = nil
+    }
+
+    @discardableResult
+    private func discardInFlightPreparedRuntime() -> SurfaceTerminationBarrier? {
+        guard let prepared = inFlightPreparedRuntime else { return nil }
+        inFlightPreparedRuntime = nil
+        return prepared.discard()
+    }
+
+    private func cancelInFlightPreparedRuntimeAndTrack() {
+        if let cleanup = discardInFlightPreparedRuntime() {
+            trackRetirementCleanup(cleanup)
         }
     }
 
-    private func performConnect(_ host: SSHHostProfile) {
+    private func connectionIsCurrent(_ generation: UInt64) -> Bool {
+        generation == connectionGeneration
+    }
+
+    private func performConnect(_ host: SSHHostProfile, generation: UInt64) async {
+        guard connectionIsCurrent(generation) else { return }
         sshLog.info("ssh connect start: \(host.destination, privacy: .private)")
+        var crossedReplacementBoundary = false
         do {
             let saved = try router?.sshHostForConnection(host, workspace: workspaceID) ?? host
+            guard connectionIsCurrent(generation) else { return }
+            let outstandingRetirements = await waitForOutstandingRetirements()
+            guard outstandingRetirements.groupsCompleted else {
+                throw NSError(
+                    domain: "RemoteCode.SSHSurface",
+                    code: 3,
+                    userInfo: [
+                        NSLocalizedDescriptionKey:
+                            "The previous SSH terminal is still shutting down. Retry shortly."
+                    ]
+                )
+            }
+            var dispositionCompleted = outstandingRetirements.dispositionCompleted
+            guard connectionIsCurrent(generation) else { return }
+            let launch = TerminalSurface.Launch.ssh(profile: saved, cwd: cwd)
+            let preparedRuntime: TerminalPreparedPTYRuntime?
+            if let terminalReplacementRuntimePreparerForTesting {
+                preparedRuntime = terminalReplacementRuntimePreparerForTesting(
+                    workspaceID,
+                    cwd,
+                    launch,
+                    descriptor.id
+                )
+            } else {
+                preparedRuntime = TerminalSurface.prepareRuntimeForReplacement(
+                    workspaceID: workspaceID,
+                    cwd: cwd,
+                    launch: launch,
+                    surfaceID: descriptor.id,
+                    closeOnExecEnabler: terminalReplacementCloseOnExecEnablerForTesting,
+                    nonBlockingEnabler: terminalReplacementNonBlockingEnablerForTesting,
+                    onFailureCleanup: { [weak self] pid, barrier in
+#if DEBUG
+                        self?.lastPreparationFailurePIDForTesting = pid
+#endif
+                        self?.trackRetirementCleanup(barrier)
+                    }
+                )
+            }
+            guard let preparedRuntime else {
+                guard connectionIsCurrent(generation) else { return }
+                if terminal?.runtimeHealth().processAlive == true {
+                    descriptor.metadata["ssh_status"] = "connected"
+                    viewModel.status = "Connected"
+                    startSessionAliveTimer()
+                } else {
+                    descriptor.metadata["ssh_status"] = "disconnected"
+                    viewModel.status = "Failed"
+                }
+                viewModel.error = "The replacement SSH terminal could not be started."
+                sshLog.error("ssh connect blocked: replacement PTY preparation failed")
+                return
+            }
+            inFlightPreparedRuntime = preparedRuntime
+            defer {
+                if inFlightPreparedRuntime === preparedRuntime {
+                    inFlightPreparedRuntime = nil
+                }
+                if let cleanup = preparedRuntime.discard() {
+                    trackRetirementCleanup(cleanup)
+                }
+            }
+            guard preparedRuntime.suspendIfOwnedAndAlive() else {
+                guard connectionIsCurrent(generation) else { return }
+                if terminal?.runtimeHealth().processAlive == true {
+                    descriptor.metadata["ssh_status"] = "connected"
+                    viewModel.status = "Connected"
+                    startSessionAliveTimer()
+                } else {
+                    descriptor.metadata["ssh_status"] = "disconnected"
+                    viewModel.status = "Failed"
+                }
+                viewModel.error = "The replacement SSH terminal exited before it was ready."
+                sshLog.error("ssh connect blocked: prepared PTY child was not alive")
+                return
+            }
+            guard connectionIsCurrent(generation) else {
+                // `TerminalPreparedPTYRuntime.deinit` closes the PTY and starts
+                // bounded child disposition when ownership was not consumed.
+                return
+            }
             stopSessionAliveTimer()
-            terminal?.close()
+            crossedReplacementBoundary = terminal != nil
+            let currentRetirement = await retireCurrentTerminalAndWait()
+            dispositionCompleted = dispositionCompleted
+                && currentRetirement.dispositionCompleted
+            guard currentRetirement.groupsCompleted else {
+                throw NSError(
+                    domain: "RemoteCode.SSHSurface",
+                    code: 4,
+                    userInfo: [
+                        NSLocalizedDescriptionKey:
+                            "The current SSH terminal did not finish shutting down. Retry shortly."
+                    ]
+                )
+            }
+            guard connectionIsCurrent(generation), terminal == nil else {
+                return
+            }
             viewModel.sessionDead = false
-            let next = try TerminalSurface(workspaceID: workspaceID, title: saved.label, launch: .ssh(profile: saved, cwd: cwd), settingsRepo: settingsRepo, terminalFontSize: terminalFontSize)
+            let shouldReplayHistory = shouldReplayHistoryOnNextConnect
+            let next = try TerminalSurface(
+                workspaceID: workspaceID,
+                title: saved.label,
+                launch: .ssh(profile: saved, cwd: cwd),
+                restoredSurfaceID: shouldReplayHistory ? descriptor.id : nil,
+                assignedSurfaceID: shouldReplayHistory ? nil : descriptor.id,
+                historyRepo: historyRepo,
+                settingsRepo: settingsRepo,
+                terminalFontSize: terminalFontSize,
+                outputBus: outputBus,
+                preparedRuntime: preparedRuntime
+            )
+            if inFlightPreparedRuntime === preparedRuntime {
+                inFlightPreparedRuntime = nil
+            }
+            guard next.runtimeHealth().processAlive,
+                  next.runtimeHealth().inputAccepting else {
+                _ = await disposeUncommittedTerminal(next)
+                throw NSError(
+                    domain: "RemoteCode.SSHSurface",
+                    code: 2,
+                    userInfo: [
+                        NSLocalizedDescriptionKey:
+                            "The replacement SSH terminal did not become interactive."
+                    ]
+                )
+            }
+            guard connectionIsCurrent(generation), terminal == nil else {
+                _ = await disposeUncommittedTerminal(next)
+                return
+            }
+            if !dispositionCompleted {
+                next.markRuntimeRestartDispositionIncomplete()
+            }
             terminal = next
+            shouldReplayHistoryOnNextConnect = true
+            if isVisible {
+                next.didBecomeVisible()
+            } else {
+                next.didBecomeHidden()
+            }
             descriptor.metadata = next.descriptor.metadata
             descriptor.metadata["ssh_status"] = "connected"
             viewModel.selectedHost = saved
@@ -383,19 +676,256 @@ final class SSHSurface: NSObject, SSHTransferSurface {
             reloadHosts()
             sshLog.info("ssh connect ok: \(saved.destination, privacy: .private)")
         } catch {
-            descriptor.metadata["ssh_status"] = "disconnected"
-            viewModel.status = "Failed"
+            guard connectionIsCurrent(generation) else { return }
+            if !crossedReplacementBoundary,
+               terminal?.runtimeHealth().processAlive == true {
+                descriptor.metadata["ssh_status"] = "connected"
+                viewModel.status = "Connected"
+                startSessionAliveTimer()
+            } else {
+                descriptor.metadata["ssh_status"] = "disconnected"
+                viewModel.status = "Failed"
+                publishDisconnected(reason: "connection_failed")
+            }
             viewModel.error = error.localizedDescription
-            publishDisconnected(reason: "connection_failed")
             sshLog.error("ssh connect failed: \(error.localizedDescription, privacy: .public)")
         }
     }
 
+    private func retireCurrentTerminalWithoutWaiting() {
+        guard let current = terminal else { return }
+        let barrier = current.closeForRuntimeRestart()
+        terminal = nil
+        current.relinquishRuntimeHealthOwnershipForReplacement()
+        guard let barrier else { return }
+        let token = registerRetirementBarrier(barrier, terminal: current)
+        monitorTerminalRetirement(
+            token: token,
+            barrier: barrier,
+            terminal: current,
+            timeoutMessage: "ssh terminal cleanup exceeded the fast asynchronous retirement window"
+        )
+    }
+
+    @discardableResult
+    private func registerRetirementBarrier(
+        _ barrier: SurfaceTerminationBarrier,
+        terminal: TerminalSurface? = nil
+    ) -> UUID {
+        let token = UUID()
+        retirementBarriers[token] = barrier
+        if let terminal {
+            retiringTerminals[token] = terminal
+        }
+        return token
+    }
+
+    private func removeRetirementBarrier(_ token: UUID) {
+        retirementBarriers.removeValue(forKey: token)
+        retiringTerminals.removeValue(forKey: token)
+    }
+
+    private func terminalHistoryOwners() -> [TerminalSurface] {
+        var seen = Set<ObjectIdentifier>()
+        var owners: [TerminalSurface] = []
+        for candidate in [terminal].compactMap({ $0 }) + Array(retiringTerminals.values) {
+            let identity = ObjectIdentifier(candidate)
+            guard seen.insert(identity).inserted else { continue }
+            owners.append(candidate)
+        }
+        return owners
+    }
+
+    private func trackRetirementCleanup(
+        _ barrier: SurfaceTerminationBarrier,
+        terminal: TerminalSurface? = nil
+    ) {
+        let token = registerRetirementBarrier(barrier, terminal: terminal)
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            let completedInFastWindow = await barrier.waitForGroupsAsync(until: .now() + 2)
+            if !completedInFastWindow {
+                sshLog.error("ssh terminal cleanup exceeded the fast fallback window; ownership retained")
+                _ = await barrier.waitForGroupsAsync(until: .distantFuture)
+            }
+            if !barrier.completionChecksSucceeded() {
+                // Production process barriers retain their PID anchor until they
+                // can complete successfully. A false check here is therefore an
+                // injected/foreign contract failure; keep it visible in logs.
+                sshLog.error("ssh terminal fallback cleanup completed without disposition proof")
+            }
+            self.removeRetirementBarrier(token)
+        }
+    }
+
+    private func monitorTerminalRetirement(
+        token: UUID,
+        barrier: SurfaceTerminationBarrier,
+        terminal: TerminalSurface,
+        alreadyTimedOut: Bool = false,
+        timeoutMessage: String
+    ) {
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            var completedInFastWindow = !alreadyTimedOut
+            if !alreadyTimedOut {
+                completedInFastWindow = await barrier.waitForGroupsAsync(until: .now() + 2)
+            }
+            if !completedInFastWindow {
+                sshLog.error("\(timeoutMessage, privacy: .public); ownership retained")
+                _ = await barrier.waitForGroupsAsync(until: .distantFuture)
+            }
+            let dispositionCompleted = barrier.completionChecksSucceeded()
+            if !dispositionCompleted,
+               let cleanup = terminal.continueCleanupAfterFailedRuntimeRestart() {
+                // Publish fallback ownership before removing the original token;
+                // app termination must never observe an empty handoff window.
+                self.trackRetirementCleanup(cleanup, terminal: terminal)
+                sshLog.error("ssh terminal disposition check failed; fallback cleanup retained")
+            }
+            self.removeRetirementBarrier(token)
+        }
+    }
+
+    private func waitForOutstandingRetirements() async -> RetirementOutcome {
+        guard !retirementBarriers.isEmpty else { return .complete }
+        let deadline = DispatchTime.now() + 2
+        var dispositionCompleted = true
+        var observed = Set<ObjectIdentifier>()
+        while true {
+            let barriers = retirementBarriers.values.filter {
+                !observed.contains(ObjectIdentifier($0))
+            }
+            if barriers.isEmpty {
+                return RetirementOutcome(
+                    groupsCompleted: true,
+                    dispositionCompleted: dispositionCompleted
+                )
+            }
+            for barrier in barriers {
+                observed.insert(ObjectIdentifier(barrier))
+                guard await barrier.waitForGroupsAsync(until: deadline) else {
+                    return RetirementOutcome(
+                        groupsCompleted: false,
+                        dispositionCompleted: false
+                    )
+                }
+                dispositionCompleted = barrier.completionChecksSucceeded()
+                    && dispositionCompleted
+            }
+            // Tracking tasks may publish a fallback barrier after evaluating a
+            // completed original disposition. Observe that handoff before reuse.
+            await Task.yield()
+        }
+    }
+
+    @discardableResult
+    private func retireCurrentTerminalAndWait() async -> RetirementOutcome {
+        guard let current = terminal else { return .complete }
+        let barrier = current.closeForRuntimeRestart()
+        terminal = nil
+        guard let barrier else {
+            current.relinquishRuntimeHealthOwnershipForReplacement()
+            return .complete
+        }
+        let token = registerRetirementBarrier(barrier, terminal: current)
+        let deadline = DispatchTime.now() + 2
+        if let requiredHistory = current.requiredHistoryBarrierForRuntimeRestart() {
+            let historyGroupsCompleted = await requiredHistory.waitForGroupsAsync(
+                until: deadline
+            )
+            guard historyGroupsCompleted,
+                  requiredHistory.completionChecksSucceeded() else {
+                monitorTerminalRetirement(
+                    token: token,
+                    barrier: barrier,
+                    terminal: current,
+                    alreadyTimedOut: !historyGroupsCompleted,
+                    timeoutMessage: "ssh terminal history retirement timed out"
+                )
+                current.relinquishRuntimeHealthOwnershipForReplacement()
+                return RetirementOutcome(
+                    groupsCompleted: false,
+                    dispositionCompleted: false
+                )
+            }
+        }
+        let groupsCompleted = await barrier.waitForGroupsAsync(until: deadline)
+        guard groupsCompleted else {
+            if let cleanup = current.continueCleanupAfterFailedRuntimeRestart() {
+                trackRetirementCleanup(cleanup, terminal: current)
+            }
+            monitorTerminalRetirement(
+                token: token,
+                barrier: barrier,
+                terminal: current,
+                alreadyTimedOut: true,
+                timeoutMessage: "ssh terminal process retirement timed out"
+            )
+            sshLog.error("ssh terminal process cleanup incomplete; replacement may continue with partial health")
+            current.relinquishRuntimeHealthOwnershipForReplacement()
+            return RetirementOutcome(
+                groupsCompleted: true,
+                dispositionCompleted: false
+            )
+        }
+        let dispositionCompleted = barrier.completionChecksSucceeded()
+        if !dispositionCompleted {
+            if let cleanup = current.continueCleanupAfterFailedRuntimeRestart() {
+                trackRetirementCleanup(cleanup, terminal: current)
+            }
+            sshLog.error("ssh terminal cleanup incomplete; replacement may continue with partial health")
+        }
+        removeRetirementBarrier(token)
+        current.relinquishRuntimeHealthOwnershipForReplacement()
+        return RetirementOutcome(
+            groupsCompleted: true,
+            dispositionCompleted: dispositionCompleted
+        )
+    }
+
+    @discardableResult
+    private func disposeUncommittedTerminal(_ uncommitted: TerminalSurface) async -> RetirementOutcome {
+        guard let barrier = uncommitted.closeForRuntimeRestart() else {
+            uncommitted.relinquishRuntimeHealthOwnershipForReplacement()
+            return .complete
+        }
+        let token = registerRetirementBarrier(barrier, terminal: uncommitted)
+        let groupsCompleted = await barrier.waitForGroupsAsync(until: .now() + 2)
+        guard groupsCompleted else {
+            monitorTerminalRetirement(
+                token: token,
+                barrier: barrier,
+                terminal: uncommitted,
+                alreadyTimedOut: true,
+                timeoutMessage: "uncommitted SSH replacement cleanup timed out"
+            )
+            uncommitted.relinquishRuntimeHealthOwnershipForReplacement()
+            return RetirementOutcome(
+                groupsCompleted: false,
+                dispositionCompleted: false
+            )
+        }
+        let dispositionCompleted = barrier.completionChecksSucceeded()
+        if !dispositionCompleted,
+           let cleanup = uncommitted.continueCleanupAfterFailedRuntimeRestart() {
+            trackRetirementCleanup(cleanup, terminal: uncommitted)
+            sshLog.error("uncommitted SSH replacement required fallback cleanup")
+        }
+        removeRetirementBarrier(token)
+        uncommitted.relinquishRuntimeHealthOwnershipForReplacement()
+        return RetirementOutcome(
+            groupsCompleted: true,
+            dispositionCompleted: dispositionCompleted
+        )
+    }
+
     // Explicit user-initiated disconnect: close the terminal, reset status/UI.
     private func disconnect() {
+        invalidateConnectionRequests()
+        cancelInFlightPreparedRuntimeAndTrack()
         stopSessionAliveTimer()
-        terminal?.close()
-        terminal = nil
+        retireCurrentTerminalWithoutWaiting()
         descriptor.metadata["ssh_status"] = "disconnected"
         viewModel.selectedHost = nil
         viewModel.status = "Disconnected"
@@ -463,6 +993,10 @@ final class SSHSurface: NSObject, SSHTransferSurface {
         disconnect()
     }
 
+    func disconnectForRouter() {
+        disconnect()
+    }
+
     func unexpectedDisconnectForTesting() {
         handleUnexpectedDisconnect()
     }
@@ -473,8 +1007,10 @@ final class SSHSurface: NSObject, SSHTransferSurface {
     }
 
     private func handleUnexpectedDisconnect() {
+        invalidateConnectionRequests()
+        cancelInFlightPreparedRuntimeAndTrack()
         stopSessionAliveTimer()
-        terminal = nil
+        retireCurrentTerminalWithoutWaiting()
         descriptor.metadata["ssh_status"] = "disconnected"
         viewModel.status = "Disconnected"
         viewModel.sessionDead = true
@@ -777,10 +1313,138 @@ final class SSHSurface: NSObject, SSHTransferSurface {
         terminal?.unfocus()
     }
 
+    func didBecomeVisible() {
+        isVisible = true
+        terminal?.didBecomeVisible()
+    }
+
+    func didBecomeHidden() {
+        isVisible = false
+        terminal?.didBecomeHidden()
+    }
+
     func close() {
+        invalidateConnectionRequests()
+        cancelInFlightPreparedRuntimeAndTrack()
         stopSessionAliveTimer()
         terminal?.close()
         publishDisconnected(reason: "user_requested")
+    }
+
+    func closeForApplicationTermination() -> SurfaceTerminationBarrier? {
+        invalidateConnectionRequests()
+        stopSessionAliveTimer()
+        if let preparedCleanup = discardInFlightPreparedRuntime() {
+            trackRetirementCleanup(preparedCleanup)
+        }
+        if let current = terminal {
+            let barrier = current.closeForApplicationTermination()
+            terminal = nil
+            current.relinquishRuntimeHealthOwnershipForReplacement()
+            if let barrier {
+                let token = registerRetirementBarrier(barrier, terminal: current)
+                monitorTerminalRetirement(
+                    token: token,
+                    barrier: barrier,
+                    terminal: current,
+                    timeoutMessage: "SSH app-termination disposition exceeded the fast window"
+                )
+            }
+        }
+        let barriers = Array(retirementBarriers.values)
+        publishDisconnected(reason: "application_termination")
+        return barriers.isEmpty ? nil : SurfaceTerminationBarrier(combining: barriers)
+    }
+
+    func closeAndDeletePersistedHistory() {
+        invalidateConnectionRequests()
+        cancelInFlightPreparedRuntimeAndTrack()
+        stopSessionAliveTimer()
+        let historyOwners = terminalHistoryOwners()
+        for owner in historyOwners {
+            owner.closeAndDeletePersistedHistory()
+        }
+        if historyOwners.isEmpty {
+            if let historyRepo {
+                TerminalSurface.scheduleOwnerlessHistoryDelete(
+                    repository: historyRepo,
+                    surfaceID: descriptor.id.value.uuidString
+                )
+            }
+            outputBus.remove(surfaceId: descriptor.id)
+        }
+        self.terminal = nil
+        publishDisconnected(reason: "user_requested")
+    }
+
+    func flushPersistedHistory() {
+        terminal?.flushPersistedHistory()
+    }
+
+    func flushPersistedHistoryForTesting() async -> Bool {
+        guard let terminal else { return false }
+        return await terminal.flushPersistedHistoryAsync()
+    }
+
+    func routedSendTextStatus(_ text: String) -> TerminalInputStatus {
+        terminal?.sendTextStatus(text) ?? .processExited
+    }
+
+    func routedTextSnapshot() -> TerminalTextSnapshot? {
+        terminal?.readTextSnapshot()
+    }
+
+    func routedRuntimeHealth() -> TerminalRuntimeHealth? {
+        terminal?.runtimeHealth()
+    }
+
+    func routedFlushPersistedHistory() {
+        terminal?.flushPersistedHistory()
+    }
+
+    func routedFlushPersistedHistoryBarrier() -> SurfaceTerminationBarrier? {
+        terminal?.flushPersistedHistoryBarrier()
+    }
+
+    func routedClearPersistedHistory() {
+        if let terminal {
+            // The live coordinator owns generation rotation. Retirees only
+            // finish the drain already started by runtime replacement.
+            terminal.clearPersistedHistory()
+            return
+        }
+
+        let retired = Array(retiringTerminals.values)
+        retired.forEach {
+            retiredHistoryDeleteAttemptForTesting?()
+            $0.closeAndDeletePersistedHistory()
+        }
+        if retired.isEmpty, let historyRepo {
+            TerminalSurface.scheduleOwnerlessHistoryClearForReuse(
+                repository: historyRepo,
+                surfaceID: descriptor.id.value.uuidString
+            )
+        }
+    }
+
+    func routedReadPersistedHistory(
+        beforeChunkID: Int64?,
+        maxBytes: Int,
+        timeout: TimeInterval
+    ) async throws -> TerminalOutputWindow {
+        guard let terminal else { throw TerminalHistoryReadError.unavailable }
+        return try await terminal.readPersistedHistory(
+            beforeChunkID: beforeChunkID,
+            maxBytes: maxBytes,
+            timeout: timeout
+        )
+    }
+
+    func routedRepairTerminalFocus(reason: String) {
+#if DEBUG
+        terminalFocusRepairForwardCountForTesting += 1
+#endif
+        terminal?.repairTerminalFocus(reason: reason)
     }
 
     func sendText(_ text: String) {
@@ -798,6 +1462,108 @@ final class SSHSurface: NSObject, SSHTransferSurface {
             "ssh_destination": descriptor.metadata["ssh_destination"] ?? ""
         ]
     }
+
+    var embeddedTerminalIDForTesting: SurfaceID? { terminal?.descriptor.id }
+    var embeddedTerminalForTesting: TerminalSurface? { terminal }
+    var embeddedTerminalLogicalVisibleForTesting: Bool? {
+        terminal?.runtimeHealth().renderDiagnostics?.logicalVisible
+    }
+    var embeddedOutputPendingBytesForTesting: Int? { terminal?.runtimeHealth().outputPendingBytes }
+
+    func connectImmediatelyForTesting(_ host: SSHHostProfile) async {
+        connectionGeneration &+= 1
+        pendingConnection = nil
+        await performConnect(host, generation: connectionGeneration)
+    }
+
+    func installEmbeddedPlaceholderForTesting() async throws {
+        let retirement = await retireCurrentTerminalAndWait()
+        guard retirement.groupsCompleted else {
+            throw NSError(domain: "RemoteCode.SSHSurface.Tests", code: 1)
+        }
+        let next = try TerminalSurface(
+            workspaceID: workspaceID,
+            title: descriptor.title,
+            launch: .sshPlaceholder(cwd: cwd),
+            assignedSurfaceID: descriptor.id,
+            historyRepo: historyRepo,
+            settingsRepo: settingsRepo,
+            terminalFontSize: terminalFontSize,
+            outputBus: outputBus
+        )
+        if !retirement.dispositionCompleted {
+            next.markRuntimeRestartDispositionIncomplete()
+        }
+        terminal = next
+        shouldReplayHistoryOnNextConnect = true
+        if isVisible {
+            next.didBecomeVisible()
+        } else {
+            next.didBecomeHidden()
+        }
+        installTerminal(next.view)
+    }
+
+    func installHistoryClearOwnersForTesting(
+        current: TerminalSurface,
+        retiree: TerminalSurface,
+        retirementBarrier: SurfaceTerminationBarrier
+    ) {
+        terminal = current
+        let token = UUID()
+        retiringTerminals[token] = retiree
+        retirementBarriers[token] = retirementBarrier
+    }
+
+    func installEmbeddedShellForApplicationTerminationTesting() async throws -> TerminalSurface {
+        let retirement = await retireCurrentTerminalAndWait()
+        guard retirement.groupsCompleted else {
+            throw NSError(domain: "RemoteCode.SSHSurface.Tests", code: 2)
+        }
+        let next = try TerminalSurface(
+            workspaceID: workspaceID,
+            title: descriptor.title,
+            launch: .shell(cwd: cwd),
+            assignedSurfaceID: descriptor.id,
+            historyRepo: historyRepo,
+            settingsRepo: settingsRepo,
+            terminalFontSize: terminalFontSize,
+            outputBus: outputBus
+        )
+        if !retirement.dispositionCompleted {
+            next.markRuntimeRestartDispositionIncomplete()
+        }
+        terminal = next
+        if isVisible {
+            next.didBecomeVisible()
+        } else {
+            next.didBecomeHidden()
+        }
+        installTerminal(next.view)
+        return next
+    }
+
+    var connectionWorkerActiveForTesting: Bool { connectionWorker != nil }
+    var inFlightPreparedPIDForTesting: pid_t? {
+        inFlightPreparedRuntime?.ownedPIDForTesting
+    }
+#if DEBUG
+    var preparationFailurePIDForTesting: pid_t? { lastPreparationFailurePIDForTesting }
+#endif
+
+    func waitForRetirementsForTesting() async {
+        let deadline = DispatchTime.now() + 3
+        while !retirementBarriers.isEmpty,
+              DispatchTime.now().uptimeNanoseconds < deadline.uptimeNanoseconds {
+            let barriers = Array(retirementBarriers.values)
+            for barrier in barriers {
+                _ = await barrier.waitAsync(until: deadline)
+            }
+            await Task.yield()
+        }
+    }
+
+    var retirementBarrierCountForTesting: Int { retirementBarriers.count }
 
     var hostSidebarWidthForTesting: CGFloat {
         sidebarWidthConstraint?.constant ?? 0

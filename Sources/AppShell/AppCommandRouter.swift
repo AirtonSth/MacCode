@@ -95,6 +95,8 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     public weak var windowController: MainWindowController?
     var destinationWindowIsKeyForTests: ((NSWindow) -> Bool)?
     var providerSignInTerminalInputSenderForTests: ((SurfaceID, String) -> TerminalInputStatus)?
+    var terminalRestartRuntimePreparerForTesting: ((WorkspaceID, String, SurfaceID) -> TerminalPreparedPTYRuntime?)?
+    var terminalRestartPreparedDiscardAdditionalBarrierForTesting: (() -> SurfaceTerminationBarrier?)?
     var codexForkProtocolSupportProbe: (String, [String: String]) -> Bool = { binary, environment in
         CodexForkProtocolSupport.probe(binary: binary, environment: environment).isSupported
     }
@@ -108,6 +110,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     private let providerProbeCacheTTL: TimeInterval = 30
     private var suppressedLayoutEventDepth = 0
     private var closedTabBuffer = ClosedTabRingBuffer(capacity: 10)
+    private var restartingSurfaceIDs = Set<SurfaceID>()
     /// Descriptors that failed to reinstantiate during session restore.
     /// Populated by `reinstantiateRestoredSurfaces`; readable by tests and diagnostics.
     public private(set) var restoreFailedSurfaceIDs: [SurfaceID] = []
@@ -275,12 +278,27 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                     let surface: Surface
                     switch desc.type {
                     case .terminal:
-                        surface = try TerminalSurface(workspaceID: wid, title: title, launch: .shell(cwd: cwd), restoredSurfaceID: desc.id, historyRepo: ctx.terminalOutputRepo, settingsRepo: ctx.settingsRepo, terminalFontSize: terminalFontSize)
+                        surface = configureTerminalSurface(
+                            try TerminalSurface(workspaceID: wid, title: title, launch: .shell(cwd: cwd), restoredSurfaceID: desc.id, historyRepo: ctx.terminalOutputRepo, settingsRepo: ctx.settingsRepo, terminalFontSize: terminalFontSize),
+                            workspace: wid
+                        )
                     case .ssh:
                         if let profile = sshProfile(from: desc) {
-                            surface = try TerminalSurface(workspaceID: wid, title: title, launch: .ssh(profile: profile, cwd: cwd), restoredSurfaceID: desc.id, historyRepo: ctx.terminalOutputRepo, settingsRepo: ctx.settingsRepo, terminalFontSize: terminalFontSize)
+                            surface = configureTerminalSurface(
+                                try TerminalSurface(workspaceID: wid, title: title, launch: .ssh(profile: profile, cwd: cwd), restoredSurfaceID: desc.id, historyRepo: ctx.terminalOutputRepo, settingsRepo: ctx.settingsRepo, terminalFontSize: terminalFontSize),
+                                workspace: wid
+                            )
                         } else {
-                            surface = try SSHSurface(workspaceID: wid, cwd: cwd, title: title, router: self, settingsRepo: ctx.settingsRepo, terminalFontSize: terminalFontSize)
+                            surface = try SSHSurface(
+                                workspaceID: wid,
+                                cwd: cwd,
+                                title: title,
+                                router: self,
+                                restoredSurfaceID: desc.id,
+                                historyRepo: ctx.terminalOutputRepo,
+                                settingsRepo: ctx.settingsRepo,
+                                terminalFontSize: terminalFontSize
+                            )
                         }
                     case .browser:
                         surface = configureBrowserSurface(BrowserSurface(workspaceID: wid, initialURL: restoredBrowserURL(from: desc), title: title))
@@ -696,6 +714,10 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         windowController?.refreshFromState()
         reconcileSurfaceVisibility()
         windowController?.repairSelectedTerminalFocus(reason: "workspace_select")
+        guard shouldPublishLayoutEvents else { return }
+        EventBus.shared.publish(kind: "workspace.selected", payload: .object([
+            "workspace_id": .string(id.value.uuidString)
+        ]))
     }
 
     public func closeWorkspace(_ id: WorkspaceID, publishEvent: Bool = true) throws {
@@ -703,19 +725,16 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         // terminal history after the workspace is removed. Guard: only surfaces that
         // belong to this workspace are collected; live surfaces in other workspaces
         // are never touched.
-        var surfaceIDsToDelete: [String] = []
+        var surfaceIDsToDelete: [SurfaceID] = []
         if let ws = context?.state.workspaces[id] {
             forEachSurface(in: ws.layout) { desc in
-                surfaceIDsToDelete.append(desc.id.value.uuidString)
+                surfaceIDsToDelete.append(desc.id)
             }
         }
         try context?.apply(.closeWorkspace(id))
         if let ctx = context {
             try? PromptHistoryStore(db: ctx.db).delete(workspaceID: id)
-            let repo = ctx.terminalOutputRepo
-            for sid in surfaceIDsToDelete {
-                try? repo.delete(surfaceID: sid)
-            }
+            surfaceIDsToDelete.forEach(permanentlyCloseRuntimeSurface)
         }
         windowController?.refreshFromState()
         reconcileSurfaceVisibility()
@@ -731,11 +750,11 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         guard !uniqueIds.isEmpty else { return }
         guard uniqueIds.allSatisfy({ ctx.state.workspaces[$0] != nil }) else { throw LayoutError.workspaceNotFound }
         // Collect surface IDs before the layout is mutated.
-        var surfaceIDsToDelete: [String] = []
+        var surfaceIDsToDelete: [SurfaceID] = []
         for id in uniqueIds {
             if let ws = ctx.state.workspaces[id] {
                 forEachSurface(in: ws.layout) { desc in
-                    surfaceIDsToDelete.append(desc.id.value.uuidString)
+                    surfaceIDsToDelete.append(desc.id)
                 }
             }
         }
@@ -744,10 +763,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         }
         let store = PromptHistoryStore(db: ctx.db)
         uniqueIds.forEach { try? store.delete(workspaceID: $0) }
-        let repo = ctx.terminalOutputRepo
-        for sid in surfaceIDsToDelete {
-            try? repo.delete(surfaceID: sid)
-        }
+        surfaceIDsToDelete.forEach(permanentlyCloseRuntimeSurface)
         windowController?.refreshFromState()
         reconcileSurfaceVisibility()
         uniqueIds.forEach(publishWorkspaceClosed)
@@ -1173,15 +1189,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             ?? SurfaceRegistry.shared.surface(surface)?.descriptor
         let workspaceCwdForReopen = context?.state.workspaces[workspace]?.cwd ?? ""
         try context?.apply(.closeSurface(workspace, surface))
-        if let s = SurfaceRegistry.shared.surface(surface) {
-            s.close()
-            SurfaceRegistry.shared.unregister(surface)
-        }
-        SurfaceOutputBus.shared.remove(surfaceId: surface)
-        // Guard: surface is no longer in the layout (apply(.closeSurface) succeeded),
-        // so it is genuinely removed. Delete its persisted terminal history now; rows
-        // have no other owner once the surface is gone.
-        try? context?.terminalOutputRepo.delete(surfaceID: surface.value.uuidString)
+        permanentlyCloseRuntimeSurface(surface)
         if let desc = closedDescriptor {
             let entry = ClosedTabEntry(descriptor: desc, workspaceCwd: workspaceCwdForReopen)
             closedTabBuffer.push(entry, for: workspace)
@@ -1202,13 +1210,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             let closedDescriptor = (try? locateSurface(surface))?.descriptor
                 ?? SurfaceRegistry.shared.surface(surface)?.descriptor
             try context?.apply(.closeSurface(workspace, surface))
-            if let s = SurfaceRegistry.shared.surface(surface) {
-                s.close()
-                SurfaceRegistry.shared.unregister(surface)
-            }
-            SurfaceOutputBus.shared.remove(surfaceId: surface)
-            // Guard: surface removed from layout; delete its persisted terminal history.
-            try? context?.terminalOutputRepo.delete(surfaceID: surface.value.uuidString)
+            permanentlyCloseRuntimeSurface(surface)
             if let desc = closedDescriptor {
                 let entry = ClosedTabEntry(descriptor: desc, workspaceCwd: workspaceCwd)
                 closedTabBuffer.push(entry, for: workspace)
@@ -1217,6 +1219,22 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         }
         windowController?.refreshFromState()
         reconcileSurfaceVisibility()
+    }
+
+    /// Permanently disposes one layout surface. Terminal history deletion is
+    /// serialized by its coordinator after any already-queued writer; all other
+    /// surfaces have no terminal writer and can delete directly.
+    private func permanentlyCloseRuntimeSurface(_ surfaceID: SurfaceID) {
+        if let terminal = SurfaceRegistry.shared.surface(surfaceID) as? TerminalSurface {
+            terminal.closeAndDeletePersistedHistory()
+        } else if let ssh = SurfaceRegistry.shared.surface(surfaceID) as? SSHSurface {
+            ssh.closeAndDeletePersistedHistory()
+        } else {
+            SurfaceRegistry.shared.surface(surfaceID)?.close()
+            try? context?.terminalOutputRepo.delete(surfaceID: surfaceID.value.uuidString)
+        }
+        SurfaceRegistry.shared.unregister(surfaceID)
+        SurfaceOutputBus.shared.remove(surfaceId: surfaceID)
     }
 
     /// Reopen the most-recently-closed tab in `workspace`, restoring its cwd.
@@ -1246,20 +1264,304 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     /// and the same working directory. No-ops if the surface is not a
     /// restartable local terminal (SSH, wrong type, cwd missing).
     public func restartSurface(_ surfaceID: SurfaceID) {
+        guard restartingSurfaceIDs.insert(surfaceID).inserted else { return }
+        Task { @MainActor [weak self] in
+            _ = await self?.performCoalescedTerminalRestart(surfaceID)
+        }
+    }
+
+    @discardableResult
+    func restartSurfaceAndWaitForTesting(_ surfaceID: SurfaceID) async -> Bool {
+        guard restartingSurfaceIDs.insert(surfaceID).inserted else { return false }
+        return await performCoalescedTerminalRestart(surfaceID)
+    }
+
+    private func performCoalescedTerminalRestart(_ surfaceID: SurfaceID) async -> Bool {
+        defer { restartingSurfaceIDs.remove(surfaceID) }
         guard let ctx = context,
               let located = try? locateSurface(surfaceID),
-              let (cwd, title) = TerminalRestartDecision.spawnRequest(from: located.descriptor) else { return }
+              let (cwd, _) = TerminalRestartDecision.spawnRequest(from: located.descriptor),
+              let oldRuntime = SurfaceRegistry.shared.surface(surfaceID) as? TerminalSurface else {
+            return false
+        }
+
         let workspaceID = located.workspaceID
-        let paneID = ctx.state.workspaces[workspaceID]
-            .flatMap { paneIDContaining(surface: surfaceID, in: $0.layout) }
-        // Close the old surface first so its PTY/FD is cleaned up before the
-        // new one is spawned (avoids a brief double-ownership window).
-        try? closeSurface(workspace: workspaceID, surface: surfaceID)
-        let newDesc = makeSurface(type: .terminal, title: title, workspace: workspaceID, cwd: cwd)
-        try? ctx.apply(.addSurface(workspaceID, paneID: paneID, descriptor: newDesc))
-        windowController?.refreshFromState()
-        reconcileSurfaceVisibility()
-        publishSurfaceCreated(workspace: workspaceID, surface: newDesc)
+        let preservedDescriptor = located.descriptor
+        SurfaceOutputBus.shared.flushNow(surfaceID)
+        let sequenceBeforeRestart = SurfaceOutputBus.shared.currentSequence(surfaceID)
+        let historyPreflight = oldRuntime.runtimeRestartHistoryPreflightBarrier()
+        let historyReady = await historyPreflight.waitAsync(until: .now() + 2)
+        guard historyReady else {
+            appRouterLog.error("terminal.restart.blocked surface=\(surfaceID.value.uuidString, privacy: .public) reason=history_preflight_timeout")
+            return false
+        }
+
+        // The preflight is intentionally non-destructive. Revalidate after its
+        // async wait before crossing the irreversible PTY teardown boundary.
+        guard SurfaceRegistry.shared.surface(surfaceID) === oldRuntime,
+              let preflightCurrent = try? locateSurface(surfaceID),
+              preflightCurrent.workspaceID == workspaceID,
+              preflightCurrent.descriptor == preservedDescriptor else {
+            return false
+        }
+        func prepareRuntime(
+            workspaceID: WorkspaceID,
+            cwd: String
+        ) -> TerminalPreparedPTYRuntime? {
+            if let terminalRestartRuntimePreparerForTesting {
+                return terminalRestartRuntimePreparerForTesting(
+                    workspaceID,
+                    cwd,
+                    surfaceID
+                )
+            }
+            return TerminalSurface.prepareShellRuntimeForRestart(
+                workspaceID: workspaceID,
+                cwd: cwd,
+                surfaceID: surfaceID
+            )
+        }
+
+        func discardPreparedRuntime(_ prepared: TerminalPreparedPTYRuntime?) async {
+            guard let prepared else { return }
+            var barriers: [SurfaceTerminationBarrier] = []
+            if let cleanup = prepared.discard() {
+                barriers.append(cleanup)
+            }
+            if let additional = terminalRestartPreparedDiscardAdditionalBarrierForTesting?() {
+                barriers.append(additional)
+            }
+            guard !barriers.isEmpty else { return }
+            let combined = SurfaceTerminationBarrier(combining: barriers)
+            _ = await combined.waitForGroupsAsync(until: .distantFuture)
+        }
+
+        var preparedRuntime = prepareRuntime(workspaceID: workspaceID, cwd: cwd)
+        guard let initialPreparedRuntime = preparedRuntime else {
+            appRouterLog.error("terminal.restart.blocked surface=\(surfaceID.value.uuidString, privacy: .public) reason=spawn_prepare_failed")
+            return false
+        }
+        guard initialPreparedRuntime.suspendIfOwnedAndAlive() else {
+            appRouterLog.error("terminal.restart.blocked surface=\(surfaceID.value.uuidString, privacy: .public) reason=prepared_child_not_alive")
+            return false
+        }
+        guard SurfaceRegistry.shared.surface(surfaceID) === oldRuntime,
+              let preparedCurrent = try? locateSurface(surfaceID),
+              preparedCurrent.workspaceID == workspaceID,
+              preparedCurrent.descriptor == preservedDescriptor else {
+            return false
+        }
+        let barrier = oldRuntime.closeForRuntimeRestart()
+        var historyCompleted = true
+        if let requiredHistory = oldRuntime.requiredHistoryBarrierForRuntimeRestart() {
+            // Finalizing disables writes immediately and owns a bounded internal
+            // retry. Wait for the group itself, not the caller's fast process
+            // deadline: only group completion proves the old writer has stopped
+            // and a replacement writer may safely take the same surface ID.
+            let historyGroupsCompleted = await requiredHistory.waitForGroupsAsync(
+                until: .distantFuture
+            )
+            historyCompleted = historyGroupsCompleted
+                && requiredHistory.completionChecksSucceeded()
+            if !historyCompleted {
+                appRouterLog.error("terminal.restart.history_incomplete surface=\(surfaceID.value.uuidString, privacy: .public) action=replacement_continues_partial")
+            }
+        }
+        let dispositionDeadline = DispatchTime.now() + 2
+        var dispositionCompleted = true
+        if let barrier {
+            let dispositionGroupsCompleted = await barrier.waitForGroupsAsync(
+                until: dispositionDeadline
+            )
+            dispositionCompleted = dispositionGroupsCompleted
+                && barrier.completionChecksSucceeded()
+            if !dispositionCompleted {
+                let reason = dispositionGroupsCompleted
+                    ? "disposition_check_failed"
+                    : "disposition_group_timeout"
+                appRouterLog.error("terminal.restart.cleanup_incomplete surface=\(surfaceID.value.uuidString, privacy: .public) reason=\(reason, privacy: .public) action=replacement_continues")
+                oldRuntime.continueCleanupAfterFailedRuntimeRestart()
+            }
+        }
+
+        let terminalFontSize = SettingsStore(db: ctx.db).load().terminalFontSize
+        var preparedWorkspaceID = workspaceID
+        var preparedCwd = cwd
+        var recoveryAttempt = 0
+        let maximumRecoveryAttempts = 5
+
+        while true {
+            // Actor reentrancy is intentional while history/process owners drain.
+            // A close or a newer runtime wins; title/layout updates are adopted.
+            guard SurfaceRegistry.shared.surface(surfaceID) === oldRuntime else {
+                await discardPreparedRuntime(preparedRuntime)
+                oldRuntime.relinquishRuntimeHealthOwnershipForReplacement()
+                return false
+            }
+            guard let current = try? locateSurface(surfaceID),
+                  let (currentCwd, _) = TerminalRestartDecision.spawnRequest(
+                    from: current.descriptor
+                  ) else {
+                await discardPreparedRuntime(preparedRuntime)
+                oldRuntime.relinquishRuntimeHealthOwnershipForReplacement()
+                if SurfaceRegistry.shared.surface(surfaceID) === oldRuntime {
+                    SurfaceRegistry.shared.unregister(surfaceID)
+                }
+                return false
+            }
+
+            if let ownedPreparedRuntime = preparedRuntime {
+                let preparedMatchesCurrentState = preparedWorkspaceID == current.workspaceID
+                    && preparedCwd == currentCwd
+                guard preparedMatchesCurrentState,
+                      ownedPreparedRuntime.isOwnedAndAlive() else {
+                    await discardPreparedRuntime(ownedPreparedRuntime)
+                    preparedRuntime = nil
+                    // The await permits close/move/rename. Never use `current`
+                    // again until registry and layout are re-read at loop top.
+                    continue
+                }
+            } else if recoveryAttempt < maximumRecoveryAttempts {
+                preparedRuntime = prepareRuntime(
+                    workspaceID: current.workspaceID,
+                    cwd: currentCwd
+                )
+                preparedWorkspaceID = current.workspaceID
+                preparedCwd = currentCwd
+                if let candidateRuntime = preparedRuntime,
+                   !candidateRuntime.suspendIfOwnedAndAlive() {
+                    await discardPreparedRuntime(candidateRuntime)
+                    preparedRuntime = nil
+                    recoveryAttempt += 1
+                    continue
+                }
+            }
+
+            let candidateRuntime: TerminalPreparedPTYRuntime?
+            if let preparedRuntime {
+                candidateRuntime = preparedRuntime
+            } else {
+                if recoveryAttempt < maximumRecoveryAttempts {
+                    recoveryAttempt += 1
+                }
+                if recoveryAttempt == 1 || recoveryAttempt == maximumRecoveryAttempts {
+                    appRouterLog.error("terminal.restart.recovery_wait surface=\(surfaceID.value.uuidString, privacy: .public) attempt=\(recoveryAttempt, privacy: .public) reason=spawn_prepare_failed")
+                }
+                guard recoveryAttempt >= maximumRecoveryAttempts else {
+                    let delay = min(1.0, 0.05 * Double(recoveryAttempt))
+                    do {
+                        try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+                    } catch {
+                        // Cancellation must accelerate the finite fallback, not
+                        // turn every subsequent sleep into a zero-delay spin.
+                        recoveryAttempt = maximumRecoveryAttempts
+                    }
+                    continue
+                }
+                // The preparer can fail under transient descriptor/process
+                // pressure. One final direct spawn produces either a healthy
+                // successor or an explicit dead-but-retryable surface; it never
+                // leaves an unbounded recovery Task resident.
+                candidateRuntime = nil
+            }
+
+            do {
+                let candidate = configureTerminalSurface(
+                    try TerminalSurface(
+                        workspaceID: current.workspaceID,
+                        title: current.descriptor.title,
+                        launch: .shell(cwd: currentCwd),
+                        restoredSurfaceID: surfaceID,
+                        historyRepo: ctx.terminalOutputRepo,
+                        settingsRepo: ctx.settingsRepo,
+                        terminalFontSize: terminalFontSize,
+                        outputBus: .shared,
+                        preservedDescriptor: current.descriptor,
+                        preparedRuntime: candidateRuntime
+                    ),
+                    workspace: current.workspaceID
+                )
+                preparedRuntime = nil
+                guard candidate.runtimeHealth().processAlive,
+                      candidate.runtimeHealth().inputAccepting,
+                      candidate.runtimeProcessIsOwnedAndAliveForRestartCommit() else {
+                    appRouterLog.error("terminal.restart.recovery_wait surface=\(surfaceID.value.uuidString, privacy: .public) attempt=\(recoveryAttempt + 1, privacy: .public) reason=replacement_not_alive")
+                    recoveryAttempt += 1
+                    if recoveryAttempt >= maximumRecoveryAttempts {
+                        oldRuntime.relinquishRuntimeHealthOwnershipForReplacement()
+                        if !dispositionCompleted {
+                            candidate.markRuntimeRestartDispositionIncomplete()
+                        }
+                        if !historyCompleted {
+                            candidate.markRuntimeRestartHistoryIncomplete()
+                        }
+                        candidate.markRuntimeRestartRecoveryExhausted()
+                        SurfaceRegistry.shared.register(candidate)
+                        windowController?.refreshFromState()
+                        reconcileSurfaceVisibility()
+                        return false
+                    }
+                    let cleanup = candidate.closeForRuntimeRestart()
+                    if let requiredHistory = candidate.requiredHistoryBarrierForRuntimeRestart() {
+                        _ = await requiredHistory.waitForGroupsAsync(until: .distantFuture)
+                    }
+                    if let cleanup {
+                        let groupsCompleted = await cleanup.waitForGroupsAsync(
+                            until: .now() + 2
+                        )
+                        if !groupsCompleted || !cleanup.completionChecksSucceeded(),
+                           let fallback = candidate.continueCleanupAfterFailedRuntimeRestart() {
+                            _ = await fallback.waitForGroupsAsync(until: .distantFuture)
+                        }
+                    }
+                    candidate.relinquishRuntimeHealthOwnershipForReplacement()
+                    let delay = min(1.0, 0.05 * Double(recoveryAttempt))
+                    do {
+                        try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+                    } catch {
+                        recoveryAttempt = maximumRecoveryAttempts
+                    }
+                    continue
+                }
+
+                oldRuntime.relinquishRuntimeHealthOwnershipForReplacement()
+                if !dispositionCompleted {
+                    candidate.markRuntimeRestartDispositionIncomplete()
+                }
+                if !historyCompleted {
+                    candidate.markRuntimeRestartHistoryIncomplete()
+                }
+                SurfaceRegistry.shared.register(candidate)
+                windowController?.refreshFromState()
+                reconcileSurfaceVisibility()
+                let sequenceAfterRestart = SurfaceOutputBus.shared.currentSequence(surfaceID)
+                guard sequenceAfterRestart >= sequenceBeforeRestart else {
+                    appRouterLog.error("terminal.restart.sequence_regressed surface=\(surfaceID.value.uuidString, privacy: .public) before=\(sequenceBeforeRestart, privacy: .public) after=\(sequenceAfterRestart, privacy: .public)")
+                    return false
+                }
+                return true
+            } catch {
+                // The current TerminalSurface initializer is effectively
+                // nonthrowing, but retain ownership if that contract changes.
+                await discardPreparedRuntime(preparedRuntime)
+                preparedRuntime = nil
+                recoveryAttempt += 1
+                appRouterLog.error("terminal.restart.recovery_wait surface=\(surfaceID.value.uuidString, privacy: .public) attempt=\(recoveryAttempt, privacy: .public) error=\(String(describing: error), privacy: .public)")
+                if recoveryAttempt >= maximumRecoveryAttempts {
+                    oldRuntime.relinquishRuntimeHealthOwnershipForReplacement()
+                    if SurfaceRegistry.shared.surface(surfaceID) === oldRuntime {
+                        SurfaceRegistry.shared.unregister(surfaceID)
+                    }
+                    return false
+                }
+                let delay = min(1.0, 0.05 * Double(recoveryAttempt))
+                do {
+                    try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+                } catch {
+                    recoveryAttempt = maximumRecoveryAttempts
+                }
+            }
+        }
     }
 
     public func focusSurface(workspace: WorkspaceID, surface: SurfaceID) throws {
@@ -1309,8 +1611,8 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         guard let ws = context?.state.workspaces[workspaceID],
               let surfaceID = focusedSelectedSurfaceID(in: ws),
               SurfaceRegistry.shared.isVisible(surfaceID),
-              let terminal = SurfaceRegistry.shared.surface(surfaceID) as? TerminalSurface else { return }
-        terminal.repairTerminalFocus(reason: reason)
+              let terminal = SurfaceRegistry.shared.surface(surfaceID) as? TerminalRuntimeRoutingSurface else { return }
+        terminal.routedRepairTerminalFocus(reason: reason)
     }
 
     public func sendText(surface: SurfaceID, text: String) throws {
@@ -1322,8 +1624,8 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         guard let s = SurfaceRegistry.shared.surface(surface) else {
             return terminalInputStatusJSON(.surfaceNotFound)
         }
-        if let terminal = s as? TerminalSurface {
-            return terminalInputStatusJSON(terminal.sendTextStatus(text))
+        if let terminal = s as? TerminalRuntimeRoutingSurface {
+            return terminalInputStatusJSON(terminal.routedSendTextStatus(text))
         }
         s.sendText(text)
         return terminalInputStatusJSON(.accepted)
@@ -1336,8 +1638,11 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
 
     public func readTextSnapshot(surface: SurfaceID) throws -> JSONValue {
         guard let s = SurfaceRegistry.shared.surface(surface) else { throw LayoutError.surfaceNotFound }
-        if let terminal = s as? TerminalSurface {
-            return terminalSnapshotJSON(terminal.readTextSnapshot())
+        if let terminal = s as? TerminalRuntimeRoutingSurface {
+            guard let snapshot = terminal.routedTextSnapshot() else {
+                return disconnectedTerminalSnapshotJSON()
+            }
+            return terminalSnapshotJSON(snapshot)
         }
         return .object([
             "text": .string(s.readText()),
@@ -1349,12 +1654,20 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         ])
     }
 
-    public func readTerminalHistory(surface: SurfaceID, beforeChunkID: Int64?, maxBytes: Int) throws -> TerminalOutputWindow {
+    public func readTerminalHistory(
+        surface: SurfaceID,
+        beforeChunkID: Int64?,
+        maxBytes: Int
+    ) async throws -> TerminalOutputWindow {
         guard let surfaceObject = SurfaceRegistry.shared.surface(surface) else { throw LayoutError.surfaceNotFound }
-        (surfaceObject as? TerminalSurface)?.flushPersistedHistory()
-        SurfaceOutputBus.shared.flushNow(surface)
-        guard let repo = context?.terminalOutputRepo else { throw LayoutError.surfaceNotFound }
-        return try repo.readWindow(surfaceID: surface.value.uuidString, beforeChunkID: beforeChunkID, maxBytes: maxBytes)
+        guard let terminal = surfaceObject as? TerminalRuntimeRoutingSurface else {
+            throw LayoutError.surfaceNotFound
+        }
+        return try await terminal.routedReadPersistedHistory(
+            beforeChunkID: beforeChunkID,
+            maxBytes: maxBytes,
+            timeout: 2
+        )
     }
 
     public func surfaceHealth(surface: SurfaceID) -> Bool {
@@ -1371,22 +1684,28 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 "terminal_dead_reason": .string(TerminalInputStatus.surfaceNotFound.rawValue)
             ])
         }
-        guard let terminal = s as? TerminalSurface else {
+        guard let terminal = s as? TerminalRuntimeRoutingSurface else {
             return .object([
                 "alive": .bool(true),
                 "surface_type": .string(s.descriptor.type.rawValue)
             ])
         }
-        return terminalHealthJSON(terminal.runtimeHealth())
+        guard let health = terminal.routedRuntimeHealth() else {
+            return disconnectedTerminalHealthJSON()
+        }
+        return terminalHealthJSON(health)
     }
 
     public func surfaceClearHistory(surface: SurfaceID) {
-        // Terminal-specific: clear persisted scrollback, then replace the live
-        // terminal viewport by sending the clear shortcut. Browser/agent
-        // surfaces ignore.
+        // Terminal-specific: discard pending + durable scrollback through the
+        // history coordinator so an in-flight writer cannot repopulate after
+        // delete, then clear the live viewport. Browser/agent surfaces ignore.
         if let s = SurfaceRegistry.shared.surface(surface), s.descriptor.type == .terminal || s.descriptor.type == .ssh {
-            (s as? TerminalSurface)?.flushPersistedHistory()
-            try? context?.terminalOutputRepo.delete(surfaceID: surface.value.uuidString)
+            if let terminal = s as? TerminalRuntimeRoutingSurface {
+                terminal.routedClearPersistedHistory()
+            } else {
+                try? context?.terminalOutputRepo.delete(surfaceID: surface.value.uuidString)
+            }
             s.sendText("\u{0C}") // ctrl-L
         }
     }
@@ -1462,8 +1781,10 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     }
 
     public func sshDisconnect(surface: SurfaceID) throws {
-        guard let s = SurfaceRegistry.shared.surface(surface) else { throw LayoutError.surfaceNotFound }
-        s.close()
+        guard let ssh = SurfaceRegistry.shared.surface(surface) as? SSHSurface else {
+            throw LayoutError.surfaceNotFound
+        }
+        ssh.disconnectForRouter()
     }
 
     public func sshTransferUpload(surface: SurfaceID, localPath: String, remotePath: String) throws -> JSONValue {
@@ -3416,6 +3737,39 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         return browser
     }
 
+    private func configureTerminalSurface(
+        _ terminal: TerminalSurface,
+        workspace: WorkspaceID
+    ) -> TerminalSurface {
+        if terminal.descriptor.type == .terminal {
+            terminal.onRestartRequested = { [weak self, weak terminal] in
+                guard let self, let terminal else { return }
+                self.restartSurface(terminal.descriptor.id)
+            }
+            terminal.refreshRestartActionForCurrentHealth()
+        }
+        terminal.onTitleChange = { [weak self, weak terminal] title in
+            guard let self, let terminal else { return }
+            let surfaceID = terminal.descriptor.id
+            do {
+                try self.renameSurface(workspace, surfaceID, title)
+            } catch {
+                NSLog(
+                    "RemoteCode terminal title persistence failed surface=%@ error=%@",
+                    surfaceID.value.uuidString,
+                    String(describing: error)
+                )
+                return
+            }
+            EventBus.shared.publish(kind: "surface.renamed", payload: .object([
+                "workspace_id": .string(workspace.value.uuidString),
+                "id": .string(surfaceID.value.uuidString),
+                "title": .string(title)
+            ]))
+        }
+        return terminal
+    }
+
     private func restoredBrowserURL(from descriptor: SurfaceDescriptor) -> URL? {
         guard let raw = descriptor.metadata["url"], !raw.isEmpty else { return nil }
         return URL(string: raw)
@@ -3914,14 +4268,20 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             let surface: Surface
             switch type {
             case .terminal:
-                let terminal = try TerminalSurface(workspaceID: workspace, title: baseTitle, launch: .shell(cwd: cwd), historyRepo: context?.terminalOutputRepo, settingsRepo: context?.settingsRepo, terminalFontSize: terminalFontSize)
-                terminal.onRestartRequested = { [weak self, weak terminal] in
-                    guard let self, let terminal else { return }
-                    self.restartSurface(terminal.descriptor.id)
-                }
-                surface = terminal
+                surface = configureTerminalSurface(
+                    try TerminalSurface(workspaceID: workspace, title: baseTitle, launch: .shell(cwd: cwd), historyRepo: context?.terminalOutputRepo, settingsRepo: context?.settingsRepo, terminalFontSize: terminalFontSize),
+                    workspace: workspace
+                )
             case .ssh:
-                surface = try SSHSurface(workspaceID: workspace, cwd: cwd, title: baseTitle, router: self, settingsRepo: context?.settingsRepo, terminalFontSize: terminalFontSize)
+                surface = try SSHSurface(
+                    workspaceID: workspace,
+                    cwd: cwd,
+                    title: baseTitle,
+                    router: self,
+                    historyRepo: context?.terminalOutputRepo,
+                    settingsRepo: context?.settingsRepo,
+                    terminalFontSize: terminalFontSize
+                )
             case .browser:
                 surface = configureBrowserSurface(BrowserSurface(workspaceID: workspace, initialURL: nil, title: baseTitle))
             case .agentApp:
@@ -4065,7 +4425,15 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     private func makeSSHSurface(profile: SSHHostProfile, title: String?, workspace: WorkspaceID, cwd: String) throws -> SurfaceDescriptor {
         let baseTitle = title ?? profile.label
         let terminalFontSize = context.map { SettingsStore(db: $0.db).load().terminalFontSize } ?? 0
-        let surface = try SSHSurface(workspaceID: workspace, cwd: cwd, title: baseTitle, router: self, settingsRepo: context?.settingsRepo, terminalFontSize: terminalFontSize)
+        let surface = try SSHSurface(
+            workspaceID: workspace,
+            cwd: cwd,
+            title: baseTitle,
+            router: self,
+            historyRepo: context?.terminalOutputRepo,
+            settingsRepo: context?.settingsRepo,
+            terminalFontSize: terminalFontSize
+        )
         surface.connectForRouter(profile)
         SurfaceRegistry.shared.register(surface)
         return surface.descriptor
@@ -4632,12 +5000,52 @@ private func terminalHealthJSON(_ health: TerminalRuntimeHealth) -> JSONValue {
         "terminal_dead_reason": health.terminalDeadReason.map { .string($0) } ?? .null,
         "last_output_at": health.lastOutputAt.map { .number($0.timeIntervalSince1970) } ?? .null,
         "output_partial": .bool(health.outputPartial),
+        "partial_reason": health.outputPartialReason.map { .string($0) } ?? .null,
         "output_pending_bytes": .number(Double(health.outputPendingBytes)),
         "history_write_failures": .number(Double(health.historyWriteFailures)),
         "dropped_output_bytes": .number(Double(health.droppedOutputBytes)),
         "rows": .number(Double(health.rows)),
         "cols": .number(Double(health.cols)),
         "render_diagnostics": health.renderDiagnostics.map(terminalRenderDiagnosticsJSON) ?? .null
+    ])
+}
+
+private func disconnectedTerminalHealthJSON() -> JSONValue {
+    .object([
+        "alive": .bool(false),
+        "process_alive": .bool(false),
+        "child_pid": .null,
+        "exit_status": .null,
+        "termination_signal": .null,
+        "pty_open": .bool(false),
+        "input_accepting": .bool(false),
+        "terminal_dead_reason": .string(TerminalInputStatus.processExited.rawValue),
+        "last_output_at": .null,
+        "output_partial": .bool(false),
+        "partial_reason": .null,
+        "output_pending_bytes": .number(0),
+        "history_write_failures": .number(0),
+        "dropped_output_bytes": .number(0),
+        "rows": .number(0),
+        "cols": .number(0),
+        "render_diagnostics": .null
+    ])
+}
+
+private func disconnectedTerminalSnapshotJSON() -> JSONValue {
+    .object([
+        "text": .string(""),
+        "ansi_text": .null,
+        "ansi_palette": .null,
+        "complete": .bool(false),
+        "partial": .bool(true),
+        "source": .string("ssh_disconnected"),
+        "timestamp": .number(Date().timeIntervalSince1970),
+        "partial_reason": .string(TerminalInputStatus.processExited.rawValue),
+        "pending_bytes": .number(0),
+        "rows": .number(0),
+        "cols": .number(0),
+        "render_diagnostics": .null
     ])
 }
 
