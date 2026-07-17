@@ -195,6 +195,11 @@ public final class AppContext {
             try await privateNotificationBridge.sendLiveActivityAcceptance(record)
         }
         self.liveActivityAcceptanceOutbox = liveActivityAcceptanceOutbox
+        // Survive Mac app updates/relaunches: keep stored iOS push-to-start
+        // tokens bound to this host identity before the sync coordinator boots.
+        let reboundPushToStart = (try? privatePushTargetStore.rebindDurableTokens(
+            toHostServerId: liveActivityIdentity.serverId
+        )) ?? []
         self.liveActivitySyncCoordinator = LiveActivitySyncCoordinator(
             serverId: liveActivityIdentity.serverId,
             bootEpoch: liveActivityIdentity.bootEpoch,
@@ -217,6 +222,15 @@ public final class AppContext {
             )
             let targets = try privateNotificationBridge.acceptanceTargets(for: delivery)
             try liveActivityAcceptanceOutbox.accept(delivery, targets: targets)
+        }
+        // Re-publish push-to-start tokens to the backend so a post-update Mac can
+        // open Live Activities without the user launching iOS first.
+        for target in reboundPushToStart {
+            do {
+                _ = try liveActivitySyncCoordinator.submitTokenRegistration(target)
+            } catch {
+                NSLog("Live Activity durable token restore failed device=\(target.deviceId): \(error)")
+            }
         }
         self.tokenSaverDistillServiceController = TokenSaverDistillServiceController(
             appSupportDirectory: self.appSupportDirectory
