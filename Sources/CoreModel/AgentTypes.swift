@@ -335,6 +335,7 @@ public struct AgentRunRequest: Codable, Sendable, Equatable {
     public let providerBinary: String?
     public let environment: [String: String]
     public let extraArgs: [String]
+    public let runAsUser: AgentRunAsUser?
 
     public init(
         runId: AgentRunID = AgentRunID(),
@@ -353,7 +354,8 @@ public struct AgentRunRequest: Codable, Sendable, Equatable {
         interactionMode: AgentInteractionMode = .default,
         providerBinary: String? = nil,
         environment: [String: String] = [:],
-        extraArgs: [String] = []
+        extraArgs: [String] = [],
+        runAsUser: AgentRunAsUser? = nil
     ) {
         self.runId = runId
         self.threadId = threadId
@@ -372,10 +374,11 @@ public struct AgentRunRequest: Codable, Sendable, Equatable {
         self.providerBinary = providerBinary
         self.environment = environment
         self.extraArgs = extraArgs
+        self.runAsUser = runAsUser
     }
 
     private enum CodingKeys: String, CodingKey {
-        case runId, threadId, provider, providerInstanceId, model, cwd, prompt, userMessageContent, attachments, providerThreadId, permissionMode, reasoningEffort, serviceTier, interactionMode, providerBinary, environment, extraArgs
+        case runId, threadId, provider, providerInstanceId, model, cwd, prompt, userMessageContent, attachments, providerThreadId, permissionMode, reasoningEffort, serviceTier, interactionMode, providerBinary, environment, extraArgs, runAsUser
     }
 
     public init(from decoder: Decoder) throws {
@@ -397,6 +400,7 @@ public struct AgentRunRequest: Codable, Sendable, Equatable {
         providerBinary = try c.decodeIfPresent(String.self, forKey: .providerBinary)
         environment = try c.decodeIfPresent([String: String].self, forKey: .environment) ?? [:]
         extraArgs = try c.decodeIfPresent([String].self, forKey: .extraArgs) ?? []
+        runAsUser = try c.decodeIfPresent(AgentRunAsUser.self, forKey: .runAsUser)
     }
 
     public var providerPrompt: String {
@@ -965,6 +969,9 @@ public struct AgentThread: Codable, Sendable, Equatable, Identifiable {
     public var modelSelection: AgentModelSelection
     /// Optional only for backward-compatible decoding of pre-v34 wire snapshots.
     public var interactionMode: AgentInteractionMode?
+    /// macOS account that executes provider processes for this thread (`sudo -u`).
+    /// Nil means the current login user. Distinct from `providerInstanceId`.
+    public var runAsUser: AgentRunAsUser?
 
     public var effectiveInteractionMode: AgentInteractionMode {
         interactionMode ?? .default
@@ -995,7 +1002,8 @@ public struct AgentThread: Codable, Sendable, Equatable, Identifiable {
         worktreePath: String? = nil,
         serviceTier: AgentServiceTier = .auto,
         modelSelection: AgentModelSelection? = nil,
-        interactionMode: AgentInteractionMode = .default
+        interactionMode: AgentInteractionMode = .default,
+        runAsUser: AgentRunAsUser? = nil
     ) {
         self.id = id
         self.projectId = projectId
@@ -1027,6 +1035,7 @@ public struct AgentThread: Codable, Sendable, Equatable, Identifiable {
             serviceTier: serviceTier
         )
         self.interactionMode = interactionMode
+        self.runAsUser = runAsUser
     }
 }
 

@@ -50,6 +50,21 @@ private func decodeModelSelection(
     )
 }
 
+private func encodeRunAsUser(_ user: AgentRunAsUser?) -> String? {
+    guard let user else { return nil }
+    guard let data = try? JSONEncoder().encode(user) else { return nil }
+    return String(data: data, encoding: .utf8)
+}
+
+private func decodeRunAsUser(_ json: String?) -> AgentRunAsUser? {
+    guard let json,
+          let data = json.data(using: .utf8),
+          let user = try? JSONDecoder().decode(AgentRunAsUser.self, from: data) else {
+        return nil
+    }
+    return user
+}
+
 public final class ProjectRepository {
     let db: SQLiteDB
     public init(db: SQLiteDB) { self.db = db }
@@ -124,9 +139,9 @@ public final class AgentThreadRepository {
 
     public func upsert(_ t: AgentThread) throws {
         let st = try db.prepare("""
-            INSERT INTO agent_threads(id, project_id, workspace_id, title, provider, provider_instance_id, model, provider_thread_id, status, created_at, updated_at, diff_additions, diff_deletions, has_unread, color, pinned, sort_order, permission_mode, reasoning_effort, execution_mode, base_branch, worktree_path, service_tier, model_selection_json, interaction_mode)
-            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(id) DO UPDATE SET title=excluded.title, provider=excluded.provider, provider_instance_id=excluded.provider_instance_id, model=excluded.model, provider_thread_id=excluded.provider_thread_id, status=excluded.status, updated_at=excluded.updated_at, diff_additions=excluded.diff_additions, diff_deletions=excluded.diff_deletions, has_unread=excluded.has_unread, color=excluded.color, pinned=excluded.pinned, sort_order=excluded.sort_order, permission_mode=excluded.permission_mode, reasoning_effort=excluded.reasoning_effort, execution_mode=excluded.execution_mode, base_branch=excluded.base_branch, worktree_path=excluded.worktree_path, service_tier=excluded.service_tier, model_selection_json=excluded.model_selection_json, interaction_mode=excluded.interaction_mode;
+            INSERT INTO agent_threads(id, project_id, workspace_id, title, provider, provider_instance_id, model, provider_thread_id, status, created_at, updated_at, diff_additions, diff_deletions, has_unread, color, pinned, sort_order, permission_mode, reasoning_effort, execution_mode, base_branch, worktree_path, service_tier, model_selection_json, interaction_mode, run_as_user_json)
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET title=excluded.title, provider=excluded.provider, provider_instance_id=excluded.provider_instance_id, model=excluded.model, provider_thread_id=excluded.provider_thread_id, status=excluded.status, updated_at=excluded.updated_at, diff_additions=excluded.diff_additions, diff_deletions=excluded.diff_deletions, has_unread=excluded.has_unread, color=excluded.color, pinned=excluded.pinned, sort_order=excluded.sort_order, permission_mode=excluded.permission_mode, reasoning_effort=excluded.reasoning_effort, execution_mode=excluded.execution_mode, base_branch=excluded.base_branch, worktree_path=excluded.worktree_path, service_tier=excluded.service_tier, model_selection_json=excluded.model_selection_json, interaction_mode=excluded.interaction_mode, run_as_user_json=excluded.run_as_user_json;
         """)
         try st.bind(1, t.id.value.uuidString)
         try st.bind(2, t.projectId?.value.uuidString)
@@ -153,13 +168,14 @@ public final class AgentThreadRepository {
         try st.bind(23, t.serviceTier.rawValue)
         try st.bind(24, encodeModelSelection(t.modelSelection))
         try st.bind(25, t.effectiveInteractionMode.rawValue)
+        try st.bind(26, encodeRunAsUser(t.runAsUser))
         _ = try st.step()
     }
 
     public func list(workspaceId: WorkspaceID? = nil) throws -> [AgentThread] {
         let sql = workspaceId == nil
-            ? "SELECT id, project_id, workspace_id, title, provider, provider_instance_id, model, provider_thread_id, status, created_at, updated_at, diff_additions, diff_deletions, has_unread, color, pinned, sort_order, permission_mode, reasoning_effort, execution_mode, base_branch, worktree_path, service_tier, model_selection_json, interaction_mode FROM agent_threads ORDER BY pinned DESC, sort_order ASC, updated_at DESC;"
-            : "SELECT id, project_id, workspace_id, title, provider, provider_instance_id, model, provider_thread_id, status, created_at, updated_at, diff_additions, diff_deletions, has_unread, color, pinned, sort_order, permission_mode, reasoning_effort, execution_mode, base_branch, worktree_path, service_tier, model_selection_json, interaction_mode FROM agent_threads WHERE workspace_id = ? ORDER BY pinned DESC, sort_order ASC, updated_at DESC;"
+            ? "SELECT id, project_id, workspace_id, title, provider, provider_instance_id, model, provider_thread_id, status, created_at, updated_at, diff_additions, diff_deletions, has_unread, color, pinned, sort_order, permission_mode, reasoning_effort, execution_mode, base_branch, worktree_path, service_tier, model_selection_json, interaction_mode, run_as_user_json FROM agent_threads ORDER BY pinned DESC, sort_order ASC, updated_at DESC;"
+            : "SELECT id, project_id, workspace_id, title, provider, provider_instance_id, model, provider_thread_id, status, created_at, updated_at, diff_additions, diff_deletions, has_unread, color, pinned, sort_order, permission_mode, reasoning_effort, execution_mode, base_branch, worktree_path, service_tier, model_selection_json, interaction_mode, run_as_user_json FROM agent_threads WHERE workspace_id = ? ORDER BY pinned DESC, sort_order ASC, updated_at DESC;"
         let st = try db.prepare(sql)
         if let wid = workspaceId { try st.bind(1, wid.value.uuidString) }
         var out: [AgentThread] = []
@@ -196,14 +212,15 @@ public final class AgentThreadRepository {
                 worktreePath: st.columnText(21),
                 serviceTier: serviceTier,
                 modelSelection: decodeModelSelection(st.columnText(23), provider: provider, model: model, reasoningEffort: reasoningEffort, serviceTier: serviceTier),
-                interactionMode: AgentInteractionMode(rawValue: st.columnText(24) ?? "") ?? .default
+                interactionMode: AgentInteractionMode(rawValue: st.columnText(24) ?? "") ?? .default,
+                runAsUser: decodeRunAsUser(st.columnText(25))
             ))
         }
         return out
     }
 
     public func get(id: AgentThreadID) throws -> AgentThread? {
-        let st = try db.prepare("SELECT id, project_id, workspace_id, title, provider, provider_instance_id, model, provider_thread_id, status, created_at, updated_at, diff_additions, diff_deletions, has_unread, color, pinned, sort_order, permission_mode, reasoning_effort, execution_mode, base_branch, worktree_path, service_tier, model_selection_json, interaction_mode FROM agent_threads WHERE id = ?;")
+        let st = try db.prepare("SELECT id, project_id, workspace_id, title, provider, provider_instance_id, model, provider_thread_id, status, created_at, updated_at, diff_additions, diff_deletions, has_unread, color, pinned, sort_order, permission_mode, reasoning_effort, execution_mode, base_branch, worktree_path, service_tier, model_selection_json, interaction_mode, run_as_user_json FROM agent_threads WHERE id = ?;")
         try st.bind(1, id.value.uuidString)
         if try st.step() {
             let idVal = AgentThreadID(UUID(uuidString: st.columnText(0) ?? "") ?? UUID())
@@ -238,7 +255,8 @@ public final class AgentThreadRepository {
                 worktreePath: st.columnText(21),
                 serviceTier: serviceTier,
                 modelSelection: decodeModelSelection(st.columnText(23), provider: provider, model: model, reasoningEffort: reasoningEffort, serviceTier: serviceTier),
-                interactionMode: AgentInteractionMode(rawValue: st.columnText(24) ?? "") ?? .default
+                interactionMode: AgentInteractionMode(rawValue: st.columnText(24) ?? "") ?? .default,
+                runAsUser: decodeRunAsUser(st.columnText(25))
             )
         }
         return nil

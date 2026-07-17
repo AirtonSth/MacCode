@@ -149,12 +149,24 @@ public final class GrokRunner: AgentProviderRunner, @unchecked Sendable {
             ? request.providerThreadId
             : UUID().uuidString.lowercased()
         let args = Self.buildArgs(request, newSessionId: request.providerThreadId == nil ? preassignedSessionId : nil)
+        let environment = CodexRunner.processEnvironment(overrides: request.environment, provider: .grok)
+        let launchPlan: RunAsUserProcessBootstrap.LaunchPlan
+        do {
+            launchPlan = try RunAsUserProcessBootstrap.plan(
+                executablePath: path,
+                arguments: args,
+                environment: environment,
+                currentDirectory: request.cwd,
+                runAsUser: request.runAsUser
+            )
+        } catch {
+            onEvent(.error(error.localizedDescription))
+            onEvent(.finished(.failed, finalMessage: nil, providerThreadId: nil))
+            throw AgentRunError.spawnFailed(error.localizedDescription)
+        }
 
         let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: path)
-        proc.arguments = args
-        proc.currentDirectoryURL = URL(fileURLWithPath: request.cwd)
-        proc.environment = CodexRunner.processEnvironment(overrides: request.environment, provider: .grok)
+        RunAsUserProcessBootstrap.apply(launchPlan, to: proc)
         let stdoutPipe = Pipe(), stderrPipe = Pipe()
         proc.standardOutput = stdoutPipe
         proc.standardError = stderrPipe

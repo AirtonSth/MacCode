@@ -28,6 +28,20 @@ public enum ProcessLocator {
             let expanded = (trimmed as NSString).expandingTildeInPath
             return FileManager.default.isExecutableFile(atPath: expanded) ? expanded : nil
         }
+        // Prefer a co-located privileged helper next to RemoteCode.app/Contents/MacOS.
+        if trimmed == "RemoteCodeRunAsUserHelper" || trimmed == "io.remotecode.RunAsUserHelper" {
+            let candidates = [
+                "/Library/PrivilegedHelperTools/io.remotecode.RunAsUserHelper",
+                "/Library/PrivilegedHelperTools/RemoteCodeRunAsUserHelper",
+                Bundle.main.bundleURL
+                    .appendingPathComponent("Contents/MacOS/RemoteCodeRunAsUserHelper").path,
+                (Bundle.main.executableURL?.deletingLastPathComponent()
+                    .appendingPathComponent("RemoteCodeRunAsUserHelper").path) ?? ""
+            ]
+            for path in candidates where !path.isEmpty {
+                if FileManager.default.isExecutableFile(atPath: path) { return path }
+            }
+        }
         for component in searchPath(environmentPath: environmentPath, homeDirectory: homeDirectory) {
             let full = component + "/" + trimmed
             if FileManager.default.isExecutableFile(atPath: full) { return full }
@@ -136,12 +150,24 @@ public final class CodexRunner: AgentProviderRunner, @unchecked Sendable {
         }
 
         let args = Self.buildArgs(request)
+        let environment = Self.processEnvironment(overrides: request.environment, provider: .codex)
+        let launchPlan: RunAsUserProcessBootstrap.LaunchPlan
+        do {
+            launchPlan = try RunAsUserProcessBootstrap.plan(
+                executablePath: path,
+                arguments: args,
+                environment: environment,
+                currentDirectory: request.cwd,
+                runAsUser: request.runAsUser
+            )
+        } catch {
+            onEvent(.error(error.localizedDescription))
+            onEvent(.finished(.failed, finalMessage: nil, providerThreadId: nil))
+            throw AgentRunError.spawnFailed(error.localizedDescription)
+        }
 
         let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: path)
-        proc.arguments = args
-        proc.currentDirectoryURL = URL(fileURLWithPath: request.cwd)
-        proc.environment = Self.processEnvironment(overrides: request.environment, provider: .codex)
+        RunAsUserProcessBootstrap.apply(launchPlan, to: proc)
         let stdoutPipe = Pipe(), stderrPipe = Pipe()
         proc.standardOutput = stdoutPipe
         proc.standardError = stderrPipe

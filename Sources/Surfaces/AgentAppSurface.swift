@@ -135,6 +135,10 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     @Published public var composerCursorOffset: Int? = nil
     @Published public var provider: AgentProvider = .codex
     @Published public var providerInstanceId: String = AgentProvider.codex.rawValue
+    /// macOS account that will execute the next provider process (`sudo -u`).
+    /// Nil / current-account means no privileged trampoline.
+    @Published public var runAsUser: AgentRunAsUser? = AgentRunAsUser.current()
+    @Published public var availableRunAsUsers: [AgentRunAsUser] = MacOSLocalUserCatalog.listEligibleUsers()
     @Published public var model: String = "gpt-5.5"
     @Published public var availableModels: [AgentModelDescriptor] = []
     @Published public var providerSnapshots: [AgentProviderSnapshot] = []
@@ -606,6 +610,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         if let t = threads.first(where: { $0.id == id }) {
             provider = t.provider
             providerInstanceId = t.providerInstanceId ?? t.provider.rawValue
+            runAsUser = t.runAsUser ?? AgentRunAsUser.current()
             model = t.model
             permissionMode = t.permissionMode
             reasoningEffort = t.reasoningEffort
@@ -2317,6 +2322,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             var updated = stored
             updated.provider = provider
             updated.providerInstanceId = providerInstanceId
+            updated.runAsUser = runAsUser
             updated.model = model
             updated.permissionMode = permissionMode
             updated.reasoningEffort = reasoningEffort
@@ -2341,6 +2347,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     private func restoreThreadConfiguration(from thread: AgentThread) {
         provider = thread.provider
         providerInstanceId = thread.providerInstanceId ?? thread.provider.rawValue
+        runAsUser = thread.runAsUser ?? AgentRunAsUser.current()
         model = thread.model
         permissionMode = thread.permissionMode
         reasoningEffort = thread.reasoningEffort
@@ -2349,6 +2356,30 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         normalizeInteractionModeForSelectedProvider()
         if let i = threads.firstIndex(where: { $0.id == thread.id }) {
             threads[i] = thread
+        }
+    }
+
+    /// Select the macOS account that will execute provider processes (sudo -u).
+    /// Locked after the first real conversation message, same as provider source.
+    public func setRunAsUser(_ user: AgentRunAsUser) {
+        guard !providerLocked else { return }
+        guard !selectedThreadRunIsStartingOrRunning else { return }
+        // Re-resolve against the live directory so deleted/recreated accounts fail closed.
+        if let live = MacOSLocalUserCatalog.resolve(shortName: user.shortName) {
+            runAsUser = live
+        } else {
+            runAsUser = user
+        }
+        persistThreadConfig()
+    }
+
+    public func refreshAvailableRunAsUsers() {
+        availableRunAsUsers = MacOSLocalUserCatalog.listEligibleUsers()
+        if let selected = runAsUser,
+           let live = MacOSLocalUserCatalog.resolve(shortName: selected.shortName) {
+            runAsUser = live
+        } else if runAsUser == nil {
+            runAsUser = AgentRunAsUser.current()
         }
     }
 
@@ -2483,7 +2514,8 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                             permissionMode: permissionMode, reasoningEffort: reasoningEffort,
                             executionMode: executionMode,
                             baseBranch: executionMode == .worktree ? (baseBranch.isEmpty ? (gitBranch ?? "main") : baseBranch) : nil,
-                            serviceTier: serviceTier, modelSelection: currentModelSelection)
+                            serviceTier: serviceTier, modelSelection: currentModelSelection,
+                            runAsUser: runAsUser)
         do {
             try threadRepo.upsert(t)
         } catch {
@@ -3299,6 +3331,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         focusTick &+= 1
         persistThreadConfig()
         let launchConfig = providerLaunchConfig?(provider, providerInstanceId)
+        let threadRunAsUser = threads.first(where: { $0.id == tid })?.runAsUser ?? runAsUser
         let req = AgentRunRequest(
             runId: runId,
             threadId: tid,
@@ -3315,7 +3348,8 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             serviceTier: serviceTier,
             interactionMode: interactionMode,
             providerBinary: launchConfig?.binary,
-            environment: launchConfig?.environment ?? [:]
+            environment: launchConfig?.environment ?? [:],
+            runAsUser: threadRunAsUser
         )
         do {
             guard var pendingThread = try threadRepo.get(id: tid) else {
@@ -7910,8 +7944,10 @@ public struct AgentAppView: View {
     private var compactComposerToolbar: some View {
         HStack(spacing: DS.Space.sm) {
             attachmentButton
-            // Account/source capsule sits left of the model pill so personal vs
-            // work ChatGPT/Claude identities are visible before model/effort.
+            // macOS user that will execute the agent (sudo -u). Distinct from
+            // provider-instance Source (CODEX_HOME / personal-vs-work CLI config).
+            runAsUserMenu
+            // Provider instance / CLI identity (not OS user).
             sourceMenu
             modelMenu
             permissionMenu
@@ -8117,9 +8153,92 @@ public struct AgentAppView: View {
         .accessibilityIdentifier("agent.execution.menu")
     }
 
-    /// Dedicated account/source capsule to the left of the model pill.
+    /// macOS user capsule (sudo -u). Left of provider source + model.
+    private var runAsUserMenu: some View {
+        let users = vm.availableRunAsUsers.isEmpty ? MacOSLocalUserCatalog.listEligibleUsers() : vm.availableRunAsUsers
+        let selected = vm.runAsUser ?? AgentRunAsUser.current()
+        let interactive = users.count > 1
+            && !vm.providerLocked
+            && !vm.selectedThreadRunIsStartingOrRunning
+        let label = selected.shortName
+        return Group {
+            if interactive {
+                Menu {
+                    ForEach(users, id: \.id) { user in
+                        Button {
+                            vm.setRunAsUser(user)
+                        } label: {
+                            HStack {
+                                if user.uid == selected.uid {
+                                    Image(systemName: "checkmark")
+                                }
+                                Text(user.shortName)
+                                if let full = user.fullName, full != user.shortName {
+                                    Text("· \(full)")
+                                        .foregroundColor(.secondary)
+                                }
+                            }
+                        }
+                    }
+                } label: {
+                    runAsUserCapsuleLabel(label: label, showChevron: true, locked: false)
+                }
+                .menuStyle(.button)
+                .buttonStyle(.plain)
+                .menuIndicator(.hidden)
+                .fixedSize()
+            } else {
+                runAsUserCapsuleLabel(
+                    label: label,
+                    showChevron: false,
+                    locked: vm.providerLocked
+                )
+            }
+        }
+        .disabled(vm.selectedThreadRunIsStartingOrRunning)
+        .help(runAsUserHelpText(interactive: interactive, selected: selected))
+        .accessibilityLabel("Run as macOS user \(label)")
+        .accessibilityIdentifier("agent.runAsUser.menu")
+        .onAppear { vm.refreshAvailableRunAsUsers() }
+    }
+
+    private func runAsUserHelpText(interactive: Bool, selected: AgentRunAsUser) -> String {
+        if vm.selectedThreadRunIsStartingOrRunning {
+            return "macOS user is fixed while a run is active"
+        }
+        if vm.providerLocked {
+            return "macOS user is fixed after the first message. Start a new thread to run as a different user."
+        }
+        if !interactive {
+            return "Provider processes run as macOS user \(selected.shortName)"
+        }
+        return "Choose which macOS user executes Codex/Claude/Grok (like sudo -u)"
+    }
+
+    private func runAsUserCapsuleLabel(label: String, showChevron: Bool, locked: Bool) -> some View {
+        HStack(spacing: DS.Space.xs) {
+            Image(systemName: locked ? "lock.fill" : "person.fill")
+                .font(.system(size: 10))
+            Text(label)
+                .font(DS.Font.caption.weight(.medium))
+                .lineLimit(1)
+                .truncationMode(.tail)
+            if showChevron {
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 7, weight: .semibold))
+            }
+        }
+        .fixedSize()
+        .foregroundColor(DS.Palette.textSecondary)
+        .padding(.horizontal, DS.Space.sm).padding(.vertical, DS.Space.xs)
+        .background(DS.Palette.surfaceRaised)
+        .clipShape(Capsule())
+        .overlay(Capsule().strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline))
+    }
+
+    /// Dedicated provider-instance source capsule (CODEX_HOME isolation).
     /// Reuses provider snapshots + `setProviderInstance` so personal/work
-    /// identities stay the single selection authority (not a second state).
+    /// CLI configs stay the single selection authority (not a second state).
     private var sourceMenu: some View {
         let interactive = AgentSourceCapsulePresentation.isInteractive(
             enabledSourceCount: sourceMenuEntries.count,

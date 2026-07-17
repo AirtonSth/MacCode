@@ -415,7 +415,8 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             interactionMode: recoveryContext?.interactionMode ?? request.interactionMode,
             providerBinary: request.providerBinary,
             environment: request.environment,
-            extraArgs: request.extraArgs
+            extraArgs: request.extraArgs,
+            runAsUser: request.runAsUser
         )
         guard let runner = providers[effectiveRequest.provider] else {
             throw AgentRunError.missingBinary(effectiveRequest.provider.rawValue)
@@ -1023,6 +1024,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         resumeCursor: String?
     ) -> AgentRunRequest {
         let prompt = BackgroundAwaitContinuation.continuationPrompt
+        let runAsUser = (try? threadRepo.get(id: threadId))?.runAsUser
         return AgentRunRequest(
             threadId: threadId,
             provider: runMetadata.provider,
@@ -1034,7 +1036,8 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             providerThreadId: resumeCursor,
             permissionMode: runMetadata.runtimeMode,
             serviceTier: runMetadata.serviceTier,
-            interactionMode: runMetadata.interactionMode
+            interactionMode: runMetadata.interactionMode,
+            runAsUser: runAsUser
         )
     }
 
@@ -1607,7 +1610,8 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             serviceTier: session.serviceTier,
             interactionMode: .default,
             environment: environment,
-            extraArgs: activeTurnId.map { ["remotecode.recovery.activeTurnId=\($0)"] } ?? []
+            extraArgs: activeTurnId.map { ["remotecode.recovery.activeTurnId=\($0)"] } ?? [],
+            runAsUser: thread.runAsUser
         )
         try await adapter.recoverSession(request) { _ in }
     }

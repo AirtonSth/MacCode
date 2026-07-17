@@ -276,17 +276,32 @@ final class SchemaMigrationMatrixTests: XCTestCase {
     func test_v38_to_head_preservesQueuedRowsAndInitializesDispatchState() throws {
         let db = try SQLiteDB(path: ":memory:")
         try Schema.migrateSteps(db, Schema.steps.filter { $0.version <= 38 })
-        let thread = AgentThread(title: "queue migration", provider: .codex, model: "gpt")
-        try AgentThreadRepository(db: db).upsert(thread)
-        let messageId = AgentQueuedMessageID()
+        // Insert with the v38 column set — AgentThreadRepository.upsert always
+        // targets HEAD columns (e.g. run_as_user_json) and cannot write a
+        // mid-migration schema.
+        let threadId = UUID().uuidString
         let now = ISO8601DateFormatter().string(from: Date())
+        let threadInsert = try db.prepare("""
+            INSERT INTO agent_threads(
+                id, title, provider, model, status, created_at, updated_at,
+                diff_additions, diff_deletions, has_unread, pinned, sort_order,
+                permission_mode, reasoning_effort, execution_mode, service_tier,
+                interaction_mode
+            ) VALUES(?, 'queue migration', 'codex', 'gpt', 'pending', ?, ?, 0, 0, 0, 0, 0,
+                     'supervised', 'medium', 'local', 'auto', 'default');
+        """)
+        try threadInsert.bind(1, threadId)
+        try threadInsert.bind(2, now)
+        try threadInsert.bind(3, now)
+        _ = try threadInsert.step()
+        let messageId = AgentQueuedMessageID()
         let insert = try db.prepare("""
             INSERT INTO agent_queued_messages(
                 id, thread_id, text, attachments_json, interaction_mode, position, created_at, updated_at
             ) VALUES(?, ?, 'survive', '[]', 'default', 1, ?, ?);
         """)
         try insert.bind(1, messageId.value.uuidString)
-        try insert.bind(2, thread.id.value.uuidString)
+        try insert.bind(2, threadId)
         try insert.bind(3, now)
         try insert.bind(4, now)
         _ = try insert.step()
