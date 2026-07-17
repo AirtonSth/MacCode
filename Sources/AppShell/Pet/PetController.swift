@@ -1,4 +1,5 @@
 import AppKit
+import AgentRuntime
 import CoreModel
 import Foundation
 import Persistence
@@ -37,6 +38,9 @@ public final class PetController {
     private var lastHandledEventSequence: Int64?
     private var companionDirector = PetCompanionDirector()
     private var isScreenLocked = false
+    private var previousActiveRunProjectionHandler:
+        ((ActiveRunProjection, ActiveRunProjectionCause) -> Void)?
+    private var installedActiveRunProjectionHandler = false
     private(set) var handledEventOutOfOrderForTests = false
     private(set) var handledEventCountForTests = 0
     private(set) var lastScheduledTransientMillisecondsForTests: Int64?
@@ -100,6 +104,8 @@ public final class PetController {
         projectionErrorMessage = prepareProjectionRecovery(capturedCursor: cursor)
         projectionRecoveryBlocked = projectionErrorMessage != nil
         afterStartupCursorCapturedForTests?()
+        installActiveRunProjectionObserver()
+        refreshActiveThreadsFromCoordinator()
         refreshAttentionNow()
         applySettings(settingsStore.load())
         if let projectionErrorMessage { model.routeError = projectionErrorMessage }
@@ -133,6 +139,7 @@ public final class PetController {
             EventBus.shared.unsubscribe(eventSubscription)
         }
         eventSubscription = nil
+        uninstallActiveRunProjectionObserver()
         transientTask?.cancel()
         transientTask = nil
         companionTask?.cancel()
@@ -286,6 +293,7 @@ public final class PetController {
             model?.routeError = "Pet artwork could not be loaded."
         }
         windowController.onOpenItem = { [weak self] item in self?.open(item) }
+        windowController.onOpenActiveThread = { [weak self] item in self?.openActive(item) }
         windowController.onMarkAllViewed = { [weak self] in self?.markAllViewed() }
         windowController.onOpenRemoteCode = { [weak self] in self?.showRemoteCode() }
         windowController.onOpenSettings = { [weak self] in
@@ -593,6 +601,61 @@ public final class PetController {
         } catch {
             model.routeError = "The exact destination could not be opened. The item was kept."
         }
+    }
+
+    private func openActive(_ item: PetActiveThreadItem) {
+        do {
+            let opened = try verifyAndOpen(item.route)
+            if opened {
+                model.routeError = nil
+                windowController?.closePopover(restoringPreviousKeyWindow: false)
+            } else {
+                model.routeError = "The exact destination could not be opened. The item was kept."
+            }
+        } catch {
+            model.routeError = "The exact destination could not be opened. The item was kept."
+        }
+    }
+
+    private func installActiveRunProjectionObserver() {
+        guard !installedActiveRunProjectionHandler else { return }
+        previousActiveRunProjectionHandler = context.coordinator.onActiveRunProjectionChanged
+        context.coordinator.onActiveRunProjectionChanged = { [weak self] projection, cause in
+            self?.previousActiveRunProjectionHandler?(projection, cause)
+            DispatchQueue.main.async {
+                self?.applyActiveRunProjection(projection)
+            }
+        }
+        installedActiveRunProjectionHandler = true
+    }
+
+    private func uninstallActiveRunProjectionObserver() {
+        guard installedActiveRunProjectionHandler else { return }
+        context.coordinator.onActiveRunProjectionChanged = previousActiveRunProjectionHandler
+        previousActiveRunProjectionHandler = nil
+        installedActiveRunProjectionHandler = false
+    }
+
+    private func refreshActiveThreadsFromCoordinator() {
+        let threadIDs = Array(context.coordinator.activeThreadIdsSnapshot())
+        applyActiveThreadIDs(threadIDs)
+    }
+
+    private func applyActiveRunProjection(_ projection: ActiveRunProjection) {
+        applyActiveThreadIDs(projection.runs.map(\.threadId))
+    }
+
+    private func applyActiveThreadIDs(_ threadIDs: [AgentThreadID]) {
+        let items = PetActiveThreadProjector.items(threadIDs: threadIDs) { [weak self] threadID in
+            guard let thread = try? self?.context.threadRepo.get(id: threadID) else {
+                return nil
+            }
+            return (
+                workspaceID: thread.workspaceId,
+                providerName: PetActiveThreadProjector.providerLabel(thread.provider)
+            )
+        }
+        model.apply(activeThreads: items)
     }
 
     private func verifyAndOpen(_ route: PetAttentionRoute) throws -> Bool {

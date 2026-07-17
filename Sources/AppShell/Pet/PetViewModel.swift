@@ -8,6 +8,8 @@ public final class PetViewModel: ObservableObject {
     @Published public private(set) var currentImage: NSImage?
     @Published public private(set) var items: [PetAttentionItem] = []
     @Published public private(set) var count = 0
+    @Published public private(set) var activeThreads: [PetActiveThreadItem] = []
+    @Published public private(set) var activeThreadCount = 0
     @Published public private(set) var settings: AppSettings
     @Published public var routeError: String?
 
@@ -17,6 +19,7 @@ public final class PetViewModel: ObservableObject {
         self.settings = settings
     }
 
+    /// Red badge: attention/ready items. Gated by petReadyCounterEnabled.
     public var badgeText: String? {
         PetAttentionCountFormatter.badgeText(
             count: count,
@@ -24,8 +27,16 @@ public final class PetViewModel: ObservableObject {
         )
     }
 
+    /// Blue badge: unique active agent threads. Not gated by the ready-counter setting.
+    public var activeBadgeText: String? {
+        PetActiveThreadCountFormatter.badgeText(count: activeThreadCount)
+    }
+
     public var accessibilityValue: String {
-        PetAttentionCountFormatter.accessibilityValue(count: count)
+        PetActiveThreadCountFormatter.combinedAccessibilityValue(
+            activeCount: activeThreadCount,
+            attentionCount: count
+        )
     }
 
     public var needsYouItems: [PetAttentionItem] {
@@ -34,6 +45,10 @@ public final class PetViewModel: ObservableObject {
 
     public var completedItems: [PetAttentionItem] {
         items.filter { !$0.kind.needsUserAction }
+    }
+
+    public var isPopoverEmpty: Bool {
+        items.isEmpty && activeThreads.isEmpty
     }
 
     public func setAnimationState(_ state: PetAnimationState) {
@@ -51,6 +66,11 @@ public final class PetViewModel: ObservableObject {
     public func apply(snapshot: PetAttentionSnapshot) {
         items = snapshot.items
         count = snapshot.count
+    }
+
+    public func apply(activeThreads: [PetActiveThreadItem]) {
+        self.activeThreads = activeThreads
+        activeThreadCount = activeThreads.count
     }
 
     public func apply(settings: AppSettings) {

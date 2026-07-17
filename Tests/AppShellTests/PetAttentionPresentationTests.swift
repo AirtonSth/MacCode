@@ -12,6 +12,14 @@ final class PetAttentionPresentationTests: XCTestCase {
         XCTAssertNil(PetAttentionCountFormatter.badgeText(count: -1))
     }
 
+    func test_activeThreadBadgeHidesAtZeroCapsAtNinetyNinePlusAndIsNotSettingGated() {
+        XCTAssertNil(PetActiveThreadCountFormatter.badgeText(count: 0))
+        XCTAssertEqual(PetActiveThreadCountFormatter.badgeText(count: 1), "1")
+        XCTAssertEqual(PetActiveThreadCountFormatter.badgeText(count: 99), "99")
+        XCTAssertEqual(PetActiveThreadCountFormatter.badgeText(count: 100), "99+")
+        XCTAssertNil(PetActiveThreadCountFormatter.badgeText(count: -1))
+    }
+
     func test_accessibilityCountUsesZeroSingularAndPluralCopy() {
         XCTAssertEqual(
             PetAttentionCountFormatter.accessibilityValue(count: 0),
@@ -28,6 +36,30 @@ final class PetAttentionPresentationTests: XCTestCase {
         XCTAssertEqual(
             PetAttentionCountFormatter.accessibilityValue(count: -4),
             "No items need attention"
+        )
+        XCTAssertEqual(
+            PetActiveThreadCountFormatter.accessibilityValue(count: 0),
+            "No active agent threads"
+        )
+        XCTAssertEqual(
+            PetActiveThreadCountFormatter.accessibilityValue(count: 1),
+            "1 active agent thread"
+        )
+        XCTAssertEqual(
+            PetActiveThreadCountFormatter.accessibilityValue(count: 3),
+            "3 active agent threads"
+        )
+        XCTAssertEqual(
+            PetActiveThreadCountFormatter.combinedAccessibilityValue(activeCount: 2, attentionCount: 1),
+            "2 active agent threads. 1 item needs attention"
+        )
+        XCTAssertEqual(
+            PetActiveThreadCountFormatter.combinedAccessibilityValue(activeCount: 0, attentionCount: 1),
+            "1 item needs attention"
+        )
+        XCTAssertEqual(
+            PetActiveThreadCountFormatter.combinedAccessibilityValue(activeCount: 2, attentionCount: 0),
+            "2 active agent threads"
         )
     }
 
@@ -69,6 +101,7 @@ final class PetAttentionPresentationTests: XCTestCase {
             (.agentOutcome(.completed), "Agent run completed"),
             (.agentOutcome(.failed), "Agent run failed"),
             (.agentOutcome(.interrupted), "Agent run interrupted"),
+            (.agentRunning, "Agent run in progress"),
             (.approval, "Approval required"),
             (.question(isSecret: false), "Input requested"),
             (.question(isSecret: true), "Secret input requested"),
