@@ -91,6 +91,80 @@ final class SurfaceVisibilityReconciliationTests: XCTestCase {
         XCTAssertTrue(visible.contains(secondSurface.id))
     }
 
+    func test_freshBackgroundTerminalStartsHiddenThenRevealDrainsExactOutput() throws {
+        let (_, router) = try makeContext()
+        let backgroundWorkspace = try router.createWorkspace(
+            name: "background",
+            cwd: NSTemporaryDirectory()
+        )
+        _ = try router.createWorkspace(name: "foreground", cwd: NSTemporaryDirectory())
+        let descriptor = try router.createSurface(
+            workspace: backgroundWorkspace.id,
+            type: .terminal,
+            paneID: nil,
+            title: "background terminal"
+        )
+        let terminal = try XCTUnwrap(
+            SurfaceRegistry.shared.surface(descriptor.id) as? TerminalSurface
+        )
+
+        XCTAssertFalse(SurfaceRegistry.shared.isVisible(descriptor.id))
+        XCTAssertFalse(terminal.runtimeHealth().renderDiagnostics?.logicalVisible ?? true)
+        XCTAssertFalse(
+            terminal.readerAllowsRenderForTesting,
+            "a fresh terminal in a background workspace must not render before registry reconciliation selects it"
+        )
+
+        let marker = "RC2_FRESH_BACKGROUND_\(UUID().uuidString)"
+        // Real PTY reader path (not appendSystemText): hidden bytes go to
+        // hiddenRendererBuffer and used to leave read_text blank until reveal.
+        terminal.injectReaderOutputForTesting(Data((marker + "\n").utf8))
+        XCTAssertGreaterThan(
+            terminal.runtimeHealth().outputPendingBytes,
+            0,
+            "hidden fresh output must stay explicitly pending instead of painting a background Ghostty surface"
+        )
+
+        // Authoritative transcript must be readable while still hidden — soak
+        // setup polls RC2_AUX_*_READY on non-selected workspaces via surface.read_text.
+        XCTAssertTrue(
+            terminal.readTextSnapshot().text.contains(marker),
+            "surface.read_text on a hidden background terminal must return buffered output before workspace select/reveal"
+        )
+        XCTAssertFalse(SurfaceRegistry.shared.isVisible(descriptor.id))
+        XCTAssertFalse(terminal.readerAllowsRenderForTesting)
+
+        try router.selectWorkspace(backgroundWorkspace.id)
+
+        XCTAssertTrue(SurfaceRegistry.shared.isVisible(descriptor.id))
+        XCTAssertTrue(terminal.readerAllowsRenderForTesting)
+        XCTAssertTrue(terminal.runtimeHealth().renderDiagnostics?.logicalVisible ?? false)
+        XCTAssertEqual(terminal.runtimeHealth().outputPendingBytes, 0)
+        XCTAssertTrue(
+            terminal.readTextSnapshot().text.contains(marker),
+            "selecting the workspace must reveal and drain the exact bytes accumulated while hidden"
+        )
+    }
+
+    func test_freshSelectedTerminalBecomesVisibleAfterRegistrationAndLayoutReconcile() throws {
+        let (_, router) = try makeContext()
+        let workspace = try router.createWorkspace(name: "selected", cwd: NSTemporaryDirectory())
+
+        let descriptor = try router.createSurface(
+            workspace: workspace.id,
+            type: .terminal,
+            paneID: nil,
+            title: "selected terminal"
+        )
+        let terminal = try XCTUnwrap(
+            SurfaceRegistry.shared.surface(descriptor.id) as? TerminalSurface
+        )
+
+        XCTAssertTrue(SurfaceRegistry.shared.isVisible(descriptor.id))
+        XCTAssertTrue(terminal.readerAllowsRenderForTesting)
+        XCTAssertTrue(terminal.runtimeHealth().renderDiagnostics?.logicalVisible ?? false)
+    }
+
     private func makeContext() throws -> (AppContext, AppCommandRouter) {
         let tmp = NSTemporaryDirectory() + "RC2VisibilityTest-" + UUID().uuidString
         let ctx = try AppContext(channel: .debug, appSupportOverride: tmp)

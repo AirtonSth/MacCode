@@ -21,6 +21,61 @@ final class WebSocketConnectionWriter: @unchecked Sendable {
     }
 }
 
+/// FIFO storage with O(1) head advancement and occasional amortized compaction.
+/// Dequeued slots are cleared immediately so frame payloads are released even
+/// before the backing array is compacted.
+struct WebSocketFrameFIFO<Element> {
+    struct Diagnostics: Equatable {
+        let queuedCount: Int
+        let storageCount: Int
+        let headIndex: Int
+        let compactionCount: Int
+    }
+
+    private static var compactionThreshold: Int { 1_024 }
+
+    private var storage: [Element?] = []
+    private var headIndex = 0
+    private var compactionCount = 0
+
+    var diagnostics: Diagnostics {
+        Diagnostics(
+            queuedCount: storage.count - headIndex,
+            storageCount: storage.count,
+            headIndex: headIndex,
+            compactionCount: compactionCount
+        )
+    }
+
+    mutating func append(_ element: Element) {
+        storage.append(element)
+    }
+
+    mutating func popFirst() -> Element? {
+        guard headIndex < storage.count,
+              let element = storage[headIndex] else {
+            return nil
+        }
+        storage[headIndex] = nil
+        headIndex += 1
+        compactIfNeeded()
+        return element
+    }
+
+    private mutating func compactIfNeeded() {
+        if headIndex == storage.count {
+            storage.removeAll(keepingCapacity: true)
+            headIndex = 0
+            compactionCount += 1
+        } else if headIndex >= Self.compactionThreshold,
+                  headIndex >= storage.count - headIndex {
+            storage.removeFirst(headIndex)
+            headIndex = 0
+            compactionCount += 1
+        }
+    }
+}
+
 final class WebSocketOutboundQueue: @unchecked Sendable {
     enum EnqueueResult: Equatable {
         case accepted
@@ -38,16 +93,18 @@ final class WebSocketOutboundQueue: @unchecked Sendable {
 
     private let queue: DispatchQueue
     private let maxQueuedBytes: Int
+    private let maxQueuedFrames: Int
     private let lock = NSLock()
     private var queuedBytes = 0
+    private var queuedFrames = 0
     private var state: State = .open
     // Pending frames are buffered here so the serial drain can prioritize
     // control frames (pong/ping/close) over queued application data. A pong
     // stuck behind up to 1 MiB of event frames on a slow uplink would miss the
     // client's pong deadline and kill a healthy connection. Each enqueue still
     // dispatches exactly one drain token; only the pick order changes.
-    private var pendingApplicationFrames: [Data] = []
-    private var pendingControlFrames: [(opcode: UInt8, data: Data)] = []
+    private var pendingApplicationFrames = WebSocketFrameFIFO<Data>()
+    private var pendingControlFrames = WebSocketFrameFIFO<(opcode: UInt8, data: Data)>()
     private let applicationWriter: @Sendable (Data) -> Bool
     private let controlWriter: @Sendable (UInt8, Data) -> Bool
     private let writeFailureClosingData: Data
@@ -59,6 +116,7 @@ final class WebSocketOutboundQueue: @unchecked Sendable {
     init(
         label: String = "rc2.ws.outbound",
         maxQueuedBytes: Int = 1024 * 1024,
+        maxQueuedFrames: Int = 4_096,
         applicationWriter: @escaping @Sendable (Data) -> Bool,
         controlWriter: @escaping @Sendable (UInt8, Data) -> Bool,
         writeFailureClosingData: Data,
@@ -69,6 +127,7 @@ final class WebSocketOutboundQueue: @unchecked Sendable {
     ) {
         self.queue = DispatchQueue(label: label)
         self.maxQueuedBytes = max(1, maxQueuedBytes)
+        self.maxQueuedFrames = max(1, maxQueuedFrames)
         self.applicationWriter = applicationWriter
         self.controlWriter = controlWriter
         self.writeFailureClosingData = writeFailureClosingData
@@ -81,12 +140,14 @@ final class WebSocketOutboundQueue: @unchecked Sendable {
     convenience init(
         label: String = "rc2.ws.outbound",
         maxQueuedBytes: Int = 1024 * 1024,
+        maxQueuedFrames: Int = 4_096,
         writer: @escaping @Sendable (Data) -> Bool,
         onClose: @escaping @Sendable (String) -> Void
     ) {
         self.init(
             label: label,
             maxQueuedBytes: maxQueuedBytes,
+            maxQueuedFrames: maxQueuedFrames,
             applicationWriter: writer,
             controlWriter: { _, _ in true },
             writeFailureClosingData: Data(),
@@ -98,6 +159,11 @@ final class WebSocketOutboundQueue: @unchecked Sendable {
     var queuedByteCount: Int {
         lock.lock(); defer { lock.unlock() }
         return queuedBytes
+    }
+
+    var queuedFrameCountForTests: Int {
+        lock.lock(); defer { lock.unlock() }
+        return queuedFrames
     }
 
     func enqueue(_ data: Data) -> EnqueueResult {
@@ -115,12 +181,14 @@ final class WebSocketOutboundQueue: @unchecked Sendable {
             lock.unlock()
             return .closed
         }
-        guard queuedBytes + data.count <= maxQueuedBytes else {
+        guard queuedFrames < maxQueuedFrames,
+              data.count <= maxQueuedBytes - queuedBytes else {
             state = .terminalReserved
             lock.unlock()
             return .queueFull
         }
         queuedBytes += data.count
+        queuedFrames += 1
         pendingApplicationFrames.append(data)
         acceptedSubmissionHook()
         queue.async { [weak self] in self?.writeNextPendingFrame() }
@@ -134,6 +202,15 @@ final class WebSocketOutboundQueue: @unchecked Sendable {
             lock.unlock()
             return .closed
         }
+        guard queuedFrames < maxQueuedFrames,
+              data.count <= maxQueuedBytes - queuedBytes else {
+            state = .terminalReserved
+            lock.unlock()
+            _ = terminate(errorData: nil, closingData: nil, reason: "queue_full")
+            return .queueFull
+        }
+        queuedBytes += data.count
+        queuedFrames += 1
         pendingControlFrames.append((opcode: opcode, data: data))
         acceptedSubmissionHook()
         queue.async { [weak self] in self?.writeNextPendingFrame() }
@@ -183,34 +260,37 @@ final class WebSocketOutboundQueue: @unchecked Sendable {
     /// interleave), so a pong waits only for the frame in progress.
     private func writeNextPendingFrame() {
         lock.lock()
-        if !pendingControlFrames.isEmpty {
-            let control = pendingControlFrames.removeFirst()
+        if let control = pendingControlFrames.popFirst() {
             lock.unlock()
             writeControl(opcode: control.opcode, data: control.data)
             return
         }
-        guard !pendingApplicationFrames.isEmpty else {
+        guard let data = pendingApplicationFrames.popFirst() else {
             lock.unlock()
             return
         }
-        let data = pendingApplicationFrames.removeFirst()
         lock.unlock()
         writeApplication(data)
     }
 
     private func writeApplication(_ data: Data) {
         guard shouldWriteQueuedItem() else {
-            removeQueuedBytes(data.count)
+            removeQueuedItem(byteCount: data.count)
             return
         }
         let succeeded = applicationWriter(data)
-        removeQueuedBytes(data.count)
+        removeQueuedItem(byteCount: data.count)
         if !succeeded { terminateImmediatelyAfterWriteFailure() }
     }
 
     private func writeControl(opcode: UInt8, data: Data) {
-        guard shouldWriteQueuedItem() else { return }
-        if !controlWriter(opcode, data) { terminateImmediatelyAfterWriteFailure() }
+        guard shouldWriteQueuedItem() else {
+            removeQueuedItem(byteCount: data.count)
+            return
+        }
+        let succeeded = controlWriter(opcode, data)
+        removeQueuedItem(byteCount: data.count)
+        if !succeeded { terminateImmediatelyAfterWriteFailure() }
     }
 
     private func shouldWriteQueuedItem() -> Bool {
@@ -225,9 +305,10 @@ final class WebSocketOutboundQueue: @unchecked Sendable {
         return true
     }
 
-    private func removeQueuedBytes(_ count: Int) {
+    private func removeQueuedItem(byteCount: Int) {
         lock.lock()
-        queuedBytes = max(0, queuedBytes - count)
+        queuedBytes = max(0, queuedBytes - byteCount)
+        queuedFrames = max(0, queuedFrames - 1)
         lock.unlock()
     }
 

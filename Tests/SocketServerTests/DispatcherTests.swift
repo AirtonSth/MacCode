@@ -981,6 +981,11 @@ final class DispatcherTests: XCTestCase {
         router.terminalHistory = TerminalOutputWindow(chunks: [
             TerminalOutputChunk(id: 10, surfaceID: sid.value.uuidString, workspaceID: nil, chunkIndex: 3, data: Data("older".utf8), createdAt: Date())
         ], hasMoreOlder: true, nextBeforeChunkID: 10)
+        router.terminalHealth = .object([
+            "output_partial": .bool(true),
+            "partial_reason": .string("history_retention_cap"),
+            "output_pending_bytes": .number(4096)
+        ])
         let d = JSONRPCDispatcher(router: router)
 
         let resp = await d.dispatch(JSONRPCRequest(jsonrpc: "2.0", id: .number(1), method: "surface.read_history", params: [
@@ -998,6 +1003,10 @@ final class DispatcherTests: XCTestCase {
                        "terminal infinite scroll must fetch text from local DB history, not from the visible renderer")
         XCTAssertEqual(result["has_more_older"], .bool(true))
         XCTAssertEqual(result["next_before_chunk_id"], .number(10))
+        XCTAssertEqual(result["partial"], .bool(true))
+        XCTAssertEqual(result["partial_reason"], .string("history_retention_cap"),
+                       "authoritative history must preserve the host's permanent partial-output truth")
+        XCTAssertEqual(result["pending_bytes"], .number(4096))
     }
 
     @MainActor
@@ -2553,6 +2562,8 @@ final class DispatcherTests: XCTestCase {
         XCTAssertEqual(result["complete"], .bool(false))
         XCTAssertEqual(result["partial_reason"], .string("ghostty_unavailable"),
                        "snapshot reads must say when terminal text is degraded so iOS does not show fake complete output")
+        XCTAssertEqual(result["surface_seq"], .number(0),
+                       "metadata snapshots must carry the live-output sequence so iOS can reject a stale RPC body")
     }
 
     @MainActor

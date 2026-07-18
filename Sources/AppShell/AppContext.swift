@@ -40,6 +40,14 @@ final class ProjectScriptRunRegistry: @unchecked Sendable {
 
     func consumeTerminalDeath(surfaceID: SurfaceID, health: TerminalRuntimeHealth) -> ProjectScriptRunOutcome? {
         guard !health.processAlive else { return nil }
+        // PTY EOF closes the descriptor before the asynchronous reaper owns an
+        // authoritative wait status. Keep the correlated run registered until
+        // that reaper publishes either a status, a consumed PID, or a terminal
+        // failure reason; otherwise a provisional EOF becomes a false failure.
+        let awaitsReaperStatus = health.exitStatus == nil
+            && health.childPID != nil
+            && health.terminalDeadReason == "process_exited"
+        guard !awaitsReaperStatus else { return nil }
         lock.lock()
         let entry = entries.removeValue(forKey: surfaceID)
         lock.unlock()
@@ -171,6 +179,7 @@ public final class AppContext {
         self.settingsRepo = SettingsRepository(db: db)
         self.eventLog = EventLogRepository(db: db)
         self.terminalOutputRepo = TerminalOutputRepository(db: db)
+        TerminalSurface.replayPendingHistoryDeletes(repository: self.terminalOutputRepo)
         self.providerSessionRuntimeRepo = ProviderSessionRuntimeRepository(db: db)
         self.commandReceiptRepo = CommandReceiptRepository(db: db)
         self.providerPendingCallbackRepo = ProviderPendingCallbackRepository(db: db)
@@ -568,19 +577,21 @@ public final class AppContext {
             }
         }
 
-        // HC-1: stream terminal/surface PTY output to the mirror so iOS
-        // renders a live terminal (not a poll). Raw bytes, base64 +
-        // monotonic seq per surface for ordered incremental rendering.
-        SurfaceOutputBus.shared.sink = { sid, seq, chunk in
-            let key = sid.value.uuidString
+        // HC-1: stream terminal/surface frames to the mirror so iOS renders
+        // a live terminal (not a poll). PTY bytes are base64; idle geometry
+        // changes use the same monotonic per-surface sequence without bytes.
+        SurfaceOutputBus.shared.sink = { frame in
+            let key = frame.surfaceID.value.uuidString
             var payload: [String: JSONValue] = [
                 "surface_id": .string(key),
-                "seq": .number(Double(seq)),
-                "base64": .string(chunk.base64EncodedString())
+                "seq": .number(Double(frame.sequence))
             ]
-            if let terminal = SurfaceRegistry.shared.surface(sid) as? TerminalSurface {
-                payload["rows"] = .number(Double(terminal.viewportSize.rows))
-                payload["cols"] = .number(Double(terminal.viewportSize.cols))
+            if !frame.data.isEmpty {
+                payload["base64"] = .string(frame.data.base64EncodedString())
+            }
+            if let rows = frame.rows, let cols = frame.cols {
+                payload["rows"] = .number(Double(rows))
+                payload["cols"] = .number(Double(cols))
             }
             EventBus.shared.publish(kind: "surface.output", payload: .object(payload))
         }
@@ -614,6 +625,7 @@ public final class AppContext {
                 "terminal_dead_reason": health.terminalDeadReason.map { .string($0) } ?? .null,
                 "last_output_at": health.lastOutputAt.map { .number($0.timeIntervalSince1970) } ?? .null,
                 "output_partial": .bool(health.outputPartial),
+                "partial_reason": health.outputPartialReason.map { .string($0) } ?? .null,
                 "output_pending_bytes": .number(Double(health.outputPendingBytes)),
                 "history_write_failures": .number(Double(health.historyWriteFailures)),
                 "dropped_output_bytes": .number(Double(health.droppedOutputBytes)),

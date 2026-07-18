@@ -28,6 +28,23 @@ final class TerminalReadTextSnapshotTests: XCTestCase {
                        "hidden_output_pending")
     }
 
+    func test_readTextPrefersRendererWhenGhosttyViewportIsBlankMultiRowGrid() {
+        // Release-soak failure mode: parked/occluded Ghostty returns a full empty
+        // grid (one blank row per terminal row). Character length can exceed a short
+        // marker-bearing renderer transcript; visible-line comparison must still
+        // prefer the renderer so RC2_AUX_*_READY is observed.
+        let blankGrid = String(repeating: " \n", count: 43)
+        let renderer = "RC2_AUX_02_READY\n"
+
+        XCTAssertTrue(
+            TerminalSurface.shouldPreferRendererSnapshotForReadText(
+                viewportText: blankGrid,
+                rendererText: renderer
+            ),
+            "a blank multi-row Ghostty viewport must not beat a shorter renderer transcript that still holds the readiness marker"
+        )
+    }
+
     func test_renderDiagnosticsNameRegistryVisibilityDriftBeforeClaimingCompleteSnapshot() {
         let diagnostics = TerminalRenderDiagnostics(
             logicalVisible: true,

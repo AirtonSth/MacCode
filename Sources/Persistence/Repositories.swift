@@ -1,5 +1,6 @@
 import Foundation
 import CoreModel
+import Darwin
 
 let iso = ISO8601DateFormatter()
 
@@ -3255,27 +3256,834 @@ public struct TerminalOutputWindow: Equatable {
     }
 
     public var text: String {
-        chunks.map(\.text).joined()
+        String(decoding: chunks.reduce(into: Data()) { $0.append($1.data) }, as: UTF8.self)
+    }
+}
+
+public struct TerminalHistoryPartialState: Codable, Equatable, Sendable {
+    public let reason: String
+    public let nextChunkIndex: Int64
+
+    public init(reason: String, nextChunkIndex: Int64) {
+        self.reason = reason
+        self.nextChunkIndex = max(1, nextChunkIndex)
+    }
+}
+
+public struct TerminalHistoryPreparation: Equatable, Sendable {
+    public let nextChunkIndex: Int64
+    public let partialState: TerminalHistoryPartialState?
+    public let writerGeneration: String
+
+    public init(
+        nextChunkIndex: Int64,
+        partialState: TerminalHistoryPartialState?,
+        writerGeneration: String
+    ) {
+        self.nextChunkIndex = max(1, nextChunkIndex)
+        self.partialState = partialState
+        self.writerGeneration = writerGeneration
+    }
+}
+
+public enum TerminalHistoryRepositoryError: Error, Equatable, CustomStringConvertible {
+    case staleWriterGeneration
+    case unresolvedWriteReservation
+
+    public var description: String {
+        switch self {
+        case .staleWriterGeneration:
+            return "stale terminal history writer generation"
+        case .unresolvedWriteReservation:
+            return "unresolved terminal history write reservation"
+        }
+    }
+}
+
+public struct TerminalHistoryFailureAnchor: Codable, Equatable, Sendable {
+    public let surfaceID: String
+    public let writerGeneration: String
+    public let reason: String
+    public let minimumNextChunkIndex: Int64
+
+    public init(
+        surfaceID: String,
+        writerGeneration: String,
+        reason: String,
+        minimumNextChunkIndex: Int64
+    ) {
+        self.surfaceID = surfaceID
+        self.writerGeneration = writerGeneration
+        self.reason = reason
+        self.minimumNextChunkIndex = max(1, minimumNextChunkIndex)
+    }
+}
+
+public struct TerminalHistoryPendingDelete: Codable, Equatable, Hashable, Sendable {
+    public enum Disposition: String, Codable, Sendable {
+        case finalDelete
+        case clearForReuse
+    }
+
+    public enum Phase: String, Codable, Sendable {
+        case pending
+        case finished
+    }
+
+    public let id: String
+    public let surfaceID: String
+    public let expectedWriterGeneration: String?
+    public let disposition: Disposition
+    public let phase: Phase
+
+    public init(
+        id: String = UUID().uuidString,
+        surfaceID: String,
+        expectedWriterGeneration: String?,
+        disposition: Disposition = .finalDelete,
+        phase: Phase = .pending
+    ) {
+        self.id = id
+        self.surfaceID = surfaceID
+        self.expectedWriterGeneration = expectedWriterGeneration
+        self.disposition = disposition
+        self.phase = phase
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id
+        case surfaceID
+        case expectedWriterGeneration
+        case disposition
+        case phase
+    }
+
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        id = try values.decode(String.self, forKey: .id)
+        surfaceID = try values.decode(String.self, forKey: .surfaceID)
+        expectedWriterGeneration = try values.decodeIfPresent(
+            String.self,
+            forKey: .expectedWriterGeneration
+        )
+        disposition = try values.decodeIfPresent(
+            Disposition.self,
+            forKey: .disposition
+        ) ?? .finalDelete
+        phase = try values.decodeIfPresent(Phase.self, forKey: .phase) ?? .pending
+    }
+}
+
+public enum TerminalHistoryFailureLedgerError: Error, Equatable {
+    case invalidIdentifier
+    case corruptAnchor
+}
+
+enum TerminalHistoryFileDescriptorFlags {
+    @discardableResult
+    static func enableCloseOnExec(
+        _ descriptor: Int32,
+        getFlags: (Int32) -> Int32 = { Darwin.fcntl($0, F_GETFD) },
+        setFlags: (Int32, Int32) -> Int32 = { Darwin.fcntl($0, F_SETFD, $1) }
+    ) -> Bool {
+        guard descriptor >= 0 else { return false }
+        let flags = getFlags(descriptor)
+        guard flags >= 0 else { return false }
+        guard flags & FD_CLOEXEC == 0 else { return true }
+        return setFlags(descriptor, flags | FD_CLOEXEC) == 0
+    }
+}
+
+/// A process-durable pre-write fence outside SQLite. SQLite can reject even the
+/// first high-water reservation while another process owns BEGIN IMMEDIATE, so
+/// one metadata-only sidecar per surface/generation is atomically committed
+/// before the payload attempt. No terminal bytes or user content are stored.
+private final class TerminalHistoryProcessLockPool: @unchecked Sendable {
+    static let shared = TerminalHistoryProcessLockPool()
+
+    private let registryLock = NSLock()
+    private let locks = NSMapTable<NSString, NSLock>(
+        keyOptions: .copyIn,
+        valueOptions: .weakMemory
+    )
+
+    func lock(for rootURL: URL) -> NSLock {
+        let key = rootURL
+            .standardizedFileURL
+            .resolvingSymlinksInPath()
+            .path as NSString
+        registryLock.lock()
+        defer { registryLock.unlock() }
+        if let existing = locks.object(forKey: key) { return existing }
+        let created = NSLock()
+        locks.setObject(created, forKey: key)
+        return created
+    }
+}
+
+private final class TerminalHistoryFailureLedger: @unchecked Sendable {
+    let rootURL: URL
+    private let fileManager = FileManager.default
+    private let processLock: NSLock
+    private let descriptorOpenedForTesting: (@Sendable (String, Int32) -> Void)?
+
+    init(
+        databasePath: String,
+        rootOverride: URL? = nil,
+        descriptorOpenedForTesting: (@Sendable (String, Int32) -> Void)? = nil
+    ) {
+        self.descriptorOpenedForTesting = descriptorOpenedForTesting
+        let resolvedRoot: URL
+        if let rootOverride {
+            resolvedRoot = rootOverride
+        } else {
+            let databaseURL = URL(fileURLWithPath: databasePath)
+            resolvedRoot = databaseURL.deletingLastPathComponent().appendingPathComponent(
+                ".\(databaseURL.lastPathComponent).terminal-history-failures",
+                isDirectory: true
+            )
+        }
+        rootURL = resolvedRoot
+        processLock = TerminalHistoryProcessLockPool.shared.lock(for: resolvedRoot)
+    }
+
+    func record(_ incoming: TerminalHistoryFailureAnchor) throws {
+        let surfaceID = try normalizedUUID(incoming.surfaceID)
+        let writerGeneration = try normalizedUUID(incoming.writerGeneration)
+        try ensureRootDirectory()
+        try withLedgerLock {
+            let url = try anchorURL(
+                surfaceID: surfaceID,
+                writerGeneration: writerGeneration
+            )
+            let existing: TerminalHistoryFailureAnchor?
+            if fileManager.fileExists(atPath: url.path) {
+                existing = try decodeAnchor(at: url)
+            } else {
+                existing = nil
+            }
+            let anchor = TerminalHistoryFailureAnchor(
+                surfaceID: surfaceID,
+                writerGeneration: writerGeneration,
+                reason: existing?.reason ?? incoming.reason,
+                minimumNextChunkIndex: max(
+                    existing?.minimumNextChunkIndex ?? 1,
+                    incoming.minimumNextChunkIndex
+                )
+            )
+            try atomicWrite(JSONEncoder().encode(anchor), to: url)
+        }
+    }
+
+    func anchors(surfaceID rawSurfaceID: String) throws -> [TerminalHistoryFailureAnchor] {
+        let surfaceID = try normalizedUUID(rawSurfaceID)
+        guard fileManager.fileExists(atPath: rootURL.path) else { return [] }
+        return try withLedgerLock {
+            let prefix = surfaceID.lowercased() + "-"
+            return try fileManager.contentsOfDirectory(
+                at: rootURL,
+                includingPropertiesForKeys: nil,
+                options: [.skipsHiddenFiles]
+            )
+            .filter { $0.lastPathComponent.hasPrefix(prefix) && $0.pathExtension == "json" }
+            .map { try decodeAnchor(at: $0) }
+            .filter { $0.surfaceID == surfaceID }
+        }
+    }
+
+    func clear(
+        surfaceID rawSurfaceID: String,
+        writerGeneration rawWriterGeneration: String,
+        throughNextChunkIndex: Int64? = nil
+    ) throws {
+        let surfaceID = try normalizedUUID(rawSurfaceID)
+        let writerGeneration = try normalizedUUID(rawWriterGeneration)
+        guard fileManager.fileExists(atPath: rootURL.path) else { return }
+        try withLedgerLock {
+            let url = try anchorURL(
+                surfaceID: surfaceID,
+                writerGeneration: writerGeneration
+            )
+            guard fileManager.fileExists(atPath: url.path) else { return }
+            if let throughNextChunkIndex {
+                let anchor = try decodeAnchor(at: url)
+                guard anchor.minimumNextChunkIndex <= throughNextChunkIndex else { return }
+            }
+            try fileManager.removeItem(at: url)
+            try syncDirectory()
+        }
+    }
+
+    func clear(surfaceID rawSurfaceID: String) throws {
+        let surfaceID = try normalizedUUID(rawSurfaceID)
+        guard fileManager.fileExists(atPath: rootURL.path) else { return }
+        try withLedgerLock {
+            let prefix = surfaceID.lowercased() + "-"
+            for url in try fileManager.contentsOfDirectory(
+                at: rootURL,
+                includingPropertiesForKeys: nil,
+                options: [.skipsHiddenFiles]
+            ) where url.lastPathComponent.hasPrefix(prefix) && url.pathExtension == "json" {
+                try fileManager.removeItem(at: url)
+            }
+            try syncDirectory()
+        }
+    }
+
+    func recordPendingDelete(
+        surfaceID rawSurfaceID: String,
+        expectedWriterGeneration rawWriterGeneration: String?,
+        disposition: TerminalHistoryPendingDelete.Disposition
+    ) throws -> TerminalHistoryPendingDelete {
+        let surfaceID = try normalizedUUID(rawSurfaceID)
+        let writerGeneration = try rawWriterGeneration.map(normalizedUUID)
+        try ensureRootDirectory()
+        return try withLedgerLock {
+            if let existing = try pendingDeletesLocked().first(where: {
+                $0.surfaceID == surfaceID
+                    && $0.expectedWriterGeneration == writerGeneration
+                    && $0.disposition == disposition
+                    && $0.phase == .pending
+            }) {
+                return existing
+            }
+            let pending = TerminalHistoryPendingDelete(
+                surfaceID: surfaceID,
+                expectedWriterGeneration: writerGeneration,
+                disposition: disposition
+            )
+            try atomicWrite(
+                JSONEncoder().encode(pending),
+                to: try pendingDeleteURL(surfaceID: surfaceID, id: pending.id)
+            )
+            return pending
+        }
+    }
+
+    func pendingDeletes() throws -> [TerminalHistoryPendingDelete] {
+        guard fileManager.fileExists(atPath: rootURL.path) else { return [] }
+        return try withLedgerLock { try pendingDeletesLocked() }
+    }
+
+    func pendingDelete(
+        surfaceID rawSurfaceID: String,
+        id rawID: String
+    ) throws -> TerminalHistoryPendingDelete? {
+        let surfaceID = try normalizedUUID(rawSurfaceID)
+        let id = try normalizedUUID(rawID)
+        guard fileManager.fileExists(atPath: rootURL.path) else { return nil }
+        return try withLedgerLock {
+            let url = try pendingDeleteURL(surfaceID: surfaceID, id: id)
+            guard fileManager.fileExists(atPath: url.path) else { return nil }
+            return try decodePendingDelete(at: url)
+        }
+    }
+
+    func markPendingDeleteFinished(_ incoming: TerminalHistoryPendingDelete) throws {
+        let surfaceID = try normalizedUUID(incoming.surfaceID)
+        let id = try normalizedUUID(incoming.id)
+        guard fileManager.fileExists(atPath: rootURL.path) else { return }
+        try withLedgerLock {
+            let url = try pendingDeleteURL(surfaceID: surfaceID, id: id)
+            guard fileManager.fileExists(atPath: url.path) else { return }
+            let current = try decodePendingDelete(at: url)
+            guard current.surfaceID == surfaceID, current.id == id else {
+                throw TerminalHistoryFailureLedgerError.corruptAnchor
+            }
+            guard current.phase != .finished else { return }
+            try atomicWrite(
+                JSONEncoder().encode(TerminalHistoryPendingDelete(
+                    id: id,
+                    surfaceID: surfaceID,
+                    expectedWriterGeneration: current.expectedWriterGeneration,
+                    disposition: current.disposition,
+                    phase: .finished
+                )),
+                to: url
+            )
+        }
+    }
+
+    func clearPendingDelete(_ incoming: TerminalHistoryPendingDelete) throws {
+        let surfaceID = try normalizedUUID(incoming.surfaceID)
+        let id = try normalizedUUID(incoming.id)
+        guard fileManager.fileExists(atPath: rootURL.path) else { return }
+        try withLedgerLock {
+            let url = try pendingDeleteURL(surfaceID: surfaceID, id: id)
+            guard fileManager.fileExists(atPath: url.path) else { return }
+            try fileManager.removeItem(at: url)
+            try syncDirectory()
+        }
+    }
+
+    func anchorURL(surfaceID: String, writerGeneration: String) throws -> URL {
+        let surface = try normalizedUUID(surfaceID).lowercased()
+        let generation = try normalizedUUID(writerGeneration).lowercased()
+        return rootURL.appendingPathComponent("\(surface)-\(generation).json", isDirectory: false)
+    }
+
+    func pendingDeleteURL(surfaceID: String, id: String) throws -> URL {
+        let surface = try normalizedUUID(surfaceID).lowercased()
+        let token = try normalizedUUID(id).lowercased()
+        return rootURL.appendingPathComponent(
+            "delete-\(surface)-\(token).tombstone",
+            isDirectory: false
+        )
+    }
+
+    private func normalizedUUID(_ raw: String) throws -> String {
+        guard let uuid = UUID(uuidString: raw) else {
+            throw TerminalHistoryFailureLedgerError.invalidIdentifier
+        }
+        return uuid.uuidString
+    }
+
+    private func ensureRootDirectory() throws {
+        try fileManager.createDirectory(
+            at: rootURL,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
+        try fileManager.setAttributes(
+            [.posixPermissions: 0o700],
+            ofItemAtPath: rootURL.path
+        )
+    }
+
+    private func withLedgerLock<T>(_ body: () throws -> T) throws -> T {
+        processLock.lock()
+        defer { processLock.unlock() }
+        let lockURL = rootURL.appendingPathComponent(".lock", isDirectory: false)
+        let descriptor = try openDescriptor(
+            at: lockURL,
+            flags: O_RDWR | O_CREAT,
+            permissions: S_IRUSR | S_IWUSR,
+            operation: "open ledger lock",
+            kind: "lock"
+        )
+        defer { Darwin.close(descriptor) }
+        var fileLock = Darwin.flock()
+        fileLock.l_start = 0
+        fileLock.l_len = 0
+        fileLock.l_pid = 0
+        fileLock.l_type = Int16(F_WRLCK)
+        fileLock.l_whence = Int16(SEEK_SET)
+        guard Darwin.fcntl(descriptor, F_SETLKW, &fileLock) != -1 else {
+            throw posixError("lock ledger")
+        }
+        defer {
+            fileLock.l_type = Int16(F_UNLCK)
+            _ = Darwin.fcntl(descriptor, F_SETLK, &fileLock)
+        }
+        guard Darwin.fchmod(descriptor, S_IRUSR | S_IWUSR) == 0 else {
+            throw posixError("chmod ledger lock")
+        }
+        return try body()
+    }
+
+    private func decodeAnchor(at url: URL) throws -> TerminalHistoryFailureAnchor {
+        let data = try Data(contentsOf: url)
+        guard let anchor = try? JSONDecoder().decode(
+            TerminalHistoryFailureAnchor.self,
+            from: data
+        ),
+        UUID(uuidString: anchor.surfaceID) != nil,
+        UUID(uuidString: anchor.writerGeneration) != nil else {
+            throw TerminalHistoryFailureLedgerError.corruptAnchor
+        }
+        return anchor
+    }
+
+    private func pendingDeletesLocked() throws -> [TerminalHistoryPendingDelete] {
+        try fileManager.contentsOfDirectory(
+            at: rootURL,
+            includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles]
+        )
+        .filter { $0.lastPathComponent.hasPrefix("delete-") && $0.pathExtension == "tombstone" }
+        .map { try decodePendingDelete(at: $0) }
+        .sorted { $0.id < $1.id }
+    }
+
+    private func decodePendingDelete(at url: URL) throws -> TerminalHistoryPendingDelete {
+        let data = try Data(contentsOf: url)
+        guard let pending = try? JSONDecoder().decode(
+            TerminalHistoryPendingDelete.self,
+            from: data
+        ),
+        UUID(uuidString: pending.id) != nil,
+        UUID(uuidString: pending.surfaceID) != nil,
+        pending.expectedWriterGeneration.map({ UUID(uuidString: $0) != nil }) ?? true else {
+            throw TerminalHistoryFailureLedgerError.corruptAnchor
+        }
+        return pending
+    }
+
+    private func atomicWrite(_ data: Data, to destination: URL) throws {
+        let temporary = rootURL.appendingPathComponent(
+            ".tmp-\(UUID().uuidString)",
+            isDirectory: false
+        )
+        let descriptor: Int32
+        do {
+            descriptor = try openDescriptor(
+                at: temporary,
+                flags: O_WRONLY | O_CREAT | O_EXCL,
+                permissions: S_IRUSR | S_IWUSR,
+                operation: "open ledger temp",
+                kind: "temp"
+            )
+        } catch {
+            try? fileManager.removeItem(at: temporary)
+            throw error
+        }
+        var descriptorNeedsClose = true
+        do {
+            try data.withUnsafeBytes { bytes in
+                guard let baseAddress = bytes.baseAddress else { return }
+                var offset = 0
+                while offset < bytes.count {
+                    let written = Darwin.write(
+                        descriptor,
+                        baseAddress.advanced(by: offset),
+                        bytes.count - offset
+                    )
+                    guard written > 0 else { throw posixError("write ledger temp") }
+                    offset += written
+                }
+            }
+            guard Darwin.fchmod(descriptor, S_IRUSR | S_IWUSR) == 0 else {
+                throw posixError("chmod ledger temp")
+            }
+            guard Darwin.fsync(descriptor) == 0 else {
+                throw posixError("sync ledger temp")
+            }
+            let closeResult = Darwin.close(descriptor)
+            descriptorNeedsClose = false
+            guard closeResult == 0 else {
+                throw posixError("close ledger temp")
+            }
+        } catch {
+            if descriptorNeedsClose {
+                Darwin.close(descriptor)
+            }
+            try? fileManager.removeItem(at: temporary)
+            throw error
+        }
+
+        let renamed = temporary.path.withCString { source in
+            destination.path.withCString { target in
+                Darwin.rename(source, target)
+            }
+        }
+        guard renamed == 0 else {
+            try? fileManager.removeItem(at: temporary)
+            throw posixError("rename ledger anchor")
+        }
+        try syncDirectory()
+    }
+
+    private func syncDirectory() throws {
+        let descriptor = try openDescriptor(
+            at: rootURL,
+            flags: O_RDONLY,
+            operation: "open ledger directory",
+            kind: "directory"
+        )
+        defer { Darwin.close(descriptor) }
+        guard Darwin.fsync(descriptor) == 0 else {
+            throw posixError("sync ledger directory")
+        }
+    }
+
+    private func openDescriptor(
+        at url: URL,
+        flags: Int32,
+        permissions: mode_t? = nil,
+        operation: String,
+        kind: String
+    ) throws -> Int32 {
+        let descriptor = url.path.withCString { path in
+            if let permissions {
+                return Darwin.open(path, flags | O_CLOEXEC, permissions)
+            }
+            return Darwin.open(path, flags | O_CLOEXEC)
+        }
+        guard descriptor >= 0 else { throw posixError(operation) }
+        guard TerminalHistoryFileDescriptorFlags.enableCloseOnExec(descriptor) else {
+            let savedErrno = errno == 0 ? EIO : errno
+            Darwin.close(descriptor)
+            errno = savedErrno
+            throw posixError("mark \(kind) close-on-exec")
+        }
+        descriptorOpenedForTesting?(kind, descriptor)
+        return descriptor
+    }
+
+    private func posixError(_ operation: String) -> NSError {
+        NSError(
+            domain: NSPOSIXErrorDomain,
+            code: Int(errno),
+            userInfo: [NSLocalizedDescriptionKey: "\(operation): \(String(cString: strerror(errno)))"]
+        )
     }
 }
 
 public final class TerminalOutputRepository {
     let db: SQLiteDB
-    public init(db: SQLiteDB) { self.db = db }
+    private let failureLedger: TerminalHistoryFailureLedger?
+
+    public init(db: SQLiteDB) {
+        self.db = db
+        failureLedger = db.path == ":memory:"
+            ? nil
+            : TerminalHistoryFailureLedger(databasePath: db.path)
+    }
+
+    init(
+        db: SQLiteDB,
+        terminalHistoryFailureLedgerRootForTesting rootURL: URL,
+        descriptorOpenedForTesting: (@Sendable (String, Int32) -> Void)? = nil
+    ) {
+        self.db = db
+        failureLedger = TerminalHistoryFailureLedger(
+            databasePath: db.path,
+            rootOverride: rootURL,
+            descriptorOpenedForTesting: descriptorOpenedForTesting
+        )
+    }
+
+    private static func partialHistoryKey(surfaceID: String) -> String {
+        "terminal.history.partial.\(surfaceID)"
+    }
+
+    private static func dirtyHistoryKey(surfaceID: String) -> String {
+        "terminal.history.dirty.\(surfaceID)"
+    }
+
+    private static func writerGenerationKey(surfaceID: String) -> String {
+        "terminal.history.writer_generation.\(surfaceID)"
+    }
+
+    private static func pendingDeleteCommitKey(surfaceID: String) -> String {
+        "terminal.history.pending_delete_commit.\(surfaceID)"
+    }
+
+    public func recordFailureAnchor(
+        surfaceID: String,
+        writerGeneration: String,
+        reason: String,
+        minimumNextChunkIndex: Int64
+    ) throws {
+        try failureLedger?.record(TerminalHistoryFailureAnchor(
+            surfaceID: surfaceID,
+            writerGeneration: writerGeneration,
+            reason: reason,
+            minimumNextChunkIndex: minimumNextChunkIndex
+        ))
+    }
+
+    public func failureAnchors(
+        surfaceID: String
+    ) throws -> [TerminalHistoryFailureAnchor] {
+        try failureLedger?.anchors(surfaceID: surfaceID) ?? []
+    }
+
+    public func clearFailureAnchor(
+        surfaceID: String,
+        writerGeneration: String,
+        throughNextChunkIndex: Int64? = nil
+    ) throws {
+        try failureLedger?.clear(
+            surfaceID: surfaceID,
+            writerGeneration: writerGeneration,
+            throughNextChunkIndex: throughNextChunkIndex
+        )
+    }
+
+    public func clearFailureAnchors(surfaceID: String) throws {
+        try failureLedger?.clear(surfaceID: surfaceID)
+    }
+
+    public func recordPendingDelete(
+        surfaceID: String,
+        expectedWriterGeneration: String?,
+        disposition: TerminalHistoryPendingDelete.Disposition = .finalDelete
+    ) throws -> TerminalHistoryPendingDelete {
+        if let failureLedger {
+            return try failureLedger.recordPendingDelete(
+                surfaceID: surfaceID,
+                expectedWriterGeneration: expectedWriterGeneration,
+                disposition: disposition
+            )
+        }
+        return TerminalHistoryPendingDelete(
+            surfaceID: surfaceID,
+            expectedWriterGeneration: expectedWriterGeneration,
+            disposition: disposition
+        )
+    }
+
+    public func recordPendingClearForReuse(
+        surfaceID: String
+    ) throws -> TerminalHistoryPendingDelete {
+        try recordPendingDelete(
+            surfaceID: surfaceID,
+            expectedWriterGeneration: writerGeneration(surfaceID: surfaceID),
+            disposition: .clearForReuse
+        )
+    }
+
+    public func pendingDeletes() throws -> [TerminalHistoryPendingDelete] {
+        try failureLedger?.pendingDeletes() ?? []
+    }
+
+    /// Executes a durable final-delete tombstone. The SQLite commit marker is
+    /// written in the same transaction as the destructive phase. The finished
+    /// file phase is then committed before removing that marker, closing both
+    /// crash gaps without allowing a replay to erase a successor generation.
+    public func performPendingDelete(_ recorded: TerminalHistoryPendingDelete) throws {
+        let pending = try failureLedger?.pendingDelete(
+            surfaceID: recorded.surfaceID,
+            id: recorded.id
+        ) ?? recorded
+        if pending.phase == .pending {
+            let shouldCleanAnchors = try db.performSync { database in
+                try database.transaction {
+                    if try Self.settingValue(
+                        key: Self.pendingDeleteCommitKey(surfaceID: pending.surfaceID),
+                        database: database
+                    ) == pending.id {
+                        return true
+                    }
+                    let currentGeneration = try Self.writerGeneration(
+                        surfaceID: pending.surfaceID,
+                        database: database
+                    )
+                    switch pending.disposition {
+                    case .finalDelete:
+                        if let expected = pending.expectedWriterGeneration,
+                           currentGeneration != expected {
+                            return false
+                        }
+                    case .clearForReuse:
+                        guard currentGeneration == pending.expectedWriterGeneration else {
+                            return false
+                        }
+                    }
+                    try Self.deleteHistoryState(
+                        surfaceID: pending.surfaceID,
+                        database: database
+                    )
+                    switch pending.disposition {
+                    case .finalDelete:
+                        try Self.deleteSetting(
+                            key: Self.writerGenerationKey(surfaceID: pending.surfaceID),
+                            database: database
+                        )
+                    case .clearForReuse:
+                        try Self.upsertSetting(
+                            key: Self.writerGenerationKey(surfaceID: pending.surfaceID),
+                            value: UUID().uuidString,
+                            database: database
+                        )
+                    }
+                    try Self.upsertSetting(
+                        key: Self.pendingDeleteCommitKey(surfaceID: pending.surfaceID),
+                        value: pending.id,
+                        database: database
+                    )
+                    return true
+                }
+            }
+            if let expected = pending.expectedWriterGeneration {
+                try clearFailureAnchor(
+                    surfaceID: pending.surfaceID,
+                    writerGeneration: expected
+                )
+            } else if shouldCleanAnchors {
+                try clearFailureAnchors(surfaceID: pending.surfaceID)
+            }
+            try failureLedger?.markPendingDeleteFinished(pending)
+        }
+
+        try db.performSync { database in
+            try database.transaction {
+                let key = Self.pendingDeleteCommitKey(surfaceID: pending.surfaceID)
+                guard try Self.settingValue(key: key, database: database) == pending.id else {
+                    return
+                }
+                try Self.deleteSetting(key: key, database: database)
+            }
+        }
+        try failureLedger?.clearPendingDelete(pending)
+    }
+
+    public func failureAnchorIsCovered(
+        _ anchor: TerminalHistoryFailureAnchor
+    ) throws -> Bool {
+        if let partial = try partialHistoryState(
+            surfaceID: anchor.surfaceID,
+            expectedWriterGeneration: anchor.writerGeneration
+        ),
+        partial.nextChunkIndex >= anchor.minimumNextChunkIndex {
+            return true
+        }
+        let chunkIndex = max(1, anchor.minimumNextChunkIndex - 1)
+        return try db.performSync { database in
+            let statement = try database.prepare("""
+                SELECT 1
+                FROM terminal_output_chunks
+                WHERE surface_id = ? AND chunk_index = ?
+                LIMIT 1;
+            """)
+            try statement.bind(1, anchor.surfaceID)
+            try statement.bind(2, chunkIndex)
+            return try statement.step()
+        }
+    }
+
+    var failureLedgerRootURLForTesting: URL? { failureLedger?.rootURL }
+
+    func failureAnchorURLForTesting(
+        surfaceID: String,
+        writerGeneration: String
+    ) throws -> URL? {
+        try failureLedger?.anchorURL(
+            surfaceID: surfaceID,
+            writerGeneration: writerGeneration
+        )
+    }
+
+    func pendingDeleteURLForTesting(
+        surfaceID: String,
+        id: String
+    ) throws -> URL? {
+        try failureLedger?.pendingDeleteURL(surfaceID: surfaceID, id: id)
+    }
 
     public func append(surfaceID: String, workspaceID: String?, chunkIndex: Int64, data: Data) throws {
         guard !data.isEmpty else { return }
-        let st = try db.prepare("""
-            INSERT OR IGNORE INTO terminal_output_chunks(surface_id, workspace_id, chunk_index, data, byte_count, created_at)
-            VALUES(?, ?, ?, ?, ?, ?);
-        """)
-        try st.bind(1, surfaceID)
-        try st.bind(2, workspaceID)
-        try st.bind(3, chunkIndex)
-        try st.bind(4, data)
-        try st.bind(5, Int64(data.count))
-        try st.bind(6, iso.string(from: Date()))
-        _ = try st.step()
+        try db.performSync { database in
+            let st = try database.prepare("""
+                INSERT INTO terminal_output_chunks(surface_id, workspace_id, chunk_index, data, byte_count, created_at)
+                VALUES(?, ?, ?, ?, ?, ?);
+            """)
+            try st.bind(1, surfaceID)
+            try st.bind(2, workspaceID)
+            try st.bind(3, chunkIndex)
+            try st.bind(4, data)
+            try st.bind(5, Int64(data.count))
+            try st.bind(6, iso.string(from: Date()))
+            _ = try st.step()
+
+            let changes = try database.prepare("SELECT changes();")
+            guard try changes.step(), changes.columnInt64(0) == 1 else {
+                throw SQLiteError.execute(
+                    "Terminal history append did not insert exactly one row for surface \(surfaceID) chunk \(chunkIndex)."
+                )
+            }
+        }
     }
 
     public func nextChunkIndex(surfaceID: String) throws -> Int64 {
@@ -3284,27 +4092,237 @@ public final class TerminalOutputRepository {
         return (try st.step()) ? st.columnInt64(0) : 1
     }
 
-    public func readWindow(surfaceID: String, beforeChunkID: Int64? = nil, maxBytes: Int = 256 * 1024) throws -> TerminalOutputWindow {
-        let byteLimit = max(1, maxBytes)
-        let sql: String
-        if beforeChunkID == nil {
-            sql = """
-                SELECT id, surface_id, workspace_id, chunk_index, data, created_at
-                FROM terminal_output_chunks
-                WHERE surface_id = ?
-                ORDER BY id DESC;
-            """
-        } else {
-            sql = """
-                SELECT id, surface_id, workspace_id, chunk_index, data, created_at
-                FROM terminal_output_chunks
-                WHERE surface_id = ? AND id < ?
-                ORDER BY id DESC;
-            """
+    public func writerGeneration(surfaceID: String) throws -> String? {
+        try db.performSync { database in
+            try Self.writerGeneration(surfaceID: surfaceID, database: database)
         }
+    }
+
+    public func prepareHistory(surfaceID: String) throws -> TerminalHistoryPreparation {
+        for pending in try pendingDeletes() where
+            pending.surfaceID == surfaceID && pending.disposition == .clearForReuse {
+            try performPendingDelete(pending)
+        }
+        return try db.performSync { database in
+            try database.transaction {
+                let writerGeneration: String
+                if let existing = try Self.settingValue(
+                    key: Self.writerGenerationKey(surfaceID: surfaceID),
+                    database: database
+                ) {
+                    writerGeneration = existing
+                } else {
+                    writerGeneration = UUID().uuidString
+                    try Self.upsertSetting(
+                        key: Self.writerGenerationKey(surfaceID: surfaceID),
+                        value: writerGeneration,
+                        database: database
+                    )
+                }
+
+                // A dirty reservation means a prior process could have exited
+                // between reserving and committing a chunk. Promote it to the
+                // durable partial marker before this writer can reserve another
+                // chunk, so a later successful append can never erase the gap.
+                if let dirty = try Self.partialState(
+                    key: Self.dirtyHistoryKey(surfaceID: surfaceID),
+                    database: database
+                ) {
+                    try Self.mergePartialState(
+                        key: Self.partialHistoryKey(surfaceID: surfaceID),
+                        incoming: dirty,
+                        database: database
+                    )
+                    try Self.deleteSetting(
+                        key: Self.dirtyHistoryKey(surfaceID: surfaceID),
+                        database: database
+                    )
+                }
+
+                let storedNextIndex = try Self.nextChunkIndex(
+                    surfaceID: surfaceID,
+                    database: database
+                )
+                let partial = try Self.partialState(
+                    key: Self.partialHistoryKey(surfaceID: surfaceID),
+                    database: database
+                )
+                return TerminalHistoryPreparation(
+                    nextChunkIndex: max(storedNextIndex, partial?.nextChunkIndex ?? 1),
+                    partialState: partial,
+                    writerGeneration: writerGeneration
+                )
+            }
+        }
+    }
+
+    public func partialHistoryState(surfaceID: String) throws -> TerminalHistoryPartialState? {
+        try db.performSync { database in
+            try Self.combinedPartialState(
+                surfaceID: surfaceID,
+                database: database
+            )
+        }
+    }
+
+    public func partialHistoryState(
+        surfaceID: String,
+        expectedWriterGeneration: String
+    ) throws -> TerminalHistoryPartialState? {
+        try db.performSync { database in
+            try Self.requireWriterGeneration(
+                expectedWriterGeneration,
+                surfaceID: surfaceID,
+                database: database
+            )
+            return try Self.combinedPartialState(
+                surfaceID: surfaceID,
+                database: database
+            )
+        }
+    }
+
+    public func markHistoryPartial(
+        surfaceID: String,
+        reason: String,
+        nextChunkIndex: Int64
+    ) throws {
+        try db.performSync { database in
+            try database.transaction {
+                try Self.mergePartialState(
+                    key: Self.partialHistoryKey(surfaceID: surfaceID),
+                    incoming: TerminalHistoryPartialState(
+                        reason: reason,
+                        nextChunkIndex: nextChunkIndex
+                    ),
+                    database: database
+                )
+            }
+        }
+    }
+
+    public func markHistoryPartial(
+        surfaceID: String,
+        reason: String,
+        nextChunkIndex: Int64,
+        expectedWriterGeneration: String
+    ) throws {
+        try db.performSync { database in
+            try database.transaction {
+                try Self.requireWriterGeneration(
+                    expectedWriterGeneration,
+                    surfaceID: surfaceID,
+                    database: database
+                )
+                try Self.mergePartialState(
+                    key: Self.partialHistoryKey(surfaceID: surfaceID),
+                    incoming: TerminalHistoryPartialState(
+                        reason: reason,
+                        nextChunkIndex: nextChunkIndex
+                    ),
+                    database: database
+                )
+            }
+        }
+    }
+
+    /// Commits a fail-closed high-water reservation before attempting the
+    /// corresponding chunk insert. The insert and reservation removal then
+    /// commit atomically. If the insert fails or the process exits, the dirty
+    /// reservation survives and prevents index reuse on relaunch.
+    public func appendWithHighWaterReservation(
+        surfaceID: String,
+        workspaceID: String?,
+        chunkIndex: Int64,
+        data: Data,
+        expectedWriterGeneration: String
+    ) throws {
+        guard !data.isEmpty else { return }
+        let reservedNextIndex = chunkIndex + 1
+        try db.performSync { database in
+            try database.transaction {
+                try Self.requireWriterGeneration(
+                    expectedWriterGeneration,
+                    surfaceID: surfaceID,
+                    database: database
+                )
+                let dirtyKey = Self.dirtyHistoryKey(surfaceID: surfaceID)
+                if let existing = try Self.partialState(key: dirtyKey, database: database) {
+                    guard existing.nextChunkIndex == reservedNextIndex else {
+                        throw TerminalHistoryRepositoryError.unresolvedWriteReservation
+                    }
+                } else {
+                    try Self.mergePartialState(
+                        key: dirtyKey,
+                        incoming: TerminalHistoryPartialState(
+                            reason: "history_persistence_failed",
+                            nextChunkIndex: reservedNextIndex
+                        ),
+                        database: database
+                    )
+                }
+            }
+        }
+
+        try db.performSync { database in
+            try database.transaction {
+                try Self.requireWriterGeneration(
+                    expectedWriterGeneration,
+                    surfaceID: surfaceID,
+                    database: database
+                )
+                let st = try database.prepare("""
+                    INSERT INTO terminal_output_chunks(surface_id, workspace_id, chunk_index, data, byte_count, created_at)
+                    VALUES(?, ?, ?, ?, ?, ?);
+                """)
+                try st.bind(1, surfaceID)
+                try st.bind(2, workspaceID)
+                try st.bind(3, chunkIndex)
+                try st.bind(4, data)
+                try st.bind(5, Int64(data.count))
+                try st.bind(6, iso.string(from: Date()))
+                _ = try st.step()
+
+                let changes = try database.prepare("SELECT changes();")
+                guard try changes.step(), changes.columnInt64(0) == 1 else {
+                    throw SQLiteError.execute(
+                        "Terminal history append did not insert exactly one row for surface \(surfaceID) chunk \(chunkIndex)."
+                    )
+                }
+                try Self.deleteSetting(
+                    key: Self.dirtyHistoryKey(surfaceID: surfaceID),
+                    database: database
+                )
+            }
+        }
+    }
+
+    public func readWindow(
+        surfaceID: String,
+        beforeChunkID: Int64? = nil,
+        maxBytes: Int = 256 * 1024,
+        beforeChunkIndex: Int64? = nil
+    ) throws -> TerminalOutputWindow {
+        let byteLimit = max(1, maxBytes)
+        var predicates = ["surface_id = ?"]
+        if beforeChunkID != nil { predicates.append("id < ?") }
+        if beforeChunkIndex != nil { predicates.append("chunk_index < ?") }
+        let sql = """
+            SELECT id, surface_id, workspace_id, chunk_index, data, created_at
+            FROM terminal_output_chunks
+            WHERE \(predicates.joined(separator: " AND "))
+            ORDER BY id DESC;
+        """
         let st = try db.prepare(sql)
         try st.bind(1, surfaceID)
-        if let beforeChunkID { try st.bind(2, beforeChunkID) }
+        var bindingIndex: Int32 = 2
+        if let beforeChunkID {
+            try st.bind(bindingIndex, beforeChunkID)
+            bindingIndex += 1
+        }
+        if let beforeChunkIndex {
+            try st.bind(bindingIndex, beforeChunkIndex)
+        }
 
         var reversed: [TerminalOutputChunk] = []
         var bytes = 0
@@ -3338,34 +4356,303 @@ public final class TerminalOutputRepository {
     /// Deletes rows with the smallest `id` values (oldest) until the byte sum fits.
     public func pruneByteCap(surfaceID: String, maxBytes: Int) throws {
         guard maxBytes > 0 else { return }
-        // Walk oldest-first, accumulate bytes, delete rows that exceed the cap.
-        let st = try db.prepare("""
-            DELETE FROM terminal_output_chunks
-            WHERE surface_id = ? AND id NOT IN (
-                SELECT id FROM (
-                    SELECT id, SUM(byte_count) OVER (ORDER BY id DESC) AS running
-                    FROM terminal_output_chunks
-                    WHERE surface_id = ?
+        try db.performSync { database in
+            _ = try Self.pruneByteCap(
+                surfaceID: surfaceID,
+                maxBytes: maxBytes,
+                database: database
+            )
+        }
+    }
+
+    /// Production retention disposition. Chunk deletion and the durable
+    /// partial/high-water marker share one transaction: either both become
+    /// visible or SQLite rolls both back.
+    @discardableResult
+    public func pruneByteCapAndMarkHistoryPartial(
+        surfaceID: String,
+        maxBytes: Int,
+        reason: String,
+        nextChunkIndex: Int64,
+        expectedWriterGeneration: String
+    ) throws -> Bool {
+        guard maxBytes > 0 else { return false }
+        return try db.performSync { database in
+            try database.transaction {
+                try Self.requireWriterGeneration(
+                    expectedWriterGeneration,
+                    surfaceID: surfaceID,
+                    database: database
                 )
-                WHERE running <= ?
-            );
-        """)
-        try st.bind(1, surfaceID)
-        try st.bind(2, surfaceID)
-        try st.bind(3, Int64(maxBytes))
-        _ = try st.step()
+                let pruned = try Self.pruneByteCap(
+                    surfaceID: surfaceID,
+                    maxBytes: maxBytes,
+                    database: database
+                )
+                guard pruned else { return false }
+                try Self.mergePartialState(
+                    key: Self.partialHistoryKey(surfaceID: surfaceID),
+                    incoming: TerminalHistoryPartialState(
+                        reason: reason,
+                        nextChunkIndex: nextChunkIndex
+                    ),
+                    database: database
+                )
+                return true
+            }
+        }
     }
 
     public func totalBytes(surfaceID: String) throws -> Int {
-        let st = try db.prepare("SELECT COALESCE(SUM(byte_count), 0) FROM terminal_output_chunks WHERE surface_id = ?;")
+        try db.performSync { database in
+            try Self.totalBytes(surfaceID: surfaceID, database: database)
+        }
+    }
+
+    private static func totalBytes(surfaceID: String, database: SQLiteDB) throws -> Int {
+        let st = try database.prepare(
+            "SELECT COALESCE(SUM(byte_count), 0) FROM terminal_output_chunks WHERE surface_id = ?;"
+        )
         try st.bind(1, surfaceID)
         return (try st.step()) ? Int(st.columnInt64(0)) : 0
     }
 
+    /// Live clear rotates the writer generation in the same transaction as the
+    /// delete. A retired runtime holding the previous generation can no longer
+    /// repopulate the cleared surface.
+    public func clearForReuse(
+        surfaceID: String,
+        expectedWriterGeneration: String
+    ) throws -> String {
+        try db.performSync { database in
+            try database.transaction {
+                try Self.requireWriterGeneration(
+                    expectedWriterGeneration,
+                    surfaceID: surfaceID,
+                    database: database
+                )
+                try Self.deleteHistoryState(surfaceID: surfaceID, database: database)
+                let nextGeneration = UUID().uuidString
+                try Self.upsertSetting(
+                    key: Self.writerGenerationKey(surfaceID: surfaceID),
+                    value: nextGeneration,
+                    database: database
+                )
+                return nextGeneration
+            }
+        }
+    }
+
     public func delete(surfaceID: String) throws {
-        let st = try db.prepare("DELETE FROM terminal_output_chunks WHERE surface_id = ?;")
-        try st.bind(1, surfaceID)
-        _ = try st.step()
+        try deletePersistedState(surfaceID: surfaceID)
+        // Unconditional deletion is the terminal ownership boundary used when
+        // no live coordinator remains (router/SSH fallbacks). Only clear the
+        // file-backed failure ledger after SQLite committed successfully. Old
+        // databases may contain opaque pre-SurfaceID values; those can be bound
+        // safely in SQLite but must never become filesystem paths.
+        if UUID(uuidString: surfaceID) != nil {
+            try clearFailureAnchors(surfaceID: surfaceID)
+        }
+    }
+
+    /// SQLite phase of an unconditional delete. Retryable ownerless
+    /// dispositions use this once, then retry only the file-backed cleanup so
+    /// a replacement writer created after commit cannot be erased later.
+    public func deletePersistedState(surfaceID: String) throws {
+        try db.performSync { database in
+            try database.transaction {
+                try Self.deleteHistoryState(surfaceID: surfaceID, database: database)
+                try Self.deleteSetting(
+                    key: Self.writerGenerationKey(surfaceID: surfaceID),
+                    database: database
+                )
+            }
+        }
+    }
+
+    /// Conditional final delete used by runtimes that may retire behind a newer
+    /// runtime with the same stable surface ID. A stale owner becomes a no-op.
+    @discardableResult
+    public func delete(
+        surfaceID: String,
+        expectedWriterGeneration: String
+    ) throws -> Bool {
+        try db.performSync { database in
+            try database.transaction {
+                guard try Self.writerGeneration(
+                    surfaceID: surfaceID,
+                    database: database
+                ) == expectedWriterGeneration else { return false }
+                try Self.deleteHistoryState(surfaceID: surfaceID, database: database)
+                try Self.deleteSetting(
+                    key: Self.writerGenerationKey(surfaceID: surfaceID),
+                    database: database
+                )
+                return true
+            }
+        }
+    }
+
+    private static func nextChunkIndex(
+        surfaceID: String,
+        database: SQLiteDB
+    ) throws -> Int64 {
+        let statement = try database.prepare(
+            "SELECT COALESCE(MAX(chunk_index), 0) + 1 FROM terminal_output_chunks WHERE surface_id = ?;"
+        )
+        try statement.bind(1, surfaceID)
+        return try statement.step() ? statement.columnInt64(0) : 1
+    }
+
+    private static func settingValue(key: String, database: SQLiteDB) throws -> String? {
+        let statement = try database.prepare("SELECT value FROM settings WHERE key = ?;")
+        try statement.bind(1, key)
+        guard try statement.step() else { return nil }
+        return statement.columnText(0)
+    }
+
+    private static func partialState(
+        key: String,
+        database: SQLiteDB
+    ) throws -> TerminalHistoryPartialState? {
+        guard let value = try settingValue(key: key, database: database) else { return nil }
+        guard let data = value.data(using: .utf8),
+              let state = try? JSONDecoder().decode(TerminalHistoryPartialState.self, from: data) else {
+            throw SQLiteError.execute("Corrupt terminal history state for key \(key).")
+        }
+        return state
+    }
+
+    private static func combinedPartialState(
+        surfaceID: String,
+        database: SQLiteDB
+    ) throws -> TerminalHistoryPartialState? {
+        let partial = try partialState(
+            key: partialHistoryKey(surfaceID: surfaceID),
+            database: database
+        )
+        let dirty = try partialState(
+            key: dirtyHistoryKey(surfaceID: surfaceID),
+            database: database
+        )
+        guard let partial else { return dirty }
+        guard let dirty else { return partial }
+        return TerminalHistoryPartialState(
+            reason: partial.reason,
+            nextChunkIndex: max(partial.nextChunkIndex, dirty.nextChunkIndex)
+        )
+    }
+
+    private static func mergePartialState(
+        key: String,
+        incoming: TerminalHistoryPartialState,
+        database: SQLiteDB
+    ) throws {
+        let existing = try partialState(key: key, database: database)
+        let state = TerminalHistoryPartialState(
+            reason: existing?.reason ?? incoming.reason,
+            nextChunkIndex: max(existing?.nextChunkIndex ?? 1, incoming.nextChunkIndex)
+        )
+        let encoded = try JSONEncoder().encode(state)
+        guard let value = String(data: encoded, encoding: .utf8) else {
+            throw SQLiteError.execute("Could not encode terminal history state for key \(key).")
+        }
+        try upsertSetting(key: key, value: value, database: database)
+    }
+
+    private static func upsertSetting(
+        key: String,
+        value: String,
+        database: SQLiteDB
+    ) throws {
+        let statement = try database.prepare("""
+            INSERT INTO settings(key, value, updated_at) VALUES(?, ?, ?)
+            ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at;
+        """)
+        try statement.bind(1, key)
+        try statement.bind(2, value)
+        try statement.bind(3, iso.string(from: Date()))
+        _ = try statement.step()
+    }
+
+    private static func deleteSetting(key: String, database: SQLiteDB) throws {
+        let statement = try database.prepare("DELETE FROM settings WHERE key = ?;")
+        try statement.bind(1, key)
+        _ = try statement.step()
+    }
+
+    private static func writerGeneration(
+        surfaceID: String,
+        database: SQLiteDB
+    ) throws -> String? {
+        try settingValue(
+            key: writerGenerationKey(surfaceID: surfaceID),
+            database: database
+        )
+    }
+
+    private static func requireWriterGeneration(
+        _ expected: String,
+        surfaceID: String,
+        database: SQLiteDB
+    ) throws {
+        guard try writerGeneration(surfaceID: surfaceID, database: database) == expected else {
+            throw TerminalHistoryRepositoryError.staleWriterGeneration
+        }
+    }
+
+    @discardableResult
+    private static func pruneByteCap(
+        surfaceID: String,
+        maxBytes: Int,
+        database: SQLiteDB
+    ) throws -> Bool {
+        var total = try totalBytes(surfaceID: surfaceID, database: database)
+        var pruned = false
+        while total > maxBytes {
+            let oldest = try database.prepare("""
+                SELECT id, byte_count
+                FROM terminal_output_chunks
+                WHERE surface_id = ?
+                ORDER BY id ASC
+                LIMIT 1;
+            """)
+            try oldest.bind(1, surfaceID)
+            guard try oldest.step() else { return pruned }
+            let id = oldest.columnInt64(0)
+            let bytes = Int(oldest.columnInt64(1))
+            let delete = try database.prepare("""
+                DELETE FROM terminal_output_chunks
+                WHERE surface_id = ? AND id = ?;
+            """)
+            try delete.bind(1, surfaceID)
+            try delete.bind(2, id)
+            _ = try delete.step()
+            let nextTotal = max(0, total - max(0, bytes))
+            guard nextTotal < total else { return pruned }
+            total = nextTotal
+            pruned = true
+        }
+        return pruned
+    }
+
+    private static func deleteHistoryState(
+        surfaceID: String,
+        database: SQLiteDB
+    ) throws {
+        let chunks = try database.prepare(
+            "DELETE FROM terminal_output_chunks WHERE surface_id = ?;"
+        )
+        try chunks.bind(1, surfaceID)
+        _ = try chunks.step()
+        try deleteSetting(
+            key: partialHistoryKey(surfaceID: surfaceID),
+            database: database
+        )
+        try deleteSetting(
+            key: dirtyHistoryKey(surfaceID: surfaceID),
+            database: database
+        )
     }
 
     private func hasOlder(surfaceID: String, before id: Int64?) -> Bool {

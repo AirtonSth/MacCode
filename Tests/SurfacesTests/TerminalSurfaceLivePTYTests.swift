@@ -40,6 +40,128 @@ final class TerminalSurfaceLivePTYTests: XCTestCase {
                        "post-exit input must fail loudly instead of silently writing to a closed PTY")
     }
 
+    /// WHY: release-soak setup creates hidden auxiliary terminals, accepts a
+    /// workload, then polls `surface.read_text` for `RC2_AUX_XX_READY`. Old
+    /// behavior buffered hidden PTY bytes only into `hiddenRendererBuffer` and
+    /// returned an unfed/blank ANSI renderer (or blank parked Ghostty grid) so
+    /// the marker never appeared. This must fail on that regression: hidden
+    /// output is readable while still hidden and after pending drain/reveal.
+    ///
+    /// Uses the reader inject seam (same `appendDataAsync` path as PTY output)
+    /// so the regression runs when the sandbox blocks `forkpty`.
+    func test_hiddenAuxiliaryPTYOutputReadableAfterPendingWithoutReveal() throws {
+        let surface = try TerminalSurface(
+            workspaceID: WorkspaceID(),
+            title: "hidden aux inject",
+            launch: .sshPlaceholder(cwd: NSTemporaryDirectory())
+        )
+        defer { surface.close() }
+
+        // Match soak auxiliaries: surface is not the selected/visible terminal.
+        surface.didBecomeHidden()
+        XCTAssertFalse(
+            surface.readerAllowsRenderForTesting,
+            "aux readiness must be observed while the terminal stays render-suppressed"
+        )
+
+        let marker = "RC2_AUX_02_READY"
+        surface.injectReaderOutputForTesting(Data("\(marker)\n".utf8))
+
+        let whileHidden = surface.readTextSnapshot()
+        XCTAssertTrue(
+            whileHidden.text.contains(marker),
+            "surface.read_text must return hidden PTY transcript (healed ANSI mirror) even before reveal; blank Ghostty/unfed renderer is the soak setup failure"
+        )
+        XCTAssertEqual(
+            whileHidden.source,
+            "ansi_fallback",
+            "while still hidden, read_text must use the healed renderer — not a parked Ghostty viewport"
+        )
+        XCTAssertFalse(
+            surface.readerAllowsRenderForTesting,
+            "observing the marker must not require flipping the surface visible"
+        )
+        XCTAssertGreaterThan(
+            surface.runtimeHealth().outputPendingBytes,
+            0,
+            "honest pending state must remain until visibility reconciliation drains Ghostty"
+        )
+        XCTAssertFalse(
+            whileHidden.complete,
+            "hidden read with pending Ghostty drain must not claim complete=true"
+        )
+        XCTAssertEqual(
+            whileHidden.partialReason,
+            "hidden_output_pending",
+            "pending hidden bytes must surface as hidden_output_pending, not a complete healthy snapshot"
+        )
+        // Double-feed guard: heal-on-read clears the buffer; reveal must not
+        // re-feed the same bytes into the ANSI mirror (marker once, not twice).
+        let markerOccurrencesWhileHidden = whileHidden.text.components(separatedBy: marker).count - 1
+        XCTAssertEqual(
+            markerOccurrencesWhileHidden,
+            1,
+            "heal-on-read must feed hidden bytes exactly once into the mirror"
+        )
+
+        // Visibility reconciliation / reveal zeros pending and may leave Ghostty
+        // blank for a beat; transcript must still contain the marker.
+        surface.didBecomeVisible()
+        XCTAssertEqual(surface.runtimeHealth().outputPendingBytes, 0)
+        let afterDrain = surface.readTextSnapshot()
+        XCTAssertTrue(
+            afterDrain.text.contains(marker),
+            "after pending drain/reveal, read_text must still expose the readiness marker even if Ghostty viewport is blank"
+        )
+        let markerOccurrencesAfterReveal = afterDrain.text.components(separatedBy: marker).count - 1
+        XCTAssertEqual(
+            markerOccurrencesAfterReveal,
+            1,
+            "reveal must not double-feed bytes already healed while hidden"
+        )
+    }
+
+    /// WHY: commit 73c00b2 switched the hidden `readTextSnapshot` branch from
+    /// always `complete: false` to `readTextComplete(...)` without the visible
+    /// path's `diagnostics.canRender` gate. AppCommandRouter exposes
+    /// `partial = !complete` while still shipping `partial_reason`. An idle
+    /// hidden surface (pending=0) must not report complete=true alongside
+    /// partial_reason=logical_hidden — that lies to surface.read_text consumers.
+    func test_hiddenIdleReadDoesNotClaimCompleteWithLogicalHiddenReason() throws {
+        let surface = try TerminalSurface(
+            workspaceID: WorkspaceID(),
+            title: "hidden idle complete honesty",
+            launch: .sshPlaceholder(cwd: NSTemporaryDirectory())
+        )
+        defer { surface.close() }
+
+        // New surfaces start visible; without a window, early PTY/banner bytes may
+        // latch outputPendingBytes. Reveal zeros pending (existing contract), then
+        // re-hide with no inject so the hidden branch decides complete/partial with
+        // pending=0 — the honesty hole from 73c00b2.
+        surface.didBecomeHidden()
+        surface.didBecomeVisible()
+        surface.didBecomeHidden()
+        XCTAssertFalse(surface.readerAllowsRenderForTesting)
+        XCTAssertEqual(
+            surface.runtimeHealth().outputPendingBytes,
+            0,
+            "post-reveal idle hide must start with pending=0 so complete is not forced by pending alone"
+        )
+
+        let snap = surface.readTextSnapshot()
+        XCTAssertEqual(snap.source, "ansi_fallback")
+        XCTAssertFalse(
+            snap.complete,
+            "hidden idle read must not claim complete=true while render is blocked (logical_hidden); partial=!complete on the wire"
+        )
+        XCTAssertEqual(
+            snap.partialReason,
+            "logical_hidden",
+            "idle hidden snapshot must stay partial with the render block reason when nothing is pending"
+        )
+    }
+
     private func waitForSnapshot(
         _ surface: TerminalSurface,
         timeout: TimeInterval = 6,

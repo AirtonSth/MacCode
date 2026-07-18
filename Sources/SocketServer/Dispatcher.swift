@@ -53,7 +53,7 @@ public protocol CommandRouting: AnyObject {
     func setSurfaceColor(_ wid: WorkspaceID, _ sid: SurfaceID, _ color: String) throws
     func sendText(surface: SurfaceID, text: String) throws
     func readText(surface: SurfaceID) throws -> String
-    func readTerminalHistory(surface: SurfaceID, beforeChunkID: Int64?, maxBytes: Int) throws -> TerminalOutputWindow
+    func readTerminalHistory(surface: SurfaceID, beforeChunkID: Int64?, maxBytes: Int) async throws -> TerminalOutputWindow
     func surfaceHealth(surface: SurfaceID) -> Bool
     func surfaceClearHistory(surface: SurfaceID)
     // SSH
@@ -1369,7 +1369,9 @@ public final class JSONRPCDispatcher {
                 return .init(id: id, result: result)
             case "workspace.select":
                 guard let wid = params["id"]?.stringValue.flatMap(UUID.init).map(WorkspaceID.init) else { throw JSONRPCError.invalidParams }
-                try router.selectWorkspace(wid)
+                try withSuppressedLayoutEvents {
+                    try router.selectWorkspace(wid)
+                }
                 EventBus.shared.publish(kind: "workspace.selected", payload: .object(["workspace_id": .string(wid.value.uuidString)]))
                 return .init(id: id, result: .bool(true))
             case "workspace.close":
@@ -1587,7 +1589,18 @@ public final class JSONRPCDispatcher {
                 guard let sid = params["id"]?.stringValue.flatMap(UUID.init).map(SurfaceID.init) else { throw JSONRPCError.invalidParams }
                 if params["include_metadata"]?.boolValue == true,
                    let terminalRouter = router as? TerminalCommandRouting {
-                    return .init(id: id, result: try terminalRouter.readTextSnapshot(surface: sid))
+                    // Establish a sequence barrier before reading the main-actor snapshot.
+                    // Any later live frame receives a greater sequence, so an iOS client
+                    // can reject this body if the RPC response loses the race with newer
+                    // output instead of overwriting the newer viewport with stale text.
+                    SurfaceOutputBus.shared.flushNow(sid)
+                    let snapshotSequence = SurfaceOutputBus.shared.currentSequence(sid)
+                    let snapshot = try terminalRouter.readTextSnapshot(surface: sid)
+                    guard var fields = snapshot.objectValue else {
+                        return .init(id: id, result: snapshot)
+                    }
+                    fields["surface_seq"] = .number(Double(snapshotSequence))
+                    return .init(id: id, result: .object(fields))
                 }
                 let text = try router.readText(surface: sid)
                 return .init(id: id, result: .string(text))
@@ -1595,7 +1608,17 @@ public final class JSONRPCDispatcher {
                 guard let sid = params["id"]?.stringValue.flatMap(UUID.init).map(SurfaceID.init) else { throw JSONRPCError.invalidParams }
                 let before = params["before_chunk_id"]?.intValue.map(Int64.init)
                 let maxBytes = params["max_bytes"]?.intValue ?? (256 * 1024)
-                let window = try router.readTerminalHistory(surface: sid, beforeChunkID: before, maxBytes: maxBytes)
+                // Capture the mirror cursor before suspending. The coordinator
+                // serializes its pending write and DB read at this boundary; if
+                // the bounded read times out/throws, the outer error response has
+                // neither text nor sequence and therefore cannot overwrite iOS.
+                SurfaceOutputBus.shared.flushNow(sid)
+                let capturedSequence = SurfaceOutputBus.shared.currentSequence(sid)
+                let window = try await router.readTerminalHistory(
+                    surface: sid,
+                    beforeChunkID: before,
+                    maxBytes: maxBytes
+                )
                 var result: [String: JSONValue] = [
                     "text": .string(window.text),
                     "chunks": .array(window.chunks.map { chunk in
@@ -1608,7 +1631,13 @@ public final class JSONRPCDispatcher {
                     "has_more_older": .bool(window.hasMoreOlder),
                     "next_before_chunk_id": window.nextBeforeChunkID.map { .number(Double($0)) } ?? .null
                 ]
-                result["surface_seq"] = .number(Double(SurfaceOutputBus.shared.currentSequence(sid)))
+                let health = (router as? TerminalCommandRouting)?
+                    .surfaceHealthDetails(surface: sid)
+                    .objectValue
+                result["partial"] = health?["output_partial"] ?? .bool(false)
+                result["partial_reason"] = health?["partial_reason"] ?? .null
+                result["pending_bytes"] = health?["output_pending_bytes"] ?? .number(0)
+                result["surface_seq"] = .number(Double(capturedSequence))
                 return .init(id: id, result: .object(result))
             case "agent.open":
                 guard let wid = params["workspace_id"]?.stringValue.flatMap(UUID.init).map(WorkspaceID.init) else { throw JSONRPCError.invalidParams }
