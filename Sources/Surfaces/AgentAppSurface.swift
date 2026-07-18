@@ -3192,16 +3192,16 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         if selectedProviderSnapshot == nil {
             await loadProviderSnapshots()
         }
-        // `$goal …` autocomplete inserts keep the `$` trigger; providers expect
-        // pass-through commands with `/`. Union snapshot catalog with the universal
-        // pass-through list so every provider normalizes `$goal` → `/goal`.
-        let text = AgentComposerSuggestions.normalizingProviderSlashPrefix(
+        // Canonical first-token triggers for every provider:
+        // commands (`$goal`/`/goal`) → `/…`; skills (`/sam-work`/`$sam-work`) → `$…`.
+        let text = AgentComposerSuggestions.normalizingComposerTriggerPrefix(
             trimmed,
             localSlashCommands: Self.localSlashCommands,
             providerSlashCommands: Array(Set(
                 (selectedProviderSnapshot?.slashCommands ?? [])
                     + AgentComposerSuggestions.passThroughSlashCommands
-            ))
+            )),
+            skills: selectedProviderSnapshot?.skills ?? []
         )
         guard selectedProviderCanRun else {
             statusMessage = providerExecutionUnavailableReason ?? "The selected provider is unavailable."
@@ -4181,36 +4181,72 @@ public enum AgentComposerSuggestions {
         return results
     }
 
-    /// Rewrites `$goal …` → `/goal …` when the bare token is a known slash command.
-    /// Skills keep their `$` prefix (`$sam-work`). Providers such as Codex only
-    /// recognize provider commands with a leading `/`.
+    /// Canonical first-token triggers before provider dispatch (all providers):
+    /// - Known slash commands → `/name` (from `$name` or `/name`)
+    /// - Known skills that are not also commands → `$name` (from `/name` or `$name`)
+    /// Commands win on name collision so `$plan`/`/plan` stay modes, not skills.
+    public static func normalizingComposerTriggerPrefix(
+        _ raw: String,
+        localSlashCommands: [String],
+        providerSlashCommands: [String],
+        skills: [String]
+    ) -> String {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let trigger = trimmed.first, trigger == "/" || trigger == "$" else { return raw }
+        let body = trimmed.dropFirst()
+        let parts = body.split(separator: " ", maxSplits: 1, omittingEmptySubsequences: true)
+        guard let barePart = parts.first else { return raw }
+        let bareRaw = String(barePart)
+        let bareKey = bareRaw.lowercased()
+        guard !bareKey.isEmpty else { return raw }
+
+        func bareCatalog(_ tokens: [String]) -> [String: String] {
+            var map: [String: String] = [:]
+            for token in tokens {
+                let trimmedToken = token.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !trimmedToken.isEmpty else { continue }
+                let name = (trimmedToken.hasPrefix("/") || trimmedToken.hasPrefix("$"))
+                    ? String(trimmedToken.dropFirst())
+                    : trimmedToken
+                let key = name.lowercased()
+                guard !key.isEmpty, map[key] == nil else { continue }
+                map[key] = name
+            }
+            return map
+        }
+
+        let commandCatalog = bareCatalog(localSlashCommands + providerSlashCommands)
+        let skillCatalog = bareCatalog(skills)
+        let argument = parts.count > 1 ? String(parts[1]) : nil
+
+        func compose(prefix: Character, name: String) -> String {
+            if let argument, !argument.isEmpty {
+                return "\(prefix)\(name) \(argument)"
+            }
+            return "\(prefix)\(name)"
+        }
+
+        if let commandName = commandCatalog[bareKey] {
+            return compose(prefix: "/", name: commandName.lowercased())
+        }
+        if let skillName = skillCatalog[bareKey] {
+            return compose(prefix: "$", name: skillName)
+        }
+        return raw
+    }
+
+    /// Compatibility wrapper: command-only rewrite (`$goal` → `/goal`).
     public static func normalizingProviderSlashPrefix(
         _ raw: String,
         localSlashCommands: [String],
         providerSlashCommands: [String]
     ) -> String {
-        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard trimmed.hasPrefix("$") else { return raw }
-        let body = trimmed.dropFirst()
-        let parts = body.split(separator: " ", maxSplits: 1, omittingEmptySubsequences: true)
-        guard let barePart = parts.first else { return raw }
-        let bare = String(barePart).lowercased()
-        guard !bare.isEmpty else { return raw }
-        var known = Set<String>()
-        for command in localSlashCommands + providerSlashCommands {
-            let token = command.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !token.isEmpty else { continue }
-            let name = (token.hasPrefix("/") || token.hasPrefix("$"))
-                ? String(token.dropFirst())
-                : token
-            let lower = name.lowercased()
-            if !lower.isEmpty { known.insert(lower) }
-        }
-        guard known.contains(bare) else { return raw }
-        if parts.count > 1 {
-            return "/\(bare) \(parts[1])"
-        }
-        return "/\(bare)"
+        normalizingComposerTriggerPrefix(
+            raw,
+            localSlashCommands: localSlashCommands,
+            providerSlashCommands: providerSlashCommands,
+            skills: []
+        )
     }
 
     public static func replacingActiveToken(in text: String, cursorOffset: Int? = nil, with replacement: String) -> String {

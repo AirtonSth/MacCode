@@ -995,34 +995,117 @@ final class AgentAppViewModelTests: XCTestCase {
                        "ads-* skills must not occupy the entire first page ahead of /goal /plan")
     }
 
-    func test_normalizingProviderSlashPrefixRewritesDollarGoalButKeepsSkills() {
+    func test_normalizingComposerTriggerPrefix_commandsAndSkillsWithEitherTrigger() {
+        let local = AgentAppViewModel.localSlashCommands
+        let provider = ["/goal", "/review"]
+        let skills = ["sam-work", "sam-codex-advisor"]
+
         XCTAssertEqual(
-            AgentComposerSuggestions.normalizingProviderSlashPrefix(
+            AgentComposerSuggestions.normalizingComposerTriggerPrefix(
                 "$goal continue until done",
-                localSlashCommands: AgentAppViewModel.localSlashCommands,
-                providerSlashCommands: ["/goal", "/review"]
+                localSlashCommands: local,
+                providerSlashCommands: provider,
+                skills: skills
             ),
             "/goal continue until done",
-            "$goal must become /goal so Codex receives a provider-owned command"
+            "$goal must become /goal so providers receive a command token"
         )
         XCTAssertEqual(
-            AgentComposerSuggestions.normalizingProviderSlashPrefix(
+            AgentComposerSuggestions.normalizingComposerTriggerPrefix(
+                "/goal continue until done",
+                localSlashCommands: local,
+                providerSlashCommands: provider,
+                skills: skills
+            ),
+            "/goal continue until done",
+            "/goal must stay a slash command"
+        )
+        XCTAssertEqual(
+            AgentComposerSuggestions.normalizingComposerTriggerPrefix(
                 "$sam-work implement the fix",
-                localSlashCommands: AgentAppViewModel.localSlashCommands,
-                providerSlashCommands: ["/goal"]
+                localSlashCommands: local,
+                providerSlashCommands: provider,
+                skills: skills
             ),
             "$sam-work implement the fix",
-            "skills must keep the $ prefix — they are not slash commands"
+            "$skill must stay the canonical skill trigger"
         )
         XCTAssertEqual(
-            AgentComposerSuggestions.normalizingProviderSlashPrefix(
-                "/goal already slash",
-                localSlashCommands: AgentAppViewModel.localSlashCommands,
-                providerSlashCommands: ["/goal"]
+            AgentComposerSuggestions.normalizingComposerTriggerPrefix(
+                "/sam-work implement the fix",
+                localSlashCommands: local,
+                providerSlashCommands: provider,
+                skills: skills
             ),
-            "/goal already slash",
-            "already-slash provider commands must pass through unchanged"
+            "$sam-work implement the fix",
+            "/skill must normalize to $skill so skills work with either trigger"
         )
+        XCTAssertEqual(
+            AgentComposerSuggestions.normalizingComposerTriggerPrefix(
+                "/sam-codex-advisor review this",
+                localSlashCommands: local,
+                providerSlashCommands: provider,
+                skills: skills
+            ),
+            "$sam-codex-advisor review this",
+            "any known skill under / must rewrite to $"
+        )
+        XCTAssertEqual(
+            AgentComposerSuggestions.normalizingComposerTriggerPrefix(
+                "/plan ship it",
+                localSlashCommands: local,
+                providerSlashCommands: provider,
+                skills: skills
+            ),
+            "/plan ship it",
+            "commands win over skills on name collision — plan stays a mode"
+        )
+        XCTAssertEqual(
+            AgentComposerSuggestions.normalizingComposerTriggerPrefix(
+                "/unknown-thing keep me",
+                localSlashCommands: local,
+                providerSlashCommands: provider,
+                skills: skills
+            ),
+            "/unknown-thing keep me",
+            "unknown first tokens must not be rewritten"
+        )
+    }
+
+    // WHY: users autocomplete skills under / or $; send must forward the canonical $ form.
+    func test_slashSkillSendNormalizesToDollarSkillForProvider() async throws {
+        let (vm, _) = try makeVM()
+        let runner = CapturingProviderRunner(provider: .grok)
+        vm.coordinator.replaceProvider(.grok, runner: runner)
+        vm.provider = .grok
+        vm.providerSnapshots = [
+            AgentProviderSnapshot(
+                id: "grok-cli",
+                provider: .grok,
+                driverKind: .grokCLI,
+                displayName: "Grok",
+                accentColor: "#1DA1F2",
+                continuationGroup: "xai-grok",
+                interactionModes: [.default],
+                enabled: true,
+                installed: true,
+                status: .available,
+                models: [AgentModelDescriptor(id: "grok-4.5", label: "Grok 4.5", provider: .grok)],
+                slashCommands: ["/status", "/goal"],
+                skills: ["sam-work", "sam-codex-advisor"]
+            )
+        ]
+        vm.providerInstanceId = "grok-cli"
+        vm.createThread(title: "slash-skill")
+        vm.prompt = "/sam-work implement the fix"
+
+        await vm.send()
+
+        await waitAsync("slash skill normalizes to dollar skill") {
+            runner.prompts.contains("$sam-work implement the fix")
+        }
+        XCTAssertFalse(runner.prompts.contains(where: { $0.hasPrefix("/sam-work") }),
+                       "/sam-work must not be forwarded literally — skills use $")
     }
 
     func test_applyComposerSuggestionReplacesOnlyActiveToken() throws {
