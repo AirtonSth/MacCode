@@ -3183,13 +3183,22 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     }
 
     public func send() async {
-        let text = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty || !attachments.isEmpty else { return }
+        let trimmed = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty || !attachments.isEmpty else { return }
         // Snapshots can still be empty on first send (seed/load race). Load once
         // before the fail-closed gate so a ready Grok/Codex install is not blocked.
+        // Also needed before `$goal` → `/goal` rewrite so provider slash catalogs
+        // (Codex `/goal`) are available for normalization.
         if selectedProviderSnapshot == nil {
             await loadProviderSnapshots()
         }
+        // `$goal …` autocomplete inserts keep the `$` trigger; Codex (and other
+        // provider CLIs) only recognize provider-owned commands with `/`.
+        let text = AgentComposerSuggestions.normalizingProviderSlashPrefix(
+            trimmed,
+            localSlashCommands: Self.localSlashCommands,
+            providerSlashCommands: selectedProviderSnapshot?.slashCommands ?? []
+        )
         guard selectedProviderCanRun else {
             statusMessage = providerExecutionUnavailableReason ?? "The selected provider is unavailable."
             return
@@ -4120,25 +4129,78 @@ public enum AgentComposerSuggestions {
             ))
         }
 
-        let ordered = ranked(candidates.map(\.bare), query: query)
+        // WHY: skill catalogs are large (50–80+). Ranking every bare name together
+        // with limit=8 buries modes/commands (`/plan`, `/goal`) under ads-* skills
+        // on bare `/`. Emit every matching command first (never truncated by limit),
+        // then fill remaining rows with skills up to max(limit, commandCount).
+        let commandBares = ranked(
+            candidates.filter { $0.kind == .slashCommand }.map(\.bare),
+            query: query
+        )
+        let skillBares = ranked(
+            candidates.filter { $0.kind == .skill }.map(\.bare),
+            query: query
+        )
         var seenBareKind = Set<String>()
         var results: [AgentComposerSuggestion] = []
-        results.reserveCapacity(min(limit, ordered.count))
-        for bare in ordered {
-            for candidate in candidates where candidate.bare.caseInsensitiveCompare(bare) == .orderedSame {
-                let key = "\(candidate.kind)-\(candidate.bare.lowercased())"
-                guard seenBareKind.insert(key).inserted else { continue }
-                let title = "\(prefix)\(candidate.bare)"
-                results.append(AgentComposerSuggestion(
-                    title: title,
-                    subtitle: candidate.subtitle,
-                    insertText: "\(title) ",
-                    kind: candidate.kind
-                ))
-                if results.count >= limit { return results }
+        results.reserveCapacity(max(limit, commandBares.count))
+
+        func append(bares: [String], kind: AgentComposerSuggestion.Kind, stopAt: Int?) {
+            for bare in bares {
+                if let stopAt, results.count >= stopAt { return }
+                for candidate in candidates
+                    where candidate.kind == kind
+                        && candidate.bare.caseInsensitiveCompare(bare) == .orderedSame {
+                    let key = "\(candidate.kind)-\(candidate.bare.lowercased())"
+                    guard seenBareKind.insert(key).inserted else { continue }
+                    let title = "\(prefix)\(candidate.bare)"
+                    results.append(AgentComposerSuggestion(
+                        title: title,
+                        subtitle: candidate.subtitle,
+                        insertText: "\(title) ",
+                        kind: candidate.kind
+                    ))
+                    if let stopAt, results.count >= stopAt { return }
+                }
             }
         }
+
+        append(bares: commandBares, kind: .slashCommand, stopAt: nil)
+        let skillCap = max(limit, results.count)
+        append(bares: skillBares, kind: .skill, stopAt: skillCap)
         return results
+    }
+
+    /// Rewrites `$goal …` → `/goal …` when the bare token is a known slash command.
+    /// Skills keep their `$` prefix (`$sam-work`). Providers such as Codex only
+    /// recognize provider commands with a leading `/`.
+    public static func normalizingProviderSlashPrefix(
+        _ raw: String,
+        localSlashCommands: [String],
+        providerSlashCommands: [String]
+    ) -> String {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.hasPrefix("$") else { return raw }
+        let body = trimmed.dropFirst()
+        let parts = body.split(separator: " ", maxSplits: 1, omittingEmptySubsequences: true)
+        guard let barePart = parts.first else { return raw }
+        let bare = String(barePart).lowercased()
+        guard !bare.isEmpty else { return raw }
+        var known = Set<String>()
+        for command in localSlashCommands + providerSlashCommands {
+            let token = command.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !token.isEmpty else { continue }
+            let name = (token.hasPrefix("/") || token.hasPrefix("$"))
+                ? String(token.dropFirst())
+                : token
+            let lower = name.lowercased()
+            if !lower.isEmpty { known.insert(lower) }
+        }
+        guard known.contains(bare) else { return raw }
+        if parts.count > 1 {
+            return "/\(bare) \(parts[1])"
+        }
+        return "/\(bare)"
     }
 
     public static func replacingActiveToken(in text: String, cursorOffset: Int? = nil, with replacement: String) -> String {

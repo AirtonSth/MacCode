@@ -960,6 +960,71 @@ final class AgentAppViewModelTests: XCTestCase {
         XCTAssertEqual(vm.composerSuggestions.first?.kind, .slashCommand)
     }
 
+    // WHY: real Codex/Grok skill dirs often have 50–80 skills. Ranking them with
+    // modes under a shared limit of 8 buried /goal and /plan under ads-* on bare `/`.
+    func test_composerPrioritizesCommandsOverSkillsUnderCatalogFlood() throws {
+        let flood = (0..<40).map { "ads-skill-\($0)" }
+        let suggestions = AgentComposerSuggestions.suggestions(
+            for: "/",
+            snapshot: AgentProviderSnapshot(
+                id: "codex-cli",
+                provider: .codex,
+                driverKind: .codexCLI,
+                displayName: "Codex",
+                accentColor: "#2F80ED",
+                continuationGroup: "openai-codex",
+                interactionModes: [.default, .plan],
+                enabled: true,
+                installed: true,
+                status: .available,
+                models: [],
+                slashCommands: ["/goal", "/review"],
+                skills: flood
+            ),
+            localSlashCommands: AgentAppViewModel.localSlashCommands,
+            limit: 8
+        )
+        let titles = suggestions.map(\.title)
+        XCTAssertTrue(titles.contains("/goal"),
+                      "/goal must remain discoverable on bare / even when dozens of skills exist")
+        XCTAssertTrue(titles.contains("/plan"),
+                      "/plan must remain discoverable on bare / even when dozens of skills exist")
+        XCTAssertTrue(suggestions.filter { $0.kind == .slashCommand }.count >= 6,
+                      "the first page of bare-/ suggestions must be dominated by commands, not skills")
+        XCTAssertFalse(titles.contains(where: { $0.hasPrefix("/ads-skill-") }),
+                       "ads-* skills must not occupy the entire first page ahead of /goal /plan")
+    }
+
+    func test_normalizingProviderSlashPrefixRewritesDollarGoalButKeepsSkills() {
+        XCTAssertEqual(
+            AgentComposerSuggestions.normalizingProviderSlashPrefix(
+                "$goal continue until done",
+                localSlashCommands: AgentAppViewModel.localSlashCommands,
+                providerSlashCommands: ["/goal", "/review"]
+            ),
+            "/goal continue until done",
+            "$goal must become /goal so Codex receives a provider-owned command"
+        )
+        XCTAssertEqual(
+            AgentComposerSuggestions.normalizingProviderSlashPrefix(
+                "$sam-work implement the fix",
+                localSlashCommands: AgentAppViewModel.localSlashCommands,
+                providerSlashCommands: ["/goal"]
+            ),
+            "$sam-work implement the fix",
+            "skills must keep the $ prefix — they are not slash commands"
+        )
+        XCTAssertEqual(
+            AgentComposerSuggestions.normalizingProviderSlashPrefix(
+                "/goal already slash",
+                localSlashCommands: AgentAppViewModel.localSlashCommands,
+                providerSlashCommands: ["/goal"]
+            ),
+            "/goal already slash",
+            "already-slash provider commands must pass through unchanged"
+        )
+    }
+
     func test_applyComposerSuggestionReplacesOnlyActiveToken() throws {
         let (vm, _) = try makeVM()
         vm.prompt = "before $sam-r"
@@ -3029,6 +3094,42 @@ final class AgentAppViewModelTests: XCTestCase {
         }
         XCTAssertFalse(vm.messages.contains { $0.role == .system && $0.content.contains("Unknown command") },
                        "unknown slash commands must not be converted into local errors because providers own commands such as /goal")
+    }
+
+    // WHY: autocomplete insert keeps the typed `$` trigger; Codex only understands /goal.
+    func test_dollarGoalSendNormalizesToSlashGoalForProvider() async throws {
+        let (vm, _) = try makeVM()
+        let runner = CapturingProviderRunner(provider: .codex)
+        vm.coordinator.replaceProvider(.codex, runner: runner)
+        vm.provider = .codex
+        vm.providerSnapshots = [
+            AgentProviderSnapshot(
+                id: "codex-cli",
+                provider: .codex,
+                driverKind: .codexCLI,
+                displayName: "Codex",
+                accentColor: "#2F80ED",
+                continuationGroup: "openai-codex",
+                interactionModes: [.default, .plan],
+                enabled: true,
+                installed: true,
+                status: .available,
+                models: [AgentModelDescriptor(id: "gpt-5.5", label: "GPT-5.5", provider: .codex)],
+                slashCommands: ["/goal", "/review"],
+                skills: ["sam-work"]
+            )
+        ]
+        vm.providerInstanceId = "codex-cli"
+        vm.createThread(title: "dollar-goal")
+        vm.prompt = "$goal continue until the audit is implemented"
+
+        await vm.send()
+
+        await waitAsync("dollar-goal normalizes to slash-goal for the provider") {
+            runner.prompts.contains("/goal continue until the audit is implemented")
+        }
+        XCTAssertFalse(runner.prompts.contains(where: { $0.hasPrefix("$goal") }),
+                       "$goal must not be forwarded literally — Codex treats only /goal as the command")
     }
 
     func test_sendingNewPromptClearsStaleVisibleError() async throws {
