@@ -948,6 +948,16 @@ final class AgentAppViewModelTests: XCTestCase {
         vm.prompt = "$sam-codex"
         XCTAssertEqual(vm.composerSuggestions.map(\.insertText), ["$sam-codex-advisor "],
                        "partial $ skill queries must rank prefix matches for every provider")
+
+        // Shared catalog: either trigger surfaces skills and modes with the typed prefix.
+        vm.prompt = "/sam-work"
+        XCTAssertEqual(vm.composerSuggestions.map(\.insertText), ["/sam-work "],
+                       "/sam-work must autocomplete skills under the slash trigger")
+        XCTAssertEqual(vm.composerSuggestions.first?.kind, .skill)
+        vm.prompt = "$stat"
+        XCTAssertEqual(vm.composerSuggestions.map(\.insertText), ["$status "],
+                       "$status must autocomplete modes under the dollar trigger")
+        XCTAssertEqual(vm.composerSuggestions.first?.kind, .slashCommand)
     }
 
     func test_applyComposerSuggestionReplacesOnlyActiveToken() throws {

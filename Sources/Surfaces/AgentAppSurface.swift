@@ -3024,7 +3024,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
 
     private static func localSlashCommandParts(_ raw: String) -> (command: String, argument: String)? {
         let line = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard line.hasPrefix("/") else { return nil }
+        // Accept `/` and `$` so autocomplete insert of `$clear` / `$plan` still
+        // hits the local RemoteCode command path (parity with slash trigger).
+        guard let first = line.first, first == "/" || first == "$" else { return nil }
         let parts = line.dropFirst().split(separator: " ", maxSplits: 1).map(String.init)
         return (
             parts.first?.lowercased() ?? "",
@@ -3217,7 +3219,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             )
             return
         }
-        if text.hasPrefix("/"), handleSlashCommand(text) {
+        if (text.hasPrefix("/") || text.hasPrefix("$")), handleSlashCommand(text) {
             prompt = ""
             return
         }
@@ -4082,28 +4084,61 @@ public enum AgentComposerSuggestions {
         limit: Int = 8
     ) -> [AgentComposerSuggestion] {
         let token = activeToken(in: text, cursorOffset: cursorOffset)
-        guard token.hasPrefix("/") || token.hasPrefix("$") else { return [] }
+        // Both `/` and `$` open the same mixed catalog: modes/commands + skills.
+        // Insert text keeps the typed trigger so `/sam-work` and `$goal` work.
+        guard let trigger = token.first, trigger == "/" || trigger == "$" else { return [] }
+        let prefix = String(trigger)
         let query = String(token.dropFirst()).lowercased()
-        if token.hasPrefix("$") {
-            return ranked(snapshot?.skills ?? [], query: query)
-                .prefix(limit)
-                .map {
-                    AgentComposerSuggestion(
-                        title: "$\($0)",
-                        subtitle: "\(snapshot?.displayName ?? "Provider") skill",
-                        insertText: "$\($0) ",
-                        kind: .skill
-                    )
-                }
-        }
+        let display = snapshot?.displayName ?? "Provider"
         let providerCommands = snapshot?.slashCommands ?? []
-        let allCommands = Array(Set(localSlashCommands + providerCommands)).sorted()
-        return ranked(allCommands, query: query)
-            .prefix(limit)
-            .map { command in
-                let source = localSlashCommands.contains(command) ? "RemoteCode command" : "\(snapshot?.displayName ?? "Provider") command"
-                return AgentComposerSuggestion(title: command, subtitle: source, insertText: "\(command) ", kind: .slashCommand)
+        let allCommands = Array(Set(localSlashCommands + providerCommands))
+        let skills = snapshot?.skills ?? []
+
+        struct Candidate: Equatable {
+            let bare: String
+            let kind: AgentComposerSuggestion.Kind
+            let subtitle: String
+        }
+
+        var candidates: [Candidate] = []
+        candidates.reserveCapacity(allCommands.count + skills.count)
+        for command in allCommands {
+            let bare = command.hasPrefix("/") || command.hasPrefix("$")
+                ? String(command.dropFirst())
+                : command
+            guard !bare.isEmpty else { continue }
+            let source = localSlashCommands.contains(command) || localSlashCommands.contains("/\(bare)")
+                ? "RemoteCode command"
+                : "\(display) command"
+            candidates.append(Candidate(bare: bare, kind: .slashCommand, subtitle: source))
+        }
+        for skill in skills where !skill.isEmpty {
+            candidates.append(Candidate(
+                bare: skill,
+                kind: .skill,
+                subtitle: "\(display) skill"
+            ))
+        }
+
+        let ordered = ranked(candidates.map(\.bare), query: query)
+        var seenBareKind = Set<String>()
+        var results: [AgentComposerSuggestion] = []
+        results.reserveCapacity(min(limit, ordered.count))
+        for bare in ordered {
+            for candidate in candidates where candidate.bare.caseInsensitiveCompare(bare) == .orderedSame {
+                let key = "\(candidate.kind)-\(candidate.bare.lowercased())"
+                guard seenBareKind.insert(key).inserted else { continue }
+                let title = "\(prefix)\(candidate.bare)"
+                results.append(AgentComposerSuggestion(
+                    title: title,
+                    subtitle: candidate.subtitle,
+                    insertText: "\(title) ",
+                    kind: candidate.kind
+                ))
+                if results.count >= limit { return results }
             }
+        }
+        return results
     }
 
     public static func replacingActiveToken(in text: String, cursorOffset: Int? = nil, with replacement: String) -> String {
