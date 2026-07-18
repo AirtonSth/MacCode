@@ -161,6 +161,25 @@ final class AgentProviderSnapshotTests: XCTestCase {
         XCTAssertEqual(snapshot.models.first?.provider, .grok)
         XCTAssertFalse(snapshot.slashCommands.isEmpty,
                        "composer slash defaults must exist for Grok like other providers")
+        XCTAssertTrue(snapshot.slashCommands.contains("/goal"),
+                      "Grok must advertise /goal so composer autocomplete and $goal work on every provider")
+    }
+
+    func test_everyProviderDefaultSlashCatalogIncludesGoal() {
+        let models: [AgentProvider: [AgentModelDescriptor]] = [
+            .codex: [AgentModelDescriptor(id: "gpt-5.5", label: "GPT-5.5", provider: .codex)],
+            .claude: [AgentModelDescriptor(id: "claude-sonnet-4-6", label: "Claude Sonnet 4.6", provider: .claude)],
+            .grok: [AgentModelDescriptor(id: "grok-4.5", label: "Grok 4.5", provider: .grok)]
+        ]
+        for provider in AgentProvider.allCases {
+            let snapshot = AgentProviderSnapshotFactory.snapshot(
+                provider: provider,
+                models: models[provider] ?? [],
+                binaryPath: "/usr/local/bin/\(provider.rawValue)"
+            )
+            XCTAssertTrue(snapshot.slashCommands.contains("/goal"),
+                          "\(provider.rawValue) snapshot defaults must include /goal for cross-provider composer parity")
+        }
     }
 
     func test_grokWireDecodeDoesNotRemapToCodexOrClaude() throws {

@@ -3096,7 +3096,7 @@ final class AgentAppViewModelTests: XCTestCase {
                        "unknown slash commands must not be converted into local errors because providers own commands such as /goal")
     }
 
-    // WHY: autocomplete insert keeps the typed `$` trigger; Codex only understands /goal.
+    // WHY: autocomplete insert keeps the typed `$` trigger; every provider expects /goal.
     func test_dollarGoalSendNormalizesToSlashGoalForProvider() async throws {
         let (vm, _) = try makeVM()
         let runner = CapturingProviderRunner(provider: .codex)
@@ -3129,7 +3129,57 @@ final class AgentAppViewModelTests: XCTestCase {
             runner.prompts.contains("/goal continue until the audit is implemented")
         }
         XCTAssertFalse(runner.prompts.contains(where: { $0.hasPrefix("$goal") }),
-                       "$goal must not be forwarded literally — Codex treats only /goal as the command")
+                       "$goal must not be forwarded literally — providers expect /goal as the command")
+    }
+
+    // WHY: Grok/Claude snapshots previously omitted /goal; $goal must still normalize
+    // and autocomplete must still surface /goal via the universal pass-through list.
+    func test_goalWorksOnGrokAndClaudeEvenWhenSnapshotOmitsGoal() async throws {
+        for provider in [AgentProvider.grok, .claude] {
+            let (vm, _) = try makeVM()
+            let runner = CapturingProviderRunner(provider: provider)
+            vm.coordinator.replaceProvider(provider, runner: runner)
+            vm.provider = provider
+            let instanceId = "\(provider.rawValue)-cli"
+            vm.providerSnapshots = [
+                AgentProviderSnapshot(
+                    id: instanceId,
+                    provider: provider,
+                    driverKind: provider == .grok ? .grokCLI : .claudeCLI,
+                    displayName: provider.rawValue.capitalized,
+                    accentColor: "#000000",
+                    continuationGroup: provider.rawValue,
+                    interactionModes: [.default],
+                    enabled: true,
+                    installed: true,
+                    status: .available,
+                    models: [AgentModelDescriptor(
+                        id: "m",
+                        label: "M",
+                        provider: provider
+                    )],
+                    // Deliberately omit /goal — pass-through must still supply it.
+                    slashCommands: ["/status"],
+                    skills: ["sam-work"]
+                )
+            ]
+            vm.providerInstanceId = instanceId
+
+            vm.prompt = "/go"
+            XCTAssertTrue(vm.composerSuggestions.map(\.insertText).contains("/goal "),
+                          "\(provider.rawValue) must autocomplete /goal even when the snapshot omits it")
+
+            vm.prompt = "$go"
+            XCTAssertTrue(vm.composerSuggestions.map(\.insertText).contains("$goal "),
+                          "\(provider.rawValue) must autocomplete $goal even when the snapshot omits it")
+
+            vm.createThread(title: "goal-\(provider.rawValue)")
+            vm.prompt = "$goal ship the fix"
+            await vm.send()
+            await waitAsync("\(provider.rawValue) $goal normalizes to /goal") {
+                runner.prompts.contains("/goal ship the fix")
+            }
+        }
     }
 
     func test_sendingNewPromptClearsStaleVisibleError() async throws {

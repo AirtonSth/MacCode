@@ -3192,12 +3192,16 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         if selectedProviderSnapshot == nil {
             await loadProviderSnapshots()
         }
-        // `$goal …` autocomplete inserts keep the `$` trigger; Codex (and other
-        // provider CLIs) only recognize provider-owned commands with `/`.
+        // `$goal …` autocomplete inserts keep the `$` trigger; providers expect
+        // pass-through commands with `/`. Union snapshot catalog with the universal
+        // pass-through list so every provider normalizes `$goal` → `/goal`.
         let text = AgentComposerSuggestions.normalizingProviderSlashPrefix(
             trimmed,
             localSlashCommands: Self.localSlashCommands,
-            providerSlashCommands: selectedProviderSnapshot?.slashCommands ?? []
+            providerSlashCommands: Array(Set(
+                (selectedProviderSnapshot?.slashCommands ?? [])
+                    + AgentComposerSuggestions.passThroughSlashCommands
+            ))
         )
         guard selectedProviderCanRun else {
             statusMessage = providerExecutionUnavailableReason ?? "The selected provider is unavailable."
@@ -4085,6 +4089,12 @@ public struct AgentComposerSuggestion: Identifiable, Equatable, Sendable {
 }
 
 public enum AgentComposerSuggestions {
+    /// Provider-pass-through commands available on every Agent provider (Codex,
+    /// Claude, Grok). Not RemoteCode-local handlers — `send` forwards them as the
+    /// first user token. Always merged into autocomplete + `$`→`/` normalization so
+    /// a stale/empty snapshot cannot hide `/goal`.
+    public static let passThroughSlashCommands = ["/goal"]
+
     public static func suggestions(
         for text: String,
         cursorOffset: Int? = nil,
@@ -4099,7 +4109,7 @@ public enum AgentComposerSuggestions {
         let prefix = String(trigger)
         let query = String(token.dropFirst()).lowercased()
         let display = snapshot?.displayName ?? "Provider"
-        let providerCommands = snapshot?.slashCommands ?? []
+        let providerCommands = Array(Set((snapshot?.slashCommands ?? []) + passThroughSlashCommands))
         let allCommands = Array(Set(localSlashCommands + providerCommands))
         let skills = snapshot?.skills ?? []
 

@@ -857,9 +857,11 @@ public enum AgentProviderSnapshotFactory {
                 environmentKeys: environmentKeys,
                 models: models,
                 slashCommands: uniqueSlashCommands(
+                    // `/goal` is a universal pass-through prompt command (Codex-native;
+                    // Claude/Grok receive it as the first user token, same as `/goal` in composer).
                     defaults: (interactionModesOverride ?? [.default, .plan]).contains(.plan)
-                        ? ["/clear", "/default", "/model", "/plan", "/status", "/fork"]
-                        : ["/clear", "/default", "/model", "/status"],
+                        ? ["/clear", "/default", "/model", "/plan", "/status", "/fork", "/goal"]
+                        : ["/clear", "/default", "/model", "/status", "/goal"],
                     probed: slashCommands
                 ),
                 skills: unique(skills),
@@ -915,9 +917,11 @@ public enum AgentProviderSnapshotFactory {
                 environmentKeys: environmentKeys,
                 models: models,
                 slashCommands: uniqueSlashCommands(
+                    // `/goal` offered on every provider so composer autocomplete and
+                    // `$goal` → `/goal` normalization work for Codex, Claude, and Grok.
                     defaults: (interactionModesOverride ?? [.default]).contains(.plan)
-                        ? ["/clear", "/default", "/model", "/plan", "/status"]
-                        : ["/clear", "/default", "/model", "/status"],
+                        ? ["/clear", "/default", "/model", "/plan", "/status", "/goal"]
+                        : ["/clear", "/default", "/model", "/status", "/goal"],
                     probed: slashCommands
                 ),
                 skills: unique(skills),
