@@ -920,6 +920,34 @@ final class AgentAppViewModelTests: XCTestCase {
         vm.prompt = "use $sam-f"
         XCTAssertEqual(vm.composerSuggestions.map(\.insertText), ["$sam-fix-bug "],
                        "Codex skills from the provider snapshot must be selectable from the composer")
+
+        vm.providerSnapshots = [
+            AgentProviderSnapshot(
+                id: "grok-cli",
+                provider: .grok,
+                driverKind: .grokCLI,
+                displayName: "Grok",
+                accentColor: "#1DA1F2",
+                continuationGroup: "xai-grok",
+                interactionModes: [.default],
+                enabled: true,
+                installed: true,
+                status: .available,
+                models: [],
+                slashCommands: ["/status"],
+                skills: ["sam-work", "sam-codex-advisor", "sam-fix-bug"]
+            )
+        ]
+        vm.provider = .grok
+        vm.providerInstanceId = "grok-cli"
+        vm.prompt = "$sam-work"
+        XCTAssertEqual(vm.composerSuggestions.map(\.insertText), ["$sam-work "],
+                       "Grok skills must autocomplete from the provider snapshot with $ prefix")
+        XCTAssertEqual(vm.composerSuggestions.first?.subtitle, "Grok skill",
+                       "skill subtitle must use the active provider display name, not a hard-coded Codex label")
+        vm.prompt = "$sam-codex"
+        XCTAssertEqual(vm.composerSuggestions.map(\.insertText), ["$sam-codex-advisor "],
+                       "partial $ skill queries must rank prefix matches for every provider")
     }
 
     func test_applyComposerSuggestionReplacesOnlyActiveToken() throws {

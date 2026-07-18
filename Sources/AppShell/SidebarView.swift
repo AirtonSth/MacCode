@@ -2555,6 +2555,15 @@ public struct SidebarRootView: View {
         )
     }
 
+    /// Managed providers ordered by used-limit progress (desc) for the selected
+    /// scope — same order as concentric rings after Token Saver.
+    private func tokenSaverProvidersByUsage(
+        in snapshot: TokenSaverUsageSnapshot,
+        scope: TokenSaverUsageScope
+    ) -> [AgentProvider] {
+        tokenSaverActivityRingValues(for: snapshot, scope: scope).providersOuterToInner
+    }
+
     private var tokenSaverActivityAccessibilityValue: String {
         let snapshot = vm.tokenSaverUsageSnapshot
         let ringVals = tokenSaverActivityRingValues(for: snapshot, scope: tokenSaverDetailsScope)
@@ -2844,9 +2853,10 @@ public struct SidebarRootView: View {
             Divider()
 
             VStack(alignment: .leading, spacing: DS.Space.sm) {
-                tokenSaverProviderRow(provider: .claude)
-                tokenSaverProviderRow(provider: .codex)
-                tokenSaverProviderRow(provider: .grok)
+                // Same usage-desc order as the concentric rings (after Token Saver).
+                ForEach(tokenSaverProvidersByUsage(in: tokenSaverDetailsSnapshot, scope: tokenSaverDetailsScope), id: \.self) { provider in
+                    tokenSaverProviderRow(provider: provider)
+                }
                 if let other = tokenSaverScopedOtherSavings() {
                     tokenSaverOtherSavingsRow(saved: other.savedTokens, runs: other.runs)
                 }
@@ -2886,21 +2896,14 @@ public struct SidebarRootView: View {
                     label: "Token Saver",
                     value: tokenSaverSavingsSummary(for: snapshot, scope: tokenSaverDetailsScope)
                 )
-                tokenSaverRingLegendRow(
-                    color: tokenSaverProviderColor(.claude),
-                    label: tokenSaverProviderTitle(.claude),
-                    value: tokenSaverLimitSummary(provider: .claude, in: snapshot, scope: tokenSaverDetailsScope)
-                )
-                tokenSaverRingLegendRow(
-                    color: tokenSaverProviderColor(.codex),
-                    label: tokenSaverProviderTitle(.codex),
-                    value: tokenSaverLimitSummary(provider: .codex, in: snapshot, scope: tokenSaverDetailsScope)
-                )
-                tokenSaverRingLegendRow(
-                    color: tokenSaverProviderColor(.grok),
-                    label: tokenSaverProviderTitle(.grok),
-                    value: tokenSaverLimitSummary(provider: .grok, in: snapshot, scope: tokenSaverDetailsScope)
-                )
+                // Legend matches concentric rings: Token Saver first, then usage desc.
+                ForEach(detailsRingVals.providersOuterToInner, id: \.self) { provider in
+                    tokenSaverRingLegendRow(
+                        color: tokenSaverProviderColor(provider),
+                        label: tokenSaverProviderTitle(provider),
+                        value: tokenSaverLimitSummary(provider: provider, in: snapshot, scope: tokenSaverDetailsScope)
+                    )
+                }
                 Text("Showing \(tokenSaverLimitScopeTitle(for: tokenSaverDetailsScope))")
                     .font(DS.Font.caption2)
                     .foregroundColor(DS.Palette.textTertiary)
@@ -3385,12 +3388,55 @@ public struct SidebarRootView: View {
         return "Token Saver rings, \(scope): saved \(savedStr) tokens toward \(goalStr) target (\(savedPct)%), Claude used \(claudePct)%, Codex used \(codexPct)%, Grok used \(grokPct)%"
     }
 
+    /// WHY: concentric rings must read as "biggest usage outer". Token Saver is
+    /// always the outermost ring; managed providers sort by used-progress desc
+    /// so the chart matches the legend (e.g. Token Saver → Grok 46% → Claude 45% → Codex 7%).
+    enum TokenSaverRingOrdering {
+        /// Provider rings outer → inner (after Token Saver). Higher usage is outer.
+        /// Ties keep a stable claude < codex < grok secondary order.
+        nonisolated static func providersOuterToInner(
+            claudeUsedProgress: Double,
+            codexUsedProgress: Double,
+            grokUsedProgress: Double
+        ) -> [AgentProvider] {
+            let items: [(AgentProvider, Double)] = [
+                (.claude, claudeUsedProgress),
+                (.codex, codexUsedProgress),
+                (.grok, grokUsedProgress)
+            ]
+            let secondary: [AgentProvider: Int] = [.claude: 0, .codex: 1, .grok: 2]
+            return items
+                .sorted { lhs, rhs in
+                    if lhs.1 != rhs.1 { return lhs.1 > rhs.1 }
+                    return (secondary[lhs.0] ?? 99) < (secondary[rhs.0] ?? 99)
+                }
+                .map(\.0)
+        }
+    }
+
     struct TokenSaverActivityRings: View {
         struct Values: Equatable {
             let tokenSaverProgress: Double
             let claudeUsedProgress: Double
             let codexUsedProgress: Double
             let grokUsedProgress: Double
+
+            /// Managed providers outer → inner after the always-outer Token Saver ring.
+            var providersOuterToInner: [AgentProvider] {
+                TokenSaverRingOrdering.providersOuterToInner(
+                    claudeUsedProgress: claudeUsedProgress,
+                    codexUsedProgress: codexUsedProgress,
+                    grokUsedProgress: grokUsedProgress
+                )
+            }
+
+            func usedProgress(for provider: AgentProvider) -> Double {
+                switch provider {
+                case .claude: return claudeUsedProgress
+                case .codex: return codexUsedProgress
+                case .grok: return grokUsedProgress
+                }
+            }
         }
 
         let values: Values
@@ -3398,6 +3444,15 @@ public struct SidebarRootView: View {
         /// (legacy behaviour when caller cannot supply values; should not occur in
         /// production paths).
         var a11yLabel: String? = nil
+
+        /// Geometry slots outer → inner (Token Saver + 3 provider rings).
+        /// Line widths taper inward so the outer ring stays dominant.
+        private static let ringSlots: [(inset: CGFloat, lineWidth: CGFloat)] = [
+            (2.0, 4.0),
+            (7.4, 3.0),
+            (12.2, 2.2),
+            (16.6, 1.8)
+        ]
 
         var body: some View {
             GeometryReader { proxy in
@@ -3414,12 +3469,33 @@ public struct SidebarRootView: View {
 
         private func scaledContent(side: CGFloat) -> some View {
             let scale = max(side / 34.0, 0.1)
+            let providers = values.providersOuterToInner
+            let slots = Self.ringSlots
             return ZStack {
-                TokenSaverActivityRing(progress: values.tokenSaverProgress, color: DS.Palette.success, inset: 2 * scale, lineWidth: 4.0 * scale)
-                TokenSaverActivityRing(progress: values.claudeUsedProgress, color: Color(nsColor: .systemOrange), inset: 7.4 * scale, lineWidth: 3.0 * scale)
-                TokenSaverActivityRing(progress: values.codexUsedProgress, color: Color(nsColor: .systemBlue), inset: 12.2 * scale, lineWidth: 2.2 * scale)
-                // Innermost: Grok purple ring (requested product color).
-                TokenSaverActivityRing(progress: values.grokUsedProgress, color: Color(nsColor: .systemPurple), inset: 16.6 * scale, lineWidth: 1.8 * scale)
+                // Slot 0: Token Saver always outermost.
+                TokenSaverActivityRing(
+                    progress: values.tokenSaverProgress,
+                    color: DS.Palette.success,
+                    inset: slots[0].inset * scale,
+                    lineWidth: slots[0].lineWidth * scale
+                )
+                ForEach(Array(providers.enumerated()), id: \.element) { index, provider in
+                    let slot = slots[min(index + 1, slots.count - 1)]
+                    TokenSaverActivityRing(
+                        progress: values.usedProgress(for: provider),
+                        color: tokenSaverProviderRingColor(provider),
+                        inset: slot.inset * scale,
+                        lineWidth: slot.lineWidth * scale
+                    )
+                }
+            }
+        }
+
+        private func tokenSaverProviderRingColor(_ provider: AgentProvider) -> Color {
+            switch provider {
+            case .claude: return Color(nsColor: .systemOrange)
+            case .codex: return Color(nsColor: .systemBlue)
+            case .grok: return Color(nsColor: .systemPurple)
             }
         }
     }

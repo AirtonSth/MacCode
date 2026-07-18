@@ -82,6 +82,29 @@ final class ComposerSuggestionPopupTests: XCTestCase {
         XCTAssertFalse(ComposerSuggestionNavigation.isOpen(count: 0, dismissed: true))
     }
 
+    // MARK: - Placement (inline panel between editor and toolbar)
+
+    // WHY: the panel height must cap at 6 rows so a long slash/skill list cannot
+    // shove the toolbar off-screen or reintroduce the caret-overlay collision.
+    func testPlacementCapsVisibleRowsAtSix() {
+        let layout = ComposerSuggestionPlacement.layout(suggestionCount: 20)
+        XCTAssertEqual(layout.height, 6 * ComposerSuggestionPlacement.defaultRowHeight)
+        XCTAssertEqual(layout.maxVisibleRows, 6)
+    }
+
+    // WHY: empty suggestion sets must produce a zero-height panel so the composer
+    // does not reserve dead space when the popup is closed.
+    func testPlacementZeroWhenEmpty() {
+        let layout = ComposerSuggestionPlacement.layout(suggestionCount: 0)
+        XCTAssertEqual(layout.height, 0)
+    }
+
+    // WHY: short lists size exactly to their row count (no empty scroll chrome).
+    func testPlacementExactHeightForShortList() {
+        let layout = ComposerSuggestionPlacement.layout(suggestionCount: 2)
+        XCTAssertEqual(layout.height, 2 * ComposerSuggestionPlacement.defaultRowHeight)
+    }
+
     // MARK: - Key resolution when popup is OPEN
 
     private let noMods: NSEvent.ModifierFlags = []

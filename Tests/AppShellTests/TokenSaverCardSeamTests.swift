@@ -291,6 +291,42 @@ final class TokenSaverCardSeamTests: XCTestCase {
         XCTAssertFalse(label.isEmpty)
     }
 
+    // MARK: - Ring ordering by usage
+
+    func test_ringOrdering_tokenSaverAlwaysOuter_providersByUsageDesc() {
+        // WHY: screenshot contract — Token Saver is always the largest/outer ring;
+        // providers sort by used % desc (Grok 46% > Claude 45% > Codex 7%).
+        let order = SidebarRootView.TokenSaverRingOrdering.providersOuterToInner(
+            claudeUsedProgress: 0.45,
+            codexUsedProgress: 0.07,
+            grokUsedProgress: 0.46
+        )
+        XCTAssertEqual(order, [.grok, .claude, .codex],
+                       "rings must order providers by usage desc after Token Saver")
+    }
+
+    func test_ringOrdering_valuesExposeSameOuterToInnerOrder() {
+        let values = SidebarRootView.TokenSaverActivityRings.Values(
+            tokenSaverProgress: 1.0,
+            claudeUsedProgress: 0.45,
+            codexUsedProgress: 0.07,
+            grokUsedProgress: 0.46
+        )
+        XCTAssertEqual(values.providersOuterToInner, [.grok, .claude, .codex])
+        XCTAssertEqual(values.usedProgress(for: .grok), 0.46)
+    }
+
+    func test_ringOrdering_tiesUseStableSecondaryOrder() {
+        // WHY: equal usage must not thrash ring order frame-to-frame.
+        let order = SidebarRootView.TokenSaverRingOrdering.providersOuterToInner(
+            claudeUsedProgress: 0.5,
+            codexUsedProgress: 0.5,
+            grokUsedProgress: 0.5
+        )
+        XCTAssertEqual(order, [.claude, .codex, .grok],
+                       "equal usage keeps stable claude < codex < grok secondary order")
+    }
+
     func test_managedProviderIDs_includeGrok() {
         // WHY: Grok savings must count in managed rows, not collapse into "CLI & other".
         XCTAssertTrue(TokenSaverSavingsDisplay.managedProviderIDs.contains("grok"),

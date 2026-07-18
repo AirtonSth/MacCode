@@ -4172,13 +4172,27 @@ public enum AgentComposerSuggestions {
     private static func ranked(_ values: [String], query: String) -> [String] {
         let unique = Array(Set(values)).sorted()
         guard !query.isEmpty else { return unique }
+        let normalizedQuery = query.hasPrefix("$") || query.hasPrefix("/")
+            ? String(query.dropFirst()).lowercased()
+            : query
+        guard !normalizedQuery.isEmpty else { return unique }
         return unique
-            .filter { $0.lowercased().contains(query) }
+            .filter {
+                let value = $0.lowercased()
+                let bare = value.hasPrefix("/") || value.hasPrefix("$")
+                    ? String(value.dropFirst())
+                    : value
+                return bare.contains(normalizedQuery) || value.contains(normalizedQuery)
+            }
             .sorted { lhs, rhs in
                 let l = lhs.lowercased()
                 let r = rhs.lowercased()
-                let lp = l.hasPrefix(query) || l.hasPrefix("/\(query)")
-                let rp = r.hasPrefix(query) || r.hasPrefix("/\(query)")
+                let lBare = l.hasPrefix("/") || l.hasPrefix("$") ? String(l.dropFirst()) : l
+                let rBare = r.hasPrefix("/") || r.hasPrefix("$") ? String(r.dropFirst()) : r
+                let lp = lBare.hasPrefix(normalizedQuery) || l.hasPrefix(normalizedQuery)
+                    || l.hasPrefix("/\(normalizedQuery)") || l.hasPrefix("$\(normalizedQuery)")
+                let rp = rBare.hasPrefix(normalizedQuery) || r.hasPrefix(normalizedQuery)
+                    || r.hasPrefix("/\(normalizedQuery)") || r.hasPrefix("$\(normalizedQuery)")
                 if lp != rp { return lp }
                 return lhs < rhs
             }
@@ -4549,12 +4563,10 @@ public struct AgentAppView: View {
     @State private var timelineDropTargeted = false
     @State private var timelineScrollScheduler = TimelineScrollScheduler()
     @State private var composerEditorHeight: CGFloat = PromptComposerEditor.minHeight
-    // macos:32: caret-anchored suggestion popup state. selection nil == nothing
-    // highlighted; dismissed == user pressed Esc for the current token. caretRect
-    // is in the editor's own coordinate space (origin top-left in SwiftUI overlay).
+    // macos:32: suggestion popup state. selection nil == nothing highlighted;
+    // dismissed == user pressed Esc for the current token.
     @State private var suggestionSelectedIndex: Int? = nil
     @State private var suggestionPopupDismissed = false
-    @State private var composerCaretRect: CGRect = .zero
     @AppStorage("agent.threadRail.intent.v1") private var threadRailIntentRaw = AdaptiveSidebarIntent.auto.rawValue
     @AppStorage("agent.planSidebar.intent.v1") private var planSidebarIntentRaw = AdaptiveSidebarIntent.auto.rawValue
     @State private var showThreadRail = true
@@ -7868,7 +7880,7 @@ public struct AgentAppView: View {
                 },
                 onFileDrop: { paths in vm.insertDroppedFilePaths(paths) },
                 onCursorMoved: { offset in vm.composerCursorOffset = offset },
-                onCaretRectChanged: { rect in composerCaretRect = rect },
+                onCaretRectChanged: { _ in },
                 popupIsOpen: {
                     ComposerSuggestionNavigation.isOpen(
                         count: vm.composerSuggestions.count,
@@ -7895,12 +7907,15 @@ public struct AgentAppView: View {
             .padding(.top, DS.Space.sm)
             .padding(.bottom, DS.Space.xs)
             .accessibilityIdentifier("agent.composer.input")
-            .overlay(alignment: .topLeading) { suggestionPopup }
             // macos:32: reset selection + un-dismiss whenever the suggestion set
             // changes identity/count (new token, or token edited into a new list).
             .onChange(of: vm.composerSuggestions.map(\.id)) { _ in
                 suggestionSelectedIndex = ComposerSuggestionNavigation.reset()
             }
+            // WHY: inline panel between editor and toolbar. A caret-overlay on the
+            // editor painted *under* the toolbar sibling and mixed with pills when
+            // the popup opened downward. Owning layout space avoids z-order fights.
+            suggestionPopup
             composerToolbar
         }
         .background(DS.Palette.surface)
@@ -8013,39 +8028,35 @@ public struct AgentAppView: View {
         suggestionPopupDismissed = true
     }
 
-    // macos:32: caret-anchored, keyboard-navigable suggestion popup. Replaces the
-    // former horizontal chip row. Anchored to the caret rect, positioned ABOVE the
-    // caret when there is room, else below.
+    // macos:32: keyboard-navigable suggestion panel. Sits between the editor and
+    // the composer toolbar so slash/skill rows never paint under attach/model/
+    // permission pills (caret-overlay + place-below collided with that toolbar).
     @ViewBuilder
     private var suggestionPopup: some View {
         let suggestions = vm.composerSuggestions
         if ComposerSuggestionNavigation.isOpen(count: suggestions.count, dismissed: suggestionPopupDismissed) {
-            let rowHeight: CGFloat = 30
-            let popupHeight = min(CGFloat(suggestions.count), 6) * rowHeight
-            let placeAbove = composerCaretRect.minY >= popupHeight + 6
-            let yOffset = placeAbove
-                ? composerCaretRect.minY - popupHeight - 4
-                : composerCaretRect.maxY + 4
+            let layout = ComposerSuggestionPlacement.layout(suggestionCount: suggestions.count)
             VStack(spacing: 0) {
-                ScrollView(.vertical, showsIndicators: suggestions.count > 6) {
+                ScrollView(.vertical, showsIndicators: suggestions.count > layout.maxVisibleRows) {
                     VStack(spacing: 0) {
                         ForEach(Array(suggestions.enumerated()), id: \.element.id) { index, suggestion in
                             suggestionRow(suggestion, highlighted: index == suggestionSelectedIndex)
-                                .frame(height: rowHeight)
+                                .frame(height: layout.rowHeight)
                         }
                     }
                 }
-                .frame(height: popupHeight)
+                .frame(height: layout.height)
             }
-            .frame(width: 280)
+            .frame(maxWidth: .infinity, alignment: .leading)
             .background(DS.Palette.surfaceRaised)
             .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
             .overlay(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
                 .strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline))
-            .shadow(color: Color.black.opacity(0.18), radius: 8, y: 2)
-            .offset(x: max(0, composerCaretRect.minX), y: yOffset)
+            .padding(.horizontal, DS.Space.lg)
+            .padding(.bottom, DS.Space.xs)
             .accessibilityIdentifier("agent.suggestion.popup")
             .allowsHitTesting(true)
+            .transition(.opacity.combined(with: .move(edge: .bottom)))
         }
     }
 
@@ -9435,7 +9446,7 @@ private struct AskUserQuestionOtherField: View {
     }
 }
 
-// macos:32: pure, value-type navigation logic for the caret-anchored suggestion
+// macos:32: pure, value-type navigation logic for the composer suggestion
 // popup. Holds NO view state and is unit-testable in isolation. `selectedIndex`
 // is the highlighted row (nil == nothing highlighted yet).
 struct ComposerSuggestionNavigation: Equatable {
@@ -9463,6 +9474,31 @@ struct ComposerSuggestionNavigation: Equatable {
     // not dismissed it (Esc) for the current token.
     static func isOpen(count: Int, dismissed: Bool) -> Bool {
         count > 0 && !dismissed
+    }
+}
+
+// WHY: layout for the slash/skill panel must stay pure and testable. The panel
+// owns vertical space between the editor and toolbar so it never collides with
+// composer controls (the previous caret-overlay + place-below path did).
+struct ComposerSuggestionPlacement: Equatable {
+    var height: CGFloat
+    var rowHeight: CGFloat
+    var maxVisibleRows: Int
+
+    static let defaultRowHeight: CGFloat = 30
+    static let defaultMaxVisibleRows = 6
+
+    static func layout(
+        suggestionCount: Int,
+        rowHeight: CGFloat = defaultRowHeight,
+        maxVisibleRows: Int = defaultMaxVisibleRows
+    ) -> ComposerSuggestionPlacement {
+        let visible = min(max(suggestionCount, 0), max(maxVisibleRows, 0))
+        return ComposerSuggestionPlacement(
+            height: CGFloat(visible) * rowHeight,
+            rowHeight: rowHeight,
+            maxVisibleRows: maxVisibleRows
+        )
     }
 }
 
