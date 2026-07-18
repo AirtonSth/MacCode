@@ -203,24 +203,37 @@ public struct AgentAttachmentUploadResult: Codable, Sendable, Equatable {
     public let mimeType: String?
     public let sha256: String
     public let sizeBytes: Int
+    /// Absolute host path for paired clients to insert into composer text
+    /// (macOS drag/drop parity). Not a structured-attachment wire field.
+    public let composerInsertionText: String
 
-    public init(id: String, displayName: String, kind: AgentAttachmentKind, mimeType: String?, sha256: String, sizeBytes: Int) {
+    public init(
+        id: String,
+        displayName: String,
+        kind: AgentAttachmentKind,
+        mimeType: String?,
+        sha256: String,
+        sizeBytes: Int,
+        composerInsertionText: String
+    ) {
         self.id = id
         self.displayName = displayName
         self.kind = kind
         self.mimeType = mimeType
         self.sha256 = sha256
         self.sizeBytes = sizeBytes
+        self.composerInsertionText = composerInsertionText
     }
 
-    public init(_ reference: AgentAttachmentReference) {
+    public init(_ reference: AgentAttachmentReference, composerInsertionText: String) {
         self.init(
             id: reference.id,
             displayName: reference.displayName,
             kind: reference.kind,
             mimeType: reference.mimeType,
             sha256: reference.sha256,
-            sizeBytes: reference.sizeBytes
+            sizeBytes: reference.sizeBytes,
+            composerInsertionText: composerInsertionText
         )
     }
 }

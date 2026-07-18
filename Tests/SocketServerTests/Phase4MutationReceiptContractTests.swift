@@ -955,7 +955,8 @@ private final class Phase4ReceiptFakeRouter: FakeRouter, CommandReceiptStateRout
             kind: .file,
             mimeType: mimeType,
             sha256: id,
-            sizeBytes: Data(base64Encoded: dataBase64)?.count ?? 0
+            sizeBytes: Data(base64Encoded: dataBase64)?.count ?? 0,
+            composerInsertionText: "/tmp/remote-code-fake-attachments/\(id)/\(filename)"
         )
     }
 
@@ -971,7 +972,8 @@ private final class Phase4ReceiptFakeRouter: FakeRouter, CommandReceiptStateRout
             kind: .file,
             mimeType: "text/plain",
             sha256: id,
-            sizeBytes: 7
+            sizeBytes: 7,
+            composerInsertionText: "/Users/dev/demo-api/\(relativePath)"
         )
     }
 

@@ -243,11 +243,27 @@ class FakeRouter: CommandRouting, TerminalCommandRouting {
         guard let data = Data(base64Encoded: dataBase64), !data.isEmpty,
               data.count <= 25 * 1024 * 1024 else { throw JSONRPCError.invalidParams }
         let digest = String(repeating: "a", count: 64)
-        return AgentAttachmentUploadResult(id: UUID().uuidString.lowercased(), displayName: filename, kind: filename.hasSuffix(".png") ? .image : .file, mimeType: mimeType, sha256: digest, sizeBytes: data.count)
+        return AgentAttachmentUploadResult(
+            id: UUID().uuidString.lowercased(),
+            displayName: filename,
+            kind: filename.hasSuffix(".png") ? .image : .file,
+            mimeType: mimeType,
+            sha256: digest,
+            sizeBytes: data.count,
+            composerInsertionText: "/tmp/remote-code-fake-attachments/\(digest)/\(filename)"
+        )
     }
     func importAgentAttachment(workspace: WorkspaceID, relativePath: String) throws -> AgentAttachmentUploadResult {
         let id = String(repeating: "b", count: 64)
-        return AgentAttachmentUploadResult(id: id, displayName: URL(fileURLWithPath: relativePath).lastPathComponent, kind: .file, mimeType: "text/plain", sha256: id, sizeBytes: 7)
+        return AgentAttachmentUploadResult(
+            id: id,
+            displayName: URL(fileURLWithPath: relativePath).lastPathComponent,
+            kind: .file,
+            mimeType: "text/plain",
+            sha256: id,
+            sizeBytes: 7,
+            composerInsertionText: "/Users/dev/demo-api/\(relativePath)"
+        )
     }
     var selectedThread: AgentThreadID?
     var lastSelectSurfaceID: SurfaceID?
@@ -1239,7 +1255,8 @@ final class DispatcherTests: XCTestCase {
         ]))
 
         guard case .object(let obj)? = uploaded.result else { return XCTFail("agent.attachment.upload must return an opaque attachment reference") }
-        XCTAssertNil(obj["path"])
+        XCTAssertNil(obj["path"],
+                     "upload must not expose a generic path field; composer insertion uses composerInsertionText only")
         let attachmentId = try XCTUnwrap(obj["id"]?.stringValue)
         XCTAssertNotNil(UUID(uuidString: attachmentId))
         XCTAssertNotEqual(obj["id"], obj["sha256"],
@@ -1247,8 +1264,13 @@ final class DispatcherTests: XCTestCase {
         XCTAssertEqual(obj["sha256"], .string(String(repeating: "a", count: 64)))
         XCTAssertEqual(obj["displayName"], .string("screen.png"))
         XCTAssertEqual(obj["kind"], .string("image"),
-                       "iOS local imports must become host-readable structured attachments before agent.message.send")
+                       "iOS local imports must become host-readable staged files before path insertion")
         XCTAssertEqual(obj["sizeBytes"], .number(11))
+        let insertion = try XCTUnwrap(obj["composerInsertionText"]?.stringValue)
+        XCTAssertTrue(insertion.hasSuffix("/screen.png"),
+                      "upload must return the staged host path for paired clients to insert into the composer")
+        XCTAssertTrue(insertion.hasPrefix("/"),
+                      "composerInsertionText must be an absolute host path")
     }
 
     @MainActor

@@ -3622,7 +3622,12 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         guard let reference = AgentAttachmentReference(attachment) else {
             throw JSONRPCError(code: -32000, message: "Attachment staging produced incomplete metadata.")
         }
-        return AgentAttachmentUploadResult(reference)
+        // iOS (and other paired clients) insert this host path into the composer
+        // as ordinary text — same UX as macOS Finder drop/paste. Prefer a
+        // display-name hardlink so the path keeps a recognizable filename.
+        let insertionPath = (try? Self.composerInsertionPath(for: attachment, store: agentAttachmentStore()))
+            ?? attachment.path
+        return AgentAttachmentUploadResult(reference, composerInsertionText: insertionPath)
     }
 
     public func importAgentAttachment(workspace: WorkspaceID, relativePath: String) throws -> AgentAttachmentUploadResult {
@@ -3647,11 +3652,14 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
            size > Int64(AgentAttachmentStore.maximumSizeBytes) {
             throw JSONRPCError(code: -32602, message: "Attachment exceeds the 25 MB limit.")
         }
+        // Prefer the original workspace path for composer insertion so agents
+        // see a stable project path. Still stage a managed copy for any legacy
+        // structured-attachment consumers of the opaque id.
         let attachment = try agentAttachmentStore().stage(path: target.path)
         guard let reference = AgentAttachmentReference(attachment) else {
             throw JSONRPCError(code: -32000, message: "Attachment import produced incomplete metadata.")
         }
-        return AgentAttachmentUploadResult(reference)
+        return AgentAttachmentUploadResult(reference, composerInsertionText: target.path)
     }
 
     private func agentAttachmentStore() throws -> AgentAttachmentStore {
@@ -3659,6 +3667,41 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         return AgentAttachmentStore(
             root: context.appSupportDirectory.appendingPathComponent("agent-attachments", isDirectory: true)
         )
+    }
+
+    /// Hardlink the content-addressed blob under a display-name path so paired
+    /// clients can insert a human-recognizable absolute path into the composer.
+    private static func composerInsertionPath(
+        for attachment: AgentAttachment,
+        store: AgentAttachmentStore
+    ) throws -> String {
+        let name = attachment.displayName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty,
+              name == URL(fileURLWithPath: name).lastPathComponent,
+              !name.contains("\0") else {
+            return attachment.path
+        }
+        let id = (attachment.id ?? attachment.sha256 ?? UUID().uuidString)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        guard !id.isEmpty else { return attachment.path }
+        let linkRoot = store.root
+            .appendingPathComponent("composer-paths", isDirectory: true)
+            .appendingPathComponent(id, isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: linkRoot,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
+        let link = linkRoot.appendingPathComponent(name)
+        if !FileManager.default.fileExists(atPath: link.path) {
+            try FileManager.default.linkItem(atPath: attachment.path, toPath: link.path)
+            try? FileManager.default.setAttributes(
+                [.posixPermissions: 0o600],
+                ofItemAtPath: link.path
+            )
+        }
+        return link.path
     }
 
     private static func decodedBase64Size(_ value: String) -> Int? {
