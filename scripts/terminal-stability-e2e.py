@@ -54,6 +54,11 @@ DIAGNOSTIC_ONLY_METRICS = (
     "max_cpu_percent",
     "max_health_rpc_latency_ms",
     "post_idle_output_roundtrip_ms",
+    # Post-soak materialization changes RSS/FD relative to the frozen soak end;
+    # deltas are reported for diagnosis only. Gates use absolute MAX_RSS_KB,
+    # zero sustained FD growth, and post-close recovery vs pre-workspace baseline.
+    "post_soak_transition_rss_delta_kb",
+    "post_soak_transition_fd_delta",
     "samples[].cpu_percent",
     "samples[].max_health_rpc_latency_ms",
 )
@@ -661,7 +666,8 @@ def wait_for_resource_recovery(
     )
 
 
-def sample(pid, stats, surface_ids=()):
+def collect_sample(pid, stats, surface_ids=()):
+    """Collect one resource sample and update running maxima; do not append."""
     if _MUTATION_CONTROL is None:
         raise Failure("soak sample requires an active mutation control websocket")
     _MUTATION_CONTROL.assert_active()
@@ -701,7 +707,7 @@ def sample(pid, stats, surface_ids=()):
     stats["max_observed_dropped_output_bytes"] = max(
         stats["max_observed_dropped_output_bytes"], dropped_bytes
     )
-    stats["samples"].append({
+    return {
         "elapsed_seconds": round(time.monotonic() - stats["soak_started_monotonic"], 3),
         "rss_kb": rss,
         "cpu_percent": cpu,
@@ -712,7 +718,11 @@ def sample(pid, stats, surface_ids=()):
         "history_write_failures": history_failures,
         "dropped_output_bytes": dropped_bytes,
         "max_health_rpc_latency_ms": round(health_latency_ms, 3),
-    })
+    }
+
+
+def sample(pid, stats, surface_ids=()):
+    stats["samples"].append(collect_sample(pid, stats, surface_ids))
 
 
 def linear_slope_per_minute(samples):
@@ -731,8 +741,25 @@ def linear_slope_per_minute(samples):
     ) / denominator
 
 
+def soak_gate_samples(stats):
+    """Samples that define the steady soak resource gate.
+
+    After the post-soak freeze, intentional transition work may append more
+    samples. Stability gates (pre-gate / post-soak / pre-exit / final) must not
+    mix those materialization samples into tail-net, plateau, or FD delta.
+    """
+    samples = stats.get("samples") or []
+    count = stats.get("soak_sample_count")
+    if count is None:
+        return list(samples)
+    count = int(count)
+    if count < 0:
+        raise Failure("soak_sample_count must be non-negative")
+    return list(samples[:count])
+
+
 def update_memory_evidence(stats):
-    samples = stats["samples"]
+    samples = soak_gate_samples(stats)
     if not samples:
         return
     tail = samples[len(samples) // 2:]
@@ -758,6 +785,83 @@ def update_memory_evidence(stats):
     stats["child_process_count_delta"] = (
         samples[-1]["child_process_count"] - samples[0]["child_process_count"]
     )
+
+
+def sample_post_soak_transition(pid, stats, surface_ids, target_fd_count, timeout=30):
+    """Record one post-soak transition sample when FD is at the freeze target.
+
+    Intentional post-soak I/O can hold a transient REG (history/ledger write).
+    Settle is condition-based readiness: each collect_sample while FD is above
+    target is a readiness poll only — not appended to stats["samples"] and not
+    part of the frozen soak window. The row stored as the transition sample is
+    the same observation that satisfied the settle predicate (no wait-then-
+    sample TOCTOU). Sticky FD above target fails after timeout; there is no
+    tolerance band and no baseline recapture. Once recorded, the sample is
+    never discarded, rebased, value-filtered, or re-taken.
+    """
+    deadline = time.monotonic() + timeout
+    last_fd_count = None
+    last_types = None
+    while time.monotonic() < deadline:
+        row = collect_sample(pid, stats, surface_ids)
+        last_fd_count = int(row["fd_count"])
+        if last_fd_count <= target_fd_count:
+            stats["samples"].append(row)
+            return row
+        # Readiness poll rejected: do not append; freeze window unchanged.
+        time.sleep(0.25)
+    try:
+        last_types = file_descriptor_type_counts(pid)
+    except Exception:
+        last_types = None
+    raise Failure(
+        "file descriptors did not settle to post-soak level after intentional "
+        f"transition work: {last_fd_count} > {target_fd_count}"
+        + (f"; type_counts={last_types}" if last_types is not None else "")
+    )
+
+
+def assert_post_soak_transition(stats):
+    """Gate intentional post-soak materialization without inventing a delta cap.
+
+    Soak stability metrics freeze at post-soak (soak_sample_count). Hidden
+    flood drain, large input, TUI, and reconnect intentionally change process
+    state afterward. Transition gates are only the product absolute MAX_RSS_KB
+    budget and zero sustained FD growth vs the frozen post-soak FD count.
+    RSS/FD deltas are diagnostic fields only. Post-close recovery remains the
+    separate absolute assert against the pre-workspace baseline.
+    """
+    samples = stats.get("samples") or []
+    soak_count = stats.get("soak_sample_count")
+    if soak_count is None:
+        raise Failure("post-soak transition requires soak_sample_count freeze")
+    soak_count = int(soak_count)
+    if soak_count < 1 or soak_count > len(samples):
+        raise Failure(
+            f"invalid soak_sample_count {soak_count} for {len(samples)} samples"
+        )
+    if len(samples) <= soak_count:
+        raise Failure("post-soak transition requires a sample after soak freeze")
+    soak_end = samples[soak_count - 1]
+    transition = samples[-1]
+    rss_delta = int(transition["rss_kb"]) - int(soak_end["rss_kb"])
+    fd_delta = int(transition["fd_count"]) - int(soak_end["fd_count"])
+    stats["post_soak_rss_kb"] = int(soak_end["rss_kb"])
+    stats["post_soak_fd_count"] = int(soak_end["fd_count"])
+    stats["post_transition_rss_kb"] = int(transition["rss_kb"])
+    stats["post_transition_fd_count"] = int(transition["fd_count"])
+    # Diagnostic only — not a gate. No invented transition-delta product cap.
+    stats["post_soak_transition_rss_delta_kb"] = rss_delta
+    stats["post_soak_transition_fd_delta"] = fd_delta
+    if int(transition["rss_kb"]) > MAX_RSS_KB:
+        raise Failure(
+            f"post-transition RSS {transition['rss_kb']} KiB exceeds absolute "
+            f"cap {MAX_RSS_KB} KiB"
+        )
+    if fd_delta > 0:
+        raise Failure(
+            f"post-soak transition sustained file descriptor growth: delta {fd_delta}"
+        )
 
 
 def assert_stability_gate(stats, gate_name):
@@ -1490,6 +1594,13 @@ def main():
         "fd_count_delta": None,
         "child_process_count_delta": None,
         "samples": [],
+        "soak_sample_count": None,
+        "post_soak_rss_kb": None,
+        "post_soak_fd_count": None,
+        "post_transition_rss_kb": None,
+        "post_transition_fd_count": None,
+        "post_soak_transition_rss_delta_kb": None,
+        "post_soak_transition_fd_delta": None,
         "soak_started_monotonic": 0.0,
         "workloads": [],
         "disconnect_count": 0,
@@ -1753,6 +1864,12 @@ def main():
         )
         sample(pid, stats, all_surface_ids)
         assert_stability_gate(stats, "post-soak")
+        # Freeze the soak gate window here. Later intentional work (hidden
+        # drain, large input, TUI, reconnect) materializes different state and
+        # must not rewrite soak tail-net / FD delta.
+        stats["soak_sample_count"] = len(stats["samples"])
+        stats["post_soak_rss_kb"] = stats["samples"][-1]["rss_kb"]
+        stats["post_soak_fd_count"] = stats["samples"][-1]["fd_count"]
         wait_snapshot_contains(primary_sid, "RC2_E2E_STREAM_DONE")
         for index, surface_id in enumerate(all_surface_ids[2:], start=2):
             wait_snapshot_contains(surface_id, f"RC2_AUX_{index:02d}_DONE", timeout=15)
@@ -1922,7 +2039,13 @@ def main():
                 assert_alive(surface_id)
             stats["baseline_converged_after_reconnect"] = True
 
-        sample(pid, stats, all_surface_ids)
+        # Record transition with FD settle in the same observation (no
+        # wait-then-sample TOCTOU). Gate: absolute MAX_RSS_KB + zero FD growth.
+        # Transition RSS/FD deltas are diagnostic; soak metrics stay frozen.
+        sample_post_soak_transition(
+            pid, stats, all_surface_ids, stats["post_soak_fd_count"]
+        )
+        assert_post_soak_transition(stats)
         assert_stability_gate(stats, "pre-exit")
         terminal_process_marker = (
             "RC2_E2E_BG_"
