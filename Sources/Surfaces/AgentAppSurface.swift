@@ -3183,13 +3183,26 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     }
 
     public func send() async {
-        let text = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty || !attachments.isEmpty else { return }
+        let trimmed = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty || !attachments.isEmpty else { return }
         // Snapshots can still be empty on first send (seed/load race). Load once
         // before the fail-closed gate so a ready Grok/Codex install is not blocked.
+        // Also needed before `$goal` → `/goal` rewrite so provider slash catalogs
+        // (Codex `/goal`) are available for normalization.
         if selectedProviderSnapshot == nil {
             await loadProviderSnapshots()
         }
+        // Canonical first-token triggers for every provider:
+        // commands (`$goal`/`/goal`) → `/…`; skills (`/sam-work`/`$sam-work`) → `$…`.
+        let text = AgentComposerSuggestions.normalizingComposerTriggerPrefix(
+            trimmed,
+            localSlashCommands: Self.localSlashCommands,
+            providerSlashCommands: Array(Set(
+                (selectedProviderSnapshot?.slashCommands ?? [])
+                    + AgentComposerSuggestions.passThroughSlashCommands
+            )),
+            skills: selectedProviderSnapshot?.skills ?? []
+        )
         guard selectedProviderCanRun else {
             statusMessage = providerExecutionUnavailableReason ?? "The selected provider is unavailable."
             return
@@ -4076,6 +4089,12 @@ public struct AgentComposerSuggestion: Identifiable, Equatable, Sendable {
 }
 
 public enum AgentComposerSuggestions {
+    /// Provider-pass-through commands available on every Agent provider (Codex,
+    /// Claude, Grok). Not RemoteCode-local handlers — `send` forwards them as the
+    /// first user token. Always merged into autocomplete + `$`→`/` normalization so
+    /// a stale/empty snapshot cannot hide `/goal`.
+    public static let passThroughSlashCommands = ["/goal"]
+
     public static func suggestions(
         for text: String,
         cursorOffset: Int? = nil,
@@ -4090,7 +4109,7 @@ public enum AgentComposerSuggestions {
         let prefix = String(trigger)
         let query = String(token.dropFirst()).lowercased()
         let display = snapshot?.displayName ?? "Provider"
-        let providerCommands = snapshot?.slashCommands ?? []
+        let providerCommands = Array(Set((snapshot?.slashCommands ?? []) + passThroughSlashCommands))
         let allCommands = Array(Set(localSlashCommands + providerCommands))
         let skills = snapshot?.skills ?? []
 
@@ -4120,25 +4139,114 @@ public enum AgentComposerSuggestions {
             ))
         }
 
-        let ordered = ranked(candidates.map(\.bare), query: query)
+        // WHY: skill catalogs are large (50–80+). Ranking every bare name together
+        // with limit=8 buries modes/commands (`/plan`, `/goal`) under ads-* skills
+        // on bare `/`. Emit every matching command first (never truncated by limit),
+        // then fill remaining rows with skills up to max(limit, commandCount).
+        let commandBares = ranked(
+            candidates.filter { $0.kind == .slashCommand }.map(\.bare),
+            query: query
+        )
+        let skillBares = ranked(
+            candidates.filter { $0.kind == .skill }.map(\.bare),
+            query: query
+        )
         var seenBareKind = Set<String>()
         var results: [AgentComposerSuggestion] = []
-        results.reserveCapacity(min(limit, ordered.count))
-        for bare in ordered {
-            for candidate in candidates where candidate.bare.caseInsensitiveCompare(bare) == .orderedSame {
-                let key = "\(candidate.kind)-\(candidate.bare.lowercased())"
-                guard seenBareKind.insert(key).inserted else { continue }
-                let title = "\(prefix)\(candidate.bare)"
-                results.append(AgentComposerSuggestion(
-                    title: title,
-                    subtitle: candidate.subtitle,
-                    insertText: "\(title) ",
-                    kind: candidate.kind
-                ))
-                if results.count >= limit { return results }
+        results.reserveCapacity(max(limit, commandBares.count))
+
+        func append(bares: [String], kind: AgentComposerSuggestion.Kind, stopAt: Int?) {
+            for bare in bares {
+                if let stopAt, results.count >= stopAt { return }
+                for candidate in candidates
+                    where candidate.kind == kind
+                        && candidate.bare.caseInsensitiveCompare(bare) == .orderedSame {
+                    let key = "\(candidate.kind)-\(candidate.bare.lowercased())"
+                    guard seenBareKind.insert(key).inserted else { continue }
+                    let title = "\(prefix)\(candidate.bare)"
+                    results.append(AgentComposerSuggestion(
+                        title: title,
+                        subtitle: candidate.subtitle,
+                        insertText: "\(title) ",
+                        kind: candidate.kind
+                    ))
+                    if let stopAt, results.count >= stopAt { return }
+                }
             }
         }
+
+        append(bares: commandBares, kind: .slashCommand, stopAt: nil)
+        let skillCap = max(limit, results.count)
+        append(bares: skillBares, kind: .skill, stopAt: skillCap)
         return results
+    }
+
+    /// Canonical first-token triggers before provider dispatch (all providers):
+    /// - Known slash commands → `/name` (from `$name` or `/name`)
+    /// - Known skills that are not also commands → `$name` (from `/name` or `$name`)
+    /// Commands win on name collision so `$plan`/`/plan` stay modes, not skills.
+    public static func normalizingComposerTriggerPrefix(
+        _ raw: String,
+        localSlashCommands: [String],
+        providerSlashCommands: [String],
+        skills: [String]
+    ) -> String {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let trigger = trimmed.first, trigger == "/" || trigger == "$" else { return raw }
+        let body = trimmed.dropFirst()
+        let parts = body.split(separator: " ", maxSplits: 1, omittingEmptySubsequences: true)
+        guard let barePart = parts.first else { return raw }
+        let bareRaw = String(barePart)
+        let bareKey = bareRaw.lowercased()
+        guard !bareKey.isEmpty else { return raw }
+
+        func bareCatalog(_ tokens: [String]) -> [String: String] {
+            var map: [String: String] = [:]
+            for token in tokens {
+                let trimmedToken = token.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !trimmedToken.isEmpty else { continue }
+                let name = (trimmedToken.hasPrefix("/") || trimmedToken.hasPrefix("$"))
+                    ? String(trimmedToken.dropFirst())
+                    : trimmedToken
+                let key = name.lowercased()
+                guard !key.isEmpty, map[key] == nil else { continue }
+                map[key] = name
+            }
+            return map
+        }
+
+        let commandCatalog = bareCatalog(localSlashCommands + providerSlashCommands)
+        let skillCatalog = bareCatalog(skills)
+        let argument = parts.count > 1 ? String(parts[1]) : nil
+
+        func compose(prefix: Character, name: String) -> String {
+            if let argument, !argument.isEmpty {
+                return "\(prefix)\(name) \(argument)"
+            }
+            return "\(prefix)\(name)"
+        }
+
+        if let commandName = commandCatalog[bareKey] {
+            return compose(prefix: "/", name: commandName.lowercased())
+        }
+        if let skillName = skillCatalog[bareKey] {
+            return compose(prefix: "$", name: skillName)
+        }
+        return raw
+    }
+
+    /// Compatibility wrapper: command-only rewrite (`$goal` → `/goal`).
+    public static func normalizingProviderSlashPrefix(
+        _ raw: String,
+        localSlashCommands: [String],
+        providerSlashCommands: [String]
+    ) -> String {
+        normalizingComposerTriggerPrefix(
+            raw,
+            localSlashCommands: localSlashCommands,
+            providerSlashCommands: providerSlashCommands,
+            skills: []
+        )
     }
 
     public static func replacingActiveToken(in text: String, cursorOffset: Int? = nil, with replacement: String) -> String {
