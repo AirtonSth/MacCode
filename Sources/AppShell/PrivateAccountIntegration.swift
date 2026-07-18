@@ -1177,18 +1177,52 @@ public final class PrivateNotificationBridge: @unchecked Sendable {
                 nextAttemptAt: nil
             )
         case .v2(let target):
-            let request = PrivateLiveActivityV2DeliveryRequest(delivery: delivery, target: target)
-            let ack = try await sessionRefresher.perform(session: session) { accessToken in
-                try await self.api.deliverLiveActivityV2(
-                    accessToken: accessToken,
-                    request: request,
-                    idempotencyKey: delivery.idempotencyKey
-                )
+            do {
+                let request = PrivateLiveActivityV2DeliveryRequest(delivery: delivery, target: target)
+                let ack = try await sessionRefresher.perform(session: session) { accessToken in
+                    try await self.api.deliverLiveActivityV2(
+                        accessToken: accessToken,
+                        request: request,
+                        idempotencyKey: delivery.idempotencyKey
+                    )
+                }
+                guard ack.isAccepted else {
+                    throw LiveActivityAcceptanceOutboxError.backendDidNotAccept(ack.status)
+                }
+                return ack
+            } catch {
+                // User dismissed the Lock Screen card or ActivityKit ended it: the
+                // activity_update token is dead. Fail over to push-to-start `.start`
+                // so the next host update re-opens the Live Activity without the
+                // iOS app needing to be foregrounded.
+                if target.purpose == .activityUpdate,
+                   delivery.event == .update || delivery.event == .start,
+                   let startTarget = (try? pushTargetStore.records()).flatMap({ records in
+                       records.first(where: {
+                           $0.supportsLiveActivityV2 &&
+                           $0.purpose == .pushToStart &&
+                           $0.serverId == delivery.projection.hostId
+                       }) ?? records.first(where: {
+                           $0.supportsLiveActivityV2 && $0.purpose == .pushToStart
+                       })
+                   }) {
+                    let startDelivery = LiveActivitySyncDelivery(
+                        event: .start,
+                        projection: delivery.projection,
+                        activityGeneration: delivery.activityGeneration,
+                        idempotencyKey: delivery.idempotencyKey + ".dismiss-reopen"
+                    )
+                    let startRecord = LiveActivityAcceptanceRecord(
+                        delivery: startDelivery,
+                        target: .v2(startTarget)
+                    )
+                    Self.log.info(
+                        "live-activity update failed; reopening via push-to-start key=\(startDelivery.idempotencyKey, privacy: .public)"
+                    )
+                    return try await sendLiveActivityAcceptance(startRecord)
+                }
+                throw error
             }
-            guard ack.isAccepted else {
-                throw LiveActivityAcceptanceOutboxError.backendDidNotAccept(ack.status)
-            }
-            return ack
         }
     }
 
