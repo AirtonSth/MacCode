@@ -1007,6 +1007,29 @@ final class GhosttyTerminalView: NSView {
         surfaceSlot.markClosed()
         pendingOutput.removeAll(keepingCapacity: false)
         pendingOutputHead = 0
+        // Drop host-side holds that otherwise survive until late view deinit
+        // (owner callbacks, Metal drawable presentation state). Ghostty scrollback
+        // is freed above; this path only clears Swift/AppKit residual state.
+        releaseHostResourcesAfterClose()
+    }
+
+    /// Clears owner callbacks and drawable presentation state after the C surface
+    /// is freed. Safe to call more than once; used by closeSurface and owner close.
+    func releaseHostResourcesAfterClose() {
+        onInputData = nil
+        onTerminalSizeChange = nil
+        onTitleChange = nil
+        onPasteNeedsConfirm = nil
+        onPlainTextDragNeedsConfirm = nil
+        onCmdClickFilePath = nil
+        ownerIsClosing = { true }
+        pendingOutput.removeAll(keepingCapacity: false)
+        pendingOutputHead = 0
+        scheduledOutputFlushGeneration = nil
+        layer?.contents = nil
+        if let metalLayer = layer as? CAMetalLayer {
+            metalLayer.removeAllAnimations()
+        }
     }
 
     func resetSurfaceOutput(_ data: Data) {

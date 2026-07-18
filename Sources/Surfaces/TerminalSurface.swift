@@ -966,6 +966,18 @@ public final class TerminalSurface: NSObject, Surface, TerminalHistoryCoordinato
         ghosttyView.readScrollbackText()
     }
 
+    /// Post-close probe: Ghostty C surface must be gone after permanent close.
+    var hasLiveGhosttySurfaceForTesting: Bool { ghosttyView.hasLiveSurfaceForTesting }
+
+    /// Post-close probe: ANSI mirror ring must shrink after eager close release.
+    var ansiMirrorScrollbackRowsForTesting: Int { renderer.scrollbackCount }
+
+    /// Post-close probe: readTextSnapshot cache must not retain transcript text.
+    var cachedTextSnapshotRetainedForTesting: Bool { cachedTextSnapshot != nil }
+
+    /// Post-close probe: input pump must be dropped so stall queues cannot pin bytes.
+    var inputPumpRetainedForTesting: Bool { inputPump != nil }
+
     public convenience init(workspaceID: WorkspaceID, cwd: String, title: String = "terminal") throws {
         try self.init(workspaceID: workspaceID, title: title, launch: .shell(cwd: cwd))
     }
@@ -2941,6 +2953,12 @@ public final class TerminalSurface: NSObject, Surface, TerminalHistoryCoordinato
         // App termination already closed the lock-serialized lease above.
         masterFD = -1
         ghosttyView.closeSurface()
+        // Permanent close (and retired restart instances) must drop heavy mirror /
+        // viewport / pump state here — not only when ARC finally deinitializes the
+        // NSObject wrapper. Post-materialization soak left ANSI rings, snapshot
+        // caches, and parked/hosted views alive until late hierarchy rebuild, so
+        // RSS/FD recovery missed the pre-workspace baseline within the gate window.
+        releaseClosedSurfaceResources()
         if removeOutputBusState {
             outputBus.remove(surfaceId: descriptor.id)
         }
@@ -2958,6 +2976,46 @@ public final class TerminalSurface: NSObject, Surface, TerminalHistoryCoordinato
             )
         }
         return nil
+    }
+
+    /// Eagerly drops per-surface memory that is no longer observable after close.
+    /// History durability already flushed/deleted above; Ghostty C surface is freed.
+    /// Transcript correctness for open tabs is unaffected — this only runs when
+    /// the surface is permanently leaving the registry (or a retired restart body).
+    private func releaseClosedSurfaceResources() {
+        pendingRendererEvents.removeAll(keepingCapacity: false)
+        pendingRendererByteCount = 0
+        hiddenRendererBuffer = Data()
+        hiddenRendererBufferOverflowed = false
+        hiddenMirrorAcceptedBytes = 0
+        outputPendingBytes = 0
+        cachedTextSnapshot = nil
+        // Replace the full ANSI ring (up to 10k attributed rows) with a minimal
+        // renderer so post-close RSS does not wait on NSObject autorelease timing.
+        renderer = ANSIRenderer(rows: 1, cols: 1)
+        rendererMutationCount &+= 1
+        isDrainingHiddenBacklog = false
+        hiddenBacklogDrainDeadline = nil
+        stuckHiddenHealScheduled = false
+        busyStatePollActive = false
+
+        inputPump?.stop(reason: .processExited)
+        inputPump?.onTerminalFailure = nil
+        inputPump?.onInputStalled = nil
+        inputPump?.onInputResumed = nil
+        inputPump = nil
+
+        ghosttyView.releaseHostResourcesAfterClose()
+
+        if let container = view as? TerminalDropContainerView {
+            container.onFileDrop = nil
+            container.onLayout = nil
+            container.onWindowChanged = nil
+        }
+        // Detach from pane/parking hierarchy immediately so Metal/AppKit can
+        // reclaim the view without waiting for a later refreshFromState rebuild.
+        view.removeFromSuperview()
+        closeParkingWindowIfNeeded()
     }
 
     private func appendClosingReaderBatches(

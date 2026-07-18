@@ -47,6 +47,10 @@ MAX_RSS_TAIL_NET_GROWTH_KB = int(
 MAX_POST_CLOSE_RSS_DELTA_KB = int(
     os.environ.get("RC2_E2E_MAX_POST_CLOSE_RSS_DELTA_KB", "32768")
 )
+# Same-process open/close cycles after the primary workload. Cycle 1 records the
+# post-close warmed baseline; cycles 2..N must recover to that warmed baseline
+# (no stacking). Cold pre-workspace delta remains diagnostic only.
+RESOURCE_CLOSE_CYCLES = int(os.environ.get("RC2_E2E_RESOURCE_CLOSE_CYCLES", "2"))
 REQUIRE_SLOW_WS = os.environ.get("RC2_E2E_REQUIRE_SLOW_WS", "0") == "1"
 CANARY_ROOT_PREFIX = "RemoteCodeAgentCanary-"
 RUN_ARTIFACT_PREFIX = "terminal-stability-e2e-"
@@ -56,9 +60,14 @@ DIAGNOSTIC_ONLY_METRICS = (
     "post_idle_output_roundtrip_ms",
     # Post-soak materialization changes RSS/FD relative to the frozen soak end;
     # deltas are reported for diagnosis only. Gates use absolute MAX_RSS_KB,
-    # zero sustained FD growth, and post-close recovery vs pre-workspace baseline.
+    # zero sustained FD growth during soak, process-tree cleanup after close,
+    # and cycle-to-cycle warmed recovery (cold pre-workspace delta is diagnostic).
     "post_soak_transition_rss_delta_kb",
     "post_soak_transition_fd_delta",
+    "post_close_rss_delta_from_cold_kb",
+    "post_close_fd_delta_from_cold",
+    "post_close_cold_rss_within_budget",
+    "post_close_cold_fd_recovered",
     "samples[].cpu_percent",
     "samples[].max_health_rpc_latency_ms",
 )
@@ -124,7 +133,7 @@ def wait_for_host():
     raise Failure("host did not become healthy")
 
 
-def parse_args():
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(
         description="Run the terminal stability suite against an isolated RemoteCode canary.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -133,13 +142,36 @@ Safe defaults: 2 terminals for 120 seconds on port 28217.
 Release gate: --release-soak enforces 12 terminals for 60 minutes, a 15-minute pre-gate,
 and a 30-second connected-client warmup before workload startup.
 
+Memory-gate semantics (unchanged thresholds):
+  Plateau / tail-slope / tail-net use the second half of the full soak sample
+  window (not a rebaseline after --pre-gate-seconds). Pre-gate is an intermediate
+  health+memory check only; it does not discard early samples from post-soak.
+  Continuous stream + Ghostty scrollback fill produces step-wise RSS growth early
+  in the soak. Short pre-gate=0 runs that end during that fill (e.g. 15-180s)
+  will false-fail the memory gate and must not be labeled as a continuing leak.
+  To prove plateau: duration must be long enough that the second half is past
+  warmup (release uses 4500s with 900s pre-gate). Absolute MAX_RSS_KB still
+  bounds total process size under product caps (ANSI ring, history retention,
+  hidden mirror force-flush, Ghostty scrollback-limit).
+
+Post-close resource contract:
+  First terminal activation loads process-global Ghostty/Metal/font/SQLite caches
+  that must not be purged between tabs (shared Ghostty runtime). Cold
+  pre-workspace RSS/FD delta after the first close is diagnostic only and must
+  not be "fixed" by raising MAX_POST_CLOSE_RSS_DELTA_KB. Hard gates are:
+  (1) child/owned process cleanup on every close, (2) per-surface PTY/kqueue
+  release (FD category diagnostics), (3) cycle-to-cycle warmed recovery across
+  RC2_E2E_RESOURCE_CLOSE_CYCLES open/close cycles so residual cannot stack.
+  Cycle recovery reuses the same RSS delta and zero-FD-growth tolerances vs the
+  post-close-1 warmed baseline.
+
 Environment equivalents:
   RC2_E2E_PORT, RC2_E2E_DURATION_SECONDS, RC2_E2E_TERMINAL_COUNT,
   RC2_E2E_PRE_GATE_SECONDS, RC2_E2E_SAMPLE_INTERVAL_SECONDS,
   RC2_E2E_CLIENT_WARMUP_SECONDS, RC2_E2E_WORKLOAD_STABILIZATION_SECONDS,
   RC2_E2E_MAX_RSS_KB, RC2_E2E_MAX_RSS_TAIL_SLOPE_KB_PER_MINUTE,
   RC2_E2E_MAX_RSS_PLATEAU_DELTA_KB, RC2_E2E_MAX_RSS_TAIL_NET_GROWTH_KB,
-  RC2_E2E_MAX_POST_CLOSE_RSS_DELTA_KB,
+  RC2_E2E_MAX_POST_CLOSE_RSS_DELTA_KB, RC2_E2E_RESOURCE_CLOSE_CYCLES,
   RC2_E2E_REQUIRE_SLOW_WS.
 
 This harness proves the isolated macOS host and RPC/event mirror seam. It does not claim real iOS UI coverage.
@@ -153,7 +185,10 @@ CPU and RPC/input latency metrics are diagnostic_only; they have no pass/fail th
         "--pre-gate-seconds",
         type=int,
         default=PRE_GATE_SECONDS,
-        help="elapsed time for the intermediate health and memory gate; 0 disables",
+        help=(
+            "elapsed soak time for the intermediate health and memory gate; "
+            "0 disables. Does not rebaseline post-soak samples"
+        ),
     )
     parser.add_argument(
         "--sample-interval-seconds",
@@ -191,11 +226,21 @@ CPU and RPC/input latency metrics are diagnostic_only; they have no pass/fail th
         help="reuse an existing canary build under --canary-root",
     )
     parser.add_argument(
+        "--resource-close-cycles",
+        type=int,
+        default=RESOURCE_CLOSE_CYCLES,
+        help=(
+            "same-process terminal open/close cycles after the primary workload; "
+            "cycle 1 warms the baseline, cycles 2+ must recover without stacking "
+            f"(default {RESOURCE_CLOSE_CYCLES}, minimum 2)"
+        ),
+    )
+    parser.add_argument(
         "--validate-only",
         action="store_true",
         help="validate and print the effective configuration without building or launching",
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     if args.release_soak:
         args.duration_seconds = max(args.duration_seconds, 3600)
         args.terminal_count = max(args.terminal_count, 12)
@@ -209,6 +254,7 @@ CPU and RPC/input latency metrics are diagnostic_only; they have no pass/fail th
 def configure(args):
     global PORT, BASE, RUN_SECONDS, TERMINAL_COUNT, PRE_GATE_SECONDS, SAMPLE_INTERVAL_SECONDS
     global CLIENT_WARMUP_SECONDS, WORKLOAD_STABILIZATION_SECONDS, REQUIRE_SLOW_WS
+    global HIDDEN_LINES, LARGE_INPUT_BYTES, TUI_SECONDS, RESOURCE_CLOSE_CYCLES
     PORT = args.port
     BASE = f"http://127.0.0.1:{PORT}"
     RUN_SECONDS = args.duration_seconds
@@ -218,6 +264,16 @@ def configure(args):
     CLIENT_WARMUP_SECONDS = args.client_warmup_seconds
     WORKLOAD_STABILIZATION_SECONDS = args.workload_stabilization_seconds
     REQUIRE_SLOW_WS = args.require_slow_ws
+    RESOURCE_CLOSE_CYCLES = args.resource_close_cycles
+    # Smoke (non-release) must stay short enough for 15-30s canaries. Release-soak
+    # keeps the heavy hidden flood / large input / TUI budgets unless env overrides.
+    if not args.release_soak:
+        if "RC2_E2E_HIDDEN_LINES" not in os.environ:
+            HIDDEN_LINES = min(HIDDEN_LINES, 800)
+        if "RC2_E2E_LARGE_INPUT_BYTES" not in os.environ:
+            LARGE_INPUT_BYTES = min(LARGE_INPUT_BYTES, 32 * 1024)
+        if "RC2_E2E_TUI_SECONDS" not in os.environ:
+            TUI_SECONDS = min(TUI_SECONDS, 3)
 
 
 def validated_canary_root(path):
@@ -275,6 +331,11 @@ def prepare_run_artifacts(canary_root):
         run_artifact_root,
         "hidden flood completion sentinel",
     )
+    primary_stream_done_path = contained_path(
+        run_artifact_root / "primary-stream.done",
+        run_artifact_root,
+        "primary stream completion sentinel",
+    )
     return (
         state_root,
         run_artifact_root,
@@ -282,6 +343,7 @@ def prepare_run_artifacts(canary_root):
         large_input_path,
         workload_trigger_path,
         hidden_flood_done_path,
+        primary_stream_done_path,
     )
 
 
@@ -339,6 +401,13 @@ def validate_configuration(args):
         raise Failure("large input byte count must be at least 1")
     if MAX_POST_CLOSE_RSS_DELTA_KB < 0:
         raise Failure("post-close RSS delta must be non-negative")
+    if args.resource_close_cycles < 2:
+        raise Failure(
+            "resource close cycles must be at least 2 "
+            "(cycle 1 warms baseline; cycle 2+ proves no stacking)"
+        )
+    if args.resource_close_cycles > 8:
+        raise Failure("resource close cycles must be at most 8")
     if args.no_build and args.canary_root is None:
         raise Failure("--no-build requires --canary-root; refusing an ambiguous build identity")
     if args.canary_root is not None:
@@ -490,6 +559,132 @@ def file_descriptor_type_delta(before, after):
     return delta
 
 
+def classify_fd_path_category(fd_type, name):
+    """Map one lsof (type, name) pair to a privacy-safe ownership category.
+
+    Never returns raw paths, socket endpoints, or user-home segments. Used to
+    distinguish per-surface PTY/kqueue leftovers from process-global first-use
+    caches (SQLite/WAL, frameworks, Ghostty resources, Metal/font).
+    """
+    # lsof type tags are mixed case (IPv4); normalize for matching only.
+    kind = (fd_type or "unknown").strip()
+    kind_key = kind.upper()
+    raw = name or ""
+    lower = raw.lower()
+
+    if kind_key == "KQUEUE":
+        return "kqueue"
+    if kind_key == "CHR":
+        if any(token in lower for token in ("/dev/ttys", "/dev/pty", "/dev/ptmx", "ptmx")):
+            return "pty_chr"
+        if lower.endswith("/dev/null") or lower == "/dev/null":
+            return "dev_null_chr"
+        return "chr_other"
+    if kind_key in ("IPV4", "IPV6"):
+        return "ip_socket"
+    if kind_key == "UNIX":
+        return "unix_socket"
+    if kind_key == "DIR":
+        return "dir_handle"
+    if kind_key == "PIPE":
+        return "pipe"
+    if kind_key == "NPOLICY":
+        return "npolicy"
+    if kind_key != "REG":
+        return f"type_{kind_key.lower()}"
+
+    # REG path categories only — match library/framework shapes, never emit path.
+    if (
+        lower.endswith(".sqlite")
+        or lower.endswith(".sqlite-wal")
+        or lower.endswith(".sqlite-shm")
+        or lower.endswith("-wal")
+        or lower.endswith("-shm")
+        or "remote-code.sqlite" in lower
+        or "remotecode.sqlite" in lower
+    ):
+        return "sqlite_reg"
+    if "ghostty" in lower:
+        return "ghostty_resource_reg"
+    if (
+        ".metallib" in lower
+        or "/metal/" in lower
+        or "agx" in lower
+        or "gpucompiler" in lower
+        or "applemetal" in lower
+    ):
+        return "metal_reg"
+    if (
+        ".ttf" in lower
+        or ".otf" in lower
+        or ".ttc" in lower
+        or "/fonts/" in lower
+        or "coretext" in lower
+        or "fontregistry" in lower
+    ):
+        return "font_reg"
+    if ".framework/" in lower or lower.endswith(".dylib") or "/dyld/" in lower:
+        return "framework_dylib_reg"
+    if "remotecode" in lower or "agentcanary" in lower or "agent-canary" in lower:
+        return "app_bundle_reg"
+    if "/system/" in lower or lower.startswith("/usr/lib") or lower.startswith("/usr/lib/"):
+        return "system_reg"
+    if "/private/var/folders/" in lower or "/tmp/" in lower or lower.startswith("/var/folders/"):
+        return "tmp_cache_reg"
+    return "reg_other"
+
+
+def file_descriptor_category_counts(pid):
+    """Count open FDs by privacy-safe ownership category (types + path class).
+
+    Uses lsof -Fftn but never returns names/paths to callers.
+    """
+    result = subprocess.run(
+        ["/usr/sbin/lsof", "-nP", "-a", "-p", str(pid), "-Fftn"],
+        text=True,
+        capture_output=True,
+    )
+    if result.returncode != 0:
+        raise Failure("could not sample app file descriptor categories")
+    counts = {}
+    current_type = None
+    current_name = ""
+    saw_fd = False
+
+    def commit():
+        nonlocal saw_fd
+        if not saw_fd:
+            return
+        category = classify_fd_path_category(current_type or "unknown", current_name)
+        counts[category] = counts.get(category, 0) + 1
+
+    for line in result.stdout.splitlines():
+        if not line:
+            continue
+        code, value = line[0], line[1:]
+        if code == "f":
+            commit()
+            saw_fd = True
+            current_type = "unknown"
+            current_name = ""
+        elif code == "t" and saw_fd:
+            current_type = value or "unknown"
+        elif code == "n" and saw_fd:
+            current_name = value
+    commit()
+    return {key: counts[key] for key in sorted(counts)}
+
+
+def file_descriptor_category_delta(before, after):
+    keys = set(before or {}) | set(after or {})
+    delta = {}
+    for key in sorted(keys):
+        change = int((after or {}).get(key, 0)) - int((before or {}).get(key, 0))
+        if change:
+            delta[key] = change
+    return delta
+
+
 def child_process_count(pid):
     result = subprocess.run(["ps", "-axo", "pid=,ppid="], text=True, capture_output=True)
     if result.returncode != 0:
@@ -600,6 +795,10 @@ def resource_counts_recovered(fd_count, child_count, baseline_fd_count, baseline
     return fd_count <= baseline_fd_count and child_count <= baseline_child_count
 
 
+def process_tree_cleaned(child_count, baseline_child_count, owned_process_count=0):
+    return child_count <= baseline_child_count and owned_process_count == 0
+
+
 def post_close_resources_recovered(
     rss_kb,
     fd_count,
@@ -621,6 +820,44 @@ def post_close_resources_recovered(
     )
 
 
+def wait_for_process_tree_cleanup(
+    pid,
+    baseline_child_count,
+    terminal_session_ids=(),
+    terminal_process_groups=(),
+    terminal_process_marker=None,
+    timeout=30,
+):
+    """Hard gate: no residual shell children or owned terminal processes.
+
+    Does not gate RSS/FD — those use warmed cycle recovery after first close.
+    """
+    deadline = time.monotonic() + timeout
+    last_child_count = None
+    last_owned_processes = []
+    last_snapshot = None
+    while time.monotonic() < deadline:
+        last_snapshot = process_resource_snapshot(pid)
+        last_child_count = last_snapshot["child_process_count"]
+        last_owned_processes = owned_terminal_processes(
+            terminal_session_ids,
+            terminal_process_groups,
+            terminal_process_marker,
+        )
+        if process_tree_cleaned(
+            last_child_count,
+            baseline_child_count,
+            len(last_owned_processes),
+        ):
+            return {**last_snapshot, "owned_processes": []}
+        time.sleep(0.5)
+    raise Failure(
+        "post-close process tree did not clean up: "
+        f"children {last_child_count} > {baseline_child_count}, or owned terminal processes "
+        f"remain {last_owned_processes}"
+    )
+
+
 def wait_for_resource_recovery(
     pid,
     baseline_rss_kb,
@@ -630,6 +867,7 @@ def wait_for_resource_recovery(
     terminal_process_groups=(),
     terminal_process_marker=None,
     timeout=30,
+    baseline_label="warmed post-close baseline",
 ):
     deadline = time.monotonic() + timeout
     last_rss_kb = None
@@ -658,12 +896,77 @@ def wait_for_resource_recovery(
             return {**snapshot, "owned_processes": []}
         time.sleep(0.5)
     raise Failure(
-        "post-close resources did not recover to the pre-workspace baseline: "
+        f"post-close resources did not recover to the {baseline_label}: "
         f"rss {last_rss_kb} > {baseline_rss_kb} + {MAX_POST_CLOSE_RSS_DELTA_KB} KiB, "
         f"fd {last_fd_count} > {baseline_fd_count}, or "
         f"children {last_child_count} > {baseline_child_count}, or owned terminal processes "
         f"remain {last_owned_processes}"
     )
+
+
+def assert_no_per_surface_fd_residue(post_categories, cold_categories=None):
+    """Fail if post-close still holds surface-local PTY/kqueue FDs.
+
+    Global first-use caches (sqlite/framework/metal/font) may remain; PTY CHR
+    and kqueues must return to the cold (pre-workspace) level.
+    """
+    cold = cold_categories or {}
+    post = post_categories or {}
+    for key in ("pty_chr", "kqueue"):
+        post_count = int(post.get(key, 0))
+        cold_count = int(cold.get(key, 0))
+        if post_count > cold_count:
+            raise Failure(
+                f"per-surface FD residue after close: {key}={post_count} "
+                f"> cold {cold_count}"
+            )
+
+
+def run_resource_close_cycle(cycle_index, terminal_count, run_artifact_root):
+    """Open terminals, prove a live marker, then close them. Returns ownership sets.
+
+    Used after the primary soak to prove residuals do not stack across cycles.
+    """
+    if terminal_count < 1:
+        raise Failure("resource close cycle requires at least one terminal")
+    workspace_ids = []
+    surface_ids = []
+    for index in range(terminal_count):
+        created = rpc(
+            "workspace.create",
+            {"name": f"E2ECloseCycle{cycle_index:02d}_{index:02d}", "cwd": "/tmp"},
+        )
+        workspace_id, surface_id = workspace_surface(created)
+        workspace_ids.append(workspace_id)
+        surface_ids.append(surface_id)
+    session_ids = {wait_for_terminal_shell_pid(surface_id) for surface_id in surface_ids}
+    if len(session_ids) != terminal_count:
+        raise Failure(
+            f"close-cycle {cycle_index} shell session identities were not unique: "
+            f"{sorted(session_ids)}"
+        )
+    primary_sid = surface_ids[0]
+    rpc("workspace.select", {"id": workspace_ids[0]})
+    marker = runtime_marker(f"RC2_CLOSE_CYCLE_{cycle_index:02d}_", "OK")
+    send_text(primary_sid, f"printf '{marker}\\n'\n")
+    wait_snapshot_contains(primary_sid, marker, timeout=15)
+    process_marker = (
+        "RC2_E2E_CYCLE_BG_"
+        + hashlib.sha256(
+            f"{run_artifact_root}:{cycle_index}".encode()
+        ).hexdigest()[:12]
+    )
+    # No stubborn background job: cycle only needs process-tree emptiness after close.
+    for workspace_id in workspace_ids:
+        rpc("workspace.close", {"id": workspace_id})
+    return {
+        "cycle_index": cycle_index,
+        "workspace_ids": workspace_ids,
+        "surface_ids": surface_ids,
+        "session_ids": session_ids,
+        "process_marker": process_marker,
+        "marker": marker,
+    }
 
 
 def collect_sample(pid, stats, surface_ids=()):
@@ -934,6 +1237,77 @@ def wait_snapshot_contains(surface_id, needle, timeout=20):
     raise Failure(f"snapshot missing {needle!r}; last tail={last[-400:]!r}")
 
 
+def runtime_marker(*parts):
+    """Join marker parts only at runtime so typed/echoed source cannot pre-match waits."""
+    if not parts or any(not isinstance(part, str) or part == "" for part in parts):
+        raise Failure("runtime marker parts must be non-empty strings")
+    return "".join(parts)
+
+
+def post_idle_input_command():
+    """Shell probe typed after soak idle: split marker, printf \\n format, real Enter.
+
+    Adjacent shell quotes keep RC2_POST_IDLE_INPUT_OK out of typed/echoed source.
+    The printf format retains a backslash-n inside quotes; the command terminator
+    must be an actual newline so the shell executes the probe.
+    """
+    return "printf 'RC2_POST_IDLE_INPUT_''OK\\n'\n"
+
+
+def foreground_child_exit_command():
+    """Deterministic foreground termination for the child-exit gate.
+
+    Intent: the interactive shell (foreground PTY child) must exit while a
+    SIGHUP/SIGTERM-ignoring background marker descendant remains for later
+    workspace-close / reaper proof.
+
+    Shell builtin ``exit`` is not used: interactive zsh job control can refuse
+    the first exit while jobs exist, so condition polling stays alive forever.
+    ``exec /usr/bin/true`` replaces the shell process; true exits 0 and the
+    existing background marker process is left for orphan-reaping checks.
+    """
+    return "exec /usr/bin/true\n"
+
+
+def python_print_runtime_marker(*parts, flush=True):
+    """Emit a Python print statement whose contiguous marker exists only after eval."""
+    marker = runtime_marker(*parts)
+    expression = " + ".join(repr(part) for part in parts)
+    flush_arg = ", flush=True" if flush else ""
+    return f"print({expression}{flush_arg})"
+
+
+def first_diff_offset(expected, actual):
+    limit = min(len(expected), len(actual))
+    for index in range(limit):
+        if expected[index] != actual[index]:
+            return index
+    if len(expected) != len(actual):
+        return limit
+    return None
+
+
+def large_input_mismatch_diagnostics(path, expected):
+    """Privacy-safe mismatch facts only: lengths, hashes, first differing offset."""
+    diagnostics = {
+        "expected_len": len(expected),
+        "expected_sha256": hashlib.sha256(expected).hexdigest(),
+        "actual_len": None,
+        "actual_sha256": None,
+        "first_diff_offset": None,
+        "read_error": None,
+    }
+    try:
+        actual = path.read_bytes()
+    except OSError as exc:
+        diagnostics["read_error"] = exc.__class__.__name__
+        return diagnostics
+    diagnostics["actual_len"] = len(actual)
+    diagnostics["actual_sha256"] = hashlib.sha256(actual).hexdigest()
+    diagnostics["first_diff_offset"] = first_diff_offset(expected, actual)
+    return diagnostics
+
+
 def send_text(surface_id, text):
     result = rpc("surface.send_text", {"id": surface_id, "text": text})
     if isinstance(result, dict) and result.get("accepted") is False:
@@ -983,6 +1357,27 @@ def wait_for_terminal_shell_pid(surface_id, timeout=10):
             return int(child_pid)
         time.sleep(0.1)
     raise Failure(f"terminal {surface_id} did not expose its shell pid")
+
+
+def wait_for_process_exited(surface_id, timeout=10):
+    """Poll surface.health until the shell exit contract is observed.
+
+    Exact contract only: alive is False and terminal_dead_reason is
+    process_exited. Other dead reasons never satisfy the gate. On timeout the
+    last privacy-safe health object (IDs/status fields only from RPC) is
+    reported; no terminal content is included.
+    """
+    deadline = time.monotonic() + timeout
+    last = None
+    while time.monotonic() < deadline:
+        last = rpc("surface.health", {"id": surface_id})
+        if (
+            last.get("alive") is False
+            and last.get("terminal_dead_reason") == "process_exited"
+        ):
+            return last
+        time.sleep(0.1)
+    raise Failure(f"child exit did not mark dead: {last}")
 
 
 def capture_terminal_diagnostics(surface_id):
@@ -1418,46 +1813,249 @@ def workload_duration_seconds():
     return RUN_SECONDS + WORKLOAD_STABILIZATION_SECONDS
 
 
+def primary_stream_done_timeout_seconds(elapsed_since_trigger, workload_seconds=None):
+    """Remaining producer budget after elapsed soak/setup; no arbitrary long wait.
+
+    Producers run for workload_duration_seconds after the shared trigger. Post-soak
+    waits must cover only what is left (plus a short sentinel-write grace), not a
+    fixed multi-second floor unrelated to remaining work.
+    """
+    if workload_seconds is None:
+        workload_seconds = workload_duration_seconds()
+    if elapsed_since_trigger < 0:
+        raise Failure("elapsed_since_trigger must be non-negative")
+    remaining = max(0.0, float(workload_seconds) - float(elapsed_since_trigger))
+    # Grace covers done.write_text / scheduler lag after the producer loop ends.
+    return remaining + 5.0
+
+
+def producer_hard_deadline_grace_seconds():
+    """Extra wall budget for SIGALRM after nominal stream end.
+
+    Covers final marker writes and done-file creation. Must stay small so a
+    stuck producer cannot stretch the harness wait indefinitely.
+    """
+    return 2.0
+
+
+def time_bounded_stdout_helpers_python():
+    """Shared producer primitives: non-blocking line writes + hard wall deadline.
+
+    Intent: PTY slave stdout blocks when the master apply path is slower than the
+    producer (kernel buffer full). A plain print(flush=True) then never returns,
+    so wall-clock loop checks and done-file writes never run. Helpers keep stress
+    high when the drain path is healthy and still exit under permanent backpressure.
+
+    Completion authority is _commit_done_sentinel only: atomic tmp+replace of the
+    done file, exactly once, with SIGALRM ignored. It must never require a
+    successful write to the same PTY that may be permanently full. Path.write_text
+    is unsafe here — open('w') truncates first; a signal before write leaves a
+    0-byte file that fails wait_for_exact_file('done\\n').
+    """
+    return (
+        "import fcntl, os, signal, sys, time\n"
+        "from pathlib import Path\n"
+        "class _ProducerBudgetExpired(Exception):\n"
+        "    pass\n"
+        "_DONE_COMMITTED=False\n"
+        "def _install_stdout_nonblocking():\n"
+        "    fd=sys.stdout.fileno()\n"
+        "    flags=fcntl.fcntl(fd, fcntl.F_GETFL)\n"
+        "    fcntl.fcntl(fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)\n"
+        "    return fd\n"
+        "def _write_line_until(fd, text, end):\n"
+        "    data=(text if text.endswith('\\n') else text + '\\n').encode()\n"
+        "    off=0\n"
+        "    while off < len(data) and time.monotonic() < end:\n"
+        "        try:\n"
+        "            n=os.write(fd, data[off:])\n"
+        "            if n is None or n <= 0:\n"
+        "                time.sleep(0.01)\n"
+        "                continue\n"
+        "            off += n\n"
+        "        except BlockingIOError:\n"
+        "            time.sleep(0.01)\n"
+        "        except InterruptedError:\n"
+        "            continue\n"
+        "        except BrokenPipeError:\n"
+        "            return False\n"
+        "    return off == len(data)\n"
+        "def _arm_producer_deadline(seconds):\n"
+        "    def _on_alarm(signum, frame):\n"
+        "        raise _ProducerBudgetExpired()\n"
+        "    signal.signal(signal.SIGALRM, _on_alarm)\n"
+        "    signal.setitimer(signal.ITIMER_REAL, max(0.05, float(seconds)))\n"
+        "def _disarm_producer_deadline():\n"
+        "    signal.setitimer(signal.ITIMER_REAL, 0.0)\n"
+        "def _commit_done_sentinel(path):\n"
+        "    global _DONE_COMMITTED\n"
+        "    if _DONE_COMMITTED:\n"
+        "        return\n"
+        "    _DONE_COMMITTED=True\n"
+        "    _disarm_producer_deadline()\n"
+        "    signal.signal(signal.SIGALRM, signal.SIG_IGN)\n"
+        "    try:\n"
+        "        signal.signal(signal.SIGPIPE, signal.SIG_IGN)\n"
+        "    except Exception:\n"
+        "        pass\n"
+        "    target=Path(path) if not isinstance(path, Path) else path\n"
+        "    tmp=f\"{target}.tmp.{os.getpid()}\"\n"
+        "    data=b'done\\n'\n"
+        "    fd=os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)\n"
+        "    try:\n"
+        "        written=0\n"
+        "        while written < len(data):\n"
+        "            written+=os.write(fd, data[written:])\n"
+        "        os.fsync(fd)\n"
+        "    finally:\n"
+        "        os.close(fd)\n"
+        "    os.replace(tmp, str(target))\n"
+    )
+
+
+def runtime_marker_write_line_call(*parts, end_expr="end"):
+    """Emit split marker via non-blocking _write_line_until (no contiguous needle)."""
+    expression = " + ".join(repr(part) for part in parts)
+    return f"_write_line_until(fd, {expression}, {end_expr})"
+
+
+def primary_stream_producer_command(
+    workload_trigger_python_path,
+    primary_stream_done_python_path,
+    duration_seconds=None,
+):
+    """Foreground primary stream: sustained lines, hard-bounded, file sentinel.
+
+    Completion proof is _commit_done_sentinel only — never a typed contiguous
+    RC2_E2E_STREAM_DONE in command source (echo false-positive class), and never
+    gated on a PTY write to a possibly full stdout.
+    """
+    if duration_seconds is None:
+        duration_seconds = workload_duration_seconds()
+    grace = producer_hard_deadline_grace_seconds()
+    # Non-blocking READY: blocking print(flush=True) never reaches the budgeted
+    # loop or done-sentinel if the PTY is already full when the producer starts.
+    # Short budget: under a permanently full PTY the host will not see READY
+    # anyway; do not stall the hard deadline or file sentinel on that write.
+    ready_write = runtime_marker_write_line_call(
+        "RC2_E2E_STREAM_",
+        "READY",
+        end_expr="time.monotonic()+5",
+    )
+    # Best-effort scrollback marker only; file sentinel is already committed.
+    done_write = runtime_marker_write_line_call(
+        "RC2_E2E_STREAM_",
+        "DONE",
+        end_expr="time.monotonic()+max(0.2, grace)",
+    )
+    return (
+        "python3 - <<'PY'\n"
+        f"{time_bounded_stdout_helpers_python()}"
+        f"trigger=Path({workload_trigger_python_path})\n"
+        f"done=Path({primary_stream_done_python_path})\n"
+        "fd=_install_stdout_nonblocking()\n"
+        f"duration={float(duration_seconds)}\n"
+        f"grace={float(grace)}\n"
+        "i=0\n"
+        "try:\n"
+        f"    {ready_write}\n"
+        "    while not trigger.exists():\n"
+        "        time.sleep(0.01)\n"
+        "    end=time.monotonic()+duration\n"
+        "    _arm_producer_deadline(duration+grace)\n"
+        "    try:\n"
+        "        while time.monotonic()<end:\n"
+        "            _write_line_until(fd, f'RC2_E2E_STREAM_{i:06d}', end)\n"
+        "            i+=1\n"
+        "            now=time.monotonic()\n"
+        "            if now>=end:\n"
+        "                break\n"
+        "            time.sleep(min(0.01, end-now))\n"
+        "    except _ProducerBudgetExpired:\n"
+        "        pass\n"
+        "finally:\n"
+        "    _commit_done_sentinel(done)\n"
+        "    try:\n"
+        f"        {done_write}\n"
+        "    except Exception:\n"
+        "        pass\n"
+        "PY\n"
+    )
+
+
 def start_auxiliary_workload(surface_id, index, workload_trigger_python_path):
     mode = (index - 2) % 4
+    ready_print = python_print_runtime_marker(f"RC2_AUX_{index:02d}_", "READY")
+    done_print = python_print_runtime_marker(f"RC2_AUX_{index:02d}_", "DONE")
+    done_write = runtime_marker_write_line_call(
+        f"RC2_AUX_{index:02d}_",
+        "DONE",
+        end_expr="time.monotonic()+max(0.2, grace)",
+    )
+    duration = float(workload_duration_seconds())
+    grace = float(producer_hard_deadline_grace_seconds())
+    helpers = time_bounded_stdout_helpers_python()
     if mode == 0:
         command = (
             "python3 - <<'PY'\n"
-            "from pathlib import Path\n"
-            "import time\n"
+            f"{helpers}"
             f"trigger=Path({workload_trigger_python_path})\n"
-            f"print('RC2_AUX_{index:02d}_READY', flush=True)\n"
+            f"{ready_print}\n"
             "while not trigger.exists():\n"
             "    time.sleep(0.01)\n"
-            f"end=time.monotonic()+{workload_duration_seconds()}\n"
+            f"duration={duration}\n"
+            f"grace={grace}\n"
+            "end=time.monotonic()+duration\n"
+            "fd=_install_stdout_nonblocking()\n"
+            "_arm_producer_deadline(duration+grace)\n"
             "i=0\n"
-            "while time.monotonic()<end:\n"
-            f"    print(f'RC2_AUX_{index:02d}_STREAM_{{i:06d}}', flush=True)\n"
-            "    i+=1\n"
-            "    time.sleep(0.025)\n"
-            f"print('RC2_AUX_{index:02d}_DONE', flush=True)\n"
+            "try:\n"
+            "    while time.monotonic()<end:\n"
+            f"        _write_line_until(fd, f'RC2_AUX_{index:02d}_STREAM_{{i:06d}}', end)\n"
+            "        i+=1\n"
+            "        now=time.monotonic()\n"
+            "        if now>=end:\n"
+            "            break\n"
+            "        time.sleep(min(0.025, end-now))\n"
+            "except _ProducerBudgetExpired:\n"
+            "    pass\n"
+            "finally:\n"
+            "    _disarm_producer_deadline()\n"
+            "    try:\n"
+            f"        {done_write}\n"
+            "    except Exception:\n"
+            "        pass\n"
             "PY\n"
         )
         workload = "stream"
     elif mode == 1:
         command = (
             "python3 - <<'PY'\n"
-            "from pathlib import Path\n"
-            "import sys, time\n"
+            f"{helpers}"
             f"trigger=Path({workload_trigger_python_path})\n"
-            f"print('RC2_AUX_{index:02d}_READY', flush=True)\n"
+            f"{ready_print}\n"
             "while not trigger.exists():\n"
             "    time.sleep(0.01)\n"
-            "sys.stdout.write('\\x1b[?1049h')\n"
-            f"end=time.monotonic()+{workload_duration_seconds()}\n"
+            f"duration={duration}\n"
+            f"grace={grace}\n"
+            "end=time.monotonic()+duration\n"
+            "fd=_install_stdout_nonblocking()\n"
+            "_arm_producer_deadline(duration+grace)\n"
             "i=0\n"
-            "while time.monotonic()<end:\n"
-            f"    sys.stdout.write('\\x1b[HRC2_AUX_{index:02d}_TUI_%06d\\n' % i)\n"
-            "    sys.stdout.flush()\n"
-            "    i+=1\n"
-            "    time.sleep(0.1)\n"
-            f"sys.stdout.write('\\x1b[?1049lRC2_AUX_{index:02d}_DONE\\n')\n"
-            "sys.stdout.flush()\n"
+            "try:\n"
+            "    _write_line_until(fd, '\\x1b[?1049h', end)\n"
+            "    while time.monotonic()<end:\n"
+            f"        _write_line_until(fd, '\\x1b[HRC2_AUX_{index:02d}_TUI_%06d' % i, end)\n"
+            "        i+=1\n"
+            "        now=time.monotonic()\n"
+            "        if now>=end:\n"
+            "            break\n"
+            "        time.sleep(min(0.1, end-now))\n"
+            f"    _write_line_until(fd, '\\x1b[?1049l' + 'RC2_AUX_{index:02d}_' + 'DONE', end+grace)\n"
+            "except _ProducerBudgetExpired:\n"
+            "    pass\n"
+            "finally:\n"
+            "    _disarm_producer_deadline()\n"
             "PY\n"
         )
         workload = "tui"
@@ -1467,31 +2065,47 @@ def start_auxiliary_workload(surface_id, index, workload_trigger_python_path):
             "from pathlib import Path\n"
             "import time\n"
             f"trigger=Path({workload_trigger_python_path})\n"
-            f"print('RC2_AUX_{index:02d}_READY', flush=True)\n"
+            f"{ready_print}\n"
             "while not trigger.exists():\n"
             "    time.sleep(0.01)\n"
-            f"time.sleep({workload_duration_seconds()})\n"
-            f"print('RC2_AUX_{index:02d}_DONE', flush=True)\n"
+            f"time.sleep({duration})\n"
+            f"{done_print}\n"
             "PY\n"
         )
         workload = "idle"
     else:
         command = (
             "python3 - <<'PY'\n"
-            "from pathlib import Path\n"
-            "import time\n"
+            f"{helpers}"
             f"trigger=Path({workload_trigger_python_path})\n"
-            f"print('RC2_AUX_{index:02d}_READY', flush=True)\n"
+            f"{ready_print}\n"
             "while not trigger.exists():\n"
             "    time.sleep(0.01)\n"
-            f"end=time.monotonic()+{workload_duration_seconds()}\n"
+            f"duration={duration}\n"
+            f"grace={grace}\n"
+            "end=time.monotonic()+duration\n"
+            "fd=_install_stdout_nonblocking()\n"
+            "_arm_producer_deadline(duration+grace)\n"
             "burst=0\n"
-            "while time.monotonic()<end:\n"
-            "    for line in range(50):\n"
-            f"        print(f'RC2_AUX_{index:02d}_BURST_{{burst:05d}}_{{line:03d}}')\n"
-            "    burst+=1\n"
-            "    time.sleep(1)\n"
-            f"print('RC2_AUX_{index:02d}_DONE', flush=True)\n"
+            "try:\n"
+            "    while time.monotonic()<end:\n"
+            "        for line in range(50):\n"
+            f"            _write_line_until(fd, f'RC2_AUX_{index:02d}_BURST_{{burst:05d}}_{{line:03d}}', end)\n"
+            "            if time.monotonic()>=end:\n"
+            "                break\n"
+            "        burst+=1\n"
+            "        now=time.monotonic()\n"
+            "        if now>=end:\n"
+            "            break\n"
+            "        time.sleep(min(1.0, end-now))\n"
+            "except _ProducerBudgetExpired:\n"
+            "    pass\n"
+            "finally:\n"
+            "    _disarm_producer_deadline()\n"
+            "    try:\n"
+            f"        {done_write}\n"
+            "    except Exception:\n"
+            "        pass\n"
             "PY\n"
         )
         workload = "burst"
@@ -1511,6 +2125,7 @@ def effective_configuration(args):
         "pre_gate_seconds": args.pre_gate_seconds,
         "profile": "release-soak" if args.release_soak else "custom-smoke",
         "require_slow_ws": args.require_slow_ws,
+        "resource_close_cycles": args.resource_close_cycles,
         "sample_interval_seconds": args.sample_interval_seconds,
         "terminal_count": args.terminal_count,
         "workload_command_seconds": (
@@ -1558,6 +2173,7 @@ def main():
         "configured_sample_interval_seconds": SAMPLE_INTERVAL_SECONDS,
         "configured_client_warmup_seconds": CLIENT_WARMUP_SECONDS,
         "configured_workload_stabilization_seconds": WORKLOAD_STABILIZATION_SECONDS,
+        "configured_resource_close_cycles": RESOURCE_CLOSE_CYCLES,
         "workload_command_seconds": workload_duration_seconds(),
         "measured_soak_seconds": None,
         "diagnostic_only_metrics": list(DIAGNOSTIC_ONLY_METRICS),
@@ -1570,6 +2186,7 @@ def main():
             "max_fd_count_delta": 0,
             "max_child_process_count_delta": 0,
             "max_observed_dropped_output_bytes": 0,
+            "resource_close_cycles": RESOURCE_CLOSE_CYCLES,
         },
         "release_soak": args.release_soak,
         "listener_owner_pid_verified": False,
@@ -1635,10 +2252,25 @@ def main():
         "pre_workspace_rss_kb": None,
         "pre_workspace_fd_count": None,
         "pre_workspace_child_process_count": None,
+        "pre_workspace_fd_type_counts": None,
+        "pre_workspace_fd_categories": None,
         "post_close_rss_kb": None,
         "post_close_rss_delta_kb": None,
+        "post_close_rss_delta_from_cold_kb": None,
         "post_close_fd_count": None,
+        "post_close_fd_delta_from_cold": None,
         "post_close_child_process_count": None,
+        "post_close_fd_type_counts": None,
+        "post_close_fd_categories": None,
+        "post_close_fd_category_delta_from_cold": None,
+        "post_close_cold_rss_within_budget": None,
+        "post_close_cold_fd_recovered": None,
+        "post_close_process_tree_cleaned": False,
+        "post_close_per_surface_fds_cleaned": False,
+        "warmed_post_close_rss_kb": None,
+        "warmed_post_close_fd_count": None,
+        "warmed_post_close_child_process_count": None,
+        "resource_close_cycle_results": [],
     }
     slow_sock = None
     mutation_control = None
@@ -1650,6 +2282,7 @@ def main():
     large_input_path = None
     workload_trigger_path = None
     hidden_flood_done_path = None
+    primary_stream_done_path = None
     terminal_process_marker = None
     try:
         (
@@ -1659,6 +2292,7 @@ def main():
             large_input_path,
             workload_trigger_path,
             hidden_flood_done_path,
+            primary_stream_done_path,
         ) = prepare_run_artifacts(canary_root)
         isolated_home = state_root / "home"
         isolated_home.mkdir(parents=True, exist_ok=True)
@@ -1676,6 +2310,7 @@ def main():
         large_input_python_path = repr(str(large_input_path))
         workload_trigger_python_path = repr(str(workload_trigger_path))
         hidden_flood_done_python_path = repr(str(hidden_flood_done_path))
+        primary_stream_done_python_path = repr(str(primary_stream_done_path))
         canary_env["RC2_CANARY_ROOT"] = str(canary_root)
         canary_env["RC2_HTTP_PORT"] = str(PORT)
         canary_env["RC2_ENABLE_GHOSTTY_IN_TESTS"] = "1"
@@ -1741,6 +2376,8 @@ def main():
         stats["pre_workspace_child_process_count"] = pre_workspace_resources[
             "child_process_count"
         ]
+        stats["pre_workspace_fd_type_counts"] = file_descriptor_type_counts(pid)
+        stats["pre_workspace_fd_categories"] = file_descriptor_category_counts(pid)
 
         primary = rpc("workspace.create", {"name": "E2EPrimary", "cwd": "/tmp"})
         primary_wid, primary_sid = workspace_surface(primary)
@@ -1784,23 +2421,15 @@ def main():
         stats["hidden_producer_completed"] = True
         observe_slow_ws_disconnect(stats)
 
-        send_text(primary_sid, (
-            "python3 - <<'PY'\n"
-            "from pathlib import Path\n"
-            "import time\n"
-            f"trigger=Path({workload_trigger_python_path})\n"
-            "print('RC2_E2E_STREAM_READY', flush=True)\n"
-            "while not trigger.exists():\n"
-            "    time.sleep(0.01)\n"
-            f"end=time.monotonic()+{workload_duration_seconds()}\n"
-            "i=0\n"
-            "while time.monotonic()<end:\n"
-            "    print(f'RC2_E2E_STREAM_{i:06d}', flush=True)\n"
-            "    i+=1\n"
-            "    time.sleep(0.01)\n"
-            "print('RC2_E2E_STREAM_DONE', flush=True)\n"
-            "PY\n"
-        ))
+        stream_ready_marker = runtime_marker("RC2_E2E_STREAM_", "READY")
+        stream_done_marker = runtime_marker("RC2_E2E_STREAM_", "DONE")
+        send_text(
+            primary_sid,
+            primary_stream_producer_command(
+                workload_trigger_python_path,
+                primary_stream_done_python_path,
+            ),
+        )
         stats["workloads"] = ["stream", "hidden-flood"]
         for index, surface_id in enumerate(all_surface_ids[2:], start=2):
             stats["workloads"].append(start_auxiliary_workload(
@@ -1809,10 +2438,15 @@ def main():
                 workload_trigger_python_path,
             ))
 
-        wait_snapshot_contains(primary_sid, "RC2_E2E_STREAM_READY", timeout=30)
+        wait_snapshot_contains(primary_sid, stream_ready_marker, timeout=30)
         for index, surface_id in enumerate(all_surface_ids[2:], start=2):
-            wait_snapshot_contains(surface_id, f"RC2_AUX_{index:02d}_READY", timeout=30)
+            wait_snapshot_contains(
+                surface_id,
+                runtime_marker(f"RC2_AUX_{index:02d}_", "READY"),
+                timeout=30,
+            )
         workload_trigger_path.write_text("start\n")
+        workload_started_monotonic = time.monotonic()
         wait_for_canary_duration(
             pid,
             canary_root,
@@ -1870,9 +2504,26 @@ def main():
         stats["soak_sample_count"] = len(stats["samples"])
         stats["post_soak_rss_kb"] = stats["samples"][-1]["rss_kb"]
         stats["post_soak_fd_count"] = stats["samples"][-1]["fd_count"]
-        wait_snapshot_contains(primary_sid, "RC2_E2E_STREAM_DONE")
+        # File sentinel is authoritative: snapshot needles must not match echoed
+        # script source while the stream child still owns the foreground tty.
+        primary_done_timeout = primary_stream_done_timeout_seconds(
+            time.monotonic() - workload_started_monotonic
+        )
+        wait_for_exact_file(
+            primary_stream_done_path,
+            "done\n",
+            timeout=primary_done_timeout,
+            description="primary stream producer completion",
+        )
+        # Marker should already be in scrollback once the done-file exists; keep
+        # a short bounded snapshot wait independent of remaining producer budget.
+        wait_snapshot_contains(primary_sid, stream_done_marker, timeout=15)
         for index, surface_id in enumerate(all_surface_ids[2:], start=2):
-            wait_snapshot_contains(surface_id, f"RC2_AUX_{index:02d}_DONE", timeout=15)
+            wait_snapshot_contains(
+                surface_id,
+                runtime_marker(f"RC2_AUX_{index:02d}_", "DONE"),
+                timeout=max(15.0, primary_done_timeout),
+            )
             assert_alive(surface_id)
         stats["terminals_alive_after_soak"] = sum(
             1 for surface_id in all_surface_ids if assert_alive(surface_id).get("process_alive")
@@ -1889,8 +2540,9 @@ def main():
         if isinstance(primary_health.get("render_diagnostics"), dict):
             stats["render_diagnostics_seen"] = True
         post_idle_started = time.monotonic()
-        send_text(primary_sid, "printf 'RC2_POST_IDLE_INPUT_OK\\n'\n")
-        wait_snapshot_contains(primary_sid, "RC2_POST_IDLE_INPUT_OK", timeout=10)
+        post_idle_marker = runtime_marker("RC2_POST_IDLE_INPUT_", "OK")
+        send_text(primary_sid, post_idle_input_command())
+        wait_snapshot_contains(primary_sid, post_idle_marker, timeout=10)
         stats["post_idle_input_seen"] = True
         stats["post_idle_output_roundtrip_ms"] = round(
             (time.monotonic() - post_idle_started) * 1000, 3
@@ -1951,18 +2603,28 @@ def main():
         large_result = send_text(primary_sid, large_command)
         assert_large_input_accepted(large_result)
         stats["large_input_accepted"] = True
-        wait_snapshot_contains(
-            primary_sid,
-            f"RC2_LARGE_INPUT_BYTES:{LARGE_INPUT_BYTES}",
-            timeout=60,
-        )
-        stats["large_input_exact_bytes_seen"] = True
-        wait_snapshot_contains(
-            primary_sid,
-            f"RC2_LARGE_INPUT_SHA256:{expected_large_input_sha256}",
-            timeout=60,
-        )
-        stats["large_input_sha256_seen"] = True
+        try:
+            wait_snapshot_contains(
+                primary_sid,
+                f"RC2_LARGE_INPUT_BYTES:{LARGE_INPUT_BYTES}",
+                timeout=60,
+            )
+            stats["large_input_exact_bytes_seen"] = True
+            wait_snapshot_contains(
+                primary_sid,
+                f"RC2_LARGE_INPUT_SHA256:{expected_large_input_sha256}",
+                timeout=60,
+            )
+            stats["large_input_sha256_seen"] = True
+        except Failure as large_input_error:
+            # Disposable run artifact: lengths/hashes/offset only — never payload bytes.
+            stats["large_input_mismatch"] = large_input_mismatch_diagnostics(
+                large_input_path,
+                expected_large_input,
+            )
+            raise Failure(
+                f"{large_input_error}; mismatch={stats['large_input_mismatch']}"
+            ) from large_input_error
 
         send_text(primary_sid, (
             "python3 - <<'PY'\n"
@@ -2072,11 +2734,8 @@ def main():
             for record in marker_processes + active_session_processes
             if record["pgid"] > 0
         }
-        send_text(primary_sid, "exit\n")
-        time.sleep(1)
-        dead = rpc("surface.health", {"id": primary_sid})
-        if dead.get("alive") is not False or dead.get("terminal_dead_reason") != "process_exited":
-            raise Failure(f"child exit did not mark dead: {dead}")
+        send_text(primary_sid, foreground_child_exit_command())
+        dead = wait_for_process_exited(primary_sid)
         stats["child_exit_dead_seen"] = True
         after_exit = send_text(primary_sid, "pwd\n")
         if after_exit.get("accepted") is not False or after_exit.get("status") != "process_exited":
@@ -2084,22 +2743,131 @@ def main():
         stats["app_alive_after_child_exit"] = app_pid(canary_root) is not None
         for workspace_id in all_workspace_ids:
             rpc("workspace.close", {"id": workspace_id})
-        recovered = wait_for_resource_recovery(
+        # Cycle 1: hard process-tree cleanup + per-surface FD category proof.
+        # Cold RSS/FD delta is diagnostic — first Ghostty/Metal/font/SQLite
+        # activation is process-global and must not be purged between tabs.
+        # Cycle-to-cycle warmed recovery (below) is the stacking gate.
+        recovered = wait_for_process_tree_cleanup(
             pid,
-            pre_workspace_resources["rss_kb"],
-            pre_workspace_resources["fd_count"],
             pre_workspace_resources["child_process_count"],
             terminal_session_ids=terminal_session_ids,
             terminal_process_groups=terminal_process_groups,
             terminal_process_marker=terminal_process_marker,
         )
+        stats["post_close_process_tree_cleaned"] = True
+        # Brief settle after tree cleanup so FD/kqueue cancel handlers finish.
+        settle_deadline = time.monotonic() + 5.0
+        while time.monotonic() < settle_deadline:
+            candidate = process_resource_snapshot(pid)
+            if process_tree_cleaned(
+                candidate["child_process_count"],
+                pre_workspace_resources["child_process_count"],
+                0,
+            ):
+                recovered = {**candidate, "owned_processes": []}
+            time.sleep(0.25)
+        post_categories = file_descriptor_category_counts(pid)
+        post_types = file_descriptor_type_counts(pid)
+        assert_no_per_surface_fd_residue(
+            post_categories,
+            stats.get("pre_workspace_fd_categories"),
+        )
+        stats["post_close_per_surface_fds_cleaned"] = True
         stats["post_close_rss_kb"] = recovered["rss_kb"]
         stats["post_close_rss_delta_kb"] = (
             recovered["rss_kb"] - pre_workspace_resources["rss_kb"]
         )
+        stats["post_close_rss_delta_from_cold_kb"] = stats["post_close_rss_delta_kb"]
         stats["post_close_fd_count"] = recovered["fd_count"]
+        stats["post_close_fd_delta_from_cold"] = (
+            recovered["fd_count"] - pre_workspace_resources["fd_count"]
+        )
         stats["post_close_child_process_count"] = recovered["child_process_count"]
         stats["post_close_owned_terminal_processes"] = len(recovered["owned_processes"])
+        stats["post_close_fd_type_counts"] = post_types
+        stats["post_close_fd_categories"] = post_categories
+        stats["post_close_fd_category_delta_from_cold"] = file_descriptor_category_delta(
+            stats.get("pre_workspace_fd_categories"),
+            post_categories,
+        )
+        stats["post_close_cold_rss_within_budget"] = (
+            recovered["rss_kb"]
+            <= pre_workspace_resources["rss_kb"] + MAX_POST_CLOSE_RSS_DELTA_KB
+        )
+        stats["post_close_cold_fd_recovered"] = (
+            recovered["fd_count"] <= pre_workspace_resources["fd_count"]
+        )
+        warmed_resources = {
+            "rss_kb": recovered["rss_kb"],
+            "fd_count": recovered["fd_count"],
+            "child_process_count": recovered["child_process_count"],
+        }
+        stats["warmed_post_close_rss_kb"] = warmed_resources["rss_kb"]
+        stats["warmed_post_close_fd_count"] = warmed_resources["fd_count"]
+        stats["warmed_post_close_child_process_count"] = warmed_resources[
+            "child_process_count"
+        ]
+        cycle_results = [
+            {
+                "cycle_index": 1,
+                "role": "warmed_baseline",
+                "rss_kb": warmed_resources["rss_kb"],
+                "fd_count": warmed_resources["fd_count"],
+                "child_process_count": warmed_resources["child_process_count"],
+                "rss_delta_from_warmed_kb": 0,
+                "fd_delta_from_warmed": 0,
+                "recovered": True,
+            }
+        ]
+        for cycle_index in range(2, RESOURCE_CLOSE_CYCLES + 1):
+            cycle = run_resource_close_cycle(
+                cycle_index,
+                TERMINAL_COUNT,
+                run_artifact_root,
+            )
+            cycle_recovered = wait_for_resource_recovery(
+                pid,
+                warmed_resources["rss_kb"],
+                warmed_resources["fd_count"],
+                warmed_resources["child_process_count"],
+                terminal_session_ids=cycle["session_ids"],
+                terminal_process_groups=(),
+                terminal_process_marker=cycle["process_marker"],
+                baseline_label=(
+                    f"warmed post-close baseline (cycle {cycle_index} vs cycle 1)"
+                ),
+            )
+            cycle_categories = file_descriptor_category_counts(pid)
+            assert_no_per_surface_fd_residue(
+                cycle_categories,
+                stats.get("pre_workspace_fd_categories"),
+            )
+            cycle_results.append(
+                {
+                    "cycle_index": cycle_index,
+                    "role": "stacking_probe",
+                    "rss_kb": cycle_recovered["rss_kb"],
+                    "fd_count": cycle_recovered["fd_count"],
+                    "child_process_count": cycle_recovered["child_process_count"],
+                    "rss_delta_from_warmed_kb": (
+                        cycle_recovered["rss_kb"] - warmed_resources["rss_kb"]
+                    ),
+                    "fd_delta_from_warmed": (
+                        cycle_recovered["fd_count"] - warmed_resources["fd_count"]
+                    ),
+                    "fd_categories": cycle_categories,
+                    "recovered": True,
+                }
+            )
+        stats["resource_close_cycle_results"] = cycle_results
+        # Final reported post-close sample is the last cycle (stacking proof).
+        final_cycle = cycle_results[-1]
+        stats["post_close_rss_kb"] = final_cycle["rss_kb"]
+        stats["post_close_fd_count"] = final_cycle["fd_count"]
+        stats["post_close_child_process_count"] = final_cycle["child_process_count"]
+        stats["post_close_rss_delta_kb"] = (
+            final_cycle["rss_kb"] - pre_workspace_resources["rss_kb"]
+        )
         stats["post_close_resources_recovered"] = True
         assert_stability_gate(stats, "final")
         stats["duration_seconds"] = int(time.time() - start)
@@ -2114,12 +2882,28 @@ def main():
         try:
             if stats.get("canary_pid"):
                 current_types = file_descriptor_type_counts(stats["canary_pid"])
+                current_categories = file_descriptor_category_counts(stats["canary_pid"])
                 failure_diagnostics["fd_type_counts"] = current_types
                 failure_diagnostics["fd_type_delta_from_pre_baseline"] = (
                     file_descriptor_type_delta(
                         stats.get("pre_baseline_fd_type_counts"),
                         current_types,
                     )
+                )
+                failure_diagnostics["fd_categories"] = current_categories
+                failure_diagnostics["fd_category_delta_from_cold"] = (
+                    file_descriptor_category_delta(
+                        stats.get("pre_workspace_fd_categories"),
+                        current_categories,
+                    )
+                )
+                failure_diagnostics["fd_category_delta_from_warmed"] = (
+                    file_descriptor_category_delta(
+                        stats.get("post_close_fd_categories"),
+                        current_categories,
+                    )
+                    if stats.get("post_close_fd_categories")
+                    else None
                 )
         except Exception as diagnostic_exc:
             failure_diagnostics["fd_type_error"] = str(diagnostic_exc)
