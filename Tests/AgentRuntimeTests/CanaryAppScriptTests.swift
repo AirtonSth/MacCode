@@ -438,7 +438,9 @@ final class CanaryAppScriptTests: XCTestCase {
         let firstWorkspace = try XCTUnwrap(
             mainSource.range(of: "primary = rpc(\"workspace.create\"")
         )
-        let ready = try XCTUnwrap(mainSource.range(of: "RC2_E2E_STREAM_READY"))
+        // WHY: READY is assembled via runtime_marker(prefix, suffix); ordering
+        // still requires stream_ready setup before shared trigger/stabilization.
+        let ready = try XCTUnwrap(mainSource.range(of: "stream_ready_marker = runtime_marker"))
         let trigger = try XCTUnwrap(mainSource.range(of: "workload_trigger_path.write_text(\"start\\n\")"))
         let stabilized = try XCTUnwrap(
             mainSource.range(of: "stats[\"workload_stabilization_completed\"] = True")
@@ -447,7 +449,16 @@ final class CanaryAppScriptTests: XCTestCase {
             mainSource.range(of: "stats[\"soak_started_monotonic\"] = time.monotonic()")
         )
         let close = try XCTUnwrap(mainSource.range(of: "rpc(\"workspace.close\""))
-        let recovery = try XCTUnwrap(mainSource.range(of: "recovered = wait_for_resource_recovery("))
+        // WHY: first close hard-gates process-tree cleanup + per-surface FDs;
+        // RSS/FD stacking is proven by cycle-to-cycle warmed recovery (not by
+        // raising cold pre-workspace 32MiB/FD tolerances).
+        let processTreeCleanup = try XCTUnwrap(
+            mainSource.range(of: "recovered = wait_for_process_tree_cleanup(")
+        )
+        let closeCycle = try XCTUnwrap(mainSource.range(of: "run_resource_close_cycle("))
+        let warmedRecovery = try XCTUnwrap(
+            mainSource.range(of: "wait_for_resource_recovery(")
+        )
         let websocketLiveEvent = try XCTUnwrap(
             mainSource.range(of: "stats[\"slow_ws_live_event_seen\"] = True")
         )
@@ -460,7 +471,17 @@ final class CanaryAppScriptTests: XCTestCase {
         XCTAssertLessThan(trigger.lowerBound, stabilized.lowerBound)
         XCTAssertLessThan(stabilized.lowerBound, measured.lowerBound)
         XCTAssertLessThan(websocketLiveEvent.lowerBound, websocketReconnect.lowerBound)
-        XCTAssertLessThan(close.lowerBound, recovery.lowerBound)
+        XCTAssertLessThan(close.lowerBound, processTreeCleanup.lowerBound)
+        XCTAssertLessThan(processTreeCleanup.lowerBound, closeCycle.lowerBound)
+        XCTAssertLessThan(closeCycle.lowerBound, warmedRecovery.lowerBound)
+        XCTAssertTrue(
+            mainSource.contains("post_close_rss_delta_from_cold_kb"),
+            "cold residual must remain a diagnostic field"
+        )
+        XCTAssertTrue(
+            mainSource.contains("warmed_post_close_rss_kb"),
+            "warmed baseline required for cycle stacking gate"
+        )
     }
 
     func testTerminalStabilityHarnessEnforcesLeakAndDroppedOutputGates() throws {
@@ -578,17 +599,19 @@ final class CanaryAppScriptTests: XCTestCase {
         harness = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(harness)
         root = Path(sys.argv[2])
-        state, first, tui, large_input, trigger, hidden_flood_done = harness.prepare_run_artifacts(root)
-        second_state, second, second_tui, second_large_input, second_trigger, second_hidden_flood_done = harness.prepare_run_artifacts(root)
+        state, first, tui, large_input, trigger, hidden_flood_done, primary_stream_done = harness.prepare_run_artifacts(root)
+        second_state, second, second_tui, second_large_input, second_trigger, second_hidden_flood_done, second_primary_stream_done = harness.prepare_run_artifacts(root)
         artifacts = (
             tui,
             large_input,
             trigger,
             hidden_flood_done,
+            primary_stream_done,
             second_tui,
             second_large_input,
             second_trigger,
             second_hidden_flood_done,
+            second_primary_stream_done,
         )
         for artifact in artifacts:
             artifact.write_text("fixture")
@@ -600,13 +623,15 @@ final class CanaryAppScriptTests: XCTestCase {
             and large_input.parent == first
             and trigger.parent == first
             and hidden_flood_done.parent == first
+            and primary_stream_done.parent == first
             and second_tui.parent == second
             and second_large_input.parent == second
             and second_trigger.parent == second
             and second_hidden_flood_done.parent == second
+            and second_primary_stream_done.parent == second
             and second_state == state
         )
-        unique = len(set((first, second) + artifacts)) == 10
+        unique = len(set((first, second) + artifacts)) == 12
         quote_round_trips = shlex.split(quoted) == [str(tui)]
         harness.cleanup_run_artifacts(first, state)
         harness.cleanup_run_artifacts(second, state)

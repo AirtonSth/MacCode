@@ -1867,6 +1867,16 @@ final class TerminalInputPump: @unchecked Sendable {
         lock.lock()
         accepting = false
         lastFailure = reason
+        // Drop retained stdin payload immediately. In-flight drain completions
+        // remain idempotent via finishedChunkIDs; waiting drains would otherwise
+        // pin up to maxQueuedBytes after tab close until a later retry fires.
+        let waiting = Array(waitingDrains.values)
+        waitingDrains.removeAll(keepingCapacity: false)
+        for drain in waiting {
+            guard finishedChunkIDs.insert(drain.chunkID).inserted else { continue }
+            queuedBytes = max(0, queuedBytes - drain.countedBytes)
+            activeChunkCount = max(0, activeChunkCount - 1)
+        }
         lock.unlock()
     }
 
