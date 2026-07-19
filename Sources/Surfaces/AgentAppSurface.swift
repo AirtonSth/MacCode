@@ -391,6 +391,10 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         // the host *after* init, so this restore-time select does not re-persist.
         if let initialThreadId, threads.contains(where: { $0.id == initialThreadId }) {
             selectThread(initialThreadId)
+        } else {
+            // Fresh composer / no restore: still publish the empty interest set so
+            // nonisolated stream delivery never buffers against a stale mirror.
+            publishInterestedThreadId(selectedThreadId)
         }
         loadGitBranch()
     }
@@ -435,7 +439,70 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// the right thread unread even after the user navigated away (B6).
     private var runThreads: [AgentRunID: AgentThreadID] = [:]
 
+    /// Cross-thread mirror of `selectedThreadId` so nonisolated stream delivery
+    /// can drop events for other surfaces without a MainActor hop. Updated on
+    /// every select/clear and on dispose. Lives in a lock-backed box so it is
+    /// not MainActor-isolated like the rest of the view-model.
+    private let interestedThread = InterestedThreadBox()
+
+    /// Coalesces reloadThreads fan-out when many Agent App tabs share a workspace
+    /// and each receives the same coordinator status/finish broadcast.
+    private var pendingThreadReloadTask: Task<Void, Never>?
+
+    /// Set by `dispose()` when the hosting surface closes so late coordinator
+    /// callbacks become no-ops even if a weak observer slot is briefly live.
+    private var isDisposed = false
+
+    private func publishInterestedThreadId(_ id: AgentThreadID?) {
+        interestedThread.set(id)
+    }
+
+    nonisolated private func currentInterestedThreadId() -> AgentThreadID? {
+        interestedThread.get()
+    }
+
+    /// Debounced thread-list refresh. Many open Agent Apps in one workspace each
+    /// observe every run status change; without coalescing, N tabs each hit the
+    /// DB on the main actor for the same event and the UI freezes under load.
+    func scheduleReloadThreads(delayMilliseconds: UInt64 = 50) {
+        guard !isDisposed else { return }
+        guard pendingThreadReloadTask == nil else { return }
+        pendingThreadReloadTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .milliseconds(delayMilliseconds))
+            guard let self, !Task.isCancelled, !self.isDisposed else { return }
+            self.pendingThreadReloadTask = nil
+            self.reloadThreads()
+        }
+    }
+
+    /// Release coordinator observation and cancel in-flight UI work when the
+    /// tab closes. Without this, multi-tab sessions keep routing stream batches
+    /// onto closed VMs until ARC collects the weak observer.
+    public func dispose() {
+        guard !isDisposed else { return }
+        isDisposed = true
+        pendingGitRefresh?.cancel()
+        pendingGitRefresh = nil
+        pendingThreadReloadTask?.cancel()
+        pendingThreadReloadTask = nil
+        timelineUpdateTickTask?.cancel()
+        timelineUpdateTickTask = nil
+        threadDeletionUndoExpiryTask?.cancel()
+        threadDeletionUndoExpiryTask = nil
+        checkpointRevertUndoExpiryTask?.cancel()
+        checkpointRevertUndoExpiryTask = nil
+        _ = streamEventBatch.drain()
+        publishInterestedThreadId(nil)
+        coordinator.removeObserver(self)
+        // Drop the heavy transcript payload so closed tabs free memory promptly.
+        messages = []
+        timeline = AssistantTimelineState()
+        sr1TranslatedMessageIds = []
+        sr1OriginalTextsByMessageId = [:]
+    }
+
     public func reloadThreads() {
+        guard !isDisposed else { return }
         do {
             threads = try threadRepo.list(workspaceId: workspaceID)
         } catch {
@@ -458,6 +525,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             // The bound thread was deleted (e.g. from another client). Fall back
             // to the fresh-composer state rather than render a dangling selection.
             selectedThreadId = nil
+            publishInterestedThreadId(nil)
             onSelectedThreadChanged?(nil)
         }
     }
@@ -583,6 +651,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     }
 
     public func selectThread(_ id: AgentThreadID, markRead: Bool = true) {
+        guard !isDisposed else { return }
         let isThreadSwitch = selectedThreadId != id
         if isThreadSwitch {
             // IMP-MAC_AGENT-011: stash the leaving thread's draft before swapping,
@@ -590,6 +659,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             // re-select of the same thread is left untouched).
             if let previous = selectedThreadId { persistComposerDraft(for: previous) }
             selectedThreadId = id
+            publishInterestedThreadId(id)
             providerThreadSnapshotStatusMessage = nil
             providerThreadSnapshotLastConfirmedAt = providerThreadSnapshotConfirmedAtByThread[id]
             // F6: the SR1 translation maps are per-thread state. Reset them on a
@@ -601,6 +671,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             sr1OriginalTextsByMessageId = [:]
         } else {
             selectedThreadId = id
+            publishInterestedThreadId(id)
         }
         // Persist the per-surface binding so app restart restores THIS surface
         // to THIS thread (not threads.first). Only fires on an actual change;
@@ -3748,6 +3819,10 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     // ONE flush Task; subsequent events in the same tick just append to the buffer
     // and the flush Task drains everything atomically. Event order is preserved.
     private func flushStreamEvents() {
+        guard !isDisposed else {
+            _ = streamEventBatch.drain()
+            return
+        }
         let pending = streamEventBatch.drain()
         guard !pending.isEmpty else { return }
         var nextTimeline = timeline
@@ -3792,7 +3867,24 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         }
     }
 
+    /// Pure multi-tab stream gate: only the surface whose selected thread matches
+    /// the event should buffer/flush. `nil` interest means no selected thread
+    /// (fresh composer) — drop all stream events.
+    nonisolated static func acceptsStreamEvent(
+        eventThreadId: AgentThreadID,
+        interestedThreadId: AgentThreadID?
+    ) -> Bool {
+        eventThreadId == interestedThreadId
+    }
+
     nonisolated public func runCoordinator(_ c: AgentRunCoordinator, didReceive event: AssistantEvent, run: AgentRunID, threadId: AgentThreadID) {
+        // Multi-tab freeze guard: every open Agent App observes the coordinator.
+        // Drop stream events for other threads before buffering/scheduling so N
+        // idle tabs do not pay MainActor work for one streaming tab.
+        guard Self.acceptsStreamEvent(
+            eventThreadId: threadId,
+            interestedThreadId: currentInterestedThreadId()
+        ) else { return }
         // PERF-MAC_AGENT-010: append to the batch buffer. If the buffer was
         // empty (first event of this tick), schedule a single flush Task.
         // Later events in the same tick just append — no extra Task allocation.
@@ -3822,6 +3914,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
 
     nonisolated public func runCoordinator(_ c: AgentRunCoordinator, didFinish runId: AgentRunID, threadId: AgentThreadID, status: AgentRunStatus, finalMessage: String?, providerThreadId: String?) {
         Task { @MainActor in
+            guard !self.isDisposed else { return }
             let finishedTid = threadId
             self.terminalRunIds = Self.boundedTerminalRunIds(existing: self.terminalRunIds, adding: runId)
             self.runThreads[runId] = nil
@@ -3856,7 +3949,8 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 self.runStartedAt = nil
                 self.isStopping = false  // UX-MAC_AGENT-STOP: run finished; clear stopping flag
             }
-            self.reloadThreads()
+            // Coalesce across many open Agent Apps receiving the same finish fan-out.
+            self.scheduleReloadThreads()
             self.loadGitBranchThrottled()   // the run may have changed the tree
             if status == .completed {
                 self.onRunCompleted?()
@@ -3871,6 +3965,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
 
     nonisolated public func runCoordinator(_ c: AgentRunCoordinator, didChangeStatus status: AgentRunStatus, runId: AgentRunID, threadId: AgentThreadID) {
         Task { @MainActor in
+            guard !self.isDisposed else { return }
             // PERF-MAC_AGENT-009: use the cache for the workspace filter; fall back to
             // DB only on a cache miss (first event for a thread not yet loaded here).
             let threadWorkspace: WorkspaceID?
@@ -3883,7 +3978,8 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 }
             }
             guard threadWorkspace == self.workspaceID else { return }
-            self.reloadThreads()
+            // Coalesce N same-workspace Agent App tabs into one reload per surface.
+            self.scheduleReloadThreads()
             if threadId == self.selectedThreadId {
                 if status == .running {
                     self.status = status
@@ -4034,6 +4130,25 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         if originals != sr1OriginalTextsByMessageId {
             sr1OriginalTextsByMessageId = originals
         }
+    }
+}
+
+/// Lock-protected selected-thread mirror for multi-tab stream filtering.
+/// Safe from coordinator background threads and the main actor.
+final class InterestedThreadBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: AgentThreadID?
+
+    func set(_ id: AgentThreadID?) {
+        lock.lock()
+        value = id
+        lock.unlock()
+    }
+
+    func get() -> AgentThreadID? {
+        lock.lock()
+        defer { lock.unlock() }
+        return value
     }
 }
 
@@ -10406,7 +10521,14 @@ public final class AgentAppSurface: NSObject, Surface {
         view.window?.makeFirstResponder(view)
     }
     public func unfocus() {}
-    public func close() { onClose?(); onClose = nil }
+    public func close() {
+        // Drop coordinator fan-out + heavy transcript state before unregister.
+        // Multi-tab freezes were amplified by closed surfaces still buffering
+        // stream events until ARC collected the weak observer.
+        viewModel.dispose()
+        onClose?()
+        onClose = nil
+    }
     public func sendText(_ text: String) {
         viewModel.prompt = (viewModel.prompt.isEmpty ? text : viewModel.prompt + "\n" + text)
     }

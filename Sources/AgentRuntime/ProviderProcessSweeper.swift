@@ -114,6 +114,57 @@ public enum ProviderProcessSweeper {
         )
     }
 
+    /// Reap launchd-reparented `RemoteCodeDistillService` processes.
+    ///
+    /// WHY: Token Saver MLX sidecars can exceed multi-GB RSS. When the owning
+    /// RemoteCode host dies without `stop()`, the sidecar is reparented to
+    /// launchd (ppid=1) and keeps the model resident forever. Heartbeat only
+    /// *counted* these orphans; it never terminated them. Memory pressure from
+    /// multi-GB orphan sidecars freezes the whole Mac (including a healthy
+    /// RemoteCode UI). Only ppid==1 roots are candidates so the current app's
+    /// live child Distill process is never touched.
+    @discardableResult
+    public static func terminateOrphanedSidecarRuntimes(
+        currentPID: Int32 = ProcessInfo.processInfo.processIdentifier
+    ) -> ProviderProcessSweepResult {
+        terminateOrphanedSidecarRuntimes(
+            processes: psRows(),
+            currentPID: currentPID
+        ) { pid in
+            Darwin.kill(pid, SIGTERM) == 0 || errno == ESRCH
+        }
+    }
+
+    @discardableResult
+    static func terminateOrphanedSidecarRuntimes(
+        processes: [ProviderRuntimeProcess],
+        currentPID: Int32,
+        terminate: (Int32) -> Bool
+    ) -> ProviderProcessSweepResult {
+        let roots = processes
+            .filter { isOrphanSidecarRoot($0, currentPID: currentPID) }
+            .map(\.pid)
+            .sorted()
+        let descendantPIDs = Set(roots.flatMap { Self.descendants(of: $0, in: processes) })
+        let ordered = Array((descendantPIDs.union(roots)).sorted().reversed())
+        var terminated: [Int32] = []
+        var failed: [Int32] = []
+
+        for pid in ordered {
+            if terminate(pid) {
+                terminated.append(pid)
+            } else {
+                failed.append(pid)
+            }
+        }
+
+        return ProviderProcessSweepResult(
+            orphanRootPIDs: roots,
+            terminatedPIDs: terminated,
+            failedPIDs: failed
+        )
+    }
+
     static func isRemoteCodeProviderRuntime(
         _ process: ProviderRuntimeProcess,
         currentPID: Int32
@@ -142,6 +193,100 @@ public enum ProviderProcessSweeper {
             || process.command.contains("/claude ")
             || process.command.hasSuffix("/claude")
             || isCodexAppServerRuntime(process.command)
+    }
+
+    /// Pure eligibility for Distill sidecar orphan reaping.
+    /// internal so unit tests can pin the contract without process-table noise.
+    static func isOrphanSidecarRoot(
+        _ process: ProviderRuntimeProcess,
+        currentPID: Int32
+    ) -> Bool {
+        guard process.pid != currentPID else { return false }
+        guard process.ppid == 1 else { return false }
+        return isRemoteCodeDistillService(process.command)
+    }
+
+    // MARK: - Single Distill MLX server policy
+
+    /// True when `command` is the long-running Token Saver Distill HTTP/MLX
+    /// server (auth-token / host / port), not a short-lived `mcp` CLI helper.
+    ///
+    /// WHY: agents invoke `RemoteCodeDistillService mcp` as the managed `| distill`
+    /// pipe. Those helpers must stay multi-instance. Only the multi-GB MLX server
+    /// is singleton-scoped.
+    public static func isRemoteCodeDistillServerCommand(_ command: String) -> Bool {
+        guard isRemoteCodeDistillService(command) else { return false }
+        return !isRemoteCodeDistillMCPCommand(command)
+    }
+
+    /// True when argv mode is `mcp` (managed distill CLI helper).
+    public static func isRemoteCodeDistillMCPCommand(_ command: String) -> Bool {
+        guard isRemoteCodeDistillService(command) else { return false }
+        let parts = command.split(whereSeparator: \.isWhitespace).map(String.init)
+        // executable [mode] …
+        return parts.count >= 2 && parts[1] == "mcp"
+    }
+
+    /// Kill every Distill MLX server except an optional keepPID (the controller's
+    /// live child). Used before start (single-instance) and on app quit.
+    @discardableResult
+    public static func terminateDistillServers(
+        keeping keepPID: Int32? = nil,
+        currentPID: Int32 = ProcessInfo.processInfo.processIdentifier
+    ) -> ProviderProcessSweepResult {
+        terminateDistillServers(
+            processes: psRows(),
+            keepPID: keepPID,
+            currentPID: currentPID
+        ) { pid in
+            Darwin.kill(pid, SIGTERM) == 0 || errno == ESRCH
+        }
+    }
+
+    @discardableResult
+    static func terminateDistillServers(
+        processes: [ProviderRuntimeProcess],
+        keepPID: Int32?,
+        currentPID: Int32,
+        terminate: (Int32) -> Bool
+    ) -> ProviderProcessSweepResult {
+        let roots = processes
+            .filter { isDistillServerRoot($0, keepPID: keepPID, currentPID: currentPID) }
+            .map(\.pid)
+            .sorted()
+        let descendantPIDs = Set(roots.flatMap { Self.descendants(of: $0, in: processes) })
+        // Never signal the host app itself if it somehow matched.
+        let ordered = Array(
+            (descendantPIDs.union(roots))
+                .filter { $0 != currentPID && $0 != keepPID }
+                .sorted()
+                .reversed()
+        )
+        var terminated: [Int32] = []
+        var failed: [Int32] = []
+        for pid in ordered {
+            if terminate(pid) {
+                terminated.append(pid)
+            } else {
+                failed.append(pid)
+            }
+        }
+        return ProviderProcessSweepResult(
+            orphanRootPIDs: roots,
+            terminatedPIDs: terminated,
+            failedPIDs: failed
+        )
+    }
+
+    /// Pure root selection for single-server policy.
+    static func isDistillServerRoot(
+        _ process: ProviderRuntimeProcess,
+        keepPID: Int32?,
+        currentPID: Int32
+    ) -> Bool {
+        guard process.pid != currentPID else { return false }
+        if let keepPID, process.pid == keepPID { return false }
+        return isRemoteCodeDistillServerCommand(process.command)
     }
 
     static func descendants(
@@ -173,7 +318,9 @@ public enum ProviderProcessSweeper {
             && parts[1] == "app-server"
     }
 
-    private static func isRemoteCodeDistillService(_ command: String) -> Bool {
+    /// Shared binary-name gate (server + mcp). public for pure unit tests of the
+    /// single-server policy without process-table noise.
+    public static func isRemoteCodeDistillService(_ command: String) -> Bool {
         guard let executable = command.split(maxSplits: 1, whereSeparator: \.isWhitespace).first else {
             return false
         }

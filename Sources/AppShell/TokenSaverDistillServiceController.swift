@@ -491,6 +491,10 @@ public struct RealDistillProcessSpawner: DistillProcessSpawning, Sendable {
 @MainActor
 public final class TokenSaverDistillServiceController {
     public typealias ExecutableURLResolver = @MainActor () -> URL?
+    /// Reap foreign Distill MLX servers. `keepPID` is the controller's live child
+    /// (or nil when none should survive). Injectable so unit tests never SIGTERM
+    /// a developer's real sidecar.
+    public typealias ForeignServerTerminator = (Int32?) -> ProviderProcessSweepResult
 
     public private(set) var status: TokenSaverDistillServiceStatus = .notStarted {
         didSet {
@@ -506,6 +510,7 @@ public final class TokenSaverDistillServiceController {
     private let appSupportDirectory: URL
     private let executableURLResolver: ExecutableURLResolver
     private let processSpawner: any DistillProcessSpawning
+    private let terminateForeignServers: ForeignServerTerminator
     private var process: Process?
     private var readyOutputHandle: FileHandle?
     private var stderrOutputHandle: FileHandle?
@@ -535,12 +540,25 @@ public final class TokenSaverDistillServiceController {
         appSupportDirectory: URL,
         executableURLResolver: @escaping ExecutableURLResolver = TokenSaverDistillServiceController.defaultExecutableURL,
         idleTimeoutMS: Int = 300_000,
-        processSpawner: any DistillProcessSpawning = RealDistillProcessSpawner()
+        processSpawner: any DistillProcessSpawning = RealDistillProcessSpawner(),
+        terminateForeignServers: @escaping ForeignServerTerminator = TokenSaverDistillServiceController.defaultTerminateForeignServers
     ) {
         self.appSupportDirectory = appSupportDirectory
         self.executableURLResolver = executableURLResolver
         self.idleTimeoutMS = idleTimeoutMS
         self.processSpawner = processSpawner
+        self.terminateForeignServers = terminateForeignServers
+    }
+
+    /// Production reaper. No-ops under XCTest so suite start/stop never kills a
+    /// live developer Distill server; tests that assert reaping inject a spy.
+    nonisolated public static func defaultTerminateForeignServers(
+        keeping keepPID: Int32?
+    ) -> ProviderProcessSweepResult {
+        if ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil {
+            return ProviderProcessSweepResult(orphanRootPIDs: [], terminatedPIDs: [], failedPIDs: [])
+        }
+        return ProviderProcessSweeper.terminateDistillServers(keeping: keepPID)
     }
 
     deinit {
@@ -592,6 +610,10 @@ public final class TokenSaverDistillServiceController {
         }
         process = nil
         bearerToken = nil
+        // Single-server + quit contract: after releasing our handle, reap any
+        // leftover MLX Distill servers (orphans, previous-launch children the
+        // Process handle lost track of). MCP CLI helpers are left alone.
+        _ = terminateForeignServers(nil)
         // Reset from EVERY state (.starting/.failed/.running) so a stuck status
         // never survives a stop()/eligibility change.
         let decision = TokenSaverDistillSupervisor.decide(
@@ -660,6 +682,9 @@ public final class TokenSaverDistillServiceController {
 
     private func start() {
         if let process, process.isRunning {
+            // Still enforce singleton: another host/crash may have left a
+            // second MLX server alive. Keep only our tracked child.
+            _ = terminateForeignServers(process.processIdentifier)
             return
         }
         // A live launch supersedes any pending backoff retry.
@@ -669,6 +694,10 @@ public final class TokenSaverDistillServiceController {
             status = .failed("RemoteCodeDistillService executable missing")
             return
         }
+
+        // Single-instance gate: never spawn a second multi-GB MLX server while
+        // any other Distill server still holds the model (orphans / prior runs).
+        _ = terminateForeignServers(nil)
 
         let token = UUID().uuidString
         stderrOutputHandle?.readabilityHandler = nil

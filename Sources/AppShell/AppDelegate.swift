@@ -363,7 +363,9 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
     /// payloads, and reinstantiating restored surfaces (a PTY spawn per restored
     /// terminal). Runs after the first frame so launch is not blocked.
     private func runDeferredStartup() {
-        terminateOrphanedProviderRuntimes(reason: "launch")
+        // Off MainActor: process scan + optional SIGTERM grace sleeps must not
+        // hitch the first interactive frame after cold launch.
+        scheduleOrphanRuntimeSweep(reason: "launch")
 
         if let log = context?.eventLog {
             do {
@@ -424,15 +426,15 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         lifecycleRecorder?.endRunCleanly(reason: "applicationWillTerminate")
         logDiagnosticsHeartbeat(reason: "will_terminate")
         disableInsomniaForAppClose()
-        // Only tear down the managed distill integration when Token Saver is already
-        // disabled. When it is enabled the integration (PATH symlink + skills) should
-        // survive app-quit so the user's shell keeps working between runs. On the next
-        // launch AppContext.init reconciles again and reinstalls whatever is needed.
+        // Always stop the Distill MLX server on quit — multi-GB model must not
+        // outlive RemoteCode. Skills/PATH symlink may still be retained when
+        // Token Saver stays enabled (shell `| distill` reinstalls on next launch).
+        stopTokenSaverDistillServiceForAppTermination()
         let tokenSaverEnabled = context.map { SettingsStore(db: $0.db).load().tokenSaverEnabled } ?? false
         if ProcessInfo.processInfo.environment["RC2_DISABLE_MANAGED_DISTILL_RECONCILE"] == "1" {
             appLifecycleLog.info("app.will_terminate distill_integration=unchanged isolated_process=true")
         } else if tokenSaverEnabled {
-            appLifecycleLog.info("app.will_terminate distill_integration=retained token_saver=enabled")
+            appLifecycleLog.info("app.will_terminate distill_integration=skills_retained distill_server=stopped token_saver=enabled")
         } else {
             appLifecycleLog.info("app.will_terminate distill_integration=removing token_saver=disabled")
             context?.reconcileManagedDistillSkills(tokenSaverEnabled: false)
@@ -449,6 +451,34 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         tokenSaverAccountUsageRefreshTimer?.invalidate()
         NotificationCenter.default.removeObserver(self)
         NSWorkspace.shared.notificationCenter.removeObserver(self)
+    }
+
+    /// Quit contract: stop the controller-owned sidecar and reap any foreign
+    /// Distill MLX servers so only zero servers remain after RemoteCode exits.
+    private func stopTokenSaverDistillServiceForAppTermination() {
+        guard Self.shouldStopDistillServerOnTerminate(
+            tokenSaverEnabled: context.map { SettingsStore(db: $0.db).load().tokenSaverEnabled } ?? false
+        ) else { return }
+        context?.tokenSaverDistillServiceController.stop()
+        // Belt-and-braces if stop()'s handle was already nil but a server lived on.
+        // Skip under XCTest — same guard as the controller default terminator.
+        if ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] == nil {
+            let leftover = ProviderProcessSweeper.terminateDistillServers(keeping: nil)
+            if !leftover.orphanRootPIDs.isEmpty || !leftover.terminatedPIDs.isEmpty {
+                appLifecycleLog.info(
+                    "app.will_terminate distill_server_sweep roots=\(leftover.orphanRootPIDs.count, privacy: .public) terminated=\(leftover.terminatedPIDs.count, privacy: .public)"
+                )
+            }
+        }
+    }
+
+    /// Pure quit policy: Distill MLX server always stops on terminate regardless
+    /// of Token Saver toggle (skills/PATH may still be retained when enabled).
+    nonisolated static func shouldStopDistillServerOnTerminate(tokenSaverEnabled: Bool) -> Bool {
+        // tokenSaverEnabled is accepted for call-site clarity / future gating;
+        // the process always dies with the app.
+        _ = tokenSaverEnabled
+        return true
     }
 
     private func disableInsomniaForAppClose() {
@@ -498,7 +528,14 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
     }
 
     private func logDiagnosticsHeartbeat(reason: String) {
-        terminateOrphanedProviderRuntimes(reason: "periodic")
+        // Periodic heartbeats must never block MainActor on process scans or
+        // SIGTERM grace sleeps — that freezes the whole UI every 60s once orphans
+        // accumulate. App termination is the only path that still reaps inline.
+        if reason == "will_terminate" {
+            terminateOrphanedProviderRuntimes(reason: reason)
+        } else {
+            scheduleOrphanRuntimeSweep(reason: reason)
+        }
         AppDiagnostics.heartbeat(
             reason: reason,
             activeAgentThreads: context?.coordinator.activeThreadIdsSnapshot().count ?? 0,
@@ -523,17 +560,77 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         lifecycleRecorder = recorder
     }
 
+    /// F9-adjacent: orphan reaping used Thread.sleep grace windows on MainActor
+    /// (via the 60s diagnostics heartbeat). Latch + detached Task keep the UI
+    /// responsive while still reaping provider + Distill orphans in the background.
+    @MainActor private var orphanSweepInFlight = false
+
+    /// Pure decision for the background-sweep latch (testable without timers).
+    enum OrphanSweepDecision: Equatable {
+        case start
+        case skipInFlight
+    }
+
+    @MainActor
+    static func beginOrphanSweepForTests(_ inFlight: inout Bool) -> OrphanSweepDecision {
+        beginOrphanSweep(inFlight: &inFlight)
+    }
+
+    @MainActor
+    private static func beginOrphanSweep(inFlight: inout Bool) -> OrphanSweepDecision {
+        guard !inFlight else { return .skipInFlight }
+        inFlight = true
+        return .start
+    }
+
+    @MainActor
+    private func scheduleOrphanRuntimeSweep(reason: String) {
+        if Self.beginOrphanSweep(inFlight: &orphanSweepInFlight) == .skipInFlight {
+            appLifecycleLog.info("provider.orphan_sweep reason=\(reason, privacy: .public) result=skipped_in_flight")
+            return
+        }
+        let minAge: TimeInterval = reason == "launch" ? 0 : ProcessSpawnTagger.defaultMinAge
+        Task.detached(priority: .utility) { [weak self] in
+            defer {
+                Task { @MainActor in
+                    self?.orphanSweepInFlight = false
+                }
+            }
+            // nonisolated static body — never hop back to MainActor for the
+            // process scan / SIGTERM grace sleeps that freeze the UI.
+            Self.performOrphanRuntimeSweep(reason: reason, minAge: minAge)
+        }
+    }
+
     private func terminateOrphanedProviderRuntimes(reason: String) {
+        let minAge: TimeInterval = reason == "launch" ? 0 : ProcessSpawnTagger.defaultMinAge
+        Self.performOrphanRuntimeSweep(reason: reason, minAge: minAge)
+    }
+
+    /// Blocking implementation. Call only from a background queue (periodic/launch)
+    /// or during applicationWillTerminate where the UI is already shutting down.
+    /// nonisolated so Task.detached can run the process-table reaper without
+    /// MainActor isolation (process I/O + Thread.sleep must stay off the UI thread).
+    nonisolated private static func performOrphanRuntimeSweep(reason: String, minAge: TimeInterval) {
         do {
             let result = try ProviderProcessSweeper.terminatePersistedOrphanedProviderRuntimes(
-                minAge: reason == "launch" ? 0 : ProcessSpawnTagger.defaultMinAge
+                minAge: minAge
             )
-            guard !result.orphanRootPIDs.isEmpty || !result.failedPIDs.isEmpty else { return }
-            appLifecycleLog.info("provider.orphan_sweep reason=\(reason, privacy: .public) roots=\(result.orphanRootPIDs.count, privacy: .public) terminated=\(result.terminatedPIDs.count, privacy: .public) failed=\(result.failedPIDs.count, privacy: .public)")
+            if !result.orphanRootPIDs.isEmpty || !result.failedPIDs.isEmpty {
+                appLifecycleLog.info("provider.orphan_sweep reason=\(reason, privacy: .public) roots=\(result.orphanRootPIDs.count, privacy: .public) terminated=\(result.terminatedPIDs.count, privacy: .public) failed=\(result.failedPIDs.count, privacy: .public)")
+            }
         } catch {
             // The ledger remains intact. Surface the failed audit instead of
             // reporting the indistinguishable all-clear result used previously.
             appLifecycleLog.fault("provider.orphan_sweep_failed reason=\(reason, privacy: .public) error=\(error.localizedDescription, privacy: .public)")
+        }
+
+        // Distill MLX sidecars are not in the provider ownership ledger. Reap
+        // launchd-orphaned RemoteCodeDistillService processes so multi-GB model
+        // memory cannot permanently pin after a host crash/exit.
+        let sidecar = ProviderProcessSweeper.terminateOrphanedSidecarRuntimes()
+        if !sidecar.orphanRootPIDs.isEmpty || !sidecar.failedPIDs.isEmpty {
+            appLifecycleLog.info("sidecar.orphan_sweep reason=\(reason, privacy: .public) roots=\(sidecar.orphanRootPIDs.count, privacy: .public) terminated=\(sidecar.terminatedPIDs.count, privacy: .public) failed=\(sidecar.failedPIDs.count, privacy: .public)")
         }
     }
 
