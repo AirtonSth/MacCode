@@ -1387,10 +1387,11 @@ public struct MLXDistillRuntime: DistillRuntime {
     /// fast while capping steady-state growth; `reclaimIdleMemory()` empties even this
     /// between bursts. 128 MB is comfortably above one distill generation's working set.
     static let gpuCacheLimitBytes = 128 * 1024 * 1024
-    /// Hard ceiling on total MLX allocation. Never reached in normal use (a distill run
-    /// needs ~1–2GB); it only throttles a pathological concurrent burst instead of letting
-    /// the process blow past it on a 16GB machine. malloc waits on scheduled work when hit.
-    static let gpuMemoryLimitBytes = 6 * 1024 * 1024 * 1024
+    /// Hard ceiling on total MLX allocation. A distill run needs ~1–2GB; the previous
+    /// 6GB ceiling allowed a single live sidecar (plus any orphan) to pin most of a
+    /// 16GB machine and freeze RemoteCode/UI under memory pressure. 3GB still admits
+    /// a healthy concurrent burst while leaving headroom for agent/provider children.
+    static let gpuMemoryLimitBytes = 3 * 1024 * 1024 * 1024
 
     /// Deterministic-first content router (G4): structured payloads are compressed
     /// losslessly on the CPU and never reach the model.

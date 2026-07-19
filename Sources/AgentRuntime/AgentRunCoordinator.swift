@@ -252,6 +252,15 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         lock.unlock()
     }
 
+    /// Drop a closed Agent App surface immediately so multi-tab sessions do not
+    /// keep fan-out stream/status work onto a disposed view-model until ARC
+    /// reaps the weak slot on the next observersSnapshot().
+    public func removeObserver(_ observer: AgentRunObserver) {
+        lock.lock()
+        observerRefs.removeAll { $0.value == nil || $0.value === observer }
+        lock.unlock()
+    }
+
     public func reconcileOnLaunch() throws {
         _ = try runRepo.reconcileRunningOnLaunch()
         let now = Date()
