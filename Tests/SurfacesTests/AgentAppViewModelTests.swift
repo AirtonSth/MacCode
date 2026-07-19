@@ -2780,14 +2780,15 @@ final class AgentAppViewModelTests: XCTestCase {
         )
     }
 
-    func test_userMessageDisplayTextCapsLongPromptsForLayout() {
-        let longPrompt = String(repeating: "a", count: AgentAppView.userMessagePreviewCharacterLimit + 50)
-        let display = AgentAppView.userMessageDisplayText(longPrompt)
-
-        XCTAssertLessThanOrEqual(display.count, AgentAppView.userMessagePreviewCharacterLimit + 160,
-                                 "long user prompts must render as a bounded preview so transcript layout and accessibility snapshots stay responsive")
-        XCTAssertTrue(display.contains("Copy message"),
-                      "the preview must tell users the full prompt is still available through the existing copy action")
+    /// WHY: user messages must never be character-truncated in the bubble; long
+    /// paths and full prompts stay intact (layout wraps / Show more by lines only).
+    func test_userMessageDisplayTextPreservesFullPromptWithoutCharacterCap() {
+        let longPrompt = String(repeating: "a", count: 2_500)
+        let pathPrompt = "/Users/samuelfajreldines/Desktop/Screenshot 2026-07-18 at 5.23.56 PM.png"
+        XCTAssertEqual(AgentAppView.userMessageDisplayText(longPrompt), longPrompt,
+                       "user bubbles must show the full stored prompt, not a character-capped preview")
+        XCTAssertEqual(AgentAppView.userMessageDisplayText(pathPrompt), pathPrompt,
+                       "file-path prompts must keep the full path visible without ellipsis in the model text")
     }
 
     func test_visibleLiveTurnItemsKeepsOnlyRecentUpdatesWhileRunning() {

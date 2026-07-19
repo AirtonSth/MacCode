@@ -855,6 +855,55 @@ final class PetWindowAndLifecycleTests: XCTestCase {
         XCTAssertFalse(controller.windowControllerForTests.isPopoverVisible)
     }
 
+    /// WHY: "Mark all viewed" must clear completed outcomes and dismiss Ready for you only.
+    /// Leaving the empty popover open (or re-opening it) is the failure mode users hit after bulk clear.
+    func test_markAllViewed_marksOutcomesAndClosesPopoverWithoutReopening() throws {
+        let directory = NSTemporaryDirectory() + "RC2PetMarkAllDismiss-\(UUID().uuidString)"
+        let context = try AppContext(channel: .debug, appSupportOverride: directory)
+        let router = AppCommandRouter(context: context)
+        context.router = router
+        let workspace = try router.createWorkspace(name: "Pet", cwd: NSTemporaryDirectory())
+        let thread = AgentThread(
+            workspaceId: workspace.id,
+            title: "private prompt",
+            provider: .codex,
+            model: "test",
+            status: .completed,
+            hasUnread: true
+        )
+        try context.threadRepo.upsert(thread)
+        let repository = NotificationRepository(db: context.db)
+        try repository.insert(AppNotification(
+            id: "git-completed-mark-all",
+            workspaceId: workspace.id,
+            title: "private git path",
+            category: PetNotificationCategory.gitCompleted.rawValue
+        ))
+        SettingsStore(db: context.db).save(AppSettings(petEnabled: true))
+        let controller = try PetController(
+            context: context,
+            router: router,
+            openSettings: { _ in false }
+        )
+        defer { controller.stop() }
+        controller.start()
+
+        XCTAssertEqual(controller.modelForTests.count, 2)
+        controller.windowControllerForTests.openPopoverForTests()
+        XCTAssertTrue(controller.windowControllerForTests.isPopoverVisible)
+
+        controller.windowControllerForTests.onMarkAllViewed?()
+
+        XCTAssertFalse(
+            controller.windowControllerForTests.isPopoverVisible,
+            "Mark all viewed must close Ready for you; it must not leave or reopen the empty panel."
+        )
+        XCTAssertEqual(controller.modelForTests.count, 0)
+        XCTAssertFalse(try XCTUnwrap(context.threadRepo.get(id: thread.id)).hasUnread)
+        XCTAssertTrue(try repository.list(unreadOnly: true).isEmpty)
+        XCTAssertNil(controller.modelForTests.routeError)
+    }
+
     func test_noiseDoesNotPostponeIdleSleep() async throws {
         let directory = NSTemporaryDirectory() + "RC2PetNoiseIdle-\(UUID().uuidString)"
         let context = try AppContext(channel: .debug, appSupportOverride: directory)

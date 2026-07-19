@@ -5249,7 +5249,6 @@ public struct AgentAppView: View {
         return hidden
     }
 
-    static let userMessagePreviewCharacterLimit = 1_200
     /// Max width for user prompt bubbles. Short text hugs content; long text wraps here.
     /// Kept well under the old 600pt hard fill so chat bubbles stay compact.
     static let userMessageBubbleMaxWidth: CGFloat = 420
@@ -5268,10 +5267,11 @@ public struct AgentAppView: View {
     static let liveTurnSummaryCharacterLimit = 240
     static let commandPreviewCharacterLimit = 1_200
 
+    /// User bubbles show the full stored prompt. Layout may wrap long lines and
+    /// offer a line-count "Show more" for very tall messages; content is never
+    /// character-truncated for display.
     static func userMessageDisplayText(_ text: String) -> String {
-        guard text.count > userMessagePreviewCharacterLimit else { return text }
-        let omitted = text.count - userMessagePreviewCharacterLimit
-        return "\(text.prefix(userMessagePreviewCharacterLimit))\n\n... \(omitted) more characters hidden. Use Copy message for the full prompt."
+        text
     }
 
     static func cappedVisibleText(_ text: String, limit: Int, truncatedLabel: String = "truncated in live view") -> String {
@@ -7432,21 +7432,22 @@ public struct AgentAppView: View {
                     // WHY: Use SwiftUI Text (not AgentSelectablePlainText / NSTextView).
                     // IntrinsicHeightTextView reports no horizontal intrinsic size, so
                     // short prompts like "oi" expanded to the full maxWidth bubble.
-                    // Order matters: maxWidth on the text first so long prompts wrap
-                    // during ideal-size measurement; fixedSize then hugs short ones.
+                    // Order: pad/background first, then maxWidth so long prompts wrap
+                    // at the bubble cap; fixedSize(horizontal+vertical) hugs short
+                    // text AND keeps multi-line height (vertical:false was collapsing
+                    // long paths to one ellipsized line).
                     Text(displayText)
                         .font(.system(size: 13))
                         .foregroundColor(DS.Palette.text)
                         .multilineTextAlignment(.leading)
                         .textSelection(.enabled)
                         .lineLimit(messageExpanded ? nil : 28)
-                        .frame(maxWidth: Self.userMessageBubbleMaxWidth - (DS.Space.xl * 2),
-                               alignment: .leading)
                         .padding(.horizontal, DS.Space.xl)
                         .padding(.vertical, DS.Space.lg)
                         .background(DS.Palette.surface)
                         .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
-                        .fixedSize(horizontal: true, vertical: false)
+                        .frame(maxWidth: Self.userMessageBubbleMaxWidth, alignment: .leading)
+                        .fixedSize(horizontal: true, vertical: true)
                         .accessibilityIdentifier("agent.userMessageBubble")
                     if showExpandToggle {
                         Button {
