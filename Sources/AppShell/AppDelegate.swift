@@ -319,9 +319,9 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         }
     }
 
-    /// One-time explanation for Files and Folders TCC. macOS cannot grant all
-    /// folder permissions in one API call. Every alert button marks onboarding
-    /// *handled* (not “permissions granted”) so launch never nags in a loop.
+    /// One-time Full Disk Access tip. Launch never probes Desktop/Documents/
+    /// Downloads (that forced multi-folder TCC spam). Every button marks
+    /// onboarding *handled* (not “permissions granted”) so launch never nags.
     func presentHostFileAccessOnboardingIfNeeded() {
         guard let context else { return }
         let repo = SettingsRepository(db: context.db)
@@ -336,19 +336,15 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
             alert.informativeText += "\n\n" + warning
         }
         alert.alertStyle = .informational
-        alert.addButton(withTitle: "Continue")
-        alert.addButton(withTitle: "Open System Settings")
-        alert.addButton(withTitle: "Not Now")
+        alert.addButton(withTitle: HostFileAccessCopy.openFullDiskAccessButton)
+        alert.addButton(withTitle: HostFileAccessCopy.notNowButton)
         let response = alert.runModal()
         do {
             try HostFileAccessOnboarding.handleAlertResponse(
                 response,
                 markHandled: { try HostFileAccessOnboarding.markHandled(repo: repo) },
-                openSystemSettings: {
-                    NSWorkspace.shared.open(HostFileAccessSystemSettings.filesAndFoldersURL)
-                },
-                checkFolderAccess: {
-                    _ = HostFileAccessProber.probeStandardTargets()
+                openFullDiskAccess: {
+                    NSWorkspace.shared.open(HostFileAccessSystemSettings.fullDiskAccessURL)
                 }
             )
         } catch {

@@ -4,13 +4,13 @@ import AppKit
 @testable import AppShell
 import Persistence
 
-/// Host Files and Folders TCC helpers.
+/// Host Files and Folders / Full Disk Access helpers.
 ///
-/// WHY: macOS does not allow silent grant-all for network volumes / Desktop /
-/// Documents / Downloads. These tests lock the pure contract: purpose strings,
-/// probe path resolution, onboarding handled-state (all three alert buttons),
-/// and ad-hoc identity warnings — so a packaging or UX regression cannot
-/// reintroduce a launch nag loop or false “re-request” claims.
+/// WHY: macOS does not allow silent grant-all. These tests lock the pure
+/// contract: purpose strings, probe path resolution, FDA-first onboarding
+/// handled-state (no launch-time folder probe), and ad-hoc identity warnings —
+/// so a packaging or UX regression cannot reintroduce launch TCC spam or a
+/// false “permissions granted” claim.
 final class HostFileAccessPermissionsTests: XCTestCase {
 
     func test_infoPlistKeysCoverAllFilesAndFoldersServices() {
@@ -44,6 +44,23 @@ final class HostFileAccessPermissionsTests: XCTestCase {
                       || HostFileAccessCopy.settingsExplanation.contains("System Settings"))
         XCTAssertEqual(HostFileAccessCopy.requestAccessButton, "Check folder access")
         XCTAssertFalse(HostFileAccessCopy.settingsExplanation.lowercased().contains("re-request access"))
+    }
+
+    func test_copyIsFullDiskAccessFirstAndDoesNotClaimRootGrant() {
+        XCTAssertEqual(HostFileAccessCopy.settingsSectionTitle, "Disk access")
+        XCTAssertEqual(HostFileAccessCopy.openFullDiskAccessButton, "Open Full Disk Access")
+        XCTAssertEqual(HostFileAccessCopy.notNowButton, "Not Now")
+        let onboarding = HostFileAccessCopy.onboardingMessage.lowercased()
+        XCTAssertTrue(onboarding.contains("full disk access"),
+                      "Onboarding must lead with Full Disk Access as the low-spam path")
+        XCTAssertFalse(onboarding.contains("continue checks"),
+                       "Onboarding must not promise launch-time folder probing")
+        XCTAssertTrue(onboarding.contains("not a root"),
+                      "Copy must explicitly reject root/universal-permission framing")
+        XCTAssertTrue(HostFileAccessCopy.settingsExplanation.lowercased().contains("full disk access"))
+        XCTAssertTrue(HostFileAccessCopy.settingsExplanation.lowercased().contains("optional")
+                      || HostFileAccessCopy.settingsExplanation.contains("Check folder access"),
+                      "Settings must keep folder check as secondary/optional")
     }
 
     func test_probeTargetResolvesHomeFolders() {
@@ -182,32 +199,24 @@ final class HostFileAccessPermissionsTests: XCTestCase {
         XCTAssertFalse(HostFileAccessOnboarding.shouldPresent(handled: true))
     }
 
-    func test_handleAlertResponseMarksHandledForAllThreeButtons() throws {
+    func test_handleAlertResponseMarksHandledForBothButtonsWithoutProbing() throws {
         for response in [
             NSApplication.ModalResponse.alertFirstButtonReturn,
             .alertSecondButtonReturn,
-            .alertThirdButtonReturn,
         ] {
             var handled = false
-            var openedSettings = false
-            var checked = false
+            var openedFDA = false
             try HostFileAccessOnboarding.handleAlertResponse(
                 response,
                 markHandled: { handled = true },
-                openSystemSettings: { openedSettings = true },
-                checkFolderAccess: { checked = true }
+                openFullDiskAccess: { openedFDA = true }
             )
             XCTAssertTrue(handled, "response \(response.rawValue) must persist handled to avoid launch nag loop")
             switch response {
             case .alertFirstButtonReturn:
-                XCTAssertTrue(checked)
-                XCTAssertFalse(openedSettings)
-            case .alertSecondButtonReturn:
-                XCTAssertTrue(openedSettings)
-                XCTAssertFalse(checked)
+                XCTAssertTrue(openedFDA, "primary CTA opens Full Disk Access settings only")
             default:
-                XCTAssertFalse(checked)
-                XCTAssertFalse(openedSettings)
+                XCTAssertFalse(openedFDA, "Not Now must not open settings or probe folders")
             }
         }
     }
@@ -215,13 +224,32 @@ final class HostFileAccessPermissionsTests: XCTestCase {
     func test_handleAlertResponsePersistsBeforeSideEffects() throws {
         var order: [String] = []
         try HostFileAccessOnboarding.handleAlertResponse(
-            .alertSecondButtonReturn,
+            .alertFirstButtonReturn,
             markHandled: { order.append("handled") },
-            openSystemSettings: { order.append("settings") },
-            checkFolderAccess: { order.append("check") }
+            openFullDiskAccess: { order.append("fda") }
         )
-        XCTAssertEqual(order, ["handled", "settings"],
-                       "Persist before opening System Settings so a crash mid-open does not re-nag")
+        XCTAssertEqual(order, ["handled", "fda"],
+                       "Persist before opening Full Disk Access so a crash mid-open does not re-nag")
+    }
+
+    func test_handleAlertResponseNeverInvokesFolderProbeOnNotNow() throws {
+        // WHY: previous Continue path called probeStandardTargets and could fire
+        // three system TCC dialogs at launch. Not Now and FDA open must stay quiet.
+        var probed = false
+        try HostFileAccessOnboarding.handleAlertResponse(
+            .alertSecondButtonReturn,
+            markHandled: {},
+            openFullDiskAccess: { probed = true }
+        )
+        XCTAssertFalse(probed)
+        // First button opens FDA only — callers must not pass a probe closure.
+        var opened = false
+        try HostFileAccessOnboarding.handleAlertResponse(
+            .alertFirstButtonReturn,
+            markHandled: {},
+            openFullDiskAccess: { opened = true }
+        )
+        XCTAssertTrue(opened)
     }
 
     @MainActor

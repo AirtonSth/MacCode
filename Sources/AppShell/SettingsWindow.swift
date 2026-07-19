@@ -731,7 +731,8 @@ public final class SettingsViewModel: ObservableObject {
         hostFileAccessOnboardingCompleted = HostFileAccessOnboarding.isHandled(repo: settingsRepo)
     }
 
-    /// Touches standard protected folders so any *pending* TCC dialog can appear.
+    /// Optional Settings-only probe: touches standard protected folders so any
+    /// *pending* TCC dialog can appear. Never called from launch onboarding.
     /// Does not reopen a prior Don’t Allow — System Settings is required for that.
     /// Marks onboarding handled after the attempt.
     public func requestHostFileAccess() {
@@ -1287,23 +1288,25 @@ public struct SettingsView: View {
                     .fixedSize(horizontal: false, vertical: true)
                     .accessibilityIdentifier("settings.hostFileAccess.adHocWarning")
             }
-            HStack(spacing: DS.Space.sm) {
-                Button(HostFileAccessCopy.requestAccessButton) {
-                    vm.requestHostFileAccess()
-                }
-                .buttonStyle(DSSecondaryButtonStyle())
-                .accessibilityIdentifier("settings.hostFileAccess.request")
-                Button(HostFileAccessCopy.openFilesAndFoldersButton) {
-                    vm.openHostFilesAndFoldersSettings()
-                }
-                .buttonStyle(DSSecondaryButtonStyle())
-                .accessibilityIdentifier("settings.hostFileAccess.openFilesAndFolders")
-            }
+            // FDA-first: primary path for least prompt spam. Folder probe is
+            // opt-in only (can surface multiple system dialogs).
             Button(HostFileAccessCopy.openFullDiskAccessButton) {
                 vm.openHostFullDiskAccessSettings()
             }
             .buttonStyle(DSSecondaryButtonStyle())
             .accessibilityIdentifier("settings.hostFileAccess.openFullDiskAccess")
+            HStack(spacing: DS.Space.sm) {
+                Button(HostFileAccessCopy.openFilesAndFoldersButton) {
+                    vm.openHostFilesAndFoldersSettings()
+                }
+                .buttonStyle(DSSecondaryButtonStyle())
+                .accessibilityIdentifier("settings.hostFileAccess.openFilesAndFolders")
+                Button(HostFileAccessCopy.requestAccessButton) {
+                    vm.requestHostFileAccess()
+                }
+                .buttonStyle(DSSecondaryButtonStyle())
+                .accessibilityIdentifier("settings.hostFileAccess.request")
+            }
             if !vm.hostFileAccessProbeResults.isEmpty {
                 VStack(alignment: .leading, spacing: DS.Space.xs) {
                     ForEach(vm.hostFileAccessProbeResults, id: \.target) { result in
