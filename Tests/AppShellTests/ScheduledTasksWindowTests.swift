@@ -53,6 +53,28 @@ final class ScheduledTasksWindowTests: XCTestCase {
         XCTAssertTrue(source.contains("Hide details"))
     }
 
+    func test_rootViewUsesDesignSystemSurfaces_becauseScheduledTasksMustMatchLatestRemoteCodeChrome() throws {
+        let source = try String(contentsOf: sourceURL("Sources/AppShell/ScheduledTasksWindow.swift"), encoding: .utf8)
+        XCTAssertTrue(source.contains("DSPrimaryButtonStyle()"))
+        XCTAssertTrue(source.contains("DSSecondaryButtonStyle()"))
+        XCTAssertTrue(source.contains("DSPill("))
+        XCTAssertTrue(source.contains("DSEmptyState("))
+        XCTAssertTrue(source.contains("dsPanel("))
+        XCTAssertTrue(source.contains("DS.Palette.sidebar"))
+        XCTAssertTrue(source.contains("serviceRequiresApproval"))
+        XCTAssertTrue(source.contains("Open Login Items"))
+        XCTAssertTrue(source.contains("editorSection(\"Basics\")"))
+        XCTAssertTrue(source.contains("editorSection(\"Agent\")"))
+        XCTAssertTrue(source.contains("editorSection(\"Schedule\")"))
+        XCTAssertTrue(source.contains("editorSection(\"Prompt\")"))
+    }
+
+    func test_mainDisablesManagedDistillInScheduledAgent_becauseHeadlessRunsMustNotMutateShellSkills() throws {
+        let source = try String(contentsOf: sourceURL("Sources/AppShell/Main.swift"), encoding: .utf8)
+        XCTAssertTrue(source.contains("setenv(\"RC2_DISABLE_MANAGED_DISTILL_RECONCILE\", \"1\", 1)"))
+        XCTAssertTrue(source.contains("--scheduled-task-agent"))
+    }
+
     private func sourceURL(_ relative: String) -> URL {
         URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent().appendingPathComponent(relative)
     }

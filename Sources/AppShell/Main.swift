@@ -33,6 +33,9 @@ struct RemoteCodeMain {
         let isScheduledTaskAgent = CommandLine.arguments.contains("--scheduled-task-agent")
             || ProcessInfo.processInfo.environment["RC2_SCHEDULED_TASK_AGENT"] == "1"
         if isScheduledTaskAgent {
+            // Headless LaunchAgent must not mutate managed ~/.claude / ~/.codex distill
+            // skills for the interactive app session. Fail closed before AppContext init.
+            setenv("RC2_DISABLE_MANAGED_DISTILL_RECONCILE", "1", 1)
             app.setActivationPolicy(.prohibited)
             let delegate = ScheduledTaskAgentAppDelegate(
                 channel: channel,

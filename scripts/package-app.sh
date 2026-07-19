@@ -223,6 +223,8 @@ cat > "$SCHEDULED_TASK_PLIST" <<EOF
   <key>EnvironmentVariables</key>
   <dict>
     <key>RC2_CHANNEL</key><string>${RC2_CHANNEL_VALUE}</string>
+    <key>RC2_SCHEDULED_TASK_AGENT</key><string>1</string>
+    <key>RC2_DISABLE_MANAGED_DISTILL_RECONCILE</key><string>1</string>
   </dict>
 </dict>
 </plist>

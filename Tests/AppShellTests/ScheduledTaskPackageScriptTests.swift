@@ -9,6 +9,9 @@ final class ScheduledTaskPackageScriptTests: XCTestCase {
         XCTAssertTrue(source.contains("MachServices"))
         XCTAssertTrue(source.contains("KeepAlive"))
         XCTAssertTrue(source.contains("RC2_CODESIGN_IDENTITY"))
+        XCTAssertTrue(source.contains("Contents/Resources/RemoteCodeScheduledTaskAgent"))
+        XCTAssertTrue(source.contains("RC2_DISABLE_MANAGED_DISTILL_RECONCILE"))
+        XCTAssertTrue(source.contains("RC2_SCHEDULED_TASK_AGENT"))
     }
 
     func test_bundleValidatorRequiresLaunchAgent_becauseMissingPackagingMustFailCI() throws {

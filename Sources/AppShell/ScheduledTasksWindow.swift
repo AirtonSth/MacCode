@@ -352,28 +352,20 @@ public struct ScheduledTasksRootView: View {
     public var body: some View {
         VStack(spacing: 0) {
             header
-            Divider()
+            serviceBanner
+            Rectangle().fill(DS.Palette.line).frame(height: DS.Border.hairline)
             HSplitView {
-                taskList.frame(minWidth: 310, idealWidth: 350, maxWidth: 430)
-                detail.frame(minWidth: 520, maxWidth: .infinity)
+                taskList
+                    .frame(minWidth: 300, idealWidth: 360, maxWidth: 440)
+                    .background(DS.Palette.sidebar)
+                detail
+                    .frame(minWidth: 540, maxWidth: .infinity)
+                    .background(DS.Palette.bg)
             }
-            Divider()
-            HStack {
-                Image(systemName: "clock.arrow.circlepath")
-                Text(vm.serviceStatus)
-                if vm.serviceRequiresApproval {
-                    Button("Open Login Items") { vm.openServiceSettings() }
-                        .accessibilityIdentifier("scheduledTasks.openLoginItems")
-                }
-                Spacer()
-                Text("Automatic runs continue when this window and RemoteCode are closed.")
-                    .foregroundColor(.secondary)
-            }
-            .font(.caption)
-            .padding(.horizontal, 16)
-            .frame(height: 36)
+            Rectangle().fill(DS.Palette.line).frame(height: DS.Border.hairline)
+            footer
         }
-        .frame(minWidth: 940, minHeight: 650)
+        .frame(minWidth: 980, minHeight: 680)
         .background(DS.Palette.bg)
         .sheet(item: $vm.editorDraft) { draft in
             ScheduledTaskEditorView(
@@ -395,43 +387,131 @@ public struct ScheduledTasksRootView: View {
     }
 
     private var header: some View {
-        HStack(spacing: 12) {
-            VStack(alignment: .leading, spacing: 3) {
-                Text("Scheduled Tasks").font(.system(size: 22, weight: .semibold))
-                Text("Run a fresh Agent thread on a reliable local schedule.").font(.caption).foregroundColor(.secondary)
+        HStack(alignment: .center, spacing: DS.Space.lg) {
+            HStack(spacing: DS.Space.md) {
+                Image(systemName: "calendar.badge.clock")
+                    .font(.system(size: 22, weight: .semibold))
+                    .foregroundColor(DS.Palette.accent)
+                    .frame(width: 36, height: 36)
+                    .background(DS.Palette.accent.opacity(0.14))
+                    .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
+                VStack(alignment: .leading, spacing: DS.Space.xxs) {
+                    Text("Scheduled Tasks")
+                        .font(DS.Font.title2.weight(.semibold))
+                        .foregroundColor(DS.Palette.text)
+                    Text("Fresh full-access Agent runs on a durable local schedule.")
+                        .font(DS.Font.caption)
+                        .foregroundColor(DS.Palette.textSecondary)
+                }
             }
-            Spacer()
-            Button { vm.createTask() } label: { Label("New Task", systemImage: "plus") }
-                .buttonStyle(.borderedProminent)
-                .accessibilityIdentifier("scheduledTasks.new")
+            Spacer(minLength: DS.Space.lg)
+            Button {
+                vm.createTask()
+            } label: {
+                Label("New Task", systemImage: "plus")
+            }
+            .buttonStyle(DSPrimaryButtonStyle())
+            .accessibilityIdentifier("scheduledTasks.new")
+            .accessibilityHint("Create a new scheduled agent task")
         }
-        .padding(16)
+        .padding(.horizontal, DS.Space.xxl)
+        .padding(.vertical, DS.Space.xl)
+        .dsBar(edge: .bottom)
+    }
+
+    @ViewBuilder
+    private var serviceBanner: some View {
+        if vm.serviceRequiresApproval {
+            HStack(alignment: .center, spacing: DS.Space.md) {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .foregroundColor(DS.Palette.warning)
+                    .accessibilityHidden(true)
+                VStack(alignment: .leading, spacing: DS.Space.xxs) {
+                    Text("Background scheduler needs Login Items approval")
+                        .font(DS.Font.body.weight(.semibold))
+                        .foregroundColor(DS.Palette.text)
+                    Text(vm.serviceStatus)
+                        .font(DS.Font.caption)
+                        .foregroundColor(DS.Palette.textSecondary)
+                }
+                Spacer(minLength: DS.Space.md)
+                Button("Open Login Items") { vm.openServiceSettings() }
+                    .buttonStyle(DSSecondaryButtonStyle())
+                    .accessibilityIdentifier("scheduledTasks.openLoginItems")
+            }
+            .padding(.horizontal, DS.Space.xxl)
+            .padding(.vertical, DS.Space.lg)
+            .background(DS.Palette.warning.opacity(0.10))
+            .overlay(alignment: .bottom) {
+                Rectangle().fill(DS.Palette.warning.opacity(0.35)).frame(height: DS.Border.hairline)
+            }
+            .accessibilityElement(children: .combine)
+            .accessibilityLabel("Background scheduler needs Login Items approval. \(vm.serviceStatus)")
+        }
+    }
+
+    private var footer: some View {
+        HStack(spacing: DS.Space.sm) {
+            Image(systemName: "clock.arrow.circlepath")
+                .foregroundColor(DS.Palette.textTertiary)
+                .accessibilityHidden(true)
+            Text(vm.serviceStatus)
+                .foregroundColor(DS.Palette.textSecondary)
+                .lineLimit(1)
+            Spacer(minLength: DS.Space.md)
+            Text("Automatic runs continue when this window and RemoteCode are closed.")
+                .foregroundColor(DS.Palette.textTertiary)
+                .lineLimit(1)
+        }
+        .font(DS.Font.caption)
+        .padding(.horizontal, DS.Space.xxl)
+        .frame(height: 40)
+        .background(DS.Palette.surface)
     }
 
     private var taskList: some View {
         VStack(spacing: 0) {
-            HStack {
-                Image(systemName: "magnifyingglass").foregroundColor(.secondary)
+            HStack(spacing: DS.Space.sm) {
+                Image(systemName: "magnifyingglass")
+                    .foregroundColor(DS.Palette.textTertiary)
+                    .accessibilityHidden(true)
                 TextField("Search tasks", text: $vm.searchText)
                     .textFieldStyle(.plain)
+                    .foregroundColor(DS.Palette.text)
                     .accessibilityIdentifier("scheduledTasks.search")
             }
-            .padding(10)
-            .background(Color.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
-            .padding(12)
+            .padding(.horizontal, DS.Space.lg)
+            .padding(.vertical, DS.Space.md)
+            .background(DS.Palette.surfaceRaised)
+            .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
+                    .strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline)
+            )
+            .padding(.horizontal, DS.Space.lg)
+            .padding(.top, DS.Space.lg)
+            .padding(.bottom, DS.Space.md)
+
             Picker("Status", selection: $vm.statusFilter) {
-                ForEach(ScheduledTaskStatusFilter.allCases) { filter in Text(filter.rawValue).tag(filter) }
+                ForEach(ScheduledTaskStatusFilter.allCases) { filter in
+                    Text(filter.rawValue).tag(filter)
+                }
             }
             .pickerStyle(.segmented)
             .labelsHidden()
-            .padding(.horizontal, 12)
-            .padding(.bottom, 8)
+            .padding(.horizontal, DS.Space.lg)
+            .padding(.bottom, DS.Space.md)
             .accessibilityIdentifier("scheduledTasks.statusFilter")
+            .accessibilityLabel("Filter tasks by status")
+
             if vm.tasks.isEmpty {
-                ContentUnavailableView(
-                    vm.searchText.isEmpty ? "No scheduled tasks" : "No matching tasks",
-                    systemImage: "calendar.badge.clock",
-                    description: Text(vm.searchText.isEmpty ? "Create a task to run an Agent automatically." : "Try another search.")
+                DSEmptyState(
+                    icon: "calendar.badge.clock",
+                    title: vm.searchText.isEmpty ? "No scheduled tasks" : "No matching tasks",
+                    subtitle: vm.searchText.isEmpty
+                        ? "Create a task to run an Agent automatically while RemoteCode is closed."
+                        : "Try another search or clear the status filter.",
+                    background: DS.Palette.sidebar
                 )
             } else {
                 List(selection: $vm.selectedTaskID) {
@@ -439,124 +519,243 @@ public struct ScheduledTasksRootView: View {
                         ScheduledTaskRow(
                             task: task,
                             workspaceName: vm.workspaces.first { $0.id == task.workspaceID }?.name ?? "Missing workspace",
-                            runCount: vm.runCounts[task.id, default: 0]
-                        ).tag(task.id)
+                            runCount: vm.runCounts[task.id, default: 0],
+                            isSelected: vm.selectedTaskID == task.id
+                        )
+                        .tag(task.id)
+                        .listRowBackground(
+                            (vm.selectedTaskID == task.id ? DS.Palette.selection : Color.clear)
+                                .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
+                        )
+                        .listRowInsets(EdgeInsets(top: 4, leading: 8, bottom: 4, trailing: 8))
                     }
                 }
                 .listStyle(.sidebar)
+                .scrollContentBackground(.hidden)
+                .background(DS.Palette.sidebar)
                 .accessibilityIdentifier("scheduledTasks.list")
             }
         }
     }
 
-    @ViewBuilder private var detail: some View {
+    @ViewBuilder
+    private var detail: some View {
         if let task = vm.selectedTask {
             ScrollView {
-                VStack(alignment: .leading, spacing: 20) {
-                    HStack(alignment: .top) {
-                        VStack(alignment: .leading, spacing: 5) {
-                            Text(task.title).font(.title2.weight(.semibold))
-                            Text(task.isEnabled ? "Active" : "Paused")
-                                .font(.caption.weight(.semibold))
-                                .foregroundStyle(task.isEnabled ? .green : .secondary)
-                        }
-                        Spacer()
-                        Button(task.isEnabled ? "Pause" : "Resume") { vm.toggle(task) }
-                            .accessibilityIdentifier("scheduledTasks.toggle")
-                        Button("Run Now") { vm.runNow(task) }
-                            .buttonStyle(.borderedProminent)
-                            .accessibilityIdentifier("scheduledTasks.runNow")
-                        Menu {
-                            Button("Edit") { vm.edit(task) }
-                            Divider()
-                            Button("Delete", role: .destructive) { vm.delete(task) }
-                        } label: { Image(systemName: "ellipsis.circle") }
-                    }
-                    taskConfiguration(task)
-                    Text("Prompt").font(.headline)
-                    Text(task.prompt).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(12).background(Color.secondary.opacity(0.07), in: RoundedRectangle(cornerRadius: 8))
-                    HStack {
-                        Text("Run history").font(.headline)
-                        Spacer()
-                        Button { vm.reload() } label: { Image(systemName: "arrow.clockwise") }
-                            .accessibilityLabel("Refresh run history")
-                    }
-                    runHistory(task)
+                VStack(alignment: .leading, spacing: DS.Space.xxl) {
+                    detailHero(task)
+                    configurationGrid(task)
+                    promptCard(task)
+                    historySection(task)
                 }
-                .padding(20)
+                .padding(DS.Space.xxl)
             }
             .accessibilityIdentifier("scheduledTasks.detail")
         } else {
-            ContentUnavailableView("Select a task", systemImage: "calendar.badge.clock")
+            DSEmptyState(
+                icon: "calendar.badge.clock",
+                title: "Select a task",
+                subtitle: "Choose a schedule on the left to inspect configuration and run history."
+            )
         }
     }
 
-    private func taskConfiguration(_ task: ScheduledTask) -> some View {
-        Grid(alignment: .leading, horizontalSpacing: 20, verticalSpacing: 9) {
-            detailRow("Workspace", vm.workspaces.first { $0.id == task.workspaceID }?.name ?? "Missing workspace")
-            detailRow("Run as", task.runAsUser)
-            detailRow("Provider", "\(task.provider.rawValue.capitalized) · \(task.providerInstanceID)")
-            detailRow("Model", "\(task.model) · \(task.reasoningEffort.displayName)")
-            detailRow("Time zone", task.timeZoneIdentifier)
-            detailRow("Next run", task.nextRunAt?.formatted(date: .abbreviated, time: .shortened) ?? "—")
-            detailRow("Access", "Full access")
+    private func detailHero(_ task: ScheduledTask) -> some View {
+        HStack(alignment: .top, spacing: DS.Space.lg) {
+            VStack(alignment: .leading, spacing: DS.Space.sm) {
+                Text(task.title)
+                    .font(DS.Font.title2.weight(.semibold))
+                    .foregroundColor(DS.Palette.text)
+                    .textSelection(.enabled)
+                HStack(spacing: DS.Space.sm) {
+                    DSPill(task.isEnabled ? "Active" : "Paused", tone: task.isEnabled ? .success : .neutral)
+                    DSPill(task.recurrence.summaryLabel, tone: .accent)
+                    DSPill("Full access", tone: .warning)
+                }
+                Text(task.nextRunAt.map { "Next run · \($0.formatted(date: .abbreviated, time: .shortened))" } ?? "No next run while paused")
+                    .font(DS.Font.caption)
+                    .foregroundColor(DS.Palette.textSecondary)
+            }
+            Spacer(minLength: DS.Space.lg)
+            HStack(spacing: DS.Space.sm) {
+                Button(task.isEnabled ? "Pause" : "Resume") { vm.toggle(task) }
+                    .buttonStyle(DSSecondaryButtonStyle())
+                    .accessibilityIdentifier("scheduledTasks.toggle")
+                Button("Run Now") { vm.runNow(task) }
+                    .buttonStyle(DSPrimaryButtonStyle())
+                    .accessibilityIdentifier("scheduledTasks.runNow")
+                Menu {
+                    Button("Edit") { vm.edit(task) }
+                    Divider()
+                    Button("Delete", role: .destructive) { vm.delete(task) }
+                } label: {
+                    Image(systemName: "ellipsis.circle")
+                        .font(.system(size: 16, weight: .medium))
+                        .foregroundColor(DS.Palette.textSecondary)
+                        .frame(width: 36, height: 32)
+                        .contentShape(Rectangle())
+                }
+                .menuStyle(.borderlessButton)
+                .help("More actions")
+                .accessibilityLabel("More actions")
+            }
         }
-        .padding(14)
-        .background(Color.secondary.opacity(0.07), in: RoundedRectangle(cornerRadius: 10))
+        .dsPanel(padding: DS.Space.xl, raised: true)
     }
 
-    private func detailRow(_ key: String, _ value: String) -> some View {
-        GridRow {
-            Text(key).foregroundColor(.secondary).frame(width: 90, alignment: .leading)
-            Text(value).textSelection(.enabled)
+    private func configurationGrid(_ task: ScheduledTask) -> some View {
+        VStack(alignment: .leading, spacing: DS.Space.md) {
+            DSSectionHeaderG("Configuration")
+            LazyVGrid(columns: [GridItem(.flexible(), spacing: DS.Space.md), GridItem(.flexible(), spacing: DS.Space.md)], spacing: DS.Space.md) {
+                configTile(icon: "folder", label: "Workspace", value: vm.workspaces.first { $0.id == task.workspaceID }?.name ?? "Missing workspace")
+                configTile(icon: "person", label: "Run as", value: task.runAsUser)
+                configTile(icon: "cpu", label: "Provider", value: "\(task.provider.rawValue.capitalized) · \(task.providerInstanceID)")
+                configTile(icon: "brain", label: "Model", value: "\(task.model) · \(task.reasoningEffort.displayName)")
+                configTile(icon: "globe", label: "Time zone", value: task.timeZoneIdentifier)
+                configTile(icon: "clock", label: "Next run", value: task.nextRunAt?.formatted(date: .abbreviated, time: .shortened) ?? "—")
+            }
+            .padding(.horizontal, DS.Space.lg)
         }
     }
 
-    @ViewBuilder private func runHistory(_ task: ScheduledTask) -> some View {
+    private func configTile(icon: String, label: String, value: String) -> some View {
+        HStack(alignment: .top, spacing: DS.Space.md) {
+            Image(systemName: icon)
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundColor(DS.Palette.accent)
+                .frame(width: 24, height: 24)
+                .background(DS.Palette.accent.opacity(0.12))
+                .clipShape(RoundedRectangle(cornerRadius: 5, style: .continuous))
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: DS.Space.xxs) {
+                Text(label.uppercased())
+                    .font(DS.Font.caption2.weight(.semibold))
+                    .tracking(0.5)
+                    .foregroundColor(DS.Palette.textTertiary)
+                Text(value)
+                    .font(DS.Font.body)
+                    .foregroundColor(DS.Palette.text)
+                    .textSelection(.enabled)
+                    .lineLimit(2)
+            }
+            Spacer(minLength: 0)
+        }
+        .dsPanel(padding: DS.Space.lg)
+    }
+
+    private func promptCard(_ task: ScheduledTask) -> some View {
+        VStack(alignment: .leading, spacing: DS.Space.md) {
+            DSSectionHeaderG("Prompt")
+            Text(task.prompt)
+                .font(DS.Font.body)
+                .foregroundColor(DS.Palette.text)
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .dsPanel(padding: DS.Space.xl)
+                .padding(.horizontal, DS.Space.lg)
+        }
+    }
+
+    private func historySection(_ task: ScheduledTask) -> some View {
+        VStack(alignment: .leading, spacing: DS.Space.md) {
+            DSSectionHeaderG("Run history") {
+                Button {
+                    vm.reload()
+                } label: {
+                    Image(systemName: "arrow.clockwise")
+                        .foregroundColor(DS.Palette.textSecondary)
+                }
+                .buttonStyle(.plain)
+                .help("Refresh run history")
+                .accessibilityLabel("Refresh run history")
+            }
+            runHistory(task)
+                .padding(.horizontal, DS.Space.lg)
+        }
+    }
+
+    @ViewBuilder
+    private func runHistory(_ task: ScheduledTask) -> some View {
         if vm.runs.isEmpty {
-            Text("No runs yet.").foregroundColor(.secondary).padding(.vertical, 12)
+            Text("No runs yet. Use Run Now or wait for the next scheduled occurrence.")
+                .font(DS.Font.body)
+                .foregroundColor(DS.Palette.textSecondary)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .dsPanel(padding: DS.Space.xl)
         } else {
             VStack(spacing: 0) {
-                ForEach(vm.runs) { run in
-                    HStack(spacing: 10) {
-                        Image(systemName: runIcon(run.status)).foregroundStyle(runColor(run.status))
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text(run.status.rawValue.capitalized).font(.body.weight(.medium))
-                            Text((run.startedAt ?? run.queuedAt).formatted(date: .abbreviated, time: .shortened)).font(.caption).foregroundColor(.secondary)
-                            Text(run.trigger == .catchUp ? "Catch-up" : run.trigger.rawValue.capitalized)
-                                .font(.caption2).foregroundColor(.secondary)
-                            if let started = run.startedAt, let finished = run.finishedAt {
-                                Text("Duration: \(finished.timeIntervalSince(started).formatted(.number.precision(.fractionLength(1))))s")
-                                    .font(.caption2).foregroundColor(.secondary)
-                            }
-                            if let code = run.errorCode {
-                                Text(code).font(.caption2.monospaced()).foregroundColor(.secondary)
-                            }
-                            if let error = run.errorSummary {
-                                Text(error)
-                                    .font(.caption)
-                                    .foregroundColor(.red)
-                                    .lineLimit(expandedRunIDs.contains(run.id) ? nil : 2)
-                                Button(expandedRunIDs.contains(run.id) ? "Hide details" : "Show details") {
-                                    if !expandedRunIDs.insert(run.id).inserted { expandedRunIDs.remove(run.id) }
-                                }
-                                .buttonStyle(.link)
-                                .font(.caption)
-                            }
-                        }
-                        Spacer()
-                        if run.status == .failed { Button("Retry") { vm.runNow(task) } }
-                        if run.threadID != nil { Button("Open Agent") { vm.openThread(run) } }
+                ForEach(Array(vm.runs.enumerated()), id: \.element.id) { index, run in
+                    runRow(task: task, run: run)
+                    if index != vm.runs.count - 1 {
+                        Rectangle().fill(DS.Palette.line).frame(height: DS.Border.hairline)
                     }
-                    .padding(.vertical, 9)
-                    if run.id != vm.runs.last?.id { Divider() }
                 }
             }
-            .padding(.horizontal, 12)
-            .background(Color.secondary.opacity(0.05), in: RoundedRectangle(cornerRadius: 8))
+            .background(DS.Palette.surface)
+            .clipShape(RoundedRectangle(cornerRadius: DS.Radius.card, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: DS.Radius.card, style: .continuous)
+                    .strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline)
+            )
             .accessibilityIdentifier("scheduledTasks.history")
         }
+    }
+
+    private func runRow(task: ScheduledTask, run: ScheduledTaskRun) -> some View {
+        HStack(alignment: .top, spacing: DS.Space.lg) {
+            Image(systemName: runIcon(run.status))
+                .font(.system(size: 14, weight: .semibold))
+                .foregroundStyle(runColor(run.status))
+                .frame(width: 20)
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: DS.Space.xs) {
+                HStack(spacing: DS.Space.sm) {
+                    Text(run.status.rawValue.capitalized)
+                        .font(DS.Font.body.weight(.semibold))
+                        .foregroundColor(DS.Palette.text)
+                    DSPill(run.trigger == .catchUp ? "Catch-up" : run.trigger.rawValue.capitalized, tone: .neutral)
+                }
+                Text((run.startedAt ?? run.queuedAt).formatted(date: .abbreviated, time: .shortened))
+                    .font(DS.Font.caption)
+                    .foregroundColor(DS.Palette.textSecondary)
+                if let started = run.startedAt, let finished = run.finishedAt {
+                    Text("Duration \(finished.timeIntervalSince(started).formatted(.number.precision(.fractionLength(1))))s")
+                        .font(DS.Font.caption2)
+                        .foregroundColor(DS.Palette.textTertiary)
+                }
+                if let code = run.errorCode {
+                    Text(code)
+                        .font(DS.Font.caption2.monospaced())
+                        .foregroundColor(DS.Palette.textSecondary)
+                }
+                if let error = run.errorSummary {
+                    Text(error)
+                        .font(DS.Font.caption)
+                        .foregroundColor(DS.Palette.danger)
+                        .lineLimit(expandedRunIDs.contains(run.id) ? nil : 2)
+                    Button(expandedRunIDs.contains(run.id) ? "Hide details" : "Show details") {
+                        if !expandedRunIDs.insert(run.id).inserted { expandedRunIDs.remove(run.id) }
+                    }
+                    .buttonStyle(.plain)
+                    .font(DS.Font.caption.weight(.semibold))
+                    .foregroundColor(DS.Palette.accent)
+                }
+            }
+            Spacer(minLength: DS.Space.md)
+            HStack(spacing: DS.Space.sm) {
+                if run.status == .failed {
+                    Button("Retry") { vm.runNow(task) }
+                        .buttonStyle(DSSecondaryButtonStyle())
+                }
+                if run.threadID != nil {
+                    Button("Open Agent") { vm.openThread(run) }
+                        .buttonStyle(DSSecondaryButtonStyle())
+                }
+            }
+        }
+        .padding(.horizontal, DS.Space.lg)
+        .padding(.vertical, DS.Space.lg)
+        .accessibilityElement(children: .combine)
     }
 
     private func runIcon(_ status: ScheduledTaskRunStatus) -> String {
@@ -572,12 +771,11 @@ public struct ScheduledTasksRootView: View {
 
     private func runColor(_ status: ScheduledTaskRunStatus) -> Color {
         switch status {
-        case .completed: return .green
-        case .failed: return .red
-        case .cancelled: return .secondary
-        case .skipped: return .secondary
-        case .queued: return .orange
-        case .running: return .blue
+        case .completed: return DS.Palette.success
+        case .failed: return DS.Palette.danger
+        case .cancelled, .skipped: return DS.Palette.textTertiary
+        case .queued: return DS.Palette.warning
+        case .running: return DS.Palette.accent
         }
     }
 }
@@ -586,25 +784,44 @@ private struct ScheduledTaskRow: View {
     let task: ScheduledTask
     let workspaceName: String
     let runCount: Int
+    let isSelected: Bool
+
     var body: some View {
-        HStack(spacing: 10) {
+        HStack(alignment: .top, spacing: DS.Space.md) {
             Image(systemName: task.isEnabled ? "calendar.badge.clock" : "pause.circle")
-                .foregroundStyle(task.isEnabled ? .blue : .secondary)
-                .frame(width: 22)
-            VStack(alignment: .leading, spacing: 3) {
-                Text(task.title).font(.body.weight(.medium)).lineLimit(1)
+                .font(.system(size: 14, weight: .semibold))
+                .foregroundStyle(task.isEnabled ? DS.Palette.accent : DS.Palette.textTertiary)
+                .frame(width: 22, height: 22)
+                .padding(.top, 2)
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: DS.Space.xs) {
+                HStack(spacing: DS.Space.sm) {
+                    Text(task.title)
+                        .font(DS.Font.body.weight(.semibold))
+                        .foregroundColor(DS.Palette.text)
+                        .lineLimit(1)
+                    Spacer(minLength: 0)
+                    DSPill(task.isEnabled ? "Active" : "Paused", tone: task.isEnabled ? .success : .neutral)
+                }
                 Text(task.nextRunAt?.formatted(date: .abbreviated, time: .shortened) ?? "Paused")
-                    .font(.caption).foregroundColor(.secondary)
+                    .font(DS.Font.caption)
+                    .foregroundColor(DS.Palette.textSecondary)
                 Text("\(workspaceName) · \(task.runAsUser)")
-                    .font(.caption2).foregroundColor(.secondary).lineLimit(1)
+                    .font(DS.Font.caption2)
+                    .foregroundColor(DS.Palette.textTertiary)
+                    .lineLimit(1)
                 Text("\(task.provider.rawValue.capitalized) · \(task.model) · \(runCount) run\(runCount == 1 ? "" : "s")")
-                    .font(.caption2).foregroundColor(.secondary).lineLimit(1)
+                    .font(DS.Font.caption2)
+                    .foregroundColor(DS.Palette.textTertiary)
+                    .lineLimit(1)
             }
-            Spacer()
         }
-        .padding(.vertical, 4)
+        .padding(.vertical, DS.Space.sm)
+        .padding(.horizontal, DS.Space.xs)
+        .contentShape(Rectangle())
         .accessibilityElement(children: .combine)
         .accessibilityIdentifier("scheduledTasks.task.\(task.id.uuidString.lowercased())")
+        .accessibilityValue(task.isEnabled ? "Active" : "Paused")
     }
 }
 
@@ -628,105 +845,237 @@ private struct ScheduledTaskEditorView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            HStack {
-                Text(draft.title.isEmpty ? "New Scheduled Task" : "Edit Scheduled Task").font(.title2.weight(.semibold))
+            HStack(spacing: DS.Space.lg) {
+                VStack(alignment: .leading, spacing: DS.Space.xxs) {
+                    Text(draft.title.isEmpty ? "New Scheduled Task" : "Edit Scheduled Task")
+                        .font(DS.Font.title2.weight(.semibold))
+                        .foregroundColor(DS.Palette.text)
+                    Text("Frozen configuration is used for every occurrence.")
+                        .font(DS.Font.caption)
+                        .foregroundColor(DS.Palette.textSecondary)
+                }
                 Spacer()
-                Button("Cancel", action: onCancel).disabled(vm.isSavingEditor)
+                Button("Cancel", action: onCancel)
+                    .buttonStyle(DSSecondaryButtonStyle())
+                    .disabled(vm.isSavingEditor)
                     .keyboardShortcut(.cancelAction)
-                Button(vm.isSavingEditor ? "Checking…" : "Save", action: confirmAndSave).buttonStyle(.borderedProminent)
+                Button(vm.isSavingEditor ? "Checking…" : "Save") { confirmAndSave() }
+                    .buttonStyle(DSPrimaryButtonStyle())
                     .disabled(vm.isSavingEditor)
                     .keyboardShortcut(.defaultAction)
                     .accessibilityIdentifier("scheduledTasks.editor.save")
             }
-            .padding(18)
-            Divider()
-            Form {
-                TextField("Title", text: $draft.title)
-                    .accessibilityIdentifier("scheduledTasks.editor.title")
-                Picker("Workspace", selection: $draft.workspaceID) {
-                    Text("Select a workspace").tag(WorkspaceID?.none)
-                    ForEach(vm.workspaces) { workspace in Text(workspace.name).tag(Optional(workspace.id)) }
-                }
-                .onChange(of: draft.workspaceID) { _, id in
-                    draft.workspacePathSnapshot = vm.workspaces.first { $0.id == id }?.cwd ?? ""
-                }
-                Picker("System user (sudo -u)", selection: $draft.runAsUser) {
-                    ForEach(vm.users) { user in Text("\(user.name) (uid \(user.uid))").tag(user.name) }
-                }
-                .onChange(of: draft.runAsUser) { _, name in
-                    draft.runAsUID = vm.users.first { $0.name == name }?.uid ?? 0
-                }
-                Picker("Provider", selection: $draft.provider) {
-                    ForEach(AgentProvider.allCases, id: \.self) { Text($0.rawValue.capitalized).tag($0) }
-                }
-                .onChange(of: draft.provider) { _, provider in
-                    if let snapshot = vm.providerSnapshots(for: provider).first {
-                        draft.providerInstanceID = snapshot.id
-                        draft.model = snapshot.models.first?.id ?? ""
+            .padding(.horizontal, DS.Space.xxl)
+            .padding(.vertical, DS.Space.xl)
+            .dsBar(edge: .bottom)
+
+            ScrollView {
+                VStack(alignment: .leading, spacing: DS.Space.xxl) {
+                    editorSection("Basics") {
+                        labeledField("Title") {
+                            TextField("Nightly audit", text: $draft.title)
+                                .textFieldStyle(.roundedBorder)
+                                .accessibilityIdentifier("scheduledTasks.editor.title")
+                        }
+                        labeledField("Workspace") {
+                            Picker("Workspace", selection: $draft.workspaceID) {
+                                Text("Select a workspace").tag(WorkspaceID?.none)
+                                ForEach(vm.workspaces) { workspace in
+                                    Text(workspace.name).tag(Optional(workspace.id))
+                                }
+                            }
+                            .labelsHidden()
+                            .onChange(of: draft.workspaceID) { _, id in
+                                draft.workspacePathSnapshot = vm.workspaces.first { $0.id == id }?.cwd ?? ""
+                            }
+                        }
+                        labeledField("System user") {
+                            Picker("System user", selection: $draft.runAsUser) {
+                                ForEach(vm.users) { user in
+                                    Text("\(user.name) (uid \(user.uid))").tag(user.name)
+                                }
+                            }
+                            .labelsHidden()
+                            .onChange(of: draft.runAsUser) { _, name in
+                                draft.runAsUID = vm.users.first { $0.name == name }?.uid ?? 0
+                            }
+                        }
                     }
-                }
-                Picker("Provider instance", selection: $draft.providerInstanceID) {
-                    ForEach(vm.providerSnapshots(for: draft.provider)) { Text($0.displayName).tag($0.id) }
-                }
-                Picker("Model", selection: $draft.model) {
-                    ForEach(vm.models(provider: draft.provider, instanceID: draft.providerInstanceID), id: \.id) { Text($0.label).tag($0.id) }
-                    if !draft.model.isEmpty && !vm.models(provider: draft.provider, instanceID: draft.providerInstanceID).contains(where: { $0.id == draft.model }) {
-                        Text(draft.model).tag(draft.model)
+
+                    editorSection("Agent") {
+                        labeledField("Provider") {
+                            Picker("Provider", selection: $draft.provider) {
+                                ForEach(AgentProvider.allCases, id: \.self) { Text($0.rawValue.capitalized).tag($0) }
+                            }
+                            .labelsHidden()
+                            .onChange(of: draft.provider) { _, provider in
+                                if let snapshot = vm.providerSnapshots(for: provider).first {
+                                    draft.providerInstanceID = snapshot.id
+                                    draft.model = snapshot.models.first?.id ?? ""
+                                }
+                            }
+                        }
+                        labeledField("Instance") {
+                            Picker("Provider instance", selection: $draft.providerInstanceID) {
+                                ForEach(vm.providerSnapshots(for: draft.provider)) { Text($0.displayName).tag($0.id) }
+                            }
+                            .labelsHidden()
+                        }
+                        labeledField("Model") {
+                            Picker("Model", selection: $draft.model) {
+                                ForEach(vm.models(provider: draft.provider, instanceID: draft.providerInstanceID), id: \.id) {
+                                    Text($0.label).tag($0.id)
+                                }
+                                if !draft.model.isEmpty,
+                                   !vm.models(provider: draft.provider, instanceID: draft.providerInstanceID).contains(where: { $0.id == draft.model }) {
+                                    Text(draft.model).tag(draft.model)
+                                }
+                            }
+                            .labelsHidden()
+                        }
+                        labeledField("Reasoning") {
+                            Picker("Reasoning", selection: $draft.reasoningEffort) {
+                                ForEach(AgentReasoningEffort.allCases, id: \.self) { Text($0.displayName).tag($0) }
+                            }
+                            .labelsHidden()
+                        }
                     }
+
+                    editorSection("Schedule") {
+                        labeledField("Frequency") {
+                            Picker("Frequency", selection: $draft.frequency) {
+                                ForEach(ScheduledTaskFrequency.allCases) { Text($0.displayName).tag($0) }
+                            }
+                            .labelsHidden()
+                        }
+                        scheduleControls
+                        labeledField("Time zone") {
+                            Picker("Time zone", selection: $draft.timeZoneIdentifier) {
+                                ForEach(Self.commonTimeZones, id: \.self) {
+                                    Text($0.replacingOccurrences(of: "_", with: " ")).tag($0)
+                                }
+                                if !Self.commonTimeZones.contains(draft.timeZoneIdentifier) {
+                                    Text(draft.timeZoneIdentifier).tag(draft.timeZoneIdentifier)
+                                }
+                            }
+                            .labelsHidden()
+                        }
+                        Toggle("Enabled after save", isOn: $draft.isEnabled)
+                            .toggleStyle(.switch)
+                            .foregroundColor(DS.Palette.text)
+                    }
+
+                    editorSection("Prompt") {
+                        TextEditor(text: $draft.prompt)
+                            .font(DS.Font.body)
+                            .foregroundColor(DS.Palette.text)
+                            .frame(minHeight: 140)
+                            .padding(DS.Space.md)
+                            .background(DS.Palette.bg)
+                            .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
+                            .overlay(
+                                RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
+                                    .strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline)
+                            )
+                            .accessibilityIdentifier("scheduledTasks.editor.prompt")
+                            .accessibilityLabel("Prompt")
+                    }
+
+                    HStack(alignment: .top, spacing: DS.Space.md) {
+                        Image(systemName: "exclamationmark.shield.fill")
+                            .foregroundColor(DS.Palette.warning)
+                            .accessibilityHidden(true)
+                        Text("Scheduled tasks always run with Full Access. RemoteCode may read, edit, execute, and delete files available to the selected system user. Review the prompt and workspace carefully.")
+                            .font(DS.Font.caption)
+                            .foregroundColor(DS.Palette.textSecondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    .padding(DS.Space.lg)
+                    .background(DS.Palette.warning.opacity(0.10))
+                    .clipShape(RoundedRectangle(cornerRadius: DS.Radius.card, style: .continuous))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: DS.Radius.card, style: .continuous)
+                            .strokeBorder(DS.Palette.warning.opacity(0.35), lineWidth: DS.Border.hairline)
+                    )
                 }
-                Picker("Reasoning", selection: $draft.reasoningEffort) {
-                    ForEach(AgentReasoningEffort.allCases, id: \.self) { Text($0.displayName).tag($0) }
-                }
-                Picker("Frequency", selection: $draft.frequency) {
-                    ForEach(ScheduledTaskFrequency.allCases) { Text($0.displayName).tag($0) }
-                }
-                scheduleControls
-                Picker("Time zone", selection: $draft.timeZoneIdentifier) {
-                    ForEach(Self.commonTimeZones, id: \.self) { Text($0.replacingOccurrences(of: "_", with: " ")).tag($0) }
-                    if !Self.commonTimeZones.contains(draft.timeZoneIdentifier) { Text(draft.timeZoneIdentifier).tag(draft.timeZoneIdentifier) }
-                }
-                Toggle("Enabled", isOn: $draft.isEnabled)
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("Prompt")
-                    TextEditor(text: $draft.prompt).font(.body).frame(minHeight: 130)
-                        .accessibilityIdentifier("scheduledTasks.editor.prompt")
-                }
-                HStack(alignment: .top, spacing: 9) {
-                    Image(systemName: "exclamationmark.shield.fill").foregroundColor(.orange)
-                    Text("Scheduled tasks run with Full Access. RemoteCode may read, edit, execute, and delete files available to the selected system user. Review the prompt and workspace carefully.")
-                        .font(.caption).foregroundColor(.secondary)
-                }
-                .padding(10).background(Color.orange.opacity(0.10), in: RoundedRectangle(cornerRadius: 8))
+                .padding(DS.Space.xxl)
             }
-            .formStyle(.grouped)
-            .padding(.horizontal, 8)
+            .background(DS.Palette.bg)
         }
-        .frame(width: 670, height: 720)
+        .frame(width: 720, height: 780)
+        .background(DS.Palette.bg)
     }
 
-    @ViewBuilder private var scheduleControls: some View {
+    private func editorSection<Content: View>(_ title: String, @ViewBuilder content: () -> Content) -> some View {
+        VStack(alignment: .leading, spacing: DS.Space.md) {
+            Text(title.uppercased())
+                .font(DS.Font.caption2.weight(.semibold))
+                .tracking(0.6)
+                .foregroundColor(DS.Palette.textTertiary)
+            VStack(alignment: .leading, spacing: DS.Space.lg) {
+                content()
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .dsPanel(padding: DS.Space.xl, raised: true)
+        }
+    }
+
+    private func labeledField<Content: View>(_ label: String, @ViewBuilder content: () -> Content) -> some View {
+        VStack(alignment: .leading, spacing: DS.Space.xs) {
+            Text(label)
+                .font(DS.Font.caption.weight(.medium))
+                .foregroundColor(DS.Palette.textSecondary)
+            content()
+        }
+    }
+
+    @ViewBuilder
+    private var scheduleControls: some View {
         switch draft.frequency {
         case .once:
-            DatePicker("Run at", selection: $draft.scheduledDate)
+            labeledField("Run at") {
+                DatePicker("Run at", selection: $draft.scheduledDate)
+                    .labelsHidden()
+                    .datePickerStyle(.compact)
+            }
         case .hourly:
-            Stepper("Every \(draft.intervalHours) hour\(draft.intervalHours == 1 ? "" : "s")", value: $draft.intervalHours, in: 1...24)
+            labeledField("Interval") {
+                Stepper("Every \(draft.intervalHours) hour\(draft.intervalHours == 1 ? "" : "s")", value: $draft.intervalHours, in: 1...24)
+                    .foregroundColor(DS.Palette.text)
+            }
         case .daily, .weekdays:
-            DatePicker("Local time", selection: $draft.localTime, displayedComponents: .hourAndMinute)
+            labeledField("Local time") {
+                DatePicker("Local time", selection: $draft.localTime, displayedComponents: .hourAndMinute)
+                    .labelsHidden()
+            }
         case .weekly:
-            DatePicker("Local time", selection: $draft.localTime, displayedComponents: .hourAndMinute)
-            HStack {
-                Text("Days")
-                Spacer()
-                ForEach(ScheduledWeekday.allCases, id: \.self) { day in
-                    Toggle(dayLabel(day), isOn: Binding(
-                        get: { draft.weekdays.contains(day) },
-                        set: { enabled in if enabled { draft.weekdays.insert(day) } else { draft.weekdays.remove(day) } }
-                    )).toggleStyle(.button)
+            labeledField("Local time") {
+                DatePicker("Local time", selection: $draft.localTime, displayedComponents: .hourAndMinute)
+                    .labelsHidden()
+            }
+            labeledField("Days") {
+                HStack(spacing: DS.Space.xs) {
+                    ForEach(ScheduledWeekday.allCases, id: \.self) { day in
+                        Toggle(dayLabel(day), isOn: Binding(
+                            get: { draft.weekdays.contains(day) },
+                            set: { enabled in
+                                if enabled { draft.weekdays.insert(day) } else { draft.weekdays.remove(day) }
+                            }
+                        ))
+                        .toggleStyle(.button)
+                        .font(DS.Font.caption.weight(.semibold))
+                    }
                 }
             }
         case .monthly:
-            Stepper("Day \(draft.monthlyDay)", value: $draft.monthlyDay, in: 1...28)
-            DatePicker("Local time", selection: $draft.localTime, displayedComponents: .hourAndMinute)
+            labeledField("Day of month") {
+                Stepper("Day \(draft.monthlyDay)", value: $draft.monthlyDay, in: 1...28)
+                    .foregroundColor(DS.Palette.text)
+            }
+            labeledField("Local time") {
+                DatePicker("Local time", selection: $draft.localTime, displayedComponents: .hourAndMinute)
+                    .labelsHidden()
+            }
         }
     }
 
@@ -753,7 +1102,17 @@ private struct ScheduledTaskEditorView: View {
     }
 
     private static let commonTimeZones: [String] = {
-        let preferred = [TimeZone.current.identifier, "UTC", "America/Asuncion", "America/New_York", "America/Los_Angeles", "America/Sao_Paulo", "Europe/London", "Europe/Berlin", "Asia/Tokyo"]
+        let preferred = [
+            TimeZone.current.identifier,
+            "UTC",
+            "America/Asuncion",
+            "America/New_York",
+            "America/Los_Angeles",
+            "America/Sao_Paulo",
+            "Europe/London",
+            "Europe/Berlin",
+            "Asia/Tokyo"
+        ]
         var seen = Set<String>()
         return preferred.filter { TimeZone(identifier: $0) != nil && seen.insert($0).inserted }
     }()
@@ -766,14 +1125,15 @@ public final class ScheduledTasksWindowController: NSWindowController, NSWindowD
     public init(context: AppContext, router: AppCommandRouter) {
         self.viewModel = ScheduledTasksViewModel(context: context, router: router)
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 1080, height: 720),
+            contentRect: NSRect(x: 0, y: 0, width: 1120, height: 760),
             styleMask: [.titled, .closable, .miniaturizable, .resizable],
             backing: .buffered,
             defer: false
         )
         window.title = "Scheduled Tasks"
-        window.minSize = NSSize(width: 940, height: 650)
+        window.minSize = NSSize(width: 980, height: 680)
         window.center()
+        window.backgroundColor = DS.NS.bg
         window.contentView = NSHostingView(rootView: ScheduledTasksRootView(vm: viewModel))
         window.setAccessibilityIdentifier("scheduledTasks.window")
         super.init(window: window)
@@ -787,5 +1147,18 @@ public final class ScheduledTasksWindowController: NSWindowController, NSWindowD
         showWindow(nil)
         window?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
+    }
+}
+
+private extension ScheduledTaskRecurrence {
+    var summaryLabel: String {
+        switch self {
+        case .once: return "Once"
+        case .hourly(let _, let hours): return hours == 1 ? "Hourly" : "Every \(hours)h"
+        case .daily: return "Daily"
+        case .weekdays: return "Weekdays"
+        case .weekly: return "Weekly"
+        case .monthly: return "Monthly"
+        }
     }
 }
