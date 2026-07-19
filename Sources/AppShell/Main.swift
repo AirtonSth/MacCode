@@ -18,8 +18,34 @@ struct RemoteCodeMain {
         let appSupportOverride = ProcessInfo.processInfo.environment["RC2_APP_SUPPORT"]
         let dbOverride = ProcessInfo.processInfo.environment["RC2_DB_PATH"]
 
+        if CommandLine.arguments.contains("--scheduled-task-agent-unregister") {
+            do {
+                try ScheduledTaskAgentServiceManager().unregister()
+                print("Scheduled Tasks background agent unregistered.")
+            } catch {
+                fputs("Unable to unregister Scheduled Tasks background agent: \(error)\n", stderr)
+            }
+            return
+        }
+
         let app = NSApplication.shared
         RemoteCodeAppearance.apply(to: app)
+        let isScheduledTaskAgent = CommandLine.arguments.contains("--scheduled-task-agent")
+            || ProcessInfo.processInfo.environment["RC2_SCHEDULED_TASK_AGENT"] == "1"
+        if isScheduledTaskAgent {
+            // Headless LaunchAgent must not mutate managed ~/.claude / ~/.codex distill
+            // skills for the interactive app session. Fail closed before AppContext init.
+            setenv("RC2_DISABLE_MANAGED_DISTILL_RECONCILE", "1", 1)
+            app.setActivationPolicy(.prohibited)
+            let delegate = ScheduledTaskAgentAppDelegate(
+                channel: channel,
+                appSupportOverride: appSupportOverride,
+                dbOverride: dbOverride
+            )
+            app.delegate = delegate
+            withExtendedLifetime(delegate) { app.run() }
+            return
+        }
         app.setActivationPolicy(.regular)
         let delegate = AppDelegate(channel: channel, appSupportOverride: appSupportOverride, dbOverride: dbOverride)
         app.delegate = delegate

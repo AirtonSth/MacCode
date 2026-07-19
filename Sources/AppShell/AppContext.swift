@@ -305,7 +305,11 @@ public final class AppContext {
         // Managed skills install into the real ~/.claude / ~/.codex skill dirs. Skip the
         // open-trigger reconcile under XCTest so the suite never mutates the developer's
         // real home; AppContext tests drive reconcile explicitly with a sandboxed home.
-        if !AppContext.isRunningUnitTests || agentSkillsHomeOverrideForTesting != nil {
+        if AppContext.shouldReconcileManagedDistillIntegration(
+            isRunningUnitTests: AppContext.isRunningUnitTests,
+            hasSkillsHomeOverride: agentSkillsHomeOverrideForTesting != nil,
+            environment: ProcessInfo.processInfo.environment
+        ) {
             reconcileManagedDistillSkills(tokenSaverEnabled: SettingsStore(db: db).load().tokenSaverEnabled)
         }
         startTokenSaverDistillServiceIfEligible()
@@ -748,6 +752,15 @@ public final class AppContext {
             managedDistillSkillInstallResults = []
             managedDistillSkillInstallError = (error as NSError).localizedDescription
         }
+    }
+
+    nonisolated static func shouldReconcileManagedDistillIntegration(
+        isRunningUnitTests: Bool,
+        hasSkillsHomeOverride: Bool,
+        environment: [String: String]
+    ) -> Bool {
+        guard environment["RC2_DISABLE_MANAGED_DISTILL_RECONCILE"] != "1" else { return false }
+        return !isRunningUnitTests || hasSkillsHomeOverride
     }
 
     private func startTokenSaverDistillServiceIfEligible() {

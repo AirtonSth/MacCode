@@ -37,6 +37,12 @@ final class AppIdentityNotificationTests: XCTestCase {
                       "packaging must require the Token Saver sidecar executable")
         XCTAssertTrue(script.contains("Contents/MacOS/RemoteCodeDistillService"),
                       "RemoteCode.app must contain the sidecar so Bundle.main can resolve it without global installs")
+        XCTAssertTrue(script.contains("SCHEDULED_TASK_AGENT=\"$BIN_DIR/RemoteCodeScheduledTaskAgent\""),
+                      "packaging must require a supplemental Scheduled Tasks agent executable")
+        XCTAssertTrue(script.contains("Contents/Resources/RemoteCodeScheduledTaskAgent"),
+                      "the LaunchAgent must not launch the GUI app executable directly because ServiceManagement rejects its launch category")
+        XCTAssertTrue(script.contains("codesign --force --sign \"$CODESIGN_IDENTITY\" --timestamp=none \"$STAGING_APP/Contents/Resources/RemoteCodeScheduledTaskAgent\""),
+                      "local packaging must explicitly sign the supplemental agent with the durable CODESIGN_IDENTITY")
         XCTAssertTrue(script.contains("<key>SUFeedURL</key><string>${SPARKLE_FEED_URL}</string>"),
                       "release bundles must point Sparkle at the stable appcast feed")
         XCTAssertTrue(script.contains("SPARKLE_FEED_URL=\"${RC2_SPARKLE_FEED_URL:-https://remotecode.io/downloads/macos/appcast.xml}\""),

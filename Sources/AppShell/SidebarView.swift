@@ -1907,16 +1907,19 @@ public struct SidebarRootView: View {
     @State private var _detailsSnapshotCacheKey: TokenSaverUsageSnapshot? = nil
     private let onOpenSettings: () -> Void
     private let onOpenAccount: () -> Void
+    private let onOpenScheduledTasks: () -> Void
     private let keyMapper = SidebarKeyIntentMapper()
 
     public init(
         vm: SidebarViewModel,
         onOpenSettings: @escaping () -> Void = {},
-        onOpenAccount: @escaping () -> Void = {}
+        onOpenAccount: @escaping () -> Void = {},
+        onOpenScheduledTasks: @escaping () -> Void = {}
     ) {
         self.vm = vm
         self.onOpenSettings = onOpenSettings
         self.onOpenAccount = onOpenAccount
+        self.onOpenScheduledTasks = onOpenScheduledTasks
     }
 
     public var body: some View {
@@ -1968,6 +1971,13 @@ public struct SidebarRootView: View {
                 .buttonStyle(.plain)
                 .help("Create new workspace")
                 .accessibilityIdentifier("sidebar.newWorkspace")
+
+                Button(action: onOpenScheduledTasks) {
+                    sidebarActionRow(symbol: "calendar.badge.clock", title: "Schedule Tasks")
+                }
+                .buttonStyle(.plain)
+                .help("Create and manage scheduled Agent tasks")
+                .accessibilityIdentifier("sidebar.scheduleTasks")
 
                 if vm.showsUpdateControl {
                     Button { vm.checkForUpdates() } label: {
@@ -4302,6 +4312,7 @@ public final class SidebarView: NSObject {
     private let host: NSHostingView<SidebarRootView>
     private var settingsController: SettingsWindowController?
     private var accountController: AccountWindowController?
+    private var scheduledTasksController: ScheduledTasksWindowController?
     private let updater: AppUpdateChecking?
 
     public init(context: AppContext, router: AppCommandRouter, updater: AppUpdateChecking? = nil) {
@@ -4337,7 +4348,8 @@ public final class SidebarView: NSObject {
         h.rootView = SidebarRootView(
             vm: viewModel,
             onOpenSettings: { [weak self] in self?.showSettings() },
-            onOpenAccount: { [weak self] in self?.showAccount() }
+            onOpenAccount: { [weak self] in self?.showAccount() },
+            onOpenScheduledTasks: { [weak self] in self?.showScheduledTasks() }
         )
     }
 
@@ -4369,5 +4381,12 @@ public final class SidebarView: NSObject {
         } else {
             controller.show()
         }
+    }
+
+    @objc private func showScheduledTasks() {
+        guard let context, let router else { return }
+        let controller = scheduledTasksController ?? ScheduledTasksWindowController(context: context, router: router)
+        scheduledTasksController = controller
+        controller.show()
     }
 }

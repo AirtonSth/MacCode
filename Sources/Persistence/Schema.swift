@@ -9,7 +9,7 @@ public struct SchemaStep {
 }
 
 public enum Schema {
-    public static let currentVersion: Int = 43
+    public static let currentVersion: Int = 44
 
     public static let steps: [SchemaStep] = [
         SchemaStep(1, """
@@ -581,6 +581,56 @@ public enum Schema {
         SchemaStep(43, """
         ALTER TABLE agent_threads
         ADD COLUMN run_as_user_json TEXT;
+        """),
+        SchemaStep(44, """
+        CREATE TABLE IF NOT EXISTS scheduled_tasks (
+            id TEXT PRIMARY KEY,
+            title TEXT NOT NULL,
+            prompt TEXT NOT NULL,
+            workspace_id TEXT NOT NULL,
+            workspace_path_snapshot TEXT NOT NULL,
+            run_as_user TEXT NOT NULL,
+            run_as_uid INTEGER NOT NULL,
+            provider TEXT NOT NULL,
+            provider_instance_id TEXT NOT NULL,
+            model TEXT NOT NULL,
+            reasoning_effort TEXT NOT NULL,
+            recurrence_json TEXT NOT NULL,
+            timezone_id TEXT NOT NULL,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            next_run_at TEXT,
+            last_run_at TEXT,
+            lease_owner TEXT,
+            lease_expires_at TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_scheduled_tasks_due
+        ON scheduled_tasks(enabled, next_run_at, lease_expires_at);
+
+        CREATE TABLE IF NOT EXISTS scheduled_task_runs (
+            id TEXT PRIMARY KEY,
+            task_id TEXT NOT NULL,
+            occurrence_key TEXT NOT NULL UNIQUE,
+            trigger TEXT NOT NULL,
+            scheduled_at TEXT NOT NULL,
+            queued_at TEXT NOT NULL,
+            started_at TEXT,
+            finished_at TEXT,
+            status TEXT NOT NULL,
+            thread_id TEXT,
+            agent_run_id TEXT,
+            error_code TEXT,
+            error_summary TEXT,
+            lease_owner TEXT,
+            heartbeat_at TEXT,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(task_id) REFERENCES scheduled_tasks(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_scheduled_task_runs_task
+        ON scheduled_task_runs(task_id, queued_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_scheduled_task_runs_status
+        ON scheduled_task_runs(status, queued_at);
         """)
     ]
 

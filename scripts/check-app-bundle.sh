@@ -103,7 +103,33 @@ do
   fi
 done
 
-# 5. PkgInfo must be EXACTLY the 8 bytes "APPL????" (the QA-mac:70 bug class: a
+# 5. Scheduled Tasks requires an embedded LaunchAgent with a bundle-relative
+# program, headless mode flag, and matching Mach service. This is the process
+# that keeps schedules running after the foreground app exits.
+BUNDLE_ID="$(plist_get CFBundleIdentifier)"
+SCHEDULED_SERVICE="${BUNDLE_ID}.scheduled-tasks"
+SCHEDULED_PLIST="$APP/Contents/Library/LaunchAgents/${SCHEDULED_SERVICE}.plist"
+if [ ! -f "$SCHEDULED_PLIST" ]; then
+  fail "missing Scheduled Tasks LaunchAgent at $SCHEDULED_PLIST"
+elif ! plutil -lint "$SCHEDULED_PLIST" >/dev/null; then
+  fail "Scheduled Tasks LaunchAgent failed plutil -lint"
+else
+  SCHEDULED_LABEL="$(plutil -extract Label raw -o - "$SCHEDULED_PLIST" 2>/dev/null || true)"
+  SCHEDULED_PROGRAM="$(plutil -extract BundleProgram raw -o - "$SCHEDULED_PLIST" 2>/dev/null || true)"
+  SCHEDULED_EXECUTABLE="$APP/$SCHEDULED_PROGRAM"
+  SCHEDULED_ARGUMENT="$(plutil -extract ProgramArguments.1 raw -o - "$SCHEDULED_PLIST" 2>/dev/null || true)"
+  # PlistBuddy treats the dotted service label as one dictionary key; plutil's
+  # key-path parser would split it at every dot and report a false negative.
+  SCHEDULED_MACH="$(/usr/libexec/PlistBuddy -c "Print :MachServices:${SCHEDULED_SERVICE}" "$SCHEDULED_PLIST" 2>/dev/null || true)"
+  [ "$SCHEDULED_LABEL" = "$SCHEDULED_SERVICE" ] || fail "Scheduled Tasks Label must match bundle identifier"
+  [ "$SCHEDULED_PROGRAM" = "Contents/Resources/RemoteCodeScheduledTaskAgent" ] || fail "Scheduled Tasks BundleProgram must use the supplemental agent executable"
+  [ -x "$SCHEDULED_EXECUTABLE" ] || fail "Scheduled Tasks agent executable is missing"
+  [ "$SCHEDULED_ARGUMENT" = "--scheduled-task-agent" ] || fail "Scheduled Tasks headless argument is missing"
+  [ "$SCHEDULED_MACH" = "true" ] || fail "Scheduled Tasks Mach service is missing"
+  note "Scheduled Tasks LaunchAgent is packaged and structurally valid"
+fi
+
+# 6. PkgInfo must be EXACTLY the 8 bytes "APPL????" (the QA-mac:70 bug class: a
 #    heredoc trailing newline made it 9 bytes, which some validators reject).
 if [ ! -f "$PKGINFO" ]; then
   fail "missing PkgInfo"
@@ -119,7 +145,7 @@ else
   fi
 fi
 
-# 6. The pet art must ship inside the real AppShell resource bundle. SwiftPM tests
+# 7. The pet art must ship inside the real AppShell resource bundle. SwiftPM tests
 # can resolve Bundle.module even when the packaging script forgets to copy it, so
 # this structural check protects the distributable .app boundary.
 #
