@@ -549,6 +549,12 @@ public final class AppContext {
             // the final token batch is never stranded in the accumulator.
             self.flushPendingTokenSaverUsage(runId: rid)
             self.recordSessionLearnFromRun(runId: rid, status: status) // P5 SessionLearn (off by default)
+            // Grok has no live `.accountUsage` stream (Claude/Codex do). Re-read
+            // the local billing snapshot after each Grok run so the Token Saver
+            // purple ring updates without waiting for the 5-minute periodic probe.
+            if let run = try? self.runRepo.get(id: rid), run.provider == .grok {
+                self.refreshGrokTokenSaverAccountUsage(reason: "run_finished")
+            }
             // Drain the next queued message after ANY terminal status. A run that
             // ended .failed previously stranded queued messages (no run to pick
             // them up); drainNextQueuedAgentMessage re-checks the thread is not
@@ -849,6 +855,60 @@ public final class AppContext {
                     providers: usages.map(\.provider.rawValue)
                 )
                 self.tokenSaverAccountUsageRefreshTask = nil
+            }
+        }
+    }
+
+    /// Grok-only account-usage refresh from the local billing log.
+    ///
+    /// WHY: Claude/Codex push live `.accountUsage` during a turn. Grok ACP does
+    /// not, so the purple weekly ring stayed stale until launch / 5-minute
+    /// periodic / details-open. Call this after a Grok run finishes (or from
+    /// tests) to re-read `~/.grok/logs/unified.jsonl` without spawning the slow
+    /// Claude/Codex CLI probes. Independent of `tokenSaverAccountUsageRefreshTask`
+    /// so a busy full refresh cannot skip Grok.
+    ///
+    /// - Parameters:
+    ///   - reason: telemetry label (`run_finished`, tests, …)
+    ///   - billingLogURL: override for tests; default is the user billing log
+    public func refreshGrokTokenSaverAccountUsage(
+        reason: String,
+        billingLogURL: URL? = nil
+    ) {
+        guard PrivateAccountSessionStore(repo: settingsRepo).load() != nil else {
+            publishTokenSaverAccountUsageRefresh(state: "skipped", reason: reason, detail: "signed_out")
+            return
+        }
+        let url = billingLogURL
+            ?? FileManager.default.homeDirectoryForCurrentUser
+                .appendingPathComponent(".grok/logs/unified.jsonl")
+        publishTokenSaverAccountUsageRefresh(state: "started", reason: reason, detail: "grok_billing_log")
+        Task { [weak self] in
+            let usage = await Task.detached {
+                AssistantAccountUsageParser.grokFromBillingLogFile(at: url)
+            }.value
+            await MainActor.run {
+                guard let self else { return }
+                if let usage {
+                    self.recordTokenSaverAccountUsage(usage)
+                    EventBus.shared.publish(
+                        kind: "agent.account.usage",
+                        payload: .object(Self.accountUsagePayload(reason: reason, usage: usage))
+                    )
+                    self.publishTokenSaverAccountUsageRefresh(
+                        state: "finished",
+                        reason: reason,
+                        detail: nil,
+                        providers: [usage.provider.rawValue]
+                    )
+                } else {
+                    self.publishTokenSaverAccountUsageRefresh(
+                        state: "finished",
+                        reason: reason,
+                        detail: "empty",
+                        providers: []
+                    )
+                }
             }
         }
     }

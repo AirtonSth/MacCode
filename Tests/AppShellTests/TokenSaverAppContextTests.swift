@@ -465,6 +465,55 @@ final class TokenSaverAppContextTests: XCTestCase {
         XCTAssertEqual(AppDelegate.tokenSaverAccountUsageRefreshInterval, 300)
     }
 
+    func test_appContextRefreshesGrokAccountUsageFromBillingLogAfterRun() async throws {
+        // WHY: Grok ACP never emits live `.accountUsage`, so the Token Saver
+        // purple ring stayed stale between the 5-minute periodic probes. After
+        // a Grok run finishes we re-read the local billing log; this pins that
+        // the lightweight path persists creditUsagePercent without Claude/Codex.
+        let appSupport = NSTemporaryDirectory() + "RC2TokenSaverGrokRunUsage-" + UUID().uuidString
+        let logDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("rc-grok-billing-run-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: logDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: logDir) }
+        let log = logDir.appendingPathComponent("unified.jsonl")
+        let body = """
+        {"msg":"noise"}
+        {"msg":"billing: fetched credits config","ctx":{"config":{"creditUsagePercent":61.0,"billingPeriodEnd":"2026-07-22T20:46:41.975270+00:00"}}}
+        """
+        try body.write(to: log, atomically: true, encoding: .utf8)
+
+        let context = try AppContext(channel: .debug, appSupportOverride: appSupport)
+        savePrivateSession(in: context)
+
+        context.refreshGrokTokenSaverAccountUsage(reason: "run_finished", billingLogURL: log)
+
+        let didPersist = await waitUntil {
+            let snapshot = TokenSaverUsageStore(appSupportDirectory: context.appSupportDirectory).load()
+            return snapshot.providers.first(where: { $0.provider == .grok })?.weeklyUsedPercent == 61
+        }
+        XCTAssertTrue(didPersist,
+                      "post-run Grok billing-log refresh must write weeklyUsedPercent so the purple ring updates without the 5-minute probe")
+    }
+
+    func test_appContextSkipsGrokBillingLogRefreshWhenNotSignedIn() async throws {
+        let appSupport = NSTemporaryDirectory() + "RC2TokenSaverGrokNoAccount-" + UUID().uuidString
+        let logDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("rc-grok-billing-signedout-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: logDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: logDir) }
+        let log = logDir.appendingPathComponent("unified.jsonl")
+        try #"{"msg":"billing: fetched credits config","ctx":{"config":{"creditUsagePercent":88.0}}}"#
+            .write(to: log, atomically: true, encoding: .utf8)
+
+        let context = try AppContext(channel: .debug, appSupportOverride: appSupport)
+        context.refreshGrokTokenSaverAccountUsage(reason: "run_finished", billingLogURL: log)
+        try? await Task.sleep(nanoseconds: 80_000_000)
+
+        let snapshot = TokenSaverUsageStore(appSupportDirectory: context.appSupportDirectory).load()
+        XCTAssertNil(snapshot.providers.first(where: { $0.provider == .grok })?.weeklyUsedPercent,
+                     "signed-out sessions must not probe or persist Grok billing usage")
+    }
+
     func test_tokenSaverCompressionCompressesPromptAndRecordsMeasuredSavingsToDB() async throws {
         let appSupport = NSTemporaryDirectory() + "RC2TokenSaverCompress-" + UUID().uuidString
         let context = try AppContext(channel: .debug, appSupportOverride: appSupport)
