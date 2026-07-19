@@ -18,8 +18,31 @@ struct RemoteCodeMain {
         let appSupportOverride = ProcessInfo.processInfo.environment["RC2_APP_SUPPORT"]
         let dbOverride = ProcessInfo.processInfo.environment["RC2_DB_PATH"]
 
+        if CommandLine.arguments.contains("--scheduled-task-agent-unregister") {
+            do {
+                try ScheduledTaskAgentServiceManager().unregister()
+                print("Scheduled Tasks background agent unregistered.")
+            } catch {
+                fputs("Unable to unregister Scheduled Tasks background agent: \(error)\n", stderr)
+            }
+            return
+        }
+
         let app = NSApplication.shared
         RemoteCodeAppearance.apply(to: app)
+        let isScheduledTaskAgent = CommandLine.arguments.contains("--scheduled-task-agent")
+            || ProcessInfo.processInfo.environment["RC2_SCHEDULED_TASK_AGENT"] == "1"
+        if isScheduledTaskAgent {
+            app.setActivationPolicy(.prohibited)
+            let delegate = ScheduledTaskAgentAppDelegate(
+                channel: channel,
+                appSupportOverride: appSupportOverride,
+                dbOverride: dbOverride
+            )
+            app.delegate = delegate
+            withExtendedLifetime(delegate) { app.run() }
+            return
+        }
         app.setActivationPolicy(.regular)
         let delegate = AppDelegate(channel: channel, appSupportOverride: appSupportOverride, dbOverride: dbOverride)
         app.delegate = delegate

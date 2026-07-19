@@ -111,6 +111,7 @@ rm -rf "$STAGING_APP"
 mkdir -p "$STAGING_APP/Contents/MacOS"
 mkdir -p "$STAGING_APP/Contents/Resources"
 mkdir -p "$STAGING_APP/Contents/Frameworks"
+mkdir -p "$STAGING_APP/Contents/Library/LaunchAgents"
 
 cp "$BIN" "$STAGING_APP/Contents/MacOS/RemoteCode"
 cp "$DISTILL_SERVICE" "$STAGING_APP/Contents/MacOS/RemoteCodeDistillService"
@@ -195,6 +196,35 @@ cat > "$STAGING_APP/Contents/Info.plist" <<EOF
 </dict>
 </plist>
 EOF
+
+SCHEDULED_TASK_SERVICE="${BUNDLE_ID}.scheduled-tasks"
+SCHEDULED_TASK_PLIST="$STAGING_APP/Contents/Library/LaunchAgents/${SCHEDULED_TASK_SERVICE}.plist"
+cat > "$SCHEDULED_TASK_PLIST" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>${SCHEDULED_TASK_SERVICE}</string>
+  <key>BundleProgram</key><string>Contents/MacOS/RemoteCode</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>RemoteCode</string>
+    <string>--scheduled-task-agent</string>
+  </array>
+  <key>MachServices</key>
+  <dict><key>${SCHEDULED_TASK_SERVICE}</key><true/></dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ProcessType</key><string>Background</string>
+  <key>ThrottleInterval</key><integer>10</integer>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>RC2_CHANNEL</key><string>${RC2_CHANNEL_VALUE}</string>
+  </dict>
+</dict>
+</plist>
+EOF
+plutil -lint "$SCHEDULED_TASK_PLIST" >/dev/null
 
 # PkgInfo must be exactly the 8 bytes "APPL????" with NO trailing newline; a
 # heredoc/echo adds one (9 bytes), which some bundle validators reject (QA-mac :70).

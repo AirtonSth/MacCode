@@ -429,7 +429,9 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         // survive app-quit so the user's shell keeps working between runs. On the next
         // launch AppContext.init reconciles again and reinstalls whatever is needed.
         let tokenSaverEnabled = context.map { SettingsStore(db: $0.db).load().tokenSaverEnabled } ?? false
-        if tokenSaverEnabled {
+        if ProcessInfo.processInfo.environment["RC2_DISABLE_MANAGED_DISTILL_RECONCILE"] == "1" {
+            appLifecycleLog.info("app.will_terminate distill_integration=unchanged isolated_process=true")
+        } else if tokenSaverEnabled {
             appLifecycleLog.info("app.will_terminate distill_integration=retained token_saver=enabled")
         } else {
             appLifecycleLog.info("app.will_terminate distill_integration=removing token_saver=disabled")
