@@ -5053,7 +5053,7 @@ public struct AgentAppView: View {
     // UX-XPLAT-007: checkpoint revert confirmation — staged turn count until user confirms.
     @State private var pendingRevertCheckpointTurnCount: Int?
     // P3: user-message "show more" — message ids the user has expanded past 28 lines.
-    @State private var expandedUserMessages: Set<AgentMessageID> = []
+
     @State private var showModelOptions = false
     @State private var showAllModelOptions = false
     // UX-MAC_AGENT-013: inline custom-model entry replaces the blocking NSAlert.
@@ -5487,9 +5487,8 @@ public struct AgentAppView: View {
     static let liveTurnSummaryCharacterLimit = 240
     static let commandPreviewCharacterLimit = 1_200
 
-    /// User bubbles show the full stored prompt. Layout may wrap long lines and
-    /// offer a line-count "Show more" for very tall messages; content is never
-    /// character-truncated for display.
+    /// User bubbles show the full stored prompt. Layout wraps long lines and
+    /// grows vertically with content — no character or line-count truncation.
     static func userMessageDisplayText(_ text: String) -> String {
         text
     }
@@ -7644,31 +7643,25 @@ public struct AgentAppView: View {
         switch msg.role {
         case .user:
             let displayText = Self.userMessageDisplayText(msg.content)
-            let messageExpanded = expandedUserMessages.contains(msg.id)
-            // P3: messages longer than 28 lines get a "Show more" toggle so the
-            // user can read the full text without the copy-only hint.
-            let lineCount = displayText.components(separatedBy: "\n").count
-            let showExpandToggle = !messageExpanded && lineCount > 28
-            // Cap against the live column so fixedSize hug cannot paint past the
-            // timeline edge (copy / "just now" meta used to hang outside the pane).
+            // Cap width against the live column so the bubble wraps instead of
+            // painting past the timeline edge. Height is content-driven — never
+            // a fixed frame and never a line-count truncate/"Show more" gate.
             let bubbleMax = Self.userMessageBubbleWidthCap(columnWidth: columnWidth)
             let textMax = max(0, bubbleMax - (DS.Space.xl * 2))
             HStack(alignment: .top, spacing: 0) {
                 Spacer(minLength: Self.userMessageBubbleLeadingGutter)
                 VStack(alignment: .trailing, spacing: DS.Space.xs) {
-                    // WHY: Use SwiftUI Text (not AgentSelectablePlainText / NSTextView).
-                    // IntrinsicHeightTextView reports no horizontal intrinsic size, so
-                    // short prompts like "oi" expanded to the full maxWidth bubble.
-                    // Order: maxWidth on the text first so long prompts wrap during
-                    // ideal-size measurement; padding/background next; fixedSize then
-                    // hugs short ones while keeping multi-line height (vertical:false
-                    // collapsed long paths to one ellipsized line).
+                    // WHY: SwiftUI Text (not NSTextView) so short prompts hug content
+                    // and long prompts wrap. No lineLimit / no fixed height — full
+                    // prompt always visible and height grows with content.
+                    // Order: maxWidth on text so wrap is measured; pad/background;
+                    // fixedSize hugs width and keeps multi-line height; outer
+                    // maxWidth clamps to the live column.
                     Text(displayText)
                         .font(.system(size: 13))
                         .foregroundColor(DS.Palette.text)
                         .multilineTextAlignment(.leading)
                         .textSelection(.enabled)
-                        .lineLimit(messageExpanded ? nil : 28)
                         .frame(maxWidth: textMax, alignment: .leading)
                         .padding(.horizontal, DS.Space.xl)
                         .padding(.vertical, DS.Space.lg)
@@ -7677,18 +7670,6 @@ public struct AgentAppView: View {
                         .fixedSize(horizontal: true, vertical: true)
                         .frame(maxWidth: bubbleMax, alignment: .trailing)
                         .accessibilityIdentifier("agent.userMessageBubble")
-                    if showExpandToggle {
-                        Button {
-                            expandedUserMessages.insert(msg.id)
-                        } label: {
-                            Text("Show more")
-                                .font(DS.Font.caption)
-                                .foregroundColor(DS.Palette.accent)
-                        }
-                        .buttonStyle(.plain)
-                        .accessibilityLabel("Show full message")
-                        .accessibilityIdentifier("agent.userMessage.showMore.\(msg.id.value.uuidString)")
-                    }
                     // UX-MAC_AGENT-017: subtle relative timestamp so long threads
                     // show when each message was sent. Keep meta inside the bubble
                     // column so copy + relative time never spill past the pane.
