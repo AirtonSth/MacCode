@@ -116,12 +116,14 @@ elif ! plutil -lint "$SCHEDULED_PLIST" >/dev/null; then
 else
   SCHEDULED_LABEL="$(plutil -extract Label raw -o - "$SCHEDULED_PLIST" 2>/dev/null || true)"
   SCHEDULED_PROGRAM="$(plutil -extract BundleProgram raw -o - "$SCHEDULED_PLIST" 2>/dev/null || true)"
+  SCHEDULED_EXECUTABLE="$APP/$SCHEDULED_PROGRAM"
   SCHEDULED_ARGUMENT="$(plutil -extract ProgramArguments.1 raw -o - "$SCHEDULED_PLIST" 2>/dev/null || true)"
   # PlistBuddy treats the dotted service label as one dictionary key; plutil's
   # key-path parser would split it at every dot and report a false negative.
   SCHEDULED_MACH="$(/usr/libexec/PlistBuddy -c "Print :MachServices:${SCHEDULED_SERVICE}" "$SCHEDULED_PLIST" 2>/dev/null || true)"
   [ "$SCHEDULED_LABEL" = "$SCHEDULED_SERVICE" ] || fail "Scheduled Tasks Label must match bundle identifier"
-  [ "$SCHEDULED_PROGRAM" = "Contents/MacOS/RemoteCode" ] || fail "Scheduled Tasks BundleProgram must be bundle-relative"
+  [ "$SCHEDULED_PROGRAM" = "Contents/Resources/RemoteCodeScheduledTaskAgent" ] || fail "Scheduled Tasks BundleProgram must use the supplemental agent executable"
+  [ -x "$SCHEDULED_EXECUTABLE" ] || fail "Scheduled Tasks agent executable is missing"
   [ "$SCHEDULED_ARGUMENT" = "--scheduled-task-agent" ] || fail "Scheduled Tasks headless argument is missing"
   [ "$SCHEDULED_MACH" = "true" ] || fail "Scheduled Tasks Mach service is missing"
   note "Scheduled Tasks LaunchAgent is packaged and structurally valid"

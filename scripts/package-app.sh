@@ -61,6 +61,7 @@ echo "[package] building $CONFIG …"
 swift build -c "$CONFIG"
 
 BIN="$BIN_DIR/RemoteCode"
+SCHEDULED_TASK_AGENT="$BIN_DIR/RemoteCodeScheduledTaskAgent"
 CLI="$BIN_DIR/rc2"
 DISTILL_SERVICE="$BIN_DIR/RemoteCodeDistillService"
 RUN_AS_USER_HELPER="$BIN_DIR/RemoteCodeRunAsUserHelper"
@@ -68,6 +69,7 @@ MLX_METALLIB="$BIN_DIR/mlx.metallib"
 SURFACES_RESOURCES="$BIN_DIR/RemoteCode_Surfaces.bundle"
 APP_SHELL_RESOURCES="$BIN_DIR/RemoteCode_AppShell.bundle"
 if [ ! -x "$BIN" ]; then echo "missing $BIN"; exit 1; fi
+if [ ! -x "$SCHEDULED_TASK_AGENT" ]; then echo "missing $SCHEDULED_TASK_AGENT"; exit 1; fi
 if [ ! -x "$DISTILL_SERVICE" ]; then echo "missing $DISTILL_SERVICE"; exit 1; fi
 if [ ! -x "$RUN_AS_USER_HELPER" ]; then echo "missing $RUN_AS_USER_HELPER"; exit 1; fi
 scripts/build-mlx-metallib.sh "$MLX_METALLIB"
@@ -114,6 +116,7 @@ mkdir -p "$STAGING_APP/Contents/Frameworks"
 mkdir -p "$STAGING_APP/Contents/Library/LaunchAgents"
 
 cp "$BIN" "$STAGING_APP/Contents/MacOS/RemoteCode"
+cp "$SCHEDULED_TASK_AGENT" "$STAGING_APP/Contents/Resources/RemoteCodeScheduledTaskAgent"
 cp "$DISTILL_SERVICE" "$STAGING_APP/Contents/MacOS/RemoteCodeDistillService"
 # Privileged trampoline for sudo -u style agent execution. Not setuid in the
 # bundle; install to /Library/PrivilegedHelperTools with root ownership for use.
@@ -205,10 +208,10 @@ cat > "$SCHEDULED_TASK_PLIST" <<EOF
 <plist version="1.0">
 <dict>
   <key>Label</key><string>${SCHEDULED_TASK_SERVICE}</string>
-  <key>BundleProgram</key><string>Contents/MacOS/RemoteCode</string>
+  <key>BundleProgram</key><string>Contents/Resources/RemoteCodeScheduledTaskAgent</string>
   <key>ProgramArguments</key>
   <array>
-    <string>RemoteCode</string>
+    <string>RemoteCodeScheduledTaskAgent</string>
     <string>--scheduled-task-agent</string>
   </array>
   <key>MachServices</key>
@@ -262,9 +265,11 @@ CODESIGN_IDENTITY="$("$CODESIGN_RESOLVER")"
 if [ "$CODESIGN_IDENTITY" = "-" ]; then
   echo "[package] WARNING: signing ad-hoc. Network volume / folder TCC prompts can return after every rebuild." >&2
   echo "[package] Fix: export RC2_CODESIGN_IDENTITY=\"Apple Development: Your Name (TEAMID)\"  # or install one unique Apple Development cert" >&2
+  codesign --force --sign - --timestamp=none "$STAGING_APP/Contents/Resources/RemoteCodeScheduledTaskAgent"
   codesign --force --deep --sign - --timestamp=none "$STAGING_APP"
 else
   echo "[package] signing with durable identity: $CODESIGN_IDENTITY" >&2
+  codesign --force --sign "$CODESIGN_IDENTITY" --timestamp=none "$STAGING_APP/Contents/Resources/RemoteCodeScheduledTaskAgent"
   codesign --force --deep --sign "$CODESIGN_IDENTITY" --timestamp=none "$STAGING_APP"
 fi
 codesign --verify --deep --strict --verbose=2 "$STAGING_APP"

@@ -8,6 +8,7 @@ let package = Package(
     ],
     products: [
         .executable(name: "RemoteCode", targets: ["AppShell"]),
+        .executable(name: "RemoteCodeScheduledTaskAgent", targets: ["RemoteCodeScheduledTaskAgent"]),
         .executable(name: "RemoteCodeDistillService", targets: ["RemoteCodeDistillService"]),
         .executable(name: "RemoteCodeRunAsUserHelper", targets: ["RemoteCodeRunAsUserHelper"]),
         .executable(name: "LifecycleSignalProbe", targets: ["LifecycleSignalProbe"]),
@@ -74,6 +75,10 @@ let package = Package(
                 .product(name: "Tokenizers", package: "swift-transformers")
             ],
             path: "Sources/DistillCore"
+        ),
+        .executableTarget(
+            name: "RemoteCodeScheduledTaskAgent",
+            path: "Sources/RemoteCodeScheduledTaskAgent"
         ),
         .executableTarget(
             name: "RemoteCodeDistillService",
