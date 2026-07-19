@@ -861,6 +861,19 @@ public final class AppContext {
                     EventBus.shared.publish(kind: "agent.account.usage",
                         payload: .object(Self.accountUsagePayload(reason: reason, usage: usage)))
                 }
+                // Partial success: providers that did not answer are inactive /
+                // signed-out / unreachable. Clear their frozen weekly % so the
+                // Token Saver card does not stay locked (Claude 45% forever).
+                // Full empty/timeout leaves the cache alone — that is noise, not
+                // proof every provider is inactive.
+                if !usages.isEmpty {
+                    let missing = TokenSaverUsageStore.providersMissingFromAccountUsageRefresh(
+                        returned: usages.map(\.provider)
+                    )
+                    for provider in missing {
+                        self.clearTokenSaverAccountUsagePercentages(provider)
+                    }
+                }
                 self.publishTokenSaverAccountUsageRefresh(
                     state: "finished",
                     reason: reason,
@@ -869,6 +882,16 @@ public final class AppContext {
                 )
                 self.tokenSaverAccountUsageRefreshTask = nil
             }
+        }
+    }
+
+    private func clearTokenSaverAccountUsagePercentages(_ provider: AgentProvider) {
+        do {
+            _ = try TokenSaverUsageStore(appSupportDirectory: appSupportDirectory)
+                .clearAccountUsagePercentages(provider: provider)
+            NotificationCenter.default.post(name: .rc2TokenSaverUsageChanged, object: nil)
+        } catch {
+            NSLog("RemoteCode Token Saver account usage clear failed (\(provider.rawValue)): \(error)")
         }
     }
 

@@ -3852,6 +3852,17 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             }
         }
         guard appliedEvent else { return }
+        // UX: transient durability banners (sqlite "database is locked", etc.)
+        // stick only while the stream is still failing. Once a later event proves
+        // the run continued, drop the banner so it does not outlive the outage.
+        let appliedEvents = pending.map(\.event)
+        if Self.shouldAutoClearTransientTimelineError(
+            errorAfterBatch: nextTimeline.error,
+            appliedEvents: appliedEvents
+        ) {
+            nextTimeline.clearError()
+            nextLastErrorRecoverable = false
+        }
         if self.currentRunId != nextCurrentRunId { self.currentRunId = nextCurrentRunId }
         if self.status != nextStatus { self.status = nextStatus }
         if self.lastErrorRecoverable != nextLastErrorRecoverable {
@@ -3864,6 +3875,30 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         // queue/start implementation without surfacing Approve/Reject.
         if pending.contains(where: { if case .proposedPlan = $0.event { return true }; return false }) {
             scheduleFullAccessPlanAutoImplementIfNeeded()
+        }
+    }
+
+    /// True for local durability noise that is not a provider-run failure.
+    /// These banners should auto-dismiss when the thread keeps making progress.
+    nonisolated static func isTransientPersistenceTimelineError(_ message: String) -> Bool {
+        let n = message.lowercased()
+        return n.contains("persistence failure")
+            || n.contains("database is locked")
+            || n.contains("sqlite step: database is locked")
+    }
+
+    /// After a stream batch: drop a transient persistence banner when any
+    /// non-error event shows the run continued past the lock/outage.
+    nonisolated static func shouldAutoClearTransientTimelineError(
+        errorAfterBatch: String?,
+        appliedEvents: [AssistantEvent]
+    ) -> Bool {
+        guard let errorAfterBatch, isTransientPersistenceTimelineError(errorAfterBatch) else {
+            return false
+        }
+        return appliedEvents.contains { event in
+            if case .error = event { return false }
+            return true
         }
     }
 
@@ -3931,6 +3966,16 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 }
             }
             if finishedTid == self.selectedThreadId {
+                if status == .completed || status == .cancelled {
+                    // A finished turn that progressed past a durability blip must
+                    // not leave "database is locked" stuck under the composer.
+                    if let err = self.timeline.error,
+                       Self.isTransientPersistenceTimelineError(err) {
+                        self.timeline.clearError()
+                        self.lastErrorRecoverable = false
+                        self.scheduleTimelineUpdateTick()
+                    }
+                }
                 if status == .failed,
                    self.timeline.error == nil,
                    let finalMessage,
@@ -4671,13 +4716,173 @@ public struct AgentImageViewPresentation: Equatable, Sendable {
     public let resourceURL: URL
 
     public static func make(for item: AssistantItem) -> AgentImageViewPresentation? {
-        guard item.type == .imageView,
-              let path = item.resourcePath?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !path.isEmpty else { return nil }
-        return AgentImageViewPresentation(
-            displayName: URL(fileURLWithPath: path).lastPathComponent,
-            resourceURL: URL(fileURLWithPath: path)
-        )
+        guard item.type == .imageView else { return nil }
+        // Prefer the private resource path (never shown as label text). Absolute
+        // paths in body/summary are a last resort when resourcePath is missing.
+        let candidates: [String?] = [item.resourcePath, item.body, item.summary, item.output]
+        for raw in candidates {
+            guard let path = Self.absoluteFilePath(from: raw) else { continue }
+            let url = URL(fileURLWithPath: path)
+            return AgentImageViewPresentation(
+                displayName: url.lastPathComponent,
+                resourceURL: url
+            )
+        }
+        return nil
+    }
+
+    /// Absolute filesystem path only — basenames alone must not resolve against CWD.
+    public static func absoluteFilePath(from raw: String?) -> String? {
+        guard let trimmed = raw?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !trimmed.isEmpty else { return nil }
+        if trimmed.hasPrefix("~") {
+            return (trimmed as NSString).expandingTildeInPath
+        }
+        guard trimmed.hasPrefix("/") else { return nil }
+        return (trimmed as NSString).standardizingPath
+    }
+
+    /// Pure: which items in a tool-burst group can show a transcript thumbnail.
+    public static func presentations(in items: [AssistantItem]) -> [AgentImageViewPresentation] {
+        items.compactMap(make(for:))
+    }
+}
+
+// MARK: - Transcript image thumbnails (UX-MAC_AGENT-IMAGE-THUMB)
+
+/// Compact or featured image preview for agent-cited images in the transcript.
+/// Loads off the main actor and reserves layout space so thumbs don't CLS the chat.
+private struct AgentTranscriptImageThumb: View {
+    enum Style {
+        /// Grid cell in a multi-image strip.
+        case strip
+        /// Single image row: larger, letterboxed.
+        case featured
+    }
+
+    let url: URL
+    let displayName: String
+    var style: Style = .strip
+    var accessibilityID: String = "agent.image.thumb"
+
+    @State private var image: NSImage?
+    @State private var failed = false
+
+    private var thumbWidth: CGFloat { style == .featured ? 320 : 112 }
+    private var thumbHeight: CGFloat { style == .featured ? 200 : 84 }
+
+    var body: some View {
+        Button {
+            NSWorkspace.shared.open(url)
+        } label: {
+            VStack(alignment: .leading, spacing: DS.Space.xs) {
+                ZStack {
+                    RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
+                        .fill(DS.Palette.surface)
+                    if let image {
+                        Image(nsImage: image)
+                            .resizable()
+                            .interpolation(.high)
+                            .scaledToFill()
+                            .frame(width: thumbWidth, height: thumbHeight)
+                            .clipped()
+                    } else if failed {
+                        VStack(spacing: DS.Space.xs) {
+                            Image(systemName: "photo")
+                                .font(.system(size: style == .featured ? 22 : 16, weight: .medium))
+                                .foregroundColor(DS.Palette.textTertiary)
+                            if style == .featured {
+                                Text("Preview unavailable")
+                                    .font(DS.Font.caption2)
+                                    .foregroundColor(DS.Palette.textTertiary)
+                            }
+                        }
+                    } else {
+                        ProgressView()
+                            .controlSize(.small)
+                    }
+                }
+                .frame(width: thumbWidth, height: thumbHeight)
+                .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
+                .overlay(
+                    RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
+                        .strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline)
+                )
+
+                Text(displayName)
+                    .font(DS.Font.caption2)
+                    .foregroundColor(DS.Palette.textSecondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .frame(width: thumbWidth, alignment: .leading)
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help("Open \(displayName)")
+        .accessibilityIdentifier(accessibilityID)
+        .accessibilityLabel("Image \(displayName)")
+        .accessibilityHint("Opens the image")
+        .dsPointingHandCursor()
+        .task(id: url.path) { await loadThumbnail() }
+    }
+
+    @MainActor
+    private func loadThumbnail() async {
+        failed = false
+        image = nil
+        let path = url.path
+        let maxPixel = style == .featured ? 960 : 280
+        let loaded: NSImage? = await Task.detached(priority: .utility) {
+            Self.downsampledImage(at: path, maxPixel: maxPixel)
+        }.value
+        if let loaded {
+            image = loaded
+        } else {
+            failed = true
+        }
+    }
+
+    /// Decode a bounded thumbnail so multi-megapixel screenshots don't stall the UI.
+    nonisolated private static func downsampledImage(at path: String, maxPixel: Int) -> NSImage? {
+        let url = URL(fileURLWithPath: path)
+        guard FileManager.default.fileExists(atPath: path) else { return nil }
+        if let source = CGImageSourceCreateWithURL(url as CFURL, nil) {
+            let options: [CFString: Any] = [
+                kCGImageSourceCreateThumbnailFromImageAlways: true,
+                kCGImageSourceCreateThumbnailWithTransform: true,
+                kCGImageSourceThumbnailMaxPixelSize: maxPixel,
+                kCGImageSourceShouldCacheImmediately: true
+            ]
+            if let cg = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) {
+                return NSImage(cgImage: cg, size: NSSize(width: cg.width, height: cg.height))
+            }
+        }
+        return NSImage(contentsOf: url)
+    }
+}
+
+/// Horizontal strip of thumbnails for grouped image citations ("Running 2 images…").
+private struct AgentTranscriptImageThumbStrip: View {
+    let presentations: [AgentImageViewPresentation]
+    var accessibilityPrefix: String = "agent.image.strip"
+
+    var body: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(alignment: .top, spacing: DS.Space.sm) {
+                ForEach(Array(presentations.enumerated()), id: \.offset) { index, presentation in
+                    AgentTranscriptImageThumb(
+                        url: presentation.resourceURL,
+                        displayName: presentation.displayName,
+                        style: .strip,
+                        accessibilityID: "\(accessibilityPrefix).\(index)"
+                    )
+                }
+            }
+            .padding(.vertical, 2)
+        }
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("\(presentations.count) image preview\(presentations.count == 1 ? "" : "s")")
     }
 }
 
@@ -5252,6 +5457,21 @@ public struct AgentAppView: View {
     /// Max width for user prompt bubbles. Short text hugs content; long text wraps here.
     /// Kept well under the old 600pt hard fill so chat bubbles stay compact.
     static let userMessageBubbleMaxWidth: CGFloat = 420
+    /// Leading spacer so user bubbles stay right-aligned with a readable gutter.
+    static let userMessageBubbleLeadingGutter: CGFloat = 48
+    /// Floor so a very narrow agent column still shows a usable bubble.
+    static let userMessageBubbleMinWidth: CGFloat = 160
+
+    /// Flexible bubble cap for the current transcript column.
+    /// Long prompts wrap at this width; short prompts still hug via `fixedSize`.
+    /// Never exceeds `userMessageBubbleMaxWidth`, and never exceeds the column
+    /// minus the leading gutter — prevents the bubble + copy/timestamp meta from
+    /// painting over the timeline edge and adjacent chrome.
+    static func userMessageBubbleWidthCap(columnWidth: CGFloat) -> CGFloat {
+        let usable = columnWidth - userMessageBubbleLeadingGutter
+        guard usable.isFinite, usable > 0 else { return userMessageBubbleMinWidth }
+        return min(userMessageBubbleMaxWidth, max(userMessageBubbleMinWidth, usable))
+    }
     nonisolated static let runningTranscriptContextSlack: TimeInterval = 2
     // PERF-MAC_AGENT-023: idle/completed threads render their transcript in an
     // eager (non-Lazy) VStack, so a very long thread re-builds and re-lays-out the
@@ -6288,6 +6508,9 @@ public struct AgentAppView: View {
         ScrollViewReader { proxy in
             ZStack(alignment: .bottomTrailing) {
                 GeometryReader { viewport in
+                    // Horizontal padding on the transcript stack is 22pt each side.
+                    // User bubbles size against this content column, not the raw viewport.
+                    let timelineColumnWidth = max(0, viewport.size.width - 44)
                     ScrollView {
                         // PERF-MAC_AGENT-022: the live transcript is already bounded.
                         // `LazyVStack` repeatedly hit SwiftUI LazyLayout placement loops
@@ -6341,7 +6564,7 @@ public struct AgentAppView: View {
                                 ForEach(hiddenEntries) { entry in
                                     switch entry {
                                     case .message(let message):
-                                        messageRow(message)
+                                        messageRow(message, columnWidth: timelineColumnWidth)
                                     case .turn(let turn):
                                         turnView(turn)
                                     }
@@ -6350,7 +6573,7 @@ public struct AgentAppView: View {
                             ForEach(entries) { entry in
                                 switch entry {
                                 case .message(let message):
-                                    messageRow(message)
+                                    messageRow(message, columnWidth: timelineColumnWidth)
                                 case .turn(let turn):
                                     turnView(turn)
                                 }
@@ -7417,7 +7640,7 @@ public struct AgentAppView: View {
     }
 
     @ViewBuilder
-    private func messageRow(_ msg: AgentMessage) -> some View {
+    private func messageRow(_ msg: AgentMessage, columnWidth: CGFloat = 10_000) -> some View {
         switch msg.role {
         case .user:
             let displayText = Self.userMessageDisplayText(msg.content)
@@ -7426,28 +7649,33 @@ public struct AgentAppView: View {
             // user can read the full text without the copy-only hint.
             let lineCount = displayText.components(separatedBy: "\n").count
             let showExpandToggle = !messageExpanded && lineCount > 28
-            HStack(spacing: 0) {
-                Spacer(minLength: 48)
+            // Cap against the live column so fixedSize hug cannot paint past the
+            // timeline edge (copy / "just now" meta used to hang outside the pane).
+            let bubbleMax = Self.userMessageBubbleWidthCap(columnWidth: columnWidth)
+            let textMax = max(0, bubbleMax - (DS.Space.xl * 2))
+            HStack(alignment: .top, spacing: 0) {
+                Spacer(minLength: Self.userMessageBubbleLeadingGutter)
                 VStack(alignment: .trailing, spacing: DS.Space.xs) {
                     // WHY: Use SwiftUI Text (not AgentSelectablePlainText / NSTextView).
                     // IntrinsicHeightTextView reports no horizontal intrinsic size, so
                     // short prompts like "oi" expanded to the full maxWidth bubble.
-                    // Order: pad/background first, then maxWidth so long prompts wrap
-                    // at the bubble cap; fixedSize(horizontal+vertical) hugs short
-                    // text AND keeps multi-line height (vertical:false was collapsing
-                    // long paths to one ellipsized line).
+                    // Order: maxWidth on the text first so long prompts wrap during
+                    // ideal-size measurement; padding/background next; fixedSize then
+                    // hugs short ones while keeping multi-line height (vertical:false
+                    // collapsed long paths to one ellipsized line).
                     Text(displayText)
                         .font(.system(size: 13))
                         .foregroundColor(DS.Palette.text)
                         .multilineTextAlignment(.leading)
                         .textSelection(.enabled)
                         .lineLimit(messageExpanded ? nil : 28)
+                        .frame(maxWidth: textMax, alignment: .leading)
                         .padding(.horizontal, DS.Space.xl)
                         .padding(.vertical, DS.Space.lg)
                         .background(DS.Palette.surface)
                         .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
-                        .frame(maxWidth: Self.userMessageBubbleMaxWidth, alignment: .leading)
                         .fixedSize(horizontal: true, vertical: true)
+                        .frame(maxWidth: bubbleMax, alignment: .trailing)
                         .accessibilityIdentifier("agent.userMessageBubble")
                     if showExpandToggle {
                         Button {
@@ -7462,21 +7690,32 @@ public struct AgentAppView: View {
                         .accessibilityIdentifier("agent.userMessage.showMore.\(msg.id.value.uuidString)")
                     }
                     // UX-MAC_AGENT-017: subtle relative timestamp so long threads
-                    // show when each message was sent.
+                    // show when each message was sent. Keep meta inside the bubble
+                    // column so copy + relative time never spill past the pane.
                     HStack(spacing: DS.Space.xs) {
                         Button { copyToPasteboard(msg.content) } label: {
-                            Image(systemName: "doc.on.doc").font(.system(size: 10))
+                            Image(systemName: "doc.on.doc")
+                                .font(.system(size: 11, weight: .regular))
+                                .frame(width: 18, height: 18)
+                                .contentShape(Rectangle())
                         }
                         .buttonStyle(.plain)
                         .foregroundColor(DS.Palette.textTertiary)
                         .accessibilityLabel("Copy message")
+                        .accessibilityIdentifier("agent.userMessage.copy.\(msg.id.value.uuidString)")
                         .help("Copy message")
                         Text(Self.relativeTimestamp(msg.createdAt))
                             .font(DS.Font.caption2)
                             .foregroundColor(DS.Palette.textTertiary)
+                            .lineLimit(1)
+                            .fixedSize(horizontal: true, vertical: true)
                             .help(Self.absoluteTimestamp(msg.createdAt))
                     }
+                    .fixedSize(horizontal: true, vertical: true)
+                    .frame(maxWidth: bubbleMax, alignment: .trailing)
                 }
+                .frame(maxWidth: bubbleMax, alignment: .trailing)
+                .layoutPriority(1)
             }
             .frame(maxWidth: .infinity, alignment: .trailing)
         case .assistant:
@@ -7700,35 +7939,52 @@ public struct AgentAppView: View {
                     .font(DS.Font.mono)
                     .foregroundColor(DS.Palette.text)
                     .lineLimit(1)
+                    .truncationMode(.middle)
                 Spacer(minLength: 0)
-            }
-            if let imagePresentation,
-               let image = NSImage(contentsOf: imagePresentation.resourceURL) {
-                Image(nsImage: image)
-                    .resizable()
-                    .scaledToFit()
-                    .frame(maxWidth: 420, maxHeight: 260)
-                    .clipShape(RoundedRectangle(cornerRadius: DS.Radius.panel, style: .continuous))
-                    .accessibilityIdentifier("agent.image.preview.\(item.id)")
-            }
-            if let imagePresentation {
-                HStack(spacing: DS.Space.sm) {
-                    Button("Open") {
+                if let imagePresentation {
+                    Button {
                         NSWorkspace.shared.open(imagePresentation.resourceURL)
+                    } label: {
+                        Image(systemName: "arrow.up.forward.square")
+                            .font(.system(size: 11, weight: .medium))
+                            .foregroundColor(DS.Palette.textTertiary)
+                            .frame(width: 22, height: 22)
+                            .contentShape(Rectangle())
                     }
+                    .buttonStyle(.plain)
+                    .help("Open image")
                     .accessibilityIdentifier("agent.image.open.\(item.id)")
-                    Button("Reveal") {
+                    Button {
                         NSWorkspace.shared.activateFileViewerSelecting([imagePresentation.resourceURL])
+                    } label: {
+                        Image(systemName: "folder")
+                            .font(.system(size: 11, weight: .medium))
+                            .foregroundColor(DS.Palette.textTertiary)
+                            .frame(width: 22, height: 22)
+                            .contentShape(Rectangle())
                     }
+                    .buttonStyle(.plain)
+                    .help("Reveal in Finder")
                     .accessibilityIdentifier("agent.image.reveal.\(item.id)")
                 }
-                .buttonStyle(.bordered)
+            }
+            if let imagePresentation {
+                AgentTranscriptImageThumb(
+                    url: imagePresentation.resourceURL,
+                    displayName: imagePresentation.displayName,
+                    style: .featured,
+                    accessibilityID: "agent.image.preview.\(item.id)"
+                )
             }
         }
-        .padding(DS.Space.sm)
+        .padding(DS.Space.md)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(DS.Palette.surfaceRaised)
         .clipShape(RoundedRectangle(cornerRadius: DS.Radius.panel, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: DS.Radius.panel, style: .continuous)
+                .strokeBorder(DS.Palette.line, lineWidth: DS.Border.hairline)
+        )
     }
 
     @ViewBuilder
@@ -7823,8 +8079,12 @@ public struct AgentAppView: View {
         let streaming = items.contains { $0.state == .streaming }
         let failed = items.contains { $0.state == .failed }
         let expanded = expandedToolGroups.contains(id)
-        let headerIcon = streaming ? "circle.dotted" : (failed ? "exclamationmark.triangle" : "terminal")
-        VStack(alignment: .leading, spacing: DS.Space.xs) {
+        let imageOnly = !items.isEmpty && items.allSatisfy { $0.type == .imageView }
+        let imagePresentations = AgentImageViewPresentation.presentations(in: items)
+        let headerIcon = streaming
+            ? "circle.dotted"
+            : (failed ? "exclamationmark.triangle" : (imageOnly ? "photo" : "terminal"))
+        VStack(alignment: .leading, spacing: DS.Space.sm) {
             Button {
                 withAnimation(.easeInOut(duration: 0.16)) {
                     if expanded { expandedToolGroups.remove(id) } else { expandedToolGroups.insert(id) }
@@ -7856,10 +8116,18 @@ public struct AgentAppView: View {
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
-            .help(expanded ? "Collapse commands" : "Expand \(items.count) commands")
+            .help(expanded ? "Collapse" : "Expand \(items.count) items")
 
-            // Live peek at the current command without forcing the group open.
-            if streaming, !expanded, let latest = items.last {
+            // UX: image citations show thumbnails in the transcript immediately —
+            // no need to expand "Running 2 images…" to see what the agent viewed.
+            if !imagePresentations.isEmpty {
+                AgentTranscriptImageThumbStrip(
+                    presentations: imagePresentations,
+                    accessibilityPrefix: "agent.toolGroup.\(id).thumb"
+                )
+                .padding(.leading, 20)
+            } else if streaming, !expanded, let latest = items.last {
+                // Live peek at the current non-image command without forcing open.
                 let preview = AgentTimelineItemPresentation.toolCommandPreview(for: latest)
                     ?? AgentTimelineItemPresentation.make(for: latest).label
                 if !preview.isEmpty {
@@ -7879,7 +8147,15 @@ public struct AgentAppView: View {
                         .frame(width: 1.5)
                         .padding(.leading, 4)
                     VStack(alignment: .leading, spacing: DS.Space.md) {
-                        ForEach(items, id: \.id) { item in toolRow(item) }
+                        ForEach(items, id: \.id) { item in
+                            // Image members keep the thumbnail card; other tools
+                            // stay on the compact command row.
+                            if item.type == .imageView {
+                                imageViewRow(item)
+                            } else {
+                                toolRow(item)
+                            }
+                        }
                     }
                 }
                 .transition(.opacity.combined(with: .move(edge: .top)))
@@ -10667,16 +10943,41 @@ extension AgentAppViewModel {
             openFileMention(raw)
             return true
         }
-        switch url.scheme?.lowercased() {
+        let scheme = url.scheme?.lowercased() ?? ""
+        switch scheme {
         case "http", "https":
             openLinkMention(url)
             return true
         case "file":
             openFileMention(url.path)
             return true
+        case "":
+            // Markdown relative targets (`[plan](./plan)`) parse with no scheme.
+            // Treat path-shaped tokens as file mentions so they open the Files split
+            // the same way auto-detected `./plan` links do.
+            if let raw = Self.relativeFileMentionToken(from: url),
+               Self.isPathShapedFileMention(raw) {
+                openFileMention(raw)
+                return true
+            }
+            return false
         default:
             return false
         }
+    }
+
+    /// Best-effort path token from a scheme-less / relative markdown URL.
+    nonisolated static func relativeFileMentionToken(from url: URL) -> String? {
+        if let raw = AgentMessageMarkdown.filePath(fromFileLink: url) { return raw }
+        let candidates = [url.relativeString, url.absoluteString, url.path]
+        for c in candidates {
+            let t = c.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !t.isEmpty, t != "/", !t.hasPrefix("http://"), !t.hasPrefix("https://") else { continue }
+            // Strip accidental percent-encoding from markdown-produced URLs.
+            let decoded = t.removingPercentEncoding ?? t
+            if isPathShapedFileMention(decoded) { return decoded }
+        }
+        return nil
     }
 
     public func openLinkMention(_ url: URL) {
@@ -10699,11 +11000,23 @@ extension AgentAppViewModel {
         }
     }
 
+    /// Path-shaped mention (`./plan`, `../x`, `/abs`, `foo/bar`) vs bare filename.
+    /// Path shapes may open Files at the workspace root when the leaf is missing;
+    /// bare filenames must not (too ambiguous).
+    nonisolated static func isPathShapedFileMention(_ token: String) -> Bool {
+        let t = token.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !t.isEmpty else { return false }
+        if t.hasPrefix("/") || t.hasPrefix("~") || t.hasPrefix(".") { return true }
+        return t.contains("/")
+    }
+
     /// Resolves a raw file mention to an existing absolute path: strips a
     /// `:line(:col)` suffix, expands `~`, resolves relative tokens against `root`,
     /// falls back to a bounded workspace search for bare filenames, then to the
     /// nearest existing ancestor directory (a mention of a since-deleted file still
-    /// lands near it). nil when nothing on disk plausibly matches.
+    /// lands near it). Path-shaped mentions may land on the workspace root so
+    /// `./plan` opens the Files split even before the file exists. nil when
+    /// nothing on disk plausibly matches.
     nonisolated static func resolveFileMention(_ raw: String, root: String, fileManager: FileManager = .default) -> String? {
         let token = strippingLineSuffix(raw.trimmingCharacters(in: .whitespacesAndNewlines))
         guard !token.isEmpty else { return nil }
@@ -10718,17 +11031,34 @@ extension AgentAppViewModel {
         if !token.contains("/"), let hit = searchWorkspace(filename: token, root: root, fileManager: fileManager) {
             return hit
         }
-        // Nearest existing ancestor — but never degrade to "/" or to the workspace
-        // root itself: a mention that resolves nowhere near anything real is a
-        // false positive, not a navigation target.
+        // Nearest existing ancestor. Bare filenames must not degrade to the
+        // workspace root. Single-segment path shapes (`./plan`) may open the root
+        // so planned deliverables still open the Files split before they exist.
+        // Deep nonsense paths (`nowhere/at/all.xyz`) still refuse.
         let standardizedRoot = (root as NSString).standardizingPath
+        let allowsRootFallback = Self.allowsWorkspaceRootFallback(forCandidate: candidate, root: standardizedRoot)
         var dir = candidate
         while dir.count > 1 {
             dir = (dir as NSString).deletingLastPathComponent
-            if dir.isEmpty || dir == "/" || dir == standardizedRoot { return nil }
+            if dir.isEmpty || dir == "/" { return nil }
+            if dir == standardizedRoot {
+                if allowsRootFallback, fileManager.fileExists(atPath: dir) { return dir }
+                return nil
+            }
             if fileManager.fileExists(atPath: dir) { return dir }
         }
         return nil
+    }
+
+    /// `./plan` / `plan.html` (one leaf under root) may open Files at the workspace
+    /// root when missing. Multi-segment missing trees do not.
+    nonisolated static func allowsWorkspaceRootFallback(forCandidate candidate: String, root: String) -> Bool {
+        let standardizedRoot = (root as NSString).standardizingPath
+        let standardizedCandidate = (candidate as NSString).standardizingPath
+        guard standardizedCandidate.hasPrefix(standardizedRoot + "/") else { return false }
+        let relative = String(standardizedCandidate.dropFirst(standardizedRoot.count + 1))
+        let parts = relative.split(separator: "/").filter { $0 != "." && !$0.isEmpty }
+        return parts.count == 1
     }
 
     /// "path.swift:12" / "path.swift:12:5" → "path.swift". Only digit-only

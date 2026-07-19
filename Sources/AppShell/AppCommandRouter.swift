@@ -1160,12 +1160,25 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     }
 
     /// Workspace-relative path + tab title for an absolute target. Files resolve
-    /// via `fileTabInfo`; directories (which `read` rejects) via `list`.
+    /// via `fileTabInfo`; directories (which `read` rejects) via `list`. When the
+    /// path is under the workspace but not yet on disk (e.g. planned `./plan`),
+    /// still return a relative target so the Files split opens at the parent.
     private func workspaceRelativeTarget(workspace: WorkspaceID, path: String) -> (relativePath: String, title: String)? {
         if let info = try? fileTabInfo(workspace: workspace, path: path) { return info }
-        guard let cwd = try? workspaceCwd(workspace),
-              let listed = try? WorkspaceFileService().list(root: cwd, path: path).objectValue,
-              let relativePath = listed["relative_path"]?.stringValue else { return nil }
+        if let cwd = try? workspaceCwd(workspace),
+           let listed = try? WorkspaceFileService().list(root: cwd, path: path).objectValue,
+           let relativePath = listed["relative_path"]?.stringValue {
+            let title = (relativePath as NSString).lastPathComponent
+            return (relativePath, title.isEmpty ? "Files" : title)
+        }
+        guard let cwd = try? workspaceCwd(workspace) else { return nil }
+        let root = (cwd as NSString).standardizingPath
+        let target = (path as NSString).standardizingPath
+        if target == root {
+            return ("", "Files")
+        }
+        guard target.hasPrefix(root + "/") else { return nil }
+        let relativePath = String(target.dropFirst(root.count + 1))
         let title = (relativePath as NSString).lastPathComponent
         return (relativePath, title.isEmpty ? "Files" : title)
     }

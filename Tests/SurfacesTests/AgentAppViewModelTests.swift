@@ -4437,6 +4437,46 @@ final class AgentAppViewModelTests: XCTestCase {
                       "a successful new send must clear the obsolete attachment error")
     }
 
+    /// WHY: sqlite "database is locked" banners are durability noise. Once the
+    /// thread streams more content, the outage is over — keep the banner and
+    /// users think the run is still broken.
+    func test_transientPersistenceError_autoClearsWhenStreamProgresses() {
+        let locked = "Persistence failure during run.stream_event.append: sqlite step: database is locked"
+        XCTAssertTrue(AgentAppViewModel.isTransientPersistenceTimelineError(locked),
+                      "the exact banner text from stream_event.append must classify as transient")
+        XCTAssertTrue(
+            AgentAppViewModel.shouldAutoClearTransientTimelineError(
+                errorAfterBatch: locked,
+                appliedEvents: [
+                    .error(message: locked, recoverable: false),
+                    .itemDelta(itemId: "i1", bodyAppend: "ok", outputAppend: nil, summary: nil),
+                ]
+            ),
+            "progress after a lock error must clear the banner"
+        )
+        XCTAssertTrue(
+            AgentAppViewModel.shouldAutoClearTransientTimelineError(
+                errorAfterBatch: locked,
+                appliedEvents: [.turnStarted(turnId: "t2")]
+            ),
+            "a later batch with only progress must clear a sticky lock banner from an earlier batch"
+        )
+        XCTAssertFalse(
+            AgentAppViewModel.shouldAutoClearTransientTimelineError(
+                errorAfterBatch: locked,
+                appliedEvents: [.error(message: locked, recoverable: false)]
+            ),
+            "a batch that is only the lock error must keep the banner visible"
+        )
+        XCTAssertFalse(
+            AgentAppViewModel.shouldAutoClearTransientTimelineError(
+                errorAfterBatch: "Provider request failed: 401 unauthorized",
+                appliedEvents: [.itemDelta(itemId: "i1", bodyAppend: "x", outputAppend: nil, summary: nil)]
+            ),
+            "real provider failures must stay until the user dismisses or retries — not auto-clear on progress"
+        )
+    }
+
     func test_errorDismissActionsClearEachVisibleErrorChannel() throws {
         let (vm, _) = try makeVM()
         vm.timeline.apply(.error(message: "provider failed", recoverable: true))

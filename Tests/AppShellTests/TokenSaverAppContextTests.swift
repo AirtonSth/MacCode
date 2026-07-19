@@ -441,6 +441,44 @@ final class TokenSaverAppContextTests: XCTestCase {
         XCTAssertEqual(requests.first?.claudeBinary, "claude")
     }
 
+    /// WHY: Claude left inactive must not keep a frozen weekly ring after a
+    /// partial refresh still succeeds for Codex/Grok.
+    func test_appContextClearsMissingProviderAccountUsageOnPartialRefresh() async throws {
+        let appSupport = NSTemporaryDirectory() + "RC2TokenSaverClearMissing-" + UUID().uuidString
+        let store = TokenSaverUsageStore(appSupportDirectory: URL(fileURLWithPath: appSupport))
+        try FileManager.default.createDirectory(
+            at: URL(fileURLWithPath: appSupport).appendingPathComponent("TokenSaver", isDirectory: true),
+            withIntermediateDirectories: true
+        )
+        _ = try store.recordAccountUsage(provider: .claude, weeklyUsedPercent: 45, weeklyWindowDurationMinutes: 10_080)
+        _ = try store.recordAccountUsage(provider: .codex, weeklyUsedPercent: 10, weeklyWindowDurationMinutes: 10_080)
+
+        let refresher = FakeTokenSaverAccountUsageRefresher(response: [
+            AssistantAccountUsage(provider: .codex, weeklyUsedPercent: 23, weeklyWindowDurationMinutes: 10_080),
+            AssistantAccountUsage(provider: .grok, weeklyUsedPercent: 59, weeklyWindowDurationMinutes: 10_080)
+        ])
+        let context = try AppContext(
+            channel: .debug,
+            appSupportOverride: appSupport,
+            tokenSaverAccountUsageRefresher: refresher
+        )
+        savePrivateSession(in: context)
+
+        context.refreshTokenSaverAccountUsage(reason: "test")
+
+        let didClear = await waitUntil {
+            let snapshot = TokenSaverUsageStore(appSupportDirectory: context.appSupportDirectory).load()
+            let claude = snapshot.providers.first { $0.provider == .claude }
+            let codex = snapshot.providers.first { $0.provider == .codex }
+            let grok = snapshot.providers.first { $0.provider == .grok }
+            return claude?.weeklyUsedPercent == 0
+                && codex?.weeklyUsedPercent == 23
+                && grok?.weeklyUsedPercent == 59
+        }
+        XCTAssertTrue(didClear,
+                      "partial refresh without Claude must zero Claude's frozen weekly % while updating the live providers")
+    }
+
     func test_appContextSkipsTokenSaverAccountUsageRefreshWhenNotSignedIn() async throws {
         let appSupport = NSTemporaryDirectory() + "RC2TokenSaverNoAccountUsage-" + UUID().uuidString
         let refresher = FakeTokenSaverAccountUsageRefresher(response: [

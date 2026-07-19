@@ -244,6 +244,11 @@ public final class SidebarViewModel: ObservableObject {
     private var previousBusyWorkspaces: Set<WorkspaceID> = []
     @Published public var selectedWorkspaceID: WorkspaceID?
     @Published public var selectedWorkspaceIDs: Set<WorkspaceID> = []
+    /// True while the main content pane shows Schedule Tasks (not a workspace).
+    @Published public var isScheduledTasksSelected: Bool = false
+    /// Fired when the user activates a workspace row so the shell can leave
+    /// the Schedule Tasks main-content destination.
+    var onWorkspaceContentActivated: (() -> Void)?
     /// IMP-MAC_SHELL_WINDOW-009: free-text filter applied to the rendered
     /// workspace list. Empty string shows everything; matching is over
     /// name, description, and cwd. The backing `workspaces` array stays
@@ -425,12 +430,22 @@ public final class SidebarViewModel: ObservableObject {
         let ordered = LayoutReducer.mostRecentlyUsedOrder(loaded)
         // Refresh the selection first so a workspace that completed AND became
         // selected this tick is correctly treated as "being viewed" (no dot).
-        selectedWorkspaceID = ctx.state.window.selectedWorkspaceID
+        // While Schedule Tasks owns the main content, keep every workspace row
+        // deselected so the shell destination is unambiguous.
+        if isScheduledTasksSelected {
+            selectedWorkspaceID = nil
+            selectedWorkspaceIDs.removeAll()
+            selectionAnchorID = nil
+        } else {
+            selectedWorkspaceID = ctx.state.window.selectedWorkspaceID
+        }
         updateCompletedWorkspaces(from: ordered)
         if ordered != workspaces {
             workspaces = ordered
         }
-        selectedWorkspaceIDs = selectedWorkspaceIDs.intersection(Set(workspaces.map(\.id)))
+        if !isScheduledTasksSelected {
+            selectedWorkspaceIDs = selectedWorkspaceIDs.intersection(Set(workspaces.map(\.id)))
+        }
         reloadPrivateAccount()
     }
 
@@ -1052,9 +1067,16 @@ public final class SidebarViewModel: ObservableObject {
         selectedWorkspaceIDs.removeAll()
         selectionAnchorID = wid
         selectedWorkspaceID = wid
+        isScheduledTasksSelected = false
         // UX-SIDEBAR-COMPLETED-DOT: opening a workspace clears its completed dot.
         completedWorkspaces.remove(wid)
         try? router?.selectWorkspace(wid)
+        onWorkspaceContentActivated?()
+    }
+
+    /// Clears shift-range anchor when leaving workspaces for a shell destination.
+    func clearSelectionAnchorForShellDestination() {
+        selectionAnchorID = nil
     }
 
     public func selectWorkspaceRow(_ ws: Workspace, extendingSelection: Bool, togglingSelection: Bool = false) {
@@ -1973,11 +1995,16 @@ public struct SidebarRootView: View {
                 .accessibilityIdentifier("sidebar.newWorkspace")
 
                 Button(action: onOpenScheduledTasks) {
-                    sidebarActionRow(symbol: "calendar.badge.clock", title: "Schedule Tasks")
+                    sidebarActionRow(
+                        symbol: "calendar.badge.clock",
+                        title: "Schedule Tasks",
+                        isSelected: vm.isScheduledTasksSelected
+                    )
                 }
                 .buttonStyle(.plain)
                 .help("Create and manage scheduled Agent tasks")
                 .accessibilityIdentifier("sidebar.scheduleTasks")
+                .accessibilityAddTraits(vm.isScheduledTasksSelected ? .isSelected : [])
 
                 if vm.showsUpdateControl {
                     Button { vm.checkForUpdates() } label: {
@@ -2187,16 +2214,22 @@ public struct SidebarRootView: View {
         )
     }
 
-    private func sidebarActionRow(symbol: String, title: String, isEmphasized: Bool = false) -> some View {
-        HStack(spacing: DS.Space.md) {
+    private func sidebarActionRow(
+        symbol: String,
+        title: String,
+        isEmphasized: Bool = false,
+        isSelected: Bool = false
+    ) -> some View {
+        let highlight = isEmphasized || isSelected
+        return HStack(spacing: DS.Space.md) {
             Image(systemName: symbol)
-                .font(.system(size: 16, weight: isEmphasized ? .semibold : .regular))
+                .font(.system(size: 16, weight: highlight ? .semibold : .regular))
                 .frame(width: 20, height: 20)
-                .foregroundColor(isEmphasized ? DS.Palette.warning : DS.Palette.text)
+                .foregroundColor(isEmphasized ? DS.Palette.warning : (isSelected ? DS.Palette.accent : DS.Palette.text))
             Text(title)
                 .font(DS.Font.body)
-                .fontWeight(isEmphasized ? .semibold : .regular)
-                .foregroundColor(isEmphasized ? DS.Palette.warning : DS.Palette.text)
+                .fontWeight(highlight ? .semibold : .regular)
+                .foregroundColor(isEmphasized ? DS.Palette.warning : (isSelected ? DS.Palette.text : DS.Palette.text))
                 .lineLimit(1)
             Spacer(minLength: 0)
         }
@@ -2205,7 +2238,11 @@ public struct SidebarRootView: View {
         .contentShape(Rectangle())
         .background(
             RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
-                .fill(isEmphasized ? DS.Palette.warning.opacity(0.16) : Color.white.opacity(0.001))
+                .fill(
+                    isEmphasized
+                        ? DS.Palette.warning.opacity(0.16)
+                        : (isSelected ? DS.Palette.selection : Color.white.opacity(0.001))
+                )
         )
         .overlay(
             RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
@@ -2720,7 +2757,9 @@ public struct SidebarRootView: View {
                 denominator: usage.currentSessionLimitTokens
             )
         case .week:
-            if let weeklyUsedPercent = usage.weeklyUsedPercent {
+            // Prefer effective % so an expired weekly window (or a zeroed
+            // inactive-provider clear) does not keep painting a stale ring.
+            if let weeklyUsedPercent = usage.effectiveWeeklyUsedPercent() {
                 return min(max(weeklyUsedPercent / 100.0, 0), 1)
             }
         }
@@ -2758,7 +2797,7 @@ public struct SidebarRootView: View {
             )
             return "Session used \(Self.formatPercent(usedProgress))"
         case .week:
-            if let weeklyUsedPercent = usage.weeklyUsedPercent {
+            if let weeklyUsedPercent = usage.effectiveWeeklyUsedPercent() {
                 return "Weekly used \(Self.formatPercent(weeklyUsedPercent / 100.0))"
             }
             let weeklyLimit = max(usage.estimatedRawTokens, tokenSaverDefaultWeeklyLimitTokens(for: provider), 1)
@@ -4312,8 +4351,14 @@ public final class SidebarView: NSObject {
     private let host: NSHostingView<SidebarRootView>
     private var settingsController: SettingsWindowController?
     private var accountController: AccountWindowController?
-    private var scheduledTasksController: ScheduledTasksWindowController?
     private let updater: AppUpdateChecking?
+    /// Main window mounts Schedule Tasks in the workspace content column.
+    public var onPresentScheduledTasks: (() -> Void)?
+    /// Fired when a workspace is selected so main content leaves Schedule Tasks.
+    public var onWorkspaceContentActivated: (() -> Void)? {
+        get { viewModel.onWorkspaceContentActivated }
+        set { viewModel.onWorkspaceContentActivated = newValue }
+    }
 
     public init(context: AppContext, router: AppCommandRouter, updater: AppUpdateChecking? = nil) {
         self.context = context
@@ -4353,6 +4398,16 @@ public final class SidebarView: NSObject {
         )
     }
 
+    public func setScheduledTasksSelected(_ selected: Bool) {
+        viewModel.isScheduledTasksSelected = selected
+        if selected {
+            // Visual deselect of all workspace rows while Schedule Tasks is active.
+            viewModel.selectedWorkspaceID = nil
+            viewModel.selectedWorkspaceIDs.removeAll()
+            viewModel.clearSelectionAnchorForShellDestination()
+        }
+    }
+
     public func refresh() {
         viewModel.reload()
     }
@@ -4384,9 +4439,14 @@ public final class SidebarView: NSObject {
     }
 
     @objc private func showScheduledTasks() {
+        // Prefer the main content column (same place workspaces open). Fall
+        // back to a detached window only if the shell presenter is missing.
+        if let onPresentScheduledTasks {
+            onPresentScheduledTasks()
+            return
+        }
         guard let context, let router else { return }
-        let controller = scheduledTasksController ?? ScheduledTasksWindowController(context: context, router: router)
-        scheduledTasksController = controller
+        let controller = ScheduledTasksWindowController(context: context, router: router)
         controller.show()
     }
 }

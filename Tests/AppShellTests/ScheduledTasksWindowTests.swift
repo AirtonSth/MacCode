@@ -33,10 +33,31 @@ final class ScheduledTasksWindowTests: XCTestCase {
         XCTAssertLessThan(scheduleTasks.lowerBound, updateControl.lowerBound)
     }
 
-    func test_editorSheetDoesNotForceUnwrapPublishedDraft_becauseSaveClearsItDuringRender() throws {
+    func test_scheduleTasksOpensInMainContent_notOnlyDetachedWindow() throws {
+        let main = try String(contentsOf: sourceURL("Sources/AppShell/MainWindowController.swift"), encoding: .utf8)
+        let sidebar = try String(contentsOf: sourceURL("Sources/AppShell/SidebarView.swift"), encoding: .utf8)
+        XCTAssertTrue(main.contains("presentScheduledTasksInMainContent"),
+                      "Schedule Tasks must mount in the main workspace content column")
+        XCTAssertTrue(main.contains("installScheduledTasksContent"),
+                      "main shell must install ScheduledTasksRootView into workspaceContent")
+        XCTAssertTrue(sidebar.contains("onPresentScheduledTasks"),
+                      "sidebar must route Schedule Tasks to the main shell presenter")
+        XCTAssertTrue(sidebar.contains("onWorkspaceContentActivated"),
+                      "selecting a workspace must leave the Schedule Tasks shell destination")
+        XCTAssertTrue(main.contains("visibleWorkspaceLabel.stringValue = \"Schedule Tasks\""),
+                      "title bar must read Schedule Tasks while that shell destination is active")
+        XCTAssertTrue(sidebar.contains("isScheduledTasksSelected"),
+                      "sidebar must track Schedule Tasks selection so workspace rows can fully deselect")
+    }
+
+    func test_editorDoesNotForceUnwrapPublishedDraft_becauseSaveClearsItDuringRender() throws {
         let source = try String(contentsOf: sourceURL("Sources/AppShell/ScheduledTasksWindow.swift"), encoding: .utf8)
         XCTAssertFalse(source.contains("vm.editorDraft!"))
-        XCTAssertTrue(source.contains(".sheet(item: $vm.editorDraft)"))
+        // Plan mockups use a full-page editor route (not a modal sheet).
+        XCTAssertTrue(source.contains("case .editor"),
+                      "editor must be a navigation screen so Cancel/Save match the plan chrome")
+        XCTAssertTrue(source.contains("if let draft = vm.editorDraft"),
+                      "editor must bind the optional draft without force-unwrap after save clears it")
     }
 
     func test_savePreflightsAndPausesForApproval_becauseBlockedTasksMustNotClaimActive() throws {
@@ -60,13 +81,17 @@ final class ScheduledTasksWindowTests: XCTestCase {
         XCTAssertTrue(source.contains("DSPill("))
         XCTAssertTrue(source.contains("DSEmptyState("))
         XCTAssertTrue(source.contains("dsPanel("))
-        XCTAssertTrue(source.contains("DS.Palette.sidebar"))
         XCTAssertTrue(source.contains("serviceRequiresApproval"))
         XCTAssertTrue(source.contains("Open Login Items"))
-        XCTAssertTrue(source.contains("editorSection(\"Basics\")"))
-        XCTAssertTrue(source.contains("editorSection(\"Agent\")"))
-        XCTAssertTrue(source.contains("editorSection(\"Schedule\")"))
-        XCTAssertTrue(source.contains("editorSection(\"Prompt\")"))
+        // Plan-faithful chrome: full-width card list + full-page editor groups.
+        XCTAssertTrue(source.contains("ScheduledTaskCard("))
+        XCTAssertTrue(source.contains("Automate recurring agent work"))
+        XCTAssertTrue(source.contains("editorGroup(\"Details\")"))
+        XCTAssertTrue(source.contains("editorGroup(\"Frequency\")"))
+        XCTAssertTrue(source.contains("Run History"))
+        XCTAssertTrue(source.contains("Save Task"))
+        XCTAssertFalse(source.contains("HSplitView"),
+                       "plan mockups use a single-column stack, not master-detail split")
     }
 
     func test_mainDisablesManagedDistillInScheduledAgent_becauseHeadlessRunsMustNotMutateShellSkills() throws {

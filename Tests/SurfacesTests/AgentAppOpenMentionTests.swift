@@ -66,6 +66,32 @@ final class AgentAppOpenMentionTests: XCTestCase {
                        "directory mentions open the Files panel at that directory")
     }
 
+    func test_missingTopLevelPathShapedMention_opensWorkspaceRootInFiles() {
+        // WHY: agents often link planned deliverables (`./plan`) before the file
+        // exists. Clicking must open the Files split at the workspace root, not beep.
+        XCTAssertEqual(resolve("./plan"), root.path,
+                       "./plan must open Files at the workspace root when the leaf is not on disk yet")
+        XCTAssertNil(resolve("plan/index.html"),
+                     "multi-segment missing paths must not open the workspace root as a guess")
+        XCTAssertTrue(AgentAppViewModel.isPathShapedFileMention("./plan"))
+        XCTAssertTrue(AgentAppViewModel.isPathShapedFileMention("foo/bar"))
+        XCTAssertFalse(AgentAppViewModel.isPathShapedFileMention("Package.swift"),
+                       "bare filenames stay bare so workspace search, not root fallback, owns them")
+        XCTAssertTrue(AgentAppViewModel.allowsWorkspaceRootFallback(
+            forCandidate: root.appendingPathComponent("plan").path, root: root.path))
+        XCTAssertFalse(AgentAppViewModel.allowsWorkspaceRootFallback(
+            forCandidate: root.appendingPathComponent("plan/index.html").path, root: root.path))
+    }
+
+    func test_relativeMarkdownURL_tokenIsPathShaped() {
+        // Scheme-less markdown targets must still route as file mentions.
+        let url = URL(string: "./plan") ?? URL(fileURLWithPath: "./plan")
+        let token = AgentAppViewModel.relativeFileMentionToken(from: url)
+        XCTAssertEqual(token, "./plan",
+                       "relative markdown URLs must yield the path token for Files-split open")
+        XCTAssertTrue(token.map(AgentAppViewModel.isPathShapedFileMention) ?? false)
+    }
+
     // MARK: line-suffix helper
 
     func test_strippingLineSuffix_onlyRemovesDigitSegments() {

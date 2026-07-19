@@ -38,6 +38,33 @@ final class AgentAppUXGapsTests: XCTestCase {
         XCTAssertFalse(timeline.detail?.contains("/Users/private") == true)
     }
 
+    /// WHY: "Running 2 images…" groups must surface thumbnails without expand.
+    /// Presentations for the strip are pure so the group row can render them.
+    func test_imagePresentationsInGroup_collectsResolvableImageViewsOnly() {
+        let img1 = AssistantItem(
+            id: "i1", turnId: "t", type: .imageView, state: .completed,
+            summary: "a.png", resourcePath: "/tmp/a.png", startedAtMs: 1, finishedAtMs: 2
+        )
+        let img2 = AssistantItem(
+            id: "i2", turnId: "t", type: .imageView, state: .completed,
+            summary: "b.png", resourcePath: "/tmp/b.png", startedAtMs: 3, finishedAtMs: 4
+        )
+        let cmd = AssistantItem(
+            id: "c1", turnId: "t", type: .commandExecution, state: .completed,
+            body: #"{"command":"ls"}"#, startedAtMs: 5, finishedAtMs: 6
+        )
+        let baseless = AssistantItem(
+            id: "i3", turnId: "t", type: .imageView, state: .completed,
+            summary: "orphan.png", startedAtMs: 7, finishedAtMs: 8
+        )
+        let found = AgentImageViewPresentation.presentations(in: [img1, cmd, img2, baseless])
+        XCTAssertEqual(found.map(\.displayName), ["a.png", "b.png"],
+                       "only imageView items with absolute resource paths feed the thumbnail strip")
+        XCTAssertEqual(AgentImageViewPresentation.absoluteFilePath(from: "~/Desktop/x.png")?.hasSuffix("/Desktop/x.png"), true)
+        XCTAssertNil(AgentImageViewPresentation.absoluteFilePath(from: "relative.png"),
+                     "basename-only tokens must not invent a CWD path for thumbnails")
+    }
+
     func test_statusAndEmptyQueueErrorsRemainRenderEligible() {
         XCTAssertEqual(AgentAppView.visibleStatusMessage("  Disk full while saving draft.  "),
                        "Disk full while saving draft.",

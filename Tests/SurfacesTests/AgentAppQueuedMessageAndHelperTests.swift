@@ -658,6 +658,34 @@ final class AgentAppQueuedMessageAndHelperTests: XCTestCase {
                      "exportThreadMarkdown must return nil for an unknown thread id instead of crashing or returning garbage")
     }
 
+    // MARK: - userMessageBubbleWidthCap
+
+    /// WHY: long user bubbles + copy/"just now" meta must stay inside the
+    /// transcript column. A hard 420pt cap alone overflows narrow agent panes
+    /// and paints over adjacent chrome.
+    func test_userMessageBubbleWidthCap_clampsToColumnMinusGutter() {
+        let wide = AgentAppView.userMessageBubbleWidthCap(columnWidth: 900)
+        XCTAssertEqual(wide, AgentAppView.userMessageBubbleMaxWidth,
+                       "wide columns keep the design-system bubble max, not grow past it")
+
+        let narrowColumn: CGFloat = 280
+        let narrow = AgentAppView.userMessageBubbleWidthCap(columnWidth: narrowColumn)
+        let expected = narrowColumn - AgentAppView.userMessageBubbleLeadingGutter
+        XCTAssertEqual(narrow, expected,
+                       "narrow columns must shrink the bubble so copy/timestamp meta cannot hang outside the pane")
+        XCTAssertLessThan(narrow, AgentAppView.userMessageBubbleMaxWidth,
+                          "narrow-column cap must be below the absolute max")
+    }
+
+    func test_userMessageBubbleWidthCap_respectsMinimumOnTinyColumns() {
+        let tiny = AgentAppView.userMessageBubbleWidthCap(columnWidth: 40)
+        XCTAssertEqual(tiny, AgentAppView.userMessageBubbleMinWidth,
+                       "pathologically narrow columns still get a usable floor so the bubble does not collapse to zero")
+        XCTAssertEqual(AgentAppView.userMessageBubbleWidthCap(columnWidth: -10),
+                       AgentAppView.userMessageBubbleMinWidth,
+                       "non-finite/negative column widths must fail closed to the minimum, not NaN or zero")
+    }
+
     // MARK: - relativeTimestamp
 
     func test_relativeTimestamp_withinSixtySecondsReturnsJustNow() {

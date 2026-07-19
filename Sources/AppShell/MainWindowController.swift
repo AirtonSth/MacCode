@@ -1,5 +1,6 @@
 import Foundation
 import AppKit
+import SwiftUI
 import CoreModel
 import Surfaces
 import DesignSystemKit
@@ -262,6 +263,16 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
     /// rebuild regressions that os.log alone cannot surface.
     var rebuildCount: Int = 0
 
+    /// Shell main-content destination. Scheduled Tasks opens here (same place
+    /// as workspaces), not in a separate NSWindow.
+    private enum ShellContentMode: Equatable {
+        case workspace
+        case scheduledTasks
+    }
+    private var shellContentMode: ShellContentMode = .workspace
+    private var scheduledTasksViewModel: ScheduledTasksViewModel?
+    private var scheduledTasksHostingView: NSView?
+
     public init(context: AppContext, router: AppCommandRouter, updater: AppUpdateChecking? = nil) {
         self.context = context
         self.router = router
@@ -292,6 +303,14 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
         super.init()
         win.delegate = self
         setupLayout()
+        // Schedule Tasks / workspace selection share the main content pane
+        // (not a separate window). Sidebar routes both through this controller.
+        sidebar.onPresentScheduledTasks = { [weak self] in
+            self?.presentScheduledTasksInMainContent()
+        }
+        sidebar.onWorkspaceContentActivated = { [weak self] in
+            self?.presentWorkspaceContent()
+        }
         // UX-MAC_SHELL_WINDOW-009: restore the collapsed sidebar state so a
         // user who works collapsed does not have to re-collapse on launch.
         if Self.storedSidebarCollapsed(context: context) {
@@ -559,17 +578,29 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
 	    }
 
 	    private func updateCollapsedWorkspaceHeader() {
+            // Schedule Tasks is a shell destination, not a workspace — title and
+            // header must not keep the last workspace name.
+            if shellContentMode == .scheduledTasks {
+                collapsedWorkspaceLabel.stringValue = "Schedule Tasks"
+                visibleWorkspaceLabel.stringValue = "Schedule Tasks"
+                window.title = "Schedule Tasks"
+                visibleFinderButton.isHidden = true
+                visibleNewWindowButton.isHidden = true
+                return
+            }
 	        guard let ctx = context,
 	              let wid = ctx.state.window.selectedWorkspaceID,
 	              let ws = ctx.state.workspaces[wid] else {
 	            collapsedWorkspaceLabel.stringValue = "RemoteCode"
 	            visibleWorkspaceLabel.stringValue = "RemoteCode"
+                window.title = "RemoteCode"
                 visibleFinderButton.isHidden = true
                 visibleNewWindowButton.isHidden = true
 	            return
 	        }
 	        collapsedWorkspaceLabel.stringValue = ws.name
 	        visibleWorkspaceLabel.stringValue = ws.name
+            window.title = ws.name
             visibleFinderButton.isHidden = false
             visibleNewWindowButton.isHidden = isWorkspaceOpenInNewWindow(wid)
 	    }
@@ -889,7 +920,66 @@ public final class MainWindowController: NSObject, NSWindowDelegate, NSSplitView
         repairSelectedTerminalFocus(reason: "detached_workspace_close")
     }
 
+    /// UX: Schedule Tasks opens in the main content column (same place as
+    /// workspace panes), not a floating NSWindow. Workspace rows are fully
+    /// deselected and the title bar reads "Schedule Tasks".
+    func presentScheduledTasksInMainContent() {
+        shellContentMode = .scheduledTasks
+        sidebar.setScheduledTasksSelected(true)
+        lastWorkspaceContainerSignature = nil
+        installScheduledTasksContent()
+        updateCollapsedWorkspaceHeader()
+        shellLog.debug("shellContentMode=scheduledTasks")
+    }
+
+    /// Return the main content column to the selected workspace layout.
+    func presentWorkspaceContent() {
+        guard shellContentMode != .workspace else { return }
+        shellContentMode = .workspace
+        sidebar.setScheduledTasksSelected(false)
+        scheduledTasksHostingView = nil
+        lastWorkspaceContainerSignature = nil
+        rebuildWorkspaceContainer()
+        updateCollapsedWorkspaceHeader()
+        shellLog.debug("shellContentMode=workspace")
+    }
+
+    private func installScheduledTasksContent() {
+        for sub in workspaceContent.subviews { sub.removeFromSuperview() }
+        paneControllers.removeAll()
+        guard let context, let router else {
+            let empty = makeEmptyState()
+            workspaceContent.addSubview(empty)
+            pin(empty, to: workspaceContent)
+            return
+        }
+        let vm = scheduledTasksViewModel ?? ScheduledTasksViewModel(context: context, router: router)
+        scheduledTasksViewModel = vm
+        vm.reload()
+        let host = NSHostingView(rootView: ScheduledTasksRootView(vm: vm))
+        host.translatesAutoresizingMaskIntoConstraints = false
+        host.wantsLayer = true
+        host.layer?.backgroundColor = DS.NS.bg.cgColor
+        RemoteCodeAppearance.apply(to: host)
+        workspaceContent.addSubview(host)
+        pin(host, to: workspaceContent)
+        scheduledTasksHostingView = host
+        lastWorkspaceContainerSignature = "scheduledTasks"
+        rebuildCount += 1
+    }
+
     private func rebuildWorkspaceContainer() {
+        // Keep Schedule Tasks mounted across refreshFromState bursts while the
+        // user is on that shell destination.
+        if shellContentMode == .scheduledTasks {
+            if scheduledTasksHostingView?.superview === workspaceContent {
+                scheduledTasksViewModel?.reload()
+                return
+            }
+            installScheduledTasksContent()
+            return
+        }
+
         // PERF-MAC_SHELL_WINDOW-002: a refresh whose layout signature
         // matches the live tree (e.g. app become-key/active/reopen) does
         // not need a teardown/rebuild — the existing pane controllers are
