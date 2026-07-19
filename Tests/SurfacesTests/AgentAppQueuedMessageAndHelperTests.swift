@@ -116,6 +116,61 @@ final class AgentAppQueuedMessageAndHelperTests: XCTestCase {
         vm.stop()
     }
 
+    func test_sendQueuesWhenAdapterTurnOutlivesCoordinatorProjection() async throws {
+        // WHY: the provider adapter is the final authority on whether a turn is
+        // still in flight. If the coordinator projection is absent, Send must
+        // queue once instead of persisting duplicate bubbles until the adapter
+        // rejects them with an unsupported-operation error.
+        let tmp = NSTemporaryDirectory() + "rc2-qa-orphaned-live-turn-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let queuedRepo = AgentQueuedMessageRepository(db: db)
+        let workspaceID = WorkspaceID()
+        let thread = AgentThread(
+            workspaceId: workspaceID,
+            title: "orphaned live turn",
+            provider: .codex,
+            model: "test-model"
+        )
+        try threadRepo.upsert(thread)
+        let adapter = OneShotProviderAdapter(runner: ActiveQueueRunner())
+        _ = try await adapter.sendTurn(AgentRunRequest(
+            threadId: thread.id,
+            provider: .codex,
+            model: "test-model",
+            cwd: tmp,
+            prompt: "existing turn"
+        )) { _ in }
+        let coordinator = AgentRunCoordinator(
+            runRepo: runRepo,
+            messageRepo: messageRepo,
+            threadRepo: threadRepo,
+            providerAdapters: [.codex: adapter]
+        )
+        let vm = AgentAppViewModel(
+            workspaceID: workspaceID,
+            cwd: tmp,
+            coordinator: coordinator,
+            threadRepo: threadRepo,
+            messageRepo: messageRepo,
+            queuedMessageRepo: queuedRepo,
+            initialThreadId: thread.id
+        )
+        vm.providerSnapshots = [operationalSnapshot()]
+        vm.prompt = "queue exactly once"
+
+        await vm.send()
+
+        XCTAssertEqual(try queuedRepo.list(threadId: thread.id).map(\.text), ["queue exactly once"])
+        XCTAssertTrue(try messageRepo.list(threadId: thread.id).isEmpty,
+                      "queueing behind the live adapter turn must not persist a second user bubble")
+        XCTAssertEqual(vm.queueStatusMessage, "Queued — will run after the current turn.")
+        XCTAssertFalse(vm.statusMessage.contains("Failed to start"))
+        adapter.stopAll()
+    }
+
     func test_cancelQueuedMessage_removesMessageFromQueue() throws {
         let (vm, repo) = try makeVM(withQueue: true)
         let queuedRepo = try XCTUnwrap(repo)

@@ -345,6 +345,9 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         }
         try beginExclusiveThreadMutation(request.threadId, operation: "provider run start")
         defer { endExclusiveThreadMutation(request.threadId) }
+        guard !hasProviderSession(threadId: request.threadId) else {
+            throw AgentProviderAdapterError.unsupported("Provider session already has an in-flight turn")
+        }
         lock.lock()
         let pendingStartFailureRunIds = pendingStartFailures.compactMap { runId, pending in
             pending.request.threadId == request.threadId ? runId : nil
@@ -777,8 +780,9 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         }
     }
 
-    /// Internal proof seam used by lifecycle tests.
-    func hasProviderSession(threadId: AgentThreadID) -> Bool {
+    /// Provider-authoritative busy state. This remains true when a surface or
+    /// coordinator projection is stale but the adapter still owns a live turn.
+    public func hasProviderSession(threadId: AgentThreadID) -> Bool {
         guard let adapter = try? adapterForThread(threadId) else { return false }
         return providerSessionIsLive(adapter, threadId: threadId)
     }
