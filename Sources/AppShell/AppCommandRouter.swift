@@ -242,7 +242,22 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         suppressedLayoutEventDepth == 0
     }
 
-    private func refreshAgentSurfaces(thread: AgentThreadID, workspace: WorkspaceID? = nil, select: Bool = false) {
+    /// Refresh every Agent App surface's rail / queue state for a thread mutation.
+    ///
+    /// Selection is PER-SURFACE. This helper must never rebind a tab that is
+    /// viewing a different thread — that residual fan-out (`select: true` for
+    /// every surface) made an iOS/CLI/RPC reply yank every open Agent App tab
+    /// onto the target thread, so a response in one conversation appeared to
+    /// affect both.
+    ///
+    /// When `reloadTranscriptIfSelected` is true, only surfaces ALREADY bound
+    /// to `thread` re-select (load messages + timeline) so a remote send is
+    /// visible on those tabs without changing sibling bindings.
+    private func refreshAgentSurfaces(
+        thread: AgentThreadID,
+        workspace: WorkspaceID? = nil,
+        reloadTranscriptIfSelected: Bool = false
+    ) {
         let resolvedWorkspace: WorkspaceID?
         if let workspace {
             resolvedWorkspace = workspace
@@ -256,7 +271,9 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                   resolvedWorkspace == nil || agent.viewModel.workspaceID == resolvedWorkspace! else { continue }
             agent.viewModel.reloadThreads()
             agent.viewModel.reloadQueuedMessages()
-            if select { agent.viewModel.selectThread(thread) }
+            if reloadTranscriptIfSelected, agent.viewModel.selectedThreadId == thread {
+                agent.viewModel.selectThread(thread, markRead: false)
+            }
         }
         windowController?.refreshFromState()
     }
@@ -2460,13 +2477,17 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             runAsUser: t.runAsUser
         )
         let runId = try await ctx.coordinator.startRun(req)
-        // HC-5 (R1): a message sent from the mobile mirror must be
-        // visible on the Mac. Route it into the live Agent surface for
-        // this workspace exactly like a local action — select the
-        // thread + reload so the just-persisted user message and the
-        // streaming turn render in the macOS window, not only over the
-        // wire.
-        refreshAgentSurfaces(thread: thread, workspace: t.workspaceId, select: true)
+        // HC-5 (R1): a message sent from the mobile mirror / RPC must become
+        // visible on the Mac host. Refresh every Agent App rail so the thread
+        // list + running state update, and re-load the transcript ONLY on
+        // surfaces already bound to this thread. Do NOT force-select every
+        // Agent App tab onto this thread — that was residual Bug B and made a
+        // reply in one conversation contaminate sibling tabs.
+        refreshAgentSurfaces(
+            thread: thread,
+            workspace: t.workspaceId,
+            reloadTranscriptIfSelected: true
+        )
         return AgentMessageSendResult(status: .started, runId: runId)
     }
 
