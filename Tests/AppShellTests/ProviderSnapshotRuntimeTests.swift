@@ -1021,6 +1021,127 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
         XCTAssertEqual(runner.lastRequest?.prompt, "count to 10")
     }
 
+    func test_sendAgentMessageQueuesWhenAdapterTurnOutlivesPersistedThreadStatus() async throws {
+        // WHY: mirror/RPC sends do not share the macOS surface's in-memory run
+        // projection. The adapter's running session must still route the message
+        // into the durable queue instead of creating a duplicate failed turn.
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let workspaceDir = root.appendingPathComponent("workspace", isDirectory: true)
+        try FileManager.default.createDirectory(at: workspaceDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        defer { closeAndUnregisterAllSurfaces() }
+
+        let ctx = try AppContext(channel: .debug, appSupportOverride: root.appendingPathComponent("support").path)
+        let router = AppCommandRouter(context: ctx)
+        ctx.router = router
+        let adapter = OneShotProviderAdapter(runner: BlockingCancelRunner(provider: .codex))
+        ctx.coordinator.replaceProviderAdapter(.codex, adapter: adapter)
+        let workspace = try router.createWorkspace(name: "orphaned-live-turn", cwd: workspaceDir.path)
+        let thread = try router.createAgentThread(
+            workspace: workspace.id,
+            title: "orphaned live turn",
+            provider: .codex,
+            model: "gpt-5.5",
+            permissionMode: .supervised,
+            reasoningEffort: .medium
+        )
+        _ = try await adapter.sendTurn(AgentRunRequest(
+            threadId: thread.id,
+            provider: .codex,
+            model: "gpt-5.5",
+            cwd: workspaceDir.path,
+            prompt: "existing turn"
+        )) { _ in }
+
+        let result = try await router.sendAgentMessage(
+            thread: thread.id,
+            text: "queue from mirror exactly once",
+            provider: nil,
+            model: nil,
+            permissionMode: nil,
+            reasoningEffort: nil
+        )
+
+        XCTAssertEqual(result.status, .queued)
+        XCTAssertEqual(try ctx.queuedMessageRepo.list(threadId: thread.id).map(\.text), ["queue from mirror exactly once"])
+        XCTAssertTrue(try ctx.messageRepo.list(threadId: thread.id).isEmpty,
+                      "adapter-busy RPC sends must not persist a duplicate user bubble")
+        adapter.stopAll()
+    }
+
+    func test_drainQueueWaitsWhenAdapterTurnOutlivesPersistedThreadStatus() async throws {
+        // WHY: lifecycle reconciliation can observe stale persisted status while
+        // the adapter still owns a turn. It must not claim or dispatch the queue
+        // head until that provider turn is actually idle.
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        defer { closeAndUnregisterAllSurfaces() }
+        let (ctx, router, adapter, thread) = try await makeLiveAdapterRouterFixture(root: root)
+        var staleThread = thread
+        staleThread.status = .completed
+        try ctx.threadRepo.upsert(staleThread)
+        let queued = try ctx.queuedMessageRepo.enqueue(
+            threadId: thread.id,
+            text: "wait for the live turn",
+            attachments: [],
+            interactionMode: .default
+        )
+
+        try await router.drainNextQueuedAgentMessage(thread: thread.id)
+
+        XCTAssertEqual(try ctx.queuedMessageRepo.get(id: queued.id)?.text, "wait for the live turn")
+        let dispatch = try XCTUnwrap(ctx.queuedMessageRepo.dispatch(id: queued.id))
+        XCTAssertEqual(dispatch.state, .queued,
+                       "busy-provider drain must not claim or prepare the queue head")
+        XCTAssertNil(dispatch.runId)
+        XCTAssertTrue(try ctx.messageRepo.list(threadId: thread.id).isEmpty)
+        adapter.stopAll()
+    }
+
+    func test_forceQueuedMessageTreatsLiveAdapterSessionAsActive() async throws {
+        // WHY: Force must promote the requested item and stop the real provider
+        // turn even when persisted thread status has already become stale.
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        defer { closeAndUnregisterAllSurfaces() }
+        let (ctx, router, adapter, thread) = try await makeLiveAdapterRouterFixture(root: root)
+        var staleThread = thread
+        staleThread.status = .completed
+        try ctx.threadRepo.upsert(staleThread)
+        _ = try ctx.queuedMessageRepo.enqueue(threadId: thread.id, text: "later", attachments: [], interactionMode: .default)
+        let forced = try ctx.queuedMessageRepo.enqueue(threadId: thread.id, text: "force first", attachments: [], interactionMode: .default)
+
+        let result = try await router.forceAgentQueuedMessageNow(id: forced.id)
+
+        XCTAssertEqual(result.status, .queued)
+        XCTAssertEqual(result.queuedMessage?.id, forced.id)
+        XCTAssertEqual(try ctx.queuedMessageRepo.list(threadId: thread.id).map(\.text), ["force first", "later"])
+        adapter.stopAll()
+    }
+
+    func test_continueRejectsLiveAdapterSessionWithoutQueueingEmptyPrompt() async throws {
+        // WHY: Continue is a recovery action, not a message. If the provider is
+        // still live it must fail as already active, never enqueue an empty turn.
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        defer { closeAndUnregisterAllSurfaces() }
+        let (ctx, router, adapter, thread) = try await makeLiveAdapterRouterFixture(root: root)
+        var staleThread = thread
+        staleThread.status = .interrupted
+        try ctx.threadRepo.upsert(staleThread)
+
+        do {
+            _ = try await router.continueAgentRun(thread: thread.id)
+            XCTFail("Continue must reject a still-live provider turn")
+        } catch let error as JSONRPCError {
+            XCTAssertTrue(error.message.contains("active run"))
+        }
+
+        XCTAssertTrue(try ctx.queuedMessageRepo.list(threadId: thread.id).isEmpty,
+                      "Continue must not turn its empty recovery prompt into a queue item")
+        adapter.stopAll()
+    }
+
     func test_drainQueue_startFailureAcknowledgesIntentAfterDurableFailedRunWithoutReplay() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         let workspaceDir = root.appendingPathComponent("workspace", isDirectory: true)
@@ -1320,6 +1441,35 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
         }
         XCTAssertEqual(try ctx.queuedMessageRepo.get(id: queued.id)?.text, "run A must remain")
         XCTAssertEqual(try ctx.queuedMessageRepo.dispatch(id: queued.id)?.state, .prepared)
+    }
+
+    private func makeLiveAdapterRouterFixture(
+        root: URL
+    ) async throws -> (AppContext, AppCommandRouter, OneShotProviderAdapter, AgentThread) {
+        let workspaceDir = root.appendingPathComponent("workspace", isDirectory: true)
+        try FileManager.default.createDirectory(at: workspaceDir, withIntermediateDirectories: true)
+        let ctx = try AppContext(channel: .debug, appSupportOverride: root.appendingPathComponent("support").path)
+        let router = AppCommandRouter(context: ctx)
+        ctx.router = router
+        let adapter = OneShotProviderAdapter(runner: BlockingCancelRunner(provider: .codex))
+        ctx.coordinator.replaceProviderAdapter(.codex, adapter: adapter)
+        let workspace = try router.createWorkspace(name: "live-adapter-fixture", cwd: workspaceDir.path)
+        let thread = try router.createAgentThread(
+            workspace: workspace.id,
+            title: "live adapter fixture",
+            provider: .codex,
+            model: "gpt-5.5",
+            permissionMode: .supervised,
+            reasoningEffort: .medium
+        )
+        _ = try await adapter.sendTurn(AgentRunRequest(
+            threadId: thread.id,
+            provider: .codex,
+            model: "gpt-5.5",
+            cwd: workspaceDir.path,
+            prompt: "existing turn"
+        )) { _ in }
+        return (ctx, router, adapter, thread)
     }
 }
 

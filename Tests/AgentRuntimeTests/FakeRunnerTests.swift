@@ -770,6 +770,62 @@ final class FakeRunnerTests: XCTestCase {
                        "live adapter sessions must be adopted before declaring missing durable resume data unrecoverable")
     }
 
+    func test_coordinatorRejectsOrphanedLiveAdapterTurnBeforePersistingDuplicateRun() async throws {
+        // WHY: a surface/coordinator can lose its in-memory active-run projection
+        // while the provider adapter still owns a running turn. A second start must
+        // fail before it persists another user bubble or invokes the provider.
+        let tmp = NSTemporaryDirectory() + "rc2-coordinator-orphaned-live-turn-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let thread = AgentThread(
+            title: "orphaned live turn",
+            provider: .codex,
+            model: "gpt-5.5",
+            providerThreadId: "live-session-1"
+        )
+        try threadRepo.upsert(thread)
+        let adapter = SpyProviderAdapter(provider: .codex, finishImmediately: false)
+        adapter.sessionSummaries = [
+            AgentProviderSessionSummary(
+                threadId: thread.id,
+                provider: .codex,
+                status: .running,
+                providerThreadId: "live-session-1"
+            )
+        ]
+        let coordinator = AgentRunCoordinator(
+            runRepo: runRepo,
+            messageRepo: messageRepo,
+            threadRepo: threadRepo,
+            providerAdapters: [.codex: adapter]
+        )
+        let attemptedRunId = AgentRunID()
+
+        do {
+            _ = try await coordinator.startRun(AgentRunRequest(
+                runId: attemptedRunId,
+                threadId: thread.id,
+                provider: .codex,
+                model: "gpt-5.5",
+                cwd: tmp,
+                prompt: "must not duplicate",
+                providerThreadId: "live-session-1"
+            ))
+            XCTFail("a running adapter session must block a second coordinator start")
+        } catch {
+            XCTAssertTrue(String(describing: error).contains("in-flight turn"))
+        }
+
+        XCTAssertEqual(adapter.sendTurnCount, 0,
+                       "the coordinator guard must stop before asking the adapter to reject the duplicate")
+        XCTAssertTrue(try messageRepo.list(threadId: thread.id).isEmpty,
+                      "a rejected duplicate start must not persist another user message")
+        XCTAssertNil(try runRepo.get(id: attemptedRunId),
+                     "a rejected duplicate start must not create a failed phantom run")
+    }
+
     func test_coordinatorFailsLoudWhenActiveRuntimeSessionHasNoLiveSessionOrCursor() async throws {
         let tmp = NSTemporaryDirectory() + "rc2-coordinator-stale-active-route-" + UUID().uuidString
         let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()

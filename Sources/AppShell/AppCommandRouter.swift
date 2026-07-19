@@ -2220,7 +2220,8 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
               let thread = try ctx.threadRepo.get(id: queued.threadId) else {
             throw JSONRPCError.invalidParams
         }
-        if thread.status == .running {
+        if thread.status == .running
+            || ctx.coordinator.hasProviderSession(threadId: queued.threadId) {
             guard let promoted = try ctx.queuedMessageRepo.promoteToFront(id: id) else {
                 throw JSONRPCError.invalidParams
             }
@@ -2414,7 +2415,8 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             interactionMode: interactionMode ?? .default,
             attachments: resolvedAttachments
         )
-        if existing.status == .running {
+        if existing.status == .running
+            || ctx.coordinator.hasProviderSession(threadId: thread) {
             if queueMessageId != nil {
                 throw JSONRPCError(code: -32000, message: "Thread became active before queued dispatch started.")
             }
@@ -2498,7 +2500,8 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         guard let ctx = context,
               let threadState = try ctx.threadRepo.get(id: thread),
               threadState.status != .running,
-              threadState.status != .pending else { return }
+              threadState.status != .pending,
+              !ctx.coordinator.hasProviderSession(threadId: thread) else { return }
         if let head = try ctx.queuedMessageRepo.first(threadId: thread),
            let dispatch = try ctx.queuedMessageRepo.dispatch(id: head.id),
            dispatch.state == .prepared,
@@ -3044,7 +3047,9 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     /// the saved resume cursor without persisting a new user message.
     public func continueAgentRun(thread: AgentThreadID) async throws -> AgentRunID? {
         guard let ctx = context else { throw LayoutError.workspaceNotFound }
-        if let existing = try ctx.threadRepo.get(id: thread), existing.status == .running {
+        if let existing = try ctx.threadRepo.get(id: thread),
+           existing.status == .running
+            || ctx.coordinator.hasProviderSession(threadId: thread) {
             throw JSONRPCError(code: -32000, message: "Thread already has an active run.")
         }
         let result = try await sendAgentMessage(thread: thread, text: "", provider: nil, model: nil, permissionMode: nil, reasoningEffort: nil)

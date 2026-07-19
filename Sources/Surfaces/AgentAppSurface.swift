@@ -2255,6 +2255,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     public var activeRunConfigurationLocked: Bool {
         selectedThreadRunIsStartingOrRunning
             || selectedThreadId.map { coordinator.activeThreadIdsSnapshot().contains($0) } == true
+            || selectedThreadId.map { coordinator.hasProviderSession(threadId: $0) } == true
     }
 
     public func setProviderInstance(_ id: String) {
@@ -3256,6 +3257,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         guard let selectedThreadId else { return false }
         if selectedThreadRunIsStartingOrRunning { return true }
         if coordinator.activeThreadIdsSnapshot().contains(selectedThreadId) { return true }
+        if coordinator.hasProviderSession(threadId: selectedThreadId) { return true }
         guard let currentRunId,
               let runStatus = try? coordinator.runStatus(currentRunId) else { return false }
         return runStatus == .running || runStatus == .pending
@@ -3947,6 +3949,10 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// the durable cursor plus runtime configuration from the interrupted session.
     public func continueInterruptedThread() async {
         guard let continuingThreadId = selectedThreadId else { return }
+        guard !coordinator.hasProviderSession(threadId: continuingThreadId) else {
+            statusMessage = "The provider turn is still running."
+            return
+        }
         let hadRecoverableContext = selectedThreadHasRecoverableContext
         let runId = await startProviderRun(
             text: "Continue the interrupted turn from the last saved context. Do not repeat completed work.",
