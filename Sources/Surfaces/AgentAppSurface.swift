@@ -5056,6 +5056,9 @@ public struct AgentAppView: View {
 
     @State private var showModelOptions = false
     @State private var showAllModelOptions = false
+    /// Source/account capsule popover (Codex / Claude / Grok). Always openable so
+    /// locked/single-source states fail loud instead of a dead click.
+    @State private var showSourceOptions = false
     // UX-MAC_AGENT-013: inline custom-model entry replaces the blocking NSAlert.
     @State private var showCustomModelField = false
     @State private var customModelDraft = ""
@@ -8786,52 +8789,93 @@ public struct AgentAppView: View {
     /// Dedicated provider-instance source capsule (CODEX_HOME isolation).
     /// Reuses provider snapshots + `setProviderInstance` so personal/work
     /// CLI configs stay the single selection authority (not a second state).
+    ///
+    /// Always openable (Button + popover), matching the model pill. A SwiftUI
+    /// `Menu` that collapses to a static label when locked made "click does
+    /// nothing" the common report after the first message — fail loud instead.
     private var sourceMenu: some View {
-        let interactive = AgentSourceCapsulePresentation.isInteractive(
-            enabledSourceCount: sourceMenuEntries.count,
-            providerLocked: vm.providerLocked,
-            runLocked: vm.selectedThreadRunIsStartingOrRunning || !vm.selectedProviderCanRun
-        )
+        let canSwitch = sourceCanSwitch
         let label = sourceCapsuleLabel
-        let helpText = sourceCapsuleHelpText(interactive: interactive)
-        return Group {
-            if interactive {
-                Menu {
-                    ForEach(sourceMenuEntries, id: \.id) { entry in
-                        Button {
-                            selectSourceMenuEntry(entry)
-                        } label: {
-                            HStack {
-                                if entry.isSelected {
-                                    Image(systemName: "checkmark")
-                                }
-                                Text(entry.title)
-                            }
-                        }
-                    }
-                } label: {
-                    sourceCapsuleLabelView(
-                        label: label,
-                        showChevron: true,
-                        locked: false
-                    )
-                }
-                .menuStyle(.button)
-                .buttonStyle(.plain)
-                .menuIndicator(.hidden)
-                .fixedSize()
-            } else {
-                sourceCapsuleLabelView(
-                    label: label,
-                    showChevron: false,
-                    locked: vm.providerLocked
-                )
-            }
+        let helpText = sourceCapsuleHelpText(canSwitch: canSwitch)
+        return Button {
+            showSourceOptions.toggle()
+        } label: {
+            sourceCapsuleLabelView(
+                label: label,
+                showChevron: true,
+                locked: vm.providerLocked || vm.selectedThreadRunIsStartingOrRunning
+            )
         }
-        .disabled(vm.selectedThreadRunIsStartingOrRunning || !vm.selectedProviderCanRun)
+        .buttonStyle(.plain)
         .help(helpText)
         .accessibilityLabel("Account \(label)")
+        .accessibilityHint(canSwitch
+            ? "Choose which ChatGPT, Claude, or Grok account runs this thread"
+            : helpText)
         .accessibilityIdentifier("agent.source.menu")
+        .popover(isPresented: $showSourceOptions, arrowEdge: .bottom) {
+            sourceOptionsPopover
+        }
+    }
+
+    private var sourceCanSwitch: Bool {
+        AgentSourceCapsulePresentation.isInteractive(
+            enabledSourceCount: sourceMenuEntries.count,
+            providerLocked: vm.providerLocked,
+            // Only an in-flight run blocks switching. An unauthenticated /
+            // unavailable *current* provider must not trap the user — they need
+            // the menu open to pick a working account.
+            runLocked: vm.selectedThreadRunIsStartingOrRunning
+        )
+    }
+
+    private var sourceOptionsPopover: some View {
+        let canSwitch = sourceCanSwitch
+        let entries = sourceMenuEntries
+        return VStack(alignment: .leading, spacing: DS.Space.xs) {
+            if vm.selectedThreadRunIsStartingOrRunning {
+                Text("Account is fixed while a run is active")
+                    .font(DS.Font.caption2)
+                    .foregroundColor(DS.Palette.textTertiary)
+                    .fixedSize(horizontal: true, vertical: false)
+            } else if vm.providerLocked {
+                Text("Account is fixed after the first message. Start a new thread to use a different account.")
+                    .font(DS.Font.caption2)
+                    .foregroundColor(DS.Palette.textTertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: compactModelMenuWidth, alignment: .leading)
+            } else if let reason = vm.providerExecutionUnavailableReason {
+                Text(reason)
+                    .font(DS.Font.caption2)
+                    .foregroundColor(DS.Palette.warning)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: compactModelMenuWidth, alignment: .leading)
+            } else if entries.count <= 1 {
+                Text("Only one account is available")
+                    .font(DS.Font.caption2)
+                    .foregroundColor(DS.Palette.textTertiary)
+                    .fixedSize(horizontal: true, vertical: false)
+            }
+
+            compactMenuSection("Account")
+            if entries.isEmpty {
+                Text("No accounts loaded")
+                    .font(DS.Font.caption)
+                    .foregroundColor(DS.Palette.textSecondary)
+            } else {
+                ForEach(entries, id: \.id) { entry in
+                    compactMenuRow(entry.title, selected: entry.isSelected) {
+                        selectSourceMenuEntry(entry)
+                        showSourceOptions = false
+                    }
+                    .disabled(!canSwitch)
+                }
+            }
+        }
+        .padding(DS.Space.sm)
+        .background(DS.Palette.surfaceOverlay)
+        .fixedSize(horizontal: true, vertical: false)
+        .accessibilityIdentifier("agent.source.popover")
     }
 
     private var sourceCapsuleLabel: String {
@@ -8853,6 +8897,7 @@ public struct AgentAppView: View {
     }
 
     private func selectSourceMenuEntry(_ entry: AgentSourceCapsulePresentation.MenuEntry) {
+        guard sourceCanSwitch else { return }
         if vm.providerSnapshots.contains(where: { $0.id == entry.id }) {
             vm.setProviderInstance(entry.id)
             return
@@ -8866,17 +8911,17 @@ public struct AgentAppView: View {
         }
     }
 
-    private func sourceCapsuleHelpText(interactive: Bool) -> String {
-        if let reason = vm.providerExecutionUnavailableReason {
-            return reason
-        }
+    private func sourceCapsuleHelpText(canSwitch: Bool) -> String {
         if vm.selectedThreadRunIsStartingOrRunning {
             return "Account is fixed while a run is active"
         }
         if vm.providerLocked {
             return "Account is fixed after the first message. Start a new thread to use a different account."
         }
-        if !interactive {
+        if let reason = vm.providerExecutionUnavailableReason {
+            return reason
+        }
+        if !canSwitch {
             return "Account / source for this agent run"
         }
         return "Choose which ChatGPT / Claude / Grok account runs this thread"
@@ -10579,8 +10624,11 @@ public enum AgentSourceCapsulePresentation {
         }
     }
 
-    /// Interactive only when the user can actually switch accounts: more than
-    /// one eligible source, thread still unlocked, and no active run block.
+    /// True only when selecting a different account would take effect.
+    /// Callers still open the capsule so locked / single-source states can
+    /// explain themselves (fail loud). `runLocked` means an in-flight run —
+    /// not "current provider cannot execute" (that must leave the menu usable
+    /// so the user can switch to a working account).
     public static func isInteractive(
         enabledSourceCount: Int,
         providerLocked: Bool,
@@ -10623,39 +10671,75 @@ public enum AgentSourceCapsulePresentation {
         selectedProvider: AgentProvider,
         providerDisplayName: (AgentProvider) -> String
     ) -> [MenuEntry] {
-        if !snapshots.isEmpty {
-            let enabled = snapshots.filter(\.enabled)
-            // Always surface the currently selected snapshot even if disabled so
-            // a locked/missing instance is not silently rewritten in the menu.
-            let rows: [AgentProviderSnapshot]
-            if let selectedSnapshotId,
-               let selected = snapshots.first(where: { $0.id == selectedSnapshotId }),
-               !enabled.contains(where: { $0.id == selected.id }) {
-                rows = enabled + [selected]
-            } else {
-                rows = enabled
-            }
-            return rows.map { snapshot in
-                let title = capsuleLabel(
-                    selected: snapshot,
-                    fallbackProvider: snapshot.provider,
-                    fallbackInstanceId: snapshot.id,
-                    snapshots: snapshots
-                )
-                return MenuEntry(
-                    id: snapshot.id,
-                    title: title,
-                    isSelected: snapshot.id == selectedSnapshotId
+        if snapshots.isEmpty {
+            return AgentProvider.allCases.map { provider in
+                MenuEntry(
+                    id: provider.rawValue,
+                    title: providerDisplayName(provider),
+                    isSelected: provider == selectedProvider
                 )
             }
         }
-        return AgentProvider.allCases.map { provider in
-            MenuEntry(
-                id: provider.rawValue,
-                title: providerDisplayName(provider),
-                isSelected: provider == selectedProvider
+
+        let enabled = snapshots.filter(\.enabled)
+        // Always surface the currently selected snapshot even if disabled so
+        // a locked/missing instance is not silently rewritten in the menu.
+        var rows: [AgentProviderSnapshot] = enabled
+        if let selectedSnapshotId,
+           let selected = snapshots.first(where: { $0.id == selectedSnapshotId }),
+           !rows.contains(where: { $0.id == selected.id }) {
+            rows.append(selected)
+        }
+
+        // Pre-thread / single-instance hosts: if discovery only returned Codex,
+        // still offer Claude and Grok so the Source capsule stays a real
+        // switcher (not a dead one-item label). Prefer any known snapshot for
+        // that provider; otherwise synthesize a provider-rawValue row.
+        let covered = Set(rows.map(\.provider))
+        for provider in AgentProvider.allCases where !covered.contains(provider) {
+            if let any = snapshots.first(where: { $0.provider == provider }) {
+                rows.append(any)
+            }
+        }
+
+        var entries = rows.map { snapshot in
+            let title = capsuleLabel(
+                selected: snapshot,
+                fallbackProvider: snapshot.provider,
+                fallbackInstanceId: snapshot.id,
+                snapshots: snapshots
+            )
+            return MenuEntry(
+                id: snapshot.id,
+                title: title,
+                isSelected: snapshot.id == selectedSnapshotId
             )
         }
+
+        let coveredAfter = Set(rows.map(\.provider))
+        for provider in AgentProvider.allCases where !coveredAfter.contains(provider) {
+            entries.append(MenuEntry(
+                id: provider.rawValue,
+                title: providerDisplayName(provider),
+                isSelected: false
+            ))
+        }
+
+        // If snapshot id did not match (stale "codex" vs "codex-cli"), mark
+        // the first row for the selected provider so the menu shows a check.
+        if !entries.contains(where: \.isSelected) {
+            if let idx = entries.firstIndex(where: { entry in
+                if let snap = rows.first(where: { $0.id == entry.id }) {
+                    return snap.provider == selectedProvider
+                }
+                return entry.id == selectedProvider.rawValue
+            }) {
+                let e = entries[idx]
+                entries[idx] = MenuEntry(id: e.id, title: e.title, isSelected: true)
+            }
+        }
+
+        return entries
     }
 
     private static func primaryLabel(
