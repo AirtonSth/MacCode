@@ -138,8 +138,20 @@ public enum ClaudeAgentSDKBridgeLocator {
         main: Bundle = .main
     ) -> String {
         let tried = candidatePaths(override: override, environment: environment, main: main)
+            .filter { !shouldRedactFromUserMessage($0) }
             .prefix(6)
             .joined(separator: "; ")
-        return "Claude Agent SDK bridge script not found (searched app Resources, Application Support cache, and local sources). Tried: \(tried)"
+        let suffix = tried.isEmpty
+            ? "Install/update RemoteCode so Contents/Resources/ClaudeAgentSDKBridge.mjs is present."
+            : "Tried: \(tried)"
+        return "Claude Agent SDK bridge script not found (searched app Resources, Application Support cache, and local sources). \(suffix)"
+    }
+
+    /// Compile-time / CI absolute paths must not reappear in customer error text
+    /// (Airton-class `.gitlab-runner/builds/…` symptom under packaging miss).
+    public static func shouldRedactFromUserMessage(_ path: String) -> Bool {
+        let lower = path.lowercased()
+        return lower.contains("/.gitlab-runner/builds/")
+            || lower.contains("/builds/") && lower.contains("gitlab")
     }
 }

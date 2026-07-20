@@ -534,17 +534,82 @@ final class AgentAppViewModelTests: XCTestCase {
         XCTAssertEqual(vm.preferredModelForCurrentProvider(), "gpt-5.6-sol",
                        "Codex with no last-used model defaults to gpt-5.6-sol")
 
-        vm.setModel("gpt-5.4")
-        XCTAssertEqual(store.model(for: .codex), "gpt-5.4")
+        // Fixture snapshots expose gpt-5.5; remember only accepts known/custom ids.
+        vm.setModel("gpt-5.5")
+        XCTAssertEqual(store.model(for: .codex), "gpt-5.5")
 
         // Simulate browsing an older thread whose model differs from last-used.
         vm.model = "gpt-5.2"
         vm.createThread(title: "from last used")
         let id = try XCTUnwrap(vm.selectedThreadId)
         let thread = try XCTUnwrap(try repo.get(id: id))
-        XCTAssertEqual(thread.model, "gpt-5.4",
+        XCTAssertEqual(thread.model, "gpt-5.5",
                        "createThread must not inherit a stale selected-thread model")
-        XCTAssertEqual(vm.model, "gpt-5.4")
+        XCTAssertEqual(vm.model, "gpt-5.5")
+    }
+
+    /// WHY: council SC-ux-1 — auto-rebind must reset model like setProvider,
+    /// not keep gpt-5.6-sol (Codex) after switching to Claude.
+    func test_autoRebind_appliesPreferredModelForNewProvider() async throws {
+        let (vm, _) = try makeVM()
+        let suiteName = "rc2-rebind-model-" + UUID().uuidString
+        let suite = UserDefaults(suiteName: suiteName)!
+        defer { suite.removePersistentDomain(forName: suiteName) }
+        vm.lastModelStore = AgentLastModelStore(defaults: suite)
+        vm.sourceSelectionUserPinned = false
+        vm.provider = .codex
+        vm.providerInstanceId = "codex"
+        vm.model = "gpt-5.6-sol"
+        let missingCodex = AgentProviderSnapshotFactory.snapshot(
+            provider: .codex,
+            models: [AgentModelDescriptor(id: "gpt-5.5", label: "GPT-5.5", provider: .codex)],
+            binaryPath: "",
+            id: "codex-cli"
+        )
+        let claude = AgentProviderSnapshotFactory.snapshot(
+            provider: .claude,
+            models: [
+                AgentModelDescriptor(id: "opus", label: "Opus", provider: .claude),
+                AgentModelDescriptor(id: "sonnet", label: "Sonnet", provider: .claude)
+            ],
+            binaryPath: "/usr/bin/true",
+            authenticated: true,
+            id: "claude-cli"
+        )
+        vm.providerSnapshotLoader = { [missingCodex, claude] }
+        await vm.loadProviderSnapshots()
+        XCTAssertEqual(vm.provider, .claude)
+        XCTAssertEqual(vm.model, "opus",
+                       "auto-rebind must apply preferred Claude model, not keep Codex gpt-5.6-sol")
+        XCTAssertNotEqual(vm.model, "gpt-5.6-sol")
+    }
+
+    /// WHY: explicit Source pick of an unrunnable provider must stay sticky so
+    /// recovery UI is not thrashed by snapshot refresh.
+    func test_userPinnedUnrunnableSource_notReboundOnSnapshotRefresh() async throws {
+        let (vm, _) = try makeVM()
+        let missingCodex = AgentProviderSnapshotFactory.snapshot(
+            provider: .codex,
+            models: [AgentModelDescriptor(id: "gpt-5.5", label: "GPT-5.5", provider: .codex)],
+            binaryPath: "",
+            id: "codex-cli"
+        )
+        let claude = AgentProviderSnapshotFactory.snapshot(
+            provider: .claude,
+            models: [AgentModelDescriptor(id: "opus", label: "Opus", provider: .claude)],
+            binaryPath: "/usr/bin/true",
+            authenticated: true,
+            id: "claude-cli"
+        )
+        vm.providerSnapshotLoader = { [missingCodex, claude] }
+        await vm.loadProviderSnapshots()
+        XCTAssertEqual(vm.provider, .claude)
+        vm.setProviderInstance("codex-cli")
+        XCTAssertTrue(vm.sourceSelectionUserPinned)
+        XCTAssertEqual(vm.provider, .codex)
+        await vm.loadProviderSnapshots()
+        XCTAssertEqual(vm.provider, .codex,
+                       "pinned unrunnable Codex must survive snapshot refresh for recovery")
     }
 
     /// WHY: Airton had Claude + Grok installed, Codex path missing. Empty Agent

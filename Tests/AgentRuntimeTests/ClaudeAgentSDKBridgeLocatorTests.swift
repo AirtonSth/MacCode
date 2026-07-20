@@ -54,4 +54,53 @@ final class ClaudeAgentSDKBridgeLocatorTests: XCTestCase {
         XCTAssertTrue(message.contains("Tried:"))
         XCTAssertTrue(message.contains("/nope/missing.mjs"))
     }
+
+    func test_notFoundMessage_redactsGitlabRunnerPaths() {
+        let ci = "/Users/x/.gitlab-runner/builds/abc/0/proj/Sources/AgentRuntime/ClaudeAgentSDKBridge.mjs"
+        XCTAssertTrue(ClaudeAgentSDKBridgeLocator.shouldRedactFromUserMessage(ci))
+        let message = ClaudeAgentSDKBridgeLocator.notFoundMessage(override: ci)
+        XCTAssertFalse(message.contains(".gitlab-runner/builds/"),
+                       "customer error text must not re-surface CI absolute paths")
+    }
+
+    func test_resolvePath_prefersPackagedResourcesLayout() throws {
+        let tmp = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("rc2-app-resources-\(UUID().uuidString)", isDirectory: true)
+        let resources = tmp
+            .appendingPathComponent("Contents", isDirectory: true)
+            .appendingPathComponent("Resources", isDirectory: true)
+        try FileManager.default.createDirectory(at: resources, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tmp) }
+        let bridge = resources.appendingPathComponent("ClaudeAgentSDKBridge.mjs")
+        try "// packaged bridge\n".write(to: bridge, atomically: true, encoding: .utf8)
+
+        // Fake Bundle.main.resourceURL by using a temporary Bundle if possible.
+        // Bundle(path:) requires a .bundle directory; place a minimal structure.
+        let fakeBundleDir = tmp.appendingPathComponent("Fake.app", isDirectory: true)
+        let fakeResources = fakeBundleDir
+            .appendingPathComponent("Contents", isDirectory: true)
+            .appendingPathComponent("Resources", isDirectory: true)
+        try FileManager.default.createDirectory(at: fakeResources, withIntermediateDirectories: true)
+        let fakeBridge = fakeResources.appendingPathComponent("ClaudeAgentSDKBridge.mjs")
+        try "// resources only\n".write(to: fakeBridge, atomically: true, encoding: .utf8)
+        // Also put Contents/Resources path in candidates via main.bundleURL layout.
+        let candidates = ClaudeAgentSDKBridgeLocator.candidatePaths(
+            override: nil,
+            environment: [:],
+            main: Bundle(path: fakeBundleDir.path) ?? .main
+        )
+        XCTAssertTrue(
+            candidates.contains(where: { $0.hasSuffix("Contents/Resources/ClaudeAgentSDKBridge.mjs") }),
+            "packaged Contents/Resources path must be a candidate"
+        )
+        if let main = Bundle(path: fakeBundleDir.path) {
+            let resolved = ClaudeAgentSDKBridgeLocator.resolvePath(
+                override: nil,
+                environment: [:],
+                main: main
+            )
+            XCTAssertEqual(resolved, fakeBridge.path,
+                           "when only packaged Resources is readable via Bundle, it must win")
+        }
+    }
 }

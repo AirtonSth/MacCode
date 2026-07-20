@@ -143,6 +143,10 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// Last model the user chose per provider (new threads + provider switches).
     /// Inject a suite-backed store in tests; production uses the shared defaults.
     public var lastModelStore: AgentLastModelStore = .shared
+    /// When true, unlocked snapshot refresh must not auto-rebind away from the
+    /// user's explicit Source choice (including an unrunnable row for recovery).
+    /// Implicit default selection stays unpinned so missing Codex can rebind.
+    public var sourceSelectionUserPinned: Bool = false
     @Published public var availableModels: [AgentModelDescriptor] = []
     @Published public var providerSnapshots: [AgentProviderSnapshot] = []
     @Published public var permissionMode: AgentPermissionMode = .supervised
@@ -1879,21 +1883,37 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
 
     private func applyProviderSnapshots(_ snapshots: [AgentProviderSnapshot]) {
         providerSnapshots = snapshots
+        let previousProvider = provider
+        let previousInstanceId = providerInstanceId
         // No provider is mandatory. Default is Codex for historical reasons,
         // but a missing Codex CLI must not trap the empty Agent App: rebind to
         // the first runnable Claude/Grok (or other) snapshot when unlocked.
         // After the first real message the source stays fixed (providerLocked).
-        if !providerLocked,
-           let preferred = AgentProviderRunnableSelection.resolve(
-            snapshots: snapshots,
-            preferredProvider: provider,
-            preferredInstanceId: providerInstanceId
-           ) {
-            providerInstanceId = preferred.id
-            provider = preferred.provider
+        // Explicit Source picks (sourceSelectionUserPinned) stay sticky so the
+        // user can inspect recovery on an unrunnable row without thrash.
+        if !providerLocked {
+            if sourceSelectionUserPinned {
+                if snapshots.first(where: { $0.id == providerInstanceId }) == nil {
+                    providerInstanceId = snapshots.first(where: { $0.provider == provider && $0.enabled })?.id
+                        ?? snapshots.first(where: { $0.provider == provider })?.id
+                        ?? providerInstanceId
+                }
+            } else if let preferred = AgentProviderRunnableSelection.resolve(
+                snapshots: snapshots,
+                preferredProvider: provider,
+                preferredInstanceId: providerInstanceId
+            ) {
+                providerInstanceId = preferred.id
+                provider = preferred.provider
+            } else if snapshots.first(where: { $0.id == providerInstanceId }) == nil {
+                providerInstanceId = snapshots.first(where: { $0.provider == provider && $0.enabled })?.id
+                    ?? snapshots.first(where: { $0.provider == provider })?.id
+                    ?? snapshots.first(where: \.enabled)?.id
+                    ?? snapshots.first?.id
+                    ?? provider.rawValue
+            }
         } else if snapshots.first(where: { $0.id == providerInstanceId }) == nil {
-            // Locked thread / no runnable rematch: still map stale ids
-            // ("codex" → "codex-cli") so the Source checkmark is correct.
+            // Locked thread: still map stale ids ("codex" → "codex-cli").
             providerInstanceId = snapshots.first(where: { $0.provider == provider && $0.enabled })?.id
                 ?? snapshots.first(where: { $0.provider == provider })?.id
                 ?? snapshots.first(where: \.enabled)?.id
@@ -1913,7 +1933,13 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 availableModelsAreFallback = current.models.map(\.id) == availableModels.map(\.id)
             }
             availableModels = current.models
-            if !modelSelectionIsValid(model, in: current.models) {
+            let sourceChanged = current.provider != previousProvider
+                || current.id != previousInstanceId
+            if sourceChanged {
+                // SC-ux-1: auto-rebind must reset model like setProvider — do not
+                // keep a Codex id (e.g. gpt-5.6-sol) after switching to Claude.
+                applyPreferredModelForCurrentProvider(availableModels: current.models)
+            } else if !modelSelectionIsValid(model, in: current.models) {
                 // F9: never silently swap a pinned model for the snapshot's
                 // first alias — a fallback snapshot may simply omit a
                 // live-discovered model. Fill only an empty selection (post
@@ -2346,6 +2372,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     public func setProviderInstance(_ id: String) {
         guard !executionLocked else { return }
         guard let snapshot = providerSnapshots.first(where: { $0.id == id }) else { return }
+        sourceSelectionUserPinned = true
         providerInstanceId = snapshot.id
         provider = snapshot.provider
         // F10/F33: same flag coherence as applyProviderSnapshots — snapshot
@@ -2364,6 +2391,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     public func setProvider(_ newProvider: AgentProvider) {
         guard !executionLocked else { return }
         if let selectedThreadId { persistComposerDraft(for: selectedThreadId) }
+        sourceSelectionUserPinned = true
         provider = newProvider
         // Prefer a real snapshot id when snapshots are loaded so Source stays
         // checkmarked after a Source switch (ids are "codex-cli", not "codex").
@@ -2642,7 +2670,17 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     }
 
     public func rememberCurrentModel() {
-        lastModelStore.remember(model: model, for: provider)
+        let trimmed = model.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        // Never poison last-model with a foreign provider id after rebind.
+        if modelIsFromAnotherProvider(trimmed) { return }
+        let options = modelOptionsForSelectedProvider
+        let known = options.contains(where: { $0.id == trimmed })
+            || (customModelsByProvider[provider] ?? []).contains(trimmed)
+        let allowCustom = options.contains(where: \.supportsCustomModel)
+            || supportsCustomModelForSelectedProvider
+        guard known || allowCustom else { return }
+        lastModelStore.remember(model: trimmed, for: provider)
     }
 
     public func preparePullRequestThread() async {

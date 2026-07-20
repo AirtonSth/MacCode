@@ -101,6 +101,10 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
     private let maxReadableEvents: Int
     private let interruptGracePeriod: TimeInterval
     private let sessionMutator: ClaudeSDKSessionMutating?
+    /// Single-flight first-run `npm install` per cache directory + package spec
+    /// so concurrent Claude starts cannot interleave node_modules.
+    private static let sdkInstallTasksLock = NSLock()
+    private static var sdkInstallTasks: [String: Task<Void, Error>] = [:]
     private let lock = NSLock()
     private let cancellationQueue = DispatchQueue(
         label: "io.remotecode.agent.claude-sdk-cancellation",
@@ -952,6 +956,40 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
     private func installSDKPackage(in directory: URL,
                                    packageSpec: String,
                                    onProgress: (@Sendable (AgentRunEvent) -> Void)? = nil) async throws {
+        let key = directory.standardizedFileURL.path + "\0" + packageSpec
+        let task: Task<Void, Error> = {
+            Self.sdkInstallTasksLock.lock()
+            if let existing = Self.sdkInstallTasks[key] {
+                Self.sdkInstallTasksLock.unlock()
+                return existing
+            }
+            let created = Task {
+                defer {
+                    Self.sdkInstallTasksLock.lock()
+                    Self.sdkInstallTasks[key] = nil
+                    Self.sdkInstallTasksLock.unlock()
+                }
+                try await self.performSDKPackageInstall(
+                    in: directory,
+                    packageSpec: packageSpec,
+                    onProgress: onProgress
+                )
+            }
+            Self.sdkInstallTasks[key] = created
+            Self.sdkInstallTasksLock.unlock()
+            return created
+        }()
+        try await task.value
+    }
+
+    private func performSDKPackageInstall(in directory: URL,
+                                          packageSpec: String,
+                                          onProgress: (@Sendable (AgentRunEvent) -> Void)?) async throws {
+        // Re-check after waiting for another installer's flight.
+        let packageJSON = directory.appendingPathComponent("node_modules/@anthropic-ai/claude-agent-sdk/package.json")
+        if Self.installedSDKPackage(at: packageJSON, matches: packageSpec) {
+            return
+        }
         let (process, outputPipe, outputBuffer) = try Self.makeNpmInstallProcess(in: directory, packageSpec: packageSpec, onProgress: onProgress)
         // Wait for termination via a continuation; the cooperative-pool thread is NOT blocked.
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
@@ -1022,7 +1060,9 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
         }
         let process = Process()
         process.executableURL = URL(fileURLWithPath: npm)
-        process.arguments = ["install", "--no-fund", "--no-audit", packageSpec]
+        // --ignore-scripts: do not run package lifecycle scripts from the
+        // Application Support cache (same-user / PATH npm supply-chain residual).
+        process.arguments = ["install", "--no-fund", "--no-audit", "--ignore-scripts", packageSpec]
         process.currentDirectoryURL = directory
         process.environment = CodexRunner.processEnvironment(overrides: [:])
         let outputPipe = Pipe()
