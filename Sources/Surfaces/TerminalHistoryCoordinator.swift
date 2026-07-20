@@ -701,6 +701,10 @@ final class TerminalHistoryCoordinator {
     private var prepareFailureReported = false
     private var replayPersistedBeforeChunkIndex: Int64?
     private var needsReplay = false
+    /// When true, prepare completion does not auto-start disk replay. Used for
+    /// restored terminals that are still hidden so cold launch does not pay
+    /// N× history reads/Ghostty resets until the surface is demanded.
+    private var deferReplayUntilRequested = false
     private var replayLiveData = Data()
     private var replayLiveOverflowed = false
     private var retryMustPreserveLiveView = false
@@ -777,9 +781,16 @@ final class TerminalHistoryCoordinator {
         self.queue = DispatchQueue(label: "rc2.terminal.history", qos: .utility)
     }
 
-    func prepare(restored: Bool) {
+    /// - Parameters:
+    ///   - restored: when true, persisted scrollback should be replayed once ready.
+    ///   - deferReplay: when true with `restored`, do not auto-start `replayIfNeeded`
+    ///     on prepare completion. Call `requestReplayIfNeeded()` on visibility or
+    ///     another correctness demand (snapshot/read). Live bytes are still captured
+    ///     while replay is pending.
+    func prepare(restored: Bool, deferReplay: Bool = false) {
         guard case .idle = preparationState else { return }
         needsReplay = restored
+        deferReplayUntilRequested = restored && deferReplay
         guard repository != nil, prepareHistory != nil else {
             preparationState = .ready(nextChunkIndex: 1)
             nextChunkIndex = 1
@@ -790,6 +801,18 @@ final class TerminalHistoryCoordinator {
         prepareStartedAt = Date()
         schedulePrepareAttempt(0, delay: 0)
     }
+
+    /// Clears cold-start replay deferral and starts replay when preparation is ready.
+    func requestReplayIfNeeded() {
+        deferReplayUntilRequested = false
+        replayIfNeeded()
+    }
+
+    /// True while restored history is intentionally held until a demand path.
+    var isReplayDeferredForTesting: Bool { deferReplayUntilRequested }
+
+    /// Whether a demand path must call `requestReplayIfNeeded` before replay runs.
+    var isReplayDeferred: Bool { deferReplayUntilRequested }
 
     private func schedulePrepareAttempt(_ attempt: Int, delay: TimeInterval) {
         guard let prepareHistory else { return }
@@ -904,7 +927,7 @@ final class TerminalHistoryCoordinator {
                 cancelRetriesOnCompletion: finalFlushScheduled
             )
         }
-        if !finalFlushScheduled {
+        if !finalFlushScheduled, !deferReplayUntilRequested {
             replayIfNeeded()
         }
         if recovered {
@@ -2240,17 +2263,28 @@ final class TerminalHistoryCoordinator {
         guard (needsReplay || replayInFlight), !data.isEmpty else { return }
         guard !replayLiveOverflowed else { return }
         let remaining = max(0, maxBytes - replayLiveData.count)
-        if remaining >= data.count {
+        // Safety: if cold-start deferred replay and the live buffer is about to
+        // overflow, force demand-start so persisted+live can still merge before
+        // the live-cap partial path drops ordering.
+        if remaining < data.count, deferReplayUntilRequested {
+            deferReplayUntilRequested = false
+            replayIfNeeded()
+        }
+        let remainingAfterDemand = max(0, maxBytes - replayLiveData.count)
+        if remainingAfterDemand >= data.count {
             replayLiveData.append(data)
         } else {
-            if remaining > 0 {
-                replayLiveData.append(data.prefix(remaining))
+            if remainingAfterDemand > 0 {
+                replayLiveData.append(data.prefix(remainingAfterDemand))
             }
             replayLiveOverflowed = true
         }
     }
 
     func replayIfNeeded() {
+        // Cold-start deferral: ignore passive calls (prepare completion, window
+        // attach) until `requestReplayIfNeeded()` clears the flag.
+        guard !deferReplayUntilRequested else { return }
         guard case .ready = preparationState,
               needsReplay,
               !replayInFlight,

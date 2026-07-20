@@ -359,7 +359,10 @@ public final class AppContext {
         ) {
             reconcileManagedDistillSkills(tokenSaverEnabled: SettingsStore(db: db).load().tokenSaverEnabled)
         }
-        startTokenSaverDistillServiceIfEligible()
+        // PERF (cold launch): do not start Distill/MLX during AppContext bootstrap.
+        // Token Saver demand paths call `startTokenSaverDistillServiceIfEligible()`
+        // (compress kick, SR1 wait helper, settings UI). Fail-open preserves the
+        // original provider input when the sidecar is not ready yet.
 
         // GAP-7: stream agent run lifecycle + timeline to the network
         // event bus so the iOS mirror renders agent output in real time
@@ -1322,6 +1325,12 @@ public final class AppContext {
             return candidate
         }
 
+        // Demand-start Distill without blocking this turn on MLX warmup. Kick the
+        // sidecar for later turns / concurrent SR1; if not already `.running`,
+        // fail open to deterministic/original input (Token Saver fail-open).
+        if semanticObservation.allowed {
+            startTokenSaverDistillServiceIfEligible()
+        }
         guard semanticObservation.allowed,
               let client = currentDistillClient() else {
             if !semanticObservation.allowed {
