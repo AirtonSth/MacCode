@@ -700,6 +700,15 @@ public final class TerminalSurface: NSObject, Surface, TerminalHistoryCoordinato
         cols: TerminalViewportGeometry.fallbackSize.cols
     )
     private var terminalSize = TerminalViewportGeometry.fallbackSize
+    /// Last geometry actually pushed to the live PTY via `TIOCSWINSZ`.
+    /// Distinct from `terminalSize` so Ghostty/ANSI can track intermediate
+    /// AppKit frames while we freeze the shell's idea of COLUMNS/LINES during
+    /// hide/park/layout thrash (workspace switch garbling).
+    private var lastCommittedPTYSize: TerminalViewportSize?
+    private var pendingPTYWinsize: TerminalViewportSize?
+    private var ptyWinsizeDebounceWorkItem: DispatchWorkItem?
+    private var ptyWinsizeCommitCountForTestingValue = 0
+    private static let ptyWinsizeDebounceInterval: TimeInterval = 0.05
     private var savedSSHPassword: String?
     private var didSendSavedSSHPassword = false
     private var passwordPromptCount = 0
@@ -909,6 +918,45 @@ public final class TerminalSurface: NSObject, Surface, TerminalHistoryCoordinato
 
     var readerAllowsRenderForTesting: Bool {
         readerAllowsRender
+    }
+
+    /// Whether Ghostty still has an owner input callback (PTY write path live).
+    var ghosttyInputHandlerPresentForTesting: Bool {
+        ghosttyView.hasInputDataHandlerForTesting
+    }
+
+    /// Drive the history-replay surface recreate path without a disk restore.
+    func replayResetSurfaceOutputForTesting(_ data: Data) {
+        ghosttyView.resetSurfaceOutput(data)
+    }
+
+    /// Capture Ghostty→owner input writes (tests only).
+    func replaceInputCaptureForTesting(_ handler: @escaping (Data) -> Void) {
+        ghosttyView.onInputData = handler
+    }
+
+    /// Simulate Ghostty's io_write callback after surface recreate.
+    func injectGhosttyInputWriteForTesting(_ data: Data) {
+        ghosttyView.writeInputData(data)
+    }
+
+    var ptyWinsizeCommitCountForTesting: Int {
+        ptyWinsizeCommitCountForTestingValue
+    }
+
+    var lastCommittedPTYSizeForTesting: TerminalViewportSize? {
+        lastCommittedPTYSize
+    }
+
+    /// Test seam: drive the same size path Ghostty uses on layout/reattach.
+    /// `force` mirrors the spawn one-shot path (commit even if not yet visible).
+    func applyViewportSizeForTesting(_ size: TerminalViewportSize, force: Bool = false) {
+        applyTerminalSize(size, sendToPTY: true, force: force)
+    }
+
+    /// Flush a pending debounced PTY winsize commit immediately (tests).
+    func flushPendingPTYWinsizeForTesting() {
+        flushPendingPTYWinsize()
     }
 
     /// Inject bytes on the live PTY reader path so tests can exercise hidden
@@ -1396,7 +1444,9 @@ public final class TerminalSurface: NSObject, Surface, TerminalHistoryCoordinato
         // events are queued, this resize must be applied AFTER them, otherwise the
         // already-received bytes would be reflowed at the wrong dimensions. Record
         // it in the same ordered buffer. When nothing is pending, apply now
-        // (current behavior, safe). gh/PTY winsize stay immediate either way.
+        // (current behavior, safe). Ghostty/ANSI track size immediately; PTY
+        // winsize is gated separately so hide/park/layout thrash cannot SIGWINCH
+        // the shell into prompt-spam garbling.
         if pendingRendererEvents.isEmpty {
             renderer.resize(rows: size.rows, cols: size.cols)
         } else {
@@ -1410,9 +1460,79 @@ public final class TerminalSurface: NSObject, Surface, TerminalHistoryCoordinato
         }
         rendererMutationCount &+= 1
         outputBus.emitGeometry(descriptor.id, rows: size.rows, cols: size.cols)
-        if sendToPTY, masterFD >= 0 {
-            _ = rc2_set_winsize(masterFD, Int32(size.rows), Int32(size.cols))
+        guard sendToPTY else { return }
+        if force {
+            // Spawn / explicit one-shot paths (initial geometry) may commit even
+            // when the surface is not yet registry-visible.
+            commitPTYWinsize(size)
+            return
         }
+        let parked = view.window != nil && view.window === parkingWindow
+        let hasUsableBounds = view.bounds.width > 1 && view.bounds.height > 1
+        guard Self.shouldPropagateInteractiveWinsize(
+            isVisible: isVisible,
+            parked: parked,
+            hasUsableBounds: hasUsableBounds
+        ) else {
+            // Drop any in-flight interactive commit while hidden/parked so a
+            // stale intermediate size cannot land after didBecomeHidden.
+            cancelPendingPTYWinsize()
+            return
+        }
+        scheduleDebouncedPTYWinsize(size)
+    }
+
+    /// Whether an interactive (layout/reattach-driven) geometry change may push
+    /// `TIOCSWINSZ` to the live PTY. Frozen while hidden or parked so workspace
+    /// switch teardown does not SIGWINCH-storm the shell into prompt garbling.
+    nonisolated static func shouldPropagateInteractiveWinsize(
+        isVisible: Bool,
+        parked: Bool,
+        hasUsableBounds: Bool
+    ) -> Bool {
+        isVisible && !parked && hasUsableBounds
+    }
+
+    private func scheduleDebouncedPTYWinsize(_ size: TerminalViewportSize) {
+        pendingPTYWinsize = size
+        ptyWinsizeDebounceWorkItem?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            self?.flushPendingPTYWinsize()
+        }
+        ptyWinsizeDebounceWorkItem = work
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + Self.ptyWinsizeDebounceInterval,
+            execute: work
+        )
+    }
+
+    private func cancelPendingPTYWinsize() {
+        ptyWinsizeDebounceWorkItem?.cancel()
+        ptyWinsizeDebounceWorkItem = nil
+        pendingPTYWinsize = nil
+    }
+
+    private func flushPendingPTYWinsize() {
+        ptyWinsizeDebounceWorkItem = nil
+        guard let size = pendingPTYWinsize else { return }
+        pendingPTYWinsize = nil
+        let parked = view.window != nil && view.window === parkingWindow
+        let hasUsableBounds = view.bounds.width > 1 && view.bounds.height > 1
+        guard Self.shouldPropagateInteractiveWinsize(
+            isVisible: isVisible,
+            parked: parked,
+            hasUsableBounds: hasUsableBounds
+        ) else { return }
+        commitPTYWinsize(size)
+    }
+
+    private func commitPTYWinsize(_ size: TerminalViewportSize) {
+        guard lastCommittedPTYSize != size else { return }
+        lastCommittedPTYSize = size
+        ptyWinsizeCommitCountForTestingValue &+= 1
+        cancelPendingPTYWinsize()
+        guard masterFD >= 0 else { return }
+        _ = rc2_set_winsize(masterFD, Int32(size.rows), Int32(size.cols))
     }
 
     private func startReader() {
@@ -1744,6 +1864,9 @@ public final class TerminalSurface: NSObject, Surface, TerminalHistoryCoordinato
             closeParkingWindowIfNeeded()
             if isVisible {
                 ghosttyView.refreshSurfaceOnly()
+                // Reattach after parking often leaves AppKit firstResponder on the
+                // window chrome; without a force repair, keys never hit Ghostty.
+                repairTerminalFocus(reason: "window_reattach", force: true)
             }
             replayPersistedHistoryIfNeeded()
             return
@@ -2629,6 +2752,13 @@ public final class TerminalSurface: NSObject, Surface, TerminalHistoryCoordinato
         // (UX-013).
         ghosttyView.forceRefresh()
         scheduleVisibleRefresh()
+        // Commit the settled post-reveal geometry once (debounced through layout).
+        // Hidden/park size thrash never reached the PTY; the shell gets a single
+        // SIGWINCH only if the visible size actually differs from the last commit.
+        scheduleDebouncedPTYWinsize(terminalSize)
+        // Workspace switch rebuild races focus repair ahead of reattach. Re-drive
+        // firstResponder after reveal so keyDown reaches Ghostty again.
+        repairTerminalFocus(reason: "became_visible", force: true)
     }
 
     /// Replays bytes buffered while `isVisible == false` into the ANSI mirror
@@ -2680,6 +2810,9 @@ public final class TerminalSurface: NSObject, Surface, TerminalHistoryCoordinato
         stuckHiddenHealScheduled = false
         isDrainingHiddenBacklog = false
         hiddenBacklogDrainDeadline = nil
+        // Drop any debounced interactive winsize so park/teardown frames cannot
+        // SIGWINCH the shell after the surface is already hidden.
+        cancelPendingPTYWinsize()
         // Fresh hidden period: clear legacy heal buffer and recoverability budget.
         hiddenRendererBuffer = Data()
         hiddenRendererBufferOverflowed = false
@@ -2871,6 +3004,7 @@ public final class TerminalSurface: NSObject, Surface, TerminalHistoryCoordinato
             }
         }
         isClosing = true
+        cancelPendingPTYWinsize()
         let deferredHistoryState = TerminalDeferredTerminationState()
         let readerClosingSnapshot = readerHandoffState.beginClosing {
             if reason == .appTermination {

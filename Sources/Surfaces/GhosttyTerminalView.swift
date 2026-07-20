@@ -989,7 +989,7 @@ final class GhosttyTerminalView: NSView {
         mouseTrackingArea = area
     }
 
-    func closeSurface(silent: Bool = false) {
+    func closeSurface(silent: Bool = false, releaseHostCallbacks: Bool = true) {
         // Audit #4 watch: closing a surface whose view is still mounted on a window
         // is the exact precondition for the permanent-freeze bug. Log loudly so the
         // (unproven) wrong-instance-close trigger is observable in the field. `silent`
@@ -1010,7 +1010,14 @@ final class GhosttyTerminalView: NSView {
         // Drop host-side holds that otherwise survive until late view deinit
         // (owner callbacks, Metal drawable presentation state). Ghostty scrollback
         // is freed above; this path only clears Swift/AppKit residual state.
-        releaseHostResourcesAfterClose()
+        // `resetSurfaceOutput` must keep owner callbacks — wiping them makes the
+        // terminal look alive but silently drop every keystroke (PTY never gets
+        // ghostty io_write → writeToPTY).
+        if releaseHostCallbacks {
+            releaseHostResourcesAfterClose()
+        } else {
+            clearDrawablePresentationState()
+        }
     }
 
     /// Clears owner callbacks and drawable presentation state after the C surface
@@ -1023,6 +1030,10 @@ final class GhosttyTerminalView: NSView {
         onPlainTextDragNeedsConfirm = nil
         onCmdClickFilePath = nil
         ownerIsClosing = { true }
+        clearDrawablePresentationState()
+    }
+
+    private func clearDrawablePresentationState() {
         pendingOutput.removeAll(keepingCapacity: false)
         pendingOutputHead = 0
         scheduledOutputFlushGeneration = nil
@@ -1033,7 +1044,9 @@ final class GhosttyTerminalView: NSView {
     }
 
     func resetSurfaceOutput(_ data: Data) {
-        closeSurface(silent: true)   // legitimate re-create — don't trip the #4 watch
+        // Recreate the Ghostty C surface only. Keep owner callbacks (input/size/
+        // title/paste) so history replay never permanently kills keyboard input.
+        closeSurface(silent: true, releaseHostCallbacks: false)
         // Intentional re-creation: allow ensureSurface() to build a fresh surface.
         surfaceClosed = false
         processOutput(data)
@@ -1045,6 +1058,9 @@ final class GhosttyTerminalView: NSView {
             ensureSurface()
         }
     }
+
+    /// Test seam: whether the owner still receives Ghostty→PTY input writes.
+    var hasInputDataHandlerForTesting: Bool { onInputData != nil }
 
     func processOutput(_ data: Data, render: Bool = true) {
         guard !data.isEmpty else { return }
@@ -1613,6 +1629,11 @@ final class GhosttyTerminalView: NSView {
         // focused and on screen, so re-derive occlusion before the input is handled —
         // otherwise a latched-off occlusion swallows the echo and typing looks dead.
         syncOcclusion()
+        // Ghostty can ignore surface_key while focus is latched off after park/
+        // reattach (firstResponder repair races layout). A keystroke is proof the
+        // user intends this surface — force focus before dispatching the key.
+        ghostty_surface_set_focus(surface, true)
+        reassertDisplayID()
         if event.modifierFlags.contains(.command) {
             switch event.charactersIgnoringModifiers {
             case "c":
