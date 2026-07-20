@@ -479,6 +479,47 @@ final class TokenSaverAppContextTests: XCTestCase {
                       "partial refresh without Claude must zero Claude's frozen weekly % while updating the live providers")
     }
 
+    /// WHY: Grok frequently painted Used 0% after Codex-only partial refreshes
+    /// even though the SuperGrok weekly window was still open. A flaky billing
+    /// log miss must keep the last live percent until the window expires.
+    func test_appContextKeepsUnexpiredGrokPercentWhenMissingFromPartialRefresh() async throws {
+        let appSupport = NSTemporaryDirectory() + "RC2TokenSaverKeepGrok-" + UUID().uuidString
+        let store = TokenSaverUsageStore(appSupportDirectory: URL(fileURLWithPath: appSupport))
+        try FileManager.default.createDirectory(
+            at: URL(fileURLWithPath: appSupport).appendingPathComponent("TokenSaver", isDirectory: true),
+            withIntermediateDirectories: true
+        )
+        let futureReset = Date().addingTimeInterval(3 * 24 * 3600)
+        _ = try store.recordAccountUsage(
+            provider: .grok,
+            weeklyUsedPercent: 65,
+            weeklyWindowDurationMinutes: 10_080,
+            weeklyResetsAt: futureReset
+        )
+        _ = try store.recordAccountUsage(provider: .codex, weeklyUsedPercent: 10, weeklyWindowDurationMinutes: 10_080)
+
+        let refresher = FakeTokenSaverAccountUsageRefresher(response: [
+            AssistantAccountUsage(provider: .codex, weeklyUsedPercent: 71, weeklyWindowDurationMinutes: 10_080)
+        ])
+        let context = try AppContext(
+            channel: .debug,
+            appSupportOverride: appSupport,
+            tokenSaverAccountUsageRefresher: refresher
+        )
+        savePrivateSession(in: context)
+
+        context.refreshTokenSaverAccountUsage(reason: "test")
+
+        let didKeep = await waitUntil {
+            let snapshot = TokenSaverUsageStore(appSupportDirectory: context.appSupportDirectory).load()
+            let grok = snapshot.providers.first { $0.provider == .grok }
+            let codex = snapshot.providers.first { $0.provider == .codex }
+            return grok?.weeklyUsedPercent == 65 && codex?.weeklyUsedPercent == 71
+        }
+        XCTAssertTrue(didKeep,
+                      "partial refresh that omits Grok must keep Grok's unexpired weekly % instead of painting 0%")
+    }
+
     func test_appContextSkipsTokenSaverAccountUsageRefreshWhenNotSignedIn() async throws {
         let appSupport = NSTemporaryDirectory() + "RC2TokenSaverNoAccountUsage-" + UUID().uuidString
         let refresher = FakeTokenSaverAccountUsageRefresher(response: [

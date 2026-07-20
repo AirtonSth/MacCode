@@ -65,6 +65,52 @@ final class TokenSaverUsageSnapshotTests: XCTestCase {
         )
     }
 
+    /// WHY: Grok frequently showed 0% after a Codex-only partial refresh even
+    /// though its weekly credit window was still open (billing log scan missed
+    /// the newest `creditUsagePercent` line). Unexpired windows must survive.
+    func test_providersToClearAfterPartialRefresh_keepsUnexpiredGrokWindow() {
+        let now = Date(timeIntervalSince1970: 2_000_000)
+        let existing = [
+            TokenSaverProviderUsage(
+                provider: .grok,
+                weeklyUsedPercent: 65,
+                weeklyResetsAt: Date(timeIntervalSince1970: 2_500_000)
+            ),
+            TokenSaverProviderUsage(
+                provider: .claude,
+                weeklyUsedPercent: 45,
+                weeklyResetsAt: nil
+            )
+        ]
+        let toClear = TokenSaverUsageStore.providersToClearAfterPartialAccountUsageRefresh(
+            returned: [.codex],
+            existing: existing,
+            now: now
+        )
+        XCTAssertFalse(toClear.contains(.grok),
+                       "Grok with an unexpired weeklyResetsAt must not be zeroed by a flaky probe miss")
+        XCTAssertTrue(toClear.contains(.claude),
+                      "Claude without an unexpired window still clears so frozen 45% cannot stick forever")
+    }
+
+    func test_providersToClearAfterPartialRefresh_clearsExpiredGrokWindow() {
+        let now = Date(timeIntervalSince1970: 2_000_000)
+        let existing = [
+            TokenSaverProviderUsage(
+                provider: .grok,
+                weeklyUsedPercent: 65,
+                weeklyResetsAt: Date(timeIntervalSince1970: 1_500_000)
+            )
+        ]
+        let toClear = TokenSaverUsageStore.providersToClearAfterPartialAccountUsageRefresh(
+            returned: [.codex],
+            existing: existing,
+            now: now
+        )
+        XCTAssertTrue(toClear.contains(.grok),
+                      "expired Grok windows may clear; effective % already reads 0")
+    }
+
     func test_clearAccountUsagePercentages_zerosWeeklyButKeepsSavings() throws {
         let dir = FileManager.default.temporaryDirectory
             .appendingPathComponent("ts-clear-\(UUID().uuidString)", isDirectory: true)

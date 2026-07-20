@@ -98,6 +98,40 @@ final class TokenSaverAccountUsageRefresherTests: XCTestCase {
                        "must use the newest billing line so the purple ring matches live Grok credits")
     }
 
+    /// WHY: production `~/.grok/logs/unified.jsonl` put 800KB+ of non-billing
+    /// traffic between credit snapshots. The old 512KB tail window returned nil,
+    /// partial refresh cleared Grok, and Token Saver showed Used 0% despite real
+    /// SuperGrok usage (and non-zero Saved tokens for Grok).
+    func test_grokFromBillingLogFile_findsPercentBeyondFormer512KBWindow() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("rc-grok-billing-gap-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let log = dir.appendingPathComponent("unified.jsonl")
+
+        let billing = #"{"msg":"billing: fetched credits config","ctx":{"config":{"creditUsagePercent":65.0,"billingPeriodEnd":"2026-07-22T20:46:41.975270+00:00"}}}"# + "\n"
+        // ~700 KiB of noise after the only billing line — larger than the old
+        // 512 KiB default, smaller than the new 4 MiB default.
+        let noiseLine = #"{"msg":"tool_result","ctx":{"output":""}}"# + String(repeating: "x", count: 200) + "\n"
+        var body = billing
+        while body.utf8.count < 700 * 1024 {
+            body += noiseLine
+        }
+        try body.write(to: log, atomically: true, encoding: .utf8)
+
+        let withLegacyWindow = AssistantAccountUsageParser.grokFromBillingLogFile(
+            at: log,
+            maxBytes: 512 * 1024
+        )
+        XCTAssertNil(withLegacyWindow,
+                     "regression fixture: 512KB window must miss a billing line buried under 700KB of noise")
+
+        let withDefaultWindow = AssistantAccountUsageParser.grokFromBillingLogFile(at: log)
+        XCTAssertEqual(withDefaultWindow?.provider, .grok)
+        XCTAssertEqual(withDefaultWindow?.weeklyUsedPercent, 65,
+                       "default scan window must still find creditUsagePercent past the old 512KB limit")
+    }
+
     func test_claudeUsageScreenParsesInteractiveUsageDialog() {
         let output = """
         Settings  Status Config Usage Stats

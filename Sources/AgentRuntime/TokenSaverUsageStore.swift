@@ -281,6 +281,31 @@ public final class TokenSaverUsageStore: @unchecked Sendable {
         return managed.filter { !present.contains($0) }
     }
 
+    /// Subset of missing providers that should actually have their cached weekly %
+    /// cleared after a partial account-usage refresh.
+    ///
+    /// WHY: a flaky probe (or Grok billing-log window miss) must not wipe a still-
+    /// valid weekly window. Grok often sits at a real 40–70% while the log scan
+    /// briefly returns nil; clearing it painted the purple ring as 0%. Only clear
+    /// when there is no unexpired `weeklyResetsAt` protecting the last probe.
+    /// Expired windows already read as 0% via `effectiveWeeklyUsedPercent`.
+    public static func providersToClearAfterPartialAccountUsageRefresh(
+        returned: [AgentProvider],
+        existing: [TokenSaverProviderUsage],
+        now: Date = Date(),
+        managed: [AgentProvider] = [.claude, .codex, .grok]
+    ) -> [AgentProvider] {
+        let missing = providersMissingFromAccountUsageRefresh(returned: returned, managed: managed)
+        let byProvider = Dictionary(uniqueKeysWithValues: existing.map { ($0.provider, $0) })
+        return missing.filter { provider in
+            guard let usage = byProvider[provider] else { return true }
+            if let resetsAt = usage.weeklyResetsAt, resetsAt > now {
+                return false
+            }
+            return true
+        }
+    }
+
     /// Clears live rate-limit percents for a provider while keeping Token Saver
     /// savings counters. Used when a refresh no longer sees the provider (signed
     /// out / inactive) so the ring drops to 0% instead of locking on last known %.

@@ -861,16 +861,22 @@ public final class AppContext {
                     EventBus.shared.publish(kind: "agent.account.usage",
                         payload: .object(Self.accountUsagePayload(reason: reason, usage: usage)))
                 }
-                // Partial success: providers that did not answer are inactive /
-                // signed-out / unreachable. Clear their frozen weekly % so the
-                // Token Saver card does not stay locked (Claude 45% forever).
+                // Partial success: providers that did not answer *and* have no
+                // unexpired weekly window are inactive / signed-out / unreachable.
+                // Clear their frozen weekly % so Claude does not stay locked at
+                // 45% forever. Do not clear providers still inside a live weekly
+                // window (especially Grok): a flaky billing-log scan must not
+                // paint the purple ring as 0% while credits are mid-window.
                 // Full empty/timeout leaves the cache alone — that is noise, not
                 // proof every provider is inactive.
                 if !usages.isEmpty {
-                    let missing = TokenSaverUsageStore.providersMissingFromAccountUsageRefresh(
-                        returned: usages.map(\.provider)
+                    let store = TokenSaverUsageStore(appSupportDirectory: self.appSupportDirectory)
+                    let existing = store.load().providers
+                    let toClear = TokenSaverUsageStore.providersToClearAfterPartialAccountUsageRefresh(
+                        returned: usages.map(\.provider),
+                        existing: existing
                     )
-                    for provider in missing {
+                    for provider in toClear {
                         self.clearTokenSaverAccountUsagePercentages(provider)
                     }
                 }
