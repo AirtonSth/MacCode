@@ -376,11 +376,39 @@ stable_macos_arm64_dmg:
       scripts/package-dmg.sh
       hdiutil verify "dist/$ASSET_NAME"
 
-      xcrun notarytool submit "dist/$ASSET_NAME" \
+      NOTARY_SUBMIT_JSON="$(mktemp)"
+      if ! xcrun notarytool submit "dist/$ASSET_NAME" \
         --apple-id "$NOTARY_APPLE_ID" \
         --team-id "$NOTARY_TEAM_ID" \
         --password "$NOTARY_PASSWORD" \
-        --wait
+        --wait \
+        --output-format json >"$NOTARY_SUBMIT_JSON"
+      then
+        echo "notarytool submit failed; raw output:" >&2
+        cat "$NOTARY_SUBMIT_JSON" >&2 || true
+        NOTARY_ID="$(jq -r '.id // empty' "$NOTARY_SUBMIT_JSON" 2>/dev/null || true)"
+        if [ -n "$NOTARY_ID" ]; then
+          xcrun notarytool log "$NOTARY_ID" \
+            --apple-id "$NOTARY_APPLE_ID" \
+            --team-id "$NOTARY_TEAM_ID" \
+            --password "$NOTARY_PASSWORD" >&2 || true
+        fi
+        exit 1
+      fi
+      NOTARY_STATUS="$(jq -r '.status // empty' "$NOTARY_SUBMIT_JSON" 2>/dev/null || true)"
+      NOTARY_ID="$(jq -r '.id // empty' "$NOTARY_SUBMIT_JSON" 2>/dev/null || true)"
+      echo "notarytool status=${NOTARY_STATUS:-unknown} id=${NOTARY_ID:-unknown}"
+      if [ "$NOTARY_STATUS" != "Accepted" ]; then
+        echo "notarization did not accept the DMG (status=${NOTARY_STATUS:-unknown})" >&2
+        cat "$NOTARY_SUBMIT_JSON" >&2 || true
+        if [ -n "$NOTARY_ID" ]; then
+          xcrun notarytool log "$NOTARY_ID" \
+            --apple-id "$NOTARY_APPLE_ID" \
+            --team-id "$NOTARY_TEAM_ID" \
+            --password "$NOTARY_PASSWORD" >&2 || true
+        fi
+        exit 1
+      fi
       xcrun stapler staple "dist/$ASSET_NAME"
       spctl --assess --type open --context context:primary-signature --verbose=4 "dist/$ASSET_NAME"
 

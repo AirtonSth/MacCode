@@ -33,8 +33,74 @@ ln -s /Applications "$DMG_ROOT/Applications"
 "$(dirname "$0")/generate-dmg-background.swift" "$BACKGROUND_IMAGE"
 chflags hidden "$BACKGROUND_DIR" 2>/dev/null || true
 
-codesign --force --deep --sign "$SIGN_IDENTITY" --options runtime "$DMG_ROOT/$APP_NAME"
-codesign --verify --deep --strict --verbose=4 "$DMG_ROOT/$APP_NAME"
+APP_BUNDLE="$DMG_ROOT/$APP_NAME"
+
+# Sign inside-out. Nested Mach-Os under Contents/Resources are NOT re-signed with
+# the outer app's --options by `codesign --deep` (Apple TN2206): the outer flags
+# do not cascade. RemoteCodeScheduledTaskAgent lived there without hardened
+# runtime / secure timestamp, and Apple notarization returned Invalid from
+# v2.0.69 onward.
+sign_nested_runtime() {
+  local path="$1"
+  if [[ ! -e "$path" ]]; then
+    return 0
+  fi
+  echo "[package] signing with hardened runtime: $path" >&2
+  codesign --force --sign "$SIGN_IDENTITY" --options runtime --timestamp "$path"
+}
+
+if [[ -d "$APP_BUNDLE/Contents/Frameworks/Sparkle.framework" ]]; then
+  # Sparkle ships nested apps/XPCs in standard locations; deep is appropriate here.
+  codesign --force --deep --sign "$SIGN_IDENTITY" --options runtime --timestamp \
+    "$APP_BUNDLE/Contents/Frameworks/Sparkle.framework"
+fi
+
+sign_nested_runtime "$APP_BUNDLE/Contents/Resources/RemoteCodeScheduledTaskAgent"
+sign_nested_runtime "$APP_BUNDLE/Contents/MacOS/RemoteCodeRunAsUserHelper"
+sign_nested_runtime "$APP_BUNDLE/Contents/MacOS/rc2"
+sign_nested_runtime "$APP_BUNDLE/Contents/MacOS/RemoteCodeDistillService"
+sign_nested_runtime "$APP_BUNDLE/Contents/MacOS/mlx.metallib"
+sign_nested_runtime "$APP_BUNDLE/Contents/MacOS/RemoteCode"
+
+# Outer bundle last (no --deep: nested code already signed with correct options).
+codesign --force --sign "$SIGN_IDENTITY" --options runtime --timestamp "$APP_BUNDLE"
+codesign --verify --deep --strict --verbose=4 "$APP_BUNDLE"
+
+# Fail closed before DMG creation: nested Mach-Os + outer app must have hardened
+# runtime + secure timestamp (notarization requirement for Developer ID).
+# Note: do not `find -perm +111` alone — directories are executable and are not
+# independent code objects.
+assert_runtime_signature() {
+  local code_path="$1"
+  local meta
+  if [[ ! -e "$code_path" ]]; then
+    return 0
+  fi
+  meta="$(codesign -dv --verbose=2 "$code_path" 2>&1 || true)"
+  if ! printf '%s\n' "$meta" | grep -Eq 'flags=0x[0-9a-fA-F]*\(runtime\)|flags=.*runtime'; then
+    echo "[package] ERROR: missing hardened runtime on $code_path" >&2
+    printf '%s\n' "$meta" >&2
+    exit 1
+  fi
+  if ! printf '%s\n' "$meta" | grep -q '^Timestamp='; then
+    echo "[package] ERROR: missing secure timestamp on $code_path" >&2
+    printf '%s\n' "$meta" >&2
+    exit 1
+  fi
+}
+
+assert_runtime_signature "$APP_BUNDLE"
+assert_runtime_signature "$APP_BUNDLE/Contents/Resources/RemoteCodeScheduledTaskAgent"
+assert_runtime_signature "$APP_BUNDLE/Contents/MacOS/RemoteCode"
+assert_runtime_signature "$APP_BUNDLE/Contents/MacOS/RemoteCodeDistillService"
+assert_runtime_signature "$APP_BUNDLE/Contents/MacOS/RemoteCodeRunAsUserHelper"
+assert_runtime_signature "$APP_BUNDLE/Contents/MacOS/rc2"
+assert_runtime_signature "$APP_BUNDLE/Contents/MacOS/mlx.metallib"
+assert_runtime_signature "$APP_BUNDLE/Contents/Frameworks/Sparkle.framework"
+assert_runtime_signature "$APP_BUNDLE/Contents/Frameworks/Sparkle.framework/Versions/Current/Autoupdate"
+assert_runtime_signature "$APP_BUNDLE/Contents/Frameworks/Sparkle.framework/Versions/Current/Updater.app"
+assert_runtime_signature "$APP_BUNDLE/Contents/Frameworks/Sparkle.framework/Versions/Current/XPCServices/Downloader.xpc"
+assert_runtime_signature "$APP_BUNDLE/Contents/Frameworks/Sparkle.framework/Versions/Current/XPCServices/Installer.xpc"
 
 hdiutil create \
   -volname "RemoteCode" \
