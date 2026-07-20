@@ -789,7 +789,9 @@ public final class CodexAppServerClient: @unchecked Sendable {
     /// amortizes it. Absent when Token Saver is off: the managed `distill` CLI is uninstalled then.
     private static func developerInstructions(for mode: AgentInteractionMode, tokenSaverEnabled: Bool) -> String {
         let base = AgentProviderInstructionText.developerInstructions(for: mode)
-        guard tokenSaverEnabled else { return base }
-        return base + "\n\n" + AgentSkillInstaller.distillAgentInstructionsBody
+        return AgentSkillInstaller.tokenSaverProviderPrompt(
+            base,
+            environment: tokenSaverEnabled ? ["RC_TOKEN_SAVER_DISTILL_HINT": "1"] : [:]
+        )
     }
 }

@@ -1166,11 +1166,10 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
     /// and `~/.codex/AGENTS.md`. Fixed for the session's life (the SDK query is
     /// long-lived); a mid-session Token Saver toggle takes effect on the next session.
     static func claudeSystemPrompt(environment: [String: String]) -> String {
-        var prompt = BackgroundAwaitContinuation.systemPromptDirective
-        if environment["RC_TOKEN_SAVER_DISTILL_HINT"] == "1" {
-            prompt += "\n\n" + AgentSkillInstaller.distillAgentInstructionsBody
-        }
-        return prompt
+        AgentSkillInstaller.tokenSaverProviderPrompt(
+            BackgroundAwaitContinuation.systemPromptDirective,
+            environment: environment
+        )
     }
 
     private func effectiveProviderThreadId(for request: AgentRunRequest) -> String? {

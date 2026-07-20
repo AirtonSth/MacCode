@@ -5148,7 +5148,7 @@ final class AgentAppViewModelTests: XCTestCase {
             runRepo: AgentRunRepository(db: db), messageRepo: messageRepo, threadRepo: threadRepo,
             providerSessionRepo: ProviderSessionRuntimeRepository(db: db), providerAdapters: [.codex: adapter]
         )
-        coordinator.recoveryEnvironmentProvider = { provider in
+        coordinator.recoveryEnvironmentProvider = { provider, _ in
             provider == .codex ? ["CODEX_HOME": isolatedCodexHome] : [:]
         }
         let surface = AgentAppViewModel(
@@ -5247,7 +5247,7 @@ final class AgentAppViewModelTests: XCTestCase {
             providerSessionRepo: sessionRepo,
             providerAdapters: [.codex: firstAdapter]
         )
-        firstCoordinator.recoveryEnvironmentProvider = { provider in
+        firstCoordinator.recoveryEnvironmentProvider = { provider, _ in
             provider == .codex ? ["CODEX_HOME": isolatedCodexHome] : [:]
         }
         let firstSurface = AgentAppViewModel(
@@ -5301,7 +5301,7 @@ final class AgentAppViewModelTests: XCTestCase {
             providerSessionRepo: sessionRepo,
             providerAdapters: [.codex: relaunchedAdapter]
         )
-        relaunchedCoordinator.recoveryEnvironmentProvider = { provider in
+        relaunchedCoordinator.recoveryEnvironmentProvider = { provider, _ in
             provider == .codex ? ["CODEX_HOME": isolatedCodexHome] : [:]
         }
         try relaunchedCoordinator.reconcileOnLaunch()

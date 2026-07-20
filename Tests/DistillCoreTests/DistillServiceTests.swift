@@ -142,7 +142,11 @@ final class DistillServiceTests: XCTestCase {
             maxConcurrentRequests: 2
         )
         let scheduler = DistillScheduler(runtime: LocalDistillRuntime(), maxConcurrentRequests: 2)
-        let server = DistillHTTPServer(configuration: configuration, scheduler: scheduler)
+        let server = DistillHTTPServer(
+            configuration: configuration,
+            scheduler: scheduler,
+            scopedRecoveryStore: TestScopedRecoveryStore()
+        )
         let ready = try await server.start()
         defer { server.stop() }
 
@@ -198,7 +202,8 @@ final class DistillServiceTests: XCTestCase {
         )
         let server = DistillHTTPServer(
             configuration: configuration,
-            scheduler: DistillScheduler(runtime: LocalDistillRuntime(), maxConcurrentRequests: 1)
+            scheduler: DistillScheduler(runtime: LocalDistillRuntime(), maxConcurrentRequests: 1),
+            scopedRecoveryStore: TestScopedRecoveryStore()
         )
         let ready = try await server.start()
         defer { server.stop() }
@@ -356,7 +361,11 @@ final class DistillServiceTests: XCTestCase {
         )
         let scheduler = DistillScheduler(runtime: LocalDistillRuntime(), maxConcurrentRequests: 2)
         let recorder = RecordingSuccessHandler()
-        let server = DistillHTTPServer(configuration: configuration, scheduler: scheduler) { request, response in
+        let server = DistillHTTPServer(
+            configuration: configuration,
+            scheduler: scheduler,
+            scopedRecoveryStore: TestScopedRecoveryStore()
+        ) { request, response in
             await recorder.record(request: request, response: response)
         }
         let ready = try await server.start()
@@ -403,7 +412,11 @@ final class DistillServiceTests: XCTestCase {
             maxConcurrentRequests: 4
         )
         let scheduler = DistillScheduler(runtime: LocalDistillRuntime(), maxConcurrentRequests: 4)
-        let server = DistillHTTPServer(configuration: configuration, scheduler: scheduler)
+        let server = DistillHTTPServer(
+            configuration: configuration,
+            scheduler: scheduler,
+            scopedRecoveryStore: TestScopedRecoveryStore()
+        )
         let ready = try await server.start()
         defer { server.stop() }
 
@@ -412,7 +425,10 @@ final class DistillServiceTests: XCTestCase {
         XCTAssertTrue(healthy, "client must reach the unauthenticated health endpoint")
 
         let verbose = (1...40).map { "line \($0): verbose output to compress" }.joined(separator: "\n")
-        let response = try await client.distill(DistillRequest(mode: .commandOutput, input: verbose, maxOutputCharacters: 4000))
+        let response = try await client.distill(
+            DistillRequest(mode: .commandOutput, input: verbose, maxOutputCharacters: 4000),
+            recoveryContext: testRecoveryContext()
+        )
         XCTAssertGreaterThan(response.savedTokens, 0, "the real client+server round-trip must yield measured savings")
         XCTAssertEqual(response.savedTokens, max(response.inputTokens - response.outputTokens, 0))
 
@@ -524,7 +540,11 @@ final class DistillServiceTests: XCTestCase {
             maxConcurrentRequests: 2
         )
         let scheduler = DistillScheduler(runtime: LocalDistillRuntime(), maxConcurrentRequests: 2)
-        let server = DistillHTTPServer(configuration: configuration, scheduler: scheduler)
+        let server = DistillHTTPServer(
+            configuration: configuration,
+            scheduler: scheduler,
+            scopedRecoveryStore: TestScopedRecoveryStore()
+        )
         let ready = try await server.start()
         defer { server.stop() }
 
@@ -610,7 +630,11 @@ final class DistillServiceTests: XCTestCase {
             maxConcurrentRequests: 2
         )
         let scheduler = DistillScheduler(runtime: LocalDistillRuntime(), maxConcurrentRequests: 2)
-        let server = DistillHTTPServer(configuration: configuration, scheduler: scheduler)
+        let server = DistillHTTPServer(
+            configuration: configuration,
+            scheduler: scheduler,
+            scopedRecoveryStore: TestScopedRecoveryStore()
+        )
         let ready = try await server.start()
         defer { server.stop() }
 
@@ -869,6 +893,16 @@ final class DistillServiceTests: XCTestCase {
             request.setValue("application/json", forHTTPHeaderField: "Content-Type")
             request.setValue("\(body.count)", forHTTPHeaderField: "Content-Length")
         }
+        if method == "POST", path == "/v1/distill" || path == "/v1/compress" {
+            let context = testRecoveryContext()
+            request.setValue(context.workspaceID, forHTTPHeaderField: "X-RemoteCode-Workspace-ID")
+            request.setValue(context.projectID, forHTTPHeaderField: "X-RemoteCode-Project-ID")
+            request.setValue(context.threadID, forHTTPHeaderField: "X-RemoteCode-Thread-ID")
+            request.setValue(context.provider, forHTTPHeaderField: "X-RemoteCode-Provider")
+            request.setValue(context.attemptID, forHTTPHeaderField: "X-RemoteCode-Attempt-ID")
+            request.setValue(context.operationID, forHTTPHeaderField: "X-RemoteCode-Operation-ID")
+            request.setValue(context.invocationID, forHTTPHeaderField: "X-RemoteCode-Invocation-ID")
+        }
         let (data, response) = try await URLSession.shared.data(for: request)
         let http = try XCTUnwrap(response as? HTTPURLResponse)
         return (http.statusCode, data)
@@ -968,6 +1002,7 @@ final class DistillServiceTests: XCTestCase {
         let server = DistillHTTPServer(
             configuration: configuration,
             scheduler: scheduler,
+            scopedRecoveryStore: TestScopedRecoveryStore(),
             metricsRecorder: sharedMetrics
         )
         let ready = try await server.start()

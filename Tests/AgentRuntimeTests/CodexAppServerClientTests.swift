@@ -471,6 +471,17 @@ final class CodexAppServerClientTests: ProviderProcessTestCase {
             hintInstructions.contains("AR-0/AR-1"),
             "Codex developer_instructions must carry the full distill language spec when Token Saver is on, not only the pipe rule"
         )
+        XCTAssertEqual(
+            hintInstructions.components(separatedBy: TokenSaverProviderSafetyABI.block).count - 1,
+            1,
+            "Codex receives the versioned Token Saver safety ABI exactly once"
+        )
+        XCTAssertEqual(
+            (AgentSkillInstaller.distillAgentInstructionsTemplate + "\n\n" + hintInstructions)
+                .components(separatedBy: TokenSaverProviderSafetyABI.block).count - 1,
+            1,
+            "Codex effective disk plus runtime context receives the safety ABI exactly once"
+        )
 
         // No hint => Token Saver off => the managed distill CLI is uninstalled, so Codex must NOT
         // be told to pipe through a binary that no longer exists.
@@ -487,6 +498,11 @@ final class CodexAppServerClientTests: ProviderProcessTestCase {
         XCTAssertFalse(
             (try collaborationSettings(from: withoutHint)["developer_instructions"] as? String)?.contains("distill") == true,
             "without the Token Saver hint Codex must not be instructed to pipe through the uninstalled distill CLI"
+        )
+        XCTAssertFalse(
+            (try collaborationSettings(from: withoutHint)["developer_instructions"] as? String)?
+                .contains(TokenSaverProviderSafetyABI.block) == true,
+            "Codex must not receive the Token Saver safety ABI when disabled"
         )
     }
 

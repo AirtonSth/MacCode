@@ -51,7 +51,7 @@ public enum AgentSkillUninstallResult: String, Sendable, Equatable {
 public final class AgentSkillInstaller: @unchecked Sendable {
     public static let distillSkillID = "distill"
     public static let distillSourceURL = "https://github.com/samuelfaj/distill/blob/main/skills/distill/SKILL.md"
-    public static let distillLocalVersion = "5"
+    public static let distillLocalVersion = "6"
     public static let distillInstructionsBeginMarker = "<!-- distill skill: begin -->"
     public static let distillInstructionsEndMarker = "<!-- distill skill: end -->"
     public static let distillCLIBeginMarker = "# RemoteCode managed distill CLI: begin"
@@ -127,12 +127,21 @@ public final class AgentSkillInstaller: @unchecked Sendable {
     /// The distill agent instructions with the begin/end HTML markers stripped. The markers
     /// only matter for the in-place upsert/removal inside CLAUDE.md/AGENTS.md; this marker-free
     /// body is what gets injected as an authoritative system prompt (Claude SDK bridge), where
-    /// the surrounding CLAUDE.md is easily buried. Single source of truth with the installed text.
+    /// the surrounding CLAUDE.md is easily buried. The runtime adapter appends the safety ABI
+    /// separately so mutable on-disk instructions cannot duplicate that contract.
     public static var distillAgentInstructionsBody: String {
         distillAgentInstructionsTemplate
             .replacingOccurrences(of: distillInstructionsBeginMarker, with: "")
             .replacingOccurrences(of: distillInstructionsEndMarker, with: "")
             .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    public static func tokenSaverProviderPrompt(_ base: String, environment: [String: String]) -> String {
+        guard environment["RC_TOKEN_SAVER_DISTILL_HINT"] == "1" else { return base }
+        let withDistill = base.contains(distillAgentInstructionsBody)
+            ? base
+            : base + "\n\n" + distillAgentInstructionsBody
+        return TokenSaverProviderSafetyABI.appendingExactlyOnce(to: withDistill, enabled: true)
     }
 
     private let claudeSkillsRoot: URL

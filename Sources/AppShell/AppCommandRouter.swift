@@ -2488,7 +2488,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             serviceTier: t.serviceTier,
             interactionMode: interactionMode ?? .default,
             providerBinary: providerBinary(provider: prov, instanceId: t.providerInstanceId),
-            environment: providerEnvironment(provider: prov, instanceId: t.providerInstanceId),
+            environment: providerEnvironment(provider: prov, instanceId: t.providerInstanceId, threadId: thread),
             runAsUser: t.runAsUser
         )
         let runId = try await ctx.coordinator.startRun(req)
@@ -3533,7 +3533,11 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         return configuredProviderBinary(provider)
     }
 
-    func providerEnvironment(provider: AgentProvider, instanceId: String?) -> [String: String] {
+    func providerEnvironment(
+        provider: AgentProvider,
+        instanceId: String?,
+        threadId: AgentThreadID? = nil
+    ) -> [String: String] {
         let instance = providerInstanceConfig(id: instanceId, provider: provider)
         var env = instance?.env ?? [:]
         let home = instance?.homePath?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
@@ -3553,11 +3557,11 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         // (streaming CLI, SDK-bridge tool-exec env, session) uses for the agent's bash tools
         // that spawn `cmd | distill`. Set unconditionally — even with no instance config.
         env["REMOTE_CODE_AGENT_PROVIDER"] = provider.rawValue
-        if let context {
+        if let context, let threadId {
             // Token Saver env (distill hint + Claude-only PostToolUse state). Shared with the
             // session-recovery path so a resumed run keeps piping/speaking distill; see
             // AppContext.tokenSaverAgentEnvironment. Empty when Token Saver is off.
-            let tokenSaverEnv = context.tokenSaverAgentEnvironment(provider: provider)
+            let tokenSaverEnv = context.tokenSaverAgentEnvironment(provider: provider, threadId: threadId)
             env.merge(tokenSaverEnv) { _, new in new }
             if !tokenSaverEnv.isEmpty {
                 env["PATH"] = Self.providerPathWithManagedWrappers(

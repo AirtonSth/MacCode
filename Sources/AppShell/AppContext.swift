@@ -17,6 +17,26 @@ struct ProjectScriptRunOutcome: Sendable, Equatable {
     var result: String { exitCode == 0 ? "success" : "failure" }
 }
 
+public enum TokenSaverRolloverError: Error, LocalizedError, Equatable {
+    case missingProjectScope
+    case laneUnavailable(String)
+    case parentBusy(AgentRunStatus)
+    case parentChanged
+
+    public var errorDescription: String? {
+        switch self {
+        case .missingProjectScope:
+            return "Token Saver rollover requires a workspace and project scope."
+        case .laneUnavailable(let reason):
+            return "Token Saver rollover is unavailable: \(reason)"
+        case .parentBusy(let status):
+            return "Token Saver rollover requires an inactive parent thread; current state is \(status.rawValue)."
+        case .parentChanged:
+            return "Token Saver rollover was cancelled because the parent thread changed during capsule creation."
+        }
+    }
+}
+
 final class ProjectScriptRunRegistry: @unchecked Sendable {
     private struct Entry {
         let workspaceID: WorkspaceID
@@ -92,6 +112,12 @@ public final class AppContext {
     public let proposedPlanRepo: AgentProposedPlanRepository
     public let turnCheckpointRepo: AgentTurnCheckpointRepository
     public let tokenSaverSavingsRepo: TokenSaverSavingsRepository
+    public let tokenSaverAttemptLedger: TokenSaverAttemptLedger
+    public let tokenSaverSessionLearnRepo: TokenSaverSessionLearnRepository
+    public let tokenSaverLaneStateRepo: TokenSaverLaneStateRepository
+    public let tokenSaverRolloverRepo: TokenSaverRolloverCapsuleRepository
+    public let tokenSaverProjectDataRepo: TokenSaverProjectDataRepository
+    public private(set) var tokenSaverLifecycleDegradedReason: String?
     public let privateNotificationBridge: PrivateNotificationBridge
     public let liveActivityHostIdentity: LiveActivityHostIdentity
     public let liveActivityAcceptanceOutbox: LiveActivityAcceptanceOutbox
@@ -144,6 +170,7 @@ public final class AppContext {
     /// tests never write /distill state into the developer's real ~/.claude or
     /// ~/.codex. Production code never sets this (installs to the real provider dirs).
     var agentSkillsHomeOverrideForTesting: URL?
+    var tokenSaverRolloverBeforeCommitForTesting: (() throws -> Void)?
     /// Prompts shorter than this are sent verbatim: distillation overhead/latency
     /// isn't worth it and tiny instructions have nothing to compress.
     // Raised from 600: below ~2k chars a model round-trip on the awaited prompt path
@@ -186,6 +213,18 @@ public final class AppContext {
         self.proposedPlanRepo = AgentProposedPlanRepository(db: db)
         self.turnCheckpointRepo = AgentTurnCheckpointRepository(db: db)
         self.tokenSaverSavingsRepo = TokenSaverSavingsRepository(db: db)
+        self.tokenSaverAttemptLedger = TokenSaverAttemptLedger(db: db)
+        self.tokenSaverSessionLearnRepo = TokenSaverSessionLearnRepository(db: db)
+        self.tokenSaverLaneStateRepo = TokenSaverLaneStateRepository(db: db)
+        self.tokenSaverRolloverRepo = TokenSaverRolloverCapsuleRepository(db: db)
+        self.tokenSaverProjectDataRepo = TokenSaverProjectDataRepository(db: db)
+        do {
+            _ = try self.tokenSaverProjectDataRepo.performLifecycleSweep()
+        } catch {
+            let reason = "lifecycle_sweep_failed: \((error as NSError).localizedDescription)"
+            self.tokenSaverLifecycleDegradedReason = reason
+            NSLog("RemoteCode Token Saver launch lifecycle sweep entered degraded verbatim mode: \(reason)")
+        }
         let privatePushTargetStore = PrivatePushTargetStore(repo: self.settingsRepo)
         let privateNotificationBridge = PrivateNotificationBridge(
             accountStore: PrivateAccountSessionStore(repo: self.settingsRepo),
@@ -272,13 +311,19 @@ public final class AppContext {
         liveActivityAcceptanceOutbox.resumePending()
         try coordinator.reconcileOnLaunch()
         try? tokenSaverSavingsRepo.prune()
-        self.coordinator.promptCompressor = { [weak self] prompt, provider, threadId in
+        self.coordinator.promptCompressor = { [weak self] prompt, provider, threadId, runId in
             guard let self else { return prompt }
-            return await self.tokenSaverCompress(prompt: prompt, provider: provider, threadId: threadId)
+            let scopedPrompt = await self.tokenSaverSessionLearnPrompt(
+                prompt, provider: provider, threadId: threadId, runId: runId
+            )
+            return await self.tokenSaverCompress(prompt: scopedPrompt, provider: provider, threadId: threadId, runId: runId)
         }
         self.coordinator.followUpPromptCompressor = { [weak self] prompt, provider, threadId in
             guard let self else { return prompt }
-            return await self.tokenSaverCompress(prompt: prompt, provider: provider, threadId: threadId, cacheState: "prompt_followup")
+            let scopedPrompt = await self.tokenSaverSessionLearnPrompt(
+                prompt, provider: provider, threadId: threadId, runId: nil
+            )
+            return await self.tokenSaverCompress(prompt: scopedPrompt, provider: provider, threadId: threadId, cacheState: "prompt_followup")
         }
         self.coordinator.finalResponseTranslator = { [weak self] response, provider, threadId, runId in
             guard let self else { return response }
@@ -286,19 +331,21 @@ public final class AppContext {
         }
         // Recovered sessions rebuild their own request env in the coordinator, bypassing
         // providerEnvironment; feed them the same Token Saver env so distill survives resume.
-        self.coordinator.recoveryEnvironmentProvider = { [weak self] provider in
-            await self?.tokenSaverAgentEnvironment(provider: provider) ?? [:]
+        self.coordinator.recoveryEnvironmentProvider = { [weak self] provider, threadId in
+            await self?.tokenSaverAgentEnvironment(provider: provider, threadId: threadId) ?? [:]
         }
-        // P3 (opt-in, default OFF): compact large tool output in persisted stream events,
-        // CCR-backed and structure-preserving, so replay still decodes. Our-storage saving.
-        if SettingsStore(db: db).load().historyCompactionEnabled {
-            let historyStore = ReversibleContentStore(db: db)
-            self.coordinator.streamPayloadCompactor = { payload in
-                ReversiblePayloadCompactor.compact(payload) { original in
-                    try? historyStore.store(Data(original.utf8))
-                }
+        self.coordinator.runEnvironmentProvider = { [weak self] provider, threadId, base in
+            await self?.tokenSaverAgentEnvironment(provider: provider, threadId: threadId, baseEnvironment: base) ?? [:]
+        }
+        self.coordinator.onRunPrepared = { [weak self] request, originalPrompt in
+            await MainActor.run { [weak self] in
+                self?.recordTokenSaverPreparedObservation(request: request, originalPrompt: originalPrompt)
             }
         }
+        // T-003 Wave -1: persisted-history compaction used global raw-hash CCR
+        // markers. Keep the stored event verbatim until scoped capabilities,
+        // durable read-back, lifecycle limits, and an authorized reader ship.
+        self.coordinator.streamPayloadCompactor = nil
         _ = try providerPendingCallbackRepo.markOpenStale(
             reason: "Provider callback state does not survive app restarts or recovered sessions. Restart the turn to continue."
         )
@@ -374,6 +421,7 @@ public final class AppContext {
         coordinator.onRunStarted = { [weak self] tid, runId in
             EventBus.shared.publish(kind: "agent.run.started",
                                     payload: agentRunPayload(threadId: tid, runId: runId))
+            self?.beginTokenSaverAttempt(runId: runId)
         }
         coordinator.onMessageAppended = { message in
             EventBus.shared.publish(kind: "agent.message.appended", payload: messageJSON(message))
@@ -690,9 +738,21 @@ public final class AppContext {
     /// rebuilds its own request env, bypassing providerEnvironment). Empty when Token Saver is off:
     /// the managed `distill` CLI is uninstalled then, so a `cmd | distill` pipe would fail. The
     /// pipe hint is also withheld when the managed CLI failed to install (F25) — same failure mode.
-    func tokenSaverAgentEnvironment(provider: AgentProvider) -> [String: String] {
-        guard SettingsStore(db: db).load().tokenSaverEnabled else { return [:] }
+    func tokenSaverAgentEnvironment(
+        provider: AgentProvider,
+        threadId: AgentThreadID,
+        baseEnvironment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> [String: String] {
+        guard tokenSaverProjectAdmission(threadId: threadId, lane: "deterministic_wrapper").allowed,
+              let thread = try? threadRepo.get(id: threadId),
+              let workspaceID = thread.workspaceId?.value.uuidString,
+              let projectID = thread.projectId?.value.uuidString else {
+            return [:]
+        }
         var env: [String: String] = [:]
+        env["RC_TOKEN_SAVER_WORKSPACE_ID"] = workspaceID
+        env["RC_TOKEN_SAVER_PROJECT_ID"] = projectID
+        env["RC_TOKEN_SAVER_THREAD_ID"] = threadId.value.uuidString
         // Signal the agent to pipe large command output through the managed `distill` CLI. Codex
         // (app-server) reads this in its per-turn developer_instructions; the Claude SDK bridge
         // reads it to inject the distill systemPrompt.
@@ -703,6 +763,10 @@ public final class AppContext {
         // Reconcile runs at launch and on every toggle, so the error state is current here.
         if managedDistillSkillInstallError == nil {
             env["RC_TOKEN_SAVER_DISTILL_HINT"] = "1"
+            let managedBin = AgentSkillInstaller.defaultManagedCLIBinDirectory().path
+            let currentPath = baseEnvironment["PATH"] ?? ProcessInfo.processInfo.environment["PATH"] ?? ""
+            let pathParts = currentPath.split(separator: ":").map(String.init).filter { $0 != managedBin }
+            env["PATH"] = ([managedBin] + pathParts).joined(separator: ":")
         }
         if provider == .claude {
             // Claude additionally auto-compresses tool output via the SDK-bridge PostToolUse hook,
@@ -723,24 +787,33 @@ public final class AppContext {
             if tokenSaverEnabled {
                 let codex = try installer.installDistillSkill(
                     for: .codex,
-                    sourceRevision: "github-main-remote-code-template-v1"
+                    sourceRevision: "github-main-remote-code-template-v2"
                 )
                 let claude = try installer.installDistillSkill(
                     for: .claude,
-                    sourceRevision: "github-main-remote-code-template-v1"
+                    sourceRevision: "github-main-remote-code-template-v2"
                 )
-                try installer.installDistillInstructions(for: .codex)
-                try installer.installDistillInstructions(for: .claude)
+                let grok = try installer.installDistillSkill(
+                    for: .grok,
+                    sourceRevision: "github-main-remote-code-template-v2"
+                )
+                // Provider instructions are injected per admitted thread at runtime.
+                // Remove legacy global blocks so off/unscoped projects stay byte-identical.
+                _ = try installer.uninstallDistillInstructions(for: .codex)
+                _ = try installer.uninstallDistillInstructions(for: .claude)
+                _ = try installer.uninstallDistillInstructions(for: .grok)
                 _ = try installer.installDistillCLI(appSupportDirectory: appSupportDirectory)
                 try? installer.installCommandWrappers() // RTK transparent wrappers (best-effort; needs the bundled binary)
                 try? installer.installRetrieveMCP() // Token Saver MCP tools (best-effort; needs the bundled binary)
-                managedDistillSkillInstallResults = [codex, claude]
+                managedDistillSkillInstallResults = [codex, claude, grok]
                 managedDistillSkillInstallError = nil
             } else {
                 _ = try installer.uninstallDistillSkill(for: .codex)
                 _ = try installer.uninstallDistillSkill(for: .claude)
+                _ = try installer.uninstallDistillSkill(for: .grok)
                 _ = try installer.uninstallDistillInstructions(for: .codex)
                 _ = try installer.uninstallDistillInstructions(for: .claude)
+                _ = try installer.uninstallDistillInstructions(for: .grok)
                 _ = try installer.uninstallDistillCLI()
                 _ = try? installer.uninstallCommandWrappers()
                 try? installer.uninstallRetrieveMCP()
@@ -1087,8 +1160,98 @@ public final class AppContext {
         return max(0, Date().timeIntervalSince(runtime.updatedAt))
     }
 
-    func tokenSaverCompress(prompt: String, provider: AgentProvider, threadId: AgentThreadID, cacheState: String = "prompt") async -> String {
-        guard SettingsStore(db: db).load().tokenSaverEnabled else { return prompt }
+    private func tokenSaverProjectAdmission(
+        threadId: AgentThreadID,
+        lane laneName: String,
+        globallyEnabled: Bool? = nil
+    ) -> TokenSaverAdmissionDecision {
+        if tokenSaverLifecycleDegradedReason != nil {
+            return .init(allowed: false, reason: "lifecycle_degraded")
+        }
+        let enabled = globallyEnabled ?? SettingsStore(db: db).load().tokenSaverEnabled
+        guard let thread = try? threadRepo.get(id: threadId),
+              let projectID = thread.projectId?.value.uuidString,
+              thread.workspaceId != nil,
+              let lane = try? tokenSaverLaneStateRepo.get(projectID: projectID, lane: laneName) else {
+            return TokenSaverProjectRuntimeAdmissionPolicy.evaluate(.init(
+                globallyEnabled: enabled,
+                hasExactProjectScope: false,
+                laneState: nil,
+                evidenceLevel: nil,
+                ownerRole: nil,
+                optedOut: false,
+                killSwitchActive: true,
+                attributionJoined: false,
+                reconciliationPassed: false,
+                usageSemanticsAvailable: false,
+                scorecardID: nil
+            ))
+        }
+        return TokenSaverProjectRuntimeAdmissionPolicy.evaluate(.init(
+            globallyEnabled: enabled,
+            hasExactProjectScope: true,
+            laneState: lane.state,
+            evidenceLevel: lane.typedEvidenceLevel.rawValue,
+            ownerRole: lane.ownerRole,
+            optedOut: lane.optedOut,
+            killSwitchActive: lane.killSwitchActive,
+            attributionJoined: lane.attributionJoined,
+            reconciliationPassed: lane.reconciliationPassed,
+            usageSemanticsAvailable: lane.usageSemanticsAvailable,
+            scorecardID: lane.scorecardID
+        ))
+    }
+
+    private func tokenSaverProjectObservation(
+        threadId: AgentThreadID,
+        lane laneName: String
+    ) -> TokenSaverAdmissionDecision {
+        guard tokenSaverLifecycleDegradedReason == nil,
+              SettingsStore(db: db).load().tokenSaverEnabled,
+              let thread = try? threadRepo.get(id: threadId),
+              let projectID = thread.projectId?.value.uuidString,
+              thread.workspaceId != nil,
+              let lane = try? tokenSaverLaneStateRepo.get(projectID: projectID, lane: laneName),
+              ["shadow_only", "promoted"].contains(lane.state),
+              !lane.optedOut,
+              !lane.killSwitchActive else {
+            return .init(allowed: false, reason: "observation_not_admitted")
+        }
+        return .init(allowed: true, reason: lane.state)
+    }
+
+    private func tokenSaverProjectObservation(runId: AgentRunID, lane: String) -> TokenSaverAdmissionDecision {
+        guard let run = try? runRepo.get(id: runId) else {
+            return .init(allowed: false, reason: "missing_run_scope")
+        }
+        return tokenSaverProjectObservation(threadId: run.threadId, lane: lane)
+    }
+
+    private func tokenSaverProjectAdmission(
+        runId: AgentRunID,
+        lane: String,
+        globallyEnabled: Bool? = nil
+    ) -> TokenSaverAdmissionDecision {
+        guard let run = try? runRepo.get(id: runId) else {
+            return .init(allowed: false, reason: "missing_run_scope")
+        }
+        return tokenSaverProjectAdmission(
+            threadId: run.threadId,
+            lane: lane,
+            globallyEnabled: globallyEnabled
+        )
+    }
+
+    func tokenSaverCompress(
+        prompt: String,
+        provider: AgentProvider,
+        threadId: AgentThreadID,
+        cacheState: String = "prompt",
+        runId: AgentRunID? = nil
+    ) async -> String {
+        guard tokenSaverProjectAdmission(threadId: threadId, lane: "deterministic_wrapper").allowed else {
+            return prompt
+        }
         // NetPositiveGate (G3): there is no app-side cached prefix to preserve (resume sends
         // the full wrapped prompt), so this is a numeric decision — compress the new-turn
         // argv only when it is large enough AND the session is not a warm follow-up.
@@ -1097,30 +1260,38 @@ public final class AppContext {
         guard gate.shouldCompress(inputCharacters: prompt.count, secondsSinceLastTurn: secondsSinceLastTurn) else {
             return prompt
         }
+        let semanticObservation = tokenSaverProjectObservation(threadId: threadId, lane: "semantic_prose")
+        let semanticPromoted: Bool = {
+            guard tokenSaverProjectAdmission(threadId: threadId, lane: "semantic_prose").allowed,
+                  let thread = try? threadRepo.get(id: threadId),
+                  let projectID = thread.projectId?.value.uuidString,
+                  let lane = try? tokenSaverLaneStateRepo.get(projectID: projectID, lane: "semantic_prose") else {
+                return false
+            }
+            return lane.retentionDays > 0 && !lane.optedOut && !lane.killSwitchActive
+        }()
+        // A shadow/audit no-win must not suppress a later promoted optimize call for
+        // the same prompt. The two paths have different recovery and adoption rights.
         let skipKey = DistillResultCacheKey(request: DistillRequest(
             mode: .longText,
             priority: .interactive,
             input: prompt,
             maxOutputCharacters: max(512, prompt.count)
-        ))
+        ), pipelineVersion: DistillResultCacheKey.pipelineVersion + (semanticPromoted ? "-optimize" : "-audit"))
         if tokenSaverPromptSkipSetContains(skipKey) {
             return prompt
         }
-        let diffWindowed = tokenSaverDiffPromptCandidate(prompt)
+        // T-003 Wave -1: diff windowing is lossy and depended on a global raw
+        // hash. Keep it off until scoped recovery is authorized and read back.
+        let diffWindowed: String? = nil
         // Non-lossy dedup pre-pass (P4): collapse exact-duplicate large blocks within the
         // prompt to a model-readable "identical to block above" pointer. The model keeps
         // full information (content once + a pointer it understands), so this is safe to
         // send AND a win even if the model compression step is unavailable.
         let dedupeProbe = DistillBlockDeduper.dedupe(prompt)
-        let deduped: String
-        if dedupeProbe.nearDedupedBlocks > 0, prompt.utf8.count >= 8_192,
-           let handle = try? ReversibleContentStore(db: db).store(prompt) {
-            deduped = DistillBlockDeduper
-                .dedupe(prompt, originalHandleMarker: ReversibleContentStore.marker(for: handle))
-                .output
-        } else {
-            deduped = dedupeProbe.output
-        }
+        // The self-contained exact/volatile pointer keeps the first block and its
+        // changed fields inline. Do not attach an unscoped recovery marker.
+        let deduped = dedupeProbe.output
         let deterministicCandidate = [diffWindowed, deduped]
             .compactMap { $0 }
             .filter { $0.count < prompt.count }
@@ -1140,6 +1311,7 @@ public final class AppContext {
             let outputTokens = TokenEstimator.estimate(candidate)
             recordTokenSaverSidecarSavings(
                 provider: provider,
+                threadId: threadId,
                 mode: DistillMode.longText.rawValue,
                 inputTokens: inputTokens,
                 outputTokens: outputTokens,
@@ -1150,7 +1322,11 @@ public final class AppContext {
             return candidate
         }
 
-        guard let client = currentDistillClient() else {
+        guard semanticObservation.allowed,
+              let client = currentDistillClient() else {
+            if !semanticObservation.allowed {
+                NSLog("RemoteCode Token Saver semantic observation skipped: \(semanticObservation.reason)")
+            }
             // No model service: deterministic pre-passes still fail open and can save tokens.
             return deterministicCandidate.count < prompt.count ? adopt(deterministicCandidate, stage: .deterministic) : prompt
         }
@@ -1158,21 +1334,71 @@ public final class AppContext {
             mode: .longText,
             priority: .interactive,
             input: deterministicCandidate,
+            runMode: semanticPromoted ? .optimize : .audit,
             maxOutputCharacters: max(512, deterministicCandidate.count)
         )
         do {
-            let response = try await client.distill(request)
+            let response: DistillResponse
+            if semanticPromoted,
+               let runId,
+               let thread = try? threadRepo.get(id: threadId),
+               let workspaceID = thread.workspaceId?.value.uuidString,
+               let projectID = thread.projectId?.value.uuidString {
+                response = try await client.distill(
+                    request,
+                    recoveryContext: .init(
+                        workspaceID: workspaceID,
+                        projectID: projectID,
+                        threadID: threadId.value.uuidString,
+                        provider: provider.rawValue,
+                        attemptID: runId.value.uuidString,
+                        operationID: "semantic-prose:\(runId.value.uuidString)"
+                    )
+                )
+            } else {
+                response = try await client.distill(request)
+            }
             let modelOutput = response.output.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? deterministicCandidate : response.output
             let literalSafeModelOutput = LiteralPreservation.guarded(original: prompt, compressed: modelOutput).droppedLiteral == nil
                 ? modelOutput
                 : deterministicCandidate
-            // Pick the smaller of {model output, deterministic pre-pass}, then adopt only if it beats the original.
+            // The deterministic lane never adopts sidecar bytes. A semantic candidate
+            // is live only after its own lane is promoted and exact-scope recovery was
+            // durably stored and read back. Shadow runs observe it verbatim-only.
             let modelWon = literalSafeModelOutput.count < deterministicCandidate.count
-            let best = modelWon ? literalSafeModelOutput : deterministicCandidate
-            // Attribute to the engine that actually produced the adopted text: the
-            // sidecar's reported route when the model output won, else the deterministic pre-pass.
-            let stage: TokenSaverRouteStage = modelWon ? (response.routeStage ?? .llmMLX) : .deterministic
-            return adopt(best, stage: stage)
+            if !modelWon, deterministicCandidate.count >= prompt.count {
+                tokenSaverPromptSkipSet[skipKey] = Date()
+            }
+            let semanticAdmitted = tokenSaverProjectAdmission(
+                threadId: threadId,
+                lane: "semantic_prose"
+            ).allowed
+            guard modelWon,
+                  semanticAdmitted,
+                  let recoveredCandidate = prepareSemanticCandidate(
+                    original: prompt,
+                    stageOriginal: deterministicCandidate,
+                    candidate: literalSafeModelOutput,
+                    capability: response.originalHandle,
+                    idempotencyKey: response.recoveryIdempotencyKey,
+                    provider: provider,
+                    threadId: threadId,
+                    runId: runId
+                  ) else {
+                // Distill may already have prepared a stage object before any later
+                // pre-adoption gate. Abandon only that provisional when adoption fails.
+                discardProvisionalSemanticRecovery(
+                    capability: response.originalHandle,
+                    idempotencyKey: response.recoveryIdempotencyKey,
+                    provider: provider,
+                    threadId: threadId,
+                    runId: runId
+                )
+                return deterministicCandidate.count < prompt.count
+                    ? adopt(deterministicCandidate, stage: .deterministic)
+                    : prompt
+            }
+            return adopt(recoveredCandidate, stage: response.routeStage ?? .llmMLX)
         } catch {
             NSLog("RemoteCode Token Saver compression skipped (provider=\(provider.rawValue)): \(error)")
             // Fail-open to the deterministic pre-pass if it helped, else the original.
@@ -1180,24 +1406,149 @@ public final class AppContext {
         }
     }
 
-    private func tokenSaverDiffPromptCandidate(_ prompt: String) -> String? {
-        guard DiffCrusher.looksLikeDiff(prompt),
-              let windowed = DiffCrusher.window(prompt) else {
+    private func prepareSemanticCandidate(
+        original: String,
+        stageOriginal: String,
+        candidate: String,
+        capability: String?,
+        idempotencyKey: String?,
+        provider: AgentProvider,
+        threadId: AgentThreadID,
+        runId: AgentRunID?
+    ) -> String? {
+        guard let runId,
+              let capability,
+              let idempotencyKey,
+              let thread = try? threadRepo.get(id: threadId),
+              let workspaceID = thread.workspaceId?.value.uuidString,
+              let projectID = thread.projectId?.value.uuidString,
+              let lane = try? tokenSaverLaneStateRepo.get(projectID: projectID, lane: "semantic_prose"),
+              lane.state == "promoted",
+              lane.retentionDays > 0,
+              !lane.optedOut,
+              !lane.killSwitchActive else {
             return nil
+        }
+        let scope = TokenSaverPersistentScope(
+            workspaceID: workspaceID,
+            projectID: projectID,
+            threadID: threadId.value.uuidString,
+            provider: provider.rawValue,
+            attemptID: runId.value.uuidString
+        )
+        var provisionals: [(capability: String, idempotencyKey: String)] = []
+        let store = TokenSaverScopedRecoveryStore(db: db)
+        func discardProvisionals() {
+            for provisional in provisionals {
+                _ = try? store.discardAbandoned(
+                    capability: provisional.capability,
+                    scope: scope,
+                    idempotencyKey: provisional.idempotencyKey
+                )
+            }
         }
         do {
-            let handle = try ReversibleContentStore(db: db).store(prompt)
-            let marker = ReversibleContentStore.marker(for: handle)
-            let candidate = """
-            \(windowed)
+            guard try store.retrieve(capability: capability, scope: scope) == Data(stageOriginal.utf8) else {
+                // Stage was prepared for this response; abandon it if content cannot be used.
+                _ = try? store.discardAbandoned(
+                    capability: capability,
+                    scope: scope,
+                    idempotencyKey: idempotencyKey
+                )
+                return nil
+            }
+            provisionals.append((capability, idempotencyKey))
 
-            \(marker) full original diff available via rc_retrieve(\(handle)).
-            """
-            return candidate.count < prompt.count ? candidate : nil
+            var recoveryMarkers = ["[[rc:\(capability)]]"]
+            var fullOriginal: TokenSaverPreparedRecovery?
+            if stageOriginal != original {
+                let diskAttributes = try FileManager.default.attributesOfFileSystem(
+                    forPath: appSupportDirectory.path
+                )
+                let disk = TokenSaverRecoveryDiskSnapshot(
+                    freeBytes: (diskAttributes[.systemFreeSize] as? NSNumber)?.int64Value ?? 0,
+                    totalBytes: (diskAttributes[.systemSize] as? NSNumber)?.int64Value ?? 0
+                )
+                let preparedFull = try TokenSaverRuntimeRecoveryWorker(db: db).prepareOriginal(
+                    Data(original.utf8),
+                    scope: scope,
+                    operationID: "semantic-full-original:\(runId.value.uuidString)",
+                    lane: "semantic_prose",
+                    disk: disk
+                )
+                provisionals.append((preparedFull.capability, preparedFull.idempotencyKey))
+                guard try store.retrieve(
+                    capability: preparedFull.capability,
+                    scope: scope
+                ) == Data(original.utf8) else {
+                    discardProvisionals()
+                    return nil
+                }
+                fullOriginal = preparedFull
+                recoveryMarkers.append("[[rc:\(preparedFull.capability)]]")
+            }
+
+            // Final marker-inclusive net-positive gate before durable delivery/ack.
+            let recoverable = candidate + "\n" + recoveryMarkers.joined(separator: "\n")
+            guard recoverable.utf8.count < original.utf8.count else {
+                discardProvisionals()
+                return nil
+            }
+
+            // Atomic multi-object finalization: stage (+ optional full-original) in one
+            // SQLite transaction. On failure both remain provisional and are discarded.
+            let fullMember = fullOriginal.map {
+                TokenSaverSemanticRecoveryMember(
+                    capability: $0.capability,
+                    idempotencyKey: $0.idempotencyKey
+                )
+            }
+            guard try store.finalizeSemanticRecoverySet(
+                stage: TokenSaverSemanticRecoveryMember(
+                    capability: capability,
+                    idempotencyKey: idempotencyKey
+                ),
+                fullOriginal: fullMember,
+                scope: scope
+            ) else {
+                discardProvisionals()
+                return nil
+            }
+            return recoverable
         } catch {
-            NSLog("RemoteCode Token Saver diff prompt windowing skipped: \(error)")
+            NSLog("RemoteCode Token Saver semantic recovery preparation failed: \(error)")
+            discardProvisionals()
             return nil
         }
+    }
+
+    private func discardProvisionalSemanticRecovery(
+        capability: String?,
+        idempotencyKey: String?,
+        provider: AgentProvider,
+        threadId: AgentThreadID,
+        runId: AgentRunID?
+    ) {
+        guard let runId,
+              let capability,
+              let idempotencyKey,
+              let thread = try? threadRepo.get(id: threadId),
+              let workspaceID = thread.workspaceId?.value.uuidString,
+              let projectID = thread.projectId?.value.uuidString else {
+            return
+        }
+        let scope = TokenSaverPersistentScope(
+            workspaceID: workspaceID,
+            projectID: projectID,
+            threadID: threadId.value.uuidString,
+            provider: provider.rawValue,
+            attemptID: runId.value.uuidString
+        )
+        _ = try? TokenSaverScopedRecoveryStore(db: db).discardAbandoned(
+            capability: capability,
+            scope: scope,
+            idempotencyKey: idempotencyKey
+        )
     }
 
     private func tokenSaverPromptSkipSetContains(_ key: DistillResultCacheKey) -> Bool {
@@ -1209,23 +1560,198 @@ public final class AppContext {
         return true
     }
 
-    /// P5 SessionLearn: on a failed run, mine a deterministic correction rule from the
-    /// run's error into the managed instructions region (FIFO-capped, appended at the file
-    /// bottom so the upper instruction prefix stays byte-stable). Off by default; best-effort.
+    /// Stores only bounded, exact-thread private learning. The production read path
+    /// uses the same scope and never mutates provider-global instruction files.
     func recordSessionLearnFromRun(runId: AgentRunID, status: AgentRunStatus) {
-        let inputTokens = sessionLearnInputTokensByRun[runId] ?? 0
-        sessionLearnInputTokensByRun.removeValue(forKey: runId)
-        guard SettingsStore(db: db).load().sessionLearnEnabled else { return }
-        guard SessionLearnRegion.shouldMine(runFailed: status == .failed, inputTokens: inputTokens) else { return }
-        guard let run = try? runRepo.get(id: runId) else { return }
-        let error = (run.errorMessage ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !error.isEmpty else { return }
-        let firstLine = error.split(whereSeparator: \.isNewline).first.map(String.init) ?? error
-        let rule = "Avoid repeating the approach that failed with: \(String(firstLine.prefix(160))). Verify preconditions before retrying."
-        let files = sessionLearnInstructionFilesOverrideForTesting
-            ?? [AgentSkillInstaller.defaultClaudeInstructionsURL(), AgentSkillInstaller.defaultCodexInstructionsURL()]
-        for url in files {
-            try? SessionLearnRegion(fileURL: url).append(rule)
+        let settings = SettingsStore(db: db).load()
+        guard settings.sessionLearnEnabled,
+              tokenSaverProjectObservation(runId: runId, lane: "session_learn").allowed,
+              let run = try? runRepo.get(id: runId),
+              let thread = try? threadRepo.get(id: run.threadId),
+              let workspaceID = thread.workspaceId?.value.uuidString,
+              let projectID = thread.projectId?.value.uuidString,
+              let lane = try? tokenSaverLaneStateRepo.get(projectID: projectID, lane: "session_learn"),
+              lane.retentionDays > 0 else {
+            sessionLearnInputTokensByRun.removeValue(forKey: runId)
+            return
+        }
+        let expensive = (sessionLearnInputTokensByRun.removeValue(forKey: runId) ?? 0) >= 64_000
+        guard status == .failed || expensive else { return }
+        let source = run.errorMessage?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let text = Self.utf8SafePrefix(
+            (source?.isEmpty == false ? source! : "High-input run required repeated context."),
+            maxBytes: 512
+        )
+        guard !text.isEmpty else { return }
+        do {
+            try tokenSaverSessionLearnRepo.save(
+                text: text,
+                scope: .init(
+                    workspaceID: workspaceID,
+                    projectID: projectID,
+                    threadID: run.threadId.value.uuidString,
+                    provider: run.provider.rawValue
+                ),
+                attemptID: runId.value.uuidString,
+                expiresAt: Date().addingTimeInterval(TimeInterval(lane.retentionDays) * 86_400)
+            )
+        } catch {
+            NSLog("RemoteCode Token Saver SessionLearn save failed: \(error)")
+        }
+    }
+
+    private func tokenSaverSessionLearnPrompt(
+        _ prompt: String,
+        provider: AgentProvider,
+        threadId: AgentThreadID,
+        runId: AgentRunID?
+    ) -> String {
+        let settings = SettingsStore(db: db).load()
+        guard settings.sessionLearnEnabled,
+              tokenSaverProjectAdmission(threadId: threadId, lane: "session_learn").allowed,
+              let thread = try? threadRepo.get(id: threadId),
+              let workspaceID = thread.workspaceId?.value.uuidString,
+              let projectID = thread.projectId?.value.uuidString else {
+            return prompt
+        }
+        let scope = TokenSaverSessionLearnScope(
+            workspaceID: workspaceID,
+            projectID: projectID,
+            threadID: threadId.value.uuidString,
+            provider: provider.rawValue
+        )
+        let recoveryScope = TokenSaverRecoveryScope(
+            workspaceID: workspaceID,
+            projectID: projectID,
+            threadID: threadId.value.uuidString,
+            provider: provider.rawValue,
+            attemptID: runId?.value.uuidString ?? "followup"
+        )
+        do {
+            let records = try tokenSaverSessionLearnRepo.topK(scope: scope, byteBudget: 2_048, limit: 20)
+            let candidates = records.map {
+                DistillCore.TokenSaverSessionLearnRecord(id: $0.id, scope: recoveryScope, text: $0.text)
+            }
+            let selected = TokenSaverSessionLearnSelector.select(
+                records: candidates,
+                scope: recoveryScope,
+                query: prompt,
+                topK: 3,
+                byteBudget: 512
+            )
+            guard !selected.isEmpty else { return prompt }
+            let bounded = selected.map { "- \($0.text)" }.joined(separator: "\n")
+            return prompt + "\n\nSESSION_LEARN_EXACT_SCOPE:\n" + bounded
+        } catch {
+            NSLog("RemoteCode Token Saver SessionLearn prompt read failed: \(error)")
+            return prompt
+        }
+    }
+
+    private static func utf8SafePrefix(_ text: String, maxBytes: Int) -> String {
+        var result = ""
+        var used = 0
+        for character in text {
+            let value = String(character)
+            let bytes = value.utf8.count
+            guard used + bytes <= maxBytes else { break }
+            result.append(value)
+            used += bytes
+        }
+        return result
+    }
+
+    public func tokenSaverRolloverAdmission(
+        parentThreadID: AgentThreadID
+    ) -> TokenSaverAdmissionDecision {
+        let admission = tokenSaverProjectAdmission(
+            threadId: parentThreadID,
+            lane: "rollover_capsule"
+        )
+        guard admission.allowed else { return admission }
+        guard let parent = try? threadRepo.get(id: parentThreadID),
+              let projectID = parent.projectId?.value.uuidString,
+              parent.workspaceId != nil,
+              let lane = try? tokenSaverLaneStateRepo.get(
+                projectID: projectID,
+                lane: "rollover_capsule"
+              ),
+              lane.retentionDays > 0 else {
+            return .init(allowed: false, reason: "retention_not_positive")
+        }
+        return admission
+    }
+
+    public func createTokenSaverRollover(
+        parentThreadID: AgentThreadID,
+        maxBytes: Int = 8_192
+    ) throws -> AgentThread {
+        guard let parent = try threadRepo.get(id: parentThreadID),
+              let projectID = parent.projectId?.value.uuidString,
+              parent.workspaceId != nil else {
+            throw TokenSaverRolloverError.missingProjectScope
+        }
+        guard parent.status != .pending, parent.status != .running else {
+            throw TokenSaverRolloverError.parentBusy(parent.status)
+        }
+        try tokenSaverLaneStateRepo.ensureDefaults(projectID: projectID)
+        let admission = tokenSaverRolloverAdmission(parentThreadID: parentThreadID)
+        guard admission.allowed else {
+            throw TokenSaverRolloverError.laneUnavailable(admission.reason)
+        }
+        _ = try tokenSaverProjectDataRepo.performLifecycleSweep()
+        let child = AgentThread(
+            projectId: parent.projectId,
+            workspaceId: parent.workspaceId,
+            title: "Rollover: \(parent.title)",
+            provider: parent.provider,
+            providerInstanceId: parent.providerInstanceId,
+            model: parent.model,
+            permissionMode: parent.permissionMode,
+            reasoningEffort: parent.reasoningEffort,
+            executionMode: parent.executionMode,
+            baseBranch: parent.baseBranch,
+            worktreePath: parent.worktreePath,
+            serviceTier: parent.serviceTier,
+            modelSelection: parent.modelSelection,
+            interactionMode: parent.effectiveInteractionMode,
+            runAsUser: parent.runAsUser
+        )
+        let parentMessages = try messageRepo.list(threadId: parentThreadID)
+        let messages = parentMessages.map {
+            TokenSaverCapsuleMessage(role: $0.role.rawValue, text: $0.content)
+        }
+        let capsule = try TokenSaverRolloverCapsuleBuilder.build(
+            parentThreadID: parentThreadID.value.uuidString,
+            childThreadID: child.id.value.uuidString,
+            messages: messages,
+            maxBytes: maxBytes
+        )
+        do {
+            try tokenSaverRolloverBeforeCommitForTesting?()
+            guard let currentParent = try threadRepo.get(id: parentThreadID),
+                  currentParent.status != .pending,
+                  currentParent.status != .running,
+                  currentParent.updatedAt == parent.updatedAt,
+                  try messageRepo.list(threadId: parentThreadID) == parentMessages else {
+                throw TokenSaverRolloverError.parentChanged
+            }
+            try threadRepo.upsert(child)
+            try messageRepo.append(.init(threadId: child.id, role: .system, content: capsule.text))
+            try tokenSaverRolloverRepo.save(.init(
+                id: UUID().uuidString,
+                parentThreadID: parentThreadID.value.uuidString,
+                childThreadID: child.id.value.uuidString,
+                scopeTransitionJSON: nil,
+                capsuleSHA256: AgentSkillInstaller.sha256Hex(Data(capsule.text.utf8)),
+                capsuleText: capsule.text
+            ))
+            _ = try tokenSaverProjectDataRepo.performLifecycleSweep()
+            return child
+        } catch {
+            try? tokenSaverRolloverRepo.delete(childThreadID: child.id.value.uuidString)
+            try? threadRepo.delete(id: child.id)
+            throw error
         }
     }
 
@@ -1236,7 +1762,7 @@ public final class AppContext {
         let fallback = Self.fallbackHumanizeSR1(response, targetLanguage: targetLanguage)
         guard let client = await currentDistillClientWaitingForStartup() else {
             NSLog("RemoteCode Token Saver SR1 humanize fallback used (provider=\(provider.rawValue)): distill client unavailable (status=\(Self.describe(tokenSaverDistillServiceController.status)))")
-            recordTokenSaverSR1HumanizeSavings(sr1: response, humanized: fallback, provider: provider)
+            recordTokenSaverSR1HumanizeSavings(sr1: response, humanized: fallback, provider: provider, threadId: threadId)
             return fallback
         }
 
@@ -1265,11 +1791,11 @@ public final class AppContext {
             } else {
                 humanized = fallback
             }
-            recordTokenSaverSR1HumanizeSavings(sr1: response, humanized: humanized, provider: provider)
+            recordTokenSaverSR1HumanizeSavings(sr1: response, humanized: humanized, provider: provider, threadId: threadId)
             return humanized
         } catch {
             NSLog("RemoteCode Token Saver SR1 humanize fallback used (provider=\(provider.rawValue)): \(error)")
-            recordTokenSaverSR1HumanizeSavings(sr1: response, humanized: fallback, provider: provider)
+            recordTokenSaverSR1HumanizeSavings(sr1: response, humanized: fallback, provider: provider, threadId: threadId)
             return fallback
         }
     }
@@ -1399,12 +1925,173 @@ public final class AppContext {
         return SR1ResponseDetector.expandVariables(in: lines.joined(separator: "\n"), from: response)
     }
 
+    private func recordTokenSaverPreparedObservation(request: AgentRunRequest, originalPrompt: String) {
+        guard tokenSaverProjectObservation(threadId: request.threadId, lane: "measurement").allowed,
+              let thread = try? threadRepo.get(id: request.threadId),
+              let workspaceID = thread.workspaceId?.value.uuidString,
+              let projectID = thread.projectId?.value.uuidString else {
+            return
+        }
+        let attemptID = request.runId.value.uuidString
+        beginTokenSaverAttempt(runId: request.runId)
+        appendTokenSaverObservationEvent(
+            attemptID: attemptID,
+            kind: "treatment_join",
+            payload: [
+                "workspace_id": workspaceID,
+                "project_id": projectID,
+                "thread_id": request.threadId.value.uuidString,
+                "provider": request.provider.rawValue,
+                "input_attribution": "pending_provider_usage",
+                "input_bytes": originalPrompt.utf8.count,
+                "treatment": "verbatim_shadow",
+                "provider_bytes_changed": false,
+            ]
+        )
+
+        if tokenSaverProjectObservation(threadId: request.threadId, lane: "semantic_prose").allowed {
+            let contentType: TokenSaverSemanticContentType
+            if originalPrompt.contains("diff --git") { contentType = .diff }
+            else if originalPrompt.contains("```") { contentType = .code }
+            else { contentType = .prose }
+            let language = Self.looksPortuguese(originalPrompt) ? "pt" : (Self.looksSpanish(originalPrompt) ? "es" : "en")
+            appendTokenSaverObservationEvent(
+                attemptID: attemptID,
+                kind: "shadow_policy",
+                payload: [
+                    "lane": "semantic_prose",
+                    "result": "unavailable",
+                    "reason": "production_model_manifest_unavailable",
+                    "content_type": contentType.rawValue,
+                    "language": language,
+                    "provider_bytes_changed": false,
+                ]
+            )
+        }
+        if tokenSaverProjectObservation(threadId: request.threadId, lane: "adaptive_effort").allowed {
+            let lower = originalPrompt.lowercased()
+            let mechanicalMarkers = ["rename ", "format ", "run the tests", "run tests", "update version", "fix lint"]
+            let markerCount = mechanicalMarkers.filter { lower.contains($0) }.count
+            let taskClass: TokenSaverAdaptiveTaskClass = markerCount > 0 ? .mechanical : .reasoning
+            let confidence = markerCount > 0 ? 0.96 : 0.65
+            let decision = TokenSaverAdaptiveEffortPolicy.evaluate(
+                taskClass: taskClass,
+                confidence: confidence,
+                persistentUserOverride: request.reasoningEffort?.rawValue
+            )
+            appendTokenSaverObservationEvent(
+                attemptID: attemptID,
+                kind: "shadow_policy",
+                payload: [
+                    "lane": "adaptive_effort",
+                    "result": decision.action.rawValue,
+                    "task_class": taskClass.rawValue,
+                    "confidence": confidence,
+                    "persistent_override_present": request.reasoningEffort != nil,
+                    "provider_bytes_changed": false,
+                ]
+            )
+        }
+        if tokenSaverProjectObservation(threadId: request.threadId, lane: "visual_artifact").allowed {
+            let images = request.attachments.filter { $0.kind == .image }
+            let knownBytes = images.compactMap(\.sizeBytes).reduce(0, +)
+            appendTokenSaverObservationEvent(
+                attemptID: attemptID,
+                kind: "shadow_policy",
+                payload: [
+                    "lane": "visual_artifact",
+                    "result": "unavailable",
+                    "reason": images.isEmpty ? "no_visual_attachment" : "provider_visual_tokens_unavailable",
+                    "image_attachment_count": images.count,
+                    "known_image_bytes": knownBytes,
+                    "all_image_sizes_known": images.allSatisfy { $0.sizeBytes != nil },
+                    "provider_bytes_changed": false,
+                ]
+            )
+        }
+        if tokenSaverProjectObservation(threadId: request.threadId, lane: "provider_native").allowed {
+            let decision = TokenSaverProviderNativePolicy.evaluate(
+                provider: request.provider.rawValue,
+                providerVersionKnown: false,
+                toolSearchExposedByActiveAdapter: false,
+                promptCacheBehaviorProven: false,
+                recoveryProven: false
+            )
+            appendShadowPolicyEvent(attemptID: attemptID, lane: "provider_native", result: decision.state.rawValue)
+        }
+        let sessionLearnObservation = tokenSaverProjectObservation(threadId: request.threadId, lane: "session_learn")
+        if sessionLearnObservation.allowed {
+            let persistentScope = TokenSaverSessionLearnScope(
+                workspaceID: workspaceID,
+                projectID: projectID,
+                threadID: request.threadId.value.uuidString,
+                provider: request.provider.rawValue
+            )
+            let recoveryScope = TokenSaverRecoveryScope(
+                workspaceID: workspaceID,
+                projectID: projectID,
+                threadID: request.threadId.value.uuidString,
+                provider: request.provider.rawValue,
+                attemptID: attemptID
+            )
+            do {
+                let records = try tokenSaverSessionLearnRepo.topK(scope: persistentScope, byteBudget: 2_048, limit: 20)
+                let candidates = records.map {
+                    DistillCore.TokenSaverSessionLearnRecord(id: $0.id, scope: recoveryScope, text: $0.text)
+                }
+                let selected = TokenSaverSessionLearnSelector.select(
+                    records: candidates,
+                    scope: recoveryScope,
+                    query: originalPrompt,
+                    topK: 3,
+                    byteBudget: 512
+                )
+                appendTokenSaverObservationEvent(
+                    attemptID: attemptID,
+                    kind: "session_learn_retrieval",
+                    payload: [
+                        "selected_count": selected.count,
+                        "selected_bytes": selected.reduce(0) { $0 + $1.text.utf8.count },
+                        "provider_bytes_changed": sessionLearnObservation.reason == "promoted" && !selected.isEmpty,
+                    ]
+                )
+            } catch {
+                NSLog("RemoteCode Token Saver SessionLearn read failed: \(error)")
+            }
+        }
+    }
+
+    private func appendShadowPolicyEvent(attemptID: String, lane: String, result: String) {
+        appendTokenSaverObservationEvent(
+            attemptID: attemptID,
+            kind: "shadow_policy",
+            payload: ["lane": lane, "result": result, "provider_bytes_changed": false]
+        )
+    }
+
+    private func appendTokenSaverObservationEvent(attemptID: String, kind: String, payload: [String: Any]) {
+        guard JSONSerialization.isValidJSONObject(payload),
+              let data = try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys]),
+              let payloadJSON = String(data: data, encoding: .utf8) else {
+            return
+        }
+        do {
+            try tokenSaverAttemptLedger.appendEvent(attemptID: attemptID, kind: kind, payloadJSON: payloadJSON)
+        } catch {
+            NSLog("RemoteCode Token Saver observation ledger failed kind=\(kind): \(error)")
+        }
+    }
+
     private func recordTokenSaverUsage(_ usage: AssistantTokenUsage, runId: AgentRunID) {
         guard usage.totalTokens > 0,
               let run = try? runRepo.get(id: runId) else {
             return
         }
-        sessionLearnInputTokensByRun[runId, default: 0] += max(0, usage.inputTokens)
+        if tokenSaverProjectObservation(runId: runId, lane: "session_learn").allowed {
+            sessionLearnInputTokensByRun[runId, default: 0] += max(0, usage.inputTokens)
+        }
+        guard tokenSaverProjectObservation(runId: runId, lane: "measurement").allowed else { return }
+        appendTokenSaverProviderUsage(usage, runId: runId)
         let settings = SettingsStore(db: db).load()
         // Record only the real provider-billed token count. Savings are now
         // measured at the local sidecar call sites (`| distill` command-output
@@ -1435,6 +2122,87 @@ public final class AppContext {
             )
         }
         schedulePendingUsageFlush()
+    }
+
+    private func beginTokenSaverAttempt(runId: AgentRunID) {
+        let attemptID = runId.value.uuidString
+        guard (try? tokenSaverAttemptLedger.attempt(id: attemptID)) == nil,
+              let run = try? runRepo.get(id: runId),
+              tokenSaverProjectObservation(runId: runId, lane: "measurement").allowed else {
+            return
+        }
+        let record = TokenSaverAttemptRecord(
+            id: attemptID,
+            runID: attemptID,
+            provider: run.provider.rawValue,
+            adapterVersion: "unavailable",
+            providerVersion: "unavailable",
+            model: run.model,
+            cacheState: "unavailable",
+            language: "unavailable",
+            hardwareClass: "unavailable",
+            workload: "interactive_agent",
+            taskClass: "observational_shadow",
+            evidenceLevel: "provider_usage",
+            unavailableFields: [
+                "adapter_version",
+                "provider_version",
+                "cache_state",
+                "language",
+                "hardware_class",
+                "provider_usage_semantics",
+                "provider_input_cost",
+            ]
+        )
+        do {
+            try tokenSaverAttemptLedger.begin(record)
+        } catch {
+            NSLog("RemoteCode Token Saver attempt begin failed: \(error)")
+        }
+    }
+
+    private func appendTokenSaverProviderUsage(_ usage: AssistantTokenUsage, runId: AgentRunID) {
+        guard tokenSaverProjectObservation(runId: runId, lane: "measurement").allowed else {
+            return
+        }
+        beginTokenSaverAttempt(runId: runId)
+        if usage.inputTokens > 0 {
+            do {
+                try tokenSaverAttemptLedger.appendInputComponent(
+                    attemptID: runId.value.uuidString,
+                    category: "unattributed_provider_input",
+                    tokens: usage.inputTokens,
+                    costMicros: 0
+                )
+            } catch {
+                NSLog("RemoteCode Token Saver provider input attribution failed: \(error)")
+            }
+        }
+        var payload: [String: Any] = [
+            "semantics": "unavailable",
+            "input_tokens": max(0, usage.inputTokens),
+            "output_tokens": max(0, usage.outputTokens),
+            "total_tokens": max(0, usage.totalTokens),
+            "billed_token_units": max(0, usage.billedTotalTokenUnits),
+        ]
+        if let value = usage.contextWindow { payload["context_window"] = max(0, value) }
+        if let value = usage.uncachedInputTokens { payload["uncached_input_tokens"] = max(0, value) }
+        if let value = usage.cacheCreationInputTokens { payload["cache_creation_input_tokens"] = max(0, value) }
+        if let value = usage.cacheReadInputTokens { payload["cache_read_input_tokens"] = max(0, value) }
+        guard JSONSerialization.isValidJSONObject(payload),
+              let data = try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys]),
+              let payloadJSON = String(data: data, encoding: .utf8) else {
+            return
+        }
+        do {
+            try tokenSaverAttemptLedger.appendEvent(
+                attemptID: runId.value.uuidString,
+                kind: "provider_usage",
+                payloadJSON: payloadJSON
+            )
+        } catch {
+            NSLog("RemoteCode Token Saver provider usage ledger failed: \(error)")
+        }
     }
 
     /// Schedules a debounced flush; resets the timer on each call so many rapid
@@ -1523,6 +2291,7 @@ public final class AppContext {
 
     private func recordTokenSaverSidecarSavings(
         provider: AgentProvider,
+        threadId: AgentThreadID,
         mode: String,
         inputTokens: Int,
         outputTokens: Int,
@@ -1530,7 +2299,7 @@ public final class AppContext {
         cacheState: String = "unknown",
         routeStage: TokenSaverRouteStage? = nil
     ) {
-        guard SettingsStore(db: db).load().tokenSaverEnabled else { return }
+        guard tokenSaverProjectAdmission(threadId: threadId, lane: "deterministic_wrapper").allowed else { return }
         do {
             _ = try tokenSaverSavingsRepo.record(
                 provider: provider.rawValue,
@@ -1546,10 +2315,16 @@ public final class AppContext {
         }
     }
 
-    private func recordTokenSaverSR1HumanizeSavings(sr1: String, humanized: String, provider: AgentProvider) {
+    private func recordTokenSaverSR1HumanizeSavings(
+        sr1: String,
+        humanized: String,
+        provider: AgentProvider,
+        threadId: AgentThreadID
+    ) {
         let estimate = TokenSaverSR1SavingsEstimator.estimate(sr1: sr1, humanized: humanized)
         recordTokenSaverSidecarSavings(
             provider: provider,
+            threadId: threadId,
             mode: "sr1-humanize",
             inputTokens: estimate.inputTokens,
             outputTokens: estimate.outputTokens,

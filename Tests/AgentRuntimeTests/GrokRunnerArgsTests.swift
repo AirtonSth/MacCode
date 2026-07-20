@@ -11,7 +11,8 @@ final class GrokRunnerArgsTests: XCTestCase {
         resume: String? = nil,
         model: String = "grok-4.5",
         interaction: AgentInteractionMode = .default,
-        effort: AgentReasoningEffort? = .medium
+        effort: AgentReasoningEffort? = .medium,
+        environment: [String: String] = [:]
     ) -> AgentRunRequest {
         AgentRunRequest(
             threadId: AgentThreadID(),
@@ -22,8 +23,26 @@ final class GrokRunnerArgsTests: XCTestCase {
             providerThreadId: resume,
             permissionMode: mode,
             reasoningEffort: effort,
-            interactionMode: interaction
+            interactionMode: interaction,
+            environment: environment
         )
+    }
+
+    func test_tokenSaverSafetyABIIsInjectedExactlyOnceForGrokHeadless() {
+        let args = GrokRunner.buildArgs(req(environment: ["RC_TOKEN_SAVER_DISTILL_HINT": "1"]))
+        let prompt = args[args.index(after: args.firstIndex(of: "-p")!)]
+        XCTAssertEqual(prompt.components(separatedBy: TokenSaverProviderSafetyABI.block).count - 1, 1)
+        XCTAssertTrue(prompt.contains("| distill"))
+        XCTAssertEqual(
+            (AgentSkillInstaller.distillAgentInstructionsTemplate + "\n\n" + prompt)
+                .components(separatedBy: TokenSaverProviderSafetyABI.block).count - 1,
+            1,
+            "Grok headless effective disk plus runtime context receives the safety ABI exactly once"
+        )
+
+        let disabledArgs = GrokRunner.buildArgs(req())
+        let disabledPrompt = disabledArgs[disabledArgs.index(after: disabledArgs.firstIndex(of: "-p")!)]
+        XCTAssertFalse(disabledPrompt.contains(TokenSaverProviderSafetyABI.block))
     }
 
     func test_headlessStreamingJsonFlags() {

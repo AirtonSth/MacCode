@@ -42,9 +42,9 @@ public final class DistillServiceClient: @unchecked Sendable {
     /// larger session timeout.
     public static let requestTimeoutSeconds: TimeInterval = 8
 
-    /// Upper bound on bytes we hand to the optimizer (item 218). The optimizer is
-    /// a best-effort summarizer, so over-cap input is head/tail truncated for the
-    /// wire only -- the caller's original payload is never lost. ~32MB.
+    /// Upper bound on bytes we hand to the optimizer (item 218). Inputs above
+    /// this limit fail open before request construction because a partial wire
+    /// copy cannot back a capability that promises the complete original. ~32MB.
     public static let stdinByteCap: Int = 32 * 1024 * 1024
 
     public init(
@@ -82,6 +82,36 @@ public final class DistillServiceClient: @unchecked Sendable {
     /// output plus measured token deltas. Throws on any non-200 so callers can
     /// fail loud or fall back to the raw text deliberately.
     public func distill(_ request: DistillRequest) async throws -> DistillResponse {
+        try await distill(request, recoveryContext: nil)
+    }
+
+    /// Scoped store-before-loss transport. Callers provide the five stable runtime
+    /// scope fields; an empty operation ID is derived from the exact canonical wire
+    /// request so retries are idempotent and distinct calls do not share outbox state.
+    public func distill(
+        _ request: DistillRequest,
+        recoveryContext: TokenSaverRecoveryRequestContext
+    ) async throws -> DistillResponse {
+        try await distill(request, recoveryContext: Optional(recoveryContext))
+    }
+
+    private func distill(
+        _ request: DistillRequest,
+        recoveryContext: TokenSaverRecoveryRequestContext?
+    ) async throws -> DistillResponse {
+        guard request.input.utf8.count <= Self.stdinByteCap else {
+            let tokens = TokenEstimator.estimate(request.input)
+            return DistillResponse(
+                requestID: request.id,
+                output: request.input,
+                inputCharacters: request.input.count,
+                inputTokens: tokens,
+                outputTokens: tokens,
+                originalHandle: nil,
+                runMode: request.effectiveRunMode,
+                routeStage: .verbatim
+            )
+        }
         var httpRequest = URLRequest(url: baseURL.appendingPathComponent("v1/distill"))
         httpRequest.httpMethod = "POST"
         httpRequest.setValue("Bearer \(authToken)", forHTTPHeaderField: "Authorization")
@@ -89,12 +119,25 @@ public final class DistillServiceClient: @unchecked Sendable {
         // Enforce the transport budget per-request so the 5-10s cap holds even if
         // the URLSession was configured with a larger timeout (item 218).
         httpRequest.timeoutInterval = Self.requestTimeoutSeconds
-        // Cap only the copy sent over the wire. The caller still holds the
-        // original `request.input` untouched (value type), so an over-cap payload
-        // degrades to best-effort optimization, never data loss.
-        let wireRequest = Self.cappedForWire(request)
+        let wireRequest = request
+        let canonicalEncoder = JSONEncoder()
+        canonicalEncoder.outputFormatting = [.sortedKeys]
         do {
-            httpRequest.httpBody = try encoder.encode(wireRequest)
+            let body = try canonicalEncoder.encode(wireRequest)
+            httpRequest.httpBody = body
+            if let recoveryContext, recoveryContext.hasCompleteScope {
+                let derivedOperationID = ManagedDistillCLI.recoveryOperationID(kind: "distill", canonicalPayload: body)
+                let operationID = recoveryContext.operationID.isEmpty
+                    ? derivedOperationID
+                    : recoveryContext.operationID + ":" + derivedOperationID
+                httpRequest.setValue(recoveryContext.workspaceID, forHTTPHeaderField: "X-RemoteCode-Workspace-ID")
+                httpRequest.setValue(recoveryContext.projectID, forHTTPHeaderField: "X-RemoteCode-Project-ID")
+                httpRequest.setValue(recoveryContext.threadID, forHTTPHeaderField: "X-RemoteCode-Thread-ID")
+                httpRequest.setValue(recoveryContext.provider, forHTTPHeaderField: "X-RemoteCode-Provider")
+                httpRequest.setValue(recoveryContext.attemptID, forHTTPHeaderField: "X-RemoteCode-Attempt-ID")
+                httpRequest.setValue(request.id.uuidString.lowercased(), forHTTPHeaderField: "X-RemoteCode-Invocation-ID")
+                httpRequest.setValue(operationID, forHTTPHeaderField: "X-RemoteCode-Operation-ID")
+            }
         } catch {
             throw DistillClientError.transport("encode request: \(error)")
         }
@@ -147,95 +190,6 @@ public final class DistillServiceClient: @unchecked Sendable {
             return false
         }
         return http.statusCode == 200
-    }
-
-    /// Marker inserted between the preserved head and tail when an over-cap
-    /// payload is truncated for the wire. Byte length is bounded and accounted
-    /// for in the budget so the result stays <= cap.
-    public static let truncationMarker =
-        "\n...[distill: input truncated for optimizer; original preserved by caller]...\n"
-
-    /// Pure helper: build the request copy actually sent to the optimizer. Under
-    /// cap it is the same request (success path unchanged). Over cap, only the
-    /// `input` is head/tail truncated; every other field is preserved.
-    nonisolated static func cappedForWire(_ request: DistillRequest) -> DistillRequest {
-        let capped = headTailTruncate(request.input, cap: stdinByteCap)
-        guard capped != request.input else { return request }
-        return DistillRequest(
-            id: request.id,
-            mode: request.mode,
-            priority: request.priority,
-            input: capped,
-            question: request.question,
-            provider: request.provider,
-            recordSavings: request.recordSavings ?? false,
-            runMode: request.effectiveRunMode,
-            cacheState: request.cacheState,
-            rerankQuery: request.rerankQuery,
-            topK: request.topK,
-            encoderLane: request.encoderLane,
-            maxOutputCharacters: request.maxOutputCharacters
-        )
-    }
-
-    /// Pure helper: clamp `input` to at most `cap` UTF-8 bytes, preserving the
-    /// head and tail around `truncationMarker`. Returns the input unchanged when
-    /// already within budget. Splits only on `Character` boundaries so the result
-    /// is always valid UTF-8 and never exceeds `cap` bytes. Stateless and
-    /// service-free so it is unit-testable in isolation (item 218).
-    nonisolated static func headTailTruncate(_ input: String, cap: Int) -> String {
-        let totalBytes = input.utf8.count
-        guard totalBytes > cap else { return input }
-
-        let markerBytes = truncationMarker.utf8.count
-        // Degenerate cap that cannot even hold the marker: keep a byte-bounded
-        // head so the result still never exceeds cap.
-        guard cap > markerBytes else {
-            return headPrefix(of: input, maxBytes: cap)
-        }
-
-        let budget = cap - markerBytes
-        let headBudget = budget - budget / 2 // head gets the rounding remainder
-        let tailBudget = budget / 2
-        let head = headPrefix(of: input, maxBytes: headBudget)
-        let tail = tailSuffix(of: input, maxBytes: tailBudget)
-        return head + truncationMarker + tail
-    }
-
-    /// Longest prefix of `s` whose UTF-8 size is <= `maxBytes`, cut on a
-    /// Character boundary so no multibyte scalar is split.
-    nonisolated private static func headPrefix(of s: String, maxBytes: Int) -> String {
-        guard maxBytes > 0 else { return "" }
-        var used = 0
-        var end = s.startIndex
-        var i = s.startIndex
-        while i < s.endIndex {
-            let next = s.index(after: i)
-            let charBytes = String(s[i..<next]).utf8.count
-            if used + charBytes > maxBytes { break }
-            used += charBytes
-            end = next
-            i = next
-        }
-        return String(s[s.startIndex..<end])
-    }
-
-    /// Longest suffix of `s` whose UTF-8 size is <= `maxBytes`, cut on a
-    /// Character boundary.
-    nonisolated private static func tailSuffix(of s: String, maxBytes: Int) -> String {
-        guard maxBytes > 0 else { return "" }
-        var used = 0
-        var start = s.endIndex
-        var i = s.endIndex
-        while i > s.startIndex {
-            let prev = s.index(before: i)
-            let charBytes = String(s[prev..<i]).utf8.count
-            if used + charBytes > maxBytes { break }
-            used += charBytes
-            start = prev
-            i = prev
-        }
-        return String(s[start..<s.endIndex])
     }
 
     private func post<Request: Encodable, Response: Decodable>(

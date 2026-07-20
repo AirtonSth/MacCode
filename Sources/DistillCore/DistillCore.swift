@@ -179,6 +179,9 @@ public struct DistillResponse: Codable, Sendable, Equatable {
     /// (small/lossless). Optional + synthesized Codable => decode tolerates older
     /// payloads that omit the key (version-skew safe).
     public let originalHandle: String?
+    /// Stable mutation identity for the scoped recovery outbox. Optional for
+    /// backward-compatible decoding from older sidecars and absent on verbatim paths.
+    public let recoveryIdempotencyKey: String?
     public let runMode: DistillRunMode?
     public let auditReport: DistillAuditReport?
     /// Which engine produced this output (deterministic router / BERT encoder lane /
@@ -193,6 +196,7 @@ public struct DistillResponse: Codable, Sendable, Equatable {
         inputTokens: Int = 0,
         outputTokens: Int = 0,
         originalHandle: String? = nil,
+        recoveryIdempotencyKey: String? = nil,
         runMode: DistillRunMode = .optimize,
         auditReport: DistillAuditReport? = nil,
         routeStage: TokenSaverRouteStage? = nil
@@ -204,6 +208,7 @@ public struct DistillResponse: Codable, Sendable, Equatable {
         self.inputTokens = max(0, inputTokens)
         self.outputTokens = max(0, outputTokens)
         self.originalHandle = originalHandle
+        self.recoveryIdempotencyKey = recoveryIdempotencyKey
         self.runMode = runMode
         self.auditReport = auditReport
         self.routeStage = routeStage
@@ -233,7 +238,7 @@ public struct DistillResponse: Codable, Sendable, Equatable {
     }
 
     /// Copy carrying the CCR handle to the stored original.
-    public func withOriginalHandle(_ handle: String?) -> DistillResponse {
+    public func withOriginalHandle(_ handle: String?, idempotencyKey: String? = nil) -> DistillResponse {
         DistillResponse(
             requestID: requestID,
             output: output,
@@ -241,6 +246,7 @@ public struct DistillResponse: Codable, Sendable, Equatable {
             inputTokens: inputTokens,
             outputTokens: outputTokens,
             originalHandle: handle,
+            recoveryIdempotencyKey: idempotencyKey,
             runMode: runMode ?? .optimize,
             auditReport: auditReport,
             routeStage: routeStage

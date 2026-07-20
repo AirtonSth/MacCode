@@ -17,6 +17,72 @@ public extension Notification.Name {
 
 @MainActor
 public final class SidebarViewModel: ObservableObject {
+    public struct TokenSaverRolloverAdmission: Equatable {
+        public let allowed: Bool
+        public let reason: String
+
+        public init(allowed: Bool, reason: String) {
+            self.allowed = allowed
+            self.reason = reason
+        }
+    }
+
+    public struct TokenSaverProjectGovernance: Equatable, Identifiable {
+        public let projectID: String
+        public let projectName: String
+        public let lanes: [TokenSaverLaneStateRecord]
+        public let lifecycleDegradedReason: String?
+        public let rolloverAdmission: TokenSaverRolloverAdmission
+
+        public init(
+            projectID: String,
+            projectName: String,
+            lanes: [TokenSaverLaneStateRecord],
+            lifecycleDegradedReason: String? = nil,
+            rolloverAdmission: TokenSaverRolloverAdmission = .init(
+                allowed: false,
+                reason: "authoritative_admission_required"
+            )
+        ) {
+            self.projectID = projectID
+            self.projectName = projectName
+            self.lanes = lanes
+            self.lifecycleDegradedReason = lifecycleDegradedReason
+            self.rolloverAdmission = rolloverAdmission
+        }
+
+        public var id: String { projectID }
+        public var optedOut: Bool { lanes.contains(where: \.optedOut) }
+        public var retentionDays: Int { lanes.first?.retentionDays ?? 0 }
+        public var promotedLaneCount: Int { lanes.filter { $0.state == "promoted" }.count }
+        public var shadowLaneCount: Int { lanes.filter { $0.state == "shadow_only" }.count }
+        /// Compatibility name retained for callers that mean live provider behavior.
+        /// Shadow lanes never count as active because they cannot change provider input.
+        public var activeLaneCount: Int { promotedLaneCount }
+        public var laneSummaryLabel: String {
+            "\(promotedLaneCount) promoted · \(shadowLaneCount) shadow"
+        }
+        public var stateLabel: String {
+            if lifecycleDegradedReason != nil { return "Degraded (verbatim)" }
+            if optedOut { return "Opted out" }
+            if lanes.contains(where: { $0.reason.contains("degraded") }) { return "Degraded" }
+            if promotedLaneCount > 0 { return "Active" }
+            if shadowLaneCount > 0 { return "Shadow only" }
+            return "Guarded off"
+        }
+        public var rolloverLane: TokenSaverLaneStateRecord? {
+            lanes.first { $0.lane == "rollover_capsule" }
+        }
+        public var rolloverAvailable: Bool {
+            rolloverAdmission.allowed && (rolloverLane?.retentionDays ?? 0) > 0
+        }
+        public var rolloverReason: String {
+            guard rolloverAdmission.allowed else { return rolloverAdmission.reason }
+            guard (rolloverLane?.retentionDays ?? 0) > 0 else { return "retention_not_positive" }
+            return "Ready"
+        }
+    }
+
     /// Pure view-state for the Insomnia keep-awake status pill. Carries no UI
     /// dependency so the view can render + wire one-click disable from it.
     public struct InsomniaStatusPillState: Equatable {
@@ -264,6 +330,8 @@ public final class SidebarViewModel: ObservableObject {
     @Published public private(set) var tokenSaverUsageSnapshot: TokenSaverUsageSnapshot = .empty()
     /// Saved-token totals from the local DB plus retained report/chart rows.
     @Published public private(set) var tokenSaverSavingsSummary: TokenSaverSavingsSummary = .empty
+    @Published public private(set) var tokenSaverProjectGovernance: [TokenSaverProjectGovernance] = []
+    @Published public private(set) var tokenSaverGovernanceNotice: String?
     @Published public var showsTokenSaverModelDownload = false
     @Published public private(set) var tokenSaverModelDownloadState: TokenSaverModelDownloadState = .idle
     /// True while a background account-usage refresh (CLI probe) is in flight.
@@ -535,6 +603,171 @@ public final class SidebarViewModel: ObservableObject {
                 self.tokenSaverUsageSnapshot = result.snapshot
                 self.tokenSaverSavingsSummary = result.summary
             }
+        }
+    }
+
+    public func reloadTokenSaverGovernance() {
+        guard let context else {
+            tokenSaverProjectGovernance = []
+            return
+        }
+        do {
+            let projects = try context.projectRepo.list()
+            let threads = try context.threadRepo.list(workspaceId: selectedWorkspaceID)
+            let lifecycleDegradedReason = context.tokenSaverLifecycleDegradedReason
+            let scopedProjectIDs: Set<String>
+            if selectedWorkspaceID == nil {
+                scopedProjectIDs = Set(projects.map { $0.id.value.uuidString })
+            } else {
+                scopedProjectIDs = Set(threads.compactMap { $0.projectId?.value.uuidString })
+            }
+            tokenSaverProjectGovernance = try projects.compactMap { project in
+                let projectID = project.id.value.uuidString
+                guard scopedProjectIDs.contains(projectID) else { return nil }
+                try context.tokenSaverLaneStateRepo.ensureDefaults(projectID: projectID)
+                let parentThread = threads
+                    .filter { $0.projectId?.value.uuidString == projectID }
+                    .max { $0.updatedAt < $1.updatedAt }
+                let rolloverAdmission = parentThread.map {
+                    let decision = context.tokenSaverRolloverAdmission(parentThreadID: $0.id)
+                    return TokenSaverRolloverAdmission(allowed: decision.allowed, reason: decision.reason)
+                } ?? .init(allowed: false, reason: "missing_project_scope")
+                return TokenSaverProjectGovernance(
+                    projectID: projectID,
+                    projectName: project.name,
+                    lanes: try context.tokenSaverLaneStateRepo.list(projectID: projectID),
+                    lifecycleDegradedReason: lifecycleDegradedReason,
+                    rolloverAdmission: rolloverAdmission
+                )
+            }
+            if let lifecycleDegradedReason {
+                tokenSaverGovernanceNotice = "Lifecycle retention is degraded; project lanes are forced to verbatim provider delivery. \(lifecycleDegradedReason)"
+            }
+        } catch {
+            tokenSaverProjectGovernance = []
+            operationErrorPresenter("Token Saver project controls unavailable", error.localizedDescription)
+        }
+    }
+
+    public func setTokenSaverProjectOptOut(projectID: String, optedOut: Bool) {
+        guard let context else { return }
+        guard validateTokenSaverGovernanceProject(
+            projectID,
+            operation: "Could not update Token Saver opt-out"
+        ) else { return }
+        do {
+            try context.tokenSaverLaneStateRepo.setOptOut(projectID: projectID, optedOut: optedOut)
+            tokenSaverGovernanceNotice = optedOut ? "Project now uses verbatim provider delivery." : "Project opt-out removed; lanes remain gated by their scorecards."
+            reloadTokenSaverGovernance()
+        } catch {
+            operationErrorPresenter("Could not update Token Saver opt-out", error.localizedDescription)
+        }
+    }
+
+    public func setTokenSaverProjectRetention(projectID: String, days: Int) {
+        guard let context else { return }
+        guard validateTokenSaverGovernanceProject(
+            projectID,
+            operation: "Could not update Token Saver retention"
+        ) else { return }
+        do {
+            try context.tokenSaverProjectDataRepo.setProjectRetentionDays(projectID: projectID, days: days)
+            tokenSaverGovernanceNotice = days == 0 ? "Persistent project retention disabled." : "Project retention set to \(days) days."
+            reloadTokenSaverGovernance()
+        } catch {
+            tokenSaverGovernanceNotice = "Retention unchanged: \(error.localizedDescription)"
+            operationErrorPresenter("Could not update Token Saver retention", error.localizedDescription)
+        }
+    }
+
+    public func forceTokenSaverVerbatim(projectID: String) {
+        guard let context else { return }
+        guard validateTokenSaverGovernanceProject(
+            projectID,
+            operation: "Could not force verbatim delivery"
+        ) else { return }
+        do {
+            try context.tokenSaverLaneStateRepo.forceVerbatim(projectID: projectID)
+            tokenSaverGovernanceNotice = "All project lanes stopped; provider delivery is verbatim."
+            reloadTokenSaverGovernance()
+        } catch {
+            operationErrorPresenter("Could not force verbatim delivery", error.localizedDescription)
+        }
+    }
+
+    public func deleteTokenSaverProjectData(projectID: String) {
+        guard let context else { return }
+        guard validateTokenSaverGovernanceProject(
+            projectID,
+            operation: "Could not delete Token Saver project data"
+        ) else { return }
+        do {
+            let result = try context.tokenSaverProjectDataRepo.deleteProjectData(projectID: projectID)
+            tokenSaverGovernanceNotice = "Deleted \(result.recoveryObjects) recovery objects, \(result.sessionLearnRecords) learned records, and \(result.rolloverCapsules) rollover capsules."
+            reloadTokenSaverGovernance()
+        } catch {
+            operationErrorPresenter("Could not delete Token Saver project data", error.localizedDescription)
+        }
+    }
+
+    public func createTokenSaverRollover(projectID: String) {
+        guard let context else { return }
+        guard validateTokenSaverGovernanceProject(
+            projectID,
+            operation: "Token Saver rollover unavailable"
+        ) else { return }
+        do {
+            let parent = try context.threadRepo.list(workspaceId: selectedWorkspaceID)
+                .filter { $0.projectId?.value.uuidString == projectID }
+                .sorted { $0.updatedAt > $1.updatedAt }
+                .first
+            guard let parent else {
+                operationErrorPresenter("Token Saver rollover unavailable", "No project thread exists in the selected workspace.")
+                return
+            }
+            let child = try context.createTokenSaverRollover(parentThreadID: parent.id)
+            tokenSaverGovernanceNotice = "Created rollover thread: \(child.title). The original thread was preserved."
+            reloadTokenSaverGovernance()
+        } catch {
+            operationErrorPresenter("Token Saver rollover unavailable", error.localizedDescription)
+        }
+    }
+
+    private func validateTokenSaverGovernanceProject(
+        _ projectID: String,
+        operation: String
+    ) -> Bool {
+        func reject(_ detail: String) -> Bool {
+            operationErrorPresenter(
+                operation,
+                detail
+            )
+            return false
+        }
+        guard tokenSaverProjectGovernance.contains(where: { $0.projectID == projectID }) else {
+            return reject("Project is not scoped to the currently selected workspace. Refresh project controls and try again.")
+        }
+        guard let context else {
+            return reject("Project controls are unavailable. Reopen the workspace and try again.")
+        }
+        do {
+            let projectExists = try context.projectRepo.list().contains {
+                $0.id.value.uuidString == projectID
+            }
+            let remainsWorkspaceScoped: Bool
+            if let selectedWorkspaceID {
+                remainsWorkspaceScoped = try context.threadRepo.list(workspaceId: selectedWorkspaceID).contains {
+                    $0.projectId?.value.uuidString == projectID
+                }
+            } else {
+                remainsWorkspaceScoped = projectExists
+            }
+            guard projectExists, remainsWorkspaceScoped else {
+                return reject("Project is not scoped to the currently selected workspace. Refresh project controls and try again.")
+            }
+            return true
+        } catch {
+            return reject("Could not verify the selected workspace project scope: \(error.localizedDescription)")
         }
     }
 
@@ -2503,6 +2736,7 @@ public struct SidebarRootView: View {
         let willOpen = !showsTokenSaverDetails
         if willOpen && refreshWhenOpening {
             vm.refreshTokenSaverAccountUsageForDetails()
+            vm.reloadTokenSaverGovernance()
         }
         showsTokenSaverDetails = willOpen
     }
@@ -2534,7 +2768,7 @@ public struct SidebarRootView: View {
     }
 
     private var tokenSaverHeadline: String {
-        guard let user = vm.privateAccountUser else { return "Track Claude + Codex + Grok savings" }
+        guard let user = vm.privateAccountUser else { return "Track Claude + Codex + Grok usage" }
         return Self.tokenSaverCardHeadline(
             subscribed: user.subscribed,
             enabled: vm.tokenSaverEnabled,
@@ -2548,13 +2782,13 @@ public struct SidebarRootView: View {
         guard let user = vm.privateAccountUser else { return "Sign in to track account usage" }
         let used = vm.tokenSaverUsageSnapshot.usedTokens
         if user.subscribed {
-            return used > 0 ? "Used \(Self.formatTokenCount(used)) in Claude + Codex + Grok" : "Enable to save tokens locally"
+            return used > 0 ? "Used \(Self.formatTokenCount(used)) in Claude + Codex + Grok" : "Enable local reduction experiments"
         }
-        return used > 0 ? "Used \(Self.formatTokenCount(used)) in Claude + Codex + Grok" : "Subscribe to activate local savings"
+        return used > 0 ? "Used \(Self.formatTokenCount(used)) in Claude + Codex + Grok" : "Subscribe to activate local reduction"
     }
 
     private var tokenSaverHelpText: String {
-        "Token Saver shows Claude, Codex, and Grok usage plus saved or potential tokens. Paid users can enable the local MLX model."
+        "Token Saver shows provider usage and local reduction estimates. Billing claims require joined provider usage evidence."
     }
 
     private var tokenSaverAccessibilityValue: String {
@@ -2737,7 +2971,9 @@ public struct SidebarRootView: View {
         for snapshot: TokenSaverUsageSnapshot,
         scope: TokenSaverUsageScope
     ) -> String {
-        let prefix = vm.privateAccountUser?.subscribed == true && vm.tokenSaverEnabled ? "Saved" : "Could save"
+        let prefix = vm.privateAccountUser?.subscribed == true && vm.tokenSaverEnabled
+            ? "Estimated save"
+            : "Estimated potential"
         return "\(prefix) \(Self.formatTokenCount(tokenSaverSavedOrPotential(in: snapshot, scope: scope)))"
     }
 
@@ -2910,6 +3146,17 @@ public struct SidebarRootView: View {
                     tokenSaverOtherSavingsRow(saved: other.savedTokens, runs: other.runs)
                 }
             }
+
+            Divider()
+
+            tokenSaverProjectControls
+
+            Text(Self.tokenSaverBillingEvidenceDisclaimer)
+                .font(DS.Font.caption2)
+                .foregroundColor(DS.Palette.textTertiary)
+                .fixedSize(horizontal: false, vertical: true)
+                .accessibilityLabel(Self.tokenSaverBillingEvidenceDisclaimer)
+                .accessibilityIdentifier("sidebar.tokenSaver.billingEvidenceDisclaimer")
         }
         .padding(DS.Space.md)
         .frame(width: 350, alignment: .leading)
@@ -2919,6 +3166,171 @@ public struct SidebarRootView: View {
 
     var tokenSaverDetailsPopoverForTesting: some View {
         tokenSaverDetailsPopover
+    }
+
+    private var tokenSaverProjectControls: some View {
+        VStack(alignment: .leading, spacing: DS.Space.sm) {
+            Text("Project controls")
+                .font(DS.Font.captionStrong)
+                .foregroundColor(DS.Palette.text)
+
+            if vm.tokenSaverProjectGovernance.isEmpty {
+                Text("No project is scoped to the selected workspace.")
+                    .font(DS.Font.caption2)
+                    .foregroundColor(DS.Palette.textTertiary)
+            } else {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: DS.Space.sm) {
+                        ForEach(vm.tokenSaverProjectGovernance) { project in
+                            tokenSaverProjectControl(project)
+                        }
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .frame(maxHeight: 260)
+            }
+
+            if let notice = vm.tokenSaverGovernanceNotice {
+                Text(notice)
+                    .font(DS.Font.caption2)
+                    .foregroundColor(DS.Palette.textSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .accessibilityIdentifier("sidebar.tokenSaver.project.notice")
+            }
+        }
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("sidebar.tokenSaver.projectControls")
+    }
+
+    private func tokenSaverProjectControl(
+        _ project: SidebarViewModel.TokenSaverProjectGovernance
+    ) -> some View {
+        DisclosureGroup {
+            VStack(alignment: .leading, spacing: DS.Space.xs) {
+                HStack {
+                    Toggle("Opt out", isOn: Binding(
+                        get: { project.optedOut },
+                        set: { vm.setTokenSaverProjectOptOut(projectID: project.projectID, optedOut: $0) }
+                    ))
+                    .toggleStyle(.checkbox)
+                    .accessibilityHint("Stops all Token Saver writers and restores verbatim provider delivery for this project")
+                    .accessibilityIdentifier("sidebar.tokenSaver.project.\(project.projectID).optOut")
+
+                    Spacer(minLength: DS.Space.sm)
+
+                    Picker("Retention", selection: Binding(
+                        get: { project.retentionDays },
+                        set: { vm.setTokenSaverProjectRetention(projectID: project.projectID, days: $0) }
+                    )) {
+                        Text("No retention").tag(0)
+                        Text("7 days").tag(7)
+                        Text("30 days").tag(30)
+                    }
+                    .labelsHidden()
+                    .frame(width: 100)
+                    .accessibilityLabel("Project retention")
+                    .accessibilityIdentifier("sidebar.tokenSaver.project.\(project.projectID).retention")
+                }
+
+                ForEach(project.lanes, id: \.lane) { lane in
+                    VStack(alignment: .leading, spacing: 1) {
+                        HStack(spacing: DS.Space.xs) {
+                            Text(Self.tokenSaverLaneTitle(lane.lane))
+                                .font(DS.Font.captionStrong)
+                                .foregroundColor(DS.Palette.text)
+                            Spacer(minLength: 0)
+                            Text(Self.tokenSaverLaneStateLabel(lane.state))
+                                .font(DS.Font.caption2)
+                                .foregroundColor(lane.state == "promoted" ? DS.Palette.success : DS.Palette.textTertiary)
+                        }
+                        Text("\(lane.reason) · evidence \(lane.evidenceLevel) · \(lane.permissionBoundary) · owner \(lane.ownerRole)")
+                            .font(DS.Font.caption2)
+                            .foregroundColor(DS.Palette.textTertiary)
+                            .fixedSize(horizontal: false, vertical: true)
+                        Text("Retention \(lane.retentionDays)d · kill switch \(lane.killSwitchActive ? "on" : "off")")
+                            .font(DS.Font.caption2)
+                            .foregroundColor(DS.Palette.textTertiary)
+                    }
+                    .accessibilityElement(children: .combine)
+                }
+
+                HStack(spacing: DS.Space.xs) {
+                    Button("Verbatim") {
+                        vm.forceTokenSaverVerbatim(projectID: project.projectID)
+                    }
+                    .help("Stop project lanes and retry with verbatim provider input")
+                    .accessibilityIdentifier("sidebar.tokenSaver.project.\(project.projectID).verbatim")
+
+                    Button("Delete data") {
+                        confirmDeleteTokenSaverProjectData(project)
+                    }
+                    .foregroundColor(DS.Palette.danger)
+                    .accessibilityIdentifier("sidebar.tokenSaver.project.\(project.projectID).delete")
+
+                    Button("Rollover") {
+                        vm.createTokenSaverRollover(projectID: project.projectID)
+                    }
+                    .disabled(!project.rolloverAvailable)
+                    .help(project.rolloverAvailable ? "Create a self-contained child thread and preserve the original" : "Blocked: \(project.rolloverReason)")
+                    .accessibilityHint(project.rolloverAvailable ? "Preserves the original thread" : "Blocked: \(project.rolloverReason)")
+                    .accessibilityIdentifier("sidebar.tokenSaver.project.\(project.projectID).rollover")
+                }
+                .controlSize(.small)
+            }
+            .padding(.top, DS.Space.xs)
+        } label: {
+            HStack {
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(project.projectName)
+                        .font(DS.Font.captionStrong)
+                        .foregroundColor(DS.Palette.text)
+                    Text("\(project.stateLabel) · \(project.laneSummaryLabel)")
+                        .font(DS.Font.caption2)
+                        .foregroundColor(DS.Palette.textTertiary)
+                }
+                Spacer(minLength: 0)
+            }
+        }
+        .padding(DS.Space.sm)
+        .background(
+            RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
+                .fill(DS.Palette.surfaceRaised.opacity(0.72))
+        )
+        .accessibilityIdentifier("sidebar.tokenSaver.project.\(project.projectID)")
+    }
+
+    private func confirmDeleteTokenSaverProjectData(
+        _ project: SidebarViewModel.TokenSaverProjectGovernance
+    ) {
+        // Nonblocking sheet only: never runModal here (main-thread-blocking ratchet).
+        // Fail safe when no host window exists — do not delete without affirmative UI.
+        guard let window = NSApp.keyWindow else { return }
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Delete Token Saver data for \(project.projectName)?"
+        alert.informativeText = "This immediately tombstones scoped recovery, learned records, and rollover capsules. Provider threads and project files are not deleted."
+        alert.addButton(withTitle: "Delete data")
+        alert.addButton(withTitle: "Cancel")
+        let projectID = project.projectID
+        alert.beginSheetModal(for: window) { response in
+            guard response == .alertFirstButtonReturn else { return }
+            Task { @MainActor in
+                self.vm.deleteTokenSaverProjectData(projectID: projectID)
+            }
+        }
+    }
+
+    nonisolated private static func tokenSaverLaneTitle(_ lane: String) -> String {
+        lane.replacingOccurrences(of: "_", with: " ").capitalized
+    }
+
+    nonisolated public static func tokenSaverLaneStateLabel(_ state: String) -> String {
+        switch state {
+        case "promoted": return "Active"
+        case "shadow_only": return "Shadow"
+        case "off": return "Off"
+        default: return state.replacingOccurrences(of: "_", with: " ").capitalized
+        }
     }
 
     private var tokenSaverDetailsActivityChart: some View {
@@ -3024,7 +3436,7 @@ public struct SidebarRootView: View {
                     .lineLimit(1)
                     .minimumScaleFactor(0.82)
                     .frame(maxWidth: .infinity, alignment: .leading)
-                Text((vm.privateAccountUser?.subscribed == true && vm.tokenSaverEnabled ? "Saved " : "Could save ") + Self.formatTokenCount(value))
+                Text((vm.privateAccountUser?.subscribed == true && vm.tokenSaverEnabled ? "Estimated save " : "Estimated potential ") + Self.formatTokenCount(value))
                     .font(DS.Font.caption)
                     .foregroundColor(DS.Palette.success)
                     .monospacedDigit()
@@ -3053,7 +3465,7 @@ public struct SidebarRootView: View {
                     .lineLimit(1)
                     .minimumScaleFactor(0.82)
                     .frame(maxWidth: .infinity, alignment: .leading)
-                Text("Saved " + Self.formatTokenCount(saved))
+                Text("Estimated save " + Self.formatTokenCount(saved))
                     .font(DS.Font.caption)
                     .foregroundColor(DS.Palette.success)
                     .monospacedDigit()
@@ -3154,7 +3566,7 @@ public struct SidebarRootView: View {
     /// Pure seam: returns the headline string for the Token Saver card. Extracted
     /// so tests can verify the degraded-state copy without rendering any SwiftUI view.
     ///
-    /// WHY: when the sidecar is blocked the user sees the same "Saved X tokens"
+    /// WHY: when the sidecar is blocked the user sees the same reduction estimate
     /// headline as when everything is healthy, giving no signal that compression
     /// has stopped. This seam makes the degraded variant testable and explicit.
     nonisolated public static func tokenSaverCardHeadline(
@@ -3169,17 +3581,20 @@ public struct SidebarRootView: View {
                 return "Token Saver degraded"
             }
             return savedTokens > 0
-                ? "Saved \(Self.formatTokenCountPublic(savedTokens)) tokens"
-                : "Tracking savings per agent run"
+                ? "Estimated save \(Self.formatTokenCountPublic(savedTokens)) tokens"
+                : "Measuring local reduction per agent run"
         }
         if subscribed {
-            return "Enable savings"
+            return "Enable Token Saver"
         }
         let potential = TokenSaverUsageStore.estimatePotentialSavings(usedTokens: usedTokens)
         return potential > 0
-            ? "Save ~\(Self.formatTokenCountPublic(potential)) tokens"
-            : "Savings estimate ready"
+            ? "Estimated potential ~\(Self.formatTokenCountPublic(potential)) tokens"
+            : "Estimate ready"
     }
+
+    nonisolated public static let tokenSaverBillingEvidenceDisclaimer =
+        "Local token estimates are diagnostic. They are not billed savings; billing claims require joined provider usage evidence. Experimental lanes remain off or shadow until their gates pass."
 
     // Internal alias exposed for the pure seam above. Mirrors `formatTokenCount`
     // which is private; keeping it nonisolated and public lets tests call it.
@@ -3434,7 +3849,7 @@ public struct SidebarRootView: View {
                 ? String(format: "%.0fK", Double(savedTokens) / 1_000)
                 : "\(savedTokens)"
         let goalStr = formatTokenCountPublic(max(savedGoalTokens, 1))
-        return "Token Saver rings, \(scope): saved \(savedStr) tokens toward \(goalStr) target (\(savedPct)%), Claude used \(claudePct)%, Codex used \(codexPct)%, Grok used \(grokPct)%"
+        return "Token Saver rings, \(scope): estimated save \(savedStr) tokens toward \(goalStr) diagnostic target (\(savedPct)%), Claude used \(claudePct)%, Codex used \(codexPct)%, Grok used \(grokPct)%"
     }
 
     /// WHY: concentric rings must read as "biggest usage outer". Token Saver is

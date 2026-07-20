@@ -28,4 +28,19 @@ final class RetrieveHandleSanitizerTests: XCTestCase {
         XCTAssertTrue(RetrieveHandleSanitizer.containsHandle("x [[rc:deadbeef]] y"))
         XCTAssertFalse(RetrieveHandleSanitizer.containsHandle("no handle here"))
     }
+
+    func test_stripsScopedCapabilityMarker() {
+        let capability = "rcv1.90a43e12-9e4b-49a4-99de-ab3cb929fa2d.2f1df7dc-ca87-474a-80d2-4cf886a1855d59c9c425-5f72-4455-b6e1-d196a2b84f40"
+        let text = "Compressed output [[rc:\(capability)]]"
+
+        XCTAssertEqual(RetrieveHandleSanitizer.strip(text), "Compressed output")
+        XCTAssertTrue(RetrieveHandleSanitizer.containsHandle(text))
+    }
+
+    func test_leavesMalformedCapabilityLiteralUnchanged() {
+        let text = "User text [[rc:rcv1.not-a-uuid.not-a-secret]]"
+
+        XCTAssertEqual(RetrieveHandleSanitizer.strip(text), text)
+        XCTAssertFalse(RetrieveHandleSanitizer.containsHandle(text))
+    }
 }

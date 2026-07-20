@@ -12,6 +12,94 @@ public protocol ReversibleStoring: Sendable {
     func retrieveOriginal(_ handle: String) throws -> Data?
 }
 
+public struct TokenSaverRecoveryRequestContext: Sendable, Equatable {
+    public let workspaceID: String
+    public let projectID: String
+    public let threadID: String
+    public let provider: String
+    public let attemptID: String
+    public let invocationID: String
+    public let operationID: String
+
+    public init(
+        workspaceID: String,
+        projectID: String,
+        threadID: String,
+        provider: String,
+        attemptID: String,
+        operationID: String,
+        invocationID: String = ""
+    ) {
+        self.workspaceID = workspaceID.trimmingCharacters(in: .whitespacesAndNewlines)
+        self.projectID = projectID.trimmingCharacters(in: .whitespacesAndNewlines)
+        self.threadID = threadID.trimmingCharacters(in: .whitespacesAndNewlines)
+        self.provider = provider.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        self.attemptID = attemptID.trimmingCharacters(in: .whitespacesAndNewlines)
+        self.invocationID = invocationID.trimmingCharacters(in: .whitespacesAndNewlines)
+        self.operationID = operationID.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    public var hasCompleteScope: Bool {
+        !workspaceID.isEmpty && !projectID.isEmpty && !threadID.isEmpty
+            && !provider.isEmpty && !attemptID.isEmpty
+    }
+
+    public var hasCompleteMutationContext: Bool {
+        hasCompleteScope && !invocationID.isEmpty && !operationID.isEmpty
+    }
+}
+
+public enum TokenSaverScopedRecoveryState: String, Sendable, Equatable {
+    case prepared
+    case delivered
+    case acked
+}
+
+public struct TokenSaverScopedPreparation: Sendable, Equatable {
+    public let capability: String
+    public let idempotencyKey: String
+    public let readBackVerified: Bool
+
+    public init(
+        capability: String,
+        idempotencyKey: String,
+        readBackVerified: Bool
+    ) {
+        self.capability = capability
+        self.idempotencyKey = idempotencyKey
+        self.readBackVerified = readBackVerified
+    }
+}
+
+public struct TokenSaverScopedInvocationState: Sendable, Equatable {
+    public let state: TokenSaverScopedRecoveryState
+    public let transportOutcome: TokenSaverScopedDeliveryOutcome
+
+    public init(state: TokenSaverScopedRecoveryState, transportOutcome: TokenSaverScopedDeliveryOutcome) {
+        self.state = state
+        self.transportOutcome = transportOutcome
+    }
+}
+
+public enum TokenSaverScopedDeliveryOutcome: String, Sendable, Equatable {
+    case notSent = "not_sent"
+    case sentUnknown = "sent_unknown"
+    case acked
+    case failed
+}
+
+public protocol TokenSaverScopedRecoveryStoring: Sendable {
+    func lookupInvocation(context: TokenSaverRecoveryRequestContext) throws -> TokenSaverScopedInvocationState?
+    func prepareOriginal(_ data: Data, context: TokenSaverRecoveryRequestContext, lane: String) throws -> TokenSaverScopedPreparation
+    func retrieveOriginal(capability: String, context: TokenSaverRecoveryRequestContext) throws -> Data?
+    func markDelivered(capability: String, idempotencyKey: String, context: TokenSaverRecoveryRequestContext, outcome: TokenSaverScopedDeliveryOutcome) throws -> Bool
+    func ack(capability: String, idempotencyKey: String, context: TokenSaverRecoveryRequestContext) throws -> Bool
+}
+
+public extension TokenSaverScopedRecoveryStoring {
+    func lookupInvocation(context: TokenSaverRecoveryRequestContext) throws -> TokenSaverScopedInvocationState? { nil }
+}
+
 public struct DistillStatsProviderSavings: Codable, Sendable, Equatable {
     public let provider: String
     public let savedTokens: Int
@@ -579,6 +667,7 @@ public final class DistillHTTPServer: @unchecked Sendable {
     private let decoder = JSONDecoder()
     private let onSuccess: SuccessHandler?
     private let reversibleStore: ReversibleStoring?
+    private let scopedRecoveryStore: TokenSaverScopedRecoveryStoring?
     private let statsProvider: DistillStatsProviding?
     private let reversibleStoreMinBytes: Int
     private let requestBodyLimitBytes: Int
@@ -591,6 +680,7 @@ public final class DistillHTTPServer: @unchecked Sendable {
         configuration: DistillServiceConfiguration,
         scheduler: DistillScheduler,
         reversibleStore: ReversibleStoring? = nil,
+        scopedRecoveryStore: TokenSaverScopedRecoveryStoring? = nil,
         statsProvider: DistillStatsProviding? = nil,
         reversibleStoreMinBytes: Int = 8_192,
         requestBodyLimitBytes: Int = DistillHTTPServer.maxRequestBodyBytes,
@@ -601,6 +691,7 @@ public final class DistillHTTPServer: @unchecked Sendable {
         self.configuration = configuration
         self.scheduler = scheduler
         self.reversibleStore = reversibleStore
+        self.scopedRecoveryStore = scopedRecoveryStore
         self.statsProvider = statsProvider
         self.reversibleStoreMinBytes = max(1, reversibleStoreMinBytes)
         self.requestBodyLimitBytes = max(1, requestBodyLimitBytes)
@@ -848,7 +939,7 @@ public final class DistillHTTPServer: @unchecked Sendable {
         case (_, "/v1/rank"), (_, "/v1/embed"):
             send(status: 405, body: ErrorBody(error: "method_not_allowed", message: "use POST"), connection: connection)
         case ("GET", let path) where path.hasPrefix("/v1/retrieve/"):
-            handleRetrieve(path: path, connection: connection)
+            handleRetrieve(request: request, connection: connection)
         default:
             send(status: 404, body: ErrorBody(error: "not_found", message: request.path), connection: connection)
         }
@@ -866,18 +957,41 @@ public final class DistillHTTPServer: @unchecked Sendable {
     /// Recover a byte-exact original previously stored via store-before-loss (N5).
     /// Returns 200 {found:true, original} when present, 404 {found:false} otherwise
     /// — never empty/hang (a typed "original unavailable").
-    private func handleRetrieve(path: String, connection: NWConnection) {
-        let handle = String(path.dropFirst("/v1/retrieve/".count))
-        guard let reversibleStore, !handle.isEmpty else {
+    private func handleRetrieve(request: HTTPRequest, connection: NWConnection) {
+        let handle = String(request.path.dropFirst("/v1/retrieve/".count))
+        guard let scopedRecoveryStore,
+              let context = recoveryContext(headers: request.headers, requiresOperationID: false),
+              !handle.isEmpty else {
+            if reversibleStore != nil {
+                send(status: 403, body: ErrorBody(error: "recovery_scope_required", message: "scoped recovery capability required"), connection: connection)
+                return
+            }
             send(status: 404, body: RetrieveResponse(handle: handle, found: false, original: nil), connection: connection)
             return
         }
-        let data = (try? reversibleStore.retrieveOriginal(handle)) ?? nil
-        if let data {
-            send(status: 200, body: RetrieveResponse(handle: handle, found: true, original: String(data: data, encoding: .utf8)), connection: connection)
-        } else {
+        do {
+            guard let data = try scopedRecoveryStore.retrieveOriginal(capability: handle, context: context),
+                  let original = String(data: data, encoding: .utf8) else {
+                send(status: 404, body: RetrieveResponse(handle: handle, found: false, original: nil), connection: connection)
+                return
+            }
+            send(status: 200, body: RetrieveResponse(handle: handle, found: true, original: original), connection: connection)
+        } catch {
             send(status: 404, body: RetrieveResponse(handle: handle, found: false, original: nil), connection: connection)
         }
+    }
+
+    private func recoveryContext(headers: [String: String], requiresOperationID: Bool) -> TokenSaverRecoveryRequestContext? {
+        let context = TokenSaverRecoveryRequestContext(
+            workspaceID: headers["x-remotecode-workspace-id"] ?? "",
+            projectID: headers["x-remotecode-project-id"] ?? "",
+            threadID: headers["x-remotecode-thread-id"] ?? "",
+            provider: headers["x-remotecode-provider"] ?? "",
+            attemptID: headers["x-remotecode-attempt-id"] ?? "",
+            operationID: headers["x-remotecode-operation-id"] ?? "",
+            invocationID: headers["x-remotecode-invocation-id"] ?? ""
+        )
+        return (requiresOperationID ? context.hasCompleteMutationContext : context.hasCompleteScope) ? context : nil
     }
 
     private func handleDistill(request: HTTPRequest, connection: NWConnection) async {
@@ -899,33 +1013,103 @@ public final class DistillHTTPServer: @unchecked Sendable {
                 await metrics.recordVolatileTokenWarnings(volatileScan.warningCount)
             }
             await metrics.recordSystemPromptHash(CacheAlignerPromptContract.systemPromptHash(for: distillRequest))
-            // Store-before-loss (N5): persist the original BEFORE the runtime can
-            // truncate (fitInput >24k) or lossily compress it, so it is always
-            // recoverable via /v1/retrieve. Only inputs large enough to be worth
-            // recovering are stored. Failure to store never blocks the response.
-            var originalHandle: String?
-            var storeFailedForLargeInput = false
-            if distillRequest.effectiveRunMode == .optimize, let reversibleStore {
-                let bytes = Data(distillRequest.input.utf8)
-                // A request may LOWER the store floor (never raise it above the server cap) so
-                // the Claude hook / RTK wrappers can guarantee a recovery handle for smaller
-                // outputs than the global default would otherwise store.
-                let effectiveStoreMin = min(reversibleStoreMinBytes, distillRequest.reversibleStoreMinBytes ?? reversibleStoreMinBytes)
-                if bytes.count >= effectiveStoreMin {
-                    // I2.4: surface the failure instead of swallowing it with `try?`, so a
-                    // lossy substitution is never served without a recoverable original.
-                    do {
-                        originalHandle = try reversibleStore.storeOriginal(bytes)
-                    } catch {
-                        storeFailedForLargeInput = true
+            var scopedContext: TokenSaverRecoveryRequestContext?
+            if distillRequest.effectiveRunMode == .optimize {
+                scopedContext = recoveryContext(headers: request.headers, requiresOperationID: true)
+                guard let scopedRecoveryStore,
+                      let context = scopedContext else {
+                    let tokens = TokenEstimator.estimate(distillRequest.input)
+                    let response = DistillResponse(
+                        requestID: distillRequest.id,
+                        output: distillRequest.input,
+                        inputCharacters: distillRequest.input.count,
+                        inputTokens: tokens,
+                        outputTokens: tokens,
+                        originalHandle: nil,
+                        runMode: .optimize,
+                        routeStage: .verbatim
+                    )
+                    if let onSuccess { await onSuccess(distillRequest, response) }
+                    await metrics.recordSuccess()
+                    send(status: 200, body: response, connection: connection)
+                    return
+                }
+                do {
+                    if let existing = try scopedRecoveryStore.lookupInvocation(context: context) {
+                        let terminal = existing.state != .prepared
+                            || existing.transportOutcome == .sentUnknown
+                            || existing.transportOutcome == .acked
+                        if terminal {
+                            let tokens = TokenEstimator.estimate(distillRequest.input)
+                            let response = DistillResponse(
+                                requestID: distillRequest.id,
+                                output: distillRequest.input,
+                                inputCharacters: distillRequest.input.count,
+                                inputTokens: tokens,
+                                outputTokens: tokens,
+                                originalHandle: nil,
+                                runMode: .optimize,
+                                routeStage: .verbatim
+                            )
+                            if let onSuccess { await onSuccess(distillRequest, response) }
+                            await metrics.recordSuccess()
+                            send(status: 200, body: response, connection: connection)
+                            return
+                        }
                     }
+                } catch {
+                    let tokens = TokenEstimator.estimate(distillRequest.input)
+                    let response = DistillResponse(
+                        requestID: distillRequest.id,
+                        output: distillRequest.input,
+                        inputCharacters: distillRequest.input.count,
+                        inputTokens: tokens,
+                        outputTokens: tokens,
+                        originalHandle: nil,
+                        runMode: .optimize,
+                        routeStage: .verbatim
+                    )
+                    if let onSuccess { await onSuccess(distillRequest, response) }
+                    await metrics.recordSuccess()
+                    send(status: 200, body: response, connection: connection)
+                    return
                 }
             }
-            let compressed = try await scheduler.submit(distillRequest).withOriginalHandle(originalHandle)
-            // I2.4: never substitute a LOSSY output whose original could not be stored.
-            let response = (storeFailedForLargeInput && compressed.output != distillRequest.input)
-                ? compressed.verbatimFallback(input: distillRequest.input)
-                : compressed
+            let compressed = try await scheduler.submit(distillRequest)
+            var response = compressed
+            if distillRequest.effectiveRunMode == .optimize,
+               compressed.output != distillRequest.input,
+               let scopedContext,
+               let scopedRecoveryStore {
+                do {
+                    let preparation = try scopedRecoveryStore.prepareOriginal(
+                        Data(distillRequest.input.utf8),
+                        context: scopedContext,
+                        lane: distillRequest.mode == .commandOutput ? "deterministic_wrapper" : "semantic_prose"
+                    )
+                    guard preparation.readBackVerified,
+                          try scopedRecoveryStore.retrieveOriginal(
+                            capability: preparation.capability,
+                            context: scopedContext
+                          ) == Data(distillRequest.input.utf8),
+                          try scopedRecoveryStore.markDelivered(
+                            capability: preparation.capability,
+                            idempotencyKey: preparation.idempotencyKey,
+                            context: scopedContext,
+                            outcome: .sentUnknown
+                          ) else {
+                        throw DistillError.invalidOutput
+                    }
+                    response = compressed.withOriginalHandle(
+                        preparation.capability,
+                        idempotencyKey: preparation.idempotencyKey
+                    )
+                } catch {
+                    response = compressed.verbatimFallback(input: distillRequest.input)
+                }
+            } else if distillRequest.effectiveRunMode == .optimize {
+                response = compressed.verbatimFallback(input: distillRequest.input)
+            }
             if distillRequest.mode == .commandOutput, response.output != distillRequest.input {
                 await metrics.recordToolOutputCompressed()
             }
