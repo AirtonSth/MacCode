@@ -54,6 +54,7 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
     private static var resolvedToolPaths: [String: String] = [:]
     private static var cachedPlatformArch: [String: String] = [:]
     private static var cachedPeerSpecs: [String: [String]] = [:]
+    private static var cachedNodeMajor: [String: Int] = [:]
     // No-progress (stall) install timeout in seconds: the deadline resets on npm
     // output, so a slow-but-progressing 205MB fetch is not killed, while a truly
     // hung fetch is. Backstop bounds total wall-clock.
@@ -759,9 +760,7 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
         guard Self.bridgeSupportsNativeSessionMutation(at: script) else {
             throw AgentProviderAdapterError.unsupported("Claude SDK bridge session mutation schema is unavailable")
         }
-        guard let node = resolveNodeExecutable() else {
-            throw AgentRunError.missingBinary(nodeBinary)
-        }
+        let node = try resolvedNodeForLaunch()
         let requestId = UUID().uuidString
         var operation = operation
         operation["request_id"] = requestId
@@ -829,9 +828,7 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
                 ClaudeAgentSDKBridgeLocator.notFoundMessage(override: bridgeScriptPathOverride)
             )
         }
-        guard let node = resolveNodeExecutable() else {
-            throw AgentRunError.missingBinary(nodeBinary)
-        }
+        let node = try resolvedNodeForLaunch()
         let process = Process()
         let stdinPipe = Pipe()
         let stdoutPipe = Pipe()
@@ -938,9 +935,7 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
         if FileManager.default.isReadableFile(atPath: localPackage.path) {
             return nil
         }
-        guard let nodePath = resolveNodeExecutable() else {
-            throw AgentRunError.missingBinary(nodeBinary)
-        }
+        let nodePath = try resolvedNodeForLaunch()
         guard let npmPath = resolveNpmExecutable() else {
             throw AgentRunError.missingBinary("npm")
         }
@@ -970,7 +965,123 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
 
     // MARK: Machine facts (resolved once per process)
 
-    private func resolveNodeExecutable() -> String? { Self.resolveTool(nodeBinary, vmName: "node") }
+    /// Node resolved against `minimumNodeMajorVersion`. The bridge is an ES
+    /// module (`.mjs`); a Node older than that runs it through the CommonJS
+    /// loader and dies with `ERR_REQUIRE_ESM` instead of a usable error — the
+    /// crash a stale system/nvm Node produced on customer machines.
+    enum NodeResolution: Equatable {
+        case ok(String)                        // usable Node >= minimum
+        case tooOld(path: String, major: Int)  // a Node exists but is too old
+        case missing                           // no Node found at all
+    }
+
+    /// Returns a Node that can actually run the ES-module bridge. Prefers the
+    /// PATH Node when it qualifies; otherwise falls back to the newest
+    /// version-manager Node that qualifies; otherwise reports the newest too-old
+    /// Node so the caller can tell the user to upgrade rather than surfacing a
+    /// cryptic Node stack trace. Only a successful resolution is memoized, so a
+    /// mid-session Node upgrade is picked up on the next turn.
+    static func resolveNode(binary: String = "node") -> NodeResolution {
+        let cacheKey = "node-ok:" + binary
+        runtimeResolveLock.lock()
+        if let cached = resolvedToolPaths[cacheKey] { runtimeResolveLock.unlock(); return .ok(cached) }
+        runtimeResolveLock.unlock()
+        let resolved = selectNode(candidates: nodeCandidatePaths(binary: binary),
+                                  majorVersion: { nodeMajorVersion(at: $0) })
+        if case .ok(let path) = resolved {
+            runtimeResolveLock.lock(); resolvedToolPaths[cacheKey] = path; runtimeResolveLock.unlock()
+        }
+        return resolved
+    }
+
+    /// Ordered, de-duplicated Node candidates. An explicit path override is used
+    /// as-is; otherwise EVERY `node` on the search path is enumerated in PATH
+    /// order (not just the first — an old `node` earlier in PATH must not hide a
+    /// modern one in a later dir like /opt/homebrew/bin), then the newest
+    /// version-manager Node as a final fallback.
+    static func nodeCandidatePaths(binary: String) -> [String] {
+        if binary.contains("/") {
+            return [ProcessLocator.resolve(binary)].compactMap { $0 }
+        }
+        let env = ProcessInfo.processInfo.environment["PATH"]
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        let dirs = ProcessLocator.expandedPath(environmentPath: env, homeDirectory: home).split(separator: ":")
+        var candidates: [String] = []
+        var seen = Set<String>()
+        let fm = FileManager.default
+        for dir in dirs {
+            let path = String(dir) + "/" + binary
+            if fm.isExecutableFile(atPath: path), seen.insert(path).inserted { candidates.append(path) }
+        }
+        if let vm = versionManagerBinary("node"), seen.insert(vm).inserted { candidates.append(vm) }
+        return candidates
+    }
+
+    /// Pure selection over ordered candidate paths (PATH first, then
+    /// version-manager). Returns the first candidate that meets the minimum;
+    /// else the newest too-old candidate; else `.missing`. Extracted so the
+    /// version-gate logic is unit-testable without spawning `node`.
+    static func selectNode(candidates: [String], majorVersion: (String) -> Int?) -> NodeResolution {
+        var newestTooOld: (path: String, major: Int)?
+        for path in candidates {
+            guard let major = majorVersion(path) else { continue }
+            if major >= minimumNodeMajorVersion { return .ok(path) }
+            if newestTooOld == nil || major > newestTooOld!.major { newestTooOld = (path, major) }
+        }
+        if let old = newestTooOld { return .tooOld(path: old.path, major: old.major) }
+        return .missing
+    }
+
+    /// Major version of a Node binary via `node --version` (works on every Node,
+    /// including too-old ones — it is not an ES-module invocation). Memoized per
+    /// path so provisioning does not re-spawn `node` every turn.
+    static func nodeMajorVersion(at path: String) -> Int? {
+        runtimeResolveLock.lock()
+        if let cached = cachedNodeMajor[path] { runtimeResolveLock.unlock(); return cached }
+        runtimeResolveLock.unlock()
+        guard let major = queryNodeMajorVersion(at: path) else { return nil }
+        runtimeResolveLock.lock(); cachedNodeMajor[path] = major; runtimeResolveLock.unlock()
+        return major
+    }
+
+    private static func queryNodeMajorVersion(at path: String) -> Int? {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: path)
+        process.arguments = ["--version"]
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = Pipe()
+        process.environment = CodexRunner.processEnvironment(overrides: [:])
+        do {
+            try process.run()
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            process.waitUntilExit()
+            guard process.terminationStatus == 0 else { return nil }
+            let text = String(decoding: data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+            return versionKey(text).first   // versionKey strips a leading 'v'
+        } catch { return nil }
+    }
+
+    /// Actionable message shown when the only Node on the machine is too old to
+    /// run the bridge — replaces the raw `ERR_REQUIRE_ESM` Node stack trace.
+    static func nodeTooOldMessage(path: String, major: Int) -> String {
+        "Claude needs Node.js \(minimumNodeMajorVersion) or newer, but the Node found on this Mac is v\(major) "
+            + "(\(scrubPathsForDisplay(path))). Install a current Node — nodejs.org or `brew install node` — "
+            + "then reopen the app."
+    }
+
+    /// Node path for launch, or a loud, actionable error. A too-old Node throws
+    /// the upgrade message; a missing Node throws the standard missing-binary
+    /// error. Never returns a Node that would crash the bridge.
+    private func resolvedNodeForLaunch() throws -> String {
+        switch Self.resolveNode(binary: nodeBinary) {
+        case .ok(let path): return path
+        case .tooOld(let path, let major):
+            throw AgentProviderAdapterError.unsupported(Self.nodeTooOldMessage(path: path, major: major))
+        case .missing:
+            throw AgentRunError.missingBinary(nodeBinary)
+        }
+    }
     private func resolveNpmExecutable() -> String? { Self.resolveTool("npm", vmName: "npm") }
 
     static func resolveTool(_ name: String, vmName: String) -> String? {
