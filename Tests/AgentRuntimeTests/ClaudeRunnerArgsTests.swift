@@ -78,6 +78,14 @@ final class ClaudeRunnerArgsTests: XCTestCase {
                       "appended system prompt must instruct the agent to self-declare a stall with the recovery marker")
         XCTAssertTrue(promptOn.contains("| distill"),
                       "with Token Saver on, the same appended prompt must also carry the `| distill` piping rule")
+        XCTAssertEqual(promptOn.components(separatedBy: TokenSaverProviderSafetyABI.block).count - 1, 1,
+                       "Claude CLI runtime context must carry the safety ABI exactly once without disk instructions")
+        XCTAssertEqual(
+            (AgentSkillInstaller.distillAgentInstructionsTemplate + "\n\n" + promptOn)
+                .components(separatedBy: TokenSaverProviderSafetyABI.block).count - 1,
+            1,
+            "Claude CLI effective disk plus runtime context must carry the safety ABI exactly once"
+        )
 
         let off = AgentRunRequest(threadId: AgentThreadID(), provider: .claude,
                                   model: "claude-opus-4-7", cwd: "/tmp", prompt: "hi")
@@ -90,6 +98,8 @@ final class ClaudeRunnerArgsTests: XCTestCase {
                       "the background-await rule must be present regardless of Token Saver")
         XCTAssertFalse(promptOff.contains("| distill"),
                        "with Token Saver off (CLI uninstalled) the distill rules must NOT be appended")
+        XCTAssertFalse(promptOff.contains(TokenSaverProviderSafetyABI.block),
+                       "Claude CLI must not receive the Token Saver safety ABI when disabled")
     }
 
     func test_modelAndPromptPlacement() {

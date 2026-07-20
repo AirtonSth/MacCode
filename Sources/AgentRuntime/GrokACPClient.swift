@@ -531,7 +531,11 @@ public final class GrokACPClient: @unchecked Sendable {
 
     public static func promptBlocks(for request: AgentRunRequest, capabilities: GrokACPInitializeResult) throws -> [JSONObject] {
         var blocks: [JSONObject] = []
-        if !request.providerPrompt.isEmpty { blocks.append(["type": "text", "text": request.providerPrompt]) }
+        let providerPrompt = AgentSkillInstaller.tokenSaverProviderPrompt(
+            request.providerPrompt,
+            environment: request.environment
+        )
+        if !providerPrompt.isEmpty { blocks.append(["type": "text", "text": providerPrompt]) }
         for attachment in request.attachments {
             switch attachment.kind {
             case .image:

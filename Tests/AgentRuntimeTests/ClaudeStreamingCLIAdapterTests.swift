@@ -1061,6 +1061,16 @@ final class ClaudeStreamingCLIAdapterTests: ProviderProcessTestCase {
                       "the background-await rule must remain present with Token Saver on")
         XCTAssertTrue(on.contains("| distill"),
                       "Token Saver on must also carry the distill piping rule")
+        XCTAssertEqual(on.components(separatedBy: TokenSaverProviderSafetyABI.block).count - 1, 1,
+                       "Claude receives the versioned Token Saver safety ABI exactly once")
+        XCTAssertEqual(
+            (AgentSkillInstaller.distillAgentInstructionsTemplate + "\n\n" + on)
+                .components(separatedBy: TokenSaverProviderSafetyABI.block).count - 1,
+            1,
+            "Claude SDK effective disk plus runtime context receives the safety ABI exactly once"
+        )
+        XCTAssertFalse(off.contains(TokenSaverProviderSafetyABI.block),
+                       "Claude SDK must not receive the Token Saver safety ABI when disabled")
     }
 
     func test_agentSDKBridgeAdapterFinalizesAssistantTextWhenBridgeExitsWithoutResult() async throws {

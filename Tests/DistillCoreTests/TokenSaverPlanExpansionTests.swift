@@ -5,6 +5,8 @@ final class TokenSaverPlanExpansionTests: XCTestCase {
     func test_crossAgentMemoryToolsRespectProjectScopeAndLifecycle() {
         var store = TokenSaverMemoryStore()
         let remoteCode = TokenSaverMemoryScope(projectPath: "/repo/remote-code", provider: "codex", threadID: "thread-a")
+        let otherProvider = TokenSaverMemoryScope(projectPath: "/repo/remote-code", provider: "claude", threadID: "thread-a")
+        let otherThread = TokenSaverMemoryScope(projectPath: "/repo/remote-code", provider: "codex", threadID: "thread-b")
         let otherProject = TokenSaverMemoryScope(projectPath: "/repo/other", provider: "codex", threadID: "thread-b")
 
         let saved = store.save(text: "ERROR checkout failed at Sources/Payment.swift:42", scope: remoteCode, provenance: "tool-output")
@@ -12,6 +14,10 @@ final class TokenSaverPlanExpansionTests: XCTestCase {
         XCTAssertEqual(store.search("checkout error", scope: remoteCode).first?.handle, saved.handle)
         XCTAssertTrue(store.search("checkout error", scope: otherProject).isEmpty,
                       "cross-agent memory must never leak handles across project scope")
+        XCTAssertNil(store.retrieve(handle: saved.handle, scope: otherProvider),
+                     "same-project records never cross provider scope")
+        XCTAssertNil(store.retrieve(handle: saved.handle, scope: otherThread),
+                     "same-project records never cross thread scope")
 
         XCTAssertTrue(store.update(handle: saved.handle, text: "ERROR checkout fixed", scope: remoteCode))
         XCTAssertEqual(store.retrieve(handle: saved.handle, scope: remoteCode), "ERROR checkout fixed")

@@ -1,8 +1,9 @@
 import Foundation
 
-/// Strips unresolved CCR handle markers (`[[rc:<hex>]]`) from final user-facing text.
+/// Strips unresolved CCR handle markers from final user-facing text.
 public enum RetrieveHandleSanitizer {
-    private static let pattern = #"\[\[rc:[0-9a-fA-F]+\]\]"#
+    private static let uuid = #"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"#
+    private static let pattern = #"\[\[rc:(?:[0-9a-fA-F]+|rcv1\."# + uuid + #"\."# + uuid + uuid + #")\]\]"#
 
     public static func strip(_ text: String) -> String {
         guard let regex = try? NSRegularExpression(pattern: pattern) else { return text }

@@ -119,10 +119,10 @@ public final class ClaudeRunner: AgentProviderRunner, @unchecked Sendable {
         // the host signals Token Saver is on (and the managed `distill` CLI therefore
         // exists), append the canonical distill instructions too. `--append-system-prompt`
         // adds to the CLI's default prompt, so it stays additive.
-        var appendedSystemPrompt = BackgroundAwaitContinuation.systemPromptDirective
-        if request.environment["RC_TOKEN_SAVER_DISTILL_HINT"] == "1" {
-            appendedSystemPrompt += "\n\n" + AgentSkillInstaller.distillAgentInstructionsBody
-        }
+        let appendedSystemPrompt = AgentSkillInstaller.tokenSaverProviderPrompt(
+            BackgroundAwaitContinuation.systemPromptDirective,
+            environment: request.environment
+        )
         args.append(contentsOf: ["--append-system-prompt", appendedSystemPrompt])
         args.append(contentsOf: request.extraArgs)
         return args

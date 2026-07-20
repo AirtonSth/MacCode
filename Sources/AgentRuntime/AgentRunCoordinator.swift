@@ -48,6 +48,28 @@ public protocol AgentRunObserver: AnyObject {
 }
 
 public final class AgentRunCoordinator: @unchecked Sendable {
+    private struct ProviderTurnScope: Equatable {
+        let tokenSaverEnabled: Bool
+        let workspaceID: String?
+        let projectID: String?
+        let threadID: String?
+        let provider: String?
+        let attemptID: String?
+
+        init(environment: [String: String]) {
+            tokenSaverEnabled = environment["RC_TOKEN_SAVER_DISTILL_HINT"] == "1"
+            workspaceID = environment["RC_TOKEN_SAVER_WORKSPACE_ID"]
+            projectID = environment["RC_TOKEN_SAVER_PROJECT_ID"]
+            threadID = environment["RC_TOKEN_SAVER_THREAD_ID"]
+            provider = environment["REMOTE_CODE_AGENT_PROVIDER"]
+            attemptID = environment["RC_TOKEN_SAVER_ATTEMPT_ID"]
+        }
+
+        var carriesTokenSaverScope: Bool {
+            tokenSaverEnabled || workspaceID != nil || projectID != nil || threadID != nil || attemptID != nil
+        }
+    }
+
     private let runRepo: AgentRunRepository
     private let messageRepo: AgentMessageRepository
     private let threadRepo: AgentThreadRepository
@@ -58,6 +80,10 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     private var activeThreads: [AgentThreadID: AgentRunID] = [:]
     private typealias RunMetadata = (provider: AgentProvider, providerInstanceId: String?, model: String, cwd: String, serviceTier: AgentServiceTier, runtimeMode: AgentPermissionMode, interactionMode: AgentInteractionMode, adapterKey: String, binaryIdentity: String?)
     private var activeRunMetadata: [AgentRunID: RunMetadata] = [:]
+    /// Process environments are immutable after launch. Resident provider adapters
+    /// therefore retain the exact scope of the process that owns their idle session.
+    /// A changed attempt/admission scope forces a process refresh before the next turn.
+    private var providerTurnScopes: [AgentThreadID: ProviderTurnScope] = [:]
     private var activeTurnIds: [AgentRunID: String] = [:]
     private var activeAssistantMessageIds: [AgentRunID: AgentMessageID] = [:]
     private var activeProviderTextItemTypes: [AgentRunID: [String: AssistantItemType]] = [:]
@@ -163,7 +189,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     /// prompt only. The original text is always preserved as the displayed
     /// user message. Must be fail-open — return the input unchanged on any
     /// error or when Token Saver is disabled.
-    public var promptCompressor: (@Sendable (_ prompt: String, _ provider: AgentProvider, _ threadId: AgentThreadID) async -> String)?
+    public var promptCompressor: (@Sendable (_ prompt: String, _ provider: AgentProvider, _ threadId: AgentThreadID, _ runId: AgentRunID?) async -> String)?
     /// Token Saver hook for free-form follow-up answers. Defaults to
     /// `promptCompressor` when nil, but app shells can provide a separate hook
     /// to tag telemetry as `prompt_followup`.
@@ -191,7 +217,15 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     /// `providerEnvironment`. Without this the recovered run loses `RC_TOKEN_SAVER_DISTILL_HINT`
     /// and silently stops piping `| distill` / speaking distill even with Token Saver on. Returns
     /// the Token Saver env vars to merge for the given provider; nil/empty => pre-fix behavior.
-    public var recoveryEnvironmentProvider: (@Sendable (_ provider: AgentProvider) async -> [String: String])?
+    public var recoveryEnvironmentProvider: (@Sendable (_ provider: AgentProvider, _ threadId: AgentThreadID) async -> [String: String])?
+    /// Exact-thread provider environment overlay for every fresh turn. The app
+    /// shell uses this to avoid leaking project-scoped Token Saver hints into
+    /// provider probes or unrelated threads.
+    public var runEnvironmentProvider: (@Sendable (_ provider: AgentProvider, _ threadId: AgentThreadID, _ base: [String: String]) async -> [String: String])?
+    /// Fires after the exact run/thread graph is durable and before provider
+    /// start. Payload consumers must remain content-free or store only scoped,
+    /// retention-governed data.
+    public var onRunPrepared: (@Sendable (_ request: AgentRunRequest, _ originalPrompt: String) async -> Void)?
 
     /// Fired (on an arbitrary executor) when a final assistant message was SR1-translated
     /// and persisted. Callers can use the id to badge the message in the UI.
@@ -408,7 +442,13 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         let preservedUserContent = request.userMessageContent ?? request.prompt
         var outboundPrompt = request.prompt
         if let promptCompressor {
-            outboundPrompt = await promptCompressor(request.prompt, request.provider, request.threadId)
+            outboundPrompt = await promptCompressor(request.prompt, request.provider, request.threadId, request.runId)
+        }
+        var effectiveEnvironment = request.environment
+        let scopedEnvironment = await runEnvironmentProvider?(request.provider, request.threadId, request.environment) ?? [:]
+        effectiveEnvironment.merge(scopedEnvironment) { _, scoped in scoped }
+        if effectiveEnvironment["RC_TOKEN_SAVER_DISTILL_HINT"] == "1" {
+            effectiveEnvironment["RC_TOKEN_SAVER_ATTEMPT_ID"] = request.runId.value.uuidString
         }
         let effectiveRequest = AgentRunRequest(
             runId: request.runId,
@@ -426,7 +466,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             serviceTier: recoveryContext?.serviceTier ?? request.serviceTier,
             interactionMode: recoveryContext?.interactionMode ?? request.interactionMode,
             providerBinary: request.providerBinary,
-            environment: request.environment,
+            environment: effectiveEnvironment,
             extraArgs: request.extraArgs,
             runAsUser: request.runAsUser
         )
@@ -435,6 +475,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         }
         let adapterKey = providerAdapterKey(runner)
         let binaryIdentity = providerBinaryIdentity(effectiveRequest.provider, adapter: runner)
+        try refreshProviderProcessIfScopeChanged(runner, request: effectiveRequest)
         // persist user message
         if recordUserMessage {
             let userMsg = AgentMessage(
@@ -475,6 +516,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             lastEventKind: "run.pending",
             runtimePayloadJSON: existingRuntimePayload
         ))
+        await onRunPrepared?(effectiveRequest, preservedUserContent)
         agentRunLog.info("run.started thread=\(effectiveRequest.threadId.value.uuidString, privacy: .public) run=\(effectiveRequest.runId.value.uuidString, privacy: .public) provider=\(effectiveRequest.provider.rawValue, privacy: .public) model=\(effectiveRequest.model, privacy: .public)")
 
         let runId = effectiveRequest.runId
@@ -489,6 +531,9 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             handle = try await runner.sendTurn(effectiveRequest) { ev in
                 coordinator.handle(event: ev, runId: runId, threadId: effectiveRequest.threadId)
             }
+            lock.lock()
+            providerTurnScopes[effectiveRequest.threadId] = ProviderTurnScope(environment: effectiveRequest.environment)
+            lock.unlock()
         } catch {
             clearDistillOutputMode(runId)
             markStartFailure(
@@ -821,6 +866,9 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         guard let adapter = try? adapterForThread(threadId),
               adapter.hasSession(threadId: threadId) else { return }
         try? adapter.stopSession(threadId: threadId)
+        lock.lock()
+        providerTurnScopes.removeValue(forKey: threadId)
+        lock.unlock()
         try? providerSessionRepo?.markStopped(threadId: threadId)
     }
 
@@ -1126,7 +1174,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         if let followUpPromptCompressor {
             outboundText = await followUpPromptCompressor(text, adapter.provider, threadId)
         } else if let promptCompressor {
-            outboundText = await promptCompressor(text, adapter.provider, threadId)
+            outboundText = await promptCompressor(text, adapter.provider, threadId, nil)
         } else {
             outboundText = text
         }
@@ -1589,6 +1637,29 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         return adapterType
     }
 
+    private func refreshProviderProcessIfScopeChanged(
+        _ adapter: AgentProviderAdapter,
+        request: AgentRunRequest
+    ) throws {
+        guard adapter.hasSession(threadId: request.threadId) else { return }
+        let nextScope = ProviderTurnScope(environment: request.environment)
+        lock.lock()
+        let priorScope = providerTurnScopes[request.threadId]
+        lock.unlock()
+        let scopeChanged = priorScope.map { $0 != nextScope }
+            ?? nextScope.carriesTokenSaverScope
+        guard scopeChanged else { return }
+        guard request.providerThreadId?.isEmpty == false else {
+            throw AgentProviderAdapterError.unsupported(
+                "Provider process scope changed before a durable provider thread id was available; refusing to reuse stale Token Saver scope."
+            )
+        }
+        try adapter.stopSession(threadId: request.threadId)
+        lock.lock()
+        providerTurnScopes.removeValue(forKey: request.threadId)
+        lock.unlock()
+    }
+
     private func recoverAdapterSessionIfNeeded(threadId: AgentThreadID, adapter: AgentProviderAdapter) async throws {
         guard !adapter.hasSession(threadId: threadId) else { return }
         guard let thread = try threadRepo.get(id: threadId) else {
@@ -1608,9 +1679,14 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         // Recovered sessions are rebuilt here, bypassing the app shell's providerEnvironment, so
         // re-derive the Token Saver env or distill silently turns off on resume. Always keep the
         // provider tag so `| distill` savings attribute to claude/codex (not "unknown").
-        var environment = await recoveryEnvironmentProvider?(thread.provider) ?? [:]
+        var environment = await recoveryEnvironmentProvider?(thread.provider, threadId) ?? [:]
         environment["REMOTE_CODE_AGENT_PROVIDER"] = thread.provider.rawValue
+        let recoveryRunID = AgentRunID()
+        if environment["RC_TOKEN_SAVER_DISTILL_HINT"] == "1" {
+            environment["RC_TOKEN_SAVER_ATTEMPT_ID"] = recoveryRunID.value.uuidString
+        }
         let request = AgentRunRequest(
+            runId: recoveryRunID,
             threadId: threadId,
             provider: thread.provider,
             providerInstanceId: thread.providerInstanceId,
@@ -1627,6 +1703,9 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             runAsUser: thread.runAsUser
         )
         try await adapter.recoverSession(request) { _ in }
+        lock.lock()
+        providerTurnScopes[threadId] = ProviderTurnScope(environment: request.environment)
+        lock.unlock()
     }
 
     private func providerBinaryIdentity(_ provider: AgentProvider, adapter: AgentProviderAdapter) -> String? {

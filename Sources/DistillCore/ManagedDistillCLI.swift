@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 
 /// Core logic of the managed `distill` CLI, ported off Python to native Swift (N1)
 /// and made FAIL-OPEN (N2/N5). The shipped Python CLI failed CLOSED: on any error it
@@ -25,6 +26,28 @@ public struct ManagedDistillCLI: Sendable {
         byteCount > cap
     }
 
+    /// Stable per-request mutation identity. The caller supplies canonical bytes
+    /// (sorted-key JSON for distill requests); retries reuse the identity while
+    /// distinct requests in one provider attempt cannot collide accidentally.
+    public static func recoveryOperationID(kind: String, canonicalPayload: Data) -> String {
+        let stablePayload: Data
+        if kind == "distill",
+           var object = (try? JSONSerialization.jsonObject(with: canonicalPayload)) as? [String: Any] {
+            object.removeValue(forKey: "id")
+            stablePayload = (try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])) ?? canonicalPayload
+        } else {
+            stablePayload = canonicalPayload
+        }
+        var material = Data()
+        let kindData = Data(kind.utf8)
+        material.append(Data("\(kindData.count):".utf8))
+        material.append(kindData)
+        material.append(Data("|\(stablePayload.count):".utf8))
+        material.append(stablePayload)
+        let digest = SHA256.hash(data: material).map { String(format: "%02x", $0) }.joined()
+        return "tscli1.\(digest)"
+    }
+
     public struct State: Sendable, Equatable {
         public let baseURL: String
         public let authToken: String
@@ -38,6 +61,10 @@ public struct ManagedDistillCLI: Sendable {
     public let stdin: Data
     public let state: State?
     public let provider: String?
+    public let recoveryContext: TokenSaverRecoveryRequestContext?
+    /// Unique logical invocation identity. Reusing one CLI value for a transport
+    /// retry preserves idempotency; a new CLI invocation always gets a new value.
+    public let invocationID: String
     public let maxOutputCharacters: Int
     /// Per-request reversible-store floor (nil = server default). The RTK command wrappers set
     /// a low value so compressed output always carries a `[[rc:<handle>]]` recovery marker.
@@ -49,6 +76,8 @@ public struct ManagedDistillCLI: Sendable {
         stdin: Data,
         state: State?,
         provider: String? = nil,
+        recoveryContext: TokenSaverRecoveryRequestContext? = nil,
+        invocationID: String = UUID().uuidString.lowercased(),
         maxOutputCharacters: Int = 4_000,
         reversibleStoreMinBytes: Int? = nil,
         transport: @escaping Transport
@@ -57,6 +86,8 @@ public struct ManagedDistillCLI: Sendable {
         self.stdin = stdin
         self.state = state
         self.provider = provider
+        self.recoveryContext = recoveryContext?.hasCompleteScope == true ? recoveryContext : nil
+        self.invocationID = invocationID
         self.maxOutputCharacters = max(128, maxOutputCharacters)
         self.reversibleStoreMinBytes = reversibleStoreMinBytes
         self.transport = transport
@@ -108,10 +139,9 @@ public struct ManagedDistillCLI: Sendable {
         // sees an error in place of its tool output.
         func failOpen() -> (Data, Int32) { (stdin, 0) }
 
-        let input = String(decoding: stdin, as: UTF8.self)
-        guard !input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            return (Data(), 0) // nothing piped → nothing to compress or lose
-        }
+        guard !stdin.isEmpty else { return (Data(), 0) }
+        guard let input = String(data: stdin, encoding: .utf8) else { return failOpen() }
+        guard !input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return failOpen() }
         if ManagedDistillCLI.exceedsStdinCap(byteCount: stdin.count, cap: ManagedDistillCLI.stdinCapBytes) {
             return await compressChunks(input: input, prompt: prompt)
         }
@@ -127,12 +157,15 @@ public struct ManagedDistillCLI: Sendable {
             maxOutputCharacters: maxOutputCharacters,
             reversibleStoreMinBytes: reversibleStoreMinBytes
         )
-        guard let body = try? JSONEncoder().encode(request) else { return failOpen() }
+        guard let body = Self.canonicalBody(request) else { return failOpen() }
 
         var urlRequest = URLRequest(url: url)
         urlRequest.httpMethod = "POST"
         urlRequest.setValue("Bearer \(state.authToken)", forHTTPHeaderField: "Authorization")
         urlRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        applyRecoveryScope(to: &urlRequest)
+        urlRequest.setValue(invocationID, forHTTPHeaderField: "X-RemoteCode-Invocation-ID")
+        urlRequest.setValue(Self.recoveryOperationID(kind: "distill", canonicalPayload: body), forHTTPHeaderField: "X-RemoteCode-Operation-ID")
         urlRequest.httpBody = body
 
         guard let (data, status) = await transport(urlRequest), status == 200,
@@ -140,6 +173,7 @@ public struct ManagedDistillCLI: Sendable {
               !response.output.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             return failOpen()
         }
+        guard response.routeStage != .verbatim else { return failOpen() }
         var out = response.output
         if let handle = response.originalHandle, !handle.isEmpty {
             out += "\n[[rc:\(handle)]]"
@@ -167,11 +201,14 @@ public struct ManagedDistillCLI: Sendable {
                 maxOutputCharacters: maxOutputCharacters,
                 reversibleStoreMinBytes: reversibleStoreMinBytes
             )
-            guard let body = try? JSONEncoder().encode(request) else { return failOpen() }
+            guard let body = Self.canonicalBody(request) else { return failOpen() }
             var urlRequest = URLRequest(url: url)
             urlRequest.httpMethod = "POST"
             urlRequest.setValue("Bearer \(state.authToken)", forHTTPHeaderField: "Authorization")
             urlRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            applyRecoveryScope(to: &urlRequest)
+            urlRequest.setValue("\(invocationID).chunk-\(offset + 1)", forHTTPHeaderField: "X-RemoteCode-Invocation-ID")
+            urlRequest.setValue(Self.recoveryOperationID(kind: "distill", canonicalPayload: body), forHTTPHeaderField: "X-RemoteCode-Operation-ID")
             urlRequest.httpBody = body
 
             guard let (data, status) = await transport(urlRequest), status == 200,
@@ -179,6 +216,7 @@ public struct ManagedDistillCLI: Sendable {
                   !response.output.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
                 return failOpen()
             }
+            guard response.routeStage != .verbatim else { return failOpen() }
             var out = response.output
             if let handle = response.originalHandle, !handle.isEmpty {
                 out += "\n[[rc:\(handle)]]"
@@ -231,6 +269,8 @@ public struct ManagedDistillCLI: Sendable {
         }
         var urlRequest = URLRequest(url: url)
         urlRequest.setValue("Bearer \(state.authToken)", forHTTPHeaderField: "Authorization")
+        applyRecoveryScope(to: &urlRequest)
+        urlRequest.setValue(Self.recoveryOperationID(kind: "retrieve", canonicalPayload: Data(handle.utf8)), forHTTPHeaderField: "X-RemoteCode-Operation-ID")
         guard let (data, status) = await transport(urlRequest), status == 200,
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               (obj["found"] as? Bool) == true,
@@ -265,5 +305,32 @@ public struct ManagedDistillCLI: Sendable {
             lines.append("mode \(mode.provider)/\(mode.mode): saved=\(mode.savedTokens) runs=\(mode.runs)")
         }
         return lines.joined(separator: "\n") + "\n"
+    }
+
+    private static func canonicalBody(_ request: DistillRequest) -> Data? {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        return try? encoder.encode(request)
+    }
+
+    public static func recoveryContext(environment: [String: String]) -> TokenSaverRecoveryRequestContext? {
+        let context = TokenSaverRecoveryRequestContext(
+            workspaceID: environment["RC_TOKEN_SAVER_WORKSPACE_ID"] ?? "",
+            projectID: environment["RC_TOKEN_SAVER_PROJECT_ID"] ?? "",
+            threadID: environment["RC_TOKEN_SAVER_THREAD_ID"] ?? "",
+            provider: environment["REMOTE_CODE_AGENT_PROVIDER"] ?? "",
+            attemptID: environment["RC_TOKEN_SAVER_ATTEMPT_ID"] ?? "",
+            operationID: ""
+        )
+        return context.hasCompleteScope ? context : nil
+    }
+
+    private func applyRecoveryScope(to request: inout URLRequest) {
+        guard let recoveryContext else { return }
+        request.setValue(recoveryContext.workspaceID, forHTTPHeaderField: "X-RemoteCode-Workspace-ID")
+        request.setValue(recoveryContext.projectID, forHTTPHeaderField: "X-RemoteCode-Project-ID")
+        request.setValue(recoveryContext.threadID, forHTTPHeaderField: "X-RemoteCode-Thread-ID")
+        request.setValue(recoveryContext.provider, forHTTPHeaderField: "X-RemoteCode-Provider")
+        request.setValue(recoveryContext.attemptID, forHTTPHeaderField: "X-RemoteCode-Attempt-ID")
     }
 }
