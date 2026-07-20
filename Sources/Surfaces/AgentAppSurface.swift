@@ -139,7 +139,10 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// Nil / current-account means no privileged trampoline.
     @Published public var runAsUser: AgentRunAsUser? = AgentRunAsUser.current()
     @Published public var availableRunAsUsers: [AgentRunAsUser] = MacOSLocalUserCatalog.listEligibleUsers()
-    @Published public var model: String = "gpt-5.5"
+    @Published public var model: String = AgentDefaultModelSelection.codexBuiltInDefault
+    /// Last model the user chose per provider (new threads + provider switches).
+    /// Inject a suite-backed store in tests; production uses the shared defaults.
+    public var lastModelStore: AgentLastModelStore = .shared
     @Published public var availableModels: [AgentModelDescriptor] = []
     @Published public var providerSnapshots: [AgentProviderSnapshot] = []
     @Published public var permissionMode: AgentPermissionMode = .supervised
@@ -1918,7 +1921,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 // kept-but-missing pin is explained by
                 // selectedModelUnavailableNotice in the picker.
                 if model.isEmpty || modelIsFromAnotherProvider(model) {
-                    model = current.models.first?.id ?? model
+                    applyPreferredModelForCurrentProvider(availableModels: current.models)
                 }
             }
             normalizeSelectedModelOptions()
@@ -2352,9 +2355,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             availableModelsAreFallback = snapshot.models.map(\.id) == availableModels.map(\.id)
         }
         availableModels = snapshot.models
-        if !modelSelectionIsValid(model, in: snapshot.models) {
-            model = snapshot.models.first?.id ?? model
-        }
+        applyPreferredModelForCurrentProvider(availableModels: snapshot.models)
         normalizeSelectedModelOptions()
         normalizeInteractionModeForSelectedProvider()
         persistThreadConfig()
@@ -2375,11 +2376,11 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 availableModelsAreFallback = snap.models.map(\.id) == availableModels.map(\.id)
             }
             availableModels = snap.models
-            model = snap.models.first?.id ?? ""
+            applyPreferredModelForCurrentProvider(availableModels: snap.models)
         } else {
             providerInstanceId = newProvider.rawValue
             availableModels = []
-            model = ""
+            applyPreferredModelForCurrentProvider(availableModels: [])
         }
         if let selectedThreadId {
             restoreComposerDraft(
@@ -2571,6 +2572,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
 
     public func setModel(_ model: String) {
         self.model = model
+        rememberCurrentModel()
         normalizeSelectedModelOptions()
         persistThreadConfig()
     }
@@ -2586,12 +2588,18 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 customModelsByProvider[provider] = values
             }
         }
-        model = trimmed.isEmpty ? (modelOptionsForSelectedProvider.first?.id ?? "") : trimmed
+        model = trimmed.isEmpty
+            ? preferredModelForCurrentProvider(availableModels: modelOptionsForSelectedProvider)
+            : trimmed
+        rememberCurrentModel()
         normalizeSelectedModelOptions()
         persistThreadConfig()
     }
 
     public func createThread(title: String) {
+        // New threads always reopen on the last model the user used for this
+        // provider (not whatever model an older selected thread left on the VM).
+        applyPreferredModelForCurrentProvider()
         normalizeSelectedModelOptions()
         let t = AgentThread(workspaceId: workspaceID, title: title, provider: provider,
                             providerInstanceId: providerInstanceId,
@@ -2610,6 +2618,31 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         reloadThreads()
         onThreadLifecycle?(.created(threads.first(where: { $0.id == t.id }) ?? t))
         selectThread(t.id)
+    }
+
+    /// Resolve last-used → built-in default → first listed model for the
+    /// active provider. Used for new threads and provider switches.
+    public func preferredModelForCurrentProvider(
+        availableModels: [AgentModelDescriptor]? = nil
+    ) -> String {
+        let options = availableModels ?? modelOptionsForSelectedProvider
+        return AgentDefaultModelSelection.resolve(
+            provider: provider,
+            lastUsed: lastModelStore.model(for: provider),
+            availableModelIds: options.map(\.id),
+            supportsCustomModel: options.contains(where: \.supportsCustomModel)
+                || supportsCustomModelForSelectedProvider
+        )
+    }
+
+    public func applyPreferredModelForCurrentProvider(
+        availableModels: [AgentModelDescriptor]? = nil
+    ) {
+        model = preferredModelForCurrentProvider(availableModels: availableModels)
+    }
+
+    public func rememberCurrentModel() {
+        lastModelStore.remember(model: model, for: provider)
     }
 
     public func preparePullRequestThread() async {
@@ -3136,8 +3169,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             if !arg.isEmpty, let m = availableModels.first(where: {
                 $0.id.localizedCaseInsensitiveContains(arg) || $0.label.localizedCaseInsensitiveContains(arg)
             }) {
-                model = m.id
-                persistThreadConfig()
+                setModel(m.id)
                 systemNote("Model → \(m.label)")
             } else {
                 let names = availableModels.map { $0.label }.joined(separator: ", ")
@@ -3290,6 +3322,8 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             statusMessage = providerExecutionUnavailableReason ?? "The selected provider is unavailable."
             return
         }
+        // A real turn "uses" the active model — new threads reopen on it.
+        rememberCurrentModel()
         lastSentAttachmentCount = attachments.count
         recordPromptHistory(text)
         clearVisibleErrorForNewUserMessage()

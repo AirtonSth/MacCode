@@ -219,6 +219,36 @@ public final class SettingsStore {
     }
 }
 
+/// Remembers the last model the user selected per provider so new threads
+/// reopen on that model instead of a stale built-in default.
+public final class AgentLastModelStore: @unchecked Sendable {
+    public static let shared = AgentLastModelStore()
+
+    private let defaults: UserDefaults
+    private let key = "agent.lastModel.byProvider.v1"
+
+    public init(defaults: UserDefaults = .standard) {
+        self.defaults = defaults
+    }
+
+    public func model(for provider: AgentProvider) -> String? {
+        let value = dict()[provider.rawValue]?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return value.isEmpty ? nil : value
+    }
+
+    public func remember(model: String, for provider: AgentProvider) {
+        let trimmed = model.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        var values = dict()
+        values[provider.rawValue] = trimmed
+        defaults.set(values, forKey: key)
+    }
+
+    private func dict() -> [String: String] {
+        defaults.dictionary(forKey: key) as? [String: String] ?? [:]
+    }
+}
+
 public final class AgentCustomModelStore {
     private let repo: any SettingsWriteRepository
     private let keyPrefix = "agent.custom_models."

@@ -521,6 +521,32 @@ final class AgentAppViewModelTests: XCTestCase {
                         "fallback seed must include Grok, not only Codex/Claude")
     }
 
+    /// WHY: new threads must reopen the last model the user used for that
+    /// provider; Codex without history defaults to gpt-5.6-sol.
+    func test_createThread_usesLastModelThenCodexBuiltInDefault() throws {
+        let (vm, repo) = try makeVM()
+        let suiteName = "rc2-last-model-" + UUID().uuidString
+        let suite = UserDefaults(suiteName: suiteName)!
+        defer { suite.removePersistentDomain(forName: suiteName) }
+        let store = AgentLastModelStore(defaults: suite)
+        vm.lastModelStore = store
+
+        XCTAssertEqual(vm.preferredModelForCurrentProvider(), "gpt-5.6-sol",
+                       "Codex with no last-used model defaults to gpt-5.6-sol")
+
+        vm.setModel("gpt-5.4")
+        XCTAssertEqual(store.model(for: .codex), "gpt-5.4")
+
+        // Simulate browsing an older thread whose model differs from last-used.
+        vm.model = "gpt-5.2"
+        vm.createThread(title: "from last used")
+        let id = try XCTUnwrap(vm.selectedThreadId)
+        let thread = try XCTUnwrap(try repo.get(id: id))
+        XCTAssertEqual(thread.model, "gpt-5.4",
+                       "createThread must not inherit a stale selected-thread model")
+        XCTAssertEqual(vm.model, "gpt-5.4")
+    }
+
     /// WHY: Airton had Claude + Grok installed, Codex path missing. Empty Agent
     /// App defaulted to Codex and blocked send — no provider is mandatory.
     func test_missingCodexDoesNotBlockClaudeOrGrokOnEmptyAgentApp() async throws {

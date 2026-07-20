@@ -138,6 +138,60 @@ final class AgentProviderRunPreflightTests: XCTestCase {
                        "an already-runnable preferred provider must not be rewritten")
     }
 
+    func test_defaultModelSelection_prefersLastUsedThenCodexBuiltIn() {
+        let codexIds = ["", "gpt-5.6-sol", "gpt-5.5", "gpt-5.4"]
+        XCTAssertEqual(
+            AgentDefaultModelSelection.resolve(
+                provider: .codex,
+                lastUsed: "gpt-5.4",
+                availableModelIds: codexIds,
+                supportsCustomModel: true
+            ),
+            "gpt-5.4",
+            "new threads must reopen the last model the user chose for that provider"
+        )
+        XCTAssertEqual(
+            AgentDefaultModelSelection.resolve(
+                provider: .codex,
+                lastUsed: nil,
+                availableModelIds: codexIds,
+                supportsCustomModel: true
+            ),
+            "gpt-5.6-sol",
+            "Codex built-in default is gpt-5.6-sol when the user has no last-used model"
+        )
+        XCTAssertEqual(
+            AgentDefaultModelSelection.resolve(
+                provider: .codex,
+                lastUsed: "  ",
+                availableModelIds: [],
+                supportsCustomModel: true
+            ),
+            "gpt-5.6-sol",
+            "empty last-used still falls through to the Codex built-in default"
+        )
+        XCTAssertEqual(
+            AgentDefaultModelSelection.resolve(
+                provider: .claude,
+                lastUsed: nil,
+                availableModelIds: ["opus", "sonnet"],
+                supportsCustomModel: true
+            ),
+            "opus",
+            "providers without a built-in default take the first named model"
+        )
+        XCTAssertEqual(
+            AgentDefaultModelSelection.resolve(
+                provider: .codex,
+                lastUsed: "my-custom",
+                availableModelIds: codexIds,
+                supportsCustomModel: true
+            ),
+            "my-custom",
+            "custom model pins survive when the provider supports free-form ids"
+        )
+    }
+
     func test_runnableSelectionKeepsPreferredWhenNothingElseCanRun() {
         let missingCodex = AgentProviderSnapshotFactory.snapshot(
             provider: .codex,

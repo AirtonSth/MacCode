@@ -102,7 +102,7 @@ final class CodexRunnerArgsTests: XCTestCase {
         let models = await CodexRunner().listModels()
         let ids = Set(models.map(\.id))
         XCTAssertTrue(ids.contains(""), "account default must stay (always works)")
-        for real in ["gpt-5.5", "gpt-5.4", "gpt-5.4-mini",
+        for real in ["gpt-5.6-sol", "gpt-5.5", "gpt-5.4", "gpt-5.4-mini",
                      "gpt-5.3-codex", "gpt-5.3-codex-spark", "gpt-5.2"] {
             XCTAssertTrue(ids.contains(real), "missing real codex model \(real)")
         }

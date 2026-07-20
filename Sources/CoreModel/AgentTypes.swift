@@ -706,6 +706,42 @@ public enum AgentProviderSnapshotSelection {
     }
 }
 
+/// Model defaults for a new / rebound provider selection.
+/// Prefer the last model the user explicitly used for that provider; otherwise
+/// a built-in default (Codex → `gpt-5.6-sol`); otherwise the first listed id.
+public enum AgentDefaultModelSelection {
+    public static let codexBuiltInDefault = "gpt-5.6-sol"
+
+    public static func builtInDefault(for provider: AgentProvider) -> String {
+        switch provider {
+        case .codex: return codexBuiltInDefault
+        case .claude, .grok: return ""
+        }
+    }
+
+    public static func resolve(
+        provider: AgentProvider,
+        lastUsed: String?,
+        availableModelIds: [String],
+        supportsCustomModel: Bool = true
+    ) -> String {
+        // 1) Last model the user chose for this provider always wins — even when
+        // the current discovery list omits it (custom id / stale baked-in list).
+        let last = lastUsed?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !last.isEmpty { return last }
+        // 2) Provider built-in (Codex → gpt-5.6-sol) before first list row so a
+        // stale list still open on the product default.
+        let builtIn = builtInDefault(for: provider)
+        if !builtIn.isEmpty { return builtIn }
+        // 3) First named id from discovery (skip empty "account default" row).
+        _ = supportsCustomModel // reserved for callers that already computed it
+        if let firstNamed = availableModelIds.first(where: { !$0.isEmpty }) {
+            return firstNamed
+        }
+        return availableModelIds.first ?? ""
+    }
+}
+
 /// No provider is mandatory. When the preferred selection cannot run (missing
 /// binary, disabled, unauthenticated), pick another installed provider so
 /// Claude/Grok still work without Codex CLI (and vice versa).
