@@ -132,6 +132,15 @@ if [ ! -d "$APP_SHELL_RESOURCES" ]; then
   echo "missing $APP_SHELL_RESOURCES" >&2
   exit 1
 fi
+# Claude Agent SDK Node bridge: must ship inside the .app. The adapter resolves
+# this at runtime from Contents/Resources — never via compile-time #filePath
+# (that baked CI gitlab-runner paths into release builds and broke customers).
+CLAUDE_SDK_BRIDGE="Sources/AgentRuntime/ClaudeAgentSDKBridge.mjs"
+if [ ! -f "$CLAUDE_SDK_BRIDGE" ]; then
+  echo "missing $CLAUDE_SDK_BRIDGE" >&2
+  exit 1
+fi
+cp "$CLAUDE_SDK_BRIDGE" "$STAGING_APP/Contents/Resources/ClaudeAgentSDKBridge.mjs"
 # Canonical location only. Do NOT copy resource bundles to the .app root:
 # codesign rejects that as "unsealed contents present in the bundle root".
 # SPM's generated Bundle.module looks at the app root and fatalErrors — never

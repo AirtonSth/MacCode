@@ -93,7 +93,10 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
 
     public let provider: AgentProvider = .claude
     private let nodeBinary: String
-    private let bridgeScriptPath: String
+    /// Optional explicit path (tests / RC_CLAUDE_AGENT_SDK_BRIDGE). Never store
+    /// a compile-time `#filePath` default — that bakes CI absolute paths into
+    /// release binaries and breaks customer machines.
+    private let bridgeScriptPathOverride: String?
     private let binaryNameOverride: String?
     private let maxReadableEvents: Int
     private let interruptGracePeriod: TimeInterval
@@ -135,13 +138,18 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
         sessionMutator: ClaudeSDKSessionMutating?
     ) {
         self.nodeBinary = nodeBinary
-        self.bridgeScriptPath = bridgeScriptPath
+        self.bridgeScriptPathOverride = bridgeScriptPath
             ?? ProcessInfo.processInfo.environment["RC_CLAUDE_AGENT_SDK_BRIDGE"]
-            ?? URL(fileURLWithPath: #filePath).deletingLastPathComponent().appendingPathComponent("ClaudeAgentSDKBridge.mjs").path
         self.binaryNameOverride = binaryNameOverride
         self.maxReadableEvents = max(1, maxReadableEvents)
         self.interruptGracePeriod = max(0, interruptGracePeriod)
         self.sessionMutator = sessionMutator
+    }
+
+    /// Runtime-resolved source path for the Node bridge script.
+    private var bridgeScriptPath: String {
+        ClaudeAgentSDKBridgeLocator.resolvePath(override: bridgeScriptPathOverride)
+            ?? ClaudeAgentSDKBridgeLocator.notFoundMessage(override: bridgeScriptPathOverride)
     }
 
     public func listModels() async -> [AgentModelDescriptor] {
@@ -149,7 +157,7 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
     }
 
     public var forkSafety: AgentProviderForkSafety {
-        guard sessionMutator != nil || Self.installedForkProtocolSupported(bridgeScriptPath: bridgeScriptPath) else {
+        guard sessionMutator != nil || Self.installedForkProtocolSupported(bridgeScriptPath: bridgeScriptPathOverride) else {
             return .unsupported
         }
         return .keyedIdempotent(compensationSupported: true)
@@ -250,10 +258,12 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
     }
 
     public static func installedForkProtocolSupported(bridgeScriptPath: String? = nil) -> Bool {
-        let configuredBridge = bridgeScriptPath
-            ?? ProcessInfo.processInfo.environment["RC_CLAUDE_AGENT_SDK_BRIDGE"]
-            ?? URL(fileURLWithPath: #filePath).deletingLastPathComponent().appendingPathComponent("ClaudeAgentSDKBridge.mjs").path
-        guard bridgeSupportsNativeSessionMutation(at: configuredBridge) else { return false }
+        let configuredBridge = ClaudeAgentSDKBridgeLocator.resolvePath(
+            override: bridgeScriptPath
+                ?? ProcessInfo.processInfo.environment["RC_CLAUDE_AGENT_SDK_BRIDGE"]
+        )
+        guard let configuredBridge,
+              bridgeSupportsNativeSessionMutation(at: configuredBridge) else { return false }
         let bridgeURL = URL(fileURLWithPath: configuredBridge)
         let localSDK = bridgeURL.deletingLastPathComponent()
             .appendingPathComponent("node_modules/@anthropic-ai/claude-agent-sdk", isDirectory: true)
@@ -772,7 +782,9 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
     // Shared session spawn logic — validates binary, wires pipes, starts process, registers session.
     private func spawnSession(_ request: AgentRunRequest, bridgeScriptPath: String) throws -> Session {
         guard FileManager.default.isReadableFile(atPath: bridgeScriptPath) else {
-            throw AgentProviderAdapterError.unsupported("Claude Agent SDK bridge script not found: \(bridgeScriptPath)")
+            throw AgentProviderAdapterError.unsupported(
+                ClaudeAgentSDKBridgeLocator.notFoundMessage(override: bridgeScriptPathOverride)
+            )
         }
         guard let node = ProcessLocator.resolve(nodeBinary) else {
             throw AgentRunError.missingBinary(nodeBinary)
@@ -844,7 +856,14 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
     }
 
     private func resolvedBridgeScriptPath(onProgress: (@Sendable (AgentRunEvent) -> Void)? = nil) async throws -> String {
-        guard let components = try resolvedBridgeScriptComponents() else { return bridgeScriptPath }
+        guard let sourcePath = ClaudeAgentSDKBridgeLocator.resolvePath(override: bridgeScriptPathOverride) else {
+            throw AgentProviderAdapterError.unsupported(
+                ClaudeAgentSDKBridgeLocator.notFoundMessage(override: bridgeScriptPathOverride)
+            )
+        }
+        guard let components = try resolvedBridgeScriptComponents(sourcePath: sourcePath) else {
+            return sourcePath
+        }
         if !Self.installedSDKPackage(at: components.cacheDir.appendingPathComponent("node_modules/@anthropic-ai/claude-agent-sdk/package.json"), matches: components.packageSpec) {
             try await installSDKPackage(in: components.cacheDir, packageSpec: components.packageSpec, onProgress: onProgress)
         }
@@ -853,8 +872,8 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
 
     // Returns (cacheDir, cachedBridgePath, packageSpec) when install may be needed,
     // or nil when the local/existing bridge script is already usable.
-    private func resolvedBridgeScriptComponents() throws -> (cacheDir: URL, cachedBridgePath: String, packageSpec: String)? {
-        let url = URL(fileURLWithPath: bridgeScriptPath)
+    private func resolvedBridgeScriptComponents(sourcePath: String) throws -> (cacheDir: URL, cachedBridgePath: String, packageSpec: String)? {
+        let url = URL(fileURLWithPath: sourcePath)
         guard FileManager.default.isReadableFile(atPath: url.path) else {
             return nil
         }
@@ -868,7 +887,7 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
             return nil
         }
         let cache = try sdkRuntimeCacheDirectory()
-        let cachedBridge = cache.appendingPathComponent("ClaudeAgentSDKBridge.mjs")
+        let cachedBridge = cache.appendingPathComponent(ClaudeAgentSDKBridgeLocator.fileName)
         if !FileManager.default.isReadableFile(atPath: cachedBridge.path)
             || ((try? String(contentsOf: cachedBridge, encoding: .utf8)) != source) {
             try source.write(to: cachedBridge, atomically: true, encoding: .utf8)

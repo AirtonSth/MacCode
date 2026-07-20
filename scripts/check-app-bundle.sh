@@ -153,6 +153,13 @@ fi
 #   Contents/Resources/RemoteCode_AppShell.bundle
 # Do NOT require an app-root copy: codesign rejects unsealed root contents, and
 # production code must not use SPM Bundle.module (it fatalErrors for customers).
+CLAUDE_SDK_BRIDGE="$APP/Contents/Resources/ClaudeAgentSDKBridge.mjs"
+if [ ! -f "$CLAUDE_SDK_BRIDGE" ]; then
+  fail "missing Claude Agent SDK bridge at $CLAUDE_SDK_BRIDGE (Claude provider fails on customer machines without it)"
+else
+  note "Claude Agent SDK bridge present under Contents/Resources"
+fi
+
 PET_DIR="$APP/Contents/Resources/RemoteCode_AppShell.bundle/Pet"
 PET_ATLAS="$PET_DIR/remote-code-black-cat-atlas.png"
 PET_MANIFEST="$PET_DIR/remote-code-black-cat-atlas-v3.json"
