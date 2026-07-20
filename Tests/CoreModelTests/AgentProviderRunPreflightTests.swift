@@ -91,6 +91,75 @@ final class AgentProviderRunPreflightTests: XCTestCase {
         )
     }
 
+    /// WHY: Airton had Claude + Grok CLIs installed but Codex path missing.
+    /// The empty Agent App defaulted to Codex and blocked send/controls — no
+    /// provider is mandatory; missing Codex must yield Claude or Grok.
+    func test_runnableSelectionSkipsMissingCodexWhenClaudeOrGrokAvailable() {
+        let missingCodex = AgentProviderSnapshotFactory.snapshot(
+            provider: .codex,
+            models: [AgentModelDescriptor(id: "gpt-5.5", label: "GPT-5.5", provider: .codex)],
+            binaryPath: "",
+            id: "codex-cli"
+        )
+        let claude = AgentProviderSnapshotFactory.snapshot(
+            provider: .claude,
+            models: [AgentModelDescriptor(id: "opus", label: "Opus", provider: .claude)],
+            binaryPath: "/Users/airtonempath/.local/bin/claude",
+            authenticated: true,
+            id: "claude-cli"
+        )
+        let grok = AgentProviderSnapshotFactory.snapshot(
+            provider: .grok,
+            models: [AgentModelDescriptor(id: "grok-4.5", label: "Grok 4.5", provider: .grok)],
+            binaryPath: "/Users/airtonjunior/.grok/bin/grok",
+            authenticated: true,
+            id: "grok-cli"
+        )
+        XCTAssertFalse(AgentProviderRunnableSelection.isRunnable(missingCodex),
+                       "empty Codex path is not runnable")
+        XCTAssertTrue(AgentProviderRunnableSelection.isRunnable(claude))
+        XCTAssertTrue(AgentProviderRunnableSelection.isRunnable(grok))
+
+        let resolved = AgentProviderRunnableSelection.resolve(
+            snapshots: [missingCodex, claude, grok],
+            preferredProvider: .codex,
+            preferredInstanceId: "codex"
+        )
+        XCTAssertEqual(resolved?.id, "claude-cli",
+                       "default Codex preference must rebind to the first runnable provider when Codex CLI is missing")
+        XCTAssertEqual(resolved?.provider, .claude)
+
+        let keepGrok = AgentProviderRunnableSelection.resolve(
+            snapshots: [missingCodex, claude, grok],
+            preferredProvider: .grok,
+            preferredInstanceId: "grok-cli"
+        )
+        XCTAssertEqual(keepGrok?.id, "grok-cli",
+                       "an already-runnable preferred provider must not be rewritten")
+    }
+
+    func test_runnableSelectionKeepsPreferredWhenNothingElseCanRun() {
+        let missingCodex = AgentProviderSnapshotFactory.snapshot(
+            provider: .codex,
+            models: [AgentModelDescriptor(id: "gpt-5.5", label: "GPT-5.5", provider: .codex)],
+            binaryPath: "",
+            id: "codex-cli"
+        )
+        let missingClaude = AgentProviderSnapshotFactory.snapshot(
+            provider: .claude,
+            models: [AgentModelDescriptor(id: "opus", label: "Opus", provider: .claude)],
+            binaryPath: "",
+            id: "claude-cli"
+        )
+        let resolved = AgentProviderRunnableSelection.resolve(
+            snapshots: [missingCodex, missingClaude],
+            preferredProvider: .codex,
+            preferredInstanceId: "codex-cli"
+        )
+        XCTAssertEqual(resolved?.id, "codex-cli",
+                       "when nothing is runnable keep preferred so recovery can name Codex as missing")
+    }
+
     func test_preflightRejectsUnsupportedPlanAndPermissionBeforeExecution() {
         let candidate = snapshot(
             interactionModes: [.default],

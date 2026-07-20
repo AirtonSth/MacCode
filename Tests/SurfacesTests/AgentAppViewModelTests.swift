@@ -521,6 +521,49 @@ final class AgentAppViewModelTests: XCTestCase {
                         "fallback seed must include Grok, not only Codex/Claude")
     }
 
+    /// WHY: Airton had Claude + Grok installed, Codex path missing. Empty Agent
+    /// App defaulted to Codex and blocked send — no provider is mandatory.
+    func test_missingCodexDoesNotBlockClaudeOrGrokOnEmptyAgentApp() async throws {
+        let (vm, _) = try makeVM()
+        // Fresh empty surface defaults to Codex before discovery.
+        vm.provider = .codex
+        vm.providerInstanceId = "codex"
+        vm.model = "gpt-5.5"
+        let missingCodex = AgentProviderSnapshotFactory.snapshot(
+            provider: .codex,
+            models: [AgentModelDescriptor(id: "gpt-5.5", label: "GPT-5.5", provider: .codex)],
+            binaryPath: "",
+            id: "codex-cli"
+        )
+        let claude = AgentProviderSnapshotFactory.snapshot(
+            provider: .claude,
+            models: [AgentModelDescriptor(id: "opus", label: "Opus", provider: .claude)],
+            binaryPath: "/Users/airtonempath/.local/bin/claude",
+            authenticated: true,
+            id: "claude-cli"
+        )
+        let grok = AgentProviderSnapshotFactory.snapshot(
+            provider: .grok,
+            models: [AgentModelDescriptor(id: "grok-4.5", label: "Grok 4.5", provider: .grok)],
+            binaryPath: "/Users/airtonjunior/.grok/bin/grok",
+            authenticated: true,
+            id: "grok-cli"
+        )
+        vm.providerSnapshotLoader = { [missingCodex, claude, grok] }
+
+        await vm.loadProviderSnapshots()
+
+        XCTAssertNotEqual(vm.provider, .codex,
+                          "missing Codex CLI must not remain selected when Claude/Grok can run")
+        XCTAssertEqual(vm.provider, .claude,
+                       "rebind to first runnable provider in allCases order (Claude before Grok)")
+        XCTAssertEqual(vm.providerInstanceId, "claude-cli")
+        XCTAssertTrue(vm.selectedProviderCanRun,
+                      "composer send/controls must enable on a runnable non-Codex provider")
+        XCTAssertEqual(vm.model, "opus",
+                       "model list must follow the rebound provider")
+    }
+
     /// WHY: nil snapshot used to look runnable (canRun true), so send hit
     /// preflight and only then showed "Provider capabilities are not loaded yet."
     func test_nilProviderSnapshotFailsClosedBeforeSend() async throws {

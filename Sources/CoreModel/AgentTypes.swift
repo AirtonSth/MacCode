@@ -695,14 +695,57 @@ public enum AgentProviderSnapshotSelection {
         provider: AgentProvider,
         instanceId: String?
     ) -> AgentProviderSnapshot? {
-        // Prefer exact instance id first. Provider instances are globally unique
-        // (personal/work homes), and the account capsule + model list must follow
-        // the selected id even when provider enum state is briefly stale.
+        // Prefer exact instance id only when it belongs to the requested
+        // provider. Cross-provider ids (e.g. stale "codex-cli" while selecting
+        // Grok) must fall through so preflight never runs the wrong CLI.
         if let instanceId,
-           let exact = snapshots.first(where: { $0.id == instanceId }) {
+           let exact = snapshots.first(where: { $0.id == instanceId && $0.provider == provider }) {
             return exact
         }
         return snapshots.first(where: { $0.provider == provider })
+    }
+}
+
+/// No provider is mandatory. When the preferred selection cannot run (missing
+/// binary, disabled, unauthenticated), pick another installed provider so
+/// Claude/Grok still work without Codex CLI (and vice versa).
+public enum AgentProviderRunnableSelection {
+    /// Basic runnability for account selection — same gates as send preflight
+    /// for enabled / installed / authenticated, without mode or attachment checks.
+    public static func isRunnable(_ snapshot: AgentProviderSnapshot) -> Bool {
+        guard snapshot.enabled, snapshot.status != .disabled else { return false }
+        guard snapshot.installed, snapshot.status != .unavailable else { return false }
+        guard snapshot.authenticated != false else { return false }
+        return true
+    }
+
+    /// Prefer the current selection when runnable; otherwise the first runnable
+    /// snapshot in `AgentProvider.allCases` order. If nothing is runnable,
+    /// keep the preferred row so recovery UI can still name the failure.
+    public static func resolve(
+        snapshots: [AgentProviderSnapshot],
+        preferredProvider: AgentProvider,
+        preferredInstanceId: String?
+    ) -> AgentProviderSnapshot? {
+        if let current = AgentProviderSnapshotSelection.resolve(
+            snapshots: snapshots,
+            provider: preferredProvider,
+            instanceId: preferredInstanceId
+        ), isRunnable(current) {
+            return current
+        }
+        for provider in AgentProvider.allCases {
+            if let snap = snapshots.first(where: { $0.provider == provider && isRunnable($0) }) {
+                return snap
+            }
+        }
+        return AgentProviderSnapshotSelection.resolve(
+            snapshots: snapshots,
+            provider: preferredProvider,
+            instanceId: preferredInstanceId
+        )
+            ?? snapshots.first(where: \.enabled)
+            ?? snapshots.first
     }
 }
 

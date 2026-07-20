@@ -1876,10 +1876,21 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
 
     private func applyProviderSnapshots(_ snapshots: [AgentProviderSnapshot]) {
         providerSnapshots = snapshots
-        // Always bind providerInstanceId to a real snapshot id. Threads often
-        // store "codex" while snapshots use "codex-cli"; without remapping the
-        // Source menu never shows a checkmark (selected: id == providerInstanceId).
-        if snapshots.first(where: { $0.id == providerInstanceId }) == nil {
+        // No provider is mandatory. Default is Codex for historical reasons,
+        // but a missing Codex CLI must not trap the empty Agent App: rebind to
+        // the first runnable Claude/Grok (or other) snapshot when unlocked.
+        // After the first real message the source stays fixed (providerLocked).
+        if !providerLocked,
+           let preferred = AgentProviderRunnableSelection.resolve(
+            snapshots: snapshots,
+            preferredProvider: provider,
+            preferredInstanceId: providerInstanceId
+           ) {
+            providerInstanceId = preferred.id
+            provider = preferred.provider
+        } else if snapshots.first(where: { $0.id == providerInstanceId }) == nil {
+            // Locked thread / no runnable rematch: still map stale ids
+            // ("codex" → "codex-cli") so the Source checkmark is correct.
             providerInstanceId = snapshots.first(where: { $0.provider == provider && $0.enabled })?.id
                 ?? snapshots.first(where: { $0.provider == provider })?.id
                 ?? snapshots.first(where: \.enabled)?.id
