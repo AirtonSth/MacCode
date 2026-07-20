@@ -896,6 +896,10 @@ public final class TerminalSurface: NSObject, Surface, TerminalHistoryCoordinato
         historyCoordinator.replayInFlight
     }
 
+    var historyReplayDeferredForTesting: Bool {
+        historyCoordinator.isReplayDeferredForTesting
+    }
+
     var historyPreparationStateForTesting: TerminalHistoryCoordinator.PreparationState {
         historyCoordinator.preparationStateForTesting
     }
@@ -1272,7 +1276,14 @@ public final class TerminalSurface: NSObject, Surface, TerminalHistoryCoordinato
         isVisible = startsVisible
         readerAllowsRender = startsVisible
         terminalView.setOcclusion(visible: startsVisible)
-        historyCoordinator.prepare(restored: restoredSurfaceID != nil)
+        // PERF (cold launch): restored tabs start hidden. Defer disk history
+        // replay until the surface becomes visible (or another demand path)
+        // so multi-terminal restore does not fan out N concurrent SQLite
+        // reads + Ghostty resets during `reinstantiateRestoredSurfaces`.
+        historyCoordinator.prepare(
+            restored: restoredSurfaceID != nil,
+            deferReplay: restoredSurfaceID != nil
+        )
 
         terminalView.onInputData = { [weak self] data in
             guard let self else { return }
@@ -1883,6 +1894,8 @@ public final class TerminalSurface: NSObject, Surface, TerminalHistoryCoordinato
     }
 
     private func replayPersistedHistoryIfNeeded() {
+        // Passive path: respects cold-start deferral. Demand paths call
+        // `requestReplayIfNeeded` (visibility / transcript read).
         historyCoordinator.replayIfNeeded()
     }
 
@@ -2217,6 +2230,10 @@ public final class TerminalSurface: NSObject, Surface, TerminalHistoryCoordinato
     }
 
     public func readTextSnapshot() -> TerminalTextSnapshot {
+        // Correctness demand: iOS/mirror/automation may read a restored terminal
+        // before the tab is selected. Kick cold-start history replay (async) so
+        // subsequent snapshots include the persisted prefix.
+        historyCoordinator.requestReplayIfNeeded()
         // Flush any deferred visible feed/resize events into `renderer` FIRST
         // (PERF-136), before the cache check, so rendererMutationCount and the
         // renderer's actual state agree for every read site below.
@@ -2724,6 +2741,10 @@ public final class TerminalSurface: NSObject, Surface, TerminalHistoryCoordinato
     public func didBecomeVisible() {
         guard !isVisible else { return }
         isVisible = true
+        // Demand-start cold-start history replay for restored tabs (prepare may
+        // have completed while hidden with deferReplay). Live capture continues
+        // during deferral; this merges persisted prefix + live tail once.
+        historyCoordinator.requestReplayIfNeeded()
         // Defensive (PERF-136): drain any deferred visible events before the hidden
         // heal feeds directly into `renderer`, so the heal bytes stay ordered after
         // them. didBecomeHidden already flushes, so this is normally a no-op.

@@ -1570,6 +1570,10 @@ final class TerminalHistoryProductionIntegrationTests: XCTestCase {
         "replay-overflow cleanup must not retain a global quit barrier"
       )
     }
+    // Restored terminals defer history replay until a demand path (visibility /
+    // read). Unlock replay so this fixture can interleave live overflow with the
+    // blocked SQLite read — the production hang fix under test.
+    surface.didBecomeVisible()
     XCTAssertEqual(
       waitForSemaphore(readStarted, timeout: 3),
       .success,
