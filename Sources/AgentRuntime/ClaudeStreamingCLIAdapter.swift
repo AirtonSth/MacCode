@@ -401,18 +401,41 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
 
     private func startNewSession(request: AgentRunRequest) throws -> Session {
         let binary = request.providerBinary?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false ? request.providerBinary! : (binaryNameOverride ?? "claude")
-        guard let path = ProcessLocator.resolve(binary) else {
-            throw AgentRunError.missingBinary(binary)
+        // Resolve `claude` for the user we will actually execute as. For a
+        // run-as-user, search THAT user's home (shared dirs like /opt/homebrew
+        // are searched too) so we get a binary the target can exec — never the
+        // invoker's private ~/.local/bin, which the target cannot run.
+        let path: String
+        if let runAsUser = request.runAsUser, runAsUser.uid != getuid() {
+            guard let targetPath = ProcessLocator.resolve(binary, environmentPath: nil, homeDirectory: runAsUser.homePath) else {
+                throw ClaudeCLIUnavailableError(message: ClaudeRunner.missingBinaryMessage(binary))
+            }
+            path = targetPath
+        } else if let resolved = ProcessLocator.resolve(binary) {
+            path = resolved
+        } else {
+            throw ClaudeCLIUnavailableError(message: ClaudeRunner.missingBinaryMessage(binary))
         }
 
         let process = Process()
         let stdinPipe = Pipe()
         let stdoutPipe = Pipe()
         let stderrPipe = Pipe()
-        process.executableURL = URL(fileURLWithPath: path)
-        process.arguments = ClaudeRunner.buildStreamingArgs(request)
-        process.currentDirectoryURL = URL(fileURLWithPath: request.cwd)
-        process.environment = CodexRunner.processEnvironment(overrides: request.environment, provider: .claude)
+        // Route through `sudo -u` when a different macOS user is selected so the
+        // provider reads that user's ~/.claude (their logged-in account + MCP).
+        let baseEnv = CodexRunner.processEnvironment(overrides: request.environment, provider: .claude)
+        let askpass = (request.runAsUser.map { $0.uid != getuid() } == true)
+            ? RunAsUserProcessBootstrap.materializeAskpass(targetUser: request.runAsUser!.shortName)
+            : nil
+        let launchPlan = try RunAsUserProcessBootstrap.plan(
+            executablePath: path,
+            arguments: ClaudeRunner.buildStreamingArgs(request),
+            environment: baseEnv,
+            currentDirectory: request.cwd,
+            runAsUser: request.runAsUser,
+            askpassPath: askpass
+        )
+        RunAsUserProcessBootstrap.apply(launchPlan, to: process)
         process.standardInput = stdinPipe
         process.standardOutput = stdoutPipe
         process.standardError = stderrPipe
