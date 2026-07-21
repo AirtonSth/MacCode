@@ -1496,12 +1496,27 @@ final class ClaudeStreamingCLIAdapterTests: ProviderProcessTestCase {
         let bridge = tmp.appendingPathComponent("ClaudeAgentSDKBridge.mjs")
         let commandLog = tmp.appendingPathComponent("commands.jsonl")
         let npmLog = tmp.appendingPathComponent("npm.jsonl")
+        // Honor the hardened completeness contract (runtimeTreeComplete): create a
+        // versioned package.json for EVERY installed spec, plus the native
+        // `claude` executable for the platform package. A bare SDK stub is
+        // rejected as an incomplete tree.
         try """
         #!/usr/bin/env bash
         set -euo pipefail
         printf '{"argv":%s,"cwd":"%s"}\\n' "$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1:]))' "$@")" "$PWD" >> "\(npmLog.path)"
-        mkdir -p node_modules/@anthropic-ai/claude-agent-sdk
-        printf '{"name":"@anthropic-ai/claude-agent-sdk"}\\n' > node_modules/@anthropic-ai/claude-agent-sdk/package.json
+        # Only `install` provisions the tree. `npm view` (peer-range resolution)
+        # is a no-op so the adapter falls back to its default pinned peers and
+        # never creates node_modules in the caller's cwd.
+        [ "${1:-}" = "install" ] || exit 0
+        for arg in "$@"; do
+          case "$arg" in -*|install) continue;; esac
+          name="${arg%@*}"
+          version="${arg##*@}"
+          [ -z "$name" ] && continue
+          mkdir -p "node_modules/$name"
+          printf '{"name":"%s","version":"%s"}\\n' "$name" "$version" > "node_modules/$name/package.json"
+          case "$name" in *claude-agent-sdk-*) printf '#!/bin/sh\\n' > "node_modules/$name/claude"; chmod +x "node_modules/$name/claude";; esac
+        done
         """.write(to: bin.appendingPathComponent("npm"), atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: bin.appendingPathComponent("npm").path)
         try """

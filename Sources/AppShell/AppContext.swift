@@ -93,6 +93,17 @@ final class ProjectScriptRunRegistry: @unchecked Sendable {
 
 @MainActor
 public final class AppContext {
+    /// Single source of truth for constructing the `.claude` provider adapter
+    /// from the resolved engine, so init and the Settings live-swap can never
+    /// diverge. `.cli` is the dependency-minimal default; `.sdk` is the advanced
+    /// opt-in that requires the Node runtime bridge.
+    static func makeClaudeAdapter(engine: ClaudeEngine, binary: String?) -> AgentProviderAdapter {
+        switch engine {
+        case .cli: return ClaudeStreamingCLIAdapter(binaryNameOverride: binary)
+        case .sdk: return ClaudeAgentSDKBridgeAdapter(binaryNameOverride: binary)
+        }
+    }
+
     public let channel: ReleaseChannel
     public let db: SQLiteDB
     public let bootstrapReport: BootstrapReport
@@ -285,9 +296,11 @@ public final class AppContext {
         )
         let codex = CodexAppServerAdapter(binaryNameOverride: try? settingsRepo.get("cli.codex.path"))
         let configuredClaudeBinary = try? settingsRepo.get("cli.claude.path")
-        let claude: AgentProviderAdapter = ProcessInfo.processInfo.environment["RC_CLAUDE_AGENT_SDK_ENABLED"] == "0"
-            ? ClaudeStreamingCLIAdapter(binaryNameOverride: configuredClaudeBinary)
-            : ClaudeAgentSDKBridgeAdapter(binaryNameOverride: configuredClaudeBinary)
+        let claudeEngine = ClaudeEnginePolicy.resolve(
+            setting: (try? settingsRepo.get(ClaudeEnginePolicy.settingsKey)).flatMap { $0 },
+            envOverride: ProcessInfo.processInfo.environment["RC_CLAUDE_AGENT_SDK_ENABLED"]
+        )
+        let claude: AgentProviderAdapter = AppContext.makeClaudeAdapter(engine: claudeEngine, binary: configuredClaudeBinary)
         let grok = GrokACPAdapter(binaryNameOverride: try? settingsRepo.get("cli.grok.path"))
         self.coordinator = AgentRunCoordinator(
             runRepo: runRepo, messageRepo: messageRepo, threadRepo: threadRepo,

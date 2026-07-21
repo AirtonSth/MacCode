@@ -132,10 +132,10 @@ public final class ClaudeRunner: AgentProviderRunner, @unchecked Sendable {
     /// Includes the most common install paths so users can diagnose the issue
     /// without opening a terminal.
     nonisolated static func missingBinaryMessage(_ binary: String) -> String {
-        "\(binary) not found in PATH. Install it with: npm install -g @anthropic-ai/claude-code  " +
-        "or: brew install claude-code  " +
-        "Searched: ~/.remote-code/bin, /opt/homebrew/bin, ~/.local/bin, ~/.npm-global/bin. " +
-        "Open Settings to set a custom path."
+        "\(binary) not found. Install the Claude CLI (native installer: " +
+        "curl -fsSL https://claude.ai/install.sh | bash, or Homebrew), then reopen the app. " +
+        "Searched: ~/.remote-code/bin, /opt/homebrew/bin, /usr/local/bin, ~/.local/bin, ~/.npm-global/bin. " +
+        "Or set a custom path in Settings \u{2192} Diagnostics."
     }
 
     public func startRun(_ request: AgentRunRequest, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) async throws -> AgentRunHandle {

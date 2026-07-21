@@ -1,6 +1,14 @@
 import Foundation
 import CoreModel
 
+/// Surfaces the actionable "install the Claude CLI" guidance verbatim (no error
+/// prefix) when the `claude` binary is absent, since the CLI adapter is now the
+/// default engine and a missing binary is the first thing a fresh user hits.
+struct ClaudeCLIUnavailableError: Error, CustomStringConvertible {
+    let message: String
+    var description: String { message }
+}
+
 public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked Sendable {
     private final class Session: @unchecked Sendable {
         let threadId: AgentThreadID
@@ -85,7 +93,14 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
     }
 
     public func sendTurn(_ request: AgentRunRequest, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) async throws -> AgentRunHandle {
-        let session = try sessionFor(request: request)
+        let session: Session
+        do {
+            session = try sessionFor(request: request)
+        } catch AgentRunError.missingBinary(let binary) {
+            // Rethrow with the full install guidance so the transcript shows an
+            // actionable message instead of a bare "CLI not found in PATH".
+            throw ClaudeCLIUnavailableError(message: ClaudeRunner.missingBinaryMessage(binary))
+        }
         lock.lock()
         if session.inFlightRunId != nil {
             lock.unlock()

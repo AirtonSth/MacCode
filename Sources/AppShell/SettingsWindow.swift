@@ -154,6 +154,38 @@ public struct CLIPathCommitPolicy {
     }
 }
 
+/// Which execution engine backs the `.claude` provider.
+/// `.cli` (default) drives the system `claude` binary directly — no Node, npm,
+/// SDK, or 205MB native package. `.sdk` is an advanced opt-in that adds session
+/// forking and live model/permission switching but requires Node 18+ and a
+/// runtime SDK install (`ClaudeAgentSDKBridgeAdapter`).
+public enum ClaudeEngine: String, CaseIterable {
+    case cli
+    case sdk
+}
+
+/// Pure resolver for the active Claude engine. Encodes the "minimize
+/// dependencies" default: the CLI engine wins unless the user has explicitly
+/// opted into the SDK, so a machine without a modern Node/npm toolchain still
+/// runs Claude. A dev/admin env override takes precedence over the setting.
+public struct ClaudeEnginePolicy {
+    /// Settings key persisting the user's engine choice.
+    public static let settingsKey = "cli.claude.engine"
+
+    /// Resolves the engine. `RC_CLAUDE_AGENT_SDK_ENABLED` is honored as a
+    /// dev/admin override ("0" → CLI, "1" → SDK); otherwise the persisted
+    /// setting is used; otherwise the CLI default. Unrecognized values fall
+    /// through to the next source rather than silently forcing an engine.
+    public static func resolve(setting: String?, envOverride: String?) -> ClaudeEngine {
+        if let env = envOverride?.trimmingCharacters(in: .whitespaces), !env.isEmpty {
+            if env == "0" { return .cli }
+            if env == "1" { return .sdk }
+        }
+        let stored = (setting ?? "").trimmingCharacters(in: .whitespaces).lowercased()
+        return ClaudeEngine(rawValue: stored) ?? .cli
+    }
+}
+
 /// Pure helper that encodes the cross-VM reload policy for
 /// rc2RemoteAccessSettingChanged.
 ///
@@ -273,6 +305,11 @@ public final class SettingsViewModel: ObservableObject {
     @Published public var codexAvailable: Bool = false
     @Published public var claudeAvailable: Bool = false
     @Published public var grokAvailable: Bool = false
+    /// Active Claude execution engine (CLI default vs SDK bridge opt-in).
+    @Published public var claudeEngine: ClaudeEngine = .cli
+    /// True when `RC_CLAUDE_AGENT_SDK_ENABLED` pins the engine, so the picker is
+    /// read-only (a dev/admin override outranks the persisted setting).
+    @Published public var claudeEngineLockedByEnv: Bool = false
     @Published public var devices: [DeviceTrust] = []
     @Published public var auditLogEntries: [AuditLogEntry] = []
     @Published public var newPairingCode: String?
@@ -541,6 +578,12 @@ public final class SettingsViewModel: ObservableObject {
         codexAvailable = resolveAvailable(codexPath)
         claudeAvailable = resolveAvailable(claudePath)
         grokAvailable = resolveAvailable(grokPath)
+        let claudeEngineEnv = ProcessInfo.processInfo.environment["RC_CLAUDE_AGENT_SDK_ENABLED"]
+        claudeEngine = ClaudeEnginePolicy.resolve(
+            setting: (try? settingsRepo.get(ClaudeEnginePolicy.settingsKey)).flatMap { $0 },
+            envOverride: claudeEngineEnv
+        )
+        claudeEngineLockedByEnv = (claudeEngineEnv == "0" || claudeEngineEnv == "1")
         // Do NOT clear providerUpdateMessages here — an account/remote-access
         // notification-driven reload was erasing update results the user may
         // be reading (P2-Settings-6).  Messages are cleared only by the setters
@@ -791,6 +834,26 @@ public final class SettingsViewModel: ObservableObject {
         }
     }
 
+    /// Switch the Claude execution engine. Persists the choice and live-swaps the
+    /// provider adapter for FUTURE sessions (in-flight turns keep their engine).
+    /// A no-op when unchanged or when an env override pins the engine.
+    public func setClaudeEngine(_ engine: ClaudeEngine) {
+        guard !claudeEngineLockedByEnv, engine != claudeEngine else { return }
+        claudeEngine = engine
+        do {
+            try settingsRepo.set(ClaudeEnginePolicy.settingsKey, engine.rawValue)
+        } catch {
+            recordSettingsWriteError(error)
+            return
+        }
+        providerUpdateMessages[.claude] = nil
+        let binary = committedClaudePath.trimmingCharacters(in: .whitespacesAndNewlines)
+        context.coordinator.replaceProviderAdapter(
+            .claude,
+            adapter: AppContext.makeClaudeAdapter(engine: engine, binary: binary.isEmpty ? nil : binary)
+        )
+    }
+
     /// Update the Grok CLI path draft. Same commit policy as Codex/Claude paths.
     public func setGrokPath(_ path: String, committed: Bool = true) {
         grokPath = path
@@ -1018,14 +1081,14 @@ public final class SettingsViewModel: ObservableObject {
         case .codex:
             context.coordinator.replaceProviderAdapter(.codex, adapter: CodexAppServerAdapter(binaryNameOverride: trimmed.isEmpty ? nil : trimmed))
         case .claude:
-            if ProcessInfo.processInfo.environment["RC_CLAUDE_AGENT_SDK_ENABLED"] == "0" {
-                context.coordinator.replaceProviderAdapter(.claude, adapter: ClaudeStreamingCLIAdapter(binaryNameOverride: trimmed.isEmpty ? nil : trimmed))
-            } else {
-                context.coordinator.replaceProviderAdapter(
-                    .claude,
-                    adapter: ClaudeAgentSDKBridgeAdapter(binaryNameOverride: trimmed.isEmpty ? nil : trimmed)
-                )
-            }
+            let engine = ClaudeEnginePolicy.resolve(
+                setting: (try? settingsRepo.get(ClaudeEnginePolicy.settingsKey)).flatMap { $0 },
+                envOverride: ProcessInfo.processInfo.environment["RC_CLAUDE_AGENT_SDK_ENABLED"]
+            )
+            context.coordinator.replaceProviderAdapter(
+                .claude,
+                adapter: AppContext.makeClaudeAdapter(engine: engine, binary: trimmed.isEmpty ? nil : trimmed)
+            )
         case .grok:
             context.coordinator.replaceProviderAdapter(
                 .grok,
@@ -1936,6 +1999,36 @@ public struct SettingsView: View {
         return parts.joined(separator: " \u{00B7} ")
     }
 
+    /// Claude engine picker: CLI (recommended, no Node/npm) vs SDK bridge
+    /// (advanced). Discloses what the SDK opt-in costs and adds. Read-only when
+    /// an env override pins the engine.
+    private var claudeEngineRow: some View {
+        VStack(alignment: .leading, spacing: DS.Space.xs) {
+            Text("Claude engine")
+                .font(DS.Font.caption2.weight(.semibold)).foregroundColor(DS.Palette.textTertiary)
+            Picker("", selection: Binding(
+                get: { vm.claudeEngine },
+                set: { vm.setClaudeEngine($0) }
+            )) {
+                Text("Claude CLI — Recommended").tag(ClaudeEngine.cli)
+                Text("Agent SDK Bridge — Advanced").tag(ClaudeEngine.sdk)
+            }
+            .labelsHidden()
+            .pickerStyle(.segmented)
+            .disabled(vm.claudeEngineLockedByEnv)
+            .accessibilityIdentifier("settings.claude.engine")
+            Text(vm.claudeEngine == .sdk
+                 ? "Advanced: needs Node.js 18+ and installs the Agent SDK on first use. Adds session forking and live model/permission switching. Uses your installed Claude CLI — no second native download."
+                 : "Runs your installed Claude CLI directly. No Node.js, npm, or SDK download. Fork and live model/permission switching are unavailable.")
+                .font(DS.Font.caption2).foregroundColor(DS.Palette.textTertiary)
+                .fixedSize(horizontal: false, vertical: true)
+            if vm.claudeEngineLockedByEnv {
+                Text("Pinned by RC_CLAUDE_AGENT_SDK_ENABLED.")
+                    .font(DS.Font.caption2).foregroundColor(DS.Palette.textTertiary)
+            }
+        }
+    }
+
     private var diagnosticsSection: some View {
         VStack(alignment: .leading, spacing: DS.Space.md) {
             DSSectionHeaderG("Diagnostics")
@@ -1955,6 +2048,7 @@ public struct SettingsView: View {
                 available: vm.claudeAvailable,
                 provider: .claude
             )
+            claudeEngineRow
             cliPathRow(
                 label: "Grok path",
                 draft: $grokPathDraft,
