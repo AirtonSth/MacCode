@@ -30,6 +30,27 @@ final class ComposerSuggestionPopupTests: XCTestCase {
         XCTAssertTrue(inserts.contains("/build-admin"))
     }
 
+    // WHY (regression, caught by grok review): when commands already fill the
+    // limit (Claude's built-ins + /mcp + local modes), the old
+    // `skillCap = max(limit, commandCount)` gave skills ZERO rows on a bare `/`,
+    // hiding every project/user skill. Skills must still appear.
+    func testBareSlashStillShowsSkillsWhenCommandsFillLimit() {
+        // 10 commands (> default limit of 8) + discovered skills.
+        let manyCommands = (0..<10).map { "/cmd\($0)" }
+        let out = AgentComposerSuggestions.suggestions(
+            for: "/",
+            snapshot: nil,
+            localSlashCommands: manyCommands,
+            extraSkillNames: ["task", "deploy", "review"]
+            // default limit = 8
+        )
+        let inserts = Set(out.map { $0.insertText.trimmingCharacters(in: .whitespaces) })
+        XCTAssertTrue(inserts.contains("/task"),
+                      "a project skill must still surface on bare `/` even when commands exceed the limit")
+        let skillCount = out.filter { $0.kind == .skill }.count
+        XCTAssertGreaterThan(skillCount, 0, "skills must never be starved to zero by a large command pool")
+    }
+
     // WHY: typing `/ta` must filter down to the matching discovered skill.
     func testExtraSkillsAreFilteredByQuery() {
         let out = AgentComposerSuggestions.suggestions(

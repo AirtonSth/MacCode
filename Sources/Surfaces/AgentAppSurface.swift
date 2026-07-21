@@ -4417,7 +4417,10 @@ public enum AgentComposerSuggestions {
         // WHY: skill catalogs are large (50–80+). Ranking every bare name together
         // with limit=8 buries modes/commands (`/plan`, `/goal`) under ads-* skills
         // on bare `/`. Emit every matching command first (never truncated by limit),
-        // then fill remaining rows with skills up to max(limit, commandCount).
+        // then give skills their OWN budget of `limit` rows on top. The earlier
+        // `max(limit, commandCount)` cap starved skills to ZERO whenever commands
+        // already filled `limit` (e.g. Claude's built-ins + `/mcp`), hiding every
+        // project/user skill on a bare `/`; skills must always get room.
         let commandBares = ranked(
             candidates.filter { $0.kind == .slashCommand }.map(\.bare),
             query: query
@@ -4451,7 +4454,7 @@ public enum AgentComposerSuggestions {
         }
 
         append(bares: commandBares, kind: .slashCommand, stopAt: nil)
-        let skillCap = max(limit, results.count)
+        let skillCap = results.count + limit
         append(bares: skillBares, kind: .skill, stopAt: skillCap)
         return results
     }
