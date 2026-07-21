@@ -41,6 +41,22 @@ final class ClaudeRunnerArgsTests: XCTestCase {
                        "the streaming fallback must not silently disable Claude tools and degrade into chat-only mode")
     }
 
+    func test_streamingLoadsUserProjectLocalSettingSources() {
+        // WHY: without --setting-sources, `claude --print` ignores ~/.claude and
+        // ./.claude, so project/user skills (e.g. `/task`), custom slash
+        // commands, MCP servers, agents, and hooks are invisible to the agent —
+        // the exact "agent mode doesn't see my skills / MCPs" report. This must
+        // match what an interactive `claude` session loads.
+        let a = ClaudeRunner.buildStreamingArgs(req())
+        let i = a.firstIndex(of: "--setting-sources")
+        XCTAssertNotNil(i, "streaming args must load filesystem settings so skills/MCP/commands resolve")
+        let value = a[a.index(after: i!)]
+        // Order-independent: must include all three sources.
+        let sources = Set(value.split(separator: ",").map(String.init))
+        XCTAssertEqual(sources, ["user", "project", "local"],
+                       "must load user + project + local to match interactive claude's `/` surface")
+    }
+
     func test_uncaughtSignalIsFailureUnlessCancellationWasRequested() {
         XCTAssertEqual(
             ClaudeRunner.terminalStatus(cancelRequested: false, terminationReason: .uncaughtSignal, terminationStatus: 9),

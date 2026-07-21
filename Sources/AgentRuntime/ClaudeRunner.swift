@@ -94,7 +94,14 @@ public final class ClaudeRunner: AgentProviderRunner, @unchecked Sendable {
             "--input-format", "stream-json",
             "--output-format", "stream-json",
             "--verbose",
-            "--replay-user-messages"
+            "--replay-user-messages",
+            // Load the SAME filesystem settings an interactive `claude` session
+            // does: user + project + local. Without this, `--print` mode ignores
+            // ~/.claude and ./.claude entirely, so project/user SKILLS and custom
+            // slash commands (e.g. `/task`), MCP servers, agents, and hooks are
+            // all invisible — the agent could not run a skill the user sees in
+            // interactive claude. Matches the old SDK bridge's settingSources.
+            "--setting-sources", "user,project,local"
         ]
         args.append(contentsOf: ["--model", request.model])
         args.append(contentsOf: effortArgs(request.reasoningEffort))
