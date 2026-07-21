@@ -103,6 +103,26 @@ final class RunAsUserProcessBootstrapTests: XCTestCase {
         XCTAssertTrue(body.contains("text returned of result"), "must print the entered password to stdout for sudo")
     }
 
+    func test_sudoKillArguments_reentersTargetUidToSignal() throws {
+        // WHY: a run-as-user provider's real children carry the TARGET uid, so
+        // this non-root app gets EPERM signalling them directly. Reaping them
+        // requires re-entering that uid via non-interactive sudo.
+        let plan = try XCTUnwrap(
+            RunAsUserProcessBootstrap.sudoKillArguments(uid: 502, signal: SIGKILL, pids: [4242, 4243])
+        )
+        XCTAssertEqual(plan.executablePath, "/usr/bin/sudo")
+        XCTAssertEqual(plan.arguments, ["-n", "-u#502", "--", "/bin/kill", "-9", "4242", "4243"],
+                       "must run kill AS the target uid, non-interactively, so teardown never prompts")
+    }
+
+    func test_sudoKillArguments_dropsInvalidPidsAndNilsWhenEmpty() {
+        XCTAssertNil(RunAsUserProcessBootstrap.sudoKillArguments(uid: 502, signal: SIGKILL, pids: []),
+                     "nothing to signal → no sudo invocation")
+        let plan = RunAsUserProcessBootstrap.sudoKillArguments(uid: 502, signal: SIGTERM, pids: [0, -1, 77])
+        XCTAssertEqual(plan?.arguments.last, "77")
+        XCTAssertFalse(plan?.arguments.contains("0") ?? true, "must never signal pid 0 (the caller's own group)")
+    }
+
     func test_materializeAskpass_writesExecutableScript() throws {
         let dir = URL(fileURLWithPath: NSTemporaryDirectory())
             .appendingPathComponent("rc-askpass-\(UUID().uuidString)", isDirectory: true)

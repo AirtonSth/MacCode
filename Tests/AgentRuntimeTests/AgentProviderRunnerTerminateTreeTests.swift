@@ -11,6 +11,15 @@ import Darwin
 ///   3. not gate the death of a cooperative (TERM-honoring) process on the grace window.
 final class AgentProviderRunnerTerminateTreeTests: XCTestCase {
 
+    /// Returns `children` for one specific parent pid and nothing for any other,
+    /// so a real (dynamically-assigned) root pid can be given synthetic
+    /// descendants without touching the OS process table.
+    private struct SingleParentFakeChildProvider: ProcessTerminator.ChildPIDProviding {
+        let parent: Int32
+        let children: [Int32]
+        func directChildren(of pid: Int32) -> [Int32] { pid == parent ? children : [] }
+    }
+
     private func spawnShell(_ script: String) throws -> Process {
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: "/bin/sh")
@@ -65,6 +74,36 @@ final class AgentProviderRunnerTerminateTreeTests: XCTestCase {
         XCTAssertFalse(proc.isRunning,
                        "SIGTERM must be delivered synchronously — a cooperative process has to exit " +
                        "well before the 5s grace window, otherwise graceful shutdown was deferred too")
+    }
+
+    func test_terminateTreeImmediately_routesForeignUserDescendantsThroughSudoBeforeKillingRoot() throws {
+        // WHY: a run-as-user provider is a `sudo` root (invoker uid, directly
+        // signalable) whose descendants carry the TARGET uid — direct SIGKILL
+        // EPERMs and sudo won't relay it. Those descendants MUST be reaped via
+        // sudo-as-target-uid, and BEFORE the sudo root is SIGKILLed (killing the
+        // root first would orphan them). Real signals to the fake descendant pids
+        // are harmless: they don't exist (ESRCH).
+        let proc = try spawnShell("sleep 5")
+        defer { kill(proc.processIdentifier, SIGKILL) }
+        let root = proc.processIdentifier
+        let fakeDescendants: [Int32] = [99990, 99991]
+        ProcessTerminator.childPIDProvider = SingleParentFakeChildProvider(parent: root, children: fakeDescendants)
+        var captured: [(uid_t, Int32, [pid_t])] = []
+        ProcessTerminator.killAsUserProvider = { uid, signal, pids in captured.append((uid, signal, pids)) }
+        defer {
+            ProcessTerminator.childPIDProvider = ProcessTerminator.LibprocChildPIDProvider()
+            ProcessTerminator.killAsUserProvider = ProcessTerminator.defaultKillAsUserProvider
+        }
+
+        ProcessTerminator.terminateTreeImmediately(proc, foreignUserUID: 502)
+
+        XCTAssertEqual(captured.count, 1, "foreign-user teardown must route exactly one sudo kill")
+        XCTAssertEqual(captured.first?.0, 502, "must reap AS the target uid")
+        XCTAssertEqual(captured.first?.1, SIGKILL)
+        XCTAssertEqual(captured.first?.2.sorted(), fakeDescendants,
+                       "only the target-uid descendants are sudo-routed; the invoker-uid sudo root is not")
+        XCTAssertFalse(captured.first?.2.contains(root) ?? true,
+                       "the sudo root is signalled directly, never through sudo")
     }
 
     func test_terminateTreeImmediatelyKillsTermIgnoringProviderBeforeAppCanExit() throws {

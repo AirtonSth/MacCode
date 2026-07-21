@@ -132,6 +132,29 @@ public enum RunAsUserProcessBootstrap {
         )
     }
 
+    /// Builds the argv for a best-effort, non-interactive `sudo` that signals
+    /// `pids` AS the target uid. A run-as-user provider's real child (`claude`
+    /// and its descendants) carries the TARGET user's uid, so this non-root app
+    /// gets EPERM signalling them directly and `sudo` never relays `SIGKILL`;
+    /// reaping them requires re-entering the target uid via `sudo`. Uses `-n`
+    /// (never prompt) so teardown never pops a password dialog — it succeeds only
+    /// on the sudo credential cached by the spawn-time askpass and otherwise fails
+    /// silently, leaving the orphan we already could not signal. Returns nil when
+    /// there is nothing to signal.
+    public static func sudoKillArguments(
+        uid: uid_t,
+        signal: Int32,
+        pids: [pid_t],
+        killPath: String = "/bin/kill",
+        sudoPathOverride: String? = nil
+    ) -> (executablePath: String, arguments: [String])? {
+        let targets = pids.filter { $0 > 0 }
+        guard !targets.isEmpty else { return nil }
+        var arguments = ["-n", "-u#\(uid)", "--", killPath, "-\(signal)"]
+        arguments.append(contentsOf: targets.map(String.init))
+        return (sudoPathOverride ?? sudoPath, arguments)
+    }
+
     /// The graphical askpass script body. `sudo -A` runs this and reads the
     /// password from stdout; a macOS dialog collects it (hidden answer). Cancel
     /// prints nothing → sudo auth fails loudly. Contains no secret itself.

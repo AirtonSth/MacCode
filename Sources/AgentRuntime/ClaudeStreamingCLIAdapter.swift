@@ -17,6 +17,10 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
         let stdoutPipe: Pipe
         let stderrPipe: Pipe
         var model: String
+        /// Set when the provider was launched via `sudo -u` as another macOS
+        /// user; its child processes carry this uid and can only be reaped by
+        /// re-entering that uid via sudo during teardown.
+        let foreignUserUID: uid_t?
         let parser = ClaudeParser()
         let lineBuffer = LineBuffer()
         let writeQueue = DispatchQueue(label: "remotecode.claude-stream.write")
@@ -53,13 +57,15 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
              model: String,
              permissionMode: AgentPermissionMode,
              reasoningEffort: AgentReasoningEffort?,
-             interactionMode: AgentInteractionMode) {
+             interactionMode: AgentInteractionMode,
+             foreignUserUID: uid_t?) {
             self.threadId = threadId
             self.process = process
             self.stdinPipe = stdinPipe
             self.stdoutPipe = stdoutPipe
             self.stderrPipe = stderrPipe
             self.model = model
+            self.foreignUserUID = foreignUserUID
             self.permissionMode = permissionMode
             self.reasoningEffort = reasoningEffort
             self.interactionMode = interactionMode
@@ -424,7 +430,9 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
         // Route through `sudo -u` when a different macOS user is selected so the
         // provider reads that user's ~/.claude (their logged-in account + MCP).
         let baseEnv = CodexRunner.processEnvironment(overrides: request.environment, provider: .claude)
-        let askpass = (request.runAsUser.map { $0.uid != getuid() } == true)
+        let isForeignUser = (request.runAsUser.map { $0.uid != getuid() } == true)
+        let foreignUserUID: uid_t? = isForeignUser ? request.runAsUser!.uid : nil
+        let askpass = isForeignUser
             ? RunAsUserProcessBootstrap.materializeAskpass(targetUser: request.runAsUser!.shortName)
             : nil
         let launchPlan = try RunAsUserProcessBootstrap.plan(
@@ -448,7 +456,8 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
                               model: request.model,
                               permissionMode: request.permissionMode,
                               reasoningEffort: request.reasoningEffort,
-                              interactionMode: request.interactionMode)
+                              interactionMode: request.interactionMode,
+                              foreignUserUID: foreignUserUID)
         session.environment = request.environment
         stdoutPipe.fileHandleForReading.readabilityHandler = { [weak self, weak session] handle in
             guard let self, let session else { return }
@@ -471,7 +480,10 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
 
         do {
             try process.run()
-            try ProcessSpawnTagger.tagProcess(process, provider: .claude)
+            // A run-as-user launch spawns a root `sudo` child whose kernel
+            // metadata this non-root app cannot read; tag it owner-anchored so
+            // the spawn is not rejected by an unreadable child identity.
+            try ProcessSpawnTagger.tagProcess(process, provider: .claude, foreignUserLaunch: launchPlan.usesHelper)
         } catch {
             throw AgentRunError.spawnFailed(error.localizedDescription)
         }
@@ -695,7 +707,7 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
         session.stdoutPipe.fileHandleForReading.readabilityHandler = nil
         session.stderrPipe.fileHandleForReading.readabilityHandler = nil
         if session.process.isRunning {
-            ProcessTerminator.terminateTree(session.process)
+            ProcessTerminator.terminateTree(session.process, foreignUserUID: session.foreignUserUID)
         }
     }
 
@@ -709,7 +721,7 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
         session.stdoutPipe.fileHandleForReading.readabilityHandler = nil
         session.stderrPipe.fileHandleForReading.readabilityHandler = nil
         if session.process.isRunning {
-            ProcessTerminator.terminateTreeImmediately(session.process)
+            ProcessTerminator.terminateTreeImmediately(session.process, foreignUserUID: session.foreignUserUID)
         }
     }
 

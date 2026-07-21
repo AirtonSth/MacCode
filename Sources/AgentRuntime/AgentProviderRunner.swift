@@ -75,28 +75,50 @@ public enum ProcessSpawnTagger {
     /// attempt is accepted only when the kernel immediately certifies the root
     /// as its own group leader. Failure kills the tree before any ledger row is
     /// written; availability never overrides complete crash-recovery ownership.
+    ///
+    /// `foreignUserLaunch` relaxes the child-metadata reads for a provider run as
+    /// another macOS user via `sudo` (see `RunAsUserProcessBootstrap`): the spawned
+    /// child is a root-owned `sudo`, whose `proc_pidinfo`/`proc_pidpath` are
+    /// unreadable to this non-root parent (EPERM). We keep the row anchored on the
+    /// always-readable OWNER identity (this app's own pid) plus the child pid, and
+    /// tolerate a nil child start identity / exec path / process group. Live
+    /// teardown is handled separately: the `sudo` root (invoker uid) is signalled
+    /// directly and its target-uid descendants are reaped via `ProcessTerminator`'s
+    /// sudo-routed path (a non-root app cannot signal a different-uid `claude`
+    /// directly). The cost is only crash-recovery reach: the sweep fail-safes such
+    /// a row (never signals a PID it cannot identify), so a cross-user orphan
+    /// surviving an app crash is retained, never mis-reaped. For a same-user launch
+    /// (`foreignUserLaunch: false`) every read stays a hard gate.
     @discardableResult
     public static func tagProcess(
         _ process: Process,
         provider: AgentProvider? = nil,
+        foreignUserLaunch: Bool = false,
         now: Date = Date()
     ) throws -> SpawnedProcessTag {
         let pid = process.processIdentifier
-        guard pid > 0,
-              let startIdentity = ProviderProcessStartIdentity.read(pid: pid) else {
+        guard pid > 0 else {
             ProcessTerminator.terminateTreeImmediately(process)
             throw ProviderProcessOwnershipError.startIdentityUnavailable(pid)
         }
+        // The owner is always this app's own process, so its kernel metadata is
+        // readable and anchors the row for crash recovery even when the child is not.
         let ownerPID = ProcessInfo.processInfo.processIdentifier
         guard let ownerStartIdentity = ProviderProcessStartIdentity.read(pid: ownerPID) else {
             ProcessTerminator.terminateTreeImmediately(process)
             throw ProviderProcessOwnershipError.startIdentityUnavailable(ownerPID)
         }
-        guard let executablePath = ProviderProcessExecutablePath.read(pid: pid) else {
+        let startIdentity = ProviderProcessStartIdentity.read(pid: pid)
+        guard startIdentity != nil || foreignUserLaunch else {
+            ProcessTerminator.terminateTreeImmediately(process)
+            throw ProviderProcessOwnershipError.startIdentityUnavailable(pid)
+        }
+        let executablePath = ProviderProcessExecutablePath.read(pid: pid)
+        guard executablePath != nil || foreignUserLaunch else {
             ProcessTerminator.terminateTreeImmediately(process)
             throw ProviderProcessOwnershipError.executablePathUnavailable(pid)
         }
-        let processGroup: pid_t
+        let processGroup: pid_t?
         do {
             processGroup = try certifyIsolatedProcessGroup(
                 pid: pid,
@@ -104,8 +126,14 @@ public enum ProcessSpawnTagger {
                 processGroup: Darwin.getpgid
             )
         } catch {
-            ProcessTerminator.terminateTreeImmediately(process)
-            throw error
+            // A root `sudo` child's group cannot always be certified from a
+            // non-root parent; leave the row owner-anchored without it. For a
+            // same-user launch an uncertifiable group is still fail-closed.
+            guard foreignUserLaunch else {
+                ProcessTerminator.terminateTreeImmediately(process)
+                throw error
+            }
+            processGroup = nil
         }
         let tag = SpawnedProcessTag(
             pgid: pid,
@@ -113,7 +141,7 @@ public enum ProcessSpawnTagger {
             ownerPID: ownerPID,
             ownerStartIdentity: ownerStartIdentity,
             provider: provider,
-            executablePath: executablePath,
+            executablePath: executablePath ?? "",
             startIdentity: startIdentity,
             isolatedProcessGroup: processGroup
         )
@@ -455,7 +483,13 @@ enum ProcessTerminator {
     // Grace window between SIGTERM and SIGKILL escalation.
     static let graceInterval: TimeInterval = 2.0
 
-    static func terminateTree(_ process: Process, grace: TimeInterval = graceInterval) {
+    /// When `foreignUserUID` is set the root is a `sudo` wrapper (invoker uid,
+    /// directly signalable) and every descendant carries that target uid, which
+    /// this non-root app cannot `SIGKILL` and `sudo` will not relay a `SIGKILL`
+    /// for. The direct signals below still drive the graceful path — `SIGTERM`
+    /// to the `sudo` root is relayed to the child — but the `SIGKILL` escalation
+    /// of a stuck child is routed back through `sudo` as the target uid.
+    static func terminateTree(_ process: Process, grace: TimeInterval = graceInterval, foreignUserUID: uid_t? = nil) {
         let root = process.processIdentifier
         // Enumerate the tree once (children first so leaves die before parents),
         // including the root, then signal each node.
@@ -475,6 +509,10 @@ enum ProcessTerminator {
             for step in escalation {
                 kill(step.pid, step.signal)
             }
+            if let foreignUserUID {
+                let survivors = pids.filter { $0 != root && Self.isAlive($0) }
+                killAsUserProvider(foreignUserUID, SIGKILL, survivors)
+            }
         }
     }
 
@@ -482,15 +520,47 @@ enum ProcessTerminator {
     /// process may exit before its asyncAfter block runs, leaving a provider
     /// child alive for the next launch to rejoin. Preserve TERM-before-KILL,
     /// but deliver both phases synchronously without sleeping on the main actor.
-    static func terminateTreeImmediately(_ process: Process) {
-        let pids = processTreePIDs(root: process.processIdentifier)
+    static func terminateTreeImmediately(_ process: Process, foreignUserUID: uid_t? = nil) {
+        let root = process.processIdentifier
+        let pids = processTreePIDs(root: root)
         for step in terminationPlan(pids: pids, isAlive: { _ in true }, graceElapsed: false) {
             kill(step.pid, step.signal)
+        }
+        // Reap the target-uid descendants via sudo BEFORE SIGKILLing the sudo
+        // root: once sudo is killed it can neither relay signals nor reap its
+        // child, so the child would orphan to launchd. `-n` sudo is fast (no
+        // prompt) so this stays synchronous even on the app-termination path.
+        if let foreignUserUID {
+            let targets = pids.filter { $0 != root }
+            killAsUserProvider(foreignUserUID, SIGKILL, targets)
         }
         for pid in pids {
             kill(pid, SIGKILL)
         }
     }
+
+    /// The real sudo-routed reaper. Named so tests can restore it after swapping
+    /// in a capture double (mirrors `LibprocChildPIDProvider` for childPIDProvider).
+    static let defaultKillAsUserProvider: (uid_t, Int32, [pid_t]) -> Void = { uid, signal, pids in
+        guard let plan = RunAsUserProcessBootstrap.sudoKillArguments(uid: uid, signal: signal, pids: pids) else { return }
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: plan.executablePath)
+        process.arguments = plan.arguments
+        process.standardInput = FileHandle.nullDevice
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        do {
+            try process.run()
+            process.waitUntilExit()
+        } catch {
+            // Best-effort teardown; a failed reap leaves an orphan we could not
+            // have signalled directly anyway.
+        }
+    }
+
+    /// Delivers `signal` to `pids` as the target uid via non-interactive `sudo`.
+    /// Injectable so tests can assert the routing without spawning `sudo`.
+    static var killAsUserProvider: (uid_t, Int32, [pid_t]) -> Void = defaultKillAsUserProvider
 
     // Pure helper: builds the signal plan for a set of pids.
     // graceElapsed == false  -> phase 1: SIGTERM every pid.
