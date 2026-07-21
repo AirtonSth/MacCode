@@ -2170,12 +2170,33 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         }
     }
 
+    /// Cache of on-disk Claude skill/command names keyed by cwd, so the composer
+    /// does not re-scan the filesystem on every keystroke. Refreshed lazily when
+    /// the cwd changes.
+    private var cachedClaudeSlashEntries: (cwd: String, entries: [String])?
+
+    /// Project + user Claude skills/commands for the composer `/` menu. Empty for
+    /// non-Claude providers (the discovery is `.claude`-directory specific).
+    private func claudeProjectSlashEntries() -> [String] {
+        guard selectedProviderSnapshot?.provider == .claude else { return [] }
+        let cwd = self.cwd
+        if let cached = cachedClaudeSlashEntries, cached.cwd == cwd { return cached.entries }
+        let home = ProcessInfo.processInfo.environment["HOME"]
+            ?? FileManager.default.homeDirectoryForCurrentUser.path
+        let entries = ClaudeSlashCommandDiscovery.discover(cwd: cwd, home: home)
+        cachedClaudeSlashEntries = (cwd, entries)
+        return entries
+    }
+
     public var composerSuggestions: [AgentComposerSuggestion] {
-        AgentComposerSuggestions.suggestions(
+        let isClaude = selectedProviderSnapshot?.provider == .claude
+        return AgentComposerSuggestions.suggestions(
             for: prompt,
             cursorOffset: composerCursorOffset,
             snapshot: selectedProviderSnapshot,
-            localSlashCommands: Self.localSlashCommands
+            localSlashCommands: Self.localSlashCommands,
+            extraCommands: isClaude ? ClaudeSlashCommandDiscovery.builtInClaudeCommands : [],
+            extraSkillNames: isClaude ? claudeProjectSlashEntries() : []
         )
     }
 
@@ -4349,6 +4370,8 @@ public enum AgentComposerSuggestions {
         cursorOffset: Int? = nil,
         snapshot: AgentProviderSnapshot?,
         localSlashCommands: [String],
+        extraCommands: [String] = [],
+        extraSkillNames: [String] = [],
         limit: Int = 8
     ) -> [AgentComposerSuggestion] {
         let token = activeToken(in: text, cursorOffset: cursorOffset)
@@ -4358,9 +4381,12 @@ public enum AgentComposerSuggestions {
         let prefix = String(trigger)
         let query = String(token.dropFirst()).lowercased()
         let display = snapshot?.displayName ?? "Provider"
-        let providerCommands = Array(Set((snapshot?.slashCommands ?? []) + passThroughSlashCommands))
+        // extraCommands = provider built-ins the app doesn't own (e.g. `/mcp`).
+        // extraSkillNames = project/user skills + commands discovered on disk so
+        // the menu matches interactive claude's `/`, not just the cached probe.
+        let providerCommands = Array(Set((snapshot?.slashCommands ?? []) + passThroughSlashCommands + extraCommands))
         let allCommands = Array(Set(localSlashCommands + providerCommands))
-        let skills = snapshot?.skills ?? []
+        let skills = Array(Set((snapshot?.skills ?? []) + extraSkillNames))
 
         struct Candidate: Equatable {
             let bare: String

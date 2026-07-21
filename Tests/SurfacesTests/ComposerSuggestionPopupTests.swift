@@ -9,6 +9,41 @@ import AppKit
 // is CLOSED.
 final class ComposerSuggestionPopupTests: XCTestCase {
 
+    // MARK: - Extra commands + discovered skills surface in the menu
+
+    // WHY: `/mcp` (a built-in Claude command the app doesn't own) and on-disk
+    // project/user skills were invisible in the `/` menu. They must appear as
+    // suggestions so the agent surface matches interactive claude's `/`.
+    func testSuggestionsSurfaceExtraCommandsAndDiscoveredSkills() {
+        let out = AgentComposerSuggestions.suggestions(
+            for: "/",
+            snapshot: nil,
+            localSlashCommands: ["/clear"],
+            extraCommands: ["/mcp"],
+            extraSkillNames: ["task", "build-admin"],
+            limit: 20
+        )
+        // insertText carries a trailing space (ready to type args): "/mcp ".
+        let inserts = Set(out.map { $0.insertText.trimmingCharacters(in: .whitespaces) })
+        XCTAssertTrue(inserts.contains("/mcp"), "built-in /mcp must be offered")
+        XCTAssertTrue(inserts.contains("/task"), "a discovered project skill must be offered")
+        XCTAssertTrue(inserts.contains("/build-admin"))
+    }
+
+    // WHY: typing `/ta` must filter down to the matching discovered skill.
+    func testExtraSkillsAreFilteredByQuery() {
+        let out = AgentComposerSuggestions.suggestions(
+            for: "/ta",
+            snapshot: nil,
+            localSlashCommands: [],
+            extraSkillNames: ["task", "unrelated"],
+            limit: 20
+        )
+        let inserts = Set(out.map { $0.insertText.trimmingCharacters(in: .whitespaces) })
+        XCTAssertTrue(inserts.contains("/task"))
+        XCTAssertFalse(inserts.contains("/unrelated"), "non-matching skill must be filtered out")
+    }
+
     // MARK: - Navigation: moveDown
 
     // WHY: from "nothing highlighted", the first Down must land on row 0 so the
