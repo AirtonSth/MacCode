@@ -234,12 +234,92 @@ final class AgentOrchestrationRuntimeTests: XCTestCase {
             )
         }
         XCTAssertThrowsError(try runtime.route(configuration: config, providerSnapshots: mixed)) {
+            guard case .preferredSourceUnavailable(let provider, let detail)? =
+                $0 as? AgentOrchestrationAdmissionError else {
+                return XCTFail("expected preferredSourceUnavailable, got \($0)")
+            }
+            XCTAssertEqual(provider, .claude,
+                           "Auto must fail closed on the Source picker host instead of silent Codex fallback.")
             XCTAssertEqual(
-                $0 as? AgentOrchestrationAdmissionError,
-                .preferredSourceUnavailable(.claude),
-                "Auto must fail closed on the Source picker host instead of silent Codex fallback."
+                detail,
+                "Claude CLI binary is unavailable.",
+                "Fail-closed error must name the concrete install failure, not a generic blob only."
+            )
+            XCTAssertTrue(
+                ($0 as? AgentOrchestrationAdmissionError)?.description.contains("Claude CLI binary is unavailable") == true
             )
         }
+    }
+
+    /// WHY: Airton's Mac showed a generic Auto/install/auth/models banner while
+    /// the Claude row already knew it was unauthenticated — recovery (Sign in)
+    /// was not discoverable from the Auto error string.
+    func testPreferredSourceUnavailabilityDetailSurfacesAuthAndMissingBinary() {
+        let unauth = AgentProviderSnapshotFactory.snapshot(
+            provider: .claude,
+            models: [AgentModelDescriptor(id: "opus", label: "Opus", provider: .claude)],
+            binaryPath: "/usr/bin/true",
+            authenticated: false,
+            id: "claude-cli"
+        )
+        XCTAssertEqual(
+            AgentOrchestrationRuntime.preferredSourceUnavailabilityDetail(
+                provider: .claude,
+                preferredInstanceId: "claude-cli",
+                providerSnapshots: [unauth]
+            ),
+            "Claude CLI is not authenticated."
+        )
+        let missing = AgentProviderSnapshotFactory.snapshot(
+            provider: .claude,
+            models: [AgentModelDescriptor(id: "opus", label: "Opus", provider: .claude)],
+            binaryPath: "",
+            authenticated: true,
+            id: "claude-cli"
+        )
+        XCTAssertEqual(
+            AgentOrchestrationRuntime.preferredSourceUnavailabilityDetail(
+                provider: .claude,
+                preferredInstanceId: "claude-cli",
+                providerSnapshots: [missing]
+            ),
+            "Claude CLI binary is unavailable."
+        )
+    }
+
+    /// WHY: Airton's machine has Claude at /Users/airtonjunior/.local/bin/claude
+    /// but the Agent user capsule was set to airtonempat — Auto must name both.
+    func testPreferredSourceUnavailabilityDetailNamesRunAsUserHomeMismatch() {
+        let claude = AgentProviderSnapshotFactory.snapshot(
+            provider: .claude,
+            models: [AgentModelDescriptor(id: "opus", label: "Opus", provider: .claude)],
+            binaryPath: "/Users/airtonjunior/.local/bin/claude",
+            authenticated: false,
+            id: "claude-cli"
+        )
+        let foreign = AgentRunAsUser(
+            generatedUID: "g-empat",
+            shortName: "airtonempat",
+            uid: 1601,
+            gid: 20,
+            homePath: "/Users/airtonempat",
+            fullName: "Airton Empath"
+        )
+        XCTAssertNotEqual(foreign.uid, getuid())
+        let detail = AgentOrchestrationRuntime.preferredSourceUnavailabilityDetail(
+            provider: .claude,
+            preferredInstanceId: "claude-cli",
+            providerSnapshots: [claude],
+            runAsUser: foreign
+        )
+        XCTAssertEqual(
+            detail,
+            "Claude CLI is not authenticated — CLI is under airtonjunior but run-as-user is airtonempat — switch the user capsule to airtonjunior or install/sign in as airtonempat"
+        )
+        XCTAssertEqual(
+            AgentOrchestrationRuntime.homeOwnerFromPath("/Users/airtonjunior/.local/bin/claude"),
+            "airtonjunior"
+        )
     }
 
     func test_autoOrchestrateProviderPromptInjectsHostReceipt() {
@@ -670,7 +750,13 @@ final class AgentOrchestrationRuntimeTests: XCTestCase {
         XCTAssertThrowsError(try runtime.route(
             configuration: unrunnablePreferred,
             providerSnapshots: onlyFallbackNonPreferred
-        )) { XCTAssertEqual($0 as? AgentOrchestrationAdmissionError, .preferredSourceUnavailable(.claude)) }
+        )) {
+            guard case .preferredSourceUnavailable(let provider, _)? =
+                $0 as? AgentOrchestrationAdmissionError else {
+                return XCTFail("expected preferredSourceUnavailable, got \($0)")
+            }
+            XCTAssertEqual(provider, .claude)
+        }
     }
 
     func test_autoDeepControllerSelectionUsesHostMatrixDeepRow() {

@@ -22,6 +22,47 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
         surfaces.forEach { SurfaceRegistry.shared.unregister($0.descriptor.id) }
     }
 
+    /// WHY: Auto admission used the app owner's ~/.local/bin + credentials while
+    /// ClaudeStreamingCLIAdapter execs as runAsUser — Airton could look
+    /// "not runnable" to Auto even when his account had a working Claude.
+    func test_resolveProviderBinaryPathUsesForeignRunAsUserHome() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("rc-runas-probe-\(UUID().uuidString)", isDirectory: true)
+        let bin = root.appendingPathComponent(".local/bin", isDirectory: true)
+        try FileManager.default.createDirectory(at: bin, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let claude = bin.appendingPathComponent("claude")
+        FileManager.default.createFile(atPath: claude.path, contents: Data("#!/bin/sh\n".utf8))
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: claude.path)
+
+        let foreign = AgentRunAsUser(
+            generatedUID: "test-foreign",
+            shortName: "airtonempat",
+            uid: 1501,
+            gid: 20,
+            homePath: root.path,
+            fullName: "Airton"
+        )
+        // Only foreign when uid differs from process owner.
+        XCTAssertNotEqual(foreign.uid, getuid())
+        let path = AppCommandRouter.resolveProviderBinaryPath(binary: "claude", runAsUser: foreign)
+        XCTAssertEqual(path, claude.path)
+
+        let current = AgentRunAsUser.current()
+        let env = AppCommandRouter.probeEnvironment(
+            base: ["PATH": "/usr/bin"],
+            provider: .claude,
+            runAsUser: foreign
+        )
+        XCTAssertEqual(env["HOME"], root.path, "foreign probe must force HOME to the target user")
+        let currentEnv = AppCommandRouter.probeEnvironment(
+            base: ["PATH": "/usr/bin"],
+            provider: .claude,
+            runAsUser: current
+        )
+        XCTAssertNil(currentEnv["HOME"], "current-user probe must not rewrite HOME")
+    }
+
     func test_claudeLegacyFallbackPresentationFailsClosed() throws {
         let presentation = ClaudeProviderRuntimePresentation.resolve(
             agentSDKEnabled: false,

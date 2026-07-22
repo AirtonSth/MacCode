@@ -822,7 +822,14 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                 providerSnapshots: providerSnapshots,
                 requireLiveCatalog: false
             ) else {
-                throw AgentOrchestrationAdmissionError.preferredSourceUnavailable(preferred)
+                throw AgentOrchestrationAdmissionError.preferredSourceUnavailable(
+                    preferred,
+                    detail: AgentOrchestrationRuntime.preferredSourceUnavailabilityDetail(
+                        provider: preferred,
+                        preferredInstanceId: configuration.manualProviderInstanceId,
+                        providerSnapshots: providerSnapshots
+                    )
+                )
             }
             let selection = AgentOrchestrationRuntime.deepControllerSelection(
                 provider: preferred,

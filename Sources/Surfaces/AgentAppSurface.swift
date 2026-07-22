@@ -2909,6 +2909,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             runAsUser = user
         }
         persistThreadConfig()
+        // Binary/auth probes are runAsUser-aware — refresh so Auto admits the
+        // account that will actually exec (not the previous user's snapshot).
+        Task { await loadProviderSnapshots() }
     }
 
     public func refreshAvailableRunAsUsers() {
@@ -3840,9 +3843,16 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             )),
             skills: selectedProviderSnapshot?.skills ?? []
         )
-        guard routingMode == .auto || selectedProviderCanRun else {
-            statusMessage = providerExecutionUnavailableReason ?? "The selected provider is unavailable."
-            return
+        // Auto no longer silently routes to another provider — the Source host
+        // must be runnable (install/auth/models). The old Auto bypass left users
+        // with a late generic preferredSourceUnavailable after a failed admit.
+        if !selectedProviderCanRun {
+            // One refresh covers stale seed rows and run-as-user probe lag.
+            await loadProviderSnapshots()
+            if !selectedProviderCanRun {
+                statusMessage = providerExecutionUnavailableReason ?? "The selected provider is unavailable."
+                return
+            }
         }
         // A real turn "uses" the active model — new threads reopen on it.
         rememberCurrentModel()
@@ -4047,7 +4057,38 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 guard selectedThreadId != nil else {
                     throw AgentOrchestrationAdmissionError.invalidRoutingMode
                 }
-                let launchConfigurations = Dictionary(uniqueKeysWithValues: providerSnapshots.map { snapshot in
+                // Prefer a fresh probe when the Source is not yet Auto-admittable
+                // (stale seed / run-as-user home not reflected in the last load).
+                var admitSnapshots = providerSnapshots
+                if AgentOrchestrationRuntime.autoAdmitSnapshot(
+                    provider: effectiveRouting.manualSelection.provider,
+                    preferredInstanceId: effectiveRouting.manualProviderInstanceId ?? runProviderInstanceId,
+                    providerSnapshots: admitSnapshots,
+                    requireLiveCatalog: false
+                ) == nil {
+                    await loadProviderSnapshots()
+                    admitSnapshots = providerSnapshots
+                }
+                if AgentOrchestrationRuntime.autoAdmitSnapshot(
+                    provider: effectiveRouting.manualSelection.provider,
+                    preferredInstanceId: effectiveRouting.manualProviderInstanceId ?? runProviderInstanceId,
+                    providerSnapshots: admitSnapshots,
+                    requireLiveCatalog: false
+                ) == nil {
+                    let threadRunAs = selectedThreadId.flatMap { id in
+                        threads.first(where: { $0.id == id })?.runAsUser
+                    } ?? runAsUser
+                    throw AgentOrchestrationAdmissionError.preferredSourceUnavailable(
+                        effectiveRouting.manualSelection.provider,
+                        detail: AgentOrchestrationRuntime.preferredSourceUnavailabilityDetail(
+                            provider: effectiveRouting.manualSelection.provider,
+                            preferredInstanceId: effectiveRouting.manualProviderInstanceId ?? runProviderInstanceId,
+                            providerSnapshots: admitSnapshots,
+                            runAsUser: threadRunAs
+                        )
+                    )
+                }
+                let launchConfigurations = Dictionary(uniqueKeysWithValues: admitSnapshots.map { snapshot in
                     let launch = providerLaunchConfig?(snapshot.provider, snapshot.id)
                     return (snapshot.id, AgentOrchestrationLaunchConfiguration(
                         binary: launch?.binary,
@@ -4055,11 +4096,11 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                     ))
                 })
                 routingSnapshot = AgentOrchestrationRoutingSnapshot(
-                configuration: effectiveRouting,
-                providerSnapshots: providerSnapshots,
-                launchConfigurations: launchConfigurations,
-                admissionSnapshot: queuedRoutingSnapshot
-            )
+                    configuration: effectiveRouting,
+                    providerSnapshots: admitSnapshots,
+                    launchConfigurations: launchConfigurations,
+                    admissionSnapshot: queuedRoutingSnapshot
+                )
             } else {
                 routingSnapshot = nil
                 try AgentProviderRunPreflight.validate(

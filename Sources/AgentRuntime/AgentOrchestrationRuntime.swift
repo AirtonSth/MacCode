@@ -356,7 +356,9 @@ public enum AgentOrchestrationAdmissionError: Error, Sendable, Equatable, Custom
     case noEligibleProvider
     /// Source picker host is eligible in policy but not runnable (missing binary,
     /// unauthenticated, empty models). Fail closed — do not silently route to another host.
-    case preferredSourceUnavailable(AgentProvider)
+    /// `detail` is an optional concrete status (e.g. "Claude is not authenticated") so
+    /// the banner is actionable instead of a generic install/auth/models blob.
+    case preferredSourceUnavailable(AgentProvider, detail: String? = nil)
     case receiptPersistenceFailed(String)
 
     public var description: String {
@@ -381,8 +383,10 @@ public enum AgentOrchestrationAdmissionError: Error, Sendable, Equatable, Custom
             return "Orchestration admission requires an Auto routing configuration."
         case .noEligibleProvider:
             return "No eligible provider has a live model catalog and confirmed streaming capability."
-        case .preferredSourceUnavailable(let provider):
-            return "Auto cannot start on \(provider.rawValue): that Source is not runnable on this Mac (install/auth/models). Fix the Source or switch it before using Auto — RemoteCode will not silently fall back to another provider."
+        case .preferredSourceUnavailable(let provider, let detail):
+            let reason = (detail?.trimmingCharacters(in: .whitespacesAndNewlines)).flatMap { $0.isEmpty ? nil : $0 }
+                ?? "that Source is not runnable on this Mac (install/auth/models)"
+            return "Auto cannot start on \(provider.rawValue): \(reason). Fix the Source or switch it before using Auto — RemoteCode will not silently fall back to another provider."
         case .receiptPersistenceFailed(let message):
             return "Could not persist the orchestration admission receipt: \(message)"
         }
@@ -857,7 +861,14 @@ public final class AgentOrchestrationRuntime: @unchecked Sendable {
         // the same host on DEEP without orchestration — never another provider.
         let preferred = configuration.manualSelection.provider
         guard configuration.eligibleProviders.contains(preferred) else {
-            throw AgentOrchestrationAdmissionError.preferredSourceUnavailable(preferred)
+            throw AgentOrchestrationAdmissionError.preferredSourceUnavailable(
+                preferred,
+                detail: Self.preferredSourceUnavailabilityDetail(
+                    provider: preferred,
+                    preferredInstanceId: configuration.manualProviderInstanceId,
+                    providerSnapshots: providerSnapshots
+                )
+            )
         }
         guard let snapshot = Self.autoAdmitSnapshot(
             provider: preferred,
@@ -865,7 +876,14 @@ public final class AgentOrchestrationRuntime: @unchecked Sendable {
             providerSnapshots: providerSnapshots,
             requireLiveCatalog: false
         ) else {
-            throw AgentOrchestrationAdmissionError.preferredSourceUnavailable(preferred)
+            throw AgentOrchestrationAdmissionError.preferredSourceUnavailable(
+                preferred,
+                detail: Self.preferredSourceUnavailabilityDetail(
+                    provider: preferred,
+                    preferredInstanceId: configuration.manualProviderInstanceId,
+                    providerSnapshots: providerSnapshots
+                )
+            )
         }
         return Self.makeRoute(
             provider: preferred,
@@ -894,7 +912,14 @@ public final class AgentOrchestrationRuntime: @unchecked Sendable {
             providerSnapshots: providerSnapshots,
             requireLiveCatalog: false
         ) else {
-            throw AgentOrchestrationAdmissionError.preferredSourceUnavailable(preferred)
+            throw AgentOrchestrationAdmissionError.preferredSourceUnavailable(
+                preferred,
+                detail: Self.preferredSourceUnavailabilityDetail(
+                    provider: preferred,
+                    preferredInstanceId: configuration.manualProviderInstanceId,
+                    providerSnapshots: providerSnapshots
+                )
+            )
         }
         return Self.makeRoute(
             provider: preferred,
@@ -951,8 +976,9 @@ public final class AgentOrchestrationRuntime: @unchecked Sendable {
     ///   built-in catalog (Claude Code OAuth without Anthropic REST credentials).
     /// When `preferredInstanceId` is set, try that instance first so personal/work
     /// accounts stay sticky.
-    /// Visible to AgentRunCoordinator for same-host DEEP Auto fallback.
-    static func autoAdmitSnapshot(
+    /// Visible to AgentRunCoordinator and Agent App surface for same-host
+    /// DEEP Auto fallback and pre-send admit checks.
+    public static func autoAdmitSnapshot(
         provider: AgentProvider,
         preferredInstanceId: String?,
         providerSnapshots: [AgentProviderSnapshot],
@@ -980,6 +1006,79 @@ public final class AgentOrchestrationRuntime: @unchecked Sendable {
             return preferred
         }
         return providerSnapshots.first(where: isEligible)
+    }
+
+    /// Concrete reason the preferred Source cannot admit Auto — prefer the
+    /// snapshot's statusDetail (install / auth / models) so the UI can recover.
+    /// When `runAsUser` is a foreign macOS account, mention it: Claude may be
+    /// installed under the app owner (e.g. airtonjunior) while the user capsule
+    /// targets another account (e.g. airtonempat) whose ~/.claude is unsigned.
+    public static func preferredSourceUnavailabilityDetail(
+        provider: AgentProvider,
+        preferredInstanceId: String?,
+        providerSnapshots: [AgentProviderSnapshot],
+        runAsUser: AgentRunAsUser? = nil
+    ) -> String? {
+        let snapshot = AgentProviderSnapshotSelection.resolve(
+            snapshots: providerSnapshots,
+            provider: provider,
+            instanceId: preferredInstanceId
+        ) ?? providerSnapshots.first(where: { $0.provider == provider })
+        guard let snapshot else {
+            return "\(provider.rawValue.capitalized) is not available in the provider list on this Mac"
+        }
+        let foreignUser: String? = {
+            guard let runAsUser, runAsUser.uid != getuid() else { return nil }
+            let name = runAsUser.shortName.trimmingCharacters(in: .whitespacesAndNewlines)
+            return name.isEmpty ? nil : name
+        }()
+        let binaryHomeOwner = homeOwnerFromPath(snapshot.binaryPath)
+        let mismatchHint: String? = {
+            guard let foreignUser else { return nil }
+            if let owner = binaryHomeOwner, owner != foreignUser {
+                return "CLI is under \(owner) but run-as-user is \(foreignUser) — switch the user capsule to \(owner) or install/sign in as \(foreignUser)"
+            }
+            return "for macOS user \(foreignUser)"
+        }()
+        func withMismatch(_ base: String) -> String {
+            guard let mismatchHint else { return base }
+            let trimmed = base.hasSuffix(".") ? String(base.dropLast()) : base
+            return "\(trimmed) — \(mismatchHint)"
+        }
+
+        if let detail = snapshot.statusDetail?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !detail.isEmpty {
+            if mismatchHint != nil, !detail.localizedCaseInsensitiveContains("run-as-user") {
+                return withMismatch(detail)
+            }
+            return detail
+        }
+        if !snapshot.installed {
+            return withMismatch("\(snapshot.displayName) CLI binary is unavailable")
+        }
+        if snapshot.models.isEmpty {
+            return "\(snapshot.displayName) CLI models are unavailable"
+        }
+        if snapshot.authenticated == false {
+            return withMismatch("\(snapshot.displayName) is not authenticated. Sign in to continue")
+        }
+        if let caps = snapshot.capabilities, caps.supportsStreaming == false {
+            return "\(snapshot.displayName) does not support streaming on this Mac"
+        }
+        if !AgentProviderRunnableSelection.isRunnable(snapshot) {
+            return "\(snapshot.displayName) is not runnable (\(snapshot.status.rawValue))"
+        }
+        return nil
+    }
+
+    /// `/Users/<shortName>/...` → shortName. Used only for recovery copy.
+    public static func homeOwnerFromPath(_ path: String?) -> String? {
+        guard let path, !path.isEmpty else { return nil }
+        let parts = path.split(separator: "/", omittingEmptySubsequences: false).map(String.init)
+        // ["", "Users", "airtonjunior", ".local", ...]
+        guard parts.count >= 3, parts[1] == "Users" else { return nil }
+        let owner = parts[2].trimmingCharacters(in: .whitespacesAndNewlines)
+        return owner.isEmpty ? nil : owner
     }
 
     /// Back-compat alias: live-catalog gate only (non-preferred fallback hosts).

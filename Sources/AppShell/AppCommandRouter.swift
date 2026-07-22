@@ -371,8 +371,10 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                         }
                         agent.subscriptionToken = AnyHashable(token)
                         agent.onClose = { EventBus.shared.unsubscribe(token) }
-                        agent.viewModel.providerSnapshotLoader = { [weak self] in
-                            await self?.listAgentProviderSnapshots() ?? []
+                        agent.viewModel.providerSnapshotLoader = { [weak self, weak agent] in
+                            // Probe as the composer run-as-user so Auto admission
+                            // matches the account Claude will actually exec as.
+                            await self?.listAgentProviderSnapshots(runAsUser: agent?.viewModel.runAsUser) ?? []
                         }
                         agent.viewModel.refreshProviderSnapshotsInBackground()
                         agent.viewModel.providerLaunchConfig = { [weak self] provider, instanceId in
@@ -3402,14 +3404,73 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         return await listAgentProviderSnapshots()
     }
 
+    /// Resolves a provider CLI for the user who will execute it.
+    /// Absolute configured paths (Settings → Claude path) win when executable —
+    /// Airton's machine stores `/Users/airtonjunior/.local/bin/claude` explicitly.
+    /// Foreign `runAsUser` otherwise searches that account's home (and shared
+    /// dirs) so admission matches ClaudeStreamingCLIAdapter's spawn path.
+    static func resolveProviderBinaryPath(
+        binary: String,
+        runAsUser: AgentRunAsUser?
+    ) -> String {
+        let trimmed = binary.trimmingCharacters(in: .whitespacesAndNewlines)
+        // Settings absolute paths must not disappear just because run-as-user
+        // points at another account — auth still uses that account's HOME.
+        if trimmed.contains("/"),
+           FileManager.default.isExecutableFile(atPath: (trimmed as NSString).expandingTildeInPath) {
+            return (trimmed as NSString).expandingTildeInPath
+        }
+        if let runAsUser, runAsUser.uid != getuid() {
+            return ProcessLocator.resolve(
+                binary,
+                environmentPath: nil,
+                homeDirectory: runAsUser.homePath
+            ) ?? ""
+        }
+        return ProcessLocator.resolve(binary) ?? ""
+    }
+
+    /// Environment for probing/auth. When running as another macOS user, force
+    /// HOME (and provider home vars) to that user's directory so `claude auth
+    /// status` reads their credentials, not the app owner's.
+    static func probeEnvironment(
+        base: [String: String],
+        provider: AgentProvider,
+        runAsUser: AgentRunAsUser?
+    ) -> [String: String] {
+        guard let runAsUser, runAsUser.uid != getuid() else { return base }
+        var env = base
+        env["HOME"] = runAsUser.homePath
+        switch provider {
+        case .claude:
+            break
+        case .codex:
+            env["CODEX_HOME"] = env["CODEX_HOME"] ?? "\(runAsUser.homePath)/.codex"
+        case .grok:
+            env["GROK_HOME"] = env["GROK_HOME"] ?? "\(runAsUser.homePath)/.grok"
+        }
+        return env
+    }
+
+    /// Protocol/CommandRouting entry — probes as the app owner.
     public func listAgentProviderSnapshots() async -> [AgentProviderSnapshot] {
+        await listAgentProviderSnapshots(runAsUser: nil)
+    }
+
+    /// Snapshot probe for Auto admission / Source UI. Pass `runAsUser` so binary
+    /// + auth match the account Claude will actually `sudo -u` as.
+    public func listAgentProviderSnapshots(runAsUser: AgentRunAsUser?) async -> [AgentProviderSnapshot] {
         var snapshots: [AgentProviderSnapshot] = []
         let configuredInstances = providerInstanceConfigs()
         if !configuredInstances.isEmpty {
             for instance in configuredInstances {
                 let binary = providerBinary(instance: instance) ?? instance.provider.rawValue
-                let binaryPath = ProcessLocator.resolve(binary) ?? ""
-                let env = providerEnvironment(provider: instance.provider, instanceId: instance.id)
+                let binaryPath = Self.resolveProviderBinaryPath(binary: binary, runAsUser: runAsUser)
+                let env = Self.probeEnvironment(
+                    base: providerEnvironment(provider: instance.provider, instanceId: instance.id),
+                    provider: instance.provider,
+                    runAsUser: runAsUser
+                )
                 let capabilities = providerProbeCapabilities(provider: instance.provider, binaryPath: binaryPath, environment: env)
                 let claudeRuntime = instance.provider == .claude
                     ? ClaudeProviderRuntimePresentation.resolve(
@@ -3528,8 +3589,9 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         }
         for provider in AgentProvider.allCases {
             let binary = configuredProviderBinary(provider) ?? provider.rawValue
-            let binaryPath = ProcessLocator.resolve(binary) ?? ""
-            let capabilities = providerProbeCapabilities(provider: provider, binaryPath: binaryPath, environment: [:])
+            let binaryPath = Self.resolveProviderBinaryPath(binary: binary, runAsUser: runAsUser)
+            let env = Self.probeEnvironment(base: [:], provider: provider, runAsUser: runAsUser)
+            let capabilities = providerProbeCapabilities(provider: provider, binaryPath: binaryPath, environment: env)
             let claudeRuntime = provider == .claude
                 ? ClaudeProviderRuntimePresentation.resolve(
                     agentSDKEnabled: ProcessInfo.processInfo.environment["RC_CLAUDE_AGENT_SDK_ENABLED"] != "0",
@@ -3539,7 +3601,8 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             let grokDiscovery = provider == .grok
                 ? await GrokACPAdapter(
                     binaryNameOverride: binaryPath.isEmpty ? binary : binaryPath,
-                    discoveryCwd: FileManager.default.currentDirectoryPath
+                    discoveryCwd: FileManager.default.currentDirectoryPath,
+                    discoveryEnvironment: env
                 ).discoveryResult()
                 : nil
             let models: [AgentModelDescriptor]
@@ -3548,7 +3611,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 models = grokDiscovery.models
                 liveCatalogVerified = !grokDiscovery.isFallback && !grokDiscovery.models.isEmpty
             } else if provider == .claude {
-                let discovery = await AnthropicModelDiscovery.listModelsResult(environment: [:])
+                let discovery = await AnthropicModelDiscovery.listModelsResult(environment: env)
                 if !discovery.isFallback && !discovery.models.isEmpty {
                     models = discovery.models
                     liveCatalogVerified = true
@@ -3557,7 +3620,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                         provider: provider,
                         installedVersion: capabilities.version,
                         binaryPath: binaryPath,
-                        environment: [:]
+                        environment: env
                     )
                     // Same Claude Code OAuth path as the instance-based loader.
                     liveCatalogVerified = !models.isEmpty
@@ -3569,7 +3632,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 let discovered = await CodexAppServerModelDiscovery.listModels(
                     binary: binaryPath,
                     cwd: cwd,
-                    environment: [:]
+                    environment: env
                 )
                 if !discovered.isEmpty {
                     models = discovered
@@ -3579,7 +3642,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                         provider: provider,
                         installedVersion: capabilities.version,
                         binaryPath: binaryPath,
-                        environment: [:]
+                        environment: env
                     )
                     liveCatalogVerified = false
                 }
@@ -3588,14 +3651,14 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                     provider: provider,
                     installedVersion: capabilities.version,
                     binaryPath: binaryPath,
-                    environment: [:]
+                    environment: env
                 )
                 liveCatalogVerified = false
             }
             let runtimeCapabilities = providerRuntimeCapabilities(
                 provider: provider,
                 binaryPath: binaryPath,
-                environment: [:],
+                environment: env,
                 claudePresentation: claudeRuntime,
                 grokCapabilities: grokDiscovery?.capabilities
             )
@@ -4755,8 +4818,8 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 }
                 agent.subscriptionToken = AnyHashable(token)
                 agent.onClose = { EventBus.shared.unsubscribe(token) }
-                agent.viewModel.providerSnapshotLoader = { [weak self] in
-                    await self?.listAgentProviderSnapshots() ?? []
+                agent.viewModel.providerSnapshotLoader = { [weak self, weak agent] in
+                    await self?.listAgentProviderSnapshots(runAsUser: agent?.viewModel.runAsUser) ?? []
                 }
                 agent.viewModel.refreshProviderSnapshotsInBackground()
                 agent.viewModel.providerLaunchConfig = { [weak self] provider, instanceId in
