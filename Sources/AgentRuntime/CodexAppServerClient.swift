@@ -175,7 +175,7 @@ public final class CodexAppServerClient: @unchecked Sendable {
         process.executableURL = URL(fileURLWithPath: path)
         process.arguments = arguments
         process.currentDirectoryURL = URL(fileURLWithPath: cwd)
-        process.environment = CodexRunner.processEnvironment(overrides: environment)
+        process.environment = CodexRunner.processEnvironment(overrides: environment, purpose: .agentTurn(.codex))
         process.standardInput = stdinPipe
         process.standardOutput = stdoutPipe
         process.standardError = stderrPipe

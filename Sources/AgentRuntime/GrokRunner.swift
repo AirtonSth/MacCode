@@ -153,7 +153,7 @@ public final class GrokRunner: AgentProviderRunner, @unchecked Sendable {
             ? request.providerThreadId
             : UUID().uuidString.lowercased()
         let args = Self.buildArgs(request, newSessionId: request.providerThreadId == nil ? preassignedSessionId : nil)
-        let environment = CodexRunner.processEnvironment(overrides: request.environment, provider: .grok)
+        let environment = CodexRunner.processEnvironment(overrides: request.environment, purpose: .agentTurn(.grok))
         let launchPlan: RunAsUserProcessBootstrap.LaunchPlan
         do {
             launchPlan = try RunAsUserProcessBootstrap.plan(

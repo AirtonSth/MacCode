@@ -393,10 +393,16 @@ public final class AppContext {
         ) {
             reconcileManagedDistillSkills(tokenSaverEnabled: SettingsStore(db: db).load().tokenSaverEnabled)
         }
-        // PERF (cold launch): do not start Distill/MLX during AppContext bootstrap.
-        // Token Saver demand paths call `startTokenSaverDistillServiceIfEligible()`
-        // (compress kick, SR1 wait helper, settings UI). Fail-open preserves the
-        // original provider input when the sidecar is not ready yet.
+        // PERF (cold launch): never block AppContext.init on multi-GB MLX warmup.
+        // Still kick Token Saver asynchronously when already enabled so managed
+        // `distill` CLI gets DistillCLIState after relaunch (terminal pipes cannot
+        // autostart the sidecar). Demand paths also call startIfEligible(); fail-open
+        // still applies until ready.
+        if SettingsStore(db: db).load().tokenSaverEnabled {
+            Task { @MainActor [weak self] in
+                self?.startTokenSaverDistillServiceIfEligible()
+            }
+        }
 
         // GAP-7: stream agent run lifecycle + timeline to the network
         // event bus so the iOS mirror renders agent output in real time
@@ -842,6 +848,11 @@ public final class AppContext {
             _ = try installer.installDistillCLI(appSupportDirectory: appSupportDirectory)
             try? installer.installCommandWrappers()
             try? installer.installRetrieveMCP()
+            // Warm the login-shell env capture at launch so agent turns get profile
+            // secret/PATH parity from turn 1 (Finder-launched apps don't source the
+            // shell profile). Non-blocking + single-flight + fail-open; a later turn
+            // still lazily triggers it if this path was skipped.
+            LoginShellEnvironment.prewarm()
             managedDistillSkillInstallResults = [appPrivate]
             managedDistillSkillInstallError = nil
             // Token Saver toggle no longer installs/uninstalls home skills.

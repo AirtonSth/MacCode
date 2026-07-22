@@ -195,7 +195,7 @@ public enum ProviderCLIProbe {
         guard !trimmed.isEmpty else { return nil }
         guard FileManager.default.isExecutableFile(atPath: trimmed) else { return nil }
 
-        let baseEnv = CodexRunner.processEnvironment(overrides: environment)
+        let baseEnv = CodexRunner.processEnvironment(overrides: environment, purpose: .supportProcess)
         let launchPlan: RunAsUserProcessBootstrap.LaunchPlan
         do {
             // Match ClaudeStreamingCLIAdapter: foreign user → sudo -n -u -H

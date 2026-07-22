@@ -151,8 +151,10 @@ final class CodexRunnerArgsTests: XCTestCase {
     func test_processEnvironmentMergesProviderInstanceHomeWithoutDroppingPath() {
         let env = CodexRunner.processEnvironment(
             overrides: ["CODEX_HOME": "/tmp/codex-work", "REMOTE_CODE_INSTANCE": "work"],
-            base: ["PATH": "/usr/bin", "HOME": "/tmp/remote-code-home", "CODEX_HOME": "/tmp/default"],
-            provider: .codex
+            purpose: .agentTurn(.codex),
+            // RC_LOGIN_SHELL_ENV_IMPORT=0 keeps this a deterministic pure-merge test
+            // (no real login-shell capture); parity import is exercised separately.
+            base: ["PATH": "/usr/bin", "HOME": "/tmp/remote-code-home", "CODEX_HOME": "/tmp/default", "RC_LOGIN_SHELL_ENV_IMPORT": "0"]
         )
 
         let path = env["PATH"]?.split(separator: ":").map(String.init) ?? []
