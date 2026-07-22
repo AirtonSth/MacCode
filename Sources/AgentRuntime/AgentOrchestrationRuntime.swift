@@ -851,48 +851,67 @@ public final class AgentOrchestrationRuntime: @unchecked Sendable {
             throw AgentOrchestrationAdmissionError.invalidPolicy
         }
 
-        // Source picker is authoritative for Auto. Never silently start on
-        // another host (UI said Claude, run was Codex). Prefer that host; if it
-        // is listed as eligible but not runnable, fail closed with a clear error.
+        // Source picker is the only host Auto may start. Never walk other
+        // providers (Claude selected → must not become Codex). If that host is
+        // not runnable, fail closed; the run coordinator may still fall back to
+        // the same host on DEEP without orchestration — never another provider.
         let preferred = configuration.manualSelection.provider
-        if configuration.eligibleProviders.contains(preferred) {
-            if let snapshot = Self.autoAdmitSnapshot(
-                provider: preferred,
-                preferredInstanceId: configuration.manualProviderInstanceId,
-                providerSnapshots: providerSnapshots,
-                requireLiveCatalog: false
-            ) {
-                return Self.makeRoute(provider: preferred, snapshot: snapshot)
-            }
+        guard configuration.eligibleProviders.contains(preferred) else {
             throw AgentOrchestrationAdmissionError.preferredSourceUnavailable(preferred)
         }
-
-        // Preferred host not in eligibleProviders (explicit policy allow-list):
-        // walk the remaining hosts; non-preferred still need a live catalog.
-        for provider in configuration.eligibleProviders {
-            guard let snapshot = Self.autoAdmitSnapshot(
-                provider: provider,
-                preferredInstanceId: nil,
-                providerSnapshots: providerSnapshots,
-                requireLiveCatalog: true
-            ) else { continue }
-            return Self.makeRoute(provider: provider, snapshot: snapshot)
+        guard let snapshot = Self.autoAdmitSnapshot(
+            provider: preferred,
+            preferredInstanceId: configuration.manualProviderInstanceId,
+            providerSnapshots: providerSnapshots,
+            requireLiveCatalog: false
+        ) else {
+            throw AgentOrchestrationAdmissionError.preferredSourceUnavailable(preferred)
         }
-        throw AgentOrchestrationAdmissionError.noEligibleProvider
+        return Self.makeRoute(
+            provider: preferred,
+            snapshot: snapshot,
+            selection: Self.lightControllerSelection(
+                provider: preferred,
+                availableModels: snapshot.models
+            )
+        )
+    }
+
+    /// Same-host DEEP binding when Auto cannot orchestrate (package/rollout/kill
+    /// switch). Still never switches provider — only drops `$remote-code-orchestrate`
+    /// and uses the host-matrix DEEP row (opus / sol / grok-4.5 high).
+    public func routeDeepFallback(
+        configuration: AgentRoutingConfiguration,
+        providerSnapshots: [AgentProviderSnapshot]
+    ) throws -> AgentOrchestrationRoute {
+        guard configuration.mode == .auto else {
+            throw AgentOrchestrationAdmissionError.invalidRoutingMode
+        }
+        let preferred = configuration.manualSelection.provider
+        guard let snapshot = Self.autoAdmitSnapshot(
+            provider: preferred,
+            preferredInstanceId: configuration.manualProviderInstanceId,
+            providerSnapshots: providerSnapshots,
+            requireLiveCatalog: false
+        ) else {
+            throw AgentOrchestrationAdmissionError.preferredSourceUnavailable(preferred)
+        }
+        return Self.makeRoute(
+            provider: preferred,
+            snapshot: snapshot,
+            selection: Self.deepControllerSelection(
+                provider: preferred,
+                availableModels: snapshot.models
+            )
+        )
     }
 
     private static func makeRoute(
         provider: AgentProvider,
-        snapshot: AgentProviderSnapshot
+        snapshot: AgentProviderSnapshot,
+        selection: AgentModelSelection
     ) -> AgentOrchestrationRoute {
-        // Auto always binds the host-matrix LIGHT row. Capability escalation
-        // (STANDARD/DEEP workers) is performed inside $remote-code-orchestrate
-        // — the controller run itself stays on LIGHT.
-        let selection = lightControllerSelection(
-            provider: provider,
-            availableModels: snapshot.models
-        )
-        return AgentOrchestrationRoute(
+        AgentOrchestrationRoute(
             provider: provider,
             providerInstanceId: snapshot.id,
             capabilitySnapshotId: capabilitySnapshotID(snapshot),
@@ -932,6 +951,7 @@ public final class AgentOrchestrationRuntime: @unchecked Sendable {
     ///   built-in catalog (Claude Code OAuth without Anthropic REST credentials).
     /// When `preferredInstanceId` is set, try that instance first so personal/work
     /// accounts stay sticky.
+    /// Visible to AgentRunCoordinator for same-host DEEP Auto fallback.
     static func autoAdmitSnapshot(
         provider: AgentProvider,
         preferredInstanceId: String?,
@@ -1114,6 +1134,69 @@ public final class AgentOrchestrationRuntime: @unchecked Sendable {
         case .grok:
             return (["grok-4.5"], .medium)
         }
+    }
+
+    /// DEEP (non-orchestrated Auto fallback) binding — same host only.
+    /// Codex → sol/high, Claude → opus/high, Grok → grok-4.5/high.
+    public static func deepMatrixBinding(for provider: AgentProvider) -> (preferredModelIds: [String], effort: AgentReasoningEffort) {
+        switch provider {
+        case .codex:
+            return (["gpt-5.6-sol", "gpt-5.6-luna", "gpt-5.5"], .high)
+        case .claude:
+            return (["opus", "claude-opus", "claude-4-opus", "claude-3-opus"], .high)
+        case .grok:
+            return (["grok-4.5"], .high)
+        }
+    }
+
+    /// DEEP controller selection when Auto skips `$remote-code-orchestrate`.
+    public static func deepControllerSelection(
+        provider: AgentProvider,
+        availableModels: [AgentModelDescriptor]
+    ) -> AgentModelSelection {
+        let binding = deepMatrixBinding(for: provider)
+        let providerModels = availableModels.filter { $0.provider == provider }
+        let selectedId: String
+        if let exact = binding.preferredModelIds.first(where: { preferred in
+            !preferred.isEmpty && providerModels.contains(where: { $0.id == preferred })
+        }) {
+            selectedId = exact
+        } else if let fuzzy = binding.preferredModelIds.first(where: { preferred in
+            guard !preferred.isEmpty else { return false }
+            let needle = preferred.lowercased()
+            return providerModels.contains {
+                let id = $0.id.lowercased()
+                return id == needle || id.hasPrefix(needle) || id.contains(needle)
+            }
+        }),
+           let match = providerModels.first(where: {
+               let id = $0.id.lowercased()
+               let needle = fuzzy.lowercased()
+               return id == needle || id.hasPrefix(needle) || id.contains(needle)
+           }) {
+            selectedId = match.id
+        } else {
+            selectedId = binding.preferredModelIds.first(where: { !$0.isEmpty })
+                ?? providerModels.first(where: { !$0.id.isEmpty })?.id
+                ?? ""
+        }
+        let selectedDescriptor = providerModels.first { $0.id == selectedId }
+        let effort: AgentReasoningEffort
+        if let selectedDescriptor,
+           !selectedDescriptor.supportedReasoningEfforts.isEmpty,
+           !selectedDescriptor.supportedReasoningEfforts.contains(binding.effort) {
+            effort = selectedDescriptor.supportedReasoningEfforts.contains(.high)
+                ? .high
+                : (selectedDescriptor.supportedReasoningEfforts.last ?? binding.effort)
+        } else {
+            effort = binding.effort
+        }
+        return AgentModelSelection(
+            provider: provider,
+            modelId: selectedId,
+            reasoningEffort: effort,
+            serviceTier: .auto
+        )
     }
 
     public static func defaultPackageURL() -> URL {

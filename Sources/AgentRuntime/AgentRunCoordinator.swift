@@ -726,47 +726,132 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             return request
         }
         guard let orchestrationRuntime else {
-            throw AgentOrchestrationAdmissionError.noEligibleProvider
+            // No orchestration runtime: still never switch provider — DEEP on Source.
+            return try Self.autoDeepFallbackRequest(
+                request,
+                configuration: routingSnapshot.configuration,
+                providerSnapshots: routingSnapshot.providerSnapshots,
+                launchConfigurations: routingSnapshot.launchConfigurations
+            )
         }
-        let admission = try orchestrationRuntime.admit(
-            runId: request.runId,
-            threadId: request.threadId,
-            configuration: routingSnapshot.configuration,
-            providerSnapshots: routingSnapshot.providerSnapshots,
-            interactionMode: request.interactionMode,
-            permissionMode: request.permissionMode,
-            attachments: request.attachments,
-            receiptId: routingSnapshot.admissionSnapshot?.admissionReceiptId,
-            deadlineAt: routingSnapshot.admissionSnapshot?.deadlineAt,
-            budgetTokens: routingSnapshot.admissionSnapshot?.budgetTokens,
-            budgetCostMicros: routingSnapshot.admissionSnapshot?.budgetCostMicros,
-            reservationId: routingSnapshot.admissionSnapshot?.reservationId,
-            reservedTokens: routingSnapshot.admissionSnapshot?.reservedTokens,
-            reservedCostMicros: routingSnapshot.admissionSnapshot?.reservedCostMicros
-        )
-        let launch = routingSnapshot.launchConfigurations[admission.route.providerInstanceId]
-        // Display the user's words unchanged; wrap only the provider-bound prompt
-        // so Auto always enters $remote-code-orchestrate with the host receipt
-        // the app already admitted (provider/model) — skill must not re-guess.
+        do {
+            let admission = try orchestrationRuntime.admit(
+                runId: request.runId,
+                threadId: request.threadId,
+                configuration: routingSnapshot.configuration,
+                providerSnapshots: routingSnapshot.providerSnapshots,
+                interactionMode: request.interactionMode,
+                permissionMode: request.permissionMode,
+                attachments: request.attachments,
+                receiptId: routingSnapshot.admissionSnapshot?.admissionReceiptId,
+                deadlineAt: routingSnapshot.admissionSnapshot?.deadlineAt,
+                budgetTokens: routingSnapshot.admissionSnapshot?.budgetTokens,
+                budgetCostMicros: routingSnapshot.admissionSnapshot?.budgetCostMicros,
+                reservationId: routingSnapshot.admissionSnapshot?.reservationId,
+                reservedTokens: routingSnapshot.admissionSnapshot?.reservedTokens,
+                reservedCostMicros: routingSnapshot.admissionSnapshot?.reservedCostMicros
+            )
+            let launch = routingSnapshot.launchConfigurations[admission.route.providerInstanceId]
+            // Display the user's words unchanged; wrap only the provider-bound prompt
+            // so Auto always enters $remote-code-orchestrate with the host receipt
+            // the app already admitted (provider/model) — skill must not re-guess.
+            let displayPrompt = request.userMessageContent ?? request.prompt
+            let orchestratedPrompt = AgentOrchestrationRuntime.autoOrchestrateProviderPrompt(
+                userPrompt: request.prompt,
+                admittedRoute: admission.route
+            )
+            return AgentRunRequest(
+                runId: request.runId,
+                threadId: request.threadId,
+                provider: admission.route.provider,
+                providerInstanceId: admission.route.providerInstanceId,
+                model: admission.route.selection.effectiveModel,
+                cwd: request.cwd,
+                prompt: orchestratedPrompt,
+                userMessageContent: displayPrompt,
+                attachments: request.attachments,
+                providerThreadId: request.providerThreadId,
+                permissionMode: request.permissionMode,
+                reasoningEffort: admission.route.selection.reasoningEffort,
+                serviceTier: admission.route.selection.serviceTier,
+                interactionMode: request.interactionMode,
+                providerBinary: launch?.binary ?? request.providerBinary,
+                environment: launch?.environment ?? request.environment,
+                extraArgs: request.extraArgs,
+                runAsUser: request.runAsUser
+            )
+        } catch let error as AgentOrchestrationAdmissionError {
+            // Same-host only. Orchestration gates may drop the skill wrap and
+            // use DEEP; never switch Claude → Codex (or any other cross-host).
+            switch error {
+            case .packageUnavailable, .rolloutDisabled, .killSwitchEnabled, .invalidPolicy:
+                return try Self.autoDeepFallbackRequest(
+                    request,
+                    configuration: routingSnapshot.configuration,
+                    providerSnapshots: routingSnapshot.providerSnapshots,
+                    launchConfigurations: routingSnapshot.launchConfigurations,
+                    runtime: orchestrationRuntime
+                )
+            case .preferredSourceUnavailable, .noEligibleProvider, .invalidRoutingMode,
+                 .deadlineExpired, .invalidBudget, .costBudgetUnavailable, .quotaExceeded,
+                 .receiptPersistenceFailed:
+                throw error
+            }
+        }
+    }
+
+    /// Auto without orchestration: bind Source picker host to DEEP (opus/sol/grok-4.5 high).
+    private static func autoDeepFallbackRequest(
+        _ request: AgentRunRequest,
+        configuration: AgentRoutingConfiguration,
+        providerSnapshots: [AgentProviderSnapshot],
+        launchConfigurations: [String: AgentOrchestrationLaunchConfiguration],
+        runtime: AgentOrchestrationRuntime? = nil
+    ) throws -> AgentRunRequest {
+        let route: AgentOrchestrationRoute
+        if let runtime {
+            route = try runtime.routeDeepFallback(
+                configuration: configuration,
+                providerSnapshots: providerSnapshots
+            )
+        } else {
+            let preferred = configuration.manualSelection.provider
+            guard let snapshot = AgentOrchestrationRuntime.autoAdmitSnapshot(
+                provider: preferred,
+                preferredInstanceId: configuration.manualProviderInstanceId,
+                providerSnapshots: providerSnapshots,
+                requireLiveCatalog: false
+            ) else {
+                throw AgentOrchestrationAdmissionError.preferredSourceUnavailable(preferred)
+            }
+            let selection = AgentOrchestrationRuntime.deepControllerSelection(
+                provider: preferred,
+                availableModels: snapshot.models
+            )
+            route = AgentOrchestrationRoute(
+                provider: preferred,
+                providerInstanceId: snapshot.id,
+                capabilitySnapshotId: "deep-fallback",
+                selection: selection
+            )
+        }
+        let launch = launchConfigurations[route.providerInstanceId]
         let displayPrompt = request.userMessageContent ?? request.prompt
-        let orchestratedPrompt = AgentOrchestrationRuntime.autoOrchestrateProviderPrompt(
-            userPrompt: request.prompt,
-            admittedRoute: admission.route
-        )
+        // No $remote-code-orchestrate — single-agent DEEP on the selected Source.
         return AgentRunRequest(
             runId: request.runId,
             threadId: request.threadId,
-            provider: admission.route.provider,
-            providerInstanceId: admission.route.providerInstanceId,
-            model: admission.route.selection.effectiveModel,
+            provider: route.provider,
+            providerInstanceId: route.providerInstanceId,
+            model: route.selection.effectiveModel,
             cwd: request.cwd,
-            prompt: orchestratedPrompt,
+            prompt: request.prompt,
             userMessageContent: displayPrompt,
             attachments: request.attachments,
             providerThreadId: request.providerThreadId,
             permissionMode: request.permissionMode,
-            reasoningEffort: admission.route.selection.reasoningEffort,
-            serviceTier: admission.route.selection.serviceTier,
+            reasoningEffort: route.selection.reasoningEffort,
+            serviceTier: route.selection.serviceTier,
             interactionMode: request.interactionMode,
             providerBinary: launch?.binary ?? request.providerBinary,
             environment: launch?.environment ?? request.environment,

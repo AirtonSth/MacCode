@@ -673,6 +673,66 @@ final class AgentOrchestrationRuntimeTests: XCTestCase {
         )) { XCTAssertEqual($0 as? AgentOrchestrationAdmissionError, .preferredSourceUnavailable(.claude)) }
     }
 
+    func test_autoDeepControllerSelectionUsesHostMatrixDeepRow() {
+        let claude = AgentOrchestrationRuntime.deepControllerSelection(
+            provider: .claude,
+            availableModels: [
+                AgentModelDescriptor(id: "haiku", label: "Haiku", provider: .claude, supportsReasoning: true),
+                AgentModelDescriptor(id: "opus", label: "Opus", provider: .claude, supportsReasoning: true,
+                                     supportedReasoningEfforts: [.low, .medium, .high, .xhigh])
+            ]
+        )
+        XCTAssertEqual(claude.modelId, "opus")
+        XCTAssertEqual(claude.reasoningEffort, .high)
+
+        let codex = AgentOrchestrationRuntime.deepControllerSelection(
+            provider: .codex,
+            availableModels: [
+                AgentModelDescriptor(id: "gpt-5.6-luna", label: "Luna", provider: .codex, supportsReasoning: true),
+                AgentModelDescriptor(id: "gpt-5.6-sol", label: "Sol", provider: .codex, supportsReasoning: true,
+                                     supportedReasoningEfforts: [.medium, .high, .xhigh])
+            ]
+        )
+        XCTAssertEqual(codex.modelId, "gpt-5.6-sol")
+        XCTAssertEqual(codex.reasoningEffort, .high)
+
+        let grok = AgentOrchestrationRuntime.deepControllerSelection(
+            provider: .grok,
+            availableModels: [
+                AgentModelDescriptor(id: "grok-4.5", label: "Grok", provider: .grok, supportsReasoning: true,
+                                     supportedReasoningEfforts: [.medium, .high])
+            ]
+        )
+        XCTAssertEqual(grok.modelId, "grok-4.5")
+        XCTAssertEqual(grok.reasoningEffort, .high)
+    }
+
+    func testRouteDeepFallbackStaysOnPreferredSource() throws {
+        let runtime = AgentOrchestrationRuntime(
+            packageVerification: { true },
+            killSwitch: { false }
+        )
+        var config = configuration(runtime: runtime)
+        config.eligibleProviders = AgentProvider.allCases
+        config.manualSelection = AgentModelSelection(
+            provider: .claude,
+            modelId: "opus",
+            reasoningEffort: .high,
+            serviceTier: .auto
+        )
+        config.manualProviderInstanceId = "claude-cli"
+        let route = try runtime.routeDeepFallback(
+            configuration: config,
+            providerSnapshots: snapshots()
+        )
+        XCTAssertEqual(route.provider, .claude)
+        XCTAssertEqual(route.providerInstanceId, "claude-cli")
+        // DEEP binding prefers opus alias when present in catalog; test snapshots
+        // only ship "claude-live" so matrix falls back to forced preferred id.
+        XCTAssertFalse(route.selection.modelId.isEmpty)
+        XCTAssertEqual(route.selection.provider, .claude)
+    }
+
     func test_autoLightControllerSelectionUsesHostMatrixNotManualSelection() {
         let claude = AgentOrchestrationRuntime.lightControllerSelection(
             provider: .claude,
