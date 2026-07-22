@@ -183,24 +183,24 @@ public final class AgentSkillInstaller: @unchecked Sendable {
     Do not return the user's prompt compressed as an artifact.
     Adopt the distill language structure and keep using it for the rest of the thread.
 
-    Core behavior:
-    - English only unless the user explicitly requests another language.
-    - Military English + AR-0/AR-1 baseline.
-    - Short command lines.
-    - Fixed semantic prefixes: S=state, C=context, D=action, R=risk, O=outcome, N=no-go, P=proof.
-    - Semantic atoms over natural phrases.
-    - One idea per line.
-    - Explicit constraints and pass criteria.
-    - Exact paths, commands, env vars, IDs when useful.
-    - No filler.
-    - No cryptic code.
-    - No long prose unless the user asks for explanation.
-    - Write surfaced reasoning/thinking in distill structure (semantic S/C/D/R/O/N/P lines), not prose; keep secrets out of it.
+    Core behavior (token-efficient dialect — sparse by default):
+    - Registers: R0 micro | R1 work | R2 tool (tool path is `| distill`, not chat prefixes).
+    - R0 micro (greeting, yes/no, trivial status, conversational only): **O-only**.
+      One short line in the user's language. No S/C/D/R/N/P. No restating the user. No English meta.
+      Example: `O: bem, obrigado — pronto pro próximo`
+    - R1 work (code, PR, debug, plan, multi-step): **O-first**, sparse optional fields.
+      Prefixes (use only when needed): S=state, C=context, D=action, R=risk, N=no-go, P=proof.
+      Never pad to six lines. Do not restate the user prompt in C. One idea per line.
+      Prefer short atoms over prose. Exact paths/commands/IDs when useful.
+    - Do not use Military English boilerplate on R0. On R1 keep short command-style English for ops fields; put user-facing answer in O (user language when the user wrote non-English).
+    - No filler. No long prose unless the user asks for explanation.
+    - Surfaced thinking: R0 none; R1 sparse distill lines only; keep secrets out.
+    - Hard caps: R0 ≤2 lines / ~60 tokens; R1 status ≤4 lines; R1 implement ≤12 lines unless user asks for detail.
 
     Thread behavior:
-    - Use distill structure for reasoning, thinking, status updates, plans, summaries, reviews, and final answers.
+    - Prefer R0 for micro chat. Escalate to R1 only when the turn does real work.
     - Do not output a rewritten/compressed version of the latest user prompt unless the user explicitly asks to compress text.
-    - Emit `Dict:` early when aliases or prefixes matter.
+    - Emit `Dict:` early only when aliases reduce repetition (never secrets/people/paths/URLs as aliases).
 
     Command-output policy (Token Saver — bias to compress; over-compressing is preferred to under-compressing):
     - DEFAULT to piping EVERY non-interactive, non-TUI shell/tool command through the RemoteCode-managed `distill` CLI whenever its output is more than ~10 lines or ~1KB. This applies to build, test, lint, install, git, grep, rg, find, ls, cat, head, tail, curl, sed, awk, docker, kubectl, terraform, and any other command that emits bulk text.
@@ -221,9 +221,11 @@ public final class AgentSkillInstaller: @unchecked Sendable {
 
     public static let distillAgentInstructionsTemplate = """
     <!-- distill skill: begin -->
-    CRITICAL: Use `/distill` for every user-visible response and your reasoning/thinking: English Military English + AR-0/AR-1, short command lines, explicit constraints, explicit pass criteria, no filler.
-    Use fixed prefixes: S=state/status, C=cause/context, D=action/decision, R=risk/blocker, O=outcome/output, N=constraint/no-go, P=pass/proof.
-    Use Dict/inline `#` variables only when they reduce repetition. Never define variables for secrets, people, IDs, paths, URLs, or one-off terms.
+    CRITICAL: Use `/distill` dialect for provider turns — **sparse, O-first, mode-aware** (not a fixed 6-line S/C/D tax).
+    Registers: **R0 micro** (greeting/yes-no/trivial status) = `O:` only, user language, ≤2 lines; no S/C/D/R/N/P, no user restatement.
+    **R1 work** (code/PR/debug/plan) = O-first; add S/C/D/R/N/P only when needed; never pad to six lines; short atoms; caps: status ≤4 lines, implement ≤12 unless asked.
+    Prefixes when used: S=state, C=context, D=action, R=risk, O=outcome, N=no-go, P=proof.
+    Dict/`#` vars only when they reduce repetition. Never alias secrets, people, IDs, paths, URLs.
     Do not return a rewritten/compressed copy of the user's prompt unless explicitly asked to compress text.
     Token Saver — bias to compress (over-compressing beats under-compressing): by DEFAULT pipe EVERY non-interactive, non-TUI command whose output exceeds ~10 lines or ~1KB through the RemoteCode-managed `distill` CLI with an explicit extraction prompt (build/test/lint/git/grep/find/ls/cat/curl/docker/kubectl/etc). If unsure it will be large, pipe it.
     Skip `| distill` ONLY when you need exact bytes (patches, hashes/tokens), output is interactive/TUI, or the local RemoteCodeDistillService is unavailable; state the skip. Never invoke Node, tsx, npm, bun, or a source-checkout CLI for `distill`.

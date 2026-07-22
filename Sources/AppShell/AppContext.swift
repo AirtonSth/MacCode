@@ -1942,49 +1942,46 @@ public final class AppContext {
     private static func fallbackHumanizeSR1(_ response: String, targetLanguage: String) -> String {
         let portuguese = targetLanguage.localizedCaseInsensitiveContains("Portuguese")
         let spanish = targetLanguage.localizedCaseInsensitiveContains("Spanish")
-        let labels: [Character: String]
-        if portuguese {
-            labels = ["S": "Estado", "C": "Contexto", "D": "Acao", "R": "Risco", "O": "Resultado", "N": "Nao fazer", "P": "Prova"]
-        } else if spanish {
-            labels = ["S": "Estado", "C": "Contexto", "D": "Accion", "R": "Riesgo", "O": "Resultado", "N": "No hacer", "P": "Prueba"]
-        } else {
-            labels = ["S": "State", "C": "Context", "D": "Action", "R": "Risk", "O": "Outcome", "N": "Do not do", "P": "Proof"]
+
+        // Prefer O (outcome) as the user-facing answer. Do not rename every
+        // prefix to Estado/Contexto — that is not human and wastes UI tokens.
+        var outcomes: [String] = []
+        var extras: [String] = []
+        for raw in response.split(whereSeparator: \.isNewline) {
+            let line = String(raw).trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !line.isEmpty else { continue }
+            let lower = line.lowercased()
+            if lower == "sr1" || lower == "dict" || lower.hasPrefix("dict:")
+                || lower.hasPrefix("s=state") || lower.hasPrefix("c=context") {
+                continue
+            }
+            let segments = SR1ResponseDetector.parseSemanticSegments(line)
+            if segments.isEmpty {
+                if !line.hasPrefix("|") { extras.append(line) }
+                continue
+            }
+            for seg in segments {
+                let content = seg.content.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !content.isEmpty else { continue }
+                if seg.prefix == "O" {
+                    outcomes.append(content)
+                } else if seg.prefix == "R" || seg.prefix == "P" {
+                    // Keep risk/proof as short add-ons only when present.
+                    extras.append(content)
+                }
+                // Drop S/C/D/N in fail-open UI — they are ops chrome.
+            }
         }
 
-        let lines = response
-            .split(whereSeparator: \.isNewline)
-            .flatMap { raw -> [String] in
-                let line = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-                guard !line.isEmpty else { return [] }
-                let lower = line.lowercased()
-                guard lower != "sr1",
-                      lower != "dict",
-                      lower != "dict:",
-                      !lower.hasPrefix("dict:"),
-                      !lower.hasPrefix("s=state"),
-                      !lower.hasPrefix("c=context"),
-                      !lower.hasPrefix("d=action"),
-                      !lower.hasPrefix("r=risk"),
-                      !lower.hasPrefix("o=outcome"),
-                      !lower.hasPrefix("n=no-go"),
-                      !lower.hasPrefix("p=proof") else {
-                    return []
-                }
-                let segments = SR1ResponseDetector.parseSemanticSegments(line)
-                guard !segments.isEmpty else {
-                    return [line]
-                }
-                return segments.map { parsed in
-                    guard let label = labels[parsed.prefix] else { return parsed.content }
-                    return "\(label): \(parsed.content)"
-                }
-            }
-        if lines.isEmpty {
+        let pieces = outcomes.isEmpty ? extras : (outcomes + extras.prefix(2))
+        if pieces.isEmpty {
             if portuguese { return "Nao consegui expandir a resposta comprimida." }
             if spanish { return "No pude expandir la respuesta comprimida." }
             return "I could not expand the compressed response."
         }
-        return SR1ResponseDetector.expandVariables(in: lines.joined(separator: "\n"), from: response)
+        let joined = pieces.joined(separator: "\n")
+        return SR1ResponseDetector.expandVariables(in: joined, from: response)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     private func recordTokenSaverPreparedObservation(request: AgentRunRequest, originalPrompt: String) {
