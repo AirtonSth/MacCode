@@ -49,6 +49,30 @@ public enum ProcessLocator {
         return nil
     }
 
+    /// Binary resolution for Auto admission + sudo -u execution (same rules).
+    /// 1) Absolute Settings path when executable (e.g. /Users/airtonjunior/.local/bin/claude)
+    /// 2) Target run-as-user home search
+    /// 3) Current user home / PATH search
+    /// So Auto can admit the same CLI the streaming adapter will spawn.
+    public static func resolveForRunAsUser(
+        _ name: String,
+        runAsUser: AgentRunAsUser?,
+        currentUID: uid_t = getuid()
+    ) -> String? {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        if trimmed.contains("/") {
+            let expanded = (trimmed as NSString).expandingTildeInPath
+            return FileManager.default.isExecutableFile(atPath: expanded) ? expanded : nil
+        }
+        if let runAsUser, runAsUser.uid != currentUID {
+            if let target = resolve(trimmed, environmentPath: nil, homeDirectory: runAsUser.homePath) {
+                return target
+            }
+        }
+        return resolve(trimmed)
+    }
+
     public static func expandedPath(environmentPath: String?, homeDirectory: String) -> String {
         searchPath(environmentPath: environmentPath, homeDirectory: homeDirectory).joined(separator: ":")
     }

@@ -407,19 +407,11 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
 
     private func startNewSession(request: AgentRunRequest) throws -> Session {
         let binary = request.providerBinary?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false ? request.providerBinary! : (binaryNameOverride ?? "claude")
-        // Resolve `claude` for the user we will actually execute as. For a
-        // run-as-user, search THAT user's home (shared dirs like /opt/homebrew
-        // are searched too) so we get a binary the target can exec — never the
-        // invoker's private ~/.local/bin, which the target cannot run.
-        let path: String
-        if let runAsUser = request.runAsUser, runAsUser.uid != getuid() {
-            guard let targetPath = ProcessLocator.resolve(binary, environmentPath: nil, homeDirectory: runAsUser.homePath) else {
-                throw ClaudeCLIUnavailableError(message: ClaudeRunner.missingBinaryMessage(binary))
-            }
-            path = targetPath
-        } else if let resolved = ProcessLocator.resolve(binary) {
-            path = resolved
-        } else {
+        // Same resolution as Auto admission: absolute Settings path, then the
+        // selected run-as-user home, then the app owner. Must match
+        // ProcessLocator.resolveForRunAsUser so Auto does not admit a path
+        // the spawn cannot find (or refuse a path spawn would use).
+        guard let path = ProcessLocator.resolveForRunAsUser(binary, runAsUser: request.runAsUser) else {
             throw ClaudeCLIUnavailableError(message: ClaudeRunner.missingBinaryMessage(binary))
         }
 

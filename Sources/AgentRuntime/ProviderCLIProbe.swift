@@ -81,6 +81,26 @@ public enum ProviderCLIProbe {
     }
 
     public static func authStatus(provider: AgentProvider, binaryPath: String, environment: [String: String] = [:], timeoutSeconds: TimeInterval = 4.0) -> AuthStatus {
+        authStatus(
+            provider: provider,
+            binaryPath: binaryPath,
+            environment: environment,
+            runAsUser: nil,
+            timeoutSeconds: timeoutSeconds
+        )
+    }
+
+    /// Auth probe aligned with provider spawn. When `runAsUser` is a foreign
+    /// macOS account, run the same `sudo -n -u <user> -H -- <binary> …` path
+    /// execution uses (non-interactive). A HOME-only probe as the app owner
+    /// false-negatives Claude OAuth for the selected user and blocks Auto.
+    public static func authStatus(
+        provider: AgentProvider,
+        binaryPath: String,
+        environment: [String: String] = [:],
+        runAsUser: AgentRunAsUser?,
+        timeoutSeconds: TimeInterval = 4.0
+    ) -> AuthStatus {
         let arguments: [String]
         switch provider {
         case .codex:
@@ -92,7 +112,15 @@ public enum ProviderCLIProbe {
             // "You are logged in with …" when authenticated.
             arguments = ["models"]
         }
-        guard let result = run(binaryPath: binaryPath, arguments: arguments, environment: environment, timeoutSeconds: timeoutSeconds) else {
+        guard let result = run(
+            binaryPath: binaryPath,
+            arguments: arguments,
+            environment: environment,
+            runAsUser: runAsUser,
+            timeoutSeconds: timeoutSeconds
+        ) else {
+            // Foreign sudo -n may fail without a cached credential — unknown,
+            // not "logged out". Auto may still admit; spawn uses sudo -A.
             return AuthStatus(authenticated: nil, accountLabel: nil, accountAuthMethod: nil)
         }
 
@@ -141,15 +169,51 @@ public enum ProviderCLIProbe {
         return UpdateResult(ok: result.status == 0, status: result.status, stdout: result.stdout, stderr: result.stderr)
     }
 
-    static func run(binaryPath: String, arguments: [String], environment: [String: String], timeoutSeconds: TimeInterval) -> CommandResult? {
+    static func run(
+        binaryPath: String,
+        arguments: [String],
+        environment: [String: String],
+        timeoutSeconds: TimeInterval
+    ) -> CommandResult? {
+        run(
+            binaryPath: binaryPath,
+            arguments: arguments,
+            environment: environment,
+            runAsUser: nil,
+            timeoutSeconds: timeoutSeconds
+        )
+    }
+
+    static func run(
+        binaryPath: String,
+        arguments: [String],
+        environment: [String: String],
+        runAsUser: AgentRunAsUser?,
+        timeoutSeconds: TimeInterval
+    ) -> CommandResult? {
         let trimmed = binaryPath.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }
         guard FileManager.default.isExecutableFile(atPath: trimmed) else { return nil }
 
+        let baseEnv = CodexRunner.processEnvironment(overrides: environment)
+        let launchPlan: RunAsUserProcessBootstrap.LaunchPlan
+        do {
+            // Match ClaudeStreamingCLIAdapter: foreign user → sudo -n -u -H
+            // (no askpass during probe — password UI only at real spawn).
+            launchPlan = try RunAsUserProcessBootstrap.plan(
+                executablePath: trimmed,
+                arguments: arguments,
+                environment: baseEnv,
+                currentDirectory: FileManager.default.currentDirectoryPath,
+                runAsUser: runAsUser,
+                askpassPath: nil
+            )
+        } catch {
+            return nil
+        }
+
         let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: trimmed)
-        proc.arguments = arguments
-        proc.environment = CodexRunner.processEnvironment(overrides: environment)
+        RunAsUserProcessBootstrap.apply(launchPlan, to: proc)
         proc.standardInput = FileHandle.nullDevice
         let out = Pipe()
         let err = Pipe()

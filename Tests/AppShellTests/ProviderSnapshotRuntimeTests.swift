@@ -22,9 +22,8 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
         surfaces.forEach { SurfaceRegistry.shared.unregister($0.descriptor.id) }
     }
 
-    /// WHY: Auto admission used the app owner's ~/.local/bin + credentials while
-    /// ClaudeStreamingCLIAdapter execs as runAsUser — Airton could look
-    /// "not runnable" to Auto even when his account had a working Claude.
+    /// WHY: Auto admission and sudo -u spawn must resolve the same Claude binary
+    /// for a foreign run-as-user (Settings absolute path + target home).
     func test_resolveProviderBinaryPathUsesForeignRunAsUserHome() throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("rc-runas-probe-\(UUID().uuidString)", isDirectory: true)
@@ -47,6 +46,11 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
         XCTAssertNotEqual(foreign.uid, getuid())
         let path = AppCommandRouter.resolveProviderBinaryPath(binary: "claude", runAsUser: foreign)
         XCTAssertEqual(path, claude.path)
+        // Absolute Settings path under another home stays usable for foreign run-as-user.
+        XCTAssertEqual(
+            AppCommandRouter.resolveProviderBinaryPath(binary: claude.path, runAsUser: foreign),
+            claude.path
+        )
 
         let current = AgentRunAsUser.current()
         let env = AppCommandRouter.probeEnvironment(

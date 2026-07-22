@@ -3404,35 +3404,19 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         return await listAgentProviderSnapshots()
     }
 
-    /// Resolves a provider CLI for the user who will execute it.
-    /// Absolute configured paths (Settings → Claude path) win when executable —
-    /// Airton's machine stores `/Users/airtonjunior/.local/bin/claude` explicitly.
-    /// Foreign `runAsUser` otherwise searches that account's home (and shared
-    /// dirs) so admission matches ClaudeStreamingCLIAdapter's spawn path.
+    /// Resolves a provider CLI for the user who will execute it — same rules as
+    /// ClaudeStreamingCLIAdapter / ProcessLocator.resolveForRunAsUser so Auto
+    /// admission and sudo -u spawn agree.
     static func resolveProviderBinaryPath(
         binary: String,
         runAsUser: AgentRunAsUser?
     ) -> String {
-        let trimmed = binary.trimmingCharacters(in: .whitespacesAndNewlines)
-        // Settings absolute paths must not disappear just because run-as-user
-        // points at another account — auth still uses that account's HOME.
-        if trimmed.contains("/"),
-           FileManager.default.isExecutableFile(atPath: (trimmed as NSString).expandingTildeInPath) {
-            return (trimmed as NSString).expandingTildeInPath
-        }
-        if let runAsUser, runAsUser.uid != getuid() {
-            return ProcessLocator.resolve(
-                binary,
-                environmentPath: nil,
-                homeDirectory: runAsUser.homePath
-            ) ?? ""
-        }
-        return ProcessLocator.resolve(binary) ?? ""
+        ProcessLocator.resolveForRunAsUser(binary, runAsUser: runAsUser) ?? ""
     }
 
-    /// Environment for probing/auth. When running as another macOS user, force
-    /// HOME (and provider home vars) to that user's directory so `claude auth
-    /// status` reads their credentials, not the app owner's.
+    /// Environment for probing. Foreign run-as-user auth is executed via
+    /// `sudo -n -u` (ProviderCLIProbe); HOME overrides remain for discovery
+    /// that does not elevate (model list REST, skills paths).
     static func probeEnvironment(
         base: [String: String],
         provider: AgentProvider,
@@ -3471,7 +3455,12 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                     provider: instance.provider,
                     runAsUser: runAsUser
                 )
-                let capabilities = providerProbeCapabilities(provider: instance.provider, binaryPath: binaryPath, environment: env)
+                let capabilities = providerProbeCapabilities(
+                    provider: instance.provider,
+                    binaryPath: binaryPath,
+                    environment: env,
+                    runAsUser: runAsUser
+                )
                 let claudeRuntime = instance.provider == .claude
                     ? ClaudeProviderRuntimePresentation.resolve(
                         agentSDKEnabled: ProcessInfo.processInfo.environment["RC_CLAUDE_AGENT_SDK_ENABLED"] != "0",
@@ -3591,7 +3580,12 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             let binary = configuredProviderBinary(provider) ?? provider.rawValue
             let binaryPath = Self.resolveProviderBinaryPath(binary: binary, runAsUser: runAsUser)
             let env = Self.probeEnvironment(base: [:], provider: provider, runAsUser: runAsUser)
-            let capabilities = providerProbeCapabilities(provider: provider, binaryPath: binaryPath, environment: env)
+            let capabilities = providerProbeCapabilities(
+                provider: provider,
+                binaryPath: binaryPath,
+                environment: env,
+                runAsUser: runAsUser
+            )
             let claudeRuntime = provider == .claude
                 ? ClaudeProviderRuntimePresentation.resolve(
                     agentSDKEnabled: ProcessInfo.processInfo.environment["RC_CLAUDE_AGENT_SDK_ENABLED"] != "0",
@@ -3764,14 +3758,34 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         }
     }
 
-    private func providerProbeCapabilities(provider: AgentProvider, binaryPath: String, environment: [String: String]) -> ProviderProbeCapabilities {
-        let key = ProviderProbeCacheKey(provider: provider, binaryPath: binaryPath, environment: environment)
+    private func providerProbeCapabilities(
+        provider: AgentProvider,
+        binaryPath: String,
+        environment: [String: String],
+        runAsUser: AgentRunAsUser? = nil
+    ) -> ProviderProbeCapabilities {
+        // Cache key includes the run-as-user so airtonempat and airtonjunior
+        // never share a stale authenticated flag.
+        let runAsKey = runAsUser.map { "\($0.uid):\($0.shortName)" } ?? "self"
+        let key = ProviderProbeCacheKey(
+            provider: provider,
+            binaryPath: binaryPath + "#runas=\(runAsKey)",
+            environment: environment
+        )
         let now = Date()
         if let cached = providerProbeCache[key],
            now.timeIntervalSince(cached.capturedAt) < providerProbeCacheTTL {
             return cached
         }
-        let auth = ProviderCLIProbe.authStatus(provider: provider, binaryPath: binaryPath, environment: environment)
+        // Foreign identity: probe via sudo -n -u (same as spawn, non-interactive).
+        // Avoids HOME-only false "not authenticated" that blocked Auto while
+        // Manual + sudo -A would still run.
+        let auth = ProviderCLIProbe.authStatus(
+            provider: provider,
+            binaryPath: binaryPath,
+            environment: environment,
+            runAsUser: runAsUser
+        )
         let version = ProviderCLIProbe.versionStatus(binaryPath: binaryPath, environment: environment)
         let capabilities = ProviderProbeCapabilities(
             version: version.version,
