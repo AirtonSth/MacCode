@@ -942,8 +942,8 @@ public final class AgentOrchestrationRuntime: @unchecked Sendable {
     }
 
     public static func defaultRolloutEnabled() -> Bool {
-        guard let value = UserDefaults.standard.object(forKey: rolloutFlagKey) as? Bool else { return false }
-        return value
+        // Auto is opt-out: only an explicit false preference disables the rollout.
+        (UserDefaults.standard.object(forKey: rolloutFlagKey) as? Bool) ?? true
     }
 
     private func reserveResources(

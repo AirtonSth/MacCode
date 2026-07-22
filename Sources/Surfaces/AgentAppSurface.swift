@@ -115,30 +115,32 @@ public enum AgentModelPopoverTransition: Equatable {
 }
 
 public struct AgentModelPopoverPresentation: Equatable {
-    public static let autoDisclaimer = "O Remote Code vai orquestrar automaticamente o modelo para buscar a máxima qualidade usando o mínimo de tokens. Se alguma capacidade não estiver disponível, a rota será degradada de forma explícita."
-    public static let autoAccessibilityLabel = "Roteamento automático do modelo"
-    public static let autoAccessibilityHint = "Ativa ou desativa o roteamento automático do modelo."
+    public static let autoDisclaimer = "Remote Code will automatically orchestrate the model to maximize quality while using the fewest tokens."
+    public static let autoStatus = "Orchestration active"
+    public static let autoAccessibilityLabel = "Automatic model routing"
+    public static let autoAccessibilityHint = "Turns automatic model routing on or off."
 
     public let mode: AgentRoutingMode
     public let reduceMotion: Bool
-    public let autoRoutingAvailable: Bool
+    public let autoRoutingLoading: Bool
 
-    public init(mode: AgentRoutingMode, reduceMotion: Bool, autoRoutingAvailable: Bool = true) {
+    public init(mode: AgentRoutingMode, reduceMotion: Bool, autoRoutingLoading: Bool = false) {
         self.mode = mode
         self.reduceMotion = reduceMotion
-        self.autoRoutingAvailable = autoRoutingAvailable
+        self.autoRoutingLoading = autoRoutingLoading
     }
 
     public var showsModelControls: Bool { mode != .auto }
     public var showsReasoningControls: Bool { mode != .auto }
     public var showsServiceTierControls: Bool { mode != .auto }
     public var showsDisclaimer: Bool { mode == .auto }
-    public var autoToggleEnabled: Bool { autoRoutingAvailable }
+    public var showsAutoLoadingIndicator: Bool { autoRoutingLoading }
+    public var autoToggleEnabled: Bool { !autoRoutingLoading }
     public var transition: AgentModelPopoverTransition {
         reduceMotion ? .none : .fadeAndSlide
     }
     public var accessibilityLabel: String { Self.autoAccessibilityLabel }
-    public var accessibilityValue: String { mode == .auto ? "Ativado" : "Desativado" }
+    public var accessibilityValue: String { mode == .auto ? "On" : "Off" }
     public var accessibilityHint: String { Self.autoAccessibilityHint }
     public var disclaimer: String { Self.autoDisclaimer }
 
@@ -178,6 +180,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// Last model the user chose per provider (new threads + provider switches).
     /// Inject a suite-backed store in tests; production uses the shared defaults.
     public var lastModelStore: AgentLastModelStore = .shared
+    public let newThreadDefaultsStore: AgentNewThreadDefaultsStore?
     /// When true, unlocked snapshot refresh must not auto-rebind away from the
     /// user's explicit Source choice (including an unrunnable row for recovery).
     /// Implicit default selection stays unpinned so missing Codex can rebind.
@@ -253,6 +256,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     @Published public var providerRecoveryActionRunning = false
     @Published public var providerRecoveryStatusMessage: String?
     @Published private var dismissedProviderStatusSignature: String?
+    @Published public private(set) var providerSnapshotsLoading = false
     @Published public var modelListLoading = false
     @Published public var modelListStatusMessage: String?
     /// True when the current Claude model list is the static built-in fallback
@@ -403,6 +407,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         customModelStore: AgentCustomModelStore? = nil,
         planNotesStore: PlanNotesStore? = nil,
         initialThreadId: AgentThreadID? = nil,
+        lastModelStore: AgentLastModelStore = .shared,
+        initialRoutingMode: AgentRoutingMode = .manual,
+        newThreadDefaultsStore: AgentNewThreadDefaultsStore? = nil,
         orchestrationRuntime: AgentOrchestrationRuntime = AgentOrchestrationRuntime()
     ) {
         self.workspaceID = workspaceID
@@ -419,6 +426,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         self.promptHistoryStore = promptHistoryStore
         self.customModelStore = customModelStore
         self.planNotesStore = planNotesStore
+        self.lastModelStore = lastModelStore
+        self.routingMode = initialRoutingMode
+        self.newThreadDefaultsStore = newThreadDefaultsStore
         self.orchestrationRuntime = orchestrationRuntime
         self.promptHistory = promptHistoryStore?.load(workspaceID: workspaceID) ?? []
         self.promptHistoryStore?.onWriteError = { [weak self] error in
@@ -434,6 +444,22 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             }
         }
         reloadThreads()
+        if let newThreadDefaultsStore {
+            if let saved = newThreadDefaultsStore.load() {
+                restoreNewThreadDefaults(saved)
+            } else if let latest = threads.max(by: { $0.updatedAt < $1.updatedAt }) {
+                let routing = latest.effectiveRoutingConfiguration
+                restoreNewThreadDefaults(AgentNewThreadDefaults(
+                    routingMode: routing.mode,
+                    runAsUser: latest.runAsUser,
+                    provider: routing.manualSelection.provider,
+                    providerInstanceId: routing.manualProviderInstanceId ?? routing.manualSelection.provider.rawValue,
+                    model: routing.manualSelection.effectiveModel,
+                    reasoningEffort: routing.manualSelection.reasoningEffort
+                ))
+                rememberNewThreadDefaults()
+            }
+        }
         // Per-surface thread binding: select ONLY the thread this surface was
         // restored/created with. A brand-new tab passes nil and stays on the
         // fresh-composer state instead of auto-adopting the workspace's first
@@ -474,6 +500,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     // completion; when several threads finish together this multiplied. Coalesce
     // bursts into a single refresh after a short trailing delay.
     private var pendingGitRefresh: Task<Void, Never>?
+    private var providerSnapshotLoadCount = 0
 
     public func loadGitBranchThrottled() {
         guard pendingGitRefresh == nil else { return }
@@ -1923,6 +1950,12 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     }
 
     public func loadProviderSnapshots() async {
+        providerSnapshotLoadCount += 1
+        providerSnapshotsLoading = true
+        defer {
+            providerSnapshotLoadCount = max(0, providerSnapshotLoadCount - 1)
+            providerSnapshotsLoading = providerSnapshotLoadCount > 0
+        }
         do {
             let loadedSnapshots: [AgentProviderSnapshot]
             if let providerSnapshotLoader {
@@ -2599,6 +2632,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     @discardableResult
     public func persistThreadConfig() -> Bool {
         normalizeSelectedModelOptions()
+        rememberNewThreadDefaults()
         guard let id = selectedThreadId else { return false }
         do {
             guard let stored = try threadRepo.get(id: id) else {
@@ -2616,6 +2650,16 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             updated.modelSelection = currentModelSelection
             updated.interactionMode = interactionMode
             updated.updatedAt = Date()
+            let routing = stored.effectiveRoutingConfiguration
+            updated.routingConfiguration = try routing.replacing(
+                expectedRevision: routing.revision,
+                mode: routing.mode,
+                manualSelection: currentModelSelection,
+                manualProviderInstanceId: providerInstanceId,
+                eligibleProviders: routing.eligibleProviders,
+                policyDigest: routing.policyDigest,
+                updatedAt: updated.updatedAt
+            )
             try threadRepo.upsert(updated)
             if let i = threads.firstIndex(where: { $0.id == id }) {
                 threads[i] = updated
@@ -2636,8 +2680,10 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     @discardableResult
     public func setAutoModelRoutingEnabled(_ enabled: Bool) -> Bool {
         guard let id = selectedThreadId else {
-            statusMessage = "Create or select a thread before enabling Auto model routing."
-            return false
+            routingMode = enabled ? .auto : .manual
+            rememberNewThreadDefaults()
+            statusMessage = ""
+            return true
         }
         do {
             guard let stored = try threadRepo.get(id: id) else {
@@ -2673,6 +2719,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 return false
             }
             routingMode = updatedConfiguration.mode
+            rememberNewThreadDefaults()
             if !enabled {
                 restoreThreadConfiguration(from: persisted)
             } else if let index = threads.firstIndex(where: { $0.id == id }) {
@@ -2863,6 +2910,13 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         // provider (not whatever model an older selected thread left on the VM).
         applyPreferredModelForCurrentProvider()
         normalizeSelectedModelOptions()
+        let routingConfiguration = AgentRoutingConfiguration(
+            mode: routingMode,
+            manualSelection: currentModelSelection,
+            manualProviderInstanceId: providerInstanceId,
+            eligibleProviders: AgentProvider.allCases,
+            policyDigest: routingMode == .auto ? orchestrationRuntime.policyDigest : ""
+        )
         let t = AgentThread(workspaceId: workspaceID, title: title, provider: provider,
                             providerInstanceId: providerInstanceId,
                             model: model,
@@ -2870,7 +2924,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                             executionMode: executionMode,
                             baseBranch: executionMode == .worktree ? (baseBranch.isEmpty ? (gitBranch ?? "main") : baseBranch) : nil,
                             serviceTier: serviceTier, modelSelection: currentModelSelection,
-                            runAsUser: runAsUser)
+                            runAsUser: runAsUser, routingConfiguration: routingConfiguration)
         do {
             try threadRepo.upsert(t)
         } catch {
@@ -2880,6 +2934,27 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         reloadThreads()
         onThreadLifecycle?(.created(threads.first(where: { $0.id == t.id }) ?? t))
         selectThread(t.id)
+    }
+
+    private func restoreNewThreadDefaults(_ saved: AgentNewThreadDefaults) {
+        routingMode = saved.routingMode
+        runAsUser = saved.runAsUser ?? AgentRunAsUser.current()
+        provider = saved.provider
+        providerInstanceId = saved.providerInstanceId
+        model = saved.model
+        lastModelStore.remember(model: saved.model, for: saved.provider)
+        reasoningEffort = saved.reasoningEffort
+    }
+
+    private func rememberNewThreadDefaults() {
+        newThreadDefaultsStore?.save(AgentNewThreadDefaults(
+            routingMode: routingMode,
+            runAsUser: runAsUser,
+            provider: provider,
+            providerInstanceId: providerInstanceId,
+            model: model,
+            reasoningEffort: reasoningEffort
+        ))
     }
 
     /// Resolve last-used → built-in default → first listed model for the
@@ -6874,6 +6949,14 @@ public struct AgentAppView: View {
         if vm.routingMode == .auto { return "Auto" }
         return vm.modelOptionsForSelectedProvider.first(where: { $0.id == vm.model })?.label ?? vm.model
     }
+    private var autoRoutingPrerequisitesLoading: Bool {
+        vm.selectedThreadId != nil && (
+            vm.providerSnapshots.isEmpty || vm.providerSnapshotsLoading || vm.modelListLoading
+        )
+    }
+    private var autoRoutingPillLoading: Bool {
+        vm.routingMode == .auto && autoRoutingPrerequisitesLoading
+    }
     private var permissionLabel: String {
         switch vm.permissionMode {
         case .supervised: return "Supervised"
@@ -6893,7 +6976,9 @@ public struct AgentAppView: View {
     /// P3: VoiceOver label for the model picker pill that reads as structured
     /// text rather than the raw concatenated visual tokens.
     private var modelMenuAccessibilityLabel: String {
-        if vm.routingMode == .auto { return "Auto model routing" }
+        if vm.routingMode == .auto {
+            return autoRoutingPillLoading ? "Auto model routing, loading" : "Auto model routing"
+        }
         var parts = ["Model \(modelLabel)"]
         if vm.supportsReasoningForSelectedModel {
             parts.append("effort \(effortLabel)")
@@ -9479,26 +9564,43 @@ public struct AgentAppView: View {
         let presentation = AgentModelPopoverPresentation(
             mode: vm.routingMode,
             reduceMotion: reduceMotion,
-            autoRoutingAvailable: AgentOrchestrationRuntime.defaultRolloutEnabled()
+            autoRoutingLoading: autoRoutingPrerequisitesLoading
         )
-        return VStack(alignment: .leading, spacing: DS.Space.xs) {
-            Toggle("Auto", isOn: Binding(
-                get: { vm.routingMode == .auto },
-                set: { _ = vm.setAutoModelRoutingEnabled($0) }
-            ))
-            .toggleStyle(.switch)
-            .disabled(running || !presentation.autoToggleEnabled)
-            .accessibilityLabel(presentation.accessibilityLabel)
-            .accessibilityValue(presentation.accessibilityValue)
-            .accessibilityHint(presentation.accessibilityHint)
+        return VStack(alignment: .leading, spacing: DS.Space.md) {
+            HStack(spacing: DS.Space.md) {
+                Text("Model")
+                    .font(DS.Font.caption.weight(.medium))
+                    .foregroundColor(DS.Palette.text)
+                Spacer(minLength: DS.Space.xxl)
+                Text("Auto")
+                    .font(DS.Font.caption)
+                    .foregroundColor(DS.Palette.text)
+                if presentation.showsAutoLoadingIndicator {
+                    ProgressView()
+                        .controlSize(.small)
+                        .accessibilityLabel("Loading automatic routing")
+                        .accessibilityIdentifier("agent.model.auto.loading")
+                }
+                Toggle("", isOn: Binding(
+                    get: { vm.routingMode == .auto },
+                    set: { _ = vm.setAutoModelRoutingEnabled($0) }
+                ))
+                .labelsHidden()
+                .toggleStyle(.switch)
+                .tint(DS.Palette.success)
+                .disabled(running || !presentation.autoToggleEnabled)
+                .accessibilityLabel(presentation.accessibilityLabel)
+                .accessibilityValue(presentation.accessibilityValue)
+                .accessibilityHint(presentation.accessibilityHint)
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 8, weight: .semibold))
+                    .foregroundColor(DS.Palette.textTertiary)
+                    .accessibilityHidden(true)
+            }
             Divider()
                 .accessibilityIdentifier("agent.model.auto.divider")
             if presentation.showsDisclaimer {
-                Text(presentation.disclaimer)
-                    .font(DS.Font.caption)
-                    .foregroundColor(DS.Palette.textSecondary)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .frame(width: 260, alignment: .leading)
+                autoRoutingCard(presentation: presentation)
                     .transition(presentation.transition == .fadeAndSlide
                         ? .opacity.combined(with: .move(edge: .top))
                         : .identity)
@@ -9669,8 +9771,66 @@ public struct AgentAppView: View {
         .accessibilityIdentifier("agent.model.popover")
     }
 
+    private func autoRoutingCard(presentation: AgentModelPopoverPresentation) -> some View {
+        HStack(alignment: .top, spacing: DS.Space.lg) {
+            ZStack {
+                Ellipse()
+                    .stroke(
+                        LinearGradient(
+                            colors: [DS.Palette.accent, DS.Palette.success],
+                            startPoint: .leading,
+                            endPoint: .trailing
+                        ),
+                        lineWidth: 1.5
+                    )
+                    .frame(width: 40, height: 20)
+                    .rotationEffect(.degrees(-12))
+                Image(systemName: "sparkles")
+                    .font(.system(size: 19, weight: .medium))
+                    .foregroundStyle(DS.Palette.text)
+            }
+            .frame(width: 48, height: 48)
+
+            VStack(alignment: .leading, spacing: DS.Space.md) {
+                Text(presentation.disclaimer)
+                    .font(DS.Font.caption)
+                    .foregroundColor(DS.Palette.text)
+                    .fixedSize(horizontal: false, vertical: true)
+                HStack(spacing: DS.Space.xs) {
+                    Image(systemName: "checkmark.circle.fill")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundColor(DS.Palette.success)
+                    Text(AgentModelPopoverPresentation.autoStatus)
+                        .font(DS.Font.caption2)
+                        .foregroundColor(DS.Palette.textSecondary)
+                }
+            }
+        }
+        .padding(DS.Space.lg)
+        .frame(width: 360, alignment: .leading)
+        .background(
+            LinearGradient(
+                colors: [DS.Palette.surfaceRaised, DS.Palette.success.opacity(0.12)],
+                startPoint: .leading,
+                endPoint: .bottomTrailing
+            )
+        )
+        .clipShape(RoundedRectangle(cornerRadius: DS.Radius.panel, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: DS.Radius.panel, style: .continuous)
+                .strokeBorder(DS.Palette.accent.opacity(0.22), lineWidth: DS.Border.hairline)
+        )
+        .accessibilityElement(children: .combine)
+        .accessibilityIdentifier("agent.model.auto.card")
+    }
+
     private var modelMenuLabel: some View {
         HStack(spacing: DS.Space.xs) {
+            if autoRoutingPillLoading {
+                ProgressView()
+                    .controlSize(.mini)
+                    .accessibilityHidden(true)
+            }
             Text(modelLabel).font(DS.Font.caption.weight(.medium)).foregroundColor(DS.Palette.text)
                 .lineLimit(1)
                 .truncationMode(.tail)
@@ -9824,9 +9984,10 @@ public struct AgentAppView: View {
         let label = currentModelMenuLabelParts.joined(separator: " · ")
         let measured = Self.measureCurrentModelMenuLabel(label)
         let chevronWidth: CGFloat = 8
+        let loadingWidth: CGFloat = autoRoutingPillLoading ? 14 + DS.Space.xs : 0
         let separatorCount = max(0, currentModelMenuLabelParts.count - 1)
         let spacing = CGFloat(separatorCount + 1) * DS.Space.xs
-        return min(max(ceil(measured + chevronWidth + spacing), 44), 260)
+        return min(max(ceil(measured + chevronWidth + loadingWidth + spacing), 44), 260)
     }
 
     private var currentModelMenuLabelParts: [String] {
@@ -11368,7 +11529,7 @@ public final class AgentAppSurface: NSObject, Surface {
         var metadata = ["workspace": workspaceID.value.uuidString, "cwd": cwd]
         if let initialThreadId { metadata["selected_thread"] = initialThreadId.value.uuidString }
         self.descriptor = SurfaceDescriptor(type: .agentApp, title: title, iconName: "sparkle", metadata: metadata)
-        self.viewModel = AgentAppViewModel(workspaceID: workspaceID, cwd: cwd, coordinator: coordinator, threadRepo: threadRepo, messageRepo: messageRepo, draftRepo: draftRepo, attachmentStore: attachmentStore, queuedMessageRepo: queuedMessageRepo, pendingCallbackRepo: pendingCallbackRepo, proposedPlanRepo: proposedPlanRepo, checkpointRepo: checkpointRepo, promptHistoryStore: promptHistoryStore, customModelStore: customModelStore, planNotesStore: planNotesStore, initialThreadId: initialThreadId)
+        self.viewModel = AgentAppViewModel(workspaceID: workspaceID, cwd: cwd, coordinator: coordinator, threadRepo: threadRepo, messageRepo: messageRepo, draftRepo: draftRepo, attachmentStore: attachmentStore, queuedMessageRepo: queuedMessageRepo, pendingCallbackRepo: pendingCallbackRepo, proposedPlanRepo: proposedPlanRepo, checkpointRepo: checkpointRepo, promptHistoryStore: promptHistoryStore, customModelStore: customModelStore, planNotesStore: planNotesStore, initialThreadId: initialThreadId, initialRoutingMode: .auto, newThreadDefaultsStore: .shared)
         let host = NSHostingView(rootView: AgentAppView(vm: viewModel))
         host.translatesAutoresizingMaskIntoConstraints = false
         let container = NSView()

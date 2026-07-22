@@ -249,6 +249,54 @@ public final class AgentLastModelStore: @unchecked Sendable {
     }
 }
 
+public struct AgentNewThreadDefaults: Codable, Sendable, Equatable {
+    public var routingMode: AgentRoutingMode
+    public var runAsUser: AgentRunAsUser?
+    public var provider: AgentProvider
+    public var providerInstanceId: String
+    public var model: String
+    public var reasoningEffort: AgentReasoningEffort
+
+    public init(
+        routingMode: AgentRoutingMode,
+        runAsUser: AgentRunAsUser?,
+        provider: AgentProvider,
+        providerInstanceId: String,
+        model: String,
+        reasoningEffort: AgentReasoningEffort
+    ) {
+        self.routingMode = routingMode
+        self.runAsUser = runAsUser
+        self.provider = provider
+        self.providerInstanceId = providerInstanceId
+        self.model = model
+        self.reasoningEffort = reasoningEffort
+    }
+}
+
+/// Persists the user's last explicit Agent picker choices so every fresh
+/// surface and subsequent thread starts from the same configuration.
+public final class AgentNewThreadDefaultsStore: @unchecked Sendable {
+    public static let shared = AgentNewThreadDefaultsStore()
+
+    private let defaults: UserDefaults
+    private let key = "agent.newThreadDefaults.v1"
+
+    public init(defaults: UserDefaults = .standard) {
+        self.defaults = defaults
+    }
+
+    public func load() -> AgentNewThreadDefaults? {
+        guard let data = defaults.data(forKey: key) else { return nil }
+        return try? JSONDecoder().decode(AgentNewThreadDefaults.self, from: data)
+    }
+
+    public func save(_ value: AgentNewThreadDefaults) {
+        guard let data = try? JSONEncoder().encode(value) else { return }
+        defaults.set(data, forKey: key)
+    }
+}
+
 public final class AgentCustomModelStore {
     private let repo: any SettingsWriteRepository
     private let keyPrefix = "agent.custom_models."

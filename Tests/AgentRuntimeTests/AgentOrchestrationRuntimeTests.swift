@@ -14,6 +14,30 @@ final class AgentOrchestrationRuntimeTests: XCTestCase {
         super.tearDown()
     }
 
+    func testDefaultRolloutEnablesAutoWithoutPreferenceButHonorsExplicitOptOut() {
+        let defaults = UserDefaults.standard
+        let previousValue = defaults.object(forKey: AgentOrchestrationRuntime.rolloutFlagKey)
+        defer {
+            if let previousValue {
+                defaults.set(previousValue, forKey: AgentOrchestrationRuntime.rolloutFlagKey)
+            } else {
+                defaults.removeObject(forKey: AgentOrchestrationRuntime.rolloutFlagKey)
+            }
+        }
+
+        defaults.removeObject(forKey: AgentOrchestrationRuntime.rolloutFlagKey)
+        XCTAssertTrue(
+            AgentOrchestrationRuntime.defaultRolloutEnabled(),
+            "A missing rollout preference must not leave the top Auto toggle inert."
+        )
+
+        defaults.set(false, forKey: AgentOrchestrationRuntime.rolloutFlagKey)
+        XCTAssertFalse(
+            AgentOrchestrationRuntime.defaultRolloutEnabled(),
+            "An explicit rollout opt-out must remain authoritative."
+        )
+    }
+
     func testVerifierUsesCanonicalInstallerPackageAndFailsClosedOnTampering() throws {
         XCTAssertEqual(
             Array(AgentOrchestrationRuntime.defaultPackageURL().pathComponents.suffix(3)),
