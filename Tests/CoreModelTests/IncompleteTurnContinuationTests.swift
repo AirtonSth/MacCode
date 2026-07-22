@@ -104,6 +104,28 @@ final class IncompleteTurnContinuationTests: XCTestCase {
         )
     }
 
+    func test_delegatedNextPhaseWithoutNumber_doesNotMatch() {
+        let delegated = """
+        Task complete; the next phase: rollout belongs to ops.
+        """
+        XCTAssertNil(
+            IncompleteTurnContinuation.classify(delegated),
+            "unnumbered delegated 'next phase' must not auto-nudge"
+        )
+    }
+
+    func test_overallDoneWithRetrospectivePhase_doesNotMatch() {
+        let done = """
+        All phases complete. Workflow complete.
+
+        Retrospective: Next: Phase 3 was the review we already finished.
+        """
+        XCTAssertNil(
+            IncompleteTurnContinuation.classify(done),
+            "overall-done language must suppress phase handoff detection"
+        )
+    }
+
     func test_userCheckpoint_doesNotMatch() {
         let userWait = """
         Phase 2 refine is done.
@@ -147,13 +169,32 @@ final class IncompleteTurnContinuationTests: XCTestCase {
             ),
             "supervised must never auto-continue"
         )
+        XCTAssertEqual(
+            IncompleteTurnContinuation.shouldAutoContinue(
+                status: .completed,
+                finalMessage: phase2HandoffNoMarker,
+                isAutonomous: true,
+                priorAutoContinuations: IncompleteTurnContinuation.maxWorkflowAutoContinuations - 1
+            ),
+            .workflowHandoff,
+            "workflow handoffs allow more auto-nudges than background stalls (sam-work phases)"
+        )
         XCTAssertNil(
             IncompleteTurnContinuation.shouldAutoContinue(
                 status: .completed,
                 finalMessage: phase2HandoffNoMarker,
                 isAutonomous: true,
-                priorAutoContinuations: IncompleteTurnContinuation.maxAutoContinuations
+                priorAutoContinuations: IncompleteTurnContinuation.maxWorkflowAutoContinuations
             )
+        )
+        XCTAssertNil(
+            IncompleteTurnContinuation.shouldAutoContinue(
+                status: .completed,
+                finalMessage: "Standing by for the demo recording to complete.",
+                isAutonomous: true,
+                priorAutoContinuations: IncompleteTurnContinuation.maxBackgroundAutoContinuations
+            ),
+            "background bound stays at 5"
         )
         XCTAssertNil(
             IncompleteTurnContinuation.shouldAutoContinue(

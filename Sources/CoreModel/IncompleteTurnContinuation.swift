@@ -3,7 +3,8 @@ import Foundation
 /// Why a just-finished full-access turn is treated as *incomplete* and may be
 /// auto-nudged instead of left as a misleading green "completed".
 ///
-/// Two causes share one scheduler budget but need different prompts and delays:
+/// Two causes share one scheduler streak counter but use different max bounds,
+/// prompts, and delays:
 /// - `workflowHandoff`: agent stopped between multi-phase skill steps
 ///   (e.g. "Next: Phase 3 — Review") while the user task is still open.
 /// - `backgroundAwait`: agent stopped while waiting on an external async job
@@ -16,23 +17,36 @@ public enum IncompleteTurnContinuationReason: String, Sendable, Equatable {
 /// Host recovery for full-access turns that end before the *user task* is done.
 ///
 /// Classifies the final assistant message, chooses a reason-specific prompt and
-/// delay, and gates auto-nudge the same way as background-await (completed +
-/// autonomous + bounded). Workflow handoffs are classified **before** background
-/// waits so a misused `[[RC_AWAITING]]` on a phase boundary gets the workflow
-/// prompt (not BashOutput / "background task may be finished").
+/// delay, and gates auto-nudge (completed + autonomous + bounded). Workflow
+/// handoffs are classified **before** background waits so a misused
+/// `[[RC_AWAITING]]` on a phase boundary gets the workflow prompt (not BashOutput).
 public enum IncompleteTurnContinuation {
-    /// Shared with `BackgroundAwaitContinuation` so mixed stalls on one thread
-    /// cannot unbounded-loop. After exhaustion the UI still shows non-green
-    /// "awaiting" from `classify` — never silent green "done".
-    public static let maxAutoContinuations = BackgroundAwaitContinuation.maxAutoContinuations
+    /// Bound for multi-phase skill handoffs. sam-work has 8 phases; agents often
+    /// stop once per phase, so 5 was too low and left mid-skill green "completed".
+    public static let maxWorkflowAutoContinuations = 12
+
+    /// Bound for true background-job stalls (unchanged — runaway standing-by).
+    public static let maxBackgroundAutoContinuations = BackgroundAwaitContinuation.maxAutoContinuations
+
+    /// Back-compat alias used by UI/tests that only need "a bound exists".
+    public static let maxAutoContinuations = maxWorkflowAutoContinuations
 
     /// Near-immediate resume for phase handoffs (no external job to wait on).
+    /// Coordinator schedules only after the finishing run is removed from
+    /// `activeThreads`, so zero delay is safe against the idle validity check.
     public static let workflowContinuationDelay: TimeInterval = 0
 
     /// Nudge when the agent stopped mid multi-phase skill (sam-work, etc.).
     public static let workflowContinuationPrompt = """
     Continue the multi-phase workflow from the next announced phase through completion of the original user task. Do not stop between phases. Do not emit \(BackgroundAwaitContinuation.awaitingMarker) for phase handoffs. Only stop when the full task is done, blocked on the user, or blocked on external background/async work (then use the background-await protocol).
     """
+
+    public static func maxAutoContinuations(for reason: IncompleteTurnContinuationReason) -> Int {
+        switch reason {
+        case .workflowHandoff: return maxWorkflowAutoContinuations
+        case .backgroundAwait: return maxBackgroundAutoContinuations
+        }
+    }
 
     /// Classify an incomplete turn. `nil` means a genuine terminal final (or
     /// nothing the host should auto-resume).
@@ -64,7 +78,7 @@ public enum IncompleteTurnContinuation {
     }
 
     /// Background waits keep the configurable job-poll delay; workflow handoffs
-    /// resume immediately.
+    /// resume immediately (after terminal cleanup).
     public static func delay(
         for reason: IncompleteTurnContinuationReason,
         backgroundDelay: TimeInterval
@@ -83,21 +97,20 @@ public enum IncompleteTurnContinuation {
         status: AgentRunStatus,
         finalMessage: String?,
         isAutonomous: Bool,
-        priorAutoContinuations: Int,
-        maxAutoContinuations: Int = maxAutoContinuations
+        priorAutoContinuations: Int
     ) -> IncompleteTurnContinuationReason? {
         guard status == .completed, isAutonomous else { return nil }
-        guard priorAutoContinuations < maxAutoContinuations else { return nil }
-        return classify(finalMessage)
+        guard let reason = classify(finalMessage) else { return nil }
+        guard priorAutoContinuations < maxAutoContinuations(for: reason) else { return nil }
+        return reason
     }
 }
 
 /// High-precision detector for multi-phase skill handoffs that end a turn while
 /// the overall task is still open (e.g. sam-work Phase 2 → "Next: Phase 3").
 ///
-/// WHY free-text is a backstop only: agents paraphrase. Patterns are deliberately
-/// tight (numbered phase transitions near the message tail) so optional roadmaps
-/// and "next steps for you" do not auto-start another full-access run.
+/// Patterns require a **numbered** phase transition on a recent line. Free-text
+/// roadmaps, delegated "next phase: ops", and user-gated language are excluded.
 public enum IncompleteWorkflowContinuation {
     /// User-handoff / deferral language that must not auto-nudge even if a phase
     /// phrase appears (precision guard — same spirit as background-await user-waits).
@@ -105,19 +118,25 @@ public enum IncompleteWorkflowContinuation {
         "if you want", "if you'd like", "if you would like",
         "when you're ready", "when you are ready",
         "on your end", "for you to", "let me know",
-        "optional", "later if", "in a follow-up", "as a follow-up"
+        "optional", "later if", "in a follow-up", "as a follow-up",
+        "belongs to", "on your side"
     ]
 
-    /// Strong terminal transitions from the demonstrated incident family.
-    /// Matched case-insensitively on the message tail. Deliberately does NOT
-    /// match bare "PHASE N RESULT" (that appears on finished phase summaries
-    /// without implying another host turn) — require an explicit next/proceeding
-    /// transition.
+    /// Whole-task completion language that means the host should NOT auto-nudge
+    /// even if a numbered "next phase" appears in a retrospective.
+    private static let overallDonePhrases = [
+        "all phases complete", "all phases completed",
+        "workflow complete", "workflow completed",
+        "original task is done", "original task is complete",
+        "nothing left to do", "task is fully complete",
+        "sam-work complete", "end-to-end complete"
+    ]
+
+    /// Numbered phase transitions only, line-anchored within the recent tail.
     private static let handoffRegexes: [NSRegularExpression] = {
         let patterns = [
-            #"proceeding to phase\s+\d+"#,
-            #"\*{0,2}next:\s*phase\s+\d+"#,
-            #"next phase\s*[:—\-]\s*\w+"#
+            #"(?m)^\s*\*{0,2}proceeding to phase\s+\d+"#,
+            #"(?m)^\s*\*{0,2}next:\s*phase\s+\d+"#
         ]
         return patterns.compactMap {
             try? NSRegularExpression(pattern: $0, options: [.caseInsensitive])
@@ -129,10 +148,14 @@ public enum IncompleteWorkflowContinuation {
     public static func isIncompleteWorkflowHandoff(_ finalMessage: String?) -> Bool {
         guard let raw = finalMessage?.trimmingCharacters(in: .whitespacesAndNewlines),
               !raw.isEmpty else { return false }
-        // Prefer the tail: phase handoffs are announced at the end of the turn.
-        let tail = String(raw.suffix(800))
+        // Prefer recent lines: phase handoffs are announced at the end of the turn.
+        let lines = raw.split(separator: "\n", omittingEmptySubsequences: false)
+        let tail = lines.suffix(8).joined(separator: "\n")
         let lowered = tail.lowercased()
         if userHandoffPhrases.contains(where: { lowered.contains($0) }) {
+            return false
+        }
+        if overallDonePhrases.contains(where: { lowered.contains($0) }) {
             return false
         }
         // Explicit overall stop / blocked must not auto-continue.

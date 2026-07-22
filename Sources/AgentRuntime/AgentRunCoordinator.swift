@@ -2740,17 +2740,6 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                     assistantMessageId: assistantMessageId
                 )
             }
-            // UX-MAC_AGENT-BG-AWAIT / incomplete-turn: a full-access run that ends
-            // still incomplete (background job await OR multi-phase workflow handoff)
-            // is auto-nudged (bounded) so it actually finishes instead of silently
-            // sitting at green "completed". Decided before run metadata is evicted.
-            maybeScheduleBackgroundAwaitContinuation(
-                threadId: threadId,
-                status: status,
-                finalMessage: finalMessage,
-                runMetadata: runMetadata,
-                resumeCursor: resumeCursor
-            )
             lock.lock()
             orchestrationDeadlineWorkItems.removeValue(forKey: runId)?.cancel()
             active.removeValue(forKey: runId)
@@ -2785,6 +2774,17 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             lastPersistedAssistantContent.removeValue(forKey: threadId)
             let activeProjection = activeRunProjectionLocked()
             lock.unlock()
+            // UX-MAC_AGENT-BG-AWAIT / incomplete-turn: schedule only AFTER the
+            // finishing run is removed from activeThreads. Zero-delay workflow
+            // continuations would otherwise fail the idle validity check and
+            // never start (silent green "completed").
+            maybeScheduleBackgroundAwaitContinuation(
+                threadId: threadId,
+                status: status,
+                finalMessage: finalMessage,
+                runMetadata: runMetadata,
+                resumeCursor: resumeCursor
+            )
             onActiveRunProjectionChanged?(activeProjection, .finished(status))
             if pendingPrune {
                 do {
