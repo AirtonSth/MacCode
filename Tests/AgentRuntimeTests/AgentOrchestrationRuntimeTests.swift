@@ -328,6 +328,68 @@ final class AgentOrchestrationRuntimeTests: XCTestCase {
         XCTAssertEqual(try repository.ledger().first?.tokenUsage, 43)
     }
 
+    func testFinalizationMarksTokenBudgetOverrunInLedger() throws {
+        let (db, root) = try database()
+        defer { try? FileManager.default.removeItem(atPath: root) }
+        let repository = AgentOrchestrationRepository(db: db)
+        let runtime = AgentOrchestrationRuntime(
+            repository: repository,
+            packageVerification: { true },
+            rolloutGate: { true },
+            killSwitch: { false }
+        )
+        let admission = try runtime.admit(
+            runId: AgentRunID(),
+            threadId: AgentThreadID(),
+            configuration: configuration(runtime: runtime),
+            providerSnapshots: snapshots(),
+            interactionMode: .default,
+            permissionMode: .supervised,
+            attachments: [],
+            budgetTokens: 10,
+            reservedTokens: 8
+        )
+        try runtime.finalizeReceipt(
+            runId: try XCTUnwrap(admission.receipt.runId),
+            status: .completed,
+            usage: AssistantTokenUsage(totalTokens: 11),
+            qualityOutcome: "verified:output-present"
+        )
+        XCTAssertEqual(try repository.ledger().first?.outcome, "completed:budget-overrun")
+    }
+
+    func testReconciliationCarriesRecoveredUsageAndQualityIntoReceipt() throws {
+        let (db, root) = try database()
+        defer { try? FileManager.default.removeItem(atPath: root) }
+        let repository = AgentOrchestrationRepository(db: db)
+        let runtime = AgentOrchestrationRuntime(
+            repository: repository,
+            packageVerification: { true },
+            rolloutGate: { true },
+            killSwitch: { false }
+        )
+        let admission = try runtime.admit(
+            runId: AgentRunID(),
+            threadId: AgentThreadID(),
+            configuration: configuration(runtime: runtime),
+            providerSnapshots: snapshots(),
+            interactionMode: .default,
+            permissionMode: .supervised,
+            attachments: []
+        )
+        let runId = try XCTUnwrap(admission.receipt.runId)
+        let usage = AssistantTokenUsage(totalTokens: 17)
+        try runtime.reconcileReceipts(
+            statusForRun: { _ in .completed },
+            usageForRun: { _ in usage },
+            qualityOutcomeForRun: { _, _ in "verified:output-present" }
+        )
+        let receipt = try XCTUnwrap(repository.receipt(runId: runId))
+        XCTAssertEqual(receipt.actualTokens, 17)
+        XCTAssertEqual(receipt.qualityOutcome, "verified:output-present")
+        XCTAssertEqual(try repository.ledger().first?.tokenUsage, 17)
+    }
+
     func testAdmissionRejectsStalePolicyAndFallbackCatalogs() throws {
         let runtime = AgentOrchestrationRuntime(
             packageVerification: { true },

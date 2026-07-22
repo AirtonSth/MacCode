@@ -723,8 +723,18 @@ public final class AgentOrchestrationRuntime: @unchecked Sendable {
                 qualityOutcome: qualityOutcome
             )
         try repository.update(finalized)
+        let budgetOverrun = Self.budgetOutcome(
+            budgetTokens: finalized.budgetTokens,
+            actualTokens: finalized.actualTokens,
+            budgetCostMicros: finalized.budgetCostMicros,
+            actualCostMicros: finalized.actualCostMicros
+        )
         try repository.saveLedger(
-            AgentOrchestrationLedgerEntry(receipt: finalized, outcome: status.rawValue, finalizedAt: finalizedAt)
+            AgentOrchestrationLedgerEntry(
+                receipt: finalized,
+                outcome: [status.rawValue, budgetOverrun].compactMap { $0 }.joined(separator: ":"),
+                finalizedAt: finalizedAt
+            )
         )
         if let reservationId = receipt.reservationId { releaseReservation(reservationId) }
     }
@@ -736,6 +746,19 @@ public final class AgentOrchestrationRuntime: @unchecked Sendable {
         return finalMessage?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
             ? "verified:output-present"
             : "rejected:missing-output"
+    }
+
+    public static func budgetOutcome(
+        budgetTokens: Int?,
+        actualTokens: Int?,
+        budgetCostMicros: Int?,
+        actualCostMicros: Int?
+    ) -> String? {
+        if let budgetTokens, let actualTokens, actualTokens > budgetTokens { return "budget-overrun" }
+        if let budgetCostMicros, let actualCostMicros, actualCostMicros > budgetCostMicros {
+            return "budget-overrun"
+        }
+        return nil
     }
 
     public func markReceiptUnknown(runId: AgentRunID) throws {
@@ -751,14 +774,34 @@ public final class AgentOrchestrationRuntime: @unchecked Sendable {
     }
 
     public func reconcileReceipts(
-        statusForRun: (AgentRunID) throws -> AgentRunStatus?
+        statusForRun: (AgentRunID) throws -> AgentRunStatus?,
+        usageForRun: ((AgentRunID) throws -> AssistantTokenUsage?)? = nil,
+        qualityOutcomeForRun: ((AgentRunID, AgentRunStatus) throws -> String?)? = nil
     ) throws {
         for receipt in try repository.receipts(limit: 500) where receipt.lifecycleStatus == .accepted {
             guard let runId = receipt.runId else { continue }
             switch try statusForRun(runId) {
-            case .completed?: try finalizeReceipt(runId: runId, status: .completed)
-            case .failed?: try finalizeReceipt(runId: runId, status: .failed)
-            case .cancelled?: try finalizeReceipt(runId: runId, status: .cancelled)
+            case .completed?:
+                try finalizeReceipt(
+                    runId: runId,
+                    status: .completed,
+                    usage: try usageForRun?(runId),
+                    qualityOutcome: try qualityOutcomeForRun?(runId, .completed)
+                )
+            case .failed?:
+                try finalizeReceipt(
+                    runId: runId,
+                    status: .failed,
+                    usage: try usageForRun?(runId),
+                    qualityOutcome: try qualityOutcomeForRun?(runId, .failed)
+                )
+            case .cancelled?:
+                try finalizeReceipt(
+                    runId: runId,
+                    status: .cancelled,
+                    usage: try usageForRun?(runId),
+                    qualityOutcome: try qualityOutcomeForRun?(runId, .cancelled)
+                )
             default: try markReceiptUnknown(runId: runId)
             }
         }

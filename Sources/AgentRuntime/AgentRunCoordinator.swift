@@ -309,9 +309,32 @@ public final class AgentRunCoordinator: @unchecked Sendable {
 
     public func reconcileOnLaunch() throws {
         _ = try runRepo.reconcileRunningOnLaunch()
-        try orchestrationRuntime?.reconcileReceipts { [runRepo] runId in
-            try runRepo.get(id: runId)?.status
-        }
+        try orchestrationRuntime?.reconcileReceipts(
+            statusForRun: { [runRepo] runId in
+                try runRepo.get(id: runId)?.status
+            },
+            usageForRun: { [runRepo] runId in
+                guard let run = try runRepo.get(id: runId) else { return nil }
+                return try runRepo.listLatestStreamEvents(threadId: run.threadId, limit: .max)
+                    .reversed()
+                    .compactMap { event in
+                        if case .tokenUsage(let usage) = event { return usage }
+                        return nil
+                    }
+                    .first
+            },
+            qualityOutcomeForRun: { [messageRepo, runRepo] runId, status in
+                guard status == .completed, let run = try runRepo.get(id: runId) else {
+                    return AgentOrchestrationRuntime.qualityOutcome(status: status, finalMessage: nil)
+                }
+                let hasOutput = try messageRepo.list(threadId: run.threadId).contains {
+                    $0.role == .assistant && !$0.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                }
+                return hasOutput
+                    ? "verified:output-present"
+                    : "rejected:missing-output"
+            }
+        )
         let now = Date()
         for thread in try threadRepo.list() where thread.status == .running {
             var copy = thread
