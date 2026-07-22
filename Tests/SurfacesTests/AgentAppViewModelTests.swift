@@ -2374,6 +2374,114 @@ final class AgentAppViewModelTests: XCTestCase {
                              "a user send must re-pin the timeline to the bottom instead of relying on a pre-layout message-count change")
         XCTAssertEqual(runner.prompts, ["next message"],
                        "clearing stale plan state must not block the provider run")
+        XCTAssertTrue(vm.messages.contains { $0.role == .user && $0.content == "next message" },
+                      "the user bubble must appear in the transcript immediately on send")
+    }
+
+    func test_queuedFollowupShowsUserBubbleAndClearsActivePlan() async throws {
+        // WHY: while a provider turn is live, follow-ups enqueue instead of
+        // starting. Users still expect their message to appear in the transcript
+        // and the prior Active plan checklist to leave the bottom of the view.
+        let tmp = NSTemporaryDirectory() + "rc2-vm-agent-queue-plan-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let queuedRepo = AgentQueuedMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let runner = SlowStartRunner()
+        let coord = AgentRunCoordinator(runRepo: runRepo, messageRepo: messageRepo,
+                                        threadRepo: threadRepo,
+                                        providers: [.codex: runner])
+        let vm = AgentAppViewModel(workspaceID: WorkspaceID(), cwd: tmp,
+                                   coordinator: coord,
+                                   threadRepo: threadRepo,
+                                   messageRepo: messageRepo,
+                                   queuedMessageRepo: queuedRepo,
+                                   promptHistoryStore: PromptHistoryStore(db: db))
+        installRunnableProviderFixtures(on: vm)
+        vm.createThread(title: "busy plan")
+        let id = try XCTUnwrap(vm.selectedThreadId)
+        vm.prompt = "start slow run"
+        Task { await vm.send() }
+        await waitAsync("selected thread becomes a real active run") {
+            vm.status == .running && vm.currentRunId != nil
+        }
+        vm.timeline.apply(.activePlanUpdated(AssistantActivePlan(
+            explanation: "Still running checklist",
+            steps: [
+                AssistantPlanStep(id: "s1", title: "Done step", status: .completed),
+                AssistantPlanStep(id: "s2", title: "In progress", status: .inProgress)
+            ],
+            updatedAtMs: 99
+        )))
+        XCTAssertNotNil(vm.activePlan)
+
+        vm.prompt = "follow up after current run"
+        await vm.send()
+
+        XCTAssertEqual((try? queuedRepo.list(threadId: id).map(\.text)) ?? [], ["follow up after current run"],
+                       "follow-up must still enqueue while the provider turn is active")
+        XCTAssertTrue(vm.messages.contains { $0.role == .user && $0.content == "follow up after current run" },
+                      "queued follow-ups must still render as a user bubble immediately")
+        XCTAssertNil(vm.activePlan,
+                     "sending a follow-up must clear the prior turn's Active plan even when the turn is still running")
+
+        // Stale plan events from the still-running turn must not resurrect the checklist
+        // via the stream observer path (flushStreamEvents filter).
+        vm.runCoordinator(
+            vm.coordinator,
+            didReceive: .activePlanUpdated(AssistantActivePlan(
+                explanation: "stale stream plan",
+                steps: [AssistantPlanStep(id: "sx", title: "Should not show", status: .pending)],
+                updatedAtMs: 101
+            )),
+            run: try XCTUnwrap(vm.currentRunId),
+            threadId: id
+        )
+        await waitAsync("stale plan stream events are suppressed") {
+            vm.activePlan == nil
+        }
+
+        vm.stop()
+        await waitAsync("slow run can still be stopped after queueing") {
+            runner.cancelled
+        }
+    }
+
+    func test_mergeLoadedMessagesPreservesInMemoryUserMirror() {
+        // WHY: concurrent same-thread reloads must not drop the optimistic user
+        // bubble before the coordinator has persisted the durable run-id row.
+        // Merge is by id so two legitimate identical prompts stay distinct.
+        let tid = AgentThreadID()
+        let sharedId = AgentMessageID()
+        let durable = AgentMessage(threadId: tid, role: .assistant, content: "prior answer")
+        let mirror = AgentMessage(id: sharedId, threadId: tid, role: .user, content: "just sent")
+        let merged = AgentAppViewModel.mergeLoadedMessagesWithInMemoryMirrors(
+            loadedRows: [durable],
+            inMemory: [durable, mirror],
+            threadId: tid
+        )
+        XCTAssertEqual(merged.map(\.content), ["prior answer", "just sent"],
+                       "in-memory user mirrors absent from the durable page must survive the merge")
+        let afterDurableUser = AgentAppViewModel.mergeLoadedMessagesWithInMemoryMirrors(
+            loadedRows: [
+                durable,
+                AgentMessage(id: sharedId, threadId: tid, role: .user, content: "just sent")
+            ],
+            inMemory: [mirror],
+            threadId: tid
+        )
+        XCTAssertEqual(afterDurableUser.filter { $0.id == sharedId }.count, 1,
+                       "id-merge must collapse the optimistic mirror once the durable run-id row lands")
+        let firstId = AgentMessageID()
+        let secondId = AgentMessageID()
+        let twoIdentical = AgentAppViewModel.mergeLoadedMessagesWithInMemoryMirrors(
+            loadedRows: [AgentMessage(id: firstId, threadId: tid, role: .user, content: "same")],
+            inMemory: [AgentMessage(id: secondId, threadId: tid, role: .user, content: "same")],
+            threadId: tid
+        )
+        XCTAssertEqual(twoIdentical.filter { $0.content == "same" }.count, 2,
+                       "identical prompt text with distinct ids must not be collapsed")
     }
 
     func test_send_runningThreadQueuesFollowupPrompt() async throws {
