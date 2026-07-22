@@ -642,7 +642,14 @@ public final class AgentOrchestrationRuntime: @unchecked Sendable {
 
     private static func capabilitySnapshotID(_ snapshot: AgentProviderSnapshot) -> String {
         let modelIDs = snapshot.models.map(\.id).joined(separator: ",")
-        return sha256Hex("\(snapshot.id)|\(snapshot.version ?? "")|\(modelIDs)|\(snapshot.modelDiscoveryCacheKey ?? "")")
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        let capabilityFingerprint = (try? encoder.encode(snapshot.effectiveCapabilities))
+            .flatMap { String(data: $0, encoding: .utf8) } ?? "unavailable"
+        let discoverySource = snapshot.modelDiscoverySource?.rawValue ?? "unknown"
+        return sha256Hex(
+            "\(snapshot.id)|\(snapshot.driverKind.rawValue)|\(snapshot.version ?? "")|\(modelIDs)|\(snapshot.modelDiscoveryCacheKey ?? "")|\(discoverySource)|\(capabilityFingerprint)"
+        )
     }
 
     private static func isSHA256(_ value: String) -> Bool {

@@ -159,6 +159,54 @@ final class AgentOrchestrationRuntimeTests: XCTestCase {
         )
     }
 
+    func testCapabilitySnapshotIDChangesWhenCapabilitiesChange() throws {
+        let runtime = AgentOrchestrationRuntime(packageVerification: { true }, killSwitch: { false })
+        let live = try runtime.route(
+            configuration: configuration(runtime: runtime),
+            providerSnapshots: snapshots(source: .live)
+        )
+        let selectedIndex = try XCTUnwrap(snapshots(source: .live).firstIndex { $0.provider == live.provider })
+        var changedCatalog = snapshots(source: .live)
+        changedCatalog[selectedIndex] = AgentProviderSnapshotFactory.snapshot(
+            provider: live.provider,
+            models: [AgentModelDescriptor(id: "\(live.provider.rawValue)-live", label: "Live", provider: live.provider)],
+            binaryPath: "/usr/bin/true",
+            authenticated: true,
+            capabilitiesOverride: AgentProviderCapabilities(
+                supportsAttachments: true,
+                supportedAttachmentKinds: [.file],
+                supportsStreaming: true
+            ),
+            modelDiscoverySource: .live
+        )
+        let changed = try runtime.route(
+            configuration: configuration(runtime: runtime),
+            providerSnapshots: changedCatalog
+        )
+        XCTAssertNotEqual(
+            live.capabilitySnapshotId,
+            changed.capabilitySnapshotId,
+            "receipt provenance must change when provider capabilities change"
+        )
+
+        let noStreaming = AgentProviderSnapshotFactory.snapshot(
+            provider: live.provider,
+            models: [AgentModelDescriptor(id: "\(live.provider.rawValue)-live", label: "Live", provider: live.provider)],
+            binaryPath: "/usr/bin/true",
+            authenticated: true,
+            capabilitiesOverride: AgentProviderCapabilities(supportsStreaming: false),
+            modelDiscoverySource: .live
+        )
+        var nonStreamingCatalog = snapshots(source: .live)
+        nonStreamingCatalog[selectedIndex] = noStreaming
+        var onlySelectedProvider = configuration(runtime: runtime)
+        onlySelectedProvider.eligibleProviders = [live.provider]
+        XCTAssertThrowsError(
+            try runtime.route(configuration: onlySelectedProvider, providerSnapshots: nonStreamingCatalog),
+            "a non-streaming live catalog must remain ineligible for Auto"
+        )
+    }
+
     func testAdmissionFailsClosedBeforeReceiptWhenPackageOrKillSwitchIsInvalid() throws {
         let (db, root) = try database()
         defer { try? FileManager.default.removeItem(atPath: root) }

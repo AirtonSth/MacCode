@@ -9472,7 +9472,7 @@ public struct AgentAppView: View {
                     .help(effort.pickerHelpText)
                 }
             }
-            if vm.supportsServiceTierForSelectedModel {
+            if vm.routingMode == .manual && vm.supportsServiceTierForSelectedModel {
                 compactMenuSection("Service tier")
                 compactMenuRow("Auto", selected: vm.serviceTier == .auto) {
                     vm.setServiceTier(.auto)
@@ -9529,7 +9529,7 @@ public struct AgentAppView: View {
             Text(modelLabel).font(DS.Font.caption.weight(.medium)).foregroundColor(DS.Palette.text)
                 .lineLimit(1)
                 .truncationMode(.tail)
-            if vm.supportsReasoningForSelectedModel {
+            if vm.routingMode == .manual && vm.supportsReasoningForSelectedModel {
                 Text("·").foregroundColor(DS.Palette.textTertiary)
                 Text(effortLabel).font(DS.Font.caption).foregroundColor(DS.Palette.textSecondary)
                     .lineLimit(1)
@@ -9655,10 +9655,10 @@ public struct AgentAppView: View {
         if modelOptions.count + customModels.count > 3, !showAllModelOptions {
             titles.append("More...")
         }
-        if vm.supportsReasoningForSelectedModel {
+        if vm.routingMode == .manual && vm.supportsReasoningForSelectedModel {
             titles.append(contentsOf: vm.supportedReasoningEffortsForSelectedModel.map(\.displayName))
         }
-        if vm.supportsServiceTierForSelectedModel {
+        if vm.routingMode == .manual && vm.supportsServiceTierForSelectedModel {
             titles.append(contentsOf: ["Auto", "Fast"])
         }
         if vm.providerRecoveryActionTitle != nil {
