@@ -784,7 +784,18 @@ public final class AgentSkillInstaller: @unchecked Sendable {
     public func reconcileRemoteCodeOrchestrate(
         installedAt: Date = Date()
     ) throws -> RemoteCodeOrchestrateInstallResult {
-        guard let embeddedDirectory = Bundle.module.url(
+        // Never SPM Bundle.module here: its generated accessor only checks the
+        // .app root and a hardcoded builder .build path, then fatalErrors —
+        // v2.0.85–v2.0.87 crashed every packaged launch through this call.
+        let resourceBundle: Bundle
+        do {
+            resourceBundle = try AgentRuntimeResourceBundle.bundle(fileManager: fileManager)
+        } catch {
+            throw RemoteCodeOrchestrateInstallError.sourceMissing(
+                "Embedded resource bundle: \(AgentRuntimeResourceBundle.bundleFileName)"
+            )
+        }
+        guard let embeddedDirectory = resourceBundle.url(
             forResource: remoteCodeOrchestratePackage.skillID,
             withExtension: nil
         ) else {
@@ -827,6 +838,37 @@ public final class AgentSkillInstaller: @unchecked Sendable {
             break
         }
 
+        // Both RemoteCode.app and the scheduled-task LaunchAgent reconcile at
+        // login; the loser of that race can fail the staging/move below after
+        // the winner installed the identical pinned package. Losing is success:
+        // re-inspect and report .skipped instead of surfacing a session-long
+        // install error. Source validation and the unmanaged-collision guard
+        // above stay OUTSIDE this catch so a corrupted shipped bundle or a
+        // user-owned destination can never be masked by an existing install.
+        do {
+            return try stageAndActivateRemoteCodeOrchestrate(
+                sourceDirectory: sourceDirectory,
+                sourceFiles: sourceFiles,
+                current: current,
+                destination: destination,
+                installedAt: installedAt
+            )
+        } catch {
+            if case .valid(let manifest) = inspectManagedPackage(at: destination),
+               manifestMatchesPinnedPackage(manifest) {
+                return RemoteCodeOrchestrateInstallResult(action: .skipped, manifest: manifest)
+            }
+            throw error
+        }
+    }
+
+    private func stageAndActivateRemoteCodeOrchestrate(
+        sourceDirectory: URL,
+        sourceFiles: [RemoteCodeOrchestrateFile],
+        current: ManagedPackageInspection,
+        destination: URL,
+        installedAt: Date
+    ) throws -> RemoteCodeOrchestrateInstallResult {
         let stagingRoot = appPrivateSkillsRoot.appendingPathComponent(".staging", isDirectory: true)
         try prepareOwnedDirectory(stagingRoot)
         let staged = stagingRoot.appendingPathComponent(

@@ -250,6 +250,10 @@ package_bundle_check:
     - RC2_CONFIG=debug bash scripts/package-app.sh
     - bash scripts/check-app-bundle.sh dist/RemoteCode.app
     - plutil -lint dist/RemoteCode.app/Contents/Info.plist
+    # Launch smoke (non-gating: runner GUI-session availability is not
+    # guaranteed): catches launch-abort regressions the structural checks
+    # cannot see. Loud in the log; run gating locally before a release tag.
+    - bash scripts/orchestrate-launch-smoke.sh dist/RemoteCode.app || echo "[smoke] WARNING - launch smoke failed; investigate before tagging a release"
 
 stable_macos_arm64_dmg:
   extends: .macos_large

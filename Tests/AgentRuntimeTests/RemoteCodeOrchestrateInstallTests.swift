@@ -126,6 +126,54 @@ final class RemoteCodeOrchestrateInstallTests: XCTestCase {
         )
     }
 
+    /// WHY: RemoteCode.app and the scheduled-task LaunchAgent both reconcile at
+    /// login. Before the loser-tolerant reconcile, the loser's moveItem threw
+    /// "file exists" and the error persisted for the whole app session even
+    /// though the identical pinned package was already installed.
+    func testLoserOfConcurrentInstallRaceConvergesToSkipped() throws {
+        let fixture = try makeFixture(files: ["SKILL.md": "# Orchestrate\n"])
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+
+        let racingFileManager = WinnerRacingFileManager()
+        racingFileManager.winnerInstall = {
+            _ = try fixture.installer.installRemoteCodeOrchestrate(from: fixture.source)
+        }
+        let loser = AgentSkillInstaller(
+            appPrivateSkillsRoot: fixture.skillsRoot,
+            remoteCodeOrchestratePackage: fixture.package,
+            fileManager: racingFileManager
+        )
+
+        let result = try loser.installRemoteCodeOrchestrate(from: fixture.source)
+
+        XCTAssertTrue(racingFileManager.raced, "fixture must actually exercise the race")
+        XCTAssertEqual(result.action, .skipped, "losing to an identical pinned install is success")
+        XCTAssertEqual(fixture.installer.remoteCodeOrchestrateStatus().state, .ready)
+        XCTAssertEqual(
+            try String(contentsOf: fixture.installer.remoteCodeOrchestrateDirectory().appendingPathComponent("SKILL.md")),
+            "# Orchestrate\n"
+        )
+    }
+
+    /// The loser-tolerant catch must never mask a real failure: when the
+    /// destination does not hold the pinned package, the original error rethrows.
+    func testInstallRaceLoserRethrowsWhenDestinationDoesNotMatchPin() throws {
+        let fixture = try makeFixture(files: ["SKILL.md": "# Orchestrate\n"])
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+
+        let racingFileManager = WinnerRacingFileManager()
+        racingFileManager.winnerInstall = {}
+        let loser = AgentSkillInstaller(
+            appPrivateSkillsRoot: fixture.skillsRoot,
+            remoteCodeOrchestratePackage: fixture.package,
+            fileManager: racingFileManager
+        )
+
+        XCTAssertThrowsError(try loser.installRemoteCodeOrchestrate(from: fixture.source)) { error in
+            XCTAssertEqual((error as? CocoaError)?.code, .fileWriteFileExists)
+        }
+    }
+
     private struct Fixture {
         let root: URL
         let source: URL
@@ -192,5 +240,22 @@ final class RemoteCodeOrchestrateInstallTests: XCTestCase {
             try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
             try Data(text.utf8).write(to: url)
         }
+    }
+}
+
+/// Simulates the concurrent-reconcile winner: the first move onto the orchestrate
+/// destination runs `winnerInstall` (the other process finishing first) and then
+/// fails the way FileManager does when the destination already exists.
+private final class WinnerRacingFileManager: FileManager, @unchecked Sendable {
+    var raced = false
+    var winnerInstall: () throws -> Void = {}
+
+    override func moveItem(at srcURL: URL, to dstURL: URL) throws {
+        if !raced, dstURL.lastPathComponent == "remote-code-orchestrate" {
+            raced = true
+            try winnerInstall()
+            throw CocoaError(.fileWriteFileExists)
+        }
+        try super.moveItem(at: srcURL, to: dstURL)
     }
 }

@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Package the SwiftPM-built executable as a minimal local .app bundle.
 # This is not a release artifact. Release DMGs must be Developer ID signed
-# and notarized by scripts/package-dmg.sh plus the GitHub release workflow.
+# and notarized by scripts/package-dmg.sh (GitLab release pipeline), which
+# delegates all packaging to this script.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -66,8 +67,6 @@ CLI="$BIN_DIR/rc2"
 DISTILL_SERVICE="$BIN_DIR/RemoteCodeDistillService"
 RUN_AS_USER_HELPER="$BIN_DIR/RemoteCodeRunAsUserHelper"
 MLX_METALLIB="$BIN_DIR/mlx.metallib"
-SURFACES_RESOURCES="$BIN_DIR/RemoteCode_Surfaces.bundle"
-APP_SHELL_RESOURCES="$BIN_DIR/RemoteCode_AppShell.bundle"
 if [ ! -x "$BIN" ]; then echo "missing $BIN"; exit 1; fi
 if [ ! -x "$SCHEDULED_TASK_AGENT" ]; then echo "missing $SCHEDULED_TASK_AGENT"; exit 1; fi
 if [ ! -x "$DISTILL_SERVICE" ]; then echo "missing $DISTILL_SERVICE"; exit 1; fi
@@ -125,11 +124,27 @@ cp "$MLX_METALLIB" "$STAGING_APP/Contents/MacOS/mlx.metallib"
 if [ -x "$CLI" ]; then
   cp "$CLI" "$STAGING_APP/Contents/MacOS/rc2"
 fi
-if [ -d "$SURFACES_RESOURCES" ]; then
-  cp -R "$SURFACES_RESOURCES" "$STAGING_APP/Contents/Resources/RemoteCode_Surfaces.bundle"
+# Canonical location only. Do NOT copy resource bundles to the .app root:
+# codesign rejects that as "unsealed contents present in the bundle root".
+# SPM's generated Bundle.module looks at the app root and fatalErrors — never
+# call Bundle.module from app code; use AppShellResourceBundle /
+# AgentRuntimeResourceBundle instead.
+# Copy EVERY first-party resource bundle so a new resource-bearing target can
+# never ship without its resources again (v2.0.85–v2.0.87 launch-crash class:
+# RemoteCode_AgentRuntime.bundle was missing from this hand-maintained list).
+for resource_bundle in "$BIN_DIR"/RemoteCode_*.bundle; do
+  [ -d "$resource_bundle" ] || continue
+  case "$(basename "$resource_bundle")" in
+    *Tests.bundle) continue ;;
+  esac
+  cp -R "$resource_bundle" "$STAGING_APP/Contents/Resources/$(basename "$resource_bundle")"
+done
+if [ ! -d "$STAGING_APP/Contents/Resources/RemoteCode_AppShell.bundle" ]; then
+  echo "missing $BIN_DIR/RemoteCode_AppShell.bundle" >&2
+  exit 1
 fi
-if [ ! -d "$APP_SHELL_RESOURCES" ]; then
-  echo "missing $APP_SHELL_RESOURCES" >&2
+if [ ! -d "$STAGING_APP/Contents/Resources/RemoteCode_AgentRuntime.bundle" ]; then
+  echo "missing $BIN_DIR/RemoteCode_AgentRuntime.bundle" >&2
   exit 1
 fi
 # Claude Agent SDK Node bridge: must ship inside the .app. The adapter resolves
@@ -141,11 +156,6 @@ if [ ! -f "$CLAUDE_SDK_BRIDGE" ]; then
   exit 1
 fi
 cp "$CLAUDE_SDK_BRIDGE" "$STAGING_APP/Contents/Resources/ClaudeAgentSDKBridge.mjs"
-# Canonical location only. Do NOT copy resource bundles to the .app root:
-# codesign rejects that as "unsealed contents present in the bundle root".
-# SPM's generated Bundle.module looks at the app root and fatalErrors — never
-# call Bundle.module from app code; use AppShellResourceBundle instead.
-cp -R "$APP_SHELL_RESOURCES" "$STAGING_APP/Contents/Resources/RemoteCode_AppShell.bundle"
 if [ -f "Resources/AppIcon.icns" ]; then
   cp "Resources/AppIcon.icns" "$STAGING_APP/Contents/Resources/AppIcon.icns"
 fi

@@ -30,6 +30,47 @@ enum MLXHuggingFaceBridges {
     static func adaptTokenizer(_ upstream: any Tokenizers.Tokenizer) -> any MLXLMCommon.Tokenizer {
         TokenizerBridge(upstream)
     }
+
+    /// Guard against swift-transformers' `fallbackTokenizerConfig`, which calls
+    /// SPM `Bundle.module`: its generated accessor only checks the .app root and
+    /// a hardcoded builder `.build` path, then fatalErrors — uncatchable — in
+    /// packaged apps, because `swift-transformers_Hub.bundle` cannot ship there
+    /// (codesign rejects the bare SPM bundle at the app root and inside
+    /// Contents/MacOS; probed 2026-07-22). The fallback fires when
+    /// `tokenizer_config.json` is absent or lacks `tokenizer_class` — the
+    /// signature of a partial or corrupted model download — so both RemoteCode
+    /// and RemoteCodeDistillService would abort instead of reporting an error.
+    /// Rejecting those directories here is strictly safer than upstream: no
+    /// tokenizer can load successfully from them in a packaged app anyway.
+    static func validateTokenizerConfigCannotReachBundleModuleFallback(
+        in directory: URL,
+        fileManager: FileManager = .default
+    ) throws {
+        let configURL = directory.appendingPathComponent("tokenizer_config.json")
+        guard fileManager.fileExists(atPath: configURL.path) else {
+            throw TokenizerConfigValidationError.missingTokenizerConfig(configURL.path)
+        }
+        let object = (try? JSONSerialization.jsonObject(with: Data(contentsOf: configURL))) as? [String: Any]
+        guard let object, object["tokenizer_class"] is String else {
+            throw TokenizerConfigValidationError.missingTokenizerClass(configURL.path)
+        }
+    }
+}
+
+/// Catchable replacement for the process abort described on
+/// `validateTokenizerConfigCannotReachBundleModuleFallback(in:fileManager:)`.
+enum TokenizerConfigValidationError: Error, LocalizedError, Equatable {
+    case missingTokenizerConfig(String)
+    case missingTokenizerClass(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .missingTokenizerConfig(let path):
+            return "Model tokenizer configuration is missing at \(path). Re-download the model."
+        case .missingTokenizerClass(let path):
+            return "Model tokenizer configuration at \(path) has no tokenizer_class. Re-download the model."
+        }
+    }
 }
 
 // MARK: - Hub
@@ -67,6 +108,7 @@ private struct HubBridge: MLXLMCommon.Downloader {
 
 private struct TransformersLoader: MLXLMCommon.TokenizerLoader {
     func load(from directory: URL) async throws -> any MLXLMCommon.Tokenizer {
+        try MLXHuggingFaceBridges.validateTokenizerConfigCannotReachBundleModuleFallback(in: directory)
         let upstream = try await Tokenizers.AutoTokenizer.from(modelFolder: directory)
         return MLXHuggingFaceBridges.adaptTokenizer(upstream)
     }
