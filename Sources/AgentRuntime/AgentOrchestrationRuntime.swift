@@ -1049,7 +1049,8 @@ public final class AgentOrchestrationRuntime: @unchecked Sendable {
         $\(skill)
 
         Auto is on. Run $\(skill) controller-only, token-efficient:
-        - Classify T0–T3 + certainty (absolute|high|medium|low); pick Micro/Single/Multi/Critical.
+        - FIRST: Micro chat bypass — if the request is only conversational (who are you, hi, which model/LLM, trivial status) and does not ask for code/files/commands/PR/deploy/repo change → answer on the controller in one short reply; no workers, no DAG, no validator, no matrix load.
+        - Otherwise classify T0–T3 + certainty (absolute|high|medium|low); pick Micro/Single/Multi/Critical.
         - Progressive disclosure: load only the skill sections needed for that mode.
         - Controller stays LIGHT; escalate workers only after capability failure.
         - Fan-out default 2 / hard cap 3; skip REVIEWER on micro absolute/high certainty when rules allow.

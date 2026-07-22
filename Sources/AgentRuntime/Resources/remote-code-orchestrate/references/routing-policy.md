@@ -6,6 +6,10 @@ capability, bind the host runtime from
 
 ## Task Classes
 
+- `T0` **Micro chat (orchestration bypass):** purely conversational request
+  (identity, greeting, which model/LLM, trivial status) with **no** ask for
+  code, files, commands, PRs, deploys, or repo changes. Controller answers in
+  one short reply; **no** workers, DAG, matrix load, or validator.
 - `T0`: one mechanical or read-only task, narrow scope, no material runtime,
   security, data, release, or cross-file risk. Use Micro path: one `LIGHT`
   execution node max (or controller-only if no delegation needed).
@@ -32,12 +36,15 @@ Record `controller_certainty`:
 
 ## Capability then runtime
 
-1. Classify `T0`–`T3` and set certainty.
-2. Pick mode: Micro / Single / Multi / Critical.
-3. Detect active host: `codex`, `claude-code`, or `grok`.
-4. Bind matrix row for that host and capability. Do not ask the user.
-5. Prefer the main controller for simple single-step work before spawning.
-6. **Never open on DEEP.** First attempt is LIGHT (Micro) or STANDARD (Single).
+1. **Micro chat bypass first** — if the request is only conversational and asks
+   for no repo work, answer on the controller and stop (no matrix, no workers).
+2. Classify remaining work `T0`–`T3` and set certainty.
+3. Pick mode: Micro / Single / Multi / Critical.
+4. Prefer host runtime receipt from RemoteCode; else detect host once
+   (`codex`, `claude-code`, `grok`).
+5. Bind matrix row for that host and capability. Do not ask the user.
+6. Prefer the main controller for simple single-step work before spawning.
+7. **Never open on DEEP.** First attempt is LIGHT (Micro) or STANDARD (Single).
 
 ## Fan-out caps
 

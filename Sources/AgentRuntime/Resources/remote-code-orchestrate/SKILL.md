@@ -36,12 +36,42 @@ re-reading this skill or re-prompting full history into every worker.
   blocker. Do not silently abandon controller-only mode.
 - Never expose secrets in prompts, reports, commands, or evidence.
 
+## Orchestration bypass (Micro chat) — decide first
+
+**Before** any DAG, worker, tool fan-out, matrix load, or validator:
+
+If the user request is **purely conversational** and does **not** ask for code,
+files, commands, PRs, deploys, refactors, or any repo change — answer **directly
+on the controller in one short reply**.
+
+Examples that **bypass orchestration** (class `T0`, certainty `absolute`, mode
+Micro chat):
+
+- Identity / host: “quem é você?”, “who are you?”, “what model?”, “que LLM é?”
+- Greeting / ack: “oi”, “olá”, “thanks”, “obrigado”
+- Trivial status: “você está aí?”, “ping”, “status?”
+
+**Do not:**
+
+- Delegate or spawn subagents
+- Build a task DAG or orchestration table theater
+- Load [host-runtime-matrix.md](references/host-runtime-matrix.md),
+  [output-contract.md](references/output-contract.md), or run the validator
+- Run tools unless a single read is strictly required to answer (usually none)
+- Claim a different host than the host runtime receipt
+
+**Do:** answer from the host receipt + this session; stop.
+
+If the message mixes chat with a real task (“who are you, and fix the bug”),
+**do not** bypass — classify and orchestrate the real work.
+
 ## Progressive Disclosure (read only what you need)
 
 Do **not** load every reference on every turn.
 
 | Path | Read now | Defer |
 | --- | --- | --- |
+| **Micro chat** (bypass above) | This section only | everything else |
 | **Micro** (`T0` + certainty `absolute`/`high`) | This SKILL (this section + §1 micro) | matrix full tables, output-contract, validator until report |
 | **Single** (`T1`) | + [routing-policy.md](references/routing-policy.md) + [prompt-contract.md](references/prompt-contract.md) | full output-contract until drafting report |
 | **Multi** (`T2`) | + [host-runtime-matrix.md](references/host-runtime-matrix.md) | — |
@@ -50,7 +80,7 @@ Do **not** load every reference on every turn.
 Always run `scripts/validate_orchestration.py` before declaring completion when
 you produced a report JSON (Single/Multi/Critical). Micro path may skip the
 formal report when no delegated workers ran and proof is a single local check —
-if you write a report, validate it.
+if you write a report, validate it. Micro chat bypass: no report.
 
 ## Certainty Budget
 
@@ -95,13 +125,16 @@ Classify `T0`–`T3` per [routing-policy.md](references/routing-policy.md). Pick
 
 When mode is Micro:
 
+0. **Micro chat bypass first** (see § Orchestration bypass): if the request is
+   only conversational (identity, greeting, status) and asks for no repo work →
+   answer on the controller and stop. No workers, DAG, tools, or validator.
 1. Do the work yourself only if it is pure controller integration; otherwise one
    short `LIGHT` worker with a **slice-only** prompt (see prompt-contract).
 2. Proof: scope diff + at most one focused command. No full-suite runs. No raw
    log dumps — summary + failing excerpt only.
 3. Skip REVIEWER when absolute/high certainty skip rules hold.
 4. Report: one table row (node / model / proof / status) or a minimal validated
-   JSON report. No narrative essay.
+   JSON report. No narrative essay. Micro chat: no report.
 
 ## 2. Build the Task DAG (Single / Multi / Critical)
 
