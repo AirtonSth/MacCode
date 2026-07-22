@@ -2431,7 +2431,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         }
         var providerStartConfirmed = false
         do {
-            let queuedRouting = try routingConfigurationForQueuedMessage(queued, context: ctx)
+            let queuedRouting = try routingSnapshotForQueuedMessage(queued, context: ctx)
             let result = try await sendAgentMessage(
                 thread: queued.threadId,
                 text: queued.text,
@@ -2445,7 +2445,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 providerInstanceId: nil,
                 attachments: queued.attachments,
                 queueMessageId: queued.id,
-                routingConfiguration: queuedRouting
+                routingSnapshot: queuedRouting
             )
             providerStartConfirmed = true
             guard try ctx.queuedMessageRepo.markDispatched(lease, runId: dispatchRunId) else {
@@ -2610,10 +2610,10 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         }
     }
 
-    private func sendAgentMessage(thread: AgentThreadID, text: String, provider: AgentProvider?, model: String?, permissionMode: AgentPermissionMode?, reasoningEffort: AgentReasoningEffort?, serviceTier: AgentServiceTier?, interactionMode: AgentInteractionMode?, modelSelection: AgentModelSelection?, providerInstanceId: String?, attachments: [AgentAttachment], queueMessageId: AgentQueuedMessageID?, routingConfiguration: AgentRoutingConfiguration? = nil) async throws -> AgentMessageSendResult {
+    private func sendAgentMessage(thread: AgentThreadID, text: String, provider: AgentProvider?, model: String?, permissionMode: AgentPermissionMode?, reasoningEffort: AgentReasoningEffort?, serviceTier: AgentServiceTier?, interactionMode: AgentInteractionMode?, modelSelection: AgentModelSelection?, providerInstanceId: String?, attachments: [AgentAttachment], queueMessageId: AgentQueuedMessageID?, routingConfiguration: AgentRoutingConfiguration? = nil, routingSnapshot: AgentQueuedMessageRoutingSnapshot? = nil) async throws -> AgentMessageSendResult {
         guard let ctx = context else { throw LayoutError.workspaceNotFound }
         guard let existing = try ctx.threadRepo.get(id: thread) else { throw LayoutError.workspaceNotFound }
-        let effectiveRouting = routingConfiguration ?? existing.routingConfiguration
+        let effectiveRouting = routingSnapshot?.configuration ?? routingConfiguration ?? existing.routingConfiguration
         let autoRoutingActive = effectiveRouting?.mode == .auto
         let resolvedAttachments = try resolveInboundAgentAttachments(attachments)
         if !autoRoutingActive {
@@ -2636,7 +2636,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 text: text,
                 attachments: resolvedAttachments,
                 interactionMode: interactionMode ?? .default,
-                routingConfiguration: effectiveRouting
+                routingSnapshot: routingSnapshot ?? effectiveRouting.map { AgentQueuedMessageRoutingSnapshot(configuration: $0) }
             )
             publishQueuedMessage(kind: "agent.message.queued", queued)
             refreshAgentSurfaces(thread: thread)
@@ -2699,7 +2699,14 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             environment: autoRoutingActive ? [:] : providerEnvironment(provider: prov, instanceId: t.providerInstanceId, threadId: thread),
             runAsUser: t.runAsUser
         )
-        let runId = try await ctx.coordinator.startRun(req)
+        let coordinatorSnapshot = routingSnapshot.map {
+            AgentOrchestrationRoutingSnapshot(
+                configuration: $0.configuration,
+                providerSnapshots: [],
+                admissionSnapshot: $0
+            )
+        }
+        let runId = try await ctx.coordinator.startRun(req, routingSnapshot: coordinatorSnapshot)
         // HC-5 (R1): a message sent from the mobile mirror / RPC must become
         // visible on the Mac host. Refresh every Agent App rail so the thread
         // list + running state update, and re-load the transcript ONLY on
@@ -2761,7 +2768,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         }
         var providerStartConfirmed = false
         do {
-            let queuedRouting = try routingConfigurationForQueuedMessage(queued, context: ctx)
+            let queuedRouting = try routingSnapshotForQueuedMessage(queued, context: ctx)
             _ = try await sendAgentMessage(
                 thread: thread,
                 text: queued.text,
@@ -2775,7 +2782,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 providerInstanceId: nil,
                 attachments: queued.attachments,
                 queueMessageId: queued.id,
-                routingConfiguration: queuedRouting
+                routingSnapshot: queuedRouting
             )
             providerStartConfirmed = true
             guard try ctx.queuedMessageRepo.markDispatched(lease, runId: dispatchRunId) else {
@@ -2804,11 +2811,11 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         }
     }
 
-    private func routingConfigurationForQueuedMessage(
+    private func routingSnapshotForQueuedMessage(
         _ message: AgentQueuedMessage,
         context: AppContext
-    ) throws -> AgentRoutingConfiguration? {
-        try context.queuedMessageRepo.routingConfiguration(id: message.id)
+    ) throws -> AgentQueuedMessageRoutingSnapshot? {
+        try context.queuedMessageRepo.routingSnapshot(id: message.id)
     }
 
     /// Relaunch recovery for queue rows left between durable prepare and provider

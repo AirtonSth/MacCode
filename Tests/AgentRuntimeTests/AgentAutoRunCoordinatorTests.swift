@@ -176,6 +176,17 @@ final class AgentAutoRunCoordinatorTests: XCTestCase {
         let supplier = SnapshotSupplierProbe(snapshots: [liveSnapshot(provider: .claude, model: "claude-live")])
         let claude = RecordingProviderRunner(provider: .claude)
         let codex = RecordingProviderRunner(provider: .codex)
+        let admissionReceiptID = UUID()
+        let admissionSnapshot = AgentQueuedMessageRoutingSnapshot(
+            configuration: immutableConfiguration,
+            deadlineAt: Date(timeIntervalSince1970: 123),
+            budgetTokens: 900,
+            budgetCostMicros: 42,
+            reservationId: "queue-reservation",
+            reservedTokens: 700,
+            reservedCostMicros: 35,
+            admissionReceiptId: admissionReceiptID
+        )
         let coordinator = AgentRunCoordinator(
             runRepo: runRepo,
             messageRepo: messageRepo,
@@ -192,13 +203,15 @@ final class AgentAutoRunCoordinatorTests: XCTestCase {
                     binary: "/verified/codex",
                     environment: ["ROUTE_OWNER": "codex"]
                 )
-            ]
+            ],
+            admissionSnapshot: admissionSnapshot
         )
 
         thread.routingConfiguration = autoConfiguration(runtime: runtime, eligibleProviders: [.claude])
         try threadRepo.upsert(thread)
+        let runId = AgentRunID()
         _ = try await coordinator.startRun(
-            request(threadId: thread.id),
+            request(threadId: thread.id, runId: runId),
             routingSnapshot: routingSnapshot
         )
 
@@ -208,6 +221,15 @@ final class AgentAutoRunCoordinatorTests: XCTestCase {
         XCTAssertEqual(codex.startCount, 1)
         XCTAssertEqual(codex.lastRequest?.providerBinary, "/verified/codex")
         XCTAssertEqual(codex.lastRequest?.environment["ROUTE_OWNER"], "codex")
+        let receipt = try XCTUnwrap(receiptRepo.receipt(runId: runId))
+        XCTAssertEqual(receipt.id, admissionReceiptID,
+                       "queued admission must reuse its immutable receipt identity")
+        XCTAssertEqual(receipt.deadlineAt, admissionSnapshot.deadlineAt)
+        XCTAssertEqual(receipt.budgetTokens, admissionSnapshot.budgetTokens)
+        XCTAssertEqual(receipt.budgetCostMicros, admissionSnapshot.budgetCostMicros)
+        XCTAssertEqual(receipt.reservationId, admissionSnapshot.reservationId)
+        XCTAssertEqual(receipt.reservedTokens, admissionSnapshot.reservedTokens)
+        XCTAssertEqual(receipt.reservedCostMicros, admissionSnapshot.reservedCostMicros)
         XCTAssertEqual(try receiptRepo.receipts().count, 1,
                        "The coordinator must create exactly one admission receipt for the run.")
     }

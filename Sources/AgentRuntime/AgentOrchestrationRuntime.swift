@@ -38,15 +38,18 @@ public struct AgentOrchestrationRoutingSnapshot: Sendable, Equatable {
     public let configuration: AgentRoutingConfiguration
     public let providerSnapshots: [AgentProviderSnapshot]
     public let launchConfigurations: [String: AgentOrchestrationLaunchConfiguration]
+    public let admissionSnapshot: AgentQueuedMessageRoutingSnapshot?
 
     public init(
         configuration: AgentRoutingConfiguration,
         providerSnapshots: [AgentProviderSnapshot],
-        launchConfigurations: [String: AgentOrchestrationLaunchConfiguration] = [:]
+        launchConfigurations: [String: AgentOrchestrationLaunchConfiguration] = [:],
+        admissionSnapshot: AgentQueuedMessageRoutingSnapshot? = nil
     ) {
         self.configuration = configuration
         self.providerSnapshots = providerSnapshots
         self.launchConfigurations = launchConfigurations
+        self.admissionSnapshot = admissionSnapshot
     }
 }
 
@@ -454,6 +457,7 @@ public final class AgentOrchestrationRuntime: @unchecked Sendable {
         attachments: [AgentAttachment],
         nodeId: String = "root",
         attemptId: UUID? = nil,
+        receiptId: UUID? = nil,
         deadlineAt: Date? = nil,
         budgetTokens: Int? = nil,
         budgetCostMicros: Int? = nil,
@@ -470,6 +474,7 @@ public final class AgentOrchestrationRuntime: @unchecked Sendable {
             attachments: attachments
         )
         let receipt = AgentOrchestrationAdmissionReceipt(
+            id: receiptId ?? UUID(),
             runId: runId,
             threadId: threadId,
             nodeId: nodeId,

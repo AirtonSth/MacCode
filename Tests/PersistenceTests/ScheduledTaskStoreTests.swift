@@ -21,7 +21,7 @@ final class ScheduledTaskStoreTests: XCTestCase {
         XCTAssertEqual(Schema.currentVersion, 49)
         let statement = try db.prepare("SELECT MAX(version) FROM schema_meta;")
         XCTAssertTrue(try statement.step())
-        XCTAssertEqual(statement.columnInt64(0), 48)
+        XCTAssertEqual(statement.columnInt64(0), 49)
     }
 
     func test_saveAndListRoundTripEveryExecutionField_becauseAgentRunsMustBeExact() throws {

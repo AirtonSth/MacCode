@@ -1000,7 +1000,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 recordHistory: false,
                 interactionMode: queued.interactionMode,
                 requestedRunId: dispatchRunId,
-                routingConfiguration: try queuedMessageRepo.routingConfiguration(id: queued.id)
+                queuedRoutingSnapshot: try queuedMessageRepo.routingSnapshot(id: queued.id)
             )
             guard runId != nil else {
                 if (try? coordinator.runStatus(dispatchRunId)) != nil {
@@ -3655,7 +3655,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 text: text,
                 attachments: attached,
                 interactionMode: mode,
-                routingConfiguration: routing
+                queuedRoutingSnapshot: AgentQueuedMessageRoutingSnapshot(configuration: routing)
             )
             prompt = ""
             attachments = []
@@ -3682,9 +3682,11 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         interactionMode: AgentInteractionMode,
         resumeInterrupted: Bool = false,
         requestedRunId: AgentRunID? = nil,
-        routingConfiguration: AgentRoutingConfiguration? = nil
+        routingConfiguration: AgentRoutingConfiguration? = nil,
+        queuedRoutingSnapshot: AgentQueuedMessageRoutingSnapshot? = nil
     ) async -> AgentRunID? {
-        let effectiveRouting = routingConfiguration
+        let effectiveRouting = queuedRoutingSnapshot?.configuration
+            ?? routingConfiguration
             ?? selectedThreadId.flatMap { try? threadRepo.get(id: $0)?.effectiveRoutingConfiguration }
             ?? .legacyManual(selection: currentModelSelection, providerInstanceId: providerInstanceId)
         let runProvider = provider
@@ -3707,10 +3709,11 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                     ))
                 })
                 routingSnapshot = AgentOrchestrationRoutingSnapshot(
-                    configuration: effectiveRouting,
-                    providerSnapshots: providerSnapshots,
-                    launchConfigurations: launchConfigurations
-                )
+                configuration: effectiveRouting,
+                providerSnapshots: providerSnapshots,
+                launchConfigurations: launchConfigurations,
+                admissionSnapshot: queuedRoutingSnapshot
+            )
             } else {
                 routingSnapshot = nil
                 try AgentProviderRunPreflight.validate(

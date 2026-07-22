@@ -645,7 +645,17 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     ) async throws -> AgentRunRequest {
         let routingSnapshot: AgentOrchestrationRoutingSnapshot
         if let suppliedSnapshot {
-            routingSnapshot = suppliedSnapshot
+            if suppliedSnapshot.providerSnapshots.isEmpty,
+               let providerSnapshotSupplier {
+                routingSnapshot = AgentOrchestrationRoutingSnapshot(
+                    configuration: suppliedSnapshot.configuration,
+                    providerSnapshots: try await providerSnapshotSupplier(),
+                    launchConfigurations: suppliedSnapshot.launchConfigurations,
+                    admissionSnapshot: suppliedSnapshot.admissionSnapshot
+                )
+            } else {
+                routingSnapshot = suppliedSnapshot
+            }
         } else {
             guard let thread = try threadRepo.get(id: request.threadId),
                   thread.effectiveRoutingConfiguration.mode == .auto else {
@@ -672,7 +682,14 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             providerSnapshots: routingSnapshot.providerSnapshots,
             interactionMode: request.interactionMode,
             permissionMode: request.permissionMode,
-            attachments: request.attachments
+            attachments: request.attachments,
+            receiptId: routingSnapshot.admissionSnapshot?.admissionReceiptId,
+            deadlineAt: routingSnapshot.admissionSnapshot?.deadlineAt,
+            budgetTokens: routingSnapshot.admissionSnapshot?.budgetTokens,
+            budgetCostMicros: routingSnapshot.admissionSnapshot?.budgetCostMicros,
+            reservationId: routingSnapshot.admissionSnapshot?.reservationId,
+            reservedTokens: routingSnapshot.admissionSnapshot?.reservedTokens,
+            reservedCostMicros: routingSnapshot.admissionSnapshot?.reservedCostMicros
         )
         let launch = routingSnapshot.launchConfigurations[admission.route.providerInstanceId]
         return AgentRunRequest(
