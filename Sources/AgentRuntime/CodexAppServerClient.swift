@@ -767,11 +767,8 @@ public final class CodexAppServerClient: @unchecked Sendable {
                 "reasoning_effort": appServerReasoningEffort(for: request.reasoningEffort).rawValue,
                 "developer_instructions": developerInstructions(
                     for: request.interactionMode,
-                    // Codex (app-server) has no automatic tool-output compression hook — that is
-                    // Claude-SDK-only — so the full Token Saver distill spec must ride in the
-                    // developer_instructions it reads every turn. providerEnvironment sets this
-                    // hint iff Token Saver is enabled (and thus the managed `distill` CLI exists).
-                    tokenSaverEnabled: request.environment["RC_TOKEN_SAVER_DISTILL_HINT"] == "1"
+                    // Always inject Distill (app-private managed skill), all Codex turns.
+                    tokenSaverEnabled: true
                 )
             ]
         ]
@@ -781,17 +778,12 @@ public final class CodexAppServerClient: @unchecked Sendable {
         effort == .minimal ? .low : (effort ?? .medium)
     }
 
-    /// Codex's per-turn `developer_instructions`: the base mode instruction, plus — when Token
-    /// Saver is on — the FULL distill spec (distill language + the `| distill` pipe rule). This is
-    /// the per-turn analog of Claude's once-per-session SDK `systemPrompt`, so Codex speaks distill
-    /// as reliably as Claude instead of depending only on the easily-buried `~/.codex/AGENTS.md`.
-    /// It is resent every turn (turnStartParams) but the body is stable, so prompt caching
-    /// amortizes it. Absent when Token Saver is off: the managed `distill` CLI is uninstalled then.
+    /// Codex's per-turn `developer_instructions`: base mode + always-on managed Distill
+    /// (app-private skill, not `~/.codex/skills`). Mirrors Claude/Grok injection.
     private static func developerInstructions(for mode: AgentInteractionMode, tokenSaverEnabled: Bool) -> String {
         let base = AgentProviderInstructionText.developerInstructions(for: mode)
-        return AgentSkillInstaller.tokenSaverProviderPrompt(
-            base,
-            environment: tokenSaverEnabled ? ["RC_TOKEN_SAVER_DISTILL_HINT": "1"] : [:]
-        )
+        // tokenSaverEnabled kept for call-site compatibility; Distill is always injected.
+        _ = tokenSaverEnabled
+        return AgentSkillInstaller.managedDistillProviderPrompt(base)
     }
 }

@@ -7,7 +7,7 @@ final class RemoteCodeOrchestrateInstallTests: XCTestCase {
 
         XCTAssertEqual(package.skillID, "remote-code-orchestrate")
         XCTAssertEqual(package.sourceRevision, "2c77fa48431bc20e5dc841652079594a3ea918c9")
-        XCTAssertEqual(package.sourceTreeSHA256, "2e1467150cc26351ff9d61154150ae7f0047af4336444150a1f67a9c5f1579e9")
+        XCTAssertEqual(package.sourceTreeSHA256, "75be88b77153884356338c03577d3b2ac153debdbca9c673e0ee6d7b6b5138d3")
         XCTAssertEqual(package.allowedPaths, [
             "SKILL.md",
             "agents/openai.yaml",

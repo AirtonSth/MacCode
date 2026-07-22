@@ -745,6 +745,12 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             reservedCostMicros: routingSnapshot.admissionSnapshot?.reservedCostMicros
         )
         let launch = routingSnapshot.launchConfigurations[admission.route.providerInstanceId]
+        // Display the user's words unchanged; wrap only the provider-bound prompt
+        // so Auto always enters $remote-code-orchestrate.
+        let displayPrompt = request.userMessageContent ?? request.prompt
+        let orchestratedPrompt = AgentOrchestrationRuntime.autoOrchestrateProviderPrompt(
+            userPrompt: request.prompt
+        )
         return AgentRunRequest(
             runId: request.runId,
             threadId: request.threadId,
@@ -752,8 +758,8 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             providerInstanceId: admission.route.providerInstanceId,
             model: admission.route.selection.effectiveModel,
             cwd: request.cwd,
-            prompt: request.prompt,
-            userMessageContent: request.userMessageContent,
+            prompt: orchestratedPrompt,
+            userMessageContent: displayPrompt,
             attachments: request.attachments,
             providerThreadId: request.providerThreadId,
             permissionMode: request.permissionMode,

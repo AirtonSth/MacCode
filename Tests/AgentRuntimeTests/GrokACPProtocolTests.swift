@@ -249,19 +249,21 @@ final class GrokACPProtocolTests: XCTestCase {
             "Grok ACP effective disk plus runtime context receives the safety ABI exactly once"
         )
 
-        let disabledRequest = AgentRunRequest(
+        // Managed Distill is always-on for Grok ACP turns (app-private skill).
+        let emptyEnvRequest = AgentRunRequest(
             threadId: AgentThreadID(),
             provider: .grok,
             model: "grok-4.5",
             cwd: "/tmp",
             prompt: "inspect"
         )
-        let disabledBlocks = try GrokACPClient.promptBlocks(
-            for: disabledRequest,
+        let emptyEnvBlocks = try GrokACPClient.promptBlocks(
+            for: emptyEnvRequest,
             capabilities: .init(protocolVersion: 1, loadSession: true, embeddedContext: true)
         )
-        let disabledPrompt = try XCTUnwrap(disabledBlocks.first?["text"] as? String)
-        XCTAssertFalse(disabledPrompt.contains(TokenSaverProviderSafetyABI.block))
+        let emptyEnvPrompt = try XCTUnwrap(emptyEnvBlocks.first?["text"] as? String)
+        XCTAssertTrue(emptyEnvPrompt.contains(TokenSaverProviderSafetyABI.block))
+        XCTAssertTrue(emptyEnvPrompt.contains("| distill"))
     }
 
     func test_mapperStreamsThoughtTextToolsPlanAndKeepsLastTextPhaseFinal() {

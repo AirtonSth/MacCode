@@ -154,7 +154,7 @@ public final class AgentSkillInstaller: @unchecked Sendable {
         skillID: "remote-code-orchestrate",
         sourceURL: "https://github.com/samuelfaj/sam-skills/tree/main/sam-orchestrate",
         sourceRevision: "2c77fa48431bc20e5dc841652079594a3ea918c9",
-        sourceTreeSHA256: "2e1467150cc26351ff9d61154150ae7f0047af4336444150a1f67a9c5f1579e9",
+        sourceTreeSHA256: "75be88b77153884356338c03577d3b2ac153debdbca9c673e0ee6d7b6b5138d3",
         localVersion: "1",
         allowedPaths: [
             "SKILL.md",
@@ -244,12 +244,71 @@ public final class AgentSkillInstaller: @unchecked Sendable {
             .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
+    /// Inject managed Distill into every provider runtime prompt (Claude / Codex / Grok).
+    /// Same app-private model as `remote-code-orchestrate`: no dependency on
+    /// `~/.claude/skills` or `~/.codex/skills`. The environment flag is ignored for
+    /// injection so every provider call carries Distill language + pipe rules.
     public static func tokenSaverProviderPrompt(_ base: String, environment: [String: String]) -> String {
-        guard environment["RC_TOKEN_SAVER_DISTILL_HINT"] == "1" else { return base }
+        _ = environment
+        return managedDistillProviderPrompt(base)
+    }
+
+    /// Always-on Distill injection used by all RemoteCode provider adapters.
+    public static func managedDistillProviderPrompt(_ base: String) -> String {
         let withDistill = base.contains(distillAgentInstructionsBody)
             ? base
             : base + "\n\n" + distillAgentInstructionsBody
         return TokenSaverProviderSafetyABI.appendingExactlyOnce(to: withDistill, enabled: true)
+    }
+
+    /// App-private Distill package directory (mirrors remote-code-orchestrate layout).
+    public func distillAppPrivateDirectory() -> URL {
+        appPrivateSkillsRoot.appendingPathComponent(Self.distillSkillID, isDirectory: true)
+    }
+
+    /// Install Distill into RemoteCode Application Support only — never into
+    /// `~/.claude/skills`, `~/.codex/skills`, or `~/.grok/skills`.
+    @discardableResult
+    public func installAppPrivateDistillSkill(
+        sourceRevision: String = "github-main-remote-code-template-v2",
+        installedAt: Date = Date()
+    ) throws -> AgentSkillInstallResult {
+        try fileManager.createDirectory(at: appPrivateSkillsRoot, withIntermediateDirectories: true)
+        let directory = distillAppPrivateDirectory()
+        try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
+        let skillURL = directory.appendingPathComponent("SKILL.md")
+        let manifestURL = directory.appendingPathComponent("manifest.json")
+        let data = Data(Self.distillSkillTemplate.utf8)
+        let checksum = Self.sha256Hex(data)
+        let manifest = AgentSkillManifest(
+            provider: .claude, // app-private; provider field is historical on the manifest
+            skillID: Self.distillSkillID,
+            sourceURL: Self.distillSourceURL,
+            sourceRevision: sourceRevision,
+            localVersion: Self.distillLocalVersion,
+            sha256: checksum,
+            installPath: skillURL.path,
+            installedAt: installedAt
+        )
+        if let existingData = try? Data(contentsOf: skillURL),
+           Self.sha256Hex(existingData) == checksum,
+           let manifestData = try? Data(contentsOf: manifestURL),
+           let existingManifest = try? decoder.decode(AgentSkillManifest.self, from: manifestData),
+           existingManifest.sourceRevision == sourceRevision,
+           existingManifest.localVersion == Self.distillLocalVersion {
+            return AgentSkillInstallResult(action: .skipped, manifest: existingManifest)
+        }
+        try data.write(to: skillURL, options: .atomic)
+        try encoder.encode(manifest).write(to: manifestURL, options: .atomic)
+        return AgentSkillInstallResult(action: .installed, manifest: manifest)
+    }
+
+    /// Remove legacy Distill copies that used to live in each provider's home skill tree.
+    public func uninstallLegacyProviderDistillSkills() throws {
+        for provider in AgentProvider.allCases {
+            _ = try uninstallDistillSkill(for: provider)
+            _ = try uninstallDistillInstructions(for: provider)
+        }
     }
 
     private let claudeSkillsRoot: URL
@@ -264,9 +323,9 @@ public final class AgentSkillInstaller: @unchecked Sendable {
     private let encoder = JSONEncoder()
     private let decoder = JSONDecoder()
 
-    /// Skills must live where each agent actually scans for them, not in RemoteCode's
-    /// private app-support: the Claude Agent SDK reads `~/.claude/skills` (via the
-    /// `user` setting source) and Codex reads `$CODEX_HOME/skills` (default `~/.codex/skills`).
+    /// Distill + remote-code-orchestrate are app-private under RemoteCode Application
+    /// Support and injected at runtime. Legacy provider-home skill roots are still
+    /// accepted for cleanup of older installs and tests.
     public init(
         claudeSkillsRoot: URL = AgentSkillInstaller.defaultClaudeSkillsRoot(),
         codexSkillsRoot: URL = AgentSkillInstaller.defaultCodexSkillsRoot(),
@@ -347,6 +406,9 @@ public final class AgentSkillInstaller: @unchecked Sendable {
         AgentOrchestrationRuntime.defaultPackageURL().deletingLastPathComponent()
     }
 
+    /// Legacy provider-home install path. Prefer `installAppPrivateDistillSkill`.
+    /// Kept for tests that exercise the old root; production reconcile no longer
+    /// writes into `~/.claude/skills` / `~/.codex/skills` / `~/.grok/skills`.
     public func installDistillSkill(
         for provider: AgentProvider,
         sourceRevision: String,

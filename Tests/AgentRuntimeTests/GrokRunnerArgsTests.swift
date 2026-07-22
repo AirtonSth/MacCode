@@ -40,9 +40,11 @@ final class GrokRunnerArgsTests: XCTestCase {
             "Grok headless effective disk plus runtime context receives the safety ABI exactly once"
         )
 
-        let disabledArgs = GrokRunner.buildArgs(req())
-        let disabledPrompt = disabledArgs[disabledArgs.index(after: disabledArgs.firstIndex(of: "-p")!)]
-        XCTAssertFalse(disabledPrompt.contains(TokenSaverProviderSafetyABI.block))
+        // Managed Distill is always-on (app-private skill), independent of the env hint.
+        let emptyEnvArgs = GrokRunner.buildArgs(req())
+        let emptyEnvPrompt = emptyEnvArgs[emptyEnvArgs.index(after: emptyEnvArgs.firstIndex(of: "-p")!)]
+        XCTAssertTrue(emptyEnvPrompt.contains(TokenSaverProviderSafetyABI.block))
+        XCTAssertTrue(emptyEnvPrompt.contains("| distill"))
     }
 
     func test_headlessStreamingJsonFlags() {

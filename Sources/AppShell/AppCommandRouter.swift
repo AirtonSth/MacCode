@@ -3867,23 +3867,21 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             }
         }
         // VITAL for the savings report: tag the agent's environment with the provider so the
-        // local `distill` CLI attributes Token Saver command-output savings to claude/codex
-        // instead of "unknown". This env flows into request.environment, which every adapter
-        // (streaming CLI, SDK-bridge tool-exec env, session) uses for the agent's bash tools
-        // that spawn `cmd | distill`. Set unconditionally — even with no instance config.
+        // local `distill` CLI attributes command-output savings to claude/codex/grok
+        // instead of "unknown". Set unconditionally — even with no instance config.
         env["REMOTE_CODE_AGENT_PROVIDER"] = provider.rawValue
+        // Managed distill CLI on PATH for every provider call (app-private skill model).
+        env["PATH"] = Self.providerPathWithManagedWrappers(
+            currentPath: env["PATH"] ?? ProcessInfo.processInfo.environment["PATH"] ?? "",
+            managedBin: AgentSkillInstaller.defaultManagedCLIBinDirectory().path
+        )
         if let context, let threadId {
-            // Token Saver env (distill hint + Claude-only PostToolUse state). Shared with the
-            // session-recovery path so a resumed run keeps piping/speaking distill; see
-            // AppContext.tokenSaverAgentEnvironment. Empty when Token Saver is off.
+            // Distill hint + Claude PostToolUse state; shared with session recovery.
             let tokenSaverEnv = context.tokenSaverAgentEnvironment(provider: provider, threadId: threadId)
             env.merge(tokenSaverEnv) { _, new in new }
-            if !tokenSaverEnv.isEmpty {
-                env["PATH"] = Self.providerPathWithManagedWrappers(
-                    currentPath: env["PATH"] ?? ProcessInfo.processInfo.environment["PATH"] ?? "",
-                    managedBin: AgentSkillInstaller.defaultManagedCLIBinDirectory().path
-                )
-            }
+        } else {
+            // No thread context: still enable always-on Distill prompt path.
+            env["RC_TOKEN_SAVER_DISTILL_HINT"] = "1"
         }
         return env
     }

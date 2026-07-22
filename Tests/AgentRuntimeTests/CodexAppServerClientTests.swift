@@ -444,10 +444,9 @@ final class CodexAppServerClientTests: ProviderProcessTestCase {
         defer { client.stop() }
         _ = try await client.initialize()
 
-        // WHY: Codex has no automatic tool-output compression (Claude-SDK-only). The Token Saver
-        // env hint (set by providerEnvironment when enabled) is the signal that makes Codex's
-        // per-turn developer_instructions instruct `| distill`; without it Codex never compresses
-        // command output, so Token Saver savings for Codex stay flat.
+        // WHY: Managed Distill is always-on for every Codex turn (app-private skill, same
+        // model as remote-code-orchestrate). developer_instructions always carry language
+        // + `| distill` pipe rules — no dependency on ~/.codex/skills or the Token Saver hint.
         let withHint = try await client.startTurn(
             providerThreadId: "thread-app-server-1",
             for: AgentRunRequest(
@@ -462,14 +461,12 @@ final class CodexAppServerClientTests: ProviderProcessTestCase {
         let hintInstructions = try XCTUnwrap(collaborationSettings(from: withHint)["developer_instructions"] as? String)
         XCTAssertTrue(
             hintInstructions.contains("| distill"),
-            "the Token Saver env hint must drive Codex developer_instructions to pipe `| distill`"
+            "Codex developer_instructions must always instruct `| distill`"
         )
-        // Parity with Claude's per-session systemPrompt: Codex must also receive the full distill
-        // LANGUAGE spec per turn, not just the pipe rule — otherwise it depends solely on the
-        // easily-buried ~/.codex/AGENTS.md to speak distill. "AR-0/AR-1" is unique to the full body.
+        // Parity with Claude's per-session systemPrompt: full distill LANGUAGE spec per turn.
         XCTAssertTrue(
             hintInstructions.contains("AR-0/AR-1"),
-            "Codex developer_instructions must carry the full distill language spec when Token Saver is on, not only the pipe rule"
+            "Codex developer_instructions must carry the full distill language spec, not only the pipe rule"
         )
         XCTAssertEqual(
             hintInstructions.components(separatedBy: TokenSaverProviderSafetyABI.block).count - 1,
@@ -483,8 +480,7 @@ final class CodexAppServerClientTests: ProviderProcessTestCase {
             "Codex effective disk plus runtime context receives the safety ABI exactly once"
         )
 
-        // No hint => Token Saver off => the managed distill CLI is uninstalled, so Codex must NOT
-        // be told to pipe through a binary that no longer exists.
+        // Empty env still gets always-on managed Distill.
         let withoutHint = try await client.startTurn(
             providerThreadId: "thread-app-server-1",
             for: AgentRunRequest(
@@ -495,14 +491,16 @@ final class CodexAppServerClientTests: ProviderProcessTestCase {
                 prompt: "explore"
             )
         )
-        XCTAssertFalse(
-            (try collaborationSettings(from: withoutHint)["developer_instructions"] as? String)?.contains("distill") == true,
-            "without the Token Saver hint Codex must not be instructed to pipe through the uninstalled distill CLI"
+        let emptyEnvInstructions = try XCTUnwrap(
+            try collaborationSettings(from: withoutHint)["developer_instructions"] as? String
         )
-        XCTAssertFalse(
-            (try collaborationSettings(from: withoutHint)["developer_instructions"] as? String)?
-                .contains(TokenSaverProviderSafetyABI.block) == true,
-            "Codex must not receive the Token Saver safety ABI when disabled"
+        XCTAssertTrue(
+            emptyEnvInstructions.contains("| distill"),
+            "empty env still injects managed Distill for every Codex call"
+        )
+        XCTAssertTrue(
+            emptyEnvInstructions.contains(TokenSaverProviderSafetyABI.block),
+            "always-on Distill carries the safety ABI"
         )
     }
 

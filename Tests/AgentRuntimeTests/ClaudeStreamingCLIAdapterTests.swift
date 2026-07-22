@@ -1029,38 +1029,36 @@ final class ClaudeStreamingCLIAdapterTests: ProviderProcessTestCase {
         XCTAssertTrue(on.contains("Background-await protocol"),
                       "the system prompt must always carry the background-await self-declaration rule")
         XCTAssertTrue(on.contains("pipe EVERY non-interactive"),
-                      "with Token Saver on, the system prompt must also carry the canonical `| distill` piping rule")
+                      "managed Distill is always-on; system prompt carries `| distill` piping rule")
         XCTAssertTrue(on.contains("S=state"),
                       "the system prompt must carry the distill-language prefixes so user-visible replies use distill language")
 
         let off = try await configureCommand(tokenSaverOn: false)
-        // UX-MAC_AGENT-BG-AWAIT: the background-await rule rides on EVERY run, so the
-        // SDK system prompt is now always present — but Token Saver's distill rules
-        // must still be gated out when the managed CLI is uninstalled.
+        // Distill is always-on (app-private managed skill), independent of the Token Saver hint.
         XCTAssertTrue(off.contains("\"system_prompt\""),
                       "the background-await rule must be sent even with Token Saver off")
         XCTAssertTrue(off.contains("Background-await protocol"),
                       "the background-await self-declaration rule must be present regardless of Token Saver")
-        XCTAssertFalse(off.contains("pipe EVERY non-interactive"),
-                       "no Token Saver hint (managed distill CLI uninstalled) must leave the distill rules out of the system prompt")
+        XCTAssertTrue(off.contains("pipe EVERY non-interactive"),
+                      "empty env still injects managed Distill for every Claude call")
     }
 
-    func test_claudeSystemPrompt_alwaysCarriesBackgroundAwaitRule_distillOnlyWithTokenSaver() {
+    func test_claudeSystemPrompt_alwaysCarriesBackgroundAwaitAndManagedDistill() {
         // Fast, direct contract for the SDK session system prompt (no bridge spawn):
-        // the background-await self-declaration rule rides on EVERY run so the agent
-        // can mark an unavoidable wait with the recovery marker; the distill rules are
-        // gated on Token Saver (the managed CLI exists) so they vanish when it is off.
-        let off = ClaudeAgentSDKBridgeAdapter.claudeSystemPrompt(environment: [:])
-        XCTAssertTrue(off.contains(BackgroundAwaitContinuation.awaitingMarker),
-                      "the background-await rule must be present even with Token Saver off")
-        XCTAssertFalse(off.contains("| distill"),
-                       "distill rules must be gated out when Token Saver is off")
+        // background-await + managed Distill ride on EVERY run (app-private skill model).
+        let emptyEnv = ClaudeAgentSDKBridgeAdapter.claudeSystemPrompt(environment: [:])
+        XCTAssertTrue(emptyEnv.contains(BackgroundAwaitContinuation.awaitingMarker),
+                      "the background-await rule must be present on every Claude call")
+        XCTAssertTrue(emptyEnv.contains("| distill"),
+                      "managed Distill is always injected, independent of Token Saver env hint")
+        XCTAssertTrue(emptyEnv.contains(TokenSaverProviderSafetyABI.block),
+                      "always-on Distill carries the safety ABI exactly once")
 
         let on = ClaudeAgentSDKBridgeAdapter.claudeSystemPrompt(environment: ["RC_TOKEN_SAVER_DISTILL_HINT": "1"])
         XCTAssertTrue(on.contains(BackgroundAwaitContinuation.awaitingMarker),
                       "the background-await rule must remain present with Token Saver on")
         XCTAssertTrue(on.contains("| distill"),
-                      "Token Saver on must also carry the distill piping rule")
+                      "Token Saver hint still carries the distill piping rule")
         XCTAssertEqual(on.components(separatedBy: TokenSaverProviderSafetyABI.block).count - 1, 1,
                        "Claude receives the versioned Token Saver safety ABI exactly once")
         XCTAssertEqual(
@@ -1069,8 +1067,7 @@ final class ClaudeStreamingCLIAdapterTests: ProviderProcessTestCase {
             1,
             "Claude SDK effective disk plus runtime context receives the safety ABI exactly once"
         )
-        XCTAssertFalse(off.contains(TokenSaverProviderSafetyABI.block),
-                       "Claude SDK must not receive the Token Saver safety ABI when disabled")
+        XCTAssertEqual(emptyEnv.components(separatedBy: TokenSaverProviderSafetyABI.block).count - 1, 1)
     }
 
     func test_agentSDKBridgeAdapterFinalizesAssistantTextWhenBridgeExitsWithoutResult() async throws {

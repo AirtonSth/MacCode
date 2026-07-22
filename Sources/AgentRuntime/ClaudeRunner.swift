@@ -121,11 +121,9 @@ public final class ClaudeRunner: AgentProviderRunner, @unchecked Sendable {
             }
         }
         // UX-MAC_AGENT-BG-AWAIT: always make the agent self-declare a background-await
-        // stall with `awaitingMarker` so the host recovers it regardless of phrasing
-        // (independent of Token Saver). Token Saver parity rides in the same flag: when
-        // the host signals Token Saver is on (and the managed `distill` CLI therefore
-        // exists), append the canonical distill instructions too. `--append-system-prompt`
-        // adds to the CLI's default prompt, so it stays additive.
+        // stall with `awaitingMarker` so the host recovers it regardless of phrasing.
+        // Managed Distill language + pipe rules are always injected (app-private skill).
+        // `--append-system-prompt` adds to the CLI's default prompt, so it stays additive.
         let appendedSystemPrompt = AgentSkillInstaller.tokenSaverProviderPrompt(
             BackgroundAwaitContinuation.systemPromptDirective,
             environment: request.environment

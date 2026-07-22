@@ -437,17 +437,16 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         logDiagnosticsHeartbeat(reason: "will_terminate")
         disableInsomniaForAppClose()
         // Always stop the Distill MLX server on quit — multi-GB model must not
-        // outlive RemoteCode. Skills/PATH symlink may still be retained when
-        // Token Saver stays enabled (shell `| distill` reinstalls on next launch).
+        // Distill is always-on app-private (like remote-code-orchestrate). On terminate
+        // we still scrub any legacy ~/.claude / ~/.codex skill copies and keep the
+        // managed CLI. The MLX Token Saver sidecar is stopped separately.
         stopTokenSaverDistillServiceForAppTermination()
         let tokenSaverEnabled = context.map { SettingsStore(db: $0.db).load().tokenSaverEnabled } ?? false
         if ProcessInfo.processInfo.environment["RC2_DISABLE_MANAGED_DISTILL_RECONCILE"] == "1" {
             appLifecycleLog.info("app.will_terminate distill_integration=unchanged isolated_process=true")
-        } else if tokenSaverEnabled {
-            appLifecycleLog.info("app.will_terminate distill_integration=skills_retained distill_server=stopped token_saver=enabled")
         } else {
-            appLifecycleLog.info("app.will_terminate distill_integration=removing token_saver=disabled")
-            context?.reconcileManagedDistillSkills(tokenSaverEnabled: false)
+            appLifecycleLog.info("app.will_terminate distill_integration=app_private_retained distill_server=stopped token_saver=\(tokenSaverEnabled ? "enabled" : "disabled")")
+            context?.reconcileManagedDistillSkills(tokenSaverEnabled: tokenSaverEnabled)
         }
         persistRestorableStateBeforeUpdate()
         stopPetController()

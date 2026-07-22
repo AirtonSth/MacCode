@@ -851,36 +851,124 @@ public final class AgentOrchestrationRuntime: @unchecked Sendable {
                 $0.modelDiscoverySource == .live &&
                 $0.capabilities?.supportsStreaming == true &&
                 !$0.models.isEmpty
-            }), let model = snapshot.models.first(where: {
-                $0.provider == provider && !$0.id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             }) else { continue }
 
-            let manual = configuration.manualSelection
-            let selectedModel = snapshot.models.first(where: {
-                $0.provider == provider && $0.id == manual.effectiveModel
-            }) ?? model
-            let effort: AgentReasoningEffort
-            if selectedModel.supportedReasoningEfforts.contains(manual.reasoningEffort) {
-                effort = manual.reasoningEffort
-            } else if selectedModel.supportedReasoningEfforts.contains(.high) {
-                effort = .high
-            } else {
-                effort = selectedModel.supportedReasoningEfforts.first ?? .medium
-            }
-            let tier = selectedModel.supportsServiceTier ? manual.serviceTier : .auto
+            // Auto always binds the host-matrix LIGHT row. Capability escalation
+            // (STANDARD/DEEP workers) is performed inside $remote-code-orchestrate
+            // — the controller run itself stays on LIGHT.
+            let selection = Self.lightControllerSelection(
+                provider: provider,
+                availableModels: snapshot.models
+            )
             return AgentOrchestrationRoute(
                 provider: provider,
                 providerInstanceId: snapshot.id,
                 capabilitySnapshotId: Self.capabilitySnapshotID(snapshot),
-                selection: AgentModelSelection(
-                    provider: provider,
-                    modelId: selectedModel.id,
-                    reasoningEffort: effort,
-                    serviceTier: tier
-                )
+                selection: selection
             )
         }
         throw AgentOrchestrationAdmissionError.noEligibleProvider
+    }
+
+    /// Skill name / package ID used for Auto invocation (`$remote-code-orchestrate`).
+    public static let orchestrateSkillInvocationName =
+        AgentSkillInstaller.remoteCodeOrchestratePinnedPackage.skillID
+
+    /// Prefix every Auto provider prompt so the controller always runs
+    /// `$remote-code-orchestrate`. Idempotent when already invoked.
+    public static func autoOrchestrateProviderPrompt(userPrompt: String) -> String {
+        let trimmed = userPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        if Self.promptAlreadyInvokesOrchestrateSkill(trimmed) {
+            return userPrompt
+        }
+        let skill = orchestrateSkillInvocationName
+        return """
+        $\(skill)
+
+        Auto is on. Run $\(skill) controller-only, token-efficient:
+        - Classify T0–T3 + certainty (absolute|high|medium|low); pick Micro/Single/Multi/Critical.
+        - Progressive disclosure: load only the skill sections needed for that mode.
+        - Controller stays LIGHT; escalate workers only after capability failure.
+        - Fan-out default 2 / hard cap 3; skip REVIEWER on micro absolute/high certainty when rules allow.
+        - Thin prompts (slice-only); cheap proof (scope diff + one focused command); lean table report.
+
+        User request:
+        \(userPrompt)
+        """
+    }
+
+    public static func promptAlreadyInvokesOrchestrateSkill(_ prompt: String) -> Bool {
+        let trimmed = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let first = trimmed.first, first == "$" || first == "/" else { return false }
+        let body = trimmed.dropFirst()
+        let token = body.split(whereSeparator: \.isWhitespace).first.map(String.init)?.lowercased() ?? ""
+        return token == orchestrateSkillInvocationName.lowercased()
+    }
+
+    /// LIGHT controller binding from `host-runtime-matrix.md`.
+    public static func lightControllerSelection(
+        provider: AgentProvider,
+        availableModels: [AgentModelDescriptor]
+    ) -> AgentModelSelection {
+        let binding = lightMatrixBinding(for: provider)
+        let providerModels = availableModels.filter { $0.provider == provider }
+        let selectedId: String
+        if let exact = binding.preferredModelIds.first(where: { preferred in
+            !preferred.isEmpty && providerModels.contains(where: { $0.id == preferred })
+        }) {
+            selectedId = exact
+        } else if let fuzzy = binding.preferredModelIds.first(where: { preferred in
+            guard !preferred.isEmpty else { return false }
+            let needle = preferred.lowercased()
+            return providerModels.contains {
+                let id = $0.id.lowercased()
+                return id == needle || id.hasPrefix(needle) || id.contains(needle)
+            }
+        }),
+           let match = providerModels.first(where: {
+               let id = $0.id.lowercased()
+               let needle = fuzzy.lowercased()
+               return id == needle || id.hasPrefix(needle) || id.contains(needle)
+           }) {
+            selectedId = match.id
+        } else {
+            // Force the matrix LIGHT id even when the live catalog omitted it so
+            // Auto never falls back to a DEEP/default model on the controller.
+            selectedId = binding.preferredModelIds.first(where: { !$0.isEmpty })
+                ?? providerModels.first(where: { !$0.id.isEmpty })?.id
+                ?? ""
+        }
+        let selectedDescriptor = providerModels.first { $0.id == selectedId }
+        let effort: AgentReasoningEffort
+        if let selectedDescriptor,
+           !selectedDescriptor.supportedReasoningEfforts.isEmpty,
+           !selectedDescriptor.supportedReasoningEfforts.contains(binding.effort) {
+            effort = selectedDescriptor.supportedReasoningEfforts.contains(.medium)
+                ? .medium
+                : (selectedDescriptor.supportedReasoningEfforts.first ?? binding.effort)
+        } else {
+            effort = binding.effort
+        }
+        return AgentModelSelection(
+            provider: provider,
+            modelId: selectedId,
+            reasoningEffort: effort,
+            serviceTier: .auto
+        )
+    }
+
+    /// Preferred model ids in matrix order, then fallbacks when a host catalog
+    /// renames aliases (e.g. dated Haiku ids).
+    public static func lightMatrixBinding(for provider: AgentProvider) -> (preferredModelIds: [String], effort: AgentReasoningEffort) {
+        switch provider {
+        case .codex:
+            return (["gpt-5.6-luna", "gpt-5.4-mini", "gpt-5.5"], .medium)
+        case .claude:
+            // host-runtime-matrix LIGHT: haiku / high
+            return (["haiku", "claude-haiku", "claude-3-5-haiku", "claude-haiku-4"], .high)
+        case .grok:
+            return (["grok-4.5"], .medium)
+        }
     }
 
     public static func defaultPackageURL() -> URL {

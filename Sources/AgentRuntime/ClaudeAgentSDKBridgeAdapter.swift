@@ -1662,12 +1662,10 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
     ///
     /// Always carries the background-await self-declaration rule
     /// (`BackgroundAwaitContinuation.systemPromptDirective`) so the agent marks any
-    /// unavoidable wait with the recovery marker independent of Token Saver. When
-    /// Token Saver is on (`RC_TOKEN_SAVER_DISTILL_HINT`, set by providerEnvironment
-    /// iff the managed `distill` CLI exists) it also carries the canonical distill
-    /// rules — the same visible behavior Codex gets via per-turn developer_instructions
-    /// and `~/.codex/AGENTS.md`. Fixed for the session's life (the SDK query is
-    /// long-lived); a mid-session Token Saver toggle takes effect on the next session.
+    /// unavoidable wait with the recovery marker. Always injects managed Distill
+    /// language + pipe rules (app-private skill; all Claude turns). Codex/Grok get
+    /// the same via per-turn developer_instructions / providerPrompt injection —
+    /// never via `~/.claude/skills` / `~/.codex/skills`.
     static func claudeSystemPrompt(environment: [String: String]) -> String {
         AgentSkillInstaller.tokenSaverProviderPrompt(
             BackgroundAwaitContinuation.systemPromptDirective,

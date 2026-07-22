@@ -54,34 +54,35 @@ final class ProviderEnvironmentAttributionTests: XCTestCase {
         )
     }
 
-    /// Codex (app-server) has no automatic tool-output compression hook, so it depends on its
-    /// per-turn developer_instructions to pipe `| distill`. providerEnvironment is the carrier:
-    /// it must emit RC_TOKEN_SAVER_DISTILL_HINT iff Token Saver is enabled (the managed distill
-    /// CLI is installed only then). With the hint absent the agent must never be told to pipe.
+    /// Distill is always-on for every provider call (app-private managed skill).
+    /// providerEnvironment must always carry the distill hint and Claude PostToolUse.
     @MainActor
-    func test_providerEnvironment_emitsDistillHint_onlyWhileTokenSaverEnabled() throws {
+    func test_providerEnvironment_alwaysEmitsDistillHintForAllProviders() throws {
         let appSupport = NSTemporaryDirectory() + "RC2ProvEnvHint-" + UUID().uuidString
         let ctx = try AppContext(channel: .debug, appSupportOverride: appSupport)
+        // Ensure managed distill reconcile succeeded so the hint is emitted.
+        ctx.reconcileManagedDistillSkills(tokenSaverEnabled: false)
         let router = AppCommandRouter(context: ctx)
         let codexThread = try admittedThread(in: ctx, provider: .codex)
         let claudeThread = try admittedThread(in: ctx, provider: .claude)
-
-        // Default off: no hint for either provider.
-        XCTAssertNil(router.providerEnvironment(provider: .codex, instanceId: nil, threadId: codexThread.id)["RC_TOKEN_SAVER_DISTILL_HINT"])
-        XCTAssertNil(router.providerEnvironment(provider: .claude, instanceId: nil, threadId: claudeThread.id)["RC_TOKEN_SAVER_DISTILL_HINT"])
-
-        SettingsStore(db: ctx.db).update { $0.tokenSaverEnabled = true }
+        let grokThread = try admittedThread(in: ctx, provider: .grok)
 
         XCTAssertEqual(
             router.providerEnvironment(provider: .codex, instanceId: nil, threadId: codexThread.id)["RC_TOKEN_SAVER_DISTILL_HINT"],
-            "1",
-            "Codex relies on this hint to enable `| distill` in its developer_instructions when Token Saver is on"
+            "1"
         )
-        // The merge must also carry Claude's PostToolUse compression env end-to-end.
+        XCTAssertEqual(
+            router.providerEnvironment(provider: .claude, instanceId: nil, threadId: claudeThread.id)["RC_TOKEN_SAVER_DISTILL_HINT"],
+            "1"
+        )
+        XCTAssertEqual(
+            router.providerEnvironment(provider: .grok, instanceId: nil, threadId: grokThread.id)["RC_TOKEN_SAVER_DISTILL_HINT"],
+            "1"
+        )
         XCTAssertEqual(
             router.providerEnvironment(provider: .claude, instanceId: nil, threadId: claudeThread.id)["RC_TOKEN_SAVER_POST_TOOL_USE"],
             "1",
-            "Claude's SDK-bridge PostToolUse compression hook is driven by this env from providerEnvironment"
+            "Claude's PostToolUse compression hook is always on with managed Distill"
         )
     }
 
@@ -98,9 +99,13 @@ final class ProviderEnvironmentAttributionTests: XCTestCase {
         let codexThread = try admittedThread(in: ctx, provider: .codex)
         let claudeThread = try admittedThread(in: ctx, provider: .claude)
 
-        // Off: empty for both providers (managed distill CLI is uninstalled).
-        XCTAssertTrue(ctx.tokenSaverAgentEnvironment(provider: .codex, threadId: codexThread.id).isEmpty)
-        XCTAssertTrue(ctx.tokenSaverAgentEnvironment(provider: .claude, threadId: claudeThread.id).isEmpty)
+        ctx.reconcileManagedDistillSkills(tokenSaverEnabled: false)
+
+        // Always-on Distill for every provider, even with Token Saver toggle off.
+        let codexOff = ctx.tokenSaverAgentEnvironment(provider: .codex, threadId: codexThread.id)
+        XCTAssertEqual(codexOff["RC_TOKEN_SAVER_DISTILL_HINT"], "1")
+        XCTAssertNil(codexOff["RC_TOKEN_SAVER_POST_TOOL_USE"],
+                     "PostToolUse auto-compression is Claude-SDK-only; Codex must not carry it")
 
         SettingsStore(db: ctx.db).update { $0.tokenSaverEnabled = true }
 
@@ -120,17 +125,15 @@ final class ProviderEnvironmentAttributionTests: XCTestCase {
     }
 
     /// Transparent command wrappers only help Codex/Claude provider shells if the managed bin
-    /// directory wins PATH lookup inside the provider process. The user's interactive shell may
-    /// still resolve Homebrew `rg`; providerEnvironment must make the provider shell resolve
-    /// `~/.remote-code/bin/rg` first when Token Saver is enabled.
+    /// directory wins PATH lookup inside the provider process. providerEnvironment always
+    /// prepends managed bin so `| distill` and wrappers resolve for every provider call.
     @MainActor
-    func test_providerEnvironmentPrependsManagedWrapperBinToProviderPathWhenTokenSaverEnabled() throws {
+    func test_providerEnvironmentPrependsManagedWrapperBinToProviderPath() throws {
         let appSupport = NSTemporaryDirectory() + "RC2TSEnvPath-" + UUID().uuidString
         let ctx = try AppContext(channel: .debug, appSupportOverride: appSupport)
         let router = AppCommandRouter(context: ctx)
         let codexThread = try admittedThread(in: ctx, provider: .codex)
         let claudeThread = try admittedThread(in: ctx, provider: .claude)
-        SettingsStore(db: ctx.db).update { $0.tokenSaverEnabled = true }
 
         let managedBin = AgentSkillInstaller.defaultManagedCLIBinDirectory().path
         let codexPath = try XCTUnwrap(router.providerEnvironment(provider: .codex, instanceId: nil, threadId: codexThread.id)["PATH"])

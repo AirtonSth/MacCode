@@ -383,9 +383,9 @@ public final class AppContext {
         if !AppContext.isRunningUnitTests || agentSkillsHomeOverrideForTesting != nil {
             reconcileRemoteCodeOrchestrate()
         }
-        // Managed Distill skills install into the real ~/.claude / ~/.codex skill dirs.
-        // Skip the open-trigger reconcile under XCTest so the suite never mutates the
-        // developer's real home; AppContext tests drive reconcile with a sandboxed home.
+        // Managed Distill is app-private (Application Support/AgentSkills/distill) and
+        // injected at runtime — never written into ~/.claude/skills or ~/.codex/skills.
+        // Skip open-trigger reconcile under XCTest unless a sandboxed home was injected.
         if AppContext.shouldReconcileManagedDistillIntegration(
             isRunningUnitTests: AppContext.isRunningUnitTests,
             hasSkillsHomeOverride: agentSkillsHomeOverrideForTesting != nil,
@@ -769,35 +769,18 @@ public final class AppContext {
             NSClassFromString("XCTestCase") != nil
     }
 
-    /// Token Saver environment vars for an agent run: the `| distill` hint (both providers) and
-    /// Claude's PostToolUse compression state path. Single source for both the normal run path
-    /// (`AppCommandRouter.providerEnvironment`) and the recovered-session path (the coordinator
-    /// rebuilds its own request env, bypassing providerEnvironment). Empty when Token Saver is off:
-    /// the managed `distill` CLI is uninstalled then, so a `cmd | distill` pipe would fail. The
-    /// pipe hint is also withheld when the managed CLI failed to install (F25) — same failure mode.
+    /// Distill + Token Saver environment for an agent run. Distill language and
+    /// `| distill` PATH are always-on for every provider (app-private skill model,
+    /// same idea as remote-code-orchestrate). Workspace attribution still requires
+    /// project admission when present. Single source for the normal run path and
+    /// recovered-session path.
     func tokenSaverAgentEnvironment(
         provider: AgentProvider,
         threadId: AgentThreadID,
         baseEnvironment: [String: String] = ProcessInfo.processInfo.environment
     ) -> [String: String] {
-        guard tokenSaverProjectAdmission(threadId: threadId, lane: "deterministic_wrapper").allowed,
-              let thread = try? threadRepo.get(id: threadId),
-              let workspaceID = thread.workspaceId?.value.uuidString,
-              let projectID = thread.projectId?.value.uuidString else {
-            return [:]
-        }
         var env: [String: String] = [:]
-        env["RC_TOKEN_SAVER_WORKSPACE_ID"] = workspaceID
-        env["RC_TOKEN_SAVER_PROJECT_ID"] = projectID
-        env["RC_TOKEN_SAVER_THREAD_ID"] = threadId.value.uuidString
-        // Signal the agent to pipe large command output through the managed `distill` CLI. Codex
-        // (app-server) reads this in its per-turn developer_instructions; the Claude SDK bridge
-        // reads it to inject the distill systemPrompt.
-        // F25: only when the managed CLI install actually succeeded — the toggle can be on while
-        // reconcileManagedDistillSkills failed (missing/unresolvable RemoteCodeDistillService), and
-        // the hint drives hard "pipe EVERY command through distill" instructions, so sending it
-        // without the binary makes every piped agent command fail with `command not found` (127).
-        // Reconcile runs at launch and on every toggle, so the error state is current here.
+        // Always expose managed distill CLI on PATH for every provider call.
         if managedDistillSkillInstallError == nil {
             env["RC_TOKEN_SAVER_DISTILL_HINT"] = "1"
             let managedBin = AgentSkillInstaller.defaultManagedCLIBinDirectory().path
@@ -805,9 +788,17 @@ public final class AppContext {
             let pathParts = currentPath.split(separator: ":").map(String.init).filter { $0 != managedBin }
             env["PATH"] = ([managedBin] + pathParts).joined(separator: ":")
         }
+        if tokenSaverProjectAdmission(threadId: threadId, lane: "deterministic_wrapper").allowed,
+           let thread = try? threadRepo.get(id: threadId),
+           let workspaceID = thread.workspaceId?.value.uuidString,
+           let projectID = thread.projectId?.value.uuidString {
+            env["RC_TOKEN_SAVER_WORKSPACE_ID"] = workspaceID
+            env["RC_TOKEN_SAVER_PROJECT_ID"] = projectID
+            env["RC_TOKEN_SAVER_THREAD_ID"] = threadId.value.uuidString
+        }
         if provider == .claude {
-            // Claude additionally auto-compresses tool output via the SDK-bridge PostToolUse hook,
-            // which talks straight to the sidecar over HTTP using this state file.
+            // Claude PostToolUse compression hook (sidecar HTTP). Always on when
+            // managed distill installed so all Claude calls speak/compress distill.
             env["RC_TOKEN_SAVER_POST_TOOL_USE"] = "1"
             env["REMOTE_CODE_DISTILL_STATE_PATH"] = appSupportDirectory
                 .appendingPathComponent("Distill", isDirectory: true)
@@ -833,45 +824,28 @@ public final class AppContext {
         return status
     }
 
+    /// Install Distill like `remote-code-orchestrate`: app-private under RemoteCode
+    /// Application Support, never into `~/.claude/skills` / `~/.codex/skills` /
+    /// `~/.grok/skills`. Always available for every provider call; Token Saver
+    /// still owns the MLX sidecar separately.
     public func reconcileManagedDistillSkills(tokenSaverEnabled: Bool) {
         let installer = makeAgentSkillInstaller()
         do {
-            if tokenSaverEnabled {
-                let codex = try installer.installDistillSkill(
-                    for: .codex,
-                    sourceRevision: "github-main-remote-code-template-v2"
-                )
-                let claude = try installer.installDistillSkill(
-                    for: .claude,
-                    sourceRevision: "github-main-remote-code-template-v2"
-                )
-                let grok = try installer.installDistillSkill(
-                    for: .grok,
-                    sourceRevision: "github-main-remote-code-template-v2"
-                )
-                // Provider instructions are injected per admitted thread at runtime.
-                // Remove legacy global blocks so off/unscoped projects stay byte-identical.
-                _ = try installer.uninstallDistillInstructions(for: .codex)
-                _ = try installer.uninstallDistillInstructions(for: .claude)
-                _ = try installer.uninstallDistillInstructions(for: .grok)
-                _ = try installer.installDistillCLI(appSupportDirectory: appSupportDirectory)
-                try? installer.installCommandWrappers() // RTK transparent wrappers (best-effort; needs the bundled binary)
-                try? installer.installRetrieveMCP() // Token Saver MCP tools (best-effort; needs the bundled binary)
-                managedDistillSkillInstallResults = [codex, claude, grok]
-                managedDistillSkillInstallError = nil
-            } else {
-                _ = try installer.uninstallDistillSkill(for: .codex)
-                _ = try installer.uninstallDistillSkill(for: .claude)
-                _ = try installer.uninstallDistillSkill(for: .grok)
-                _ = try installer.uninstallDistillInstructions(for: .codex)
-                _ = try installer.uninstallDistillInstructions(for: .claude)
-                _ = try installer.uninstallDistillInstructions(for: .grok)
-                _ = try installer.uninstallDistillCLI()
-                _ = try? installer.uninstallCommandWrappers()
-                try? installer.uninstallRetrieveMCP()
-                managedDistillSkillInstallResults = []
-                managedDistillSkillInstallError = nil
-            }
+            // 1) App-private package (source of truth for the managed skill body).
+            let appPrivate = try installer.installAppPrivateDistillSkill(
+                sourceRevision: "github-main-remote-code-template-v2"
+            )
+            // 2) Remove any legacy per-provider home skill / AGENTS.md blocks.
+            try installer.uninstallLegacyProviderDistillSkills()
+            // 3) Keep the managed `distill` CLI on PATH so all-call instructions
+            // that require `| distill` resolve for every provider.
+            _ = try installer.installDistillCLI(appSupportDirectory: appSupportDirectory)
+            try? installer.installCommandWrappers()
+            try? installer.installRetrieveMCP()
+            managedDistillSkillInstallResults = [appPrivate]
+            managedDistillSkillInstallError = nil
+            // Token Saver toggle no longer installs/uninstalls home skills.
+            _ = tokenSaverEnabled
         } catch {
             NSLog("RemoteCode managed Distill skill reconcile failed: \(error)")
             managedDistillSkillInstallResults = []
@@ -880,8 +854,22 @@ public final class AppContext {
     }
 
     private func makeAgentSkillInstaller() -> AgentSkillInstaller {
-        agentSkillsHomeOverrideForTesting.map { AgentSkillInstaller(homeDirectory: $0) }
-            ?? AgentSkillInstaller()
+        // App-private Distill + remote-code-orchestrate live under the same skills root.
+        // Production uses the default Application Support path; unit tests with a
+        // sandboxed home keep app-private packages under this AppContext's
+        // appSupportDirectory so they never write into the developer's real tree.
+        if let home = agentSkillsHomeOverrideForTesting {
+            return AgentSkillInstaller(
+                claudeSkillsRoot: home.appendingPathComponent(".claude/skills", isDirectory: true),
+                codexSkillsRoot: home.appendingPathComponent(".codex/skills", isDirectory: true),
+                claudeInstructionsURL: home.appendingPathComponent(".claude/CLAUDE.md"),
+                codexInstructionsURL: home.appendingPathComponent(".codex/AGENTS.md"),
+                cliBinDirectory: home.appendingPathComponent(".remote-code/bin", isDirectory: true),
+                pathBinDirectory: home.appendingPathComponent(".local/bin", isDirectory: true),
+                appPrivateSkillsRoot: appSupportDirectory.appendingPathComponent("AgentSkills", isDirectory: true)
+            )
+        }
+        return AgentSkillInstaller()
     }
 
     nonisolated static func shouldReconcileManagedDistillIntegration(

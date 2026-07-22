@@ -152,15 +152,23 @@ final class AgentAutoRunCoordinatorTests: XCTestCase {
         XCTAssertEqual(admittedRequest.threadId, thread.id)
         XCTAssertEqual(admittedRequest.provider, .codex)
         XCTAssertEqual(admittedRequest.providerInstanceId, "codex-live")
-        XCTAssertEqual(admittedRequest.model, "gpt-5.6-sol")
-        XCTAssertEqual(admittedRequest.reasoningEffort, .high)
-        XCTAssertEqual(admittedRequest.serviceTier, .fast)
+        // Auto controller is always LIGHT (Codex matrix: gpt-5.6-luna / medium).
+        XCTAssertEqual(admittedRequest.model, "gpt-5.6-luna")
+        XCTAssertEqual(admittedRequest.reasoningEffort, .medium)
+        XCTAssertEqual(admittedRequest.serviceTier, .auto)
+        XCTAssertEqual(admittedRequest.userMessageContent, "route this run",
+                       "user-visible transcript keeps the original message")
+        XCTAssertTrue(
+            AgentOrchestrationRuntime.promptAlreadyInvokesOrchestrateSkill(admittedRequest.prompt),
+            "Auto must always invoke $remote-code-orchestrate"
+        )
+        XCTAssertTrue(admittedRequest.prompt.contains("route this run"))
         let receipt = try XCTUnwrap(receiptRepo.receipts().first)
         XCTAssertEqual(try receiptRepo.receipts().count, 1)
         XCTAssertEqual(receipt.runId, runId)
         XCTAssertEqual(receipt.threadId, thread.id)
         XCTAssertEqual(receipt.provider, .codex)
-        XCTAssertEqual(receipt.model, "gpt-5.6-sol")
+        XCTAssertEqual(receipt.model, "gpt-5.6-luna")
     }
 
     func testImmutableRoutingSnapshotPreventsTOCTOUAndUsesAdmittedProviderLaunchEnvironment() async throws {

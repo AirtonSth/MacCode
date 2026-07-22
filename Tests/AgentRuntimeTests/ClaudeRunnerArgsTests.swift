@@ -77,11 +77,8 @@ final class ClaudeRunnerArgsTests: XCTestCase {
                      "resumed Claude streaming sessions must not also request a new session id")
     }
 
-    func test_streamingAlwaysAppendsBackgroundAwaitDirective_andDistillOnlyWithTokenSaver() {
-        // UX-MAC_AGENT-BG-AWAIT: the background-await self-declaration rule must ride
-        // in the system prompt on EVERY Claude run (independent of Token Saver) so the
-        // agent marks any unavoidable wait with the recovery marker. Token Saver's
-        // distill rules ride in the SAME `--append-system-prompt` value when on.
+    func test_streamingAlwaysAppendsBackgroundAwaitAndManagedDistill() {
+        // Background-await + managed Distill ride on EVERY Claude run (app-private skill).
         let on = AgentRunRequest(threadId: AgentThreadID(), provider: .claude,
                                  model: "claude-opus-4-7", cwd: "/tmp", prompt: "hi",
                                  environment: ["RC_TOKEN_SAVER_DISTILL_HINT": "1"])
@@ -93,7 +90,7 @@ final class ClaudeRunnerArgsTests: XCTestCase {
         XCTAssertTrue(promptOn.contains(BackgroundAwaitContinuation.awaitingMarker),
                       "appended system prompt must instruct the agent to self-declare a stall with the recovery marker")
         XCTAssertTrue(promptOn.contains("| distill"),
-                      "with Token Saver on, the same appended prompt must also carry the `| distill` piping rule")
+                      "managed Distill always injects the `| distill` piping rule")
         XCTAssertEqual(promptOn.components(separatedBy: TokenSaverProviderSafetyABI.block).count - 1, 1,
                        "Claude CLI runtime context must carry the safety ABI exactly once without disk instructions")
         XCTAssertEqual(
@@ -103,19 +100,19 @@ final class ClaudeRunnerArgsTests: XCTestCase {
             "Claude CLI effective disk plus runtime context must carry the safety ABI exactly once"
         )
 
-        let off = AgentRunRequest(threadId: AgentThreadID(), provider: .claude,
+        let emptyEnv = AgentRunRequest(threadId: AgentThreadID(), provider: .claude,
                                   model: "claude-opus-4-7", cwd: "/tmp", prompt: "hi")
-        let aOff = ClaudeRunner.buildStreamingArgs(off)
-        guard let idxOff = aOff.firstIndex(of: "--append-system-prompt") else {
-            return XCTFail("even with Token Saver off, the background-await rule must still be appended")
+        let aEmpty = ClaudeRunner.buildStreamingArgs(emptyEnv)
+        guard let idxEmpty = aEmpty.firstIndex(of: "--append-system-prompt") else {
+            return XCTFail("system prompt must always be appended")
         }
-        let promptOff = aOff[aOff.index(after: idxOff)]
-        XCTAssertTrue(promptOff.contains(BackgroundAwaitContinuation.awaitingMarker),
-                      "the background-await rule must be present regardless of Token Saver")
-        XCTAssertFalse(promptOff.contains("| distill"),
-                       "with Token Saver off (CLI uninstalled) the distill rules must NOT be appended")
-        XCTAssertFalse(promptOff.contains(TokenSaverProviderSafetyABI.block),
-                       "Claude CLI must not receive the Token Saver safety ABI when disabled")
+        let promptEmpty = aEmpty[aEmpty.index(after: idxEmpty)]
+        XCTAssertTrue(promptEmpty.contains(BackgroundAwaitContinuation.awaitingMarker),
+                      "the background-await rule must be present on every Claude call")
+        XCTAssertTrue(promptEmpty.contains("| distill"),
+                      "empty env still injects managed Distill for every Claude call")
+        XCTAssertTrue(promptEmpty.contains(TokenSaverProviderSafetyABI.block),
+                      "always-on Distill carries the safety ABI")
     }
 
     func test_modelAndPromptPlacement() {

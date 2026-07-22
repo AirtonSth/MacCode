@@ -259,6 +259,37 @@ final class TokenSaverInstallTests: XCTestCase {
         XCTAssertTrue(AgentSkillInstaller.distillSkillTemplate.contains("git diff | distill"))
     }
 
+    func test_installAppPrivateDistillSkillNeverTouchesProviderHomes() throws {
+        let home = tempDir()
+        let appPrivateRoot = tempDir().appendingPathComponent("AgentSkills", isDirectory: true)
+        let installer = AgentSkillInstaller(
+            claudeSkillsRoot: home.appendingPathComponent(".claude/skills", isDirectory: true),
+            codexSkillsRoot: home.appendingPathComponent(".codex/skills", isDirectory: true),
+            claudeInstructionsURL: home.appendingPathComponent(".claude/CLAUDE.md"),
+            codexInstructionsURL: home.appendingPathComponent(".codex/AGENTS.md"),
+            cliBinDirectory: home.appendingPathComponent(".remote-code/bin", isDirectory: true),
+            pathBinDirectory: home.appendingPathComponent(".local/bin", isDirectory: true),
+            appPrivateSkillsRoot: appPrivateRoot
+        )
+
+        let first = try installer.installAppPrivateDistillSkill(sourceRevision: "rev-app-private")
+        let second = try installer.installAppPrivateDistillSkill(sourceRevision: "rev-app-private")
+        XCTAssertEqual(first.action, .installed)
+        XCTAssertEqual(second.action, .skipped)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: appPrivateRoot.appendingPathComponent("distill/SKILL.md").path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: home.appendingPathComponent(".claude/skills/distill/SKILL.md").path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: home.appendingPathComponent(".codex/skills/distill/SKILL.md").path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: home.appendingPathComponent(".grok/skills/distill/SKILL.md").path))
+
+        // Seed a legacy home install, then scrub it.
+        _ = try installer.installDistillSkill(for: .claude, sourceRevision: "legacy")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: home.appendingPathComponent(".claude/skills/distill/SKILL.md").path))
+        try installer.uninstallLegacyProviderDistillSkills()
+        XCTAssertFalse(FileManager.default.fileExists(atPath: home.appendingPathComponent(".claude/skills/distill/SKILL.md").path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: appPrivateRoot.appendingPathComponent("distill/SKILL.md").path),
+                      "legacy scrub must not remove the app-private package")
+    }
+
     func test_runtimePromptIsSoleSafetyABIOwnerWithOrWithoutInstalledInstructions() {
         let enabledEnvironment = ["RC_TOKEN_SAVER_DISTILL_HINT": "1"]
         let runtimePrompt = AgentSkillInstaller.tokenSaverProviderPrompt(
@@ -281,15 +312,15 @@ final class TokenSaverInstallTests: XCTestCase {
         XCTAssertEqual(alreadyOwnedRuntime.components(separatedBy: TokenSaverProviderSafetyABI.block).count - 1, 1,
                        "runtime injection must preserve exactly one ABI when the base already carries it")
 
-        let disabledRuntime = AgentSkillInstaller.tokenSaverProviderPrompt(
+        // Distill is always-on for every provider call (app-private managed skill).
+        let alwaysOnRuntime = AgentSkillInstaller.tokenSaverProviderPrompt(
             "provider runtime context",
             environment: [:]
         )
-        let disabledCombined = AgentSkillInstaller.distillAgentInstructionsTemplate
-            + "\n\n"
-            + disabledRuntime
-        XCTAssertFalse(disabledCombined.contains(TokenSaverProviderSafetyABI.block),
-                       "disabled Token Saver must not inject the ABI through disk or runtime context")
+        XCTAssertTrue(alwaysOnRuntime.contains(AgentSkillInstaller.distillAgentInstructionsBody),
+                      "empty env must still inject managed Distill for all provider calls")
+        XCTAssertTrue(alwaysOnRuntime.contains(TokenSaverProviderSafetyABI.block),
+                      "managed Distill always carries the safety ABI exactly once")
     }
 
     func test_runtimePromptNormalizesAdversarialSafetyABIForClaudeCodexAndGrok() {

@@ -46,7 +46,13 @@ final class AgentOrchestrationRuntimeTests: XCTestCase {
 
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("rc-orchestration-package-\(UUID().uuidString)", isDirectory: true)
-        defer { try? FileManager.default.removeItem(at: root) }
+        defer {
+            // Best-effort only: the package may already be gone if a prior step
+            // deleted the temp tree; never fail the test on cleanup.
+            if FileManager.default.fileExists(atPath: root.path) {
+                try? FileManager.default.removeItem(at: root)
+            }
+        }
         let skillsRoot = root.appendingPathComponent("AgentSkills", isDirectory: true)
         let installer = AgentSkillInstaller(appPrivateSkillsRoot: skillsRoot)
         let source = URL(fileURLWithPath: #filePath)
@@ -134,7 +140,9 @@ final class AgentOrchestrationRuntimeTests: XCTestCase {
         )
 
         XCTAssertEqual(admission.route.provider, .claude)
-        XCTAssertEqual(admission.route.selection.modelId, "claude-live")
+        // Auto controller always binds LIGHT (Haiku), not the manual selection.
+        XCTAssertEqual(admission.route.selection.modelId, "haiku")
+        XCTAssertEqual(admission.route.selection.reasoningEffort, .high)
         XCTAssertEqual(admission.receipt.routingRevision, 3)
         XCTAssertEqual(admission.receipt.runId, runId)
         XCTAssertEqual(admission.receipt.nodeId, "root")
@@ -480,5 +488,59 @@ final class AgentOrchestrationRuntimeTests: XCTestCase {
             configuration: configuration(runtime: runtime),
             providerSnapshots: snapshots(source: .builtInFallback)
         )) { XCTAssertEqual($0 as? AgentOrchestrationAdmissionError, .noEligibleProvider) }
+    }
+
+    func test_autoLightControllerSelectionUsesHostMatrixNotManualSelection() {
+        let claude = AgentOrchestrationRuntime.lightControllerSelection(
+            provider: .claude,
+            availableModels: [
+                AgentModelDescriptor(id: "claude-live", label: "Live", provider: .claude, supportsReasoning: true),
+                AgentModelDescriptor(id: "haiku", label: "Haiku", provider: .claude, supportsReasoning: true,
+                                     supportedReasoningEfforts: [.low, .medium, .high])
+            ]
+        )
+        XCTAssertEqual(claude.modelId, "haiku")
+        XCTAssertEqual(claude.reasoningEffort, .high)
+
+        let codex = AgentOrchestrationRuntime.lightControllerSelection(
+            provider: .codex,
+            availableModels: [
+                AgentModelDescriptor(id: "gpt-5.6-sol", label: "Sol", provider: .codex, supportsReasoning: true)
+            ]
+        )
+        XCTAssertEqual(codex.modelId, "gpt-5.6-luna",
+                       "LIGHT matrix id is forced even when the live catalog only lists DEEP models")
+        XCTAssertEqual(codex.reasoningEffort, .medium)
+
+        let grok = AgentOrchestrationRuntime.lightControllerSelection(
+            provider: .grok,
+            availableModels: [
+                AgentModelDescriptor(id: "grok-4.5", label: "Grok 4.5", provider: .grok, supportsReasoning: true,
+                                     supportedReasoningEfforts: [.medium, .high])
+            ]
+        )
+        XCTAssertEqual(grok.modelId, "grok-4.5")
+        XCTAssertEqual(grok.reasoningEffort, .medium)
+    }
+
+    func test_autoOrchestrateProviderPromptAlwaysInvokesSkill() {
+        let wrapped = AgentOrchestrationRuntime.autoOrchestrateProviderPrompt(userPrompt: "fix the bug")
+        XCTAssertTrue(wrapped.hasPrefix("$remote-code-orchestrate"))
+        XCTAssertTrue(wrapped.contains("fix the bug"))
+        XCTAssertTrue(AgentOrchestrationRuntime.promptAlreadyInvokesOrchestrateSkill(wrapped))
+
+        let already = "$remote-code-orchestrate\n\ndo the thing"
+        XCTAssertEqual(
+            AgentOrchestrationRuntime.autoOrchestrateProviderPrompt(userPrompt: already),
+            already,
+            "wrapping must be idempotent"
+        )
+        XCTAssertTrue(
+            AgentOrchestrationRuntime.promptAlreadyInvokesOrchestrateSkill("$remote-code-orchestrate please")
+        )
+        XCTAssertFalse(
+            AgentOrchestrationRuntime.promptAlreadyInvokesOrchestrateSkill("$sam-orchestrate please"),
+            "legacy sam-orchestrate is not the Auto skill name"
+        )
     }
 }
