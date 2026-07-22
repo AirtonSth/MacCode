@@ -316,6 +316,11 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// The UI holds only a bounded recent message page. Older durable messages
     /// remain in SQLite and are intentionally outside the hot screen-memory set.
     @Published public private(set) var messageHistoryIsPartial = false
+    /// After the user sends a follow-up (including a queued one), ignore
+    /// `activePlanUpdated` events from the prior turn so the stale checklist
+    /// cannot reappear under the new user bubble. Cleared when the next run
+    /// actually starts and may publish a fresh plan.
+    private var suppressStaleActivePlanUpdates = false
 
     public let workspaceID: WorkspaceID
     public let cwd: String
@@ -749,6 +754,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             // from the opened thread's replayed timeline.
             sr1TranslatedMessageIds = []
             sr1OriginalTextsByMessageId = [:]
+            // Plan-suppression is per open thread session: do not carry a queued
+            // follow-up suppress flag onto a different thread's durable plan.
+            suppressStaleActivePlanUpdates = false
         } else {
             selectedThreadId = id
             publishInterestedThreadId(id)
@@ -832,6 +840,11 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         timeline.enforceAggregateHotTextBudget()
         lastErrorRecoverable = Self.displayedErrorIsRecoverable(in: persistedReplay)
         rehydrateDurableActiveState(threadId: id)
+        // A pending follow-up means the user already superseded the prior Active
+        // plan; keep it cleared across select/reopen until the next run starts.
+        // Also re-mirror queued text into the transcript so the bubble survives
+        // a thread switch (messages were reloaded from durable storage only).
+        restoreQueuedFollowupTranscriptPresentation(threadId: id)
         refreshSR1TranslationStateFromTimeline(preservingExisting: true)
         // PERF: rebuild the O(1) item index once over the fully-replayed timeline so
         // subsequent item-location lookups skip the O(turns x items) linear scan.
@@ -860,6 +873,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 }
                 self.timeline.enforceAggregateHotTextBudget()
                 self.rehydrateDurableActiveState(threadId: id)
+                self.restoreQueuedFollowupTranscriptPresentation(threadId: id)
                 self.lastErrorRecoverable = Self.displayedErrorIsRecoverable(in: replayEvents)
                 self.refreshSR1TranslationStateFromTimeline(preservingExisting: true)
                 self.timelineItemIndex = TimelineItemIndex(turns: self.timeline.turns)
@@ -952,6 +966,15 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 queueStatusMessage = nil
                 self.editingQueuedMessage = nil
                 queuedMessageDraft = ""
+                let display = updated.attachments.isEmpty ? updated.text
+                    : updated.text + "\n\n📎 " + updated.attachments.map(\.displayName).joined(separator: ", ")
+                presentOutgoingUserMessage(
+                    threadId: updated.threadId,
+                    messageId: AgentMessageID(updated.id.value),
+                    display: display,
+                    attachments: updated.attachments,
+                    bumpFocus: false
+                )
                 reloadQueuedMessages()
                 onQueuedMessageEvent?(AgentQueueEventKinds.updated, updated)
             } else {
@@ -1112,6 +1135,18 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 if editingQueuedMessage?.id == message.id {
                     editingQueuedMessage = nil
                     queuedMessageDraft = ""
+                }
+                // Optimistic bubble id == queued id; remove only if not yet
+                // durable under that same id (drain/start persist uses it).
+                let mirrorId = AgentMessageID(cancelled.id.value)
+                if (try? messageRepo.get(id: mirrorId)) == nil,
+                   let idx = messages.firstIndex(where: { $0.id == mirrorId }) {
+                    messages.remove(at: idx)
+                }
+                if queuedMessages.count <= 1 {
+                    // Last queued follow-up cancelled: allow plan events again
+                    // for the still-running turn (if any).
+                    suppressStaleActivePlanUpdates = false
                 }
                 reloadQueuedMessages()
                 onQueuedMessageEvent?(AgentQueueEventKinds.cancelled, cancelled)
@@ -1380,6 +1415,8 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     }
 
     private func rehydrateDurableActiveState(threadId: AgentThreadID) {
+        // A user send superseded the prior plan until the next run starts.
+        guard !suppressStaleActivePlanUpdates else { return }
         guard let state = coordinator.durableActiveThreadState(threadId: threadId),
               let activePlan = state.activePlan else { return }
         timeline.apply(.activePlanUpdated(activePlan))
@@ -1394,8 +1431,14 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         // keyset/row/byte bounded: opening a multi-year thread no longer scans every
         // historical shell or hydrates an unbounded array on MainActor.
         messageHistoryLoadTask?.cancel()
-        messages = []
-        messageHistoryIsPartial = false
+        // Same-thread reloads must NOT wipe the visible array first. A concurrent
+        // finish/select reload used to set messages=[] and drop the optimistic
+        // user-message mirror (and system notes) before the durable row existed.
+        // Only clear when switching threads so the prior thread's rows do not flash.
+        if messages.contains(where: { $0.threadId != id }) {
+            messages = []
+            messageHistoryIsPartial = false
+        }
         let repository = messageRepo
         messageHistoryLoadTask = Task { @MainActor [weak self] in
             let loaded = await Self.loadMessagePageOffMain(repository: repository, threadId: id)
@@ -1404,21 +1447,94 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             let loadedRows = loaded?.rows ?? []
             // Rows appended in-memory while the page was being read (system
             // notes, the send() user-message mirror) must survive the swap —
-            // the page snapshot predates them. Content-level dedupe keeps the
-            // user-message mirror from doubling once its durable copy (written
-            // under the run id) is in the page.
-            let appendedWhileLoading = self.messages.filter { candidate in
-                candidate.threadId == id
-                    && !loadedRows.contains {
-                        $0.id == candidate.id
-                            || ($0.role == candidate.role && $0.content == candidate.content)
-                    }
-            }
-            self.messages = loadedRows + appendedWhileLoading
+            // the page snapshot predates them. Optimistic mirrors share the
+            // durable id, so id-merge collapses once the run/queue row lands.
+            self.messages = Self.mergeLoadedMessagesWithInMemoryMirrors(
+                loadedRows: loadedRows,
+                inMemory: self.messages,
+                threadId: id
+            )
             self.messageHistoryIsPartial = loaded?.hasMoreOlder ?? false
+            // Queue rows may not be in the durable message page yet — restore
+            // their transcript presentation after the merge.
+            self.restoreQueuedFollowupTranscriptPresentation(threadId: id)
             if self.messageHistoryIsPartial {
                 NSLog("[AgentApp] recent message page loaded: \(self.messages.count) rows; older durable messages remain outside the hot UI window")
             }
+        }
+    }
+
+    /// Pure merge used by load completion and tests: durable page first, then any
+    /// same-thread in-memory rows whose id is not already in the page.
+    /// Optimistic queue/start mirrors use the durable run/queue UUID so drain
+    /// and coordinator persist collapse to one row by id (not by content — two
+    /// legitimate identical prompts must remain two bubbles).
+    nonisolated static func mergeLoadedMessagesWithInMemoryMirrors(
+        loadedRows: [AgentMessage],
+        inMemory: [AgentMessage],
+        threadId: AgentThreadID
+    ) -> [AgentMessage] {
+        let loadedIds = Set(loadedRows.map(\.id))
+        let mirrors = inMemory.filter { candidate in
+            candidate.threadId == threadId && !loadedIds.contains(candidate.id)
+        }
+        return loadedRows + mirrors
+    }
+
+    /// Shared UX for every user send path (immediate start and mid-run queue):
+    /// show the bubble now, drop the previous turn's Active plan, and re-pin
+    /// the transcript to the bottom. `messageId` must be the durable identity
+    /// (`AgentMessageID(runId)` / `AgentMessageID(queued.id)`) so later persist
+    /// and drain do not double the bubble.
+    private func presentOutgoingUserMessage(
+        threadId: AgentThreadID,
+        messageId: AgentMessageID,
+        display: String,
+        attachments: [AgentAttachment],
+        bumpFocus: Bool = true
+    ) {
+        let capped = AssistantTimelineState.cappedText(display)
+        timeline.clearActivePlan()
+        suppressStaleActivePlanUpdates = true
+        resetTimelineUpdateTick()
+        if let idx = messages.firstIndex(where: { $0.id == messageId }) {
+            // Queue edit / re-present: refresh content under the stable id.
+            messages[idx] = AgentMessage(
+                id: messageId,
+                threadId: threadId,
+                role: .user,
+                content: capped,
+                createdAt: messages[idx].createdAt,
+                attachments: attachments
+            )
+        } else {
+            messages.append(AgentMessage(
+                id: messageId,
+                threadId: threadId,
+                role: .user,
+                content: capped,
+                attachments: attachments
+            ))
+            if bumpFocus { focusTick &+= 1 }
+        }
+    }
+
+    /// After a durable message-page load / timeline rehydrate, re-apply the
+    /// user-visible contract for pending queue rows: bubble + cleared plan.
+    private func restoreQueuedFollowupTranscriptPresentation(threadId: AgentThreadID) {
+        guard !queuedMessages.isEmpty else { return }
+        suppressStaleActivePlanUpdates = true
+        timeline.clearActivePlan()
+        for queued in queuedMessages where queued.threadId == threadId {
+            let display = queued.attachments.isEmpty ? queued.text
+                : queued.text + "\n\n📎 " + queued.attachments.map(\.displayName).joined(separator: ", ")
+            presentOutgoingUserMessage(
+                threadId: threadId,
+                messageId: AgentMessageID(queued.id.value),
+                display: display,
+                attachments: queued.attachments,
+                bumpFocus: false
+            )
         }
     }
 
@@ -3818,6 +3934,18 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 interactionMode: mode,
                 queuedRoutingSnapshot: AgentQueuedMessageRoutingSnapshot(configuration: routing)
             )
+            let display = attached.isEmpty ? text
+                : text + "\n\n📎 " + attached.map(\.displayName).joined(separator: ", ")
+            // Mirror the bubble + clear Active plan immediately even though the
+            // provider turn is still in flight. The queue section alone is not the
+            // transcript contract users expect for "I sent a message."
+            // Identity = queued id = future run id on drain (AgentRunID(queued.id)).
+            presentOutgoingUserMessage(
+                threadId: selectedThreadId,
+                messageId: AgentMessageID(queued.id.value),
+                display: display,
+                attachments: attached
+            )
             prompt = ""
             attachments = []
             clearComposerDraftMemory(threadId: selectedThreadId, providerInstanceId: providerInstanceId)
@@ -3958,20 +4086,33 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         }
         loadAllMessages(tid)
         suppressPersistedFinalDuplicatedByTimeline()
-        timeline.clearActivePlan()
-        resetTimelineUpdateTick()
         lastErrorRecoverable = false  // UX-MAC_AGENT-009: clear stale Retry on new run
         selectedThreadHasRecoverableContext = false  // UX-MAC_AGENT-CONTINUE: run started; hide Continue
         let display = attached.isEmpty ? text
             : text + "\n\n📎 " + attached.map(\.displayName).joined(separator: ", ")
         // The coordinator is the single writer of run messages — mirror
-        // the user message in-memory only (no double-persist).
+        // the user message in-memory only (no double-persist). Queue drain
+        // passes the same UUID as runId, so the optimistic bubble is stable.
         let runId = requestedRunId ?? AgentRunID()
         let durableUserMessageExists = (try? messageRepo.get(id: AgentMessageID(runId.value))) != nil
         if !resumeInterrupted && !durableUserMessageExists {
-            messages.append(AgentMessage(threadId: tid, role: .user, content: AssistantTimelineState.cappedText(display), attachments: attached))
+            presentOutgoingUserMessage(
+                threadId: tid,
+                messageId: AgentMessageID(runId.value),
+                display: display,
+                attachments: attached
+            )
+        } else {
+            // Resume / already-persisted path still drops a stale Active plan so
+            // the transcript bottom is the new turn, not the prior checklist.
+            timeline.clearActivePlan()
+            suppressStaleActivePlanUpdates = true
+            resetTimelineUpdateTick()
+            focusTick &+= 1
         }
-        focusTick &+= 1
+        // A real provider start is about to own plan progress for this turn —
+        // accept subsequent activePlanUpdated events from this run.
+        suppressStaleActivePlanUpdates = false
         persistThreadConfig()
         let launchConfig = providerLaunchConfig?(runProvider, runProviderInstanceId)
         let threadRunAsUser = threads.first(where: { $0.id == tid })?.runAsUser ?? runAsUser
@@ -4405,6 +4546,11 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         appliedEvents.reserveCapacity(pending.count)
         for (event, run, threadId) in pending {
             guard threadId == self.selectedThreadId else { continue }
+            // User already sent a follow-up: drop plan progress from the prior
+            // turn so the checklist cannot reappear under the new user bubble.
+            if suppressStaleActivePlanUpdates, case .activePlanUpdated = event {
+                continue
+            }
             appliedEvent = true
             appliedEvents.append(event)
             if !self.terminalRunIds.contains(run) {
