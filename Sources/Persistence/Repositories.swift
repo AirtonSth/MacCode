@@ -1144,7 +1144,8 @@ public final class AgentQueuedMessageRepository {
         text: String,
         attachments: [AgentAttachment],
         interactionMode: AgentInteractionMode,
-        routingConfiguration: AgentRoutingConfiguration? = nil
+        routingConfiguration: AgentRoutingConfiguration? = nil,
+        routingSnapshot: AgentQueuedMessageRoutingSnapshot? = nil
     ) throws -> AgentQueuedMessage {
         let position = try nextPosition(threadId: threadId)
         let queued = AgentQueuedMessage(
@@ -1154,7 +1155,7 @@ public final class AgentQueuedMessageRepository {
             interactionMode: interactionMode,
             position: position
         )
-        try upsert(queued, routingConfiguration: routingConfiguration)
+        try upsert(queued, routingConfiguration: routingConfiguration, routingSnapshot: routingSnapshot)
         return queued
     }
 
@@ -1167,7 +1168,8 @@ public final class AgentQueuedMessageRepository {
         text: String,
         attachments: [AgentAttachment],
         interactionMode: AgentInteractionMode,
-        routingConfiguration: AgentRoutingConfiguration? = nil
+        routingConfiguration: AgentRoutingConfiguration? = nil,
+        queuedRoutingSnapshot: AgentQueuedMessageRoutingSnapshot? = nil
     ) throws -> AgentQueuedMessage {
         try db.performSync { database in
             try database.transaction {
@@ -1197,8 +1199,14 @@ public final class AgentQueuedMessageRepository {
                 try insert.bind(8, iso.string(from: queued.updatedAt))
                 _ = try insert.step()
 
-                if let routingConfiguration {
-                    try persistRoutingConfiguration(routingConfiguration, queuedMessageId: queued.id, database: database)
+                if let queuedRoutingSnapshot {
+                    try persistRoutingSnapshot(queuedRoutingSnapshot, queuedMessageId: queued.id, database: database)
+                } else if let routingConfiguration {
+                    try persistRoutingSnapshot(
+                        AgentQueuedMessageRoutingSnapshot(configuration: routingConfiguration),
+                        queuedMessageId: queued.id,
+                        database: database
+                    )
                 }
 
                 let deleteDraft = try database.prepare(
@@ -1214,7 +1222,8 @@ public final class AgentQueuedMessageRepository {
 
     public func upsert(
         _ message: AgentQueuedMessage,
-        routingConfiguration: AgentRoutingConfiguration? = nil
+        routingConfiguration: AgentRoutingConfiguration? = nil,
+        routingSnapshot: AgentQueuedMessageRoutingSnapshot? = nil
     ) throws {
         try db.performSync { database in try database.transaction {
                 if try rowExists(message.id), try threadHasActiveLease(message.threadId) {
@@ -1234,43 +1243,83 @@ public final class AgentQueuedMessageRepository {
                 try st.bind(7, iso.string(from: message.createdAt))
                 try st.bind(8, iso.string(from: message.updatedAt))
                 _ = try st.step()
-                if let routingConfiguration {
-                    try persistRoutingConfiguration(routingConfiguration, queuedMessageId: message.id, database: database)
+                if let routingSnapshot {
+                    try persistRoutingSnapshot(routingSnapshot, queuedMessageId: message.id, database: database)
+                } else if let routingConfiguration {
+                    try persistRoutingSnapshot(
+                        AgentQueuedMessageRoutingSnapshot(configuration: routingConfiguration),
+                        queuedMessageId: message.id,
+                        database: database
+                    )
                 }
         } }
     }
 
     public func routingConfiguration(id: AgentQueuedMessageID) throws -> AgentRoutingConfiguration? {
+        try routingSnapshot(id: id)?.configuration
+    }
+
+    public func routingSnapshot(id: AgentQueuedMessageID) throws -> AgentQueuedMessageRoutingSnapshot? {
         let statement = try db.prepare("""
-            SELECT configuration_json, revision
+            SELECT configuration_json, revision, deadline_at, budget_tokens,
+                   budget_cost_micros, reservation_id, reserved_tokens,
+                   reserved_cost_micros, admission_receipt_id
             FROM agent_queued_message_routing
             WHERE queued_message_id = ?;
         """)
         try statement.bind(1, id.value.uuidString)
         guard try statement.step() else { return nil }
-        return try decodeRoutingConfiguration(
+        let configuration = try decodeRoutingConfiguration(
             json: statement.columnText(0),
             storedMode: nil,
             storedRevision: Int(statement.columnInt64(1))
         )
+        return AgentQueuedMessageRoutingSnapshot(
+            configuration: configuration,
+            deadlineAt: statement.columnText(2).flatMap(iso.date(from:)),
+            budgetTokens: statement.columnIsNull(3) ? nil : Int(statement.columnInt64(3)),
+            budgetCostMicros: statement.columnIsNull(4) ? nil : Int(statement.columnInt64(4)),
+            reservationId: statement.columnText(5),
+            reservedTokens: statement.columnIsNull(6) ? nil : Int(statement.columnInt64(6)),
+            reservedCostMicros: statement.columnIsNull(7) ? nil : Int(statement.columnInt64(7)),
+            admissionReceiptId: statement.columnText(8).flatMap(UUID.init(uuidString:))
+        )
     }
 
-    private func persistRoutingConfiguration(
-        _ configuration: AgentRoutingConfiguration,
+    private func persistRoutingSnapshot(
+        _ snapshot: AgentQueuedMessageRoutingSnapshot,
         queuedMessageId: AgentQueuedMessageID,
         database: SQLiteDB
     ) throws {
         let statement = try database.prepare("""
-            INSERT INTO agent_queued_message_routing(queued_message_id, configuration_json, revision, created_at)
-            VALUES(?, ?, ?, ?)
+            INSERT INTO agent_queued_message_routing(
+                queued_message_id, configuration_json, revision, created_at,
+                deadline_at, budget_tokens, budget_cost_micros, reservation_id,
+                reserved_tokens, reserved_cost_micros, admission_receipt_id
+            )
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(queued_message_id) DO UPDATE SET
                 configuration_json=excluded.configuration_json,
-                revision=excluded.revision;
+                revision=excluded.revision,
+                deadline_at=excluded.deadline_at,
+                budget_tokens=excluded.budget_tokens,
+                budget_cost_micros=excluded.budget_cost_micros,
+                reservation_id=excluded.reservation_id,
+                reserved_tokens=excluded.reserved_tokens,
+                reserved_cost_micros=excluded.reserved_cost_micros,
+                admission_receipt_id=excluded.admission_receipt_id;
         """)
         try statement.bind(1, queuedMessageId.value.uuidString)
-        try statement.bind(2, try encodeRoutingConfiguration(configuration))
-        try statement.bind(3, configuration.revision)
-        try statement.bind(4, iso.string(from: configuration.updatedAt))
+        try statement.bind(2, try encodeRoutingConfiguration(snapshot.configuration))
+        try statement.bind(3, snapshot.configuration.revision)
+        try statement.bind(4, iso.string(from: snapshot.configuration.updatedAt))
+        try statement.bind(5, snapshot.deadlineAt.map(iso.string(from:)))
+        try statement.bind(6, snapshot.budgetTokens)
+        try statement.bind(7, snapshot.budgetCostMicros)
+        try statement.bind(8, snapshot.reservationId)
+        try statement.bind(9, snapshot.reservedTokens)
+        try statement.bind(10, snapshot.reservedCostMicros)
+        try statement.bind(11, snapshot.admissionReceiptId?.uuidString)
         _ = try statement.step()
     }
 

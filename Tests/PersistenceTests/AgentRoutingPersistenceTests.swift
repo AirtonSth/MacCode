@@ -76,6 +76,85 @@ final class AgentRoutingPersistenceTests: XCTestCase {
         XCTAssertEqual(try queue.routingConfiguration(id: queued.id)?.mode, .auto)
     }
 
+    func testQueuePersistsAndReloadsAdmissionSnapshot() throws {
+        let (db, root) = try database()
+        defer { try? FileManager.default.removeItem(atPath: root) }
+        let queue = AgentQueuedMessageRepository(db: db)
+        let thread = AgentThread(title: "snapshot", provider: .claude, model: "claude")
+        try AgentThreadRepository(db: db).upsert(thread)
+        let configuration = AgentRoutingConfiguration(
+            mode: .auto,
+            manualSelection: AgentModelSelection(provider: .claude, modelId: "claude"),
+            policyDigest: String(repeating: "a", count: 64),
+            revision: 7
+        )
+        let receiptID = UUID()
+        let snapshot = AgentQueuedMessageRoutingSnapshot(
+            configuration: configuration,
+            deadlineAt: Date(timeIntervalSince1970: 123),
+            budgetTokens: 4_000,
+            budgetCostMicros: 125,
+            reservationId: "reservation-7",
+            reservedTokens: 3_500,
+            reservedCostMicros: 100,
+            admissionReceiptId: receiptID
+        )
+
+        let queued = try queue.enqueue(
+            threadId: thread.id,
+            text: "queued",
+            attachments: [],
+            interactionMode: .default,
+            routingSnapshot: snapshot
+        )
+
+        XCTAssertEqual(try queue.routingSnapshot(id: queued.id), snapshot,
+                       "enqueue must durably preserve every admission value for replay")
+    }
+
+    func testQueueAdmissionSnapshotSurvivesThreadRoutingChange() throws {
+        let (db, root) = try database()
+        defer { try? FileManager.default.removeItem(atPath: root) }
+        let threads = AgentThreadRepository(db: db)
+        let queue = AgentQueuedMessageRepository(db: db)
+        let original = AgentRoutingConfiguration(
+            mode: .auto,
+            manualSelection: AgentModelSelection(provider: .claude, modelId: "claude"),
+            policyDigest: String(repeating: "b", count: 64),
+            revision: 2
+        )
+        let thread = AgentThread(title: "immutable", provider: .claude, model: "claude",
+                                 routingConfiguration: original)
+        try threads.upsert(thread)
+        let snapshot = AgentQueuedMessageRoutingSnapshot(
+            configuration: original,
+            deadlineAt: Date(timeIntervalSince1970: 200),
+            budgetTokens: 900,
+            reservationId: "reservation-original"
+        )
+        let queued = try queue.enqueue(
+            threadId: thread.id,
+            text: "queued",
+            attachments: [],
+            interactionMode: .default,
+            routingSnapshot: snapshot
+        )
+
+        let changed = try original.replacing(
+            expectedRevision: original.revision,
+            mode: .manual,
+            manualSelection: original.manualSelection,
+            manualProviderInstanceId: original.manualProviderInstanceId,
+            eligibleProviders: original.eligibleProviders,
+            policyDigest: original.policyDigest
+        )
+        try threads.setRoutingConfiguration(changed, threadId: thread.id, expectedRevision: original.revision)
+
+        XCTAssertEqual(try threads.get(id: thread.id)?.effectiveRoutingConfiguration.mode, .manual)
+        XCTAssertEqual(try queue.routingSnapshot(id: queued.id), snapshot,
+                       "replay must use the enqueue snapshot, not the thread's current routing")
+    }
+
     func testModeAndJSONConflictReturnsTypedError() throws {
         let (db, root) = try database()
         defer { try? FileManager.default.removeItem(atPath: root) }

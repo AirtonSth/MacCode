@@ -18,7 +18,7 @@ final class ScheduledTaskStoreTests: XCTestCase {
     }
 
     func test_schemaVersionIncludesScheduledTables_becauseUpgradesMustBeAtomic() throws {
-        XCTAssertEqual(Schema.currentVersion, 48)
+        XCTAssertEqual(Schema.currentVersion, 49)
         let statement = try db.prepare("SELECT MAX(version) FROM schema_meta;")
         XCTAssertTrue(try statement.step())
         XCTAssertEqual(statement.columnInt64(0), 48)

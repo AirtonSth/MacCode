@@ -1483,6 +1483,39 @@ public struct AgentQueuedMessage: Codable, Sendable, Equatable, Identifiable {
     }
 }
 
+/// Admission values captured with queued work. These are immutable so a later
+/// thread-routing edit cannot change the deadline or reservation used on replay.
+public struct AgentQueuedMessageRoutingSnapshot: Codable, Sendable, Equatable {
+    public let configuration: AgentRoutingConfiguration
+    public let deadlineAt: Date?
+    public let budgetTokens: Int?
+    public let budgetCostMicros: Int?
+    public let reservationId: String?
+    public let reservedTokens: Int?
+    public let reservedCostMicros: Int?
+    public let admissionReceiptId: UUID?
+
+    public init(
+        configuration: AgentRoutingConfiguration,
+        deadlineAt: Date? = nil,
+        budgetTokens: Int? = nil,
+        budgetCostMicros: Int? = nil,
+        reservationId: String? = nil,
+        reservedTokens: Int? = nil,
+        reservedCostMicros: Int? = nil,
+        admissionReceiptId: UUID? = nil
+    ) {
+        self.configuration = configuration
+        self.deadlineAt = deadlineAt
+        self.budgetTokens = budgetTokens
+        self.budgetCostMicros = budgetCostMicros
+        self.reservationId = reservationId
+        self.reservedTokens = reservedTokens
+        self.reservedCostMicros = reservedCostMicros
+        self.admissionReceiptId = admissionReceiptId
+    }
+}
+
 public enum AgentMessageSendStatus: String, Codable, Sendable, Equatable {
     case started
     case queued
