@@ -390,6 +390,58 @@ final class AgentOrchestrationRuntimeTests: XCTestCase {
         XCTAssertEqual(try repository.ledger().first?.tokenUsage, 17)
     }
 
+    func testCostBudgetFailsClosedWithoutVerifiedEstimator() throws {
+        let runtime = AgentOrchestrationRuntime(
+            packageVerification: { true },
+            rolloutGate: { true },
+            killSwitch: { false }
+        )
+        XCTAssertThrowsError(
+            try runtime.admit(
+                runId: AgentRunID(),
+                threadId: AgentThreadID(),
+                configuration: configuration(runtime: runtime),
+                providerSnapshots: snapshots(),
+                interactionMode: .default,
+                permissionMode: .supervised,
+                attachments: [],
+                budgetCostMicros: 10
+            )
+        ) { XCTAssertEqual($0 as? AgentOrchestrationAdmissionError, .costBudgetUnavailable) }
+    }
+
+    func testCostEstimatorLiquidatesAndMarksCostBudgetOverrun() throws {
+        let (db, root) = try database()
+        defer { try? FileManager.default.removeItem(atPath: root) }
+        let repository = AgentOrchestrationRepository(db: db)
+        let runtime = AgentOrchestrationRuntime(
+            repository: repository,
+            packageVerification: { true },
+            rolloutGate: { true },
+            killSwitch: { false },
+            costEstimator: { _, _ in 12 }
+        )
+        let admission = try runtime.admit(
+            runId: AgentRunID(),
+            threadId: AgentThreadID(),
+            configuration: configuration(runtime: runtime),
+            providerSnapshots: snapshots(),
+            interactionMode: .default,
+            permissionMode: .supervised,
+            attachments: [],
+            budgetCostMicros: 10,
+            reservedCostMicros: 10
+        )
+        try runtime.finalizeReceipt(
+            runId: try XCTUnwrap(admission.receipt.runId),
+            status: .completed,
+            usage: AssistantTokenUsage(totalTokens: 1),
+            qualityOutcome: "verified:output-present"
+        )
+        XCTAssertEqual(try repository.receipt(runId: admission.receipt.runId!)?.actualCostMicros, 12)
+        XCTAssertEqual(try repository.ledger().first?.outcome, "completed:budget-overrun")
+    }
+
     func testAdmissionRejectsStalePolicyAndFallbackCatalogs() throws {
         let runtime = AgentOrchestrationRuntime(
             packageVerification: { true },

@@ -120,7 +120,8 @@ final class AgentAutoRunCoordinatorTests: XCTestCase {
         let runtime = AgentOrchestrationRuntime(
             repository: receiptRepo,
             packageVerification: { true },
-            killSwitch: { false }
+            killSwitch: { false },
+            costEstimator: { _, usage in usage?.totalTokens }
         )
         let thread = AgentThread(
             title: "auto",
@@ -172,7 +173,8 @@ final class AgentAutoRunCoordinatorTests: XCTestCase {
         let runtime = AgentOrchestrationRuntime(
             repository: receiptRepo,
             packageVerification: { true },
-            killSwitch: { false }
+            killSwitch: { false },
+            costEstimator: { _, usage in usage?.totalTokens }
         )
         let immutableConfiguration = autoConfiguration(runtime: runtime, eligibleProviders: [.codex])
         var thread = AgentThread(

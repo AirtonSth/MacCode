@@ -2690,6 +2690,7 @@ public final class JSONRPCDispatcher {
             case .invalidPolicy: kind = "invalid_policy"
             case .deadlineExpired: kind = "deadline_expired"
             case .invalidBudget: kind = "invalid_budget"
+            case .costBudgetUnavailable: kind = "cost_budget_unavailable"
             case .quotaExceeded: kind = "quota_exceeded"
             case .invalidRoutingMode: kind = "invalid_mode"
             case .noEligibleProvider: kind = "no_eligible_provider"

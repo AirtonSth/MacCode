@@ -262,6 +262,7 @@ public struct AgentOrchestrationAdmissionReceipt: Codable, Sendable, Equatable {
     func updatingUsage(
         _ usage: AssistantTokenUsage?,
         latencyMilliseconds: Int64,
+        actualCostMicros: Int? = nil,
         qualityOutcome: String? = nil
     ) -> AgentOrchestrationAdmissionReceipt {
         AgentOrchestrationAdmissionReceipt(
@@ -292,6 +293,7 @@ public struct AgentOrchestrationAdmissionReceipt: Codable, Sendable, Equatable {
             reservedCostMicros: reservedCostMicros,
             permissionMode: permissionMode,
             actualTokens: usage?.totalTokens,
+            actualCostMicros: actualCostMicros ?? self.actualCostMicros,
             latencyMilliseconds: latencyMilliseconds,
             qualityOutcome: qualityOutcome ?? self.qualityOutcome
         )
@@ -348,6 +350,7 @@ public enum AgentOrchestrationAdmissionError: Error, Sendable, Equatable, Custom
     case invalidPolicy
     case deadlineExpired
     case invalidBudget
+    case costBudgetUnavailable
     case quotaExceeded
     case invalidRoutingMode
     case noEligibleProvider
@@ -367,6 +370,8 @@ public enum AgentOrchestrationAdmissionError: Error, Sendable, Equatable, Custom
             return "The Auto routing deadline has already expired."
         case .invalidBudget:
             return "The Auto routing budget or reservation is invalid."
+        case .costBudgetUnavailable:
+            return "Auto routing cannot admit a cost budget until live provider pricing is available."
         case .quotaExceeded:
             return "The Auto routing quota is unavailable for this run."
         case .invalidRoutingMode:
@@ -550,6 +555,7 @@ public final class AgentOrchestrationRuntime: @unchecked Sendable {
     private let rolloutGate: @Sendable () -> Bool
     private let killSwitch: @Sendable () -> Bool
     private let now: @Sendable () -> Date
+    private let costEstimator: (@Sendable (AgentOrchestrationAdmissionReceipt, AssistantTokenUsage?) -> Int?)?
     private let reservationLock = NSLock()
     private var reservations: [String: (tokens: Int?, costMicros: Int?, deadlineAt: Date?)] = [:]
 
@@ -558,13 +564,15 @@ public final class AgentOrchestrationRuntime: @unchecked Sendable {
         packageVerification: @escaping @Sendable () -> Bool = AgentOrchestrationRuntime.verifyInstalledPackage,
         rolloutGate: @escaping @Sendable () -> Bool = AgentOrchestrationRuntime.defaultRolloutEnabled,
         killSwitch: @escaping @Sendable () -> Bool = AgentOrchestrationRuntime.defaultKillSwitch,
-        now: @escaping @Sendable () -> Date = { Date() }
+        now: @escaping @Sendable () -> Date = { Date() },
+        costEstimator: (@Sendable (AgentOrchestrationAdmissionReceipt, AssistantTokenUsage?) -> Int?)? = nil
     ) {
         self.repository = repository
         self.packageVerification = packageVerification
         self.rolloutGate = rolloutGate
         self.killSwitch = killSwitch
         self.now = now
+        self.costEstimator = costEstimator
         policyDigest = Self.sha256Hex(
             "\(Self.packageID)|\(Self.requiredPackageRevision)|\(Self.policyContractVersion)"
         )
@@ -626,6 +634,9 @@ public final class AgentOrchestrationRuntime: @unchecked Sendable {
         reservedCostMicros: Int? = nil
     ) throws -> (route: AgentOrchestrationRoute, receipt: AgentOrchestrationAdmissionReceipt) {
         let resolved = try route(configuration: configuration, providerSnapshots: providerSnapshots)
+        guard budgetCostMicros == nil || costEstimator != nil else {
+            throw AgentOrchestrationAdmissionError.costBudgetUnavailable
+        }
         let snapshot = providerSnapshots.first { $0.id == resolved.providerInstanceId }
         try AgentProviderRunPreflight.validate(
             snapshot: snapshot,
@@ -715,11 +726,13 @@ public final class AgentOrchestrationRuntime: @unchecked Sendable {
         guard let receipt = try repository.receipt(runId: runId),
               receipt.lifecycleStatus != .finalized else { return }
         let finalizedAt = now()
+        let actualCostMicros = costEstimator?(receipt, usage)
         let finalized = receipt
             .updatingLifecycle(.finalized, finalRunStatus: status, at: finalizedAt)
             .updatingUsage(
                 usage,
                 latencyMilliseconds: Int64(max(0, finalizedAt.timeIntervalSince(receipt.admittedAt) * 1_000)),
+                actualCostMicros: actualCostMicros,
                 qualityOutcome: qualityOutcome
             )
         try repository.update(finalized)
@@ -754,6 +767,7 @@ public final class AgentOrchestrationRuntime: @unchecked Sendable {
         budgetCostMicros: Int?,
         actualCostMicros: Int?
     ) -> String? {
+        if budgetCostMicros != nil && actualCostMicros == nil { return "budget-cost-unverified" }
         if let budgetTokens, let actualTokens, actualTokens > budgetTokens { return "budget-overrun" }
         if let budgetCostMicros, let actualCostMicros, actualCostMicros > budgetCostMicros {
             return "budget-overrun"
