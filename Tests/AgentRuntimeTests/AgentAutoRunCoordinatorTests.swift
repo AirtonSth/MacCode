@@ -264,7 +264,7 @@ final class AgentAutoRunCoordinatorTests: XCTestCase {
             routingConfiguration: autoConfiguration(runtime: runtime)
         )
         try threadRepo.upsert(thread)
-        let runner = RecordingProviderRunner(provider: .codex, terminalStatus: .completed)
+        let runner = RecordingProviderRunner(provider: .codex, terminalStatus: .completed, terminalMessage: "done")
         let snapshot = liveSnapshot()
         let coordinator = AgentRunCoordinator(
             runRepo: runRepo,
@@ -281,7 +281,68 @@ final class AgentAutoRunCoordinatorTests: XCTestCase {
         let receipt = try XCTUnwrap(receiptRepo.receipt(runId: runId))
         XCTAssertEqual(receipt.lifecycleStatus, .finalized)
         XCTAssertEqual(receipt.finalRunStatus, .completed)
+        XCTAssertEqual(receipt.qualityOutcome, "verified:output-present")
         XCTAssertEqual(try receiptRepo.receipts().count, 1)
+    }
+
+    func testAutoDeadlineCancelsAnActiveProviderAndFinalizesItsReceipt() async throws {
+        let (db, root) = try database()
+        defer { try? FileManager.default.removeItem(atPath: root) }
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let receiptRepo = AgentOrchestrationRepository(db: db)
+        let runtime = AgentOrchestrationRuntime(
+            repository: receiptRepo,
+            packageVerification: { true },
+            killSwitch: { false }
+        )
+        let configuration = autoConfiguration(runtime: runtime)
+        let thread = AgentThread(
+            title: "deadline auto",
+            provider: .claude,
+            model: "claude-manual",
+            routingConfiguration: configuration
+        )
+        try threadRepo.upsert(thread)
+        let runner = RecordingProviderRunner(provider: .codex)
+        let snapshot = liveSnapshot()
+        let runId = AgentRunID()
+        let deadline = Date().addingTimeInterval(0.05)
+        let routingSnapshot = AgentOrchestrationRoutingSnapshot(
+            configuration: configuration,
+            providerSnapshots: [snapshot],
+            admissionSnapshot: AgentQueuedMessageRoutingSnapshot(
+                configuration: configuration,
+                deadlineAt: deadline
+            )
+        )
+        let coordinator = AgentRunCoordinator(
+            runRepo: runRepo,
+            messageRepo: messageRepo,
+            threadRepo: threadRepo,
+            orchestrationRuntime: runtime,
+            providerSnapshotSupplier: { [snapshot] in [snapshot] },
+            providers: [.codex: runner]
+        )
+
+        _ = try await coordinator.startRun(
+            request(threadId: thread.id, runId: runId),
+            routingSnapshot: routingSnapshot
+        )
+
+        for _ in 0..<50 {
+            if try runRepo.get(id: runId)?.status == .cancelled,
+               try receiptRepo.receipt(runId: runId)?.lifecycleStatus == .finalized {
+                break
+            }
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        XCTAssertEqual(try runRepo.get(id: runId)?.status, .cancelled)
+        let receipt = try XCTUnwrap(receiptRepo.receipt(runId: runId))
+        XCTAssertEqual(receipt.lifecycleStatus, .finalized)
+        XCTAssertEqual(receipt.finalRunStatus, .cancelled)
+        XCTAssertEqual(receipt.qualityOutcome, "not-verified:cancelled")
     }
 
     func testAutoRoutingBlocksBeforeProviderStartWhenPackageIsUnavailable() async throws {
@@ -419,10 +480,16 @@ private final class RecordingProviderRunner: AgentProviderRunner, @unchecked Sen
     private let lock = NSLock()
     private var requests: [AgentRunRequest] = []
     private let terminalStatus: AgentRunStatus?
+    private let terminalMessage: String?
 
-    init(provider: AgentProvider, terminalStatus: AgentRunStatus? = nil) {
+    init(
+        provider: AgentProvider,
+        terminalStatus: AgentRunStatus? = nil,
+        terminalMessage: String? = nil
+    ) {
         self.provider = provider
         self.terminalStatus = terminalStatus
+        self.terminalMessage = terminalMessage
     }
 
     var startCount: Int {
@@ -441,7 +508,7 @@ private final class RecordingProviderRunner: AgentProviderRunner, @unchecked Sen
     ) async throws -> AgentRunHandle {
         lock.withLock { requests.append(request) }
         if let terminalStatus {
-            onEvent(.finished(terminalStatus, finalMessage: nil, providerThreadId: nil))
+            onEvent(.finished(terminalStatus, finalMessage: terminalMessage, providerThreadId: nil))
         }
         return AgentRunHandle(runId: request.runId, process: nil) {}
     }

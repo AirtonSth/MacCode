@@ -88,6 +88,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     private var providerTurnScopes: [AgentThreadID: ProviderTurnScope] = [:]
     private var activeTurnIds: [AgentRunID: String] = [:]
     private var latestTokenUsage: [AgentRunID: AssistantTokenUsage] = [:]
+    private var orchestrationDeadlineWorkItems: [AgentRunID: DispatchWorkItem] = [:]
     private var activeAssistantMessageIds: [AgentRunID: AgentMessageID] = [:]
     private var activeProviderTextItemTypes: [AgentRunID: [String: AssistantItemType]] = [:]
     private var bufferedProviderTextItems: [AgentRunID: [String: BufferedProviderTextItem]] = [:]
@@ -439,6 +440,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
            let error = flushPendingStreamWritesResult(runId: priorBufferedRunId, threadId: request.threadId) {
             throw error
         }
+        let admittedDeadlineAt = routingSnapshot?.admissionSnapshot?.deadlineAt
         let request = try await requestAdmittingAutoRoute(request, routingSnapshot: routingSnapshot)
         // A user-initiated run ends any background-await auto-continuation streak;
         // the auto-nudge path passes `isAutoContinuation: true` to preserve the bound.
@@ -636,8 +638,28 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             onRunStarted?(effectiveRequest.threadId, effectiveRequest.runId)
             onActiveRunProjectionChanged?(activeProjection, .started)
         }
+        if terminalStatus == nil {
+            scheduleOrchestrationDeadline(admittedDeadlineAt, runId: runId)
+        }
         if shouldCancel { handle.cancel() }
         return runId
+    }
+
+    private func scheduleOrchestrationDeadline(_ deadlineAt: Date?, runId: AgentRunID) {
+        guard let deadlineAt else { return }
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.lock.lock()
+            let isActive = self.active[runId] != nil
+            self.lock.unlock()
+            if isActive { self.stopRun(runId) }
+        }
+        lock.lock()
+        orchestrationDeadlineWorkItems[runId]?.cancel()
+        orchestrationDeadlineWorkItems[runId] = workItem
+        lock.unlock()
+        let delay = max(0, deadlineAt.timeIntervalSinceNow)
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + delay, execute: workItem)
     }
 
     private func requestAdmittingAutoRoute(
@@ -2423,7 +2445,15 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             latestTokenUsage.removeValue(forKey: runId)
             lock.unlock()
             do {
-                try orchestrationRuntime?.finalizeReceipt(runId: runId, status: status, usage: usage)
+                try orchestrationRuntime?.finalizeReceipt(
+                    runId: runId,
+                    status: status,
+                    usage: usage,
+                    qualityOutcome: AgentOrchestrationRuntime.qualityOutcome(
+                        status: status,
+                        finalMessage: pendingTerminal.finalMessage
+                    )
+                )
             } catch {
                 emitPersistenceIssue(
                     "orchestration.receipt.finalize",
@@ -2461,6 +2491,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                 resumeCursor: resumeCursor
             )
             lock.lock()
+            orchestrationDeadlineWorkItems.removeValue(forKey: runId)?.cancel()
             active.removeValue(forKey: runId)
             activeThreads.removeValue(forKey: threadId)
             activeRunMetadata.removeValue(forKey: runId)
@@ -2749,7 +2780,15 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                 streamEvent: pending.streamEvent
             )
             do {
-                try orchestrationRuntime?.finalizeReceipt(runId: runId, status: .failed)
+                lock.lock()
+                let usage = latestTokenUsage.removeValue(forKey: runId)
+                lock.unlock()
+                try orchestrationRuntime?.finalizeReceipt(
+                    runId: runId,
+                    status: .failed,
+                    usage: usage,
+                    qualityOutcome: AgentOrchestrationRuntime.qualityOutcome(status: .failed, finalMessage: nil)
+                )
             } catch {
                 emitPersistenceIssue(
                     "orchestration.receipt.finalize",

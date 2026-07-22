@@ -315,10 +315,16 @@ final class AgentOrchestrationRuntimeTests: XCTestCase {
             attachments: [], budgetTokens: 100, reservationId: "reconcile-once", reservedTokens: 90
         )
         let usage = AssistantTokenUsage(inputTokens: 40, outputTokens: 3, totalTokens: 43)
-        try runtime.finalizeReceipt(runId: try XCTUnwrap(second.receipt.runId), status: .completed, usage: usage)
+        try runtime.finalizeReceipt(
+            runId: try XCTUnwrap(second.receipt.runId),
+            status: .completed,
+            usage: usage,
+            qualityOutcome: "verified:rubric-pass"
+        )
         let finalized = try XCTUnwrap(repository.receipt(runId: second.receipt.runId!))
         XCTAssertEqual(finalized.actualTokens, 43)
         XCTAssertNotNil(finalized.latencyMilliseconds)
+        XCTAssertEqual(finalized.qualityOutcome, "verified:rubric-pass")
         XCTAssertEqual(try repository.ledger().first?.tokenUsage, 43)
     }
 

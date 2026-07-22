@@ -259,7 +259,11 @@ public struct AgentOrchestrationAdmissionReceipt: Codable, Sendable, Equatable {
         )
     }
 
-    func updatingUsage(_ usage: AssistantTokenUsage?, latencyMilliseconds: Int64) -> AgentOrchestrationAdmissionReceipt {
+    func updatingUsage(
+        _ usage: AssistantTokenUsage?,
+        latencyMilliseconds: Int64,
+        qualityOutcome: String? = nil
+    ) -> AgentOrchestrationAdmissionReceipt {
         AgentOrchestrationAdmissionReceipt(
             id: id,
             runId: runId,
@@ -288,7 +292,8 @@ public struct AgentOrchestrationAdmissionReceipt: Codable, Sendable, Equatable {
             reservedCostMicros: reservedCostMicros,
             permissionMode: permissionMode,
             actualTokens: usage?.totalTokens,
-            latencyMilliseconds: latencyMilliseconds
+            latencyMilliseconds: latencyMilliseconds,
+            qualityOutcome: qualityOutcome ?? self.qualityOutcome
         )
     }
 }
@@ -701,18 +706,36 @@ public final class AgentOrchestrationRuntime: @unchecked Sendable {
         return (resolved, admittedReceipt)
     }
 
-    public func finalizeReceipt(runId: AgentRunID, status: AgentRunStatus, usage: AssistantTokenUsage? = nil) throws {
+    public func finalizeReceipt(
+        runId: AgentRunID,
+        status: AgentRunStatus,
+        usage: AssistantTokenUsage? = nil,
+        qualityOutcome: String? = nil
+    ) throws {
         guard let receipt = try repository.receipt(runId: runId),
               receipt.lifecycleStatus != .finalized else { return }
         let finalizedAt = now()
         let finalized = receipt
             .updatingLifecycle(.finalized, finalRunStatus: status, at: finalizedAt)
-            .updatingUsage(usage, latencyMilliseconds: Int64(max(0, finalizedAt.timeIntervalSince(receipt.admittedAt) * 1_000)))
+            .updatingUsage(
+                usage,
+                latencyMilliseconds: Int64(max(0, finalizedAt.timeIntervalSince(receipt.admittedAt) * 1_000)),
+                qualityOutcome: qualityOutcome
+            )
         try repository.update(finalized)
         try repository.saveLedger(
             AgentOrchestrationLedgerEntry(receipt: finalized, outcome: status.rawValue, finalizedAt: finalizedAt)
         )
         if let reservationId = receipt.reservationId { releaseReservation(reservationId) }
+    }
+
+    /// First-route quality evidence is content-free: the runtime records
+    /// whether a completed run produced a non-empty sanitized output.
+    public static func qualityOutcome(status: AgentRunStatus, finalMessage: String?) -> String {
+        guard status == .completed else { return "not-verified:\(status.rawValue)" }
+        return finalMessage?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+            ? "verified:output-present"
+            : "rejected:missing-output"
     }
 
     public func markReceiptUnknown(runId: AgentRunID) throws {
