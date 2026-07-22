@@ -247,11 +247,20 @@ public final class GrokParser {
             var uncached = 0
             var read = 0
             var output = 0
+            var modelCostUSD = 0.0
+            var modelCostComplete = true
+            var modelCount = 0
             for value in modelUsage.values {
                 guard let usage = value as? [String: Any] else { continue }
+                modelCount += 1
                 uncached += intValue(usage["inputTokens"]) ?? intValue(usage["input_tokens"]) ?? 0
                 read += intValue(usage["cacheReadInputTokens"]) ?? intValue(usage["cache_read_input_tokens"]) ?? 0
                 output += intValue(usage["outputTokens"]) ?? intValue(usage["output_tokens"]) ?? 0
+                if let cost = doubleValue(usage["costUSD"] ?? usage["cost_usd"]) {
+                    modelCostUSD += cost
+                } else {
+                    modelCostComplete = false
+                }
             }
             // Prefer top-level usage for cache-read when modelUsage omitted it.
             if read == 0, let top = obj["usage"] as? [String: Any] {
@@ -260,12 +269,18 @@ public final class GrokParser {
             let input = uncached + read
             let total = input + output
             guard total > 0 else { return nil }
+            let reportedCostMicros = costMicros(
+                fromUSD: doubleValue(obj["total_cost_usd"] ?? obj["totalCostUSD"])
+                    ?? (modelCount > 0 && modelCostComplete ? modelCostUSD : nil)
+                    ?? costUSD(from: obj["usage"] as? [String: Any])
+            )
             return AssistantTokenUsage(
                 inputTokens: input,
                 outputTokens: output,
                 totalTokens: total,
                 uncachedInputTokens: uncached,
-                cacheReadInputTokens: read > 0 ? read : nil
+                cacheReadInputTokens: read > 0 ? read : nil,
+                reportedCostMicros: reportedCostMicros
             )
         }
 
@@ -282,13 +297,43 @@ public final class GrokParser {
             ?? intValue(usage["totalTokens"])
             ?? (input + output + reasoning)
         guard total > 0 || input > 0 || output > 0 else { return nil }
+        let reportedCostMicros = costMicros(
+            fromUSD: doubleValue(obj["total_cost_usd"] ?? obj["totalCostUSD"])
+                ?? doubleValue(usage["costUSD"] ?? usage["cost_usd"])
+                ?? costUSD(from: usage)
+        )
         return AssistantTokenUsage(
             inputTokens: input,
             outputTokens: max(output, reasoning > 0 && output == 0 ? reasoning : output),
             totalTokens: total,
             uncachedInputTokens: uncached,
-            cacheReadInputTokens: read > 0 ? read : nil
+            cacheReadInputTokens: read > 0 ? read : nil,
+            reportedCostMicros: reportedCostMicros
         )
+    }
+
+    private static func costUSD(from usage: [String: Any]?) -> Double? {
+        guard let usage else { return nil }
+        if let ticks = doubleValue(usage["cost_in_usd_ticks"] ?? usage["costInUsdTicks"]),
+           ticks.isFinite, ticks >= 0 {
+            return ticks / 10_000_000_000
+        }
+        return nil
+    }
+
+    private static func costMicros(fromUSD value: Double?) -> Int? {
+        guard let value, value.isFinite, value >= 0 else { return nil }
+        let micros = (value * 1_000_000).rounded()
+        guard micros <= Double(Int.max) else { return nil }
+        return Int(micros)
+    }
+
+    private static func doubleValue(_ any: Any?) -> Double? {
+        if let value = any as? Double { return value }
+        if let value = any as? Int { return Double(value) }
+        if let value = any as? NSNumber { return value.doubleValue }
+        if let value = any as? String { return Double(value.trimmingCharacters(in: .whitespacesAndNewlines)) }
+        return nil
     }
 
     private static func intValue(_ any: Any?) -> Int? {

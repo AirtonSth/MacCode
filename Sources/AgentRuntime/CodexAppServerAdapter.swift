@@ -2601,7 +2601,8 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         let totalTokens = int(source["totalTokens"]) ?? int(source["total_tokens"]) ?? int(container["usedTokens"]) ?? (input + output)
         guard totalTokens > 0 || input > 0 || output > 0 else { return nil }
         let contextWindow = int(container["modelContextWindow"]) ?? int(container["contextWindow"]) ?? int(container["maxTokens"])
-        return AssistantTokenUsage(inputTokens: input, outputTokens: output, totalTokens: totalTokens, contextWindow: contextWindow, compactsAutomatically: true)
+        let reportedCostMicros = costMicros(from: source) ?? costMicros(from: container)
+        return AssistantTokenUsage(inputTokens: input, outputTokens: output, totalTokens: totalTokens, contextWindow: contextWindow, compactsAutomatically: true, reportedCostMicros: reportedCostMicros)
     }
 
     private static func goalDetail(from payload: [String: Any]) -> String {
@@ -2709,6 +2710,22 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         if let value = value as? Double { return value }
         if let value = value as? Int { return Double(value) }
         if let value = value as? String { return Double(value) }
+        return nil
+    }
+
+    private static func costMicros(from payload: [String: Any]) -> Int? {
+        if let usd = double(payload["costUSD"] ?? payload["cost_usd"] ?? payload["totalCostUSD"] ?? payload["total_cost_usd"]),
+           usd.isFinite, usd >= 0 {
+            let micros = (usd * 1_000_000).rounded()
+            guard micros <= Double(Int.max) else { return nil }
+            return Int(micros)
+        }
+        if let ticks = double(payload["cost_in_usd_ticks"] ?? payload["costInUsdTicks"]),
+           ticks.isFinite, ticks >= 0 {
+            let micros = (ticks / 10_000).rounded()
+            guard micros <= Double(Int.max) else { return nil }
+            return Int(micros)
+        }
         return nil
     }
 
