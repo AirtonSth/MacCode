@@ -66,9 +66,12 @@ public final class ProviderProcessOwnershipStore: @unchecked Sendable {
         // A corrupt/unreadable ledger is evidence, not an empty ledger. Never
         // overwrite it while appending a newly spawned provider.
         let existing = try loadUnlocked()
-        let next = existing.filter { $0.pgid != tag.pgid } + [tag]
-        guard next.count <= maxRecords else {
-            throw ProviderProcessOwnershipError.ownershipLedgerCapacityExceeded(maxRecords)
+        var next = existing.filter { $0.pgid != tag.pgid } + [tag]
+        // Never refuse a user spawn for ledger size. Drop the oldest ownership
+        // rows first so concurrent sessions stay under the safety bound without
+        // a hard session cap surface to the user.
+        if next.count > maxRecords {
+            next = Array(next.sorted { $0.spawnedAt < $1.spawnedAt }.suffix(maxRecords))
         }
         try replaceUnlocked(next)
     }

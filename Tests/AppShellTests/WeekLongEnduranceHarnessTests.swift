@@ -128,7 +128,7 @@ final class WeekLongEnduranceHarnessTests: XCTestCase {
         let eightGiB = UInt64(8) * 1_024 * 1_024 * 1_024
         let profile = ManagedProcessMemoryProfile.resolve(physicalMemoryBytes: eightGiB)
         XCTAssertEqual(profile.name, "low-memory-8g")
-        XCTAssertEqual(profile.providerRootCap, 2)
+        XCTAssertNil(profile.providerRootCap)
         XCTAssertEqual(profile.sidecarMaxConcurrentRequests, 1)
         XCTAssertEqual(profile.sidecarMaxQueueDepth, 4)
 
@@ -269,7 +269,8 @@ final class WeekLongEnduranceHarnessTests: XCTestCase {
             let thirdAdmission = await admissionGate.decide(profile: profile, scan: emptyProcessScan, appFootprintKB: 256 * 1_024, key: ManagedProviderAdmissionKey(provider: .codex, threadId: AgentThreadID()), now: now)
             XCTAssertEqual(firstAdmission, .admit)
             XCTAssertEqual(secondAdmission, .admit)
-            XCTAssertEqual(thirdAdmission, .blockedAtProviderCap(limit: 2))
+            XCTAssertEqual(thirdAdmission, .admit,
+                           "session count is unlimited; only memory ceilings may block")
             providerAdmissionChecks += 3
 
             await MainActor.run {

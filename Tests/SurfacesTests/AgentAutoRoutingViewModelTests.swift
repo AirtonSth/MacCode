@@ -221,4 +221,91 @@ final class AgentAutoRoutingViewModelTests: XCTestCase {
         await load.value
         XCTAssertFalse(vm.providerSnapshotsLoading)
     }
+
+    /// WHY: with Auto selected and provider/model catalogs still loading, send
+    /// must refuse so the user cannot start a turn against incomplete routing
+    /// (button disabled + Enter path blocked).
+    func test_composerSendBlockedWhileAutoRoutingPrerequisitesLoad() {
+        XCTAssertTrue(
+            AgentAppViewModel.isComposerSendBlockedByAutoRoutingLoad(
+                routingMode: .auto,
+                hasSelectedThread: true,
+                providerSnapshotsEmpty: true,
+                providerSnapshotsLoading: false,
+                modelListLoading: false
+            )
+        )
+        XCTAssertTrue(
+            AgentAppViewModel.isComposerSendBlockedByAutoRoutingLoad(
+                routingMode: .auto,
+                hasSelectedThread: true,
+                providerSnapshotsEmpty: false,
+                providerSnapshotsLoading: true,
+                modelListLoading: false
+            )
+        )
+        XCTAssertTrue(
+            AgentAppViewModel.isComposerSendBlockedByAutoRoutingLoad(
+                routingMode: .auto,
+                hasSelectedThread: true,
+                providerSnapshotsEmpty: false,
+                providerSnapshotsLoading: false,
+                modelListLoading: true
+            )
+        )
+        XCTAssertFalse(
+            AgentAppViewModel.isComposerSendBlockedByAutoRoutingLoad(
+                routingMode: .auto,
+                hasSelectedThread: true,
+                providerSnapshotsEmpty: false,
+                providerSnapshotsLoading: false,
+                modelListLoading: false
+            ),
+            "Auto ready must allow send"
+        )
+        XCTAssertFalse(
+            AgentAppViewModel.isComposerSendBlockedByAutoRoutingLoad(
+                routingMode: .manual,
+                hasSelectedThread: true,
+                providerSnapshotsEmpty: true,
+                providerSnapshotsLoading: true,
+                modelListLoading: true
+            ),
+            "manual mode is not gated by Auto loading"
+        )
+        XCTAssertFalse(
+            AgentAppViewModel.isComposerSendBlockedByAutoRoutingLoad(
+                routingMode: .auto,
+                hasSelectedThread: false,
+                providerSnapshotsEmpty: true,
+                providerSnapshotsLoading: true,
+                modelListLoading: true
+            ),
+            "no thread selected → Auto pill is not loading against a thread"
+        )
+    }
+
+    func test_sendWhileAutoLoadingRefusesWithoutStartingProvider() async throws {
+        let (vm, _, root) = try fixture()
+        defer { try? FileManager.default.removeItem(atPath: root) }
+
+        // Force Auto + incomplete prerequisites with a real selected thread.
+        // Empty snapshots (still loading / not seeded) is the same gate the UI
+        // uses for the Auto loading pill.
+        vm.createThread(title: "auto-loading-send")
+        XCTAssertNotNil(vm.selectedThreadId)
+        XCTAssertEqual(vm.routingMode, .auto)
+        vm.providerSnapshots = []
+        vm.modelListLoading = true
+        vm.prompt = "oi"
+
+        await vm.send()
+
+        XCTAssertTrue(
+            vm.statusMessage.contains("still loading"),
+            "expected loading refusal, got: \(vm.statusMessage)"
+        )
+        XCTAssertNotEqual(vm.status, .running)
+        XCTAssertNil(vm.currentRunId)
+    }
 }

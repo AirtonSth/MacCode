@@ -185,7 +185,17 @@ public enum ProcessSpawnTagger {
             ProcessTerminator.terminateTreeImmediately(process)
             throw ProviderProcessOwnershipError.startIdentityUnavailable(pid)
         }
-        let executablePath = ProviderProcessExecutablePath.read(pid: pid)
+        // Prefer the durable launch path over a transient shebang interpreter.
+        // `#!/usr/bin/env node` scripts (Codex via Homebrew, many npm CLIs) race
+        // `proc_pidpath` toward `/usr/bin/env` or `node` before the scan; the
+        // Process.executableURL is the operator-intended binary and survives that
+        // re-exec for ownership corroboration.
+        let livePath = ProviderProcessExecutablePath.read(pid: pid)
+        let launchedPath = process.executableURL?.path
+        let executablePath = Self.preferredOwnershipExecutablePath(
+            livePath: livePath,
+            launchedPath: launchedPath
+        )
         guard executablePath != nil || foreignUserLaunch else {
             ProcessTerminator.terminateTreeImmediately(process)
             throw ProviderProcessOwnershipError.executablePathUnavailable(pid)
@@ -256,6 +266,30 @@ public enum ProcessSpawnTagger {
     ) -> Bool {
         guard isAlive(pgid) else { return false }
         return now.timeIntervalSince(spawnedAt) >= minAge
+    }
+
+    /// Choose the path stored in the ownership ledger for a just-spawned process.
+    /// Prefer a non-env live `proc_pidpath` result; fall back to the Process launch
+    /// URL when the kernel still reports the shebang trampoline (`env`) so Codex
+    /// and other `#!/usr/bin/env node` CLIs do not permanently poison accounting.
+    public static func preferredOwnershipExecutablePath(
+        livePath: String?,
+        launchedPath: String?
+    ) -> String? {
+        if let livePath, !livePath.isEmpty, !isEnvStyleLauncher(livePath) {
+            return livePath
+        }
+        if let launchedPath, !launchedPath.isEmpty {
+            return launchedPath
+        }
+        if let livePath, !livePath.isEmpty {
+            return livePath
+        }
+        return nil
+    }
+
+    static func isEnvStyleLauncher(_ path: String) -> Bool {
+        URL(fileURLWithPath: path).lastPathComponent == "env"
     }
 }
 

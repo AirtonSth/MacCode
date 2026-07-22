@@ -183,4 +183,132 @@ final class ProviderProcessSweeperTests: XCTestCase {
                       "an exited run-as-user turn contributes nothing and blocks nothing")
     }
 
+    /// WHY: Codex and many Homebrew CLIs are `#!/usr/bin/env node` scripts. The
+    /// ownership ledger can store `/usr/bin/env` (or the script path) while `ps`
+    /// later shows `node …/codex app-server`. Before this fix that path drift
+    /// marked the scan incomplete and blocked every provider start with
+    /// processAccountingUnavailable — not just Codex, and on every Mac that
+    /// hit the race.
+    func test_managedScanAccountsShebangReExecWithoutPoisoningCompleteness() {
+        let identity = ProviderProcessStartIdentity(seconds: 50, microseconds: 2)
+        let tags = [
+            SpawnedProcessTag(
+                pgid: 101, spawnedAt: Date(), provider: .codex,
+                managedKind: .provider, executablePath: "/usr/bin/env",
+                startIdentity: identity, isolatedProcessGroup: 101
+            ),
+            SpawnedProcessTag(
+                pgid: 201, spawnedAt: Date(), provider: .grok,
+                managedKind: .provider, executablePath: "/opt/grok",
+                startIdentity: ProviderProcessStartIdentity(seconds: 60, microseconds: 1),
+                isolatedProcessGroup: 201
+            )
+        ]
+        let processes = [
+            ProviderRuntimeProcess(
+                pid: 101, ppid: 1, pgid: 101, rssKB: 120,
+                command: "node /opt/homebrew/bin/codex app-server"
+            ),
+            ProviderRuntimeProcess(
+                pid: 102, ppid: 101, pgid: 101, rssKB: 80,
+                command: "codex-worker --session"
+            ),
+            ProviderRuntimeProcess(
+                pid: 201, ppid: 1, pgid: 201, rssKB: 90,
+                command: "/opt/grok agent stdio"
+            )
+        ]
+
+        let scan = ProviderProcessSweeper.managedProcessScan(
+            tags: tags,
+            processes: processes,
+            processStartIdentity: {
+                $0 == 101 ? identity
+                    : $0 == 201 ? ProviderProcessStartIdentity(seconds: 60, microseconds: 1)
+                    : nil
+            }
+        )
+
+        XCTAssertTrue(scan.isComplete,
+                      "shebang re-exec path drift must never block provider admission")
+        XCTAssertEqual(scan.incompleteRootPIDs, [])
+        XCTAssertEqual(scan.providerRootCount, 2)
+        XCTAssertEqual(scan.providerProcesses.map(\.pid), [101, 102, 201])
+    }
+
+    /// WHY: identity still gates ownership — a reused PID with a different start
+    /// identity must not inherit the old env-tagged Codex row even after the
+    /// shebang fix relaxes executable matching.
+    func test_managedScanStillRejectsPIDReuseAfterShebangRelaxation() {
+        let oldIdentity = ProviderProcessStartIdentity(seconds: 10, microseconds: 1)
+        let newIdentity = ProviderProcessStartIdentity(seconds: 99, microseconds: 9)
+        let tags = [
+            SpawnedProcessTag(
+                pgid: 101, spawnedAt: Date(), provider: .codex,
+                managedKind: .provider, executablePath: "/usr/bin/env",
+                startIdentity: oldIdentity, isolatedProcessGroup: 101
+            )
+        ]
+        let processes = [
+            ProviderRuntimeProcess(
+                pid: 101, ppid: 1, pgid: 101, rssKB: 50,
+                command: "node /opt/homebrew/bin/codex app-server"
+            )
+        ]
+
+        let scan = ProviderProcessSweeper.managedProcessScan(
+            tags: tags,
+            processes: processes,
+            processStartIdentity: { _ in newIdentity }
+        )
+
+        XCTAssertTrue(scan.isComplete)
+        XCTAssertTrue(scan.providerProcesses.isEmpty)
+        XCTAssertEqual(scan.providerRootCount, 0)
+    }
+
+}
+
+final class ProcessSpawnTaggerExecutablePathTests: XCTestCase {
+    func test_preferredOwnershipExecutablePathPrefersLiveNonEnvPath() {
+        XCTAssertEqual(
+            ProcessSpawnTagger.preferredOwnershipExecutablePath(
+                livePath: "/opt/homebrew/Cellar/node/26.3.1/bin/node",
+                launchedPath: "/opt/homebrew/bin/codex"
+            ),
+            "/opt/homebrew/Cellar/node/26.3.1/bin/node"
+        )
+    }
+
+    func test_preferredOwnershipExecutablePathFallsBackFromEnvLauncher() {
+        // WHY: tagging during the `env` trampoline would otherwise store
+        // `/usr/bin/env` and later poison managed-process scans for every Mac.
+        XCTAssertEqual(
+            ProcessSpawnTagger.preferredOwnershipExecutablePath(
+                livePath: "/usr/bin/env",
+                launchedPath: "/opt/homebrew/bin/codex"
+            ),
+            "/opt/homebrew/bin/codex"
+        )
+        XCTAssertEqual(
+            ProcessSpawnTagger.preferredOwnershipExecutablePath(
+                livePath: nil,
+                launchedPath: "/opt/homebrew/bin/codex"
+            ),
+            "/opt/homebrew/bin/codex"
+        )
+        XCTAssertEqual(
+            ProcessSpawnTagger.preferredOwnershipExecutablePath(
+                livePath: "/usr/bin/env",
+                launchedPath: nil
+            ),
+            "/usr/bin/env"
+        )
+        XCTAssertNil(
+            ProcessSpawnTagger.preferredOwnershipExecutablePath(
+                livePath: nil,
+                launchedPath: nil
+            )
+        )
+    }
 }

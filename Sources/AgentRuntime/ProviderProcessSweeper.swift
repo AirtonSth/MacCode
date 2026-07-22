@@ -156,7 +156,7 @@ public enum ProviderProcessSweeper {
             }
 
             let root = rowsByPID[tag.pgid]?.first
-            if let root {
+            if root != nil {
                 guard let liveIdentity = processStartIdentity(tag.pgid) else {
                     incomplete.append(tag.pgid)
                     continue
@@ -164,10 +164,14 @@ public enum ProviderProcessSweeper {
                 // A reused PID exhausts this old tag; it does not make the new
                 // unrelated process managed and is never counted or signalled.
                 guard liveIdentity == expectedIdentity else { continue }
-                guard managedExecutableMatches(command: root.command, expectedPath: tag.executablePath) else {
-                    incomplete.append(tag.pgid)
-                    continue
-                }
+                // Identity already certifies the exact process lifetime. Executable
+                // path is corroboration only: shebang launchers (`#!/usr/bin/env node`,
+                // npm shims, etc.) re-exec in-place so `ps` shows `node …` while the
+                // ledger still holds `/usr/bin/env` or the original script path.
+                // Treating that drift as incomplete blocked EVERY later provider
+                // admission with processAccountingUnavailable on any Mac that runs
+                // Codex/Homebrew-style CLI scripts — never fail-closed the host for
+                // path drift when the kernel start identity still matches.
             }
 
             var tree = processes.filter { $0.pgid == tag.pgid }
@@ -301,7 +305,11 @@ public enum ProviderProcessSweeper {
         return ProviderRuntimeProcess(pid: pid, ppid: ppid, pgid: pgid, rssKB: rssKB, command: String(parts[4]))
     }
 
-    private static func managedExecutableMatches(command: String, expectedPath: String) -> Bool {
+    /// Corroborates a live `ps` command against the ownership ledger path.
+    /// Intentionally unused by completeness gates: shebang re-exec makes path
+    /// drift common while the kernel start identity still certifies the lifetime.
+    /// Kept for focused matching tests and future soft telemetry.
+    static func managedExecutableMatches(command: String, expectedPath: String) -> Bool {
         guard !expectedPath.isEmpty else { return false }
         if command == expectedPath || command.hasPrefix(expectedPath + " ") { return true }
         guard let commandPath = command.split(separator: " ", maxSplits: 1).first else { return false }

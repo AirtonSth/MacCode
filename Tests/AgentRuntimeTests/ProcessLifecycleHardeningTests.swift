@@ -24,15 +24,16 @@ final class ProcessLifecycleHardeningTests: XCTestCase {
                        "sidecar exit disposition must not erase a newer lifetime that reused its PID")
     }
 
-    func test_ownershipLedgerRejectsUnboundedGrowthWithoutDroppingEvidence() throws {
+    func test_ownershipLedgerDropsOldestRowsInsteadOfRefusingSpawn() throws {
         let file = FileManager.default.temporaryDirectory
             .appendingPathComponent("provider-ledger-capacity-\(UUID().uuidString).json")
         let store = ProviderProcessOwnershipStore(fileURL: file, maxRecords: 2)
         let identity = ProviderProcessStartIdentity(seconds: 1, microseconds: 1)
+        let base = Date(timeIntervalSince1970: 1_000)
         let tags = (1...3).map { pid in
             SpawnedProcessTag(
                 pgid: pid_t(pid),
-                spawnedAt: Date(),
+                spawnedAt: base.addingTimeInterval(TimeInterval(pid)),
                 ownerStartIdentity: identity,
                 provider: .codex,
                 managedKind: .provider,
@@ -43,12 +44,12 @@ final class ProcessLifecycleHardeningTests: XCTestCase {
         }
         try store.append(tags[0])
         try store.append(tags[1])
+        try store.append(tags[2])
 
-        XCTAssertThrowsError(try store.append(tags[2])) { error in
-            XCTAssertEqual(error as? ProviderProcessOwnershipError, .ownershipLedgerCapacityExceeded(2))
-        }
-        XCTAssertEqual(try store.load(), Array(tags.prefix(2)),
-                       "capacity pressure must fail the new spawn without deleting live ownership rows")
+        let loaded = try store.load()
+        XCTAssertEqual(loaded.count, 2)
+        XCTAssertEqual(loaded.map(\.pgid), [2, 3],
+                       "overflow must keep the newest ownership rows and never refuse spawn")
     }
 
     func test_periodicSweepPrunesExitedCurrentOwnerRowsButRetainsLateGroupMembers() throws {

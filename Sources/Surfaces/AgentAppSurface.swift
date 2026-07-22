@@ -3664,9 +3664,36 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         dismissedProviderStatusSignature = "\(snapshot.id)|\(snapshot.status.rawValue)|\(message)"
     }
 
+    /// WHY: while Auto is on and provider/model lists are still loading, a send
+    /// would start with incomplete routing and race the orchestrator. The send
+    /// button and Enter path must both refuse until prerequisites are ready.
+    nonisolated public static func isComposerSendBlockedByAutoRoutingLoad(
+        routingMode: AgentRoutingMode,
+        hasSelectedThread: Bool,
+        providerSnapshotsEmpty: Bool,
+        providerSnapshotsLoading: Bool,
+        modelListLoading: Bool
+    ) -> Bool {
+        routingMode == .auto
+            && hasSelectedThread
+            && (providerSnapshotsEmpty || providerSnapshotsLoading || modelListLoading)
+    }
+
     public func send() async {
         let trimmed = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty || !attachments.isEmpty else { return }
+        // Auto is still resolving providers/models — refuse send (button is also
+        // disabled) so a half-ready routing snapshot cannot start a provider.
+        if Self.isComposerSendBlockedByAutoRoutingLoad(
+            routingMode: routingMode,
+            hasSelectedThread: selectedThreadId != nil,
+            providerSnapshotsEmpty: providerSnapshots.isEmpty,
+            providerSnapshotsLoading: providerSnapshotsLoading,
+            modelListLoading: modelListLoading
+        ) {
+            statusMessage = "Automatic model routing is still loading. Try again in a moment."
+            return
+        }
         // Snapshots can still be empty on first send (seed/load race). Load once
         // before the fail-closed gate so a ready Grok/Codex install is not blocked.
         // Also needed before `$goal` → `/goal` rewrite so provider slash catalogs
@@ -3964,7 +3991,10 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             return runId
         } catch {
             await MainActor.run {
-                self.statusMessage = "Failed to start: \(error)"
+                // Prefer LocalizedError copy so ManagedProviderAdmissionError shows
+                // the human message instead of the raw enum case name in the banner.
+                let detail = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+                self.statusMessage = "Failed to start: \(detail)"
                 self.status = .failed
                 self.currentRunId = nil
                 self.runThreads[runId] = nil
@@ -8129,18 +8159,21 @@ public struct AgentAppView: View {
         let recoverable = vm.lastErrorRecoverable
         let recoveryAction = vm.displayedErrorRecoveryAction
         return VStack(alignment: .leading, spacing: DS.Space.sm) {
-            HStack(alignment: .top, spacing: DS.Space.sm) {
+            HStack(alignment: .center, spacing: DS.Space.sm) {
                 Image(systemName: recoverable ? "exclamationmark.triangle" : "xmark.octagon")
                     .font(.system(size: 11))
                     .foregroundColor(recoverable ? DS.Palette.warning : DS.Palette.danger)
+                    .frame(width: 14, height: 14, alignment: .center)
                 Text(err)
                     .font(DS.Font.monoSmall)
                     .foregroundColor(recoverable ? DS.Palette.warning : DS.Palette.danger)
                     .lineSpacing(3).textSelection(.enabled)
-                Spacer(minLength: 0)
+                    .frame(maxWidth: .infinity, alignment: .leading)
                 Button { vm.dismissDisplayedError() } label: {
                     Image(systemName: "xmark")
                         .font(.system(size: 9, weight: .bold))
+                        .frame(width: 16, height: 16, alignment: .center)
+                        .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
                 .foregroundColor(DS.Palette.textTertiary)
@@ -8836,30 +8869,39 @@ public struct AgentAppView: View {
         offersCopy: Bool = true,
         retry: (() -> Void)? = nil
     ) -> some View {
-        HStack(alignment: .top, spacing: DS.Space.sm) {
+        // Center the trailing controls with the message row so the dismiss "×"
+        // sits on the same optical midline as "Copy"/Retry (`.top` left the
+        // glyph high relative to caption text).
+        HStack(alignment: .center, spacing: DS.Space.sm) {
             Image(systemName: "exclamationmark.triangle.fill")
+                .font(.system(size: 11, weight: .semibold))
                 .foregroundColor(DS.Palette.danger)
+                .frame(width: 14, height: 14, alignment: .center)
             Text(message)
                 .font(DS.Font.caption)
                 .foregroundColor(DS.Palette.text)
                 .textSelection(.enabled)
-            Spacer(minLength: 0)
+                .frame(maxWidth: .infinity, alignment: .leading)
             if offersCopy {
                 Button("Copy") {
                     NSPasteboard.general.clearContents()
                     NSPasteboard.general.setString(message, forType: .string)
                 }
                 .buttonStyle(.plain)
+                .font(DS.Font.caption)
                 .accessibilityIdentifier("\(identifier).copy")
             }
             if let retry {
                 Button("Retry", action: retry)
                     .buttonStyle(.plain)
+                    .font(DS.Font.caption)
                     .accessibilityIdentifier("\(identifier).retry")
             }
             Button(action: dismiss) {
                 Image(systemName: "xmark")
                     .font(.system(size: 9, weight: .bold))
+                    .frame(width: 16, height: 16, alignment: .center)
+                    .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
             .foregroundColor(DS.Palette.textTertiary)
@@ -8880,15 +8922,17 @@ public struct AgentAppView: View {
         color: Color,
         dismiss: @escaping () -> Void
     ) -> some View {
-        HStack(alignment: .top, spacing: DS.Space.sm) {
+        HStack(alignment: .center, spacing: DS.Space.sm) {
             Text(message)
                 .font(DS.Font.caption)
                 .foregroundColor(color)
                 .fixedSize(horizontal: false, vertical: true)
-            Spacer(minLength: 0)
+                .frame(maxWidth: .infinity, alignment: .leading)
             Button(action: dismiss) {
                 Image(systemName: "xmark")
-                    .font(.system(size: 8, weight: .bold))
+                    .font(.system(size: 9, weight: .bold))
+                    .frame(width: 16, height: 16, alignment: .center)
+                    .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
             .foregroundColor(DS.Palette.textTertiary)
@@ -10162,7 +10206,9 @@ public struct AgentAppView: View {
     }
 
     private var sendIdleDisabled: Bool {
-        vm.prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && vm.attachments.isEmpty
+        let empty =
+            vm.prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && vm.attachments.isEmpty
+        return empty || autoRoutingPillLoading
     }
 
     private func selectThreadRow(_ thread: AgentThread) {

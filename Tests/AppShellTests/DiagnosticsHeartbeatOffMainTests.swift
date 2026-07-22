@@ -114,17 +114,39 @@ final class DiagnosticsHeartbeatOffMainTests: XCTestCase {
         let profile = ManagedProcessMemoryProfile.resolve(physicalMemoryBytes: eightGiB)
 
         XCTAssertEqual(profile.name, "low-memory-8g")
-        XCTAssertEqual(profile.providerRootCap, 2,
-                       "an 8 GiB Mac must not restore an unbounded provider tree")
+        XCTAssertNil(profile.providerRootCap,
+                     "session count is unlimited — user controls concurrent agents")
         XCTAssertEqual(profile.sidecarMaxConcurrentRequests, 1)
         XCTAssertEqual(profile.sidecarMaxQueueDepth, 4)
         XCTAssertEqual(profile.idleReleaseAge, 30 * 60,
                        "only safely resumable completed sessions use the shorter release window")
-        XCTAssertEqual(profile.hostProcessCeilingKB, 768 * 1_024)
-        XCTAssertEqual(profile.managedTreeCeilingKB, 3_584 * 1_024)
+        XCTAssertNil(profile.hostProcessCeilingKB,
+                     "memory ceilings must not refuse user-started providers")
+        XCTAssertNil(profile.managedTreeCeilingKB)
     }
 
-    func test_providerAdmissionFailsClosedForIncompleteScanAndMultipleRestoredRoots() {
+    func test_standardProfileHasUnlimitedProviderRootCap() {
+        let profile = ManagedProcessMemoryProfile.resolve(
+            physicalMemoryBytes: UInt64(16) * 1_024 * 1_024 * 1_024
+        )
+        XCTAssertEqual(profile.name, "standard")
+        XCTAssertNil(profile.providerRootCap,
+                     "Codex long-lived app-servers must not hit a fixed session budget")
+        XCTAssertEqual(
+            ManagedProviderAdmissionPolicy.decide(
+                profile: profile,
+                scanComplete: true,
+                appFootprintKB: 256 * 1_024,
+                managedTreeRSSKB: 512 * 1_024,
+                liveProviderRoots: 64,
+                requiresNewProviderRoot: true
+            ),
+            .admit,
+            "no count-based admission block"
+        )
+    }
+
+    func test_providerAdmissionNeverBlocksUserStarts() {
         let profile = ManagedProcessMemoryProfile.resolve(physicalMemoryBytes: eightGiB)
 
         XCTAssertEqual(
@@ -136,24 +158,36 @@ final class DiagnosticsHeartbeatOffMainTests: XCTestCase {
                 liveProviderRoots: 0,
                 requiresNewProviderRoot: true
             ),
-            .blockedIncompleteScan,
-            "a failed ownership/process scan is unknown, never zero providers"
+            .admit,
+            "incomplete process accounting must not refuse a user start"
+        )
+        let capped = ManagedProcessMemoryProfile(
+            name: "test-capped",
+            physicalMemoryBytes: eightGiB,
+            providerRootCap: 2,
+            sidecarMaxConcurrentRequests: 1,
+            sidecarMaxQueueDepth: 4,
+            idleReleaseAge: 30 * 60,
+            warningFraction: 0.60,
+            criticalFraction: 0.75,
+            hostProcessCeilingKB: 1,
+            managedTreeCeilingKB: 1
         )
         XCTAssertEqual(
             ManagedProviderAdmissionPolicy.decide(
-                profile: profile,
+                profile: capped,
                 scanComplete: true,
                 appFootprintKB: 256 * 1_024,
                 managedTreeRSSKB: 512 * 1_024,
-                liveProviderRoots: 2,
+                liveProviderRoots: 99,
                 requiresNewProviderRoot: true
             ),
-            .blockedAtProviderCap(limit: 2),
-            "two restored low-memory sessions consume the full live-provider budget"
+            .admit,
+            "session/memory knobs are telemetry only — user controls concurrency"
         )
     }
 
-    func test_admissionGateReservesConcurrentLaunchesUntilProcessAppears() async {
+    func test_admissionGateAlwaysAdmitsConcurrentLaunches() async {
         let profile = ManagedProcessMemoryProfile.resolve(physicalMemoryBytes: eightGiB)
         let empty = ManagedProcessScan(
             providerProcesses: [], sidecarProcesses: [], providerRootCount: 0,
@@ -165,75 +199,43 @@ final class DiagnosticsHeartbeatOffMainTests: XCTestCase {
             ManagedProviderAdmissionKey(provider: .codex, threadId: AgentThreadID())
         }
 
-        let first = await gate.decide(profile: profile, scan: empty, appFootprintKB: 256 * 1_024, key: keys[0], now: now)
-        let second = await gate.decide(profile: profile, scan: empty, appFootprintKB: 256 * 1_024, key: keys[1], now: now)
-        let third = await gate.decide(profile: profile, scan: empty, appFootprintKB: 256 * 1_024, key: keys[2], now: now)
-        let afterExpiry = await gate.decide(
-            profile: profile,
-            scan: empty,
-            appFootprintKB: 256 * 1_024,
-            key: keys[3],
-            now: now.addingTimeInterval(61)
-        )
-        XCTAssertEqual(first, .admit)
-        XCTAssertEqual(second, .admit)
-        XCTAssertEqual(
-            third,
-            .blockedAtProviderCap(limit: 2),
-            "overlapping starts must count reservations instead of racing past the cap"
-        )
-        XCTAssertEqual(
-            afterExpiry,
-            .admit,
-            "a failed launch reservation must expire instead of blocking weeks-long operation"
-        )
+        let decisions = await withTaskGroup(of: ManagedProviderAdmissionDecision.self) { group in
+            for key in keys {
+                group.addTask {
+                    await gate.decide(
+                        profile: profile,
+                        scan: empty,
+                        appFootprintKB: 256 * 1_024,
+                        key: key,
+                        now: now
+                    )
+                }
+            }
+            var collected: [ManagedProviderAdmissionDecision] = []
+            for await decision in group { collected.append(decision) }
+            return collected
+        }
+        XCTAssertEqual(decisions, Array(repeating: .admit, count: 4),
+                       "every concurrent user start must be admitted")
     }
 
-    func test_lowMemoryAdmissionBlocksAtAndAboveMeasuredMemoryCeilings() {
+    func test_admissionNeverBlocksOnMeasuredMemory() {
         let profile = ManagedProcessMemoryProfile.resolve(physicalMemoryBytes: eightGiB)
-        let hostLimit = try! XCTUnwrap(profile.hostProcessCeilingKB)
-        let treeLimit = try! XCTUnwrap(profile.managedTreeCeilingKB)
-
-        XCTAssertEqual(
-            AppDiagnostics.providerAdmissionDecision(
-                profile: profile,
-                scanComplete: true,
-                appFootprintKB: hostLimit - 1,
-                managedTreeRSSKB: treeLimit - 1,
-                liveProviderRoots: 0
-            ),
-            .admit,
-            "both measured values below their ceilings must leave admission available"
-        )
-        for measured in [hostLimit, hostLimit + 1] {
+        for measured in [1, 256 * 1_024, 8 * 1_024 * 1_024] {
             XCTAssertEqual(
                 AppDiagnostics.providerAdmissionDecision(
                     profile: profile,
                     scanComplete: true,
                     appFootprintKB: measured,
-                    managedTreeRSSKB: treeLimit - 1,
-                    liveProviderRoots: 0
-                ),
-                .blockedAtHostMemoryCeiling(limitKB: hostLimit, measuredKB: measured),
-                "the host ceiling is exclusive: equality and overflow must block"
-            )
-        }
-        for measured in [treeLimit, treeLimit + 1] {
-            XCTAssertEqual(
-                AppDiagnostics.providerAdmissionDecision(
-                    profile: profile,
-                    scanComplete: true,
-                    appFootprintKB: hostLimit - 1,
                     managedTreeRSSKB: measured,
                     liveProviderRoots: 0
                 ),
-                .blockedAtManagedTreeMemoryCeiling(limitKB: treeLimit, measuredKB: measured),
-                "the aggregate managed-tree ceiling is exclusive and includes the app"
+                .admit
             )
         }
     }
 
-    func test_lowMemoryAdmissionBlocksUnknownMeasuredMemory() {
+    func test_admissionNeverBlocksOnUnknownMeasuredMemory() {
         let profile = ManagedProcessMemoryProfile.resolve(physicalMemoryBytes: eightGiB)
         XCTAssertEqual(
             AppDiagnostics.providerAdmissionDecision(
@@ -243,17 +245,16 @@ final class DiagnosticsHeartbeatOffMainTests: XCTestCase {
                 managedTreeRSSKB: nil,
                 liveProviderRoots: 0
             ),
-            .blockedUnknownMemory,
-            "a complete ownership scan without a valid app/aggregate sample is not an all-clear"
+            .admit,
+            "unknown memory samples must not refuse a user start"
         )
     }
 
-    func test_admissionGateSumsAppProviderAndSidecarAtManagedTreeCeiling() async {
+    func test_admissionGateAdmitsEvenWhenManagedTreeRSSIsHigh() async {
         let profile = ManagedProcessMemoryProfile.resolve(physicalMemoryBytes: eightGiB)
-        let treeLimit = try! XCTUnwrap(profile.managedTreeCeilingKB)
         let appRSS = 512 * 1_024
         let providerRSS = 2_000 * 1_024
-        let sidecarRSS = treeLimit - appRSS - providerRSS
+        let sidecarRSS = 2_000 * 1_024
         let scan = ManagedProcessScan(
             providerProcesses: [ProviderRuntimeProcess(pid: 10, ppid: 2, pgid: 10, rssKB: providerRSS, command: "redacted")],
             sidecarProcesses: [ProviderRuntimeProcess(pid: 20, ppid: 2, pgid: 20, rssKB: sidecarRSS, command: "redacted")],
@@ -268,14 +269,10 @@ final class DiagnosticsHeartbeatOffMainTests: XCTestCase {
             appFootprintKB: appRSS,
             key: ManagedProviderAdmissionKey(provider: .codex, threadId: AgentThreadID())
         )
-        XCTAssertEqual(
-            decision,
-            .blockedAtManagedTreeMemoryCeiling(limitKB: treeLimit, measuredKB: treeLimit),
-            "the gate must use one complete app + provider + sidecar aggregate, not provider RSS alone"
-        )
+        XCTAssertEqual(decision, .admit)
     }
 
-    func test_residentProviderTurnsDoNotConsumeNewRootReservations() async {
+    func test_residentProviderTurnsRemainAdmittedWithoutSessionCap() async {
         let profile = ManagedProcessMemoryProfile.resolve(physicalMemoryBytes: eightGiB)
         let empty = ManagedProcessScan(
             providerProcesses: [], sidecarProcesses: [], providerRootCount: 0,
@@ -291,51 +288,25 @@ final class DiagnosticsHeartbeatOffMainTests: XCTestCase {
         )
         let gate = ManagedProviderAdmissionGate()
         let residentKey = ManagedProviderAdmissionKey(provider: .codex, threadId: AgentThreadID())
-        let initialAdmission = await gate.decide(
-            profile: profile,
-            scan: empty,
-            appFootprintKB: 256 * 1_024,
-            key: residentKey
+        let initial = await gate.decide(
+            profile: profile, scan: empty, appFootprintKB: 256 * 1_024, key: residentKey
         )
-        XCTAssertEqual(
-            initialAdmission,
-            .admit,
-            "the first turn reserves the provider root before it appears"
-        )
+        XCTAssertEqual(initial, .admit)
         for _ in 0..<3 {
-            let residentTurn = await gate.decide(
+            let turn = await gate.decide(
+                profile: profile, scan: resident, appFootprintKB: 256 * 1_024, key: residentKey
+            )
+            XCTAssertEqual(turn, .admit)
+        }
+        for _ in 0..<5 {
+            let extra = await gate.decide(
                 profile: profile,
                 scan: resident,
                 appFootprintKB: 256 * 1_024,
-                key: residentKey
+                key: ManagedProviderAdmissionKey(provider: .codex, threadId: AgentThreadID())
             )
-            XCTAssertEqual(
-                residentTurn,
-                .admit,
-                "another turn on the same resident provider root must not reserve a new root"
-            )
+            XCTAssertEqual(extra, .admit, "additional roots must stay user-controlled")
         }
-        let secondRoot = await gate.decide(
-            profile: profile,
-            scan: resident,
-            appFootprintKB: 256 * 1_024,
-            key: ManagedProviderAdmissionKey(provider: .codex, threadId: AgentThreadID())
-        )
-        XCTAssertEqual(
-            secondRoot,
-            .admit
-        )
-        let thirdRoot = await gate.decide(
-            profile: profile,
-            scan: resident,
-            appFootprintKB: 256 * 1_024,
-            key: ManagedProviderAdmissionKey(provider: .codex, threadId: AgentThreadID())
-        )
-        XCTAssertEqual(
-            thirdRoot,
-            .blockedAtProviderCap(limit: 2),
-            "only a genuinely new root consumes the remaining reservation"
-        )
     }
 
     func test_aggregateManagedSampleHasCompleteArithmeticSlopeAndHighWater() {
@@ -389,7 +360,8 @@ final class DiagnosticsHeartbeatOffMainTests: XCTestCase {
         XCTAssertNil(sample.totalManagedRSSKB,
                      "partial scans must be unavailable, not a false all-clear zero")
         XCTAssertEqual(sample.pressureDecision, .unknown)
-        XCTAssertEqual(sample.admissionDecision, .blockedIncompleteScan)
+        XCTAssertEqual(sample.admissionDecision, .admit,
+                       "incomplete scans stay observational; user starts are never refused")
     }
 
     func test_aggregateManagedSampleExposesWarningAndCriticalDecisionSeam() {
@@ -412,14 +384,17 @@ final class DiagnosticsHeartbeatOffMainTests: XCTestCase {
 
         XCTAssertEqual(warning.pressureDecision, .warning)
         XCTAssertEqual(critical.pressureDecision, .critical)
-        XCTAssertEqual(warning.admissionDecision.telemetryReason, "blocked_host_memory_ceiling")
-        XCTAssertEqual(critical.admissionDecision.telemetryReason, "blocked_host_memory_ceiling")
+        // Pressure is observational only — admission remains user-controlled.
+        XCTAssertEqual(warning.admissionDecision, .admit)
+        XCTAssertEqual(critical.admissionDecision, .admit)
     }
 
     @MainActor
     func test_appDelegateUsesInjectablePhysicalMemoryProfile() {
         let delegate = AppDelegate(physicalMemoryBytesProvider: { UInt64(4) * 1_024 * 1_024 * 1_024 })
         XCTAssertEqual(delegate.managedProcessMemoryProfile.name, "low-memory-8g")
-        XCTAssertEqual(delegate.managedProcessMemoryProfile.providerRootCap, 2)
+        XCTAssertNil(delegate.managedProcessMemoryProfile.providerRootCap)
+        XCTAssertNil(delegate.managedProcessMemoryProfile.hostProcessCeilingKB)
+        XCTAssertNil(delegate.managedProcessMemoryProfile.managedTreeCeilingKB)
     }
 }

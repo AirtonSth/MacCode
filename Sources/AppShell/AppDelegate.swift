@@ -503,10 +503,10 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
     private func configureManagedProviderAdmission() {
         let profile = managedProcessMemoryProfile
         let gate = ManagedProviderAdmissionGate()
+        // Best-effort accounting only: never refuse a user-started provider for
+        // session count, memory ceilings, incomplete scans, or store errors.
         context.coordinator.providerAdmissionCheck = { provider, threadId in
-            guard let store = ProviderProcessOwnership.shared.store() else {
-                throw ManagedProviderAdmissionError.processAccountingUnavailable
-            }
+            guard let store = ProviderProcessOwnership.shared.store() else { return }
             let scan: ManagedProcessScan
             let appFootprintKB: Int?
             do {
@@ -516,25 +516,14 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
                     return (scan, footprint >= 0 ? footprint : nil)
                 }.value
             } catch {
-                throw ManagedProviderAdmissionError.processAccountingUnavailable
+                return
             }
-            switch await gate.decide(
+            _ = await gate.decide(
                 profile: profile,
                 scan: scan,
                 appFootprintKB: appFootprintKB,
                 key: ManagedProviderAdmissionKey(provider: provider, threadId: threadId)
-            ) {
-            case .admit:
-                return
-            case .blockedIncompleteScan, .blockedUnknownMemory:
-                throw ManagedProviderAdmissionError.processAccountingUnavailable
-            case .blockedAtProviderCap(let limit):
-                throw ManagedProviderAdmissionError.providerLimitReached(limit)
-            case .blockedAtHostMemoryCeiling(let limitKB, _):
-                throw ManagedProviderAdmissionError.hostMemoryLimitReached(limitKB)
-            case .blockedAtManagedTreeMemoryCeiling(let limitKB, _):
-                throw ManagedProviderAdmissionError.managedTreeMemoryLimitReached(limitKB)
-            }
+            )
         }
     }
 

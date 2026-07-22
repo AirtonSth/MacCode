@@ -11,13 +11,17 @@ private let appDiagnosticsLog = Logger(subsystem: "io.remotecode.app", category:
 public struct ManagedProcessMemoryProfile: Sendable, Equatable {
     public let name: String
     public let physicalMemoryBytes: UInt64
-    public let providerRootCap: Int
+    /// Reserved for telemetry only. Production admission never enforces a
+    /// session count — the user decides how many concurrent agents to run.
+    public let providerRootCap: Int?
     public let sidecarMaxConcurrentRequests: Int
     public let sidecarMaxQueueDepth: Int
     public let idleReleaseAge: TimeInterval
     public let warningFraction: Double
     public let criticalFraction: Double
+    /// Reserved for telemetry only. Never used to refuse a user-started provider.
     public let hostProcessCeilingKB: Int?
+    /// Reserved for telemetry only. Never used to refuse a user-started provider.
     public let managedTreeCeilingKB: Int?
 
     public static func resolve(physicalMemoryBytes: UInt64) -> Self {
@@ -26,20 +30,21 @@ public struct ManagedProcessMemoryProfile: Sendable, Equatable {
             return Self(
                 name: "low-memory-8g",
                 physicalMemoryBytes: physicalMemoryBytes,
-                providerRootCap: 2,
+                providerRootCap: nil,
                 sidecarMaxConcurrentRequests: 1,
                 sidecarMaxQueueDepth: 4,
                 idleReleaseAge: 30 * 60,
                 warningFraction: 0.60,
                 criticalFraction: 0.75,
-                hostProcessCeilingKB: 768 * 1_024,
-                managedTreeCeilingKB: 3_584 * 1_024
+                // Observation/pressure only — never admission-blocking.
+                hostProcessCeilingKB: nil,
+                managedTreeCeilingKB: nil
             )
         }
         return Self(
             name: "standard",
             physicalMemoryBytes: physicalMemoryBytes,
-            providerRootCap: 6,
+            providerRootCap: nil,
             sidecarMaxConcurrentRequests: 4,
             sidecarMaxQueueDepth: 32,
             idleReleaseAge: 6 * 60 * 60,
@@ -92,6 +97,9 @@ public enum ManagedProviderAdmissionError: Error, LocalizedError, Sendable, Equa
 }
 
 public enum ManagedProviderAdmissionPolicy {
+    /// Provider starts are user-controlled. Resource ceilings, session counts,
+    /// incomplete process scans, and unknown memory samples must never refuse a
+    /// start — they remain available only as telemetry enums for diagnostics.
     public static func decide(
         profile: ManagedProcessMemoryProfile,
         scanComplete: Bool,
@@ -100,22 +108,12 @@ public enum ManagedProviderAdmissionPolicy {
         liveProviderRoots: Int,
         requiresNewProviderRoot: Bool
     ) -> ManagedProviderAdmissionDecision {
-        guard scanComplete else { return .blockedIncompleteScan }
-        guard let appFootprintKB, appFootprintKB >= 0,
-              let managedTreeRSSKB, managedTreeRSSKB >= 0 else {
-            return .blockedUnknownMemory
-        }
-        if let limit = profile.hostProcessCeilingKB,
-           appFootprintKB >= limit {
-            return .blockedAtHostMemoryCeiling(limitKB: limit, measuredKB: appFootprintKB)
-        }
-        if let limit = profile.managedTreeCeilingKB,
-           managedTreeRSSKB >= limit {
-            return .blockedAtManagedTreeMemoryCeiling(limitKB: limit, measuredKB: managedTreeRSSKB)
-        }
-        guard !requiresNewProviderRoot || liveProviderRoots < profile.providerRootCap else {
-            return .blockedAtProviderCap(limit: profile.providerRootCap)
-        }
+        _ = profile
+        _ = scanComplete
+        _ = appFootprintKB
+        _ = managedTreeRSSKB
+        _ = liveProviderRoots
+        _ = requiresNewProviderRoot
         return .admit
     }
 }
@@ -512,7 +510,7 @@ enum AppDiagnostics {
         let value: (Int?) -> String = { $0.map(String.init) ?? "unavailable" }
         let doubleValue: (Double?) -> String = { $0.map { String(format: "%.2f", $0) } ?? "unavailable" }
         appDiagnosticsLog.info(
-            "app.heartbeat reason=\(reason, privacy: .public) pid=\(pid, privacy: .public) managedScan=\(scanState, privacy: .public) complete=\(sample.isComplete, privacy: .public) appRSSKB=\(value(sample.appFootprintKB), privacy: .public) providerProcesses=\(value(sample.providerProcessCount), privacy: .public) providerRoots=\(value(sample.providerRootCount), privacy: .public) providerRSSKB=\(value(sample.providerRSSKB), privacy: .public) sidecarProcesses=\(value(sample.sidecarProcessCount), privacy: .public) sidecarRoots=\(value(sample.sidecarRootCount), privacy: .public) sidecarRSSKB=\(value(sample.sidecarRSSKB), privacy: .public) totalManagedRSSKB=\(value(sample.totalManagedRSSKB), privacy: .public) previousManagedRSSKB=\(value(sample.previousTotalManagedRSSKB), privacy: .public) sampleIntervalSeconds=\(doubleValue(sample.sampleIntervalSeconds), privacy: .public) deltaManagedRSSKB=\(value(sample.deltaManagedRSSKB), privacy: .public) slopeKBPerMinute=\(doubleValue(sample.slopeKBPerMinute), privacy: .public) highWaterManagedRSSKB=\(value(sample.highWaterManagedRSSKB), privacy: .public) memoryProfile=\(sample.profile.name, privacy: .public) physicalMemoryBytes=\(sample.profile.physicalMemoryBytes, privacy: .public) providerRootCap=\(sample.profile.providerRootCap, privacy: .public) hostProcessCeilingKB=\(value(sample.profile.hostProcessCeilingKB), privacy: .public) managedTreeCeilingKB=\(value(sample.profile.managedTreeCeilingKB), privacy: .public) admission=\(sample.admissionDecision.telemetryReason, privacy: .public) sidecarRequestCap=\(sample.profile.sidecarMaxConcurrentRequests, privacy: .public) sidecarQueueCap=\(sample.profile.sidecarMaxQueueDepth, privacy: .public) ownershipLedgerCap=\(ProviderProcessOwnershipStore.defaultMaxRecords, privacy: .public) pressure=\(sample.pressureDecision.rawValue, privacy: .public) surfaces=\(surface.surfaceCount, privacy: .public) terminals=\(surface.terminalCount, privacy: .public) runningTerminals=\(surface.runningTerminals, privacy: .public) activeAgentThreads=\(activeAgentThreads, privacy: .public) terminalPendingBytes=\(surface.pendingBytes, privacy: .public) terminalDroppedBytes=\(surface.droppedBytes, privacy: .public) terminalHistoryFailures=\(surface.historyFailures, privacy: .public)"
+            "app.heartbeat reason=\(reason, privacy: .public) pid=\(pid, privacy: .public) managedScan=\(scanState, privacy: .public) complete=\(sample.isComplete, privacy: .public) appRSSKB=\(value(sample.appFootprintKB), privacy: .public) providerProcesses=\(value(sample.providerProcessCount), privacy: .public) providerRoots=\(value(sample.providerRootCount), privacy: .public) providerRSSKB=\(value(sample.providerRSSKB), privacy: .public) sidecarProcesses=\(value(sample.sidecarProcessCount), privacy: .public) sidecarRoots=\(value(sample.sidecarRootCount), privacy: .public) sidecarRSSKB=\(value(sample.sidecarRSSKB), privacy: .public) totalManagedRSSKB=\(value(sample.totalManagedRSSKB), privacy: .public) previousManagedRSSKB=\(value(sample.previousTotalManagedRSSKB), privacy: .public) sampleIntervalSeconds=\(doubleValue(sample.sampleIntervalSeconds), privacy: .public) deltaManagedRSSKB=\(value(sample.deltaManagedRSSKB), privacy: .public) slopeKBPerMinute=\(doubleValue(sample.slopeKBPerMinute), privacy: .public) highWaterManagedRSSKB=\(value(sample.highWaterManagedRSSKB), privacy: .public) memoryProfile=\(sample.profile.name, privacy: .public) physicalMemoryBytes=\(sample.profile.physicalMemoryBytes, privacy: .public) providerRootCap=\(value(sample.profile.providerRootCap), privacy: .public) hostProcessCeilingKB=\(value(sample.profile.hostProcessCeilingKB), privacy: .public) managedTreeCeilingKB=\(value(sample.profile.managedTreeCeilingKB), privacy: .public) admission=\(sample.admissionDecision.telemetryReason, privacy: .public) sidecarRequestCap=\(sample.profile.sidecarMaxConcurrentRequests, privacy: .public) sidecarQueueCap=\(sample.profile.sidecarMaxQueueDepth, privacy: .public) ownershipLedgerCap=\(ProviderProcessOwnershipStore.defaultMaxRecords, privacy: .public) pressure=\(sample.pressureDecision.rawValue, privacy: .public) surfaces=\(surface.surfaceCount, privacy: .public) terminals=\(surface.terminalCount, privacy: .public) runningTerminals=\(surface.runningTerminals, privacy: .public) activeAgentThreads=\(activeAgentThreads, privacy: .public) terminalPendingBytes=\(surface.pendingBytes, privacy: .public) terminalDroppedBytes=\(surface.droppedBytes, privacy: .public) terminalHistoryFailures=\(surface.historyFailures, privacy: .public)"
         )
     }
 
