@@ -144,11 +144,12 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     /// honestly certify a watermark for that thread. Retain the first failure
     /// and fail recovery loudly instead of silently advancing iOS past the gap.
     private var mirrorPersistenceFailures: [AgentThreadID: Error] = [:]
-    // UX-MAC_AGENT-BG-AWAIT: per-thread consecutive auto-continuation count and a
-    // monotonic token used to cancel a scheduled continuation when the thread is
-    // stopped or a fresh run starts. Both touched under `lock`. See
-    // BackgroundAwaitContinuation: a full-access run that stalls awaiting a
-    // background job it launched is auto-nudged (bounded) so it actually finishes.
+    // UX-MAC_AGENT-BG-AWAIT / incomplete-turn: per-thread consecutive auto-continuation
+    // count and a monotonic token used to cancel a scheduled continuation when the
+    // thread is stopped or a fresh run starts. Both touched under `lock`. Covers
+    // background-await stalls and multi-phase workflow handoffs (see
+    // IncompleteTurnContinuation) so full-access runs are not left green-"completed"
+    // while unfinished.
     private var autoContinuationCounts: [AgentThreadID: Int] = [:]
     private var autoContinuationTokens: [AgentThreadID: Int] = [:]
     // PERF-MAC_AGENT-006: last assistant text persisted per thread, to dedup the
@@ -1270,9 +1271,9 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         lock.unlock()
     }
 
-    /// Decide, at run finish, whether a full-access run stalled awaiting a
-    /// background job and should be auto-nudged to resume; if so, schedule a
-    /// bounded re-invocation after `backgroundAwaitContinuationDelay`.
+    /// Decide, at run finish, whether a full-access run ended incomplete (background
+    /// await or multi-phase workflow handoff) and should be auto-nudged; if so,
+    /// schedule a bounded re-invocation with a reason-specific delay/prompt.
     private func maybeScheduleBackgroundAwaitContinuation(
         threadId: AgentThreadID,
         status: AgentRunStatus,
@@ -1284,7 +1285,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         lock.lock()
         let prior = autoContinuationCounts[threadId] ?? 0
         lock.unlock()
-        guard BackgroundAwaitContinuation.shouldAutoContinue(
+        guard let reason = IncompleteTurnContinuation.shouldAutoContinue(
             status: status,
             finalMessage: finalMessage,
             isAutonomous: isAutonomous,
@@ -1302,9 +1303,17 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         autoContinuationTokens[threadId] = token
         lock.unlock()
         let attempt = prior + 1
-        let delay = backgroundAwaitContinuationDelay
-        let request = backgroundAwaitContinuationRequest(threadId: threadId, runMetadata: runMetadata, resumeCursor: resumeCursor)
-        agentRunLog.info("run.autoContinue.scheduled thread=\(threadId.value.uuidString, privacy: .public) attempt=\(attempt, privacy: .public)")
+        let delay = IncompleteTurnContinuation.delay(
+            for: reason,
+            backgroundDelay: backgroundAwaitContinuationDelay
+        )
+        let request = incompleteTurnContinuationRequest(
+            threadId: threadId,
+            runMetadata: runMetadata,
+            resumeCursor: resumeCursor,
+            reason: reason
+        )
+        agentRunLog.info("run.autoContinue.scheduled thread=\(threadId.value.uuidString, privacy: .public) attempt=\(attempt, privacy: .public) reason=\(reason.rawValue, privacy: .public)")
         Task { [weak self] in
             guard let self else { return }
             if delay > 0 {
@@ -1328,12 +1337,13 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         return (try? threadRepo.get(id: threadId))?.status == .completed
     }
 
-    private func backgroundAwaitContinuationRequest(
+    private func incompleteTurnContinuationRequest(
         threadId: AgentThreadID,
         runMetadata: RunMetadata,
-        resumeCursor: String?
+        resumeCursor: String?,
+        reason: IncompleteTurnContinuationReason
     ) -> AgentRunRequest {
-        let prompt = BackgroundAwaitContinuation.continuationPrompt
+        let prompt = IncompleteTurnContinuation.prompt(for: reason)
         let runAsUser = (try? threadRepo.get(id: threadId))?.runAsUser
         return AgentRunRequest(
             threadId: threadId,
@@ -2730,17 +2740,6 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                     assistantMessageId: assistantMessageId
                 )
             }
-            // UX-MAC_AGENT-BG-AWAIT: a full-access run that ends still awaiting a
-            // background job it launched is auto-nudged (bounded) so it actually
-            // finishes instead of silently sitting at "completed". Decided before
-            // the run metadata is evicted below.
-            maybeScheduleBackgroundAwaitContinuation(
-                threadId: threadId,
-                status: status,
-                finalMessage: finalMessage,
-                runMetadata: runMetadata,
-                resumeCursor: resumeCursor
-            )
             lock.lock()
             orchestrationDeadlineWorkItems.removeValue(forKey: runId)?.cancel()
             active.removeValue(forKey: runId)
@@ -2775,6 +2774,17 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             lastPersistedAssistantContent.removeValue(forKey: threadId)
             let activeProjection = activeRunProjectionLocked()
             lock.unlock()
+            // UX-MAC_AGENT-BG-AWAIT / incomplete-turn: schedule only AFTER the
+            // finishing run is removed from activeThreads. Zero-delay workflow
+            // continuations would otherwise fail the idle validity check and
+            // never start (silent green "completed").
+            maybeScheduleBackgroundAwaitContinuation(
+                threadId: threadId,
+                status: status,
+                finalMessage: finalMessage,
+                runMetadata: runMetadata,
+                resumeCursor: resumeCursor
+            )
             onActiveRunProjectionChanged?(activeProjection, .finished(status))
             if pendingPrune {
                 do {
