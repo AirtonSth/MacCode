@@ -775,6 +775,13 @@ public final class AgentOrchestrationRuntime: @unchecked Sendable {
         return nil
     }
 
+    public static func productionCostEstimator(
+        _: AgentOrchestrationAdmissionReceipt,
+        usage: AssistantTokenUsage?
+    ) -> Int? {
+        usage?.reportedCostMicros
+    }
+
     public func markReceiptUnknown(runId: AgentRunID) throws {
         guard let receipt = try repository.receipt(runId: runId),
               receipt.lifecycleStatus == .accepted else { return }

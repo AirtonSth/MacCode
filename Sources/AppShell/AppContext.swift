@@ -315,7 +315,8 @@ public final class AppContext {
             providerSessionRepo: providerSessionRuntimeRepo,
             checkpointRepo: turnCheckpointRepo,
             orchestrationRuntime: AgentOrchestrationRuntime(
-                repository: AgentOrchestrationRepository(db: db)
+                repository: AgentOrchestrationRepository(db: db),
+                costEstimator: AgentOrchestrationRuntime.productionCostEstimator
             ),
             providerSnapshotSupplier: {
                 await contextReference.value?.router?.listAgentProviderSnapshots() ?? []

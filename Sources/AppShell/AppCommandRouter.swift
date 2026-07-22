@@ -2061,7 +2061,8 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             base.policyDigest = policyDigest
         }
         let runtime = AgentOrchestrationRuntime(
-            repository: AgentOrchestrationRepository(db: ctx.db)
+            repository: AgentOrchestrationRepository(db: ctx.db),
+            costEstimator: AgentOrchestrationRuntime.productionCostEstimator
         )
         switch request.mode {
         case .auto:
