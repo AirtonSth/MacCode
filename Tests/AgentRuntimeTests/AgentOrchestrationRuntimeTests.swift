@@ -116,6 +116,89 @@ final class AgentOrchestrationRuntimeTests: XCTestCase {
         )
     }
 
+    func testOrderedEligibleProvidersPutsPreferredSourceFirst() {
+        XCTAssertEqual(
+            AgentOrchestrationRuntime.orderedEligibleProviders(
+                eligible: AgentProvider.allCases,
+                preferred: .claude
+            ),
+            [.claude, .codex, .grok],
+            "Auto must try the Source picker host before allCases order (codex-first)."
+        )
+        XCTAssertEqual(
+            AgentOrchestrationRuntime.orderedEligibleProviders(
+                eligible: [.codex, .grok],
+                preferred: .claude
+            ),
+            [.codex, .grok],
+            "A preferred host not in eligibleProviders must not be injected."
+        )
+        XCTAssertEqual(
+            AgentOrchestrationRuntime.orderedEligibleProviders(
+                eligible: [.grok, .claude, .codex],
+                preferred: .grok
+            ),
+            [.grok, .claude, .codex]
+        )
+    }
+
+    func testRoutePrefersManualSourceProviderOverAllCasesOrder() throws {
+        let runtime = AgentOrchestrationRuntime(
+            packageVerification: { true },
+            killSwitch: { false }
+        )
+        // allCases is codex → claude → grok. Manual Source is Claude; Auto must
+        // not silently admit Codex just because it appears first in allCases.
+        var config = configuration(runtime: runtime)
+        config.eligibleProviders = AgentProvider.allCases
+        config.manualSelection = AgentModelSelection(
+            provider: .claude,
+            modelId: "claude-live",
+            reasoningEffort: .high,
+            serviceTier: .auto
+        )
+        config.manualProviderInstanceId = "claude-cli"
+
+        let route = try runtime.route(configuration: config, providerSnapshots: snapshots())
+        XCTAssertEqual(route.provider, .claude)
+        XCTAssertEqual(route.providerInstanceId, "claude-cli")
+    }
+
+    func testRouteFallsBackWhenPreferredSourceIsNotLive() throws {
+        let runtime = AgentOrchestrationRuntime(
+            packageVerification: { true },
+            killSwitch: { false }
+        )
+        var config = configuration(runtime: runtime)
+        config.eligibleProviders = AgentProvider.allCases
+        config.manualSelection = AgentModelSelection(
+            provider: .claude,
+            modelId: "claude-live",
+            reasoningEffort: .high,
+            serviceTier: .auto
+        )
+        // Only Codex is live; Claude is fallback catalog → not eligible for Auto.
+        let mixed = AgentProvider.allCases.map { provider -> AgentProviderSnapshot in
+            AgentProviderSnapshotFactory.snapshot(
+                provider: provider,
+                models: [AgentModelDescriptor(
+                    id: "\(provider.rawValue)-live",
+                    label: "Live",
+                    provider: provider,
+                    supportsReasoning: true,
+                    supportsServiceTier: true
+                )],
+                binaryPath: "/usr/bin/true",
+                authenticated: true,
+                capabilitiesOverride: AgentProviderCapabilities(supportsStreaming: true),
+                modelDiscoverySource: provider == .claude ? .builtInFallback : .live
+            )
+        }
+        let route = try runtime.route(configuration: config, providerSnapshots: mixed)
+        XCTAssertEqual(route.provider, .codex,
+                       "When the Source host is not live, Auto may fall back to the next eligible provider.")
+    }
+
     func testAdmissionSelectsLiveEligibleProviderAndPersistsAuditableReceipt() throws {
         let (db, root) = try database()
         defer { try? FileManager.default.removeItem(atPath: root) }

@@ -659,7 +659,7 @@ public final class AgentOrchestrationRuntime: @unchecked Sendable {
             providerInstanceId: resolved.providerInstanceId,
             model: resolved.selection.effectiveModel,
             capabilitySnapshotId: resolved.capabilitySnapshotId,
-            decisionReason: "deterministic-first-live-eligible-provider",
+            decisionReason: "preferred-source-then-live-eligible-provider",
             admittedAt: now(),
             lifecycleStatus: .accepted,
             deadlineAt: deadlineAt,
@@ -846,14 +846,21 @@ public final class AgentOrchestrationRuntime: @unchecked Sendable {
             throw AgentOrchestrationAdmissionError.invalidPolicy
         }
 
-        for provider in configuration.eligibleProviders {
-            guard let snapshot = providerSnapshots.first(where: {
-                $0.provider == provider &&
-                AgentProviderRunnableSelection.isRunnable($0) &&
-                $0.modelDiscoverySource == .live &&
-                $0.capabilities?.supportsStreaming == true &&
-                !$0.models.isEmpty
-            }) else { continue }
+        // Prefer the Source picker host (manualSelection) so Auto runs on the
+        // provider the user sees selected — not always the first of allCases
+        // (codex). Fall back through the rest of eligibleProviders if that host
+        // is not live/runnable yet.
+        for provider in Self.orderedEligibleProviders(
+            eligible: configuration.eligibleProviders,
+            preferred: configuration.manualSelection.provider
+        ) {
+            guard let snapshot = Self.liveRunnableSnapshot(
+                provider: provider,
+                preferredInstanceId: provider == configuration.manualSelection.provider
+                    ? configuration.manualProviderInstanceId
+                    : nil,
+                providerSnapshots: providerSnapshots
+            ) else { continue }
 
             // Auto always binds the host-matrix LIGHT row. Capability escalation
             // (STANDARD/DEEP workers) is performed inside $remote-code-orchestrate
@@ -870,6 +877,47 @@ public final class AgentOrchestrationRuntime: @unchecked Sendable {
             )
         }
         throw AgentOrchestrationAdmissionError.noEligibleProvider
+    }
+
+    /// Eligible provider walk order for Auto: preferred Source host first, then
+    /// the remaining list in declared order (no duplicates).
+    public static func orderedEligibleProviders(
+        eligible: [AgentProvider],
+        preferred: AgentProvider
+    ) -> [AgentProvider] {
+        var ordered: [AgentProvider] = []
+        var seen = Set<AgentProvider>()
+        if eligible.contains(preferred), seen.insert(preferred).inserted {
+            ordered.append(preferred)
+        }
+        for provider in eligible where seen.insert(provider).inserted {
+            ordered.append(provider)
+        }
+        return ordered
+    }
+
+    /// Live, streaming, non-empty catalog snapshot for Auto admission.
+    /// When `preferredInstanceId` is set (matching the Source picker), try that
+    /// instance first so personal/work Codex/Claude accounts stay sticky.
+    static func liveRunnableSnapshot(
+        provider: AgentProvider,
+        preferredInstanceId: String?,
+        providerSnapshots: [AgentProviderSnapshot]
+    ) -> AgentProviderSnapshot? {
+        func isEligible(_ snapshot: AgentProviderSnapshot) -> Bool {
+            snapshot.provider == provider
+                && AgentProviderRunnableSelection.isRunnable(snapshot)
+                && snapshot.modelDiscoverySource == .live
+                && snapshot.capabilities?.supportsStreaming == true
+                && !snapshot.models.isEmpty
+        }
+        if let preferredInstanceId,
+           let preferred = providerSnapshots.first(where: {
+               $0.id == preferredInstanceId && isEligible($0)
+           }) {
+            return preferred
+        }
+        return providerSnapshots.first(where: isEligible)
     }
 
     /// Skill name / package ID used for Auto invocation (`$remote-code-orchestrate`).
