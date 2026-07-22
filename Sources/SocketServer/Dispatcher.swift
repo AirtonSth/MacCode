@@ -23,6 +23,28 @@ public struct AgentThreadMirrorSnapshot: Sendable, Equatable {
     }
 }
 
+public struct AgentRoutingRequest: Sendable, Equatable {
+    public let mode: AgentRoutingMode
+    public let expectedRevision: Int
+    public let manualSelection: AgentModelSelection?
+    public let eligibleProviders: [AgentProvider]?
+    public let policyDigest: String?
+
+    public init(
+        mode: AgentRoutingMode,
+        expectedRevision: Int,
+        manualSelection: AgentModelSelection? = nil,
+        eligibleProviders: [AgentProvider]? = nil,
+        policyDigest: String? = nil
+    ) {
+        self.mode = mode
+        self.expectedRevision = expectedRevision
+        self.manualSelection = manualSelection
+        self.eligibleProviders = eligibleProviders
+        self.policyDigest = policyDigest
+    }
+}
+
 @MainActor
 public protocol CommandRouting: AnyObject {
     // window/workspace/pane/surface
@@ -70,7 +92,9 @@ public protocol CommandRouting: AnyObject {
     func openAgentApp(workspace: WorkspaceID) throws -> SurfaceDescriptor
     func listAgentThreads(workspace: WorkspaceID?) throws -> [AgentThread]
     func createAgentThread(workspace: WorkspaceID?, title: String, provider: AgentProvider, model: String, permissionMode: AgentPermissionMode, reasoningEffort: AgentReasoningEffort, serviceTier: AgentServiceTier, modelSelection: AgentModelSelection?, providerInstanceId: String?, runAsUser: AgentRunAsUser?, surfaceID: SurfaceID?) throws -> AgentThread
+    func createAgentThreadRouting(workspace: WorkspaceID?, title: String, provider: AgentProvider, model: String, permissionMode: AgentPermissionMode, reasoningEffort: AgentReasoningEffort, serviceTier: AgentServiceTier, modelSelection: AgentModelSelection?, providerInstanceId: String?, runAsUser: AgentRunAsUser?, surfaceID: SurfaceID?, routing: AgentRoutingRequest?) async throws -> AgentThread
     func configureAgentThread(thread: AgentThreadID, provider: AgentProvider?, model: String?, permissionMode: AgentPermissionMode?, reasoningEffort: AgentReasoningEffort?, serviceTier: AgentServiceTier?, modelSelection: AgentModelSelection?, providerInstanceId: String?, runAsUser: AgentRunAsUser?) throws -> AgentThread
+    func configureAgentThreadRouting(thread: AgentThreadID, provider: AgentProvider?, model: String?, permissionMode: AgentPermissionMode?, reasoningEffort: AgentReasoningEffort?, serviceTier: AgentServiceTier?, modelSelection: AgentModelSelection?, providerInstanceId: String?, runAsUser: AgentRunAsUser?, routing: AgentRoutingRequest?) async throws -> AgentThread
     func listAgentRunAsUsers() throws -> [AgentRunAsUser]
     func configureAgentThreadExecution(thread: AgentThreadID, executionMode: AgentExecutionMode, baseBranch: String?) throws -> AgentThread
     func prepareAgentThreadForPullRequest(workspace: WorkspaceID, url: String, provider: AgentProvider, model: String, permissionMode: AgentPermissionMode, reasoningEffort: AgentReasoningEffort, serviceTier: AgentServiceTier, modelSelection: AgentModelSelection?, providerInstanceId: String?) throws -> AgentThread
@@ -93,6 +117,7 @@ public protocol CommandRouting: AnyObject {
     /// mutation the mac queue drag-reorder performs.
     func reorderAgentQueuedMessage(thread: AgentThreadID, id: AgentQueuedMessageID, position: Int) throws
     func sendAgentMessage(thread: AgentThreadID, text: String, provider: AgentProvider?, model: String?, permissionMode: AgentPermissionMode?, reasoningEffort: AgentReasoningEffort?, serviceTier: AgentServiceTier?, interactionMode: AgentInteractionMode?, modelSelection: AgentModelSelection?, providerInstanceId: String?, attachments: [AgentAttachment]) async throws -> AgentMessageSendResult
+    func sendAgentMessageRouting(thread: AgentThreadID, text: String, provider: AgentProvider?, model: String?, permissionMode: AgentPermissionMode?, reasoningEffort: AgentReasoningEffort?, serviceTier: AgentServiceTier?, interactionMode: AgentInteractionMode?, modelSelection: AgentModelSelection?, providerInstanceId: String?, attachments: [AgentAttachment], routing: AgentRoutingRequest?) async throws -> AgentMessageSendResult
     func implementAgentPlan(thread: AgentThreadID, planId: String, planMarkdown: String?, newThread: Bool, provider: AgentProvider?, model: String?, permissionMode: AgentPermissionMode?, reasoningEffort: AgentReasoningEffort?, serviceTier: AgentServiceTier?, modelSelection: AgentModelSelection?) async throws -> (runId: AgentRunID, implementationThreadId: AgentThreadID)
     func saveAgentPlan(thread: AgentThreadID, planId: String, planMarkdown: String?, relativePath: String?) throws -> (path: String, relativePath: String)
     /// Per-thread plan notes (mac plan sidebar). Returns "" when none exist.
@@ -208,6 +233,27 @@ public extension CommandRouting {
 
     func activeAgentRun(thread: AgentThreadID) throws -> AgentActiveRunSnapshot? {
         nil
+    }
+
+    func createAgentThreadRouting(workspace: WorkspaceID?, title: String, provider: AgentProvider, model: String, permissionMode: AgentPermissionMode, reasoningEffort: AgentReasoningEffort, serviceTier: AgentServiceTier, modelSelection: AgentModelSelection?, providerInstanceId: String?, runAsUser: AgentRunAsUser?, surfaceID: SurfaceID?, routing: AgentRoutingRequest?) async throws -> AgentThread {
+        guard routing == nil else {
+            throw JSONRPCError(code: -32020, message: "Model routing is not supported by this host.", data: .object(["domain": .string("routing"), "kind": .string("unsupported")]))
+        }
+        return try createAgentThread(workspace: workspace, title: title, provider: provider, model: model, permissionMode: permissionMode, reasoningEffort: reasoningEffort, serviceTier: serviceTier, modelSelection: modelSelection, providerInstanceId: providerInstanceId, runAsUser: runAsUser, surfaceID: surfaceID)
+    }
+
+    func configureAgentThreadRouting(thread: AgentThreadID, provider: AgentProvider?, model: String?, permissionMode: AgentPermissionMode?, reasoningEffort: AgentReasoningEffort?, serviceTier: AgentServiceTier?, modelSelection: AgentModelSelection?, providerInstanceId: String?, runAsUser: AgentRunAsUser?, routing: AgentRoutingRequest?) async throws -> AgentThread {
+        guard routing == nil else {
+            throw JSONRPCError(code: -32020, message: "Model routing is not supported by this host.", data: .object(["domain": .string("routing"), "kind": .string("unsupported")]))
+        }
+        return try configureAgentThread(thread: thread, provider: provider, model: model, permissionMode: permissionMode, reasoningEffort: reasoningEffort, serviceTier: serviceTier, modelSelection: modelSelection, providerInstanceId: providerInstanceId, runAsUser: runAsUser)
+    }
+
+    func sendAgentMessageRouting(thread: AgentThreadID, text: String, provider: AgentProvider?, model: String?, permissionMode: AgentPermissionMode?, reasoningEffort: AgentReasoningEffort?, serviceTier: AgentServiceTier?, interactionMode: AgentInteractionMode?, modelSelection: AgentModelSelection?, providerInstanceId: String?, attachments: [AgentAttachment], routing: AgentRoutingRequest?) async throws -> AgentMessageSendResult {
+        guard routing == nil else {
+            throw JSONRPCError(code: -32020, message: "Model routing is not supported by this host.", data: .object(["domain": .string("routing"), "kind": .string("unsupported")]))
+        }
+        return try await sendAgentMessage(thread: thread, text: text, provider: provider, model: model, permissionMode: permissionMode, reasoningEffort: reasoningEffort, serviceTier: serviceTier, interactionMode: interactionMode, modelSelection: modelSelection, providerInstanceId: providerInstanceId, attachments: attachments)
     }
 
     func ensureGitSurface(workspace: WorkspaceID) throws -> SurfaceDescriptor {
@@ -1667,7 +1713,8 @@ public final class JSONRPCDispatcher {
                 let providerInstanceId = params["provider_instance_id"]?.stringValue ?? params["providerInstanceId"]?.stringValue
                 let runAsUser = decodeRunAsUser(from: params["run_as_user"] ?? params["runAsUser"])
                 let createSurfaceID = (params["surface_id"]?.stringValue ?? params["surfaceId"]?.stringValue).flatMap(UUID.init).map(SurfaceID.init)
-                let t = try router.createAgentThread(workspace: wid, title: title, provider: provider, model: model, permissionMode: permission, reasoningEffort: reasoning, serviceTier: serviceTier, modelSelection: modelSelection, providerInstanceId: providerInstanceId, runAsUser: runAsUser, surfaceID: createSurfaceID)
+                let routing = try routingRequest(from: params, requireManualSelection: true)
+                let t = try await router.createAgentThreadRouting(workspace: wid, title: title, provider: provider, model: model, permissionMode: permission, reasoningEffort: reasoning, serviceTier: serviceTier, modelSelection: modelSelection, providerInstanceId: providerInstanceId, runAsUser: runAsUser, surfaceID: createSurfaceID, routing: routing)
                 EventBus.shared.publish(kind: "agent.thread.created", payload: threadPayload(t))
                 return .init(id: id, result: encodeThread(t))
             case "agent.thread.configure":
@@ -1680,7 +1727,8 @@ public final class JSONRPCDispatcher {
                 let serviceTier = modelSelection?.serviceTier ?? params["service_tier"]?.stringValue.flatMap(AgentServiceTier.init)
                 let providerInstanceId = params["provider_instance_id"]?.stringValue ?? params["providerInstanceId"]?.stringValue
                 let runAsUser = decodeRunAsUser(from: params["run_as_user"] ?? params["runAsUser"])
-                let t = try router.configureAgentThread(thread: tid, provider: provider, model: model, permissionMode: permission, reasoningEffort: reasoning, serviceTier: serviceTier, modelSelection: modelSelection, providerInstanceId: providerInstanceId, runAsUser: runAsUser)
+                let routing = try routingRequest(from: params, requireManualSelection: true)
+                let t = try await router.configureAgentThreadRouting(thread: tid, provider: provider, model: model, permissionMode: permission, reasoningEffort: reasoning, serviceTier: serviceTier, modelSelection: modelSelection, providerInstanceId: providerInstanceId, runAsUser: runAsUser, routing: routing)
                 var payload: [String: JSONValue] = [
                     "thread_id": .string(t.id.value.uuidString),
                     "workspace_id": t.workspaceId.map { .string($0.value.uuidString) } ?? .null,
@@ -1697,6 +1745,7 @@ public final class JSONRPCDispatcher {
                 payload["runAsUser"] = encodeRunAsUser(t.runAsUser)
                 payload["provider_locked"] = .bool(providerLocked(t))
                 payload["providerLocked"] = .bool(providerLocked(t))
+                appendRouting(t.effectiveRoutingConfiguration, to: &payload)
                 EventBus.shared.publish(kind: "agent.thread.updated", payload: .object(payload))
                 return .init(id: id, result: encodeThread(t))
             case "agent.thread.execution.configure":
@@ -1769,7 +1818,12 @@ public final class JSONRPCDispatcher {
                 let interactionMode = params["interaction_mode"]?.stringValue.flatMap(AgentInteractionMode.init)
                 let providerInstanceId = params["provider_instance_id"]?.stringValue ?? params["providerInstanceId"]?.stringValue
                 let attachments = try agentAttachments(from: params["attachments"])
-                let sendResult = try await router.sendAgentMessage(thread: tid, text: text, provider: provider, model: model, permissionMode: permission, reasoningEffort: reasoning, serviceTier: serviceTier, interactionMode: interactionMode, modelSelection: modelSelection, providerInstanceId: providerInstanceId, attachments: attachments)
+                let routing = try routingRequest(from: params, requireManualSelection: false)
+                if routing?.mode == .auto,
+                   ["provider", "provider_instance_id", "providerInstanceId", "model", "reasoning_effort", "service_tier", "model_selection"].contains(where: { params[$0] != nil }) {
+                    throw JSONRPCError.invalidParams
+                }
+                let sendResult = try await router.sendAgentMessageRouting(thread: tid, text: text, provider: provider, model: model, permissionMode: permission, reasoningEffort: reasoning, serviceTier: serviceTier, interactionMode: interactionMode, modelSelection: modelSelection, providerInstanceId: providerInstanceId, attachments: attachments, routing: routing)
                 let result = messageSendResultPayload(sendResult)
                 recordCommandReceipt(method: req.method, clientRequestId: receiptKey, result: result)
                 return .init(id: id, result: result)
@@ -2609,6 +2663,39 @@ public final class JSONRPCDispatcher {
     static func mapDomainError(_ error: Error, method: String) -> JSONRPCError {
         let verbose = String(describing: error)
         switch error {
+        case let error as AgentRoutingRevisionError:
+            let expected: Int
+            let actual: Int
+            switch error {
+            case .conflict(let requested, let current):
+                expected = requested
+                actual = current
+            }
+            return JSONRPCError(
+                code: -32020,
+                message: "Model routing changed on the host. Refresh the thread and try again.",
+                data: .object([
+                    "domain": .string("routing"),
+                    "kind": .string("revision_conflict"),
+                    "expected_revision": .number(Double(expected)),
+                    "actual_revision": .number(Double(actual))
+                ])
+            )
+        case let error as AgentOrchestrationAdmissionError:
+            let kind: String
+            switch error {
+            case .packageUnavailable: kind = "package_unavailable"
+            case .killSwitchEnabled: kind = "kill_switch_enabled"
+            case .invalidPolicy: kind = "invalid_policy"
+            case .invalidRoutingMode: kind = "invalid_mode"
+            case .noEligibleProvider: kind = "no_eligible_provider"
+            case .receiptPersistenceFailed: kind = "receipt_persistence_failed"
+            }
+            return JSONRPCError(
+                code: -32020,
+                message: error.description,
+                data: .object(["domain": .string("routing"), "kind": .string(kind)])
+            )
         case let e as AgentProviderAdapterError:
             switch e {
             case .sessionNotFound:
@@ -2865,6 +2952,7 @@ public final class JSONRPCDispatcher {
         let locked = providerLocked(thread)
         object["providerLocked"] = .bool(locked)
         object["provider_locked"] = .bool(locked)
+        appendRouting(thread.effectiveRoutingConfiguration, to: &object)
         appendActiveRun(to: &object, thread: thread.id)
         return .object(object)
     }
@@ -2888,6 +2976,7 @@ public final class JSONRPCDispatcher {
         let locked = lockedThreads.contains(thread.id)
         object["providerLocked"] = .bool(locked)
         object["provider_locked"] = .bool(locked)
+        appendRouting(thread.effectiveRoutingConfiguration, to: &object)
         appendActiveRun(to: &object, thread: thread.id)
         return .object(object)
     }
@@ -3022,6 +3111,51 @@ public final class JSONRPCDispatcher {
         )
     }
 
+    private func routingRequest(
+        from params: [String: JSONValue],
+        requireManualSelection: Bool
+    ) throws -> AgentRoutingRequest? {
+        let keys = ["routing_mode", "routingMode", "routing_revision", "routingRevision", "manual_selection", "manualSelection", "eligible_providers", "eligibleProviders", "policy_digest", "policyDigest"]
+        guard keys.contains(where: { params[$0] != nil }) else { return nil }
+        guard let rawMode = (params["routing_mode"] ?? params["routingMode"])?.stringValue,
+              let mode = AgentRoutingMode(rawValue: rawMode),
+              let revisionValue = params["routing_revision"] ?? params["routingRevision"],
+              case .number(let rawRevision) = revisionValue,
+              rawRevision.isFinite,
+              rawRevision.rounded(.towardZero) == rawRevision,
+              rawRevision >= 0,
+              rawRevision <= Double(Int.max) else {
+            throw JSONRPCError.invalidParams
+        }
+        let manualValue = params["manual_selection"] ?? params["manualSelection"]
+        let manualSelection = modelSelection(from: manualValue)
+        if requireManualSelection, manualSelection == nil {
+            throw JSONRPCError.invalidParams
+        }
+        let eligibleValue = params["eligible_providers"] ?? params["eligibleProviders"]
+        let eligibleProviders: [AgentProvider]?
+        if let eligibleValue {
+            guard case .array(let values) = eligibleValue else { throw JSONRPCError.invalidParams }
+            eligibleProviders = try values.map { value in
+                guard let raw = value.stringValue, let provider = AgentProvider(rawValue: raw) else {
+                    throw JSONRPCError.invalidParams
+                }
+                return provider
+            }
+        } else {
+            eligibleProviders = nil
+        }
+        let policyValue = params["policy_digest"] ?? params["policyDigest"]
+        if let policyValue, policyValue.stringValue == nil { throw JSONRPCError.invalidParams }
+        return AgentRoutingRequest(
+            mode: mode,
+            expectedRevision: Int(rawRevision),
+            manualSelection: manualSelection,
+            eligibleProviders: eligibleProviders,
+            policyDigest: policyValue?.stringValue
+        )
+    }
+
     private func agentAttachments(from value: JSONValue?) throws -> [AgentAttachment] {
         guard let value else { return [] }
         guard case .array(let values) = value else { throw JSONRPCError.invalidParams }
@@ -3111,7 +3245,30 @@ public final class JSONRPCDispatcher {
         payload["color"] = thread.color.map { .string($0) } ?? .null
         payload["pinned"] = .bool(thread.pinned)
         payload["sort_order"] = .number(Double(thread.sortOrder))
+        appendRouting(thread.effectiveRoutingConfiguration, to: &payload)
         return .object(payload)
+    }
+
+    private func appendRouting(_ routing: AgentRoutingConfiguration, to object: inout [String: JSONValue]) {
+        let manualSelection = encode(routing.manualSelection)
+        let eligibleProviders = JSONValue.array(routing.eligibleProviders.map { .string($0.rawValue) })
+        object["routing"] = .object([
+            "mode": .string(routing.mode.rawValue),
+            "revision": .number(Double(routing.revision)),
+            "manualSelection": manualSelection,
+            "eligibleProviders": eligibleProviders,
+            "policyDigest": .string(routing.policyDigest)
+        ])
+        object["routing_mode"] = .string(routing.mode.rawValue)
+        object["routingMode"] = .string(routing.mode.rawValue)
+        object["routing_revision"] = .number(Double(routing.revision))
+        object["routingRevision"] = .number(Double(routing.revision))
+        object["manual_selection"] = manualSelection
+        object["manualSelection"] = manualSelection
+        object["eligible_providers"] = eligibleProviders
+        object["eligibleProviders"] = eligibleProviders
+        object["policy_digest"] = .string(routing.policyDigest)
+        object["policyDigest"] = .string(routing.policyDigest)
     }
 
     private func providerLocked(_ thread: AgentThread) -> Bool {

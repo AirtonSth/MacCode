@@ -48,6 +48,95 @@ public enum AgentSkillUninstallResult: String, Sendable, Equatable {
     case notPresent
 }
 
+public struct RemoteCodeOrchestrateFile: Codable, Sendable, Equatable {
+    public let relativePath: String
+    public let byteCount: Int
+    public let sha256: String
+
+    public init(relativePath: String, byteCount: Int, sha256: String) {
+        self.relativePath = relativePath
+        self.byteCount = byteCount
+        self.sha256 = sha256
+    }
+}
+
+public struct RemoteCodeOrchestratePackage: Sendable, Equatable {
+    public let skillID: String
+    public let sourceURL: String
+    public let sourceRevision: String
+    public let sourceTreeSHA256: String
+    public let localVersion: String
+    public let allowedPaths: [String]
+
+    public init(
+        skillID: String,
+        sourceURL: String,
+        sourceRevision: String,
+        sourceTreeSHA256: String,
+        localVersion: String,
+        allowedPaths: [String]
+    ) {
+        self.skillID = skillID
+        self.sourceURL = sourceURL
+        self.sourceRevision = sourceRevision
+        self.sourceTreeSHA256 = sourceTreeSHA256
+        self.localVersion = localVersion
+        self.allowedPaths = allowedPaths.sorted()
+    }
+}
+
+public struct RemoteCodeOrchestrateManifest: Codable, Sendable, Equatable {
+    public let schemaVersion: Int
+    public let managedBy: String
+    public let skillID: String
+    public let sourceURL: String
+    public let sourceRevision: String
+    public let sourceTreeSHA256: String
+    public let localVersion: String
+    public let installPath: String
+    public let installedAt: Date
+    public let files: [RemoteCodeOrchestrateFile]
+}
+
+public struct RemoteCodeOrchestrateInstallResult: Sendable, Equatable {
+    public enum Action: String, Sendable {
+        case installed
+        case skipped
+        case updated
+        case repaired
+    }
+
+    public let action: Action
+    public let manifest: RemoteCodeOrchestrateManifest
+}
+
+public struct RemoteCodeOrchestrateStatus: Sendable, Equatable {
+    public enum State: String, Sendable {
+        case notInstalled
+        case ready
+        case updateRequired
+        case repairRequired
+        case unmanagedCollision
+    }
+
+    public let state: State
+    public let manifest: RemoteCodeOrchestrateManifest?
+    public let lastKnownGoodAvailable: Bool
+    public let repairReason: String?
+}
+
+public enum RemoteCodeOrchestrateInstallError: Error, Sendable, Equatable {
+    case sourceMissing(String)
+    case unsafeRelativePath(String)
+    case symbolicLink(String)
+    case unexpectedEntry(String)
+    case missingRequiredFile(String)
+    case sourceTreeDigestMismatch(expected: String, actual: String)
+    case unmanagedCollision(String)
+    case invalidManagedPackage(String)
+    case lastKnownGoodUnavailable
+}
+
 public final class AgentSkillInstaller: @unchecked Sendable {
     public static let distillSkillID = "distill"
     public static let distillSourceURL = "https://github.com/samuelfaj/distill/blob/main/skills/distill/SKILL.md"
@@ -59,6 +148,25 @@ public final class AgentSkillInstaller: @unchecked Sendable {
     public static let mcpBeginMarker = "# RemoteCode managed MCP: begin"
     public static let mcpEndMarker = "# RemoteCode managed MCP: end"
     public static let retrieveMCPName = "remotecode-distill-retrieve"
+    public static let remoteCodeOrchestrateManifestName = ".remote-code-install.json"
+    public static let remoteCodeOrchestrateRuntimeManifestName = "manifest.json"
+    public static let remoteCodeOrchestratePinnedPackage = RemoteCodeOrchestratePackage(
+        skillID: "remote-code-orchestrate",
+        sourceURL: "https://github.com/samuelfaj/sam-skills/tree/main/sam-orchestrate",
+        sourceRevision: "2c77fa48431bc20e5dc841652079594a3ea918c9",
+        sourceTreeSHA256: "2e1467150cc26351ff9d61154150ae7f0047af4336444150a1f67a9c5f1579e9",
+        localVersion: "1",
+        allowedPaths: [
+            "SKILL.md",
+            "agents/openai.yaml",
+            "references/host-runtime-matrix.md",
+            "references/output-contract.md",
+            "references/prompt-contract.md",
+            "references/routing-policy.md",
+            "scripts/test_orchestration_harness.py",
+            "scripts/validate_orchestration.py"
+        ]
+    )
 
     public static let distillSkillTemplate = """
     ---
@@ -150,6 +258,8 @@ public final class AgentSkillInstaller: @unchecked Sendable {
     private let codexInstructionsURL: URL
     private let cliBinDirectory: URL
     private let pathBinDirectory: URL
+    private let appPrivateSkillsRoot: URL
+    private let remoteCodeOrchestratePackage: RemoteCodeOrchestratePackage
     private let fileManager: FileManager
     private let encoder = JSONEncoder()
     private let decoder = JSONDecoder()
@@ -164,6 +274,8 @@ public final class AgentSkillInstaller: @unchecked Sendable {
         codexInstructionsURL: URL = AgentSkillInstaller.defaultCodexInstructionsURL(),
         cliBinDirectory: URL = AgentSkillInstaller.defaultManagedCLIBinDirectory(),
         pathBinDirectory: URL = AgentSkillInstaller.defaultPathBinDirectory(),
+        appPrivateSkillsRoot: URL = AgentSkillInstaller.defaultAppPrivateSkillsRoot(),
+        remoteCodeOrchestratePackage: RemoteCodeOrchestratePackage = AgentSkillInstaller.remoteCodeOrchestratePinnedPackage,
         fileManager: FileManager = .default
     ) {
         self.claudeSkillsRoot = claudeSkillsRoot
@@ -172,6 +284,8 @@ public final class AgentSkillInstaller: @unchecked Sendable {
         self.codexInstructionsURL = codexInstructionsURL
         self.cliBinDirectory = cliBinDirectory
         self.pathBinDirectory = pathBinDirectory
+        self.appPrivateSkillsRoot = appPrivateSkillsRoot
+        self.remoteCodeOrchestratePackage = remoteCodeOrchestratePackage
         self.fileManager = fileManager
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         encoder.dateEncodingStrategy = .iso8601
@@ -188,6 +302,7 @@ public final class AgentSkillInstaller: @unchecked Sendable {
             codexInstructionsURL: homeDirectory.appendingPathComponent(".codex/AGENTS.md"),
             cliBinDirectory: homeDirectory.appendingPathComponent(".remote-code/bin", isDirectory: true),
             pathBinDirectory: homeDirectory.appendingPathComponent(".local/bin", isDirectory: true),
+            appPrivateSkillsRoot: homeDirectory.appendingPathComponent(".remote-code/app-private-skills", isDirectory: true),
             fileManager: fileManager
         )
     }
@@ -226,6 +341,10 @@ public final class AgentSkillInstaller: @unchecked Sendable {
     public static func defaultPathBinDirectory() -> URL {
         FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(".local/bin", isDirectory: true)
+    }
+
+    public static func defaultAppPrivateSkillsRoot() -> URL {
+        AgentOrchestrationRuntime.defaultPackageURL().deletingLastPathComponent()
     }
 
     public func installDistillSkill(
@@ -659,6 +778,445 @@ public final class AgentSkillInstaller: @unchecked Sendable {
             return
         }
         try? fileManager.removeItem(at: link)
+    }
+
+    @discardableResult
+    public func reconcileRemoteCodeOrchestrate(
+        installedAt: Date = Date()
+    ) throws -> RemoteCodeOrchestrateInstallResult {
+        guard let embeddedDirectory = Bundle.module.url(
+            forResource: remoteCodeOrchestratePackage.skillID,
+            withExtension: nil
+        ) else {
+            throw RemoteCodeOrchestrateInstallError.sourceMissing(
+                "Embedded resource: \(remoteCodeOrchestratePackage.skillID)"
+            )
+        }
+        return try installRemoteCodeOrchestrate(from: embeddedDirectory, installedAt: installedAt)
+    }
+
+    public func remoteCodeOrchestrateDirectory() -> URL {
+        appPrivateSkillsRoot.appendingPathComponent(remoteCodeOrchestratePackage.skillID, isDirectory: true)
+    }
+
+    public func remoteCodeOrchestrateLastKnownGoodDirectory() -> URL {
+        appPrivateSkillsRoot.appendingPathComponent(
+            "\(remoteCodeOrchestratePackage.skillID).last-known-good",
+            isDirectory: true
+        )
+    }
+
+    public func installRemoteCodeOrchestrate(
+        from sourceDirectory: URL,
+        installedAt: Date = Date()
+    ) throws -> RemoteCodeOrchestrateInstallResult {
+        let sourceFiles = try validatedRemoteCodeOrchestrateSource(
+            at: sourceDirectory,
+            package: remoteCodeOrchestratePackage
+        )
+        try prepareAppPrivateSkillsRoot()
+
+        let destination = remoteCodeOrchestrateDirectory()
+        let current = inspectManagedPackage(at: destination)
+        switch current {
+        case .unmanaged:
+            throw RemoteCodeOrchestrateInstallError.unmanagedCollision(destination.path)
+        case .valid(let manifest) where manifestMatchesPinnedPackage(manifest):
+            return RemoteCodeOrchestrateInstallResult(action: .skipped, manifest: manifest)
+        default:
+            break
+        }
+
+        let stagingRoot = appPrivateSkillsRoot.appendingPathComponent(".staging", isDirectory: true)
+        try prepareOwnedDirectory(stagingRoot)
+        let staged = stagingRoot.appendingPathComponent(
+            "\(remoteCodeOrchestratePackage.skillID)-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        try fileManager.createDirectory(at: staged, withIntermediateDirectories: false)
+        defer { try? fileManager.removeItem(at: staged) }
+
+        for file in sourceFiles {
+            let source = sourceDirectory.appendingPathComponent(file.relativePath)
+            let target = staged.appendingPathComponent(file.relativePath)
+            try fileManager.createDirectory(at: target.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try fileManager.copyItem(at: source, to: target)
+        }
+
+        let stagedFiles = try validatedRemoteCodeOrchestrateSource(
+            at: staged,
+            package: remoteCodeOrchestratePackage
+        )
+        let manifest = RemoteCodeOrchestrateManifest(
+            schemaVersion: 1,
+            managedBy: "RemoteCode",
+            skillID: remoteCodeOrchestratePackage.skillID,
+            sourceURL: remoteCodeOrchestratePackage.sourceURL,
+            sourceRevision: remoteCodeOrchestratePackage.sourceRevision,
+            sourceTreeSHA256: remoteCodeOrchestratePackage.sourceTreeSHA256,
+            localVersion: remoteCodeOrchestratePackage.localVersion,
+            installPath: destination.path,
+            installedAt: installedAt,
+            files: stagedFiles
+        )
+        try encoder.encode(manifest).write(
+            to: staged.appendingPathComponent(Self.remoteCodeOrchestrateManifestName),
+            options: .atomic
+        )
+        let runtimeManifest = RemoteCodeOrchestrateRuntimeManifest(
+            schemaVersion: 1,
+            packageID: remoteCodeOrchestratePackage.skillID,
+            sourceRevision: remoteCodeOrchestratePackage.sourceRevision,
+            files: Dictionary(uniqueKeysWithValues: stagedFiles.map { ($0.relativePath, $0.sha256) })
+        )
+        try encoder.encode(runtimeManifest).write(
+            to: staged.appendingPathComponent(Self.remoteCodeOrchestrateRuntimeManifestName),
+            options: .atomic
+        )
+        _ = try validateManagedPackage(at: staged)
+
+        let action: RemoteCodeOrchestrateInstallResult.Action
+        switch current {
+        case .absent:
+            try fileManager.moveItem(at: staged, to: destination)
+            action = .installed
+        case .valid:
+            try replaceActivePackage(with: staged, preserveCurrentAsLastKnownGood: true)
+            action = .updated
+        case .invalidManaged:
+            try replaceActivePackage(with: staged, preserveCurrentAsLastKnownGood: false)
+            action = .repaired
+        case .unmanaged:
+            throw RemoteCodeOrchestrateInstallError.unmanagedCollision(destination.path)
+        }
+
+        let activated = try validateManagedPackage(at: destination)
+        return RemoteCodeOrchestrateInstallResult(action: action, manifest: activated)
+    }
+
+    public func remoteCodeOrchestrateStatus() -> RemoteCodeOrchestrateStatus {
+        let lastKnownGoodAvailable: Bool
+        if case .valid = inspectManagedPackage(at: remoteCodeOrchestrateLastKnownGoodDirectory()) {
+            lastKnownGoodAvailable = true
+        } else {
+            lastKnownGoodAvailable = false
+        }
+
+        switch inspectManagedPackage(at: remoteCodeOrchestrateDirectory()) {
+        case .absent:
+            return RemoteCodeOrchestrateStatus(
+                state: .notInstalled,
+                manifest: nil,
+                lastKnownGoodAvailable: lastKnownGoodAvailable,
+                repairReason: nil
+            )
+        case .unmanaged:
+            return RemoteCodeOrchestrateStatus(
+                state: .unmanagedCollision,
+                manifest: nil,
+                lastKnownGoodAvailable: lastKnownGoodAvailable,
+                repairReason: "The app-private skill path contains content not owned by RemoteCode."
+            )
+        case .invalidManaged(let reason):
+            return RemoteCodeOrchestrateStatus(
+                state: .repairRequired,
+                manifest: nil,
+                lastKnownGoodAvailable: lastKnownGoodAvailable,
+                repairReason: reason
+            )
+        case .valid(let manifest):
+            return RemoteCodeOrchestrateStatus(
+                state: manifestMatchesPinnedPackage(manifest) ? .ready : .updateRequired,
+                manifest: manifest,
+                lastKnownGoodAvailable: lastKnownGoodAvailable,
+                repairReason: nil
+            )
+        }
+    }
+
+    @discardableResult
+    public func restoreRemoteCodeOrchestrateLastKnownGood() throws -> RemoteCodeOrchestrateManifest {
+        let lastKnownGood = remoteCodeOrchestrateLastKnownGoodDirectory()
+        guard case .valid(let manifest) = inspectManagedPackage(at: lastKnownGood) else {
+            throw RemoteCodeOrchestrateInstallError.lastKnownGoodUnavailable
+        }
+
+        let destination = remoteCodeOrchestrateDirectory()
+        if case .unmanaged = inspectManagedPackage(at: destination) {
+            throw RemoteCodeOrchestrateInstallError.unmanagedCollision(destination.path)
+        }
+
+        let displaced = appPrivateSkillsRoot.appendingPathComponent(
+            ".repair-displaced-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        let destinationExists = pathEntryExists(destination)
+        if destinationExists {
+            try fileManager.moveItem(at: destination, to: displaced)
+        }
+        do {
+            try fileManager.moveItem(at: lastKnownGood, to: destination)
+        } catch {
+            if destinationExists {
+                try? fileManager.moveItem(at: displaced, to: destination)
+            }
+            throw error
+        }
+        if destinationExists {
+            try fileManager.removeItem(at: displaced)
+        }
+        let activated = try validateManagedPackage(at: destination)
+        guard activated == manifest else {
+            throw RemoteCodeOrchestrateInstallError.invalidManagedPackage(
+                "restored package changed during activation"
+            )
+        }
+        return activated
+    }
+
+    static func remoteCodeOrchestrateTreeDigest(_ files: [RemoteCodeOrchestrateFile]) -> String {
+        let canonical = files.sorted { $0.relativePath < $1.relativePath }.map {
+            "\($0.relativePath)\t\($0.byteCount)\t\($0.sha256)\n"
+        }.joined()
+        return sha256Hex(Data(canonical.utf8))
+    }
+
+    private enum ManagedPackageInspection {
+        case absent
+        case unmanaged
+        case invalidManaged(String)
+        case valid(RemoteCodeOrchestrateManifest)
+    }
+
+    private struct RemoteCodeOrchestrateRuntimeManifest: Codable {
+        let schemaVersion: Int
+        let packageID: String
+        let sourceRevision: String
+        let files: [String: String]
+    }
+
+    private func inspectManagedPackage(at directory: URL) -> ManagedPackageInspection {
+        guard pathEntryExists(directory) else { return .absent }
+        guard !isSymbolicLink(directory), isDirectory(directory) else { return .unmanaged }
+        let manifestURL = directory.appendingPathComponent(Self.remoteCodeOrchestrateManifestName)
+        guard pathEntryExists(manifestURL), !isSymbolicLink(manifestURL) else {
+            return .unmanaged
+        }
+        do {
+            return .valid(try validateManagedPackage(at: directory))
+        } catch {
+            return .invalidManaged(String(describing: error))
+        }
+    }
+
+    private func validatedRemoteCodeOrchestrateSource(
+        at directory: URL,
+        package: RemoteCodeOrchestratePackage,
+        ignoredPaths: Set<String> = []
+    ) throws -> [RemoteCodeOrchestrateFile] {
+        if isSymbolicLink(directory) {
+            throw RemoteCodeOrchestrateInstallError.symbolicLink(".")
+        }
+        guard fileManager.fileExists(atPath: directory.path), isDirectory(directory) else {
+            throw RemoteCodeOrchestrateInstallError.sourceMissing(directory.path)
+        }
+
+        let allowedPaths = package.allowedPaths
+        for path in allowedPaths {
+            try validateSafeRelativePath(path)
+        }
+        guard Set(allowedPaths).count == allowedPaths.count else {
+            throw RemoteCodeOrchestrateInstallError.invalidManagedPackage("duplicate allowed path")
+        }
+        let allowed = Set(allowedPaths)
+        let allowedDirectories = Set(allowedPaths.flatMap(Self.parentDirectories))
+        var found: [RemoteCodeOrchestrateFile] = []
+        var foundPaths = Set<String>()
+        let keys: [URLResourceKey] = [.isDirectoryKey, .isRegularFileKey, .isSymbolicLinkKey]
+        guard let enumerator = fileManager.enumerator(
+            at: directory,
+            includingPropertiesForKeys: keys,
+            options: [],
+            errorHandler: { _, _ in false }
+        ) else {
+            throw RemoteCodeOrchestrateInstallError.sourceMissing(directory.path)
+        }
+
+        for case let item as URL in enumerator {
+            let relativePath = try relativePath(of: item, under: directory)
+            let values = try item.resourceValues(forKeys: Set(keys))
+            if values.isSymbolicLink == true {
+                throw RemoteCodeOrchestrateInstallError.symbolicLink(relativePath)
+            }
+            if values.isDirectory == true {
+                guard allowedDirectories.contains(relativePath) else {
+                    throw RemoteCodeOrchestrateInstallError.unexpectedEntry(relativePath)
+                }
+                continue
+            }
+            if ignoredPaths.contains(relativePath) {
+                guard values.isRegularFile == true else {
+                    throw RemoteCodeOrchestrateInstallError.unexpectedEntry(relativePath)
+                }
+                continue
+            }
+            guard values.isRegularFile == true, allowed.contains(relativePath) else {
+                throw RemoteCodeOrchestrateInstallError.unexpectedEntry(relativePath)
+            }
+            let data = try Data(contentsOf: item, options: [.mappedIfSafe])
+            found.append(RemoteCodeOrchestrateFile(
+                relativePath: relativePath,
+                byteCount: data.count,
+                sha256: Self.sha256Hex(data)
+            ))
+            foundPaths.insert(relativePath)
+        }
+
+        if let missing = allowed.subtracting(foundPaths).sorted().first {
+            throw RemoteCodeOrchestrateInstallError.missingRequiredFile(missing)
+        }
+        let actualDigest = Self.remoteCodeOrchestrateTreeDigest(found)
+        guard actualDigest == package.sourceTreeSHA256 else {
+            throw RemoteCodeOrchestrateInstallError.sourceTreeDigestMismatch(
+                expected: package.sourceTreeSHA256,
+                actual: actualDigest
+            )
+        }
+        return found.sorted { $0.relativePath < $1.relativePath }
+    }
+
+    private func validateManagedPackage(at directory: URL) throws -> RemoteCodeOrchestrateManifest {
+        let manifestURL = directory.appendingPathComponent(Self.remoteCodeOrchestrateManifestName)
+        let manifest = try decoder.decode(RemoteCodeOrchestrateManifest.self, from: Data(contentsOf: manifestURL))
+        guard manifest.schemaVersion == 1,
+              manifest.managedBy == "RemoteCode",
+              manifest.skillID == remoteCodeOrchestratePackage.skillID else {
+            throw RemoteCodeOrchestrateInstallError.invalidManagedPackage("ownership manifest mismatch")
+        }
+        let package = RemoteCodeOrchestratePackage(
+            skillID: manifest.skillID,
+            sourceURL: manifest.sourceURL,
+            sourceRevision: manifest.sourceRevision,
+            sourceTreeSHA256: manifest.sourceTreeSHA256,
+            localVersion: manifest.localVersion,
+            allowedPaths: manifest.files.map(\.relativePath)
+        )
+        let files = try validatedRemoteCodeOrchestrateSource(
+            at: directory,
+            package: package,
+            ignoredPaths: [
+                Self.remoteCodeOrchestrateManifestName,
+                Self.remoteCodeOrchestrateRuntimeManifestName
+            ]
+        )
+        guard files == manifest.files.sorted(by: { $0.relativePath < $1.relativePath }) else {
+            throw RemoteCodeOrchestrateInstallError.invalidManagedPackage("file manifest mismatch")
+        }
+        let runtimeManifestURL = directory.appendingPathComponent(Self.remoteCodeOrchestrateRuntimeManifestName)
+        let runtimeManifest = try decoder.decode(
+            RemoteCodeOrchestrateRuntimeManifest.self,
+            from: Data(contentsOf: runtimeManifestURL)
+        )
+        guard runtimeManifest.schemaVersion == 1,
+              runtimeManifest.packageID == manifest.skillID,
+              runtimeManifest.sourceRevision == manifest.sourceRevision,
+              runtimeManifest.files == Dictionary(
+                uniqueKeysWithValues: files.map { ($0.relativePath, $0.sha256) }
+              ) else {
+            throw RemoteCodeOrchestrateInstallError.invalidManagedPackage("runtime manifest mismatch")
+        }
+        return manifest
+    }
+
+    private func manifestMatchesPinnedPackage(_ manifest: RemoteCodeOrchestrateManifest) -> Bool {
+        manifest.skillID == remoteCodeOrchestratePackage.skillID
+            && manifest.sourceURL == remoteCodeOrchestratePackage.sourceURL
+            && manifest.sourceRevision == remoteCodeOrchestratePackage.sourceRevision
+            && manifest.sourceTreeSHA256 == remoteCodeOrchestratePackage.sourceTreeSHA256
+            && manifest.localVersion == remoteCodeOrchestratePackage.localVersion
+    }
+
+    private func replaceActivePackage(with staged: URL, preserveCurrentAsLastKnownGood: Bool) throws {
+        let destination = remoteCodeOrchestrateDirectory()
+        let lastKnownGood = remoteCodeOrchestrateLastKnownGoodDirectory()
+        if preserveCurrentAsLastKnownGood {
+            switch inspectManagedPackage(at: lastKnownGood) {
+            case .absent:
+                break
+            case .valid:
+                try fileManager.removeItem(at: lastKnownGood)
+            case .invalidManaged, .unmanaged:
+                throw RemoteCodeOrchestrateInstallError.unmanagedCollision(lastKnownGood.path)
+            }
+            let stagedLastKnownGood = appPrivateSkillsRoot.appendingPathComponent(
+                ".last-known-good-\(UUID().uuidString)",
+                isDirectory: true
+            )
+            defer { try? fileManager.removeItem(at: stagedLastKnownGood) }
+            try fileManager.copyItem(at: destination, to: stagedLastKnownGood)
+            _ = try validateManagedPackage(at: stagedLastKnownGood)
+            try fileManager.moveItem(at: stagedLastKnownGood, to: lastKnownGood)
+        }
+
+        _ = try fileManager.replaceItemAt(
+            destination,
+            withItemAt: staged,
+            backupItemName: nil,
+            options: []
+        )
+    }
+
+    private func prepareAppPrivateSkillsRoot() throws {
+        try prepareOwnedDirectory(appPrivateSkillsRoot)
+    }
+
+    private func prepareOwnedDirectory(_ directory: URL) throws {
+        if pathEntryExists(directory) {
+            guard !isSymbolicLink(directory), isDirectory(directory) else {
+                throw RemoteCodeOrchestrateInstallError.unmanagedCollision(directory.path)
+            }
+        } else {
+            try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
+        }
+    }
+
+    private func relativePath(of item: URL, under root: URL) throws -> String {
+        let rootPath = root.standardizedFileURL.path
+        let itemPath = item.standardizedFileURL.path
+        guard itemPath.hasPrefix(rootPath + "/") else {
+            throw RemoteCodeOrchestrateInstallError.unsafeRelativePath(itemPath)
+        }
+        let relativePath = String(itemPath.dropFirst(rootPath.count + 1))
+        try validateSafeRelativePath(relativePath)
+        return relativePath
+    }
+
+    private func validateSafeRelativePath(_ path: String) throws {
+        let components = path.split(separator: "/", omittingEmptySubsequences: false)
+        guard !path.isEmpty,
+              !path.hasPrefix("/"),
+              components.allSatisfy({ !$0.isEmpty && $0 != "." && $0 != ".." }) else {
+            throw RemoteCodeOrchestrateInstallError.unsafeRelativePath(path)
+        }
+    }
+
+    private static func parentDirectories(_ path: String) -> [String] {
+        let components = path.split(separator: "/")
+        guard components.count > 1 else { return [] }
+        return (1..<components.count).map { components.prefix($0).joined(separator: "/") }
+    }
+
+    private func isDirectory(_ url: URL) -> Bool {
+        (try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true
+    }
+
+    private func isSymbolicLink(_ url: URL) -> Bool {
+        guard let attributes = try? fileManager.attributesOfItem(atPath: url.path) else { return false }
+        return attributes[.type] as? FileAttributeType == .typeSymbolicLink
+    }
+
+    private func pathEntryExists(_ url: URL) -> Bool {
+        fileManager.fileExists(atPath: url.path) || isSymbolicLink(url)
     }
 
     public func installSkill(

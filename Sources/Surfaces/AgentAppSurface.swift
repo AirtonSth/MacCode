@@ -109,6 +109,39 @@ public enum AgentErrorRecoveryAction: String, Sendable, Equatable {
     }
 }
 
+public enum AgentModelPopoverTransition: Equatable {
+    case none
+    case fadeAndSlide
+}
+
+public struct AgentModelPopoverPresentation: Equatable {
+    public static let autoDisclaimer = "O Remote Code vai orquestrar automaticamente o modelo para buscar a máxima qualidade usando o mínimo de tokens. Se alguma capacidade não estiver disponível, a rota será degradada de forma explícita."
+    public static let autoAccessibilityLabel = "Roteamento automático do modelo"
+    public static let autoAccessibilityHint = "Ativa ou desativa o roteamento automático do modelo."
+
+    public let mode: AgentRoutingMode
+    public let reduceMotion: Bool
+
+    public init(mode: AgentRoutingMode, reduceMotion: Bool) {
+        self.mode = mode
+        self.reduceMotion = reduceMotion
+    }
+
+    public var showsModelControls: Bool { mode != .auto }
+    public var showsReasoningControls: Bool { mode != .auto }
+    public var showsServiceTierControls: Bool { mode != .auto }
+    public var showsDisclaimer: Bool { mode == .auto }
+    public var autoToggleEnabled: Bool { true }
+    public var transition: AgentModelPopoverTransition {
+        reduceMotion ? .none : .fadeAndSlide
+    }
+    public var accessibilityLabel: String { Self.autoAccessibilityLabel }
+    public var accessibilityValue: String { mode == .auto ? "Ativado" : "Desativado" }
+    public var accessibilityHint: String { Self.autoAccessibilityHint }
+    public var disclaimer: String { Self.autoDisclaimer }
+
+}
+
 @MainActor
 public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     @Published public var threads: [AgentThread] = []
@@ -152,6 +185,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     @Published public var permissionMode: AgentPermissionMode = .supervised
     @Published public var reasoningEffort: AgentReasoningEffort = .medium
     @Published public var serviceTier: AgentServiceTier = .auto
+    @Published public private(set) var routingMode: AgentRoutingMode = .manual
     @Published public var executionMode: AgentExecutionMode = .local
     @Published public var baseBranch: String = ""
     @Published public var worktreePath: String?
@@ -288,6 +322,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     public let promptHistoryStore: PromptHistoryStore?
     public let customModelStore: AgentCustomModelStore?
     public let planNotesStore: PlanNotesStore?
+    private let orchestrationRuntime: AgentOrchestrationRuntime
     private var promptHistory: [String] = []
     private var promptHistoryCursor: Int?
     private var terminalRunIds = Set<AgentRunID>()
@@ -361,7 +396,8 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         promptHistoryStore: PromptHistoryStore? = nil,
         customModelStore: AgentCustomModelStore? = nil,
         planNotesStore: PlanNotesStore? = nil,
-        initialThreadId: AgentThreadID? = nil
+        initialThreadId: AgentThreadID? = nil,
+        orchestrationRuntime: AgentOrchestrationRuntime = AgentOrchestrationRuntime()
     ) {
         self.workspaceID = workspaceID
         self.cwd = cwd
@@ -377,6 +413,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         self.promptHistoryStore = promptHistoryStore
         self.customModelStore = customModelStore
         self.planNotesStore = planNotesStore
+        self.orchestrationRuntime = orchestrationRuntime
         self.promptHistory = promptHistoryStore?.load(workspaceID: workspaceID) ?? []
         self.promptHistoryStore?.onWriteError = { [weak self] error in
             Task { @MainActor [weak self] in
@@ -686,13 +723,16 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         if isThreadSwitch { onSelectedThreadChanged?(id) }
         reloadQueuedMessages()
         if let t = threads.first(where: { $0.id == id }) {
-            provider = t.provider
-            providerInstanceId = t.providerInstanceId ?? t.provider.rawValue
+            let routing = t.effectiveRoutingConfiguration
+            routingMode = routing.mode
+            let manual = routing.manualSelection
+            provider = manual.provider
+            providerInstanceId = routing.manualProviderInstanceId ?? manual.provider.rawValue
             runAsUser = t.runAsUser ?? AgentRunAsUser.current()
-            model = t.model
+            model = manual.effectiveModel
             permissionMode = t.permissionMode
-            reasoningEffort = t.reasoningEffort
-            serviceTier = t.serviceTier
+            reasoningEffort = manual.reasoningEffort
+            serviceTier = manual.serviceTier
             executionMode = t.executionMode
             baseBranch = t.baseBranch ?? gitBranch ?? "main"
             worktreePath = t.worktreePath
@@ -959,7 +999,8 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 attached: queued.attachments,
                 recordHistory: false,
                 interactionMode: queued.interactionMode,
-                requestedRunId: dispatchRunId
+                requestedRunId: dispatchRunId,
+                routingConfiguration: try queuedMessageRepo.routingConfiguration(id: queued.id)
             )
             guard runId != nil else {
                 if (try? coordinator.runStatus(dispatchRunId)) != nil {
@@ -1858,12 +1899,13 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
 
     public func loadProviderSnapshots() async {
         do {
-            let snapshots: [AgentProviderSnapshot]
+            let loadedSnapshots: [AgentProviderSnapshot]
             if let providerSnapshotLoader {
-                snapshots = try await providerSnapshotLoader()
+                loadedSnapshots = try await providerSnapshotLoader()
             } else {
-                snapshots = await Self.localFallbackProviderSnapshots()
+                loadedSnapshots = await Self.localFallbackProviderSnapshots()
             }
+            let snapshots = await snapshotsWithVerifiedCatalogProvenance(loadedSnapshots)
             await MainActor.run {
                 self.providerSnapshotStatusMessage = nil
                 self.applyProviderSnapshots(snapshots)
@@ -2017,10 +2059,94 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             rows.append(AgentProviderSnapshotFactory.snapshot(
                 provider: provider,
                 models: models,
-                binaryPath: ProcessLocator.resolve(provider.rawValue) ?? ""
+                binaryPath: ProcessLocator.resolve(provider.rawValue) ?? "",
+                modelDiscoverySource: .builtInFallback
             ))
         }
         return rows
+    }
+
+    private func snapshotsWithVerifiedCatalogProvenance(
+        _ snapshots: [AgentProviderSnapshot]
+    ) async -> [AgentProviderSnapshot] {
+        var resolved: [AgentProviderSnapshot] = []
+        resolved.reserveCapacity(snapshots.count)
+        for snapshot in snapshots {
+            guard snapshot.modelDiscoverySource == nil,
+                  snapshot.provider == .claude || snapshot.provider == .codex else {
+                resolved.append(snapshot)
+                continue
+            }
+            let launch = providerLaunchConfig?(snapshot.provider, snapshot.id)
+            let binary = launch?.binary ?? snapshot.binaryPath ?? snapshot.provider.rawValue
+            let environment = launch?.environment ?? [:]
+            let liveModels: [AgentModelDescriptor]
+            switch snapshot.provider {
+            case .claude:
+                let result = await ClaudeRunner(binaryNameOverride: binary)
+                    .listModelsResult(environment: environment)
+                liveModels = result.isFallback ? [] : result.models
+            case .codex:
+                liveModels = await CodexAppServerModelDiscovery.listModels(
+                    binary: binary,
+                    cwd: cwd,
+                    environment: environment
+                )
+            case .grok:
+                liveModels = []
+            }
+            let capabilityVerified = snapshot.installed
+                && snapshot.status == .available
+                && snapshot.capabilities?.supportsStreaming == true
+                && snapshot.binaryPath?.isEmpty == false
+            let source = AgentProviderCatalogProvenance.resolvedSource(
+                reportedSource: snapshot.modelDiscoverySource,
+                liveCatalogVerified: !liveModels.isEmpty,
+                streamingCapabilityVerified: capabilityVerified
+            )
+            resolved.append(Self.snapshot(
+                snapshot,
+                models: liveModels.isEmpty ? snapshot.models : liveModels,
+                discoverySource: source
+            ))
+        }
+        return resolved
+    }
+
+    nonisolated private static func snapshot(
+        _ snapshot: AgentProviderSnapshot,
+        models: [AgentModelDescriptor],
+        discoverySource: AgentModelDiscoverySource
+    ) -> AgentProviderSnapshot {
+        AgentProviderSnapshot(
+            id: snapshot.id,
+            provider: snapshot.provider,
+            driverKind: snapshot.driverKind,
+            displayName: snapshot.displayName,
+            accentColor: snapshot.accentColor,
+            continuationGroup: snapshot.continuationGroup,
+            interactionModes: snapshot.interactionModes,
+            permissionModes: snapshot.permissionModes,
+            enabled: snapshot.enabled,
+            installed: snapshot.installed,
+            version: snapshot.version,
+            status: snapshot.status,
+            statusDetail: snapshot.statusDetail,
+            authenticated: snapshot.authenticated,
+            accountLabel: snapshot.accountLabel,
+            accountAuthMethod: snapshot.accountAuthMethod,
+            binaryPath: snapshot.binaryPath,
+            homePath: snapshot.homePath,
+            environmentKeys: snapshot.environmentKeys,
+            models: models,
+            slashCommands: snapshot.slashCommands,
+            skills: snapshot.skills,
+            advisory: snapshot.advisory,
+            updateState: snapshot.updateState,
+            capabilities: snapshot.capabilities,
+            modelDiscoverySource: discoverySource,
+            modelDiscoveryCacheKey: snapshot.modelDiscoveryCacheKey
+        )
     }
 
     public var selectedProviderSnapshot: AgentProviderSnapshot? {
@@ -2479,14 +2605,76 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         }
     }
 
+    /// Changes the thread-owned routing mode with optimistic revision protection.
+    /// Auto never overwrites the manual picker values; disabling it restores the
+    /// exact provider/model/effort/tier captured when Auto was enabled.
+    @discardableResult
+    public func setAutoModelRoutingEnabled(_ enabled: Bool) -> Bool {
+        guard let id = selectedThreadId else {
+            statusMessage = "Create or select a thread before enabling Auto model routing."
+            return false
+        }
+        do {
+            guard let stored = try threadRepo.get(id: id) else {
+                statusMessage = "Could not save Auto model routing: thread not found."
+                return false
+            }
+            let current = stored.effectiveRoutingConfiguration
+            let requestedMode: AgentRoutingMode = enabled ? .auto : .manual
+            guard current.mode != requestedMode else { return true }
+
+            let updatedConfiguration: AgentRoutingConfiguration
+            if enabled {
+                updatedConfiguration = try orchestrationRuntime.autoConfiguration(
+                    replacing: current,
+                    expectedRevision: current.revision,
+                    manualSelection: currentModelSelection,
+                    manualProviderInstanceId: providerInstanceId,
+                    providerSnapshots: providerSnapshots
+                )
+            } else {
+                updatedConfiguration = try orchestrationRuntime.manualConfiguration(
+                    replacing: current,
+                    expectedRevision: current.revision
+                )
+            }
+            try threadRepo.setRoutingConfiguration(
+                updatedConfiguration,
+                threadId: id,
+                expectedRevision: current.revision
+            )
+            guard let persisted = try threadRepo.get(id: id) else {
+                statusMessage = "Could not restore the persisted routing configuration."
+                return false
+            }
+            routingMode = updatedConfiguration.mode
+            if !enabled {
+                restoreThreadConfiguration(from: persisted)
+            } else if let index = threads.firstIndex(where: { $0.id == id }) {
+                threads[index] = persisted
+            }
+            statusMessage = ""
+            onThreadConfigPersisted?(persisted)
+            return true
+        } catch {
+            if let latest = try? threadRepo.get(id: id) {
+                restoreThreadConfiguration(from: latest)
+            }
+            statusMessage = "Could not save Auto model routing: \(error)"
+            return false
+        }
+    }
+
     private func restoreThreadConfiguration(from thread: AgentThread) {
-        provider = thread.provider
-        providerInstanceId = thread.providerInstanceId ?? thread.provider.rawValue
+        let routing = thread.effectiveRoutingConfiguration
+        routingMode = routing.mode
+        provider = routing.manualSelection.provider
+        providerInstanceId = routing.manualProviderInstanceId ?? routing.manualSelection.provider.rawValue
         runAsUser = thread.runAsUser ?? AgentRunAsUser.current()
-        model = thread.model
+        model = routing.manualSelection.effectiveModel
         permissionMode = thread.permissionMode
-        reasoningEffort = thread.reasoningEffort
-        serviceTier = thread.serviceTier
+        reasoningEffort = routing.manualSelection.reasoningEffort
+        serviceTier = routing.manualSelection.serviceTier
         interactionMode = thread.effectiveInteractionMode
         normalizeInteractionModeForSelectedProvider()
         if let i = threads.firstIndex(where: { $0.id == thread.id }) {
@@ -3377,7 +3565,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             )),
             skills: selectedProviderSnapshot?.skills ?? []
         )
-        guard selectedProviderCanRun else {
+        guard routingMode == .auto || selectedProviderCanRun else {
             statusMessage = providerExecutionUnavailableReason ?? "The selected provider is unavailable."
             return
         }
@@ -3446,18 +3634,28 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         guard let selectedThreadId, let queuedMessageRepo else { return false }
         let mode = interactionMode ?? self.interactionMode
         do {
-            try AgentProviderRunPreflight.validate(
-                snapshot: selectedProviderSnapshot,
-                interactionMode: mode,
-                permissionMode: permissionMode,
-                attachments: attached
-            )
+            let routing = (try? threadRepo.get(id: selectedThreadId))?.effectiveRoutingConfiguration
+                ?? .legacyManual(selection: currentModelSelection, providerInstanceId: providerInstanceId)
+            if routing.mode == .auto {
+                _ = try orchestrationRuntime.route(
+                    configuration: routing,
+                    providerSnapshots: providerSnapshots
+                )
+            } else {
+                try AgentProviderRunPreflight.validate(
+                    snapshot: selectedProviderSnapshot,
+                    interactionMode: mode,
+                    permissionMode: permissionMode,
+                    attachments: attached
+                )
+            }
             let queued = try queuedMessageRepo.enqueueConsumingDraft(
                 threadId: selectedThreadId,
                 providerInstanceId: providerInstanceId,
                 text: text,
                 attachments: attached,
-                interactionMode: mode
+                interactionMode: mode,
+                routingConfiguration: routing
             )
             prompt = ""
             attachments = []
@@ -3483,15 +3681,45 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         recordHistory: Bool,
         interactionMode: AgentInteractionMode,
         resumeInterrupted: Bool = false,
-        requestedRunId: AgentRunID? = nil
+        requestedRunId: AgentRunID? = nil,
+        routingConfiguration: AgentRoutingConfiguration? = nil
     ) async -> AgentRunID? {
+        let effectiveRouting = routingConfiguration
+            ?? selectedThreadId.flatMap { try? threadRepo.get(id: $0)?.effectiveRoutingConfiguration }
+            ?? .legacyManual(selection: currentModelSelection, providerInstanceId: providerInstanceId)
+        let runProvider = provider
+        let runProviderInstanceId = providerInstanceId
+        let runModel = model
+        let runReasoningEffort = reasoningEffort
+        let runServiceTier = serviceTier
+        let runSnapshot = selectedProviderSnapshot
+        let routingSnapshot: AgentOrchestrationRoutingSnapshot?
         do {
-            try AgentProviderRunPreflight.validate(
-                snapshot: selectedProviderSnapshot,
-                interactionMode: interactionMode,
-                permissionMode: permissionMode,
-                attachments: attached
-            )
+            if effectiveRouting.mode == .auto {
+                guard selectedThreadId != nil else {
+                    throw AgentOrchestrationAdmissionError.invalidRoutingMode
+                }
+                let launchConfigurations = Dictionary(uniqueKeysWithValues: providerSnapshots.map { snapshot in
+                    let launch = providerLaunchConfig?(snapshot.provider, snapshot.id)
+                    return (snapshot.id, AgentOrchestrationLaunchConfiguration(
+                        binary: launch?.binary,
+                        environment: launch?.environment ?? [:]
+                    ))
+                })
+                routingSnapshot = AgentOrchestrationRoutingSnapshot(
+                    configuration: effectiveRouting,
+                    providerSnapshots: providerSnapshots,
+                    launchConfigurations: launchConfigurations
+                )
+            } else {
+                routingSnapshot = nil
+                try AgentProviderRunPreflight.validate(
+                    snapshot: runSnapshot,
+                    interactionMode: interactionMode,
+                    permissionMode: permissionMode,
+                    attachments: attached
+                )
+            }
         } catch {
             statusMessage = String(describing: error)
             return nil
@@ -3524,22 +3752,26 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         }
         focusTick &+= 1
         persistThreadConfig()
-        let launchConfig = providerLaunchConfig?(provider, providerInstanceId)
+        let launchConfig = providerLaunchConfig?(runProvider, runProviderInstanceId)
         let threadRunAsUser = threads.first(where: { $0.id == tid })?.runAsUser ?? runAsUser
+        let persistedThread = threads.first(where: { $0.id == tid })
+        let providerThreadId = persistedThread?.provider == runProvider
+            ? persistedThread?.providerThreadId
+            : nil
         let req = AgentRunRequest(
             runId: runId,
             threadId: tid,
-            provider: provider,
-            providerInstanceId: providerInstanceId,
-            model: model,
+            provider: runProvider,
+            providerInstanceId: runProviderInstanceId,
+            model: runModel,
             cwd: cwd,
             prompt: text,
             userMessageContent: display,
             attachments: attached,
-            providerThreadId: resumeInterrupted ? nil : threads.first(where: { $0.id == tid })?.providerThreadId,
+            providerThreadId: resumeInterrupted ? nil : providerThreadId,
             permissionMode: permissionMode,
-            reasoningEffort: reasoningEffort,
-            serviceTier: serviceTier,
+            reasoningEffort: runReasoningEffort,
+            serviceTier: runServiceTier,
             interactionMode: interactionMode,
             providerBinary: launchConfig?.binary,
             environment: launchConfig?.environment ?? [:],
@@ -3571,7 +3803,11 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             return nil
         }
         do {
-            let runId = try await coordinator.startRun(req, recordUserMessage: !resumeInterrupted)
+            let runId = try await coordinator.startRun(
+                req,
+                routingSnapshot: routingSnapshot,
+                recordUserMessage: !resumeInterrupted
+            )
             do {
                 try clearComposerDraft(threadId: tid, providerInstanceId: providerInstanceId)
                 attachments = []
@@ -6498,7 +6734,8 @@ public struct AgentAppView: View {
     }
 
     private var modelLabel: String {
-        vm.modelOptionsForSelectedProvider.first(where: { $0.id == vm.model })?.label ?? vm.model
+        if vm.routingMode == .auto { return "Auto" }
+        return vm.modelOptionsForSelectedProvider.first(where: { $0.id == vm.model })?.label ?? vm.model
     }
     private var permissionLabel: String {
         switch vm.permissionMode {
@@ -6519,6 +6756,7 @@ public struct AgentAppView: View {
     /// P3: VoiceOver label for the model picker pill that reads as structured
     /// text rather than the raw concatenated visual tokens.
     private var modelMenuAccessibilityLabel: String {
+        if vm.routingMode == .auto { return "Auto model routing" }
         var parts = ["Model \(modelLabel)"]
         if vm.supportsReasoningForSelectedModel {
             parts.append("effort \(effortLabel)")
@@ -9096,7 +9334,30 @@ public struct AgentAppView: View {
         // while running; the retry and recovery rows are excluded.
         let running = vm.selectedThreadRunIsStartingOrRunning
         let configurationLocked = running || !vm.selectedProviderCanRun
+        let reduceMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+        let presentation = AgentModelPopoverPresentation(mode: vm.routingMode, reduceMotion: reduceMotion)
         return VStack(alignment: .leading, spacing: DS.Space.xs) {
+            Toggle("Auto", isOn: Binding(
+                get: { vm.routingMode == .auto },
+                set: { _ = vm.setAutoModelRoutingEnabled($0) }
+            ))
+            .toggleStyle(.switch)
+            .disabled(running || !presentation.autoToggleEnabled)
+            .accessibilityLabel(presentation.accessibilityLabel)
+            .accessibilityValue(presentation.accessibilityValue)
+            .accessibilityHint(presentation.accessibilityHint)
+            Divider()
+                .accessibilityIdentifier("agent.model.auto.divider")
+            if presentation.showsDisclaimer {
+                Text(presentation.disclaimer)
+                    .font(DS.Font.caption)
+                    .foregroundColor(DS.Palette.textSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(width: 260, alignment: .leading)
+                    .transition(presentation.transition == .fadeAndSlide
+                        ? .opacity.combined(with: .move(edge: .top))
+                        : .identity)
+            } else {
             // UX-MAC_AGENT-016: readable while running; mutation rows disable below.
             if running {
                 Text("Read-only while running")
@@ -9198,7 +9459,7 @@ public struct AgentAppView: View {
             if vm.supportsReasoningForSelectedModel || vm.supportsServiceTierForSelectedModel {
                 compactMenuDivider
             }
-            if vm.supportsReasoningForSelectedModel {
+            if vm.routingMode == .manual && vm.supportsReasoningForSelectedModel {
                 compactMenuSection("Reasoning effort")
                 ForEach(vm.supportedReasoningEffortsForSelectedModel, id: \.self) { effort in
                     compactMenuRow(effort.displayName, selected: effort == vm.reasoningEffort) {
@@ -9249,7 +9510,14 @@ public struct AgentAppView: View {
                     dismiss: { vm.dismissProviderRecoveryStatusMessage() }
                 )
             }
+            }
         }
+        .animation(
+            presentation.transition == .fadeAndSlide
+                ? .easeInOut(duration: 0.2)
+                : nil,
+            value: vm.routingMode
+        )
         .padding(DS.Space.sm)
         .background(DS.Palette.surfaceOverlay)
         .fixedSize(horizontal: true, vertical: false)
@@ -9267,14 +9535,14 @@ public struct AgentAppView: View {
                     .lineLimit(1)
                     .truncationMode(.tail)
             }
-            if vm.serviceTier == .fast {
+            if vm.routingMode == .manual && vm.serviceTier == .fast {
                 Text("·").foregroundColor(DS.Palette.textTertiary)
                 Text(serviceTierLabel).font(DS.Font.caption).foregroundColor(DS.Palette.warning)
                     .lineLimit(1)
             }
             // IMP-MAC_AGENT-014: surface the model's context window on the pill so
             // the active limit is visible at a glance without opening the popover.
-            if let ctx = vm.selectedModelContextWindowLabel {
+            if vm.routingMode == .manual, let ctx = vm.selectedModelContextWindowLabel {
                 Text("·").foregroundColor(DS.Palette.textTertiary)
                 Text(ctx).font(DS.Font.caption).foregroundColor(DS.Palette.textTertiary)
                     .lineLimit(1)
@@ -9417,6 +9685,7 @@ public struct AgentAppView: View {
     }
 
     private var currentModelMenuLabelParts: [String] {
+        if vm.routingMode == .auto { return ["Auto"] }
         var parts = [modelLabel]
         if vm.supportsReasoningForSelectedModel {
             parts.append(effortLabel)

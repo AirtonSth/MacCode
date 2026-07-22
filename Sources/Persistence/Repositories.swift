@@ -21,6 +21,13 @@ public enum PersistenceDataError: Error, CustomStringConvertible {
     }
 }
 
+public enum AgentRoutingPersistenceError: Error, Equatable {
+    case invalidConfigurationJSON
+    case invalidMode(String)
+    case modeConflict(column: AgentRoutingMode, configuration: AgentRoutingMode)
+    case revisionConflict(column: Int, configuration: Int)
+}
+
 private func parseDate(_ s: String?) -> Date {
     guard let s, let d = iso.date(from: s) else { return Date() }
     return d
@@ -64,6 +71,37 @@ private func decodeRunAsUser(_ json: String?) -> AgentRunAsUser? {
         return nil
     }
     return user
+}
+
+private func encodeRoutingConfiguration(_ configuration: AgentRoutingConfiguration) throws -> String {
+    let data = try JSONEncoder().encode(configuration)
+    guard let json = String(data: data, encoding: .utf8) else {
+        throw AgentRoutingPersistenceError.invalidConfigurationJSON
+    }
+    return json
+}
+
+private func decodeRoutingConfiguration(
+    json: String?,
+    storedMode: String?,
+    storedRevision: Int?
+) throws -> AgentRoutingConfiguration {
+    guard let json,
+          let data = json.data(using: .utf8),
+          let configuration = try? JSONDecoder().decode(AgentRoutingConfiguration.self, from: data) else {
+        throw AgentRoutingPersistenceError.invalidConfigurationJSON
+    }
+    guard let storedMode else { return configuration }
+    guard let mode = AgentRoutingMode(rawValue: storedMode) else {
+        throw AgentRoutingPersistenceError.invalidMode(storedMode)
+    }
+    guard mode == configuration.mode else {
+        throw AgentRoutingPersistenceError.modeConflict(column: mode, configuration: configuration.mode)
+    }
+    if let storedRevision, storedRevision != configuration.revision {
+        throw AgentRoutingPersistenceError.revisionConflict(column: storedRevision, configuration: configuration.revision)
+    }
+    return configuration
 }
 
 public final class ProjectRepository {
@@ -171,6 +209,28 @@ public final class AgentThreadRepository {
         try st.bind(25, t.effectiveInteractionMode.rawValue)
         try st.bind(26, encodeRunAsUser(t.runAsUser))
         _ = try st.step()
+
+        if let routingConfiguration = t.routingConfiguration {
+            let routing = try db.prepare("""
+                INSERT INTO agent_thread_routing(thread_id, mode, configuration_json, revision, updated_at)
+                VALUES(?, ?, ?, ?, ?)
+                ON CONFLICT(thread_id) DO UPDATE SET
+                    mode=excluded.mode,
+                    configuration_json=excluded.configuration_json,
+                    revision=excluded.revision,
+                    updated_at=excluded.updated_at;
+            """)
+            try routing.bind(1, t.id.value.uuidString)
+            try routing.bind(2, routingConfiguration.mode.rawValue)
+            try routing.bind(3, try encodeRoutingConfiguration(routingConfiguration))
+            try routing.bind(4, routingConfiguration.revision)
+            try routing.bind(5, iso.string(from: routingConfiguration.updatedAt))
+            _ = try routing.step()
+        } else {
+            let routing = try db.prepare("DELETE FROM agent_thread_routing WHERE thread_id = ?;")
+            try routing.bind(1, t.id.value.uuidString)
+            _ = try routing.step()
+        }
     }
 
     public func list(workspaceId: WorkspaceID? = nil) throws -> [AgentThread] {
@@ -214,7 +274,8 @@ public final class AgentThreadRepository {
                 serviceTier: serviceTier,
                 modelSelection: decodeModelSelection(st.columnText(23), provider: provider, model: model, reasoningEffort: reasoningEffort, serviceTier: serviceTier),
                 interactionMode: AgentInteractionMode(rawValue: st.columnText(24) ?? "") ?? .default,
-                runAsUser: decodeRunAsUser(st.columnText(25))
+                runAsUser: decodeRunAsUser(st.columnText(25)),
+                routingConfiguration: try loadRoutingConfiguration(threadId: id)
             ))
         }
         return out
@@ -257,10 +318,41 @@ public final class AgentThreadRepository {
                 serviceTier: serviceTier,
                 modelSelection: decodeModelSelection(st.columnText(23), provider: provider, model: model, reasoningEffort: reasoningEffort, serviceTier: serviceTier),
                 interactionMode: AgentInteractionMode(rawValue: st.columnText(24) ?? "") ?? .default,
-                runAsUser: decodeRunAsUser(st.columnText(25))
+                runAsUser: decodeRunAsUser(st.columnText(25)),
+                routingConfiguration: try loadRoutingConfiguration(threadId: idVal)
             )
         }
         return nil
+    }
+
+    public func setRoutingConfiguration(
+        _ configuration: AgentRoutingConfiguration,
+        threadId: AgentThreadID,
+        expectedRevision: Int
+    ) throws {
+        guard var thread = try get(id: threadId) else { return }
+        let actualRevision = thread.routingConfiguration?.revision ?? 0
+        guard actualRevision == expectedRevision else {
+            throw AgentRoutingRevisionError.conflict(expected: expectedRevision, actual: actualRevision)
+        }
+        thread.routingConfiguration = configuration
+        thread.updatedAt = configuration.updatedAt
+        try upsert(thread)
+    }
+
+    private func loadRoutingConfiguration(threadId: AgentThreadID) throws -> AgentRoutingConfiguration? {
+        let statement = try db.prepare("""
+            SELECT mode, configuration_json, revision
+            FROM agent_thread_routing
+            WHERE thread_id = ?;
+        """)
+        try statement.bind(1, threadId.value.uuidString)
+        guard try statement.step() else { return nil }
+        return try decodeRoutingConfiguration(
+            json: statement.columnText(1),
+            storedMode: statement.columnText(0),
+            storedRevision: Int(statement.columnInt64(2))
+        )
     }
 
     public func delete(id: AgentThreadID) throws {
@@ -1051,7 +1143,8 @@ public final class AgentQueuedMessageRepository {
         threadId: AgentThreadID,
         text: String,
         attachments: [AgentAttachment],
-        interactionMode: AgentInteractionMode
+        interactionMode: AgentInteractionMode,
+        routingConfiguration: AgentRoutingConfiguration? = nil
     ) throws -> AgentQueuedMessage {
         let position = try nextPosition(threadId: threadId)
         let queued = AgentQueuedMessage(
@@ -1061,7 +1154,7 @@ public final class AgentQueuedMessageRepository {
             interactionMode: interactionMode,
             position: position
         )
-        try upsert(queued)
+        try upsert(queued, routingConfiguration: routingConfiguration)
         return queued
     }
 
@@ -1073,7 +1166,8 @@ public final class AgentQueuedMessageRepository {
         providerInstanceId: String,
         text: String,
         attachments: [AgentAttachment],
-        interactionMode: AgentInteractionMode
+        interactionMode: AgentInteractionMode,
+        routingConfiguration: AgentRoutingConfiguration? = nil
     ) throws -> AgentQueuedMessage {
         try db.performSync { database in
             try database.transaction {
@@ -1103,6 +1197,10 @@ public final class AgentQueuedMessageRepository {
                 try insert.bind(8, iso.string(from: queued.updatedAt))
                 _ = try insert.step()
 
+                if let routingConfiguration {
+                    try persistRoutingConfiguration(routingConfiguration, queuedMessageId: queued.id, database: database)
+                }
+
                 let deleteDraft = try database.prepare(
                     "DELETE FROM agent_thread_drafts WHERE thread_id = ? AND provider_instance_id = ?;"
                 )
@@ -1114,7 +1212,10 @@ public final class AgentQueuedMessageRepository {
         }
     }
 
-    public func upsert(_ message: AgentQueuedMessage) throws {
+    public func upsert(
+        _ message: AgentQueuedMessage,
+        routingConfiguration: AgentRoutingConfiguration? = nil
+    ) throws {
         try db.performSync { database in try database.transaction {
                 if try rowExists(message.id), try threadHasActiveLease(message.threadId) {
                     throw AgentQueuedMessageMutationError.queueIsLeased
@@ -1133,7 +1234,44 @@ public final class AgentQueuedMessageRepository {
                 try st.bind(7, iso.string(from: message.createdAt))
                 try st.bind(8, iso.string(from: message.updatedAt))
                 _ = try st.step()
+                if let routingConfiguration {
+                    try persistRoutingConfiguration(routingConfiguration, queuedMessageId: message.id, database: database)
+                }
         } }
+    }
+
+    public func routingConfiguration(id: AgentQueuedMessageID) throws -> AgentRoutingConfiguration? {
+        let statement = try db.prepare("""
+            SELECT configuration_json, revision
+            FROM agent_queued_message_routing
+            WHERE queued_message_id = ?;
+        """)
+        try statement.bind(1, id.value.uuidString)
+        guard try statement.step() else { return nil }
+        return try decodeRoutingConfiguration(
+            json: statement.columnText(0),
+            storedMode: nil,
+            storedRevision: Int(statement.columnInt64(1))
+        )
+    }
+
+    private func persistRoutingConfiguration(
+        _ configuration: AgentRoutingConfiguration,
+        queuedMessageId: AgentQueuedMessageID,
+        database: SQLiteDB
+    ) throws {
+        let statement = try database.prepare("""
+            INSERT INTO agent_queued_message_routing(queued_message_id, configuration_json, revision, created_at)
+            VALUES(?, ?, ?, ?)
+            ON CONFLICT(queued_message_id) DO UPDATE SET
+                configuration_json=excluded.configuration_json,
+                revision=excluded.revision;
+        """)
+        try statement.bind(1, queuedMessageId.value.uuidString)
+        try statement.bind(2, try encodeRoutingConfiguration(configuration))
+        try statement.bind(3, configuration.revision)
+        try statement.bind(4, iso.string(from: configuration.updatedAt))
+        _ = try statement.step()
     }
 
     public func list(threadId: AgentThreadID) throws -> [AgentQueuedMessage] {

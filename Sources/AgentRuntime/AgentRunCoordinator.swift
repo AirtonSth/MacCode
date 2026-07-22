@@ -75,6 +75,8 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     private let threadRepo: AgentThreadRepository
     private let providerSessionRepo: ProviderSessionRuntimeRepository?
     private let checkpointRepo: AgentTurnCheckpointRepository?
+    private let orchestrationRuntime: AgentOrchestrationRuntime?
+    private let providerSnapshotSupplier: (@Sendable () async throws -> [AgentProviderSnapshot])?
     private var providers: [AgentProvider: AgentProviderAdapter]
     private var active: [AgentRunID: AgentRunHandle] = [:]
     private var activeThreads: [AgentThreadID: AgentRunID] = [:]
@@ -238,6 +240,8 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         threadRepo: AgentThreadRepository,
         providerSessionRepo: ProviderSessionRuntimeRepository? = nil,
         checkpointRepo: AgentTurnCheckpointRepository? = nil,
+        orchestrationRuntime: AgentOrchestrationRuntime? = nil,
+        providerSnapshotSupplier: (@Sendable () async throws -> [AgentProviderSnapshot])? = nil,
         providers: [AgentProvider: AgentProviderRunner]
     ) {
         self.runRepo = runRepo
@@ -245,6 +249,8 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         self.threadRepo = threadRepo
         self.providerSessionRepo = providerSessionRepo
         self.checkpointRepo = checkpointRepo
+        self.orchestrationRuntime = orchestrationRuntime
+        self.providerSnapshotSupplier = providerSnapshotSupplier
         self.providers = providers.mapValues { OneShotProviderAdapter(runner: $0) }
     }
 
@@ -254,6 +260,8 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         threadRepo: AgentThreadRepository,
         providerSessionRepo: ProviderSessionRuntimeRepository? = nil,
         checkpointRepo: AgentTurnCheckpointRepository? = nil,
+        orchestrationRuntime: AgentOrchestrationRuntime? = nil,
+        providerSnapshotSupplier: (@Sendable () async throws -> [AgentProviderSnapshot])? = nil,
         providerAdapters: [AgentProvider: AgentProviderAdapter]
     ) {
         self.init(
@@ -262,6 +270,8 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             threadRepo: threadRepo,
             providerSessionRepo: providerSessionRepo,
             checkpointRepo: checkpointRepo,
+            orchestrationRuntime: orchestrationRuntime,
+            providerSnapshotSupplier: providerSnapshotSupplier,
             providers: [:]
         )
         self.providers = providerAdapters
@@ -297,6 +307,9 @@ public final class AgentRunCoordinator: @unchecked Sendable {
 
     public func reconcileOnLaunch() throws {
         _ = try runRepo.reconcileRunningOnLaunch()
+        try orchestrationRuntime?.reconcileReceipts { [runRepo] runId in
+            try runRepo.get(id: runId)?.status
+        }
         let now = Date()
         for thread in try threadRepo.list() where thread.status == .running {
             var copy = thread
@@ -377,6 +390,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     @discardableResult
     public func startRun(
         _ request: AgentRunRequest,
+        routingSnapshot: AgentOrchestrationRoutingSnapshot? = nil,
         isAutoContinuation: Bool = false,
         recordUserMessage: Bool = true
     ) async throws -> AgentRunID {
@@ -424,6 +438,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
            let error = flushPendingStreamWritesResult(runId: priorBufferedRunId, threadId: request.threadId) {
             throw error
         }
+        let request = try await requestAdmittingAutoRoute(request, routingSnapshot: routingSnapshot)
         // A user-initiated run ends any background-await auto-continuation streak;
         // the auto-nudge path passes `isAutoContinuation: true` to preserve the bound.
         // F37: it must also invalidate any ALREADY-SCHEDULED continuation (same
@@ -622,6 +637,64 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         }
         if shouldCancel { handle.cancel() }
         return runId
+    }
+
+    private func requestAdmittingAutoRoute(
+        _ request: AgentRunRequest,
+        routingSnapshot suppliedSnapshot: AgentOrchestrationRoutingSnapshot?
+    ) async throws -> AgentRunRequest {
+        let routingSnapshot: AgentOrchestrationRoutingSnapshot
+        if let suppliedSnapshot {
+            routingSnapshot = suppliedSnapshot
+        } else {
+            guard let thread = try threadRepo.get(id: request.threadId),
+                  thread.effectiveRoutingConfiguration.mode == .auto else {
+                return request
+            }
+            guard let providerSnapshotSupplier else {
+                throw AgentOrchestrationAdmissionError.noEligibleProvider
+            }
+            routingSnapshot = AgentOrchestrationRoutingSnapshot(
+                configuration: thread.effectiveRoutingConfiguration,
+                providerSnapshots: try await providerSnapshotSupplier()
+            )
+        }
+        guard routingSnapshot.configuration.mode == .auto else {
+            return request
+        }
+        guard let orchestrationRuntime else {
+            throw AgentOrchestrationAdmissionError.noEligibleProvider
+        }
+        let admission = try orchestrationRuntime.admit(
+            runId: request.runId,
+            threadId: request.threadId,
+            configuration: routingSnapshot.configuration,
+            providerSnapshots: routingSnapshot.providerSnapshots,
+            interactionMode: request.interactionMode,
+            permissionMode: request.permissionMode,
+            attachments: request.attachments
+        )
+        let launch = routingSnapshot.launchConfigurations[admission.route.providerInstanceId]
+        return AgentRunRequest(
+            runId: request.runId,
+            threadId: request.threadId,
+            provider: admission.route.provider,
+            providerInstanceId: admission.route.providerInstanceId,
+            model: admission.route.selection.effectiveModel,
+            cwd: request.cwd,
+            prompt: request.prompt,
+            userMessageContent: request.userMessageContent,
+            attachments: request.attachments,
+            providerThreadId: request.providerThreadId,
+            permissionMode: request.permissionMode,
+            reasoningEffort: admission.route.selection.reasoningEffort,
+            serviceTier: admission.route.selection.serviceTier,
+            interactionMode: request.interactionMode,
+            providerBinary: launch?.binary ?? request.providerBinary,
+            environment: launch?.environment ?? request.environment,
+            extraArgs: request.extraArgs,
+            runAsUser: request.runAsUser
+        )
     }
 
     public func stopRun(_ runId: AgentRunID) {
@@ -2322,6 +2395,16 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                 scheduleTerminalDurabilityRetry(runId: runId, threadId: threadId)
                 return
             }
+            do {
+                try orchestrationRuntime?.finalizeReceipt(runId: runId, status: status)
+            } catch {
+                emitPersistenceIssue(
+                    "orchestration.receipt.finalize",
+                    error: error,
+                    runId: runId,
+                    threadId: threadId
+                )
+            }
             let runMetadata = terminalPersistence.runMetadata
             let completedTurnId = terminalPersistence.completedTurnId
             let assistantMessageId = terminalPersistence.assistantMessageId
@@ -2638,6 +2721,16 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                 providerSession: providerSession,
                 streamEvent: pending.streamEvent
             )
+            do {
+                try orchestrationRuntime?.finalizeReceipt(runId: runId, status: .failed)
+            } catch {
+                emitPersistenceIssue(
+                    "orchestration.receipt.finalize",
+                    error: error,
+                    runId: runId,
+                    threadId: pending.request.threadId
+                )
+            }
         } catch {
             emitPersistenceIssue(
                 "run.start_failure.terminal_graph.commit",

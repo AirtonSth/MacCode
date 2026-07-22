@@ -60,7 +60,10 @@ let package = Package(
         .target(
             name: "AgentRuntime",
             dependencies: ["CoreModel", "Persistence", "RemoteCodeCSystem"],
-            path: "Sources/AgentRuntime"
+            path: "Sources/AgentRuntime",
+            resources: [
+                .copy("Resources/remote-code-orchestrate")
+            ]
         ),
         .target(
             name: "DistillCore",
