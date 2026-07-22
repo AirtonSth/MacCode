@@ -76,7 +76,38 @@ final class AgentAutoRoutingViewModelTests: XCTestCase {
             XCTAssertEqual(thread.effectiveRoutingConfiguration.mode, .auto,
                            "Auto must be available and selected for \(provider.rawValue).")
             XCTAssertEqual(thread.effectiveRoutingConfiguration.eligibleProviders, AgentProvider.allCases)
+            XCTAssertGreaterThan(thread.effectiveRoutingConfiguration.revision, 0,
+                                 "Auto threads must be admit-ready (revision > 0); revision 0 fails with invalidPolicy.")
+            let expectedDigest = AgentOrchestrationRuntime(
+                packageVerification: { true },
+                rolloutGate: { true },
+                killSwitch: { false }
+            ).policyDigest
+            XCTAssertEqual(
+                thread.effectiveRoutingConfiguration.policyDigest,
+                expectedDigest,
+                "Auto threads must store the current orchestration policy digest."
+            )
         }
+    }
+
+    func testCreateThreadAutoConfigurationIsAdmitReady() throws {
+        let (vm, threads, root) = try fixture()
+        defer { try? FileManager.default.removeItem(atPath: root) }
+
+        vm.createThread(title: "admit-ready auto")
+        let thread = try XCTUnwrap(try threads.get(id: try XCTUnwrap(vm.selectedThreadId)))
+        let configuration = thread.effectiveRoutingConfiguration
+        let runtime = AgentOrchestrationRuntime(
+            packageVerification: { true },
+            rolloutGate: { true },
+            killSwitch: { false }
+        )
+
+        XCTAssertNoThrow(
+            try runtime.route(configuration: configuration, providerSnapshots: vm.providerSnapshots),
+            "A freshly created Auto thread must pass orchestration route admission."
+        )
     }
 
     func testNextThreadRestoresLastUserProviderModelAndReasoningChoice() throws {

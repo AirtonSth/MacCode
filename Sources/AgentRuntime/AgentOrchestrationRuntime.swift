@@ -343,7 +343,7 @@ public struct AgentOrchestrationLedgerEntry: Codable, Sendable, Equatable {
     }
 }
 
-public enum AgentOrchestrationAdmissionError: Error, Sendable, Equatable, CustomStringConvertible {
+public enum AgentOrchestrationAdmissionError: Error, Sendable, Equatable, CustomStringConvertible, LocalizedError {
     case packageUnavailable
     case rolloutDisabled
     case killSwitchEnabled
@@ -382,6 +382,8 @@ public enum AgentOrchestrationAdmissionError: Error, Sendable, Equatable, Custom
             return "Could not persist the orchestration admission receipt: \(message)"
         }
     }
+
+    public var errorDescription: String? { description }
 }
 
 /// Durable, content-free audit storage for orchestration admission decisions.

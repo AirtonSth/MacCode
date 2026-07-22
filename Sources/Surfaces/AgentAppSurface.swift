@@ -2929,12 +2929,16 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         // provider (not whatever model an older selected thread left on the VM).
         applyPreferredModelForCurrentProvider()
         normalizeSelectedModelOptions()
+        // Auto admission requires revision > 0 and a current policy digest.
+        // Leaving revision at the default 0 makes every first Auto send fail with
+        // AgentOrchestrationAdmissionError.invalidPolicy (NSError code 4).
         let routingConfiguration = AgentRoutingConfiguration(
             mode: routingMode,
             manualSelection: currentModelSelection,
             manualProviderInstanceId: providerInstanceId,
             eligibleProviders: AgentProvider.allCases,
-            policyDigest: routingMode == .auto ? orchestrationRuntime.policyDigest : ""
+            policyDigest: routingMode == .auto ? orchestrationRuntime.policyDigest : "",
+            revision: routingMode == .auto ? 1 : 0
         )
         let t = AgentThread(workspaceId: workspaceID, title: title, provider: provider,
                             providerInstanceId: providerInstanceId,
@@ -3823,6 +3827,53 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         }
     }
 
+    /// Ensures Auto routing can pass orchestration admission (`revision > 0` +
+    /// current policy digest). Heals threads created before that contract was
+    /// enforced, without changing manual routing.
+    private func admitReadyAutoRoutingConfiguration(
+        from configuration: AgentRoutingConfiguration,
+        threadId: AgentThreadID?
+    ) throws -> AgentRoutingConfiguration {
+        guard configuration.mode == .auto else { return configuration }
+        let needsHeal = configuration.revision <= 0
+            || configuration.policyDigest != orchestrationRuntime.policyDigest
+            || configuration.eligibleProviders.isEmpty
+        guard needsHeal else { return configuration }
+
+        let seed = AgentRoutingConfiguration(
+            schemaVersion: configuration.schemaVersion,
+            mode: .manual,
+            manualSelection: configuration.manualSelection,
+            manualProviderInstanceId: configuration.manualProviderInstanceId,
+            eligibleProviders: configuration.eligibleProviders.isEmpty
+                ? AgentProvider.allCases
+                : configuration.eligibleProviders,
+            policyDigest: "",
+            revision: max(0, configuration.revision),
+            updatedAt: configuration.updatedAt
+        )
+        let healed = try orchestrationRuntime.autoConfiguration(
+            replacing: seed,
+            expectedRevision: seed.revision,
+            manualSelection: configuration.manualSelection,
+            manualProviderInstanceId: configuration.manualProviderInstanceId ?? providerInstanceId,
+            providerSnapshots: providerSnapshots
+        )
+        if let threadId {
+            try threadRepo.setRoutingConfiguration(
+                healed,
+                threadId: threadId,
+                expectedRevision: configuration.revision
+            )
+            if let persisted = try threadRepo.get(id: threadId),
+               let index = threads.firstIndex(where: { $0.id == threadId }) {
+                threads[index] = persisted
+            }
+            routingMode = .auto
+        }
+        return healed
+    }
+
     @discardableResult
     private func startProviderRun(
         text: String,
@@ -3834,7 +3885,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         routingConfiguration: AgentRoutingConfiguration? = nil,
         queuedRoutingSnapshot: AgentQueuedMessageRoutingSnapshot? = nil
     ) async -> AgentRunID? {
-        let effectiveRouting = queuedRoutingSnapshot?.configuration
+        let baseRouting = queuedRoutingSnapshot?.configuration
             ?? routingConfiguration
             ?? selectedThreadId.flatMap { try? threadRepo.get(id: $0)?.effectiveRoutingConfiguration }
             ?? .legacyManual(selection: currentModelSelection, providerInstanceId: providerInstanceId)
@@ -3845,7 +3896,17 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         let runServiceTier = serviceTier
         let runSnapshot = selectedProviderSnapshot
         let routingSnapshot: AgentOrchestrationRoutingSnapshot?
+        let effectiveRouting: AgentRoutingConfiguration
         do {
+            // Queued messages keep the snapshot captured at enqueue time.
+            if queuedRoutingSnapshot != nil {
+                effectiveRouting = baseRouting
+            } else {
+                effectiveRouting = try admitReadyAutoRoutingConfiguration(
+                    from: baseRouting,
+                    threadId: selectedThreadId
+                )
+            }
             if effectiveRouting.mode == .auto {
                 guard selectedThreadId != nil else {
                     throw AgentOrchestrationAdmissionError.invalidRoutingMode
@@ -3873,7 +3934,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 )
             }
         } catch {
-            statusMessage = String(describing: error)
+            statusMessage = (error as? LocalizedError)?.errorDescription ?? String(describing: error)
             return nil
         }
         if recordHistory { recordPromptHistory(text) }
