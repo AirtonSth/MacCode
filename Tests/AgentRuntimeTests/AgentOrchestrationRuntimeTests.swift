@@ -164,7 +164,7 @@ final class AgentOrchestrationRuntimeTests: XCTestCase {
         XCTAssertEqual(route.providerInstanceId, "claude-cli")
     }
 
-    func testRouteFallsBackWhenPreferredSourceIsNotLive() throws {
+    func testRoutePrefersRunnableClaudeEvenWithBuiltInCatalog() throws {
         let runtime = AgentOrchestrationRuntime(
             packageVerification: { true },
             killSwitch: { false }
@@ -173,11 +173,14 @@ final class AgentOrchestrationRuntimeTests: XCTestCase {
         config.eligibleProviders = AgentProvider.allCases
         config.manualSelection = AgentModelSelection(
             provider: .claude,
-            modelId: "claude-live",
+            modelId: "opus",
             reasoningEffort: .high,
             serviceTier: .auto
         )
-        // Only Codex is live; Claude is fallback catalog → not eligible for Auto.
+        config.manualProviderInstanceId = "claude-cli"
+        // Claude Code OAuth: Anthropic REST discovery is fallback, but CLI is
+        // installed + authenticated. Preferred Source must still admit Claude
+        // (not silent Codex).
         let mixed = AgentProvider.allCases.map { provider -> AgentProviderSnapshot in
             AgentProviderSnapshotFactory.snapshot(
                 provider: provider,
@@ -195,8 +198,44 @@ final class AgentOrchestrationRuntimeTests: XCTestCase {
             )
         }
         let route = try runtime.route(configuration: config, providerSnapshots: mixed)
+        XCTAssertEqual(route.provider, .claude,
+                       "Preferred Claude Source must admit even when catalog provenance is built-in fallback.")
+        XCTAssertEqual(route.providerInstanceId, "claude-cli")
+    }
+
+    func testRouteFallsBackWhenPreferredSourceIsNotRunnable() throws {
+        let runtime = AgentOrchestrationRuntime(
+            packageVerification: { true },
+            killSwitch: { false }
+        )
+        var config = configuration(runtime: runtime)
+        config.eligibleProviders = AgentProvider.allCases
+        config.manualSelection = AgentModelSelection(
+            provider: .claude,
+            modelId: "claude-live",
+            reasoningEffort: .high,
+            serviceTier: .auto
+        )
+        // Claude present but not authenticated / not runnable → fall back to live Codex.
+        let mixed = AgentProvider.allCases.map { provider -> AgentProviderSnapshot in
+            AgentProviderSnapshotFactory.snapshot(
+                provider: provider,
+                models: [AgentModelDescriptor(
+                    id: "\(provider.rawValue)-live",
+                    label: "Live",
+                    provider: provider,
+                    supportsReasoning: true,
+                    supportsServiceTier: true
+                )],
+                binaryPath: provider == .claude ? "" : "/usr/bin/true",
+                authenticated: provider == .claude ? false : true,
+                capabilitiesOverride: AgentProviderCapabilities(supportsStreaming: true),
+                modelDiscoverySource: .live
+            )
+        }
+        let route = try runtime.route(configuration: config, providerSnapshots: mixed)
         XCTAssertEqual(route.provider, .codex,
-                       "When the Source host is not live, Auto may fall back to the next eligible provider.")
+                       "When the preferred Source host is not runnable, Auto may fall back to the next live eligible provider.")
     }
 
     func testAdmissionSelectsLiveEligibleProviderAndPersistsAuditableReceipt() throws {
@@ -567,9 +606,43 @@ final class AgentOrchestrationRuntimeTests: XCTestCase {
         XCTAssertThrowsError(try runtime.route(configuration: stale, providerSnapshots: snapshots())) {
             XCTAssertEqual($0 as? AgentOrchestrationAdmissionError, .invalidPolicy)
         }
-        XCTAssertThrowsError(try runtime.route(
+        // Preferred Source may admit with a built-in catalog (Claude Code OAuth).
+        let preferredFallback = try runtime.route(
             configuration: configuration(runtime: runtime),
             providerSnapshots: snapshots(source: .builtInFallback)
+        )
+        XCTAssertEqual(preferredFallback.provider, .claude)
+
+        // Non-preferred hosts still require a verified live catalog. Prefer a
+        // host that is not runnable so fallback walks the remaining list.
+        var unrunnablePreferred = configuration(runtime: runtime)
+        unrunnablePreferred.manualSelection = AgentModelSelection(
+            provider: .claude,
+            modelId: "claude-live",
+            reasoningEffort: .high,
+            serviceTier: .auto
+        )
+        let onlyFallbackNonPreferred = AgentProvider.allCases.map { provider -> AgentProviderSnapshot in
+            AgentProviderSnapshotFactory.snapshot(
+                provider: provider,
+                models: provider == .claude ? [] : [
+                    AgentModelDescriptor(
+                        id: "\(provider.rawValue)-live",
+                        label: "Live",
+                        provider: provider,
+                        supportsReasoning: true,
+                        supportsServiceTier: true
+                    )
+                ],
+                binaryPath: provider == .claude ? "" : "/usr/bin/true",
+                authenticated: provider == .claude ? false : true,
+                capabilitiesOverride: AgentProviderCapabilities(supportsStreaming: true),
+                modelDiscoverySource: .builtInFallback
+            )
+        }
+        XCTAssertThrowsError(try runtime.route(
+            configuration: unrunnablePreferred,
+            providerSnapshots: onlyFallbackNonPreferred
         )) { XCTAssertEqual($0 as? AgentOrchestrationAdmissionError, .noEligibleProvider) }
     }
 

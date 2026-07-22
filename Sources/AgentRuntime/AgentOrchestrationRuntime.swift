@@ -850,16 +850,24 @@ public final class AgentOrchestrationRuntime: @unchecked Sendable {
         // provider the user sees selected — not always the first of allCases
         // (codex). Fall back through the rest of eligibleProviders if that host
         // is not live/runnable yet.
+        //
+        // Preferred host: runnable + streaming + models is enough. Claude Code
+        // OAuth users often have no ANTHROPIC_API_KEY, so Anthropic REST model
+        // discovery stays builtInFallback even though `claude` runs fine — a
+        // strict `.live` gate previously forced silent Codex fallback.
+        // Non-preferred fallback hosts still require a verified live catalog.
         for provider in Self.orderedEligibleProviders(
             eligible: configuration.eligibleProviders,
             preferred: configuration.manualSelection.provider
         ) {
-            guard let snapshot = Self.liveRunnableSnapshot(
+            let isPreferred = provider == configuration.manualSelection.provider
+            guard let snapshot = Self.autoAdmitSnapshot(
                 provider: provider,
-                preferredInstanceId: provider == configuration.manualSelection.provider
+                preferredInstanceId: isPreferred
                     ? configuration.manualProviderInstanceId
                     : nil,
-                providerSnapshots: providerSnapshots
+                providerSnapshots: providerSnapshots,
+                requireLiveCatalog: !isPreferred
             ) else { continue }
 
             // Auto always binds the host-matrix LIGHT row. Capability escalation
@@ -896,20 +904,32 @@ public final class AgentOrchestrationRuntime: @unchecked Sendable {
         return ordered
     }
 
-    /// Live, streaming, non-empty catalog snapshot for Auto admission.
-    /// When `preferredInstanceId` is set (matching the Source picker), try that
-    /// instance first so personal/work Codex/Claude accounts stay sticky.
-    static func liveRunnableSnapshot(
+    /// Snapshot eligible for Auto admission.
+    /// - `requireLiveCatalog == true`: verified live catalog + streaming (fallback hosts).
+    /// - `requireLiveCatalog == false`: runnable preferred Source host may use a
+    ///   built-in catalog (Claude Code OAuth without Anthropic REST credentials).
+    /// When `preferredInstanceId` is set, try that instance first so personal/work
+    /// accounts stay sticky.
+    static func autoAdmitSnapshot(
         provider: AgentProvider,
         preferredInstanceId: String?,
-        providerSnapshots: [AgentProviderSnapshot]
+        providerSnapshots: [AgentProviderSnapshot],
+        requireLiveCatalog: Bool
     ) -> AgentProviderSnapshot? {
         func isEligible(_ snapshot: AgentProviderSnapshot) -> Bool {
-            snapshot.provider == provider
-                && AgentProviderRunnableSelection.isRunnable(snapshot)
-                && snapshot.modelDiscoverySource == .live
-                && snapshot.capabilities?.supportsStreaming == true
-                && !snapshot.models.isEmpty
+            guard snapshot.provider == provider,
+                  AgentProviderRunnableSelection.isRunnable(snapshot),
+                  !snapshot.models.isEmpty else { return false }
+            if let caps = snapshot.capabilities, caps.supportsStreaming == false {
+                return false
+            }
+            if requireLiveCatalog {
+                return snapshot.modelDiscoverySource == .live
+                    && snapshot.capabilities?.supportsStreaming == true
+            }
+            // Preferred Source: admit when runnable. Live catalog is ideal but
+            // not required — Claude Code is often OAuth-only.
+            return true
         }
         if let preferredInstanceId,
            let preferred = providerSnapshots.first(where: {
@@ -918,6 +938,20 @@ public final class AgentOrchestrationRuntime: @unchecked Sendable {
             return preferred
         }
         return providerSnapshots.first(where: isEligible)
+    }
+
+    /// Back-compat alias: live-catalog gate only (non-preferred fallback hosts).
+    static func liveRunnableSnapshot(
+        provider: AgentProvider,
+        preferredInstanceId: String?,
+        providerSnapshots: [AgentProviderSnapshot]
+    ) -> AgentProviderSnapshot? {
+        autoAdmitSnapshot(
+            provider: provider,
+            preferredInstanceId: preferredInstanceId,
+            providerSnapshots: providerSnapshots,
+            requireLiveCatalog: true
+        )
     }
 
     /// Skill name / package ID used for Auto invocation (`$remote-code-orchestrate`).

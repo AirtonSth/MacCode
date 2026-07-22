@@ -3441,7 +3441,13 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                             binaryPath: binaryPath,
                             environment: env
                         )
-                        liveCatalogVerified = false
+                        // Claude Code (claude.ai OAuth) has no ANTHROPIC_API_KEY;
+                        // Anthropic REST discovery falls back. Treat installed +
+                        // authenticated CLI with models as verified so Auto can
+                        // admit Claude instead of silently routing to Codex.
+                        liveCatalogVerified = !models.isEmpty
+                            && !binaryPath.isEmpty
+                            && capabilities.authenticated != false
                     }
                 } else if instance.provider == .codex, !binaryPath.isEmpty {
                     let cwd = context?.state.workspaces.values.first?.cwd ?? NSHomeDirectory()
@@ -3553,7 +3559,10 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                         binaryPath: binaryPath,
                         environment: [:]
                     )
-                    liveCatalogVerified = false
+                    // Same Claude Code OAuth path as the instance-based loader.
+                    liveCatalogVerified = !models.isEmpty
+                        && !binaryPath.isEmpty
+                        && capabilities.authenticated != false
                 }
             } else if provider == .codex, !binaryPath.isEmpty {
                 let cwd = context?.state.workspaces.values.first?.cwd ?? NSHomeDirectory()
