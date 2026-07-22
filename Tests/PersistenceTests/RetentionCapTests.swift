@@ -253,4 +253,319 @@ final class RetentionCapTests: XCTestCase {
         XCTAssertLessThanOrEqual(try chunkRepo.totalBytes(surfaceID: surfaceID), terminalByteCap,
                        "terminal output bytes must stay within the byte cap after a heavy session")
     }
+
+    func test_agentEventRetention_enforcesBytesAndCountAcrossManySmallRows() throws {
+        let db = try makeDB()
+        let runs = AgentRunRepository(db: db)
+        let thread = try makeThread(db: db)
+        let run = try makeRun(db: db, threadId: thread.id)
+        let streamPayload = String(repeating: "s", count: 100)
+        let providerPayload = String(repeating: "p", count: 120)
+
+        for index in 0..<40 {
+            try runs.appendStreamEvent(runId: run.id, seq: index + 1, kind: "k", payloadJSON: streamPayload)
+            try runs.appendProviderEventLog(
+                threadId: thread.id,
+                runId: run.id,
+                event: ProviderRuntimeEvent(
+                    id: "provider-\(index)",
+                    provider: .codex,
+                    source: "test",
+                    method: "item/completed",
+                    payloadJSON: providerPayload,
+                    receivedAtMs: Int64(index)
+                )
+            )
+        }
+
+        try runs.pruneStreamEvents(threadId: thread.id, keepLatest: 10, maxPayloadBytes: 350)
+        try runs.pruneProviderEventLogs(threadId: thread.id, keepLatest: 10, maxPayloadBytes: 370)
+
+        XCTAssertLessThanOrEqual(try runs.countStreamEvents(threadId: thread.id), 10)
+        XCTAssertLessThanOrEqual(try runs.streamEventPayloadBytes(threadId: thread.id), 350,
+                                 "encoded bytes, not only rows, must plateau")
+        XCTAssertLessThanOrEqual(try runs.countProviderEventLogs(threadId: thread.id), 10)
+        XCTAssertLessThanOrEqual(try runs.providerEventPayloadBytes(threadId: thread.id), 370)
+    }
+
+    func test_agentEventRetention_replacesOversizedNewestRowWithinHardCeiling() throws {
+        let db = try makeDB()
+        let runs = AgentRunRepository(db: db)
+        let thread = try makeThread(db: db)
+        let run = try makeRun(db: db, threadId: thread.id)
+        try runs.appendStreamEvent(
+            runId: run.id,
+            seq: 1,
+            kind: "oversized",
+            payloadJSON: String(repeating: "x", count: 700 * 1_024)
+        )
+        try runs.appendStreamEvent(runId: run.id, seq: 2, kind: "newest", payloadJSON: String(repeating: "y", count: 700 * 1_024))
+
+        try runs.pruneStreamEvents(threadId: thread.id, keepLatest: 10, maxPayloadBytes: 16 * 1_024)
+
+        XCTAssertLessThanOrEqual(try runs.streamEventPayloadBytes(threadId: thread.id), 16 * 1_024,
+                                 "no newest-row exception may exceed the hard byte ceiling")
+        let replay = try runs.listLatestStreamEvents(threadId: thread.id, limit: 10, strictDecoding: true)
+        XCTAssertFalse(replay.isEmpty)
+        XCTAssertTrue(replay.allSatisfy { event in
+            if case .error(let message, _) = event { return message.contains("omitted") }
+            return false
+        })
+    }
+
+    func test_providerEventPersistence_replacesOversizedPayloadWithBoundedMarker() throws {
+        let db = try makeDB()
+        let runs = AgentRunRepository(db: db)
+        let thread = try makeThread(db: db)
+        let run = try makeRun(db: db, threadId: thread.id)
+        try runs.appendProviderEventLog(
+            threadId: thread.id,
+            runId: run.id,
+            event: ProviderRuntimeEvent(
+                id: "oversized-provider",
+                provider: .codex,
+                source: "test",
+                method: "item/completed",
+                payloadJSON: String(repeating: "p", count: 700 * 1_024),
+                receivedAtMs: 1
+            )
+        )
+
+        let replay = try runs.listLatestProviderEventLogs(threadId: thread.id, limit: 1)
+        let event = try XCTUnwrap(replay.first)
+        XCTAssertLessThanOrEqual(event.payloadJSON.utf8.count, AgentRunRepository.maximumPersistedEventRowBytes)
+        XCTAssertTrue(event.payloadJSON.contains("event_size_limit"),
+                      "an oversized provider frame must become an explicit compact marker")
+    }
+
+    func test_hotReplay_appliesEncodedByteAndCountHighWaterInFIFOOrder() throws {
+        let db = try makeDB()
+        let runs = AgentRunRepository(db: db)
+        let thread = try makeThread(db: db)
+        let run = try makeRun(db: db, threadId: thread.id)
+        let encoder = JSONEncoder()
+        for index in 0..<30 {
+            let event = AssistantEvent.turnStarted(turnId: "turn-\(index)-" + String(repeating: "x", count: 80))
+            let json = String(decoding: try encoder.encode(event), as: UTF8.self)
+            try runs.appendStreamEvent(runId: run.id, seq: index + 1, kind: event.debugDescription, payloadJSON: json)
+        }
+
+        let replay = try runs.listLatestStreamEvents(threadId: thread.id, limit: 5, maxPayloadBytes: 420)
+
+        XCTAssertLessThanOrEqual(replay.count, 5)
+        let ids = replay.compactMap { event -> String? in
+            if case .turnStarted(let id) = event { return id }
+            return nil
+        }
+        XCTAssertEqual(ids, ids.sorted { lhs, rhs in
+            Int(lhs.split(separator: "-")[1])! < Int(rhs.split(separator: "-")[1])!
+        }, "bounded hot replay must retain exact chronological FIFO order")
+        XCTAssertTrue(ids.last?.hasPrefix("turn-29-") == true)
+    }
+
+    func test_multiThreadRetention_repeatedWavesPlateauLogicalAndPhysicalPages() throws {
+        let db = try makeDB()
+        let runs = AgentRunRepository(db: db)
+        let manager = LocalStorageBudgetManager(db: db)
+        var fixtures: [(AgentThread, AgentRun)] = []
+        for index in 0..<6 {
+            let thread = try makeThread(db: db, title: "thread-\(index)")
+            fixtures.append((thread, try makeRun(db: db, threadId: thread.id)))
+        }
+
+        func writeAndPrune(wave: Int) throws {
+            for (threadIndex, fixture) in fixtures.enumerated() {
+                for offset in 0..<80 {
+                    let seq = wave * 1_000 + offset + 1
+                    try runs.appendStreamEvent(
+                        runId: fixture.1.id,
+                        seq: seq,
+                        kind: "wave-\(wave)",
+                        payloadJSON: String(repeating: "a", count: 256)
+                    )
+                    try runs.appendProviderEventLog(
+                        threadId: fixture.0.id,
+                        runId: fixture.1.id,
+                        event: ProviderRuntimeEvent(
+                            id: "wave-\(wave)-\(threadIndex)-\(offset)",
+                            provider: .codex,
+                            source: "plateau",
+                            method: "item/completed",
+                            payloadJSON: String(repeating: "b", count: 256),
+                            receivedAtMs: Int64(seq)
+                        )
+                    )
+                }
+                try runs.pruneStreamEvents(threadId: fixture.0.id, keepLatest: 8, maxPayloadBytes: 2_048)
+                try runs.pruneProviderEventLogs(threadId: fixture.0.id, keepLatest: 8, maxPayloadBytes: 2_048)
+            }
+        }
+
+        try writeAndPrune(wave: 1)
+        let first = try manager.snapshot()
+        try writeAndPrune(wave: 2)
+        let second = try manager.snapshot()
+
+        for fixture in fixtures {
+            XCTAssertEqual(try runs.countStreamEvents(threadId: fixture.0.id), 8)
+            XCTAssertEqual(try runs.streamEventPayloadBytes(threadId: fixture.0.id), 2_048)
+            XCTAssertEqual(try runs.countProviderEventLogs(threadId: fixture.0.id), 8)
+            XCTAssertEqual(try runs.providerEventPayloadBytes(threadId: fixture.0.id), 2_048)
+        }
+        XCTAssertLessThanOrEqual(second.databaseBytes, first.databaseBytes + 64 * 1_024,
+                                 "a repeated many-thread write/prune wave must reuse physical SQLite pages instead of preserving a linear slope")
+    }
+
+    func test_globalAgentQuotasDrainOldestAcrossThreadsInBoundedQuanta() throws {
+        let db = try makeDB()
+        let runs = AgentRunRepository(db: db)
+        var fixtures: [(AgentThread, AgentRun)] = []
+        for index in 0..<4 {
+            let thread = try makeThread(db: db, title: "global-\(index)")
+            fixtures.append((thread, try makeRun(db: db, threadId: thread.id)))
+        }
+        for (threadIndex, fixture) in fixtures.enumerated() {
+            for offset in 0..<6 {
+                try runs.appendStreamEvent(
+                    runId: fixture.1.id,
+                    seq: offset + 1,
+                    kind: "global",
+                    payloadJSON: String(repeating: "s", count: 100)
+                )
+                try appendEvent(runs: runs, run: fixture.1, index: threadIndex * 100 + offset)
+            }
+        }
+        let policy = AgentEventRetentionPolicy(
+            streamEventBytesGlobal: 600,
+            providerLogBytesGlobal: 100,
+            pruneQuantumRows: 3,
+            pruneQuantumBytes: 1_024
+        )
+        for _ in 0..<20 {
+            _ = try runs.pruneGlobalEventPayloads(policy: policy)
+        }
+        let snapshot = try LocalStorageBudgetManager(db: db).snapshot()
+        let stream = try XCTUnwrap(snapshot.classes.first { $0.storageClass == .streamEvents })
+        let provider = try XCTUnwrap(snapshot.classes.first { $0.storageClass == .providerLogs })
+        XCTAssertLessThanOrEqual(stream.payloadBytes, policy.streamEventBytesGlobal)
+        XCTAssertLessThanOrEqual(provider.payloadBytes, policy.providerLogBytesGlobal)
+        XCTAssertTrue(try fixtures.contains { try runs.streamHistoryWasPruned(threadId: $0.0.id) },
+                      "global eviction must leave a durable partial-history signal instead of pretending the prefix still exists")
+    }
+
+    func test_globalAgentPruneUsesIncrementalCountersInsteadOfHotPathSUM() throws {
+        let db = try makeDB()
+        let runs = AgentRunRepository(db: db)
+        let thread = try makeThread(db: db)
+        let run = try makeRun(db: db, threadId: thread.id)
+        for index in 0..<2_000 {
+            try runs.appendStreamEvent(
+                runId: run.id,
+                seq: index + 1,
+                kind: "counter",
+                payloadJSON: String(repeating: "x", count: 64)
+            )
+        }
+
+        var observedAggregateScan = false
+        db.beforeStatementStepForTesting = { sql in
+            if sql.uppercased().contains("SUM(") { observedAggregateScan = true }
+        }
+        defer { db.beforeStatementStepForTesting = nil }
+        _ = try runs.pruneGlobalEventPayloads(policy: AgentEventRetentionPolicy(
+            streamEventBytesGlobal: 1,
+            providerLogBytesGlobal: 1,
+            pruneQuantumRows: 16,
+            pruneQuantumBytes: 4 * 1_024
+        ))
+
+        XCTAssertFalse(observedAggregateScan,
+                       "global retention cadence must read O(1) usage counters, not rescan legacy tables")
+    }
+
+    func test_globalAgentNearMaximumEventsSelfDrainAcrossThreadsWithoutFurtherWrites() throws {
+        let db = try makeDB()
+        let runs = AgentRunRepository(db: db)
+        var fixtures: [(AgentThread, AgentRun)] = []
+        for index in 0..<4 {
+            let thread = try makeThread(db: db, title: "near-max-\(index)")
+            fixtures.append((thread, try makeRun(db: db, threadId: thread.id)))
+        }
+        let payload = String(repeating: "x", count: 500 * 1_024)
+        for fixture in fixtures {
+            for sequence in 1...5 {
+                try runs.appendStreamEvent(
+                    runId: fixture.1.id,
+                    seq: sequence,
+                    kind: "near-maximum",
+                    payloadJSON: payload
+                )
+            }
+        }
+        let policy = AgentEventRetentionPolicy(
+            streamEventBytesGlobal: 1 * 1_024 * 1_024,
+            providerLogBytesGlobal: 1 * 1_024 * 1_024,
+            pruneQuantumRows: 1,
+            pruneQuantumBytes: 512 * 1_024
+        )
+        try runs.persistStreamBatch(
+            runId: fixtures[0].1.id,
+            threadId: fixtures[0].0.id,
+            items: [],
+            shouldPruneStreamEvents: true,
+            retentionPolicy: policy
+        )
+        let usage = try db.prepare(
+            "SELECT payload_bytes FROM storage_usage_counters WHERE storage_class = 'stream_events';"
+        )
+        let deadline = Date().addingTimeInterval(5)
+        var retainedBytes = Int64.max
+        while Date() < deadline {
+            usage.reset()
+            if try usage.step() { retainedBytes = usage.columnInt64(0) }
+            if retainedBytes <= policy.streamEventBytesGlobal { break }
+            Thread.sleep(forTimeInterval: 0.01)
+        }
+        XCTAssertLessThanOrEqual(
+            retainedBytes,
+            policy.streamEventBytesGlobal,
+            "one production cadence request must self-drain multiple quanta without another Agent event"
+        )
+        XCTAssertTrue(
+            try fixtures.contains { try runs.streamHistoryWasPruned(threadId: $0.0.id) },
+            "every evicted stream prefix must remain visibly marked partial"
+        )
+    }
+
+    func test_globalTerminalQuotaProtectsWriterAndMarksEveryPrunedSurface() throws {
+        let db = try makeDB()
+        let repo = TerminalOutputRepository(db: db)
+        let protected = "terminal-active"
+        let dormantA = "terminal-dormant-a"
+        let dormantB = "terminal-dormant-b"
+        for index in 0..<5 {
+            try repo.append(surfaceID: protected, workspaceID: nil, chunkIndex: Int64(index + 1), data: Data(repeating: 0x41, count: 10))
+            try repo.append(surfaceID: dormantA, workspaceID: nil, chunkIndex: Int64(index + 1), data: Data(repeating: 0x42, count: 10))
+            try repo.append(surfaceID: dormantB, workspaceID: nil, chunkIndex: Int64(index + 1), data: Data(repeating: 0x43, count: 10))
+        }
+
+        for _ in 0..<10 {
+            let result = try repo.pruneGlobalByteCapAndMarkHistoryPartial(
+                maxBytes: 60,
+                protectedSurfaceID: protected,
+                maxRows: 2,
+                maxDeleteBytes: 20
+            )
+            XCTAssertLessThanOrEqual(result.deletedRows, 2, "each maintenance transaction must remain a bounded quantum")
+            if !result.remainsOverBudget { break }
+        }
+
+        XCTAssertLessThanOrEqual(try repo.totalBytesAllSurfaces(), 60)
+        XCTAssertEqual(try repo.totalBytes(surfaceID: protected), 50,
+                       "global pruning must preserve the actively writing terminal")
+        XCTAssertNotNil(try repo.partialHistoryState(surfaceID: dormantA))
+        XCTAssertNotNil(try repo.partialHistoryState(surfaceID: dormantB))
+        let retained = try repo.readWindow(surfaceID: dormantB, maxBytes: 1_024).chunks.map(\.chunkIndex)
+        XCTAssertEqual(retained, retained.sorted(), "surviving dormant chunks must retain FIFO order")
+    }
 }

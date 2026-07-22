@@ -216,6 +216,37 @@ final class AgentAppPerfBundleTests: XCTestCase {
                        "batched stream flush must preserve the original compressed text for the View original disclosure")
     }
 
+    func test_sr1PublishedCacheDropsTranslationsEvictedByHotBudget() throws {
+        let (vm, _) = try makeVM()
+        var state = AssistantTimelineState()
+        let text = String(repeating: "s", count: 100_000)
+        for _ in 0..<50 {
+            let messageID = AgentMessageID()
+            state.apply(.sr1Translation(AssistantSR1Translation(
+                messageId: messageID.value.uuidString,
+                originalText: text,
+                rewrittenText: text
+            )))
+        }
+        vm.refreshSR1TranslationStateFromTimeline(state)
+        let before = vm.sr1TranslatedMessageIds
+        XCTAssertEqual(before.count, 50)
+
+        state.enforceAggregateHotTextBudget()
+        vm.refreshSR1TranslationStateFromTimeline(state)
+
+        let retained = Set(state.sr1TranslationsByMessageId.keys.compactMap(UUID.init(uuidString:)).map(AgentMessageID.init))
+        XCTAssertEqual(vm.sr1TranslatedMessageIds, retained,
+                       "published badges must be an exact projection of the budgeted timeline")
+        XCTAssertTrue(vm.sr1TranslatedMessageIds.isStrictSubset(of: before),
+                      "translations evicted by the 8 MiB budget must not remain in a duplicate cache")
+        XCTAssertEqual(Set(vm.sr1OriginalTextsByMessageId.keys), retained)
+        XCTAssertLessThanOrEqual(
+            vm.sr1OriginalTextsByMessageId.values.reduce(0) { $0 + $1.utf8.count },
+            AssistantTimelineState.aggregateHotTextByteLimit
+        )
+    }
+
     func test_hiddenTranscriptRevealWindowKeepsLargeHistoryRevealBounded() {
         let threadId = AgentThreadID()
         let entries = (0..<140).map { index in
@@ -248,7 +279,7 @@ final class AgentAppPerfBundleTests: XCTestCase {
         XCTAssertEqual(secondReveal.first?.id, entries[10].id)
     }
 
-    // MARK: - PERF #1: 5,000-event thread-open replay benchmark
+    // MARK: - PERF #1: bounded hot replay from a 5,000-event thread
 
     func test_threadOpenReplayFiveThousandEventsStaysWithinBudget() async throws {
         let runner = ReplayBenchmarkRunner(turns: 1_000)
@@ -268,10 +299,12 @@ final class AgentAppPerfBundleTests: XCTestCase {
         let budgetMs = 2_000.0
 
         print("ThreadOpenReplayBenchmark events=5000 turns=1000 elapsedMs=\(Int(elapsedMs)) budgetMs=\(Int(budgetMs))")
-        XCTAssertEqual(vm.timeline.turns.count, 1_000,
-                       "thread-open replay must restore every persisted turn from the 5,000-event run")
+        XCTAssertEqual(vm.timeline.turns.count, 400,
+                       "thread-open hot replay must apply only the configured 2,000-event window on the MainActor")
         XCTAssertEqual(vm.timeline.latestAssistantMessage, "REPLAY_999",
                        "thread-open replay must preserve the newest assistant message after rebuilding the timeline")
+        XCTAssertTrue(vm.statusMessage.contains("recent Agent history window"),
+                      "bounded replay must be explicit instead of presenting a pruned prefix as complete history")
         XCTAssertLessThanOrEqual(elapsedMs, budgetMs,
                                  "opening a 5,000-event thread must stay under the CI replay budget to catch O(n^2) regressions")
     }
@@ -476,6 +509,127 @@ final class AgentAppPerfBundleTests: XCTestCase {
                 XCTFail("unexpected event type at index \(idx)")
             }
         }
+    }
+
+    func test_streamEventBatch_enforcesHighWaterAndDrainsInYieldingQuanta() {
+        let batch = StreamEventBatch(limits: .init(
+            maxBufferedCount: 3,
+            maxBufferedBytes: 64 * 1_024,
+            drainCount: 2,
+            drainBytes: 64 * 1_024
+        ))
+        let tid = AgentThreadID()
+        let run = AgentRunID()
+        XCTAssertEqual(batch.appendBounded(event: .turnStarted(turnId: "1"), run: run, threadId: tid), .scheduled)
+        XCTAssertEqual(batch.appendBounded(event: .turnStarted(turnId: "2"), run: run, threadId: tid), .buffered)
+        XCTAssertEqual(batch.appendBounded(event: .turnStarted(turnId: "3"), run: run, threadId: tid), .buffered)
+        XCTAssertEqual(batch.appendBounded(event: .turnStarted(turnId: "4"), run: run, threadId: tid), .saturated,
+                       "a blocked MainActor must trigger controlled stop instead of unbounded queue growth")
+
+        let first = batch.drainQuantum()
+        XCTAssertEqual(first.entries.count, 2,
+                       "one MainActor application turn must never exceed the configured work quantum")
+        XCTAssertTrue(first.hasMore)
+        let second = batch.drainQuantum()
+        XCTAssertEqual(second.entries.count, 1)
+        XCTAssertFalse(second.hasMore)
+    }
+
+    func test_streamEventBatch_rejectsOversizedEventAndLatchesOneStopEpisode() {
+        let batch = StreamEventBatch(limits: .init(
+            maxBufferedCount: 8,
+            maxBufferedBytes: 512,
+            drainCount: 8,
+            drainBytes: 512
+        ))
+        let tid = AgentThreadID()
+        let run = AgentRunID()
+        let oversized = AssistantEvent.error(message: String(repeating: "x", count: 8_192), recoverable: true)
+
+        XCTAssertEqual(batch.appendBounded(event: oversized, run: run, threadId: tid), .saturated,
+                       "an event larger than one UI quantum must fail closed instead of exceeding the ceiling")
+        XCTAssertEqual(batch.appendBounded(event: oversized, run: run, threadId: tid), .saturationAlreadyReported,
+                       "one saturation episode may schedule at most one controlled stop")
+        XCTAssertTrue(batch.drainQuantum().entries.isEmpty)
+    }
+
+    func test_streamEventBatch_finishResetsSaturationForNextRun() {
+        let batch = StreamEventBatch(limits: .init(
+            maxBufferedCount: 8,
+            maxBufferedBytes: 512,
+            drainCount: 8,
+            drainBytes: 512
+        ))
+        let thread = AgentThreadID()
+        let runA = AgentRunID()
+        let runB = AgentRunID()
+        let oversized = AssistantEvent.error(
+            message: String(repeating: "x", count: 8_192),
+            recoverable: true
+        )
+        XCTAssertEqual(batch.appendBounded(event: oversized, run: runA, threadId: thread), .saturated)
+        batch.resetSaturation(for: runA)
+
+        XCTAssertEqual(
+            batch.appendBounded(event: .turnStarted(turnId: "run-b"), run: runB, threadId: thread),
+            .scheduled,
+            "a stopped saturation episode must not suppress the first event of the next run"
+        )
+    }
+
+    func test_timelineAggregateTextBudgetPreservesCompactActiveState() {
+        var state = AssistantTimelineState()
+        let plan = AssistantActivePlan(
+            steps: [.init(id: "active", title: "Must survive", status: .inProgress)],
+            updatedAtMs: 1
+        )
+        state.apply(.activePlanUpdated(plan))
+        for index in 0..<40 {
+            let turn = "turn-\(index)"
+            state.apply(.turnStarted(turnId: turn))
+            state.apply(.itemStarted(item: AssistantItem(
+                id: "item-\(index)", turnId: turn, type: .assistantMessage,
+                body: String(repeating: "x", count: 2_000), startedAtMs: Int64(index)
+            )))
+        }
+        state.enforceAggregateHotTextBudget(byteLimit: 8_000)
+        XCTAssertLessThanOrEqual(state.aggregateHotTextByteCount, 8_000)
+        XCTAssertEqual(state.activePlan, plan, "evictable rendered text must not own correctness-critical active state")
+    }
+
+    func test_timelineAggregateBudgetIncludesRequestsInputsPlansAndWorkLog() {
+        var state = AssistantTimelineState()
+        state.apply(.activePlanUpdated(AssistantActivePlan(
+            explanation: "active",
+            steps: [.init(id: "active-step", title: "Keep status", status: .inProgress)],
+            updatedAtMs: 1
+        )))
+        let large = String(repeating: "x", count: 20_000)
+        for index in 0..<200 {
+            state.apply(.requestOpened(AssistantPendingRequest(
+                id: "request-\(index)", turnId: "turn", kind: .exec,
+                title: large, detail: large, createdAtMs: Int64(index)
+            )))
+            state.apply(.userInputRequested(AssistantUserInputRequest(
+                id: "input-\(index)", turnId: "turn", prompt: large,
+                options: [large], createdAtMs: Int64(index)
+            )))
+            state.apply(.proposedPlan(AssistantProposedPlan(
+                id: "plan-\(index)", turnId: "turn", markdown: large
+            )))
+        }
+
+        XCTAssertGreaterThan(state.aggregateHotTextByteCount, AssistantTimelineState.aggregateHotTextByteLimit)
+        state.enforceAggregateHotTextBudget()
+
+        XCTAssertLessThanOrEqual(
+            state.aggregateHotTextByteCount,
+            AssistantTimelineState.aggregateHotTextByteLimit,
+            "every rendered hot-state class plus collection overhead must share one hard budget"
+        )
+        XCTAssertEqual(state.activePlan?.steps.first?.id, "active-step")
+        XCTAssertEqual(state.activePlan?.steps.first?.status, .inProgress,
+                       "memory eviction must preserve compact active-plan identity and status")
     }
 }
 

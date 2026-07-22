@@ -90,6 +90,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
     public let channel: ReleaseChannel
     private let appSupportOverride: String?
     private let dbOverride: String?
+    private let physicalMemoryBytesProvider: @Sendable () -> UInt64
     private var providerSessionReaperTimer: Timer?
     private var ccrRetentionTimer: Timer?
     private var diagnosticsHeartbeatTimer: Timer?
@@ -115,11 +116,23 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
     /// via `AppDelegate.shared?.serverStartupFailures` after the post.
     public static let serverStartupFailureNotification = Notification.Name("io.remotecode.serverStartupFailure")
 
-    public init(channel: ReleaseChannel = .debug, appSupportOverride: String? = nil, dbOverride: String? = nil) {
+    public init(
+        channel: ReleaseChannel = .debug,
+        appSupportOverride: String? = nil,
+        dbOverride: String? = nil,
+        physicalMemoryBytesProvider: @escaping @Sendable () -> UInt64 = {
+            ProcessInfo.processInfo.physicalMemory
+        }
+    ) {
         self.channel = channel
         self.appSupportOverride = appSupportOverride
         self.dbOverride = dbOverride
+        self.physicalMemoryBytesProvider = physicalMemoryBytesProvider
         super.init()
+    }
+
+    var managedProcessMemoryProfile: ManagedProcessMemoryProfile {
+        ManagedProcessMemoryProfile.resolve(physicalMemoryBytes: physicalMemoryBytesProvider())
     }
 
     public func applicationDidFinishLaunching(_ notification: Notification) {
@@ -158,6 +171,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
             NSApp.terminate(nil)
             return
         }
+        configureManagedProviderAdmission()
 
         // UX-MAC_PERSISTENCE-P1: inform the user when a corrupt database was
         // silently quarantined so they know prior data was preserved as a backup.
@@ -456,16 +470,6 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
             tokenSaverEnabled: context.map { SettingsStore(db: $0.db).load().tokenSaverEnabled } ?? false
         ) else { return }
         context?.tokenSaverDistillServiceController.stop()
-        // Belt-and-braces if stop()'s handle was already nil but a server lived on.
-        // Skip under XCTest — same guard as the controller default terminator.
-        if ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] == nil {
-            let leftover = ProviderProcessSweeper.terminateDistillServers(keeping: nil)
-            if !leftover.orphanRootPIDs.isEmpty || !leftover.terminatedPIDs.isEmpty {
-                appLifecycleLog.info(
-                    "app.will_terminate distill_server_sweep roots=\(leftover.orphanRootPIDs.count, privacy: .public) terminated=\(leftover.terminatedPIDs.count, privacy: .public)"
-                )
-            }
-        }
     }
 
     /// Pure quit policy: Distill MLX server always stops on terminate regardless
@@ -493,6 +497,44 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         let completed = closeSurfacesForApplicationTermination(SurfaceRegistry.shared.all())
         if !completed {
             appLifecycleLog.error("app.will_terminate terminal_disposition=incomplete")
+        }
+    }
+
+    private func configureManagedProviderAdmission() {
+        let profile = managedProcessMemoryProfile
+        let gate = ManagedProviderAdmissionGate()
+        context.coordinator.providerAdmissionCheck = { provider, threadId in
+            guard let store = ProviderProcessOwnership.shared.store() else {
+                throw ManagedProviderAdmissionError.processAccountingUnavailable
+            }
+            let scan: ManagedProcessScan
+            let appFootprintKB: Int?
+            do {
+                (scan, appFootprintKB) = try await Task.detached(priority: .userInitiated) {
+                    let scan = try ProviderProcessSweeper.managedProcessScan(store: store)
+                    let footprint = AppDiagnostics.currentProcessFootprintKB()
+                    return (scan, footprint >= 0 ? footprint : nil)
+                }.value
+            } catch {
+                throw ManagedProviderAdmissionError.processAccountingUnavailable
+            }
+            switch await gate.decide(
+                profile: profile,
+                scan: scan,
+                appFootprintKB: appFootprintKB,
+                key: ManagedProviderAdmissionKey(provider: provider, threadId: threadId)
+            ) {
+            case .admit:
+                return
+            case .blockedIncompleteScan, .blockedUnknownMemory:
+                throw ManagedProviderAdmissionError.processAccountingUnavailable
+            case .blockedAtProviderCap(let limit):
+                throw ManagedProviderAdmissionError.providerLimitReached(limit)
+            case .blockedAtHostMemoryCeiling(let limitKB, _):
+                throw ManagedProviderAdmissionError.hostMemoryLimitReached(limitKB)
+            case .blockedAtManagedTreeMemoryCeiling(let limitKB, _):
+                throw ManagedProviderAdmissionError.managedTreeMemoryLimitReached(limitKB)
+            }
         }
     }
 
@@ -528,13 +570,14 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         // SIGTERM grace sleeps — that freezes the whole UI every 60s once orphans
         // accumulate. App termination is the only path that still reaps inline.
         if reason == "will_terminate" {
-            terminateOrphanedProviderRuntimes(reason: reason)
+            reconcilePersistedProcessOwnership(reason: reason)
         } else {
             scheduleOrphanRuntimeSweep(reason: reason)
         }
         AppDiagnostics.heartbeat(
             reason: reason,
             activeAgentThreads: context?.coordinator.activeThreadIdsSnapshot().count ?? 0,
+            profile: managedProcessMemoryProfile,
             lifecycleRecorder: lifecycleRecorder
         )
     }
@@ -598,7 +641,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         }
     }
 
-    private func terminateOrphanedProviderRuntimes(reason: String) {
+    private func reconcilePersistedProcessOwnership(reason: String) {
         let minAge: TimeInterval = reason == "launch" ? 0 : ProcessSpawnTagger.defaultMinAge
         Self.performOrphanRuntimeSweep(reason: reason, minAge: minAge)
     }
@@ -621,13 +664,6 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
             appLifecycleLog.fault("provider.orphan_sweep_failed reason=\(reason, privacy: .public) error=\(error.localizedDescription, privacy: .public)")
         }
 
-        // Distill MLX sidecars are not in the provider ownership ledger. Reap
-        // launchd-orphaned RemoteCodeDistillService processes so multi-GB model
-        // memory cannot permanently pin after a host crash/exit.
-        let sidecar = ProviderProcessSweeper.terminateOrphanedSidecarRuntimes()
-        if !sidecar.orphanRootPIDs.isEmpty || !sidecar.failedPIDs.isEmpty {
-            appLifecycleLog.info("sidecar.orphan_sweep reason=\(reason, privacy: .public) roots=\(sidecar.orphanRootPIDs.count, privacy: .public) terminated=\(sidecar.terminatedPIDs.count, privacy: .public) failed=\(sidecar.failedPIDs.count, privacy: .public)")
-        }
     }
 
     public func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
@@ -681,7 +717,9 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
 
     private func reapIdleProviderSessions() {
         do {
-            let result = try context.reapIdleProviderSessions()
+            let result = try context.reapIdleProviderSessions(
+                idleAge: managedProcessMemoryProfile.idleReleaseAge
+            )
             if !result.stoppedThreadIds.isEmpty {
                 NSLog("Stopped \(result.stoppedThreadIds.count) idle provider session runtime(s).")
             }

@@ -124,6 +124,11 @@ public final class SQLiteDB {
         try execute("PRAGMA journal_mode=WAL;")
         try execute("PRAGMA foreign_keys=ON;")
         try execute("PRAGMA synchronous=NORMAL;")
+        // Keep week-long processes from accumulating an ever-growing WAL. The
+        // passive auto-checkpoint is reader-friendly; the size limit is applied
+        // only after a successful reset/checkpoint and never truncates live data.
+        try execute("PRAGMA wal_autocheckpoint=512;")
+        try execute("PRAGMA journal_size_limit=16777216;")
         // WAL gives one writer + many readers across processes. The Token Saver
         // sidecar and the app open this same file concurrently (CCR store writes
         // in the sidecar, history/dedup writes in the app), so a writer can briefly

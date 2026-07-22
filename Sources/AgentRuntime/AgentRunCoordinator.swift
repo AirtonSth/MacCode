@@ -189,6 +189,12 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     public var onMessageAppended: ((AgentMessage) -> Void)?
     public var onPersistenceIssue: ((String, AgentThreadID, AgentRunID) -> Void)?
 
+    /// Host-injected provider admission gate. AppShell owns memory/process policy;
+    /// AgentRuntime only enforces its fail-closed decision before any provider
+    /// spawn or pending run/message persistence. The default preserves existing
+    /// tests and hosts that do not install a policy.
+    public var providerAdmissionCheck: @Sendable (AgentProvider, AgentThreadID) async throws -> Void = { _, _ in }
+
     /// Token Saver hook: async transform applied to the outbound provider
     /// prompt only. The original text is always preserved as the displayed
     /// user message. Must be fail-open — return the input unchanged on any
@@ -514,6 +520,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         guard let runner = providers[effectiveRequest.provider] else {
             throw AgentRunError.missingBinary(effectiveRequest.provider.rawValue)
         }
+        try await providerAdmissionCheck(effectiveRequest.provider, effectiveRequest.threadId)
         let adapterKey = providerAdapterKey(runner)
         let binaryIdentity = providerBinaryIdentity(effectiveRequest.provider, adapter: runner)
         try refreshProviderProcessIfScopeChanged(runner, request: effectiveRequest)
@@ -1325,7 +1332,51 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     public func readThread(threadId: AgentThreadID) async throws -> [AssistantEvent] {
         let adapter = try adapterForThread(threadId)
         try await recoverAdapterSessionIfNeeded(threadId: threadId, adapter: adapter)
-        return try await adapter.readThread(threadId: threadId)
+        return Self.boundedHotReplay(try await adapter.readThread(threadId: threadId))
+    }
+
+    public static func boundedHotReplay(
+        _ events: [AssistantEvent],
+        countLimit: Int = hotReplayEventCount,
+        byteLimit: Int64 = hotReplayEventBytes
+    ) -> [AssistantEvent] {
+        let encoder = JSONEncoder()
+        var retained: [AssistantEvent] = []
+        retained.reserveCapacity(min(events.count, max(1, countLimit)))
+        var bytes: Int64 = 0
+        for event in events.reversed() {
+            guard retained.count < max(1, countLimit) else { break }
+            var boundedEvent = event
+            var eventBytes = Int64((try? encoder.encode(boundedEvent).count) ?? boundedEvent.debugDescription.utf8.count)
+            if eventBytes > max(1, byteLimit) {
+                boundedEvent = .error(
+                    message: "An oversized provider event was omitted from the hot replay window.",
+                    recoverable: true
+                )
+                eventBytes = Int64((try? encoder.encode(boundedEvent).count) ?? 256)
+                guard eventBytes <= max(1, byteLimit) else { continue }
+            }
+            if bytes + eventBytes > max(1, byteLimit) { break }
+            retained.append(boundedEvent)
+            bytes += eventBytes
+        }
+        retained.reverse()
+        return retained
+    }
+
+    /// Correctness-critical state is stored in the compact provider-session row,
+    /// independently of the evictable stream transcript.
+    public func durableActiveThreadState(threadId: AgentThreadID) -> AgentActiveThreadState? {
+        guard let providerSessionRepo,
+              let session = try? providerSessionRepo.get(threadId: threadId) else { return nil }
+        let payload = ProviderSessionRuntimePayload.decode(session.runtimePayloadJSON)
+        return AgentActiveThreadState(
+            resumeCursor: session.resumeCursor ?? payload.providerThreadId,
+            activeTurnId: payload.activeTurnId,
+            activePlan: payload.activePlan,
+            pendingApprovalRequestIds: payload.pendingApprovalRequestIds,
+            pendingUserInputRequestIds: payload.pendingUserInputRequestIds
+        )
     }
 
     @discardableResult
@@ -1615,11 +1666,24 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         return checkpoint
     }
 
-    /// Replay the ENTIRE persisted thread, not just the last 500 events. The DB is already
-    /// pruned to ~5000 events/thread (pruneStreamEvents), so this is bounded; capping the
-    /// replay at 500 here was truncating the reopened transcript to its last few turns.
+    /// Hot replay is bounded independently by encoded bytes and row count. Durable
+    /// messages and compact ActiveThreadState preserve completed output and resume
+    /// correctness when the evictable event prefix is outside this window.
+    public static let hotReplayEventCount = 2_000
+    public static let hotReplayEventBytes: Int64 = 24 * 1_024 * 1_024
+
     public func latestStreamEvents(threadId: AgentThreadID) -> [AssistantEvent] {
-        (try? runRepo.listLatestStreamEvents(threadId: threadId, limit: .max)) ?? []
+        (try? runRepo.listLatestStreamEvents(
+            threadId: threadId,
+            limit: Self.hotReplayEventCount,
+            maxPayloadBytes: Self.hotReplayEventBytes
+        )) ?? []
+    }
+
+    public func hotReplayIsPartial(threadId: AgentThreadID) -> Bool {
+        ((try? runRepo.streamHistoryWasPruned(threadId: threadId)) ?? false)
+            || ((try? runRepo.countStreamEvents(threadId: threadId)) ?? 0) > Self.hotReplayEventCount
+            || ((try? runRepo.streamEventPayloadBytes(threadId: threadId)) ?? 0) > Self.hotReplayEventBytes
     }
 
     /// Returns the exact locally-processed AssistantEvent snapshot while
@@ -2007,9 +2071,15 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             payload.claudeResumeSessionAt = snapshot["resumeSessionAt"] as? String
                 ?? snapshot["lastAssistantUuid"] as? String
                 ?? payload.claudeResumeSessionAt
-            payload.claudeInFlightToolIds = snapshot["inFlightToolIds"] as? [String] ?? payload.claudeInFlightToolIds
-            payload.pendingApprovalRequestIds = snapshot["pendingApprovalRequestIds"] as? [String] ?? payload.pendingApprovalRequestIds
-            payload.pendingUserInputRequestIds = snapshot["pendingUserInputRequestIds"] as? [String] ?? payload.pendingUserInputRequestIds
+            payload.claudeInFlightToolIds = Self.boundedRuntimeIdentifiers(
+                snapshot["inFlightToolIds"] as? [String] ?? payload.claudeInFlightToolIds
+            )
+            payload.pendingApprovalRequestIds = Self.boundedRuntimeIdentifiers(
+                snapshot["pendingApprovalRequestIds"] as? [String] ?? payload.pendingApprovalRequestIds
+            )
+            payload.pendingUserInputRequestIds = Self.boundedRuntimeIdentifiers(
+                snapshot["pendingUserInputRequestIds"] as? [String] ?? payload.pendingUserInputRequestIds
+            )
             payload.updatedAtMs = Int64(Date().timeIntervalSince1970 * 1000)
         }
     }
@@ -2188,6 +2258,27 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                     threadId: threadId
                 )
             }
+            // A failed SQLite flush must not turn the retry prefix into an
+            // unbounded spool. Before accepting another provider event, retry a
+            // prefix that already reached either high-water mark. If it is still
+            // locked, stop the provider at the durable resume cursor and fail
+            // loud; the retained prefix remains available for a later retry.
+            lock.lock()
+            let saturatedRetry = pendingStreamWrites[threadId].map {
+                Self.shouldFlushStreamBatch(
+                    pendingCount: $0.count,
+                    pendingBytes: $0.encodedByteCount,
+                    sinceLastFlushMs: 0
+                )
+            } ?? false
+            lock.unlock()
+            if saturatedRetry,
+               let retryError = flushPendingStreamWritesResult(runId: runId, threadId: threadId) {
+                recordMirrorPersistenceFailure(retryError, threadId: threadId)
+                emitPersistenceIssue("run.stream_event.retry_saturated", error: retryError, runId: runId, threadId: threadId)
+                stopRun(runId)
+                return
+            }
             lock.lock()
             let s = allocateStreamSequenceLocked(runId: runId, threadId: threadId)
             lock.unlock()
@@ -2205,9 +2296,13 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             // are coalesced into the flush. The payload compactor runs outside the
             // lock (as before) since it is an external, structure-preserving call.
             if let data, let json = String(data: data, encoding: .utf8) {
-                let payloadJSON = streamPayloadCompactor?(json) ?? json
+                let payloadJSON = Self.boundedPersistedStreamPayload(
+                    streamPayloadCompactor?(json) ?? json
+                )
                 let providerEvent: ProviderRuntimeEvent?
-                if case .providerRuntime(let runtimeEvent) = ev { providerEvent = runtimeEvent } else { providerEvent = nil }
+                if case .providerRuntime(let runtimeEvent) = ev {
+                    providerEvent = Self.boundedProviderRuntimeEvent(runtimeEvent)
+                } else { providerEvent = nil }
                 lock.lock()
                 if let owner = pendingStreamRunIds[threadId], owner != runId {
                     lock.unlock()
@@ -2233,7 +2328,11 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                 let lastMs = lastStreamFlushMs[threadId] ?? nowMs
                 lastStreamFlushMs[threadId] = lastStreamFlushMs[threadId] ?? nowMs
                 var flushNow: BatchFlush?
-                if Self.shouldFlushStreamBatch(pendingCount: batch.count, sinceLastFlushMs: nowMs - lastMs) || pruneDue {
+                if Self.shouldFlushStreamBatch(
+                    pendingCount: batch.count,
+                    pendingBytes: batch.encodedByteCount,
+                    sinceLastFlushMs: nowMs - lastMs
+                ) || pruneDue {
                     flushNow = takeStreamFlushLocked(threadId: threadId, pruneDue: pruneDue, nowMs: nowMs)
                 }
                 lock.unlock()
@@ -2274,9 +2373,10 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                 }
             case .requestOpened(let request):
                 updateProviderRuntimePayload(threadId: threadId, runId: runId) { payload in
-                    if !payload.pendingApprovalRequestIds.contains(request.id) {
-                        payload.pendingApprovalRequestIds.append(request.id)
-                    }
+                    payload.pendingApprovalRequestIds = Self.boundedRuntimeIdentifiers(
+                        existing: payload.pendingApprovalRequestIds,
+                        adding: request.id
+                    )
                     payload.updatedAtMs = Int64(Date().timeIntervalSince1970 * 1000)
                 }
             case .requestResolved(let requestId, _):
@@ -2286,9 +2386,10 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                 }
             case .userInputRequested(let request):
                 updateProviderRuntimePayload(threadId: threadId, runId: runId) { payload in
-                    if !payload.pendingUserInputRequestIds.contains(request.id) {
-                        payload.pendingUserInputRequestIds.append(request.id)
-                    }
+                    payload.pendingUserInputRequestIds = Self.boundedRuntimeIdentifiers(
+                        existing: payload.pendingUserInputRequestIds,
+                        adding: request.id
+                    )
                     payload.updatedAtMs = Int64(Date().timeIntervalSince1970 * 1000)
                 }
             case .userInputResolved(let requestId, _):
@@ -2305,6 +2406,27 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                     lock.lock()
                     activeAssistantMessageIds[runId] = persisted.id
                     lock.unlock()
+                }
+                if finalMessage?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false {
+                    updateProviderRuntimePayload(threadId: threadId, runId: runId) { payload in
+                        payload.activePlan = nil
+                        payload.updatedAtMs = Int64(Date().timeIntervalSince1970 * 1000)
+                    }
+                }
+            case .activePlanUpdated(let plan):
+                guard Self.activePlanFitsCompactBudget(plan) else {
+                    let error = NSError(
+                        domain: "RemoteCode.AgentRunCoordinator",
+                        code: 413,
+                        userInfo: [NSLocalizedDescriptionKey: "Active plan exceeds the compact recovery-state budget."]
+                    )
+                    emitPersistenceIssue("provider_session.active_plan.budget", error: error, runId: runId, threadId: threadId)
+                    stopRun(runId)
+                    return
+                }
+                updateProviderRuntimePayload(threadId: threadId, runId: runId) { payload in
+                    payload.activePlan = plan
+                    payload.updatedAtMs = Int64(Date().timeIntervalSince1970 * 1000)
                 }
             default:
                 break
@@ -3291,6 +3413,10 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         var kind: String
         var payloadJSON: String
         var providerEvent: ProviderRuntimeEvent?
+
+        var encodedByteCount: Int {
+            kind.utf8.count + payloadJSON.utf8.count + (providerEvent?.payloadJSON.utf8.count ?? 0)
+        }
     }
 
     struct StreamWriteBatch {
@@ -3298,6 +3424,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
 
         var isEmpty: Bool { items.isEmpty }
         var count: Int { items.count }
+        var encodedByteCount: Int { items.reduce(0) { $0 + $1.encodedByteCount } }
         var highestSeq: Int { items.map(\.seq).max() ?? 0 }
 
         mutating func append(_ item: StreamWriteItem) {
@@ -3391,21 +3518,101 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     /// How many buffered stream events force a flush. Bounds both the in-memory
     /// buffer and the lock-held replay size on a single flush.
     nonisolated static let streamFlushCountThreshold = 16
+    /// A handful of very large provider frames must flush before count reaches
+    /// 16. Individual frames are bounded before entering this buffer, so one
+    /// malformed provider event cannot exceed the flush or resident-memory cap.
+    nonisolated static let streamFlushByteThreshold = 512 * 1_024
+    nonisolated static let maximumBufferedEventBytes = 512 * 1_024
     /// Max latency (ms) a buffered stream event may wait before being flushed,
     /// so a slow trickle still reaches the DB (and survives reload/crash).
     nonisolated static let streamFlushTimeThresholdMs: Int64 = 250
+
+    nonisolated static func boundedPersistedStreamPayload(
+        _ payloadJSON: String,
+        byteLimit: Int = maximumBufferedEventBytes
+    ) -> String {
+        guard payloadJSON.utf8.count > max(1, byteLimit) else { return payloadJSON }
+        let marker = AssistantEvent.error(
+            message: "A provider event was omitted from local history because it exceeded the event memory limit (\(payloadJSON.utf8.count) bytes).",
+            recoverable: true
+        )
+        return (try? JSONEncoder().encode(marker)).map { String(decoding: $0, as: UTF8.self) }
+            ?? #"{"error":{"message":"Oversized provider event omitted.","recoverable":true}}"#
+    }
+
+    nonisolated static func boundedProviderRuntimeEvent(
+        _ event: ProviderRuntimeEvent,
+        byteLimit: Int = maximumBufferedEventBytes
+    ) -> ProviderRuntimeEvent {
+        guard event.payloadJSON.utf8.count > max(1, byteLimit) else { return event }
+        return ProviderRuntimeEvent(
+            id: event.id,
+            provider: event.provider,
+            source: event.source,
+            method: event.method,
+            providerTurnId: event.providerTurnId,
+            providerItemId: event.providerItemId,
+            providerRequestId: event.providerRequestId,
+            payloadJSON: #"{"remote_code_truncated":true,"reason":"event_size_limit","original_bytes":\#(event.payloadJSON.utf8.count)}"#,
+            receivedAtMs: event.receivedAtMs
+        )
+    }
+
+    /// FIFO-set helper for correctness identifiers stored in the compact runtime
+    /// payload. The newest identifier is always retained; old resolved/stale IDs
+    /// are evicted from this diagnostic index, while their durable callback rows
+    /// remain authoritative.
+    nonisolated static func boundedRuntimeIdentifiers(
+        existing: [String],
+        adding identifier: String,
+        countLimit: Int = 128,
+        byteLimit: Int = 32 * 1_024
+    ) -> [String] {
+        boundedRuntimeIdentifiers(existing.filter { $0 != identifier } + [identifier], countLimit: countLimit, byteLimit: byteLimit)
+    }
+
+    nonisolated static func boundedRuntimeIdentifiers(
+        _ identifiers: [String],
+        countLimit: Int = 128,
+        byteLimit: Int = 32 * 1_024
+    ) -> [String] {
+        var result = identifiers
+        var bytes = result.reduce(0) { $0 + $1.utf8.count }
+        while result.count > max(1, countLimit)
+            || (bytes > max(1, byteLimit) && result.count > 1) {
+            bytes -= result.removeFirst().utf8.count
+        }
+        return result
+    }
+
+    nonisolated static let compactActivePlanStepLimit = 512
+    nonisolated static let compactActivePlanByteLimit = 256 * 1_024
+
+    nonisolated static func activePlanFitsCompactBudget(
+        _ plan: AssistantActivePlan,
+        stepLimit: Int = compactActivePlanStepLimit,
+        byteLimit: Int = compactActivePlanByteLimit
+    ) -> Bool {
+        guard plan.steps.count <= max(1, stepLimit),
+              let bytes = try? JSONEncoder().encode(plan).count else { return false }
+        return bytes <= max(1, byteLimit)
+    }
 
     /// Pure flush-cadence decision: flush when there is pending work AND either the
     /// count cap is reached or the time budget has elapsed. nonisolated so it is
     /// directly unit-testable without standing up a coordinator.
     nonisolated static func shouldFlushStreamBatch(
         pendingCount: Int,
+        pendingBytes: Int = 0,
         sinceLastFlushMs: Int64,
         countThreshold: Int = streamFlushCountThreshold,
+        byteThreshold: Int = streamFlushByteThreshold,
         timeThresholdMs: Int64 = streamFlushTimeThresholdMs
     ) -> Bool {
         guard pendingCount > 0 else { return false }
-        return pendingCount >= countThreshold || sinceLastFlushMs >= timeThresholdMs
+        return pendingCount >= countThreshold
+            || pendingBytes >= byteThreshold
+            || sinceLastFlushMs >= timeThresholdMs
     }
 
     private func captureFileDiffs(files: [AgentTurnCheckpointFile], cwd: String) -> [AgentTurnCheckpointFileDiff] {
@@ -3746,6 +3953,7 @@ private struct ProviderSessionRuntimePayload: Codable, Equatable {
     var runtimeMode: AgentPermissionMode?
     var interactionMode: AgentInteractionMode?
     var activeTurnId: String?
+    var activePlan: AssistantActivePlan?
     var pendingApprovalRequestIds: [String] = []
     var pendingUserInputRequestIds: [String] = []
     var claudeResumeSessionAt: String?
@@ -3753,7 +3961,7 @@ private struct ProviderSessionRuntimePayload: Codable, Equatable {
     var updatedAtMs: Int64?
 
     private enum CodingKeys: String, CodingKey {
-        case providerThreadId, lastCompletedTurnId, turnCount, model, serviceTier, runtimeMode, interactionMode, activeTurnId, pendingApprovalRequestIds, pendingUserInputRequestIds, claudeResumeSessionAt, claudeInFlightToolIds, updatedAtMs
+        case providerThreadId, lastCompletedTurnId, turnCount, model, serviceTier, runtimeMode, interactionMode, activeTurnId, activePlan, pendingApprovalRequestIds, pendingUserInputRequestIds, claudeResumeSessionAt, claudeInFlightToolIds, updatedAtMs
     }
 
     init(turnCount: Int = 0) {
@@ -3770,6 +3978,7 @@ private struct ProviderSessionRuntimePayload: Codable, Equatable {
         runtimeMode = try container.decodeIfPresent(AgentPermissionMode.self, forKey: .runtimeMode)
         interactionMode = try container.decodeIfPresent(AgentInteractionMode.self, forKey: .interactionMode)
         activeTurnId = try container.decodeIfPresent(String.self, forKey: .activeTurnId)
+        activePlan = try container.decodeIfPresent(AssistantActivePlan.self, forKey: .activePlan)
         pendingApprovalRequestIds = try container.decodeIfPresent([String].self, forKey: .pendingApprovalRequestIds) ?? []
         pendingUserInputRequestIds = try container.decodeIfPresent([String].self, forKey: .pendingUserInputRequestIds) ?? []
         claudeResumeSessionAt = try container.decodeIfPresent(String.self, forKey: .claudeResumeSessionAt)

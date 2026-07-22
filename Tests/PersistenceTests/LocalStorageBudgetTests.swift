@@ -93,6 +93,32 @@ final class LocalStorageBudgetTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(snapshot.reclaimableBytes, 0)
     }
 
+    func test_snapshotAccountsMainWALAndSHMAndPassiveCheckpointRemainsNonVacuuming() throws {
+        let fixture = try makeFixture()
+        defer { try? FileManager.default.removeItem(atPath: fixture.directory) }
+        let messages = AgentMessageRepository(db: fixture.db)
+        for index in 0..<200 {
+            try messages.append(AgentMessage(
+                threadId: fixture.thread.id,
+                role: .assistant,
+                content: "row-\(index)-" + String(repeating: "x", count: 1_024)
+            ))
+        }
+        let manager = LocalStorageBudgetManager(db: fixture.db)
+        let before = try manager.snapshot()
+        XCTAssertGreaterThan(before.databaseFileBytes, 0)
+        XCTAssertEqual(before.physicalBytes, before.databaseFileBytes + before.walBytes + before.sharedMemoryBytes,
+                       "physical accounting must include every SQLite sidecar, not only logical page_count")
+
+        let checkpoint = try manager.passiveCheckpoint()
+        XCTAssertGreaterThanOrEqual(checkpoint.busyReaders, 0)
+        XCTAssertGreaterThanOrEqual(checkpoint.walFrames, checkpoint.checkpointedFrames)
+        XCTAssertEqual(checkpoint.snapshot.physicalBytes,
+                       checkpoint.snapshot.databaseFileBytes + checkpoint.snapshot.walBytes + checkpoint.snapshot.sharedMemoryBytes)
+        XCTAssertGreaterThanOrEqual(checkpoint.snapshot.databaseBytes, before.databaseBytes,
+                                    "PASSIVE checkpoint must not VACUUM or rewrite the logical database smaller")
+    }
+
     func test_undoGCPinExpiryNeverRoundsEarlierThanFullPrecisionUndoWindow() throws {
         let fixture = try makeFixture()
         defer { try? FileManager.default.removeItem(atPath: fixture.directory) }

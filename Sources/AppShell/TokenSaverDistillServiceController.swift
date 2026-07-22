@@ -444,11 +444,18 @@ public struct DistillSpawnResult: @unchecked Sendable {
     public let process: Process
     public let stdoutHandle: FileHandle
     public let stderrHandle: FileHandle
+    public let ownershipTag: SpawnedProcessTag?
 
-    public init(process: Process, stdoutHandle: FileHandle, stderrHandle: FileHandle) {
+    public init(
+        process: Process,
+        stdoutHandle: FileHandle,
+        stderrHandle: FileHandle,
+        ownershipTag: SpawnedProcessTag? = nil
+    ) {
         self.process = process
         self.stdoutHandle = stdoutHandle
         self.stderrHandle = stderrHandle
+        self.ownershipTag = ownershipTag
     }
 }
 
@@ -480,10 +487,12 @@ public struct RealDistillProcessSpawner: DistillProcessSpawning, Sendable {
         process.standardError = stderr
         process.arguments = arguments
         try process.run()
+        let ownershipTag = try ProcessSpawnTagger.tagProcess(process, managedKind: .sidecar)
         return DistillSpawnResult(
             process: process,
             stdoutHandle: stdout.fileHandleForReading,
-            stderrHandle: stderr.fileHandleForReading
+            stderrHandle: stderr.fileHandleForReading,
+            ownershipTag: ownershipTag
         )
     }
 }
@@ -491,9 +500,8 @@ public struct RealDistillProcessSpawner: DistillProcessSpawning, Sendable {
 @MainActor
 public final class TokenSaverDistillServiceController {
     public typealias ExecutableURLResolver = @MainActor () -> URL?
-    /// Reap foreign Distill MLX servers. `keepPID` is the controller's live child
-    /// (or nil when none should survive). Injectable so unit tests never SIGTERM
-    /// a developer's real sidecar.
+    /// Reconcile exact persisted ownership before a sidecar launch. Injectable so
+    /// unit tests never signal a developer's real sidecar.
     public typealias ForeignServerTerminator = (Int32?) -> ProviderProcessSweepResult
 
     public private(set) var status: TokenSaverDistillServiceStatus = .notStarted {
@@ -511,7 +519,13 @@ public final class TokenSaverDistillServiceController {
     private let executableURLResolver: ExecutableURLResolver
     private let processSpawner: any DistillProcessSpawning
     private let terminateForeignServers: ForeignServerTerminator
+    private let memoryProfileProvider: @Sendable () -> ManagedProcessMemoryProfile
+    private let ownedProcessTerminationTimeout: TimeInterval
     private var process: Process?
+    private var processOwnershipTag: SpawnedProcessTag?
+    private var terminatingProcess: Process?
+    private var terminationTask: Task<Void, Never>?
+    private var pendingStartAfterTermination = false
     private var readyOutputHandle: FileHandle?
     private var stderrOutputHandle: FileHandle?
     private var readyOutputBuffer = Data()
@@ -541,28 +555,40 @@ public final class TokenSaverDistillServiceController {
         executableURLResolver: @escaping ExecutableURLResolver = TokenSaverDistillServiceController.defaultExecutableURL,
         idleTimeoutMS: Int = 300_000,
         processSpawner: any DistillProcessSpawning = RealDistillProcessSpawner(),
-        terminateForeignServers: @escaping ForeignServerTerminator = TokenSaverDistillServiceController.defaultTerminateForeignServers
+        terminateForeignServers: @escaping ForeignServerTerminator = TokenSaverDistillServiceController.defaultTerminateForeignServers,
+        ownedProcessTerminationTimeout: TimeInterval = 2.5,
+        memoryProfileProvider: @escaping @Sendable () -> ManagedProcessMemoryProfile = {
+            ManagedProcessMemoryProfile.resolve(physicalMemoryBytes: ProcessInfo.processInfo.physicalMemory)
+        }
     ) {
         self.appSupportDirectory = appSupportDirectory
         self.executableURLResolver = executableURLResolver
         self.idleTimeoutMS = idleTimeoutMS
         self.processSpawner = processSpawner
         self.terminateForeignServers = terminateForeignServers
+        self.ownedProcessTerminationTimeout = max(0.1, ownedProcessTerminationTimeout)
+        self.memoryProfileProvider = memoryProfileProvider
     }
 
-    /// Production reaper. No-ops under XCTest so suite start/stop never kills a
-    /// live developer Distill server; tests that assert reaping inject a spy.
+    /// Production ownership reconciliation. No-ops under XCTest so suite
+    /// start/stop never signals a developer's real sidecar; tests inject a spy.
     nonisolated public static func defaultTerminateForeignServers(
         keeping keepPID: Int32?
     ) -> ProviderProcessSweepResult {
         if ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil {
             return ProviderProcessSweepResult(orphanRootPIDs: [], terminatedPIDs: [], failedPIDs: [])
         }
-        return ProviderProcessSweeper.terminateDistillServers(keeping: keepPID)
+        _ = keepPID
+        do {
+            return try ProviderProcessSweeper.terminatePersistedOrphanedProviderRuntimes(minAge: 0)
+        } catch {
+            return ProviderProcessSweepResult(orphanRootPIDs: [], terminatedPIDs: [], failedPIDs: [])
+        }
     }
 
     deinit {
         process?.terminate()
+        terminatingProcess?.terminate()
     }
 
     public func startIfEligible(
@@ -602,18 +628,14 @@ public final class TokenSaverDistillServiceController {
         stderrOutputBuffer.removeAll(keepingCapacity: false)
         lastStderrLine = nil
         removeCLIState()
+        pendingStartAfterTermination = false
         if let process {
             process.terminationHandler = nil
-            if process.isRunning {
-                process.terminate()
-            }
+            beginBoundedTermination(of: process, ownershipTag: processOwnershipTag)
         }
         process = nil
+        processOwnershipTag = nil
         bearerToken = nil
-        // Single-server + quit contract: after releasing our handle, reap any
-        // leftover MLX Distill servers (orphans, previous-launch children the
-        // Process handle lost track of). MCP CLI helpers are left alone.
-        _ = terminateForeignServers(nil)
         // Reset from EVERY state (.starting/.failed/.running) so a stuck status
         // never survives a stop()/eligibility change.
         let decision = TokenSaverDistillSupervisor.decide(
@@ -623,6 +645,47 @@ public final class TokenSaverDistillServiceController {
         )
         status = decision.nextStatus
         isStopping = false
+    }
+
+    private func beginBoundedTermination(
+        of process: Process,
+        ownershipTag: SpawnedProcessTag?
+    ) {
+        guard process.isRunning else {
+            if let ownershipTag {
+                try? ProviderProcessOwnership.shared.store()?.removeExact(ownershipTag)
+            }
+            return
+        }
+        let expectedIdentity = ownershipTag?.startIdentity
+            ?? ProviderProcessStartIdentity.read(pid: process.processIdentifier)
+        terminatingProcess = process
+        let timeout = ownedProcessTerminationTimeout
+        terminationTask = Task.detached(priority: .userInitiated) { [weak self, weak process] in
+            guard let process else { return }
+            let stopped = ProcessSpawnTagger.terminateExactOwnedProcessAndWait(
+                process,
+                expectedStartIdentity: expectedIdentity,
+                timeout: timeout
+            )
+            if stopped, let ownershipTag {
+                try? ProviderProcessOwnership.shared.store()?.removeExact(ownershipTag)
+            }
+            await MainActor.run { [weak self, weak process] in
+                guard let self, let process, self.terminatingProcess === process else { return }
+                self.terminatingProcess = nil
+                self.terminationTask = nil
+                let shouldRestart = self.pendingStartAfterTermination
+                self.pendingStartAfterTermination = false
+                guard stopped else {
+                    self.status = .failed("Previous RemoteCodeDistillService did not stop within the bounded handoff window")
+                    return
+                }
+                if shouldRestart {
+                    self.start()
+                }
+            }
+        }
     }
 
     /// Called from the process termination handler on the MainActor.
@@ -682,9 +745,10 @@ public final class TokenSaverDistillServiceController {
 
     private func start() {
         if let process, process.isRunning {
-            // Still enforce singleton: another host/crash may have left a
-            // second MLX server alive. Keep only our tracked child.
-            _ = terminateForeignServers(process.processIdentifier)
+            return
+        }
+        if terminatingProcess != nil {
+            pendingStartAfterTermination = true
             return
         }
         // A live launch supersedes any pending backoff retry.
@@ -708,6 +772,7 @@ public final class TokenSaverDistillServiceController {
         let model = manifest.flatMap {
             TokenSaverApprovedModels.approved(id: $0.modelID, url: $0.modelURL, runtime: $0.runtime)
         } ?? TokenSaverApprovedModels.defaultModel
+        let memoryProfile = memoryProfileProvider()
         let arguments = [
             "--auth-token", token,
             "--app-support-dir", appSupportDirectory.path,
@@ -716,8 +781,8 @@ public final class TokenSaverDistillServiceController {
             "--runtime", model.runtime,
             "--model-id", model.id,
             "--model-url", model.url,
-            "--max-concurrent-requests", "8",
-            "--max-queue-depth", "64",
+            "--max-concurrent-requests", String(memoryProfile.sidecarMaxConcurrentRequests),
+            "--max-queue-depth", String(memoryProfile.sidecarMaxQueueDepth),
             "--idle-timeout-ms", String(idleTimeoutMS)
         ]
 
@@ -725,6 +790,7 @@ public final class TokenSaverDistillServiceController {
             let spawned = try processSpawner.spawn(executableURL: executableURL, arguments: arguments)
             let process = spawned.process
             self.process = process
+            self.processOwnershipTag = spawned.ownershipTag
             self.bearerToken = token
             self.status = .starting
             // Supervise: when the sidecar exits unexpectedly, downgrade status
@@ -752,6 +818,7 @@ public final class TokenSaverDistillServiceController {
             self.status = .failed("RemoteCodeDistillService launch failed")
             self.bearerToken = nil
             self.process = nil
+            self.processOwnershipTag = nil
         }
     }
 

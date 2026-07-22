@@ -704,14 +704,23 @@ public enum AgentThreadForkPersistenceError: Error, Equatable {
 public struct AgentMessageBodyBudgetResult: Sendable, Equatable {
     public var rows: [AgentMessage]
     public var blanked: Int
+    public var hasMoreOlder: Bool
+    public var nextBefore: AgentMessageCursor?
 
-    public init(rows: [AgentMessage], blanked: Int) {
+    public init(
+        rows: [AgentMessage],
+        blanked: Int,
+        hasMoreOlder: Bool = false,
+        nextBefore: AgentMessageCursor? = nil
+    ) {
         self.rows = rows
         self.blanked = blanked
+        self.hasMoreOlder = hasMoreOlder
+        self.nextBefore = nextBefore
     }
 }
 
-public final class AgentMessageRepository {
+public final class AgentMessageRepository: @unchecked Sendable {
     let db: SQLiteDB
     private let encoder = JSONEncoder()
     private let decoder = JSONDecoder()
@@ -846,6 +855,102 @@ public final class AgentMessageRepository {
         }
 
         return AgentMessageBodyBudgetResult(rows: rows, blanked: blanked)
+    }
+
+    /// Keyset-bounded transcript page. Unlike `listWithinBodyBudget`, this never
+    /// scans shells for the full thread and never asks SQLite to return more than
+    /// `limit + 1` capped bodies. Repeated `before` cursors use the same
+    /// (created_at,rowid) order as rendering, preventing page gaps/duplicates.
+    public func listPageWithinBodyBudget(
+        threadId: AgentThreadID,
+        limit requestedLimit: Int,
+        before cursor: AgentMessageCursor? = nil,
+        budget: Int,
+        contentLimit: Int = AssistantTimelineState.liveTextLimit
+    ) throws -> AgentMessageBodyBudgetResult {
+        try db.performSync { database in
+        let limit = max(1, min(requestedLimit, 500))
+        let cappedContentLimit = max(1, contentLimit)
+        let cappedByteLimit = cappedContentLimit >= (Int.max - 128) / 4
+            ? Int.max
+            : (cappedContentLimit * 4) + 128
+        let predicate: String
+        if cursor == nil {
+            predicate = "thread_id = ?"
+        } else {
+            predicate = "thread_id = ? AND (created_at < ? OR (created_at = ? AND rowid < (SELECT rowid FROM agent_messages WHERE id = ?)))"
+        }
+        let statement = try database.prepare("""
+            WITH candidates AS (
+                SELECT rowid, id, thread_id, role,
+                       substr(content, 1, ?) AS capped_content,
+                       length(CAST(content AS BLOB)) AS body_bytes,
+                       created_at, attachments_json
+                FROM agent_messages
+                WHERE \(predicate)
+                ORDER BY created_at DESC, rowid DESC
+                LIMIT ?
+            ), ranked AS (
+                SELECT *,
+                       ROW_NUMBER() OVER (ORDER BY created_at DESC, rowid DESC) AS row_number,
+                       SUM(MIN(body_bytes, ?)) OVER (
+                           ORDER BY created_at DESC, rowid DESC
+                           ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                       ) AS running_bytes,
+                       COUNT(*) OVER () AS candidate_count
+                FROM candidates
+            )
+            SELECT id, thread_id, role, capped_content, created_at,
+                   attachments_json, body_bytes, candidate_count
+            FROM ranked
+            WHERE row_number <= ? AND (row_number = 1 OR running_bytes <= ?)
+            ORDER BY created_at ASC, rowid ASC;
+        """)
+        var index: Int32 = 1
+        try statement.bind(index, cappedContentLimit); index += 1
+        try statement.bind(index, threadId.value.uuidString); index += 1
+        if let cursor {
+            let created = iso.string(from: cursor.createdAt)
+            try statement.bind(index, created); index += 1
+            try statement.bind(index, created); index += 1
+            try statement.bind(index, cursor.id.value.uuidString); index += 1
+        }
+        try statement.bind(index, limit + 1); index += 1
+        try statement.bind(index, cappedByteLimit); index += 1
+        try statement.bind(index, limit); index += 1
+        try statement.bind(index, max(1, budget))
+
+        var rows: [AgentMessage] = []
+        var candidateCount = 0
+        while try statement.step() {
+            guard let idText = statement.columnText(0), let id = UUID(uuidString: idText),
+                  let threadText = statement.columnText(1), let threadUUID = UUID(uuidString: threadText),
+                  let roleText = statement.columnText(2), let role = AgentMessageRole(rawValue: roleText),
+                  let createdText = statement.columnText(4), let createdAt = iso.date(from: createdText)
+            else { continue }
+            let rawContent = statement.columnText(3) ?? ""
+            let originalBytes = Int(statement.columnInt64(6))
+            let content = originalBytes > rawContent.utf8.count
+                ? AssistantTimelineState.cappedText(rawContent + "…", limit: cappedContentLimit)
+                : rawContent
+            candidateCount = max(candidateCount, Int(statement.columnInt64(7)))
+            rows.append(AgentMessage(
+                id: AgentMessageID(id),
+                threadId: AgentThreadID(threadUUID),
+                role: role,
+                content: content,
+                createdAt: createdAt,
+                attachments: decodeAttachments(statement.columnText(5))
+            ))
+        }
+        let hasMoreOlder = candidateCount > rows.count || candidateCount > limit
+        return AgentMessageBodyBudgetResult(
+            rows: rows,
+            blanked: max(0, candidateCount - rows.count),
+            hasMoreOlder: hasMoreOlder,
+            nextBefore: rows.first.map { AgentMessageCursor(createdAt: $0.createdAt, id: $0.id) }
+        )
+        }
     }
 
     public func count(threadId: AgentThreadID) throws -> Int {
@@ -1817,9 +1922,38 @@ public final class AgentQueuedMessageRepository {
     }
 }
 
-public final class AgentRunRepository {
+public final class AgentRunRepository: @unchecked Sendable {
+    public static let maximumPersistedEventRowBytes = 512 * 1_024
     let db: SQLiteDB
+    private let globalRetentionStateLock = NSLock()
+    private let globalRetentionQueue = DispatchQueue(
+        label: "rc2.agent.global-retention",
+        qos: .utility
+    )
+    private var globalRetentionScheduled = false
+    private var globalRetentionRequested = false
+    private var globalRetentionCompletions: [@Sendable (Bool) -> Void] = []
     public init(db: SQLiteDB) { self.db = db }
+
+    private func boundedStreamRow(kind: String, payloadJSON: String) -> (kind: String, payloadJSON: String) {
+        guard kind.utf8.count + payloadJSON.utf8.count > Self.maximumPersistedEventRowBytes else {
+            return (kind, payloadJSON)
+        }
+        let marker = AssistantEvent.error(
+            message: "A provider event was omitted from local history because it exceeded the 512 KiB event limit (\(payloadJSON.utf8.count) bytes).",
+            recoverable: true
+        )
+        let encoded = (try? JSONEncoder().encode(marker)).map { String(decoding: $0, as: UTF8.self) }
+            ?? #"{"error":{"message":"Oversized provider event omitted.","recoverable":true}}"#
+        return ("historyPayloadOmitted", encoded)
+    }
+
+    private func boundedProviderPayload(_ payloadJSON: String) -> String {
+        guard payloadJSON.utf8.count <= Self.maximumPersistedEventRowBytes else {
+            return #"{"remote_code_truncated":true,"reason":"event_size_limit","original_bytes":\#(payloadJSON.utf8.count)}"#
+        }
+        return payloadJSON
+    }
 
     public func upsert(_ r: AgentRun) throws {
         let st = try db.prepare("""
@@ -1883,11 +2017,12 @@ public final class AgentRunRepository {
     }
 
     public func appendStreamEvent(runId: AgentRunID, seq: Int, kind: String, payloadJSON: String) throws {
+        let bounded = boundedStreamRow(kind: kind, payloadJSON: payloadJSON)
         let st = try db.prepare("INSERT INTO agent_stream_events(run_id, seq, event_kind, payload_json, created_at) VALUES(?, ?, ?, ?, ?);")
         try st.bind(1, runId.value.uuidString)
         try st.bind(2, Int64(seq))
-        try st.bind(3, kind)
-        try st.bind(4, payloadJSON)
+        try st.bind(3, bounded.kind)
+        try st.bind(4, bounded.payloadJSON)
         try st.bind(5, iso.string(from: Date()))
         _ = try st.step()
     }
@@ -2029,7 +2164,8 @@ public final class AgentRunRepository {
         runId: AgentRunID,
         threadId: AgentThreadID,
         items: [StreamWriteIntent],
-        shouldPruneStreamEvents: Bool
+        shouldPruneStreamEvents: Bool,
+        retentionPolicy policy: AgentEventRetentionPolicy = .production
     ) throws {
         guard !items.isEmpty || shouldPruneStreamEvents else { return }
         try db.performSync { db in
@@ -2046,13 +2182,31 @@ public final class AgentRunRepository {
                     }
                 }
                 if shouldPruneStreamEvents {
-                    try pruneStreamEvents(db: db, threadId: threadId, keepLatest: 5_000)
+                    let streamPruned = try pruneStreamEvents(
+                        db: db,
+                        threadId: threadId,
+                        keepLatest: policy.streamEventCountPerThread,
+                        maxPayloadBytes: policy.streamEventBytesPerThread
+                    )
+                    if streamPruned {
+                        try markAgentHistoryPartial(db: db, threadId: threadId)
+                    }
+                    _ = try pruneProviderEventLogs(
+                        db: db,
+                        threadId: threadId,
+                        keepLatest: policy.providerLogCountPerThread,
+                        maxPayloadBytes: policy.providerLogBytesPerThread
+                    )
                 }
             }
+        }
+        if shouldPruneStreamEvents {
+            scheduleGlobalEventPayloadPruning(policy: policy)
         }
     }
 
     public func appendProviderEventLog(threadId: AgentThreadID, runId: AgentRunID?, event: ProviderRuntimeEvent) throws {
+        let boundedPayload = boundedProviderPayload(event.payloadJSON)
         let st = try db.prepare("""
             INSERT INTO agent_provider_event_logs(
                 thread_id, run_id, event_id, provider, source, method,
@@ -2069,7 +2223,7 @@ public final class AgentRunRepository {
         try st.bind(7, event.providerTurnId)
         try st.bind(8, event.providerItemId)
         try st.bind(9, event.providerRequestId)
-        try st.bind(10, event.payloadJSON)
+        try st.bind(10, boundedPayload)
         try st.bind(11, Int64(event.receivedAtMs))
         try st.bind(12, iso.string(from: Date()))
         _ = try st.step()
@@ -2132,27 +2286,76 @@ public final class AgentRunRepository {
     }
 
     public func pruneProviderEventLogs(threadId: AgentThreadID, keepLatest limit: Int = 10_000) throws {
-        guard limit > 0 else { return }
+        try pruneProviderEventLogs(
+            threadId: threadId,
+            keepLatest: limit,
+            maxPayloadBytes: AgentEventRetentionPolicy.production.providerLogBytesPerThread
+        )
+    }
+
+    public func pruneProviderEventLogs(
+        threadId: AgentThreadID,
+        keepLatest limit: Int,
+        maxPayloadBytes: Int64
+    ) throws {
+        try pruneProviderEventLogs(
+            db: db,
+            threadId: threadId,
+            keepLatest: limit,
+            maxPayloadBytes: maxPayloadBytes
+        )
+    }
+
+    @discardableResult
+    private func pruneProviderEventLogs(
+        db: SQLiteDB,
+        threadId: AgentThreadID,
+        keepLatest limit: Int,
+        maxPayloadBytes: Int64
+    ) throws -> Bool {
+        guard limit > 0, maxPayloadBytes > 0 else { return false }
         let st = try db.prepare("""
+            WITH ranked AS (
+                SELECT id,
+                       ROW_NUMBER() OVER (ORDER BY id DESC) AS row_number,
+                       SUM(LENGTH(CAST(payload_json AS BLOB))) OVER (
+                           ORDER BY id DESC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                       ) AS running_bytes
+                FROM agent_provider_event_logs
+                WHERE thread_id = ?
+            )
             DELETE FROM agent_provider_event_logs
             WHERE id IN (
-                SELECT id FROM (
-                    SELECT id
-                    FROM agent_provider_event_logs
-                    WHERE thread_id = ?
-                    ORDER BY id DESC
-                    LIMIT -1 OFFSET ?
-                )
+                SELECT id FROM ranked
+                WHERE row_number > ? OR running_bytes > ?
             );
         """)
         try st.bind(1, threadId.value.uuidString)
         try st.bind(2, Int64(limit))
+        try st.bind(3, maxPayloadBytes)
         _ = try st.step()
+        return try changedRowCount(db) > 0
     }
 
     public func pruneStreamEvents(threadId: AgentThreadID, keepLatest limit: Int = 5_000) throws {
-        guard limit > 0 else { return }
-        try pruneStreamEvents(db: db, threadId: threadId, keepLatest: limit)
+        try pruneStreamEvents(
+            threadId: threadId,
+            keepLatest: limit,
+            maxPayloadBytes: AgentEventRetentionPolicy.production.streamEventBytesPerThread
+        )
+    }
+
+    public func pruneStreamEvents(
+        threadId: AgentThreadID,
+        keepLatest limit: Int,
+        maxPayloadBytes: Int64
+    ) throws {
+        try pruneStreamEvents(
+            db: db,
+            threadId: threadId,
+            keepLatest: limit,
+            maxPayloadBytes: maxPayloadBytes
+        )
     }
 
     private func persistStreamEventIdempotently(
@@ -2160,14 +2363,15 @@ public final class AgentRunRepository {
         runId: AgentRunID,
         item: StreamWriteIntent
     ) throws {
+        let bounded = boundedStreamRow(kind: item.kind, payloadJSON: item.payloadJSON)
         let existing = try db.prepare("SELECT event_kind, payload_json FROM agent_stream_events WHERE run_id = ? AND seq = ? LIMIT 1;")
         try existing.bind(1, runId.value.uuidString)
         try existing.bind(2, Int64(item.seq))
         if try existing.step() {
             let existingKind = existing.columnText(0)
             let existingPayload = existing.columnText(1)
-            guard existingKind == item.kind,
-                  existingPayload == item.payloadJSON else {
+            guard existingKind == bounded.kind,
+                  existingPayload == bounded.payloadJSON else {
                 let existingKindDescription = existingKind ?? "nil"
                 throw SQLiteError.execute(
                     "Conflicting stream event identity for run \(runId.value.uuidString) seq \(item.seq) " +
@@ -2180,8 +2384,8 @@ public final class AgentRunRepository {
         let insert = try db.prepare("INSERT INTO agent_stream_events(run_id, seq, event_kind, payload_json, created_at) VALUES(?, ?, ?, ?, ?);")
         try insert.bind(1, runId.value.uuidString)
         try insert.bind(2, Int64(item.seq))
-        try insert.bind(3, item.kind)
-        try insert.bind(4, item.payloadJSON)
+        try insert.bind(3, bounded.kind)
+        try insert.bind(4, bounded.payloadJSON)
         try insert.bind(5, iso.string(from: Date()))
         _ = try insert.step()
     }
@@ -2192,6 +2396,7 @@ public final class AgentRunRepository {
         runId: AgentRunID,
         event: ProviderRuntimeEvent
     ) throws {
+        let boundedPayload = boundedProviderPayload(event.payloadJSON)
         let existing = try db.prepare("""
             SELECT provider, source, method, provider_turn_id, provider_item_id,
                    provider_request_id, payload_json, received_at_ms
@@ -2208,7 +2413,7 @@ public final class AgentRunRepository {
                   existing.columnText(3) == event.providerTurnId,
                   existing.columnText(4) == event.providerItemId,
                   existing.columnText(5) == event.providerRequestId,
-                  existing.columnText(6) == event.payloadJSON,
+                  existing.columnText(6) == boundedPayload,
                   existing.columnInt64(7) == Int64(event.receivedAtMs) else {
                 throw SQLiteError.execute("Conflicting provider event identity for thread \(threadId.value.uuidString) event \(event.id).")
             }
@@ -2231,30 +2436,264 @@ public final class AgentRunRepository {
         try insert.bind(7, event.providerTurnId)
         try insert.bind(8, event.providerItemId)
         try insert.bind(9, event.providerRequestId)
-        try insert.bind(10, event.payloadJSON)
+        try insert.bind(10, boundedPayload)
         try insert.bind(11, Int64(event.receivedAtMs))
         try insert.bind(12, iso.string(from: Date()))
         _ = try insert.step()
     }
 
-    private func pruneStreamEvents(db: SQLiteDB, threadId: AgentThreadID, keepLatest limit: Int) throws {
-        guard limit > 0 else { return }
+    @discardableResult
+    private func pruneStreamEvents(
+        db: SQLiteDB,
+        threadId: AgentThreadID,
+        keepLatest limit: Int,
+        maxPayloadBytes: Int64
+    ) throws -> Bool {
+        guard limit > 0, maxPayloadBytes > 0 else { return false }
         let st = try db.prepare("""
+            WITH ranked AS (
+                SELECT e.id,
+                       ROW_NUMBER() OVER (
+                           ORDER BY r.started_at DESC, e.seq DESC, e.id DESC
+                       ) AS row_number,
+                       SUM(LENGTH(CAST(e.payload_json AS BLOB))) OVER (
+                           ORDER BY r.started_at DESC, e.seq DESC, e.id DESC
+                           ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                       ) AS running_bytes
+                FROM agent_stream_events e
+                JOIN agent_runs r ON r.id = e.run_id
+                WHERE r.thread_id = ?
+            )
             DELETE FROM agent_stream_events
             WHERE id IN (
-                SELECT id FROM (
-                    SELECT e.id
-                    FROM agent_stream_events e
-                    JOIN agent_runs r ON r.id = e.run_id
-                    WHERE r.thread_id = ?
-                    ORDER BY r.started_at DESC, e.seq DESC, e.id DESC
-                    LIMIT -1 OFFSET ?
-                )
+                SELECT id FROM ranked
+                WHERE row_number > ? OR running_bytes > ?
             );
         """)
         try st.bind(1, threadId.value.uuidString)
         try st.bind(2, Int64(limit))
+        try st.bind(3, maxPayloadBytes)
         _ = try st.step()
+        return try changedRowCount(db) > 0
+    }
+
+    private func changedRowCount(_ db: SQLiteDB) throws -> Int {
+        let statement = try db.prepare("SELECT changes();")
+        return try statement.step() ? Int(statement.columnInt64(0)) : 0
+    }
+
+    private func markAgentHistoryPartial(db: SQLiteDB, threadId: AgentThreadID) throws {
+        let statement = try db.prepare("""
+            INSERT INTO settings(key, value, updated_at) VALUES(?, '1', ?)
+            ON CONFLICT(key) DO UPDATE SET value='1', updated_at=excluded.updated_at;
+        """)
+        try statement.bind(1, "agent.history.partial.\(threadId.value.uuidString)")
+        try statement.bind(2, iso.string(from: Date()))
+        _ = try statement.step()
+    }
+
+    public func streamHistoryWasPruned(threadId: AgentThreadID) throws -> Bool {
+        let statement = try db.prepare("SELECT 1 FROM settings WHERE key = ? LIMIT 1;")
+        try statement.bind(1, "agent.history.partial.\(threadId.value.uuidString)")
+        return try statement.step()
+    }
+
+    /// Global write-time quota. One bounded quantum is removed per retention
+    /// cadence, which drains legacy databases without a single long DELETE while
+    /// always deleting faster than the bounded ingress batch can grow.
+    @discardableResult
+    public func pruneGlobalEventPayloads(policy: AgentEventRetentionPolicy = .production) throws -> (
+        streamThreads: Set<AgentThreadID>,
+        providerRows: Int,
+        remainsOverBudget: Bool,
+        deletedPayloadBytes: Int64
+    ) {
+        try db.performSync { database in
+            try database.transaction {
+                let streamBefore = try storageUsageCounter(database, storageClass: "stream_events")
+                let providerBefore = try storageUsageCounter(database, storageClass: "provider_logs")
+                let streamThreads = try pruneGlobalStreamEvents(
+                    db: database,
+                    maxPayloadBytes: policy.streamEventBytesGlobal,
+                    maxRows: policy.pruneQuantumRows,
+                    maxDeleteBytes: policy.pruneQuantumBytes
+                )
+                for threadId in streamThreads {
+                    try markAgentHistoryPartial(db: database, threadId: threadId)
+                }
+                let providerRows = try pruneGlobalProviderEventLogs(
+                    db: database,
+                    maxPayloadBytes: policy.providerLogBytesGlobal,
+                    maxRows: policy.pruneQuantumRows,
+                    maxDeleteBytes: policy.pruneQuantumBytes
+                )
+                let streamAfter = try storageUsageCounter(database, storageClass: "stream_events")
+                let providerAfter = try storageUsageCounter(database, storageClass: "provider_logs")
+                return (
+                    streamThreads,
+                    providerRows,
+                    streamAfter > policy.streamEventBytesGlobal || providerAfter > policy.providerLogBytesGlobal,
+                    max(0, streamBefore - streamAfter) + max(0, providerBefore - providerAfter)
+                )
+            }
+        }
+    }
+
+    /// Starts one idempotent utility-queue drainer. Each turn performs one
+    /// bounded transaction and yields before the next, so legacy/backlogged
+    /// data converges without extending the stream-write transaction.
+    public func scheduleGlobalEventPayloadPruning(
+        policy: AgentEventRetentionPolicy = .production,
+        completion: (@Sendable (Bool) -> Void)? = nil
+    ) {
+        globalRetentionStateLock.lock()
+        globalRetentionRequested = true
+        if let completion { globalRetentionCompletions.append(completion) }
+        guard !globalRetentionScheduled else {
+            globalRetentionStateLock.unlock()
+            return
+        }
+        globalRetentionScheduled = true
+        globalRetentionStateLock.unlock()
+        scheduleGlobalEventPayloadPruningQuantum(policy: policy)
+    }
+
+    private func scheduleGlobalEventPayloadPruningQuantum(policy: AgentEventRetentionPolicy) {
+        globalRetentionQueue.asyncAfter(deadline: .now() + 0.01) { [self] in
+            globalRetentionStateLock.lock()
+            globalRetentionRequested = false
+            globalRetentionStateLock.unlock()
+            do {
+                let result = try pruneGlobalEventPayloads(policy: policy)
+                if result.remainsOverBudget, result.deletedPayloadBytes > 0 {
+                    scheduleGlobalEventPayloadPruningQuantum(policy: policy)
+                    return
+                }
+                finishGlobalEventPayloadPruning(
+                    policy: policy,
+                    success: !result.remainsOverBudget
+                )
+            } catch {
+                finishGlobalEventPayloadPruning(policy: policy, success: false)
+            }
+        }
+    }
+
+    private func finishGlobalEventPayloadPruning(
+        policy: AgentEventRetentionPolicy,
+        success: Bool
+    ) {
+        globalRetentionStateLock.lock()
+        if globalRetentionRequested {
+            globalRetentionRequested = false
+            globalRetentionStateLock.unlock()
+            scheduleGlobalEventPayloadPruningQuantum(policy: policy)
+            return
+        }
+        globalRetentionScheduled = false
+        let completions = globalRetentionCompletions
+        globalRetentionCompletions.removeAll(keepingCapacity: true)
+        globalRetentionStateLock.unlock()
+        for completion in completions { completion(success) }
+    }
+
+    private func pruneGlobalStreamEvents(
+        db: SQLiteDB,
+        maxPayloadBytes: Int64,
+        maxRows: Int,
+        maxDeleteBytes: Int64
+    ) throws -> Set<AgentThreadID> {
+        let total = try storageUsageCounter(db, storageClass: "stream_events")
+        guard total > maxPayloadBytes else { return [] }
+        let candidates = try db.prepare("""
+            SELECT e.id, r.thread_id,
+                   LENGTH(CAST(e.event_kind AS BLOB)) + LENGTH(CAST(e.payload_json AS BLOB))
+            FROM agent_stream_events e
+            JOIN agent_runs r ON r.id = e.run_id
+            ORDER BY e.id ASC
+            LIMIT ?;
+        """)
+        try candidates.bind(1, max(1, maxRows))
+        var ids: [Int64] = []
+        var threads = Set<AgentThreadID>()
+        var bytes: Int64 = 0
+        let needed = min(total - maxPayloadBytes, max(1, maxDeleteBytes))
+        while try candidates.step() {
+            ids.append(candidates.columnInt64(0))
+            if let raw = candidates.columnText(1), let uuid = UUID(uuidString: raw) {
+                threads.insert(AgentThreadID(uuid))
+            }
+            bytes += max(0, candidates.columnInt64(2))
+            if bytes >= needed { break }
+        }
+        try deleteRows(db, table: "agent_stream_events", ids: ids)
+        return threads
+    }
+
+    private func pruneGlobalProviderEventLogs(
+        db: SQLiteDB,
+        maxPayloadBytes: Int64,
+        maxRows: Int,
+        maxDeleteBytes: Int64
+    ) throws -> Int {
+        let total = try storageUsageCounter(db, storageClass: "provider_logs")
+        guard total > maxPayloadBytes else { return 0 }
+        let candidates = try db.prepare("""
+            SELECT id,
+                   LENGTH(CAST(source AS BLOB)) + LENGTH(CAST(method AS BLOB)) + LENGTH(CAST(payload_json AS BLOB))
+            FROM agent_provider_event_logs
+            ORDER BY id ASC
+            LIMIT ?;
+        """)
+        try candidates.bind(1, max(1, maxRows))
+        var ids: [Int64] = []
+        var bytes: Int64 = 0
+        let needed = min(total - maxPayloadBytes, max(1, maxDeleteBytes))
+        while try candidates.step() {
+            ids.append(candidates.columnInt64(0))
+            bytes += max(0, candidates.columnInt64(1))
+            if bytes >= needed { break }
+        }
+        try deleteRows(db, table: "agent_provider_event_logs", ids: ids)
+        return ids.count
+    }
+
+    private func storageUsageCounter(_ db: SQLiteDB, storageClass: String) throws -> Int64 {
+        let statement = try db.prepare(
+            "SELECT payload_bytes FROM storage_usage_counters WHERE storage_class = ? LIMIT 1;"
+        )
+        try statement.bind(1, storageClass)
+        return try statement.step() ? statement.columnInt64(0) : 0
+    }
+
+    private func deleteRows(_ db: SQLiteDB, table: String, ids: [Int64]) throws {
+        guard !ids.isEmpty else { return }
+        let placeholders = ids.map { _ in "?" }.joined(separator: ",")
+        let statement = try db.prepare("DELETE FROM \(table) WHERE id IN (\(placeholders));")
+        for (index, id) in ids.enumerated() {
+            try statement.bind(Int32(index + 1), id)
+        }
+        _ = try statement.step()
+    }
+
+    public func streamEventPayloadBytes(threadId: AgentThreadID) throws -> Int64 {
+        let st = try db.prepare("""
+            SELECT COALESCE(SUM(LENGTH(CAST(e.payload_json AS BLOB))), 0)
+            FROM agent_stream_events e
+            JOIN agent_runs r ON r.id = e.run_id
+            WHERE r.thread_id = ?;
+        """)
+        try st.bind(1, threadId.value.uuidString)
+        return try st.step() ? st.columnInt64(0) : 0
+    }
+
+    public func providerEventPayloadBytes(threadId: AgentThreadID) throws -> Int64 {
+        let st = try db.prepare("""
+            SELECT COALESCE(SUM(LENGTH(CAST(payload_json AS BLOB))), 0)
+            FROM agent_provider_event_logs WHERE thread_id = ?;
+        """)
+        try st.bind(1, threadId.value.uuidString)
+        return try st.step() ? st.columnInt64(0) : 0
     }
 
     public func countStreamEvents(threadId: AgentThreadID) throws -> Int {
@@ -2272,9 +2711,35 @@ public final class AgentRunRepository {
     public func listLatestStreamEvents(
         threadId: AgentThreadID,
         limit: Int = 500,
+        maxPayloadBytes: Int64? = nil,
         strictDecoding: Bool = false
     ) throws -> [AssistantEvent] {
-        let st = try db.prepare("""
+        let sql: String
+        if maxPayloadBytes != nil {
+            sql = """
+            WITH ranked AS (
+                SELECT e.payload_json, r.started_at, e.seq, e.id,
+                       ROW_NUMBER() OVER (
+                           ORDER BY r.started_at DESC, e.seq DESC, e.id DESC
+                       ) AS row_number,
+                       SUM(LENGTH(CAST(e.payload_json AS BLOB))) OVER (
+                           ORDER BY r.started_at DESC, e.seq DESC, e.id DESC
+                           ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                       ) AS running_bytes
+                FROM agent_stream_events e
+                JOIN agent_runs r ON r.id = e.run_id
+                WHERE r.thread_id = ?
+            )
+            SELECT payload_json, id
+            FROM (
+                SELECT payload_json, started_at, seq, id
+                FROM ranked
+                WHERE row_number <= ? AND (row_number = 1 OR running_bytes <= ?)
+            )
+            ORDER BY started_at ASC, seq ASC, id ASC;
+            """
+        } else {
+            sql = """
             SELECT payload_json, id
             FROM (
                 SELECT e.payload_json, r.started_at, e.seq, e.id
@@ -2285,9 +2750,12 @@ public final class AgentRunRepository {
                 LIMIT ?
             )
             ORDER BY started_at ASC, seq ASC, id ASC;
-        """)
+            """
+        }
+        let st = try db.prepare(sql)
         try st.bind(1, threadId.value.uuidString)
         try st.bind(2, Int64(limit))
+        if let maxPayloadBytes { try st.bind(3, max(1, maxPayloadBytes)) }
         var events: [AssistantEvent] = []
         let decoder = JSONDecoder()
         while try st.step() {
@@ -3445,6 +3913,20 @@ public struct TerminalOutputWindow: Equatable {
     }
 }
 
+public struct TerminalHistoryGlobalPruneResult: Equatable, Sendable {
+    public let deletedRows: Int
+    public let deletedBytes: Int
+    public let truncatedSurfaceIDs: Set<String>
+    public let remainsOverBudget: Bool
+
+    public init(deletedRows: Int, deletedBytes: Int, truncatedSurfaceIDs: Set<String>, remainsOverBudget: Bool) {
+        self.deletedRows = deletedRows
+        self.deletedBytes = deletedBytes
+        self.truncatedSurfaceIDs = truncatedSurfaceIDs
+        self.remainsOverBudget = remainsOverBudget
+    }
+}
+
 public struct TerminalHistoryPartialState: Codable, Equatable, Sendable {
     public let reason: String
     public let nextChunkIndex: Int64
@@ -4594,12 +5076,97 @@ public final class TerminalOutputRepository {
         }
     }
 
+    public func totalBytesAllSurfaces() throws -> Int {
+        try db.performSync { database in
+            try Self.totalBytesAllSurfaces(database: database)
+        }
+    }
+
+    /// Deletes at most one bounded oldest-first quantum across inactive
+    /// histories. The writing surface is protected; its independent 8 MiB cap is
+    /// enforced first by the coordinator. Every affected surface receives its
+    /// durable partial marker in the same transaction as the chunk deletion.
+    public func pruneGlobalByteCapAndMarkHistoryPartial(
+        maxBytes: Int,
+        protectedSurfaceID: String,
+        maxRows: Int = 256,
+        maxDeleteBytes: Int = 8 * 1_024 * 1_024
+    ) throws -> TerminalHistoryGlobalPruneResult {
+        guard maxBytes > 0 else {
+            return TerminalHistoryGlobalPruneResult(deletedRows: 0, deletedBytes: 0, truncatedSurfaceIDs: [], remainsOverBudget: false)
+        }
+        return try db.performSync { database in
+            try database.transaction {
+                let total = try Self.totalBytesAllSurfaces(database: database)
+                guard total > maxBytes else {
+                    return TerminalHistoryGlobalPruneResult(deletedRows: 0, deletedBytes: 0, truncatedSurfaceIDs: [], remainsOverBudget: false)
+                }
+                let needed = min(total - maxBytes, max(1, maxDeleteBytes))
+                let candidates = try database.prepare("""
+                    SELECT id, surface_id, byte_count
+                    FROM terminal_output_chunks
+                    WHERE surface_id <> ?
+                    ORDER BY id ASC
+                    LIMIT ?;
+                """)
+                try candidates.bind(1, protectedSurfaceID)
+                try candidates.bind(2, max(1, maxRows))
+                var ids: [Int64] = []
+                var deletedBytes = 0
+                var surfaces = Set<String>()
+                while try candidates.step() {
+                    ids.append(candidates.columnInt64(0))
+                    if let surface = candidates.columnText(1) { surfaces.insert(surface) }
+                    deletedBytes += max(0, Int(candidates.columnInt64(2)))
+                    if deletedBytes >= needed { break }
+                }
+                guard !ids.isEmpty else {
+                    return TerminalHistoryGlobalPruneResult(deletedRows: 0, deletedBytes: 0, truncatedSurfaceIDs: [], remainsOverBudget: true)
+                }
+                var nextIndexes: [String: Int64] = [:]
+                for surface in surfaces {
+                    nextIndexes[surface] = try Self.nextChunkIndex(surfaceID: surface, database: database)
+                }
+                let placeholders = ids.map { _ in "?" }.joined(separator: ",")
+                let deletion = try database.prepare("DELETE FROM terminal_output_chunks WHERE id IN (\(placeholders));")
+                for (index, id) in ids.enumerated() {
+                    try deletion.bind(Int32(index + 1), id)
+                }
+                _ = try deletion.step()
+                for surface in surfaces {
+                    try Self.mergePartialState(
+                        key: Self.partialHistoryKey(surfaceID: surface),
+                        incoming: TerminalHistoryPartialState(
+                            reason: "history_global_retention_cap",
+                            nextChunkIndex: nextIndexes[surface] ?? 1
+                        ),
+                        database: database
+                    )
+                }
+                let remaining = max(0, total - deletedBytes)
+                return TerminalHistoryGlobalPruneResult(
+                    deletedRows: ids.count,
+                    deletedBytes: deletedBytes,
+                    truncatedSurfaceIDs: surfaces,
+                    remainsOverBudget: remaining > maxBytes
+                )
+            }
+        }
+    }
+
     private static func totalBytes(surfaceID: String, database: SQLiteDB) throws -> Int {
         let st = try database.prepare(
             "SELECT COALESCE(SUM(byte_count), 0) FROM terminal_output_chunks WHERE surface_id = ?;"
         )
         try st.bind(1, surfaceID)
         return (try st.step()) ? Int(st.columnInt64(0)) : 0
+    }
+
+    private static func totalBytesAllSurfaces(database: SQLiteDB) throws -> Int {
+        let statement = try database.prepare(
+            "SELECT COALESCE(SUM(byte_count), 0) FROM terminal_output_chunks;"
+        )
+        return try statement.step() ? Int(statement.columnInt64(0)) : 0
     }
 
     /// Live clear rotates the writer generation in the same transaction as the
@@ -4792,33 +5359,35 @@ public final class TerminalOutputRepository {
         maxBytes: Int,
         database: SQLiteDB
     ) throws -> Bool {
-        var total = try totalBytes(surfaceID: surfaceID, database: database)
-        var pruned = false
-        while total > maxBytes {
-            let oldest = try database.prepare("""
-                SELECT id, byte_count
-                FROM terminal_output_chunks
-                WHERE surface_id = ?
-                ORDER BY id ASC
-                LIMIT 1;
-            """)
-            try oldest.bind(1, surfaceID)
-            guard try oldest.step() else { return pruned }
-            let id = oldest.columnInt64(0)
-            let bytes = Int(oldest.columnInt64(1))
-            let delete = try database.prepare("""
-                DELETE FROM terminal_output_chunks
-                WHERE surface_id = ? AND id = ?;
-            """)
-            try delete.bind(1, surfaceID)
-            try delete.bind(2, id)
-            _ = try delete.step()
-            let nextTotal = max(0, total - max(0, bytes))
-            guard nextTotal < total else { return pruned }
-            total = nextTotal
-            pruned = true
+        let total = try totalBytes(surfaceID: surfaceID, database: database)
+        guard total > maxBytes else { return false }
+        let overflow = total - maxBytes
+        let candidates = try database.prepare("""
+            SELECT id, byte_count
+            FROM terminal_output_chunks
+            WHERE surface_id = ?
+            ORDER BY id ASC
+            LIMIT 512;
+        """)
+        try candidates.bind(1, surfaceID)
+        var ids: [Int64] = []
+        var bytes = 0
+        while try candidates.step() {
+            ids.append(candidates.columnInt64(0))
+            bytes += max(0, Int(candidates.columnInt64(1)))
+            if bytes >= overflow { break }
         }
-        return pruned
+        guard !ids.isEmpty else { return false }
+        let placeholders = ids.map { _ in "?" }.joined(separator: ",")
+        let deletion = try database.prepare(
+            "DELETE FROM terminal_output_chunks WHERE surface_id = ? AND id IN (\(placeholders));"
+        )
+        try deletion.bind(1, surfaceID)
+        for (index, id) in ids.enumerated() {
+            try deletion.bind(Int32(index + 2), id)
+        }
+        _ = try deletion.step()
+        return true
     }
 
     private static func deleteHistoryState(

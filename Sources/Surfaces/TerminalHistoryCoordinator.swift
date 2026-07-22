@@ -424,6 +424,7 @@ private final class TerminalHistoryQueueState: @unchecked Sendable {
     private var failureGeneration: UInt64 = 0
     private var durablePartial = false
     private var retentionMaintenanceScheduled = false
+    private var globalRetentionMaintenanceScheduled = false
     private var retryDeadline = Date.distantFuture
     private var retriesCancelled = false
 
@@ -456,6 +457,7 @@ private final class TerminalHistoryQueueState: @unchecked Sendable {
         failureGeneration = 0
         durablePartial = false
         retentionMaintenanceScheduled = false
+        globalRetentionMaintenanceScheduled = false
         retryDeadline = .distantFuture
         retriesCancelled = false
         condition.broadcast()
@@ -473,6 +475,20 @@ private final class TerminalHistoryQueueState: @unchecked Sendable {
     func finishRetentionMaintenance() {
         condition.lock()
         retentionMaintenanceScheduled = false
+        condition.unlock()
+    }
+
+    func beginGlobalRetentionMaintenanceIfNeeded() -> Bool {
+        condition.lock()
+        defer { condition.unlock() }
+        guard !retriesCancelled, !globalRetentionMaintenanceScheduled else { return false }
+        globalRetentionMaintenanceScheduled = true
+        return true
+    }
+
+    func finishGlobalRetentionMaintenance() {
+        condition.lock()
+        globalRetentionMaintenanceScheduled = false
         condition.unlock()
     }
 
@@ -658,8 +674,19 @@ final class TerminalHistoryCoordinator {
 
     private nonisolated static let maxChunkBytes = 64 * 1024
     private nonisolated static let maxOutstandingBytes = 4 * 1024 * 1024
+    /// Leave room for the one already-read PTY handoff (bounded at 256 KiB)
+    /// that can reach MainActor after its DispatchSource is suspended for a
+    /// Ghostty replay. Larger canonical merges preserve the current live parser
+    /// and report partial history instead of resetting from a truncated stream.
+    nonisolated static let maxCanonicalReplayBytes = (4 * 1024 * 1024) - (256 * 1024)
     private nonisolated static let finalDeleteRetryTimeout: TimeInterval = 2
-    private nonisolated static let maxPersistedBytes = 32 * 1024 * 1024
+    /// Recent scrollback remains useful, but terminal sessions are expected to
+    /// stay open for weeks. Keep a Terminal-like rolling window instead of an
+    /// ever-heavier per-surface transcript.
+    nonisolated static let maxPersistedBytes = 8 * 1024 * 1024
+    /// Aggregate disk ceiling across dormant terminal histories. The currently
+    /// writing surface is protected and remains governed by its per-surface cap.
+    nonisolated static let maxGlobalPersistedBytes = 256 * 1024 * 1024
     private nonisolated static let retentionCheckInterval = 1024 * 1024
     private nonisolated static let prepareRetryDelays: [TimeInterval] = [0.05, 0.1, 0.2, 0.4, 0.8]
     private nonisolated static let maxRetryDuration: TimeInterval = 30
@@ -820,6 +847,7 @@ final class TerminalHistoryCoordinator {
         let repository = repository
         let surfaceID = surfaceID
         let queueState = queueState
+        let historyQueue = queue
         queue.asyncAfter(deadline: .now() + delay) { [weak self] in
             guard !queueState.retriesAreCancelled() else { return }
             do {
@@ -839,6 +867,39 @@ final class TerminalHistoryCoordinator {
                         memoryFailure: memoryFailure,
                         durableFailures: durableFailures
                     )
+                    if try repository.totalBytes(surfaceID: surfaceID) > Self.maxPersistedBytes {
+                        let pruned = try repository.pruneByteCapAndMarkHistoryPartial(
+                            surfaceID: surfaceID,
+                            maxBytes: Self.maxPersistedBytes,
+                            reason: "history_retention_cap",
+                            nextChunkIndex: preparation.nextChunkIndex,
+                            expectedWriterGeneration: preparation.writerGeneration
+                        )
+                        if pruned {
+                            queueState.recordDurablePartial()
+                            preparation = TerminalHistoryPreparation(
+                                nextChunkIndex: preparation.nextChunkIndex,
+                                partialState: try repository.partialHistoryState(
+                                    surfaceID: surfaceID,
+                                    expectedWriterGeneration: preparation.writerGeneration
+                                ),
+                                writerGeneration: preparation.writerGeneration
+                            )
+                        }
+                    }
+                    let globalResult = try repository.pruneGlobalByteCapAndMarkHistoryPartial(
+                        maxBytes: Self.maxGlobalPersistedBytes,
+                        protectedSurfaceID: surfaceID
+                    )
+                    if globalResult.remainsOverBudget,
+                       queueState.beginGlobalRetentionMaintenanceIfNeeded() {
+                        Self.scheduleGlobalRetentionMaintenance(
+                            repository: repository,
+                            surfaceID: surfaceID,
+                            queue: historyQueue,
+                            queueState: queueState
+                        )
+                    }
                 }
                 let authoritativeIndex = max(
                     injectedIndex ?? preparation.nextChunkIndex,
@@ -1415,6 +1476,19 @@ final class TerminalHistoryCoordinator {
                             queueState.recordDurablePartial()
                         }
                     }
+                    let globalResult = try repository.pruneGlobalByteCapAndMarkHistoryPartial(
+                        maxBytes: Self.maxGlobalPersistedBytes,
+                        protectedSurfaceID: surfaceID
+                    )
+                    if globalResult.remainsOverBudget,
+                       queueState.beginGlobalRetentionMaintenanceIfNeeded() {
+                        Self.scheduleGlobalRetentionMaintenance(
+                            repository: repository,
+                            surfaceID: surfaceID,
+                            queue: historyQueue,
+                            queueState: queueState
+                        )
+                    }
                 } catch {
                     NSLog(
                         "RemoteCode terminal history retention maintenance failed surface=%@ error=%@",
@@ -1784,6 +1858,86 @@ final class TerminalHistoryCoordinator {
                 queueState.finishRetentionMaintenance()
             }
         }
+    }
+
+    /// Continues one bounded global delete quantum per utility-queue turn. This
+    /// converges legacy multi-gigabyte histories without a hot-path loop and
+    /// without requiring another PTY write to trigger the next quantum.
+    private nonisolated static func scheduleGlobalRetentionMaintenance(
+        repository: TerminalOutputRepository,
+        surfaceID: String,
+        queue: DispatchQueue,
+        queueState: TerminalHistoryQueueState,
+        maxBytes: Int = maxGlobalPersistedBytes,
+        maxRows: Int = 256,
+        maxDeleteBytes: Int = 8 * 1_024 * 1_024,
+        completion: (@Sendable (Bool) -> Void)? = nil
+    ) {
+        queue.asyncAfter(deadline: .now() + 0.01) {
+            guard !queueState.retriesAreCancelled() else {
+                queueState.finishGlobalRetentionMaintenance()
+                completion?(false)
+                return
+            }
+            do {
+                let result = try repository.pruneGlobalByteCapAndMarkHistoryPartial(
+                    maxBytes: maxBytes,
+                    protectedSurfaceID: surfaceID,
+                    maxRows: maxRows,
+                    maxDeleteBytes: maxDeleteBytes
+                )
+                if result.remainsOverBudget, result.deletedRows > 0 {
+                    scheduleGlobalRetentionMaintenance(
+                        repository: repository,
+                        surfaceID: surfaceID,
+                        queue: queue,
+                        queueState: queueState,
+                        maxBytes: maxBytes,
+                        maxRows: maxRows,
+                        maxDeleteBytes: maxDeleteBytes,
+                        completion: completion
+                    )
+                } else {
+                    queueState.finishGlobalRetentionMaintenance()
+                    completion?(!result.remainsOverBudget)
+                }
+            } catch {
+                queueState.finishGlobalRetentionMaintenance()
+                completion?(false)
+                NSLog(
+                    "RemoteCode terminal global history maintenance stopped surface=%@ error=%@",
+                    surfaceID,
+                    String(describing: error)
+                )
+            }
+        }
+    }
+
+    /// Deterministic regression seam for the self-scheduling legacy-history
+    /// drainer. Production uses the same helper with the 256 MiB ceiling.
+    nonisolated static func drainGlobalRetentionForTesting(
+        repository: TerminalOutputRepository,
+        protectedSurfaceID: String,
+        maxBytes: Int,
+        maxRows: Int,
+        maxDeleteBytes: Int,
+        completion: @escaping @Sendable (Bool) -> Void
+    ) {
+        let state = TerminalHistoryQueueState()
+        guard state.beginGlobalRetentionMaintenanceIfNeeded() else {
+            completion(false)
+            return
+        }
+        scheduleGlobalRetentionMaintenance(
+            repository: repository,
+            surfaceID: protectedSurfaceID,
+            queue: DispatchQueue(label: "rc2.terminal.history.global-retention-test", qos: .utility),
+            queueState: state,
+            maxBytes: maxBytes,
+            maxRows: maxRows,
+            maxDeleteBytes: maxDeleteBytes,
+            completion: completion
+        )
     }
 
     private func scheduleDeferredOperation(_ operation: DeferredOperation) {
@@ -2385,7 +2539,10 @@ final class TerminalHistoryCoordinator {
             replayReadFailurePending = false
             return
         }
-        if liveOverflowed {
+        let canonicalSize = payload.count.addingReportingOverflow(liveData.count)
+        if liveOverflowed
+            || canonicalSize.overflow
+            || canonicalSize.partialValue > Self.maxCanonicalReplayBytes {
             replayReadFailurePending = false
             delegate.terminalHistoryCoordinator(self, didEncounter: .replayLiveCap)
             return

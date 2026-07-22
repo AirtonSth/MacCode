@@ -1,5 +1,6 @@
 import XCTest
 @testable import AgentRuntime
+import CoreModel
 
 // PERF-MAC_AGENT-007: fast provider streaming was issuing 2-3 synchronous SQLite
 // writes per stream event (appendStreamEvent + appendProviderEventLog +
@@ -60,6 +61,19 @@ final class StreamEventFlushCadenceTests: XCTestCase {
         XCTAssertTrue(decision, "an elapsed time budget must flush the tail even below the count cap")
     }
 
+    func test_atByteThreshold_flushesBeforeCountThreshold() {
+        let decision = AgentRunCoordinator.shouldFlushStreamBatch(
+            pendingCount: 2,
+            pendingBytes: 512 * 1_024,
+            sinceLastFlushMs: 0,
+            countThreshold: 16,
+            byteThreshold: 512 * 1_024,
+            timeThresholdMs: 250
+        )
+        XCTAssertTrue(decision,
+                      "two oversized provider frames must flush by encoded bytes instead of waiting for sixteen rows")
+    }
+
     // Time elapsed but buffer empty -> nothing to flush. WHY: shouldFlush must be
     // a no-op when there is no pending work; flushing an empty batch would issue a
     // pointless diagnostics write every tick and re-create write pressure.
@@ -82,12 +96,86 @@ final class StreamEventFlushCadenceTests: XCTestCase {
         buffer.append(.init(seq: 2, kind: "b", payloadJSON: "{\"i\":2}", providerEvent: nil))
         buffer.append(.init(seq: 3, kind: "c", payloadJSON: "{\"i\":3}", providerEvent: nil))
 
+        XCTAssertGreaterThan(buffer.encodedByteCount, 0,
+                             "retry high-water accounting must include encoded payload and kind bytes")
+
         let drained = buffer.drain()
 
         XCTAssertEqual(drained.map(\.seq), [1, 2, 3], "drain must preserve append (seq) order")
         XCTAssertEqual(drained.map(\.kind), ["a", "b", "c"])
         XCTAssertTrue(buffer.isEmpty, "drain must empty the buffer so items are not re-persisted on the next flush")
         XCTAssertTrue(buffer.drain().isEmpty, "a second drain of an emptied buffer must yield nothing")
+    }
+
+    func test_boundedRuntimeIdentifiers_keepsNewestWithinCountAndBytes() {
+        var ids: [String] = []
+        for index in 0..<20 {
+            ids = AgentRunCoordinator.boundedRuntimeIdentifiers(
+                existing: ids,
+                adding: "request-\(index)",
+                countLimit: 4,
+                byteLimit: 36
+            )
+        }
+        XCTAssertLessThanOrEqual(ids.count, 4)
+        XCTAssertLessThanOrEqual(ids.reduce(0) { $0 + $1.utf8.count }, 36)
+        XCTAssertEqual(ids.last, "request-19",
+                       "the newest pending interaction must survive compact-state pressure")
+    }
+
+    func test_activePlanCompactBudget_rejectsOversizedRecoveryState() {
+        let small = AssistantActivePlan(
+            steps: [.init(id: "1", title: "bounded", status: .pending)],
+            updatedAtMs: 1
+        )
+        XCTAssertTrue(AgentRunCoordinator.activePlanFitsCompactBudget(small, stepLimit: 2, byteLimit: 1_024))
+
+        let tooMany = AssistantActivePlan(
+            steps: (0..<3).map { .init(id: "\($0)", title: "step", status: .pending) },
+            updatedAtMs: 1
+        )
+        XCTAssertFalse(AgentRunCoordinator.activePlanFitsCompactBudget(tooMany, stepLimit: 2, byteLimit: 1_024),
+                       "correctness state must stop explicitly instead of growing a non-evictable step array")
+
+        let tooLarge = AssistantActivePlan(
+            explanation: String(repeating: "x", count: 2_048),
+            steps: [],
+            updatedAtMs: 1
+        )
+        XCTAssertFalse(AgentRunCoordinator.activePlanFitsCompactBudget(tooLarge, stepLimit: 2, byteLimit: 256))
+    }
+
+    func test_boundedHotReplay_keepsNewestFIFOAndNeverRetainsOversizedEvent() {
+        let events = (0..<20).map {
+            AssistantEvent.turnStarted(turnId: "turn-\($0)-" + String(repeating: "x", count: 64))
+        }
+        let replay = AgentRunCoordinator.boundedHotReplay(events, countLimit: 4, byteLimit: 10_000)
+        XCTAssertEqual(replay.count, 4)
+        XCTAssertEqual(replay.compactMap { event -> String? in
+            if case .turnStarted(let id) = event { return id }
+            return nil
+        }.map { String($0.prefix(7)) }, ["turn-16", "turn-17", "turn-18", "turn-19"])
+
+        let oversized = AssistantEvent.error(message: String(repeating: "z", count: 10_000), recoverable: true)
+        XCTAssertTrue(
+            AgentRunCoordinator.boundedHotReplay([events[0], oversized], countLimit: 4, byteLimit: 1).isEmpty,
+            "an event that cannot fit the replay byte ceiling must never be retained above it"
+        )
+    }
+
+    func test_persistedPayloadBoundingReplacesOversizedFramesWithSmallMarkers() throws {
+        let raw = String(repeating: "z", count: 700 * 1_024)
+        let bounded = AgentRunCoordinator.boundedPersistedStreamPayload(raw)
+        XCTAssertLessThanOrEqual(bounded.utf8.count, AgentRunCoordinator.maximumBufferedEventBytes)
+        XCTAssertNotEqual(bounded, raw)
+
+        let runtime = ProviderRuntimeEvent(
+            id: "oversized", provider: .codex, source: "test", method: "event",
+            payloadJSON: raw, receivedAtMs: 1
+        )
+        let boundedRuntime = AgentRunCoordinator.boundedProviderRuntimeEvent(runtime)
+        XCTAssertLessThanOrEqual(boundedRuntime.payloadJSON.utf8.count, AgentRunCoordinator.maximumBufferedEventBytes)
+        XCTAssertTrue(boundedRuntime.payloadJSON.contains("remote_code_truncated"))
     }
 
     // The last kind in the batch is the one diagnostics should report. WHY: the

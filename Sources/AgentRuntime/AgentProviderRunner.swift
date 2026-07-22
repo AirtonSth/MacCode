@@ -30,12 +30,18 @@ public struct ProviderProcessStartIdentity: Codable, Sendable, Equatable {
     }
 }
 
+public enum ManagedProcessKind: String, Codable, Sendable, Equatable {
+    case provider
+    case sidecar
+}
+
 public struct SpawnedProcessTag: Codable, Sendable, Equatable {
     public let pgid: pid_t
     public let spawnedAt: Date
     public let ownerPID: pid_t
     public let ownerStartIdentity: ProviderProcessStartIdentity?
     public let provider: AgentProvider?
+    public let managedKind: ManagedProcessKind?
     public let executablePath: String
     public let startIdentity: ProviderProcessStartIdentity?
     /// Present only when the spawned root was verified as the leader of its own
@@ -49,6 +55,7 @@ public struct SpawnedProcessTag: Codable, Sendable, Equatable {
         ownerPID: pid_t = ProcessInfo.processInfo.processIdentifier,
         ownerStartIdentity: ProviderProcessStartIdentity? = nil,
         provider: AgentProvider? = nil,
+        managedKind: ManagedProcessKind? = nil,
         executablePath: String = "",
         startIdentity: ProviderProcessStartIdentity? = nil,
         isolatedProcessGroup: pid_t? = nil
@@ -58,6 +65,7 @@ public struct SpawnedProcessTag: Codable, Sendable, Equatable {
         self.ownerPID = ownerPID
         self.ownerStartIdentity = ownerStartIdentity
         self.provider = provider
+        self.managedKind = managedKind
         self.executablePath = executablePath
         self.startIdentity = startIdentity
         self.isolatedProcessGroup = isolatedProcessGroup
@@ -69,6 +77,69 @@ public struct SpawnedProcessTag: Codable, Sendable, Equatable {
 public enum ProcessSpawnTagger {
     /// Default minimum age before a tagged process is eligible for reap.
     public static let defaultMinAge: TimeInterval = 30.0
+
+    /// Terminate one controller-owned process lifetime without command matching
+    /// or PID-only signalling. Intended for bounded sidecar handoff and app quit.
+    public static func terminateExactOwnedProcessAndWait(
+        _ process: Process,
+        expectedStartIdentity: ProviderProcessStartIdentity?,
+        graceInterval: TimeInterval = 0.25,
+        timeout: TimeInterval = 2.5
+    ) -> Bool {
+        guard process.isRunning else { return true }
+        let pid = process.processIdentifier
+        guard let expectedStartIdentity,
+              ProviderProcessStartIdentity.read(pid: pid) == expectedStartIdentity else {
+            return false
+        }
+
+        let exactTargets: () -> [(pid: pid_t, identity: ProviderProcessStartIdentity)] = {
+            guard ProviderProcessStartIdentity.read(pid: pid) == expectedStartIdentity else {
+                return []
+            }
+            return ProcessTerminator.processTreePIDs(root: pid).compactMap { target in
+                ProviderProcessStartIdentity.read(pid: target).map { (target, $0) }
+            }
+        }
+        var targets = exactTargets()
+        guard targets.contains(where: { $0.pid == pid && $0.identity == expectedStartIdentity }) else {
+            return false
+        }
+        for target in targets where ProviderProcessStartIdentity.read(pid: target.pid) == target.identity {
+            _ = Darwin.kill(target.pid, SIGTERM)
+        }
+
+        let grace = max(0, min(graceInterval, timeout))
+        let start = Date()
+        let escalationAt = start.addingTimeInterval(grace)
+        let deadline = start.addingTimeInterval(max(0, timeout))
+        var escalated = false
+        while Date() < deadline {
+            if !escalated, Date() >= escalationAt {
+                if ProviderProcessStartIdentity.read(pid: pid) == expectedStartIdentity {
+                    let currentTargets = exactTargets()
+                    let newTargets = currentTargets.filter { candidate in
+                        !targets.contains {
+                            $0.pid == candidate.pid && $0.identity == candidate.identity
+                        }
+                    }
+                    targets += newTargets
+                }
+                for target in targets where ProviderProcessStartIdentity.read(pid: target.pid) == target.identity {
+                    _ = Darwin.kill(target.pid, SIGKILL)
+                }
+                escalated = true
+            }
+            let survivors = targets.contains {
+                ProviderProcessStartIdentity.read(pid: $0.pid) == $0.identity
+            }
+            if !survivors { return true }
+            Thread.sleep(forTimeInterval: 0.01)
+        }
+        return !targets.contains {
+            ProviderProcessStartIdentity.read(pid: $0.pid) == $0.identity
+        }
+    }
 
     /// Call immediately after `process.run()` to persist exact ownership.
     /// Foundation exposes no pre-exec group hook, so the post-spawn `setpgid`
@@ -93,6 +164,7 @@ public enum ProcessSpawnTagger {
     public static func tagProcess(
         _ process: Process,
         provider: AgentProvider? = nil,
+        managedKind: ManagedProcessKind = .provider,
         foreignUserLaunch: Bool = false,
         now: Date = Date()
     ) throws -> SpawnedProcessTag {
@@ -141,6 +213,7 @@ public enum ProcessSpawnTagger {
             ownerPID: ownerPID,
             ownerStartIdentity: ownerStartIdentity,
             provider: provider,
+            managedKind: managedKind,
             executablePath: executablePath ?? "",
             startIdentity: startIdentity,
             isolatedProcessGroup: processGroup
@@ -356,16 +429,25 @@ public final class OneShotProviderAdapter: AgentProviderAdapter, @unchecked Send
     }
 
     public func sendTurn(_ request: AgentRunRequest, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) async throws -> AgentRunHandle {
-        lock.lock()
-        sessions[request.threadId] = AgentProviderSessionSummary(threadId: request.threadId, provider: provider, status: .running, providerThreadId: request.providerThreadId)
-        lock.unlock()
-        let handle = try await runner.startRun(request) { [weak self] event in
-            self?.record(event: event, threadId: request.threadId)
-            onEvent(event)
+        lock.withLock {
+            sessions[request.threadId] = AgentProviderSessionSummary(threadId: request.threadId, provider: provider, status: .running, providerThreadId: request.providerThreadId)
         }
-        lock.lock()
-        handles[request.threadId] = handle
-        lock.unlock()
+        let handle: AgentRunHandle
+        do {
+            handle = try await runner.startRun(request) { [weak self] event in
+                self?.record(event: event, threadId: request.threadId)
+                onEvent(event)
+            }
+        } catch {
+            lock.withLock {
+                sessions.removeValue(forKey: request.threadId)
+                handles.removeValue(forKey: request.threadId)
+            }
+            throw error
+        }
+        lock.withLock {
+            handles[request.threadId] = handle
+        }
         return handle
     }
 

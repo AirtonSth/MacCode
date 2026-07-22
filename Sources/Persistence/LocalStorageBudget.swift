@@ -17,6 +17,44 @@ public enum LocalStorageClass: String, CaseIterable, Sendable {
     }
 }
 
+/// One authority for evictable Agent transcript/log retention. Count protects
+/// row/decoder overhead; encoded-byte limits protect large provider payloads.
+/// Individual oversized events are replaced by a compact explicit marker before
+/// persistence, so neither a newest-row exception nor one provider frame can
+/// break the hard byte ceilings.
+public struct AgentEventRetentionPolicy: Sendable, Equatable {
+    public var streamEventCountPerThread: Int
+    public var streamEventBytesPerThread: Int64
+    public var providerLogCountPerThread: Int
+    public var providerLogBytesPerThread: Int64
+    public var streamEventBytesGlobal: Int64
+    public var providerLogBytesGlobal: Int64
+    public var pruneQuantumRows: Int
+    public var pruneQuantumBytes: Int64
+
+    public init(
+        streamEventCountPerThread: Int = 5_000,
+        streamEventBytesPerThread: Int64 = 16 * 1_024 * 1_024,
+        providerLogCountPerThread: Int = 10_000,
+        providerLogBytesPerThread: Int64 = 16 * 1_024 * 1_024,
+        streamEventBytesGlobal: Int64 = 256 * 1_024 * 1_024,
+        providerLogBytesGlobal: Int64 = 256 * 1_024 * 1_024,
+        pruneQuantumRows: Int = 512,
+        pruneQuantumBytes: Int64 = 8 * 1_024 * 1_024
+    ) {
+        self.streamEventCountPerThread = max(1, streamEventCountPerThread)
+        self.streamEventBytesPerThread = max(1, streamEventBytesPerThread)
+        self.providerLogCountPerThread = max(1, providerLogCountPerThread)
+        self.providerLogBytesPerThread = max(1, providerLogBytesPerThread)
+        self.streamEventBytesGlobal = max(1, streamEventBytesGlobal)
+        self.providerLogBytesGlobal = max(1, providerLogBytesGlobal)
+        self.pruneQuantumRows = max(1, pruneQuantumRows)
+        self.pruneQuantumBytes = max(1, pruneQuantumBytes)
+    }
+
+    public static let production = AgentEventRetentionPolicy()
+}
+
 public struct LocalStorageClassUsage: Sendable, Equatable {
     public let storageClass: LocalStorageClass
     public let payloadBytes: Int64
@@ -40,21 +78,48 @@ public struct LocalStorageClassUsage: Sendable, Equatable {
 }
 
 public struct LocalStorageSnapshot: Sendable, Equatable {
+    /// Logical SQLite allocation (`page_size * page_count`).
     public let databaseBytes: Int64
+    /// Physical main database file size on disk.
+    public let databaseFileBytes: Int64
+    public let walBytes: Int64
+    public let sharedMemoryBytes: Int64
+    public let physicalBytes: Int64
     public let reclaimableBytes: Int64
     public let classes: [LocalStorageClassUsage]
     public let generatedAt: Date
 
     public init(
         databaseBytes: Int64,
+        databaseFileBytes: Int64? = nil,
+        walBytes: Int64 = 0,
+        sharedMemoryBytes: Int64 = 0,
         reclaimableBytes: Int64,
         classes: [LocalStorageClassUsage],
         generatedAt: Date
     ) {
         self.databaseBytes = databaseBytes
+        self.databaseFileBytes = databaseFileBytes ?? databaseBytes
+        self.walBytes = walBytes
+        self.sharedMemoryBytes = sharedMemoryBytes
+        self.physicalBytes = max(0, databaseFileBytes ?? databaseBytes) + max(0, walBytes) + max(0, sharedMemoryBytes)
         self.reclaimableBytes = reclaimableBytes
         self.classes = classes
         self.generatedAt = generatedAt
+    }
+}
+
+public struct LocalStoragePassiveCheckpointResult: Sendable, Equatable {
+    public let busyReaders: Int
+    public let walFrames: Int
+    public let checkpointedFrames: Int
+    public let snapshot: LocalStorageSnapshot
+
+    public init(busyReaders: Int, walFrames: Int, checkpointedFrames: Int, snapshot: LocalStorageSnapshot) {
+        self.busyReaders = busyReaders
+        self.walFrames = walFrames
+        self.checkpointedFrames = checkpointedFrames
+        self.snapshot = snapshot
     }
 }
 
@@ -185,8 +250,8 @@ public final class LocalStorageBudgetManager: @unchecked Sendable {
     public static let payloadQuotaBytes: [LocalStorageClass: Int64] = [
         .reversibleContent: durableUserPayloadQuotaBytes,
         .attachmentBlobs: durableUserPayloadQuotaBytes,
-        .streamEvents: 512 * 1_024 * 1_024,
-        .providerLogs: 512 * 1_024 * 1_024
+        .streamEvents: 256 * 1_024 * 1_024,
+        .providerLogs: 256 * 1_024 * 1_024
     ]
 
     public static let terminalRunStatuses: Set<AgentRunStatus> = [
@@ -236,13 +301,46 @@ public final class LocalStorageBudgetManager: @unchecked Sendable {
                     retentionDays: Self.retentionDays
                 )
             }
+            let physical = physicalDatabaseFiles()
             return LocalStorageSnapshot(
                 databaseBytes: pageSize * pageCount,
+                databaseFileBytes: physical.database,
+                walBytes: physical.wal,
+                sharedMemoryBytes: physical.sharedMemory,
                 reclaimableBytes: pageSize * freePages,
                 classes: classes,
                 generatedAt: now
             )
         }
+    }
+
+    /// Non-blocking lifecycle maintenance. PASSIVE never waits for readers and
+    /// never performs a VACUUM; SQLite reports any busy readers to the caller.
+    public func passiveCheckpoint(now: Date = Date()) throws -> LocalStoragePassiveCheckpointResult {
+        let values = try db.performSync { database -> (Int, Int, Int) in
+            let statement = try database.prepare("PRAGMA wal_checkpoint(PASSIVE);")
+            guard try statement.step() else { return (0, 0, 0) }
+            return (
+                Int(statement.columnInt64(0)),
+                Int(statement.columnInt64(1)),
+                Int(statement.columnInt64(2))
+            )
+        }
+        return LocalStoragePassiveCheckpointResult(
+            busyReaders: values.0,
+            walFrames: values.1,
+            checkpointedFrames: values.2,
+            snapshot: try snapshot(now: now)
+        )
+    }
+
+    private func physicalDatabaseFiles() -> (database: Int64, wal: Int64, sharedMemory: Int64) {
+        guard db.path != ":memory:" else { return (0, 0, 0) }
+        func size(_ path: String) -> Int64 {
+            guard let raw = try? fileManager.attributesOfItem(atPath: path)[.size] as? NSNumber else { return 0 }
+            return max(0, raw.int64Value)
+        }
+        return (size(db.path), size(db.path + "-wal"), size(db.path + "-shm"))
     }
 
     /// Delete expired rows in one transaction, then optionally compact only after

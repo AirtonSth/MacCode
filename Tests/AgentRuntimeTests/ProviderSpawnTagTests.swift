@@ -207,6 +207,25 @@ final class ProviderSpawnTagTests: ProviderProcessTestCase {
                        "kernel start identity must survive the exact JSON ledger round trip used across app relaunches")
     }
 
+    func test_realSidecarTagPersistsExactManagedKindAndLifetime() throws {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/sleep")
+        process.arguments = ["30"]
+        try process.run()
+        defer { if process.isRunning { process.terminate() } }
+
+        let tag = try ProcessSpawnTagger.tagProcess(process, managedKind: .sidecar)
+
+        XCTAssertEqual(tag.managedKind, .sidecar)
+        XCTAssertNil(tag.provider)
+        XCTAssertNotNil(tag.startIdentity)
+        XCTAssertEqual(tag.isolatedProcessGroup, process.processIdentifier)
+        XCTAssertTrue(
+            try XCTUnwrap(ProviderProcessOwnership.shared.store()).load().contains(tag),
+            "the sidecar must enter the same durable exact-identity ledger used for provider crash recovery"
+        )
+    }
+
     func test_foreignUserLaunchStillCapturesRealIdentityWhenChildIsReadable() throws {
         // WHY: the run-as-user relaxation must only DROP TO owner-anchoring when the
         // child is genuinely unreadable. A readable child (same-user, e.g. a dev
@@ -775,6 +794,7 @@ final class ProviderSpawnTagTests: ProviderProcessTestCase {
             tags: [],   // no tags -> nothing eligible
             minAge: 30,
             isAlive: { _ in true },
+            processStartIdentity: { _ in nil },
             now: now,
             terminate: { _ in true }
         )
@@ -840,11 +860,12 @@ final class ProviderSpawnTagTests: ProviderProcessTestCase {
         // ineligible tags in a mixed batch (old vs fresh, alive vs dead).
         let base = Date(timeIntervalSince1970: 0)
         let now = Date(timeIntervalSince1970: 120)
+        let identity = ProviderProcessStartIdentity(seconds: 1, microseconds: 1)
 
         let tags: [SpawnedProcessTag] = [
-            SpawnedProcessTag(pgid: 10, spawnedAt: base),           // old + alive -> reap
-            SpawnedProcessTag(pgid: 20, spawnedAt: Date(timeIntervalSince1970: 110)), // fresh -> skip
-            SpawnedProcessTag(pgid: 30, spawnedAt: base),           // old + dead -> skip
+            SpawnedProcessTag(pgid: 10, spawnedAt: base, startIdentity: identity),
+            SpawnedProcessTag(pgid: 20, spawnedAt: Date(timeIntervalSince1970: 110), startIdentity: identity),
+            SpawnedProcessTag(pgid: 30, spawnedAt: base, startIdentity: identity),
         ]
 
         let aliveSet: Set<pid_t> = [10, 20] // 30 is dead
@@ -854,6 +875,7 @@ final class ProviderSpawnTagTests: ProviderProcessTestCase {
             tags: tags,
             minAge: 30,
             isAlive: { aliveSet.contains($0) },
+            processStartIdentity: { aliveSet.contains($0) ? identity : nil },
             now: now,
             terminate: { pid in terminated.append(pid); return true }
         )
@@ -871,12 +893,14 @@ final class ProviderSpawnTagTests: ProviderProcessTestCase {
         // the caller can log/retry; it must NOT appear in terminatedPIDs.
         let base = Date(timeIntervalSince1970: 0)
         let now = Date(timeIntervalSince1970: 120)
-        let tags = [SpawnedProcessTag(pgid: 99, spawnedAt: base)]
+        let identity = ProviderProcessStartIdentity(seconds: 1, microseconds: 1)
+        let tags = [SpawnedProcessTag(pgid: 99, spawnedAt: base, startIdentity: identity)]
 
         let result = ProviderProcessSweeper.sweepTaggedOrphans(
             tags: tags,
             minAge: 30,
             isAlive: { _ in true },
+            processStartIdentity: { _ in identity },
             now: now,
             terminate: { _ in false } // simulate killpg failure
         )
@@ -890,16 +914,18 @@ final class ProviderSpawnTagTests: ProviderProcessTestCase {
         // WHY: deterministic output simplifies logging and idempotent retry logic.
         let base = Date(timeIntervalSince1970: 0)
         let now = Date(timeIntervalSince1970: 120)
+        let identity = ProviderProcessStartIdentity(seconds: 1, microseconds: 1)
         let tags = [
-            SpawnedProcessTag(pgid: 300, spawnedAt: base),
-            SpawnedProcessTag(pgid: 100, spawnedAt: base),
-            SpawnedProcessTag(pgid: 200, spawnedAt: base),
+            SpawnedProcessTag(pgid: 300, spawnedAt: base, startIdentity: identity),
+            SpawnedProcessTag(pgid: 100, spawnedAt: base, startIdentity: identity),
+            SpawnedProcessTag(pgid: 200, spawnedAt: base, startIdentity: identity),
         ]
 
         let result = ProviderProcessSweeper.sweepTaggedOrphans(
             tags: tags,
             minAge: 30,
             isAlive: { _ in true },
+            processStartIdentity: { _ in identity },
             now: now,
             terminate: { _ in true }
         )

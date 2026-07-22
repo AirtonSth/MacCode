@@ -426,6 +426,32 @@ public struct AssistantActivePlan: Codable, Sendable, Equatable {
     }
 }
 
+/// Compact correctness state that survives transcript retention. Transcript
+/// events are replay/display data and may be evicted; these fields are the
+/// minimum needed to resume an interrupted turn without losing an active plan
+/// or an outstanding provider interaction.
+public struct AgentActiveThreadState: Codable, Sendable, Equatable {
+    public var resumeCursor: String?
+    public var activeTurnId: String?
+    public var activePlan: AssistantActivePlan?
+    public var pendingApprovalRequestIds: [String]
+    public var pendingUserInputRequestIds: [String]
+
+    public init(
+        resumeCursor: String? = nil,
+        activeTurnId: String? = nil,
+        activePlan: AssistantActivePlan? = nil,
+        pendingApprovalRequestIds: [String] = [],
+        pendingUserInputRequestIds: [String] = []
+    ) {
+        self.resumeCursor = resumeCursor
+        self.activeTurnId = activeTurnId
+        self.activePlan = activePlan
+        self.pendingApprovalRequestIds = pendingApprovalRequestIds
+        self.pendingUserInputRequestIds = pendingUserInputRequestIds
+    }
+}
+
 public struct ProviderRuntimeEvent: Codable, Sendable, Equatable, Identifiable {
     public let id: String
     public var provider: AgentProvider
@@ -642,6 +668,8 @@ public struct AssistantTimelineState: Codable, Sendable, Equatable {
     // (per-line UUID fallbacks, items evicted by trimTurnItems) never pair, so
     // without a cap the buffer grows monotonically for the life of the timeline.
     public static let pendingItemDeltaLimit = 64
+    public static let aggregateHotTextByteLimit = 8 * 1_024 * 1_024
+    private static let aggregateHotElementOverhead = 128
 
     public var threadId: String?
     public var providerThreadId: String?
@@ -712,6 +740,175 @@ public struct AssistantTimelineState: Codable, Sendable, Equatable {
 
     public mutating func clearError() {
         error = nil
+    }
+
+    public var aggregateHotTextByteCount: Int {
+        func bytes(_ value: String?) -> Int { value?.utf8.count ?? 0 }
+        var total = bytes(threadId) + bytes(providerThreadId) + bytes(error)
+            + bytes(contextCompactionSummary)
+        var elements = turns.count + workActivities.count + pendingRequests.count
+            + pendingUserInputs.count + proposedPlans.count + providerRuntimeEvents.count
+            + sr1TranslationsByItemId.count + sr1TranslationsByMessageId.count
+            + pendingItemDeltas.count
+        for turn in turns {
+            total += turn.turnId.utf8.count + bytes(turn.finalAssistantMessage)
+            elements += turn.items.count
+            for item in turn.items {
+                total += item.body.utf8.count
+                total += item.id.utf8.count + item.turnId.utf8.count
+                total += bytes(item.output) + bytes(item.summary) + bytes(item.resourcePath)
+            }
+        }
+        for activity in workActivities {
+            total += activity.id.utf8.count + activity.title.utf8.count
+            total += bytes(activity.detail) + bytes(activity.state)
+        }
+        for request in pendingRequests {
+            total += request.id.utf8.count + bytes(request.turnId)
+            total += request.title.utf8.count + bytes(request.detail)
+        }
+        for request in pendingUserInputs {
+            total += request.id.utf8.count + bytes(request.turnId)
+            total += request.prompt.utf8.count + bytes(request.answer)
+            for option in request.options { total += option.utf8.count }
+            elements += request.options.count + request.questions.count
+            for question in request.questions {
+                total += question.id.utf8.count + question.prompt.utf8.count + bytes(question.header)
+                elements += question.options.count
+                for option in question.options {
+                    total += option.label.utf8.count + bytes(option.detail)
+                }
+            }
+        }
+        for plan in proposedPlans {
+            total += plan.id.utf8.count + bytes(plan.turnId) + plan.markdown.utf8.count
+        }
+        if let activePlan {
+            elements += 1 + activePlan.steps.count
+            total += bytes(activePlan.explanation)
+            for step in activePlan.steps {
+                total += step.id.utf8.count + step.title.utf8.count
+            }
+        }
+        for event in providerRuntimeEvents {
+            total += event.id.utf8.count + event.source.utf8.count + event.method.utf8.count
+            total += bytes(event.providerTurnId) + bytes(event.providerItemId)
+                + bytes(event.providerRequestId) + event.payloadJSON.utf8.count
+        }
+        for translation in sr1TranslationsByItemId.values {
+            total += bytes(translation.itemId) + bytes(translation.messageId)
+                + translation.originalText.utf8.count + translation.rewrittenText.utf8.count
+        }
+        for translation in sr1TranslationsByMessageId.values {
+            total += bytes(translation.itemId) + bytes(translation.messageId)
+                + translation.originalText.utf8.count + translation.rewrittenText.utf8.count
+        }
+        for (id, delta) in pendingItemDeltas {
+            total += id.utf8.count + delta.body.utf8.count + delta.output.utf8.count
+                + bytes(delta.summary)
+        }
+        return total + elements * Self.aggregateHotElementOverhead
+    }
+
+    /// Keeps the newest live transcript content while evicting old rendered text.
+    /// Compact active plan and pending interaction state are deliberately untouched.
+    public mutating func enforceAggregateHotTextBudget(
+        byteLimit: Int = aggregateHotTextByteLimit
+    ) {
+        let limit = max(1, byteLimit)
+        var total = aggregateHotTextByteCount
+        guard total > limit else { return }
+        func remove(_ value: inout String?) {
+            guard total > limit, let text = value else { return }
+            total -= text.utf8.count
+            value = nil
+        }
+        for turnIndex in turns.indices {
+            for itemIndex in turns[turnIndex].items.indices {
+                if total <= limit { return }
+                total -= turns[turnIndex].items[itemIndex].body.utf8.count
+                turns[turnIndex].items[itemIndex].body = ""
+                remove(&turns[turnIndex].items[itemIndex].output)
+                remove(&turns[turnIndex].items[itemIndex].summary)
+            }
+            remove(&turns[turnIndex].finalAssistantMessage)
+        }
+        while total > limit, !providerRuntimeEvents.isEmpty {
+            providerRuntimeEvents.removeFirst()
+            total = aggregateHotTextByteCount
+        }
+        while total > limit, let key = sr1TranslationsByItemId.keys.first,
+              sr1TranslationsByItemId.removeValue(forKey: key) != nil {
+            total = aggregateHotTextByteCount
+        }
+        while total > limit, let key = sr1TranslationsByMessageId.keys.first,
+              sr1TranslationsByMessageId.removeValue(forKey: key) != nil {
+            total = aggregateHotTextByteCount
+        }
+        if total > limit {
+            pendingItemDeltas.removeAll(keepingCapacity: true)
+            pendingItemDeltaOrder.removeAll(keepingCapacity: true)
+            total = aggregateHotTextByteCount
+        }
+        if total > limit {
+            contextCompactionSummary = nil
+            for index in workActivities.indices {
+                workActivities[index].title = ""
+                workActivities[index].detail = nil
+                workActivities[index].state = nil
+            }
+            for index in proposedPlans.indices { proposedPlans[index].markdown = "" }
+            for index in pendingRequests.indices {
+                pendingRequests[index].title = ""
+                pendingRequests[index].detail = nil
+            }
+            for index in pendingUserInputs.indices {
+                pendingUserInputs[index].prompt = ""
+                pendingUserInputs[index].options.removeAll(keepingCapacity: false)
+                pendingUserInputs[index].answer = nil
+                for questionIndex in pendingUserInputs[index].questions.indices {
+                    pendingUserInputs[index].questions[questionIndex].prompt = ""
+                    pendingUserInputs[index].questions[questionIndex].header = nil
+                    pendingUserInputs[index].questions[questionIndex].options.removeAll(keepingCapacity: false)
+                }
+            }
+            total = aggregateHotTextByteCount
+        }
+        while total > limit, workActivities.count > 1 {
+            workActivities.removeFirst()
+            total = aggregateHotTextByteCount
+        }
+        while total > limit, proposedPlans.count > 1 {
+            proposedPlans.removeFirst()
+            total = aggregateHotTextByteCount
+        }
+        while total > limit, pendingRequests.count > 1 {
+            pendingRequests.removeFirst()
+            total = aggregateHotTextByteCount
+        }
+        while total > limit, pendingUserInputs.count > 1 {
+            pendingUserInputs.removeFirst()
+            total = aggregateHotTextByteCount
+        }
+        while total > limit, turns.count > 1 {
+            turns.removeFirst()
+            total = aggregateHotTextByteCount
+        }
+        if total > limit { remove(&error); total = aggregateHotTextByteCount }
+        if total > limit, var plan = activePlan {
+            plan.explanation = nil
+            for index in plan.steps.indices { plan.steps[index].title = "" }
+            activePlan = plan
+            total = aggregateHotTextByteCount
+        }
+        if total > limit { workActivities.removeAll(); proposedPlans.removeAll(); total = aggregateHotTextByteCount }
+        if total > limit { pendingRequests.removeAll(); pendingUserInputs.removeAll(); total = aggregateHotTextByteCount }
+        if total > limit { turns.removeAll(); total = aggregateHotTextByteCount }
+        if total > limit { activePlan = nil; total = aggregateHotTextByteCount }
+        if total > limit {
+            threadId = nil
+            providerThreadId = nil
+        }
     }
 
     public mutating func apply(_ ev: AssistantEvent) {

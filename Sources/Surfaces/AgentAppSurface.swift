@@ -309,6 +309,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// events on thread open so the badge survives restarts.
     @Published public private(set) var sr1TranslatedMessageIds: Set<AgentMessageID> = []
     @Published public private(set) var sr1OriginalTextsByMessageId: [AgentMessageID: String] = [:]
+    /// The UI holds only a bounded recent message page. Older durable messages
+    /// remain in SQLite and are intentionally outside the hot screen-memory set.
+    @Published public private(set) var messageHistoryIsPartial = false
 
     public let workspaceID: WorkspaceID
     public let cwd: String
@@ -335,6 +338,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     // UX-XPLAT-REVERT-UNDO: drops the transient checkpoint-revert undo toast when
     // the undo window lapses. Cancelled on a new revert, on undo, or on teardown.
     private var checkpointRevertUndoExpiryTask: Task<Void, Never>?
+    private var messageHistoryLoadTask: Task<Void, Never>?
     /// PERF: tracks thread ids whose placeholder titles have already been repaired
     /// so reloadThreads never issues a full messageRepo.list for the same thread twice.
     private var repairedThreadIds: Set<AgentThreadID> = []
@@ -537,11 +541,14 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         threadDeletionUndoExpiryTask = nil
         checkpointRevertUndoExpiryTask?.cancel()
         checkpointRevertUndoExpiryTask = nil
+        messageHistoryLoadTask?.cancel()
+        messageHistoryLoadTask = nil
         _ = streamEventBatch.drain()
         publishInterestedThreadId(nil)
         coordinator.removeObserver(self)
         // Drop the heavy transcript payload so closed tabs free memory promptly.
         messages = []
+        messageHistoryIsPartial = false
         timeline = AssistantTimelineState()
         sr1TranslatedMessageIds = []
         sr1OriginalTextsByMessageId = [:]
@@ -780,6 +787,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         loadAllMessages(id)
         timeline = AssistantTimelineState()
         let persistedEvents = coordinator.latestStreamEvents(threadId: id)
+        if coordinator.hotReplayIsPartial(threadId: id) {
+            statusMessage = "Showing the recent Agent history window. Earlier transcript events remain outside the hot replay budget."
+        }
         // PERF: the provider-thread snapshot read (coordinator.readThread) used to
         // block thread-open for up to a provider round-trip (codex app-server),
         // freezing the UI on every open/switch. Open instantly from persisted
@@ -792,7 +802,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         for event in persistedReplay {
             timeline.apply(event)
         }
+        timeline.enforceAggregateHotTextBudget()
         lastErrorRecoverable = Self.displayedErrorIsRecoverable(in: persistedReplay)
+        rehydrateDurableActiveState(threadId: id)
         refreshSR1TranslationStateFromTimeline()
         // PERF: rebuild the O(1) item index once over the fully-replayed timeline so
         // subsequent item-location lookups skip the O(turns x items) linear scan.
@@ -819,6 +831,8 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 for event in replayEvents {
                     self.timeline.apply(event)
                 }
+                self.timeline.enforceAggregateHotTextBudget()
+                self.rehydrateDurableActiveState(threadId: id)
                 self.lastErrorRecoverable = Self.displayedErrorIsRecoverable(in: replayEvents)
                 self.refreshSR1TranslationStateFromTimeline()
                 self.timelineItemIndex = TimelineItemIndex(turns: self.timeline.turns)
@@ -1338,39 +1352,48 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         }
     }
 
-    // MARK: Full-thread message history
-    //
-    // The transcript loads EVERY message in the thread up front — no infinite-scroll
-    // paging, no off-screen body eviction. The old viewport window paged 30 rows at a
-    // time and evicted off-screen bodies on scroll; hydrate/evict flips a row's height
-    // mid-scroll, which is exactly what made auto-scroll jump around (the reported bug).
-    // Render/CPU stays bounded because the LazyVStack only realizes on-screen rows, the
-    // transcript signature is O(turns) (not O(messages)), and a memory safety-valve
-    // blanks the oldest bodies on a pathological thread so a full load can't blow up RAM.
+    private func rehydrateDurableActiveState(threadId: AgentThreadID) {
+        guard let state = coordinator.durableActiveThreadState(threadId: threadId),
+              let activePlan = state.activePlan else { return }
+        timeline.apply(.activePlanUpdated(activePlan))
+    }
+
+    // MARK: Bounded message history
     nonisolated static let fullLoadBodyBudgetBytes = 24 * 1024 * 1024  // ~24 MB of transcript text
+    nonisolated static let messageHistoryPageLimit = 500
 
     private func loadAllMessages(_ id: AgentThreadID) {
-        // F5: this read intentionally stays on the main actor. SQLiteDB serialises the
-        // C connection (FULLMUTEX), but its Swift statement cache is only safe when all
-        // access shares ONE concurrency domain (see SQLite.prepare) — this app keeps
-        // that domain on the main actor, so dispatching this read to a background queue
-        // would race the statement cache against concurrent main-actor DB access. The
-        // full (unpaged) load is deliberate for scroll stability (see above); the work
-        // that scaled with thread length was the per-row cost, cut by the utf8 fast path
-        // (F11) and the single-pass cap+budget below.
-        let loaded = try? messageRepo.listWithinBodyBudget(
-            threadId: id,
-            budget: Self.fullLoadBodyBudgetBytes,
-            contentLimit: AssistantTimelineState.liveTextLimit
-        )
-        let raw = loaded?.rows ?? []
-        let (rows, additionalBlanked) = Self.cappedRowsWithinBudget(raw)
-        let blanked = (loaded?.blanked ?? 0) + additionalBlanked
-        if blanked > 0 {
-            // Fail loud: a thread big enough to trip the budget loses its oldest bodies.
-            NSLog("[AgentApp] full-load body budget tripped: blanked \(blanked)/\(raw.count) oldest message bodies to stay under \(Self.fullLoadBodyBudgetBytes) bytes")
+        // SQLite access remains on the app's established DB actor, but the query is
+        // keyset/row/byte bounded: opening a multi-year thread no longer scans every
+        // historical shell or hydrates an unbounded array on MainActor.
+        messageHistoryLoadTask?.cancel()
+        messages = []
+        messageHistoryIsPartial = false
+        let repository = messageRepo
+        messageHistoryLoadTask = Task { @MainActor [weak self] in
+            let loaded = await Self.loadMessagePageOffMain(repository: repository, threadId: id)
+            guard let self, !Task.isCancelled, !self.isDisposed,
+                  self.selectedThreadId == id else { return }
+            self.messages = loaded?.rows ?? []
+            self.messageHistoryIsPartial = loaded?.hasMoreOlder ?? false
+            if self.messageHistoryIsPartial {
+                NSLog("[AgentApp] recent message page loaded: \(self.messages.count) rows; older durable messages remain outside the hot UI window")
+            }
         }
-        messages = rows
+    }
+
+    nonisolated static func loadMessagePageOffMain(
+        repository: AgentMessageRepository,
+        threadId: AgentThreadID
+    ) async -> AgentMessageBodyBudgetResult? {
+        await Task.detached(priority: .userInitiated) {
+            try? repository.listPageWithinBodyBudget(
+                threadId: threadId,
+                limit: messageHistoryPageLimit,
+                budget: fullLoadBodyBudgetBytes,
+                contentLimit: AssistantTimelineState.liveTextLimit
+            )
+        }.value
     }
 
     /// Safety valve for a pathological thread: keep the NEWEST bodies in full and blank
@@ -3094,6 +3117,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         if wasSelected {
             self.selectedThreadId = nil
         messages = []
+        messageHistoryIsPartial = false
         timeline = AssistantTimelineState()
         resetTimelineUpdateTick()
         }
@@ -4168,16 +4192,26 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             _ = streamEventBatch.drain()
             return
         }
-        let pending = streamEventBatch.drain()
+        let quantum = streamEventBatch.drainQuantum()
+        let pending = quantum.entries
         guard !pending.isEmpty else { return }
+        if quantum.hasMore {
+            Task { @MainActor [weak self] in
+                await Task.yield()
+                self?.flushStreamEvents()
+            }
+        }
         var nextTimeline = timeline
         var nextCurrentRunId = currentRunId
         var nextStatus = status
         var nextLastErrorRecoverable = lastErrorRecoverable
         var appliedEvent = false
+        var appliedEvents: [AssistantEvent] = []
+        appliedEvents.reserveCapacity(pending.count)
         for (event, run, threadId) in pending {
             guard threadId == self.selectedThreadId else { continue }
             appliedEvent = true
+            appliedEvents.append(event)
             if !self.terminalRunIds.contains(run) {
                 nextCurrentRunId = run
                 self.runThreads[run] = threadId
@@ -4196,11 +4230,11 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 nextLastErrorRecoverable = recoverable
             }
         }
+        nextTimeline.enforceAggregateHotTextBudget()
         guard appliedEvent else { return }
         // UX: transient durability banners (sqlite "database is locked", etc.)
         // stick only while the stream is still failing. Once a later event proves
         // the run continued, drop the banner so it does not outlive the outage.
-        let appliedEvents = pending.map(\.event)
         if Self.shouldAutoClearTransientTimelineError(
             errorAfterBatch: nextTimeline.error,
             appliedEvents: appliedEvents
@@ -4218,7 +4252,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         self.scheduleTimelineUpdateTick()
         // Full access auto-approves plans: if a proposed plan arrived mid-stream,
         // queue/start implementation without surfacing Approve/Reject.
-        if pending.contains(where: { if case .proposedPlan = $0.event { return true }; return false }) {
+        if appliedEvents.contains(where: { if case .proposedPlan = $0 { return true }; return false }) {
             scheduleFullAccessPlanAutoImplementIfNeeded()
         }
     }
@@ -4268,10 +4302,21 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         // PERF-MAC_AGENT-010: append to the batch buffer. If the buffer was
         // empty (first event of this tick), schedule a single flush Task.
         // Later events in the same tick just append — no extra Task allocation.
-        let shouldSchedule = streamEventBatch.append(event: event, run: run, threadId: threadId)
-        if shouldSchedule {
+        let outcome = streamEventBatch.appendBounded(event: event, run: run, threadId: threadId)
+        if outcome == .scheduled {
             Task { @MainActor in
                 self.flushStreamEvents()
+            }
+        } else if outcome == .saturated {
+            // The coordinator persisted the event before observer fan-out. Stop at
+            // the durable resume cursor instead of letting a blocked MainActor
+            // create an unbounded in-memory transcript queue. Reopening/Continue
+            // replays the retained durable tail; the visible status makes the
+            // controlled stop explicit rather than silently dropping UI work.
+            c.stopRun(run)
+            Task { @MainActor in
+                guard !self.isDisposed, self.selectedThreadId == threadId else { return }
+                self.statusMessage = "Agent paused because the UI event buffer reached its memory budget. Continue to resume from the saved provider cursor."
             }
         }
     }
@@ -4293,6 +4338,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     }
 
     nonisolated public func runCoordinator(_ c: AgentRunCoordinator, didFinish runId: AgentRunID, threadId: AgentThreadID, status: AgentRunStatus, finalMessage: String?, providerThreadId: String?) {
+        streamEventBatch.resetSaturation(for: runId)
         Task { @MainActor in
             guard !self.isDisposed else { return }
             let finishedTid = threadId
@@ -4505,10 +4551,13 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         return updated
     }
 
-    private func refreshSR1TranslationStateFromTimeline() {
-        var ids = sr1TranslatedMessageIds
-        var originals = sr1OriginalTextsByMessageId
-        for (rawId, translation) in timeline.sr1TranslationsByMessageId {
+    func refreshSR1TranslationStateFromTimeline(
+        _ sourceTimeline: AssistantTimelineState? = nil
+    ) {
+        let sourceTimeline = sourceTimeline ?? timeline
+        var ids: Set<AgentMessageID> = []
+        var originals: [AgentMessageID: String] = [:]
+        for (rawId, translation) in sourceTimeline.sr1TranslationsByMessageId {
             guard let uuid = UUID(uuidString: rawId) else { continue }
             let id = AgentMessageID(uuid)
             ids.insert(id)
@@ -4546,24 +4595,99 @@ final class InterestedThreadBox: @unchecked Sendable {
 // to coalesce streaming events. Safe to access from both the coordinator's
 // background thread (append) and the main actor (drain).
 final class StreamEventBatch: @unchecked Sendable {
+    struct Limits: Equatable {
+        var maxBufferedCount: Int = 512
+        var maxBufferedBytes: Int = 4 * 1_024 * 1_024
+        var drainCount: Int = 64
+        var drainBytes: Int = 512 * 1_024
+    }
+
+    enum AppendOutcome: Equatable {
+        case scheduled
+        case buffered
+        case saturated
+        case saturationAlreadyReported
+    }
+
+    struct DrainQuantum {
+        let entries: [(event: AssistantEvent, run: AgentRunID, threadId: AgentThreadID)]
+        let encodedByteCount: Int
+        let hasMore: Bool
+    }
+
     private struct Entry {
         let event: AssistantEvent
         let run: AgentRunID
         let threadId: AgentThreadID
+        let encodedByteCount: Int
     }
     private let lock = NSLock()
+    private let limits: Limits
     private var buffer: [Entry] = []
+    private var bufferedBytes = 0
     private var flushScheduled = false
+    private var saturationRunID: AgentRunID?
+
+    init(limits: Limits = Limits()) {
+        self.limits = Limits(
+            maxBufferedCount: max(1, limits.maxBufferedCount),
+            maxBufferedBytes: max(1, limits.maxBufferedBytes),
+            drainCount: max(1, limits.drainCount),
+            drainBytes: max(1, limits.drainBytes)
+        )
+    }
 
     /// Appends an event. Returns `true` iff the caller should schedule a flush Task
     /// (i.e. the buffer was empty before this append — first event of the tick).
     func append(event: AssistantEvent, run: AgentRunID, threadId: AgentThreadID) -> Bool {
+        appendBounded(event: event, run: run, threadId: threadId) == .scheduled
+    }
+
+    func appendBounded(event: AssistantEvent, run: AgentRunID, threadId: AgentThreadID) -> AppendOutcome {
+        let eventBytes = (try? JSONEncoder().encode(event).count) ?? event.debugDescription.utf8.count
+        let bytes = eventBytes + MemoryLayout<AgentRunID>.stride + MemoryLayout<AgentThreadID>.stride
         lock.lock()
         defer { lock.unlock() }
-        buffer.append(Entry(event: event, run: run, threadId: threadId))
-        if flushScheduled { return false }
+        if let saturationRunID, saturationRunID != run {
+            self.saturationRunID = nil
+        }
+        let wouldExceedCount = buffer.count >= limits.maxBufferedCount
+        let wouldExceedBytes = bufferedBytes + bytes > limits.maxBufferedBytes
+        let eventExceedsQuantum = bytes > limits.drainBytes || bytes > limits.maxBufferedBytes
+        if eventExceedsQuantum || wouldExceedCount || wouldExceedBytes {
+            if saturationRunID == run { return .saturationAlreadyReported }
+            saturationRunID = run
+            return .saturated
+        }
+        buffer.append(Entry(event: event, run: run, threadId: threadId, encodedByteCount: bytes))
+        bufferedBytes += bytes
+        if flushScheduled { return .buffered }
         flushScheduled = true
-        return true
+        return .scheduled
+    }
+
+    func drainQuantum() -> DrainQuantum {
+        lock.lock()
+        defer { lock.unlock() }
+        var count = 0
+        var bytes = 0
+        while count < buffer.count && count < limits.drainCount {
+            let next = buffer[count].encodedByteCount
+            if count > 0 && bytes + next > limits.drainBytes { break }
+            bytes += next
+            count += 1
+        }
+        let drained = Array(buffer.prefix(count))
+        buffer.removeFirst(count)
+        bufferedBytes -= bytes
+        let hasMore = !buffer.isEmpty
+        flushScheduled = hasMore
+        if !hasMore { saturationRunID = nil }
+        return DrainQuantum(
+            entries: drained.map { ($0.event, $0.run, $0.threadId) },
+            encodedByteCount: bytes,
+            hasMore: hasMore
+        )
     }
 
     /// Drains and returns all buffered entries, resetting the buffer and the
@@ -4573,8 +4697,16 @@ final class StreamEventBatch: @unchecked Sendable {
         defer { lock.unlock() }
         let out = buffer.map { ($0.event, $0.run, $0.threadId) }
         buffer.removeAll(keepingCapacity: true)
+        bufferedBytes = 0
         flushScheduled = false
+        saturationRunID = nil
         return out
+    }
+
+    func resetSaturation(for runID: AgentRunID) {
+        lock.lock()
+        if saturationRunID == runID { saturationRunID = nil }
+        lock.unlock()
     }
 }
 
@@ -6896,9 +7028,13 @@ public struct AgentAppView: View {
                             )
                             .frame(width: 0, height: 0)
                             .accessibilityHidden(true)
-                            // Full thread is loaded up front (no infinite-scroll paging),
-                            // so there are no top/bottom history sentinels and no per-row
-                            // body hydrate/evict.
+                            if vm.messageHistoryIsPartial {
+                                Text("Showing the recent message window. Earlier messages remain stored locally and are not kept in screen memory.")
+                                    .font(DS.Font.caption)
+                                    .foregroundColor(DS.Palette.textTertiary)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                    .accessibilityIdentifier("agent.transcript.partialMessageHistory")
+                            }
                             if hiddenCount > 0 {
                                 runningHiddenTranscriptRow(
                                     hiddenCount,

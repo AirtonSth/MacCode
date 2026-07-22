@@ -4,6 +4,92 @@ import Darwin
 import CoreModel
 
 final class ProcessLifecycleHardeningTests: XCTestCase {
+    func test_exactOwnedDispositionDoesNotEraseReusedPIDLifetime() throws {
+        let file = FileManager.default.temporaryDirectory
+            .appendingPathComponent("provider-ledger-exact-disposition-\(UUID().uuidString).json")
+        let store = ProviderProcessOwnershipStore(fileURL: file)
+        let old = SpawnedProcessTag(
+            pgid: 40, spawnedAt: Date(timeIntervalSince1970: 1), managedKind: .sidecar,
+            startIdentity: ProviderProcessStartIdentity(seconds: 1, microseconds: 1)
+        )
+        let reused = SpawnedProcessTag(
+            pgid: 40, spawnedAt: Date(timeIntervalSince1970: 2), managedKind: .sidecar,
+            startIdentity: ProviderProcessStartIdentity(seconds: 2, microseconds: 1)
+        )
+        try store.replace([reused])
+
+        try store.removeExact(old)
+
+        XCTAssertEqual(try store.load(), [reused],
+                       "sidecar exit disposition must not erase a newer lifetime that reused its PID")
+    }
+
+    func test_ownershipLedgerRejectsUnboundedGrowthWithoutDroppingEvidence() throws {
+        let file = FileManager.default.temporaryDirectory
+            .appendingPathComponent("provider-ledger-capacity-\(UUID().uuidString).json")
+        let store = ProviderProcessOwnershipStore(fileURL: file, maxRecords: 2)
+        let identity = ProviderProcessStartIdentity(seconds: 1, microseconds: 1)
+        let tags = (1...3).map { pid in
+            SpawnedProcessTag(
+                pgid: pid_t(pid),
+                spawnedAt: Date(),
+                ownerStartIdentity: identity,
+                provider: .codex,
+                managedKind: .provider,
+                executablePath: "/opt/codex",
+                startIdentity: identity,
+                isolatedProcessGroup: pid_t(pid)
+            )
+        }
+        try store.append(tags[0])
+        try store.append(tags[1])
+
+        XCTAssertThrowsError(try store.append(tags[2])) { error in
+            XCTAssertEqual(error as? ProviderProcessOwnershipError, .ownershipLedgerCapacityExceeded(2))
+        }
+        XCTAssertEqual(try store.load(), Array(tags.prefix(2)),
+                       "capacity pressure must fail the new spawn without deleting live ownership rows")
+    }
+
+    func test_periodicSweepPrunesExitedCurrentOwnerRowsButRetainsLateGroupMembers() throws {
+        let file = FileManager.default.temporaryDirectory
+            .appendingPathComponent("provider-ledger-current-owner-prune-\(UUID().uuidString).json")
+        let store = ProviderProcessOwnershipStore(fileURL: file)
+        let ownerIdentity = ProviderProcessStartIdentity(seconds: 1, microseconds: 1)
+        let rootIdentity = ProviderProcessStartIdentity(seconds: 2, microseconds: 1)
+        let drained = SpawnedProcessTag(
+            pgid: 41, spawnedAt: Date(), ownerPID: 700, ownerStartIdentity: ownerIdentity,
+            provider: .codex, managedKind: .provider, executablePath: "/opt/codex",
+            startIdentity: rootIdentity, isolatedProcessGroup: 41
+        )
+        let lateGroup = SpawnedProcessTag(
+            pgid: 42, spawnedAt: Date(), ownerPID: 700, ownerStartIdentity: ownerIdentity,
+            managedKind: .sidecar, executablePath: "/opt/RemoteCodeDistillService",
+            startIdentity: rootIdentity, isolatedProcessGroup: 42
+        )
+        try store.replace([drained, lateGroup])
+
+        let result = try ProviderProcessSweeper.sweepPersistedOrphans(
+            store: store,
+            currentPID: 700,
+            minAge: 0,
+            ownerIsAlive: { _ in true },
+            ownerStartIdentity: { _ in ownerIdentity },
+            processCommand: { _ in nil },
+            processStartIdentity: { _ in nil },
+            descendantPIDs: { _ in [] },
+            processGroupMembers: { $0 == 42 ? [420] : [] },
+            processIsAlive: { _ in false },
+            graceInterval: 0,
+            wait: { _ in },
+            sendSignal: { _, _ in XCTFail("current-owner rows must never be signalled"); return false }
+        )
+
+        XCTAssertEqual(result, ProviderProcessSweepResult(orphanRootPIDs: [], terminatedPIDs: [], failedPIDs: []))
+        XCTAssertEqual(try store.load(), [lateGroup],
+                       "drained rows must not consume the bounded ledger, while late group descendants retain exact ownership")
+    }
+
     private enum TestSessionGone: Error { case gone }
     private enum TestListFailure: Error { case failed }
 

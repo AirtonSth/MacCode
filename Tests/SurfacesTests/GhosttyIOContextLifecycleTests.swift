@@ -111,4 +111,168 @@ final class GhosttyIOContextLifecycleTests: XCTestCase {
             "overflow must compact in batches instead of copying on every chunk"
         )
     }
+
+    func test_oversizedLegacyReplayRemainsMemoryBoundedBeforeAttach() {
+        // WHY: a restored tab may still be windowless while its legacy history
+        // arrives. Async replay must not trade the launch hang for an unbounded
+        // in-memory queue while it waits for AppKit attachment.
+        let view = GhosttyTerminalView(frame: .zero)
+        let legacyBytes = 9 * 1024 * 1024
+
+        let accepted = view.resetSurfaceOutput(Data(repeating: 0x52, count: legacyBytes))
+
+        let diagnostics = view.pendingOutputDiagnosticsForTesting
+        XCTAssertFalse(accepted)
+        XCTAssertEqual(diagnostics.logicalBytes, 0)
+        XCTAssertEqual(view.droppedOutputBytes, legacyBytes)
+        XCTAssertEqual(diagnostics.storageBytes, diagnostics.logicalBytes)
+        XCTAssertFalse(view.historyReplayDrainInProgressForTesting)
+    }
+
+    func test_replayPressureRejectsWholeHandoffWithoutSlicingStream() {
+        // WHY: callers can retry a complete handoff after PTY backpressure is
+        // released. Accepting only a suffix/prefix would corrupt parser state.
+        let view = GhosttyTerminalView(frame: .zero)
+        let replay = Data(repeating: 0x52, count: GhosttyTerminalView.maxPendingOutputBytes)
+        XCTAssertTrue(view.resetSurfaceOutput(replay))
+
+        let continuation = Data("\u{001B}[31mWHOLE_HANDOFF".utf8)
+        XCTAssertFalse(view.processOutput(continuation))
+        XCTAssertEqual(
+            view.pendingOutputDiagnosticsForTesting.logicalBytes,
+            GhosttyTerminalView.maxPendingOutputBytes
+        )
+        XCTAssertEqual(view.droppedOutputBytes, 0)
+    }
+
+    func test_terminalMemoryAuthorityBoundsManyHiddenOwnersAndProtectsActiveOwner() {
+        // WHY: multiplying a valid per-tab cap by weeks of opened tabs is still
+        // unbounded process memory. One process-wide authority must reclaim old
+        // hidden owners while never reclaiming the active terminal.
+        let authority = TerminalMemoryBudgetAuthority(maxRetainedBytes: 64)
+        let active = TerminalMemoryOwnerForTesting(bytes: 40, isProtected: true)
+        var owners = [active]
+        var tokens = [authority.register(
+            owner: active,
+            retainedBytes: { [weak active] in active?.bytes ?? 0 },
+            priority: { [weak active] in active?.priority ?? 0 },
+            reclaim: { [weak active] in active?.reclaim() }
+        )]
+
+        for _ in 0..<20 {
+            let owner = TerminalMemoryOwnerForTesting(bytes: 4, isProtected: false)
+            owners.append(owner)
+            tokens.append(authority.register(
+                owner: owner,
+                retainedBytes: { [weak owner] in owner?.bytes ?? 0 },
+                priority: { [weak owner] in owner?.priority ?? 0 },
+                reclaim: { [weak owner] in owner?.reclaim() }
+            ))
+        }
+
+        authority.enforceBudget()
+
+        XCTAssertLessThanOrEqual(authority.retainedBytesForTesting, 64)
+        XCTAssertEqual(active.reclaimCount, 0, "the active terminal must stay responsive")
+        XCTAssertGreaterThan(owners.dropFirst().filter { $0.reclaimCount > 0 }.count, 0)
+        for token in tokens { authority.unregister(token) }
+        XCTAssertEqual(authority.registeredCountForTesting, 0)
+    }
+
+    func test_terminalMemoryAuthorityCompactsAllVisibleOwnersToHardAggregateCap() {
+        // WHY: "visible" is a reclaim priority, not an exemption. Multi-pane
+        // layouts can otherwise multiply per-surface caps past process memory.
+        let authority = TerminalMemoryBudgetAuthority(maxRetainedBytes: 64)
+        let owners = (0..<20).map { index in
+            TerminalMemoryOwnerForTesting(
+                bytes: 8,
+                isProtected: true,
+                compactedBytes: 2,
+                frameToken: "frame-\(index)"
+            )
+        }
+        for owner in owners {
+            _ = authority.register(
+                owner: owner,
+                retainedBytes: { [weak owner] in owner?.bytes ?? 0 },
+                priority: { [weak owner] in owner?.priority ?? 0 },
+                reclaim: { [weak owner] in owner?.reclaim() }
+            )
+        }
+
+        authority.enforceBudget()
+
+        XCTAssertLessThanOrEqual(authority.retainedBytesForTesting, 64)
+        XCTAssertGreaterThan(owners.filter { $0.reclaimCount > 0 }.count, 0)
+        for (index, owner) in owners.enumerated() {
+            XCTAssertTrue(owner.acceptsInput, "compaction must not close a visible session")
+            XCTAssertEqual(owner.frameToken, "frame-\(index)")
+        }
+    }
+
+    func test_terminalMemoryAuthorityPurgesReleasedOwnerWithoutRegistryLeak() {
+        let authority = TerminalMemoryBudgetAuthority(maxRetainedBytes: 64)
+        var owner: TerminalMemoryOwnerForTesting? = TerminalMemoryOwnerForTesting(
+            bytes: 4,
+            isProtected: false
+        )
+        weak var weakOwner = owner
+        _ = authority.register(
+            owner: owner!,
+            retainedBytes: { [weak owner] in owner?.bytes ?? 0 },
+            priority: { [weak owner] in owner?.priority ?? 0 },
+            reclaim: { [weak owner] in owner?.reclaim() }
+        )
+
+        owner = nil
+
+        XCTAssertNil(weakOwner)
+        XCTAssertEqual(authority.registeredCountForTesting, 0)
+    }
+
+    func test_budgetReleasedGhosttyDoesNotRegrowHiddenRawQueue() {
+        let view = GhosttyTerminalView(frame: .zero)
+        XCTAssertTrue(view.processOutput(Data(repeating: 0x41, count: 512 * 1024)))
+        XCTAssertGreaterThan(view.retainedTerminalBytesEstimate, 0)
+
+        view.releaseForTerminalMemoryBudget()
+        XCTAssertEqual(view.retainedTerminalBytesEstimate, 0)
+        XCTAssertTrue(view.wasReleasedForTerminalMemoryBudgetForTesting)
+
+        XCTAssertTrue(view.processOutput(Data(repeating: 0x42, count: 512 * 1024)))
+        XCTAssertEqual(
+            view.retainedTerminalBytesEstimate,
+            0,
+            "hidden output is already retained by the compact ANSI mirror + SQLite"
+        )
+    }
+}
+
+@MainActor
+private final class TerminalMemoryOwnerForTesting {
+    var bytes: Int
+    let isProtected: Bool
+    let compactedBytes: Int
+    let frameToken: String
+    private(set) var acceptsInput = true
+    private(set) var reclaimCount = 0
+
+    var priority: Int { isProtected ? 1 : 0 }
+
+    init(
+        bytes: Int,
+        isProtected: Bool,
+        compactedBytes: Int = 0,
+        frameToken: String = "frame"
+    ) {
+        self.bytes = bytes
+        self.isProtected = isProtected
+        self.compactedBytes = compactedBytes
+        self.frameToken = frameToken
+    }
+
+    func reclaim() {
+        reclaimCount += 1
+        bytes = compactedBytes
+    }
 }

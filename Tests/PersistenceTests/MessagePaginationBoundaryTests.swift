@@ -45,4 +45,40 @@ final class MessagePaginationBoundaryTests: XCTestCase {
         XCTAssertEqual(oldestFirst, contents,
             "every same-second row must appear exactly once, in insertion (rowid) order — no boundary skips or duplicates")
     }
+
+    func test_byteBoundedKeysetPagesReturnEveryRowOnceWithoutFullHistoryScan() throws {
+        let tmp = NSTemporaryDirectory() + "RC2PageBudget-" + UUID().uuidString
+        defer { try? FileManager.default.removeItem(atPath: tmp) }
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let thread = AgentThread(title: "bounded", provider: .codex, model: "gpt-5")
+        try AgentThreadRepository(db: db).upsert(thread)
+        let messages = AgentMessageRepository(db: db)
+        let shared = Date(timeIntervalSinceReferenceDate: 7_000)
+        for index in 0..<9 {
+            try messages.append(AgentMessage(
+                threadId: thread.id,
+                role: .assistant,
+                content: "m\(index)-" + String(repeating: "x", count: 40),
+                createdAt: shared
+            ))
+        }
+
+        var cursor: AgentMessageCursor? = nil
+        var collected: [String] = []
+        for _ in 0..<10 {
+            let page = try messages.listPageWithinBodyBudget(
+                threadId: thread.id,
+                limit: 3,
+                before: cursor,
+                budget: 10_000,
+                contentLimit: 80_000
+            )
+            XCTAssertLessThanOrEqual(page.rows.count, 3)
+            collected = page.rows.map(\.content) + collected
+            guard page.hasMoreOlder else { break }
+            cursor = page.nextBefore
+        }
+        XCTAssertEqual(collected, (0..<9).map { "m\($0)-" + String(repeating: "x", count: 40) },
+                       "bounded keyset pages must neither duplicate nor skip same-timestamp rows")
+    }
 }

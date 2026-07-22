@@ -1261,6 +1261,99 @@ final class TerminalHistoryProductionIntegrationTests: XCTestCase {
     XCTAssertEqual(delegate.replayReadRecoveryCount, 0)
   }
 
+  func testCombinedReplayOverBoundPreservesLiveParserInsteadOfResettingFromPartialBytes() throws {
+    // WHY: the bounded Ghostty replay reserves one 256 KiB PTY handoff. If the
+    // persisted prefix plus captured live tail cannot fit, keeping the current
+    // live parser is semantically safe; truncating or rebuilding it is not.
+    let surfaceID = SurfaceID().value.uuidString
+    let workspaceID = WorkspaceID().value.uuidString
+    let persisted = Data("P".utf8)
+    let window = TerminalOutputWindow(
+      chunks: [TerminalOutputChunk(
+        id: 1,
+        surfaceID: surfaceID,
+        workspaceID: workspaceID,
+        chunkIndex: 0,
+        data: persisted,
+        createdAt: Date()
+      )],
+      hasMoreOlder: false,
+      nextBeforeChunkID: nil
+    )
+    let delegate = HistoryCoordinatorDelegateSpy()
+    let liveView = Data("LIVE_PARSER_MUST_SURVIVE".utf8)
+    delegate.renderedData = liveView
+    let coordinator = TerminalHistoryCoordinator(
+      repository: nil,
+      surfaceID: surfaceID,
+      workspaceID: workspaceID,
+      readWindow: { _ in window }
+    )
+    coordinator.delegate = delegate
+    coordinator.prepare(restored: true)
+    coordinator.recordLiveReplayData(
+      Data(repeating: 0x4C, count: TerminalHistoryCoordinator.maxCanonicalReplayBytes),
+      maxBytes: 4 * 1024 * 1024
+    )
+
+    coordinator.replayIfNeeded()
+    try waitForReplayCompletion(coordinator)
+
+    XCTAssertEqual(delegate.renderedData, liveView)
+    XCTAssertEqual(delegate.replayLiveCapCount, 1)
+  }
+
+  func testHeadlessDemandReplayKeepsPTYReaderMovingAndPreservesPersistedThenLiveOrder() async throws {
+    // WHY: automation can demand read_text for a restored, unselected terminal
+    // before any user-visible pane exists. Replay must improve the mirror without
+    // suspending the producer until a future UI attachment that may never happen.
+    let database = try SQLiteDB(path: ":memory:")
+    try Schema.migrate(database)
+    let repository = TerminalOutputRepository(db: database)
+    let surfaceID = SurfaceID()
+    let workspaceID = WorkspaceID()
+    let persistedMarker = "RC2_HEADLESS_PERSISTED_\(UUID().uuidString)"
+    let liveMarker = "RC2_HEADLESS_LIVE_\(UUID().uuidString)"
+    try repository.append(
+      surfaceID: surfaceID.value.uuidString,
+      workspaceID: workspaceID.value.uuidString,
+      chunkIndex: 1,
+      data: Data("\(persistedMarker)\n".utf8)
+    )
+    let surface = try TerminalSurface(
+      workspaceID: workspaceID,
+      title: "headless demand replay",
+      launch: .shell(cwd: NSTemporaryDirectory()),
+      restoredSurfaceID: surfaceID,
+      historyRepo: repository,
+      outputBus: SurfaceOutputBus(flushDelay: 0)
+    )
+    defer { surface.close() }
+    _ = try await waitForSurfacePreparationReadyAsync(surface)
+    XCTAssertFalse(surface.ghosttyHasLiveSurfaceForTesting)
+
+    _ = surface.readTextSnapshot()
+    XCTAssertEqual(surface.sendTextStatus("printf '\\n\(liveMarker)\\n'\n"), .accepted)
+    let deadline = Date().addingTimeInterval(6)
+    var final = surface.readTextSnapshot()
+    while Date() < deadline,
+          !(final.text.contains(persistedMarker) && final.text.contains(liveMarker)) {
+      XCTAssertFalse(surface.readerPausedForHistoryReplayForTesting)
+      try await Task.sleep(nanoseconds: 10_000_000)
+      final = surface.readTextSnapshot()
+    }
+
+    XCTAssertTrue(final.text.contains(persistedMarker))
+    XCTAssertTrue(final.text.contains(liveMarker))
+    XCTAssertLessThan(
+      final.text.range(of: persistedMarker)!.lowerBound,
+      final.text.range(of: liveMarker)!.lowerBound
+    )
+    XCTAssertFalse(surface.readerPausedForHistoryReplayForTesting)
+    XCTAssertTrue(surface.hasDeferredUnhostedGhosttyReplayForTesting)
+    XCTAssertTrue(surface.runtimeHealth().processAlive)
+  }
+
   func testFinalDeleteRunsAfterBlockedWriterAndRejectsPostDeleteChurn() throws {
     // WHY: user-close must be the final queue disposition. A queued append that
     // lands after router deletion would recreate ownerless history rows forever.
@@ -1734,7 +1827,7 @@ final class TerminalHistoryProductionIntegrationTests: XCTestCase {
     XCTAssertTrue(surface.runtimeHealth().outputPartial)
   }
 
-  func testLiveWritePathPrunesOldestHistoryAndRetainsNewestBytes() throws {
+  func testWeeksOfHighVolumeLiveWritesStayBoundedAndRetainNewestBytes() throws {
     let db = try SQLiteDB(path: ":memory:")
     try Schema.migrate(db)
     let repository = TerminalOutputRepository(db: db)
@@ -1749,6 +1842,8 @@ final class TerminalHistoryProductionIntegrationTests: XCTestCase {
     let surfaceID = surface.descriptor.id.value.uuidString
     let payloadBytes = 1024 * 1024
 
+    // Model more than a month of daily 1 MiB bursts without a restart. The
+    // storage ceiling must depend on the rolling window, not session age.
     for index in 0..<34 {
       let marker = String(format: "RC2_HISTORY_%03d|", index)
       surface.appendSystemText(
@@ -1759,12 +1854,12 @@ final class TerminalHistoryProductionIntegrationTests: XCTestCase {
 
     XCTAssertLessThanOrEqual(
       try repository.totalBytes(surfaceID: surfaceID),
-      32 * 1024 * 1024,
+      TerminalHistoryCoordinator.maxPersistedBytes,
       "the production append path must enforce the declared per-surface disk cap while the tab remains open"
     )
     let retained = try repository.readWindow(
       surfaceID: surfaceID,
-      maxBytes: 32 * 1024 * 1024
+      maxBytes: TerminalHistoryCoordinator.maxPersistedBytes
     ).text
     XCTAssertTrue(
       retained.contains("RC2_HISTORY_033"), "the newest retained output must survive pruning")
@@ -1774,6 +1869,165 @@ final class TerminalHistoryProductionIntegrationTests: XCTestCase {
       surface.runtimeHealth().outputPartial,
       "retention truncation must be explicit instead of presenting bounded history as complete"
     )
+  }
+
+  func testLegacyOversizedHistoryIsPrunedBeforeBoundedReplay() throws {
+    let db = try SQLiteDB(path: ":memory:")
+    try Schema.migrate(db)
+    let repository = TerminalOutputRepository(db: db)
+    let surfaceID = SurfaceID().value.uuidString
+    let workspaceID = WorkspaceID().value.uuidString
+    let chunkBytes = 64 * 1024
+    let chunkCount = 160
+    let newestMarker = Data("RC2_LEGACY_NEWEST_SCROLLBACK\n".utf8)
+
+    for index in 0..<chunkCount {
+      var data = Data(repeating: UInt8(ascii: "x"), count: chunkBytes)
+      if index == chunkCount - 1 {
+        data.replaceSubrange(0..<newestMarker.count, with: newestMarker)
+      }
+      try repository.append(
+        surfaceID: surfaceID,
+        workspaceID: workspaceID,
+        chunkIndex: Int64(index + 1),
+        data: data
+      )
+    }
+    XCTAssertGreaterThan(
+      try repository.totalBytes(surfaceID: surfaceID),
+      TerminalHistoryCoordinator.maxPersistedBytes
+    )
+
+    let delegate = HistoryCoordinatorDelegateSpy()
+    let coordinator = TerminalHistoryCoordinator(
+      repository: repository,
+      surfaceID: surfaceID,
+      workspaceID: workspaceID
+    )
+    coordinator.delegate = delegate
+    coordinator.prepare(restored: true)
+    try waitForPreparationReady(coordinator)
+    try waitForReplayCompletion(coordinator)
+
+    XCTAssertLessThanOrEqual(
+      try repository.totalBytes(surfaceID: surfaceID),
+      TerminalHistoryCoordinator.maxPersistedBytes,
+      "legacy databases must be normalized during background preparation, before new output arrives"
+    )
+    XCTAssertLessThanOrEqual(
+      delegate.renderedData.count,
+      256 * 1024,
+      "startup must never hydrate the complete oversized legacy transcript"
+    )
+    XCTAssertTrue(delegate.renderedData.contains(newestMarker))
+    XCTAssertEqual(
+      try repository.partialHistoryState(surfaceID: surfaceID)?.reason,
+      "history_retention_cap"
+    )
+  }
+
+  func testGlobalLegacyHistoryContinuesPruningWithoutAnotherTerminalWrite() throws {
+    let db = try SQLiteDB(path: ":memory:")
+    try Schema.migrate(db)
+    let repository = TerminalOutputRepository(db: db)
+    let active = "active-writer"
+    let dormant = "dormant-history"
+    for index in 0..<20 {
+      try repository.append(
+        surfaceID: active, workspaceID: nil, chunkIndex: Int64(index + 1),
+        data: Data(repeating: 0x41, count: 10))
+      try repository.append(
+        surfaceID: dormant, workspaceID: nil, chunkIndex: Int64(index + 1),
+        data: Data(repeating: 0x42, count: 10))
+    }
+
+    let finished = DispatchSemaphore(value: 0)
+    TerminalHistoryCoordinator.drainGlobalRetentionForTesting(
+      repository: repository,
+      protectedSurfaceID: active,
+      maxBytes: 220,
+      maxRows: 1,
+      maxDeleteBytes: 10
+    ) { _ in
+      finished.signal()
+    }
+
+    XCTAssertEqual(
+      finished.wait(timeout: .now() + 3), .success,
+      "bounded maintenance quanta must self-schedule to completion without another PTY write")
+    XCTAssertLessThanOrEqual(try repository.totalBytesAllSurfaces(), 220)
+    XCTAssertEqual(try repository.totalBytes(surfaceID: active), 200,
+                   "the active writer remains protected while dormant history is drained")
+    XCTAssertNotNil(try repository.partialHistoryState(surfaceID: dormant))
+  }
+
+  func testHiddenTerminalMemoryReclaimKeepsNewestOrderedOutputAndRebuildsOnReveal() throws {
+    // WHY: an inactive tab may run for weeks. Reclaim must drop old screen rows
+    // and native scrollback, keep accepting ordered output, and restore a usable
+    // active parser/mirror when the tab is selected again.
+    let surface = try TerminalSurface(
+      workspaceID: WorkspaceID(),
+      title: "aggregate memory reclaim",
+      launch: .sshPlaceholder(cwd: NSTemporaryDirectory()),
+      outputBus: SurfaceOutputBus(flushDelay: 0)
+    )
+    defer { surface.close() }
+    let beforeMarker = "RC2_BEFORE_RECLAIM_\(UUID().uuidString)"
+    let hiddenMarker = "RC2_AFTER_RECLAIM_\(UUID().uuidString)"
+    surface.appendSystemText(
+      (0..<600).map { "screen row \($0) " + String(repeating: "x", count: 80) }
+        .joined(separator: "\r\n") + "\r\n\(beforeMarker)\r\n"
+    )
+    _ = surface.readTextSnapshot()
+    surface.didBecomeHidden()
+    let retainedBefore = surface.terminalMemoryRetainedBytesForTesting
+
+    surface.reclaimTerminalMemoryForTesting()
+
+    XCTAssertTrue(surface.terminalMemoryWasReclaimedForTesting)
+    XCTAssertLessThan(surface.terminalMemoryRetainedBytesForTesting, retainedBefore)
+    surface.appendSystemText("\r\n\(hiddenMarker)\r\n")
+    XCTAssertTrue(surface.readTextSnapshot().text.contains(hiddenMarker))
+
+    surface.didBecomeVisible()
+
+    XCTAssertFalse(surface.terminalMemoryWasReclaimedForTesting)
+    let rebuilt = surface.readTextSnapshot().text
+    XCTAssertTrue(rebuilt.contains(beforeMarker))
+    XCTAssertTrue(rebuilt.contains(hiddenMarker))
+    XCTAssertLessThan(
+      rebuilt.range(of: beforeMarker)!.lowerBound,
+      rebuilt.range(of: hiddenMarker)!.lowerBound
+    )
+  }
+
+  func testVisibleTerminalMemoryCompactionKeepsCurrentFrameAndInputOwner() throws {
+    // WHY: visible is a priority, not an exemption. Its pressure pass may drop
+    // old scrollback, but must leave the current frame and PTY input ownership.
+    let surface = try TerminalSurface(
+      workspaceID: WorkspaceID(),
+      title: "visible aggregate memory compaction",
+      launch: .sshPlaceholder(cwd: NSTemporaryDirectory()),
+      outputBus: SurfaceOutputBus(flushDelay: 0)
+    )
+    defer { surface.close() }
+    let frameMarker = "RC2_VISIBLE_FRAME_\(UUID().uuidString)"
+    surface.appendSystemText(
+      (0..<600).map { "visible row \($0) " + String(repeating: "v", count: 80) }
+        .joined(separator: "\r\n") + "\r\n\(frameMarker)\r\n"
+    )
+    _ = surface.readTextSnapshot()
+    let retainedBefore = surface.terminalMemoryRetainedBytesForTesting
+    var input = Data()
+    surface.replaceInputCaptureForTesting { input.append($0) }
+
+    surface.reclaimTerminalMemoryForTesting()
+    surface.injectGhosttyInputWriteForTesting(Data("typed-after-compaction".utf8))
+
+    XCTAssertLessThan(surface.terminalMemoryRetainedBytesForTesting, retainedBefore)
+    XCTAssertTrue(surface.readTextSnapshot().text.contains(frameMarker))
+    XCTAssertEqual(String(decoding: input, as: UTF8.self), "typed-after-compaction")
+    XCTAssertTrue(surface.ghosttyInputHandlerPresentForTesting)
   }
 
   private func waitForPreparationReady(
@@ -2025,6 +2279,7 @@ final class TerminalHistoryProductionIntegrationTests: XCTestCase {
     var renderedData = Data()
     var replayReadFailureCount = 0
     var replayReadRecoveryCount = 0
+    var replayLiveCapCount = 0
     var durablePartialReasons: [String] = []
 
     func terminalHistoryCoordinator(
@@ -2036,6 +2291,9 @@ final class TerminalHistoryProductionIntegrationTests: XCTestCase {
       }
       if case .replayReadRecovered = issue {
         replayReadRecoveryCount += 1
+      }
+      if case .replayLiveCap = issue {
+        replayLiveCapCount += 1
       }
       if case .durablePartial(let reason) = issue {
         durablePartialReasons.append(reason)

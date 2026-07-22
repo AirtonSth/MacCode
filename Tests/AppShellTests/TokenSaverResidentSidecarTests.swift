@@ -82,6 +82,33 @@ final class TokenSaverResidentSidecarTests: XCTestCase {
             "the controller must forward its configured idle-timeout to the sidecar: the SERVER reclaims model RAM on queue-drain while the controller keeps the process resident so terminal | distill always reaches a live server")
     }
 
+    func test_lowMemoryProfileBoundsSidecarConcurrencyAndQueue() {
+        let spawner = CapturingSpawner()
+        let controller = TokenSaverDistillServiceController(
+            appSupportDirectory: URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true),
+            executableURLResolver: { URL(fileURLWithPath: "/bin/sh") },
+            processSpawner: spawner,
+            memoryProfileProvider: {
+                ManagedProcessMemoryProfile.resolve(
+                    physicalMemoryBytes: UInt64(8) * 1_024 * 1_024 * 1_024
+                )
+            }
+        )
+
+        controller.startIfEligible(
+            session: paidSession(),
+            settings: AppSettings(tokenSaverEnabled: true),
+            modelValidation: .installed
+        )
+        defer { controller.stop() }
+
+        let args = spawner.capturedArguments
+        let requestIndex = args.firstIndex(of: "--max-concurrent-requests")
+        let queueIndex = args.firstIndex(of: "--max-queue-depth")
+        XCTAssertEqual(requestIndex.map { args[$0 + 1] }, "1")
+        XCTAssertEqual(queueIndex.map { args[$0 + 1] }, "4")
+    }
+
     func test_savingsRecordedEvent_refreshesTokenSaverUI() {
         let controller = TokenSaverDistillServiceController(
             appSupportDirectory: URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true),

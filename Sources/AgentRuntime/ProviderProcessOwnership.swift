@@ -7,6 +7,7 @@ public enum ProviderProcessOwnershipError: Error, LocalizedError, Equatable {
     case executablePathUnavailable(pid_t)
     case isolatedProcessGroupUnavailable(pid_t)
     case processListFailed(String)
+    case ownershipLedgerCapacityExceeded(Int)
 
     public var errorDescription: String? {
         switch self {
@@ -20,6 +21,8 @@ public enum ProviderProcessOwnershipError: Error, LocalizedError, Equatable {
             return "Could not certify an isolated provider process group for pid \(pid)."
         case .processListFailed(let reason):
             return "Could not list provider processes: \(reason)"
+        case .ownershipLedgerCapacityExceeded(let limit):
+            return "Managed process ownership ledger reached its \(limit)-record safety limit."
         }
     }
 }
@@ -35,11 +38,14 @@ public enum ProviderProcessExecutablePath {
 }
 
 public final class ProviderProcessOwnershipStore: @unchecked Sendable {
+    public static let defaultMaxRecords = 256
     public let fileURL: URL
+    public let maxRecords: Int
     private let lock = NSLock()
 
-    public init(fileURL: URL) {
+    public init(fileURL: URL, maxRecords: Int = defaultMaxRecords) {
         self.fileURL = fileURL
+        self.maxRecords = max(1, maxRecords)
     }
 
     public func load() throws -> [SpawnedProcessTag] {
@@ -61,7 +67,19 @@ public final class ProviderProcessOwnershipStore: @unchecked Sendable {
         // overwrite it while appending a newly spawned provider.
         let existing = try loadUnlocked()
         let next = existing.filter { $0.pgid != tag.pgid } + [tag]
+        guard next.count <= maxRecords else {
+            throw ProviderProcessOwnershipError.ownershipLedgerCapacityExceeded(maxRecords)
+        }
         try replaceUnlocked(next)
+    }
+
+    /// Remove only the exact process lifetime supplied by its owner. A reused
+    /// PID or concurrently appended replacement row is preserved.
+    public func removeExact(_ tag: SpawnedProcessTag) throws {
+        lock.lock()
+        defer { lock.unlock() }
+        let current = try loadUnlocked()
+        try replaceUnlocked(current.filter { $0 != tag })
     }
 
     /// Commit decisions made from one sweep snapshot without erasing process
@@ -159,7 +177,32 @@ public extension ProviderProcessSweeper {
         var failed: [Int32] = []
 
         for tag in tags {
-            if tag.ownerPID == currentPID {
+            let rootIsAlive = processIsAlive(tag.pgid)
+            let hasVerifiedGroupIdentity = tag.isolatedProcessGroup == tag.pgid
+                && tag.startIdentity != nil
+            let groupMembers = hasVerifiedGroupIdentity
+                ? processGroupMembers(tag.pgid).filter { $0 > 0 && $0 != currentPID }
+                : []
+
+            if tag.ownerPID == currentPID,
+               let expectedOwnerIdentity = tag.ownerStartIdentity,
+               ownerStartIdentity(currentPID) == expectedOwnerIdentity {
+                if rootIsAlive {
+                    // Keep only the exact recorded root lifetime. A recycled PID
+                    // exhausts this row and must not inherit its ownership.
+                    if tag.startIdentity == nil
+                        || processStartIdentity(tag.pgid) == tag.startIdentity {
+                        retained.append(tag)
+                    }
+                } else if !groupMembers.isEmpty {
+                    // The root exited, but its certified group still has late
+                    // descendants. Retain ownership until the group drains.
+                    retained.append(tag)
+                }
+                continue
+            } else if tag.ownerPID == currentPID && tag.ownerStartIdentity == nil {
+                // Legacy current-owner rows cannot be tied to this app lifetime.
+                // Preserve them rather than erasing the only cleanup evidence.
                 retained.append(tag)
                 continue
             }
@@ -177,13 +220,6 @@ public extension ProviderProcessSweeper {
                     continue
                 }
             }
-            let rootIsAlive = processIsAlive(tag.pgid)
-            let hasVerifiedGroupIdentity = tag.isolatedProcessGroup == tag.pgid
-                && tag.startIdentity != nil
-            let groupMembers = hasVerifiedGroupIdentity
-                ? processGroupMembers(tag.pgid).filter { $0 > 0 && $0 != currentPID }
-                : []
-
             if rootIsAlive {
                 guard let command = processCommand(tag.pgid) else {
                     failed.append(tag.pgid)

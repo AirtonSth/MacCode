@@ -8,9 +8,207 @@ import os
 
 private let appDiagnosticsLog = Logger(subsystem: "io.remotecode.app", category: "diagnostics")
 
+public struct ManagedProcessMemoryProfile: Sendable, Equatable {
+    public let name: String
+    public let physicalMemoryBytes: UInt64
+    public let providerRootCap: Int
+    public let sidecarMaxConcurrentRequests: Int
+    public let sidecarMaxQueueDepth: Int
+    public let idleReleaseAge: TimeInterval
+    public let warningFraction: Double
+    public let criticalFraction: Double
+    public let hostProcessCeilingKB: Int?
+    public let managedTreeCeilingKB: Int?
+
+    public static func resolve(physicalMemoryBytes: UInt64) -> Self {
+        let eightGiB = UInt64(8) * 1_024 * 1_024 * 1_024
+        if physicalMemoryBytes <= eightGiB {
+            return Self(
+                name: "low-memory-8g",
+                physicalMemoryBytes: physicalMemoryBytes,
+                providerRootCap: 2,
+                sidecarMaxConcurrentRequests: 1,
+                sidecarMaxQueueDepth: 4,
+                idleReleaseAge: 30 * 60,
+                warningFraction: 0.60,
+                criticalFraction: 0.75,
+                hostProcessCeilingKB: 768 * 1_024,
+                managedTreeCeilingKB: 3_584 * 1_024
+            )
+        }
+        return Self(
+            name: "standard",
+            physicalMemoryBytes: physicalMemoryBytes,
+            providerRootCap: 6,
+            sidecarMaxConcurrentRequests: 4,
+            sidecarMaxQueueDepth: 32,
+            idleReleaseAge: 6 * 60 * 60,
+            warningFraction: 0.70,
+            criticalFraction: 0.85,
+            hostProcessCeilingKB: nil,
+            managedTreeCeilingKB: nil
+        )
+    }
+}
+
+public enum ManagedProviderAdmissionDecision: Sendable, Equatable {
+    case admit
+    case blockedIncompleteScan
+    case blockedUnknownMemory
+    case blockedAtProviderCap(limit: Int)
+    case blockedAtHostMemoryCeiling(limitKB: Int, measuredKB: Int)
+    case blockedAtManagedTreeMemoryCeiling(limitKB: Int, measuredKB: Int)
+
+    var telemetryReason: String {
+        switch self {
+        case .admit: "admit"
+        case .blockedIncompleteScan: "blocked_incomplete_scan"
+        case .blockedUnknownMemory: "blocked_unknown_memory"
+        case .blockedAtProviderCap: "blocked_provider_cap"
+        case .blockedAtHostMemoryCeiling: "blocked_host_memory_ceiling"
+        case .blockedAtManagedTreeMemoryCeiling: "blocked_managed_tree_memory_ceiling"
+        }
+    }
+}
+
+public enum ManagedProviderAdmissionError: Error, LocalizedError, Sendable, Equatable {
+    case processAccountingUnavailable
+    case providerLimitReached(Int)
+    case hostMemoryLimitReached(Int)
+    case managedTreeMemoryLimitReached(Int)
+
+    public var errorDescription: String? {
+        switch self {
+        case .processAccountingUnavailable:
+            return "A new provider could not start because managed-process accounting is incomplete. Try again after the next diagnostics scan."
+        case .providerLimitReached(let limit):
+            return "This Mac is already running the safe limit of \(limit) managed provider sessions. Finish or release an idle session, then try again."
+        case .hostMemoryLimitReached(let limitKB):
+            return "A new provider could not start because RemoteCode reached its low-memory host limit of \(limitKB / 1_024) MiB. Finish or release an idle session, then try again."
+        case .managedTreeMemoryLimitReached(let limitKB):
+            return "A new provider could not start because managed runtimes reached their low-memory limit of \(limitKB / 1_024) MiB. Finish or release an idle session, then try again."
+        }
+    }
+}
+
+public enum ManagedProviderAdmissionPolicy {
+    public static func decide(
+        profile: ManagedProcessMemoryProfile,
+        scanComplete: Bool,
+        appFootprintKB: Int?,
+        managedTreeRSSKB: Int?,
+        liveProviderRoots: Int,
+        requiresNewProviderRoot: Bool
+    ) -> ManagedProviderAdmissionDecision {
+        guard scanComplete else { return .blockedIncompleteScan }
+        guard let appFootprintKB, appFootprintKB >= 0,
+              let managedTreeRSSKB, managedTreeRSSKB >= 0 else {
+            return .blockedUnknownMemory
+        }
+        if let limit = profile.hostProcessCeilingKB,
+           appFootprintKB >= limit {
+            return .blockedAtHostMemoryCeiling(limitKB: limit, measuredKB: appFootprintKB)
+        }
+        if let limit = profile.managedTreeCeilingKB,
+           managedTreeRSSKB >= limit {
+            return .blockedAtManagedTreeMemoryCeiling(limitKB: limit, measuredKB: managedTreeRSSKB)
+        }
+        guard !requiresNewProviderRoot || liveProviderRoots < profile.providerRootCap else {
+            return .blockedAtProviderCap(limit: profile.providerRootCap)
+        }
+        return .admit
+    }
+}
+
+public struct ManagedProviderAdmissionKey: Hashable, Sendable {
+    public let provider: AgentProvider
+    public let threadId: AgentThreadID
+
+    public init(provider: AgentProvider, threadId: AgentThreadID) {
+        self.provider = provider
+        self.threadId = threadId
+    }
+}
+
+public actor ManagedProviderAdmissionGate {
+    private var pendingAdmissionDates: [ManagedProviderAdmissionKey: Date] = [:]
+    private var residentRootByKey: [ManagedProviderAdmissionKey: pid_t] = [:]
+    private var lastProviderRootPIDs: Set<pid_t> = []
+    private let reservationLifetime: TimeInterval
+
+    public init(reservationLifetime: TimeInterval = 60) {
+        self.reservationLifetime = max(1, reservationLifetime)
+    }
+
+    public func decide(
+        profile: ManagedProcessMemoryProfile,
+        scan: ManagedProcessScan,
+        appFootprintKB: Int?,
+        key: ManagedProviderAdmissionKey,
+        now: Date = Date()
+    ) -> ManagedProviderAdmissionDecision {
+        pendingAdmissionDates = pendingAdmissionDates.filter {
+            now.timeIntervalSince($0.value) < reservationLifetime
+        }
+        let currentRootPIDs = Set(scan.providerProcesses.compactMap(\.pgid).filter { $0 > 0 })
+        residentRootByKey = residentRootByKey.filter { currentRootPIDs.contains($0.value) }
+        let appearedRootPIDs = currentRootPIDs.subtracting(lastProviderRootPIDs).sorted()
+        let pendingKeys = pendingAdmissionDates.sorted {
+            if $0.value == $1.value {
+                return $0.key.threadId.value.uuidString < $1.key.threadId.value.uuidString
+            }
+            return $0.value < $1.value
+        }.map(\.key)
+        for (pendingKey, rootPID) in zip(pendingKeys, appearedRootPIDs) {
+            residentRootByKey[pendingKey] = rootPID
+            pendingAdmissionDates.removeValue(forKey: pendingKey)
+        }
+        lastProviderRootPIDs = currentRootPIDs
+
+        let alreadyOwnsRootOrReservation = residentRootByKey[key] != nil
+            || pendingAdmissionDates[key] != nil
+        let effectiveRoots = scan.providerRootCount + pendingAdmissionDates.count
+        let decision = ManagedProviderAdmissionPolicy.decide(
+            profile: profile,
+            scanComplete: scan.isComplete,
+            appFootprintKB: appFootprintKB,
+            managedTreeRSSKB: Self.totalManagedRSSKB(appFootprintKB: appFootprintKB, scan: scan),
+            liveProviderRoots: effectiveRoots,
+            requiresNewProviderRoot: !alreadyOwnsRootOrReservation
+        )
+        if decision == .admit, !alreadyOwnsRootOrReservation {
+            pendingAdmissionDates[key] = now
+        }
+        return decision
+    }
+
+    private static func totalManagedRSSKB(
+        appFootprintKB: Int?,
+        scan: ManagedProcessScan
+    ) -> Int? {
+        guard scan.isComplete, let appFootprintKB, appFootprintKB >= 0 else { return nil }
+        let values = [appFootprintKB]
+            + scan.providerProcesses.map(\.rssKB)
+            + scan.sidecarProcesses.map(\.rssKB)
+        var total = 0
+        for value in values {
+            guard value >= 0 else { return nil }
+            let (next, overflow) = total.addingReportingOverflow(value)
+            guard !overflow else { return nil }
+            total = next
+        }
+        return total
+    }
+}
+
+public enum ManagedMemoryPressureDecision: String, Sendable, Equatable {
+    case unknown
+    case normal
+    case warning
+    case critical
+}
+
 enum AppDiagnostics {
-    /// Snapshot of surface-level counters captured on the main actor before
-    /// dispatching the blocking process scan to a background task.
     struct SurfaceSnapshot: Sendable {
         let surfaceCount: Int
         let terminalCount: Int
@@ -20,16 +218,59 @@ enum AppDiagnostics {
         let historyFailures: Int
     }
 
-    /// Aggregated process stats derived from a list of provider or sidecar processes.
-    /// Pure, `nonisolated`-safe: no actor context required.
-    ///
-    /// WHY: the caller (`heartbeat`) dispatches `currentProviderProcesses()`
-    /// to a background queue; the aggregation must therefore be testable in
-    /// isolation without any actor or AppKit state.
-    struct ProviderStats: Sendable {
+    struct ProviderStats: Sendable, Equatable {
         let processCount: Int
         let totalRSSKB: Int
         let orphanCount: Int
+    }
+
+    struct ManagedAggregateSample: Sendable, Equatable {
+        let appFootprintKB: Int?
+        let providerProcessCount: Int?
+        let providerRootCount: Int?
+        let providerRSSKB: Int?
+        let sidecarProcessCount: Int?
+        let sidecarRootCount: Int?
+        let sidecarRSSKB: Int?
+        let totalManagedRSSKB: Int?
+        let previousTotalManagedRSSKB: Int?
+        let sampleIntervalSeconds: TimeInterval?
+        let deltaManagedRSSKB: Int?
+        let slopeKBPerMinute: Double?
+        let highWaterManagedRSSKB: Int?
+        let isComplete: Bool
+        let pressureDecision: ManagedMemoryPressureDecision
+        let admissionDecision: ManagedProviderAdmissionDecision
+        let profile: ManagedProcessMemoryProfile
+    }
+
+    struct ManagedTrendState: Sendable, Equatable {
+        private(set) var previousTotalManagedRSSKB: Int?
+        private(set) var previousDate: Date?
+        private(set) var highWaterManagedRSSKB: Int?
+
+        mutating func record(
+            appFootprintKB: Int?,
+            scan: ManagedProcessScan?,
+            profile: ManagedProcessMemoryProfile,
+            now: Date
+        ) -> ManagedAggregateSample {
+            let interval = previousDate.map { now.timeIntervalSince($0) }
+            let sample = aggregateManagedSample(
+                appFootprintKB: appFootprintKB,
+                scan: scan,
+                profile: profile,
+                previousTotalManagedRSSKB: previousTotalManagedRSSKB,
+                sampleIntervalSeconds: interval,
+                previousHighWaterManagedRSSKB: highWaterManagedRSSKB
+            )
+            if let total = sample.totalManagedRSSKB {
+                previousTotalManagedRSSKB = total
+                previousDate = now
+                highWaterManagedRSSKB = sample.highWaterManagedRSSKB
+            }
+            return sample
+        }
     }
 
     @MainActor
@@ -47,8 +288,6 @@ enum AppDiagnostics {
         )
     }
 
-    /// Aggregates process stats from a list of processes.
-    /// This is the pure helper that runs off the main thread in `heartbeat`.
     nonisolated static func aggregateProviderStats(
         processes: [ProviderRuntimeProcess]
     ) -> ProviderStats {
@@ -59,32 +298,120 @@ enum AppDiagnostics {
         )
     }
 
-    /// Heartbeat entry point — must remain `@MainActor` because it reads
-    /// `SurfaceRegistry` (itself `@MainActor`).
-    ///
-    /// The blocking work (`/bin/ps` via `currentProviderProcesses`) is
-    /// dispatched to a background `Task` with `.utility` priority so it
-    /// never competes with UI rendering on the main thread. The log entry
-    /// is written back on the main actor once the scan completes.
-    /// F9: guards against stacking a second `/bin/ps` provider sweep on top of one
-    /// still running. Main-actor isolated, so no lock is needed; the detached scan
-    /// clears it back on the main actor when it finishes.
+    nonisolated static func providerAdmissionDecision(
+        profile: ManagedProcessMemoryProfile,
+        scanComplete: Bool,
+        appFootprintKB: Int?,
+        managedTreeRSSKB: Int?,
+        liveProviderRoots: Int,
+        requiresNewProviderRoot: Bool = true
+    ) -> ManagedProviderAdmissionDecision {
+        ManagedProviderAdmissionPolicy.decide(
+            profile: profile,
+            scanComplete: scanComplete,
+            appFootprintKB: appFootprintKB,
+            managedTreeRSSKB: managedTreeRSSKB,
+            liveProviderRoots: liveProviderRoots,
+            requiresNewProviderRoot: requiresNewProviderRoot
+        )
+    }
+
+    nonisolated static func aggregateManagedSample(
+        appFootprintKB: Int?,
+        scan: ManagedProcessScan?,
+        profile: ManagedProcessMemoryProfile,
+        previousTotalManagedRSSKB: Int? = nil,
+        sampleIntervalSeconds: TimeInterval? = nil,
+        previousHighWaterManagedRSSKB: Int? = nil
+    ) -> ManagedAggregateSample {
+        let validApp = appFootprintKB.flatMap { $0 >= 0 ? $0 : nil }
+        let complete = validApp != nil && scan?.isComplete == true
+        guard complete, let validApp, let scan else {
+            return ManagedAggregateSample(
+                appFootprintKB: validApp,
+                providerProcessCount: nil,
+                providerRootCount: nil,
+                providerRSSKB: nil,
+                sidecarProcessCount: nil,
+                sidecarRootCount: nil,
+                sidecarRSSKB: nil,
+                totalManagedRSSKB: nil,
+                previousTotalManagedRSSKB: previousTotalManagedRSSKB,
+                sampleIntervalSeconds: sampleIntervalSeconds,
+                deltaManagedRSSKB: nil,
+                slopeKBPerMinute: nil,
+                highWaterManagedRSSKB: previousHighWaterManagedRSSKB,
+                isComplete: false,
+                pressureDecision: .unknown,
+                admissionDecision: ManagedProviderAdmissionPolicy.decide(
+                    profile: profile,
+                    scanComplete: scan?.isComplete == true,
+                    appFootprintKB: validApp,
+                    managedTreeRSSKB: nil,
+                    liveProviderRoots: scan?.providerRootCount ?? 0,
+                    requiresNewProviderRoot: true
+                ),
+                profile: profile
+            )
+        }
+
+        let providerStats = aggregateProviderStats(processes: scan.providerProcesses)
+        let sidecarStats = aggregateProviderStats(processes: scan.sidecarProcesses)
+        let total = validApp + providerStats.totalRSSKB + sidecarStats.totalRSSKB
+        let delta = previousTotalManagedRSSKB.map { total - $0 }
+        let slope = delta.flatMap { delta -> Double? in
+            guard let sampleIntervalSeconds, sampleIntervalSeconds > 0 else { return nil }
+            return Double(delta) * 60 / sampleIntervalSeconds
+        }
+        let highWater = max(previousHighWaterManagedRSSKB ?? total, total)
+        let physicalKB = Double(profile.physicalMemoryBytes) / 1_024
+        let fraction = physicalKB > 0 ? Double(total) / physicalKB : 0
+        let pressure: ManagedMemoryPressureDecision
+        if fraction >= profile.criticalFraction {
+            pressure = .critical
+        } else if fraction >= profile.warningFraction {
+            pressure = .warning
+        } else {
+            pressure = .normal
+        }
+        return ManagedAggregateSample(
+            appFootprintKB: validApp,
+            providerProcessCount: providerStats.processCount,
+            providerRootCount: scan.providerRootCount,
+            providerRSSKB: providerStats.totalRSSKB,
+            sidecarProcessCount: sidecarStats.processCount,
+            sidecarRootCount: scan.sidecarRootCount,
+            sidecarRSSKB: sidecarStats.totalRSSKB,
+            totalManagedRSSKB: total,
+            previousTotalManagedRSSKB: previousTotalManagedRSSKB,
+            sampleIntervalSeconds: sampleIntervalSeconds,
+            deltaManagedRSSKB: delta,
+            slopeKBPerMinute: slope,
+            highWaterManagedRSSKB: highWater,
+            isComplete: true,
+            pressureDecision: pressure,
+            admissionDecision: ManagedProviderAdmissionPolicy.decide(
+                profile: profile,
+                scanComplete: true,
+                appFootprintKB: validApp,
+                managedTreeRSSKB: total,
+                liveProviderRoots: scan.providerRootCount,
+                requiresNewProviderRoot: true
+            ),
+            profile: profile
+        )
+    }
+
     @MainActor private static var providerScanInFlight = false
+    @MainActor private static var managedTrendState = ManagedTrendState()
 
     enum ProviderScanDecision: Equatable {
         case start
         case skipInFlight
     }
 
-    @MainActor
-    static func beginProviderScanForTests() -> ProviderScanDecision {
-        beginProviderScan()
-    }
-
-    @MainActor
-    static func finishProviderScanForTests() {
-        finishProviderScan()
-    }
+    @MainActor static func beginProviderScanForTests() -> ProviderScanDecision { beginProviderScan() }
+    @MainActor static func finishProviderScanForTests() { finishProviderScan() }
 
     @MainActor
     private static func beginProviderScan() -> ProviderScanDecision {
@@ -93,58 +420,102 @@ enum AppDiagnostics {
         return .start
     }
 
-    @MainActor
-    private static func finishProviderScan() {
-        providerScanInFlight = false
-    }
+    @MainActor private static func finishProviderScan() { providerScanInFlight = false }
 
     @MainActor
     static func heartbeat(
         reason: String,
         activeAgentThreads: Int,
+        profile: ManagedProcessMemoryProfile,
         lifecycleRecorder: AppLifecycleRecorder? = nil
     ) {
-        // Snapshot main-actor surface state before leaving the actor.
-        let surfaces = SurfaceRegistry.shared.all()
-        let snapshot = aggregateSurfaceSnapshot(surfaces)
-        // Cheap mach call; no I/O — sample here while still on the main actor.
-        let rssKB = currentProcessFootprintKB()
+        let snapshot = aggregateSurfaceSnapshot(SurfaceRegistry.shared.all())
+        let footprint = currentProcessFootprintKB()
+        let appFootprint = footprint >= 0 ? footprint : nil
         let pid = ProcessInfo.processInfo.processIdentifier
 
-        // F9: if a prior /bin/ps sweep is still running, don't launch another — at the
-        // 60s cadence this is rare, but two concurrent sweeps would compete for CPU
-        // with the UI at the worst moment. Skip the scan this tick (telemetry may miss
-        // one sample) while still recording the cheap surface snapshot.
-        if beginProviderScan() == .skipInFlight {
-            appDiagnosticsLog.info("app.heartbeat reason=\(reason, privacy: .public) pid=\(pid, privacy: .public) rssKB=\(rssKB, privacy: .public) surfaces=\(snapshot.surfaceCount, privacy: .public) terminals=\(snapshot.terminalCount, privacy: .public) runningTerminals=\(snapshot.runningTerminals, privacy: .public) activeAgentThreads=\(activeAgentThreads, privacy: .public) providerScan=skipped_in_flight terminalPendingBytes=\(snapshot.pendingBytes, privacy: .public) terminalDroppedBytes=\(snapshot.droppedBytes, privacy: .public) terminalHistoryFailures=\(snapshot.historyFailures, privacy: .public)")
+        guard beginProviderScan() == .start else {
+            let sample = managedTrendState.record(
+                appFootprintKB: appFootprint,
+                scan: nil,
+                profile: profile,
+                now: Date()
+            )
+            logHeartbeat(
+                reason: reason,
+                pid: pid,
+                activeAgentThreads: activeAgentThreads,
+                surface: snapshot,
+                sample: sample,
+                scanState: "skipped_in_flight"
+            )
             return
         }
 
-        // Dispatch the blocking /bin/ps scan off the main thread.
         Task.detached(priority: .utility) {
-            let providerProcesses = ProviderProcessSweeper.currentProviderProcesses()
-            let sidecarProcesses = ProviderProcessSweeper.currentSidecarProcesses()
-            let stats = aggregateProviderStats(processes: providerProcesses)
-            let sidecarStats = aggregateProviderStats(processes: sidecarProcesses)
+            let scan: ManagedProcessScan?
+            let scanState: String
+            do {
+                guard let store = ProviderProcessOwnership.shared.store() else {
+                    throw ProviderProcessOwnershipError.storeNotConfigured
+                }
+                scan = try ProviderProcessSweeper.managedProcessScan(store: store)
+                scanState = scan?.isComplete == true ? "complete" : "incomplete_ownership"
+            } catch {
+                scan = nil
+                scanState = "failed"
+            }
             await MainActor.run {
-                finishProviderScan()   // F9: sweep done — allow the next tick
-                appDiagnosticsLog.info(
-                    "app.heartbeat reason=\(reason, privacy: .public) pid=\(pid, privacy: .public) rssKB=\(rssKB, privacy: .public) surfaces=\(snapshot.surfaceCount, privacy: .public) terminals=\(snapshot.terminalCount, privacy: .public) runningTerminals=\(snapshot.runningTerminals, privacy: .public) activeAgentThreads=\(activeAgentThreads, privacy: .public) providerProcesses=\(stats.processCount, privacy: .public) providerRSSKB=\(stats.totalRSSKB, privacy: .public) orphanProviders=\(stats.orphanCount, privacy: .public) sidecarProcesses=\(sidecarStats.processCount, privacy: .public) sidecarRSSKB=\(sidecarStats.totalRSSKB, privacy: .public) orphanSidecars=\(sidecarStats.orphanCount, privacy: .public) terminalPendingBytes=\(snapshot.pendingBytes, privacy: .public) terminalDroppedBytes=\(snapshot.droppedBytes, privacy: .public) terminalHistoryFailures=\(snapshot.historyFailures, privacy: .public)"
+                finishProviderScan()
+                let sample = managedTrendState.record(
+                    appFootprintKB: appFootprint,
+                    scan: scan,
+                    profile: profile,
+                    now: Date()
                 )
-                lifecycleRecorder?.recordHeartbeat(
+                logHeartbeat(
                     reason: reason,
-                    providerProcesses: stats.processCount,
-                    providerRSSKB: stats.totalRSSKB,
-                    orphanProviders: stats.orphanCount,
-                    sidecarProcesses: sidecarStats.processCount,
-                    sidecarRSSKB: sidecarStats.totalRSSKB,
-                    orphanSidecars: sidecarStats.orphanCount
+                    pid: pid,
+                    activeAgentThreads: activeAgentThreads,
+                    surface: snapshot,
+                    sample: sample,
+                    scanState: scanState
                 )
+                if sample.isComplete,
+                   let providerProcesses = sample.providerProcessCount,
+                   let providerRSSKB = sample.providerRSSKB,
+                   let sidecarProcesses = sample.sidecarProcessCount,
+                   let sidecarRSSKB = sample.sidecarRSSKB {
+                    lifecycleRecorder?.recordHeartbeat(
+                        reason: reason,
+                        providerProcesses: providerProcesses,
+                        providerRSSKB: providerRSSKB,
+                        orphanProviders: scan.map { aggregateProviderStats(processes: $0.providerProcesses).orphanCount } ?? 0,
+                        sidecarProcesses: sidecarProcesses,
+                        sidecarRSSKB: sidecarRSSKB,
+                        orphanSidecars: scan.map { aggregateProviderStats(processes: $0.sidecarProcesses).orphanCount } ?? 0
+                    )
+                }
             }
         }
     }
 
-    // internal (not private) so Tests/@testable can verify the mach call succeeds.
+    @MainActor
+    private static func logHeartbeat(
+        reason: String,
+        pid: Int32,
+        activeAgentThreads: Int,
+        surface: SurfaceSnapshot,
+        sample: ManagedAggregateSample,
+        scanState: String
+    ) {
+        let value: (Int?) -> String = { $0.map(String.init) ?? "unavailable" }
+        let doubleValue: (Double?) -> String = { $0.map { String(format: "%.2f", $0) } ?? "unavailable" }
+        appDiagnosticsLog.info(
+            "app.heartbeat reason=\(reason, privacy: .public) pid=\(pid, privacy: .public) managedScan=\(scanState, privacy: .public) complete=\(sample.isComplete, privacy: .public) appRSSKB=\(value(sample.appFootprintKB), privacy: .public) providerProcesses=\(value(sample.providerProcessCount), privacy: .public) providerRoots=\(value(sample.providerRootCount), privacy: .public) providerRSSKB=\(value(sample.providerRSSKB), privacy: .public) sidecarProcesses=\(value(sample.sidecarProcessCount), privacy: .public) sidecarRoots=\(value(sample.sidecarRootCount), privacy: .public) sidecarRSSKB=\(value(sample.sidecarRSSKB), privacy: .public) totalManagedRSSKB=\(value(sample.totalManagedRSSKB), privacy: .public) previousManagedRSSKB=\(value(sample.previousTotalManagedRSSKB), privacy: .public) sampleIntervalSeconds=\(doubleValue(sample.sampleIntervalSeconds), privacy: .public) deltaManagedRSSKB=\(value(sample.deltaManagedRSSKB), privacy: .public) slopeKBPerMinute=\(doubleValue(sample.slopeKBPerMinute), privacy: .public) highWaterManagedRSSKB=\(value(sample.highWaterManagedRSSKB), privacy: .public) memoryProfile=\(sample.profile.name, privacy: .public) physicalMemoryBytes=\(sample.profile.physicalMemoryBytes, privacy: .public) providerRootCap=\(sample.profile.providerRootCap, privacy: .public) hostProcessCeilingKB=\(value(sample.profile.hostProcessCeilingKB), privacy: .public) managedTreeCeilingKB=\(value(sample.profile.managedTreeCeilingKB), privacy: .public) admission=\(sample.admissionDecision.telemetryReason, privacy: .public) sidecarRequestCap=\(sample.profile.sidecarMaxConcurrentRequests, privacy: .public) sidecarQueueCap=\(sample.profile.sidecarMaxQueueDepth, privacy: .public) ownershipLedgerCap=\(ProviderProcessOwnershipStore.defaultMaxRecords, privacy: .public) pressure=\(sample.pressureDecision.rawValue, privacy: .public) surfaces=\(surface.surfaceCount, privacy: .public) terminals=\(surface.terminalCount, privacy: .public) runningTerminals=\(surface.runningTerminals, privacy: .public) activeAgentThreads=\(activeAgentThreads, privacy: .public) terminalPendingBytes=\(surface.pendingBytes, privacy: .public) terminalDroppedBytes=\(surface.droppedBytes, privacy: .public) terminalHistoryFailures=\(surface.historyFailures, privacy: .public)"
+        )
+    }
+
     static func currentProcessFootprintKB() -> Int {
         var info = task_vm_info_data_t()
         var count = mach_msg_type_number_t(MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<natural_t>.size)
@@ -154,6 +525,6 @@ enum AppDiagnostics {
             }
         }
         guard result == KERN_SUCCESS else { return -1 }
-        return Int(info.phys_footprint / 1024)
+        return Int(info.phys_footprint / 1_024)
     }
 }

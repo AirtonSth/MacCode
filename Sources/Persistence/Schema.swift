@@ -9,7 +9,7 @@ public struct SchemaStep {
 }
 
 public enum Schema {
-    public static let currentVersion: Int = 49
+    public static let currentVersion: Int = 50
 
     public static let steps: [SchemaStep] = [
         SchemaStep(1, """
@@ -837,6 +837,45 @@ public enum Schema {
         ALTER TABLE agent_queued_message_routing ADD COLUMN reserved_tokens INTEGER;
         ALTER TABLE agent_queued_message_routing ADD COLUMN reserved_cost_micros INTEGER;
         ALTER TABLE agent_queued_message_routing ADD COLUMN admission_receipt_id TEXT;
+        """),
+        SchemaStep(50, """
+        CREATE TABLE IF NOT EXISTS storage_usage_counters (
+            storage_class TEXT PRIMARY KEY,
+            payload_bytes INTEGER NOT NULL DEFAULT 0
+        );
+        INSERT OR REPLACE INTO storage_usage_counters(storage_class, payload_bytes)
+        SELECT 'stream_events', COALESCE(SUM(
+            LENGTH(CAST(event_kind AS BLOB)) + LENGTH(CAST(payload_json AS BLOB))
+        ), 0) FROM agent_stream_events;
+        INSERT OR REPLACE INTO storage_usage_counters(storage_class, payload_bytes)
+        SELECT 'provider_logs', COALESCE(SUM(
+            LENGTH(CAST(source AS BLOB)) + LENGTH(CAST(method AS BLOB)) + LENGTH(CAST(payload_json AS BLOB))
+        ), 0) FROM agent_provider_event_logs;
+
+        CREATE TRIGGER IF NOT EXISTS trg_stream_usage_insert
+        AFTER INSERT ON agent_stream_events BEGIN
+            UPDATE storage_usage_counters
+            SET payload_bytes = payload_bytes + LENGTH(CAST(NEW.event_kind AS BLOB)) + LENGTH(CAST(NEW.payload_json AS BLOB))
+            WHERE storage_class = 'stream_events';
+        END;
+        CREATE TRIGGER IF NOT EXISTS trg_stream_usage_delete
+        AFTER DELETE ON agent_stream_events BEGIN
+            UPDATE storage_usage_counters
+            SET payload_bytes = MAX(0, payload_bytes - LENGTH(CAST(OLD.event_kind AS BLOB)) - LENGTH(CAST(OLD.payload_json AS BLOB)))
+            WHERE storage_class = 'stream_events';
+        END;
+        CREATE TRIGGER IF NOT EXISTS trg_provider_usage_insert
+        AFTER INSERT ON agent_provider_event_logs BEGIN
+            UPDATE storage_usage_counters
+            SET payload_bytes = payload_bytes + LENGTH(CAST(NEW.source AS BLOB)) + LENGTH(CAST(NEW.method AS BLOB)) + LENGTH(CAST(NEW.payload_json AS BLOB))
+            WHERE storage_class = 'provider_logs';
+        END;
+        CREATE TRIGGER IF NOT EXISTS trg_provider_usage_delete
+        AFTER DELETE ON agent_provider_event_logs BEGIN
+            UPDATE storage_usage_counters
+            SET payload_bytes = MAX(0, payload_bytes - LENGTH(CAST(OLD.source AS BLOB)) - LENGTH(CAST(OLD.method AS BLOB)) - LENGTH(CAST(OLD.payload_json AS BLOB)))
+            WHERE storage_class = 'provider_logs';
+        END;
         """)
     ]
 
