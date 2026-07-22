@@ -375,16 +375,31 @@ final class PaneActionTests: XCTestCase {
         XCTAssertEqual(newSurface.snapshot()["ssh_status"], "connected")
     }
 
-    func test_agentTabBusyRollsUpRunningThreadFromRepository() throws {
+    func test_agentTabBusyUsesBoundThreadNotWholeWorkspace() throws {
         let (ctx, router) = try makeContext()
         let ws = try router.createWorkspace(name: "tab-repo-busy", cwd: NSTemporaryDirectory())
-        let desc = try router.createSurface(workspace: ws.id, type: .agentApp, paneID: nil, title: "Agent App")
-        var thread = AgentThread(workspaceId: ws.id, title: "Long task", provider: .codex, model: "gpt-5.5")
-        thread.status = .running
-        try ctx.threadRepo.upsert(thread)
+        let idleDesc = try router.createSurface(workspace: ws.id, type: .agentApp, paneID: nil, title: "Idle Agent")
+        var runningThread = AgentThread(workspaceId: ws.id, title: "Long task", provider: .codex, model: "gpt-5.5")
+        runningThread.status = .running
+        try ctx.threadRepo.upsert(runningThread)
+        var idleThread = AgentThread(workspaceId: ws.id, title: "Idle", provider: .codex, model: "gpt-5.5")
+        idleThread.status = .completed
+        try ctx.threadRepo.upsert(idleThread)
 
-        XCTAssertTrue(PaneTabsView.isSurfaceBusy(desc, router: router),
-                      "tab rendering must show a spinner when any thread in that Agent App workspace is running, even if the live surface VM has stale thread state")
+        // Unbound idle tab must NOT spin just because another thread is running.
+        XCTAssertFalse(PaneTabsView.isSurfaceBusy(idleDesc, router: router),
+                       "an Agent App tab without a bound running thread must not spin for sibling threads")
+
+        // Bound to the running thread → spinner (fallback when live surface is stale).
+        var boundDesc = idleDesc
+        boundDesc.metadata["selected_thread"] = runningThread.id.value.uuidString
+        XCTAssertTrue(PaneTabsView.isSurfaceBusy(boundDesc, router: router),
+                      "tab spinner fallback may use the surface-bound selected_thread when that thread is running")
+
+        // Bound to an idle thread → no spinner even if another workspace thread runs.
+        boundDesc.metadata["selected_thread"] = idleThread.id.value.uuidString
+        XCTAssertFalse(PaneTabsView.isSurfaceBusy(boundDesc, router: router),
+                       "a tab bound to an idle thread must not spin for other running workspace threads")
     }
 
     func test_terminalBusySurfaceRollsUpToTabAndWorkspaceBusyState() throws {
@@ -1385,40 +1400,47 @@ final class PaneActionTests: XCTestCase {
         XCTAssertNil(SurfaceRegistry.shared.surface(c.id), "c must be unregistered after batch close")
     }
 
-    // PERF: verifies that the batch isSurfaceBusy overload produces the same
-    // result as the per-tab original. If a running thread exists the batch set
-    // must flag that workspace busy; if no thread is running both paths must
-    // agree it is not busy. Catches any drift between the batch criterion and
-    // the original threadRepo.list per-tab check.
+    // PERF: batch isSurfaceBusy overload must match the per-tab path. Busy is
+    // per-surface (bound selected_thread / live surface isBusy), not workspace-wide.
     func test_batchIsSurfaceBusy_matchesPerTabResult() throws {
         let (ctx, router) = try makeContext()
         let ws = try router.createWorkspace(name: "batch-busy", cwd: NSTemporaryDirectory())
-        let desc = try router.createSurface(workspace: ws.id, type: .agentApp, paneID: nil, title: "Agent")
+        var desc = try router.createSurface(workspace: ws.id, type: .agentApp, paneID: nil, title: "Agent")
 
-        // No running thread: both paths must agree -- not busy.
+        // No running bound thread: both paths must agree -- not busy.
         let runningEmpty = PaneTabsView.runningWorkspaceIDs(for: [desc], router: router)
         XCTAssertFalse(
             PaneTabsView.isSurfaceBusy(desc, runningWorkspaceIDs: runningEmpty, router: router),
-            "batch path must agree with per-tab: not busy when no thread is running"
+            "batch path must agree with per-tab: not busy when no bound thread is running"
         )
         XCTAssertFalse(
             PaneTabsView.isSurfaceBusy(desc, router: router),
-            "per-tab original must also report not busy when no thread is running"
+            "per-tab original must also report not busy when no bound thread is running"
         )
 
-        // Insert a running thread: both paths must agree -- busy.
-        var thread = AgentThread(workspaceId: ws.id, title: "T", provider: .codex, model: "m")
-        thread.status = .running
-        try ctx.threadRepo.upsert(thread)
-
+        // Unrelated running thread must not busy this tab.
+        var other = AgentThread(workspaceId: ws.id, title: "other", provider: .codex, model: "m")
+        other.status = .running
+        try ctx.threadRepo.upsert(other)
         let runningFull = PaneTabsView.runningWorkspaceIDs(for: [desc], router: router)
+        XCTAssertFalse(
+            PaneTabsView.isSurfaceBusy(desc, runningWorkspaceIDs: runningFull, router: router),
+            "batch path must not mark a tab busy for an unbound sibling running thread"
+        )
+        XCTAssertFalse(
+            PaneTabsView.isSurfaceBusy(desc, router: router),
+            "per-tab path must not mark a tab busy for an unbound sibling running thread"
+        )
+
+        // Bound to the running thread: both paths busy.
+        desc.metadata["selected_thread"] = other.id.value.uuidString
         XCTAssertTrue(
             PaneTabsView.isSurfaceBusy(desc, runningWorkspaceIDs: runningFull, router: router),
-            "batch path must agree with per-tab: busy when a thread in the workspace is running"
+            "batch path must busy a tab bound to a running thread"
         )
         XCTAssertTrue(
             PaneTabsView.isSurfaceBusy(desc, router: router),
-            "per-tab original must also report busy when a running thread exists"
+            "per-tab path must busy a tab bound to a running thread"
         )
     }
 }

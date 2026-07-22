@@ -1506,10 +1506,18 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         threads.filter { isThreadStartingOrRunning($0.id) }.count
     }
 
-    /// Chrome should spin only for work the coordinator/repository still sees
-    /// as running. A stale local status must not keep tab/sidebar chrome busy.
+    /// Chrome spinner for this Agent App tab only.
+    ///
+    /// Spins when the selected thread has tracked in-flight work, or when this
+    /// surface still owns a live run in `runThreads` (user switched threads
+    /// mid-run). Does **not** roll up every workspace thread — multiple Agent
+    /// App tabs share the same thread list, and a workspace-wide check made
+    /// every tab spin whenever any one of them was running.
     public var hasRunningWorkForChrome: Bool {
-        threads.contains { isThreadStartingOrRunning($0.id) }
+        if selectedThreadRunIsStartingOrRunning { return true }
+        return runThreads.values.contains { threadId in
+            coordinator.activeRunId(threadId: threadId) != nil
+        }
     }
 
     /// UX-MAC_AGENT-BG-AWAIT: the most recent final answer for the selected
@@ -8345,6 +8353,21 @@ public struct AgentAppView: View {
         return "Worked"
     }
 
+    /// Shared chrome for user prompt bubbles (text + padding + fill). Sized by
+    /// the caller so short prompts hug and long prompts wrap without clipping.
+    @ViewBuilder
+    private func userMessageBubbleLabel(_ displayText: String) -> some View {
+        Text(displayText)
+            .font(.system(size: 13))
+            .foregroundColor(DS.Palette.text)
+            .multilineTextAlignment(.leading)
+            .textSelection(.enabled)
+            .padding(.horizontal, DS.Space.xl)
+            .padding(.vertical, DS.Space.lg)
+            .background(DS.Palette.surface)
+            .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+    }
+
     @ViewBuilder
     private func messageRow(_ msg: AgentMessage, columnWidth: CGFloat = 10_000) -> some View {
         switch msg.role {
@@ -8361,22 +8384,20 @@ public struct AgentAppView: View {
                     // WHY: SwiftUI Text (not NSTextView) so short prompts hug content
                     // and long prompts wrap. No lineLimit / no fixed height — full
                     // prompt always visible and height grows with content.
-                    // Order: maxWidth on text so wrap is measured; pad/background;
-                    // fixedSize hugs width and keeps multi-line height; outer
-                    // maxWidth clamps to the live column.
-                    Text(displayText)
-                        .font(.system(size: 13))
-                        .foregroundColor(DS.Palette.text)
-                        .multilineTextAlignment(.leading)
-                        .textSelection(.enabled)
-                        .frame(maxWidth: textMax, alignment: .leading)
-                        .padding(.horizontal, DS.Space.xl)
-                        .padding(.vertical, DS.Space.lg)
-                        .background(DS.Palette.surface)
-                        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
-                        .fixedSize(horizontal: true, vertical: true)
-                        .frame(maxWidth: bubbleMax, alignment: .trailing)
-                        .accessibilityIdentifier("agent.userMessageBubble")
+                    //
+                    // ViewThatFits: prefer horizontal hug for short prompts ("oi"),
+                    // fall back to a width-capped wrap for long prompts / URLs.
+                    // The old fixedSize(horizontal: true) + outer maxWidth clip
+                    // cropped long unbroken URLs so only a mid-string slice showed.
+                    ViewThatFits(in: .horizontal) {
+                        userMessageBubbleLabel(displayText)
+                            .fixedSize(horizontal: true, vertical: true)
+                        userMessageBubbleLabel(displayText)
+                            .frame(maxWidth: textMax, alignment: .leading)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    .frame(maxWidth: bubbleMax, alignment: .trailing)
+                    .accessibilityIdentifier("agent.userMessageBubble")
                     // UX-MAC_AGENT-017: subtle relative timestamp so long threads
                     // show when each message was sent. Keep meta inside the bubble
                     // column so copy + relative time never spill past the pane.

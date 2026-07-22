@@ -692,26 +692,32 @@ public final class PaneTabsView: NSObject {
 
     static func isSurfaceBusy(_ desc: SurfaceDescriptor, router: AppCommandRouter?) -> Bool {
         if SurfaceRegistry.shared.surface(desc.id)?.isBusy == true { return true }
+        // Agent App: busy is per-surface (selected thread / surface-owned run),
+        // never "any thread in the workspace is running". That rollup made every
+        // Agent App tab spin when only one tab had a live run.
+        // Fallback for a stale/unregistered surface VM: only the surface's own
+        // bound thread (metadata selected_thread) may light the spinner.
         guard desc.type == .agentApp,
-              let workspaceID = workspaceID(for: desc, router: router),
-              let context = router?.context else { return false }
-        return ((try? context.threadRepo.list(workspaceId: workspaceID)) ?? []).contains { $0.status == .running }
+              let context = router?.context,
+              let raw = desc.metadata["selected_thread"],
+              let uuid = UUID(uuidString: raw),
+              let thread = try? context.threadRepo.get(id: AgentThreadID(uuid)) else {
+            return false
+        }
+        return thread.status == .running
     }
 
-    /// PERF: variant that takes a pre-computed running-workspace set so callers
-    /// iterating multiple tabs share ONE query instead of one per tab.
-    /// Criterion is identical to isSurfaceBusy(_:router:): SurfaceRegistry busy
-    /// check first, then membership in the running set for agentApp surfaces.
+    /// PERF: batch overload kept for call-site compatibility. Busy is
+    /// per-surface now, so the workspace running set is ignored and the
+    /// single-surface check is authoritative.
     static func isSurfaceBusy(_ desc: SurfaceDescriptor, runningWorkspaceIDs: Set<WorkspaceID>, router: AppCommandRouter?) -> Bool {
-        if SurfaceRegistry.shared.surface(desc.id)?.isBusy == true { return true }
-        guard desc.type == .agentApp,
-              let wid = workspaceID(for: desc, router: router) else { return false }
-        return runningWorkspaceIDs.contains(wid)
+        _ = runningWorkspaceIDs
+        return isSurfaceBusy(desc, router: router)
     }
 
-    /// PERF: collects the unique workspace IDs referenced by agentApp surfaces
-    /// in `surfaces`, then fires ONE runningWorkspaceIds(in:) query. Returns the
-    /// set of workspace IDs that have at least one running thread.
+    /// PERF: retained for call sites that still batch tab busy refresh.
+    /// Returns workspace IDs that have at least one running agent thread — used
+    /// only as a cheap prefilter hint; tab busy itself is per-surface.
     static func runningWorkspaceIDs(for surfaces: [SurfaceDescriptor], router: AppCommandRouter?) -> Set<WorkspaceID> {
         guard let context = router?.context else { return [] }
         let ids: [WorkspaceID] = surfaces.compactMap { desc in
