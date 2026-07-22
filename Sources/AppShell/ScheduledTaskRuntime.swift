@@ -84,13 +84,73 @@ public enum ScheduledTaskPreflightError: Error, CustomStringConvertible, Equatab
 public final class ScheduledTaskExecutor {
     private let context: AppContext
     private let router: AppCommandRouter
+    private let orchestrationRuntime: AgentOrchestrationRuntime
 
-    public init(context: AppContext, router: AppCommandRouter) {
+    public init(
+        context: AppContext,
+        router: AppCommandRouter,
+        orchestrationRuntime: AgentOrchestrationRuntime = AgentOrchestrationRuntime()
+    ) {
         self.context = context
         self.router = router
+        self.orchestrationRuntime = orchestrationRuntime
     }
 
     public func preflight(_ task: ScheduledTask) async throws -> Workspace {
+        try await prepareExecution(task).workspace
+    }
+
+    public func execute(_ task: ScheduledTask) async throws -> (threadID: AgentThreadID, runID: AgentRunID) {
+        let prepared = try await prepareExecution(task)
+        let selection = AgentModelSelection(
+            provider: task.provider,
+            modelId: task.model,
+            reasoningEffort: task.reasoningEffort
+        )
+        let routingConfiguration = prepared.routingSnapshot?.configuration
+            ?? AgentRoutingConfiguration.legacyManual(
+                selection: selection,
+                providerInstanceId: task.providerInstanceID
+            )
+        let thread = AgentThread(
+            workspaceId: task.workspaceID,
+            title: task.title,
+            provider: task.provider,
+            providerInstanceId: task.providerInstanceID,
+            model: task.model,
+            permissionMode: .fullAccess,
+            reasoningEffort: task.reasoningEffort,
+            serviceTier: .auto,
+            modelSelection: selection,
+            routingConfiguration: routingConfiguration
+        )
+        try context.threadRepo.upsert(thread)
+        let request = AgentRunRequest(
+            threadId: thread.id,
+            provider: task.provider,
+            providerInstanceId: task.providerInstanceID,
+            model: task.model,
+            cwd: prepared.workspace.cwd,
+            prompt: task.prompt,
+            permissionMode: .fullAccess,
+            reasoningEffort: task.reasoningEffort,
+            providerBinary: prepared.manualLaunch?.binary,
+            environment: prepared.manualLaunch?.environment ?? [:]
+        )
+        let runID = try await context.coordinator.startRun(
+            request,
+            routingSnapshot: prepared.routingSnapshot
+        )
+        return (thread.id, runID)
+    }
+
+    private struct PreparedExecution {
+        let workspace: Workspace
+        let manualLaunch: AgentOrchestrationLaunchConfiguration?
+        let routingSnapshot: AgentOrchestrationRoutingSnapshot?
+    }
+
+    private func prepareExecution(_ task: ScheduledTask) async throws -> PreparedExecution {
         let validation = task.validationErrors()
         guard validation.isEmpty else { throw ScheduledTaskPreflightError.invalidTask(validation.joined(separator: " ")) }
         guard let workspace = try router.listWorkspaces().first(where: { $0.id == task.workspaceID }) else {
@@ -115,6 +175,18 @@ public final class ScheduledTaskExecutor {
         if user.name != NSUserName() { try verifyPasswordlessSudo(user: user) }
 
         let snapshots = await router.listAgentProviderSnapshots()
+        if task.effectiveRoutingMode == .auto {
+            return PreparedExecution(
+                workspace: workspace,
+                manualLaunch: nil,
+                routingSnapshot: try await autoRoutingSnapshot(
+                    task: task,
+                    user: user,
+                    snapshots: snapshots
+                )
+            )
+        }
+
         let snapshot = snapshots.first { $0.id == task.providerInstanceID && $0.provider == task.provider }
         do {
             try AgentProviderRunPreflight.validate(
@@ -157,50 +229,152 @@ public final class ScheduledTaskExecutor {
                 "The selected provider account is unavailable for system user \(user.name). Sign in as that user and retry."
             )
         }
-        return workspace
+        return PreparedExecution(
+            workspace: workspace,
+            manualLaunch: AgentOrchestrationLaunchConfiguration(
+                binary: probeBinary,
+                environment: probeEnvironment
+            ),
+            routingSnapshot: nil
+        )
     }
 
-    public func execute(_ task: ScheduledTask) async throws -> (threadID: AgentThreadID, runID: AgentRunID) {
-        let workspace = try await preflight(task)
-        let snapshots = await router.listAgentProviderSnapshots()
-        guard let snapshot = snapshots.first(where: { $0.id == task.providerInstanceID && $0.provider == task.provider }) else {
-            throw ScheduledTaskPreflightError.providerUnavailable("Provider capabilities are not loaded yet.")
-        }
-        let baseBinary = snapshot.binaryPath?.trimmingCharacters(in: .whitespacesAndNewlines)
-        let providerBinary = try executionBinary(task: task, baseBinary: baseBinary?.isEmpty == false ? baseBinary! : task.provider.rawValue)
-        let environment = task.runAsUser == NSUserName()
-            ? router.providerEnvironment(provider: task.provider, instanceId: task.providerInstanceID)
-            : [:]
-        let thread = AgentThread(
-            workspaceId: task.workspaceID,
-            title: task.title,
-            provider: task.provider,
-            providerInstanceId: task.providerInstanceID,
-            model: task.model,
-            permissionMode: .fullAccess,
-            reasoningEffort: task.reasoningEffort,
-            serviceTier: .auto,
-            modelSelection: AgentModelSelection(
+    nonisolated static func routingConfiguration(
+        for task: ScheduledTask,
+        policyDigest: String,
+        eligibleProviders: [AgentProvider] = AgentProvider.allCases
+    ) -> AgentRoutingConfiguration {
+        AgentRoutingConfiguration(
+            mode: task.effectiveRoutingMode,
+            manualSelection: AgentModelSelection(
                 provider: task.provider,
                 modelId: task.model,
                 reasoningEffort: task.reasoningEffort
+            ),
+            manualProviderInstanceId: task.providerInstanceID,
+            eligibleProviders: eligibleProviders,
+            policyDigest: task.effectiveRoutingMode == .auto ? policyDigest : "",
+            revision: task.effectiveRoutingMode == .auto ? 1 : 0
+        )
+    }
+
+    private func autoRoutingSnapshot(
+        task: ScheduledTask,
+        user: ScheduledSystemUser,
+        snapshots: [AgentProviderSnapshot]
+    ) async throws -> AgentOrchestrationRoutingSnapshot {
+        var verifiedSnapshots: [AgentProviderSnapshot] = []
+        var launches: [String: AgentOrchestrationLaunchConfiguration] = [:]
+
+        for snapshot in snapshots where snapshot.enabled
+            && snapshot.installed
+            && snapshot.modelDiscoverySource == .live
+            && snapshot.capabilities?.supportsStreaming == true
+            && !snapshot.models.isEmpty {
+            let binary = snapshot.binaryPath?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let baseBinary = binary?.isEmpty == false ? binary! : snapshot.provider.rawValue
+            if user.name != NSUserName() {
+                do { try verifyProviderBinary(baseBinary, user: user) }
+                catch { continue }
+            }
+            let launchBinary: String
+            do {
+                launchBinary = try executionBinary(
+                    task: task,
+                    baseBinary: baseBinary,
+                    providerInstanceID: snapshot.id
+                )
+            } catch {
+                continue
+            }
+            let environment = user.name == NSUserName()
+                ? router.providerEnvironment(provider: snapshot.provider, instanceId: snapshot.id)
+                : [:]
+            let authenticated = await Task.detached {
+                ProviderCLIProbe.authenticated(
+                    provider: snapshot.provider,
+                    binaryPath: launchBinary,
+                    environment: environment
+                )
+            }.value
+            guard authenticated == true else { continue }
+
+            let verified = Self.snapshot(snapshot, authenticated: true)
+            do {
+                try AgentProviderRunPreflight.validate(
+                    snapshot: verified,
+                    interactionMode: .default,
+                    permissionMode: .fullAccess,
+                    attachments: []
+                )
+            } catch {
+                continue
+            }
+            verifiedSnapshots.append(verified)
+            launches[snapshot.id] = AgentOrchestrationLaunchConfiguration(
+                binary: launchBinary,
+                environment: environment
             )
+        }
+
+        let eligibleProviders = AgentProvider.allCases.filter { provider in
+            verifiedSnapshots.contains { $0.provider == provider }
+        }
+        let configuration = Self.routingConfiguration(
+            for: task,
+            policyDigest: orchestrationRuntime.policyDigest,
+            eligibleProviders: eligibleProviders
         )
-        try context.threadRepo.upsert(thread)
-        let request = AgentRunRequest(
-            threadId: thread.id,
-            provider: task.provider,
-            providerInstanceId: task.providerInstanceID,
-            model: task.model,
-            cwd: workspace.cwd,
-            prompt: task.prompt,
-            permissionMode: .fullAccess,
-            reasoningEffort: task.reasoningEffort,
-            providerBinary: providerBinary,
-            environment: environment
+        do {
+            _ = try orchestrationRuntime.route(
+                configuration: configuration,
+                providerSnapshots: verifiedSnapshots
+            )
+        } catch {
+            throw ScheduledTaskPreflightError.providerUnavailable(
+                "Auto model routing is unavailable: \(error)"
+            )
+        }
+        return AgentOrchestrationRoutingSnapshot(
+            configuration: configuration,
+            providerSnapshots: verifiedSnapshots,
+            launchConfigurations: launches
         )
-        let runID = try await context.coordinator.startRun(request)
-        return (thread.id, runID)
+    }
+
+    private static func snapshot(
+        _ snapshot: AgentProviderSnapshot,
+        authenticated: Bool
+    ) -> AgentProviderSnapshot {
+        AgentProviderSnapshot(
+            id: snapshot.id,
+            provider: snapshot.provider,
+            driverKind: snapshot.driverKind,
+            displayName: snapshot.displayName,
+            accentColor: snapshot.accentColor,
+            continuationGroup: snapshot.continuationGroup,
+            interactionModes: snapshot.interactionModes,
+            permissionModes: snapshot.permissionModes,
+            enabled: snapshot.enabled,
+            installed: snapshot.installed,
+            version: snapshot.version,
+            status: snapshot.status,
+            statusDetail: snapshot.statusDetail,
+            authenticated: authenticated,
+            accountLabel: snapshot.accountLabel,
+            accountAuthMethod: snapshot.accountAuthMethod,
+            binaryPath: snapshot.binaryPath,
+            homePath: snapshot.homePath,
+            environmentKeys: snapshot.environmentKeys,
+            models: snapshot.models,
+            slashCommands: snapshot.slashCommands,
+            skills: snapshot.skills,
+            advisory: snapshot.advisory,
+            updateState: snapshot.updateState,
+            capabilities: snapshot.capabilities,
+            modelDiscoverySource: snapshot.modelDiscoverySource,
+            modelDiscoveryCacheKey: snapshot.modelDiscoveryCacheKey
+        )
     }
 
     private func verifyPasswordlessSudo(user: ScheduledSystemUser) throws {
@@ -214,7 +388,11 @@ public final class ScheduledTaskExecutor {
         guard process.terminationStatus == 0 else { throw ScheduledTaskPreflightError.sudoUnavailable(user.name) }
     }
 
-    private func executionBinary(task: ScheduledTask, baseBinary: String) throws -> String {
+    private func executionBinary(
+        task: ScheduledTask,
+        baseBinary: String,
+        providerInstanceID: String? = nil
+    ) throws -> String {
         guard let user = ScheduledSystemUserCatalog.user(named: task.runAsUser) else {
             throw ScheduledTaskPreflightError.ineligibleUser(task.runAsUser)
         }
@@ -222,11 +400,20 @@ public final class ScheduledTaskExecutor {
         let directory = context.appSupportDirectory.appendingPathComponent("scheduled-task-runners", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         try FileManager.default.setAttributes([.posixPermissions: 0o711], ofItemAtPath: directory.path)
-        let wrapper = directory.appendingPathComponent("\(task.id.uuidString.lowercased()).sh")
+        let wrapper = directory.appendingPathComponent(Self.runnerFilename(
+            taskID: task.id,
+            providerInstanceID: providerInstanceID ?? task.providerInstanceID
+        ))
         let script = "#!/bin/sh\nexec /usr/bin/sudo -n -u '#\(user.uid)' -H -- \(Self.shellQuote(baseBinary)) \"$@\"\n"
         try Data(script.utf8).write(to: wrapper, options: .atomic)
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: wrapper.path)
         return wrapper.path
+    }
+
+    nonisolated static func runnerFilename(taskID: UUID, providerInstanceID: String) -> String {
+        let suffix = providerInstanceID
+            .replacingOccurrences(of: "[^A-Za-z0-9._-]", with: "-", options: .regularExpression)
+        return "\(taskID.uuidString.lowercased())-\(suffix).sh"
     }
 
     private static func shellQuote(_ value: String) -> String {

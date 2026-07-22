@@ -73,6 +73,43 @@ final class ScheduledTaskRuntimeTests: XCTestCase {
         XCTAssertTrue(source.contains("store.listActiveRuns()"))
     }
 
+    func test_autoRoutingConfigurationCarriesScheduledFallbackAndEligibleProviders() {
+        var task = makeHourly(nextRunAt: nil)
+        task.routingMode = .auto
+
+        let configuration = ScheduledTaskExecutor.routingConfiguration(
+            for: task,
+            policyDigest: String(repeating: "a", count: 64),
+            eligibleProviders: [.codex, .grok]
+        )
+
+        XCTAssertEqual(configuration.mode, .auto)
+        XCTAssertEqual(configuration.manualSelection.provider, task.provider)
+        XCTAssertEqual(configuration.manualSelection.effectiveModel, task.model)
+        XCTAssertEqual(configuration.manualProviderInstanceId, task.providerInstanceID)
+        XCTAssertEqual(configuration.eligibleProviders, [.codex, .grok])
+        XCTAssertEqual(configuration.revision, 1)
+    }
+
+    func test_crossUserAutoUsesOneRunnerPerProvider_becauseRoutesMustLaunchTheAdmittedCLI() {
+        let id = UUID()
+
+        let codex = ScheduledTaskExecutor.runnerFilename(taskID: id, providerInstanceID: "codex-primary")
+        let grok = ScheduledTaskExecutor.runnerFilename(taskID: id, providerInstanceID: "grok/primary")
+
+        XCTAssertNotEqual(codex, grok)
+        XCTAssertTrue(codex.hasSuffix("-codex-primary.sh"))
+        XCTAssertTrue(grok.hasSuffix("-grok-primary.sh"))
+    }
+
+    func test_executorPassesImmutableAutoSnapshotToCoordinator_becauseScheduledRunsMustActuallyRoute() throws {
+        let source = try String(contentsOf: repositoryRoot.appendingPathComponent("Sources/AppShell/ScheduledTaskRuntime.swift"))
+
+        XCTAssertTrue(source.contains("routingSnapshot: prepared.routingSnapshot"))
+        XCTAssertTrue(source.contains("launchConfigurations: launches"))
+        XCTAssertTrue(source.contains("orchestrationRuntime.route("))
+    }
+
     func test_preflightProbesAuthenticationInSelectedUserContext_becauseAccountsMustNotLeakAcrossHomes() throws {
         let source = try String(contentsOf: repositoryRoot.appendingPathComponent("Sources/AppShell/ScheduledTaskRuntime.swift"))
 

@@ -9,7 +9,7 @@ public struct SchemaStep {
 }
 
 public enum Schema {
-    public static let currentVersion: Int = 50
+    public static let currentVersion: Int = 51
 
     public static let steps: [SchemaStep] = [
         SchemaStep(1, """
@@ -876,6 +876,11 @@ public enum Schema {
             SET payload_bytes = MAX(0, payload_bytes - LENGTH(CAST(OLD.source AS BLOB)) - LENGTH(CAST(OLD.method AS BLOB)) - LENGTH(CAST(OLD.payload_json AS BLOB)))
             WHERE storage_class = 'provider_logs';
         END;
+        """),
+        SchemaStep(51, """
+        ALTER TABLE scheduled_tasks
+        ADD COLUMN routing_mode TEXT NOT NULL DEFAULT 'manual'
+            CHECK(routing_mode IN ('manual', 'auto'));
         """)
     ]
 

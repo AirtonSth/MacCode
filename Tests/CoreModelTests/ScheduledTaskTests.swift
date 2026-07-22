@@ -13,6 +13,35 @@ final class ScheduledTaskTests: XCTestCase {
         XCTAssertEqual(task.validationErrors().count, 8)
     }
 
+    func test_autoDoesNotRequireAResolvedManualModel_duringColdStartProviderLoading() {
+        let task = ScheduledTask(
+            title: "Auto", prompt: "Run", workspaceID: WorkspaceID(), workspacePathSnapshot: "/tmp",
+            runAsUser: "sam", runAsUID: 501, provider: .codex, providerInstanceID: "", model: "",
+            reasoningEffort: .high, routingMode: .auto,
+            recurrence: .daily(at: ScheduledLocalTime(hour: 9, minute: 0)!), timeZoneIdentifier: "UTC"
+        )
+
+        XCTAssertTrue(task.validationErrors().isEmpty)
+    }
+
+    func test_missingRoutingModeDecodesAsManual_becauseOlderSerializedTasksMustKeepBehavior() throws {
+        let task = ScheduledTask(
+            title: "Legacy", prompt: "Run", workspaceID: WorkspaceID(), workspacePathSnapshot: "/tmp",
+            runAsUser: "sam", runAsUID: 501, provider: .codex, providerInstanceID: "codex",
+            model: "gpt-5", reasoningEffort: .high,
+            recurrence: .daily(at: ScheduledLocalTime(hour: 9, minute: 0)!), timeZoneIdentifier: "UTC"
+        )
+        var object = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(task)) as? [String: Any])
+        object.removeValue(forKey: "routingMode")
+
+        let decoded = try JSONDecoder().decode(
+            ScheduledTask.self,
+            from: JSONSerialization.data(withJSONObject: object)
+        )
+
+        XCTAssertEqual(decoded.effectiveRoutingMode, .manual)
+    }
+
     func test_calculatedNextRun_usesStoredIANATimeZone_becauseSchedulesAreCivilTime() throws {
         let task = ScheduledTask(
             title: "Daily", prompt: "Run", workspaceID: WorkspaceID(), workspacePathSnapshot: "/tmp", runAsUser: "sam", runAsUID: 501,

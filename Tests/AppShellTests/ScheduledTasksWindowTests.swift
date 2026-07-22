@@ -20,6 +20,7 @@ final class ScheduledTasksWindowTests: XCTestCase {
         let task = try draft.makeTask(now: Date(timeIntervalSince1970: 150))
 
         XCTAssertEqual(task.permissionModeForScheduledExecution, .fullAccess)
+        XCTAssertEqual(task.effectiveRoutingMode, .auto)
         XCTAssertEqual(task.nextRunAt, Date(timeIntervalSince1970: 200))
     }
 
@@ -92,6 +93,15 @@ final class ScheduledTasksWindowTests: XCTestCase {
         XCTAssertTrue(source.contains("Save Task"))
         XCTAssertFalse(source.contains("HSplitView"),
                        "plan mockups use a single-column stack, not master-detail split")
+    }
+
+    func test_editorOffersAutoAndHidesManualPickersWhileEnabled_becauseRoutingMustBeUnambiguous() throws {
+        let source = try String(contentsOf: sourceURL("Sources/AppShell/ScheduledTasksWindow.swift"), encoding: .utf8)
+
+        XCTAssertTrue(source.contains("scheduledTasks.editor.autoRouting"))
+        XCTAssertTrue(source.contains("if draft.routingMode == .auto"))
+        XCTAssertTrue(source.contains("Auto selects the best available provider and model at run time."))
+        XCTAssertTrue(source.contains("ProgressView()"))
     }
 
     func test_mainDisablesManagedDistillInScheduledAgent_becauseHeadlessRunsMustNotMutateShellSkills() throws {

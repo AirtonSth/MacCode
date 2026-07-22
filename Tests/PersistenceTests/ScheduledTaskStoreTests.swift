@@ -18,17 +18,41 @@ final class ScheduledTaskStoreTests: XCTestCase {
     }
 
     func test_schemaVersionIncludesScheduledTables_becauseUpgradesMustBeAtomic() throws {
-        XCTAssertEqual(Schema.currentVersion, 49)
+        XCTAssertEqual(Schema.currentVersion, 51)
         let statement = try db.prepare("SELECT MAX(version) FROM schema_meta;")
         XCTAssertTrue(try statement.step())
-        XCTAssertEqual(statement.columnInt64(0), 49)
+        XCTAssertEqual(statement.columnInt64(0), 51)
+    }
+
+    func test_routingMigrationKeepsExistingTasksManual_becauseUpgradesMustNotChangeExecution() throws {
+        let legacyDB = try SQLiteDB(path: ":memory:")
+        try Schema.migrateSteps(legacyDB, Schema.steps.filter { $0.version <= 50 })
+        try legacyDB.execute("""
+            INSERT INTO scheduled_tasks(
+                id, title, prompt, workspace_id, workspace_path_snapshot, run_as_user, run_as_uid,
+                provider, provider_instance_id, model, reasoning_effort, recurrence_json, timezone_id,
+                enabled, created_at, updated_at
+            ) VALUES(
+                'legacy', 'Legacy', 'Run', 'workspace', '/tmp', 'sam', 501,
+                'codex', 'codex', 'gpt-5', 'high', '{"kind":"daily","hour":9,"minute":0}',
+                'UTC', 1, '2026-07-22T00:00:00Z', '2026-07-22T00:00:00Z'
+            );
+        """)
+
+        try Schema.migrate(legacyDB)
+
+        let statement = try legacyDB.prepare("SELECT routing_mode FROM scheduled_tasks WHERE id = 'legacy';")
+        XCTAssertTrue(try statement.step())
+        XCTAssertEqual(statement.columnText(0), "manual")
     }
 
     func test_saveAndListRoundTripEveryExecutionField_becauseAgentRunsMustBeExact() throws {
-        let task = makeTask(nextRunAt: Date(timeIntervalSince1970: 100))
+        var task = makeTask(nextRunAt: Date(timeIntervalSince1970: 100))
+        task.routingMode = .auto
         try store.save(task)
 
         XCTAssertEqual(try store.list(), [task])
+        XCTAssertEqual(try store.get(id: task.id)?.effectiveRoutingMode, .auto)
     }
 
     func test_claimDueDeduplicatesOccurrenceAndBlocksSameTaskOverlap_becauseCrashesMustNotDoubleRun() throws {

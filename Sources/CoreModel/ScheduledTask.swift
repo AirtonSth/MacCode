@@ -27,6 +27,9 @@ public struct ScheduledTask: Codable, Sendable, Equatable, Identifiable {
     public var providerInstanceID: String
     public var model: String
     public var reasoningEffort: AgentReasoningEffort
+    /// Optional for backward-compatible Codable decoding of tasks serialized
+    /// before scheduled Auto routing existed. Missing values mean Manual.
+    public var routingMode: AgentRoutingMode?
     public var recurrence: ScheduledTaskRecurrence
     public var timeZoneIdentifier: String
     public var isEnabled: Bool
@@ -47,6 +50,7 @@ public struct ScheduledTask: Codable, Sendable, Equatable, Identifiable {
         providerInstanceID: String,
         model: String,
         reasoningEffort: AgentReasoningEffort,
+        routingMode: AgentRoutingMode = .manual,
         recurrence: ScheduledTaskRecurrence,
         timeZoneIdentifier: String,
         isEnabled: Bool = true,
@@ -66,6 +70,7 @@ public struct ScheduledTask: Codable, Sendable, Equatable, Identifiable {
         self.providerInstanceID = providerInstanceID
         self.model = model
         self.reasoningEffort = reasoningEffort
+        self.routingMode = routingMode
         self.recurrence = recurrence
         self.timeZoneIdentifier = timeZoneIdentifier
         self.isEnabled = isEnabled
@@ -74,6 +79,8 @@ public struct ScheduledTask: Codable, Sendable, Equatable, Identifiable {
         self.createdAt = createdAt
         self.updatedAt = updatedAt
     }
+
+    public var effectiveRoutingMode: AgentRoutingMode { routingMode ?? .manual }
 
     public func validationErrors() -> [String] {
         var errors: [String] = []
@@ -86,8 +93,10 @@ public struct ScheduledTask: Codable, Sendable, Equatable, Identifiable {
         if workspacePathSnapshot.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { errors.append("Workspace path is required.") }
         if runAsUser.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { errors.append("System user is required.") }
         if runAsUID < 500 || runAsUID == UInt32.max { errors.append("System user must be an eligible non-root account.") }
-        if providerInstanceID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { errors.append("Provider instance is required.") }
-        if model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { errors.append("Model is required.") }
+        if effectiveRoutingMode == .manual {
+            if providerInstanceID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { errors.append("Provider instance is required.") }
+            if model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { errors.append("Model is required.") }
+        }
         if TimeZone(identifier: timeZoneIdentifier) == nil { errors.append("Time zone must be a valid IANA identifier.") }
         switch recurrence {
         case .hourly(_, let interval) where !ScheduledTaskRecurrence.isValidHourlyInterval(interval):

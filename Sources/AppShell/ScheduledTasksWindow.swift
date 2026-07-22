@@ -25,6 +25,7 @@ public struct ScheduledTaskEditorDraft: Identifiable, Equatable {
     public var providerInstanceID: String
     public var model: String
     public var reasoningEffort: AgentReasoningEffort
+    public var routingMode: AgentRoutingMode
     public var frequency: ScheduledTaskFrequency
     public var scheduledDate: Date
     public var intervalHours: Int
@@ -47,6 +48,7 @@ public struct ScheduledTaskEditorDraft: Identifiable, Equatable {
         providerInstanceID = task?.providerInstanceID ?? "codex"
         model = task?.model ?? ""
         reasoningEffort = task?.reasoningEffort ?? .high
+        routingMode = task?.effectiveRoutingMode ?? .auto
         timeZoneIdentifier = task?.timeZoneIdentifier ?? TimeZone.current.identifier
         isEnabled = task?.isEnabled ?? true
         scheduledDate = now.addingTimeInterval(60 * 60)
@@ -131,6 +133,7 @@ public struct ScheduledTaskEditorDraft: Identifiable, Equatable {
             providerInstanceID: providerInstanceID,
             model: model,
             reasoningEffort: reasoningEffort,
+            routingMode: routingMode,
             recurrence: recurrence,
             timeZoneIdentifier: timeZoneIdentifier,
             isEnabled: isEnabled,
@@ -154,6 +157,7 @@ public final class ScheduledTasksViewModel: ObservableObject {
     @Published public private(set) var runs: [ScheduledTaskRun] = []
     @Published public private(set) var workspaces: [Workspace] = []
     @Published public private(set) var providers: [AgentProviderSnapshot] = []
+    @Published public private(set) var providersLoading = false
     @Published public private(set) var users: [ScheduledSystemUser] = []
     @Published public private(set) var runCounts: [UUID: Int] = [:]
     /// Task IDs with a queued/running agent occurrence (drives “Running” badges).
@@ -173,6 +177,7 @@ public final class ScheduledTasksViewModel: ObservableObject {
     private let router: AppCommandRouter
     private let store: ScheduledTaskStore
     private let service = ScheduledTaskAgentServiceManager()
+    private var providerLoadCount = 0
 
     public init(context: AppContext, router: AppCommandRouter) {
         self.context = context
@@ -193,6 +198,12 @@ public final class ScheduledTasksViewModel: ObservableObject {
         } catch { errorMessage = String(describing: error) }
         Task { [weak self] in
             guard let self else { return }
+            providerLoadCount += 1
+            providersLoading = true
+            defer {
+                providerLoadCount = max(0, providerLoadCount - 1)
+                providersLoading = providerLoadCount > 0
+            }
             providers = await router.listAgentProviderSnapshots()
         }
     }
@@ -364,6 +375,7 @@ public final class ScheduledTasksViewModel: ObservableObject {
     }
 
     public func providerLabel(for task: ScheduledTask) -> String {
+        if task.effectiveRoutingMode == .auto { return "Auto" }
         if let snap = providers.first(where: { $0.id == task.providerInstanceID }) {
             return "\(task.provider.rawValue.capitalized) · \(snap.displayName)"
         }
@@ -1223,42 +1235,68 @@ private struct ScheduledTaskEditorView: View {
                                 draft.runAsUID = vm.users.first { $0.name == name }?.uid ?? 0
                             }
                         }
-                        formRow("Provider") {
-                            Picker("Provider", selection: $draft.provider) {
-                                ForEach(AgentProvider.allCases, id: \.self) { Text($0.rawValue.capitalized).tag($0) }
-                            }
-                            .labelsHidden()
-                            .onChange(of: draft.provider) { _, provider in
-                                if let snapshot = vm.providerSnapshots(for: provider).first {
-                                    draft.providerInstanceID = snapshot.id
-                                    draft.model = snapshot.models.first?.id ?? ""
+                        formRow("Model routing") {
+                            HStack(spacing: DS.Space.sm) {
+                                if vm.providersLoading {
+                                    ProgressView()
+                                        .controlSize(.small)
+                                        .accessibilityLabel("Loading providers")
                                 }
+                                Toggle("Auto", isOn: Binding(
+                                    get: { draft.routingMode == .auto },
+                                    set: { setAutoRoutingEnabled($0) }
+                                ))
+                                .toggleStyle(.switch)
+                                .tint(DS.Palette.success)
+                                .accessibilityIdentifier("scheduledTasks.editor.autoRouting")
                             }
                         }
-                        // Instance is part of provider binding; keep accessible picker for multi-account.
-                        formRow("Provider account") {
-                            Picker("Provider instance", selection: $draft.providerInstanceID) {
-                                ForEach(vm.providerSnapshots(for: draft.provider)) { Text($0.displayName).tag($0.id) }
+                        if draft.routingMode == .auto {
+                            formRow("Model") {
+                                Text("Auto selects the best available provider and model at run time.")
+                                    .font(DS.Font.caption)
+                                    .foregroundColor(DS.Palette.textSecondary)
+                                    .multilineTextAlignment(.trailing)
+                                    .fixedSize(horizontal: false, vertical: true)
                             }
-                            .labelsHidden()
-                        }
-                        formRow("Model") {
-                            Picker("Model", selection: $draft.model) {
-                                ForEach(vm.models(provider: draft.provider, instanceID: draft.providerInstanceID), id: \.id) {
-                                    Text($0.label).tag($0.id)
+                        } else {
+                            formRow("Provider") {
+                                Picker("Provider", selection: $draft.provider) {
+                                    ForEach(AgentProvider.allCases, id: \.self) { Text($0.rawValue.capitalized).tag($0) }
                                 }
-                                if !draft.model.isEmpty,
-                                   !vm.models(provider: draft.provider, instanceID: draft.providerInstanceID).contains(where: { $0.id == draft.model }) {
-                                    Text(draft.model).tag(draft.model)
+                                .labelsHidden()
+                                .onChange(of: draft.provider) { _, provider in
+                                    if let snapshot = vm.providerSnapshots(for: provider).first {
+                                        draft.providerInstanceID = snapshot.id
+                                        draft.model = snapshot.models.first?.id ?? ""
+                                    }
                                 }
                             }
-                            .labelsHidden()
-                        }
-                        formRow("Reasoning") {
-                            Picker("Reasoning", selection: $draft.reasoningEffort) {
-                                ForEach(AgentReasoningEffort.allCases, id: \.self) { Text($0.displayName).tag($0) }
+                            // Instance is part of provider binding; keep accessible picker for multi-account.
+                            formRow("Provider account") {
+                                Picker("Provider instance", selection: $draft.providerInstanceID) {
+                                    ForEach(vm.providerSnapshots(for: draft.provider)) { Text($0.displayName).tag($0.id) }
+                                }
+                                .labelsHidden()
                             }
-                            .labelsHidden()
+                            formRow("Model") {
+                                Picker("Model", selection: $draft.model) {
+                                    ForEach(vm.models(provider: draft.provider, instanceID: draft.providerInstanceID), id: \.id) {
+                                        Text($0.label).tag($0.id)
+                                    }
+                                    if !draft.model.isEmpty,
+                                       !vm.models(provider: draft.provider, instanceID: draft.providerInstanceID).contains(where: { $0.id == draft.model }) {
+                                        Text(draft.model).tag(draft.model)
+                                    }
+                                }
+                                .labelsHidden()
+                            }
+                            formRow("Reasoning") {
+                                Picker("Reasoning", selection: $draft.reasoningEffort) {
+                                    ForEach(AgentReasoningEffort.allCases, id: \.self) { Text($0.displayName).tag($0) }
+                                }
+                                .labelsHidden()
+                            }
                         }
                     }
 
@@ -1443,6 +1481,19 @@ private struct ScheduledTaskEditorView: View {
         if alert.runModal() == .alertFirstButtonReturn { onSave(draft) }
     }
 
+    private func setAutoRoutingEnabled(_ enabled: Bool) {
+        draft.routingMode = enabled ? .auto : .manual
+        guard !enabled,
+              draft.model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              let snapshot = vm.providers.first(where: { $0.enabled && $0.installed }) ?? vm.providers.first else {
+            return
+        }
+        draft.provider = snapshot.provider
+        draft.providerInstanceID = snapshot.id
+        draft.model = snapshot.models.first?.id ?? ""
+        draft.reasoningEffort = snapshot.models.first?.supportedReasoningEfforts.first ?? .high
+    }
+
     private func dayLabel(_ day: ScheduledWeekday) -> String {
         switch day {
         case .sunday: return "S"
@@ -1561,4 +1612,3 @@ private extension ScheduledWeekday {
         }
     }
 }
-
