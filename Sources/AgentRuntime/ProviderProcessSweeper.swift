@@ -120,8 +120,35 @@ public enum ProviderProcessSweeper {
 
         for tag in tags.sorted(by: { $0.pgid < $1.pgid }) {
             let kind = tag.managedKind ?? (tag.provider == nil ? nil : .provider)
-            guard let kind,
-                  let expectedIdentity = tag.startIdentity,
+            guard let kind else {
+                incomplete.append(tag.pgid)
+                continue
+            }
+
+            // Owner-anchored run-as-user rows (`foreignUserLaunch`) legitimately
+            // have no child start identity: a non-root parent cannot read a root
+            // `sudo` child's kernel metadata (EPERM). They must never poison scan
+            // completeness — one run-as-user turn otherwise blocks EVERY later
+            // provider admission with processAccountingUnavailable until the row
+            // ages out. Account them fail-safe instead: a live root PID and its
+            // ppid-descendants are counted (PID reuse can only overcount memory;
+            // the row is never signalled from a scan), an exited root counts 0.
+            if tag.startIdentity == nil {
+                guard rowsByPID[tag.pgid] != nil else { continue }
+                let treePIDs = Set([tag.pgid] + descendants(of: tag.pgid, in: processes))
+                let tree = processes.filter { treePIDs.contains($0.pid) }
+                switch kind {
+                case .provider:
+                    providerRoots += 1
+                    for row in tree { providerByPID[row.pid] = row }
+                case .sidecar:
+                    sidecarRoots += 1
+                    for row in tree { sidecarByPID[row.pid] = row }
+                }
+                continue
+            }
+
+            guard let expectedIdentity = tag.startIdentity,
                   tag.isolatedProcessGroup == tag.pgid,
                   !tag.executablePath.isEmpty else {
                 incomplete.append(tag.pgid)
