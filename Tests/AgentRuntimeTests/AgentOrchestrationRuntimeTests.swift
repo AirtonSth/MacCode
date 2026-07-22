@@ -233,6 +233,49 @@ final class AgentOrchestrationRuntimeTests: XCTestCase {
         XCTAssertTrue(try repository.receipts().isEmpty)
     }
 
+    func testAdmissionHonorsRolloutFlagAndResourceConstraints() throws {
+        let (db, root) = try database()
+        defer { try? FileManager.default.removeItem(atPath: root) }
+        let repository = AgentOrchestrationRepository(db: db)
+        let disabled = AgentOrchestrationRuntime(
+            repository: repository,
+            packageVerification: { true },
+            rolloutGate: { false },
+            killSwitch: { false }
+        )
+        XCTAssertThrowsError(try disabled.route(configuration: configuration(runtime: disabled), providerSnapshots: snapshots())) {
+            XCTAssertEqual($0 as? AgentOrchestrationAdmissionError, .rolloutDisabled)
+        }
+
+        let now = Date(timeIntervalSince1970: 100)
+        let runtime = AgentOrchestrationRuntime(
+            repository: repository,
+            packageVerification: { true },
+            rolloutGate: { true },
+            killSwitch: { false },
+            now: { now }
+        )
+        XCTAssertThrowsError(try runtime.admit(
+            runId: AgentRunID(), threadId: AgentThreadID(), configuration: configuration(runtime: runtime),
+            providerSnapshots: snapshots(), interactionMode: .default, permissionMode: .supervised,
+            attachments: [], deadlineAt: now.addingTimeInterval(-1)
+        )) { XCTAssertEqual($0 as? AgentOrchestrationAdmissionError, .deadlineExpired) }
+
+        let admission = try runtime.admit(
+            runId: AgentRunID(), threadId: AgentThreadID(), configuration: configuration(runtime: runtime),
+            providerSnapshots: snapshots(), interactionMode: .default, permissionMode: .supervised,
+            attachments: [], deadlineAt: now.addingTimeInterval(60), budgetTokens: 100,
+            reservedTokens: 50
+        )
+        XCTAssertEqual(admission.receipt.reservedTokens, 50)
+        XCTAssertNotNil(admission.receipt.reservationId)
+        try runtime.finalizeReceipt(runId: try XCTUnwrap(admission.receipt.runId), status: .completed)
+        let ledger = try repository.ledger()
+        XCTAssertEqual(ledger.count, 1)
+        XCTAssertEqual(ledger[0].tokenUsage, nil)
+        XCTAssertEqual(ledger[0].outcome, AgentRunStatus.completed.rawValue)
+    }
+
     func testAdmissionRejectsStalePolicyAndFallbackCatalogs() throws {
         let runtime = AgentOrchestrationRuntime(
             packageVerification: { true },

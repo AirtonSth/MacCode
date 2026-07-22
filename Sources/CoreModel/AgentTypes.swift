@@ -1461,6 +1461,7 @@ public struct AgentQueuedMessage: Codable, Sendable, Equatable, Identifiable {
     public var position: Int
     public let createdAt: Date
     public var updatedAt: Date
+    public var routingSnapshot: AgentQueuedMessageRoutingSnapshot?
 
     public init(
         id: AgentQueuedMessageID = AgentQueuedMessageID(),
@@ -1470,7 +1471,8 @@ public struct AgentQueuedMessage: Codable, Sendable, Equatable, Identifiable {
         interactionMode: AgentInteractionMode = .default,
         position: Int = 0,
         createdAt: Date = Date(),
-        updatedAt: Date = Date()
+        updatedAt: Date = Date(),
+        routingSnapshot: AgentQueuedMessageRoutingSnapshot? = nil
     ) {
         self.id = id
         self.threadId = threadId
@@ -1480,6 +1482,7 @@ public struct AgentQueuedMessage: Codable, Sendable, Equatable, Identifiable {
         self.position = position
         self.createdAt = createdAt
         self.updatedAt = updatedAt
+        self.routingSnapshot = routingSnapshot
     }
 }
 

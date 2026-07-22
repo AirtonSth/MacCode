@@ -1153,7 +1153,8 @@ public final class AgentQueuedMessageRepository {
             text: text,
             attachments: attachments,
             interactionMode: interactionMode,
-            position: position
+            position: position,
+            routingSnapshot: routingSnapshot ?? routingConfiguration.map { AgentQueuedMessageRoutingSnapshot(configuration: $0) }
         )
         try upsert(queued, routingConfiguration: routingConfiguration, routingSnapshot: routingSnapshot)
         return queued
@@ -1183,7 +1184,8 @@ public final class AgentQueuedMessageRepository {
                     text: text,
                     attachments: attachments,
                     interactionMode: interactionMode,
-                    position: position
+                    position: position,
+                    routingSnapshot: queuedRoutingSnapshot ?? routingConfiguration.map { AgentQueuedMessageRoutingSnapshot(configuration: $0) }
                 )
                 let insert = try database.prepare("""
                     INSERT INTO agent_queued_messages(id, thread_id, text, attachments_json, interaction_mode, position, created_at, updated_at)
@@ -1199,14 +1201,8 @@ public final class AgentQueuedMessageRepository {
                 try insert.bind(8, iso.string(from: queued.updatedAt))
                 _ = try insert.step()
 
-                if let queuedRoutingSnapshot {
-                    try persistRoutingSnapshot(queuedRoutingSnapshot, queuedMessageId: queued.id, database: database)
-                } else if let routingConfiguration {
-                    try persistRoutingSnapshot(
-                        AgentQueuedMessageRoutingSnapshot(configuration: routingConfiguration),
-                        queuedMessageId: queued.id,
-                        database: database
-                    )
+                if let routingSnapshot = queued.routingSnapshot {
+                    try persistRoutingSnapshot(routingSnapshot, queuedMessageId: queued.id, database: database)
                 }
 
                 let deleteDraft = try database.prepare(
@@ -1243,7 +1239,7 @@ public final class AgentQueuedMessageRepository {
                 try st.bind(7, iso.string(from: message.createdAt))
                 try st.bind(8, iso.string(from: message.updatedAt))
                 _ = try st.step()
-                if let routingSnapshot {
+                if let routingSnapshot = routingSnapshot ?? message.routingSnapshot {
                     try persistRoutingSnapshot(routingSnapshot, queuedMessageId: message.id, database: database)
                 } else if let routingConfiguration {
                     try persistRoutingSnapshot(
@@ -1806,7 +1802,7 @@ public final class AgentQueuedMessageRepository {
     }
 
     private func decodeRow(_ st: SQLiteStatement) -> AgentQueuedMessage {
-        AgentQueuedMessage(
+        var message = AgentQueuedMessage(
             id: AgentQueuedMessageID(UUID(uuidString: st.columnText(0) ?? "") ?? UUID()),
             threadId: AgentThreadID(UUID(uuidString: st.columnText(1) ?? "") ?? UUID()),
             text: st.columnText(2) ?? "",
@@ -1816,6 +1812,8 @@ public final class AgentQueuedMessageRepository {
             createdAt: parseDate(st.columnText(6)),
             updatedAt: parseDate(st.columnText(7))
         )
+        message.routingSnapshot = try? routingSnapshot(id: message.id)
+        return message
     }
 }
 

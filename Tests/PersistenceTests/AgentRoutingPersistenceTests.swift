@@ -110,6 +110,8 @@ final class AgentRoutingPersistenceTests: XCTestCase {
 
         XCTAssertEqual(try queue.routingSnapshot(id: queued.id), snapshot,
                        "enqueue must durably preserve every admission value for replay")
+        XCTAssertEqual(queued.routingSnapshot, snapshot,
+                       "the host queue payload must carry the same immutable snapshot for iOS replay")
     }
 
     func testQueueAdmissionSnapshotSurvivesThreadRoutingChange() throws {

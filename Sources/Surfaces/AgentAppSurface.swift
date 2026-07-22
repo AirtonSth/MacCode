@@ -121,17 +121,19 @@ public struct AgentModelPopoverPresentation: Equatable {
 
     public let mode: AgentRoutingMode
     public let reduceMotion: Bool
+    public let autoRoutingAvailable: Bool
 
-    public init(mode: AgentRoutingMode, reduceMotion: Bool) {
+    public init(mode: AgentRoutingMode, reduceMotion: Bool, autoRoutingAvailable: Bool = true) {
         self.mode = mode
         self.reduceMotion = reduceMotion
+        self.autoRoutingAvailable = autoRoutingAvailable
     }
 
     public var showsModelControls: Bool { mode != .auto }
     public var showsReasoningControls: Bool { mode != .auto }
     public var showsServiceTierControls: Bool { mode != .auto }
     public var showsDisclaimer: Bool { mode == .auto }
-    public var autoToggleEnabled: Bool { true }
+    public var autoToggleEnabled: Bool { autoRoutingAvailable }
     public var transition: AgentModelPopoverTransition {
         reduceMotion ? .none : .fadeAndSlide
     }
@@ -9338,7 +9340,11 @@ public struct AgentAppView: View {
         let running = vm.selectedThreadRunIsStartingOrRunning
         let configurationLocked = running || !vm.selectedProviderCanRun
         let reduceMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
-        let presentation = AgentModelPopoverPresentation(mode: vm.routingMode, reduceMotion: reduceMotion)
+        let presentation = AgentModelPopoverPresentation(
+            mode: vm.routingMode,
+            reduceMotion: reduceMotion,
+            autoRoutingAvailable: AgentOrchestrationRuntime.defaultRolloutEnabled()
+        )
         return VStack(alignment: .leading, spacing: DS.Space.xs) {
             Toggle("Auto", isOn: Binding(
                 get: { vm.routingMode == .auto },

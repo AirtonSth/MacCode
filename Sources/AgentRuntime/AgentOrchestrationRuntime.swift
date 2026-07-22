@@ -103,6 +103,10 @@ public struct AgentOrchestrationAdmissionReceipt: Codable, Sendable, Equatable {
     public let reservedTokens: Int?
     public let reservedCostMicros: Int?
     public let permissionMode: AgentPermissionMode
+    public let actualTokens: Int?
+    public let actualCostMicros: Int?
+    public let latencyMilliseconds: Int64?
+    public let qualityOutcome: String?
 
     public init(
         id: UUID = UUID(),
@@ -130,7 +134,11 @@ public struct AgentOrchestrationAdmissionReceipt: Codable, Sendable, Equatable {
         reservationId: String? = nil,
         reservedTokens: Int? = nil,
         reservedCostMicros: Int? = nil,
-        permissionMode: AgentPermissionMode = .supervised
+        permissionMode: AgentPermissionMode = .supervised,
+        actualTokens: Int? = nil,
+        actualCostMicros: Int? = nil,
+        latencyMilliseconds: Int64? = nil,
+        qualityOutcome: String? = nil
     ) {
         self.id = id
         self.runId = runId
@@ -158,6 +166,10 @@ public struct AgentOrchestrationAdmissionReceipt: Codable, Sendable, Equatable {
         self.reservedTokens = reservedTokens
         self.reservedCostMicros = reservedCostMicros
         self.permissionMode = permissionMode
+        self.actualTokens = actualTokens
+        self.actualCostMicros = actualCostMicros
+        self.latencyMilliseconds = latencyMilliseconds
+        self.qualityOutcome = qualityOutcome
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -166,7 +178,8 @@ public struct AgentOrchestrationAdmissionReceipt: Codable, Sendable, Equatable {
         case capabilitySnapshotId, decisionReason, admittedAt, lifecycleStatus
         case lifecycleUpdatedAt, finalizedAt, finalRunStatus, deadlineAt
         case budgetTokens, budgetCostMicros, reservationId, reservedTokens
-        case reservedCostMicros, permissionMode
+        case reservedCostMicros, permissionMode, actualTokens, actualCostMicros
+        case latencyMilliseconds, qualityOutcome
     }
 
     public init(from decoder: Decoder) throws {
@@ -201,6 +214,10 @@ public struct AgentOrchestrationAdmissionReceipt: Codable, Sendable, Equatable {
         reservedTokens = try values.decodeIfPresent(Int.self, forKey: .reservedTokens)
         reservedCostMicros = try values.decodeIfPresent(Int.self, forKey: .reservedCostMicros)
         permissionMode = try values.decodeIfPresent(AgentPermissionMode.self, forKey: .permissionMode) ?? .supervised
+        actualTokens = try values.decodeIfPresent(Int.self, forKey: .actualTokens)
+        actualCostMicros = try values.decodeIfPresent(Int.self, forKey: .actualCostMicros)
+        latencyMilliseconds = try values.decodeIfPresent(Int64.self, forKey: .latencyMilliseconds)
+        qualityOutcome = try values.decodeIfPresent(String.self, forKey: .qualityOutcome)
     }
 
     func updatingLifecycle(
@@ -234,15 +251,65 @@ public struct AgentOrchestrationAdmissionReceipt: Codable, Sendable, Equatable {
             reservationId: reservationId,
             reservedTokens: reservedTokens,
             reservedCostMicros: reservedCostMicros,
-            permissionMode: permissionMode
+            permissionMode: permissionMode,
+            actualTokens: actualTokens,
+            actualCostMicros: actualCostMicros,
+            latencyMilliseconds: latencyMilliseconds,
+            qualityOutcome: qualityOutcome
         )
+    }
+}
+
+/// Content-free ledger row used for reconciliation and rollout decisions.
+/// Prompt and provider output are intentionally absent.
+public struct AgentOrchestrationLedgerEntry: Codable, Sendable, Equatable {
+    public let runId: AgentRunID?
+    public let threadId: AgentThreadID
+    public let nodeId: String
+    public let attemptId: UUID?
+    public let provider: AgentProvider
+    public let providerInstanceId: String
+    public let model: String
+    public let capabilitySnapshotId: String
+    public let policyDigest: String
+    public let routingRevision: Int
+    public let reservationId: String?
+    public let admittedAt: Date
+    public let finalizedAt: Date?
+    public let tokenUsage: Int?
+    public let costMicros: Int?
+    public let latencyMilliseconds: Int64?
+    public let outcome: String
+
+    public init(receipt: AgentOrchestrationAdmissionReceipt, outcome: String, finalizedAt: Date? = nil) {
+        runId = receipt.runId
+        threadId = receipt.threadId
+        nodeId = receipt.nodeId
+        attemptId = receipt.attemptId
+        provider = receipt.provider
+        providerInstanceId = receipt.providerInstanceId
+        model = receipt.model
+        capabilitySnapshotId = receipt.capabilitySnapshotId
+        policyDigest = receipt.policyDigest
+        routingRevision = receipt.routingRevision
+        reservationId = receipt.reservationId
+        admittedAt = receipt.admittedAt
+        self.finalizedAt = finalizedAt
+        tokenUsage = receipt.actualTokens
+        costMicros = receipt.actualCostMicros
+        latencyMilliseconds = receipt.latencyMilliseconds
+        self.outcome = outcome
     }
 }
 
 public enum AgentOrchestrationAdmissionError: Error, Sendable, Equatable, CustomStringConvertible {
     case packageUnavailable
+    case rolloutDisabled
     case killSwitchEnabled
     case invalidPolicy
+    case deadlineExpired
+    case invalidBudget
+    case quotaExceeded
     case invalidRoutingMode
     case noEligibleProvider
     case receiptPersistenceFailed(String)
@@ -251,10 +318,18 @@ public enum AgentOrchestrationAdmissionError: Error, Sendable, Equatable, Custom
         switch self {
         case .packageUnavailable:
             return "The pinned remote-code-orchestrate package is unavailable or invalid."
+        case .rolloutDisabled:
+            return "Auto model routing is disabled by the orchestration rollout flag."
         case .killSwitchEnabled:
             return "Auto model routing is disabled by the orchestration kill switch."
         case .invalidPolicy:
             return "The Auto routing policy is invalid or no longer current."
+        case .deadlineExpired:
+            return "The Auto routing deadline has already expired."
+        case .invalidBudget:
+            return "The Auto routing budget or reservation is invalid."
+        case .quotaExceeded:
+            return "The Auto routing quota is unavailable for this run."
         case .invalidRoutingMode:
             return "Orchestration admission requires an Auto routing configuration."
         case .noEligibleProvider:
@@ -271,6 +346,7 @@ public enum AgentOrchestrationAdmissionError: Error, Sendable, Equatable, Custom
 public final class AgentOrchestrationRepository: @unchecked Sendable {
     private static let admissionAction = "agent.orchestration.admitted"
     private static let lifecycleAction = "agent.orchestration.lifecycle"
+    private static let ledgerAction = "agent.orchestration.ledger"
     private enum Storage {
         case database(DeviceTrustRepository)
         case file(URL)
@@ -305,6 +381,44 @@ public final class AgentOrchestrationRepository: @unchecked Sendable {
 
     public func update(_ receipt: AgentOrchestrationAdmissionReceipt) throws {
         try persist(receipt, action: Self.lifecycleAction)
+    }
+
+    public func saveLedger(_ entry: AgentOrchestrationLedgerEntry) throws {
+        let data = try encoder.encode(entry)
+        guard let detail = String(data: data, encoding: .utf8) else {
+            throw AgentOrchestrationAdmissionError.receiptPersistenceFailed("invalid UTF-8")
+        }
+        switch storage {
+        case .database(let repository):
+            try repository.audit(actor: "RemoteCode", action: Self.ledgerAction, detail: detail, at: entry.finalizedAt ?? entry.admittedAt)
+        case .file(let url):
+            lock.lock()
+            defer { lock.unlock() }
+            try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+            if !FileManager.default.fileExists(atPath: url.path) { try Data().write(to: url, options: .atomic) }
+            let handle = try FileHandle(forWritingTo: url)
+            defer { try? handle.close() }
+            try handle.seekToEnd()
+            try handle.write(contentsOf: data + Data([0x0A]))
+            try handle.synchronize()
+        }
+    }
+
+    public func ledger(limit: Int = 50) throws -> [AgentOrchestrationLedgerEntry] {
+        let details: [String]
+        switch storage {
+        case .database(let repository):
+            details = try repository.listAuditLog(limit: max(1, limit) * 4)
+                .filter { $0.action == Self.ledgerAction }
+                .compactMap(\.detail)
+        case .file(let url):
+            lock.lock()
+            defer { lock.unlock() }
+            guard let data = try? Data(contentsOf: url), let text = String(data: data, encoding: .utf8) else { return [] }
+            details = text.split(separator: "\n").map(String.init)
+        }
+        return details.compactMap { try? decoder.decode(AgentOrchestrationLedgerEntry.self, from: Data($0.utf8)) }
+            .prefix(max(1, limit)).map { $0 }
     }
 
     private func persist(_ receipt: AgentOrchestrationAdmissionReceipt, action: String) throws {
@@ -388,21 +502,28 @@ public final class AgentOrchestrationRuntime: @unchecked Sendable {
     public static let packageID = AgentSkillInstaller.remoteCodeOrchestratePinnedPackage.skillID
     public static let requiredPackageRevision = AgentSkillInstaller.remoteCodeOrchestratePinnedPackage.sourceRevision
     public static let policyContractVersion = "1"
+    public static let rolloutFlagKey = "agent.orchestration.rollout-enabled"
+    private static let maxConcurrentReservations = 32
 
     public let policyDigest: String
     private let repository: AgentOrchestrationRepository
     private let packageVerification: @Sendable () -> Bool
+    private let rolloutGate: @Sendable () -> Bool
     private let killSwitch: @Sendable () -> Bool
     private let now: @Sendable () -> Date
+    private let reservationLock = NSLock()
+    private var reservations: [String: (tokens: Int?, costMicros: Int?, deadlineAt: Date?)] = [:]
 
     public init(
         repository: AgentOrchestrationRepository = AgentOrchestrationRepository(),
         packageVerification: @escaping @Sendable () -> Bool = AgentOrchestrationRuntime.verifyInstalledPackage,
+        rolloutGate: @escaping @Sendable () -> Bool = AgentOrchestrationRuntime.defaultRolloutEnabled,
         killSwitch: @escaping @Sendable () -> Bool = AgentOrchestrationRuntime.defaultKillSwitch,
         now: @escaping @Sendable () -> Date = { Date() }
     ) {
         self.repository = repository
         self.packageVerification = packageVerification
+        self.rolloutGate = rolloutGate
         self.killSwitch = killSwitch
         self.now = now
         policyDigest = Self.sha256Hex(
@@ -497,20 +618,65 @@ public final class AgentOrchestrationRuntime: @unchecked Sendable {
             reservedCostMicros: reservedCostMicros,
             permissionMode: permissionMode
         )
+        let reservation = try reserveResources(
+            receiptId: receipt.id,
+            deadlineAt: deadlineAt,
+            budgetTokens: budgetTokens,
+            budgetCostMicros: budgetCostMicros,
+            reservationId: reservationId,
+            reservedTokens: reservedTokens,
+            reservedCostMicros: reservedCostMicros
+        )
+        let admittedReceipt = AgentOrchestrationAdmissionReceipt(
+            id: receipt.id,
+            runId: receipt.runId,
+            threadId: receipt.threadId,
+            nodeId: receipt.nodeId,
+            attemptId: receipt.attemptId,
+            routingRevision: receipt.routingRevision,
+            policyDigest: receipt.policyDigest,
+            policyVersion: receipt.policyVersion,
+            packageRevision: receipt.packageRevision,
+            provider: receipt.provider,
+            providerInstanceId: receipt.providerInstanceId,
+            model: receipt.model,
+            capabilitySnapshotId: receipt.capabilitySnapshotId,
+            decisionReason: receipt.decisionReason,
+            admittedAt: receipt.admittedAt,
+            lifecycleStatus: receipt.lifecycleStatus,
+            lifecycleUpdatedAt: receipt.lifecycleUpdatedAt,
+            finalizedAt: receipt.finalizedAt,
+            finalRunStatus: receipt.finalRunStatus,
+            deadlineAt: receipt.deadlineAt,
+            budgetTokens: receipt.budgetTokens,
+            budgetCostMicros: receipt.budgetCostMicros,
+            reservationId: reservation.id,
+            reservedTokens: reservation.tokens,
+            reservedCostMicros: reservation.costMicros,
+            permissionMode: receipt.permissionMode
+        )
         do {
-            try repository.save(receipt)
+            try repository.save(admittedReceipt)
         } catch let error as AgentOrchestrationAdmissionError {
+            if let reservationId = reservation.id { releaseReservation(reservationId) }
             throw error
         } catch {
+            if let reservationId = reservation.id { releaseReservation(reservationId) }
             throw AgentOrchestrationAdmissionError.receiptPersistenceFailed(String(describing: error))
         }
-        return (resolved, receipt)
+        return (resolved, admittedReceipt)
     }
 
     public func finalizeReceipt(runId: AgentRunID, status: AgentRunStatus) throws {
         guard let receipt = try repository.receipt(runId: runId),
               receipt.lifecycleStatus != .finalized else { return }
-        try repository.update(receipt.updatingLifecycle(.finalized, finalRunStatus: status, at: now()))
+        let finalizedAt = now()
+        let finalized = receipt.updatingLifecycle(.finalized, finalRunStatus: status, at: finalizedAt)
+        try repository.update(finalized)
+        try repository.saveLedger(
+            AgentOrchestrationLedgerEntry(receipt: finalized, outcome: status.rawValue, finalizedAt: finalizedAt)
+        )
+        if let reservationId = receipt.reservationId { releaseReservation(reservationId) }
     }
 
     public func markReceiptUnknown(runId: AgentRunID) throws {
@@ -537,6 +703,7 @@ public final class AgentOrchestrationRuntime: @unchecked Sendable {
         configuration: AgentRoutingConfiguration,
         providerSnapshots: [AgentProviderSnapshot]
     ) throws -> AgentOrchestrationRoute {
+        guard rolloutGate() else { throw AgentOrchestrationAdmissionError.rolloutDisabled }
         guard !killSwitch() else { throw AgentOrchestrationAdmissionError.killSwitchEnabled }
         guard packageVerification() else { throw AgentOrchestrationAdmissionError.packageUnavailable }
         guard configuration.mode == .auto else { throw AgentOrchestrationAdmissionError.invalidRoutingMode }
@@ -643,6 +810,60 @@ public final class AgentOrchestrationRuntime: @unchecked Sendable {
 
     public static func defaultKillSwitch() -> Bool {
         UserDefaults.standard.bool(forKey: "agent.orchestration.kill-switch")
+    }
+
+    public static func defaultRolloutEnabled() -> Bool {
+        guard let value = UserDefaults.standard.object(forKey: rolloutFlagKey) as? Bool else { return true }
+        return value
+    }
+
+    private func reserveResources(
+        receiptId: UUID,
+        deadlineAt: Date?,
+        budgetTokens: Int?,
+        budgetCostMicros: Int?,
+        reservationId requestedReservationId: String?,
+        reservedTokens: Int?,
+        reservedCostMicros: Int?
+    ) throws -> (id: String?, tokens: Int?, costMicros: Int?) {
+        let current = now()
+        if let deadlineAt, deadlineAt <= current { throw AgentOrchestrationAdmissionError.deadlineExpired }
+        guard budgetTokens == nil || budgetTokens! > 0,
+              budgetCostMicros == nil || budgetCostMicros! > 0,
+              reservedTokens == nil || reservedTokens! > 0,
+              reservedCostMicros == nil || reservedCostMicros! > 0,
+              reservedTokens == nil || budgetTokens == nil || reservedTokens! <= budgetTokens!,
+              reservedCostMicros == nil || budgetCostMicros == nil || reservedCostMicros! <= budgetCostMicros! else {
+            throw AgentOrchestrationAdmissionError.invalidBudget
+        }
+        guard budgetTokens != nil || budgetCostMicros != nil || requestedReservationId == nil else {
+            throw AgentOrchestrationAdmissionError.invalidBudget
+        }
+        guard budgetTokens != nil || budgetCostMicros != nil else {
+            return (requestedReservationId, reservedTokens, reservedCostMicros)
+        }
+        let id = requestedReservationId ?? "orchestration-\(receiptId.uuidString)"
+        reservationLock.lock()
+        defer { reservationLock.unlock() }
+        if let existing = reservations[id] {
+            guard existing.tokens == reservedTokens, existing.costMicros == reservedCostMicros, existing.deadlineAt == deadlineAt else {
+                throw AgentOrchestrationAdmissionError.quotaExceeded
+            }
+            return (id, existing.tokens, existing.costMicros)
+        }
+        guard reservations.count < Self.maxConcurrentReservations else {
+            throw AgentOrchestrationAdmissionError.quotaExceeded
+        }
+        let tokens = reservedTokens ?? budgetTokens
+        let costMicros = reservedCostMicros ?? budgetCostMicros
+        reservations[id] = (tokens, costMicros, deadlineAt)
+        return (id, tokens, costMicros)
+    }
+
+    private func releaseReservation(_ id: String) {
+        reservationLock.lock()
+        reservations.removeValue(forKey: id)
+        reservationLock.unlock()
     }
 
     private static func capabilitySnapshotID(_ snapshot: AgentProviderSnapshot) -> String {

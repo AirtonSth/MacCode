@@ -2685,8 +2685,12 @@ public final class JSONRPCDispatcher {
             let kind: String
             switch error {
             case .packageUnavailable: kind = "package_unavailable"
+            case .rolloutDisabled: kind = "rollout_disabled"
             case .killSwitchEnabled: kind = "kill_switch_enabled"
             case .invalidPolicy: kind = "invalid_policy"
+            case .deadlineExpired: kind = "deadline_expired"
+            case .invalidBudget: kind = "invalid_budget"
+            case .quotaExceeded: kind = "quota_exceeded"
             case .invalidRoutingMode: kind = "invalid_mode"
             case .noEligibleProvider: kind = "no_eligible_provider"
             case .receiptPersistenceFailed: kind = "receipt_persistence_failed"
