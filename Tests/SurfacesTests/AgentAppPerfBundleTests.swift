@@ -27,6 +27,13 @@ import AgentRuntime
 @MainActor
 final class AgentAppPerfBundleTests: XCTestCase {
 
+    override func setUp() {
+        super.setUp()
+        // Isolate from model choices remembered by earlier test runs via
+        // AgentLastModelStore.shared (runner-level UserDefaults leak).
+        UserDefaults.standard.removeObject(forKey: "agent.lastModel.byProvider.v1")
+    }
+
     // MARK: - Helpers
 
     private func makeVM(provider: AgentProviderRunner? = nil) throws -> (AgentAppViewModel, AgentThreadRepository) {
@@ -157,6 +164,10 @@ final class AgentAppPerfBundleTests: XCTestCase {
         let (vm, _) = try makeVM()
         vm.createThread(title: "stream invalidation")
         let tid = try XCTUnwrap(vm.selectedThreadId)
+        // Drain the select-time off-main history load before counting: its
+        // publish lands nondeterministically inside the measured window and
+        // this guard is about STREAM-batch publishes, not thread-open ones.
+        await vm.waitForMessageHistoryLoad()
         let runId = AgentRunID()
         var publishCount = 0
         let cancellable = vm.objectWillChange.sink { publishCount += 1 }

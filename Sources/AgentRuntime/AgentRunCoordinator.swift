@@ -990,7 +990,13 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     ) -> Bool {
         guard adapter.hasSession(threadId: threadId) else { return false }
         guard let summary = adapter.listSessions().first(where: { $0.threadId == threadId }) else {
-            return true
+            // A session the adapter cannot summarize proves nothing about an
+            // in-flight turn. Treating it as live routed composer sends into
+            // the queue on an IDLE thread ("will run after the current turn"
+            // with no turn), and with no queue repo wired the prompt was
+            // silently dropped. Runs stay serialized by the coordinator's
+            // exclusive thread mutation either way.
+            return false
         }
         return summary.status == .running || summary.status == .pending
     }

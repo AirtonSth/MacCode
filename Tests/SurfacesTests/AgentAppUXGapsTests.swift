@@ -17,6 +17,13 @@ import AgentRuntime
 ///  UX-SR1-BADGE — showsTranslatedBadge: true=>true, false=>false
 @MainActor
 final class AgentAppUXGapsTests: XCTestCase {
+
+    override func setUp() {
+        super.setUp()
+        // Isolate from model choices remembered by earlier test runs via
+        // AgentLastModelStore.shared (runner-level UserDefaults leak).
+        UserDefaults.standard.removeObject(forKey: "agent.lastModel.byProvider.v1")
+    }
     func test_imageViewPresentationUsesBasenameAndKeepsPrivateActionURL() throws {
         let item = AssistantItem(
             id: "generated-image",
@@ -382,8 +389,8 @@ final class AgentAppUXGapsTests: XCTestCase {
     func test_fullAccessScopeCopy_matchesPersistedThreadSetting() {
         XCTAssertEqual(
             AgentAppView.fullAccessScopeDescription,
-            "The agent runs tools and edits without asking for this thread until you change it.",
-            "full-access copy must describe the persisted thread scope instead of promising a process session scope"
+            "The agent runs tools, edits, and proposed plans without asking for this thread until you change it.",
+            "full-access copy must describe the persisted thread scope — including that proposed plans auto-implement — instead of promising a process session scope"
         )
         XCTAssertEqual(
             AgentAppView.sessionApprovalHelp,

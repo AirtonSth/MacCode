@@ -14,6 +14,15 @@ import CoreModel
 @MainActor
 final class AgentAppViewModelTests: XCTestCase {
 
+    override func setUp() {
+        super.setUp()
+        // AgentLastModelStore.shared persists to the test runner's
+        // UserDefaults, so model choices remembered by EARLIER test runs leak
+        // into preferredModelForCurrentProvider and make these tests
+        // machine-dependent. Key literal mirrors AgentLastModelStore.key.
+        UserDefaults.standard.removeObject(forKey: "agent.lastModel.byProvider.v1")
+    }
+
     private func makeVM(provider: AgentProviderRunner? = nil) throws -> (AgentAppViewModel, AgentThreadRepository) {
         let tmp = NSTemporaryDirectory() + "rc2-vm-agent-" + UUID().uuidString
         let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
@@ -89,7 +98,11 @@ final class AgentAppViewModelTests: XCTestCase {
         AgentProviderSnapshotFactory.snapshot(
             provider: .codex,
             models: [AgentModelDescriptor(id: "gpt-5", label: "GPT-5", provider: .codex)],
-            binaryPath: "/usr/local/bin/codex",
+            // Runnable on any machine: send()'s fail-closed provider gate probes
+            // the real binary path, so a fixture path that only exists on some
+            // dev machines silently blocks the sends this test asserts on.
+            binaryPath: "/usr/bin/true",
+            authenticated: true,
             capabilitiesOverride: AgentProviderCapabilities(
                 supportsAttachments: true,
                 supportedAttachmentKinds: [.file, .image],
@@ -443,6 +456,9 @@ final class AgentAppViewModelTests: XCTestCase {
             )
         ]
         vm.setProviderInstance("codex-cli")
+        // Pin the model the UI way (setModel remembers it for the provider) so
+        // createThread's preferred-model re-resolution lands on it.
+        vm.setModel("gpt-5.5")
         vm.createThread(title: "locked source")
         let id = try XCTUnwrap(vm.selectedThreadId)
         vm.messages.append(AgentMessage(threadId: id, role: .user, content: "first turn"))
@@ -1125,8 +1141,17 @@ final class AgentAppViewModelTests: XCTestCase {
                       "/plan must remain discoverable on bare / even when dozens of skills exist")
         XCTAssertTrue(suggestions.filter { $0.kind == .slashCommand }.count >= 6,
                       "the first page of bare-/ suggestions must be dominated by commands, not skills")
-        XCTAssertFalse(titles.contains(where: { $0.hasPrefix("/ads-skill-") }),
-                       "ads-* skills must not occupy the entire first page ahead of /goal /plan")
+        // Commands are never truncated and always rank ahead; skills then get
+        // their OWN bounded budget (they must stay discoverable, not banned —
+        // the old page-exclusion hid every project/user skill on bare `/`).
+        let lastCommandIndex = suggestions.lastIndex { $0.kind == .slashCommand }
+        let firstSkillIndex = suggestions.firstIndex { $0.kind == .skill }
+        if let lastCommandIndex, let firstSkillIndex {
+            XCTAssertLessThan(lastCommandIndex, firstSkillIndex,
+                              "every command must rank ahead of the first ads-* skill")
+        }
+        XCTAssertLessThanOrEqual(suggestions.filter { $0.kind == .skill }.count, 8,
+                                 "flooding skills stay within their own page budget")
     }
 
     func test_normalizingComposerTriggerPrefix_commandsAndSkillsWithEitherTrigger() {
@@ -2123,14 +2148,20 @@ final class AgentAppViewModelTests: XCTestCase {
     func test_createThreadCopiesCurrentConfigFromLastThread() throws {
         let (vm, repo) = try makeVM()
         vm.provider = .codex
-        vm.model = "gpt-5.5"
+        vm.availableModels = [
+            AgentModelDescriptor(id: "gpt-5.5", label: "GPT-5.5", provider: .codex)
+        ]
+        // createThread re-resolves the model from the last one the USER chose
+        // for the provider (setModel → rememberCurrentModel), not from whatever
+        // an older selected thread left on the VM — so choose it the UI way.
+        vm.setModel("gpt-5.5")
         vm.permissionMode = .fullAccess
         vm.reasoningEffort = .medium
         vm.createThread(title: "next")
 
         let id = try XCTUnwrap(vm.selectedThreadId)
         let t = try repo.get(id: id)
-        XCTAssertEqual(t?.model, "gpt-5.5")
+        XCTAssertEqual(t?.model, "gpt-5.5", "new threads must inherit the last model the user chose for the provider")
         XCTAssertEqual(t?.permissionMode, .fullAccess,
                        "new threads must inherit the last active permission mode")
         XCTAssertEqual(t?.reasoningEffort, .medium,
@@ -2281,6 +2312,11 @@ final class AgentAppViewModelTests: XCTestCase {
         await vm.send()
         XCTAssertEqual(try repo.get(id: id)?.title, "Refactor the auth module please",
                        "the first message must rename a still-default thread")
+        // send() and the didFinish fan-out each schedule an off-main history
+        // reload; poll until the durable user row lands in the published array.
+        await waitAsync("user message lands in reloaded history", timeout: 2) {
+            vm.messages.contains { $0.role == .user && $0.content == "Refactor the auth module please" }
+        }
         XCTAssertTrue(vm.messages.contains { $0.role == .user && $0.content == "Refactor the auth module please" })
     }
 
@@ -3011,6 +3047,11 @@ final class AgentAppViewModelTests: XCTestCase {
                           finalMessage: "done", providerThreadId: nil)
         await fulfillment(of: [callbackFinished], timeout: 2)
 
+        // The rail reload is coalesced (scheduleReloadThreads, ~50ms) so many
+        // open Agent Apps don't stampede on one finish fan-out — poll for it.
+        await waitAsync("rail reflects coordinator-owned unread", timeout: 2) {
+            vm.threads.first { $0.id == id }?.hasUnread == true
+        }
         XCTAssertTrue(vm.threads.first { $0.id == id }?.hasUnread ?? false,
                       "the callback must reflect coordinator-owned unread state in the rail")
 
@@ -3975,14 +4016,15 @@ final class AgentAppViewModelTests: XCTestCase {
     }
 
     func test_loadModels_keepsModelValidForProvider() async throws {
-        // F8 update: loadModels no longer rewrites a non-empty pinned model
-        // against a fallback list (see AgentAppModelPickerFixesTests). The B8
-        // contract lives in the real switch flow: setProvider clears the model
-        // and loadModels must then fill in a valid one for the new provider.
+        // Auto-routing update: setProvider no longer clears the model — it
+        // immediately resolves the provider's preferred model (last-used →
+        // built-in default → first listed) so the composer never shows an
+        // empty or foreign model while the async list loads.
         let (vm, _) = try makeVM()
         vm.providerSnapshots = []
         vm.setProvider(.codex)
-        XCTAssertEqual(vm.model, "", "a provider switch clears the model before the async load")
+        XCTAssertEqual(vm.model, AgentDefaultModelSelection.codexBuiltInDefault,
+                       "a provider switch resolves the built-in default before the async load")
         await vm.loadModels()
         if !vm.availableModels.isEmpty {
             XCTAssertTrue(vm.availableModels.contains { $0.id == vm.model },
@@ -4207,7 +4249,9 @@ final class AgentAppViewModelTests: XCTestCase {
             )
         ]
 
-        vm.providerInstanceId = "claude-cli"
+        // The Source picker row calls setProviderInstance (AgentAppSurface
+        // :9484); a raw property write is not a product path.
+        vm.setProviderInstance("claude-cli")
 
         XCTAssertEqual(vm.selectedProviderSnapshot?.provider, .claude)
         XCTAssertEqual(vm.modelOptionsForSelectedProvider.map(\.provider), [.claude],
@@ -4326,7 +4370,7 @@ final class AgentAppViewModelTests: XCTestCase {
 
     // MARK: Full-thread message history (replaces the old viewport window)
 
-    func test_selectingThreadLoadsEntireThreadWithBodiesRetained() throws {
+    func test_selectingThreadLoadsEntireThreadWithBodiesRetained() async throws {
         let (vm, _) = try makeVM()
         vm.createThread(title: "long")
         let tid = vm.selectedThreadId!
@@ -4336,11 +4380,13 @@ final class AgentAppViewModelTests: XCTestCase {
                 content: "m\(i)", createdAt: base.addingTimeInterval(Double(i))))
         }
         vm.selectThread(tid)
-        // The fix: the entire thread loads at once — no infinite-scroll paging and no
-        // off-screen body eviction. Paging + evict flipped row heights mid-scroll, which
-        // is what made auto-scroll jump. Full load makes every row's height stable.
+        // selectThread hydrates history via a bounded off-main page (500 rows /
+        // 24 MB budget) so thread-open never blocks MainActor; await it before
+        // asserting. A 100-row thread fits the page, so the full-load contract
+        // below is unchanged for normal threads.
+        await vm.waitForMessageHistoryLoad()
         XCTAssertEqual(vm.messages.count, 100,
-                       "the whole thread must load up front, not a 30-row viewport window")
+                       "a normal thread loads fully within one bounded page, not a 30-row viewport window")
         XCTAssertEqual(vm.messages.first?.content, "m0", "oldest message present and ordered first")
         XCTAssertEqual(vm.messages.last?.content, "m99", "newest message present and ordered last")
         XCTAssertTrue(vm.messages.allSatisfy { !$0.content.isEmpty },
@@ -4397,7 +4443,7 @@ final class AgentAppViewModelTests: XCTestCase {
         XCTAssertEqual(AgentAppViewModel.chooseReplayEvents(persisted: persisted, snapshot: nil).count, 5)
     }
 
-    func test_loadWindowClipsHugePersistedMessagesBeforeRendering() throws {
+    func test_loadWindowClipsHugePersistedMessagesBeforeRendering() async throws {
         let (vm, _) = try makeVM()
         vm.createThread(title: "huge")
         let tid = vm.selectedThreadId!
@@ -4408,6 +4454,7 @@ final class AgentAppViewModelTests: XCTestCase {
         ))
 
         vm.selectThread(tid)
+        await vm.waitForMessageHistoryLoad()
 
         XCTAssertEqual(vm.messages.first?.content.count, AssistantTimelineState.liveTextLimit,
                        "a huge persisted transcript must be clipped before SwiftUI renders it")
@@ -4452,9 +4499,10 @@ final class AgentAppViewModelTests: XCTestCase {
         // Reopen from a COLD state (fresh VM has no live timeline) — this exercises the
         // replay-from-persisted-events path, which used to cap at the last 500 events.
         vm.selectThread(threadId)
+        await vm.waitForMessageHistoryLoad()
         let persistedCount = (try? vm.messageRepo.list(threadId: threadId).count) ?? -1
         XCTAssertEqual(vm.messages.count, persistedCount,
-                       "reopening a long thread loads the ENTIRE thread (no infinite-scroll window)")
+                       "reopening a long thread loads the whole persisted history within the bounded page")
         XCTAssertGreaterThan(vm.timeline.turns.count, 80,
                              "reopen replays the WHOLE persisted thread (>500-event window, >80-turn cap) — the long run's turns must come back, not just the last few")
 
@@ -4915,6 +4963,7 @@ final class AgentAppViewModelTests: XCTestCase {
                                            coordinator: coordinator, threadRepo: threadRepo,
                                            messageRepo: messageRepo)
         reloadedVM.selectThread(streamedThread)
+        await reloadedVM.waitForMessageHistoryLoad()
 
         XCTAssertTrue(reloadedVM.timeline.turns.flatMap(\.items).contains {
             $0.type == .assistantMessage && $0.body.contains("partial stream")
@@ -6341,7 +6390,8 @@ final class AgentAppViewModelTests: XCTestCase {
     /// output. The default must be a model the CLI actually accepts.
     func test_defaultModel_isARealCodexModel() async throws {
         let (vm, _) = try makeVM()
-        XCTAssertEqual(vm.model, "gpt-5.5", "fresh threads must start on a live codex model")
+        XCTAssertEqual(vm.model, AgentDefaultModelSelection.codexBuiltInDefault,
+                       "fresh threads must start on the product's built-in codex default")
         await vm.loadModels()
         XCTAssertTrue(vm.availableModels.contains { $0.id == vm.model },
                       "the default model must be one the picker actually offers")

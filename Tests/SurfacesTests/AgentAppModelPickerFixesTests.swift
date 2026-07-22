@@ -12,6 +12,13 @@ import Persistence
 @MainActor
 final class AgentAppModelPickerFixesTests: XCTestCase {
 
+    override func setUp() {
+        super.setUp()
+        // Isolate from model choices remembered by earlier test runs via
+        // AgentLastModelStore.shared (runner-level UserDefaults leak).
+        UserDefaults.standard.removeObject(forKey: "agent.lastModel.byProvider.v1")
+    }
+
     private func makeVM() throws -> AgentAppViewModel {
         let tmp = NSTemporaryDirectory() + "rc2-vm-modelpicker-" + UUID().uuidString
         let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
@@ -187,7 +194,12 @@ final class AgentAppModelPickerFixesTests: XCTestCase {
                       "with no snapshots, the flagged baked-in fetch is exactly what the picker shows")
 
         let live = [codexModel("gpt-6-live")]
-        vm.providerSnapshotLoader = { [AgentProviderSnapshotFactory.snapshot(provider: .codex, models: live)] }
+        // Declare the source: a nil modelDiscoverySource makes
+        // snapshotsWithVerifiedCatalogProvenance probe the REAL provider binary
+        // to verify the catalog, which is neither hermetic nor this test's point.
+        vm.providerSnapshotLoader = { [AgentProviderSnapshotFactory.snapshot(
+            provider: .codex, models: live, modelDiscoverySource: .live
+        )] }
         await vm.loadProviderSnapshots()
 
         XCTAssertFalse(vm.availableModelsAreFallback,

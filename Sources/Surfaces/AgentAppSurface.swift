@@ -832,7 +832,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         timeline.enforceAggregateHotTextBudget()
         lastErrorRecoverable = Self.displayedErrorIsRecoverable(in: persistedReplay)
         rehydrateDurableActiveState(threadId: id)
-        refreshSR1TranslationStateFromTimeline()
+        refreshSR1TranslationStateFromTimeline(preservingExisting: true)
         // PERF: rebuild the O(1) item index once over the fully-replayed timeline so
         // subsequent item-location lookups skip the O(turns x items) linear scan.
         timelineItemIndex = TimelineItemIndex(turns: timeline.turns)
@@ -861,7 +861,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 self.timeline.enforceAggregateHotTextBudget()
                 self.rehydrateDurableActiveState(threadId: id)
                 self.lastErrorRecoverable = Self.displayedErrorIsRecoverable(in: replayEvents)
-                self.refreshSR1TranslationStateFromTimeline()
+                self.refreshSR1TranslationStateFromTimeline(preservingExisting: true)
                 self.timelineItemIndex = TimelineItemIndex(turns: self.timeline.turns)
             } catch {
                 guard self.selectedThreadId == id else { return }
@@ -1401,12 +1401,31 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             let loaded = await Self.loadMessagePageOffMain(repository: repository, threadId: id)
             guard let self, !Task.isCancelled, !self.isDisposed,
                   self.selectedThreadId == id else { return }
-            self.messages = loaded?.rows ?? []
+            let loadedRows = loaded?.rows ?? []
+            // Rows appended in-memory while the page was being read (system
+            // notes, the send() user-message mirror) must survive the swap —
+            // the page snapshot predates them. Content-level dedupe keeps the
+            // user-message mirror from doubling once its durable copy (written
+            // under the run id) is in the page.
+            let appendedWhileLoading = self.messages.filter { candidate in
+                candidate.threadId == id
+                    && !loadedRows.contains {
+                        $0.id == candidate.id
+                            || ($0.role == candidate.role && $0.content == candidate.content)
+                    }
+            }
+            self.messages = loadedRows + appendedWhileLoading
             self.messageHistoryIsPartial = loaded?.hasMoreOlder ?? false
             if self.messageHistoryIsPartial {
                 NSLog("[AgentApp] recent message page loaded: \(self.messages.count) rows; older durable messages remain outside the hot UI window")
             }
         }
+    }
+
+    /// Test seam: awaits the off-main message-history page kicked off by
+    /// selectThread, so tests can assert on `messages` deterministically.
+    func waitForMessageHistoryLoad() async {
+        await messageHistoryLoadTask?.value
     }
 
     nonisolated static func loadMessagePageOffMain(
@@ -3685,8 +3704,10 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 return
             }
             _ = handleSlashCommand("/\(slash.command)")
-            if selectedThreadCanQueuePrompt {
-                await enqueuePromptWhileRunning(text: slash.argument, attached: attachments)
+            // A failed/unavailable enqueue must fall through to a real run —
+            // returning anyway silently dropped the user's prompt.
+            if selectedThreadCanQueuePrompt,
+               await enqueuePromptWhileRunning(text: slash.argument, attached: attachments) {
                 return
             }
             _ = await startProviderRun(
@@ -3701,8 +3722,8 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             prompt = ""
             return
         }
-        if selectedThreadCanQueuePrompt {
-            await enqueuePromptWhileRunning(text: text, attached: attachments)
+        if selectedThreadCanQueuePrompt,
+           await enqueuePromptWhileRunning(text: text, attached: attachments) {
             return
         }
         _ = await startProviderRun(text: text, attached: attachments, recordHistory: false, interactionMode: interactionMode)
@@ -4627,7 +4648,8 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     }
 
     func refreshSR1TranslationStateFromTimeline(
-        _ sourceTimeline: AssistantTimelineState? = nil
+        _ sourceTimeline: AssistantTimelineState? = nil,
+        preservingExisting: Bool = false
     ) {
         let sourceTimeline = sourceTimeline ?? timeline
         var ids: Set<AgentMessageID> = []
@@ -4637,6 +4659,18 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             let id = AgentMessageID(uuid)
             ids.insert(id)
             originals[id] = translation.originalText
+        }
+        // Two callers, two semantics:
+        // - Live-stream batches REPLACE, so translations evicted by the hot-text
+        //   budget also leave the published cache (memory bound).
+        // - selectThread replays PRESERVE, because live badges
+        //   (onSR1TranslatedMessageId) are not in the persisted replay and a
+        //   same-thread reselect or the deferred provider-snapshot re-replay must
+        //   not wipe them (F6 keeps clearing as the explicit job of the
+        //   thread-SWITCH branch in selectThread).
+        if preservingExisting {
+            ids.formUnion(sr1TranslatedMessageIds)
+            originals.merge(sr1OriginalTextsByMessageId) { fromTimeline, _ in fromTimeline }
         }
         if ids != sr1TranslatedMessageIds {
             sr1TranslatedMessageIds = ids
