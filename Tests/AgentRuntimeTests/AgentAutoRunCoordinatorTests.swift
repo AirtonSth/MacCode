@@ -177,9 +177,10 @@ final class AgentAutoRunCoordinatorTests: XCTestCase {
         let claude = RecordingProviderRunner(provider: .claude)
         let codex = RecordingProviderRunner(provider: .codex)
         let admissionReceiptID = UUID()
+        let queuedDeadline = Date(timeIntervalSince1970: 4_102_444_800)
         let admissionSnapshot = AgentQueuedMessageRoutingSnapshot(
             configuration: immutableConfiguration,
-            deadlineAt: Date(timeIntervalSince1970: 123),
+            deadlineAt: queuedDeadline,
             budgetTokens: 900,
             budgetCostMicros: 42,
             reservationId: "queue-reservation",
