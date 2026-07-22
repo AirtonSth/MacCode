@@ -1645,13 +1645,20 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         return messages.last(where: { $0.role == .assistant })?.content
     }
 
-    /// UX-MAC_AGENT-BG-AWAIT: true when the selected thread finished while the
-    /// agent was still waiting on a background job it launched (e.g. "Standing by
-    /// for the demo recording to complete."). Surfaced as an "awaiting" badge plus
-    /// a Continue button instead of a misleading green "completed".
+    /// UX-MAC_AGENT-BG-AWAIT / incomplete-turn: true when the selected thread
+    /// finished while still incomplete — either waiting on a background job or
+    /// stopped mid multi-phase workflow (e.g. "Next: Phase 3 — Review"). Surfaced
+    /// as an "awaiting" badge plus a Continue button instead of a misleading green
+    /// "completed".
     public var isAwaitingBackgroundWork: Bool {
         status == .completed
-            && BackgroundAwaitContinuation.isAwaitingBackgroundWork(latestFinalAssistantMessage)
+            && IncompleteTurnContinuation.isIncompleteTurn(latestFinalAssistantMessage)
+    }
+
+    /// Reason for the incomplete-turn chrome, if any (drives Continue prompt).
+    public var incompleteTurnReason: IncompleteTurnContinuationReason? {
+        guard status == .completed else { return nil }
+        return IncompleteTurnContinuation.classify(latestFinalAssistantMessage)
     }
 
     /// P2: threads visible in the rail after applying the search query.
@@ -3894,12 +3901,12 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         _ = await startProviderRun(text: text, attached: attachments, recordHistory: false, interactionMode: interactionMode)
     }
 
-    /// UX-MAC_AGENT-BG-AWAIT: manually resume a thread that stalled awaiting a
-    /// background job (the supervised-mode counterpart of the autonomous auto-nudge
-    /// the coordinator runs for full-access threads).
+    /// UX-MAC_AGENT-BG-AWAIT / incomplete-turn: manually resume a thread that
+    /// stalled mid-task (supervised counterpart of the autonomous auto-nudge).
+    /// Uses the reason-specific prompt (workflow handoff vs background await).
     public func continueAfterBackgroundWait() async {
-        guard isAwaitingBackgroundWork else { return }
-        prompt = BackgroundAwaitContinuation.continuationPrompt
+        guard let reason = incompleteTurnReason else { return }
+        prompt = IncompleteTurnContinuation.prompt(for: reason)
         await send()
     }
 
@@ -7589,22 +7596,26 @@ public struct AgentAppView: View {
         if !expandedCompletedWorkTurns.isEmpty { expandedCompletedWorkTurns.formIntersection(liveTurnIds) }
     }
 
-    // UX-MAC_AGENT-BG-AWAIT: when a thread ends while the agent is still waiting on
-    // a background job it launched, the run reads "awaiting" (not a green
-    // "completed"); this banner lets the user resume it. Full-access threads are
-    // also auto-nudged by the coordinator, so this is mainly the supervised path.
+    // UX-MAC_AGENT-BG-AWAIT / incomplete-turn: when a thread ends incomplete
+    // (background job await or multi-phase handoff), the run reads "awaiting"
+    // (not a green "completed"); this banner lets the user resume it. Full-access
+    // threads are also auto-nudged by the coordinator, so this is mainly supervised.
     @ViewBuilder
     private var backgroundAwaitBanner: some View {
-        if vm.isAwaitingBackgroundWork {
+        if let reason = vm.incompleteTurnReason {
             HStack(spacing: DS.Space.sm) {
                 Image(systemName: "hourglass")
                     .font(.system(size: 12))
                     .foregroundColor(DS.Palette.warning)
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("Agent is waiting on a background task")
+                    Text(reason == .workflowHandoff
+                         ? "Agent stopped mid-workflow"
+                         : "Agent is waiting on a background task")
                         .font(DS.Font.caption.weight(.semibold))
                         .foregroundColor(DS.Palette.textSecondary)
-                    Text("The run ended while standing by. Resume it to check the task and finish.")
+                    Text(reason == .workflowHandoff
+                         ? "The run ended between phases. Resume it to finish the original task."
+                         : "The run ended while standing by. Resume it to check the task and finish.")
                         .font(DS.Font.caption2)
                         .foregroundColor(DS.Palette.textTertiary)
                 }

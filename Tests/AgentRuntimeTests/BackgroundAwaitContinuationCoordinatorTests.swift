@@ -167,4 +167,121 @@ final class BackgroundAwaitContinuationCoordinatorTests: XCTestCase {
         XCTAssertEqual(runner.startCount, 1,
                        "a run whose final message is a real answer (not a background-await stall) must not be auto-nudged")
     }
+
+    func test_fullAccessWorkflowHandoff_autoNudgesWithWorkflowPromptNotBackground() async throws {
+        // Incident: Phase 2 ends with "Next: Phase 3 — Review" and no marker → was
+        // green completed forever. Must auto-nudge with the workflow prompt, never
+        // the BashOutput background-await prompt.
+        let handoff = """
+        **PHASE 2 RESULT: HIGH_CONFIDENCE**
+        Strategy is executable.
+        **Next: Phase 3 — Review**
+        """
+        let runner = PromptCapturingStallingRunner(finalMessage: handoff)
+        let (coordinator, thread, tmp) = try makePromptCapturingCoordinator(runner: runner)
+
+        _ = try await coordinator.startRun(AgentRunRequest(
+            threadId: thread.id, provider: .claude, model: "fake-model", cwd: tmp,
+            prompt: "implement all in todo.md /sam-work", permissionMode: .fullAccess
+        ))
+
+        await waitUntil { runner.startCount >= 2 }
+        try? await Task.sleep(nanoseconds: 200_000_000)
+        XCTAssertGreaterThanOrEqual(runner.startCount, 2,
+                                    "workflow handoff must auto-nudge at least once")
+        XCTAssertTrue(
+            runner.prompts.contains(where: { $0 == IncompleteTurnContinuation.workflowContinuationPrompt }),
+            "auto-nudge must use the workflow continuation prompt"
+        )
+        XCTAssertFalse(
+            runner.prompts.contains(BackgroundAwaitContinuation.continuationPrompt),
+            "workflow handoff must NOT use the background BashOutput prompt"
+        )
+    }
+
+    func test_fullAccessPhaseHandoffWithMisusedMarker_usesWorkflowPrompt() async throws {
+        // Phase 1 ended with Proceeding to Phase 2 + [[RC_AWAITING]]. Workflow
+        // classification must win over the marker so we do not send BashOutput.
+        let handoff = """
+        Phase 1 COMPLETE.
+        Proceeding to Phase 2: **REFINE** — stress-test the implementation strategy.
+
+        [[RC_AWAITING]]
+        """
+        let runner = PromptCapturingStallingRunner(finalMessage: handoff)
+        let (coordinator, thread, tmp) = try makePromptCapturingCoordinator(runner: runner)
+
+        _ = try await coordinator.startRun(AgentRunRequest(
+            threadId: thread.id, provider: .claude, model: "fake-model", cwd: tmp,
+            prompt: "/sam-work", permissionMode: .fullAccess
+        ))
+
+        await waitUntil { runner.startCount >= 2 }
+        try? await Task.sleep(nanoseconds: 200_000_000)
+        XCTAssertTrue(
+            runner.prompts.contains(where: { $0 == IncompleteTurnContinuation.workflowContinuationPrompt }),
+            "misused marker on phase handoff must still get the workflow prompt"
+        )
+        XCTAssertFalse(
+            runner.prompts.contains(BackgroundAwaitContinuation.continuationPrompt),
+            "must not send background-await prompt when workflow handoff matches"
+        )
+    }
+
+    /// Like StallingRunner but records every start prompt for reason assertions.
+    private final class PromptCapturingStallingRunner: AgentProviderRunner, @unchecked Sendable {
+        let provider: AgentProvider
+        let finalMessage: String
+        private let lock = NSLock()
+        private var _starts = 0
+        private var _prompts: [String] = []
+        var startCount: Int { lock.lock(); defer { lock.unlock() }; return _starts }
+        var prompts: [String] { lock.lock(); defer { lock.unlock() }; return _prompts }
+
+        init(provider: AgentProvider = .claude, finalMessage: String) {
+            self.provider = provider
+            self.finalMessage = finalMessage
+        }
+
+        func listModels() async -> [AgentModelDescriptor] { [] }
+
+        func startRun(_ request: AgentRunRequest, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) async throws -> AgentRunHandle {
+            lock.lock()
+            _starts += 1
+            _prompts.append(request.prompt)
+            lock.unlock()
+            let handle = AgentRunHandle(runId: request.runId, process: nil) {}
+            let final = finalMessage
+            let providerThreadId = request.providerThreadId ?? UUID().uuidString
+            Task.detached {
+                onEvent(.status(.running))
+                onEvent(.event(.threadStarted(threadId: providerThreadId, providerThreadId: providerThreadId)))
+                let turnId = UUID().uuidString
+                onEvent(.event(.turnStarted(turnId: turnId)))
+                let itemId = UUID().uuidString
+                onEvent(.event(.itemStarted(item: AssistantItem(id: itemId, turnId: turnId, type: .assistantMessage, startedAtMs: 0))))
+                onEvent(.event(.itemDelta(itemId: itemId, bodyAppend: final, outputAppend: nil, summary: nil)))
+                onEvent(.event(.itemCompleted(itemId: itemId, finalState: .completed)))
+                onEvent(.event(.turnCompleted(turnId: turnId, finalMessage: final)))
+                onEvent(.status(.completed))
+                onEvent(.finished(.completed, finalMessage: final, providerThreadId: providerThreadId))
+            }
+            return handle
+        }
+    }
+
+    private func makePromptCapturingCoordinator(runner: PromptCapturingStallingRunner) throws -> (AgentRunCoordinator, AgentThread, String) {
+        let tmp = NSTemporaryDirectory() + "rc2-wf-handoff-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let thread = AgentThread(title: "wf-handoff", provider: runner.provider, model: "fake-model")
+        try threadRepo.upsert(thread)
+        let coordinator = AgentRunCoordinator(runRepo: runRepo, messageRepo: messageRepo,
+                                              threadRepo: threadRepo,
+                                              providers: [runner.provider: runner])
+        coordinator.backgroundAwaitContinuationDelay = 0
+        return (coordinator, thread, tmp)
+    }
 }
