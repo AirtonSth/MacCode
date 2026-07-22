@@ -258,13 +258,46 @@ public struct AgentOrchestrationAdmissionReceipt: Codable, Sendable, Equatable {
             qualityOutcome: qualityOutcome
         )
     }
+
+    func updatingUsage(_ usage: AssistantTokenUsage?, latencyMilliseconds: Int64) -> AgentOrchestrationAdmissionReceipt {
+        AgentOrchestrationAdmissionReceipt(
+            id: id,
+            runId: runId,
+            threadId: threadId,
+            nodeId: nodeId,
+            attemptId: attemptId,
+            routingRevision: routingRevision,
+            policyDigest: policyDigest,
+            policyVersion: policyVersion,
+            packageRevision: packageRevision,
+            provider: provider,
+            providerInstanceId: providerInstanceId,
+            model: model,
+            capabilitySnapshotId: capabilitySnapshotId,
+            decisionReason: decisionReason,
+            admittedAt: admittedAt,
+            lifecycleStatus: lifecycleStatus,
+            lifecycleUpdatedAt: lifecycleUpdatedAt,
+            finalizedAt: finalizedAt,
+            finalRunStatus: finalRunStatus,
+            deadlineAt: deadlineAt,
+            budgetTokens: budgetTokens,
+            budgetCostMicros: budgetCostMicros,
+            reservationId: reservationId,
+            reservedTokens: reservedTokens,
+            reservedCostMicros: reservedCostMicros,
+            permissionMode: permissionMode,
+            actualTokens: usage?.totalTokens,
+            latencyMilliseconds: latencyMilliseconds
+        )
+    }
 }
 
 /// Content-free ledger row used for reconciliation and rollout decisions.
 /// Prompt and provider output are intentionally absent.
 public struct AgentOrchestrationLedgerEntry: Codable, Sendable, Equatable {
     public let runId: AgentRunID?
-    public let threadId: AgentThreadID
+    public let threadIdHash: String
     public let nodeId: String
     public let attemptId: UUID?
     public let provider: AgentProvider
@@ -283,7 +316,8 @@ public struct AgentOrchestrationLedgerEntry: Codable, Sendable, Equatable {
 
     public init(receipt: AgentOrchestrationAdmissionReceipt, outcome: String, finalizedAt: Date? = nil) {
         runId = receipt.runId
-        threadId = receipt.threadId
+        threadIdHash = SHA256.hash(data: Data(receipt.threadId.value.uuidString.utf8))
+            .map { String(format: "%02x", $0) }.joined()
         nodeId = receipt.nodeId
         attemptId = receipt.attemptId
         provider = receipt.provider
@@ -667,11 +701,13 @@ public final class AgentOrchestrationRuntime: @unchecked Sendable {
         return (resolved, admittedReceipt)
     }
 
-    public func finalizeReceipt(runId: AgentRunID, status: AgentRunStatus) throws {
+    public func finalizeReceipt(runId: AgentRunID, status: AgentRunStatus, usage: AssistantTokenUsage? = nil) throws {
         guard let receipt = try repository.receipt(runId: runId),
               receipt.lifecycleStatus != .finalized else { return }
         let finalizedAt = now()
-        let finalized = receipt.updatingLifecycle(.finalized, finalRunStatus: status, at: finalizedAt)
+        let finalized = receipt
+            .updatingLifecycle(.finalized, finalRunStatus: status, at: finalizedAt)
+            .updatingUsage(usage, latencyMilliseconds: Int64(max(0, finalizedAt.timeIntervalSince(receipt.admittedAt) * 1_000)))
         try repository.update(finalized)
         try repository.saveLedger(
             AgentOrchestrationLedgerEntry(receipt: finalized, outcome: status.rawValue, finalizedAt: finalizedAt)
@@ -682,7 +718,13 @@ public final class AgentOrchestrationRuntime: @unchecked Sendable {
     public func markReceiptUnknown(runId: AgentRunID) throws {
         guard let receipt = try repository.receipt(runId: runId),
               receipt.lifecycleStatus == .accepted else { return }
-        try repository.update(receipt.updatingLifecycle(.unknown, at: now()))
+        let updatedAt = now()
+        let unknown = receipt.updatingLifecycle(.unknown, at: updatedAt)
+        try repository.update(unknown)
+        try repository.saveLedger(
+            AgentOrchestrationLedgerEntry(receipt: unknown, outcome: "unknown", finalizedAt: updatedAt)
+        )
+        if let reservationId = receipt.reservationId { releaseReservation(reservationId) }
     }
 
     public func reconcileReceipts(
@@ -813,7 +855,7 @@ public final class AgentOrchestrationRuntime: @unchecked Sendable {
     }
 
     public static func defaultRolloutEnabled() -> Bool {
-        guard let value = UserDefaults.standard.object(forKey: rolloutFlagKey) as? Bool else { return true }
+        guard let value = UserDefaults.standard.object(forKey: rolloutFlagKey) as? Bool else { return false }
         return value
     }
 

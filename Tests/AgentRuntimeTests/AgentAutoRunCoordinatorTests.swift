@@ -4,6 +4,16 @@ import CoreModel
 @testable import AgentRuntime
 
 final class AgentAutoRunCoordinatorTests: XCTestCase {
+    override func setUp() {
+        super.setUp()
+        UserDefaults.standard.set(true, forKey: AgentOrchestrationRuntime.rolloutFlagKey)
+    }
+
+    override func tearDown() {
+        UserDefaults.standard.removeObject(forKey: AgentOrchestrationRuntime.rolloutFlagKey)
+        super.tearDown()
+    }
+
     private func database() throws -> (SQLiteDB, String) {
         let root = NSTemporaryDirectory() + "rc-auto-run-coordinator-" + UUID().uuidString
         let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: root).run()

@@ -26,6 +26,7 @@ final class AgentAutoRoutingViewModelTests: XCTestCase {
         let runtime = AgentOrchestrationRuntime(
             repository: AgentOrchestrationRepository(db: db),
             packageVerification: { true },
+            rolloutGate: { true },
             killSwitch: { false }
         )
         let vm = AgentAppViewModel(

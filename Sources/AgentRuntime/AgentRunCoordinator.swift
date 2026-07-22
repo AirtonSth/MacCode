@@ -87,6 +87,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     /// A changed attempt/admission scope forces a process refresh before the next turn.
     private var providerTurnScopes: [AgentThreadID: ProviderTurnScope] = [:]
     private var activeTurnIds: [AgentRunID: String] = [:]
+    private var latestTokenUsage: [AgentRunID: AssistantTokenUsage] = [:]
     private var activeAssistantMessageIds: [AgentRunID: AgentMessageID] = [:]
     private var activeProviderTextItemTypes: [AgentRunID: [String: AssistantItemType]] = [:]
     private var bufferedProviderTextItems: [AgentRunID: [String: BufferedProviderTextItem]] = [:]
@@ -2048,6 +2049,11 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         switch event {
         case .event(let rawEvent):
             let ev = sanitizeFinalAssistantEvent(rawEvent)
+            if case .tokenUsage(let usage) = ev {
+                lock.lock()
+                latestTokenUsage[runId] = usage
+                lock.unlock()
+            }
             if allowFinalResponseTranslation,
                case .turnCompleted(let turnId, let finalMessage) = ev,
                let finalMessage,
@@ -2412,8 +2418,12 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                 scheduleTerminalDurabilityRetry(runId: runId, threadId: threadId)
                 return
             }
+            lock.lock()
+            let usage = latestTokenUsage[runId]
+            latestTokenUsage.removeValue(forKey: runId)
+            lock.unlock()
             do {
-                try orchestrationRuntime?.finalizeReceipt(runId: runId, status: status)
+                try orchestrationRuntime?.finalizeReceipt(runId: runId, status: status, usage: usage)
             } catch {
                 emitPersistenceIssue(
                     "orchestration.receipt.finalize",

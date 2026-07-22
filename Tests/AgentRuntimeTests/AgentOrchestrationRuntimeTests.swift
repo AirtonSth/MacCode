@@ -4,6 +4,16 @@ import CoreModel
 @testable import AgentRuntime
 
 final class AgentOrchestrationRuntimeTests: XCTestCase {
+    override func setUp() {
+        super.setUp()
+        UserDefaults.standard.set(true, forKey: AgentOrchestrationRuntime.rolloutFlagKey)
+    }
+
+    override func tearDown() {
+        UserDefaults.standard.removeObject(forKey: AgentOrchestrationRuntime.rolloutFlagKey)
+        super.tearDown()
+    }
+
     func testVerifierUsesCanonicalInstallerPackageAndFailsClosedOnTampering() throws {
         XCTAssertEqual(
             Array(AgentOrchestrationRuntime.defaultPackageURL().pathComponents.suffix(3)),
@@ -274,6 +284,42 @@ final class AgentOrchestrationRuntimeTests: XCTestCase {
         XCTAssertEqual(ledger.count, 1)
         XCTAssertEqual(ledger[0].tokenUsage, nil)
         XCTAssertEqual(ledger[0].outcome, AgentRunStatus.completed.rawValue)
+    }
+
+    func testUnknownReconciliationReleasesReservationAndWritesHashedUsageFreeLedger() throws {
+        let (db, root) = try database()
+        defer { try? FileManager.default.removeItem(atPath: root) }
+        let repository = AgentOrchestrationRepository(db: db)
+        let runtime = AgentOrchestrationRuntime(
+            repository: repository,
+            packageVerification: { true },
+            rolloutGate: { true },
+            killSwitch: { false },
+            now: { Date(timeIntervalSince1970: 200) }
+        )
+        let threadId = AgentThreadID()
+        let first = try runtime.admit(
+            runId: AgentRunID(), threadId: threadId, configuration: configuration(runtime: runtime),
+            providerSnapshots: snapshots(), interactionMode: .default, permissionMode: .supervised,
+            attachments: [], budgetTokens: 100, reservationId: "reconcile-once", reservedTokens: 90
+        )
+        try runtime.markReceiptUnknown(runId: try XCTUnwrap(first.receipt.runId))
+        let unknown = try XCTUnwrap(repository.ledger().first)
+        XCTAssertEqual(unknown.outcome, "unknown")
+        XCTAssertEqual(unknown.threadIdHash.count, 64)
+        XCTAssertFalse(unknown.threadIdHash.contains(threadId.value.uuidString))
+
+        let second = try runtime.admit(
+            runId: AgentRunID(), threadId: threadId, configuration: configuration(runtime: runtime),
+            providerSnapshots: snapshots(), interactionMode: .default, permissionMode: .supervised,
+            attachments: [], budgetTokens: 100, reservationId: "reconcile-once", reservedTokens: 90
+        )
+        let usage = AssistantTokenUsage(inputTokens: 40, outputTokens: 3, totalTokens: 43)
+        try runtime.finalizeReceipt(runId: try XCTUnwrap(second.receipt.runId), status: .completed, usage: usage)
+        let finalized = try XCTUnwrap(repository.receipt(runId: second.receipt.runId!))
+        XCTAssertEqual(finalized.actualTokens, 43)
+        XCTAssertNotNil(finalized.latencyMilliseconds)
+        XCTAssertEqual(try repository.ledger().first?.tokenUsage, 43)
     }
 
     func testAdmissionRejectsStalePolicyAndFallbackCatalogs() throws {
