@@ -369,7 +369,7 @@ final class TokenSaverAppContextTests: XCTestCase {
             "RC_TOKEN_SAVER_PROJECT_ID": "project",
             "RC_TOKEN_SAVER_THREAD_ID": "thread",
             "RC_TOKEN_SAVER_ATTEMPT_ID": "attempt",
-        ])
+        ], purpose: .supportProcess)
 
         try process.run()
         stdin.fileHandleForWriting.write(Data("unit tests passed\nno failures\n".utf8))

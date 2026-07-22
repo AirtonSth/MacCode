@@ -421,7 +421,7 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
         let stderrPipe = Pipe()
         // Route through `sudo -u` when a different macOS user is selected so the
         // provider reads that user's ~/.claude (their logged-in account + MCP).
-        let baseEnv = CodexRunner.processEnvironment(overrides: request.environment, provider: .claude)
+        let baseEnv = CodexRunner.processEnvironment(overrides: request.environment, purpose: .agentTurn(.claude))
         let isForeignUser = (request.runAsUser.map { $0.uid != getuid() } == true)
         let foreignUserUID: uid_t? = isForeignUser ? request.runAsUser!.uid : nil
         let askpass = isForeignUser

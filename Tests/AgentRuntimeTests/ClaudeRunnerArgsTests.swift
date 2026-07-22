@@ -115,6 +115,33 @@ final class ClaudeRunnerArgsTests: XCTestCase {
                       "always-on Distill carries the safety ABI")
     }
 
+    func test_mcpAvailabilityDirectiveRidesBothLiveClaudeRoutes() {
+        // WHY: in --print / autonomous mode Claude preemptively declared a connected
+        // OAuth MCP server (Linear) "unauthenticated / unavailable in this
+        // non-interactive session" and returned BLOCKED WITHOUT ever calling the
+        // tool — even though it had loaded `mcp__linear__get_issue` via ToolSearch
+        // and the cached token works headlessly. The corrective rule must ride EVERY
+        // Claude turn on BOTH live routes (CLI streaming + SDK bridge) from one
+        // shared source (`alwaysOnClaudeDirectives`) so the two routes cannot drift.
+        // Asserts the LIVE builder `buildStreamingArgs` and `claudeSystemPrompt`,
+        // never the dead `buildArgs` (unused for turns), so a green test is meaningful.
+        let request = req()
+        let cliArgs = ClaudeRunner.buildStreamingArgs(request)
+        guard let idx = cliArgs.firstIndex(of: "--append-system-prompt") else {
+            return XCTFail("streaming runs must append a system prompt carrying the MCP-availability rule")
+        }
+        let cliPrompt = cliArgs[cliArgs.index(after: idx)]
+        XCTAssertTrue(cliPrompt.contains(BackgroundAwaitContinuation.mcpToolAvailabilityDirective),
+                      "the live CLI streaming route must carry the MCP-availability rule so the agent stops preemptively refusing connected MCP tools")
+
+        let sdkPrompt = ClaudeAgentSDKBridgeAdapter.claudeSystemPrompt(environment: request.environment)
+        XCTAssertTrue(sdkPrompt.contains(BackgroundAwaitContinuation.mcpToolAvailabilityDirective),
+                      "the SDK bridge route must carry the identical MCP-availability rule (both routes share one source so they cannot drift)")
+
+        XCTAssertTrue(BackgroundAwaitContinuation.alwaysOnClaudeDirectives.contains(BackgroundAwaitContinuation.awaitingMarker),
+                      "the shared directive bundle must retain the background-await rule alongside the new MCP rule")
+    }
+
     func test_modelAndPromptPlacement() {
         let a = ClaudeRunner.buildArgs(req())
         let m = a.firstIndex(of: "--model")!

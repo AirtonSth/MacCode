@@ -572,18 +572,78 @@ public final class TokenSaverDistillServiceController {
 
     /// Production ownership reconciliation. No-ops under XCTest so suite
     /// start/stop never signals a developer's real sidecar; tests inject a spy.
+    ///
+    /// Also reaps live HTTP/MLX Distill servers found via process table that are
+    /// not the keepPID. Worktree/manual sidecars are often absent from the
+    /// ownership ledger, and leaving them alive breaks the multi-GB singleton
+    /// gate (second spawn fails or competes for unified memory).
+    /// Never signals `mcp` helpers (multi-instance CLI path).
     nonisolated public static func defaultTerminateForeignServers(
         keeping keepPID: Int32?
     ) -> ProviderProcessSweepResult {
         if ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil {
             return ProviderProcessSweepResult(orphanRootPIDs: [], terminatedPIDs: [], failedPIDs: [])
         }
-        _ = keepPID
+        var orphanRootPIDs: [Int32] = []
+        var terminatedPIDs: [Int32] = []
+        var failedPIDs: [Int32] = []
         do {
-            return try ProviderProcessSweeper.terminatePersistedOrphanedProviderRuntimes(minAge: 0)
+            let ledger = try ProviderProcessSweeper.terminatePersistedOrphanedProviderRuntimes(minAge: 0)
+            orphanRootPIDs.append(contentsOf: ledger.orphanRootPIDs)
+            terminatedPIDs.append(contentsOf: ledger.terminatedPIDs)
+            failedPIDs.append(contentsOf: ledger.failedPIDs)
         } catch {
+            // Fall through to process-table reaping; ledger absence must not
+            // leave a multi-GB foreign Distill HTTP server alive.
+        }
+        let table = reapForeignHTTPDistillServers(keeping: keepPID)
+        orphanRootPIDs.append(contentsOf: table.orphanRootPIDs)
+        terminatedPIDs.append(contentsOf: table.terminatedPIDs)
+        failedPIDs.append(contentsOf: table.failedPIDs)
+        return ProviderProcessSweepResult(
+            orphanRootPIDs: orphanRootPIDs,
+            terminatedPIDs: terminatedPIDs,
+            failedPIDs: failedPIDs
+        )
+    }
+
+    /// TERM then brief wait then KILL for HTTP Distill servers only (`mcp` excluded).
+    nonisolated private static func reapForeignHTTPDistillServers(
+        keeping keepPID: Int32?
+    ) -> ProviderProcessSweepResult {
+        guard let rows = try? ProviderProcessSweeper.psRowsThrowing() else {
             return ProviderProcessSweepResult(orphanRootPIDs: [], terminatedPIDs: [], failedPIDs: [])
         }
+        var orphans: [Int32] = []
+        var terminated: [Int32] = []
+        var failed: [Int32] = []
+        for row in rows {
+            guard ProviderProcessSweeper.isRemoteCodeDistillServerCommand(row.command) else { continue }
+            if let keepPID, row.pid == keepPID { continue }
+            orphans.append(row.pid)
+            let pid = row.pid
+            guard pid > 1 else { continue }
+            _ = Darwin.kill(pid, SIGTERM)
+            Thread.sleep(forTimeInterval: 0.25)
+            if processIsAlive(pid) {
+                _ = Darwin.kill(pid, SIGKILL)
+                Thread.sleep(forTimeInterval: 0.05)
+            }
+            if processIsAlive(pid) {
+                failed.append(pid)
+            } else {
+                terminated.append(pid)
+            }
+        }
+        return ProviderProcessSweepResult(
+            orphanRootPIDs: orphans,
+            terminatedPIDs: terminated,
+            failedPIDs: failed
+        )
+    }
+
+    nonisolated private static func processIsAlive(_ pid: Int32) -> Bool {
+        Darwin.kill(pid, 0) == 0 || errno == EPERM
     }
 
     deinit {

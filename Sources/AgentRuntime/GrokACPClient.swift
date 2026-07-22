@@ -411,7 +411,7 @@ public final class GrokACPClient: @unchecked Sendable {
         process.executableURL = URL(fileURLWithPath: path)
         process.arguments = ["agent", "stdio"]
         process.currentDirectoryURL = URL(fileURLWithPath: cwd)
-        process.environment = CodexRunner.processEnvironment(overrides: environment, provider: .grok)
+        process.environment = CodexRunner.processEnvironment(overrides: environment, purpose: .agentTurn(.grok))
         process.standardInput = stdinPipe
         process.standardOutput = stdoutPipe
         process.standardError = stderrPipe

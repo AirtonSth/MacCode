@@ -1013,66 +1013,42 @@ public final class DistillHTTPServer: @unchecked Sendable {
                 await metrics.recordVolatileTokenWarnings(volatileScan.warningCount)
             }
             await metrics.recordSystemPromptHash(CacheAlignerPromptContract.systemPromptHash(for: distillRequest))
+            // Recovery scope is optional for compression. Without complete scope we still
+            // run the scheduler so `cmd | distill` saves tokens; we only attach a
+            // reversible handle when store+scope prepare succeeds (store-before-loss).
+            // Prior behavior returned input verbatim whenever scope was missing, which
+            // made bare CLI pipes and partial agent env always fail-open with zero savings.
             var scopedContext: TokenSaverRecoveryRequestContext?
             if distillRequest.effectiveRunMode == .optimize {
                 scopedContext = recoveryContext(headers: request.headers, requiresOperationID: true)
-                guard let scopedRecoveryStore,
-                      let context = scopedContext else {
-                    let tokens = TokenEstimator.estimate(distillRequest.input)
-                    let response = DistillResponse(
-                        requestID: distillRequest.id,
-                        output: distillRequest.input,
-                        inputCharacters: distillRequest.input.count,
-                        inputTokens: tokens,
-                        outputTokens: tokens,
-                        originalHandle: nil,
-                        runMode: .optimize,
-                        routeStage: .verbatim
-                    )
-                    if let onSuccess { await onSuccess(distillRequest, response) }
-                    await metrics.recordSuccess()
-                    send(status: 200, body: response, connection: connection)
-                    return
-                }
-                do {
-                    if let existing = try scopedRecoveryStore.lookupInvocation(context: context) {
-                        let terminal = existing.state != .prepared
-                            || existing.transportOutcome == .sentUnknown
-                            || existing.transportOutcome == .acked
-                        if terminal {
-                            let tokens = TokenEstimator.estimate(distillRequest.input)
-                            let response = DistillResponse(
-                                requestID: distillRequest.id,
-                                output: distillRequest.input,
-                                inputCharacters: distillRequest.input.count,
-                                inputTokens: tokens,
-                                outputTokens: tokens,
-                                originalHandle: nil,
-                                runMode: .optimize,
-                                routeStage: .verbatim
-                            )
-                            if let onSuccess { await onSuccess(distillRequest, response) }
-                            await metrics.recordSuccess()
-                            send(status: 200, body: response, connection: connection)
-                            return
+                if let scopedRecoveryStore, let context = scopedContext {
+                    do {
+                        if let existing = try scopedRecoveryStore.lookupInvocation(context: context) {
+                            let terminal = existing.state != .prepared
+                                || existing.transportOutcome == .sentUnknown
+                                || existing.transportOutcome == .acked
+                            if terminal {
+                                let tokens = TokenEstimator.estimate(distillRequest.input)
+                                let response = DistillResponse(
+                                    requestID: distillRequest.id,
+                                    output: distillRequest.input,
+                                    inputCharacters: distillRequest.input.count,
+                                    inputTokens: tokens,
+                                    outputTokens: tokens,
+                                    originalHandle: nil,
+                                    runMode: .optimize,
+                                    routeStage: .verbatim
+                                )
+                                if let onSuccess { await onSuccess(distillRequest, response) }
+                                await metrics.recordSuccess()
+                                send(status: 200, body: response, connection: connection)
+                                return
+                            }
                         }
+                    } catch {
+                        // Fall through to compress without handle.
+                        scopedContext = nil
                     }
-                } catch {
-                    let tokens = TokenEstimator.estimate(distillRequest.input)
-                    let response = DistillResponse(
-                        requestID: distillRequest.id,
-                        output: distillRequest.input,
-                        inputCharacters: distillRequest.input.count,
-                        inputTokens: tokens,
-                        outputTokens: tokens,
-                        originalHandle: nil,
-                        runMode: .optimize,
-                        routeStage: .verbatim
-                    )
-                    if let onSuccess { await onSuccess(distillRequest, response) }
-                    await metrics.recordSuccess()
-                    send(status: 200, body: response, connection: connection)
-                    return
                 }
             }
             let compressed = try await scheduler.submit(distillRequest)
@@ -1105,10 +1081,9 @@ public final class DistillHTTPServer: @unchecked Sendable {
                         idempotencyKey: preparation.idempotencyKey
                     )
                 } catch {
-                    response = compressed.verbatimFallback(input: distillRequest.input)
+                    // Keep compressed text; omit handle when store fails (lossy summary still useful).
+                    response = compressed
                 }
-            } else if distillRequest.effectiveRunMode == .optimize {
-                response = compressed.verbatimFallback(input: distillRequest.input)
             }
             if distillRequest.mode == .commandOutput, response.output != distillRequest.input {
                 await metrics.recordToolOutputCompressed()

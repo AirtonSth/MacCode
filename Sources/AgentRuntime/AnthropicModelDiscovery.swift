@@ -99,7 +99,7 @@ public enum AnthropicModelDiscovery {
         environment: [String: String] = [:],
         session: URLSession = .shared
     ) async -> ModelListResult {
-        let env = CodexRunner.processEnvironment(overrides: environment)
+        let env = CodexRunner.processEnvironment(overrides: environment, purpose: .supportProcess)
         let cacheKey = credentialFingerprint(environment: env)
 
         // Cache hit? Cache stores only live data, keyed per credential so

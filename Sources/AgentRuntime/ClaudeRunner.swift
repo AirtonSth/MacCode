@@ -122,10 +122,13 @@ public final class ClaudeRunner: AgentProviderRunner, @unchecked Sendable {
         }
         // UX-MAC_AGENT-BG-AWAIT: always make the agent self-declare a background-await
         // stall with `awaitingMarker` so the host recovers it regardless of phrasing.
+        // Also carries the MCP-tool-availability rule so the agent does not preemptively
+        // refuse a connected MCP tool as "unauthenticated" in a non-interactive run
+        // (both live via `alwaysOnClaudeDirectives`).
         // Managed Distill language + pipe rules are always injected (app-private skill).
         // `--append-system-prompt` adds to the CLI's default prompt, so it stays additive.
         let appendedSystemPrompt = AgentSkillInstaller.tokenSaverProviderPrompt(
-            BackgroundAwaitContinuation.systemPromptDirective,
+            BackgroundAwaitContinuation.alwaysOnClaudeDirectives,
             environment: request.environment
         )
         args.append(contentsOf: ["--append-system-prompt", appendedSystemPrompt])
@@ -152,7 +155,7 @@ public final class ClaudeRunner: AgentProviderRunner, @unchecked Sendable {
         }
 
         let args = Self.buildArgs(request)
-        let environment = CodexRunner.processEnvironment(overrides: request.environment, provider: .claude)
+        let environment = CodexRunner.processEnvironment(overrides: request.environment, purpose: .agentTurn(.claude))
         let launchPlan: RunAsUserProcessBootstrap.LaunchPlan
         do {
             launchPlan = try RunAsUserProcessBootstrap.plan(

@@ -784,7 +784,7 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
         let stderrPipe = Pipe()
         process.executableURL = URL(fileURLWithPath: node)
         process.arguments = [script]
-        process.environment = CodexRunner.processEnvironment(overrides: [:], provider: .claude)
+        process.environment = CodexRunner.processEnvironment(overrides: [:], purpose: .supportProcess)
         process.standardInput = stdinPipe
         process.standardOutput = stdoutPipe
         process.standardError = stderrPipe
@@ -836,7 +836,7 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
         process.executableURL = URL(fileURLWithPath: node)
         process.arguments = [bridgeScriptPath] + request.extraArgs
         process.currentDirectoryURL = URL(fileURLWithPath: request.cwd)
-        process.environment = CodexRunner.processEnvironment(overrides: request.environment, provider: .claude)
+        process.environment = CodexRunner.processEnvironment(overrides: request.environment, purpose: .agentTurn(.claude))
         process.standardInput = stdinPipe
         process.standardOutput = stdoutPipe
         process.standardError = stderrPipe
@@ -1051,7 +1051,7 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
         let pipe = Pipe()
         process.standardOutput = pipe
         process.standardError = Pipe()
-        process.environment = CodexRunner.processEnvironment(overrides: [:])
+        process.environment = CodexRunner.processEnvironment(overrides: [:], purpose: .supportProcess)
         do {
             try process.run()
             let data = pipe.fileHandleForReading.readDataToEndOfFile()
@@ -1146,7 +1146,7 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
         let pipe = Pipe()
         process.standardOutput = pipe
         process.standardError = Pipe()
-        process.environment = CodexRunner.processEnvironment(overrides: [:])
+        process.environment = CodexRunner.processEnvironment(overrides: [:], purpose: .supportProcess)
         do {
             try process.run()
             let data = pipe.fileHandleForReading.readDataToEndOfFile()
@@ -1214,7 +1214,7 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
         let pipe = Pipe()
         process.standardOutput = pipe
         process.standardError = Pipe()
-        process.environment = CodexRunner.processEnvironment(overrides: [:])
+        process.environment = CodexRunner.processEnvironment(overrides: [:], purpose: .supportProcess)
         let deadline = Date().addingTimeInterval(20)
         do {
             try process.run()
@@ -1413,7 +1413,7 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
         process.executableURL = URL(fileURLWithPath: try resolvedNpmForInstall())
         process.arguments = ["install", "--no-fund", "--no-audit", "--ignore-scripts", "--include=optional"] + plan.specs
         process.currentDirectoryURL = plan.cacheDir
-        process.environment = CodexRunner.processEnvironment(overrides: [:])
+        process.environment = CodexRunner.processEnvironment(overrides: [:], purpose: .supportProcess)
         let outputPipe = Pipe()
         process.standardOutput = outputPipe
         process.standardError = outputPipe
@@ -1508,7 +1508,7 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
         // Application Support cache (same-user / PATH npm supply-chain residual).
         process.arguments = ["install", "--no-fund", "--no-audit", "--ignore-scripts", packageSpec]
         process.currentDirectoryURL = directory
-        process.environment = CodexRunner.processEnvironment(overrides: [:])
+        process.environment = CodexRunner.processEnvironment(overrides: [:], purpose: .supportProcess)
         let outputPipe = Pipe()
         process.standardOutput = outputPipe
         process.standardError = outputPipe
@@ -1660,15 +1660,17 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
     /// `systemPrompt` string does not introduce the `claude_code` preset; the agent
     /// behaviour rides on the separate `tools` preset, so this never strips it).
     ///
-    /// Always carries the background-await self-declaration rule
-    /// (`BackgroundAwaitContinuation.systemPromptDirective`) so the agent marks any
-    /// unavoidable wait with the recovery marker. Always injects managed Distill
+    /// Always carries the always-on Claude rules
+    /// (`BackgroundAwaitContinuation.alwaysOnClaudeDirectives`: the background-await
+    /// self-declaration marker + the MCP-tool-availability rule) so the agent marks
+    /// any unavoidable wait with the recovery marker and does not preemptively refuse
+    /// a connected MCP tool as "unauthenticated" in a non-interactive run. Always injects managed Distill
     /// language + pipe rules (app-private skill; all Claude turns). Codex/Grok get
     /// the same via per-turn developer_instructions / providerPrompt injection —
     /// never via `~/.claude/skills` / `~/.codex/skills`.
     static func claudeSystemPrompt(environment: [String: String]) -> String {
         AgentSkillInstaller.tokenSaverProviderPrompt(
-            BackgroundAwaitContinuation.systemPromptDirective,
+            BackgroundAwaitContinuation.alwaysOnClaudeDirectives,
             environment: environment
         )
     }

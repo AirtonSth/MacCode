@@ -1269,40 +1269,41 @@ public struct LocalDistillRuntime: DistillRuntime {
     static func humanizeSR1Fallback(_ input: String, maxOutputCharacters: Int) -> String {
         let portuguese = input.localizedCaseInsensitiveContains("portuguese") ||
             input.localizedCaseInsensitiveContains("português")
-        let source = input.components(separatedBy: "SR1_RESPONSE:").last ?? input
-        let labels: [Character: String] = portuguese
-            ? ["S": "Estado", "C": "Contexto", "D": "Acao", "R": "Risco", "O": "Resultado", "N": "Nao fazer", "P": "Prova"]
-            : ["S": "State", "C": "Context", "D": "Action", "R": "Risk", "O": "Outcome", "N": "Do not do", "P": "Proof"]
-        let lines = source
-            .split(whereSeparator: \.isNewline)
-            .flatMap { raw -> [String] in
-                let line = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-                guard !line.isEmpty else { return [] }
-                let lower = line.lowercased()
-                guard lower != "sr1",
-                      lower != "dict",
-                      lower != "dict:",
-                      !lower.hasPrefix("s=state"),
-                      !lower.hasPrefix("c=context"),
-                      !lower.hasPrefix("d=action"),
-                      !lower.hasPrefix("r=risk"),
-                      !lower.hasPrefix("o=outcome"),
-                      !lower.hasPrefix("n=no-go"),
-                      !lower.hasPrefix("p=proof") else {
-                    return []
-                }
-                let segments = SR1LineParser.parseSemanticSegments(line)
-                guard !segments.isEmpty else {
-                    return [line]
-                }
-                return segments.map { parsed in
-                    guard let label = labels[parsed.prefix] else { return parsed.content }
-                    return "\(label): \(parsed.content)"
+        var source = input
+        if let range = input.range(of: "SR1_RESPONSE:", options: [.caseInsensitive]) {
+            source = String(input[range.upperBound...])
+        }
+        source = source.trimmingCharacters(in: .whitespacesAndNewlines)
+        // O-first prose: surface outcome lines; drop S/C/D/N chrome.
+        var outcomes: [String] = []
+        var extras: [String] = []
+        for raw in source.split(whereSeparator: \.isNewline) {
+            let line = String(raw).trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !line.isEmpty else { continue }
+            let lower = line.lowercased()
+            if lower == "sr1" || lower == "dict" || lower.hasPrefix("dict:")
+                || lower.hasPrefix("s=state") || lower.hasPrefix("c=context") {
+                continue
+            }
+            let segments = SR1LineParser.parseSemanticSegments(line)
+            if segments.isEmpty {
+                if !line.hasPrefix("|") { extras.append(line) }
+                continue
+            }
+            for parsed in segments {
+                let content = parsed.content.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !content.isEmpty else { continue }
+                if parsed.prefix == "O" {
+                    outcomes.append(content)
+                } else if parsed.prefix == "R" || parsed.prefix == "P" {
+                    extras.append(content)
                 }
             }
-        let output = lines.isEmpty
+        }
+        let pieces = outcomes.isEmpty ? extras : (outcomes + extras.prefix(2))
+        let output = pieces.isEmpty
             ? (portuguese ? "Nao consegui expandir a resposta comprimida." : "I could not expand the compressed response.")
-            : lines.joined(separator: "\n")
+            : pieces.joined(separator: "\n")
         let expanded = SR1LineParser.expandVariables(in: output, from: source)
         return String(expanded.prefix(maxOutputCharacters))
     }

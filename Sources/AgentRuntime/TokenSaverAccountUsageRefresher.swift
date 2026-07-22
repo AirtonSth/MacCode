@@ -446,7 +446,7 @@ public final class TokenSaverAccountUsageRefresher: TokenSaverAccountUsageRefres
             return nil
         }
 
-        var environment = CodexRunner.processEnvironment(overrides: request.environment)
+        var environment = CodexRunner.processEnvironment(overrides: request.environment, purpose: .supportProcess)
         environment["TERM"] = "xterm-256color"
         environment["LANG"] = environment["LANG"] ?? "C.UTF-8"
         environment["LC_ALL"] = environment["LC_ALL"] ?? "C.UTF-8"
@@ -612,7 +612,7 @@ public final class TokenSaverAccountUsageRefresher: TokenSaverAccountUsageRefres
         proc.executableURL = URL(fileURLWithPath: path)
         proc.arguments = arguments
         proc.currentDirectoryURL = URL(fileURLWithPath: cwd)
-        proc.environment = CodexRunner.processEnvironment(overrides: environment)
+        proc.environment = CodexRunner.processEnvironment(overrides: environment, purpose: .supportProcess)
         proc.standardInput = FileHandle.nullDevice
         let out = Pipe()
         proc.standardOutput = out
