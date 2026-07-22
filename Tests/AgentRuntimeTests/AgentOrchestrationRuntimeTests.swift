@@ -203,7 +203,7 @@ final class AgentOrchestrationRuntimeTests: XCTestCase {
         XCTAssertEqual(route.providerInstanceId, "claude-cli")
     }
 
-    func testRouteFallsBackWhenPreferredSourceIsNotRunnable() throws {
+    func testRouteFailsClosedWhenPreferredSourceIsNotRunnable() throws {
         let runtime = AgentOrchestrationRuntime(
             packageVerification: { true },
             killSwitch: { false }
@@ -216,7 +216,7 @@ final class AgentOrchestrationRuntimeTests: XCTestCase {
             reasoningEffort: .high,
             serviceTier: .auto
         )
-        // Claude present but not authenticated / not runnable → fall back to live Codex.
+        // Claude selected in UI but not runnable — must NOT silently start Codex.
         let mixed = AgentProvider.allCases.map { provider -> AgentProviderSnapshot in
             AgentProviderSnapshotFactory.snapshot(
                 provider: provider,
@@ -233,9 +233,37 @@ final class AgentOrchestrationRuntimeTests: XCTestCase {
                 modelDiscoverySource: .live
             )
         }
-        let route = try runtime.route(configuration: config, providerSnapshots: mixed)
-        XCTAssertEqual(route.provider, .codex,
-                       "When the preferred Source host is not runnable, Auto may fall back to the next live eligible provider.")
+        XCTAssertThrowsError(try runtime.route(configuration: config, providerSnapshots: mixed)) {
+            XCTAssertEqual(
+                $0 as? AgentOrchestrationAdmissionError,
+                .preferredSourceUnavailable(.claude),
+                "Auto must fail closed on the Source picker host instead of silent Codex fallback."
+            )
+        }
+    }
+
+    func test_autoOrchestrateProviderPromptInjectsHostReceipt() {
+        let route = AgentOrchestrationRoute(
+            provider: .claude,
+            providerInstanceId: "claude-cli",
+            capabilitySnapshotId: "cap",
+            selection: AgentModelSelection(
+                provider: .claude,
+                modelId: "haiku",
+                reasoningEffort: .high,
+                serviceTier: .auto
+            )
+        )
+        let wrapped = AgentOrchestrationRuntime.autoOrchestrateProviderPrompt(
+            userPrompt: "Quem é você?",
+            admittedRoute: route
+        )
+        XCTAssertTrue(wrapped.contains("active_host: claude-code"))
+        XCTAssertTrue(wrapped.contains("provider: claude"))
+        XCTAssertTrue(wrapped.contains("controller_model: haiku"))
+        XCTAssertTrue(wrapped.contains("Quem é você?"))
+        XCTAssertFalse(wrapped.contains("active_host: codex"),
+                       "Host receipt must match the admitted route, not allCases default.")
     }
 
     func testAdmissionSelectsLiveEligibleProviderAndPersistsAuditableReceipt() throws {
@@ -613,8 +641,7 @@ final class AgentOrchestrationRuntimeTests: XCTestCase {
         )
         XCTAssertEqual(preferredFallback.provider, .claude)
 
-        // Non-preferred hosts still require a verified live catalog. Prefer a
-        // host that is not runnable so fallback walks the remaining list.
+        // Preferred host listed but unrunnable → fail closed (no silent Codex).
         var unrunnablePreferred = configuration(runtime: runtime)
         unrunnablePreferred.manualSelection = AgentModelSelection(
             provider: .claude,
@@ -643,7 +670,7 @@ final class AgentOrchestrationRuntimeTests: XCTestCase {
         XCTAssertThrowsError(try runtime.route(
             configuration: unrunnablePreferred,
             providerSnapshots: onlyFallbackNonPreferred
-        )) { XCTAssertEqual($0 as? AgentOrchestrationAdmissionError, .noEligibleProvider) }
+        )) { XCTAssertEqual($0 as? AgentOrchestrationAdmissionError, .preferredSourceUnavailable(.claude)) }
     }
 
     func test_autoLightControllerSelectionUsesHostMatrixNotManualSelection() {

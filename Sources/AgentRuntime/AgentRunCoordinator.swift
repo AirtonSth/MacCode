@@ -746,10 +746,12 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         )
         let launch = routingSnapshot.launchConfigurations[admission.route.providerInstanceId]
         // Display the user's words unchanged; wrap only the provider-bound prompt
-        // so Auto always enters $remote-code-orchestrate.
+        // so Auto always enters $remote-code-orchestrate with the host receipt
+        // the app already admitted (provider/model) — skill must not re-guess.
         let displayPrompt = request.userMessageContent ?? request.prompt
         let orchestratedPrompt = AgentOrchestrationRuntime.autoOrchestrateProviderPrompt(
-            userPrompt: request.prompt
+            userPrompt: request.prompt,
+            admittedRoute: admission.route
         )
         return AgentRunRequest(
             runId: request.runId,

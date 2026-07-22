@@ -354,6 +354,9 @@ public enum AgentOrchestrationAdmissionError: Error, Sendable, Equatable, Custom
     case quotaExceeded
     case invalidRoutingMode
     case noEligibleProvider
+    /// Source picker host is eligible in policy but not runnable (missing binary,
+    /// unauthenticated, empty models). Fail closed — do not silently route to another host.
+    case preferredSourceUnavailable(AgentProvider)
     case receiptPersistenceFailed(String)
 
     public var description: String {
@@ -378,6 +381,8 @@ public enum AgentOrchestrationAdmissionError: Error, Sendable, Equatable, Custom
             return "Orchestration admission requires an Auto routing configuration."
         case .noEligibleProvider:
             return "No eligible provider has a live model catalog and confirmed streaming capability."
+        case .preferredSourceUnavailable(let provider):
+            return "Auto cannot start on \(provider.rawValue): that Source is not runnable on this Mac (install/auth/models). Fix the Source or switch it before using Auto — RemoteCode will not silently fall back to another provider."
         case .receiptPersistenceFailed(let message):
             return "Could not persist the orchestration admission receipt: \(message)"
         }
@@ -846,45 +851,62 @@ public final class AgentOrchestrationRuntime: @unchecked Sendable {
             throw AgentOrchestrationAdmissionError.invalidPolicy
         }
 
-        // Prefer the Source picker host (manualSelection) so Auto runs on the
-        // provider the user sees selected — not always the first of allCases
-        // (codex). Fall back through the rest of eligibleProviders if that host
-        // is not live/runnable yet.
-        //
-        // Preferred host: runnable + streaming + models is enough. Claude Code
-        // OAuth users often have no ANTHROPIC_API_KEY, so Anthropic REST model
-        // discovery stays builtInFallback even though `claude` runs fine — a
-        // strict `.live` gate previously forced silent Codex fallback.
-        // Non-preferred fallback hosts still require a verified live catalog.
-        for provider in Self.orderedEligibleProviders(
-            eligible: configuration.eligibleProviders,
-            preferred: configuration.manualSelection.provider
-        ) {
-            let isPreferred = provider == configuration.manualSelection.provider
+        // Source picker is authoritative for Auto. Never silently start on
+        // another host (UI said Claude, run was Codex). Prefer that host; if it
+        // is listed as eligible but not runnable, fail closed with a clear error.
+        let preferred = configuration.manualSelection.provider
+        if configuration.eligibleProviders.contains(preferred) {
+            if let snapshot = Self.autoAdmitSnapshot(
+                provider: preferred,
+                preferredInstanceId: configuration.manualProviderInstanceId,
+                providerSnapshots: providerSnapshots,
+                requireLiveCatalog: false
+            ) {
+                return Self.makeRoute(provider: preferred, snapshot: snapshot)
+            }
+            throw AgentOrchestrationAdmissionError.preferredSourceUnavailable(preferred)
+        }
+
+        // Preferred host not in eligibleProviders (explicit policy allow-list):
+        // walk the remaining hosts; non-preferred still need a live catalog.
+        for provider in configuration.eligibleProviders {
             guard let snapshot = Self.autoAdmitSnapshot(
                 provider: provider,
-                preferredInstanceId: isPreferred
-                    ? configuration.manualProviderInstanceId
-                    : nil,
+                preferredInstanceId: nil,
                 providerSnapshots: providerSnapshots,
-                requireLiveCatalog: !isPreferred
+                requireLiveCatalog: true
             ) else { continue }
-
-            // Auto always binds the host-matrix LIGHT row. Capability escalation
-            // (STANDARD/DEEP workers) is performed inside $remote-code-orchestrate
-            // — the controller run itself stays on LIGHT.
-            let selection = Self.lightControllerSelection(
-                provider: provider,
-                availableModels: snapshot.models
-            )
-            return AgentOrchestrationRoute(
-                provider: provider,
-                providerInstanceId: snapshot.id,
-                capabilitySnapshotId: Self.capabilitySnapshotID(snapshot),
-                selection: selection
-            )
+            return Self.makeRoute(provider: provider, snapshot: snapshot)
         }
         throw AgentOrchestrationAdmissionError.noEligibleProvider
+    }
+
+    private static func makeRoute(
+        provider: AgentProvider,
+        snapshot: AgentProviderSnapshot
+    ) -> AgentOrchestrationRoute {
+        // Auto always binds the host-matrix LIGHT row. Capability escalation
+        // (STANDARD/DEEP workers) is performed inside $remote-code-orchestrate
+        // — the controller run itself stays on LIGHT.
+        let selection = lightControllerSelection(
+            provider: provider,
+            availableModels: snapshot.models
+        )
+        return AgentOrchestrationRoute(
+            provider: provider,
+            providerInstanceId: snapshot.id,
+            capabilitySnapshotId: capabilitySnapshotID(snapshot),
+            selection: selection
+        )
+    }
+
+    /// Host key used by `remote-code-orchestrate` host-runtime-matrix.
+    public static func orchestrateHostKey(for provider: AgentProvider) -> String {
+        switch provider {
+        case .codex: return "codex"
+        case .claude: return "claude-code"
+        case .grok: return "grok"
+        }
     }
 
     /// Eligible provider walk order for Auto: preferred Source host first, then
@@ -959,13 +981,50 @@ public final class AgentOrchestrationRuntime: @unchecked Sendable {
         AgentSkillInstaller.remoteCodeOrchestratePinnedPackage.skillID
 
     /// Prefix every Auto provider prompt so the controller always runs
-    /// `$remote-code-orchestrate`. Idempotent when already invoked.
-    public static func autoOrchestrateProviderPrompt(userPrompt: String) -> String {
+    /// `$remote-code-orchestrate`. Idempotent when the skill is already invoked
+    /// (still injects the host receipt once when missing).
+    ///
+    /// The host binds provider/model before spawn — pass that receipt so the
+    /// skill does not re-detect the host (which caused "I'm Codex" while the
+    /// UI showed Claude). Do not split the skill per provider.
+    public static func autoOrchestrateProviderPrompt(
+        userPrompt: String,
+        admittedRoute: AgentOrchestrationRoute? = nil
+    ) -> String {
+        let skill = orchestrateSkillInvocationName
+        let hostBlock: String
+        if let route = admittedRoute {
+            let host = orchestrateHostKey(for: route.provider)
+            let effort = route.selection.reasoningEffort.rawValue
+            hostBlock = """
+            Host runtime receipt (authoritative — do not re-detect, do not claim another host):
+            - active_host: \(host)
+            - provider: \(route.provider.rawValue)
+            - provider_instance_id: \(route.providerInstanceId)
+            - controller_model: \(route.selection.effectiveModel)
+            - controller_effort: \(effort)
+            - Bind every worker/reviewer from host-runtime-matrix.md row for active_host=\(host) only.
+            """
+        } else {
+            hostBlock = """
+            Host runtime receipt: not supplied by host; detect active host once from this session only.
+            """
+        }
+
         let trimmed = userPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
         if Self.promptAlreadyInvokesOrchestrateSkill(trimmed) {
+            if admittedRoute != nil, trimmed.contains("active_host:") {
+                return userPrompt
+            }
+            if admittedRoute != nil {
+                return """
+                \(trimmed)
+
+                \(hostBlock)
+                """
+            }
             return userPrompt
         }
-        let skill = orchestrateSkillInvocationName
         return """
         $\(skill)
 
@@ -975,6 +1034,8 @@ public final class AgentOrchestrationRuntime: @unchecked Sendable {
         - Controller stays LIGHT; escalate workers only after capability failure.
         - Fan-out default 2 / hard cap 3; skip REVIEWER on micro absolute/high certainty when rules allow.
         - Thin prompts (slice-only); cheap proof (scope diff + one focused command); lean table report.
+
+        \(hostBlock)
 
         User request:
         \(userPrompt)

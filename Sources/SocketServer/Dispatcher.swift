@@ -2694,6 +2694,7 @@ public final class JSONRPCDispatcher {
             case .quotaExceeded: kind = "quota_exceeded"
             case .invalidRoutingMode: kind = "invalid_mode"
             case .noEligibleProvider: kind = "no_eligible_provider"
+            case .preferredSourceUnavailable: kind = "preferred_source_unavailable"
             case .receiptPersistenceFailed: kind = "receipt_persistence_failed"
             }
             return JSONRPCError(

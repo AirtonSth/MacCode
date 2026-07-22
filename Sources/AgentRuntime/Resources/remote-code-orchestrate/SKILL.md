@@ -124,8 +124,10 @@ better `LIGHT`/`STANDARD` re-prompt over escalating model tier.
 
 ## 3. Bind Runtime and Delegate
 
-Detect host once (`codex`, `claude-code`, `grok`). Bind matrix rows from
-[host-runtime-matrix.md](references/host-runtime-matrix.md).
+Use the **host runtime receipt** from RemoteCode when present (`active_host`,
+`provider`, `controller_model`). It is authoritative — do not re-detect or claim
+another host. If absent, detect host once (`codex`, `claude-code`, `grok`). Bind
+matrix rows from [host-runtime-matrix.md](references/host-runtime-matrix.md).
 
 | Capability | Codex | Claude Code | Grok |
 | --- | --- | --- | --- |

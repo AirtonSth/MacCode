@@ -36,7 +36,12 @@ only after capability failure or new risk evidence.
 
 ## Active host selection
 
-Detect the active controller host once per run:
+**Prefer the host runtime receipt from RemoteCode** when present in the prompt
+(`active_host`, `provider`, `controller_model`). That receipt is authoritative —
+do not re-detect the host and do not claim a different family (e.g. do not say
+you are Codex when `active_host: claude-code`).
+
+If no receipt is supplied, detect the active controller host once per run:
 
 | Host key | Detection signals |
 | --- | --- |

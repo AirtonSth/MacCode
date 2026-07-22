@@ -154,7 +154,7 @@ public final class AgentSkillInstaller: @unchecked Sendable {
         skillID: "remote-code-orchestrate",
         sourceURL: "https://github.com/samuelfaj/sam-skills/tree/main/sam-orchestrate",
         sourceRevision: "2c77fa48431bc20e5dc841652079594a3ea918c9",
-        sourceTreeSHA256: "75be88b77153884356338c03577d3b2ac153debdbca9c673e0ee6d7b6b5138d3",
+        sourceTreeSHA256: "3e26edbe5d79f719ca8b8bb4999275fe88abf8865d2932613cee88e59537510c",
         localVersion: "1",
         allowedPaths: [
             "SKILL.md",
