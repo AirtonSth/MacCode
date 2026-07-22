@@ -2287,7 +2287,7 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
             "turnId": "turn-app-server-1",
             "tokenUsage": [
                 "total": ["inputTokens": 11833, "outputTokens": 6, "totalTokens": 11839],
-                "last": ["inputTokens": 120, "outputTokens": 6, "totalTokens": 126],
+                "last": ["inputTokens": 120, "outputTokens": 6, "totalTokens": 126, "costUSD": 0.0042],
                 "modelContextWindow": 258400
             ]
         ])
@@ -2309,6 +2309,8 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
         XCTAssertEqual(usage.inputTokens, 120)
         XCTAssertEqual(usage.outputTokens, 6)
         XCTAssertEqual(usage.totalTokens, 126)
+        XCTAssertEqual(usage.reportedCostMicros, 4_200,
+                       "Codex monetary receipts must be preserved when the app-server provides one")
         XCTAssertEqual(usage.contextWindow, 258400)
         XCTAssertEqual(usage.compactsAutomatically, true,
                        "Codex app-server context windows auto-compact; RemoteCode must preserve that capability in the same context status surface as T3Code")

@@ -52,7 +52,7 @@ final class GrokParserTests: XCTestCase {
     /// Token Saver Grok ring stays "No data" unless end.usage becomes a tokenUsage event.
     func test_endEventEmitsTokenUsageForTokenSaverRing() {
         let line = #"""
-        {"type":"end","stopReason":"EndTurn","sessionId":"s1","requestId":"r1","usage":{"input_tokens":25103,"cache_read_input_tokens":6016,"output_tokens":18,"reasoning_tokens":13,"total_tokens":31137},"modelUsage":{"grok-4.5":{"inputTokens":25103,"outputTokens":18,"cacheReadInputTokens":6016,"modelCalls":1}}}
+        {"type":"end","stopReason":"EndTurn","sessionId":"s1","requestId":"r1","usage":{"input_tokens":25103,"cache_read_input_tokens":6016,"output_tokens":18,"reasoning_tokens":13,"total_tokens":31137,"cost_in_usd_ticks":123450000},"modelUsage":{"grok-4.5":{"inputTokens":25103,"outputTokens":18,"cacheReadInputTokens":6016,"modelCalls":1}}}
         """#
         let events = GrokParser().parseLine(line)
         let usage = events.compactMap { ev -> AssistantTokenUsage? in
@@ -65,6 +65,8 @@ final class GrokParserTests: XCTestCase {
         // input = uncached + cache read (25103 + 6016) when using modelUsage path
         XCTAssertEqual(usage?.inputTokens, 25103 + 6016)
         XCTAssertEqual(usage?.cacheReadInputTokens, 6016)
+        XCTAssertEqual(usage?.reportedCostMicros, 12_345,
+                       "Grok cost_in_usd_ticks must become integer micros without floating pricing")
     }
 
     func test_tokenUsageFromUsageOnlyObject() {

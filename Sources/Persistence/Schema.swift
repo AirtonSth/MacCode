@@ -9,7 +9,7 @@ public struct SchemaStep {
 }
 
 public enum Schema {
-    public static let currentVersion: Int = 47
+    public static let currentVersion: Int = 49
 
     public static let steps: [SchemaStep] = [
         SchemaStep(1, """
@@ -811,6 +811,32 @@ public enum Schema {
         ADD COLUMN usage_semantics_available INTEGER NOT NULL DEFAULT 0;
         ALTER TABLE token_saver_lane_state
         ADD COLUMN scorecard_id TEXT NOT NULL DEFAULT '';
+        """),
+        SchemaStep(48, """
+        CREATE TABLE IF NOT EXISTS agent_thread_routing (
+            thread_id TEXT PRIMARY KEY,
+            mode TEXT NOT NULL CHECK(mode IN ('manual', 'auto')),
+            configuration_json TEXT NOT NULL,
+            revision INTEGER NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY(thread_id) REFERENCES agent_threads(id) ON DELETE CASCADE
+        );
+        CREATE TABLE IF NOT EXISTS agent_queued_message_routing (
+            queued_message_id TEXT PRIMARY KEY,
+            configuration_json TEXT NOT NULL,
+            revision INTEGER NOT NULL,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(queued_message_id) REFERENCES agent_queued_messages(id) ON DELETE CASCADE
+        );
+        """),
+        SchemaStep(49, """
+        ALTER TABLE agent_queued_message_routing ADD COLUMN deadline_at TEXT;
+        ALTER TABLE agent_queued_message_routing ADD COLUMN budget_tokens INTEGER;
+        ALTER TABLE agent_queued_message_routing ADD COLUMN budget_cost_micros INTEGER;
+        ALTER TABLE agent_queued_message_routing ADD COLUMN reservation_id TEXT;
+        ALTER TABLE agent_queued_message_routing ADD COLUMN reserved_tokens INTEGER;
+        ALTER TABLE agent_queued_message_routing ADD COLUMN reserved_cost_micros INTEGER;
+        ALTER TABLE agent_queued_message_routing ADD COLUMN admission_receipt_id TEXT;
         """)
     ]
 

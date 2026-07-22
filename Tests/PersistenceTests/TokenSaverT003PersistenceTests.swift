@@ -35,7 +35,7 @@ final class TokenSaverT003PersistenceTests: XCTestCase {
 
         try Schema.migrate(db)
 
-        XCTAssertEqual(Schema.currentVersion, 47)
+        XCTAssertEqual(Schema.currentVersion, 49)
         XCTAssertEqual(try count(db, table: "rc_reversible_content"), 1, "migration preserves legacy bytes for explicit user-approved reattachment")
         XCTAssertEqual(try count(db, table: "token_saver_recovery_objects"), 0, "legacy hashes never receive fabricated scope or capability")
         XCTAssertEqual(try count(db, table: "token_saver_attempts"), 0)

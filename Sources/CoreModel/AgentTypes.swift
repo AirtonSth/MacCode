@@ -330,6 +330,87 @@ public struct AgentModelSelection: Codable, Sendable, Equatable, Hashable {
     }
 }
 
+public enum AgentRoutingMode: String, Codable, Sendable, Equatable, CaseIterable {
+    case manual
+    case auto
+}
+
+public enum AgentRoutingRevisionError: Error, Sendable, Equatable {
+    case conflict(expected: Int, actual: Int)
+}
+
+/// Thread-owned model-routing state. The manual selection remains authoritative
+/// while Auto is enabled so turning Auto off restores every picker value exactly.
+public struct AgentRoutingConfiguration: Codable, Sendable, Equatable {
+    public static let currentSchemaVersion = 1
+
+    public var schemaVersion: Int
+    public var mode: AgentRoutingMode
+    public var manualSelection: AgentModelSelection
+    public var manualProviderInstanceId: String?
+    public var eligibleProviders: [AgentProvider]
+    public var policyDigest: String
+    public var revision: Int
+    public var updatedAt: Date
+
+    public init(
+        schemaVersion: Int = AgentRoutingConfiguration.currentSchemaVersion,
+        mode: AgentRoutingMode,
+        manualSelection: AgentModelSelection,
+        manualProviderInstanceId: String? = nil,
+        eligibleProviders: [AgentProvider] = AgentProvider.allCases,
+        policyDigest: String = "",
+        revision: Int = 0,
+        updatedAt: Date = Date()
+    ) {
+        self.schemaVersion = schemaVersion
+        self.mode = mode
+        self.manualSelection = manualSelection
+        self.manualProviderInstanceId = manualProviderInstanceId
+        self.eligibleProviders = eligibleProviders
+        self.policyDigest = policyDigest
+        self.revision = revision
+        self.updatedAt = updatedAt
+    }
+
+    public static func legacyManual(
+        selection: AgentModelSelection,
+        providerInstanceId: String? = nil,
+        updatedAt: Date = Date()
+    ) -> AgentRoutingConfiguration {
+        AgentRoutingConfiguration(
+            mode: .manual,
+            manualSelection: selection,
+            manualProviderInstanceId: providerInstanceId,
+            updatedAt: updatedAt
+        )
+    }
+
+    public func replacing(
+        expectedRevision: Int,
+        mode: AgentRoutingMode,
+        manualSelection: AgentModelSelection,
+        manualProviderInstanceId: String?,
+        eligibleProviders: [AgentProvider],
+        policyDigest: String,
+        updatedAt: Date = Date()
+    ) throws -> AgentRoutingConfiguration {
+        guard expectedRevision == revision else {
+            throw AgentRoutingRevisionError.conflict(expected: expectedRevision, actual: revision)
+        }
+        return AgentRoutingConfiguration(
+            schemaVersion: schemaVersion,
+            mode: mode,
+            manualSelection: manualSelection,
+            manualProviderInstanceId: manualProviderInstanceId,
+            eligibleProviders: eligibleProviders,
+            policyDigest: policyDigest,
+            revision: revision + 1,
+            updatedAt: updatedAt
+        )
+    }
+}
+
 public struct AgentRunRequest: Codable, Sendable, Equatable {
     public let runId: AgentRunID
     public let threadId: AgentThreadID
@@ -1063,6 +1144,9 @@ public struct AgentThread: Codable, Sendable, Equatable, Identifiable {
     public var worktreePath: String?
     public var serviceTier: AgentServiceTier
     public var modelSelection: AgentModelSelection
+    /// Nil is an intentional legacy representation. Its effective value is
+    /// always Manual with the legacy provider/model/reasoning/tier precedence.
+    public var routingConfiguration: AgentRoutingConfiguration?
     /// Optional only for backward-compatible decoding of pre-v34 wire snapshots.
     public var interactionMode: AgentInteractionMode?
     /// macOS account that executes provider processes for this thread (`sudo -u`).
@@ -1071,6 +1155,14 @@ public struct AgentThread: Codable, Sendable, Equatable, Identifiable {
 
     public var effectiveInteractionMode: AgentInteractionMode {
         interactionMode ?? .default
+    }
+
+    public var effectiveRoutingConfiguration: AgentRoutingConfiguration {
+        routingConfiguration ?? .legacyManual(
+            selection: modelSelection,
+            providerInstanceId: providerInstanceId,
+            updatedAt: updatedAt
+        )
     }
 
     public init(
@@ -1099,7 +1191,8 @@ public struct AgentThread: Codable, Sendable, Equatable, Identifiable {
         serviceTier: AgentServiceTier = .auto,
         modelSelection: AgentModelSelection? = nil,
         interactionMode: AgentInteractionMode = .default,
-        runAsUser: AgentRunAsUser? = nil
+        runAsUser: AgentRunAsUser? = nil,
+        routingConfiguration: AgentRoutingConfiguration? = nil
     ) {
         self.id = id
         self.projectId = projectId
@@ -1130,6 +1223,7 @@ public struct AgentThread: Codable, Sendable, Equatable, Identifiable {
             reasoningEffort: reasoningEffort,
             serviceTier: serviceTier
         )
+        self.routingConfiguration = routingConfiguration
         self.interactionMode = interactionMode
         self.runAsUser = runAsUser
     }
@@ -1367,6 +1461,7 @@ public struct AgentQueuedMessage: Codable, Sendable, Equatable, Identifiable {
     public var position: Int
     public let createdAt: Date
     public var updatedAt: Date
+    public var routingSnapshot: AgentQueuedMessageRoutingSnapshot?
 
     public init(
         id: AgentQueuedMessageID = AgentQueuedMessageID(),
@@ -1376,7 +1471,8 @@ public struct AgentQueuedMessage: Codable, Sendable, Equatable, Identifiable {
         interactionMode: AgentInteractionMode = .default,
         position: Int = 0,
         createdAt: Date = Date(),
-        updatedAt: Date = Date()
+        updatedAt: Date = Date(),
+        routingSnapshot: AgentQueuedMessageRoutingSnapshot? = nil
     ) {
         self.id = id
         self.threadId = threadId
@@ -1386,6 +1482,40 @@ public struct AgentQueuedMessage: Codable, Sendable, Equatable, Identifiable {
         self.position = position
         self.createdAt = createdAt
         self.updatedAt = updatedAt
+        self.routingSnapshot = routingSnapshot
+    }
+}
+
+/// Admission values captured with queued work. These are immutable so a later
+/// thread-routing edit cannot change the deadline or reservation used on replay.
+public struct AgentQueuedMessageRoutingSnapshot: Codable, Sendable, Equatable {
+    public let configuration: AgentRoutingConfiguration
+    public let deadlineAt: Date?
+    public let budgetTokens: Int?
+    public let budgetCostMicros: Int?
+    public let reservationId: String?
+    public let reservedTokens: Int?
+    public let reservedCostMicros: Int?
+    public let admissionReceiptId: UUID?
+
+    public init(
+        configuration: AgentRoutingConfiguration,
+        deadlineAt: Date? = nil,
+        budgetTokens: Int? = nil,
+        budgetCostMicros: Int? = nil,
+        reservationId: String? = nil,
+        reservedTokens: Int? = nil,
+        reservedCostMicros: Int? = nil,
+        admissionReceiptId: UUID? = nil
+    ) {
+        self.configuration = configuration
+        self.deadlineAt = deadlineAt
+        self.budgetTokens = budgetTokens
+        self.budgetCostMicros = budgetCostMicros
+        self.reservationId = reservationId
+        self.reservedTokens = reservedTokens
+        self.reservedCostMicros = reservedCostMicros
+        self.admissionReceiptId = admissionReceiptId
     }
 }
 

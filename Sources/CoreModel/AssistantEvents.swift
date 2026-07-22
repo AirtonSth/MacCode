@@ -233,6 +233,9 @@ public struct AssistantTokenUsage: Codable, Sendable, Equatable {
     public var uncachedInputTokens: Int?
     public var cacheCreationInputTokens: Int?
     public var cacheReadInputTokens: Int?
+    /// Provider-reported billed cost in micros. Nil means this provider/runtime
+    /// did not return a verifiable monetary amount for the turn.
+    public var reportedCostMicros: Int?
 
     public init(
         inputTokens: Int = 0,
@@ -242,7 +245,8 @@ public struct AssistantTokenUsage: Codable, Sendable, Equatable {
         compactsAutomatically: Bool? = nil,
         uncachedInputTokens: Int? = nil,
         cacheCreationInputTokens: Int? = nil,
-        cacheReadInputTokens: Int? = nil
+        cacheReadInputTokens: Int? = nil,
+        reportedCostMicros: Int? = nil
     ) {
         self.inputTokens = inputTokens
         self.outputTokens = outputTokens
@@ -252,6 +256,7 @@ public struct AssistantTokenUsage: Codable, Sendable, Equatable {
         self.uncachedInputTokens = uncachedInputTokens
         self.cacheCreationInputTokens = cacheCreationInputTokens
         self.cacheReadInputTokens = cacheReadInputTokens
+        self.reportedCostMicros = reportedCostMicros
     }
 
     public var billedInputTokenUnits: Double {

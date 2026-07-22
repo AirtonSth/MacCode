@@ -93,6 +93,10 @@ final class ProjectScriptRunRegistry: @unchecked Sendable {
 
 @MainActor
 public final class AppContext {
+    private final class WeakReference: @unchecked Sendable {
+        weak var value: AppContext?
+    }
+
     /// Single source of truth for constructing the `.claude` provider adapter
     /// from the resolved engine, so init and the Settings live-swap can never
     /// diverge. `.cli` is the dependency-minimal default; `.sdk` is the advanced
@@ -135,6 +139,9 @@ public final class AppContext {
     public let liveActivitySyncCoordinator: LiveActivitySyncCoordinator
     public let tokenSaverDistillServiceController: TokenSaverDistillServiceController
     let projectScriptRuns = ProjectScriptRunRegistry()
+    public private(set) var remoteCodeOrchestrateInstallResult: RemoteCodeOrchestrateInstallResult?
+    public private(set) var remoteCodeOrchestrateStatus: RemoteCodeOrchestrateStatus?
+    public private(set) var remoteCodeOrchestrateInstallError: String?
     public private(set) var managedDistillSkillInstallResults: [AgentSkillInstallResult] = []
     /// Last managed-distill reconcile error (nil when off or installed cleanly). Lets
     /// the UI distinguish "Token Saver off" from "install failed" instead of both
@@ -302,12 +309,21 @@ public final class AppContext {
         )
         let claude: AgentProviderAdapter = AppContext.makeClaudeAdapter(engine: claudeEngine, binary: configuredClaudeBinary)
         let grok = GrokACPAdapter(binaryNameOverride: try? settingsRepo.get("cli.grok.path"))
+        let contextReference = WeakReference()
         self.coordinator = AgentRunCoordinator(
             runRepo: runRepo, messageRepo: messageRepo, threadRepo: threadRepo,
             providerSessionRepo: providerSessionRuntimeRepo,
             checkpointRepo: turnCheckpointRepo,
+            orchestrationRuntime: AgentOrchestrationRuntime(
+                repository: AgentOrchestrationRepository(db: db),
+                costEstimator: AgentOrchestrationRuntime.productionCostEstimator
+            ),
+            providerSnapshotSupplier: {
+                await contextReference.value?.router?.listAgentProviderSnapshots() ?? []
+            },
             providerAdapters: [.codex: codex, .claude: claude, .grok: grok]
         )
+        contextReference.value = self
         let liveActivitySyncCoordinator = self.liveActivitySyncCoordinator
         coordinator.onActiveRunProjectionChanged = { projection, cause in
             let syncCause: LiveActivitySyncCause
@@ -362,9 +378,14 @@ public final class AppContext {
         _ = try providerPendingCallbackRepo.markOpenStale(
             reason: "Provider callback state does not survive app restarts or recovered sessions. Restart the turn to continue."
         )
-        // Managed skills install into the real ~/.claude / ~/.codex skill dirs. Skip the
-        // open-trigger reconcile under XCTest so the suite never mutates the developer's
-        // real home; AppContext tests drive reconcile explicitly with a sandboxed home.
+        // The orchestration package is app-private and independent of Token Saver. Keep
+        // XCTest isolated unless a sandboxed skills home was injected explicitly.
+        if !AppContext.isRunningUnitTests || agentSkillsHomeOverrideForTesting != nil {
+            reconcileRemoteCodeOrchestrate()
+        }
+        // Managed Distill skills install into the real ~/.claude / ~/.codex skill dirs.
+        // Skip the open-trigger reconcile under XCTest so the suite never mutates the
+        // developer's real home; AppContext tests drive reconcile with a sandboxed home.
         if AppContext.shouldReconcileManagedDistillIntegration(
             isRunningUnitTests: AppContext.isRunningUnitTests,
             hasSkillsHomeOverride: agentSkillsHomeOverrideForTesting != nil,
@@ -796,9 +817,24 @@ public final class AppContext {
         return env
     }
 
+    @discardableResult
+    public func reconcileRemoteCodeOrchestrate() -> RemoteCodeOrchestrateStatus {
+        let installer = makeAgentSkillInstaller()
+        do {
+            remoteCodeOrchestrateInstallResult = try installer.reconcileRemoteCodeOrchestrate()
+            remoteCodeOrchestrateInstallError = nil
+        } catch {
+            NSLog("RemoteCode orchestrate package reconcile failed: \(error)")
+            remoteCodeOrchestrateInstallResult = nil
+            remoteCodeOrchestrateInstallError = (error as NSError).localizedDescription
+        }
+        let status = installer.remoteCodeOrchestrateStatus()
+        remoteCodeOrchestrateStatus = status
+        return status
+    }
+
     public func reconcileManagedDistillSkills(tokenSaverEnabled: Bool) {
-        let installer = agentSkillsHomeOverrideForTesting.map { AgentSkillInstaller(homeDirectory: $0) }
-            ?? AgentSkillInstaller()
+        let installer = makeAgentSkillInstaller()
         do {
             if tokenSaverEnabled {
                 let codex = try installer.installDistillSkill(
@@ -841,6 +877,11 @@ public final class AppContext {
             managedDistillSkillInstallResults = []
             managedDistillSkillInstallError = (error as NSError).localizedDescription
         }
+    }
+
+    private func makeAgentSkillInstaller() -> AgentSkillInstaller {
+        agentSkillsHomeOverrideForTesting.map { AgentSkillInstaller(homeDirectory: $0) }
+            ?? AgentSkillInstaller()
     }
 
     nonisolated static func shouldReconcileManagedDistillIntegration(

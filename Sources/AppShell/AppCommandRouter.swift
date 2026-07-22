@@ -177,7 +177,25 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         payload["color"] = thread.color.map { .string($0) } ?? .null
         payload["pinned"] = .bool(thread.pinned)
         payload["sort_order"] = .number(Double(thread.sortOrder))
+        appendAgentRouting(thread.effectiveRoutingConfiguration, to: &payload)
         return .object(payload)
+    }
+
+    private func appendAgentRouting(_ routing: AgentRoutingConfiguration, to payload: inout [String: JSONValue]) {
+        let manualSelection = jsonValue(routing.manualSelection)
+        let eligibleProviders = JSONValue.array(routing.eligibleProviders.map { .string($0.rawValue) })
+        payload["routing"] = .object([
+            "mode": .string(routing.mode.rawValue),
+            "revision": .number(Double(routing.revision)),
+            "manualSelection": manualSelection,
+            "eligibleProviders": eligibleProviders,
+            "policyDigest": .string(routing.policyDigest)
+        ])
+        payload["routing_mode"] = .string(routing.mode.rawValue)
+        payload["routing_revision"] = .number(Double(routing.revision))
+        payload["manual_selection"] = manualSelection
+        payload["eligible_providers"] = eligibleProviders
+        payload["policy_digest"] = .string(routing.policyDigest)
     }
 
     /// Mirrors macOS-UI thread lifecycle mutations (AgentAppViewModel
@@ -1986,6 +2004,88 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         return t
     }
 
+    public func createAgentThreadRouting(workspace: WorkspaceID?, title: String, provider: AgentProvider, model: String, permissionMode: AgentPermissionMode, reasoningEffort: AgentReasoningEffort, serviceTier: AgentServiceTier, modelSelection: AgentModelSelection?, providerInstanceId: String?, runAsUser: AgentRunAsUser?, surfaceID: SurfaceID?, routing: AgentRoutingRequest?) async throws -> AgentThread {
+        guard let routing else {
+            return try createAgentThread(workspace: workspace, title: title, provider: provider, model: model, permissionMode: permissionMode, reasoningEffort: reasoningEffort, serviceTier: serviceTier, modelSelection: modelSelection, providerInstanceId: providerInstanceId, runAsUser: runAsUser, surfaceID: surfaceID)
+        }
+        guard let ctx = context, let manualSelection = routing.manualSelection else {
+            throw JSONRPCError.invalidParams
+        }
+        let manualInstance = normalizedProviderInstanceId(
+            provider: manualSelection.provider,
+            requested: providerInstanceId
+        )
+        let current = AgentRoutingConfiguration.legacyManual(
+            selection: manualSelection,
+            providerInstanceId: manualInstance
+        )
+        let resolvedRouting = try await resolveAgentRouting(
+            routing,
+            current: current,
+            manualSelection: manualSelection,
+            manualProviderInstanceId: manualInstance
+        )
+        let resolvedRunAs = resolveRunAsUser(runAsUser)
+        let thread = AgentThread(
+            workspaceId: workspace,
+            title: title,
+            provider: manualSelection.provider,
+            providerInstanceId: manualInstance,
+            model: manualSelection.effectiveModel,
+            permissionMode: permissionMode,
+            reasoningEffort: manualSelection.reasoningEffort,
+            serviceTier: manualSelection.serviceTier,
+            modelSelection: manualSelection,
+            runAsUser: resolvedRunAs,
+            routingConfiguration: resolvedRouting
+        )
+        try ctx.threadRepo.upsert(thread)
+        try selectAgentThread(thread: thread.id, surfaceID: surfaceID)
+        return thread
+    }
+
+    private func resolveAgentRouting(
+        _ request: AgentRoutingRequest,
+        current: AgentRoutingConfiguration,
+        manualSelection: AgentModelSelection,
+        manualProviderInstanceId: String?
+    ) async throws -> AgentRoutingConfiguration {
+        guard let ctx = context else { throw LayoutError.workspaceNotFound }
+        var base = current
+        base.manualSelection = manualSelection
+        base.manualProviderInstanceId = manualProviderInstanceId
+        if let eligibleProviders = request.eligibleProviders {
+            base.eligibleProviders = eligibleProviders
+        }
+        if let policyDigest = request.policyDigest {
+            base.policyDigest = policyDigest
+        }
+        let runtime = AgentOrchestrationRuntime(
+            repository: AgentOrchestrationRepository(db: ctx.db),
+            costEstimator: AgentOrchestrationRuntime.productionCostEstimator
+        )
+        switch request.mode {
+        case .auto:
+            if let policyDigest = request.policyDigest,
+               !policyDigest.isEmpty,
+               policyDigest != runtime.policyDigest {
+                throw AgentOrchestrationAdmissionError.invalidPolicy
+            }
+            return try runtime.autoConfiguration(
+                replacing: base,
+                expectedRevision: request.expectedRevision,
+                manualSelection: manualSelection,
+                manualProviderInstanceId: manualProviderInstanceId,
+                providerSnapshots: await listAgentProviderSnapshots()
+            )
+        case .manual:
+            return try runtime.manualConfiguration(
+                replacing: base,
+                expectedRevision: request.expectedRevision
+            )
+        }
+    }
+
     public func listAgentRunAsUsers() throws -> [AgentRunAsUser] {
         MacOSLocalUserCatalog.listEligibleUsers()
     }
@@ -2081,6 +2181,56 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         }
         windowController?.refreshFromState()
         return t
+    }
+
+    public func configureAgentThreadRouting(thread: AgentThreadID, provider: AgentProvider?, model: String?, permissionMode: AgentPermissionMode?, reasoningEffort: AgentReasoningEffort?, serviceTier: AgentServiceTier?, modelSelection: AgentModelSelection?, providerInstanceId: String?, runAsUser: AgentRunAsUser?, routing: AgentRoutingRequest?) async throws -> AgentThread {
+        guard let ctx = context, let currentThread = try ctx.threadRepo.get(id: thread) else {
+            throw LayoutError.workspaceNotFound
+        }
+        guard let routing else {
+            guard currentThread.routingConfiguration == nil else {
+                throw AgentRoutingRevisionError.conflict(
+                    expected: 0,
+                    actual: currentThread.effectiveRoutingConfiguration.revision
+                )
+            }
+            return try configureAgentThread(thread: thread, provider: provider, model: model, permissionMode: permissionMode, reasoningEffort: reasoningEffort, serviceTier: serviceTier, modelSelection: modelSelection, providerInstanceId: providerInstanceId, runAsUser: runAsUser)
+        }
+        guard let manualSelection = routing.manualSelection else {
+            throw JSONRPCError.invalidParams
+        }
+        let manualInstance = normalizedProviderInstanceId(
+            provider: manualSelection.provider,
+            requested: providerInstanceId
+                ?? currentThread.effectiveRoutingConfiguration.manualProviderInstanceId
+        )
+        let resolvedRouting = try await resolveAgentRouting(
+            routing,
+            current: currentThread.effectiveRoutingConfiguration,
+            manualSelection: manualSelection,
+            manualProviderInstanceId: manualInstance
+        )
+        _ = try configureAgentThread(
+            thread: thread,
+            provider: manualSelection.provider,
+            model: manualSelection.effectiveModel,
+            permissionMode: permissionMode,
+            reasoningEffort: manualSelection.reasoningEffort,
+            serviceTier: manualSelection.serviceTier,
+            modelSelection: manualSelection,
+            providerInstanceId: manualInstance,
+            runAsUser: runAsUser
+        )
+        try ctx.threadRepo.setRoutingConfiguration(
+            resolvedRouting,
+            threadId: thread,
+            expectedRevision: routing.expectedRevision
+        )
+        guard let updated = try ctx.threadRepo.get(id: thread) else {
+            throw LayoutError.workspaceNotFound
+        }
+        refreshAgentSurfaces(thread: thread, workspace: updated.workspaceId)
+        return updated
     }
 
     public func configureAgentThreadExecution(thread: AgentThreadID, executionMode: AgentExecutionMode, baseBranch: String?) throws -> AgentThread {
@@ -2282,6 +2432,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         }
         var providerStartConfirmed = false
         do {
+            let queuedRouting = try routingSnapshotForQueuedMessage(queued, context: ctx)
             let result = try await sendAgentMessage(
                 thread: queued.threadId,
                 text: queued.text,
@@ -2294,7 +2445,8 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 modelSelection: nil,
                 providerInstanceId: nil,
                 attachments: queued.attachments,
-                queueMessageId: queued.id
+                queueMessageId: queued.id,
+                routingSnapshot: queuedRouting
             )
             providerStartConfirmed = true
             guard try ctx.queuedMessageRepo.markDispatched(lease, runId: dispatchRunId) else {
@@ -2384,6 +2536,49 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         )
     }
 
+    public func sendAgentMessageRouting(thread: AgentThreadID, text: String, provider: AgentProvider?, model: String?, permissionMode: AgentPermissionMode?, reasoningEffort: AgentReasoningEffort?, serviceTier: AgentServiceTier?, interactionMode: AgentInteractionMode?, modelSelection: AgentModelSelection?, providerInstanceId: String?, attachments: [AgentAttachment], routing: AgentRoutingRequest?) async throws -> AgentMessageSendResult {
+        guard let ctx = context, let currentThread = try ctx.threadRepo.get(id: thread) else {
+            throw LayoutError.workspaceNotFound
+        }
+        let currentRouting = currentThread.effectiveRoutingConfiguration
+        if let routing {
+            guard routing.expectedRevision == currentRouting.revision else {
+                throw AgentRoutingRevisionError.conflict(
+                    expected: routing.expectedRevision,
+                    actual: currentRouting.revision
+                )
+            }
+            guard routing.mode == currentRouting.mode else {
+                throw JSONRPCError(
+                    code: -32020,
+                    message: "Model routing mode changed on the host. Refresh the thread and try again.",
+                    data: .object(["domain": .string("routing"), "kind": .string("mode_conflict")])
+                )
+            }
+        } else if currentRouting.mode == .auto {
+            throw JSONRPCError(
+                code: -32020,
+                message: "This thread requires an Auto routing revision. Refresh the thread and try again.",
+                data: .object(["domain": .string("routing"), "kind": .string("routing_required")])
+            )
+        }
+        return try await sendAgentMessage(
+            thread: thread,
+            text: text,
+            provider: provider,
+            model: model,
+            permissionMode: permissionMode,
+            reasoningEffort: reasoningEffort,
+            serviceTier: serviceTier,
+            interactionMode: interactionMode,
+            modelSelection: modelSelection,
+            providerInstanceId: providerInstanceId,
+            attachments: attachments,
+            queueMessageId: nil,
+            routingConfiguration: currentThread.routingConfiguration
+        )
+    }
+
     private func preflightAgentRun(
         thread: AgentThread,
         provider: AgentProvider?,
@@ -2416,18 +2611,22 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         }
     }
 
-    private func sendAgentMessage(thread: AgentThreadID, text: String, provider: AgentProvider?, model: String?, permissionMode: AgentPermissionMode?, reasoningEffort: AgentReasoningEffort?, serviceTier: AgentServiceTier?, interactionMode: AgentInteractionMode?, modelSelection: AgentModelSelection?, providerInstanceId: String?, attachments: [AgentAttachment], queueMessageId: AgentQueuedMessageID?) async throws -> AgentMessageSendResult {
+    private func sendAgentMessage(thread: AgentThreadID, text: String, provider: AgentProvider?, model: String?, permissionMode: AgentPermissionMode?, reasoningEffort: AgentReasoningEffort?, serviceTier: AgentServiceTier?, interactionMode: AgentInteractionMode?, modelSelection: AgentModelSelection?, providerInstanceId: String?, attachments: [AgentAttachment], queueMessageId: AgentQueuedMessageID?, routingConfiguration: AgentRoutingConfiguration? = nil, routingSnapshot: AgentQueuedMessageRoutingSnapshot? = nil) async throws -> AgentMessageSendResult {
         guard let ctx = context else { throw LayoutError.workspaceNotFound }
         guard let existing = try ctx.threadRepo.get(id: thread) else { throw LayoutError.workspaceNotFound }
+        let effectiveRouting = routingSnapshot?.configuration ?? routingConfiguration ?? existing.routingConfiguration
+        let autoRoutingActive = effectiveRouting?.mode == .auto
         let resolvedAttachments = try resolveInboundAgentAttachments(attachments)
-        try await preflightAgentRun(
-            thread: existing,
-            provider: modelSelection?.provider ?? provider,
-            providerInstanceId: providerInstanceId,
-            permissionMode: permissionMode ?? existing.permissionMode,
-            interactionMode: interactionMode ?? .default,
-            attachments: resolvedAttachments
-        )
+        if !autoRoutingActive {
+            try await preflightAgentRun(
+                thread: existing,
+                provider: modelSelection?.provider ?? provider,
+                providerInstanceId: providerInstanceId,
+                permissionMode: permissionMode ?? existing.permissionMode,
+                interactionMode: interactionMode ?? .default,
+                attachments: resolvedAttachments
+            )
+        }
         if existing.status == .running
             || ctx.coordinator.hasProviderSession(threadId: thread) {
             if queueMessageId != nil {
@@ -2437,7 +2636,8 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 threadId: thread,
                 text: text,
                 attachments: resolvedAttachments,
-                interactionMode: interactionMode ?? .default
+                interactionMode: interactionMode ?? .default,
+                routingSnapshot: routingSnapshot ?? effectiveRouting.map { AgentQueuedMessageRoutingSnapshot(configuration: $0) }
             )
             publishQueuedMessage(kind: "agent.message.queued", queued)
             refreshAgentSurfaces(thread: thread)
@@ -2454,7 +2654,16 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         // model/session state. The explicit agent.thread.configure RPC keeps enforcing
         // both locks for the UI's change-provider gesture.
         let alreadyStarted = !((try? ctx.messageRepo.listRecent(threadId: thread, limit: 1)) ?? []).isEmpty
-        var t = try configureAgentThread(thread: thread, provider: provider, model: model, permissionMode: permissionMode, reasoningEffort: reasoningEffort, serviceTier: serviceTier, modelSelection: modelSelection, providerInstanceId: alreadyStarted ? nil : providerInstanceId)
+        var t = try configureAgentThread(
+            thread: thread,
+            provider: autoRoutingActive ? nil : provider,
+            model: autoRoutingActive ? nil : model,
+            permissionMode: permissionMode,
+            reasoningEffort: autoRoutingActive ? nil : reasoningEffort,
+            serviceTier: autoRoutingActive ? nil : serviceTier,
+            modelSelection: autoRoutingActive ? nil : modelSelection,
+            providerInstanceId: autoRoutingActive || alreadyStarted ? nil : providerInstanceId
+        )
         if AgentThreadTitle.isPlaceholder(t.title),
            ((try? ctx.messageRepo.listRecent(threadId: thread, limit: 1)) ?? []).isEmpty {
             t.title = AgentThreadTitle.titleFromFirstMessage(text)
@@ -2487,11 +2696,18 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             reasoningEffort: t.reasoningEffort,
             serviceTier: t.serviceTier,
             interactionMode: interactionMode ?? .default,
-            providerBinary: providerBinary(provider: prov, instanceId: t.providerInstanceId),
-            environment: providerEnvironment(provider: prov, instanceId: t.providerInstanceId, threadId: thread),
+            providerBinary: autoRoutingActive ? nil : providerBinary(provider: prov, instanceId: t.providerInstanceId),
+            environment: autoRoutingActive ? [:] : providerEnvironment(provider: prov, instanceId: t.providerInstanceId, threadId: thread),
             runAsUser: t.runAsUser
         )
-        let runId = try await ctx.coordinator.startRun(req)
+        let coordinatorSnapshot = routingSnapshot.map {
+            AgentOrchestrationRoutingSnapshot(
+                configuration: $0.configuration,
+                providerSnapshots: [],
+                admissionSnapshot: $0
+            )
+        }
+        let runId = try await ctx.coordinator.startRun(req, routingSnapshot: coordinatorSnapshot)
         // HC-5 (R1): a message sent from the mobile mirror / RPC must become
         // visible on the Mac host. Refresh every Agent App rail so the thread
         // list + running state update, and re-load the transcript ONLY on
@@ -2553,6 +2769,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         }
         var providerStartConfirmed = false
         do {
+            let queuedRouting = try routingSnapshotForQueuedMessage(queued, context: ctx)
             _ = try await sendAgentMessage(
                 thread: thread,
                 text: queued.text,
@@ -2565,7 +2782,8 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 modelSelection: nil,
                 providerInstanceId: nil,
                 attachments: queued.attachments,
-                queueMessageId: queued.id
+                queueMessageId: queued.id,
+                routingSnapshot: queuedRouting
             )
             providerStartConfirmed = true
             guard try ctx.queuedMessageRepo.markDispatched(lease, runId: dispatchRunId) else {
@@ -2592,6 +2810,13 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             refreshAgentSurfaces(thread: thread)
             throw error
         }
+    }
+
+    private func routingSnapshotForQueuedMessage(
+        _ message: AgentQueuedMessage,
+        context: AppContext
+    ) throws -> AgentQueuedMessageRoutingSnapshot? {
+        try context.queuedMessageRepo.routingSnapshot(id: message.id)
     }
 
     /// Relaunch recovery for queue rows left between durable prepare and provider
@@ -3200,8 +3425,43 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                     ).discoveryResult()
                     : nil
                 let models: [AgentModelDescriptor]
+                let liveCatalogVerified: Bool
                 if let grokDiscovery {
                     models = grokDiscovery.models
+                    liveCatalogVerified = !grokDiscovery.isFallback && !grokDiscovery.models.isEmpty
+                } else if instance.provider == .claude {
+                    let discovery = await AnthropicModelDiscovery.listModelsResult(environment: env)
+                    if !discovery.isFallback && !discovery.models.isEmpty {
+                        models = discovery.models
+                        liveCatalogVerified = true
+                    } else {
+                        models = await listAgentModels(
+                            provider: instance.provider,
+                            installedVersion: capabilities.version,
+                            binaryPath: binaryPath,
+                            environment: env
+                        )
+                        liveCatalogVerified = false
+                    }
+                } else if instance.provider == .codex, !binaryPath.isEmpty {
+                    let cwd = context?.state.workspaces.values.first?.cwd ?? NSHomeDirectory()
+                    let discovered = await CodexAppServerModelDiscovery.listModels(
+                        binary: binaryPath,
+                        cwd: cwd,
+                        environment: env
+                    )
+                    if !discovered.isEmpty {
+                        models = discovered
+                        liveCatalogVerified = true
+                    } else {
+                        models = await listAgentModels(
+                            provider: instance.provider,
+                            installedVersion: capabilities.version,
+                            binaryPath: binaryPath,
+                            environment: env
+                        )
+                        liveCatalogVerified = false
+                    }
                 } else {
                     models = await listAgentModels(
                         provider: instance.provider,
@@ -3209,6 +3469,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                         binaryPath: binaryPath,
                         environment: env
                     )
+                    liveCatalogVerified = false
                 }
                 let runtimeCapabilities = providerRuntimeCapabilities(
                     provider: instance.provider,
@@ -3219,6 +3480,15 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 )
                 let runtimeSlashCommands = capabilities.slashCommands
                     + (runtimeCapabilities?.supportsFork == true ? ["/fork"] : [])
+                let modelDiscoverySource: AgentModelDiscoverySource?
+                switch instance.provider {
+                case .claude, .codex:
+                    modelDiscoverySource = liveCatalogVerified && runtimeCapabilities?.supportsStreaming == true
+                        ? .live
+                        : .builtInFallback
+                case .grok:
+                    modelDiscoverySource = grokDiscovery.map { $0.isFallback ? .builtInFallback : .live }
+                }
                 snapshots.append(AgentProviderSnapshotFactory.snapshot(
                     provider: instance.provider,
                     models: models,
@@ -3244,7 +3514,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                     interactionModesOverride: grokDiscovery?.interactionModes ?? claudeRuntime?.interactionModes,
                     permissionModesOverride: grokDiscovery?.permissionModes ?? claudeRuntime?.permissionModes,
                     capabilitiesOverride: runtimeCapabilities,
-                    modelDiscoverySource: grokDiscovery.map { $0.isFallback ? .builtInFallback : .live },
+                    modelDiscoverySource: modelDiscoverySource,
                     modelDiscoveryCacheKey: grokDiscovery?.discoveryCacheKey
                 ))
             }
@@ -3267,8 +3537,43 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 ).discoveryResult()
                 : nil
             let models: [AgentModelDescriptor]
+            let liveCatalogVerified: Bool
             if let grokDiscovery {
                 models = grokDiscovery.models
+                liveCatalogVerified = !grokDiscovery.isFallback && !grokDiscovery.models.isEmpty
+            } else if provider == .claude {
+                let discovery = await AnthropicModelDiscovery.listModelsResult(environment: [:])
+                if !discovery.isFallback && !discovery.models.isEmpty {
+                    models = discovery.models
+                    liveCatalogVerified = true
+                } else {
+                    models = await listAgentModels(
+                        provider: provider,
+                        installedVersion: capabilities.version,
+                        binaryPath: binaryPath,
+                        environment: [:]
+                    )
+                    liveCatalogVerified = false
+                }
+            } else if provider == .codex, !binaryPath.isEmpty {
+                let cwd = context?.state.workspaces.values.first?.cwd ?? NSHomeDirectory()
+                let discovered = await CodexAppServerModelDiscovery.listModels(
+                    binary: binaryPath,
+                    cwd: cwd,
+                    environment: [:]
+                )
+                if !discovered.isEmpty {
+                    models = discovered
+                    liveCatalogVerified = true
+                } else {
+                    models = await listAgentModels(
+                        provider: provider,
+                        installedVersion: capabilities.version,
+                        binaryPath: binaryPath,
+                        environment: [:]
+                    )
+                    liveCatalogVerified = false
+                }
             } else {
                 models = await listAgentModels(
                     provider: provider,
@@ -3276,6 +3581,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                     binaryPath: binaryPath,
                     environment: [:]
                 )
+                liveCatalogVerified = false
             }
             let runtimeCapabilities = providerRuntimeCapabilities(
                 provider: provider,
@@ -3286,6 +3592,15 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             )
             let runtimeSlashCommands = capabilities.slashCommands
                 + (runtimeCapabilities?.supportsFork == true ? ["/fork"] : [])
+            let modelDiscoverySource: AgentModelDiscoverySource?
+            switch provider {
+            case .claude, .codex:
+                modelDiscoverySource = liveCatalogVerified && runtimeCapabilities?.supportsStreaming == true
+                    ? .live
+                    : .builtInFallback
+            case .grok:
+                modelDiscoverySource = grokDiscovery.map { $0.isFallback ? .builtInFallback : .live }
+            }
             snapshots.append(AgentProviderSnapshotFactory.snapshot(
                 provider: provider,
                 models: models,
@@ -3301,7 +3616,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 interactionModesOverride: grokDiscovery?.interactionModes ?? claudeRuntime?.interactionModes,
                 permissionModesOverride: grokDiscovery?.permissionModes ?? claudeRuntime?.permissionModes,
                 capabilitiesOverride: runtimeCapabilities,
-                modelDiscoverySource: grokDiscovery.map { $0.isFallback ? .builtInFallback : .live },
+                modelDiscoverySource: modelDiscoverySource,
                 modelDiscoveryCacheKey: grokDiscovery?.discoveryCacheKey
             ))
         }
