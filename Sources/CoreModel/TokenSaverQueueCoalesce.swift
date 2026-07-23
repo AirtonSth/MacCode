@@ -118,12 +118,21 @@ public final class TokenSaverQueueCoalesceRuntime: @unchecked Sendable {
         public let pendingMutation: Bool
     }
 
+    public enum OmissionSaveResult: Sendable, Equatable {
+        /// First durable write of this handle.
+        case created
+        /// Handle already present with identical bytes (shared / re-save); must not be rolled back.
+        case alreadyIdentical
+        /// Handle present with different bytes, or write failed.
+        case conflict
+    }
+
     public protocol DurabilityStore: AnyObject {
         func loadProjection(key: String) -> Projection?
         func saveProjection(key: String, projection: Projection) -> Bool
         func deleteProjection(key: String)
         func loadOmission(handle: String) -> Data?
-        func saveOmission(handle: String, data: Data) -> Bool
+        func saveOmission(handle: String, data: Data) -> OmissionSaveResult
         func deleteOmission(handle: String)
     }
 
@@ -153,11 +162,13 @@ public final class TokenSaverQueueCoalesceRuntime: @unchecked Sendable {
         public func loadOmission(handle: String) -> Data? {
             lock.lock(); defer { lock.unlock() }; return omissions[handle]
         }
-        public func saveOmission(handle: String, data: Data) -> Bool {
+        public func saveOmission(handle: String, data: Data) -> OmissionSaveResult {
             lock.lock(); defer { lock.unlock() }
-            if omissions[handle] != nil { return false }
+            if let existing = omissions[handle] {
+                return existing == data ? .alreadyIdentical : .conflict
+            }
             omissions[handle] = data
-            return true
+            return .created
         }
         public func deleteOmission(handle: String) {
             lock.lock(); omissions.removeValue(forKey: handle); lock.unlock()
@@ -217,18 +228,24 @@ public final class TokenSaverQueueCoalesceRuntime: @unchecked Sendable {
             lock.lock(); defer { lock.unlock() }
             return try? Data(contentsOf: omitURL(handle))
         }
-        public func saveOmission(handle: String, data: Data) -> Bool {
+        public func saveOmission(handle: String, data: Data) -> OmissionSaveResult {
             lock.lock(); defer { lock.unlock() }
             let url = omitURL(handle)
             if FileManager.default.fileExists(atPath: url.path) {
-                // Immutable handles: only identical bytes may re-save.
-                if let existing = try? Data(contentsOf: url), existing == data { return true }
-                return false
+                if let existing = try? Data(contentsOf: url), existing == data {
+                    return .alreadyIdentical
+                }
+                return .conflict
             }
             do {
                 try data.write(to: url, options: [.withoutOverwriting])
-                return true
-            } catch { return false }
+                return .created
+            } catch {
+                if let existing = try? Data(contentsOf: url), existing == data {
+                    return .alreadyIdentical
+                }
+                return .conflict
+            }
         }
         public func deleteOmission(handle: String) {
             lock.lock(); defer { lock.unlock() }
@@ -349,20 +366,25 @@ public final class TokenSaverQueueCoalesceRuntime: @unchecked Sendable {
         }
 
         // Store-before-loss: originals before compact projection becomes authoritative.
-        var writtenOmissions: [String] = []
+        // Only newly-created handles are rolled back on failure (never shared pre-existing).
+        var newlyCreated: [String] = []
         if projection == .compact {
             for (h, data) in prepared {
-                if !store.saveOmission(handle: h, data: data) {
-                    for w in writtenOmissions { store.deleteOmission(handle: w) }
+                switch store.saveOmission(handle: h, data: data) {
+                case .created:
+                    newlyCreated.append(h)
+                case .alreadyIdentical:
+                    break
+                case .conflict:
+                    for w in newlyCreated { store.deleteOmission(handle: w) }
                     return false
                 }
-                writtenOmissions.append(h)
             }
         }
 
-        // Exclusive projection publish (raw XOR compact). Failure leaves originals durable.
+        // Exclusive projection publish (raw XOR compact).
         if !store.saveProjection(key: op.storageKey, projection: projection) {
-            for w in writtenOmissions { store.deleteOmission(handle: w) }
+            for w in newlyCreated { store.deleteOmission(handle: w) }
             return false
         }
 
@@ -370,8 +392,10 @@ public final class TokenSaverQueueCoalesceRuntime: @unchecked Sendable {
         return true
     }
 
-    /// Every `[[rc:handle]]` in compact text maps 1:1 to an omission; no extras / no missing.
+    /// Every well-formed `[[rc:handle]]` maps 1:1 to an omission; no extras, missing, empty, or malformed `[[rc:` stubs.
     public static func validateCompactMarkers(text: String, omissions: [Omission]) -> Bool {
+        // Reject any `[[rc:` that is not a complete well-formed marker with non-empty handle.
+        let openCount = text.components(separatedBy: TokenSaverQueueCoalesce.handlePrefix).count - 1
         let pattern = #"\[\[rc:([^\]]+)\]\]"#
         guard let re = try? NSRegularExpression(pattern: pattern) else { return false }
         let ns = text as NSString
@@ -381,18 +405,21 @@ public final class TokenSaverQueueCoalesceRuntime: @unchecked Sendable {
             guard let match, match.numberOfRanges >= 2 else { return }
             let r = match.range(at: 1)
             if r.location != NSNotFound {
-                textHandles.append(ns.substring(with: r))
+                let h = ns.substring(with: r)
+                // Empty or whitespace-only handles are malformed.
+                if !h.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    textHandles.append(h)
+                }
             }
         }
+        // Every `[[rc:` open must produce exactly one valid non-empty handle match.
+        guard openCount == textHandles.count else { return false }
         let omissionHandles = omissions.map { $0.handle.trimmingCharacters(in: .whitespacesAndNewlines) }
         guard omissionHandles.allSatisfy({ !$0.isEmpty }) else { return false }
         guard Set(omissionHandles).count == omissionHandles.count else { return false }
-        guard Set(textHandles).count == textHandles.count else { return false } // duplicate markers
+        guard Set(textHandles).count == textHandles.count else { return false }
         guard textHandles.count == omissionHandles.count else { return false }
-        let textSet = Set(textHandles)
-        let omitSet = Set(omissionHandles)
-        guard textSet == omitSet else { return false }
-        // Each omission's canonical marker must appear (handles already matched).
+        guard Set(textHandles) == Set(omissionHandles) else { return false }
         for o in omissions {
             guard text.contains(o.marker) else { return false }
         }

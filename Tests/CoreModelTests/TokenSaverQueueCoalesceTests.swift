@@ -76,7 +76,8 @@ final class TokenSaverQueueCoalesceTests: XCTestCase {
         XCTAssertFalse(rt.commit(op: op, projection: .raw))
         XCTAssertEqual(rt.retrieveOmission(handle: "h1"), Data("secret-omission".utf8))
         // Immutable handle
-        XCTAssertFalse(store.saveOmission(handle: "h1", data: Data("other".utf8)))
+        XCTAssertEqual(store.saveOmission(handle: "h1", data: Data("other".utf8)), .conflict)
+        XCTAssertEqual(store.saveOmission(handle: "h1", data: Data("secret-omission".utf8)), .alreadyIdentical)
 
         // Relaunch: new runtime + same durable store recovers projection (crash matrix)
         let rt2 = TokenSaverQueueCoalesceRuntime(store: try TokenSaverQueueCoalesceRuntime.FileDurabilityStore(directory: dir))
@@ -146,11 +147,47 @@ final class TokenSaverQueueCoalesceTests: XCTestCase {
         XCTAssertFalse(rt.commit(op: op, projection: .compact, compactProjectionText: extra, omissions: [om]))
         XCTAssertNil(rt.projection(for: op))
         XCTAssertNil(rt.retrieveOmission(handle: "h1"))
+        // Malformed empty handle stub must fail
+        XCTAssertFalse(rt.commit(
+            op: op,
+            projection: .compact,
+            compactProjectionText: "\(om.marker) [[rc:]]",
+            omissions: [om]
+        ))
         // Missing marker fails
         XCTAssertFalse(rt.commit(op: op, projection: .compact, compactProjectionText: "no markers", omissions: [om]))
         // Exact bijection succeeds
         XCTAssertTrue(rt.commit(op: op, projection: .compact, compactProjectionText: "x \(om.marker) y", omissions: [om]))
         XCTAssertEqual(rt.retrieveOmission(handle: "h1"), Data("orig".utf8))
+    }
+
+    func test_rollback_doesNotDeletePreexistingIdenticalOmission() {
+        let store = TokenSaverQueueCoalesceRuntime.MemoryDurabilityStore()
+        // Pre-seed shared original used by a prior compact.
+        XCTAssertEqual(store.saveOmission(handle: "shared", data: Data("keep-me".utf8)), .created)
+        final class FailProjStore: TokenSaverQueueCoalesceRuntime.DurabilityStore, @unchecked Sendable {
+            let inner: TokenSaverQueueCoalesceRuntime.MemoryDurabilityStore
+            init(_ inner: TokenSaverQueueCoalesceRuntime.MemoryDurabilityStore) { self.inner = inner }
+            func loadProjection(key: String) -> TokenSaverQueueCoalesceRuntime.Projection? { inner.loadProjection(key: key) }
+            func saveProjection(key: String, projection: TokenSaverQueueCoalesceRuntime.Projection) -> Bool { false }
+            func deleteProjection(key: String) { inner.deleteProjection(key: key) }
+            func loadOmission(handle: String) -> Data? { inner.loadOmission(handle: handle) }
+            func saveOmission(handle: String, data: Data) -> TokenSaverQueueCoalesceRuntime.OmissionSaveResult {
+                inner.saveOmission(handle: handle, data: data)
+            }
+            func deleteOmission(handle: String) { inner.deleteOmission(handle: handle) }
+        }
+        let rt = TokenSaverQueueCoalesceRuntime(store: FailProjStore(store))
+        rt.live = true
+        rt.setProviderAuthority(head: "h", generation: 1)
+        let op = TokenSaverQueueCoalesceRuntime.CompactionOperationID(
+            providerHead: "h", generation: 1, boundary: "nb", rawHistoryDigest: "nr"
+        )
+        XCTAssertTrue(rt.admitCompaction(pendingTool: false, pendingApproval: false, op: op))
+        let om = TokenSaverQueueCoalesceRuntime.Omission(handle: "shared", original: Data("keep-me".utf8))
+        XCTAssertFalse(rt.commit(op: op, projection: .compact, compactProjectionText: om.marker, omissions: [om]))
+        // Pre-existing original must survive projection CAS failure rollback.
+        XCTAssertEqual(store.loadOmission(handle: "shared"), Data("keep-me".utf8))
     }
 
     func test_storeBeforeLoss_originalsBeforeProjection() {
@@ -177,12 +214,14 @@ final class TokenSaverQueueCoalesceTests: XCTestCase {
             func loadOmission(handle: String) -> Data? {
                 lock.lock(); defer { lock.unlock() }; return omissions[handle]
             }
-            func saveOmission(handle: String, data: Data) -> Bool {
+            func saveOmission(handle: String, data: Data) -> TokenSaverQueueCoalesceRuntime.OmissionSaveResult {
                 lock.lock(); defer { lock.unlock() }
                 order.append("omit:\(handle)")
-                if omissions[handle] != nil { return omissions[handle] == data }
+                if let existing = omissions[handle] {
+                    return existing == data ? .alreadyIdentical : .conflict
+                }
                 omissions[handle] = data
-                return true
+                return .created
             }
             func deleteOmission(handle: String) {
                 lock.lock(); omissions.removeValue(forKey: handle); lock.unlock()
