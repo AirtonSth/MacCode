@@ -3976,7 +3976,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     }
 
     /// Removes Token Saver env keys and managed distill bin from PATH (task-08 raw-only).
-    static func scrubTokenSaverEnvironment(_ env: [String: String]) -> [String: String] {
+    nonisolated static func scrubTokenSaverEnvironment(_ env: [String: String]) -> [String: String] {
         var cleaned = env
         for key in env.keys where key.hasPrefix("RC_TOKEN_SAVER_") || key == "REMOTE_CODE_DISTILL_STATE_PATH" {
             cleaned.removeValue(forKey: key)
