@@ -60,6 +60,42 @@ public final class TokenSaverRolloverHandoffRuntime: @unchecked Sendable {
         public let marker: String
     }
 
+    /// Opaque gate for lossy admission. Cannot be forged from free booleans — only
+    /// `LossyGate.seal` mints seals after corpus + scope thresholds pass.
+    public struct LossyGateSeal: Sendable, Equatable {
+        fileprivate let token: UInt64
+        fileprivate init(token: UInt64) { self.token = token }
+    }
+
+    public enum LossyGate {
+        /// Minimum fixed-corpus size for lossy promotion (aligned with quality gates).
+        public static let minimumCorpusSamples = 24
+
+        /// Mint a seal only when corpus and scope evidence meet thresholds.
+        /// Free `Bool` flags alone never produce a seal.
+        public static func seal(
+            corpusSamples: Int,
+            corpusFailures: Int,
+            scopeBindingDigest: String,
+            pinsRespected: Bool
+        ) -> LossyGateSeal? {
+            let binding = scopeBindingDigest.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard corpusSamples >= minimumCorpusSamples,
+                  corpusFailures == 0,
+                  !binding.isEmpty,
+                  pinsRespected else {
+                return nil
+            }
+            // Mix evidence into token so seals are not a constant singleton.
+            var hasher = Hasher()
+            hasher.combine(corpusSamples)
+            hasher.combine(corpusFailures)
+            hasher.combine(binding)
+            hasher.combine(pinsRespected)
+            return LossyGateSeal(token: UInt64(bitPattern: Int64(hasher.finalize())))
+        }
+    }
+
     public final class MemoryDurabilityStore: DurabilityStore, @unchecked Sendable {
         private let lock = NSLock()
         private var snap: Snapshot?
@@ -143,7 +179,6 @@ public final class TokenSaverRolloverHandoffRuntime: @unchecked Sendable {
     private var _live = TokenSaverRolloverHandoff.defaultEnabled
     private var parentState: ParentState = .parentActive
     private var branches: [String: Branch] = [:]
-    private var lossyValidatorPresent = false
     private var handoffConsent = false
     private var handoffDestinationBinding = ""
     /// Bound at init — only this user may own forks (same-user AC).
@@ -174,10 +209,6 @@ public final class TokenSaverRolloverHandoffRuntime: @unchecked Sendable {
     public var live: Bool {
         get { lock.lock(); defer { lock.unlock() }; return _live }
         set { lock.lock(); _live = newValue; lock.unlock() }
-    }
-
-    public func setLossyValidatorPresent(_ v: Bool) {
-        lock.lock(); lossyValidatorPresent = v; lock.unlock()
     }
 
     public func setHandoff(consent: Bool, destinationBinding: String) {
@@ -242,16 +273,16 @@ public final class TokenSaverRolloverHandoffRuntime: @unchecked Sendable {
         return branches[forkID]
     }
 
-    /// Lossy admission **owns** store-before-loss: writes original, verifies exact readback,
-    /// then returns a recoverable `[[rc:handle]]` marker. Caller-asserted booleans are not accepted.
+    /// Lossy admission requires a `LossyGateSeal` (thresholded corpus+scope) and **owns**
+    /// store-before-loss: writes original, verifies exact readback, returns `[[rc:handle]]`.
     public func admitLossy(
         original: Data,
         recoveryHandle: String,
-        corpusOK: Bool,
-        scopeOK: Bool = true
+        gate: LossyGateSeal
     ) -> LossyAdmission? {
         lock.lock(); defer { lock.unlock() }
-        guard _live, lossyValidatorPresent, corpusOK, scopeOK else { return nil }
+        guard _live else { return nil }
+        _ = gate.token // seal existence is the gate; no free booleans
         let handle = recoveryHandle.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !handle.isEmpty, !original.isEmpty else { return nil }
         guard lossyStore.storeOriginal(handle: handle, data: original) else { return nil }

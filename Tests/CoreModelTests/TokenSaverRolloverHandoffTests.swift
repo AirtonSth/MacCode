@@ -79,13 +79,25 @@ final class TokenSaverRolloverHandoffTests: XCTestCase {
         let rt = TokenSaverRolloverHandoffRuntime(boundUserID: "u")
         rt.live = true
         let original = Data("secret-bytes".utf8)
-        // Validator off
-        XCTAssertNil(rt.admitLossy(original: original, recoveryHandle: "h1", corpusOK: true))
-        rt.setLossyValidatorPresent(true)
-        XCTAssertNil(rt.admitLossy(original: original, recoveryHandle: "h1", corpusOK: false))
-        XCTAssertNil(rt.admitLossy(original: original, recoveryHandle: "  ", corpusOK: true))
-        XCTAssertNil(rt.admitLossy(original: Data(), recoveryHandle: "h1", corpusOK: true))
-        let adm = rt.admitLossy(original: original, recoveryHandle: "h1", corpusOK: true)!
+        // Gate seal cannot be minted from undersized corpus / failures / empty scope.
+        XCTAssertNil(TokenSaverRolloverHandoffRuntime.LossyGate.seal(
+            corpusSamples: 10, corpusFailures: 0, scopeBindingDigest: "s", pinsRespected: true
+        ))
+        XCTAssertNil(TokenSaverRolloverHandoffRuntime.LossyGate.seal(
+            corpusSamples: 24, corpusFailures: 1, scopeBindingDigest: "s", pinsRespected: true
+        ))
+        XCTAssertNil(TokenSaverRolloverHandoffRuntime.LossyGate.seal(
+            corpusSamples: 24, corpusFailures: 0, scopeBindingDigest: "  ", pinsRespected: true
+        ))
+        XCTAssertNil(TokenSaverRolloverHandoffRuntime.LossyGate.seal(
+            corpusSamples: 24, corpusFailures: 0, scopeBindingDigest: "s", pinsRespected: false
+        ))
+        let gate = TokenSaverRolloverHandoffRuntime.LossyGate.seal(
+            corpusSamples: 24, corpusFailures: 0, scopeBindingDigest: "scope-bind", pinsRespected: true
+        )!
+        XCTAssertNil(rt.admitLossy(original: original, recoveryHandle: "  ", gate: gate))
+        XCTAssertNil(rt.admitLossy(original: Data(), recoveryHandle: "h1", gate: gate))
+        let adm = rt.admitLossy(original: original, recoveryHandle: "h1", gate: gate)!
         XCTAssertEqual(adm.handle, "h1")
         XCTAssertEqual(adm.marker, "[[rc:h1]]")
         XCTAssertEqual(rt.retrieveLossyOriginal(handle: "h1"), original)
@@ -93,12 +105,11 @@ final class TokenSaverRolloverHandoffTests: XCTestCase {
         XCTAssertEqual(rt.applyVerbosity(toGenerated: "done", level: "brief"), "done")
         XCTAssertTrue(rt.visualForcesOriginal(isOCR: true, isUI: false, isDebug: false))
 
-        // Store failure → no admission
+        // Store failure → no admission even with valid gate
         let failStore = TokenSaverRolloverHandoffRuntime.MemoryLossyOriginalStore()
         failStore.failStores = true
         let rt2 = TokenSaverRolloverHandoffRuntime(boundUserID: "u", lossyStore: failStore)
         rt2.live = true
-        rt2.setLossyValidatorPresent(true)
-        XCTAssertNil(rt2.admitLossy(original: original, recoveryHandle: "hx", corpusOK: true))
+        XCTAssertNil(rt2.admitLossy(original: original, recoveryHandle: "hx", gate: gate))
     }
 }
