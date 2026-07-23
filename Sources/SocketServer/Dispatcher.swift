@@ -1036,10 +1036,11 @@ public final class JSONRPCDispatcher {
               !connectionId.isEmpty,
               params["expected_host_id"]?.stringValue == context.hostId,
               case .number(let epoch)? = params["expected_boot_epoch"],
-              epoch.isFinite,
-              epoch.rounded(.towardZero) == epoch,
-              epoch >= 0,
-              UInt64(epoch) == context.bootEpoch,
+              // `UInt64(_: Double)` traps on overflow (e.g. 2^64, which passes an
+              // unbounded `>= 0` guard). `UInt64(exactly:)` rejects non-finite,
+              // fractional, negative, and out-of-range doubles.
+              let epochValue = UInt64(exactly: epoch),
+              epochValue == context.bootEpoch,
               context.ownsActiveConnection(connectionId) else {
             return nil
         }
@@ -3127,10 +3128,12 @@ public final class JSONRPCDispatcher {
               let mode = AgentRoutingMode(rawValue: rawMode),
               let revisionValue = params["routing_revision"] ?? params["routingRevision"],
               case .number(let rawRevision) = revisionValue,
-              rawRevision.isFinite,
-              rawRevision.rounded(.towardZero) == rawRevision,
-              rawRevision >= 0,
-              rawRevision <= Double(Int.max) else {
+              // `Int(_: Double)` traps on overflow, and `Double(Int.max)` rounds up
+              // to 2^63, so a `<= Double(Int.max)` bound admits a value that then
+              // traps. `Int(exactly:)` rejects non-finite, fractional, and
+              // out-of-range doubles, closing the remote abort.
+              let expectedRevision = Int(exactly: rawRevision),
+              expectedRevision >= 0 else {
             throw JSONRPCError.invalidParams
         }
         let manualValue = params["manual_selection"] ?? params["manualSelection"]
@@ -3155,7 +3158,7 @@ public final class JSONRPCDispatcher {
         if let policyValue, policyValue.stringValue == nil { throw JSONRPCError.invalidParams }
         return AgentRoutingRequest(
             mode: mode,
-            expectedRevision: Int(rawRevision),
+            expectedRevision: expectedRevision,
             manualSelection: manualSelection,
             eligibleProviders: eligibleProviders,
             policyDigest: policyValue?.stringValue

@@ -1054,35 +1054,46 @@ public final class DistillHTTPServer: @unchecked Sendable {
             let compressed = try await scheduler.submit(distillRequest)
             var response = compressed
             if distillRequest.effectiveRunMode == .optimize,
-               compressed.output != distillRequest.input,
-               let scopedContext,
-               let scopedRecoveryStore {
-                do {
-                    let preparation = try scopedRecoveryStore.prepareOriginal(
-                        Data(distillRequest.input.utf8),
-                        context: scopedContext,
-                        lane: distillRequest.mode == .commandOutput ? "deterministic_wrapper" : "semantic_prose"
-                    )
-                    guard preparation.readBackVerified,
-                          try scopedRecoveryStore.retrieveOriginal(
-                            capability: preparation.capability,
-                            context: scopedContext
-                          ) == Data(distillRequest.input.utf8),
-                          try scopedRecoveryStore.markDelivered(
-                            capability: preparation.capability,
-                            idempotencyKey: preparation.idempotencyKey,
+               compressed.output != distillRequest.input {
+                // Store-before-loss (T-003 unscoped-loss containment): a lossy
+                // optimize output may only be served when it is backed by a
+                // scope-bound recovery handle. Any other case — no/incomplete
+                // scope, missing scoped store, a store prepare/readback/deliver
+                // failure, or a lookup error that cleared the scope above — must
+                // fail open to the byte-exact original, never an unrecoverable
+                // lossy summary. (Raw SHA is not an authorization grant.)
+                var deliveredWithHandle = false
+                if let scopedContext, let scopedRecoveryStore {
+                    do {
+                        let preparation = try scopedRecoveryStore.prepareOriginal(
+                            Data(distillRequest.input.utf8),
                             context: scopedContext,
-                            outcome: .sentUnknown
-                          ) else {
-                        throw DistillError.invalidOutput
+                            lane: distillRequest.mode == .commandOutput ? "deterministic_wrapper" : "semantic_prose"
+                        )
+                        guard preparation.readBackVerified,
+                              try scopedRecoveryStore.retrieveOriginal(
+                                capability: preparation.capability,
+                                context: scopedContext
+                              ) == Data(distillRequest.input.utf8),
+                              try scopedRecoveryStore.markDelivered(
+                                capability: preparation.capability,
+                                idempotencyKey: preparation.idempotencyKey,
+                                context: scopedContext,
+                                outcome: .sentUnknown
+                              ) else {
+                            throw DistillError.invalidOutput
+                        }
+                        response = compressed.withOriginalHandle(
+                            preparation.capability,
+                            idempotencyKey: preparation.idempotencyKey
+                        )
+                        deliveredWithHandle = true
+                    } catch {
+                        deliveredWithHandle = false
                     }
-                    response = compressed.withOriginalHandle(
-                        preparation.capability,
-                        idempotencyKey: preparation.idempotencyKey
-                    )
-                } catch {
-                    // Keep compressed text; omit handle when store fails (lossy summary still useful).
-                    response = compressed
+                }
+                if !deliveredWithHandle {
+                    response = compressed.verbatimFallback(input: distillRequest.input)
                 }
             }
             if distillRequest.mode == .commandOutput, response.output != distillRequest.input {

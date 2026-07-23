@@ -1290,6 +1290,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             activeThreads.removeValue(forKey: threadId)
         }
         activeRunMetadata.removeValue(forKey: runId)
+        latestTokenUsage.removeValue(forKey: runId)
         activeTurnIds.removeValue(forKey: runId)
         activeAssistantMessageIds.removeValue(forKey: runId)
         activeProviderTextItemTypes.removeValue(forKey: runId)

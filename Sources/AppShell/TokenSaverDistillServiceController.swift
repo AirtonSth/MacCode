@@ -502,7 +502,7 @@ public final class TokenSaverDistillServiceController {
     public typealias ExecutableURLResolver = @MainActor () -> URL?
     /// Reconcile exact persisted ownership before a sidecar launch. Injectable so
     /// unit tests never signal a developer's real sidecar.
-    public typealias ForeignServerTerminator = (Int32?) -> ProviderProcessSweepResult
+    public typealias ForeignServerTerminator = @Sendable (Int32?) -> ProviderProcessSweepResult
 
     public private(set) var status: TokenSaverDistillServiceStatus = .notStarted {
         didSet {
@@ -526,6 +526,12 @@ public final class TokenSaverDistillServiceController {
     private var terminatingProcess: Process?
     private var terminationTask: Task<Void, Never>?
     private var pendingStartAfterTermination = false
+    // Desired lifecycle state (a start request wants the sidecar running) plus a
+    // latch for the in-flight off-main foreign-server sweep. The sweep completes
+    // on the MainActor and re-checks `shouldRun` before spawning, so an
+    // overlapping stop()/termination cannot leave a stale sidecar running.
+    private var shouldRun = false
+    private var foreignSweepInFlight = false
     private var readyOutputHandle: FileHandle?
     private var stderrOutputHandle: FileHandle?
     private var readyOutputBuffer = Data()
@@ -555,7 +561,7 @@ public final class TokenSaverDistillServiceController {
         executableURLResolver: @escaping ExecutableURLResolver = TokenSaverDistillServiceController.defaultExecutableURL,
         idleTimeoutMS: Int = 300_000,
         processSpawner: any DistillProcessSpawning = RealDistillProcessSpawner(),
-        terminateForeignServers: @escaping ForeignServerTerminator = TokenSaverDistillServiceController.defaultTerminateForeignServers,
+        terminateForeignServers: @escaping ForeignServerTerminator = { TokenSaverDistillServiceController.defaultTerminateForeignServers(keeping: $0) },
         ownedProcessTerminationTimeout: TimeInterval = 2.5,
         memoryProfileProvider: @escaping @Sendable () -> ManagedProcessMemoryProfile = {
             ManagedProcessMemoryProfile.resolve(physicalMemoryBytes: ProcessInfo.processInfo.physicalMemory)
@@ -677,6 +683,7 @@ public final class TokenSaverDistillServiceController {
 
     public func stop() {
         isStopping = true
+        shouldRun = false
         restartTask?.cancel()
         restartTask = nil
         restartAttempts = 0
@@ -804,11 +811,18 @@ public final class TokenSaverDistillServiceController {
     }
 
     private func start() {
+        // A start request wants the sidecar running; the off-main sweep below can
+        // overlap with stop()/termination, so its completion re-checks this latch.
+        shouldRun = true
         if let process, process.isRunning {
             return
         }
         if terminatingProcess != nil {
             pendingStartAfterTermination = true
+            return
+        }
+        // A sweep is already running; its MainActor completion spawns exactly once.
+        if foreignSweepInFlight {
             return
         }
         // A live launch supersedes any pending backoff retry.
@@ -819,10 +833,29 @@ public final class TokenSaverDistillServiceController {
             return
         }
 
-        // Single-instance gate: never spawn a second multi-GB MLX server while
-        // any other Distill server still holds the model (orphans / prior runs).
-        _ = terminateForeignServers(nil)
+        // Single-instance gate: never spawn a second multi-GB MLX server while any
+        // other Distill server still holds the model (orphans / prior runs). The
+        // sweep does blocking `ps` execs + SIGTERM grace sleeps, so it must run OFF
+        // the main actor — running it inline here froze the UI (F3). It still
+        // completes BEFORE the spawn, so two model-holding servers never overlap.
+        foreignSweepInFlight = true
+        let terminate = terminateForeignServers
+        Task.detached(priority: .userInitiated) {
+            _ = terminate(nil)
+            await MainActor.run { [weak self] in
+                guard let self else { return }
+                self.foreignSweepInFlight = false
+                // stop()/termination/an existing process may have intervened
+                // during the sweep; never spawn against the current intent.
+                guard self.shouldRun,
+                      !(self.process?.isRunning ?? false),
+                      self.terminatingProcess == nil else { return }
+                self.performSpawn(executableURL: executableURL)
+            }
+        }
+    }
 
+    private func performSpawn(executableURL: URL) {
         let token = UUID().uuidString
         stderrOutputHandle?.readabilityHandler = nil
         stderrOutputHandle = nil
