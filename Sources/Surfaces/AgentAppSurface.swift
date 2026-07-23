@@ -4826,11 +4826,56 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         }
     }
 
+    /// Whether this Agent App surface should treat a finished run as local work
+    /// that may promote the sidebar workspace MRU / refresh busy chrome.
+    /// WHY: every mounted Agent App observes the coordinator. Without a workspace
+    /// gate, one completed run fans out `onRunCompleted` to every surface and each
+    /// re-stamps a different workspace's `lastActivityAt`, so the workspace that
+    /// just finished is no longer first in the MRU list.
+    nonisolated public static func shouldHandleRunFinishForWorkspace(
+        threadWorkspace: WorkspaceID?,
+        surfaceWorkspace: WorkspaceID
+    ) -> Bool {
+        threadWorkspace == surfaceWorkspace
+    }
+
+    /// Sidebar promote / busy refresh belongs only to the workspace that owned
+    /// the finished run — not to every open Agent App tab in other workspaces.
+    nonisolated public static func shouldNotifyHostOfRunLifecycle(
+        threadWorkspace: WorkspaceID?,
+        surfaceWorkspace: WorkspaceID,
+        status: AgentRunStatus,
+        notifyOnCompletedOnly: Bool
+    ) -> Bool {
+        guard shouldHandleRunFinishForWorkspace(
+            threadWorkspace: threadWorkspace,
+            surfaceWorkspace: surfaceWorkspace
+        ) else { return false }
+        if notifyOnCompletedOnly { return status == .completed }
+        return true
+    }
+
     nonisolated public func runCoordinator(_ c: AgentRunCoordinator, didFinish runId: AgentRunID, threadId: AgentThreadID, status: AgentRunStatus, finalMessage: String?, providerThreadId: String?) {
         streamEventBatch.resetSaturation(for: runId)
         Task { @MainActor in
             guard !self.isDisposed else { return }
             let finishedTid = threadId
+            // Same workspace filter as didChangeStatus: multi-tab Agent Apps must
+            // not pay MainActor work or promote unrelated workspaces on finish.
+            let threadWorkspace: WorkspaceID?
+            if let cached = self.threadWorkspaceCache[finishedTid] {
+                threadWorkspace = cached
+            } else {
+                threadWorkspace = try? self.threadRepo.get(id: finishedTid)?.workspaceId
+                if let wid = threadWorkspace {
+                    self.threadWorkspaceCache[finishedTid] = wid
+                }
+            }
+            guard Self.shouldHandleRunFinishForWorkspace(
+                threadWorkspace: threadWorkspace,
+                surfaceWorkspace: self.workspaceID
+            ) else { return }
+
             self.terminalRunIds = Self.boundedTerminalRunIds(existing: self.terminalRunIds, adding: runId)
             self.runThreads[runId] = nil
             if status == .completed, let msg = finalMessage, !msg.isEmpty {
@@ -4877,10 +4922,15 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 self.runStartedAt = nil
                 self.isStopping = false  // UX-MAC_AGENT-STOP: run finished; clear stopping flag
             }
-            // Coalesce across many open Agent Apps receiving the same finish fan-out.
+            // Coalesce N same-workspace Agent App tabs into one reload per surface.
             self.scheduleReloadThreads()
             self.loadGitBranchThrottled()   // the run may have changed the tree
-            if status == .completed {
+            if Self.shouldNotifyHostOfRunLifecycle(
+                threadWorkspace: threadWorkspace,
+                surfaceWorkspace: self.workspaceID,
+                status: status,
+                notifyOnCompletedOnly: true
+            ) {
                 self.onRunCompleted?()
                 // Plan may have landed only as the turn ended; full access must still auto-implement.
                 if finishedTid == self.selectedThreadId {
