@@ -73,15 +73,21 @@ public struct ToolOutputCompressionPolicy: Sendable, Equatable {
         output: String,
         toolArgumentsSummary: String? = nil,
         taskSummary: String? = nil,
-        bindingDigest: String? = nil
+        bindingDigest: String? = nil,
+        resultScopeDigest: String? = nil
     ) -> ToolCompressionDecision {
         // Wave A shadow instrumentation (task-12): content-free scorecard; requires BindingID.
         TokenSaverWaveAShadowBridge.failOpenObserve {
             TokenSaverWaveAShadowBridge.observeToolOutput(
                 toolName: toolName, output: output, bindingDigest: bindingDigest
             )
-            // Wave B typed crushers (task-15): production admission probe (default OFF → no-op accept).
-            TokenSaverTypedCrushersBridge.observeToolOutput(toolName: toolName, output: output)
+            // Wave B typed crushers (task-15) + recovery (task-16) probes (default OFF).
+            TokenSaverTypedCrushersBridge.observeToolOutput(
+                toolName: toolName,
+                output: output,
+                bindingDigest: bindingDigest,
+                resultScopeDigest: resultScopeDigest
+            )
         }
         let profile = profile(for: toolName)
         let skipReason: ToolCompressionSkipReason?

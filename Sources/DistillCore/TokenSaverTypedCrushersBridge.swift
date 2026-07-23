@@ -17,8 +17,26 @@ public enum TokenSaverTypedCrushersBridge {
         }
     }
 
+    /// Extract `[[rc:…]]` handles (hex SHA or production `rcv1.*` scoped form).
+    public static func extractRecoveryHandles(from output: String) -> [String] {
+        let pattern = #"\[\[rc:([^\]]+)\]\]"#
+        guard let re = try? NSRegularExpression(pattern: pattern) else { return [] }
+        let ns = output as NSString
+        return re.matches(in: output, range: NSRange(location: 0, length: ns.length)).compactMap { m in
+            guard m.numberOfRanges >= 2 else { return nil }
+            let h = ns.substring(with: m.range(at: 1)).trimmingCharacters(in: .whitespacesAndNewlines)
+            return h.isEmpty ? nil : h
+        }
+    }
+
     /// Probe crushers on tool output. Fail-open: never throws; never mutates `output`.
-    public static func observeToolOutput(toolName: String, output: String) {
+    /// `resultScopeDigest` is independent of query BindingID so cross-scope denial is real.
+    public static func observeToolOutput(
+        toolName: String,
+        output: String,
+        bindingDigest: String? = nil,
+        resultScopeDigest: String? = nil
+    ) {
         if output.range(of: #"\d+\s+failed"#, options: .regularExpression) != nil
             || output.contains("pytest") {
             _ = TokenSaverTypedCrushers.crushPytest(
@@ -40,6 +58,21 @@ public enum TokenSaverTypedCrushersBridge {
         let trimmed = output.trimmingCharacters(in: .whitespacesAndNewlines)
         if trimmed.first == "{" || trimmed.first == "[" {
             _ = TokenSaverTypedCrushers.crushAdaptiveJSON(original: trimmed)
+        }
+        // task-16 recovery probes (default OFF → deny)
+        for handle in extractRecoveryHandles(from: output) {
+            _ = TokenSaverRecoveryBridge.observeRetrieve(
+                handle: handle,
+                bytes: Data(output.utf8),
+                original: Data(output.utf8),
+                revoked: false
+            )
+        }
+        if toolName == "Grep" || toolName == "Glob" {
+            // Missing result scope must deny (empty), not self-match on query BindingID.
+            let q = bindingDigest ?? ""
+            let r = resultScopeDigest ?? ""
+            _ = TokenSaverRecoveryBridge.observeSearch(queryScope: q, resultScope: r)
         }
     }
 }
