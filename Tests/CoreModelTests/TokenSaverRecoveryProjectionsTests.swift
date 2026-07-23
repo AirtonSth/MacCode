@@ -6,9 +6,8 @@ final class TokenSaverRecoveryProjectionsTests: XCTestCase {
         XCTAssertFalse(TokenSaverRecoveryProjections.defaultEnabled)
         XCTAssertFalse(TokenSaverRecoveryProjections.admitSearch(queryScopeDigest: "a", resultScopeDigest: "a"))
         XCTAssertFalse(TokenSaverRecoveryProjections.admitRetrieve(bytes: Data("a".utf8), original: Data("a".utf8), handle: "h"))
-        let r = TokenSaverRecoveryProjections.ReceiptFactory.fromLocalLedger(
-            bindingDigest: "b", confirmedTokens: 10, ledgerDigestMatch: true
-        )
+        let led = Self.measuredLedger(digest: "op", tokens: 10, binding: "b")
+        let r = TokenSaverRecoveryProjections.ReceiptFactory.fromLocalLedger(ledger: led, operationDigest: "op")
         XCTAssertEqual(TokenSaverRecoveryProjections.admitPrefetchSavings(used: true, receipt: r, creditBindingDigest: "b"), 0)
     }
 
@@ -34,19 +33,29 @@ final class TokenSaverRecoveryProjectionsTests: XCTestCase {
     }
 
     func test_receiptFactoryTrustedOnly() {
-        XCTAssertNil(TokenSaverRecoveryProjections.ReceiptFactory.fromLocalLedger(
-            bindingDigest: "b", confirmedTokens: 10, ledgerDigestMatch: false
-        ))
-        XCTAssertNil(TokenSaverRecoveryProjections.ReceiptFactory.fromProviderUsage(
-            bindingDigest: "b", providerTokensSaved: 5, usageEventPresent: false
-        ))
-        let r = TokenSaverRecoveryProjections.ReceiptFactory.fromProviderUsage(
-            bindingDigest: "bind", providerTokensSaved: 42, usageEventPresent: true
-        )!
+        let empty = TokenSaverAccountingV2.Ledger()
+        XCTAssertNil(TokenSaverRecoveryProjections.ReceiptFactory.fromLocalLedger(ledger: empty, operationDigest: "missing"))
+        XCTAssertNil(TokenSaverRecoveryProjections.ReceiptFactory.fromProviderUsage(ledger: empty, operationDigest: "missing"))
+
+        let unmeasured = TokenSaverAccountingV2.Ledger()
+        _ = unmeasured.record(TokenSaverAccountingV2.Operation(digest: "op", generation: 1, state: .providerApplied))
+        XCTAssertNil(TokenSaverRecoveryProjections.ReceiptFactory.fromLocalLedger(ledger: unmeasured, operationDigest: "op"))
+
+        let led = Self.measuredLedger(digest: "op", tokens: 42, binding: "bind")
+        let r = TokenSaverRecoveryProjections.ReceiptFactory.fromProviderUsage(ledger: led, operationDigest: "op")!
+        XCTAssertEqual(r.tokens, 42)
+        XCTAssertEqual(r.bindingDigest, "bind")
+        XCTAssertEqual(r.source, .providerUsage)
+        // Binding comes from ledger — cannot rebind via factory args
         XCTAssertEqual(TokenSaverRecoveryProjections.prefetchConfirmedSavings(used: true, receipt: r, creditBindingDigest: "bind"), 42)
-        // Wrong binding → zero
         XCTAssertEqual(TokenSaverRecoveryProjections.prefetchConfirmedSavings(used: true, receipt: r, creditBindingDigest: "other"), 0)
         XCTAssertEqual(TokenSaverRecoveryProjections.prefetchConfirmedSavings(used: false, receipt: r, creditBindingDigest: "bind"), 0)
+
+        let charOnly = TokenSaverAccountingV2.Ledger()
+        _ = charOnly.record(TokenSaverAccountingV2.Operation(digest: "c", generation: 1, state: .providerApplied))
+        _ = charOnly.addCharacterCountSavings(999, to: "c")
+        XCTAssertNil(TokenSaverRecoveryProjections.ReceiptFactory.fromLocalLedger(ledger: charOnly, operationDigest: "c"))
+        XCTAssertNil(TokenSaverRecoveryProjections.ReceiptFactory.fromLocalLedger(ledger: led, operationDigest: ""))
     }
 
     func test_dedupeHandles() {
@@ -67,12 +76,10 @@ final class TokenSaverRecoveryProjectionsTests: XCTestCase {
         let payload = Data("blob-content-for-excerpt-and-exact-match".utf8)
         XCTAssertTrue(rt.store(handle: "h1", scopeDigest: "scopeA", payload: payload))
         XCTAssertTrue(rt.store(handle: "h2", scopeDigest: "scopeB", payload: Data("other".utf8)))
-        // Immutable: second store rejected
         XCTAssertFalse(rt.store(handle: "h1", scopeDigest: "scopeA", payload: payload))
         let hits = rt.search(queryScope: "scopeA", resultHandles: ["h1", "h2"])
         XCTAssertEqual(hits.map(\.handle), ["h1"])
         XCTAssertTrue(hits[0].excerpt.contains("blob"))
-        // Exact retrieve requires expected bytes
         XCTAssertEqual(rt.retrieve(handle: "h1", expected: payload), payload)
         XCTAssertNil(rt.retrieve(handle: "h1", expected: Data("wrong".utf8)))
         rt.revoke("h1")
@@ -86,18 +93,22 @@ final class TokenSaverRecoveryProjectionsTests: XCTestCase {
         let off = TokenSaverRecoveryRuntime()
         XCTAssertTrue(off.store(handle: "h3", scopeDigest: "s", payload: payload))
         XCTAssertNil(off.retrieve(handle: "h3", expected: payload))
-        // Unknown revoke → tombstone blocks later store
         rt.revoke("never-stored")
         XCTAssertFalse(rt.store(handle: "never-stored", scopeDigest: "s", payload: payload))
-        // Search budget
         rt.maxSearchHits = 1
         _ = rt.store(handle: "a1", scopeDigest: "scopeA", payload: payload)
         _ = rt.store(handle: "a2", scopeDigest: "scopeA", payload: payload)
         XCTAssertEqual(rt.search(queryScope: "scopeA", resultHandles: ["a1", "a2"]).count, 1)
-        // Excerpt budget
         rt.excerptBytes = 4
         let hit = rt.search(queryScope: "scopeA", resultHandles: ["a2"]).first
         XCTAssertNotNil(hit)
         XCTAssertLessThanOrEqual(hit!.excerpt.utf8.count, 4)
+    }
+
+    private static func measuredLedger(digest: String, tokens: Int64, binding: String) -> TokenSaverAccountingV2.Ledger {
+        let led = TokenSaverAccountingV2.Ledger()
+        _ = led.record(TokenSaverAccountingV2.Operation(digest: digest, generation: 1, state: .providerApplied))
+        _ = led.markProviderMeasured(digest, experimentalPair: true, providerTokensSaved: tokens, bindingDigest: binding)
+        return led
     }
 }

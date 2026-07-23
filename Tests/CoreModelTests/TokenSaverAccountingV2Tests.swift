@@ -6,7 +6,7 @@ final class TokenSaverAccountingV2Tests: XCTestCase {
         let led = TokenSaverAccountingV2.Ledger()
         var op = TokenSaverAccountingV2.Operation(digest: "d1", generation: 1, state: .providerApplied)
         _ = led.record(op)
-        let r = led.markProviderMeasured("d1", experimentalPair: false)
+        let r = led.markProviderMeasured("d1", experimentalPair: false, bindingDigest: "bind")
         XCTAssertEqual(r, .failure(.measuredRequiresPair))
     }
 
@@ -80,7 +80,7 @@ final class TokenSaverAccountingV2Tests: XCTestCase {
     func test_characterCounts_doNotConfirm() {
         let led = TokenSaverAccountingV2.Ledger()
         _ = led.record(TokenSaverAccountingV2.Operation(digest: "d", generation: 1, state: .providerApplied))
-        _ = led.markProviderMeasured("d", experimentalPair: true, providerTokensSaved: 42)
+        _ = led.markProviderMeasured("d", experimentalPair: true, providerTokensSaved: 42, bindingDigest: "bind")
         XCTAssertEqual(led.addCharacterCountSavings(9999, to: "d"), 42)
         XCTAssertEqual(led.rebuildConfirmedTotal(), 42)
     }
@@ -90,7 +90,10 @@ final class TokenSaverAccountingV2Tests: XCTestCase {
         _ = led.record(TokenSaverAccountingV2.Operation(digest: "d", generation: 1, state: .providerApplied))
         led.markDeleted("d")
         XCTAssertTrue(led.isDeleted("d"))
-        XCTAssertEqual(led.markProviderMeasured("d", experimentalPair: true, providerTokensSaved: 10), .failure(.deleted))
+        XCTAssertEqual(
+            led.markProviderMeasured("d", experimentalPair: true, providerTokensSaved: 10, bindingDigest: "bind"),
+            .failure(.deleted)
+        )
         XCTAssertEqual(led.rebuildConfirmedTotal(), 0)
     }
 
@@ -102,13 +105,32 @@ final class TokenSaverAccountingV2Tests: XCTestCase {
         let led = TokenSaverAccountingV2.Ledger()
         _ = led.record(TokenSaverAccountingV2.Operation(digest: "a", generation: 1, state: .providerApplied))
         _ = led.record(TokenSaverAccountingV2.Operation(digest: "b", generation: 1, state: .providerApplied))
-        _ = led.markProviderMeasured("a", experimentalPair: true, providerTokensSaved: 10)
-        _ = led.markProviderMeasured("b", experimentalPair: true, providerTokensSaved: 5)
+        _ = led.markProviderMeasured("a", experimentalPair: true, providerTokensSaved: 10, bindingDigest: "bindA")
+        _ = led.markProviderMeasured("b", experimentalPair: true, providerTokensSaved: 5, bindingDigest: "bindB")
         XCTAssertEqual(led.rebuildConfirmedTotal(), led.storedConfirmedTotal())
         XCTAssertEqual(led.rebuildConfirmedTotal(), 15)
     }
 
     func test_sixTruthStates_enumerated() {
         XCTAssertEqual(TokenSaverAccountingV2.TruthState.allCases.count, 6)
+    }
+
+    func test_recordCannotSmuggleMeasuredSavings() {
+        let led = TokenSaverAccountingV2.Ledger()
+        // Missing binding on measure is rejected
+        _ = led.record(TokenSaverAccountingV2.Operation(digest: "d", generation: 1, state: .providerApplied))
+        XCTAssertEqual(
+            led.markProviderMeasured("d", experimentalPair: true, providerTokensSaved: 9, bindingDigest: "  "),
+            .failure(.missingBinding)
+        )
+        XCTAssertNil(led.measuredSnapshot(for: "d"))
+        // Measure with binding succeeds; snapshot carries binding
+        _ = led.markProviderMeasured("d", experimentalPair: true, providerTokensSaved: 9, bindingDigest: "bind")
+        let snap = led.measuredSnapshot(for: "d")
+        XCTAssertEqual(snap?.tokens, 9)
+        XCTAssertEqual(snap?.bindingDigest, "bind")
+        // confirmedTokensSaved is not publicly settable (compile-time); re-record of measured state fails
+        // via state machine only markProviderMeasured path
+        XCTAssertEqual(led.measuredConfirmedTokens(for: "missing"), nil)
     }
 }

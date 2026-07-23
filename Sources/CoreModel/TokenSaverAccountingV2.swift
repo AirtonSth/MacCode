@@ -20,15 +20,38 @@ public enum TokenSaverAccountingV2 {
         public let digest: String
         public let generation: UInt64
         public var state: TruthState
-        public var confirmedTokensSaved: Int64
+        /// Confirmed savings — only written by `Ledger.markProviderMeasured`, never by callers.
+        public private(set) var confirmedTokensSaved: Int64
+        /// Binding that owns this measurement. Set only via `markProviderMeasured`.
+        public private(set) var bindingDigest: String
+        /// Optional evidence digest (e.g. prefetch stdout) bound at measure time.
+        public private(set) var evidenceDigest: String
         public var deleted: Bool
 
         public init(digest: String, generation: UInt64, state: TruthState = .candidate) {
             self.digest = digest
             self.generation = generation
+            // Measured state cannot be invented on construct; record() also rejects it.
+            precondition(state != .providerMeasured, "providerMeasured only via markProviderMeasured")
             self.state = state
             self.confirmedTokensSaved = 0
+            self.bindingDigest = ""
+            self.evidenceDigest = ""
             self.deleted = false
+        }
+
+        /// Same-file ledger mutation path for measured confirmation.
+        fileprivate mutating func applyMeasured(tokens: Int64, binding: String, evidence: String) {
+            state = .providerMeasured
+            confirmedTokensSaved = max(0, tokens)
+            bindingDigest = binding
+            evidenceDigest = evidence
+        }
+
+        fileprivate mutating func clearSavings() {
+            confirmedTokensSaved = 0
+            bindingDigest = ""
+            evidenceDigest = ""
         }
     }
 
@@ -64,22 +87,26 @@ public enum TokenSaverAccountingV2 {
         public func record(_ op: Operation) -> Result<Operation, LedgerError> {
             lock.lock(); defer { lock.unlock() }
             if op.deleted { return .failure(.deleted) }
+            // Measured savings cannot be smuggled in via record(); only markProviderMeasured writes them.
+            if op.state == .providerMeasured {
+                return .failure(.illegalTransition)
+            }
             let store = batchOpen ? batchStaging : byDigest
             if let existing = store[op.digest] ?? byDigest[op.digest] {
                 if existing.deleted { return .failure(.deleted) }
                 // Same-byte replay: identical digest+state+generation is idempotent.
                 if existing.digest == op.digest,
                    existing.state == op.state,
-                   existing.generation == op.generation {
+                   existing.generation == op.generation,
+                   existing.confirmedTokensSaved == 0,
+                   existing.bindingDigest.isEmpty {
                     return .success(existing)
                 }
                 return .failure(.digestConflict)
             }
             var copy = op
-            if copy.generation < currentGeneration {
-                // Stale generation cannot confirm savings.
-                copy.confirmedTokensSaved = 0
-            }
+            // Strip any residual savings fields (private(set) cleared here).
+            copy.clearSavings()
             if batchOpen {
                 batchStaging[op.digest] = copy
             } else {
@@ -103,21 +130,26 @@ public enum TokenSaverAccountingV2 {
         public func markProviderMeasured(
             _ digest: String,
             experimentalPair: Bool,
-            providerTokensSaved: Int64 = 0
+            providerTokensSaved: Int64 = 0,
+            bindingDigest: String,
+            evidenceDigest: String = ""
         ) -> Result<Operation, LedgerError> {
             lock.lock(); defer { lock.unlock() }
             guard var op = byDigest[digest] else { return .failure(.missing) }
             if op.deleted { return .failure(.deleted) }
             guard experimentalPair else { return .failure(.measuredRequiresPair) }
+            let binding = bindingDigest.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !binding.isEmpty else { return .failure(.missingBinding) }
             guard TokenSaverAccountingV2.canTransition(from: op.state, to: .providerMeasured)
                 || op.state == .providerMeasured else {
                 return .failure(.illegalTransition)
             }
-            op.state = .providerMeasured
+            let evidence = evidenceDigest.trimmingCharacters(in: .whitespacesAndNewlines)
             if op.generation >= currentGeneration {
-                op.confirmedTokensSaved = max(0, providerTokensSaved)
+                op.applyMeasured(tokens: providerTokensSaved, binding: binding, evidence: evidence)
             } else {
-                op.confirmedTokensSaved = 0
+                // Stale generation cannot confirm savings but may reach measured with zero.
+                op.applyMeasured(tokens: 0, binding: binding, evidence: evidence)
             }
             byDigest[digest] = op
             return .success(op)
@@ -128,6 +160,24 @@ public enum TokenSaverAccountingV2 {
             _ = chars
             lock.lock(); defer { lock.unlock() }
             return byDigest[digest]?.confirmedTokensSaved ?? 0
+        }
+
+        /// Authoritative measured snapshot for receipt minting.
+        /// Nil unless op exists, not deleted, providerMeasured, and binding is non-empty.
+        public func measuredSnapshot(for digest: String) -> (tokens: Int64, bindingDigest: String, evidenceDigest: String)? {
+            lock.lock(); defer { lock.unlock() }
+            guard let op = byDigest[digest],
+                  !op.deleted,
+                  op.state == .providerMeasured,
+                  !op.bindingDigest.isEmpty else {
+                return nil
+            }
+            return (op.confirmedTokensSaved, op.bindingDigest, op.evidenceDigest)
+        }
+
+        /// Tokens only (binding available via measuredSnapshot).
+        public func measuredConfirmedTokens(for digest: String) -> Int64? {
+            measuredSnapshot(for: digest)?.tokens
         }
 
         public func beginBatch() {
@@ -166,8 +216,10 @@ public enum TokenSaverAccountingV2 {
 
         public func markDeleted(_ digest: String) {
             lock.lock(); defer { lock.unlock() }
-            byDigest[digest]?.deleted = true
-            byDigest[digest]?.confirmedTokensSaved = 0
+            guard var op = byDigest[digest] else { return }
+            op.deleted = true
+            op.clearSavings()
+            byDigest[digest] = op
         }
 
         public func isDeleted(_ digest: String) -> Bool {
@@ -197,7 +249,7 @@ public enum TokenSaverAccountingV2 {
         }
 
         public enum LedgerError: Error, Equatable {
-            case digestConflict, missing, measuredRequiresPair, deleted, illegalTransition
+            case digestConflict, missing, measuredRequiresPair, deleted, illegalTransition, missingBinding
         }
     }
 }
