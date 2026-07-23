@@ -3956,18 +3956,21 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         // local `distill` CLI attributes command-output savings to claude/codex/grok
         // instead of "unknown". Set unconditionally — even with no instance config.
         env["REMOTE_CODE_AGENT_PROVIDER"] = provider.rawValue
-        // Managed distill CLI on PATH for every provider call (app-private skill model).
-        env["PATH"] = Self.providerPathWithManagedWrappers(
-            currentPath: env["PATH"] ?? ProcessInfo.processInfo.environment["PATH"] ?? "",
-            managedBin: AgentSkillInstaller.defaultManagedCLIBinDirectory().path
-        )
         if let context, let threadId {
-            // Distill hint + Claude PostToolUse state; shared with session recovery.
+            // task-08: Token Saver PATH/hint only when same-user admission allows.
             let tokenSaverEnv = context.tokenSaverAgentEnvironment(provider: provider, threadId: threadId)
+            if tokenSaverEnv.isEmpty {
+                // Cross-user / raw-only: no managed distill bin, no Token Saver hints.
+                return env
+            }
+            env["PATH"] = Self.providerPathWithManagedWrappers(
+                currentPath: env["PATH"] ?? ProcessInfo.processInfo.environment["PATH"] ?? "",
+                managedBin: AgentSkillInstaller.defaultManagedCLIBinDirectory().path
+            )
             env.merge(tokenSaverEnv) { _, new in new }
         } else {
-            // No thread context: still enable always-on Distill prompt path.
-            env["RC_TOKEN_SAVER_DISTILL_HINT"] = "1"
+            // No thread context: keep provider tag only; do not force Token Saver PATH/hint
+            // without same-user admission (task-08 fail-closed).
         }
         return env
     }
