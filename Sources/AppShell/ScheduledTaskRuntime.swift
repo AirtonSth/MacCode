@@ -266,16 +266,34 @@ public final class ScheduledTaskExecutor {
         var verifiedSnapshots: [AgentProviderSnapshot] = []
         var launches: [String: AgentOrchestrationLaunchConfiguration] = [:]
 
-        for snapshot in snapshots where snapshot.enabled
-            && snapshot.installed
-            && snapshot.modelDiscoverySource == .live
-            && snapshot.capabilities?.supportsStreaming == true
-            && !snapshot.models.isEmpty {
+        // Scheduled Auto is host-bound: only the user-chosen provider account may
+        // run. Never admit other providers or substitute another account of the
+        // same provider when the saved instance is unavailable (SCHED-005).
+        let candidateSnapshots = snapshots.filter {
+            $0.provider == task.provider
+                && $0.id == task.providerInstanceID
+                && $0.enabled
+                && $0.installed
+                && $0.modelDiscoverySource == .live
+                && $0.capabilities?.supportsStreaming == true
+                && !$0.models.isEmpty
+        }
+        guard !candidateSnapshots.isEmpty else {
+            throw ScheduledTaskPreflightError.providerUnavailable(
+                "The selected provider account (\(task.provider.rawValue) · \(task.providerInstanceID)) is unavailable for Auto model routing."
+            )
+        }
+
+        for snapshot in candidateSnapshots {
             let binary = snapshot.binaryPath?.trimmingCharacters(in: .whitespacesAndNewlines)
             let baseBinary = binary?.isEmpty == false ? binary! : snapshot.provider.rawValue
             if user.name != NSUserName() {
                 do { try verifyProviderBinary(baseBinary, user: user) }
-                catch { continue }
+                catch {
+                    throw ScheduledTaskPreflightError.providerUnavailable(
+                        "The selected provider account is not executable as \(user.name): \(error)"
+                    )
+                }
             }
             let launchBinary: String
             do {
@@ -285,7 +303,9 @@ public final class ScheduledTaskExecutor {
                     providerInstanceID: snapshot.id
                 )
             } catch {
-                continue
+                throw ScheduledTaskPreflightError.providerUnavailable(
+                    "Could not resolve the selected provider binary: \(error)"
+                )
             }
             let environment = user.name == NSUserName()
                 ? router.providerEnvironment(provider: snapshot.provider, instanceId: snapshot.id)
@@ -297,7 +317,11 @@ public final class ScheduledTaskExecutor {
                     environment: environment
                 )
             }.value
-            guard authenticated == true else { continue }
+            guard authenticated == true else {
+                throw ScheduledTaskPreflightError.providerUnavailable(
+                    "The selected provider account is unavailable for system user \(user.name). Sign in as that user and retry."
+                )
+            }
 
             let verified = Self.snapshot(snapshot, authenticated: true)
             do {
@@ -308,7 +332,7 @@ public final class ScheduledTaskExecutor {
                     attachments: []
                 )
             } catch {
-                continue
+                throw ScheduledTaskPreflightError.providerUnavailable(String(describing: error))
             }
             verifiedSnapshots.append(verified)
             launches[snapshot.id] = AgentOrchestrationLaunchConfiguration(
@@ -317,13 +341,10 @@ public final class ScheduledTaskExecutor {
             )
         }
 
-        let eligibleProviders = AgentProvider.allCases.filter { provider in
-            verifiedSnapshots.contains { $0.provider == provider }
-        }
         let configuration = Self.routingConfiguration(
             for: task,
             policyDigest: orchestrationRuntime.policyDigest,
-            eligibleProviders: eligibleProviders
+            eligibleProviders: [task.provider]
         )
         do {
             _ = try orchestrationRuntime.route(
@@ -717,7 +738,14 @@ public final class ScheduledTaskAgentAppDelegate: NSObject, NSApplicationDelegat
             ProviderProcessOwnership.shared.configure(
                 fileURL: Self.providerOwnershipFile(in: appSupportDirectory)
             )
-            let context = try AppContext(channel: channel, dbPathOverride: dbOverride, appSupportOverride: appSupportOverride)
+            // Share the interactive app's SQLite, but do not run launch
+            // reconciliation that marks every live Agent App run interrupted.
+            let context = try AppContext(
+                channel: channel,
+                dbPathOverride: dbOverride,
+                appSupportOverride: appSupportOverride,
+                performLaunchRunReconciliation: false
+            )
             let router = AppCommandRouter(context: context)
             context.router = router
             let scheduler = ScheduledTaskScheduler(context: context, router: router)

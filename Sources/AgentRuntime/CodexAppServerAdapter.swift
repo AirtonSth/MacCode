@@ -95,6 +95,9 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         var startedItemIds: Set<String>
         var streamedItemIds: Set<String>
         var permissionMode: AgentPermissionMode
+        /// Generation for bounded final_answer → thread/read reconciliation so a
+        /// missing turn/completed cannot leave the coordinator owning a finished turn.
+        var finalAnswerReconcileGeneration: Int
     }
 
     private struct PendingFinish {
@@ -1117,6 +1120,12 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
                 ))
             }
             events.append(.itemCompleted(itemId: itemId, finalState: Self.itemState(for: string(item, "status"))))
+            // Codex can complete a final_answer item without ever emitting
+            // turn/completed. Arm a bounded thread/read reconcile so the run
+            // only finishes when the server authoritatively reports the turn idle.
+            if Self.isFinalAnswerPhaseItem(item, type: rawType) {
+                scheduleFinalAnswerTurnReconciliation(threadId: threadId, turnId: turnId)
+            }
         case "item/agentMessage/delta", "item.agentMessage.delta":
             let itemId = string(payload, "itemId") ?? string(payload, "item_id") ?? UUID().uuidString
             let turnId = string(payload, "turnId") ?? string(payload, "turn_id") ?? activeTurnId(threadId: threadId) ?? ""
@@ -1576,7 +1585,8 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
             emittedProposedPlanIds: [],
             startedItemIds: [],
             streamedItemIds: [],
-            permissionMode: permissionMode
+            permissionMode: permissionMode,
+            finalAnswerReconcileGeneration: 0
         )
         lock.unlock()
     }
@@ -1683,12 +1693,99 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         return sessions[threadId]?.finalAssistantMessage ?? ""
     }
 
+    /// After a final_answer item completes, wait briefly for the normal
+    /// turn/completed path, then authoritatively reconcile via thread/read.
+    private func scheduleFinalAnswerTurnReconciliation(threadId: AgentThreadID, turnId: String) {
+        lock.lock()
+        guard sessions[threadId] != nil else {
+            lock.unlock()
+            return
+        }
+        let generation = (sessions[threadId]?.finalAnswerReconcileGeneration ?? 0) &+ 1
+        sessions[threadId]?.finalAnswerReconcileGeneration = generation
+        lock.unlock()
+        Task { [weak self] in
+            // Bound: let a racing turn/completed win first (typical happy path).
+            try? await Task.sleep(nanoseconds: 2_000_000_000)
+            await self?.reconcileFinalAnswerTurnIfStillOpen(
+                threadId: threadId,
+                expectedTurnId: turnId,
+                generation: generation
+            )
+        }
+    }
+
+    private func reconcileFinalAnswerTurnIfStillOpen(
+        threadId: AgentThreadID,
+        expectedTurnId: String,
+        generation: Int
+    ) async {
+        let snapshot: (client: CodexAppServerControlling, providerThreadId: String)? = {
+            lock.lock(); defer { lock.unlock() }
+            guard let session = sessions[threadId],
+                  session.finalAnswerReconcileGeneration == generation,
+                  session.status == .running || session.activeTurnId != nil
+            else { return nil }
+            return (session.client, session.providerThreadId)
+        }()
+        guard let snapshot else { return }
+
+        let response: CodexAppServerClient.JSONObject
+        do {
+            response = try await snapshot.client.readThread(
+                providerThreadId: snapshot.providerThreadId,
+                includeTurns: true
+            )
+        } catch {
+            return
+        }
+
+        let turnId = expectedTurnId.isEmpty
+            ? (Self.turnIds(fromThreadReadResponse: response).last ?? "")
+            : expectedTurnId
+        guard !turnId.isEmpty,
+              Self.turnIsAuthoritativelyTerminal(in: response, turnId: turnId)
+        else {
+            return
+        }
+
+        let bufferedFinal: String? = {
+            lock.lock(); defer { lock.unlock() }
+            guard let live = sessions[threadId],
+                  live.finalAnswerReconcileGeneration == generation,
+                  live.status == .running || live.activeTurnId != nil
+            else { return nil }
+            return live.finalAssistantMessage
+        }()
+        guard let bufferedFinal else { return }
+
+        mergeCompletedTurnIds(threadId: threadId, turnIds: Self.turnIds(fromThreadReadResponse: response))
+        let final = Self.finalMessageFromThreadRead(response, turnId: turnId)
+            ?? (bufferedFinal.isEmpty ? nil : bufferedFinal)
+        emit([.turnCompleted(turnId: turnId, finalMessage: final)], threadId: threadId)
+        markFinished(threadId: threadId, status: .completed, turnId: turnId)
+        SessionEventEmitter(onEvent: onEventCallback(threadId: threadId))
+            .broadcastEvent(
+                .finished(
+                    .completed,
+                    finalMessage: final,
+                    providerThreadId: snapshot.providerThreadId
+                )
+            )
+    }
+
     private func markFinished(threadId: AgentThreadID, status: AgentRunStatus, turnId: String?) {
         lock.lock()
         sessions[threadId]?.status = status
         sessions[threadId]?.activeTurnId = nil
         sessions[threadId]?.threadStatusType = nil
         sessions[threadId]?.pendingFinish = nil
+        // Invalidate any pending final_answer reconcile so it cannot finish a
+        // turn that already completed via the normal turn/completed path.
+        if var session = sessions[threadId] {
+            session.finalAnswerReconcileGeneration &+= 1
+            sessions[threadId] = session
+        }
         if let turnId, !turnId.isEmpty, sessions[threadId]?.completedTurnIds.contains(turnId) == false {
             sessions[threadId]?.completedTurnIds.append(turnId)
         }
@@ -2382,6 +2479,57 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
     private static func isAssistantMessageItem(_ item: [String: Any], type: String) -> Bool {
         guard assistantItemType(for: type) == .assistantMessage else { return false }
         return !isUserMessageItem(item, type: type)
+    }
+
+    /// True only when Codex marks the item as the terminal final_answer phase.
+    /// Never infer completion from ordinary assistantMessage text alone.
+    nonisolated static func isFinalAnswerPhaseItem(_ item: [String: Any], type: String) -> Bool {
+        guard isAssistantMessageItem(item, type: type) else { return false }
+        let phase = (string(item, "phase") ?? string(item, "phaseType") ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        return phase == "final_answer" || phase == "finalanswer"
+    }
+
+    /// Authoritative turn terminal check from a thread/read response.
+    nonisolated static func turnIsAuthoritativelyTerminal(
+        in response: CodexAppServerClient.JSONObject,
+        turnId: String
+    ) -> Bool {
+        let thread = response["thread"] as? [String: Any] ?? response
+        let turns = thread["turns"] as? [[String: Any]] ?? []
+        guard let turn = turns.first(where: { string($0, "id") == turnId }) else {
+            // No turn id match: still allow idle thread status as authority.
+            let state = (string(thread, "status") ?? string(thread, "state") ?? "").lowercased()
+            return isIdleThreadStatus(state)
+        }
+        let status = (string(turn, "status") ?? "").lowercased()
+        if status == "completed" || status == "failed" || status == "cancelled" || status == "interrupted" {
+            return true
+        }
+        let state = (string(thread, "status") ?? string(thread, "state") ?? "").lowercased()
+        return isIdleThreadStatus(state)
+    }
+
+    /// Final assistant text from an authoritative thread/read snapshot.
+    nonisolated static func finalMessageFromThreadRead(
+        _ response: CodexAppServerClient.JSONObject,
+        turnId: String
+    ) -> String? {
+        let thread = response["thread"] as? [String: Any] ?? response
+        let turns = thread["turns"] as? [[String: Any]] ?? []
+        let turn = turns.first(where: { string($0, "id") == turnId }) ?? turns.last
+        guard let turn else { return nil }
+        let items = turn["items"] as? [[String: Any]] ?? []
+        for item in items.reversed() {
+            let type = string(item, "type") ?? ""
+            if isAssistantMessageItem(item, type: type),
+               let text = body(for: item, type: type)?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !text.isEmpty {
+                return text
+            }
+        }
+        return nil
     }
 
     private static func isRawResponseItemType(_ type: String) -> Bool {

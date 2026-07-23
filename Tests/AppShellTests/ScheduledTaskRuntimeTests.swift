@@ -110,6 +110,15 @@ final class ScheduledTaskRuntimeTests: XCTestCase {
         XCTAssertTrue(source.contains("orchestrationRuntime.route("))
     }
 
+    func test_autoRoutingIsBoundToSavedProviderAccount_becauseScheduledRunsMustNotSubstituteSource() throws {
+        let source = try String(contentsOf: repositoryRoot.appendingPathComponent("Sources/AppShell/ScheduledTaskRuntime.swift"), encoding: .utf8)
+
+        // Auto may only admit the exact saved provider + instance (SCHED-005).
+        XCTAssertTrue(source.contains("$0.id == task.providerInstanceID"))
+        XCTAssertTrue(source.contains("eligibleProviders: [task.provider]"))
+        XCTAssertTrue(source.contains("is unavailable for Auto model routing"))
+    }
+
     func test_preflightProbesAuthenticationInSelectedUserContext_becauseAccountsMustNotLeakAcrossHomes() throws {
         let source = try String(contentsOf: repositoryRoot.appendingPathComponent("Sources/AppShell/ScheduledTaskRuntime.swift"))
 

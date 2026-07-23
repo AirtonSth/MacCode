@@ -93,9 +93,14 @@ public struct ScheduledTask: Codable, Sendable, Equatable, Identifiable {
         if workspacePathSnapshot.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { errors.append("Workspace path is required.") }
         if runAsUser.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { errors.append("System user is required.") }
         if runAsUID < 500 || runAsUID == UInt32.max { errors.append("System user must be an eligible non-root account.") }
-        if effectiveRoutingMode == .manual {
-            if providerInstanceID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { errors.append("Provider instance is required.") }
-            if model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { errors.append("Model is required.") }
+        // Provider/Source is always user-chosen (Agent App parity). Auto only
+        // selects the model within that host — never the provider itself.
+        if providerInstanceID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            errors.append("Provider instance is required.")
+        }
+        if effectiveRoutingMode == .manual,
+           model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            errors.append("Model is required.")
         }
         if TimeZone(identifier: timeZoneIdentifier) == nil { errors.append("Time zone must be a valid IANA identifier.") }
         switch recurrence {

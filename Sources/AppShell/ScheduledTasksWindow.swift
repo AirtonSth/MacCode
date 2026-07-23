@@ -375,11 +375,15 @@ public final class ScheduledTasksViewModel: ObservableObject {
     }
 
     public func providerLabel(for task: ScheduledTask) -> String {
-        if task.effectiveRoutingMode == .auto { return "Auto" }
+        let host: String
         if let snap = providers.first(where: { $0.id == task.providerInstanceID }) {
-            return "\(task.provider.rawValue.capitalized) · \(snap.displayName)"
+            host = "\(task.provider.rawValue.capitalized) · \(snap.displayName)"
+        } else {
+            host = task.provider.rawValue.capitalized
         }
-        return task.provider.rawValue.capitalized
+        // Auto never replaces the Source — surface the chosen host plus routing mode.
+        if task.effectiveRoutingMode == .auto { return "\(host) · Auto" }
+        return host
     }
 
     public var footerStatsLine: String {
@@ -658,7 +662,10 @@ public struct ScheduledTasksRootView: View {
     }
 
     private func shortProviderModel(_ task: ScheduledTask) -> String {
-        "\(task.provider.rawValue.capitalized) · \(task.model) · \(task.reasoningEffort.displayName)"
+        if task.effectiveRoutingMode == .auto {
+            return "\(task.provider.rawValue.capitalized) · Auto"
+        }
+        return "\(task.provider.rawValue.capitalized) · \(task.model) · \(task.reasoningEffort.displayName)"
     }
 
     // MARK: Detail / history (plan: scheduled-task-history)
@@ -1235,6 +1242,38 @@ private struct ScheduledTaskEditorView: View {
                                 draft.runAsUID = vm.users.first { $0.name == name }?.uid ?? 0
                             }
                         }
+                        formRow("Provider") {
+                            Picker("Provider", selection: $draft.provider) {
+                                ForEach(AgentProvider.allCases, id: \.self) { Text($0.rawValue.capitalized).tag($0) }
+                            }
+                            .labelsHidden()
+                            .onChange(of: draft.provider) { _, provider in
+                                if let snapshot = vm.providerSnapshots(for: provider).first {
+                                    draft.providerInstanceID = snapshot.id
+                                    draft.model = snapshot.models.first?.id ?? ""
+                                    draft.reasoningEffort = snapshot.models.first?.supportedReasoningEfforts.first ?? .high
+                                }
+                            }
+                            .accessibilityIdentifier("scheduledTasks.editor.provider")
+                        }
+                        // Instance is part of provider binding; keep accessible picker for multi-account.
+                        formRow("Provider account") {
+                            Picker("Provider instance", selection: $draft.providerInstanceID) {
+                                ForEach(vm.providerSnapshots(for: draft.provider)) { Text($0.displayName).tag($0.id) }
+                            }
+                            .labelsHidden()
+                            .onChange(of: draft.providerInstanceID) { _, instanceID in
+                                guard let snapshot = vm.providers.first(where: {
+                                    $0.id == instanceID && $0.provider == draft.provider
+                                }) else { return }
+                                let models = snapshot.models
+                                if draft.model.isEmpty || !models.contains(where: { $0.id == draft.model }) {
+                                    draft.model = models.first?.id ?? ""
+                                    draft.reasoningEffort = models.first?.supportedReasoningEfforts.first ?? .high
+                                }
+                            }
+                            .accessibilityIdentifier("scheduledTasks.editor.providerAccount")
+                        }
                         formRow("Model routing") {
                             HStack(spacing: DS.Space.sm) {
                                 if vm.providersLoading {
@@ -1251,34 +1290,17 @@ private struct ScheduledTaskEditorView: View {
                                 .accessibilityIdentifier("scheduledTasks.editor.autoRouting")
                             }
                         }
+                        // Parity with Agent App: Auto never picks the provider/Source —
+                        // only the model within the selected host at run time.
                         if draft.routingMode == .auto {
                             formRow("Model") {
-                                Text("Auto selects the best available provider and model at run time.")
+                                Text("Auto selects the best model for the selected provider at run time.")
                                     .font(DS.Font.caption)
                                     .foregroundColor(DS.Palette.textSecondary)
                                     .multilineTextAlignment(.trailing)
                                     .fixedSize(horizontal: false, vertical: true)
                             }
                         } else {
-                            formRow("Provider") {
-                                Picker("Provider", selection: $draft.provider) {
-                                    ForEach(AgentProvider.allCases, id: \.self) { Text($0.rawValue.capitalized).tag($0) }
-                                }
-                                .labelsHidden()
-                                .onChange(of: draft.provider) { _, provider in
-                                    if let snapshot = vm.providerSnapshots(for: provider).first {
-                                        draft.providerInstanceID = snapshot.id
-                                        draft.model = snapshot.models.first?.id ?? ""
-                                    }
-                                }
-                            }
-                            // Instance is part of provider binding; keep accessible picker for multi-account.
-                            formRow("Provider account") {
-                                Picker("Provider instance", selection: $draft.providerInstanceID) {
-                                    ForEach(vm.providerSnapshots(for: draft.provider)) { Text($0.displayName).tag($0.id) }
-                                }
-                                .labelsHidden()
-                            }
                             formRow("Model") {
                                 Picker("Model", selection: $draft.model) {
                                     ForEach(vm.models(provider: draft.provider, instanceID: draft.providerInstanceID), id: \.id) {
@@ -1290,12 +1312,14 @@ private struct ScheduledTaskEditorView: View {
                                     }
                                 }
                                 .labelsHidden()
+                                .accessibilityIdentifier("scheduledTasks.editor.model")
                             }
                             formRow("Reasoning") {
                                 Picker("Reasoning", selection: $draft.reasoningEffort) {
                                     ForEach(AgentReasoningEffort.allCases, id: \.self) { Text($0.displayName).tag($0) }
                                 }
                                 .labelsHidden()
+                                .accessibilityIdentifier("scheduledTasks.editor.reasoning")
                             }
                         }
                     }
@@ -1483,12 +1507,17 @@ private struct ScheduledTaskEditorView: View {
 
     private func setAutoRoutingEnabled(_ enabled: Bool) {
         draft.routingMode = enabled ? .auto : .manual
+        // Turning Auto off must keep the chosen Source (provider + account).
+        // Only fill a missing model from the exact selected instance — never
+        // jump to the first available provider in the catalog.
         guard !enabled,
-              draft.model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-              let snapshot = vm.providers.first(where: { $0.enabled && $0.installed }) ?? vm.providers.first else {
+              draft.model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             return
         }
-        draft.provider = snapshot.provider
+        let snapshot = vm.providers.first(where: {
+            $0.id == draft.providerInstanceID && $0.provider == draft.provider
+        }) ?? vm.providerSnapshots(for: draft.provider).first
+        guard let snapshot else { return }
         draft.providerInstanceID = snapshot.id
         draft.model = snapshot.models.first?.id ?? ""
         draft.reasoningEffort = snapshot.models.first?.supportedReasoningEfforts.first ?? .high

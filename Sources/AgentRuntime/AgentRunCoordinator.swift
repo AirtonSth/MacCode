@@ -1130,7 +1130,21 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         // double-fire didChangeStatus/onRunFinished for the same run (duplicate
         // notifications, two concurrent queue drains), so a run that is already
         // terminal is done.
-        if let runId, (try? runRepo.get(id: runId))?.finishedAt != nil {
+        //
+        // Exception: durable terminal + leftover in-memory ownership (partial
+        // finish / multi-process reconcile race). Release the ghost active run so
+        // Stop/Working cannot stick after finishedAt is already set.
+        if let runId, let row = try? runRepo.get(id: runId), row.finishedAt != nil {
+            _ = releaseStaleInMemoryOwnershipIfDurableTerminal(
+                runId: runId,
+                threadId: threadId,
+                preferredStatus: row.status,
+                finalMessage: nil,
+                providerThreadId: nil
+            )
+            if let adapter = try? adapterForThread(threadId), adapter.hasSession(threadId: threadId) {
+                try? adapter.stopSession(threadId: threadId)
+            }
             return
         }
         if let runId {
@@ -1141,8 +1155,15 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             // commits. This prevents Stop-first from evicting active ownership or
             // publishing `.cancelled` while SQLite still holds uncommitted events.
             lock.lock()
-            guard !finishingRuns.contains(runId), pendingTerminalEvents[runId] == nil else {
+            let durabilityPending = finishingRuns.contains(runId) || pendingTerminalEvents[runId] != nil
+            guard !durabilityPending else {
+                let needsRetry = pendingTerminalEvents[runId] != nil
                 lock.unlock()
+                // Already finishing: re-arm durability retry so a stuck flush cannot
+                // leave activeThreads owned forever after the user hits Stop.
+                if needsRetry {
+                    scheduleTerminalDurabilityRetry(runId: runId, threadId: threadId)
+                }
                 return
             }
             finishingRuns.insert(runId)
@@ -1242,6 +1263,75 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         autoContinuationCounts.removeValue(forKey: threadId)
         autoContinuationTokens.removeValue(forKey: threadId)
         lock.unlock()
+    }
+
+    /// When SQLite already has a terminal run row but this process still lists the
+    /// run in `active` / `activeThreads`, release in-memory ownership and fan out
+    /// `didFinish` exactly once. No-op when the run is not owned in memory (avoids
+    /// double-notifying a fully completed finish path).
+    @discardableResult
+    private func releaseStaleInMemoryOwnershipIfDurableTerminal(
+        runId: AgentRunID,
+        threadId: AgentThreadID,
+        preferredStatus: AgentRunStatus?,
+        finalMessage: String?,
+        providerThreadId: String?
+    ) -> Bool {
+        lock.lock()
+        let ownsRun = active[runId] != nil || activeThreads[threadId] == runId
+        guard ownsRun else {
+            lock.unlock()
+            return false
+        }
+        // Cancel any still-registered handle so provider processes do not outlive
+        // the durable terminal row (Stop-after-partial-finish path).
+        let handle = active.removeValue(forKey: runId)
+        if activeThreads[threadId] == runId {
+            activeThreads.removeValue(forKey: threadId)
+        }
+        activeRunMetadata.removeValue(forKey: runId)
+        activeTurnIds.removeValue(forKey: runId)
+        activeAssistantMessageIds.removeValue(forKey: runId)
+        activeProviderTextItemTypes.removeValue(forKey: runId)
+        bufferedProviderTextItems.removeValue(forKey: runId)
+        activeDistillOutputRuns.remove(runId)
+        finishingRuns.remove(runId)
+        pendingTerminalEvents.removeValue(forKey: runId)
+        terminalRetryScheduled.remove(runId)
+        deferredProviderTerminalEvents.removeValue(forKey: runId)
+        providerTextTranslationsInFlight.removeValue(forKey: runId)
+        pendingGracefulStopFallbacks.remove(runId)
+        awaitingTerminationRuns.remove(runId)
+        providerTerminatedRuns.remove(runId)
+        pendingThreadStops.remove(threadId)
+        orchestrationDeadlineWorkItems.removeValue(forKey: runId)?.cancel()
+        seq.removeValue(forKey: runId)
+        lastPersistedAssistantContent.removeValue(forKey: threadId)
+        autoContinuationCounts.removeValue(forKey: threadId)
+        autoContinuationTokens[threadId] = (autoContinuationTokens[threadId] ?? 0) + 1
+        let projection = activeRunProjectionLocked()
+        lock.unlock()
+
+        handle?.cancel()
+        let status = preferredStatus
+            ?? (try? runRepo.get(id: runId))?.status
+            ?? .cancelled
+        agentRunLog.info(
+            "run.stale_ownership_released thread=\(threadId.value.uuidString, privacy: .public) run=\(runId.value.uuidString, privacy: .public) status=\(status.rawValue, privacy: .public)"
+        )
+        onActiveRunProjectionChanged?(projection, .finished(status))
+        for observer in observersSnapshot() {
+            observer.runCoordinator(
+                self,
+                didFinish: runId,
+                threadId: threadId,
+                status: status,
+                finalMessage: finalMessage,
+                providerThreadId: providerThreadId
+            )
+        }
+        onRunFinished?(threadId, runId, status)
+        return true
     }
 
     #if DEBUG
@@ -2591,6 +2681,17 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             }
             lock.unlock()
             if let row = try? runRepo.get(id: runId), row.finishedAt != nil {
+                // Durable row is terminal (possibly written by another process's
+                // launch reconciliation or a partial finish). If this process still
+                // owns the run in memory, release it and fan out didFinish once so
+                // Working/Stop cannot stick after finishedAt is set.
+                _ = releaseStaleInMemoryOwnershipIfDurableTerminal(
+                    runId: runId,
+                    threadId: threadId,
+                    preferredStatus: status,
+                    finalMessage: sanitizeFinalAssistantText(rawFinalMessage),
+                    providerThreadId: providerThreadId
+                )
                 return
             }
             lock.lock()

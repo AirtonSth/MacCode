@@ -95,13 +95,28 @@ final class ScheduledTasksWindowTests: XCTestCase {
                        "plan mockups use a single-column stack, not master-detail split")
     }
 
-    func test_editorOffersAutoAndHidesManualPickersWhileEnabled_becauseRoutingMustBeUnambiguous() throws {
+    func test_editorKeepsProviderPickersWithAuto_becauseAutoOnlySelectsModel() throws {
         let source = try String(contentsOf: sourceURL("Sources/AppShell/ScheduledTasksWindow.swift"), encoding: .utf8)
 
         XCTAssertTrue(source.contains("scheduledTasks.editor.autoRouting"))
+        XCTAssertTrue(source.contains("scheduledTasks.editor.provider"))
+        XCTAssertTrue(source.contains("scheduledTasks.editor.providerAccount"))
         XCTAssertTrue(source.contains("if draft.routingMode == .auto"))
-        XCTAssertTrue(source.contains("Auto selects the best available provider and model at run time."))
+        // Auto must never claim it picks the provider — only the model for the chosen Source.
+        XCTAssertTrue(source.contains("Auto selects the best model for the selected provider at run time."))
+        XCTAssertFalse(source.contains("Auto selects the best available provider and model at run time."))
         XCTAssertTrue(source.contains("ProgressView()"))
+        // Provider pickers live outside the Auto-only branch so they stay visible.
+        let providerPicker = try XCTUnwrap(source.range(of: "scheduledTasks.editor.provider"))
+        let autoBranch = try XCTUnwrap(source.range(of: "if draft.routingMode == .auto"))
+        XCTAssertLessThan(providerPicker.lowerBound, autoBranch.lowerBound,
+                          "Provider picker must render before the Auto-only model branch")
+        // Labels must keep the chosen Source when Auto is on (not "Provider: Auto").
+        XCTAssertTrue(source.contains("\\(host) · Auto"))
+        XCTAssertTrue(source.contains("\\(task.provider.rawValue.capitalized) · Auto"))
+        // Auto → Manual must restore model from the selected account, not first catalog host.
+        XCTAssertTrue(source.contains("$0.id == draft.providerInstanceID && $0.provider == draft.provider"))
+        XCTAssertFalse(source.contains("vm.providers.first(where: { $0.enabled && $0.installed }) ?? vm.providers.first"))
     }
 
     func test_mainDisablesManagedDistillInScheduledAgent_becauseHeadlessRunsMustNotMutateShellSkills() throws {
