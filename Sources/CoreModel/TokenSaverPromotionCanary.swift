@@ -40,9 +40,15 @@ public final class TokenSaverPromotionCanaryRuntime: @unchecked Sendable {
     private var modelBOMComplete = false
     private var semanticConsent = false
     private var presentationParityOK = false
-    private var originalViews: [String: Data] = [:] // handle -> original
+    private var originalViews: [String: Data] = [:] // handle -> original (memory cache)
+    private let durableRoot: URL?
 
-    public init() {}
+    public init(durableDirectory: URL? = nil) {
+        self.durableRoot = durableDirectory
+        if let dir = durableDirectory {
+            try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        }
+    }
 
     public var live: Bool {
         get { lock.lock(); defer { lock.unlock() }; return _live }
@@ -63,9 +69,12 @@ public final class TokenSaverPromotionCanaryRuntime: @unchecked Sendable {
         return isLive && hasDeliveringConfirmedLane
     }
 
-    /// Never sum measured test impact with estimated as one confirmed total (AC-02).
+    /// Never sum measured + estimated. Confirmed totals require live runtime (default OFF → 0).
     public func confirmedTotal(receipt: PresentationReceipt) -> Int64 {
-        receipt.confirmed ? receipt.measuredTokens : 0
+        lock.lock(); let isLive = _live; lock.unlock()
+        guard isLive else { return 0 }
+        // Estimated tokens never contribute; only measured when confirmed.
+        return receipt.confirmed ? max(0, receipt.measuredTokens) : 0
     }
 
     public func storeOriginal(handle: String, bytes: Data) -> Bool {
@@ -73,14 +82,30 @@ public final class TokenSaverPromotionCanaryRuntime: @unchecked Sendable {
         guard !h.isEmpty else { return false }
         lock.lock(); defer { lock.unlock() }
         if originalViews[h] != nil { return false }
+        if let root = durableRoot {
+            let url = root.appendingPathComponent(Self.safeName(h))
+            if FileManager.default.fileExists(atPath: url.path) { return false }
+            do { try bytes.write(to: url, options: .atomic) } catch { return false }
+        }
         originalViews[h] = bytes
         return true
     }
 
     public func viewOriginal(handle: String) -> Data? {
         let h = handle.trimmingCharacters(in: .whitespacesAndNewlines)
-        lock.lock(); defer { lock.unlock() }
-        return originalViews[h]
+        lock.lock()
+        if let mem = originalViews[h] {
+            lock.unlock()
+            return mem
+        }
+        let root = durableRoot
+        lock.unlock()
+        guard let root else { return nil }
+        return try? Data(contentsOf: root.appendingPathComponent(Self.safeName(h)))
+    }
+
+    private static func safeName(_ handle: String) -> String {
+        Data(handle.utf8).base64EncodedString().replacingOccurrences(of: "/", with: "_")
     }
 
     /// Canary advances only with outcomes watermark, never time alone (AC-05).

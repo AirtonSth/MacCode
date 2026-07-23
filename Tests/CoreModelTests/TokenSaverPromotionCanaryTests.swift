@@ -9,8 +9,13 @@ final class TokenSaverPromotionCanaryTests: XCTestCase {
         let r = TokenSaverPromotionCanaryRuntime.PresentationReceipt(
             bindingDigest: "b", measuredTokens: 10, estimatedTokens: 99, confirmed: false, originalHandle: nil
         )
+        // Default OFF: never credit confirmed totals
         XCTAssertEqual(rt.confirmedTotal(receipt: r), 0)
+        XCTAssertEqual(rt.confirmedTotal(receipt: .init(bindingDigest: "b", measuredTokens: 10, estimatedTokens: 99, confirmed: true, originalHandle: nil)), 0)
+        rt.live = true
         XCTAssertEqual(rt.confirmedTotal(receipt: .init(bindingDigest: "b", measuredTokens: 10, estimatedTokens: 99, confirmed: true, originalHandle: nil)), 10)
+        // Estimated never summed in
+        XCTAssertEqual(rt.confirmedTotal(receipt: .init(bindingDigest: "b", measuredTokens: 10, estimatedTokens: 99, confirmed: false, originalHandle: nil)), 0)
     }
 
     func test_canaryWatermarkNotTime() {
@@ -51,5 +56,15 @@ final class TokenSaverPromotionCanaryTests: XCTestCase {
         XCTAssertTrue(rt.storeOriginal(handle: "h1", bytes: Data("orig".utf8)))
         XCTAssertEqual(rt.viewOriginal(handle: "h1"), Data("orig".utf8))
         XCTAssertFalse(rt.storeOriginal(handle: "h1", bytes: Data("x".utf8)))
+    }
+
+    func test_originalSurvivesRelaunchViaDurableDir() throws {
+        let dir = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("ts-canary-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let rt1 = TokenSaverPromotionCanaryRuntime(durableDirectory: dir)
+        XCTAssertTrue(rt1.storeOriginal(handle: "h1", bytes: Data("durable-orig".utf8)))
+        // New runtime, same durable dir (relaunch)
+        let rt2 = TokenSaverPromotionCanaryRuntime(durableDirectory: dir)
+        XCTAssertEqual(rt2.viewOriginal(handle: "h1"), Data("durable-orig".utf8))
     }
 }
