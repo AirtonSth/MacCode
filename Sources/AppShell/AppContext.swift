@@ -2209,7 +2209,14 @@ public final class AppContext {
         if tokenSaverProjectObservation(runId: runId, lane: "session_learn").allowed {
             sessionLearnInputTokensByRun[runId, default: 0] += max(0, usage.inputTokens)
         }
-        guard tokenSaverProjectObservation(runId: runId, lane: "measurement").allowed else { return }
+        // The sidebar "used tokens" display reflects the real provider-billed count
+        // and must be recorded for every Token-Saver-enabled thread — NOT gated on
+        // the measurement lane (which requires a projectId + seeded lane rows).
+        // Normal thread creation makes projectless threads, so an outer measurement
+        // gate here left the sidebar showing 0 used tokens despite real billing. The
+        // measurement/attribution ledger stays gated: `appendTokenSaverProviderUsage`
+        // self-gates on the same measurement observation, and no other path below
+        // writes measurement/savings rows.
         appendTokenSaverProviderUsage(usage, runId: runId)
         let settings = SettingsStore(db: db).load()
         // Record only the real provider-billed token count. Savings are now
