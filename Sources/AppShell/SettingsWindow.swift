@@ -242,12 +242,11 @@ public enum DistillInstallStatus: Equatable {
     case failed(String)
 
     /// A reconcile error wins (so a failure is never hidden as "off"); otherwise
-    /// `installed` when the app-private Distill package is present. The Token Saver
-    /// toggle no longer gates Distill skill install (always-on, like remote-code-orchestrate).
+    /// `installed` only while Token Saver is enabled and the Distill package is present.
+    /// Token economy is paid — Distill integration tracks the Token Saver toggle.
     public static func from(error: String?, enabled: Bool, installedCount: Int) -> DistillInstallStatus {
         if let error { return .failed(error) }
-        _ = enabled
-        if installedCount > 0 { return .installed }
+        if enabled, installedCount > 0 { return .installed }
         return .inactive
     }
 }

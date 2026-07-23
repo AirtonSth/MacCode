@@ -77,8 +77,8 @@ final class ClaudeRunnerArgsTests: XCTestCase {
                      "resumed Claude streaming sessions must not also request a new session id")
     }
 
-    func test_streamingAlwaysAppendsBackgroundAwaitAndManagedDistill() {
-        // Background-await + managed Distill ride on EVERY Claude run (app-private skill).
+    func test_streamingAppendsBackgroundAwaitAlwaysAndDistillOnlyWithTokenSaver() {
+        // Background-await always; Distill only with Token Saver hint.
         let on = AgentRunRequest(threadId: AgentThreadID(), provider: .claude,
                                  model: "claude-opus-4-7", cwd: "/tmp", prompt: "hi",
                                  environment: ["RC_TOKEN_SAVER_DISTILL_HINT": "1"])
@@ -90,7 +90,7 @@ final class ClaudeRunnerArgsTests: XCTestCase {
         XCTAssertTrue(promptOn.contains(BackgroundAwaitContinuation.awaitingMarker),
                       "appended system prompt must instruct the agent to self-declare a stall with the recovery marker")
         XCTAssertTrue(promptOn.contains("| distill"),
-                      "managed Distill always injects the `| distill` piping rule")
+                      "Token Saver on injects the `| distill` piping rule")
         XCTAssertEqual(promptOn.components(separatedBy: TokenSaverProviderSafetyABI.block).count - 1, 1,
                        "Claude CLI runtime context must carry the safety ABI exactly once without disk instructions")
         XCTAssertEqual(
@@ -109,10 +109,10 @@ final class ClaudeRunnerArgsTests: XCTestCase {
         let promptEmpty = aEmpty[aEmpty.index(after: idxEmpty)]
         XCTAssertTrue(promptEmpty.contains(BackgroundAwaitContinuation.awaitingMarker),
                       "the background-await rule must be present on every Claude call")
-        XCTAssertTrue(promptEmpty.contains("| distill"),
-                      "empty env still injects managed Distill for every Claude call")
-        XCTAssertTrue(promptEmpty.contains(TokenSaverProviderSafetyABI.block),
-                      "always-on Distill carries the safety ABI")
+        XCTAssertFalse(promptEmpty.contains("| distill"),
+                       "Token Saver off must not inject Distill")
+        XCTAssertFalse(promptEmpty.contains(TokenSaverProviderSafetyABI.block),
+                       "Token Saver off must not inject safety ABI")
     }
 
     func test_mcpAvailabilityDirectiveRidesBothLiveClaudeRoutes() {

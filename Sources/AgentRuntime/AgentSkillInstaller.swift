@@ -246,16 +246,18 @@ public final class AgentSkillInstaller: @unchecked Sendable {
             .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    /// Inject managed Distill into every provider runtime prompt (Claude / Codex / Grok).
-    /// Same app-private model as `remote-code-orchestrate`: no dependency on
-    /// `~/.claude/skills` or `~/.codex/skills`. The environment flag is ignored for
-    /// injection so every provider call carries Distill language + pipe rules.
+    /// Inject managed Distill into provider runtime prompts (Claude / Codex / Grok)
+    /// only while Token Saver is active (`RC_TOKEN_SAVER_DISTILL_HINT=1`).
+    /// Token economy is the paid feature: no Distill dialect, `| distill` rules,
+    /// or safety ABI when the toggle is off.
     public static func tokenSaverProviderPrompt(_ base: String, environment: [String: String]) -> String {
-        _ = environment
+        guard environment["RC_TOKEN_SAVER_DISTILL_HINT"] == "1" else {
+            return base
+        }
         return managedDistillProviderPrompt(base)
     }
 
-    /// Always-on Distill injection used by all RemoteCode provider adapters.
+    /// Distill injection for Token-Saver-enabled provider adapters.
     public static func managedDistillProviderPrompt(_ base: String) -> String {
         let withDistill = base.contains(distillAgentInstructionsBody)
             ? base

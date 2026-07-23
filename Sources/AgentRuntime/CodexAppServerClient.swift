@@ -782,15 +782,15 @@ public final class CodexAppServerClient: @unchecked Sendable {
     }
 
     private static func collaborationMode(for request: AgentRunRequest, normalizedModel model: String?) -> JSONObject {
-        [
+        let tokenSaverEnabled = request.environment["RC_TOKEN_SAVER_DISTILL_HINT"] == "1"
+        return [
             "mode": request.interactionMode.rawValue,
             "settings": [
                 "model": model ?? "gpt-5.5",
                 "reasoning_effort": appServerReasoningEffort(for: request.reasoningEffort).rawValue,
                 "developer_instructions": developerInstructions(
                     for: request.interactionMode,
-                    // Always inject Distill (app-private managed skill), all Codex turns.
-                    tokenSaverEnabled: true
+                    tokenSaverEnabled: tokenSaverEnabled
                 )
             ]
         ]
@@ -800,12 +800,11 @@ public final class CodexAppServerClient: @unchecked Sendable {
         effort == .minimal ? .low : (effort ?? .medium)
     }
 
-    /// Codex's per-turn `developer_instructions`: base mode + always-on managed Distill
-    /// (app-private skill, not `~/.codex/skills`). Mirrors Claude/Grok injection.
+    /// Codex's per-turn `developer_instructions`: base mode + Distill only when
+    /// Token Saver is active (paid token-economy feature).
     private static func developerInstructions(for mode: AgentInteractionMode, tokenSaverEnabled: Bool) -> String {
         let base = AgentProviderInstructionText.developerInstructions(for: mode)
-        // tokenSaverEnabled kept for call-site compatibility; Distill is always injected.
-        _ = tokenSaverEnabled
+        guard tokenSaverEnabled else { return base }
         return AgentSkillInstaller.managedDistillProviderPrompt(base)
     }
 }

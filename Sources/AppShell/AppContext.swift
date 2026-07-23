@@ -812,11 +812,11 @@ public final class AppContext {
             NSClassFromString("XCTestCase") != nil
     }
 
-    /// Distill + Token Saver environment for an agent run. Distill language and
-    /// `| distill` PATH are always-on for every provider (app-private skill model,
-    /// same idea as remote-code-orchestrate). Workspace attribution still requires
-    /// project admission when present. Single source for the normal run path and
-    /// recovered-session path.
+    /// Distill + Token Saver environment for an agent run.
+    /// Token economy is paid: Distill hint, managed-bin PATH, and Claude
+    /// PostToolUse compression are emitted only while Token Saver is enabled.
+    /// Workspace attribution still requires project admission when present.
+    /// Single source for the normal run path and recovered-session path.
     func tokenSaverAgentEnvironment(
         provider: AgentProvider,
         threadId: AgentThreadID,
@@ -829,8 +829,12 @@ public final class AppContext {
         ) else {
             return [:]
         }
+        // Paid feature gate: no token-economy env while Token Saver is off.
+        guard SettingsStore(db: db).load().tokenSaverEnabled else {
+            return [:]
+        }
         var env: [String: String] = [:]
-        // Always expose managed distill CLI on PATH for every provider call.
+        // Expose managed distill CLI + wrappers on PATH only while Token Saver is on.
         if managedDistillSkillInstallError == nil {
             env["RC_TOKEN_SAVER_DISTILL_HINT"] = "1"
             let managedBin = AgentSkillInstaller.defaultManagedCLIBinDirectory().path
@@ -847,8 +851,7 @@ public final class AppContext {
             env["RC_TOKEN_SAVER_THREAD_ID"] = threadId.value.uuidString
         }
         if provider == .claude {
-            // Claude PostToolUse compression hook (sidecar HTTP). Always on when
-            // managed distill installed so all Claude calls speak/compress distill.
+            // Claude PostToolUse compression hook (sidecar HTTP) — Token Saver only.
             env["RC_TOKEN_SAVER_POST_TOOL_USE"] = "1"
             env["REMOTE_CODE_DISTILL_STATE_PATH"] = appSupportDirectory
                 .appendingPathComponent("Distill", isDirectory: true)
@@ -874,33 +877,34 @@ public final class AppContext {
         return status
     }
 
-    /// Install Distill like `remote-code-orchestrate`: app-private under RemoteCode
-    /// Application Support, never into `~/.claude/skills` / `~/.codex/skills` /
-    /// `~/.grok/skills`. Always available for every provider call; Token Saver
-    /// still owns the MLX sidecar separately.
+    /// Reconcile Distill integration with the Token Saver toggle (paid feature).
+    /// App-private skill package lives under Application Support only (never
+    /// `~/.claude` / `~/.codex` skill trees). CLI, command wrappers, and retrieve
+    /// MCP are installed only while Token Saver is enabled; disabled removes them
+    /// so free/unsubscribed runs never get token-economy hooks.
     public func reconcileManagedDistillSkills(tokenSaverEnabled: Bool) {
         let installer = makeAgentSkillInstaller()
         do {
-            // 1) App-private package (source of truth for the managed skill body).
-            let appPrivate = try installer.installAppPrivateDistillSkill(
-                sourceRevision: "github-main-remote-code-template-v2"
-            )
-            // 2) Remove any legacy per-provider home skill / AGENTS.md blocks.
+            // Always scrub legacy per-provider home skill / AGENTS.md blocks.
             try installer.uninstallLegacyProviderDistillSkills()
-            // 3) Keep the managed `distill` CLI on PATH so all-call instructions
-            // that require `| distill` resolve for every provider.
-            _ = try installer.installDistillCLI(appSupportDirectory: appSupportDirectory)
-            try? installer.installCommandWrappers()
-            try? installer.installRetrieveMCP()
-            // Warm the login-shell env capture at launch so agent turns get profile
-            // secret/PATH parity from turn 1 (Finder-launched apps don't source the
-            // shell profile). Non-blocking + single-flight + fail-open; a later turn
-            // still lazily triggers it if this path was skipped.
-            LoginShellEnvironment.prewarm()
-            managedDistillSkillInstallResults = [appPrivate]
-            managedDistillSkillInstallError = nil
-            // Token Saver toggle no longer installs/uninstalls home skills.
-            _ = tokenSaverEnabled
+            if tokenSaverEnabled {
+                let appPrivate = try installer.installAppPrivateDistillSkill(
+                    sourceRevision: "github-main-remote-code-template-v2"
+                )
+                _ = try installer.installDistillCLI(appSupportDirectory: appSupportDirectory)
+                try? installer.installCommandWrappers()
+                try? installer.installRetrieveMCP()
+                // Warm login-shell env so agent turns get profile secret/PATH parity.
+                LoginShellEnvironment.prewarm()
+                managedDistillSkillInstallResults = [appPrivate]
+                managedDistillSkillInstallError = nil
+            } else {
+                _ = try? installer.uninstallCommandWrappers()
+                _ = try? installer.uninstallDistillCLI()
+                try? installer.uninstallRetrieveMCP()
+                managedDistillSkillInstallResults = []
+                managedDistillSkillInstallError = nil
+            }
         } catch {
             NSLog("RemoteCode managed Distill skill reconcile failed: \(error)")
             managedDistillSkillInstallResults = []
