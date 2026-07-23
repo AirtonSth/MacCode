@@ -4,10 +4,10 @@ import Foundation
 public enum TokenSaverPromotionCanary {
     public static let taskID = "task-21"
     public static let defaultEnabled = false
-    /// Immutable alpha-spending schedule (steps require outcomes, not time alone).
     public static let canarySteps: [Double] = [0.01, 0.05, 0.25]
     public static let minAttribution: Double = 0.99
     public static let maxReconciliation: Double = 0.02
+    public static let minDwellHours: [Int] = [24, 72, 72]
 }
 
 public final class TokenSaverPromotionCanaryRuntime: @unchecked Sendable {
@@ -20,34 +20,67 @@ public final class TokenSaverPromotionCanaryRuntime: @unchecked Sendable {
         case complete = 3
     }
 
-    public struct PresentationReceipt: Sendable, Equatable {
-        public let bindingDigest: String
-        public let measuredTokens: Int64
-        public let estimatedTokens: Int64
-        public let confirmed: Bool
-        public let originalHandle: String?
+    public struct PromotionGateSeal: Sendable, Equatable {
+        fileprivate let token: UInt64
+        fileprivate let bindingDigest: String
+        fileprivate let registryEpoch: UInt64
+        fileprivate init(token: UInt64, bindingDigest: String, registryEpoch: UInt64) {
+            self.token = token
+            self.bindingDigest = bindingDigest
+            self.registryEpoch = registryEpoch
+        }
     }
 
+    public enum PromotionGate {
+        internal static func seal(
+            coverageCellsComplete: Bool,
+            presentationParityOK: Bool,
+            modelBOMComplete: Bool,
+            semanticConsent: Bool,
+            rollbackDrillOK: Bool,
+            bindingDigest: String,
+            registryEpoch: UInt64,
+            revoked: Bool
+        ) -> PromotionGateSeal? {
+            let b = bindingDigest.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard coverageCellsComplete, presentationParityOK, modelBOMComplete,
+                  semanticConsent, rollbackDrillOK, !b.isEmpty, !revoked,
+                  registryEpoch > 0 else { return nil }
+            var h = Hasher()
+            h.combine(b)
+            h.combine(registryEpoch)
+            return PromotionGateSeal(
+                token: UInt64(bitPattern: Int64(h.finalize())),
+                bindingDigest: b,
+                registryEpoch: registryEpoch
+            )
+        }
+    }
+
+    public let boundUserID: String
+    public let bindingDigest: String
     private let lock = NSLock()
     private var _live = TokenSaverPromotionCanary.defaultEnabled
     private var step: CanaryStep = .one
     private var outcomesWatermark: Int = 0
     private var requiredOutcomes: [Int] = [10, 50, 200]
+    private var stepEnteredAtHours: [Int: Int] = [:]
     private var revoked = false
-    private var coverageCellsComplete = false
     private var attribution: Double = 1.0
     private var reconciliation: Double = 0.0
-    private var modelBOMComplete = false
-    private var semanticConsent = false
-    private var presentationParityOK = false
-    private var originalViews: [String: Data] = [:] // handle -> original (memory cache)
+    private var originalViews: [String: Data] = [:]
     private let durableRoot: URL?
+    /// Injectable clock (hours since epoch). Default is wall clock. Tests may replace via @testable.
+    internal var nowHours: () -> Int = {
+        Int(Date().timeIntervalSince1970 / 3600.0)
+    }
 
-    public init(durableDirectory: URL? = nil) {
+    public init(boundUserID: String, bindingDigest: String, durableDirectory: URL) {
+        self.boundUserID = boundUserID.trimmingCharacters(in: .whitespacesAndNewlines)
+        self.bindingDigest = bindingDigest.trimmingCharacters(in: .whitespacesAndNewlines)
         self.durableRoot = durableDirectory
-        if let dir = durableDirectory {
-            try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        }
+        try? FileManager.default.createDirectory(at: durableDirectory, withIntermediateDirectories: true)
+        // stepEnteredAtHours is stamped on first advanceCanary using the (possibly injected) clock.
     }
 
     public var live: Bool {
@@ -55,44 +88,51 @@ public final class TokenSaverPromotionCanaryRuntime: @unchecked Sendable {
         set { lock.lock(); _live = newValue; lock.unlock() }
     }
 
-    public func setCoverageComplete(_ v: Bool) { lock.lock(); coverageCellsComplete = v; lock.unlock() }
     public func setAttribution(_ v: Double) { lock.lock(); attribution = v; lock.unlock() }
     public func setReconciliation(_ v: Double) { lock.lock(); reconciliation = v; lock.unlock() }
-    public func setModelBOMComplete(_ v: Bool) { lock.lock(); modelBOMComplete = v; lock.unlock() }
-    public func setSemanticConsent(_ v: Bool) { lock.lock(); semanticConsent = v; lock.unlock() }
-    public func setPresentationParityOK(_ v: Bool) { lock.lock(); presentationParityOK = v; lock.unlock() }
     public func recordOutcomes(_ n: Int) { lock.lock(); outcomesWatermark += max(0, n); lock.unlock() }
 
-    /// UI must not show positive confirmed savings copy without a delivering confirmed lane (AC-01).
     public func uiMayShowConfirmedSavingsCopy(hasDeliveringConfirmedLane: Bool) -> Bool {
         lock.lock(); let isLive = _live; lock.unlock()
         return isLive && hasDeliveringConfirmedLane
     }
 
-    /// Never sum measured + estimated. Confirmed totals require live runtime (default OFF → 0).
-    public func confirmedTotal(receipt: PresentationReceipt) -> Int64 {
+    public func confirmedTotal(
+        receipt: TokenSaverRecoveryProjections.MeasuredSavingsReceipt?,
+        creditBindingDigest: String
+    ) -> Int64 {
         lock.lock(); let isLive = _live; lock.unlock()
         guard isLive else { return 0 }
-        // Estimated tokens never contribute; only measured when confirmed.
-        return receipt.confirmed ? max(0, receipt.measuredTokens) : 0
+        guard let receipt else { return 0 }
+        guard receipt.bindingDigest == creditBindingDigest,
+              creditBindingDigest == bindingDigest else { return 0 }
+        return max(0, receipt.tokens)
     }
 
-    public func storeOriginal(handle: String, bytes: Data) -> Bool {
+    /// Store-before-loss: durable directory required; key scoped by user+binding+handle.
+    public func storeOriginal(handle: String, bytes: Data, requestingUserID: String) -> Bool {
         let h = handle.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !h.isEmpty else { return false }
+        let u = requestingUserID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !h.isEmpty, !bytes.isEmpty, u == boundUserID, !boundUserID.isEmpty else { return false }
+        guard let root = durableRoot else { return false }
         lock.lock(); defer { lock.unlock() }
-        if originalViews[h] != nil { return false }
-        if let root = durableRoot {
-            let url = root.appendingPathComponent(Self.safeName(h))
-            if FileManager.default.fileExists(atPath: url.path) { return false }
-            do { try bytes.write(to: url, options: .atomic) } catch { return false }
+        let url = fileURL(root: root, handle: h)
+        if FileManager.default.fileExists(atPath: url.path) { return false }
+        do {
+            try bytes.write(to: url, options: [.withoutOverwriting])
+        } catch { return false }
+        guard let readback = try? Data(contentsOf: url), readback == bytes else {
+            try? FileManager.default.removeItem(at: url)
+            return false
         }
         originalViews[h] = bytes
         return true
     }
 
-    public func viewOriginal(handle: String) -> Data? {
+    public func viewOriginal(handle: String, requestingUserID: String) -> Data? {
         let h = handle.trimmingCharacters(in: .whitespacesAndNewlines)
+        let u = requestingUserID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard u == boundUserID else { return nil }
         lock.lock()
         if let mem = originalViews[h] {
             lock.unlock()
@@ -101,26 +141,35 @@ public final class TokenSaverPromotionCanaryRuntime: @unchecked Sendable {
         let root = durableRoot
         lock.unlock()
         guard let root else { return nil }
-        return try? Data(contentsOf: root.appendingPathComponent(Self.safeName(h)))
+        return try? Data(contentsOf: fileURL(root: root, handle: h))
     }
 
-    private static func safeName(_ handle: String) -> String {
-        Data(handle.utf8).base64EncodedString().replacingOccurrences(of: "/", with: "_")
+    private func fileURL(root: URL, handle: String) -> URL {
+        let key = "\(boundUserID)|\(bindingDigest)|\(handle)"
+        let safe = Data(key.utf8).base64EncodedString().replacingOccurrences(of: "/", with: "_")
+        return root.appendingPathComponent(safe)
     }
 
-    /// Canary advances only with outcomes watermark, never time alone (AC-05).
-    public func advanceCanary(elapsedHours: Int) -> CanaryStep {
+    public func advanceCanary() -> CanaryStep {
         lock.lock(); defer { lock.unlock() }
-        _ = elapsedHours // time alone insufficient
         guard _live, !revoked else { return step }
+        let now = nowHours()
+        if stepEnteredAtHours[step.rawValue] == nil {
+            stepEnteredAtHours[step.rawValue] = now
+        }
         while step.rawValue < CanaryStep.complete.rawValue {
             let idx = step.rawValue
             guard idx < requiredOutcomes.count, outcomesWatermark >= requiredOutcomes[idx] else { break }
+            let entered = stepEnteredAtHours[idx] ?? now
+            let dwell = TokenSaverPromotionCanary.minDwellHours[idx]
+            guard now - entered >= dwell else { break }
             if attribution < TokenSaverPromotionCanary.minAttribution ||
                 reconciliation > TokenSaverPromotionCanary.maxReconciliation {
-                return step // hold
+                return step
             }
-            step = CanaryStep(rawValue: idx + 1) ?? .complete
+            let next = CanaryStep(rawValue: idx + 1) ?? .complete
+            step = next
+            stepEnteredAtHours[next.rawValue] = now
         }
         return step
     }
@@ -130,6 +179,7 @@ public final class TokenSaverPromotionCanaryRuntime: @unchecked Sendable {
         revoked = true
         step = .one
         outcomesWatermark = 0
+        stepEnteredAtHours = [0: nowHours()]
         lock.unlock()
     }
 
@@ -137,14 +187,13 @@ public final class TokenSaverPromotionCanaryRuntime: @unchecked Sendable {
         lock.lock(); defer { lock.unlock() }; return step
     }
 
-    /// Promotion requires complete coverage, parity, BOM, semantic consent (AC-03/07/08/09).
-    public func mayPromote(bindingDigest: String) -> Bool {
+    public func mayPromote(gate: PromotionGateSeal, requestingUserID: String) -> Bool {
         lock.lock(); defer { lock.unlock() }
-        guard _live, !bindingDigest.isEmpty, !revoked else { return false }
-        guard coverageCellsComplete else { return false }
-        guard presentationParityOK else { return false }
-        guard modelBOMComplete else { return false }
-        guard semanticConsent else { return false }
+        let u = requestingUserID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard _live, !revoked, u == boundUserID, !bindingDigest.isEmpty else { return false }
+        // Seal must be bound to this runtime's binding digest.
+        guard gate.bindingDigest == bindingDigest, gate.registryEpoch > 0 else { return false }
+        _ = gate.token
         guard attribution >= TokenSaverPromotionCanary.minAttribution else { return false }
         guard reconciliation <= TokenSaverPromotionCanary.maxReconciliation else { return false }
         return step == .complete || step == .twentyFive
