@@ -40,7 +40,7 @@ final class TokenSaverRolloverHandoffTests: XCTestCase {
         XCTAssertTrue(rt.parentAllowsNewTurns())
         _ = rt.fork(op: .init(parentHead: "h", kind: .rollover), requestingUserID: "u")
         XCTAssertFalse(rt.parentAllowsNewTurns())
-        XCTAssertEqual(rt.parentStateValue(), .fenced)
+        XCTAssertEqual(rt.parentStateValue(), TokenSaverRolloverHandoffRuntime.ParentState.fenced)
     }
 
     func test_crashRelaunch_recoversFenceAndBranches() throws {
@@ -51,7 +51,7 @@ final class TokenSaverRolloverHandoffTests: XCTestCase {
         rt.live = true
         let op = TokenSaverRolloverHandoffRuntime.ForkOperationID(parentHead: "h", kind: .rollover)
         let branch = rt.fork(op: op, requestingUserID: "u")!
-        XCTAssertEqual(rt.parentStateValue(), .fenced)
+        XCTAssertEqual(rt.parentStateValue(), TokenSaverRolloverHandoffRuntime.ParentState.fenced)
 
         let store2 = try TokenSaverRolloverHandoffRuntime.FileDurabilityStore(directory: dir)
         let rt2 = TokenSaverRolloverHandoffRuntime(boundUserID: "u", store: store2)
@@ -59,25 +59,46 @@ final class TokenSaverRolloverHandoffTests: XCTestCase {
         XCTAssertEqual(rt2.parentStateValue(), TokenSaverRolloverHandoffRuntime.ParentState.fenced)
         XCTAssertFalse(rt2.parentAllowsNewTurns())
         XCTAssertEqual(rt2.branch(forkID: op.id)?.childHead, branch.childHead)
-        // Wrong bound user cannot load another user's snapshot as own
         let store3 = try TokenSaverRolloverHandoffRuntime.FileDurabilityStore(directory: dir)
         let other = TokenSaverRolloverHandoffRuntime(boundUserID: "other", store: store3)
         XCTAssertEqual(other.parentStateValue(), TokenSaverRolloverHandoffRuntime.ParentState.parentActive)
         XCTAssertNil(other.branch(forkID: op.id))
     }
 
-    func test_lossyRequiresStoreBeforeLoss() {
+    func test_forkFailsWhenDurabilitySaveFails() {
+        let store = TokenSaverRolloverHandoffRuntime.MemoryDurabilityStore()
+        store.failSaves = true
+        let rt = TokenSaverRolloverHandoffRuntime(boundUserID: "u", store: store)
+        rt.live = true
+        XCTAssertNil(rt.fork(op: .init(parentHead: "h", kind: .rollover), requestingUserID: "u"))
+        XCTAssertEqual(rt.parentStateValue(), TokenSaverRolloverHandoffRuntime.ParentState.parentActive)
+        XCTAssertTrue(rt.parentAllowsNewTurns())
+    }
+
+    func test_lossyOwnsStoreBeforeLossAndMarker() {
         let rt = TokenSaverRolloverHandoffRuntime(boundUserID: "u")
         rt.live = true
+        let original = Data("secret-bytes".utf8)
+        // Validator off
+        XCTAssertNil(rt.admitLossy(original: original, recoveryHandle: "h1", corpusOK: true))
         rt.setLossyValidatorPresent(true)
-        // Missing durable original / readback / handle → deny
-        XCTAssertFalse(rt.admitLossy(corpusOK: true, originalStored: false, verifiedReadback: true, recoveryHandle: "h"))
-        XCTAssertFalse(rt.admitLossy(corpusOK: true, originalStored: true, verifiedReadback: false, recoveryHandle: "h"))
-        XCTAssertFalse(rt.admitLossy(corpusOK: true, originalStored: true, verifiedReadback: true, recoveryHandle: "  "))
-        XCTAssertTrue(rt.admitLossy(corpusOK: true, originalStored: true, verifiedReadback: true, recoveryHandle: "h1"))
-        XCTAssertFalse(rt.admitLossy(corpusOK: false, originalStored: true, verifiedReadback: true, recoveryHandle: "h1"))
+        XCTAssertNil(rt.admitLossy(original: original, recoveryHandle: "h1", corpusOK: false))
+        XCTAssertNil(rt.admitLossy(original: original, recoveryHandle: "  ", corpusOK: true))
+        XCTAssertNil(rt.admitLossy(original: Data(), recoveryHandle: "h1", corpusOK: true))
+        let adm = rt.admitLossy(original: original, recoveryHandle: "h1", corpusOK: true)!
+        XCTAssertEqual(adm.handle, "h1")
+        XCTAssertEqual(adm.marker, "[[rc:h1]]")
+        XCTAssertEqual(rt.retrieveLossyOriginal(handle: "h1"), original)
         XCTAssertTrue(rt.rejectCriticalSuppression(bound: 10, candidate: 11))
         XCTAssertEqual(rt.applyVerbosity(toGenerated: "done", level: "brief"), "done")
         XCTAssertTrue(rt.visualForcesOriginal(isOCR: true, isUI: false, isDebug: false))
+
+        // Store failure → no admission
+        let failStore = TokenSaverRolloverHandoffRuntime.MemoryLossyOriginalStore()
+        failStore.failStores = true
+        let rt2 = TokenSaverRolloverHandoffRuntime(boundUserID: "u", lossyStore: failStore)
+        rt2.live = true
+        rt2.setLossyValidatorPresent(true)
+        XCTAssertNil(rt2.admitLossy(original: original, recoveryHandle: "hx", corpusOK: true))
     }
 }

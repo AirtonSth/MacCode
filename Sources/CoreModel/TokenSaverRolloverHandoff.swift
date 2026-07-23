@@ -43,30 +43,66 @@ public final class TokenSaverRolloverHandoffRuntime: @unchecked Sendable {
         func saveSnapshot(_ snapshot: Snapshot) -> Bool
     }
 
+    /// Owns durable originals for lossy admission (store-before-loss).
+    public protocol LossyOriginalStore: AnyObject {
+        func storeOriginal(handle: String, data: Data) -> Bool
+        func loadOriginal(handle: String) -> Data?
+    }
+
     public struct Snapshot: Sendable, Equatable, Codable {
         public var parentState: ParentState
         public var branches: [String: Branch]
         public var boundUserID: String
     }
 
+    public struct LossyAdmission: Sendable, Equatable {
+        public let handle: String
+        public let marker: String
+    }
+
     public final class MemoryDurabilityStore: DurabilityStore, @unchecked Sendable {
         private let lock = NSLock()
         private var snap: Snapshot?
+        /// Test hook: force save failures.
+        public var failSaves = false
         public init() {}
         public func loadSnapshot() -> Snapshot? {
             lock.lock(); defer { lock.unlock() }; return snap
         }
         public func saveSnapshot(_ snapshot: Snapshot) -> Bool {
-            lock.lock(); snap = snapshot; lock.unlock(); return true
+            lock.lock(); defer { lock.unlock() }
+            if failSaves { return false }
+            snap = snapshot
+            return true
         }
     }
 
-    public final class FileDurabilityStore: DurabilityStore, @unchecked Sendable {
+    public final class MemoryLossyOriginalStore: LossyOriginalStore, @unchecked Sendable {
+        private let lock = NSLock()
+        private var byHandle: [String: Data] = [:]
+        public var failStores = false
+        public init() {}
+        public func storeOriginal(handle: String, data: Data) -> Bool {
+            lock.lock(); defer { lock.unlock() }
+            if failStores { return false }
+            if let existing = byHandle[handle], existing != data { return false }
+            byHandle[handle] = data
+            return true
+        }
+        public func loadOriginal(handle: String) -> Data? {
+            lock.lock(); defer { lock.unlock() }; return byHandle[handle]
+        }
+    }
+
+    public final class FileDurabilityStore: DurabilityStore, LossyOriginalStore, @unchecked Sendable {
         private let lock = NSLock()
         private let url: URL
+        private let omitDir: URL
         public init(directory: URL) throws {
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
             self.url = directory.appendingPathComponent("rollover-snapshot.json")
+            self.omitDir = directory.appendingPathComponent("lossy-originals")
+            try FileManager.default.createDirectory(at: omitDir, withIntermediateDirectories: true)
         }
         public func loadSnapshot() -> Snapshot? {
             lock.lock(); defer { lock.unlock() }
@@ -81,6 +117,26 @@ public final class TokenSaverRolloverHandoffRuntime: @unchecked Sendable {
                 return true
             } catch { return false }
         }
+        private func omitURL(_ handle: String) -> URL {
+            let safe = Data(handle.utf8).base64EncodedString().replacingOccurrences(of: "/", with: "_")
+            return omitDir.appendingPathComponent(safe)
+        }
+        public func storeOriginal(handle: String, data: Data) -> Bool {
+            lock.lock(); defer { lock.unlock() }
+            let path = omitURL(handle)
+            if FileManager.default.fileExists(atPath: path.path) {
+                if let existing = try? Data(contentsOf: path), existing == data { return true }
+                return false
+            }
+            do {
+                try data.write(to: path, options: [.withoutOverwriting])
+                return true
+            } catch { return false }
+        }
+        public func loadOriginal(handle: String) -> Data? {
+            lock.lock(); defer { lock.unlock() }
+            return try? Data(contentsOf: omitURL(handle))
+        }
     }
 
     private let lock = NSLock()
@@ -93,10 +149,22 @@ public final class TokenSaverRolloverHandoffRuntime: @unchecked Sendable {
     /// Bound at init — only this user may own forks (same-user AC).
     public let boundUserID: String
     private let store: DurabilityStore
+    private let lossyStore: LossyOriginalStore
 
-    public init(boundUserID: String, store: DurabilityStore = MemoryDurabilityStore()) {
+    public init(
+        boundUserID: String,
+        store: DurabilityStore = MemoryDurabilityStore(),
+        lossyStore: LossyOriginalStore? = nil
+    ) {
         self.boundUserID = boundUserID.trimmingCharacters(in: .whitespacesAndNewlines)
         self.store = store
+        if let lossyStore {
+            self.lossyStore = lossyStore
+        } else if let combined = store as? LossyOriginalStore {
+            self.lossyStore = combined
+        } else {
+            self.lossyStore = MemoryLossyOriginalStore()
+        }
         if let snap = store.loadSnapshot(), snap.boundUserID == self.boundUserID {
             self.parentState = snap.parentState
             self.branches = snap.branches
@@ -135,6 +203,7 @@ public final class TokenSaverRolloverHandoffRuntime: @unchecked Sendable {
         } else if let existing = branches[op.id] {
             return existing
         }
+        let priorState = parentState
         if op.kind == .rollover {
             if parentState == .fenced { return nil }
             parentState = .childPrepared
@@ -148,7 +217,12 @@ public final class TokenSaverRolloverHandoffRuntime: @unchecked Sendable {
         if op.kind == .rollover {
             parentState = .fenced
         }
-        _ = persistUnlocked()
+        // Durability is required before publishing fork/fence (crash recovery).
+        if !persistUnlocked() {
+            branches.removeValue(forKey: op.id)
+            parentState = priorState
+            return nil
+        }
         return child
     }
 
@@ -168,23 +242,29 @@ public final class TokenSaverRolloverHandoffRuntime: @unchecked Sendable {
         return branches[forkID]
     }
 
-    /// Lossy lanes require validator + corpus + durable original store-before-loss (AC-05).
+    /// Lossy admission **owns** store-before-loss: writes original, verifies exact readback,
+    /// then returns a recoverable `[[rc:handle]]` marker. Caller-asserted booleans are not accepted.
     public func admitLossy(
-        corpusOK: Bool,
-        originalStored: Bool,
-        verifiedReadback: Bool,
+        original: Data,
         recoveryHandle: String,
+        corpusOK: Bool,
         scopeOK: Bool = true
-    ) -> Bool {
+    ) -> LossyAdmission? {
         lock.lock(); defer { lock.unlock() }
+        guard _live, lossyValidatorPresent, corpusOK, scopeOK else { return nil }
         let handle = recoveryHandle.trimmingCharacters(in: .whitespacesAndNewlines)
-        return _live
-            && lossyValidatorPresent
-            && corpusOK
-            && originalStored
-            && verifiedReadback
-            && !handle.isEmpty
-            && scopeOK
+        guard !handle.isEmpty, !original.isEmpty else { return nil }
+        guard lossyStore.storeOriginal(handle: handle, data: original) else { return nil }
+        guard let readback = lossyStore.loadOriginal(handle: handle), readback == original else {
+            return nil
+        }
+        let marker = "[[rc:\(handle)]]"
+        return LossyAdmission(handle: handle, marker: marker)
+    }
+
+    public func retrieveLossyOriginal(handle: String) -> Data? {
+        let h = handle.trimmingCharacters(in: .whitespacesAndNewlines)
+        return lossyStore.loadOriginal(handle: h)
     }
 
     public func rejectCriticalSuppression(bound: Int, candidate: Int) -> Bool {
