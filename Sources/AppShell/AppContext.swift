@@ -342,6 +342,11 @@ public final class AppContext {
         try? tokenSaverSavingsRepo.prune()
         self.coordinator.promptCompressor = { [weak self] prompt, provider, threadId, runId in
             guard let self else { return prompt }
+            // task-08: cross-user raw-only before any SessionLearn/compress work.
+            let sameUser = await MainActor.run { self.tokenSaverIsSameUser(threadId: threadId) }
+            guard TokenSaverAdapterMatrix.tokenSaverCallbacksAllowed(isSameUser: sameUser, turn: .initial) else {
+                return prompt
+            }
             let scopedPrompt = await self.tokenSaverSessionLearnPrompt(
                 prompt, provider: provider, threadId: threadId, runId: runId
             )
@@ -349,6 +354,10 @@ public final class AppContext {
         }
         self.coordinator.followUpPromptCompressor = { [weak self] prompt, provider, threadId in
             guard let self else { return prompt }
+            let sameUser = await MainActor.run { self.tokenSaverIsSameUser(threadId: threadId) }
+            guard TokenSaverAdapterMatrix.tokenSaverCallbacksAllowed(isSameUser: sameUser, turn: .followUp) else {
+                return prompt
+            }
             let scopedPrompt = await self.tokenSaverSessionLearnPrompt(
                 prompt, provider: provider, threadId: threadId, runId: nil
             )
@@ -356,15 +365,29 @@ public final class AppContext {
         }
         self.coordinator.finalResponseTranslator = { [weak self] response, provider, threadId, runId in
             guard let self else { return response }
+            let sameUser = await MainActor.run { self.tokenSaverIsSameUser(threadId: threadId) }
+            guard TokenSaverAdapterMatrix.tokenSaverCallbacksAllowed(isSameUser: sameUser, turn: .finalResponse) else {
+                return response
+            }
             return await self.tokenSaverHumanizeSR1Response(response, provider: provider, threadId: threadId, runId: runId)
         }
         // Recovered sessions rebuild their own request env in the coordinator, bypassing
         // providerEnvironment; feed them the same Token Saver env so distill survives resume.
         self.coordinator.recoveryEnvironmentProvider = { [weak self] provider, threadId in
-            await self?.tokenSaverAgentEnvironment(provider: provider, threadId: threadId) ?? [:]
+            guard let self else { return [:] }
+            let sameUser = await MainActor.run { self.tokenSaverIsSameUser(threadId: threadId) }
+            guard TokenSaverAdapterMatrix.tokenSaverCallbacksAllowed(isSameUser: sameUser, turn: .recovery) else {
+                return [:]
+            }
+            return await self.tokenSaverAgentEnvironment(provider: provider, threadId: threadId)
         }
         self.coordinator.runEnvironmentProvider = { [weak self] provider, threadId, base in
-            await self?.tokenSaverAgentEnvironment(provider: provider, threadId: threadId, baseEnvironment: base) ?? [:]
+            guard let self else { return [:] }
+            let sameUser = await MainActor.run { self.tokenSaverIsSameUser(threadId: threadId) }
+            guard TokenSaverAdapterMatrix.tokenSaverCallbacksAllowed(isSameUser: sameUser, turn: .initial) else {
+                return [:]
+            }
+            return await self.tokenSaverAgentEnvironment(provider: provider, threadId: threadId, baseEnvironment: base)
         }
         self.coordinator.onRunPrepared = { [weak self] request, originalPrompt in
             await MainActor.run { [weak self] in
@@ -785,6 +808,13 @@ public final class AppContext {
         threadId: AgentThreadID,
         baseEnvironment: [String: String] = ProcessInfo.processInfo.environment
     ) -> [String: String] {
+        // task-08: cross-user runs get no Token Saver env/hint/PATH managed bin.
+        guard TokenSaverAdapterMatrix.tokenSaverCallbacksAllowed(
+            isSameUser: tokenSaverIsSameUser(threadId: threadId),
+            turn: .initial
+        ) else {
+            return [:]
+        }
         var env: [String: String] = [:]
         // Always expose managed distill CLI on PATH for every provider call.
         if managedDistillSkillInstallError == nil {
@@ -1298,6 +1328,14 @@ public final class AppContext {
         )
     }
 
+    /// task-08: cross-user Token Saver is raw-only for every compressor turn kind.
+    /// Unknown identity fails closed (disables Token Saver callbacks) while keeping provider raw.
+    private func tokenSaverIsSameUser(threadId: AgentThreadID) -> Bool {
+        guard let thread = try? threadRepo.get(id: threadId) else { return false }
+        guard let runAs = thread.runAsUser else { return true }
+        return runAs.uid == getuid()
+    }
+
     func tokenSaverCompress(
         prompt: String,
         provider: AgentProvider,
@@ -1305,6 +1343,14 @@ public final class AppContext {
         cacheState: String = "prompt",
         runId: AgentRunID? = nil
     ) async -> String {
+        let turn: TokenSaverAdapterMatrix.CrossUserTurn =
+            cacheState.contains("follow") ? .followUp : .initial
+        guard TokenSaverAdapterMatrix.tokenSaverCallbacksAllowed(
+            isSameUser: tokenSaverIsSameUser(threadId: threadId),
+            turn: turn
+        ) else {
+            return prompt
+        }
         guard tokenSaverProjectAdmission(threadId: threadId, lane: "deterministic_wrapper").allowed else {
             return prompt
         }

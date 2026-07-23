@@ -3956,20 +3956,37 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         // local `distill` CLI attributes command-output savings to claude/codex/grok
         // instead of "unknown". Set unconditionally — even with no instance config.
         env["REMOTE_CODE_AGENT_PROVIDER"] = provider.rawValue
-        // Managed distill CLI on PATH for every provider call (app-private skill model).
-        env["PATH"] = Self.providerPathWithManagedWrappers(
-            currentPath: env["PATH"] ?? ProcessInfo.processInfo.environment["PATH"] ?? "",
-            managedBin: AgentSkillInstaller.defaultManagedCLIBinDirectory().path
-        )
         if let context, let threadId {
-            // Distill hint + Claude PostToolUse state; shared with session recovery.
+            // task-08: Token Saver PATH/hint only when same-user admission allows.
             let tokenSaverEnv = context.tokenSaverAgentEnvironment(provider: provider, threadId: threadId)
+            if tokenSaverEnv.isEmpty {
+                // Cross-user / raw-only: scrub Token Saver keys and managed distill PATH.
+                return Self.scrubTokenSaverEnvironment(env)
+            }
+            env["PATH"] = Self.providerPathWithManagedWrappers(
+                currentPath: env["PATH"] ?? ProcessInfo.processInfo.environment["PATH"] ?? "",
+                managedBin: AgentSkillInstaller.defaultManagedCLIBinDirectory().path
+            )
             env.merge(tokenSaverEnv) { _, new in new }
         } else {
-            // No thread context: still enable always-on Distill prompt path.
-            env["RC_TOKEN_SAVER_DISTILL_HINT"] = "1"
+            // No thread context: keep provider tag only; scrub any residual TS keys.
+            return Self.scrubTokenSaverEnvironment(env)
         }
         return env
+    }
+
+    /// Removes Token Saver env keys and managed distill bin from PATH (task-08 raw-only).
+    static func scrubTokenSaverEnvironment(_ env: [String: String]) -> [String: String] {
+        var cleaned = env
+        for key in env.keys where key.hasPrefix("RC_TOKEN_SAVER_") || key == "REMOTE_CODE_DISTILL_STATE_PATH" {
+            cleaned.removeValue(forKey: key)
+        }
+        let managedBin = AgentSkillInstaller.defaultManagedCLIBinDirectory().path
+        if let path = cleaned["PATH"] {
+            let parts = path.split(separator: ":").map(String.init).filter { $0 != managedBin }
+            cleaned["PATH"] = parts.joined(separator: ":")
+        }
+        return cleaned
     }
 
     static func providerPathWithManagedWrappers(currentPath: String, managedBin: String) -> String {
