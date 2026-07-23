@@ -50,6 +50,13 @@ public final class TokenSaverWaveDRuntime: @unchecked Sendable {
         public let marker: String
         public let language: String
         public let lineMapDigest: String
+
+        public init(handle: String, marker: String, language: String, lineMapDigest: String) {
+            self.handle = handle
+            self.marker = marker
+            self.language = language
+            self.lineMapDigest = lineMapDigest
+        }
     }
 
     public struct GraphProvenance: Sendable, Equatable {
@@ -59,6 +66,22 @@ public final class TokenSaverWaveDRuntime: @unchecked Sendable {
         public let startLine: Int
         public let endLine: Int
         public let lspGeneration: UInt64
+
+        public init(
+            sourceDigest: String,
+            coverageDigest: String,
+            path: String,
+            startLine: Int,
+            endLine: Int,
+            lspGeneration: UInt64
+        ) {
+            self.sourceDigest = sourceDigest
+            self.coverageDigest = coverageDigest
+            self.path = path
+            self.startLine = startLine
+            self.endLine = endLine
+            self.lspGeneration = lspGeneration
+        }
 
         public var isValid: Bool {
             let s = sourceDigest.trimmingCharacters(in: .whitespacesAndNewlines)
