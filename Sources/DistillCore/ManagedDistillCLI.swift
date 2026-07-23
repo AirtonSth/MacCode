@@ -1,5 +1,6 @@
 import Foundation
 import CryptoKit
+import CoreModel
 
 /// Core logic of the managed `distill` CLI, ported off Python to native Swift (N1)
 /// and made FAIL-OPEN (N2/N5). The shipped Python CLI failed CLOSED: on any error it
