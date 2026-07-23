@@ -120,6 +120,126 @@ final class TokenSaverQueueCoalesceTests: XCTestCase {
         XCTAssertEqual(cp.narrative?.count, 500)
     }
 
+    func test_admitRequiresInitializedAuthority() {
+        let rt = TokenSaverQueueCoalesceRuntime()
+        rt.live = true
+        let op = TokenSaverQueueCoalesceRuntime.CompactionOperationID(
+            providerHead: "h", generation: 1, boundary: "b", rawHistoryDigest: "r"
+        )
+        // Unset authority (empty head / zero gen) fails closed — no wildcards.
+        XCTAssertFalse(rt.admitCompaction(pendingTool: false, pendingApproval: false, op: op))
+        rt.setProviderAuthority(head: "h", generation: 1)
+        XCTAssertTrue(rt.admitCompaction(pendingTool: false, pendingApproval: false, op: op))
+    }
+
+    func test_compactMarkers_requireExactBijection() {
+        let rt = TokenSaverQueueCoalesceRuntime()
+        rt.live = true
+        rt.setProviderAuthority(head: "head-1", generation: 2)
+        let op = TokenSaverQueueCoalesceRuntime.CompactionOperationID(
+            providerHead: "head-1", generation: 2, boundary: "bx", rawHistoryDigest: "rx"
+        )
+        XCTAssertTrue(rt.admitCompaction(pendingTool: false, pendingApproval: false, op: op))
+        let om = TokenSaverQueueCoalesceRuntime.Omission(handle: "h1", original: Data("orig".utf8))
+        // Extra unresolved marker in text must fail.
+        let extra = "kept \(om.marker) and [[rc:orphan]]"
+        XCTAssertFalse(rt.commit(op: op, projection: .compact, compactProjectionText: extra, omissions: [om]))
+        XCTAssertNil(rt.projection(for: op))
+        XCTAssertNil(rt.retrieveOmission(handle: "h1"))
+        // Missing marker fails
+        XCTAssertFalse(rt.commit(op: op, projection: .compact, compactProjectionText: "no markers", omissions: [om]))
+        // Exact bijection succeeds
+        XCTAssertTrue(rt.commit(op: op, projection: .compact, compactProjectionText: "x \(om.marker) y", omissions: [om]))
+        XCTAssertEqual(rt.retrieveOmission(handle: "h1"), Data("orig".utf8))
+    }
+
+    func test_storeBeforeLoss_originalsBeforeProjection() {
+        final class OrderStore: TokenSaverQueueCoalesceRuntime.DurabilityStore, @unchecked Sendable {
+            private let lock = NSLock()
+            var order: [String] = []
+            var projections: [String: TokenSaverQueueCoalesceRuntime.Projection] = [:]
+            var omissions: [String: Data] = [:]
+            var failProjection = false
+            func loadProjection(key: String) -> TokenSaverQueueCoalesceRuntime.Projection? {
+                lock.lock(); defer { lock.unlock() }; return projections[key]
+            }
+            func saveProjection(key: String, projection: TokenSaverQueueCoalesceRuntime.Projection) -> Bool {
+                lock.lock(); defer { lock.unlock() }
+                order.append("proj")
+                if failProjection { return false }
+                if projections[key] != nil { return projections[key] == projection }
+                projections[key] = projection
+                return true
+            }
+            func deleteProjection(key: String) {
+                lock.lock(); projections.removeValue(forKey: key); lock.unlock()
+            }
+            func loadOmission(handle: String) -> Data? {
+                lock.lock(); defer { lock.unlock() }; return omissions[handle]
+            }
+            func saveOmission(handle: String, data: Data) -> Bool {
+                lock.lock(); defer { lock.unlock() }
+                order.append("omit:\(handle)")
+                if omissions[handle] != nil { return omissions[handle] == data }
+                omissions[handle] = data
+                return true
+            }
+            func deleteOmission(handle: String) {
+                lock.lock(); omissions.removeValue(forKey: handle); lock.unlock()
+            }
+        }
+        let store = OrderStore()
+        let rt = TokenSaverQueueCoalesceRuntime(store: store)
+        rt.live = true
+        rt.setProviderAuthority(head: "h", generation: 1)
+        let op = TokenSaverQueueCoalesceRuntime.CompactionOperationID(
+            providerHead: "h", generation: 1, boundary: "b", rawHistoryDigest: "r"
+        )
+        XCTAssertTrue(rt.admitCompaction(pendingTool: false, pendingApproval: false, op: op))
+        let om = TokenSaverQueueCoalesceRuntime.Omission(handle: "h1", original: Data("secret".utf8))
+        XCTAssertTrue(rt.commit(op: op, projection: .compact, compactProjectionText: om.marker, omissions: [om]))
+        XCTAssertEqual(store.order.first, "omit:h1")
+        XCTAssertEqual(store.order.last, "proj")
+
+        // Crash-before-projection: originals may exist; projection must not become compact without success.
+        let store2 = OrderStore()
+        store2.failProjection = true
+        let rt2 = TokenSaverQueueCoalesceRuntime(store: store2)
+        rt2.live = true
+        rt2.setProviderAuthority(head: "h", generation: 1)
+        let op2 = TokenSaverQueueCoalesceRuntime.CompactionOperationID(
+            providerHead: "h", generation: 1, boundary: "b2", rawHistoryDigest: "r2"
+        )
+        XCTAssertTrue(rt2.admitCompaction(pendingTool: false, pendingApproval: false, op: op2))
+        XCTAssertFalse(rt2.commit(op: op2, projection: .compact, compactProjectionText: om.marker, omissions: [om]))
+        XCTAssertNil(store2.projections[op2.storageKey])
+        // Rolled back omissions after failed projection publish
+        XCTAssertNil(store2.omissions["h1"])
+    }
+
+    func test_concurrentRuntimes_exclusiveProjection() throws {
+        let dir = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("ts-c18-cas-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let storeA = try TokenSaverQueueCoalesceRuntime.FileDurabilityStore(directory: dir)
+        let storeB = try TokenSaverQueueCoalesceRuntime.FileDurabilityStore(directory: dir)
+        let a = TokenSaverQueueCoalesceRuntime(store: storeA)
+        let b = TokenSaverQueueCoalesceRuntime(store: storeB)
+        a.live = true; b.live = true
+        a.setProviderAuthority(head: "h", generation: 1)
+        b.setProviderAuthority(head: "h", generation: 1)
+        let op = TokenSaverQueueCoalesceRuntime.CompactionOperationID(
+            providerHead: "h", generation: 1, boundary: "shared", rawHistoryDigest: "raw"
+        )
+        XCTAssertTrue(a.admitCompaction(pendingTool: false, pendingApproval: false, op: op))
+        XCTAssertTrue(b.admitCompaction(pendingTool: false, pendingApproval: false, op: op))
+        XCTAssertTrue(a.commit(op: op, projection: .raw))
+        // Second writer cannot overwrite with compact
+        let om = TokenSaverQueueCoalesceRuntime.Omission(handle: "hx", original: Data("x".utf8))
+        XCTAssertFalse(b.commit(op: op, projection: .compact, compactProjectionText: om.marker, omissions: [om]))
+        XCTAssertEqual(a.projection(for: op), .raw)
+        XCTAssertEqual(b.projection(for: op), .raw)
+    }
+
     private func intent(
         id: String,
         kind: TokenSaverQueueCoalesceRuntime.IntentKind = .additive,
