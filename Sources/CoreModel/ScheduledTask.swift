@@ -96,7 +96,7 @@ public struct ScheduledTask: Codable, Sendable, Equatable, Identifiable {
         // Provider/Source is always user-chosen (Agent App parity). Auto only
         // selects the model within that host — never the provider itself.
         if providerInstanceID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            errors.append("Provider instance is required.")
+            errors.append("Provider is required.")
         }
         if effectiveRoutingMode == .manual,
            model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {

@@ -1,7 +1,7 @@
 import Foundation
 import CoreModel
 
-public enum ScheduledTaskStoreError: Error, CustomStringConvertible {
+public enum ScheduledTaskStoreError: Error, CustomStringConvertible, LocalizedError {
     case invalidRow(String)
     case missingTask(UUID)
 
@@ -11,6 +11,10 @@ public enum ScheduledTaskStoreError: Error, CustomStringConvertible {
         case .missingTask(let id): return "Scheduled task not found: \(id.uuidString)"
         }
     }
+
+    /// WHY: LaunchAgent XPC replies use `error.localizedDescription`. Without
+    /// LocalizedError the associated message is lost over the wire.
+    public var errorDescription: String? { description }
 }
 
 public struct ScheduledTaskClaim: Sendable, Equatable {
@@ -293,17 +297,47 @@ public final class ScheduledTaskStore: @unchecked Sendable {
 
     /// Link a scheduled occurrence to its agent thread before provider start so
     /// main-app Stop can resolve ownership during the create→send window.
+    ///
+    /// Metadata-only: does **not** change status. Path B calls this while the
+    /// run is still `queued`; feeding `updateRun(status: .queued)` fails because
+    /// `canTransition` rejects queued→queued (identity is not a lifecycle step).
     public func attachThread(runID: UUID, threadID: AgentThreadID) throws {
-        try updateRun(
-            id: runID,
-            status: .queued,
-            startedAt: nil,
-            finishedAt: nil,
-            threadID: threadID,
-            agentRunID: nil,
-            errorSummary: nil,
-            releaseTaskLease: false
-        )
+        try db.performSync { database in
+            let current = try database.prepare("""
+                SELECT status, thread_id FROM scheduled_task_runs WHERE id = ? LIMIT 1;
+                """)
+            defer { current.reset() }
+            try current.bind(1, runID.uuidString.lowercased())
+            guard try current.step(), let statusRaw = current.columnText(0),
+                  let status = ScheduledTaskRunStatus(rawValue: statusRaw) else {
+                throw ScheduledTaskStoreError.invalidRow("run \(runID.uuidString) is missing")
+            }
+            guard status == .queued else {
+                throw ScheduledTaskStoreError.invalidRow(
+                    "can only attach a thread while the run is queued (current: \(status.rawValue))"
+                )
+            }
+            if let existing = current.columnText(1),
+               let existingID = UUID(uuidString: existing) {
+                if existingID == threadID.value {
+                    return // idempotent re-attach of the same thread
+                }
+                throw ScheduledTaskStoreError.invalidRow(
+                    "run already linked to a different agent thread"
+                )
+            }
+            let update = try database.prepare("""
+                UPDATE scheduled_task_runs
+                SET thread_id = ?, heartbeat_at = ?
+                WHERE id = ? AND status = 'queued';
+                """)
+            defer { update.reset() }
+            let now = Date()
+            try update.bind(1, threadID.value.uuidString.lowercased())
+            try update.bind(2, string(now))
+            try update.bind(3, runID.uuidString.lowercased())
+            _ = try update.step()
+        }
     }
 
     public func markStarted(runID: UUID, threadID: AgentThreadID, agentRunID: AgentRunID) throws {

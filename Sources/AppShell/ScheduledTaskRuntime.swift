@@ -56,7 +56,7 @@ public enum ScheduledSystemUserCatalog {
     }
 }
 
-public enum ScheduledTaskPreflightError: Error, CustomStringConvertible, Equatable {
+public enum ScheduledTaskPreflightError: Error, CustomStringConvertible, LocalizedError, Equatable {
     case invalidTask(String)
     case missingWorkspace
     case inaccessibleWorkspace(String)
@@ -78,6 +78,11 @@ public enum ScheduledTaskPreflightError: Error, CustomStringConvertible, Equatab
         case .unsupportedReasoning(let effort): return "The selected model does not support \(effort) reasoning."
         }
     }
+
+    /// WHY: Run Now / XPC failure paths use `error.localizedDescription`. Without
+    /// LocalizedError, Foundation bridges to NSError and drops the human message
+    /// ("AppShell.ScheduledTaskPreflightError error 0.").
+    public var errorDescription: String? { description }
 }
 
 @MainActor
@@ -251,7 +256,7 @@ public final class ScheduledTaskExecutor {
         }.value
         guard authenticated == true else {
             throw ScheduledTaskPreflightError.providerUnavailable(
-                "The selected provider account is unavailable for system user \(user.name). Sign in as that user and retry."
+                "The selected provider is unavailable for system user \(user.name). Sign in as that user and retry."
             )
         }
         return PreparedExecution(
@@ -291,9 +296,9 @@ public final class ScheduledTaskExecutor {
         var verifiedSnapshots: [AgentProviderSnapshot] = []
         var launches: [String: AgentOrchestrationLaunchConfiguration] = [:]
 
-        // Scheduled Auto is host-bound: only the user-chosen provider account may
-        // run. Never admit other providers or substitute another account of the
-        // same provider when the saved instance is unavailable (SCHED-005).
+        // Scheduled Auto is host-bound: only the user-chosen provider may run.
+        // Never admit other providers or substitute another host when the saved
+        // provider is unavailable (SCHED-005).
         let candidateSnapshots = snapshots.filter {
             $0.provider == task.provider
                 && $0.id == task.providerInstanceID
@@ -305,7 +310,7 @@ public final class ScheduledTaskExecutor {
         }
         guard !candidateSnapshots.isEmpty else {
             throw ScheduledTaskPreflightError.providerUnavailable(
-                "The selected provider account (\(task.provider.rawValue) · \(task.providerInstanceID)) is unavailable for Auto model routing."
+                "The selected provider (\(task.provider.rawValue.capitalized)) is unavailable for Auto model routing."
             )
         }
 
@@ -316,7 +321,7 @@ public final class ScheduledTaskExecutor {
                 do { try verifyProviderBinary(baseBinary, user: user) }
                 catch {
                     throw ScheduledTaskPreflightError.providerUnavailable(
-                        "The selected provider account is not executable as \(user.name): \(error)"
+                        "The selected provider is not executable as \(user.name): \(error)"
                     )
                 }
             }
@@ -344,7 +349,7 @@ public final class ScheduledTaskExecutor {
             }.value
             guard authenticated == true else {
                 throw ScheduledTaskPreflightError.providerUnavailable(
-                    "The selected provider account is unavailable for system user \(user.name). Sign in as that user and retry."
+                    "The selected provider is unavailable for system user \(user.name). Sign in as that user and retry."
                 )
             }
 
@@ -506,6 +511,13 @@ public final class ScheduledTaskScheduler {
                 try observeRunning(now: now)
                 _ = try store.recoverStaleLeases(now: now)
                 try reconcileCatchUp(now: now)
+                // Global travel kill switch — still observe/finish live runs, but
+                // do not claim new automatic occurrences while inactive.
+                let settings = SettingsStore(db: context.db).load()
+                guard settings.scheduledTasksActive else {
+                    scheduledTaskLog.debug("scheduler.tick_skipped global_active=false")
+                    return
+                }
                 let claims = try store.claimDue(now: now, owner: owner)
                 for claim in claims { await execute(claim) }
             } catch {

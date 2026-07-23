@@ -172,10 +172,13 @@ public final class ScheduledTasksViewModel: ObservableObject {
     @Published public private(set) var serviceStatus: String = "Checking background scheduler…"
     @Published public private(set) var serviceRequiresApproval = false
     @Published public private(set) var isSavingEditor = false
+    /// Global kill switch: when false, automatic scheduled occurrences do not claim/run.
+    @Published public private(set) var schedulerActive: Bool = true
 
     private let context: AppContext
     private let router: AppCommandRouter
     private let store: ScheduledTaskStore
+    private let settingsStore: SettingsStore
     private let service = ScheduledTaskAgentServiceManager()
     private var providerLoadCount = 0
     private var activeRunPollTask: Task<Void, Never>?
@@ -184,6 +187,7 @@ public final class ScheduledTasksViewModel: ObservableObject {
         self.context = context
         self.router = router
         self.store = ScheduledTaskStore(db: context.db)
+        self.settingsStore = SettingsStore(db: context.db)
         reload()
     }
 
@@ -193,6 +197,7 @@ public final class ScheduledTasksViewModel: ObservableObject {
         do {
             workspaces = try router.listWorkspaces()
             users = ScheduledSystemUserCatalog.eligibleUsers()
+            schedulerActive = settingsStore.load().scheduledTasksActive
             reloadTasks()
             reloadRuns()
             reloadServiceStatus()
@@ -451,11 +456,36 @@ public final class ScheduledTasksViewModel: ObservableObject {
         return host
     }
 
-    public var footerStatsLine: String {
+    public func setSchedulerActive(_ active: Bool) {
+        settingsStore.update { $0.scheduledTasksActive = active }
+        schedulerActive = settingsStore.load().scheduledTasksActive
+        // Wake the LaunchAgent so its next tick sees the new flag promptly.
+        if active {
+            service.wake { [weak self] result in
+                if case .failure(let error) = result {
+                    self?.errorMessage = error.localizedDescription
+                }
+            }
+        }
+        ScheduledTaskCrossProcess.notifyStoreChanged(reason: active ? "global_active" : "global_paused")
+    }
+
+    public var footerTaskCountLine: String {
         let total = filterCounts.all
         let active = filterCounts.active
-        let online = serviceRequiresApproval ? "Scheduler needs approval" : "Scheduler online"
-        return "\(total) task\(total == 1 ? "" : "s") · \(active) active · \(online)"
+        return "\(total) task\(total == 1 ? "" : "s") · \(active) active"
+    }
+
+    public var footerStatsLine: String {
+        let online: String
+        if !schedulerActive {
+            online = "Scheduler paused"
+        } else if serviceRequiresApproval {
+            online = "Scheduler needs approval"
+        } else {
+            online = "Scheduler online"
+        }
+        return "\(footerTaskCountLine) · \(online)"
     }
 }
 
@@ -572,18 +602,19 @@ public struct ScheduledTasksRootView: View {
     }
 
     private var footerBar: some View {
-        HStack(spacing: DS.Space.sm) {
-            Text(vm.footerStatsLine)
+        HStack(spacing: DS.Space.md) {
+            Text(vm.footerTaskCountLine)
+                .font(DS.Font.caption)
                 .foregroundColor(DS.Palette.textSecondary)
             if !vm.serviceRequiresApproval {
-                Circle()
-                    .fill(DS.Palette.success)
-                    .frame(width: 7, height: 7)
-                    .accessibilityHidden(true)
+                DSPill(
+                    vm.schedulerActive ? "Scheduler online" : "Scheduler paused",
+                    tone: vm.schedulerActive ? .success : .warning
+                )
+                .accessibilityHidden(true)
             }
             Spacer(minLength: DS.Space.md)
         }
-        .font(DS.Font.caption)
         .padding(.horizontal, DS.Space.xxl)
         .frame(height: 40)
         .background(DS.Palette.surface)
@@ -600,19 +631,26 @@ public struct ScheduledTasksRootView: View {
                     Text("Scheduled Tasks")
                         .font(DS.Font.title.weight(.semibold))
                         .foregroundColor(DS.Palette.text)
-                    Text("Automate recurring agent work")
+                    Text(vm.schedulerActive
+                         ? "Automate recurring agent work"
+                         : "Automatic runs paused — turn Active on when you're back")
                         .font(DS.Font.body)
-                        .foregroundColor(DS.Palette.textSecondary)
+                        .foregroundColor(vm.schedulerActive ? DS.Palette.textSecondary : DS.Palette.warning)
+                        .animation(DS.Motion.micro, value: vm.schedulerActive)
                 }
                 Spacer(minLength: DS.Space.lg)
-                Button {
-                    vm.createTask()
-                    openEditor(returnTo: .overview)
-                } label: {
-                    Label("New Task", systemImage: "plus")
+                HStack(spacing: DS.Space.md) {
+                    Button {
+                        vm.createTask()
+                        openEditor(returnTo: .overview)
+                    } label: {
+                        Label("New Task", systemImage: "plus")
+                    }
+                    .buttonStyle(DSPrimaryButtonStyle())
+                    .accessibilityIdentifier("scheduledTasks.new")
+
+                    schedulerActiveControl
                 }
-                .buttonStyle(DSPrimaryButtonStyle())
-                .accessibilityIdentifier("scheduledTasks.new")
             }
             .padding(.horizontal, DS.Space.xxl)
             .padding(.top, DS.Space.xxl)
@@ -667,6 +705,71 @@ public struct ScheduledTasksRootView: View {
                 .accessibilityIdentifier("scheduledTasks.list")
             }
         }
+    }
+
+    /// Global kill-switch control: status chrome + switch.
+    /// State is conveyed by icon + label + tint (not color alone — WCAG 1.4.1).
+    private var schedulerActiveControl: some View {
+        let active = vm.schedulerActive
+        let tone = active ? DS.Palette.success : DS.Palette.warning
+        let icon = active ? "bolt.fill" : "pause.fill"
+        let title = active ? "Active" : "Paused"
+        let subtitle = active ? "Schedules on" : "Travel pause"
+
+        return HStack(spacing: DS.Space.md) {
+            HStack(spacing: DS.Space.sm) {
+                Image(systemName: icon)
+                    .font(.system(size: 10, weight: .bold))
+                    .foregroundColor(tone)
+                    .frame(width: 22, height: 22)
+                    .background(tone.opacity(0.16))
+                    .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
+
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(title)
+                        .font(DS.Font.captionStrong)
+                        .foregroundColor(DS.Palette.text)
+                    Text(subtitle)
+                        .font(DS.Font.caption2)
+                        .foregroundColor(DS.Palette.textTertiary)
+                }
+            }
+            .accessibilityHidden(true)
+
+            Toggle(isOn: Binding(
+                get: { vm.schedulerActive },
+                set: { vm.setSchedulerActive($0) }
+            )) {
+                Text("Active")
+            }
+            .labelsHidden()
+            .toggleStyle(.switch)
+            .controlSize(.small)
+            .tint(DS.Palette.success)
+            .accessibilityIdentifier("scheduledTasks.globalActive")
+            .accessibilityLabel(active ? "Schedules active" : "Schedules paused")
+            .accessibilityValue(active ? "On" : "Off")
+            .accessibilityHint("Disables all automatic scheduled task runs without deleting tasks")
+        }
+        .padding(.leading, DS.Space.lg)
+        .padding(.trailing, DS.Space.md)
+        .padding(.vertical, DS.Space.sm)
+        .background(
+            RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
+                .fill(DS.Palette.surfaceRaised)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
+                .strokeBorder(
+                    active ? tone.opacity(0.45) : DS.Palette.line,
+                    lineWidth: DS.Border.hairline
+                )
+        )
+        .animation(DS.Motion.micro, value: active)
+        .help(active
+              ? "Schedules are running. Turn off to pause all automatic runs (e.g. while traveling)."
+              : "All automatic runs are paused. Turn on when you return.")
+        .contentShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
     }
 
     private var filterChips: some View {
@@ -1352,6 +1455,9 @@ private struct ScheduledTaskEditorView: View {
                                 draft.runAsUID = vm.users.first { $0.name == name }?.uid ?? 0
                             }
                         }
+                        // Parity with Agent App: one Provider/Source picker only
+                        // (Codex / Claude / Grok). Instance id is derived from the
+                        // selected provider's primary snapshot and stays in the model.
                         formRow("Provider") {
                             Picker("Provider", selection: $draft.provider) {
                                 ForEach(AgentProvider.allCases, id: \.self) { Text($0.rawValue.capitalized).tag($0) }
@@ -1365,24 +1471,6 @@ private struct ScheduledTaskEditorView: View {
                                 }
                             }
                             .accessibilityIdentifier("scheduledTasks.editor.provider")
-                        }
-                        // Instance is part of provider binding; keep accessible picker for multi-account.
-                        formRow("Provider account") {
-                            Picker("Provider instance", selection: $draft.providerInstanceID) {
-                                ForEach(vm.providerSnapshots(for: draft.provider)) { Text($0.displayName).tag($0.id) }
-                            }
-                            .labelsHidden()
-                            .onChange(of: draft.providerInstanceID) { _, instanceID in
-                                guard let snapshot = vm.providers.first(where: {
-                                    $0.id == instanceID && $0.provider == draft.provider
-                                }) else { return }
-                                let models = snapshot.models
-                                if draft.model.isEmpty || !models.contains(where: { $0.id == draft.model }) {
-                                    draft.model = models.first?.id ?? ""
-                                    draft.reasoningEffort = models.first?.supportedReasoningEfforts.first ?? .high
-                                }
-                            }
-                            .accessibilityIdentifier("scheduledTasks.editor.providerAccount")
                         }
                         formRow("Model routing") {
                             HStack(spacing: DS.Space.sm) {
@@ -1617,9 +1705,9 @@ private struct ScheduledTaskEditorView: View {
 
     private func setAutoRoutingEnabled(_ enabled: Bool) {
         draft.routingMode = enabled ? .auto : .manual
-        // Turning Auto off must keep the chosen Source (provider + account).
-        // Only fill a missing model from the exact selected instance — never
-        // jump to the first available provider in the catalog.
+        // Turning Auto off must keep the chosen provider.
+        // Only fill a missing model from that provider's snapshot — never
+        // jump to the first available host in the catalog.
         guard !enabled,
               draft.model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             return

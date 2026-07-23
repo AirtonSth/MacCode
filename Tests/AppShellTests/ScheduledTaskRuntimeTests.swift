@@ -73,6 +73,31 @@ final class ScheduledTaskRuntimeTests: XCTestCase {
         XCTAssertTrue(source.contains("store.listActiveRuns()"))
     }
 
+    func test_preflightErrorLocalizedDescriptionPreservesMessage_becauseRunNowAlertMustNotShowError0() {
+        // WHY: without LocalizedError, NSError bridging surfaces
+        // "AppShell.ScheduledTaskPreflightError error 0" and hides the payload.
+        let cases: [ScheduledTaskPreflightError] = [
+            .invalidTask("Two scheduled task runs are already active."),
+            .missingWorkspace,
+            .inaccessibleWorkspace("/tmp/ws"),
+            .ineligibleUser("nobody"),
+            .sudoUnavailable("guest"),
+            .providerUnavailable("Provider not signed in."),
+            .unsupportedModel("gpt-x"),
+            .unsupportedReasoning("High"),
+        ]
+        for error in cases {
+            XCTAssertEqual(error.localizedDescription, error.description, String(describing: error))
+            XCTAssertFalse(
+                error.localizedDescription.contains("error 0")
+                    || error.localizedDescription.contains("ScheduledTaskPreflightError error"),
+                "localizedDescription leaked NSError bridge: \(error.localizedDescription)"
+            )
+        }
+        let asError: Error = ScheduledTaskPreflightError.invalidTask("Scheduler version mismatch. Retry.")
+        XCTAssertEqual(asError.localizedDescription, "Scheduler version mismatch. Retry.")
+    }
+
     func test_autoRoutingConfigurationCarriesScheduledFallbackAndEligibleProviders() {
         var task = makeHourly(nextRunAt: nil)
         task.routingMode = .auto
@@ -128,7 +153,7 @@ final class ScheduledTaskRuntimeTests: XCTestCase {
 
         XCTAssertTrue(source.contains("ProviderCLIProbe.authenticated("))
         XCTAssertTrue(source.contains("probeEnvironment = user.name == NSUserName()"))
-        XCTAssertTrue(source.contains("The selected provider account is unavailable for system user"))
+        XCTAssertTrue(source.contains("The selected provider is unavailable for system user"))
     }
 
     func test_xpcChecksBundleAndProtocolVersion_becauseUpdatesMustReplaceStaleHelpers() throws {
