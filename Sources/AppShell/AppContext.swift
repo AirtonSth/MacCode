@@ -343,7 +343,9 @@ public final class AppContext {
         }
         liveActivityAcceptanceOutbox.resumePending()
         if performLaunchRunReconciliation {
-            try coordinator.reconcileOnLaunch()
+            // Do not interrupt threads still owned by the scheduled-task LaunchAgent.
+            let preserved = (try? ScheduledTaskStore(db: db).activeOwnedThreadIDs()) ?? []
+            try coordinator.reconcileOnLaunch(preservingThreadIDs: preserved)
         } else {
             // Shared-DB background agents: never steal interactive ownership.
             // Publish an empty projection for this process only; leave durable

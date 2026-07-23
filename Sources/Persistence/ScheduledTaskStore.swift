@@ -154,6 +154,38 @@ public final class ScheduledTaskStore: @unchecked Sendable {
         }
     }
 
+    /// Active scheduled occurrence for a given agent thread, if any.
+    public func activeRun(forThreadID threadID: AgentThreadID) throws -> ScheduledTaskRun? {
+        try db.performSync { database in
+            let statement = try database.prepare(
+                Self.runSelect
+                    + " WHERE status IN ('queued', 'running') AND thread_id = ? ORDER BY queued_at DESC LIMIT 1;"
+            )
+            defer { statement.reset() }
+            try statement.bind(1, threadID.value.uuidString.lowercased())
+            guard try statement.step() else { return nil }
+            return try decodeRun(statement)
+        }
+    }
+
+    /// Thread IDs currently owned by a live scheduled occurrence (LaunchAgent).
+    /// Used so interactive launch reconciliation does not interrupt them.
+    public func activeOwnedThreadIDs() throws -> Set<AgentThreadID> {
+        try db.performSync { database in
+            let statement = try database.prepare(
+                "SELECT thread_id FROM scheduled_task_runs WHERE status IN ('queued', 'running') AND thread_id IS NOT NULL;"
+            )
+            defer { statement.reset() }
+            var result = Set<AgentThreadID>()
+            while try statement.step() {
+                if let raw = statement.columnText(0), let uuid = UUID(uuidString: raw) {
+                    result.insert(AgentThreadID(uuid))
+                }
+            }
+            return result
+        }
+    }
+
     public func runCounts() throws -> [UUID: Int] {
         try db.performSync { database in
             let statement = try database.prepare("SELECT task_id, COUNT(*) FROM scheduled_task_runs GROUP BY task_id;")
@@ -257,6 +289,21 @@ public final class ScheduledTaskStore: @unchecked Sendable {
             _ = try statement.step()
             return ScheduledTaskClaim(task: task, run: run)
         }
+    }
+
+    /// Link a scheduled occurrence to its agent thread before provider start so
+    /// main-app Stop can resolve ownership during the create→send window.
+    public func attachThread(runID: UUID, threadID: AgentThreadID) throws {
+        try updateRun(
+            id: runID,
+            status: .queued,
+            startedAt: nil,
+            finishedAt: nil,
+            threadID: threadID,
+            agentRunID: nil,
+            errorSummary: nil,
+            releaseTaskLease: false
+        )
     }
 
     public func markStarted(runID: UUID, threadID: AgentThreadID, agentRunID: AgentRunID) throws {

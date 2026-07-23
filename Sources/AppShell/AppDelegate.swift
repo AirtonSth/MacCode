@@ -96,6 +96,8 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
     private var diagnosticsHeartbeatTimer: Timer?
     private var tokenSaverAccountUsageRefreshTimer: Timer?
     private var lifecycleRecorder: AppLifecycleRecorder?
+    /// Distributed-notification observer: LaunchAgent SQLite commits → rail reload.
+    private var scheduledTaskStoreObserver: NSObjectProtocol?
     /// Menu items whose keyEquivalent is controlled by keybindings.json.
     /// Populated by installMainMenu(); refreshed by reapplyKeybindingOverrides().
     private var keybindableMenuItems: [(item: NSMenuItem, command: String)] = []
@@ -229,6 +231,9 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         windowController = MainWindowController(context: context, router: router, updater: updater)
         router.windowController = windowController
         settings = SettingsWindowController(context: context, updater: updater)
+        // LaunchAgent owns scheduled runs (path B). Observe store invalidation
+        // so Agent App rails reload when the agent commits threads/runs.
+        installScheduledTaskStoreObserver()
         startPetController()
 
         // start unix socket server
@@ -427,6 +432,35 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         petController = nil
     }
 
+    /// LaunchAgent posts when it mutates scheduled runs / agent threads. The UI
+    /// process reloads Agent App rails from SQLite (EventBus is not cross-process).
+    func installScheduledTaskStoreObserver() {
+        removeScheduledTaskStoreObserver()
+        scheduledTaskStoreObserver = ScheduledTaskCrossProcess.observeStoreChanged { [weak self] _ in
+            self?.reloadAgentSurfacesFromScheduledStoreChange()
+        }
+    }
+
+    func removeScheduledTaskStoreObserver() {
+        if let scheduledTaskStoreObserver {
+            ScheduledTaskCrossProcess.removeObserver(scheduledTaskStoreObserver)
+            self.scheduledTaskStoreObserver = nil
+        }
+    }
+
+    private func reloadAgentSurfacesFromScheduledStoreChange() {
+        for surface in SurfaceRegistry.shared.all() {
+            guard let agent = surface as? AgentAppSurface else { continue }
+            let selected = agent.viewModel.selectedThreadId
+            agent.viewModel.reloadThreads()
+            // Re-bind the open thread so status/transcript pick up LaunchAgent writes.
+            if let selected {
+                agent.viewModel.selectThread(selected, markRead: false)
+            }
+        }
+        windowController?.refreshSurfaceRuntimeState()
+    }
+
     public func checkForUpdatesAfterOpeningApp() {
         updater?.checkForUpdates()
     }
@@ -435,6 +469,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         appLifecycleLog.info("app.will_terminate pid=\(ProcessInfo.processInfo.processIdentifier, privacy: .public)")
         lifecycleRecorder?.endRunCleanly(reason: "applicationWillTerminate")
         logDiagnosticsHeartbeat(reason: "will_terminate")
+        removeScheduledTaskStoreObserver()
         disableInsomniaForAppClose()
         // Always stop the Distill MLX server on quit — multi-GB model must not
         // Distill is always-on app-private (like remote-code-orchestrate). On terminate

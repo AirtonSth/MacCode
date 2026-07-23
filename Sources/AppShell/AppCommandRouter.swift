@@ -427,6 +427,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                         agent.viewModel.onThreadLifecycle = { [weak self] event in
                             self?.publishAgentThreadLifecycle(event)
                         }
+                        Self.wireScheduledRunControl(on: agent.viewModel, db: ctx.db)
                         agent.viewModel.onPlanNotesPersisted = { [weak self] thread, notes in
                             self?.publishAgentPlanNotesUpdated(thread: thread, notes: notes)
                         }
@@ -1909,8 +1910,17 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             detachedWindow.makeKeyAndOrderFront(nil)
             destinationWindow = detachedWindow
         } else {
+            // Exact-route navigation must leave shell destinations (Schedule
+            // Tasks) and mount workspace panes. Schedule Tasks replaces
+            // workspaceContent; createSurface would otherwise register the
+            // Agent App in layout state while surface.view.window stays nil,
+            // and the markRead destination check throws surfaceNotFound.
+            // Order: select the thread's workspace first, then present that
+            // workspace's content (present is idempotent when already there).
             windowController?.show()
             try selectWorkspace(workspaceID)
+            windowController?.presentWorkspaceContent()
+            windowController?.flushPendingRefresh()
             destinationWindow = windowController?.window
         }
         guard let destinationWindow else {
@@ -1988,6 +1998,24 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         return try ctx.threadRepo.list(workspaceId: workspace)
     }
 
+    /// Path B: Agent App Stop for LaunchAgent-owned scheduled runs goes over XPC.
+    private static func wireScheduledRunControl(on viewModel: AgentAppViewModel, db: SQLiteDB) {
+        let store = ScheduledTaskStore(db: db)
+        viewModel.isScheduledThreadRunning = { threadID in
+            (try? store.activeRun(forThreadID: threadID)) != nil
+        }
+        viewModel.stopScheduledThread = { threadID, agentRunID in
+            await withCheckedContinuation { cont in
+                ScheduledTaskAgentServiceManager().stop(
+                    threadID: threadID,
+                    agentRunID: agentRunID
+                ) { result, _ in
+                    cont.resume(returning: result.isSuccess)
+                }
+            }
+        }
+    }
+
     public func createAgentThread(workspace: WorkspaceID?, title: String, provider: AgentProvider, model: String, permissionMode: AgentPermissionMode, reasoningEffort: AgentReasoningEffort, serviceTier: AgentServiceTier = .auto, modelSelection: AgentModelSelection? = nil, providerInstanceId: String? = nil, runAsUser: AgentRunAsUser? = nil, surfaceID: SurfaceID? = nil) throws -> AgentThread {
         guard let ctx = context else { throw LayoutError.workspaceNotFound }
         let resolvedRunAs = resolveRunAsUser(runAsUser)
@@ -1999,10 +2027,17 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                             modelSelection: modelSelection ?? AgentModelSelection(provider: provider, modelId: model, reasoningEffort: reasoningEffort, serviceTier: serviceTier),
                             runAsUser: resolvedRunAs)
         try ctx.threadRepo.upsert(t)
+        if let workspace {
+            _ = try? ctx.threadRepo.enforceWorkspaceThreadLimit(workspaceId: workspace)
+        }
         // Only bind/select the new thread on the requesting surface (if any).
         // Without a surfaceID this just refreshes rails — a thread created from
         // one client no longer hijacks every other open agent tab.
         try selectAgentThread(thread: t.id, surfaceID: surfaceID)
+        // After rails reload: broadcast create so iOS mirrors and any EventBus
+        // subscribers (including Agent App surfaces that listen for thread.*)
+        // see scheduled / RPC-created threads immediately.
+        EventBus.shared.publish(kind: "agent.thread.created", payload: agentThreadPayload(t))
         return t
     }
 
@@ -4886,6 +4921,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 agent.viewModel.onThreadLifecycle = { [weak self] event in
                     self?.publishAgentThreadLifecycle(event)
                 }
+                Self.wireScheduledRunControl(on: agent.viewModel, db: ctx.db)
                 agent.viewModel.onPlanNotesPersisted = { [weak self] thread, notes in
                     self?.publishAgentPlanNotesUpdated(thread: thread, notes: notes)
                 }

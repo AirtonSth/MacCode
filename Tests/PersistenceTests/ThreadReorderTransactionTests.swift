@@ -37,65 +37,128 @@ final class ThreadReorderTransactionTests: XCTestCase {
 
     // MARK: - normalizeOrder: final row state after reorder
 
-    /// WHY: reorder() calls normalizeOrder which now issues a single transaction.
-    /// The resulting sortOrder values must be identical to pre-fix behavior:
-    /// pinned threads first, then unpinned, each group in the moved order.
+    /// WHY: reorder() still renumbers sortOrder in one transaction. With
+    /// activity-based list order the move uses that order, but the final
+    /// sortOrder set must stay contiguous 0..n-1.
     func test_reorder_finalSortOrderIsIdenticalAfterTransactionWrap() throws {
         let db = try makeDB()
         let repo = AgentThreadRepository(db: db)
         let wid = try makeWorkspace(db: db)
 
-        let tA = try makeThread(db: db, workspaceId: wid, title: "A")
-        let tB = try makeThread(db: db, workspaceId: wid, title: "B")
+        _ = try makeThread(db: db, workspaceId: wid, title: "A")
+        _ = try makeThread(db: db, workspaceId: wid, title: "B")
         let tC = try makeThread(db: db, workspaceId: wid, title: "C")
 
-        // Move C to front (position 0)
         try repo.reorder(id: tC.id, position: 0)
 
         let listed = try repo.list(workspaceId: wid)
-        XCTAssertEqual(listed.map(\.title), ["C", "A", "B"],
-            "reorder to front must produce C-A-B; transaction wrap must not change final order")
-        XCTAssertEqual(listed.map(\.sortOrder), [0, 1, 2],
-            "sortOrder must be contiguous 0-1-2 after normalizeOrder; each row gets its enumeration index")
+        XCTAssertEqual(Set(listed.map(\.sortOrder)), Set([0, 1, 2]),
+            "sortOrder must be contiguous 0-1-2 after normalizeOrder")
+        XCTAssertEqual(listed.count, 3)
     }
 
-    /// WHY: pinned threads always sort before unpinned. After pinning a thread
-    /// and normalizing, pinned group must head the list regardless of insertion order.
-    func test_setPinned_pinnedGroupLeadsAfterNormalizeOrder() throws {
+    /// WHY: pin remains a retention/visual marker, but rail order is last
+    /// activity only — pinning must not force a stale thread above newer work.
+    func test_setPinned_doesNotOverrideLastActivityOrder() throws {
         let db = try makeDB()
         let repo = AgentThreadRepository(db: db)
         let wid = try makeWorkspace(db: db)
 
-        let tA = try makeThread(db: db, workspaceId: wid, title: "A")
-        let tB = try makeThread(db: db, workspaceId: wid, title: "B")
-        let tC = try makeThread(db: db, workspaceId: wid, title: "C")
+        var oldPinned = AgentThread(workspaceId: wid, title: "old-pinned", provider: .codex, model: "m")
+        oldPinned.updatedAt = Date(timeIntervalSince1970: 100)
+        try repo.upsert(oldPinned)
+        try repo.setPinned(id: oldPinned.id, pinned: true)
 
-        try repo.setPinned(id: tC.id, pinned: true)
+        // setPinned bumps updatedAt — reset it so the case is activity-driven.
+        var pinned = try XCTUnwrap(repo.get(id: oldPinned.id))
+        pinned.updatedAt = Date(timeIntervalSince1970: 100)
+        try repo.upsert(pinned)
+
+        var fresh = AgentThread(workspaceId: wid, title: "fresh", provider: .codex, model: "m")
+        fresh.updatedAt = Date(timeIntervalSince1970: 500)
+        try repo.upsert(fresh)
 
         let listed = try repo.list(workspaceId: wid)
-        XCTAssertEqual(listed.first?.title, "C",
-            "pinned thread must appear first after normalizeOrder; transaction wrap must not disturb grouping")
-        XCTAssertEqual(listed.map(\.sortOrder), [0, 1, 2],
-            "sortOrder must remain contiguous 0-1-2 with pinned group at the front")
+        XCTAssertEqual(listed.map(\.title), ["fresh", "old-pinned"],
+            "last activity wins over pin for rail order")
+        XCTAssertTrue(listed.contains(where: { $0.title == "old-pinned" && $0.pinned }))
     }
 
-    /// WHY: reorder to a clamped position (beyond list end) must land at the tail.
+    /// WHY: reorder to a clamped position (beyond list end) must renumber
+    /// sortOrder without leaving gaps or crashing.
     func test_reorder_beyondEnd_clampsToTail() throws {
         let db = try makeDB()
         let repo = AgentThreadRepository(db: db)
         let wid = try makeWorkspace(db: db)
 
         let tA = try makeThread(db: db, workspaceId: wid, title: "A")
-        let tB = try makeThread(db: db, workspaceId: wid, title: "B")
-        let tC = try makeThread(db: db, workspaceId: wid, title: "C")
+        _ = try makeThread(db: db, workspaceId: wid, title: "B")
+        _ = try makeThread(db: db, workspaceId: wid, title: "C")
 
-        // Move A to position 999 (beyond list count of 3)
         try repo.reorder(id: tA.id, position: 999)
 
         let listed = try repo.list(workspaceId: wid)
-        XCTAssertEqual(listed.map(\.title), ["B", "C", "A"],
-            "reorder beyond end must clamp to tail; transaction wrap must not affect clamp behavior")
-        XCTAssertEqual(listed.map(\.sortOrder), [0, 1, 2])
+        XCTAssertEqual(Set(listed.map(\.sortOrder)), Set([0, 1, 2]),
+            "reorder beyond end must leave contiguous sortOrder values")
+        XCTAssertEqual(listed.first(where: { $0.id == tA.id })?.sortOrder, 2,
+            "clamped tail index is the last sortOrder slot")
+    }
+
+    /// WHY: users expect the rail to surface the most recently finished/active
+    /// thread at the top (last activity DESC), not a frozen manual sort_order.
+    func test_list_ordersByLastActivityDescending_becauseFinishedRunsShouldFloatToTop() throws {
+        let db = try makeDB()
+        let repo = AgentThreadRepository(db: db)
+        let wid = try makeWorkspace(db: db)
+
+        var older = AgentThread(workspaceId: wid, title: "older", provider: .codex, model: "m")
+        older.updatedAt = Date(timeIntervalSince1970: 100)
+        older.status = .completed
+        try repo.upsert(older)
+
+        var middle = AgentThread(workspaceId: wid, title: "middle", provider: .codex, model: "m")
+        middle.updatedAt = Date(timeIntervalSince1970: 200)
+        middle.status = .completed
+        try repo.upsert(middle)
+
+        var newest = AgentThread(workspaceId: wid, title: "newest", provider: .codex, model: "m")
+        newest.updatedAt = Date(timeIntervalSince1970: 300)
+        newest.status = .completed
+        try repo.upsert(newest)
+
+        let listed = try repo.list(workspaceId: wid)
+        XCTAssertEqual(listed.map(\.title), ["newest", "middle", "older"],
+            "list must order by updated_at DESC so the most recent activity is first")
+    }
+
+    /// WHY: each workspace keeps at most 100 threads so scheduled runs cannot
+    /// grow SQLite without bound. Oldest non-active, unpinned threads go first.
+    func test_enforceWorkspaceThreadLimit_prunesOldestBeyond100() throws {
+        let db = try makeDB()
+        let repo = AgentThreadRepository(db: db)
+        let wid = try makeWorkspace(db: db)
+        let limit = 5
+
+        for i in 0..<8 {
+            var t = AgentThread(workspaceId: wid, title: "t\(i)", provider: .codex, model: "m")
+            t.updatedAt = Date(timeIntervalSince1970: TimeInterval(i))
+            t.status = .completed
+            try repo.upsert(t)
+        }
+        // Keep one old running thread — must not be pruned.
+        var running = AgentThread(workspaceId: wid, title: "running", provider: .codex, model: "m")
+        running.updatedAt = Date(timeIntervalSince1970: 0)
+        running.status = .running
+        try repo.upsert(running)
+
+        let deleted = try repo.enforceWorkspaceThreadLimit(workspaceId: wid, limit: limit)
+        XCTAssertEqual(try repo.count(workspaceId: wid), limit)
+        XCTAssertEqual(deleted.count, 4, "9 rows → keep 5, delete 4 oldest eligible")
+        let remaining = try repo.list(workspaceId: wid)
+        XCTAssertTrue(remaining.contains(where: { $0.title == "running" }),
+                      "running threads must never be auto-pruned")
+        XCTAssertFalse(remaining.contains(where: { $0.title == "t1" }),
+                       "oldest idle history must be pruned first")
     }
 
     // MARK: - promoteToFront: final positions after transaction wrap

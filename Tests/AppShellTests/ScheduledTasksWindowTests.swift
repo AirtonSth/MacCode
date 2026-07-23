@@ -73,6 +73,54 @@ final class ScheduledTasksWindowTests: XCTestCase {
         XCTAssertTrue(source.contains("expandedRunIDs"))
         XCTAssertTrue(source.contains("Show details"))
         XCTAssertTrue(source.contains("Hide details"))
+        XCTAssertTrue(source.contains("scheduledTasks.history.toggleDetails"),
+                      "failure disclosure must be a dedicated control, not the whole row")
+    }
+
+    func test_historyRowOpensThreadOnPrimaryClick_becauseCompletedRunsMustStayNavigable() throws {
+        let source = try String(contentsOf: sourceURL("Sources/AppShell/ScheduledTasksWindow.swift"), encoding: .utf8)
+        // WHY: completed runs used to wrap the row in a disabled Button, which also
+        // disabled the nested Agent Task control and blocked openThread navigation.
+        XCTAssertTrue(source.contains("scheduledTasks.history.openThread"))
+        XCTAssertTrue(source.contains("vm.openThread(run)"))
+        XCTAssertTrue(source.contains("canOpenThread"))
+        XCTAssertTrue(source.contains("historyRowPrimaryContent"))
+        XCTAssertFalse(
+            source.contains(".disabled(run.errorSummary == nil && run.status != .failed)"),
+            "history rows must not disable open-thread hit targets on successful runs"
+        )
+    }
+
+    func test_runNowSetsQueuedImmediately_becauseUsersNeedSameClickFeedback() throws {
+        let source = try String(contentsOf: sourceURL("Sources/AppShell/ScheduledTasksWindow.swift"), encoding: .utf8)
+        // WHY: Run Now used to wait for the XPC claim before any badge change,
+        // so the overview card stayed Active until the agent replied.
+        XCTAssertTrue(source.contains("activeRunStatuses[task.id] = .queued"))
+        XCTAssertTrue(source.contains("DSPill(\"Queued\""))
+        XCTAssertTrue(source.contains("activeRunStatus: vm.activeRunStatus(for: task.id)"))
+        XCTAssertTrue(source.contains("ensureActiveRunPolling"))
+    }
+
+    func test_scheduledExecutionUsesAgentAppSendPath_becauseStopAndRailMustMatchManualThreads() throws {
+        let runtime = try String(contentsOf: sourceURL("Sources/AppShell/ScheduledTaskRuntime.swift"), encoding: .utf8)
+        let main = try String(contentsOf: sourceURL("Sources/AppShell/AppDelegate.swift"), encoding: .utf8)
+        let router = try String(contentsOf: sourceURL("Sources/AppShell/AppCommandRouter.swift"), encoding: .utf8)
+        // Path B: LaunchAgent is sole executor; UI stops via XPC; rails reload
+        // on distributed store invalidation (not a second in-process scheduler).
+        XCTAssertTrue(runtime.contains("router.createAgentThread("))
+        XCTAssertTrue(runtime.contains("router.sendAgentMessage("))
+        XCTAssertTrue(runtime.contains("func stop(threadID:"))
+        XCTAssertTrue(runtime.contains("ScheduledTaskCrossProcess.notifyStoreChanged"))
+        XCTAssertTrue(runtime.contains("protocolVersion = 2"))
+        XCTAssertFalse(runtime.contains("ScheduledTaskInProcessHost"),
+                       "path B must not dual-host an in-process scheduler")
+        XCTAssertTrue(main.contains("installScheduledTaskStoreObserver"))
+        XCTAssertTrue(router.contains("wireScheduledRunControl"))
+        XCTAssertTrue(router.contains("stopScheduledThread"))
+        XCTAssertFalse(
+            runtime.contains("context.coordinator.startRun("),
+            "scheduled execute still uses create+send inside the agent process"
+        )
     }
 
     func test_rootViewUsesDesignSystemSurfaces_becauseScheduledTasksMustMatchLatestRemoteCodeChrome() throws {

@@ -314,8 +314,11 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         lock.unlock()
     }
 
-    public func reconcileOnLaunch() throws {
-        _ = try runRepo.reconcileRunningOnLaunch()
+    /// Marks orphaned in-process runs/threads interrupted after relaunch.
+    /// - Parameter preservingThreadIDs: threads owned by another process
+    ///   (e.g. scheduled-task LaunchAgent) that must stay durable-running.
+    public func reconcileOnLaunch(preservingThreadIDs: Set<AgentThreadID> = []) throws {
+        _ = try runRepo.reconcileRunningOnLaunch(preservingThreadIDs: preservingThreadIDs)
         try orchestrationRuntime?.reconcileReceipts(
             statusForRun: { [runRepo] runId in
                 try runRepo.get(id: runId)?.status
@@ -344,6 +347,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         )
         let now = Date()
         for thread in try threadRepo.list() where thread.status == .running {
+            if preservingThreadIDs.contains(thread.id) { continue }
             var copy = thread
             copy.status = .interrupted
             copy.hasUnread = Self.hasUnread(for: .interrupted)
@@ -353,6 +357,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         if let providerSessionRepo {
             let future = Date.distantFuture
             for session in try providerSessionRepo.list(status: .running, updatedBefore: future) {
+                if preservingThreadIDs.contains(session.threadId) { continue }
                 // A stale running session on an already-terminal thread is not a
                 // relaunch interrupt. Align the session to the thread so pet/open
                 // does not show "interrupted by an app restart" for finished work.

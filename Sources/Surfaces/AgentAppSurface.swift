@@ -221,6 +221,12 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// repo write + reloadThreads) so the host can mirror them to remote
     /// clients. Wired by AppCommandRouter like onThreadConfigPersisted.
     public var onThreadLifecycle: ((AgentThreadLifecycleEvent) -> Void)?
+    /// When non-nil, Stop for LaunchAgent-owned scheduled runs is routed here
+    /// (path B). Return true if the request was accepted / already terminal.
+    public var stopScheduledThread: ((AgentThreadID, AgentRunID?) async -> Bool)?
+    /// True when a thread has an active scheduled occurrence in SQLite even if
+    /// this process's coordinator has no session (LaunchAgent owns the run).
+    public var isScheduledThreadRunning: ((AgentThreadID) -> Bool)?
     /// Fired when this surface's bound (selected) thread changes, so the host
     /// can persist it into the surface descriptor metadata (`selected_thread`)
     /// for per-surface restore. nil means the surface returned to the
@@ -593,7 +599,17 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     public func reloadThreads() {
         guard !isDisposed else { return }
         do {
+            // Cap first so oversized workspaces (scheduled runs, long sessions)
+            // shrink before the rail reads. CASCADE removes messages.
+            _ = try threadRepo.enforceWorkspaceThreadLimit(workspaceId: workspaceID)
             threads = try threadRepo.list(workspaceId: workspaceID)
+            // Clear Stopping… once a LaunchAgent-owned run is no longer active.
+            if isStopping,
+               let selectedThreadId,
+               trackedRunId(for: selectedThreadId) == nil,
+               isScheduledThreadRunning?(selectedThreadId) != true {
+                isStopping = false
+            }
         } catch {
             statusMessage = "Could not reload threads: \(error)"
             return
@@ -2717,7 +2733,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// affordance therefore needs a run identity, not status alone; otherwise a
     /// never-started thread is rendered as busy and its first prompt is queued.
     public func isThreadStartingOrRunning(_ threadId: AgentThreadID) -> Bool {
-        trackedRunId(for: threadId) != nil
+        if trackedRunId(for: threadId) != nil { return true }
+        // LaunchAgent-owned scheduled runs have no local coordinator session.
+        return isScheduledThreadRunning?(threadId) == true
     }
 
     private func trackedRunId(for threadId: AgentThreadID) -> AgentRunID? {
@@ -3091,6 +3109,8 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                             runAsUser: runAsUser, routingConfiguration: routingConfiguration)
         do {
             try threadRepo.upsert(t)
+            // Drop oldest history when this create pushes past the workspace cap.
+            _ = try threadRepo.enforceWorkspaceThreadLimit(workspaceId: workspaceID)
         } catch {
             statusMessage = "Could not create thread: \(error)"
             return
@@ -3098,6 +3118,13 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         reloadThreads()
         onThreadLifecycle?(.created(threads.first(where: { $0.id == t.id }) ?? t))
         selectThread(t.id)
+    }
+
+    /// Delete every thread in this workspace (stops active providers first).
+    @discardableResult
+    public func clearAllThreads() async -> Bool {
+        let ids = Set(threads.map(\.id))
+        return await deleteThreads(ids)
     }
 
     private func restoreNewThreadDefaults(_ saved: AgentNewThreadDefaults) {
@@ -4496,10 +4523,26 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     }
 
     public func stop() {
-        if let r = currentRunId {
+        let tid = selectedThreadId
+        let localRunId = currentRunId ?? tid.flatMap { trackedRunId(for: $0) }
+        // Path B: scheduled runs are owned by the LaunchAgent. Prefer XPC stop
+        // when SQLite says this thread has an active scheduled occurrence.
+        if let tid, isScheduledThreadRunning?(tid) == true, let stopScheduledThread {
+            isStopping = true
+            Task { @MainActor in
+                let accepted = await stopScheduledThread(tid, localRunId)
+                if !accepted {
+                    // Loud failure: do not leave the UI stuck on Stopping…
+                    self.isStopping = false
+                    self.statusMessage = "Could not stop scheduled run (scheduler unavailable or run not owned)."
+                }
+            }
+            return
+        }
+        if let r = localRunId {
             coordinator.stopRun(r)
         }
-        if let tid = selectedThreadId {
+        if let tid {
             coordinator.stopRun(threadId: tid)
         }
         // UX-MAC_AGENT-STOP: signal that the interrupt was sent so the UI can
@@ -4510,6 +4553,12 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// Stop a specific thread by id, regardless of which thread is currently selected.
     /// Allows the thread rail to stop any running thread without switching selection.
     public func stopThread(_ id: AgentThreadID) {
+        if isScheduledThreadRunning?(id) == true, let stopScheduledThread {
+            Task { @MainActor in
+                _ = await stopScheduledThread(id, trackedRunId(for: id))
+            }
+            return
+        }
         coordinator.stopRun(threadId: id)
     }
 
@@ -6124,6 +6173,8 @@ public struct AgentAppView: View {
     @State private var declineReasonDrafts: [String: String] = [:]
     // P1: thread delete confirmation — ids staged here until user confirms.
     @State private var pendingDeleteThreadIds: Set<AgentThreadID> = []
+    /// Clear All confirmation for the thread rail.
+    @State private var pendingClearAllThreads = false
     // UX-XPLAT-007: checkpoint revert confirmation — staged turn count until user confirms.
     @State private var pendingRevertCheckpointTurnCount: Int?
     // P3: user-message "show more" — message ids the user has expanded past 28 lines.
@@ -7096,6 +7147,16 @@ public struct AgentAppView: View {
         } message: {
             Text(Self.threadDeletionConfirmationDescription)
         }
+        .confirmationDialog(
+            "Clear all threads?",
+            isPresented: $pendingClearAllThreads,
+            titleVisibility: .visible
+        ) {
+            Button("Clear All", role: .destructive) { commitClearAllThreads() }
+            Button("Cancel", role: .cancel) { pendingClearAllThreads = false }
+        } message: {
+            Text("Deletes every thread in this workspace and its history. Running agents will be stopped first. This cannot be undone after the undo window expires.")
+        }
     }
 
     // UX-MAC_AGENT-002: ⌘N starts a thread even when the rail (and its "+"
@@ -7118,6 +7179,14 @@ public struct AgentAppView: View {
                     DSIconButton("sidebar.left", help: "Hide threads") {
                         threadRailIntent = .forcedHidden
                         showThreadRail = false
+                    }
+                    if !vm.threads.isEmpty {
+                        Button("Clear All") { pendingClearAllThreads = true }
+                            .buttonStyle(.plain)
+                            .font(DS.Font.caption.weight(.medium))
+                            .foregroundColor(DS.Palette.textSecondary)
+                            .accessibilityIdentifier("agent.thread.clearAll")
+                            .help("Delete all threads in this workspace")
                     }
                     DSIconButton("plus", help: "New thread (⌘N)") { vm.createThread(title: "New thread") }
                         .accessibilityIdentifier("agent.thread.new")
@@ -10799,6 +10868,15 @@ public struct AgentAppView: View {
         let ids = pendingDeleteThreadIds
         pendingDeleteThreadIds = []
         deleteThreads(ids)
+    }
+
+    private func commitClearAllThreads() {
+        pendingClearAllThreads = false
+        Task {
+            guard await vm.clearAllThreads() else { return }
+            selectedThreadIds = []
+            lastSelectedThreadId = nil
+        }
     }
 
     // MARK: Plan notes sidebar

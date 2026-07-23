@@ -100,48 +100,73 @@ public final class ScheduledTaskExecutor {
         try await prepareExecution(task).workspace
     }
 
-    public func execute(_ task: ScheduledTask) async throws -> (threadID: AgentThreadID, runID: AgentRunID) {
+    /// Create + send like a manual Agent App turn inside the LaunchAgent.
+    /// - Parameter onThreadCreated: called after the thread row exists so the
+    ///   scheduler can link `scheduled_task_runs.thread_id` before provider start.
+    public func execute(
+        _ task: ScheduledTask,
+        onThreadCreated: ((AgentThreadID) throws -> Void)? = nil
+    ) async throws -> (threadID: AgentThreadID, runID: AgentRunID) {
         let prepared = try await prepareExecution(task)
-        let selection = AgentModelSelection(
-            provider: task.provider,
-            modelId: task.model,
-            reasoningEffort: task.reasoningEffort
-        )
-        let routingConfiguration = prepared.routingSnapshot?.configuration
-            ?? AgentRoutingConfiguration.legacyManual(
-                selection: selection,
-                providerInstanceId: task.providerInstanceID
+        // Prefer the Auto-resolved selection when present so the run matches what
+        // preflight admitted. Otherwise use the task's stored provider/model.
+        let selection = prepared.routingSnapshot?.configuration.manualSelection
+            ?? AgentModelSelection(
+                provider: task.provider,
+                modelId: task.model,
+                reasoningEffort: task.reasoningEffort
             )
-        let thread = AgentThread(
-            workspaceId: task.workspaceID,
+        let providerInstanceID = prepared.routingSnapshot?.configuration.manualProviderInstanceId
+            ?? task.providerInstanceID
+        let runAsUser = Self.resolveRunAsUser(task: task)
+        // Path B: still create+send (manual-shaped persistence), but ownership
+        // stays in this LaunchAgent process; main UI stops via XPC.
+        let thread = try router.createAgentThread(
+            workspace: task.workspaceID,
             title: task.title,
-            provider: task.provider,
-            providerInstanceId: task.providerInstanceID,
-            model: task.model,
+            provider: selection.provider,
+            model: selection.effectiveModel,
+            // Unattended schedules need Full Access so tools do not block on UI.
             permissionMode: .fullAccess,
-            reasoningEffort: task.reasoningEffort,
-            serviceTier: .auto,
+            reasoningEffort: selection.reasoningEffort,
+            serviceTier: selection.serviceTier,
             modelSelection: selection,
-            routingConfiguration: routingConfiguration
+            providerInstanceId: providerInstanceID,
+            runAsUser: runAsUser,
+            surfaceID: nil
         )
-        try context.threadRepo.upsert(thread)
-        let request = AgentRunRequest(
-            threadId: thread.id,
-            provider: task.provider,
-            providerInstanceId: task.providerInstanceID,
-            model: task.model,
-            cwd: prepared.workspace.cwd,
-            prompt: task.prompt,
+        try onThreadCreated?(thread.id)
+        let send = try await router.sendAgentMessage(
+            thread: thread.id,
+            text: task.prompt,
+            provider: selection.provider,
+            model: selection.effectiveModel,
             permissionMode: .fullAccess,
-            reasoningEffort: task.reasoningEffort,
-            providerBinary: prepared.manualLaunch?.binary,
-            environment: prepared.manualLaunch?.environment ?? [:]
+            reasoningEffort: selection.reasoningEffort,
+            serviceTier: selection.serviceTier,
+            modelSelection: selection,
+            providerInstanceId: providerInstanceID,
+            attachments: []
         )
-        let runID = try await context.coordinator.startRun(
-            request,
-            routingSnapshot: prepared.routingSnapshot
-        )
+        guard let runID = send.runId else {
+            throw ScheduledTaskPreflightError.invalidTask(
+                "Scheduled task send did not start a provider run (status: \(send.status.rawValue))."
+            )
+        }
         return (thread.id, runID)
+    }
+
+    private static func resolveRunAsUser(task: ScheduledTask) -> AgentRunAsUser? {
+        guard let user = ScheduledSystemUserCatalog.user(named: task.runAsUser) else {
+            return AgentRunAsUser.current()
+        }
+        return AgentRunAsUser(
+            generatedUID: "",
+            shortName: user.name,
+            uid: user.uid,
+            gid: getgid(),
+            homePath: user.homeDirectory
+        )
     }
 
     private struct PreparedExecution {
@@ -509,11 +534,59 @@ public final class ScheduledTaskScheduler {
         do {
             let next = claim.task.calculatedNextRun(after: claim.run.scheduledAt)
             try store.advance(taskID: claim.task.id, nextRunAt: next, lastRunAt: claim.task.lastRunAt)
-            let identifiers = try await executor.execute(claim.task)
+            ScheduledTaskCrossProcess.notifyStoreChanged(reason: "queued")
+            let identifiers = try await executor.execute(claim.task) { [self] threadID in
+                // Link ownership before provider start so main-app Stop can route.
+                try self.store.attachThread(runID: claim.run.id, threadID: threadID)
+                ScheduledTaskCrossProcess.notifyStoreChanged(reason: "thread_linked")
+            }
             try store.markStarted(runID: claim.run.id, threadID: identifiers.threadID, agentRunID: identifiers.runID)
+            ScheduledTaskCrossProcess.notifyStoreChanged(reason: "started")
         } catch {
             try? store.finish(runID: claim.run.id, status: .failed, errorSummary: String(describing: error))
+            ScheduledTaskCrossProcess.notifyStoreChanged(reason: "failed")
             SystemNotifier.shared.post(title: "Scheduled task failed", body: claim.task.title, category: nil)
+        }
+    }
+
+    /// Stop a LaunchAgent-owned provider for a scheduled occurrence.
+    public func stop(
+        threadID: AgentThreadID,
+        agentRunID: AgentRunID?,
+        completion: @escaping @MainActor (ScheduledTaskStopResult, String?) -> Void
+    ) {
+        Task {
+            let (result, message) = await stopOwned(threadID: threadID, agentRunID: agentRunID)
+            completion(result, message)
+        }
+    }
+
+    private func stopOwned(
+        threadID: AgentThreadID,
+        agentRunID: AgentRunID?
+    ) async -> (ScheduledTaskStopResult, String?) {
+        do {
+            guard let occurrence = try store.activeRun(forThreadID: threadID) else {
+                return (.notOwned, nil)
+            }
+            if let expected = agentRunID,
+               let owned = occurrence.agentRunID,
+               expected != owned {
+                return (.notOwned, "Active scheduled run ID does not match.")
+            }
+            if occurrence.status == .queued {
+                try store.finish(runID: occurrence.id, status: .cancelled, errorSummary: "Cancelled before start.")
+                ScheduledTaskCrossProcess.notifyStoreChanged(reason: "cancelled")
+                return (.alreadyTerminal, nil)
+            }
+            if let runID = occurrence.agentRunID ?? agentRunID {
+                context.coordinator.stopRun(runID)
+            }
+            context.coordinator.stopRun(threadId: threadID)
+            ScheduledTaskCrossProcess.notifyStoreChanged(reason: "stop_requested")
+            return (.accepted, nil)
+        } catch {
+            return (.failed, error.localizedDescription)
         }
     }
 
@@ -524,11 +597,14 @@ public final class ScheduledTaskScheduler {
             switch agentRun.status {
             case .completed:
                 try store.finish(runID: run.id, status: .completed, at: agentRun.finishedAt ?? now)
+                ScheduledTaskCrossProcess.notifyStoreChanged(reason: "completed")
             case .failed, .interrupted:
                 try store.finish(runID: run.id, status: .failed, errorSummary: agentRun.errorMessage, at: agentRun.finishedAt ?? now)
+                ScheduledTaskCrossProcess.notifyStoreChanged(reason: "failed")
                 notifyFailure(for: run)
             case .cancelled:
                 try store.finish(runID: run.id, status: .cancelled, errorSummary: agentRun.errorMessage, at: agentRun.finishedAt ?? now)
+                ScheduledTaskCrossProcess.notifyStoreChanged(reason: "cancelled")
             case .pending, .running:
                 break
             }
@@ -563,9 +639,67 @@ public final class ScheduledTaskScheduler {
     }
 }
 
+/// Cross-process result for scheduled-run stop requests (XPC-friendly strings).
+public enum ScheduledTaskStopResult: String, Sendable, Equatable {
+    case accepted
+    case alreadyTerminal
+    case notOwned
+    case failed
+
+    public var isSuccess: Bool {
+        switch self {
+        case .accepted, .alreadyTerminal: return true
+        case .notOwned, .failed: return false
+        }
+    }
+
+    public static func parse(_ raw: String?, message: String?) -> (ScheduledTaskStopResult, String?) {
+        if let raw, let known = ScheduledTaskStopResult(rawValue: raw) {
+            return (known, message)
+        }
+        return (.failed, message ?? raw ?? "Unknown stop result")
+    }
+}
+
+/// Posts/observes Darwin distributed notifications so the interactive app can
+/// reload rails after LaunchAgent SQLite commits (EventBus is in-process only).
+public enum ScheduledTaskCrossProcess {
+    public static let storeChangedName = Notification.Name("io.remotecode.scheduled-tasks.store-changed")
+
+    public static func notifyStoreChanged(reason: String) {
+        DistributedNotificationCenter.default().postNotificationName(
+            storeChangedName,
+            object: reason,
+            userInfo: nil,
+            deliverImmediately: true
+        )
+    }
+
+    @discardableResult
+    public static func observeStoreChanged(
+        queue: OperationQueue? = .main,
+        handler: @escaping (String?) -> Void
+    ) -> NSObjectProtocol {
+        DistributedNotificationCenter.default().addObserver(
+            forName: storeChangedName,
+            object: nil,
+            queue: queue
+        ) { note in
+            handler(note.object as? String)
+        }
+    }
+
+    public static func removeObserver(_ token: NSObjectProtocol) {
+        DistributedNotificationCenter.default().removeObserver(token)
+    }
+}
+
 @objc public protocol ScheduledTaskAgentXPCProtocol {
     func ping(withReply reply: @escaping (String) -> Void)
     func wake(taskID: String?, withReply reply: @escaping (Bool, String?) -> Void)
+    /// Stop a LaunchAgent-owned scheduled provider run. Replies with
+    /// (statusRaw: accepted|alreadyTerminal|notOwned|failed, message?).
+    func stop(threadID: String, agentRunID: String?, withReply reply: @escaping (String, String?) -> Void)
 }
 
 @MainActor
@@ -594,6 +728,17 @@ private final class ScheduledTaskAgentXPCEndpoint: NSObject, @preconcurrency Sch
         }
         reply(true, nil)
     }
+
+    func stop(threadID: String, agentRunID: String?, withReply reply: @escaping (String, String?) -> Void) {
+        guard let tid = UUID(uuidString: threadID).map(AgentThreadID.init) else {
+            reply(ScheduledTaskStopResult.failed.rawValue, "Invalid thread ID.")
+            return
+        }
+        let runID = agentRunID.flatMap(UUID.init(uuidString:)).map(AgentRunID.init)
+        scheduler.stop(threadID: tid, agentRunID: runID) { result, message in
+            reply(result.rawValue, message)
+        }
+    }
 }
 
 @MainActor
@@ -620,7 +765,8 @@ public final class ScheduledTaskAgentXPCListener: NSObject, @preconcurrency NSXP
 
 @MainActor
 public final class ScheduledTaskAgentServiceManager {
-    public static let protocolVersion = 1
+    /// Bump when XPC methods change. Clients re-register a mismatched agent.
+    public static let protocolVersion = 2
     public static var serviceBaseName: String { (Bundle.main.bundleIdentifier ?? "io.remotecode.desktop") + ".scheduled-tasks" }
     public static var plistName: String { serviceBaseName + ".plist" }
     public static var machServiceName: String { serviceBaseName }
@@ -669,16 +815,61 @@ public final class ScheduledTaskAgentServiceManager {
     }
 
     public func wake(taskID: UUID? = nil, completion: @escaping @MainActor (Result<Void, Error>) -> Void) {
+        withReadyProxy { proxy, connection, fail in
+            proxy.wake(taskID: taskID?.uuidString) { ok, message in
+                Task { @MainActor in
+                    if ok { completion(.success(())) }
+                    else {
+                        completion(.failure(ScheduledTaskPreflightError.invalidTask(
+                            message ?? "Background scheduler rejected the request."
+                        )))
+                    }
+                    connection.invalidate()
+                }
+            }
+        } onFailure: { error in
+            completion(.failure(error))
+        }
+    }
+
+    /// Ask the LaunchAgent to stop a scheduled provider run it owns.
+    public func stop(
+        threadID: AgentThreadID,
+        agentRunID: AgentRunID?,
+        completion: @escaping @MainActor (ScheduledTaskStopResult, String?) -> Void
+    ) {
+        withReadyProxy { proxy, connection, _ in
+            proxy.stop(
+                threadID: threadID.value.uuidString,
+                agentRunID: agentRunID?.value.uuidString
+            ) { statusRaw, message in
+                Task { @MainActor in
+                    let parsed = ScheduledTaskStopResult.parse(statusRaw, message: message)
+                    completion(parsed.0, parsed.1)
+                    connection.invalidate()
+                }
+            }
+        } onFailure: { error in
+            completion(.failed, error.localizedDescription)
+        }
+    }
+
+    private func withReadyProxy(
+        _ body: @escaping (ScheduledTaskAgentXPCProtocol, NSXPCConnection, @escaping (Error) -> Void) -> Void,
+        onFailure: @escaping @MainActor (Error) -> Void
+    ) {
         let connection = NSXPCConnection(machServiceName: Self.machServiceName, options: [])
         connection.remoteObjectInterface = NSXPCInterface(with: ScheduledTaskAgentXPCProtocol.self)
         connection.interruptionHandler = { connection.invalidate() }
         connection.invalidationHandler = {}
         connection.resume()
         let proxy = connection.remoteObjectProxyWithErrorHandler { error in
-            Task { @MainActor in completion(.failure(error)); connection.invalidate() }
+            Task { @MainActor in onFailure(error); connection.invalidate() }
         } as? ScheduledTaskAgentXPCProtocol
         guard let proxy else {
-            completion(.failure(ScheduledTaskPreflightError.providerUnavailable("Background scheduler is unavailable.")))
+            Task { @MainActor in
+                onFailure(ScheduledTaskPreflightError.providerUnavailable("Background scheduler is unavailable."))
+            }
             connection.invalidate()
             return
         }
@@ -689,23 +880,19 @@ public final class ScheduledTaskAgentServiceManager {
                         try self.unregister()
                         try self.register()
                     } catch {
-                        completion(.failure(error))
+                        onFailure(error)
                         connection.invalidate()
                         return
                     }
-                    completion(.failure(ScheduledTaskPreflightError.invalidTask(
+                    onFailure(ScheduledTaskPreflightError.invalidTask(
                         "Scheduler version mismatch. The background scheduler was re-registered; retry when its status becomes active."
-                    )))
+                    ))
                     connection.invalidate()
                     return
                 }
-                proxy.wake(taskID: taskID?.uuidString) { ok, message in
-                    Task { @MainActor in
-                        if ok { completion(.success(())) }
-                        else { completion(.failure(ScheduledTaskPreflightError.invalidTask(message ?? "Background scheduler rejected the request."))) }
-                        connection.invalidate()
-                    }
-                }
+                body(proxy, connection, { error in
+                    Task { @MainActor in onFailure(error) }
+                })
             }
         }
     }

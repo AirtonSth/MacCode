@@ -105,9 +105,13 @@ final class ScheduledTaskRuntimeTests: XCTestCase {
     func test_executorPassesImmutableAutoSnapshotToCoordinator_becauseScheduledRunsMustActuallyRoute() throws {
         let source = try String(contentsOf: repositoryRoot.appendingPathComponent("Sources/AppShell/ScheduledTaskRuntime.swift"))
 
-        XCTAssertTrue(source.contains("routingSnapshot: prepared.routingSnapshot"))
+        // Auto still resolves through orchestrationRuntime.route in prepareExecution;
+        // the admitted selection is then sent via the Agent App path (not a bare
+        // coordinator.startRun) so Stop / rail match manual threads.
+        XCTAssertTrue(source.contains("prepared.routingSnapshot?.configuration.manualSelection"))
         XCTAssertTrue(source.contains("launchConfigurations: launches"))
         XCTAssertTrue(source.contains("orchestrationRuntime.route("))
+        XCTAssertTrue(source.contains("router.sendAgentMessage("))
     }
 
     func test_autoRoutingIsBoundToSavedProviderAccount_becauseScheduledRunsMustNotSubstituteSource() throws {
@@ -130,12 +134,14 @@ final class ScheduledTaskRuntimeTests: XCTestCase {
     func test_xpcChecksBundleAndProtocolVersion_becauseUpdatesMustReplaceStaleHelpers() throws {
         let source = try String(contentsOf: repositoryRoot.appendingPathComponent("Sources/AppShell/ScheduledTaskRuntime.swift"))
 
-        XCTAssertTrue(source.contains("public static let protocolVersion = 1"))
+        XCTAssertTrue(source.contains("public static let protocolVersion = 2"))
         XCTAssertTrue(source.contains("proxy.ping { version in"))
         XCTAssertTrue(source.contains("version == Self.serviceVersion"))
         XCTAssertTrue(source.contains("Scheduler version mismatch"))
         XCTAssertTrue(source.contains("try self.unregister()"))
         XCTAssertTrue(source.contains("try self.register()"))
+        XCTAssertTrue(source.contains("func stop(threadID:"))
+        XCTAssertTrue(source.contains("ScheduledTaskStopResult"))
     }
 
     func test_helperPostsFailureNotifications_becauseUnattendedErrorsMustBeVisible() throws {

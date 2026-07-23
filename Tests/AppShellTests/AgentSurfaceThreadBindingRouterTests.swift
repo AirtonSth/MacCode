@@ -260,7 +260,16 @@ final class AgentSurfaceThreadBindingRouterTests: XCTestCase {
         )
         target.hasUnread = true
         try ctx.threadRepo.upsert(target)
-        XCTAssertTrue(agentSurfaces(in: workspace.id).isEmpty)
+        // New workspaces open with a default Agent App tab already registered.
+        // Tear it down so this case still proves create-on-open when none remain.
+        for surface in agentSurfaces(in: workspace.id) {
+            try router.closeSurface(workspace: workspace.id, surface: surface.descriptor.id)
+            surface.close()
+            SurfaceRegistry.shared.unregister(surface.descriptor.id)
+        }
+        controller.flushPendingRefresh()
+        XCTAssertTrue(agentSurfaces(in: workspace.id).isEmpty,
+                      "precondition: no Agent App surfaces before the open route")
         var readEvents: [EventBus.Event] = []
         let token = EventBus.shared.subscribe(since: EventBus.shared.currentSeq) { event in
             guard event.kind == "agent.thread.read",
@@ -281,6 +290,46 @@ final class AgentSurfaceThreadBindingRouterTests: XCTestCase {
             "a successful route requested with markRead must clear unread state")
         XCTAssertEqual(readEvents.count, 1,
             "verified routing must broadcast exactly one canonical read event")
+    }
+
+    func test_openAgentThread_fromScheduledTasksShell_mountsAgentAppInWorkspace() throws {
+        // WHY: Schedule Tasks replaces workspaceContent. Opening a run-history
+        // thread must leave that shell destination, mount Agent App in the
+        // workspace, and succeed with markRead — not throw surfaceNotFound
+        // because surface.view.window was nil while Schedule Tasks stayed up.
+        let dir = NSTemporaryDirectory() + "RC2Bind-OpenFromSchedule-" + UUID().uuidString
+        let (ctx, router) = try makeRouter(dir)
+        let controller = MainWindowController(context: ctx, router: router)
+        router.windowController = controller
+        router.destinationWindowIsKeyForTests = { $0 === controller.window }
+        defer { controller.window.orderOut(nil) }
+
+        let workspace = try router.createWorkspace(name: "SCHEDULE-OPEN", cwd: NSTemporaryDirectory())
+        defer { closeAndUnregisterAgentSurfaces(workspace: workspace.id) }
+        var target = try router.createAgentThread(
+            workspace: workspace.id,
+            title: "scheduled-run",
+            provider: .codex,
+            model: "fake-model",
+            permissionMode: .supervised,
+            reasoningEffort: .medium
+        )
+        target.hasUnread = true
+        try ctx.threadRepo.upsert(target)
+
+        // Same workspace already selected + Schedule Tasks shell mounted is the
+        // failing production path (selectWorkspace no-ops, panes stay unmounted).
+        controller.presentScheduledTasksInMainContent()
+        XCTAssertEqual(ctx.state.window.selectedWorkspaceID, workspace.id)
+
+        let routed = try router.openAgentThread(thread: target.id, markRead: true)
+        let surface = try XCTUnwrap(SurfaceRegistry.shared.surface(routed.id) as? AgentAppSurface)
+
+        XCTAssertEqual(surface.viewModel.selectedThreadId, target.id)
+        XCTAssertTrue(surface.view.window === controller.window,
+                      "Agent App must be mounted in the main window after leaving Schedule Tasks")
+        XCTAssertFalse(try XCTUnwrap(ctx.threadRepo.get(id: target.id)).hasUnread,
+                       "markRead only after the surface is visibly attached")
     }
 
     func test_openAgentThread_missingDestinationWindowPreservesUnread() throws {
