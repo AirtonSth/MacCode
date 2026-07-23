@@ -504,8 +504,24 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
         let data = try JSONSerialization.data(withJSONObject: payload)
         var line = data
         line.append(0x0A)
+        // Census observes outbound provider-bound bytes without mutation (AC-01).
+        let binding = TokenSaverCensusSeam.defaultBinding(
+            trigger: "provider_outbound_user",
+            provider: "claude",
+            providerAdapterVersion: "cli-stream-json",
+            toolShape: "user_json_line"
+        )
+        let sameUser = session.foreignUserUID == nil
+        let toWrite = TokenSaverCensusSeam.observeProviderVisiblePayload(
+            line,
+            binding: binding,
+            control: .noChange,
+            streamKind: .completedTranscript,
+            toolKind: .unknown,
+            isSameUser: sameUser
+        )
         try session.writeQueue.sync {
-            try GuardedStdinWrite.write(line,
+            try GuardedStdinWrite.write(toWrite,
                                         to: session.stdinPipe.fileHandleForWriting,
                                         process: session.process,
                                         notFound: { AgentProviderAdapterError.sessionNotFound(session.threadId) })
@@ -513,6 +529,26 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
     }
 
     private func handleLine(_ line: String, session: Session) {
+        // Token Saver census (task-03): shadow-only observation of provider-visible
+        // stream lines. Must not alter the line passed to the parser.
+        if let lineData = line.data(using: .utf8) {
+            let binding = TokenSaverCensusSeam.defaultBinding(
+                trigger: "provider_stream_line",
+                provider: "claude",
+                providerAdapterVersion: "cli-stream-json",
+                toolShape: "stream_json_line"
+            )
+            // Discard return: seam is identity; parser continues on original `line`.
+            let sameUser = session.foreignUserUID == nil
+            _ = TokenSaverCensusSeam.observeProviderVisiblePayload(
+                lineData,
+                binding: binding,
+                control: .noChange,
+                streamKind: .streaming,
+                toolKind: .unknown,
+                isSameUser: sameUser
+            )
+        }
         // F12: decode the line once and reuse the dict for both the assistant-uuid
         // probe and the runtime-event build instead of re-running JSONSerialization
         // for each. (The parser keeps its own decode: it has a no-reserialize fast

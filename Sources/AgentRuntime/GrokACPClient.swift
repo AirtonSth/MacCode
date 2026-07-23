@@ -665,9 +665,23 @@ public final class GrokACPClient: @unchecked Sendable {
         let data = try JSONSerialization.data(withJSONObject: object)
         var line = data
         line.append(0x0A)
+        let binding = TokenSaverCensusSeam.defaultBinding(
+            trigger: "provider_outbound_user",
+            provider: "grok",
+            providerAdapterVersion: "acp-jsonrpc",
+            toolShape: "jsonrpc_line"
+        )
+        let toWrite = TokenSaverCensusSeam.observeProviderVisiblePayload(
+            line,
+            binding: binding,
+            control: .noChange,
+            streamKind: .completedTranscript,
+            toolKind: .unknown,
+            isSameUser: true
+        )
         try writeQueue.sync {
             try GuardedStdinWrite.write(
-                line, to: stdinPipe.fileHandleForWriting, process: process,
+                toWrite, to: stdinPipe.fileHandleForWriting, process: process,
                 notFound: { GrokACPError.processExited(reason: .exit, status: -1, stderrTail: "") }
             )
         }
