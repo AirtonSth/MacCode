@@ -18,15 +18,20 @@ public enum TokenSaverTypedCrushers {
     public final class Registry: @unchecked Sendable {
         private let lock = NSLock()
         private var enabled: [CrusherKind: Bool]
+        private var releaseSeal: TokenSaverAuthorityPlane.ReleaseSeal?
 
         public init(allEnabled: Bool = false) {
             self.enabled = Dictionary(uniqueKeysWithValues: CrusherKind.allCases.map { ($0, allEnabled) })
         }
 
-        public func isEnabled(_ kind: CrusherKind) -> Bool {
+        public func isEnabled(_ kind: CrusherKind, bindingDigest: String?) -> Bool {
             lock.lock(); defer { lock.unlock() }
-            // Master kill switch: defaultEnabled must be true for any ON path.
-            return TokenSaverTypedCrushers.defaultEnabled && (enabled[kind] ?? false)
+            guard let releaseSeal,
+                  let bindingDigest,
+                  releaseSeal.isStillValid(for: bindingDigest) else {
+                return false
+            }
+            return enabled[kind] ?? false
         }
 
         /// Test/ops hook: enable a single trigger only when master allows (or for test registry that
@@ -41,6 +46,23 @@ public enum TokenSaverTypedCrushers {
             lock.unlock()
         }
 
+        /// Production activation is possible only with an opaque full-release proof.
+        public func activate(_ kinds: Set<CrusherKind>, releaseSeal: TokenSaverAuthorityPlane.ReleaseSeal) {
+            lock.lock()
+            self.releaseSeal = releaseSeal
+            for kind in CrusherKind.allCases {
+                enabled[kind] = kinds.contains(kind)
+            }
+            lock.unlock()
+        }
+
+        public func deactivate() {
+            lock.lock()
+            releaseSeal = nil
+            for kind in CrusherKind.allCases { enabled[kind] = false }
+            lock.unlock()
+        }
+
         public func snapshot() -> [CrusherKind: Bool] {
             lock.lock(); defer { lock.unlock() }
             return enabled
@@ -51,8 +73,12 @@ public enum TokenSaverTypedCrushers {
 
     /// Whether a kind is live: master defaultEnabled AND registry bit.
     /// For production, defaultEnabled stays false so this is always false until both flip.
-    public static func isLive(_ kind: CrusherKind, registry: Registry = sharedRegistry) -> Bool {
-        registry.isEnabled(kind)
+    public static func isLive(
+        _ kind: CrusherKind,
+        bindingDigest: String? = nil,
+        registry: Registry = sharedRegistry
+    ) -> Bool {
+        registry.isEnabled(kind, bindingDigest: bindingDigest)
     }
 
     /// Test-only: evaluate admit predicates with an explicit live flag (avoids mutating global default).
@@ -83,6 +109,32 @@ public enum TokenSaverTypedCrushers {
     }
 
     public static let sharedMemory = MemoryStore()
+
+    public final class EncryptedStore: BlobStore, @unchecked Sendable {
+        private let originals: TokenSaverLossyOriginalStoring
+
+        public init(originals: TokenSaverLossyOriginalStoring) {
+            self.originals = originals
+        }
+
+        public func store(id: String, plaintext: Data) throws {
+            guard originals.save(handle: "typed-crusher|\(id)", data: plaintext) != .conflict else {
+                throw StoreError.conflict
+            }
+        }
+
+        public func retrieve(id: String) throws -> Data {
+            guard let data = originals.load(handle: "typed-crusher|\(id)") else {
+                throw StoreError.missing
+            }
+            return data
+        }
+
+        public enum StoreError: Error {
+            case conflict
+            case missing
+        }
+    }
 
     public static func handleID(for data: Data) -> String {
         SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
@@ -199,9 +251,11 @@ public enum TokenSaverTypedCrushers {
         failureLines: [String],
         store: BlobStore = sharedMemory,
         registry: Registry = sharedRegistry,
-        masterEnabled: Bool? = nil
+        masterEnabled: Bool? = nil,
+        bindingDigest: String? = nil
     ) -> Result {
-        let live = (masterEnabled ?? defaultEnabled) && (registry.snapshot()[.pytest] ?? false)
+        let live = masterEnabled.map { $0 && (registry.snapshot()[.pytest] ?? false) }
+            ?? registry.isEnabled(.pytest, bindingDigest: bindingDigest)
         guard live else { return off(.pytest) }
         guard let parsed = parsePytestFailedCount(original) else {
             return Result(accepted: false, collapsed: nil, handle: nil, kind: .pytest)
@@ -226,9 +280,11 @@ public enum TokenSaverTypedCrushers {
         original: String,
         store: BlobStore = sharedMemory,
         registry: Registry = sharedRegistry,
-        masterEnabled: Bool? = nil
+        masterEnabled: Bool? = nil,
+        bindingDigest: String? = nil
     ) -> Result {
-        let live = (masterEnabled ?? defaultEnabled) && (registry.snapshot()[.stacktrace] ?? false)
+        let live = masterEnabled.map { $0 && (registry.snapshot()[.stacktrace] ?? false) }
+            ?? registry.isEnabled(.stacktrace, bindingDigest: bindingDigest)
         guard live else { return off(.stacktrace) }
         let (collapsedBody, hadRun) = collapseConsecutiveIdenticalFrames(original)
         let hasFrame = original.split(separator: "\n").contains { isStackFrameLine(String($0)) }
@@ -300,9 +356,11 @@ public enum TokenSaverTypedCrushers {
         isBinary: Bool,
         store: BlobStore = sharedMemory,
         registry: Registry = sharedRegistry,
-        masterEnabled: Bool? = nil
+        masterEnabled: Bool? = nil,
+        bindingDigest: String? = nil
     ) -> Result {
-        let live = (masterEnabled ?? defaultEnabled) && (registry.snapshot()[.diff] ?? false)
+        let live = masterEnabled.map { $0 && (registry.snapshot()[.diff] ?? false) }
+            ?? registry.isEnabled(.diff, bindingDigest: bindingDigest)
         guard live else { return off(.diff) }
         guard isUnifiedDiff(original) else {
             return Result(accepted: false, collapsed: nil, handle: nil, kind: .diff)
@@ -326,9 +384,11 @@ public enum TokenSaverTypedCrushers {
         matchLines: [String],
         store: BlobStore = sharedMemory,
         registry: Registry = sharedRegistry,
-        masterEnabled: Bool? = nil
+        masterEnabled: Bool? = nil,
+        bindingDigest: String? = nil
     ) -> Result {
-        let live = (masterEnabled ?? defaultEnabled) && (registry.snapshot()[.search] ?? false)
+        let live = masterEnabled.map { $0 && (registry.snapshot()[.search] ?? false) }
+            ?? registry.isEnabled(.search, bindingDigest: bindingDigest)
         guard live else { return off(.search) }
         let matchCount = matchLines.count
         guard let handle = storeVerified(Data(original.utf8), store: store) else {
@@ -350,9 +410,11 @@ public enum TokenSaverTypedCrushers {
         windowElements: Int = 3,
         store: BlobStore = sharedMemory,
         registry: Registry = sharedRegistry,
-        masterEnabled: Bool? = nil
+        masterEnabled: Bool? = nil,
+        bindingDigest: String? = nil
     ) -> Result {
-        let live = (masterEnabled ?? defaultEnabled) && (registry.snapshot()[.adaptiveJSON] ?? false)
+        let live = masterEnabled.map { $0 && (registry.snapshot()[.adaptiveJSON] ?? false) }
+            ?? registry.isEnabled(.adaptiveJSON, bindingDigest: bindingDigest)
         guard live else { return off(.adaptiveJSON) }
         guard let data = original.data(using: .utf8),
               let obj = try? JSONSerialization.jsonObject(with: data) else {

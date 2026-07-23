@@ -13,15 +13,25 @@ final class ScheduledTaskTests: XCTestCase {
         XCTAssertEqual(task.validationErrors().count, 8)
     }
 
-    func test_autoDoesNotRequireAResolvedManualModel_duringColdStartProviderLoading() {
-        let task = ScheduledTask(
+    func test_autoRequiresProviderButNotManualModel_becauseSourceIsUserChosen() {
+        // Provider/Source is always required (Agent App parity). Auto may omit
+        // a concrete model id; runtime picks one within the selected host.
+        let missingInstance = ScheduledTask(
             title: "Auto", prompt: "Run", workspaceID: WorkspaceID(), workspacePathSnapshot: "/tmp",
             runAsUser: "sam", runAsUID: 501, provider: .codex, providerInstanceID: "", model: "",
             reasoningEffort: .high, routingMode: .auto,
             recurrence: .daily(at: ScheduledLocalTime(hour: 9, minute: 0)!), timeZoneIdentifier: "UTC"
         )
+        XCTAssertTrue(missingInstance.validationErrors().contains("Provider instance is required."))
+        XCTAssertFalse(missingInstance.validationErrors().contains("Model is required."))
 
-        XCTAssertTrue(task.validationErrors().isEmpty)
+        let autoWithSource = ScheduledTask(
+            title: "Auto", prompt: "Run", workspaceID: WorkspaceID(), workspacePathSnapshot: "/tmp",
+            runAsUser: "sam", runAsUID: 501, provider: .codex, providerInstanceID: "codex", model: "",
+            reasoningEffort: .high, routingMode: .auto,
+            recurrence: .daily(at: ScheduledLocalTime(hour: 9, minute: 0)!), timeZoneIdentifier: "UTC"
+        )
+        XCTAssertTrue(autoWithSource.validationErrors().isEmpty)
     }
 
     func test_missingRoutingModeDecodesAsManual_becauseOlderSerializedTasksMustKeepBehavior() throws {

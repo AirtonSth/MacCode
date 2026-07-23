@@ -1,5 +1,133 @@
 import Foundation
 import CryptoKit
+import Security
+
+public protocol TokenSaverProjectKeyProviding: AnyObject {
+    func load(reference: String) throws -> Data?
+    /// Atomically inserts a new key or returns the existing winner.
+    func storeIfAbsent(_ key: Data, reference: String) throws -> Data
+    func delete(reference: String) throws
+}
+
+public final class TokenSaverKeychainProjectKeyProvider: TokenSaverProjectKeyProviding, @unchecked Sendable {
+    private static let service = "io.remotecode.token-saver.project-dek"
+
+    public init() {}
+
+    public func load(reference: String) throws -> Data? {
+        var query = baseQuery(reference: reference)
+        query[kSecReturnData as String] = true
+        query[kSecMatchLimit as String] = kSecMatchLimitOne
+        var item: CFTypeRef?
+        let status = SecItemCopyMatching(query as CFDictionary, &item)
+        if status == errSecItemNotFound { return nil }
+        guard status == errSecSuccess, let data = item as? Data else {
+            throw KeyError.status(status)
+        }
+        return data
+    }
+
+    public func storeIfAbsent(_ key: Data, reference: String) throws -> Data {
+        var add = baseQuery(reference: reference)
+        add[kSecValueData as String] = key
+        add[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+        let status = SecItemAdd(add as CFDictionary, nil)
+        if status == errSecSuccess { return key }
+        if status == errSecDuplicateItem, let existing = try load(reference: reference) {
+            return existing
+        }
+        throw KeyError.status(status)
+    }
+
+    public func delete(reference: String) throws {
+        let status = SecItemDelete(baseQuery(reference: reference) as CFDictionary)
+        guard status == errSecSuccess || status == errSecItemNotFound else {
+            throw KeyError.status(status)
+        }
+    }
+
+    private func baseQuery(reference: String) -> [String: Any] {
+        [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: Self.service,
+            kSecAttrAccount as String: reference,
+        ]
+    }
+
+    public enum KeyError: Error {
+        case status(OSStatus)
+    }
+}
+
+final class TokenSaverInMemoryProjectKeyProvider: TokenSaverProjectKeyProviding, @unchecked Sendable {
+    private let lock = NSLock()
+    private var keys: [String: Data] = [:]
+
+    func load(reference: String) -> Data? {
+        lock.lock(); defer { lock.unlock() }
+        return keys[reference]
+    }
+
+    func storeIfAbsent(_ key: Data, reference: String) -> Data {
+        lock.lock(); defer { lock.unlock() }
+        if let existing = keys[reference] { return existing }
+        keys[reference] = key
+        return key
+    }
+
+    func delete(reference: String) {
+        lock.lock(); keys.removeValue(forKey: reference); lock.unlock()
+    }
+}
+
+public enum TokenSaverOriginalSaveResult: Sendable, Equatable {
+    case created
+    case alreadyIdentical
+    case conflict
+}
+
+public protocol TokenSaverLossyOriginalStoring: AnyObject {
+    func save(handle: String, data: Data) -> TokenSaverOriginalSaveResult
+    func load(handle: String) -> Data?
+    func delete(handle: String)
+}
+
+/// Shared adapter for every lossy lane. It keeps recoverable originals inside the
+/// project-scoped encrypted store rather than in lane-specific plaintext files.
+public final class TokenSaverEncryptedOriginalStore: TokenSaverLossyOriginalStoring, @unchecked Sendable {
+    private let store: TokenSaverEncryptedStore
+    private let scope: TokenSaverEncryptedStore.Scope
+
+    public init(store: TokenSaverEncryptedStore, scope: TokenSaverEncryptedStore.Scope) {
+        self.store = store
+        self.scope = scope
+    }
+
+    public func save(handle: String, data: Data) -> TokenSaverOriginalSaveResult {
+        if let existing = try? store.readback(id: handle, expectedScope: scope) {
+            return existing == data ? .alreadyIdentical : .conflict
+        }
+        do {
+            _ = try store.store(id: handle, plaintext: data, scope: scope)
+            return .created
+        } catch TokenSaverEncryptedStore.StoreError.conflict {
+            guard let existing = try? store.readback(id: handle, expectedScope: scope) else {
+                return .conflict
+            }
+            return existing == data ? .alreadyIdentical : .conflict
+        } catch {
+            return .conflict
+        }
+    }
+
+    public func load(handle: String) -> Data? {
+        try? store.readback(id: handle, expectedScope: scope)
+    }
+
+    public func delete(handle: String) {
+        try? store.delete(id: handle, expectedScope: scope)
+    }
+}
 
 /// Fase 2 encrypted project-scoped store (task-09).
 /// On-disk encrypted records; DEK + meta (migration/deleteEpoch) persist across process restarts.
@@ -32,9 +160,29 @@ public final class TokenSaverEncryptedStore: @unchecked Sendable {
             self.sessionGeneration = sessionGeneration
         }
 
+        public var isComplete: Bool {
+            sessionGeneration > 0
+                && [workspaceID, projectID, threadID, provider].allSatisfy {
+                    !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                }
+        }
+
         public var digest: String {
-            let payload = "\(uid)|\(workspaceID)|\(projectID)|\(threadID)|\(provider)|\(sessionGeneration)"
-            return SHA256.hash(data: Data(payload.utf8)).map { String(format: "%02x", $0) }.joined()
+            var payload = Data()
+            for field in [
+                String(uid),
+                workspaceID,
+                projectID,
+                threadID,
+                provider,
+                String(sessionGeneration),
+            ] {
+                let bytes = Data(field.utf8)
+                var length = UInt64(bytes.count).bigEndian
+                withUnsafeBytes(of: &length) { payload.append(contentsOf: $0) }
+                payload.append(bytes)
+            }
+            return SHA256.hash(data: payload).map { String(format: "%02x", $0) }.joined()
         }
     }
 
@@ -52,6 +200,8 @@ public final class TokenSaverEncryptedStore: @unchecked Sendable {
         /// Shadow migration journal: list of record ids still pending upgrade N-1→N.
         var pendingMigrationIDs: [String]
         var shredActive: Bool
+        /// Opaque Keychain account; never contains key bytes.
+        var keyReference: String?
     }
 
     public struct Envelope: Sendable, Equatable {
@@ -63,7 +213,10 @@ public final class TokenSaverEncryptedStore: @unchecked Sendable {
     private let lock = NSLock()
     private let rootURL: URL
     private let metaURL: URL
+    /// N-1 migration source only. New stores never persist a plaintext DEK file.
     private let dekURL: URL
+    private let keyProvider: TokenSaverProjectKeyProviding
+    private let keyReference: String
     private var key: SymmetricKey?
     private var meta: Meta
     public private(set) var lateOutcomesRejected: Int {
@@ -79,11 +232,15 @@ public final class TokenSaverEncryptedStore: @unchecked Sendable {
         return meta.deleteEpoch
     }
 
-    public init(projectRoot: URL) throws {
+    public init(
+        projectRoot: URL,
+        keyProvider: TokenSaverProjectKeyProviding = TokenSaverKeychainProjectKeyProvider()
+    ) throws {
         let root = projectRoot.appendingPathComponent("token-saver-store", isDirectory: true)
         self.rootURL = root
         self.metaURL = root.appendingPathComponent("meta.json")
         self.dekURL = root.appendingPathComponent("dek.bin")
+        self.keyProvider = keyProvider
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
 
         if FileManager.default.fileExists(atPath: metaURL.path) {
@@ -101,24 +258,39 @@ public final class TokenSaverEncryptedStore: @unchecked Sendable {
                 retentionDays: 30,
                 lateOutcomesRejected: 0,
                 pendingMigrationIDs: [],
-                shredActive: false
+                shredActive: false,
+                keyReference: nil
             )
-            try Self.writeMeta(self.meta, to: metaURL)
+        }
+
+        let reference = meta.keyReference ?? Self.defaultKeyReference(for: root)
+        self.keyReference = reference
+        if meta.keyReference == nil {
+            meta.keyReference = reference
+            try Self.writeMeta(meta, to: metaURL)
         }
 
         if meta.shredActive || meta.deleteEpoch > 0 {
             // After shred/delete: no DEK; store is terminal for lossy writes.
             self.key = nil
+            try keyProvider.delete(reference: reference)
             try? FileManager.default.removeItem(at: dekURL)
-        } else if FileManager.default.fileExists(atPath: dekURL.path) {
-            let raw = try Data(contentsOf: dekURL)
+        } else {
+            let raw: Data
+            if let stored = try keyProvider.load(reference: reference) {
+                raw = stored
+            } else if FileManager.default.fileExists(atPath: dekURL.path) {
+                // One-way N-1 migration from the unencapsulated branch prototype.
+                let legacy = try Data(contentsOf: dekURL)
+                raw = try keyProvider.storeIfAbsent(legacy, reference: reference)
+                try FileManager.default.removeItem(at: dekURL)
+            } else {
+                let generated = SymmetricKey(size: .bits256)
+                let candidate = generated.withUnsafeBytes { Data($0) }
+                raw = try keyProvider.storeIfAbsent(candidate, reference: reference)
+            }
             guard raw.count == 32 else { throw StoreError.corruptKey }
             self.key = SymmetricKey(data: raw)
-        } else {
-            let generated = SymmetricKey(size: .bits256)
-            let raw = generated.withUnsafeBytes { Data($0) }
-            try raw.write(to: dekURL, options: .atomic)
-            self.key = generated
         }
     }
 
@@ -165,7 +337,7 @@ public final class TokenSaverEncryptedStore: @unchecked Sendable {
         try Self.writeMeta(meta, to: metaURL)
 
         for id in pending {
-            let url = fileURL(for: id)
+            let url = rootURL.appendingPathComponent(id + ".tsrec")
             let data = try Data(contentsOf: url)
             let record = try JSONDecoder().decode(DiskRecord.self, from: data)
             let box = try AES.GCM.SealedBox(combined: record.ciphertext)
@@ -195,17 +367,23 @@ public final class TokenSaverEncryptedStore: @unchecked Sendable {
               !meta.shredActive else {
             throw StoreError.lossyDenied
         }
+        guard scope.isComplete else { throw StoreError.denied }
         let sealed = try AES.GCM.seal(plaintext, using: key)
         let combined = sealed.combined!
         let record = DiskRecord(formatVersion: Self.schemaVersion, scope: scope, ciphertext: combined)
         let data = try JSONEncoder().encode(record)
-        try data.write(to: fileURL(for: id), options: .atomic)
+        do {
+            try data.write(to: fileURL(for: id), options: .withoutOverwriting)
+        } catch CocoaError.fileWriteFileExists {
+            throw StoreError.conflict
+        }
         return Envelope(ciphertext: combined, scope: scope, formatVersion: Self.schemaVersion)
     }
 
     public func readback(id: String, expectedScope: Scope) throws -> Data {
         lock.lock()
         defer { lock.unlock() }
+        guard expectedScope.isComplete else { throw StoreError.denied }
         guard let key else { throw StoreError.shredded }
         let url = fileURL(for: id)
         guard FileManager.default.fileExists(atPath: url.path) else { throw StoreError.missing }
@@ -222,18 +400,33 @@ public final class TokenSaverEncryptedStore: @unchecked Sendable {
         return try readback(id: id, expectedScope: scope)
     }
 
+    public func delete(id: String, expectedScope: Scope) throws {
+        lock.lock()
+        defer { lock.unlock() }
+        guard expectedScope.isComplete else { throw StoreError.denied }
+        let url = fileURL(for: id)
+        guard FileManager.default.fileExists(atPath: url.path) else { return }
+        let data = try Data(contentsOf: url)
+        let record = try JSONDecoder().decode(DiskRecord.self, from: data)
+        guard record.scope == expectedScope else { throw StoreError.denied }
+        try FileManager.default.removeItem(at: url)
+    }
+
     /// Crypto-shred: persist irreversible tombstone FIRST, then destroy DEK + records.
     /// Ordering is intentional: crash mid-shred must reopen as shredded (deleteEpoch/shredActive),
     /// never regenerate a live DEK under stale migrationComplete=true.
     public func markDeleted() throws {
         lock.lock()
         defer { lock.unlock() }
-        meta.deleteEpoch += 1
+        if meta.deleteEpoch < .max {
+            meta.deleteEpoch += 1
+        }
         meta.shredActive = true
         meta.migrationComplete = false
         // Durable tombstone before any shred of DEK/records.
         try Self.writeMeta(meta, to: metaURL)
         key = nil
+        try keyProvider.delete(reference: keyReference)
         if let files = try? FileManager.default.contentsOfDirectory(at: rootURL, includingPropertiesForKeys: nil) {
             for f in files {
                 if f.lastPathComponent == "meta.json" { continue }
@@ -247,7 +440,9 @@ public final class TokenSaverEncryptedStore: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         if meta.deleteEpoch > 0 || meta.shredActive {
-            meta.lateOutcomesRejected += 1
+            if meta.lateOutcomesRejected < .max {
+                meta.lateOutcomesRejected += 1
+            }
             try? Self.writeMeta(meta, to: metaURL)
             return false
         }
@@ -257,6 +452,7 @@ public final class TokenSaverEncryptedStore: @unchecked Sendable {
     public func seedLegacyRecord(id: String, plaintext: Data, scope: Scope) throws {
         lock.lock()
         defer { lock.unlock() }
+        guard scope.isComplete else { throw StoreError.denied }
         guard let key else { throw StoreError.shredded }
         let sealed = try AES.GCM.seal(plaintext, using: key)
         let record = DiskRecord(
@@ -283,7 +479,10 @@ public final class TokenSaverEncryptedStore: @unchecked Sendable {
     public var projectRootForTests: URL { rootURL.deletingLastPathComponent() }
 
     private func fileURL(for id: String) -> URL {
-        rootURL.appendingPathComponent(id + ".tsrec")
+        let safe = SHA256.hash(data: Data(id.utf8))
+            .map { String(format: "%02x", $0) }
+            .joined()
+        return rootURL.appendingPathComponent(safe + ".tsrec")
     }
 
     private static func writeMeta(_ meta: Meta, to url: URL) throws {
@@ -291,8 +490,15 @@ public final class TokenSaverEncryptedStore: @unchecked Sendable {
         try data.write(to: url, options: .atomic)
     }
 
+    private static func defaultKeyReference(for root: URL) -> String {
+        let canonical = root.resolvingSymlinksInPath().standardizedFileURL.path
+        return SHA256.hash(data: Data(canonical.utf8))
+            .map { String(format: "%02x", $0) }
+            .joined()
+    }
+
     public enum StoreError: Error {
-        case lossyDenied, missing, denied, unsupportedFormat
+        case lossyDenied, missing, denied, unsupportedFormat, conflict
         case corruptKey, keyGenerationFailed, shredded, corruptMeta
     }
 

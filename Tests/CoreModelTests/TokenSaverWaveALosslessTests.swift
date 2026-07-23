@@ -84,6 +84,22 @@ final class TokenSaverWaveALosslessTests: XCTestCase {
         XCTAssertEqual(board.snapshot(bindingDigest: "b2", trigger: .repeatedLog).eligible, 0)
     }
 
+    func test_scorecardBoundsDistinctBindings() {
+        let board = TokenSaverWaveALossless.Scoreboard(maxEntries: 2)
+        for binding in ["b1", "b2", "b3"] {
+            TokenSaverWaveALossless.observeShadow(
+                trigger: .repeatedLog,
+                eligible: true,
+                wouldAccept: true,
+                bindingDigest: binding,
+                scoreboard: board
+            )
+        }
+        XCTAssertEqual(board.snapshot(bindingDigest: "b1", trigger: .repeatedLog).eligible, 1)
+        XCTAssertEqual(board.snapshot(bindingDigest: "b2", trigger: .repeatedLog).eligible, 1)
+        XCTAssertEqual(board.snapshot(bindingDigest: "b3", trigger: .repeatedLog).eligible, 0)
+    }
+
     func test_jsonRejectsUnparseableCollapsed() {
         let original = "{ \"a\": 1, \"b\": 2, \"c\": 3, \"d\": 4, \"e\": 5 }"
         XCTAssertFalse(TokenSaverWaveALossless.structuredJSONAllows(original: original, collapsed: "not-json"))

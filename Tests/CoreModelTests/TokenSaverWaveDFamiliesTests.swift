@@ -2,16 +2,41 @@ import XCTest
 @testable import CoreModel
 
 final class TokenSaverWaveDFamiliesTests: XCTestCase {
+    private var keyProviders: [String: TokenSaverInMemoryProjectKeyProvider] = [:]
     private func tempDir() -> URL {
         let d = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("ts-wd-\(UUID().uuidString)")
         try! FileManager.default.createDirectory(at: d, withIntermediateDirectories: true)
         return d
     }
 
+    private func makeOriginalStore(
+        at dir: URL,
+        user: String = "u",
+        binding: String = "b"
+    ) throws -> TokenSaverEncryptedOriginalStore {
+        let provider = keyProviders[dir.path] ?? TokenSaverInMemoryProjectKeyProvider()
+        keyProviders[dir.path] = provider
+        let store = try TokenSaverEncryptedStore(projectRoot: dir, keyProvider: provider)
+        try store.markMigrationComplete()
+        let scope = TokenSaverEncryptedStore.Scope(
+            uid: 501,
+            workspaceID: "w",
+            projectID: binding,
+            threadID: user,
+            provider: "test",
+            sessionGeneration: 1
+        )
+        return TokenSaverEncryptedOriginalStore(store: store, scope: scope)
+    }
+
     func test_defaultOff() {
         XCTAssertFalse(TokenSaverWaveDFamilies.defaultEnabled)
         let dir = tempDir(); defer { try? FileManager.default.removeItem(at: dir) }
-        let rt = TokenSaverWaveDRuntime(boundUserID: "u", bindingDigest: "b", durableDirectory: dir)
+        let rt = TokenSaverWaveDRuntime(
+            boundUserID: "u",
+            bindingDigest: "b",
+            originalStore: try! makeOriginalStore(at: dir)
+        )
         XCTAssertEqual(rt.admitCommand(.test, requestingUserID: "u", bindingDigest: "b"), .notLive)
         XCTAssertTrue(rt.taskDoneAllowed())
         XCTAssertFalse(TokenSaverWaveDRuntime.packageManagerAutoWrapEnabled)
@@ -19,7 +44,11 @@ final class TokenSaverWaveDFamiliesTests: XCTestCase {
 
     func test_commandsUserBindingAndNoPackageWrap() {
         let dir = tempDir(); defer { try? FileManager.default.removeItem(at: dir) }
-        let rt = TokenSaverWaveDRuntime(boundUserID: "alice", bindingDigest: "bind-1", durableDirectory: dir)
+        let rt = TokenSaverWaveDRuntime(
+            boundUserID: "alice",
+            bindingDigest: "bind-1",
+            originalStore: try! makeOriginalStore(at: dir, user: "alice", binding: "bind-1")
+        )
         rt.live = true
         XCTAssertEqual(rt.admitCommand(.test, requestingUserID: "alice", bindingDigest: "bind-1"), .admitted)
         XCTAssertEqual(rt.admitCommand(.test, requestingUserID: "bob", bindingDigest: "bind-1"), .userMismatch)
@@ -31,7 +60,11 @@ final class TokenSaverWaveDFamiliesTests: XCTestCase {
 
     func test_structureDurableAuthAndGraphProvenance() {
         let dir = tempDir(); defer { try? FileManager.default.removeItem(at: dir) }
-        let rt = TokenSaverWaveDRuntime(boundUserID: "u", bindingDigest: "b", durableDirectory: dir)
+        let rt = TokenSaverWaveDRuntime(
+            boundUserID: "u",
+            bindingDigest: "b",
+            originalStore: try! makeOriginalStore(at: dir)
+        )
         rt.live = true
         // Memory-only (no durable dir) fails
         let mem = TokenSaverWaveDRuntime(boundUserID: "u", bindingDigest: "b")
@@ -54,10 +87,18 @@ final class TokenSaverWaveDFamiliesTests: XCTestCase {
         XCTAssertEqual(rt.retrieveStructureOriginal(handle: view.handle, requestingUserID: "u", bindingDigest: "b"), original)
         XCTAssertNil(rt.retrieveStructureOriginal(handle: view.handle, requestingUserID: "other", bindingDigest: "b"))
         // Relaunch
-        let rt2 = TokenSaverWaveDRuntime(boundUserID: "u", bindingDigest: "b", durableDirectory: dir)
+        let rt2 = TokenSaverWaveDRuntime(
+            boundUserID: "u",
+            bindingDigest: "b",
+            originalStore: try! makeOriginalStore(at: dir)
+        )
         XCTAssertEqual(rt2.retrieveStructureOriginal(handle: view.handle, requestingUserID: "u", bindingDigest: "b"), original)
         // Cross-user same dir cannot read
-        let other = TokenSaverWaveDRuntime(boundUserID: "other", bindingDigest: "b", durableDirectory: dir)
+        let other = TokenSaverWaveDRuntime(
+            boundUserID: "other",
+            bindingDigest: "b",
+            originalStore: try! makeOriginalStore(at: dir, user: "other")
+        )
         XCTAssertNil(other.retrieveStructureOriginal(handle: view.handle, requestingUserID: "other", bindingDigest: "b"))
 
         if case .failure(let a) = rt.codeStructureView(
@@ -88,6 +129,18 @@ final class TokenSaverWaveDFamiliesTests: XCTestCase {
             .admitted
         )
         XCTAssertFalse(rt.mlxMayInventShell())
+        XCTAssertFalse(rt.taskDoneAllowed(), "live task cannot finish without validation proof")
+        XCTAssertFalse(rt.recordValidationSuccess(
+            proofDigest: "proof",
+            requestingUserID: "other",
+            bindingDigest: "b"
+        ))
+        XCTAssertTrue(rt.recordValidationSuccess(
+            proofDigest: "proof",
+            requestingUserID: "u",
+            bindingDigest: "b"
+        ))
+        XCTAssertTrue(rt.taskDoneAllowed())
         rt.recordValidationFailure()
         XCTAssertFalse(rt.taskDoneAllowed())
     }

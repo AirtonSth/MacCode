@@ -6,6 +6,54 @@ import CoreModel
 public enum TokenSaverTypedCrushersBridge {
     public static let taskID = "task-15"
 
+    private final class ActivationState: @unchecked Sendable {
+        private let lock = NSLock()
+        private var bindingDigest: String?
+        private var store: TokenSaverTypedCrushers.BlobStore?
+
+        func activate(bindingDigest: String, store: TokenSaverTypedCrushers.BlobStore) {
+            lock.lock()
+            self.bindingDigest = bindingDigest
+            self.store = store
+            lock.unlock()
+        }
+
+        func deactivate() {
+            lock.lock()
+            bindingDigest = nil
+            store = nil
+            lock.unlock()
+        }
+
+        func store(for bindingDigest: String?) -> TokenSaverTypedCrushers.BlobStore? {
+            lock.lock(); defer { lock.unlock() }
+            guard self.bindingDigest == bindingDigest else { return nil }
+            return store
+        }
+    }
+
+    private static let activation = ActivationState()
+
+    public static func activate(
+        kinds: Set<TokenSaverTypedCrushers.CrusherKind>,
+        bindingDigest: String,
+        releaseSeal: TokenSaverAuthorityPlane.ReleaseSeal,
+        encryptedStore: TokenSaverEncryptedStore,
+        scope: TokenSaverEncryptedStore.Scope
+    ) {
+        TokenSaverTypedCrushers.sharedRegistry.activate(kinds, releaseSeal: releaseSeal)
+        let originals = TokenSaverEncryptedOriginalStore(store: encryptedStore, scope: scope)
+        activation.activate(
+            bindingDigest: bindingDigest,
+            store: TokenSaverTypedCrushers.EncryptedStore(originals: originals)
+        )
+    }
+
+    public static func deactivate() {
+        TokenSaverTypedCrushers.sharedRegistry.deactivate()
+        activation.deactivate()
+    }
+
     /// Extract pytest failure case lines (not the summary "N failed" line).
     public static func pytestFailureLines(from output: String) -> [String] {
         output.split(separator: "\n").map(String.init).filter { line in
@@ -37,27 +85,50 @@ public enum TokenSaverTypedCrushersBridge {
         bindingDigest: String? = nil,
         resultScopeDigest: String? = nil
     ) {
-        if output.range(of: #"\d+\s+failed"#, options: .regularExpression) != nil
-            || output.contains("pytest") {
-            _ = TokenSaverTypedCrushers.crushPytest(
-                original: output,
-                failureLines: pytestFailureLines(from: output)
-            )
-        }
-        if output.contains("Traceback")
-            || output.split(separator: "\n").contains(where: { TokenSaverTypedCrushers.isStackFrameLine(String($0)) }) {
-            _ = TokenSaverTypedCrushers.crushStacktrace(original: output)
-        }
-        if TokenSaverTypedCrushers.isUnifiedDiff(output) {
-            _ = TokenSaverTypedCrushers.crushDiff(original: output, isBinary: false)
-        }
-        if toolName == "Grep" || toolName == "Glob" {
-            let lines = output.split(separator: "\n").map(String.init).filter { !$0.isEmpty }
-            _ = TokenSaverTypedCrushers.crushSearch(original: output, matchLines: lines)
-        }
-        let trimmed = output.trimmingCharacters(in: .whitespacesAndNewlines)
-        if trimmed.first == "{" || trimmed.first == "[" {
-            _ = TokenSaverTypedCrushers.crushAdaptiveJSON(original: trimmed)
+        // A release-approved binding without its encrypted original store still fails open/raw.
+        if let store = activation.store(for: bindingDigest) {
+            if output.range(of: #"\d+\s+failed"#, options: .regularExpression) != nil
+                || output.contains("pytest") {
+                _ = TokenSaverTypedCrushers.crushPytest(
+                    original: output,
+                    failureLines: pytestFailureLines(from: output),
+                    store: store,
+                    bindingDigest: bindingDigest
+                )
+            }
+            if output.contains("Traceback")
+                || output.split(separator: "\n").contains(where: { TokenSaverTypedCrushers.isStackFrameLine(String($0)) }) {
+                _ = TokenSaverTypedCrushers.crushStacktrace(
+                    original: output,
+                    store: store,
+                    bindingDigest: bindingDigest
+                )
+            }
+            if TokenSaverTypedCrushers.isUnifiedDiff(output) {
+                _ = TokenSaverTypedCrushers.crushDiff(
+                    original: output,
+                    isBinary: false,
+                    store: store,
+                    bindingDigest: bindingDigest
+                )
+            }
+            if toolName == "Grep" || toolName == "Glob" {
+                let lines = output.split(separator: "\n").map(String.init).filter { !$0.isEmpty }
+                _ = TokenSaverTypedCrushers.crushSearch(
+                    original: output,
+                    matchLines: lines,
+                    store: store,
+                    bindingDigest: bindingDigest
+                )
+            }
+            let trimmed = output.trimmingCharacters(in: .whitespacesAndNewlines)
+            if trimmed.first == "{" || trimmed.first == "[" {
+                _ = TokenSaverTypedCrushers.crushAdaptiveJSON(
+                    original: trimmed,
+                    store: store,
+                    bindingDigest: bindingDigest
+                )
+            }
         }
         // task-16 recovery probes (default OFF → deny)
         for handle in extractRecoveryHandles(from: output) {

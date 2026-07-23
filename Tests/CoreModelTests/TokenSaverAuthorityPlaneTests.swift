@@ -88,6 +88,34 @@ final class TokenSaverAuthorityPlaneTests: XCTestCase {
         XCTAssertEqual(TokenSaverAuthorityPlane.shadowHeadlineConfirmedSavings, 0)
     }
 
+    func test_incompleteBindingCannotMintReleaseAuthority() {
+        let reg = TokenSaverAuthorityPlane.Registry()
+        let incomplete = binding(" ")
+        reg.setReplacementAllowed(true, for: incomplete)
+        let consent = TokenSaverAuthorityPlane.ConsentState(
+            exactLossless: true,
+            semanticLocalAI: false,
+            isLegacyPreference: false
+        )
+        XCTAssertEqual(
+            TokenSaverAuthorityPlane.evaluateRelease(
+                binding: incomplete,
+                registry: reg,
+                manifest: fullPresentManifest(),
+                consent: consent,
+                requiresSemantic: false
+            ),
+            .denyIncompleteBinding
+        )
+        XCTAssertNil(TokenSaverAuthorityPlane.mintReleaseSeal(
+            binding: incomplete,
+            registry: reg,
+            manifest: fullPresentManifest(),
+            consent: consent,
+            requiresSemantic: false
+        ))
+    }
+
     func test_legacyConsent_neverEnablesSemantic() {
         let c = TokenSaverAuthorityPlane.ConsentState(
             exactLossless: true, semanticLocalAI: true, isLegacyPreference: true
@@ -108,6 +136,13 @@ final class TokenSaverAuthorityPlaneTests: XCTestCase {
         XCTAssertEqual(r.binding.digestHex.count, 64)
         XCTAssertFalse(r.handle.isEmpty)
         XCTAssertEqual(r.recoveryState, "available")
+        XCTAssertFalse(TokenSaverAuthorityPlane.PresentationReceipt(
+            binding: binding(" "),
+            operationID: "op-2",
+            handle: "rc:h2",
+            recoveryState: "available",
+            expiry: nil
+        ).isWellFormed)
     }
 
     func test_shadow_zeroHeadlineConfirmed() {

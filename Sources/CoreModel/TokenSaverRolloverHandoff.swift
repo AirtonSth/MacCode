@@ -1,4 +1,5 @@
 import Foundation
+import Darwin
 
 /// Wave C rollover / handoff / lossy / verbosity / visual (task-19). Default OFF.
 public enum TokenSaverRolloverHandoff {
@@ -40,7 +41,7 @@ public final class TokenSaverRolloverHandoffRuntime: @unchecked Sendable {
 
     public protocol DurabilityStore: AnyObject {
         func loadSnapshot() -> Snapshot?
-        func saveSnapshot(_ snapshot: Snapshot) -> Bool
+        func saveSnapshot(_ snapshot: Snapshot, expectedRevision: UInt64) -> Bool
     }
 
     /// Owns durable originals for lossy admission (store-before-loss).
@@ -53,6 +54,31 @@ public final class TokenSaverRolloverHandoffRuntime: @unchecked Sendable {
         public var parentState: ParentState
         public var branches: [String: Branch]
         public var boundUserID: String
+        public var revision: UInt64
+
+        public init(
+            parentState: ParentState,
+            branches: [String: Branch],
+            boundUserID: String,
+            revision: UInt64 = 0
+        ) {
+            self.parentState = parentState
+            self.branches = branches
+            self.boundUserID = boundUserID
+            self.revision = revision
+        }
+
+        private enum CodingKeys: String, CodingKey {
+            case parentState, branches, boundUserID, revision
+        }
+
+        public init(from decoder: Decoder) throws {
+            let values = try decoder.container(keyedBy: CodingKeys.self)
+            parentState = try values.decode(ParentState.self, forKey: .parentState)
+            branches = try values.decode([String: Branch].self, forKey: .branches)
+            boundUserID = try values.decode(String.self, forKey: .boundUserID)
+            revision = try values.decodeIfPresent(UInt64.self, forKey: .revision) ?? 0
+        }
     }
 
     public struct LossyAdmission: Sendable, Equatable {
@@ -64,7 +90,11 @@ public final class TokenSaverRolloverHandoffRuntime: @unchecked Sendable {
     /// `LossyGate.seal` mints seals after corpus + scope thresholds pass.
     public struct LossyGateSeal: Sendable, Equatable {
         fileprivate let token: UInt64
-        fileprivate init(token: UInt64) { self.token = token }
+        fileprivate let bindingDigest: String
+        fileprivate init(token: UInt64, bindingDigest: String) {
+            self.token = token
+            self.bindingDigest = bindingDigest
+        }
     }
 
     public enum LossyGate {
@@ -93,7 +123,10 @@ public final class TokenSaverRolloverHandoffRuntime: @unchecked Sendable {
             hasher.combine(corpusFailures)
             hasher.combine(binding)
             hasher.combine(pinsRespected)
-            return LossyGateSeal(token: UInt64(bitPattern: Int64(hasher.finalize())))
+            return LossyGateSeal(
+                token: UInt64(bitPattern: Int64(hasher.finalize())),
+                bindingDigest: binding
+            )
         }
     }
 
@@ -106,9 +139,10 @@ public final class TokenSaverRolloverHandoffRuntime: @unchecked Sendable {
         public func loadSnapshot() -> Snapshot? {
             lock.lock(); defer { lock.unlock() }; return snap
         }
-        public func saveSnapshot(_ snapshot: Snapshot) -> Bool {
+        public func saveSnapshot(_ snapshot: Snapshot, expectedRevision: UInt64) -> Bool {
             lock.lock(); defer { lock.unlock() }
             if failSaves { return false }
+            guard (snap?.revision ?? 0) == expectedRevision else { return false }
             snap = snapshot
             return true
         }
@@ -134,45 +168,53 @@ public final class TokenSaverRolloverHandoffRuntime: @unchecked Sendable {
     public final class FileDurabilityStore: DurabilityStore, LossyOriginalStore, @unchecked Sendable {
         private let lock = NSLock()
         private let url: URL
-        private let omitDir: URL
-        public init(directory: URL) throws {
+        private let lockURL: URL
+        private let originalStore: TokenSaverLossyOriginalStoring?
+        public init(directory: URL, originalStore: TokenSaverLossyOriginalStoring? = nil) throws {
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
             self.url = directory.appendingPathComponent("rollover-snapshot.json")
-            self.omitDir = directory.appendingPathComponent("lossy-originals")
-            try FileManager.default.createDirectory(at: omitDir, withIntermediateDirectories: true)
+            self.lockURL = directory.appendingPathComponent("rollover-snapshot.lock")
+            self.originalStore = originalStore
         }
         public func loadSnapshot() -> Snapshot? {
             lock.lock(); defer { lock.unlock() }
             guard let data = try? Data(contentsOf: url) else { return nil }
             return try? JSONDecoder().decode(Snapshot.self, from: data)
         }
-        public func saveSnapshot(_ snapshot: Snapshot) -> Bool {
+        public func saveSnapshot(_ snapshot: Snapshot, expectedRevision: UInt64) -> Bool {
             lock.lock(); defer { lock.unlock() }
+            let descriptor = Darwin.open(lockURL.path, O_CREAT | O_RDWR, S_IRUSR | S_IWUSR)
+            guard descriptor >= 0 else { return false }
+            guard flock(descriptor, LOCK_EX) == 0 else {
+                Darwin.close(descriptor)
+                return false
+            }
+            defer {
+                _ = flock(descriptor, LOCK_UN)
+                Darwin.close(descriptor)
+            }
             do {
+                let current: Snapshot?
+                if FileManager.default.fileExists(atPath: url.path) {
+                    current = try JSONDecoder().decode(Snapshot.self, from: Data(contentsOf: url))
+                } else {
+                    current = nil
+                }
+                guard (current?.revision ?? 0) == expectedRevision else { return false }
                 let data = try JSONEncoder().encode(snapshot)
                 try data.write(to: url, options: .atomic)
                 return true
             } catch { return false }
         }
-        private func omitURL(_ handle: String) -> URL {
-            let safe = Data(handle.utf8).base64EncodedString().replacingOccurrences(of: "/", with: "_")
-            return omitDir.appendingPathComponent(safe)
-        }
         public func storeOriginal(handle: String, data: Data) -> Bool {
-            lock.lock(); defer { lock.unlock() }
-            let path = omitURL(handle)
-            if FileManager.default.fileExists(atPath: path.path) {
-                if let existing = try? Data(contentsOf: path), existing == data { return true }
-                return false
-            }
-            do {
-                try data.write(to: path, options: [.withoutOverwriting])
-                return true
-            } catch { return false }
+            guard let originalStore else { return false }
+            return originalStore.save(handle: storageHandle(handle), data: data) != .conflict
         }
         public func loadOriginal(handle: String) -> Data? {
-            lock.lock(); defer { lock.unlock() }
-            return try? Data(contentsOf: omitURL(handle))
+            originalStore?.load(handle: storageHandle(handle))
+        }
+        private func storageHandle(_ handle: String) -> String {
+            "rollover|\(handle)"
         }
     }
 
@@ -182,17 +224,21 @@ public final class TokenSaverRolloverHandoffRuntime: @unchecked Sendable {
     private var branches: [String: Branch] = [:]
     private var handoffConsent = false
     private var handoffDestinationBinding = ""
+    private var snapshotRevision: UInt64 = 0
     /// Bound at init — only this user may own forks (same-user AC).
     public let boundUserID: String
+    public let bindingDigest: String
     private let store: DurabilityStore
     private let lossyStore: LossyOriginalStore
 
     public init(
         boundUserID: String,
+        bindingDigest: String = "",
         store: DurabilityStore = MemoryDurabilityStore(),
         lossyStore: LossyOriginalStore? = nil
     ) {
         self.boundUserID = boundUserID.trimmingCharacters(in: .whitespacesAndNewlines)
+        self.bindingDigest = bindingDigest.trimmingCharacters(in: .whitespacesAndNewlines)
         self.store = store
         if let lossyStore {
             self.lossyStore = lossyStore
@@ -204,6 +250,7 @@ public final class TokenSaverRolloverHandoffRuntime: @unchecked Sendable {
         if let snap = store.loadSnapshot(), snap.boundUserID == self.boundUserID {
             self.parentState = snap.parentState
             self.branches = snap.branches
+            self.snapshotRevision = snap.revision
         }
     }
 
@@ -231,9 +278,11 @@ public final class TokenSaverRolloverHandoffRuntime: @unchecked Sendable {
         let req = requestingUserID.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !boundUserID.isEmpty, req == boundUserID else { return nil }
         if replay {
-            if let existing = branches[op.id] { return existing }
+            if let existing = branches[op.id] {
+                return existing.forkID == op ? existing : nil
+            }
         } else if let existing = branches[op.id] {
-            return existing
+            return existing.forkID == op ? existing : nil
         }
         let priorState = parentState
         if op.kind == .rollover {
@@ -283,7 +332,8 @@ public final class TokenSaverRolloverHandoffRuntime: @unchecked Sendable {
     ) -> LossyAdmission? {
         lock.lock(); defer { lock.unlock() }
         guard _live else { return nil }
-        _ = gate.token // seal existence is the gate; no free booleans
+        _ = gate.token
+        guard !bindingDigest.isEmpty, gate.bindingDigest == bindingDigest else { return nil }
         let handle = recoveryHandle.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !handle.isEmpty, !original.isEmpty else { return nil }
         guard lossyStore.storeOriginal(handle: handle, data: original) else { return nil }
@@ -324,7 +374,16 @@ public final class TokenSaverRolloverHandoffRuntime: @unchecked Sendable {
     }
 
     private func persistUnlocked() -> Bool {
-        let snap = Snapshot(parentState: parentState, branches: branches, boundUserID: boundUserID)
-        return store.saveSnapshot(snap)
+        let (nextRevision, overflow) = snapshotRevision.addingReportingOverflow(1)
+        guard !overflow else { return false }
+        let snap = Snapshot(
+            parentState: parentState,
+            branches: branches,
+            boundUserID: boundUserID,
+            revision: nextRevision
+        )
+        guard store.saveSnapshot(snap, expectedRevision: snapshotRevision) else { return false }
+        snapshotRevision = nextRevision
+        return true
     }
 }

@@ -14,6 +14,8 @@ public enum TokenSaverWaveAShadowBridge {
     private static let lock = NSLock()
     private static var priorByKey: [ReplayKey: Data] = [:]
     private static var pointerCounts: [ReplayKey: Int] = [:]
+    private static var replayInsertionOrder: [ReplayKey] = []
+    private static let maxReplayKeys = 2_048
 
     /// Exact-replay state is atomic per BindingID+tool — never cross-binding.
     public static func observeExactReplay(
@@ -24,6 +26,14 @@ public enum TokenSaverWaveAShadowBridge {
         guard !bindingDigest.isEmpty else { return } // no synthetic BindingID
         let key = ReplayKey(bindingDigest: bindingDigest, toolName: toolName)
         lock.lock()
+        if priorByKey[key] == nil {
+            if replayInsertionOrder.count >= maxReplayKeys {
+                let evicted = replayInsertionOrder.removeFirst()
+                priorByKey.removeValue(forKey: evicted)
+                pointerCounts.removeValue(forKey: evicted)
+            }
+            replayInsertionOrder.append(key)
+        }
         let prior = priorByKey[key]
         let count = pointerCounts[key] ?? 0
         let isMostRecent = prior == nil || prior != current
@@ -48,6 +58,19 @@ public enum TokenSaverWaveAShadowBridge {
             wouldAccept: allows,
             bindingDigest: bindingDigest
         )
+    }
+
+    internal static func replayStateCountForTesting() -> Int {
+        lock.lock(); defer { lock.unlock() }
+        return priorByKey.count
+    }
+
+    internal static func resetReplayStateForTesting() {
+        lock.lock()
+        priorByKey.removeAll()
+        pointerCounts.removeAll()
+        replayInsertionOrder.removeAll()
+        lock.unlock()
     }
 
     public static func observeToolOutput(

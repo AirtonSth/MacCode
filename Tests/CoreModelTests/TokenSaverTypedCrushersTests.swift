@@ -39,6 +39,53 @@ final class TokenSaverTypedCrushersTests: XCTestCase {
         ).accepted)
     }
 
+    func test_releaseSealActivatesOnlyItsBinding() {
+        let binding = TokenSaverBindingID(
+            trigger: "pytest",
+            provider: "claude",
+            providerAdapterVersion: "1",
+            toolShape: "text",
+            model: "m",
+            cachePolicy: "none",
+            triggerPolicyClassifierRecipeIndexVersion: "1",
+            billingCohort: "test",
+            hardwareTier: "apple-silicon",
+            consentVersion: "1"
+        )
+        let authority = TokenSaverAuthorityPlane.Registry()
+        authority.setReplacementAllowed(true, for: binding)
+        let manifest = TokenSaverAuthorityPlane.CoverageManifest(
+            cells: Dictionary(
+                uniqueKeysWithValues: TokenSaverAuthorityPlane.CoverageManifest.requiredCellIDs.map {
+                    ($0, .present)
+                }
+            )
+        )
+        let consent = TokenSaverAuthorityPlane.ConsentState(
+            exactLossless: true,
+            semanticLocalAI: false,
+            isLegacyPreference: false
+        )
+        let seal = TokenSaverAuthorityPlane.mintReleaseSeal(
+            binding: binding,
+            registry: authority,
+            manifest: manifest,
+            consent: consent,
+            requiresSemantic: false
+        )
+        XCTAssertNotNil(seal)
+
+        let registry = TokenSaverTypedCrushers.Registry()
+        registry.activate([.pytest], releaseSeal: seal!)
+        XCTAssertTrue(registry.isEnabled(.pytest, bindingDigest: binding.digestHex))
+        XCTAssertFalse(registry.isEnabled(.pytest, bindingDigest: "other"))
+        XCTAssertFalse(registry.isEnabled(.diff, bindingDigest: binding.digestHex))
+        authority.revoke(binding: binding)
+        XCTAssertFalse(registry.isEnabled(.pytest, bindingDigest: binding.digestHex))
+        registry.deactivate()
+        XCTAssertFalse(registry.isEnabled(.pytest, bindingDigest: binding.digestHex))
+    }
+
     func test_pytest_ON_parsesFailedCountAndStores() {
         let reg = liveRegistry()
         let store = TokenSaverTypedCrushers.MemoryStore()

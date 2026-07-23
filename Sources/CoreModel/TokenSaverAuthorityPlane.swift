@@ -36,7 +36,10 @@ public enum TokenSaverAuthorityPlane {
         }
 
         public var isWellFormed: Bool {
-            !operationID.isEmpty && !handle.isEmpty && !recoveryState.isEmpty
+            binding.isComplete
+                && !operationID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                && !handle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                && !recoveryState.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         }
     }
 
@@ -110,7 +113,9 @@ public enum TokenSaverAuthorityPlane {
             lock.lock()
             defer { lock.unlock() }
             let d = binding.digestHex
-            revocationEpoch[d, default: 0] += 1
+            if revocationEpoch[d, default: 0] < .max {
+                revocationEpoch[d, default: 0] += 1
+            }
             replacementAllowed[d] = false
         }
 
@@ -119,14 +124,47 @@ public enum TokenSaverAuthorityPlane {
             defer { lock.unlock() }
             return revocationEpoch[binding.digestHex] ?? 0
         }
+
+        fileprivate func allowsReplacement(forDigest digest: String) -> Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            guard (revocationEpoch[digest] ?? 0) == 0 else { return false }
+            return replacementAllowed[digest] ?? false
+        }
+
+        fileprivate func epoch(forDigest digest: String) -> UInt64 {
+            lock.lock()
+            defer { lock.unlock() }
+            return revocationEpoch[digest] ?? 0
+        }
     }
 
     public enum ReleaseGateDecision: Sendable, Equatable {
         case allowReplacement
         case denyUnknownBinding
+        case denyIncompleteBinding
         case denyCoverage
         case denyRevoked
         case denySemanticWithoutConsent
+    }
+
+    /// Opaque proof that a concrete BindingID passed the full release gate.
+    public struct ReleaseSeal: Sendable {
+        let bindingDigest: String
+        private let revocationEpoch: UInt64
+        private let registry: Registry
+
+        fileprivate init(bindingDigest: String, revocationEpoch: UInt64, registry: Registry) {
+            self.bindingDigest = bindingDigest
+            self.revocationEpoch = revocationEpoch
+            self.registry = registry
+        }
+
+        func isStillValid(for digest: String) -> Bool {
+            digest == bindingDigest
+                && registry.epoch(forDigest: digest) == revocationEpoch
+                && registry.allowsReplacement(forDigest: digest)
+        }
     }
 
     public static func evaluateRelease(
@@ -136,6 +174,7 @@ public enum TokenSaverAuthorityPlane {
         consent: ConsentState,
         requiresSemantic: Bool
     ) -> ReleaseGateDecision {
+        if !binding.isComplete { return .denyIncompleteBinding }
         if registry.epoch(for: binding) > 0 && !registry.allowsReplacement(for: binding) {
             // After revoke, even re-enable requires fresh epoch handling; deny if not allowed.
         }
@@ -147,6 +186,29 @@ public enum TokenSaverAuthorityPlane {
         if manifest.hasBlockingCell { return .denyCoverage }
         if requiresSemantic && !consent.allowsSemanticLossy { return .denySemanticWithoutConsent }
         return .allowReplacement
+    }
+
+    public static func mintReleaseSeal(
+        binding: TokenSaverBindingID,
+        registry: Registry,
+        manifest: CoverageManifest,
+        consent: ConsentState,
+        requiresSemantic: Bool
+    ) -> ReleaseSeal? {
+        guard evaluateRelease(
+            binding: binding,
+            registry: registry,
+            manifest: manifest,
+            consent: consent,
+            requiresSemantic: requiresSemantic
+        ) == .allowReplacement else {
+            return nil
+        }
+        return ReleaseSeal(
+            bindingDigest: binding.digestHex,
+            revocationEpoch: registry.epoch(for: binding),
+            registry: registry
+        )
     }
 
     /// Shadow path: never confirms savings headline.

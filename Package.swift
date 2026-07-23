@@ -47,7 +47,10 @@ let package = Package(
         ),
         .target(
             name: "CoreModel",
-            path: "Sources/CoreModel"
+            path: "Sources/CoreModel",
+            linkerSettings: [
+                .linkedFramework("Security")
+            ]
         ),
         .target(
             name: "Persistence",

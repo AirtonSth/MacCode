@@ -2,9 +2,27 @@ import XCTest
 @testable import CoreModel
 
 final class TokenSaverRolloverHandoffTests: XCTestCase {
+    private var keyProviders: [String: TokenSaverInMemoryProjectKeyProvider] = [:]
+
+    private func makeOriginalStore(at dir: URL) throws -> TokenSaverEncryptedOriginalStore {
+        let provider = keyProviders[dir.path] ?? TokenSaverInMemoryProjectKeyProvider()
+        keyProviders[dir.path] = provider
+        let store = try TokenSaverEncryptedStore(projectRoot: dir, keyProvider: provider)
+        try store.markMigrationComplete()
+        let scope = TokenSaverEncryptedStore.Scope(
+            uid: 501,
+            workspaceID: "w",
+            projectID: "p",
+            threadID: "t",
+            provider: "test",
+            sessionGeneration: 1
+        )
+        return TokenSaverEncryptedOriginalStore(store: store, scope: scope)
+    }
+
     func test_defaultOff() {
         XCTAssertFalse(TokenSaverRolloverHandoff.defaultEnabled)
-        let rt = TokenSaverRolloverHandoffRuntime(boundUserID: "u")
+        let rt = TokenSaverRolloverHandoffRuntime(boundUserID: "u", bindingDigest: "scope-bind")
         XCTAssertNil(rt.fork(op: .init(parentHead: "h", kind: .manual), requestingUserID: "u"))
         XCTAssertTrue(rt.parentAllowsNewTurns()) // fail-open when OFF
     }
@@ -22,6 +40,11 @@ final class TokenSaverRolloverHandoffTests: XCTestCase {
         XCTAssertEqual(replay.forkID.id, a.id)
         XCTAssertEqual(replay.childHead, ba.childHead)
         XCTAssertEqual(ba.runAsUser, "alice")
+        XCTAssertNil(rt.fork(
+            op: .init(id: a.id, parentHead: "different", kind: .manual),
+            requestingUserID: "alice",
+            replay: true
+        ), "same operation ID with different dimensions is a terminal conflict")
     }
 
     func test_sameUser_rejectsCrossUserForkAndHandoff() {
@@ -65,6 +88,43 @@ final class TokenSaverRolloverHandoffTests: XCTestCase {
         XCTAssertNil(other.branch(forkID: op.id))
     }
 
+    func test_staleConcurrentRuntimeCannotOverwritePublishedFork() throws {
+        let dir = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("ts-r19-cas-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let first = TokenSaverRolloverHandoffRuntime(
+            boundUserID: "u",
+            store: try TokenSaverRolloverHandoffRuntime.FileDurabilityStore(directory: dir)
+        )
+        let stale = TokenSaverRolloverHandoffRuntime(
+            boundUserID: "u",
+            store: try TokenSaverRolloverHandoffRuntime.FileDurabilityStore(directory: dir)
+        )
+        first.live = true
+        stale.live = true
+        let winner = TokenSaverRolloverHandoffRuntime.ForkOperationID(
+            id: "winner",
+            parentHead: "h",
+            kind: .rollover
+        )
+        let loser = TokenSaverRolloverHandoffRuntime.ForkOperationID(
+            id: "loser",
+            parentHead: "h",
+            kind: .manual
+        )
+
+        XCTAssertNotNil(first.fork(op: winner, requestingUserID: "u"))
+        XCTAssertNil(stale.fork(op: loser, requestingUserID: "u"))
+
+        let reopened = TokenSaverRolloverHandoffRuntime(
+            boundUserID: "u",
+            store: try TokenSaverRolloverHandoffRuntime.FileDurabilityStore(directory: dir)
+        )
+        XCTAssertNotNil(reopened.branch(forkID: winner.id))
+        XCTAssertNil(reopened.branch(forkID: loser.id))
+        XCTAssertEqual(reopened.parentStateValue(), .fenced)
+    }
+
     func test_forkFailsWhenDurabilitySaveFails() {
         let store = TokenSaverRolloverHandoffRuntime.MemoryDurabilityStore()
         store.failSaves = true
@@ -76,7 +136,7 @@ final class TokenSaverRolloverHandoffTests: XCTestCase {
     }
 
     func test_lossyOwnsStoreBeforeLossAndMarker() {
-        let rt = TokenSaverRolloverHandoffRuntime(boundUserID: "u")
+        let rt = TokenSaverRolloverHandoffRuntime(boundUserID: "u", bindingDigest: "scope-bind")
         rt.live = true
         let original = Data("secret-bytes".utf8)
         // Public surface: LossyGate.seal is internal — external modules cannot mint seals.
@@ -96,6 +156,13 @@ final class TokenSaverRolloverHandoffTests: XCTestCase {
         let gate = TokenSaverRolloverHandoffRuntime.LossyGate.seal(
             corpusSamples: 24, corpusFailures: 0, scopeBindingDigest: "scope-bind", pinsRespected: true
         )!
+        let wrongGate = TokenSaverRolloverHandoffRuntime.LossyGate.seal(
+            corpusSamples: 24,
+            corpusFailures: 0,
+            scopeBindingDigest: "other-bind",
+            pinsRespected: true
+        )!
+        XCTAssertNil(rt.admitLossy(original: original, recoveryHandle: "wrong-scope", gate: wrongGate))
         XCTAssertNil(rt.admitLossy(original: original, recoveryHandle: "  ", gate: gate))
         XCTAssertNil(rt.admitLossy(original: Data(), recoveryHandle: "h1", gate: gate))
         let adm = rt.admitLossy(original: original, recoveryHandle: "h1", gate: gate)!
@@ -109,8 +176,52 @@ final class TokenSaverRolloverHandoffTests: XCTestCase {
         // Store failure → no admission even with valid gate
         let failStore = TokenSaverRolloverHandoffRuntime.MemoryLossyOriginalStore()
         failStore.failStores = true
-        let rt2 = TokenSaverRolloverHandoffRuntime(boundUserID: "u", lossyStore: failStore)
+        let rt2 = TokenSaverRolloverHandoffRuntime(
+            boundUserID: "u",
+            bindingDigest: "scope-bind",
+            lossyStore: failStore
+        )
         rt2.live = true
         XCTAssertNil(rt2.admitLossy(original: original, recoveryHandle: "hx", gate: gate))
+    }
+
+    func test_fileRuntimePersistsLossyOriginalOnlyThroughEncryptedStore() throws {
+        let dir = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("ts-r19-lossy-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let original = Data("encrypted-original".utf8)
+        let gate = TokenSaverRolloverHandoffRuntime.LossyGate.seal(
+            corpusSamples: 24,
+            corpusFailures: 0,
+            scopeBindingDigest: "scope-bind",
+            pinsRespected: true
+        )!
+        let firstStore = try TokenSaverRolloverHandoffRuntime.FileDurabilityStore(
+            directory: dir,
+            originalStore: makeOriginalStore(at: dir)
+        )
+        let first = TokenSaverRolloverHandoffRuntime(
+            boundUserID: "u",
+            bindingDigest: "scope-bind",
+            store: firstStore
+        )
+        first.live = true
+        XCTAssertNotNil(first.admitLossy(original: original, recoveryHandle: "h", gate: gate))
+
+        let reopenedStore = try TokenSaverRolloverHandoffRuntime.FileDurabilityStore(
+            directory: dir,
+            originalStore: makeOriginalStore(at: dir)
+        )
+        let reopened = TokenSaverRolloverHandoffRuntime(
+            boundUserID: "u",
+            bindingDigest: "scope-bind",
+            store: reopenedStore
+        )
+        XCTAssertEqual(reopened.retrieveLossyOriginal(handle: "h"), original)
+        XCTAssertFalse(
+            FileManager.default.fileExists(
+                atPath: dir.appendingPathComponent("lossy-originals").path
+            )
+        )
     }
 }

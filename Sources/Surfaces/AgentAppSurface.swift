@@ -374,6 +374,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     // lock for nonisolated callers) and drain the whole buffer in one hop when
     // the first event of each tick schedules the flush Task.
     private let streamEventBatch = StreamEventBatch()
+    /// True when the hot UI event queue refused at least one already-durable
+    /// stream event. Cleared after a durable replay rebuilds the live timeline.
+    private var streamUIBackpressured = false
 
     // QA-MAC_AGENT-CLOCK: injectable clock so "Working for Xs" elapsed math
     // and adaptive-sidebar debounce timestamps are deterministically testable.
@@ -576,6 +579,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         messageHistoryLoadTask?.cancel()
         messageHistoryLoadTask = nil
         _ = streamEventBatch.drain()
+        streamUIBackpressured = false
         publishInterestedThreadId(nil)
         coordinator.removeObserver(self)
         // Drop the heavy transcript payload so closed tabs free memory promptly.
@@ -821,6 +825,8 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         }
         loadAllMessages(id)
         timeline = AssistantTimelineState()
+        streamUIBackpressured = false
+        _ = streamEventBatch.drain()
         let persistedEvents = coordinator.latestStreamEvents(threadId: id)
         if coordinator.hotReplayIsPartial(threadId: id) {
             statusMessage = "Showing the recent Agent history window. Earlier transcript events remain outside the hot replay budget."
@@ -1423,8 +1429,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     }
 
     // MARK: Bounded message history
-    nonisolated static let fullLoadBodyBudgetBytes = 24 * 1024 * 1024  // ~24 MB of transcript text
-    nonisolated static let messageHistoryPageLimit = 500
+    /// Hot transcript window for a 16 GB MacBook class machine (~0.6% of RAM).
+    nonisolated static let fullLoadBodyBudgetBytes = 96 * 1024 * 1024
+    nonisolated static let messageHistoryPageLimit = 2_000
 
     private func loadAllMessages(_ id: AgentThreadID) {
         // SQLite access remains on the app's established DB actor, but the query is
@@ -4578,7 +4585,12 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         }
         let quantum = streamEventBatch.drainQuantum()
         let pending = quantum.entries
-        guard !pending.isEmpty else { return }
+        if pending.isEmpty {
+            if streamUIBackpressured, let tid = selectedThreadId {
+                rehydrateTimelineAfterStreamBackpressure(threadId: tid)
+            }
+            return
+        }
         if quantum.hasMore {
             Task { @MainActor [weak self] in
                 await Task.yield()
@@ -4605,6 +4617,12 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 nextCurrentRunId = run
                 self.runThreads[run] = threadId
                 if nextStatus != .running { nextStatus = .running }
+                // Stream events can mark the run running before startProviderRun
+                // assigns runStartedAt. Seed it so the live window does not fall
+                // through to a full-history paint on the first deltas.
+                if self.runStartedAt == nil {
+                    self.runStartedAt = Date()
+                }
             }
             nextTimeline.apply(event)
             // UX-MAC_AGENT-009: track recoverability of the latest error so the
@@ -4620,7 +4638,12 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             }
         }
         nextTimeline.enforceAggregateHotTextBudget()
-        guard appliedEvent else { return }
+        guard appliedEvent else {
+            if !quantum.hasMore, streamUIBackpressured, let tid = selectedThreadId {
+                rehydrateTimelineAfterStreamBackpressure(threadId: tid)
+            }
+            return
+        }
         // UX: transient durability banners (sqlite "database is locked", etc.)
         // stick only while the stream is still failing. Once a later event proves
         // the run continued, drop the banner so it does not outlive the outage.
@@ -4644,6 +4667,64 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         if appliedEvents.contains(where: { if case .proposedPlan = $0 { return true }; return false }) {
             scheduleFullAccessPlanAutoImplementIfNeeded()
         }
+        // After the hot queue drains, rebuild from durable stream events so any
+        // paints skipped while the MainActor was behind are restored without
+        // forcing the user to Continue / reopen the thread.
+        if !quantum.hasMore, streamUIBackpressured, let tid = selectedThreadId {
+            rehydrateTimelineAfterStreamBackpressure(threadId: tid)
+        }
+    }
+
+    /// Apply one event that the hot queue refused, without growing the queue.
+    /// Timeline caps keep the paint bounded; used for the first saturation of an
+    /// episode so a single huge tool payload still appears live.
+    private func applyRefusedStreamEventDirectly(
+        _ event: AssistantEvent,
+        run: AgentRunID,
+        threadId: AgentThreadID
+    ) {
+        guard threadId == selectedThreadId else { return }
+        if suppressStaleActivePlanUpdates, case .activePlanUpdated = event {
+            return
+        }
+        if !terminalRunIds.contains(run) {
+            currentRunId = run
+            runThreads[run] = threadId
+            if status != .running { status = .running }
+        }
+        timeline.apply(event)
+        timeline.enforceAggregateHotTextBudget()
+        if case let .error(_, recoverable) = event {
+            lastErrorRecoverable = recoverable
+        }
+        refreshSR1TranslationStateFromTimeline()
+        scheduleTimelineUpdateTick()
+        if case .proposedPlan = event {
+            scheduleFullAccessPlanAutoImplementIfNeeded()
+        }
+    }
+
+    /// Rebuild the live timeline from the durable hot-replay window after the UI
+    /// queue refused events. Idempotent: clears the backpressure flag so a quiet
+    /// stream does not keep replaying.
+    private func rehydrateTimelineAfterStreamBackpressure(threadId: AgentThreadID) {
+        guard streamUIBackpressured, selectedThreadId == threadId else { return }
+        streamUIBackpressured = false
+        let events = coordinator.latestStreamEvents(threadId: threadId)
+        var rebuilt = AssistantTimelineState()
+        for event in events {
+            if suppressStaleActivePlanUpdates, case .activePlanUpdated = event {
+                continue
+            }
+            rebuilt.apply(event)
+        }
+        rebuilt.enforceAggregateHotTextBudget()
+        timeline = rebuilt
+        rehydrateDurableActiveState(threadId: threadId)
+        lastErrorRecoverable = Self.displayedErrorIsRecoverable(in: events)
+        refreshSR1TranslationStateFromTimeline()
+        timelineItemIndex = TimelineItemIndex(turns: timeline.turns)
+        scheduleTimelineUpdateTick()
     }
 
     /// True for local durability noise that is not a provider-run failure.
@@ -4692,20 +4773,39 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         // empty (first event of this tick), schedule a single flush Task.
         // Later events in the same tick just append — no extra Task allocation.
         let outcome = streamEventBatch.appendBounded(event: event, run: run, threadId: threadId)
-        if outcome == .scheduled {
+        switch outcome {
+        case .scheduled, .scheduledAfterEviction:
             Task { @MainActor in
                 self.flushStreamEvents()
             }
-        } else if outcome == .saturated {
-            // The coordinator persisted the event before observer fan-out. Stop at
-            // the durable resume cursor instead of letting a blocked MainActor
-            // create an unbounded in-memory transcript queue. Reopening/Continue
-            // replays the retained durable tail; the visible status makes the
-            // controlled stop explicit rather than silently dropping UI work.
-            c.stopRun(run)
+            if outcome == .scheduledAfterEviction {
+                Task { @MainActor in
+                    guard !self.isDisposed, self.selectedThreadId == threadId else { return }
+                    // Oldest UI paints were dropped under budget; durable history
+                    // still has them — rehydrate when the queue drains / run ends.
+                    self.streamUIBackpressured = true
+                }
+            }
+        case .bufferedAfterEviction:
             Task { @MainActor in
                 guard !self.isDisposed, self.selectedThreadId == threadId else { return }
-                self.statusMessage = "Agent paused because the UI event buffer reached its memory budget. Continue to resume from the saved provider cursor."
+                self.streamUIBackpressured = true
+            }
+        case .buffered:
+            break
+        case .saturated:
+            // Single frame larger than the entire hot queue. Provider keeps
+            // running; apply directly (timeline caps) and rehydrate later.
+            let refused = event
+            Task { @MainActor in
+                guard !self.isDisposed, self.selectedThreadId == threadId else { return }
+                self.streamUIBackpressured = true
+                self.applyRefusedStreamEventDirectly(refused, run: run, threadId: threadId)
+            }
+        case .saturationAlreadyReported:
+            Task { @MainActor in
+                guard !self.isDisposed, self.selectedThreadId == threadId else { return }
+                self.streamUIBackpressured = true
             }
         }
     }
@@ -4726,11 +4826,56 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         }
     }
 
+    /// Whether this Agent App surface should treat a finished run as local work
+    /// that may promote the sidebar workspace MRU / refresh busy chrome.
+    /// WHY: every mounted Agent App observes the coordinator. Without a workspace
+    /// gate, one completed run fans out `onRunCompleted` to every surface and each
+    /// re-stamps a different workspace's `lastActivityAt`, so the workspace that
+    /// just finished is no longer first in the MRU list.
+    nonisolated public static func shouldHandleRunFinishForWorkspace(
+        threadWorkspace: WorkspaceID?,
+        surfaceWorkspace: WorkspaceID
+    ) -> Bool {
+        threadWorkspace == surfaceWorkspace
+    }
+
+    /// Sidebar promote / busy refresh belongs only to the workspace that owned
+    /// the finished run — not to every open Agent App tab in other workspaces.
+    nonisolated public static func shouldNotifyHostOfRunLifecycle(
+        threadWorkspace: WorkspaceID?,
+        surfaceWorkspace: WorkspaceID,
+        status: AgentRunStatus,
+        notifyOnCompletedOnly: Bool
+    ) -> Bool {
+        guard shouldHandleRunFinishForWorkspace(
+            threadWorkspace: threadWorkspace,
+            surfaceWorkspace: surfaceWorkspace
+        ) else { return false }
+        if notifyOnCompletedOnly { return status == .completed }
+        return true
+    }
+
     nonisolated public func runCoordinator(_ c: AgentRunCoordinator, didFinish runId: AgentRunID, threadId: AgentThreadID, status: AgentRunStatus, finalMessage: String?, providerThreadId: String?) {
         streamEventBatch.resetSaturation(for: runId)
         Task { @MainActor in
             guard !self.isDisposed else { return }
             let finishedTid = threadId
+            // Same workspace filter as didChangeStatus: multi-tab Agent Apps must
+            // not pay MainActor work or promote unrelated workspaces on finish.
+            let threadWorkspace: WorkspaceID?
+            if let cached = self.threadWorkspaceCache[finishedTid] {
+                threadWorkspace = cached
+            } else {
+                threadWorkspace = try? self.threadRepo.get(id: finishedTid)?.workspaceId
+                if let wid = threadWorkspace {
+                    self.threadWorkspaceCache[finishedTid] = wid
+                }
+            }
+            guard Self.shouldHandleRunFinishForWorkspace(
+                threadWorkspace: threadWorkspace,
+                surfaceWorkspace: self.workspaceID
+            ) else { return }
+
             self.terminalRunIds = Self.boundedTerminalRunIds(existing: self.terminalRunIds, adding: runId)
             self.runThreads[runId] = nil
             if status == .completed, let msg = finalMessage, !msg.isEmpty {
@@ -4746,6 +4891,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 }
             }
             if finishedTid == self.selectedThreadId {
+                if self.streamUIBackpressured {
+                    self.rehydrateTimelineAfterStreamBackpressure(threadId: finishedTid)
+                }
                 if status == .completed || status == .cancelled {
                     // A finished turn that progressed past a durability blip must
                     // not leave "database is locked" stuck under the composer.
@@ -4774,10 +4922,15 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 self.runStartedAt = nil
                 self.isStopping = false  // UX-MAC_AGENT-STOP: run finished; clear stopping flag
             }
-            // Coalesce across many open Agent Apps receiving the same finish fan-out.
+            // Coalesce N same-workspace Agent App tabs into one reload per surface.
             self.scheduleReloadThreads()
             self.loadGitBranchThrottled()   // the run may have changed the tree
-            if status == .completed {
+            if Self.shouldNotifyHostOfRunLifecycle(
+                threadWorkspace: threadWorkspace,
+                surfaceWorkspace: self.workspaceID,
+                status: status,
+                notifyOnCompletedOnly: true
+            ) {
                 self.onRunCompleted?()
                 // Plan may have landed only as the turn ended; full access must still auto-implement.
                 if finishedTid == self.selectedThreadId {
@@ -4998,15 +5151,25 @@ final class InterestedThreadBox: @unchecked Sendable {
 // background thread (append) and the main actor (drain).
 final class StreamEventBatch: @unchecked Sendable {
     struct Limits: Equatable {
-        var maxBufferedCount: Int = 512
-        var maxBufferedBytes: Int = 4 * 1_024 * 1_024
-        var drainCount: Int = 64
-        var drainBytes: Int = 512 * 1_024
+        /// Hot UI queue only — durable stream history is bounded separately.
+        /// Sized for a 16 GB MacBook class machine: leave headroom for the OS,
+        /// Chrome, and provider processes while absorbing multi-minute tool
+        /// storms (Chrome HTML dumps, shell output) without thrashing the latch.
+        /// ~256 MB is ~1.5% of 16 GB and still fail-closed above that.
+        var maxBufferedCount: Int = 32_768
+        var maxBufferedBytes: Int = 256 * 1_024 * 1_024
+        var drainCount: Int = 512
+        var drainBytes: Int = 8 * 1_024 * 1_024
     }
 
     enum AppendOutcome: Equatable {
         case scheduled
         case buffered
+        /// Newest event admitted after dropping oldest buffered UI events.
+        case scheduledAfterEviction
+        case bufferedAfterEviction
+        /// Single frame larger than the entire hot queue — cannot retain; durable
+        /// history still holds it and the surface rehydrates from there.
         case saturated
         case saturationAlreadyReported
     }
@@ -5039,6 +5202,12 @@ final class StreamEventBatch: @unchecked Sendable {
         )
     }
 
+    var isEmpty: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return buffer.isEmpty
+    }
+
     /// Appends an event. Returns `true` iff the caller should schedule a flush Task
     /// (i.e. the buffer was empty before this append — first event of the tick).
     func append(event: AssistantEvent, run: AgentRunID, threadId: AgentThreadID) -> Bool {
@@ -5053,16 +5222,34 @@ final class StreamEventBatch: @unchecked Sendable {
         if let saturationRunID, saturationRunID != run {
             self.saturationRunID = nil
         }
-        let wouldExceedCount = buffer.count >= limits.maxBufferedCount
-        let wouldExceedBytes = bufferedBytes + bytes > limits.maxBufferedBytes
-        let eventExceedsQuantum = bytes > limits.drainBytes || bytes > limits.maxBufferedBytes
-        if eventExceedsQuantum || wouldExceedCount || wouldExceedBytes {
+        // drainBytes is a *paint quantum* (how much work one MainActor hop applies),
+        // not a hard admission ceiling. drainQuantum already admits a single event
+        // larger than the quantum when the buffer head is oversized.
+        //
+        // Budget pressure: drop OLDEST buffered UI events until the newest fits.
+        // Durable stream history still has the dropped paints; the surface rehydrates.
+        // Only a single frame larger than the entire hot queue is refused.
+        if bytes > limits.maxBufferedBytes {
             if saturationRunID == run { return .saturationAlreadyReported }
             saturationRunID = run
             return .saturated
         }
+        var didEvict = false
+        while !buffer.isEmpty
+            && (buffer.count >= limits.maxBufferedCount
+                || bufferedBytes + bytes > limits.maxBufferedBytes) {
+            let removed = buffer.removeFirst()
+            bufferedBytes = max(0, bufferedBytes - removed.encodedByteCount)
+            didEvict = true
+        }
         buffer.append(Entry(event: event, run: run, threadId: threadId, encodedByteCount: bytes))
         bufferedBytes += bytes
+        if didEvict {
+            saturationRunID = run
+            if flushScheduled { return .bufferedAfterEviction }
+            flushScheduled = true
+            return .scheduledAfterEviction
+        }
         if flushScheduled { return .buffered }
         flushScheduled = true
         return .scheduled
@@ -6163,24 +6350,60 @@ public struct AgentAppView: View {
         let renderable = renderableItems(in: turn, persistedAssistantTexts: persistedAssistantTexts)
             .filter { !($0.type == .plan && !turnPlans.isEmpty) }
         let runningTurn = !turn.finished && running
-        let visibleRenderable = visibleLiveTurnItems(renderable, running: runningTurn)
-        let hiddenLiveItemCount = renderable.count - visibleRenderable.count
-        // Derive the final-answer item ids ONCE and split renderable items into the
-        // visible answer vs the "Worked" log, instead of computing finalIDs twice.
+        // Chat-fluid live path: fold already-settled tools/thoughts into the same
+        // "Worked" disclosure used after completion, and only paint the active
+        // tail (streaming item + brief context). Grok emits Thought between tools,
+        // which breaks consecutive tool grouping — without this partition the live
+        // transcript re-expands every command as a full toolRow.
+        if runningTurn {
+            let (settled, active) = partitionLiveTurnItems(renderable)
+            let activeVisible = visibleLiveTurnItems(active, running: true)
+            let hiddenLiveItemCount = max(0, renderable.count - settled.count - activeVisible.count)
+            return TurnRenderInputs(
+                turnPlans: turnPlans,
+                visibleBlocks: turnRenderBlocks(activeVisible),
+                completedWorkBlocks: turnRenderBlocks(settled),
+                hiddenLiveItemCount: hiddenLiveItemCount,
+                shouldRenderFinal: false
+            )
+        }
         let finalIDs = turn.finished
             ? completedFinalAssistantItemIDs(in: turn, renderableItems: renderable, persistedAssistantTexts: persistedAssistantTexts)
             : []
         let workItems = turn.finished ? renderable.filter { !finalIDs.contains($0.id) } : []
-        let visibleAssistant = turn.finished ? renderable.filter { finalIDs.contains($0.id) } : []
-        let visibleBlocks = turnRenderBlocks(turn.finished ? visibleAssistant : visibleRenderable)
+        let visibleAssistant = turn.finished ? renderable.filter { finalIDs.contains($0.id) } : renderable
+        let visibleBlocks = turnRenderBlocks(visibleAssistant)
         let completedWorkBlocks = turnRenderBlocks(workItems)
         let shouldRenderFinal = turn.finalAssistantMessage != nil
             && shouldRenderFinalAssistantMessage(turn, persistedAssistantTexts: persistedAssistantTexts)
         return TurnRenderInputs(turnPlans: turnPlans,
                                 visibleBlocks: visibleBlocks,
                                 completedWorkBlocks: completedWorkBlocks,
-                                hiddenLiveItemCount: hiddenLiveItemCount,
+                                hiddenLiveItemCount: 0,
                                 shouldRenderFinal: shouldRenderFinal)
+    }
+
+    /// Split a live turn into settled work (already done — collapse) vs the active
+    /// tail the user needs to see right now (streaming + short open context).
+    /// Pure + testable. Finished turns never call this.
+    nonisolated static func partitionLiveTurnItems(
+        _ items: [AssistantItem],
+        activeTailLimit: Int = liveTurnActiveTailLimit
+    ) -> (settled: [AssistantItem], active: [AssistantItem]) {
+        guard !items.isEmpty else { return ([], []) }
+        let tailLimit = max(1, activeTailLimit)
+        if let lastStreaming = items.lastIndex(where: { $0.state == .streaming }) {
+            // Keep a short pre-stream context so the active command/thought has
+            // continuity, but fold everything older into the work disclosure.
+            let activeStart = max(0, lastStreaming - (tailLimit - 1))
+            return (Array(items.prefix(activeStart)), Array(items.suffix(from: activeStart)))
+        }
+        // Between tools nothing is streaming: keep only the newest tail live so
+        // a multi-minute turn does not re-paint every completed command.
+        if items.count <= tailLimit {
+            return ([], items)
+        }
+        return (Array(items.dropLast(tailLimit)), Array(items.suffix(tailLimit)))
     }
 
     /// Collapsed-group header text: count-aware verb + noun, e.g. "Ran 4 commands",
@@ -6372,6 +6595,10 @@ public struct AgentAppView: View {
     nonisolated static let idleTranscriptWindowCount = 30
     nonisolated static let hiddenTranscriptRevealPageCount = 50
     static let liveTurnRenderableItemLimit = 48
+    /// How many trailing items stay expanded while a turn is still running.
+    /// Everything older folds into the "Work so far" disclosure so Thought-
+    /// interleaved tool storms read like a chat, not a full command log.
+    static let liveTurnActiveTailLimit = 3
     static let liveTurnBodyCharacterLimit = 2_000
     static let liveTurnOutputCharacterLimit = 1_500
     static let liveTurnSummaryCharacterLimit = 240
@@ -6608,7 +6835,10 @@ public struct AgentAppView: View {
     /// Pure seam: which transcript entries the eager VStack renders.
     ///
     /// - Running: the time-cutoff live window (entries at/after `runStartedAt`
-    ///   minus `runningSlack`), with a 2-entry floor — unchanged behavior.
+    ///   minus `runningSlack`), with a 2-entry floor. If `runStartedAt` is not
+    ///   set yet (race between status=.running and the start timestamp), fall
+    ///   back to the idle tail — never the full thread — so a follow-up does not
+    ///   flash every historical agent turn expanded.
     /// - Idle/completed: the most recent `idleWindowCount` entries when the thread
     ///   is longer than that, so a huge thread no longer re-renders in full on
     ///   every invalidation. The pre-window slice is surfaced by the existing
@@ -6620,10 +6850,16 @@ public struct AgentAppView: View {
         idleWindowCount: Int = idleTranscriptWindowCount,
         runningSlack: TimeInterval = runningTranscriptContextSlack
     ) -> [TranscriptEntry] {
-        if status == .running {
-            // Running path is unchanged: the time-cutoff live window, with the
-            // existing 2-entry floor and the "return all" fallbacks preserved.
-            guard let startedAt = runStartedAt, entries.count > 2 else { return entries }
+        // Pending is part of the active follow-up lifecycle (composer send →
+        // provider start). Treat it like a live turn so we never flash the
+        // idle "last 30" history between send and running.
+        if status == .running || status == .pending {
+            guard entries.count > 2 else { return entries }
+            guard status == .running, let startedAt = runStartedAt else {
+                // Pending, or running before runStartedAt is assigned: keep the
+                // chat focused on the newest segment, not the whole thread.
+                return Array(entries.suffix(min(idleWindowCount, entries.count)))
+            }
             let cutoff = startedAt.addingTimeInterval(-runningSlack).timeIntervalSince1970
             let liveEntries = entries.filter { $0.sortTime >= cutoff }
             return liveEntries.isEmpty ? Array(entries.suffix(2)) : liveEntries
@@ -7568,10 +7804,17 @@ public struct AgentAppView: View {
                 }
             }
             .onChange(of: vm.status) { _ in scheduleTimelineScrollToBottom(proxy) }
-            // P1: collapse revealed history whenever a new run starts so the
-            // window resets to the live context automatically.
+            // P1: collapse revealed history + open work/tool disclosures whenever
+            // a new run starts so a follow-up reads as a fresh chat turn, not a
+            // re-expansion of every prior command.
             .onChange(of: vm.runStartedAt) { newValue in
-                if newValue != nil { transcriptHistoryRevealCount = 0 }
+                if newValue != nil {
+                    transcriptHistoryRevealCount = 0
+                    expandedCompletedWorkTurns = []
+                    expandedTools = []
+                    expandedToolGroups = []
+                    expandedReasoning = []
+                }
             }
             // PERF-MAC_AGENT-023: also collapse on thread switch. Idle threads now
             // bound their render to a recent tail (visibleTranscriptWindow), so a
@@ -8544,7 +8787,17 @@ public struct AgentAppView: View {
         return seconds < 60 ? "\(seconds)s" : "\(seconds / 60)m \(seconds % 60)s"
     }
 
-    static func completedWorkLabel(_ turn: AssistantTurnSnapshot) -> String {
+    static func completedWorkLabel(
+        _ turn: AssistantTurnSnapshot,
+        live: Bool = false,
+        workBlockCount: Int = 0
+    ) -> String {
+        if live {
+            if workBlockCount > 1 {
+                return "Work so far · \(workBlockCount) steps"
+            }
+            return "Work so far"
+        }
         if let duration = turnDurationLabel(turn) {
             return "Worked for \(duration)"
         }
@@ -8687,8 +8940,15 @@ public struct AgentAppView: View {
         let inputs = turnRenderInputs(for: turn)
         let blocks = inputs.visibleBlocks
         VStack(alignment: .leading, spacing: DS.Space.xl) {
-            if turn.finished, !inputs.completedWorkBlocks.isEmpty {
-                completedWorkDisclosure(turn: turn, blocks: inputs.completedWorkBlocks)
+            // Finished turns and live turns both fold settled work into one
+            // disclosure so follow-ups read as chat (answer + compact work), not
+            // a re-expanded command dump of the whole turn.
+            if !inputs.completedWorkBlocks.isEmpty {
+                completedWorkDisclosure(
+                    turn: turn,
+                    blocks: inputs.completedWorkBlocks,
+                    live: !turn.finished
+                )
             }
             if !turn.finished {
                 if inputs.hiddenLiveItemCount > 0 {
@@ -8728,7 +8988,11 @@ public struct AgentAppView: View {
     }
 
     @ViewBuilder
-    private func completedWorkDisclosure(turn: AssistantTurnSnapshot, blocks: [TurnRenderBlock]) -> some View {
+    private func completedWorkDisclosure(
+        turn: AssistantTurnSnapshot,
+        blocks: [TurnRenderBlock],
+        live: Bool = false
+    ) -> some View {
         let expanded = expandedCompletedWorkTurns.contains(turn.turnId)
         VStack(alignment: .leading, spacing: DS.Space.md) {
             Button {
@@ -8741,7 +9005,12 @@ public struct AgentAppView: View {
                 }
             } label: {
                 HStack(spacing: DS.Space.sm) {
-                    Text(Self.completedWorkLabel(turn))
+                    if live {
+                        Image(systemName: "circle.dotted")
+                            .font(.system(size: 11, weight: .semibold))
+                            .foregroundColor(DS.Palette.textTertiary)
+                    }
+                    Text(Self.completedWorkLabel(turn, live: live, workBlockCount: blocks.count))
                         .font(DS.Font.body.weight(.medium))
                         .foregroundColor(DS.Palette.textTertiary)
                     Image(systemName: expanded ? "chevron.down" : "chevron.right")
@@ -8754,7 +9023,7 @@ public struct AgentAppView: View {
             .buttonStyle(.plain)
             .help(expanded ? "Hide work details" : "Show work details")
             .accessibilityLabel(expanded ? "Hide work details" : "Show work details")
-            .accessibilityIdentifier("agent.completedWork.\(turn.turnId)")
+            .accessibilityIdentifier(live ? "agent.liveWork.\(turn.turnId)" : "agent.completedWork.\(turn.turnId)")
 
             if expanded {
                 VStack(alignment: .leading, spacing: DS.Space.lg) {
@@ -8931,12 +9200,14 @@ public struct AgentAppView: View {
             // was missing. Always visible (truncated when collapsed); full when expanded.
             // UX-MAC_AGENT-OPEN-SPLIT: when the input is a file path or URL, a trailing
             // button opens it in a split panel (Files / Browser) to the right.
+            // Collapsed: one-line command peek (chat density). Full multi-line
+            // command only when the user expands the row.
             if let command, !command.isEmpty {
                 HStack(alignment: .top, spacing: DS.Space.xs) {
                     Text(command)
                         .font(DS.Font.monoSmall).foregroundColor(DS.Palette.textSecondary)
                         .textSelection(.enabled)
-                        .lineLimit(expanded ? nil : 3)
+                        .lineLimit(expanded ? nil : 1)
                         .truncationMode(.tail)
                         .frame(maxWidth: .infinity, alignment: .leading)
                     if let target = AgentTimelineItemPresentation.toolOpenTarget(for: item) {

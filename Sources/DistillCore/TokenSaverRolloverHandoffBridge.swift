@@ -8,15 +8,20 @@ public enum TokenSaverRolloverHandoffBridge {
 
     public static func sharedRuntime(
         boundUserID: String,
-        storeDirectory: URL? = nil
+        storeDirectory: URL,
+        encryptedStore: TokenSaverEncryptedStore,
+        scope: TokenSaverEncryptedStore.Scope
     ) -> TokenSaverRolloverHandoffRuntime? {
-        if let dir = storeDirectory {
-            guard let fileStore = try? TokenSaverRolloverHandoffRuntime.FileDurabilityStore(directory: dir) else {
-                return nil
-            }
-            return TokenSaverRolloverHandoffRuntime(boundUserID: boundUserID, store: fileStore)
-        }
-        return TokenSaverRolloverHandoffRuntime(boundUserID: boundUserID)
+        let originals = TokenSaverEncryptedOriginalStore(store: encryptedStore, scope: scope)
+        guard let fileStore = try? TokenSaverRolloverHandoffRuntime.FileDurabilityStore(
+            directory: storeDirectory,
+            originalStore: originals
+        ) else { return nil }
+        return TokenSaverRolloverHandoffRuntime(
+            boundUserID: boundUserID,
+            bindingDigest: scope.digest,
+            store: fileStore
+        )
     }
 
     public static func observeFork(

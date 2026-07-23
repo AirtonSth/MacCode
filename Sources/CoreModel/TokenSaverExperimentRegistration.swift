@@ -57,8 +57,8 @@ public struct TokenSaverExperimentRegistration: Sendable, Equatable {
                 && margins.isComplete
                 && oneSidedAlpha > 0 && oneSidedAlpha < 0.5
                 && power > 0 && power < 1
-                && !multiplicityAdjustment.isEmpty
-                && !missingnessRule.isEmpty
+                && !multiplicityAdjustment.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                && !missingnessRule.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         }
     }
 
@@ -90,7 +90,7 @@ public struct TokenSaverExperimentRegistration: Sendable, Equatable {
         self.isSealed = sealed
     }
 
-    public var canSeal: Bool { statistics.isComplete && !isSealed }
+    public var canSeal: Bool { binding.isComplete && statistics.isComplete && !isSealed }
 
     /// Seal only when complete. Returns new sealed copy; original unchanged if incomplete.
     public func sealed() -> TokenSaverExperimentRegistration? {

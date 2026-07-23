@@ -205,7 +205,11 @@ public final class AppContext {
         dbPathOverride: String? = nil,
         appSupportOverride: String? = nil,
         tokenSaverAccountUsageRefresher: TokenSaverAccountUsageRefreshing = TokenSaverAccountUsageRefresher(),
-        agentSkillsHomeOverrideForTesting: URL? = nil
+        agentSkillsHomeOverrideForTesting: URL? = nil,
+        /// Interactive RemoteCode must reconcile abandoned runs on launch.
+        /// Background helpers that share the same SQLite (Scheduled Task Agent)
+        /// must NOT flip every live interactive run to `interrupted`.
+        performLaunchRunReconciliation: Bool = true
     ) throws {
         self.channel = channel
         self.tokenSaverAccountUsageRefresher = tokenSaverAccountUsageRefresher
@@ -338,7 +342,17 @@ public final class AppContext {
             liveActivitySyncCoordinator.submit(projection, cause: syncCause)
         }
         liveActivityAcceptanceOutbox.resumePending()
-        try coordinator.reconcileOnLaunch()
+        if performLaunchRunReconciliation {
+            try coordinator.reconcileOnLaunch()
+        } else {
+            // Shared-DB background agents: never steal interactive ownership.
+            // Publish an empty projection for this process only; leave durable
+            // run/thread/session rows alone for the interactive host to own.
+            coordinator.onActiveRunProjectionChanged?(
+                ActiveRunProjection(runs: []),
+                .launchReconciliation
+            )
+        }
         try? tokenSaverSavingsRepo.prune()
         self.coordinator.promptCompressor = { [weak self] prompt, provider, threadId, runId in
             guard let self else { return prompt }

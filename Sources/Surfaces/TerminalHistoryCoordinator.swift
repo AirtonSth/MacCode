@@ -673,20 +673,22 @@ final class TerminalHistoryCoordinator {
     }
 
     private nonisolated static let maxChunkBytes = 64 * 1024
-    private nonisolated static let maxOutstandingBytes = 4 * 1024 * 1024
+    /// In-flight write backlog for a 16 GB MacBook class machine. When full,
+    /// oldest buffered bytes are dropped so newest output always admits.
+    private nonisolated static let maxOutstandingBytes = 16 * 1024 * 1024
     /// Leave room for the one already-read PTY handoff (bounded at 256 KiB)
     /// that can reach MainActor after its DispatchSource is suspended for a
     /// Ghostty replay. Larger canonical merges preserve the current live parser
     /// and report partial history instead of resetting from a truncated stream.
-    nonisolated static let maxCanonicalReplayBytes = (4 * 1024 * 1024) - (256 * 1024)
+    nonisolated static let maxCanonicalReplayBytes = (16 * 1024 * 1024) - (256 * 1024)
     private nonisolated static let finalDeleteRetryTimeout: TimeInterval = 2
     /// Recent scrollback remains useful, but terminal sessions are expected to
     /// stay open for weeks. Keep a Terminal-like rolling window instead of an
     /// ever-heavier per-surface transcript.
-    nonisolated static let maxPersistedBytes = 8 * 1024 * 1024
+    nonisolated static let maxPersistedBytes = 64 * 1024 * 1024
     /// Aggregate disk ceiling across dormant terminal histories. The currently
     /// writing surface is protected and remains governed by its per-surface cap.
-    nonisolated static let maxGlobalPersistedBytes = 256 * 1024 * 1024
+    nonisolated static let maxGlobalPersistedBytes = 1 * 1024 * 1024 * 1024
     private nonisolated static let retentionCheckInterval = 1024 * 1024
     private nonisolated static let prepareRetryDelays: [TimeInterval] = [0.05, 0.1, 0.2, 0.4, 0.8]
     private nonisolated static let maxRetryDuration: TimeInterval = 30
@@ -1059,16 +1061,19 @@ final class TerminalHistoryCoordinator {
             || liveClearRecoveryPending
             || liveClearRequestedBeforePreparation {
             guard !finalFlushScheduled, !finalDeleteScheduled else { return }
-            guard Self.shouldAcceptBacklog(
-                queuedBytes: outstandingBytes,
-                incomingBytes: data.count,
-                maxQueuedBytes: Self.maxOutstandingBytes
-            ) else {
-                if !liveClearOverflowed {
-                    liveClearOverflowed = true
-                    backlogOverflowed = true
-                    writeFailures += 1
-                    queueState.recordFailure()
+            // Prefer admitting the newest PTY bytes: reclaim oldest buffered
+            // output instead of fail-closing the whole backlog.
+            let admitted = admitBacklogBytes(data, into: \.liveClearBuffer)
+            if admitted < data.count {
+                liveClearOverflowed = true
+                backlogOverflowed = true
+                writeFailures += 1
+                queueState.recordFailure()
+                recordDurablePartial(
+                    reason: "history_backlog_cap",
+                    minimumNextChunkIndex: nextChunkIndex ?? 1
+                )
+                if admitted == 0 {
                     delegate?.terminalHistoryCoordinator(
                         self,
                         didEncounter: .backlogCap(
@@ -1077,10 +1082,7 @@ final class TerminalHistoryCoordinator {
                         )
                     )
                 }
-                return
             }
-            outstandingBytes += data.count
-            liveClearBuffer.append(data)
             return
         }
         guard acceptsWrites else { return }
@@ -1091,12 +1093,9 @@ final class TerminalHistoryCoordinator {
             }
             return
         }
-        guard Self.shouldAcceptBacklog(
-            queuedBytes: outstandingBytes,
-            incomingBytes: data.count,
-            maxQueuedBytes: Self.maxOutstandingBytes
-        ) else {
-            if !backlogOverflowed {
+        if case .ready = preparationState {
+            let admitted = admitBacklogBytesForReadyPath(data)
+            if admitted < data.count {
                 backlogOverflowed = true
                 writeFailures += 1
                 queueState.recordFailure()
@@ -1104,25 +1103,101 @@ final class TerminalHistoryCoordinator {
                     reason: "history_backlog_cap",
                     minimumNextChunkIndex: nextChunkIndex ?? 1
                 )
-                delegate?.terminalHistoryCoordinator(
-                    self,
-                    didEncounter: .backlogCap(
-                        outstandingBytes: outstandingBytes,
-                        incomingBytes: data.count
-                    )
-                )
             }
-            return
-        }
-
-        outstandingBytes += data.count
-        if case .ready = preparationState {
-            ingestReadyData(data)
             if !pendingData.isEmpty {
                 scheduleFlush()
             }
         } else {
-            preflightData.append(data)
+            let admitted = admitBacklogBytes(data, into: \.preflightData)
+            if admitted < data.count {
+                backlogOverflowed = true
+                writeFailures += 1
+                queueState.recordFailure()
+                recordDurablePartial(
+                    reason: "history_backlog_cap",
+                    minimumNextChunkIndex: nextChunkIndex ?? 1
+                )
+            }
+        }
+    }
+
+    /// Drop oldest buffered bytes until `incoming` fits, then append. Returns how
+    /// many bytes of `incoming` were admitted (tail of the chunk is preferred when
+    /// the chunk itself exceeds the whole budget).
+    @discardableResult
+    private func admitBacklogBytes(
+        _ incoming: Data,
+        into keyPath: ReferenceWritableKeyPath<TerminalHistoryCoordinator, Data>
+    ) -> Int {
+        let maxBytes = Self.maxOutstandingBytes
+        guard maxBytes > 0 else { return 0 }
+        var slice = incoming
+        if slice.count > maxBytes {
+            // Keep the newest portion of an oversized chunk.
+            slice = slice.suffix(maxBytes)
+            reclaimOldestBufferedBytes(targetOutstanding: 0)
+        } else {
+            reclaimOldestBufferedBytes(targetOutstanding: max(0, maxBytes - slice.count))
+        }
+        guard Self.shouldAcceptBacklog(
+            queuedBytes: outstandingBytes,
+            incomingBytes: slice.count,
+            maxQueuedBytes: maxBytes
+        ) else {
+            return 0
+        }
+        self[keyPath: keyPath].append(slice)
+        outstandingBytes += slice.count
+        return slice.count
+    }
+
+    @discardableResult
+    private func admitBacklogBytesForReadyPath(_ incoming: Data) -> Int {
+        let maxBytes = Self.maxOutstandingBytes
+        guard maxBytes > 0 else { return 0 }
+        var slice = incoming
+        if slice.count > maxBytes {
+            slice = slice.suffix(maxBytes)
+            reclaimOldestBufferedBytes(targetOutstanding: 0)
+        } else {
+            reclaimOldestBufferedBytes(targetOutstanding: max(0, maxBytes - slice.count))
+        }
+        guard Self.shouldAcceptBacklog(
+            queuedBytes: outstandingBytes,
+            incomingBytes: slice.count,
+            maxQueuedBytes: maxBytes
+        ) else {
+            return 0
+        }
+        outstandingBytes += slice.count
+        ingestReadyData(slice)
+        return slice.count
+    }
+
+    /// Shrink `outstandingBytes` toward `targetOutstanding` by dropping oldest
+    /// buffered content (preflight → pending → live-clear). Newest data wins.
+    private func reclaimOldestBufferedBytes(targetOutstanding: Int) {
+        let target = max(0, targetOutstanding)
+        while outstandingBytes > target {
+            if !preflightData.isEmpty {
+                let drop = min(preflightData.count, outstandingBytes - target)
+                preflightData.removeFirst(drop)
+                outstandingBytes = max(0, outstandingBytes - drop)
+                continue
+            }
+            if !pendingData.isEmpty {
+                let drop = min(pendingData.count, outstandingBytes - target)
+                pendingData.removeFirst(drop)
+                outstandingBytes = max(0, outstandingBytes - drop)
+                continue
+            }
+            if !liveClearBuffer.isEmpty {
+                let drop = min(liveClearBuffer.count, outstandingBytes - target)
+                liveClearBuffer.removeFirst(drop)
+                outstandingBytes = max(0, outstandingBytes - drop)
+                continue
+            }
+            break
         }
     }
 
@@ -2572,6 +2647,21 @@ final class TerminalHistoryCoordinator {
         guard queuedBytes >= 0, incomingBytes >= 0, maxQueuedBytes >= 0 else { return false }
         let (total, overflowed) = queuedBytes.addingReportingOverflow(incomingBytes)
         return !overflowed && total <= maxQueuedBytes
+    }
+
+    /// Pure seam: how many leading bytes to drop from an oldest-first buffer so
+    /// `queued + incoming` fits under `maxQueued`. Used by reclaim tests.
+    nonisolated static func oldestBytesToEvict(
+        queuedBytes: Int,
+        incomingBytes: Int,
+        maxQueuedBytes: Int
+    ) -> Int {
+        guard queuedBytes >= 0, incomingBytes >= 0, maxQueuedBytes >= 0 else { return 0 }
+        let (total, overflowed) = queuedBytes.addingReportingOverflow(incomingBytes)
+        if overflowed { return queuedBytes }
+        let excess = total - maxQueuedBytes
+        guard excess > 0 else { return 0 }
+        return min(queuedBytes, excess)
     }
 
     nonisolated static func assembleReplayPayload(from chunkData: [Data]) -> Data {

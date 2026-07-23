@@ -50,12 +50,14 @@ public final class TokenSaverTurnBatchRuntime: @unchecked Sendable {
         case skippedUnknownDep
         case deniedNoApproval
         case deniedMutationGate
+        case deniedMissingIdempotency
         case rejectedMLXMutation
         case preconditionFailed
         case failed
         case cancelled
         case timedOut
         case duplicateIdempotent
+        case invalidBatch
         case notLive
         case missingExecutor
     }
@@ -131,9 +133,13 @@ public final class TokenSaverTurnBatchRuntime: @unchecked Sendable {
         }
         public func tryReserve(_ key: String) -> Bool {
             lock.lock(); defer { lock.unlock() }
-            let path = url(for: key).path
-            if FileManager.default.fileExists(atPath: path) { return false }
-            return FileManager.default.createFile(atPath: path, contents: Data("reserved".utf8))
+            let target = url(for: key)
+            do {
+                try Data("reserved".utf8).write(to: target, options: [.withoutOverwriting])
+                return true
+            } catch {
+                return false
+            }
         }
         public func release(_ key: String) {
             lock.lock(); defer { lock.unlock() }
@@ -142,9 +148,14 @@ public final class TokenSaverTurnBatchRuntime: @unchecked Sendable {
         @discardableResult
         public func mark(_ key: String) -> Bool {
             lock.lock(); defer { lock.unlock() }
-            let path = url(for: key).path
-            if FileManager.default.fileExists(atPath: path) { return true }
-            return FileManager.default.createFile(atPath: path, contents: Data("done".utf8))
+            let target = url(for: key)
+            if FileManager.default.fileExists(atPath: target.path) { return true }
+            do {
+                try Data("done".utf8).write(to: target, options: [.withoutOverwriting])
+                return true
+            } catch {
+                return FileManager.default.fileExists(atPath: target.path)
+            }
         }
     }
 
@@ -234,6 +245,20 @@ public final class TokenSaverTurnBatchRuntime: @unchecked Sendable {
         outcomes = [:]
         receipts = []
         lock.unlock()
+
+        let actionIDs = actions.map(\.id)
+        guard Set(actionIDs).count == actionIDs.count,
+              actionIDs.allSatisfy({ !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }) else {
+            lock.lock()
+            aborted = true
+            for action in actions {
+                outcomes[action.id] = .invalidBatch
+                receipts.append(makeReceipt(action, .invalidBatch, outputKnown: false))
+            }
+            let snap = snapshotLocked()
+            lock.unlock()
+            return snap
+        }
 
         var remaining = actions
         var safety = 0
@@ -522,6 +547,10 @@ public final class TokenSaverTurnBatchRuntime: @unchecked Sendable {
         if action.kind == .mutation {
             if !_mutationsEnabled { return .deniedMutationGate }
             if !action.approved { return .deniedNoApproval }
+            guard let key = action.idempotencyKey,
+                  !key.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                return .deniedMissingIdempotency
+            }
         }
         if action.requiresPriorOutput {
             let missingKnown = action.dependsOn.contains { !knownOutputs.contains($0) }

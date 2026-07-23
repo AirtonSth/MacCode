@@ -12,7 +12,15 @@ public enum TokenSaverCapacityOps {
         public let expiresAt: Date
         public let signed: Bool
 
-        public init(concurrency: Int, maxBytesPerTurn: Int64, maxRSSBytes: Int64, expiresAt: Date, signed: Bool) {
+        /// Internal until a real signature-verifying profile loader mints instances.
+        /// External modules cannot promote a free `signed: true` scalar.
+        internal init(
+            concurrency: Int,
+            maxBytesPerTurn: Int64,
+            maxRSSBytes: Int64,
+            expiresAt: Date,
+            signed: Bool
+        ) {
             self.concurrency = concurrency
             self.maxBytesPerTurn = maxBytesPerTurn
             self.maxRSSBytes = maxRSSBytes
@@ -33,6 +41,7 @@ public enum TokenSaverCapacityOps {
         case allow
         case offMissingOrExpiredProfile
         case rawBreach
+        case rawStaleOps
         case rawKillSwitch
     }
 
@@ -54,9 +63,12 @@ public enum TokenSaverCapacityOps {
         public func evaluate(profile: CapacityProfile?, rss: Int64, bytes: Int64, now: Date = Date()) -> Admission {
             lock.lock()
             let kill = killSwitchActive
+            let telemetryFresh = opsTelemetryFresh
             lock.unlock()
             guard let profile, profile.isValid(now: now) else { return .offMissingOrExpiredProfile }
             if kill { return .rawKillSwitch }
+            if !telemetryFresh { return .rawStaleOps }
+            if rss < 0 || bytes < 0 { return .rawBreach }
             if rss > profile.maxRSSBytes || bytes > profile.maxBytesPerTurn { return .rawBreach }
             return .allow
         }
@@ -64,7 +76,7 @@ public enum TokenSaverCapacityOps {
         public func activateKillSwitch() {
             lock.lock()
             killSwitchActive = true
-            generationFence += 1
+            if generationFence < .max { generationFence += 1 }
             lock.unlock()
         }
 
@@ -81,7 +93,7 @@ public enum TokenSaverCapacityOps {
         /// Advance delete epoch (project deletion). Irreversible for late outcomes.
         public func advanceDeleteEpoch() {
             lock.lock()
-            deleteEpoch += 1
+            if deleteEpoch < .max { deleteEpoch += 1 }
             lock.unlock()
         }
 

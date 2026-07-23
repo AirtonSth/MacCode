@@ -13,6 +13,18 @@ private final class AlwaysOKExecutor: TokenSaverTurnBatchRuntime.ActionExecutor 
     }
 }
 
+private final class RecordingExecutor: TokenSaverTurnBatchRuntime.ActionExecutor {
+    private let lock = NSLock()
+    private(set) var performed: [String] = []
+
+    func perform(_ action: TokenSaverTurnBatchRuntime.Action) -> TokenSaverTurnBatchRuntime.ExecutionResult {
+        lock.lock()
+        performed.append(action.id)
+        lock.unlock()
+        return .init(success: true)
+    }
+}
+
 final class TokenSaverTurnBatchPrefetchTests: XCTestCase {
     func test_defaultOff() {
         XCTAssertFalse(TokenSaverTurnBatchPrefetch.defaultEnabled)
@@ -69,7 +81,14 @@ final class TokenSaverTurnBatchPrefetchTests: XCTestCase {
         rt.readOnlyLive = true
         XCTAssertEqual(rt.admit(.init(id: "m", kind: .mutation, approved: true)), .deniedMutationGate)
         rt.mutationsEnabled = true
-        XCTAssertEqual(rt.admit(.init(id: "m", kind: .mutation, approved: true)), .completed)
+        XCTAssertEqual(
+            rt.admit(.init(id: "m", kind: .mutation, approved: true)),
+            .deniedMissingIdempotency
+        )
+        XCTAssertEqual(
+            rt.admit(.init(id: "m", kind: .mutation, approved: true, idempotencyKey: "mutation-m")),
+            .completed
+        )
         XCTAssertEqual(rt.admit(.init(id: "m2", kind: .mutation, approved: false)), .deniedNoApproval)
         XCTAssertEqual(rt.admit(.init(id: "mx", kind: .mutation, approved: true, proposedByMLX: true)), .rejectedMLXMutation)
     }
@@ -100,6 +119,46 @@ final class TokenSaverTurnBatchPrefetchTests: XCTestCase {
         let rt2 = TokenSaverTurnBatchRuntime(idempotency: try! TokenSaverTurnBatchRuntime.FileIdempotencyStore(directory: dir))
         rt2.readOnlyLive = true
         XCTAssertEqual(rt2.admit(.init(id: "y", kind: .read, approved: true, idempotencyKey: "f1")), .duplicateIdempotent)
+    }
+
+    /// Duplicate action IDs make receipts ambiguous and must fail before any action runs.
+    func test_runtime_rejectsDuplicateActionIDsBeforeExecution() {
+        let executor = RecordingExecutor()
+        let runtime = TokenSaverTurnBatchRuntime()
+        runtime.readOnlyLive = true
+        runtime.executor = executor
+
+        let result = runtime.run(actions: [
+            .init(id: "duplicate", kind: .read),
+            .init(id: "duplicate", kind: .read),
+            .init(id: "independent", kind: .read),
+        ])
+
+        XCTAssertTrue(result.aborted)
+        XCTAssertEqual(result.outcomes["duplicate"], .invalidBatch)
+        XCTAssertEqual(result.outcomes["independent"], .invalidBatch)
+        XCTAssertTrue(executor.performed.isEmpty, "an ambiguous batch must not execute any action")
+    }
+
+    func test_fileIdempotencyReservation_isAtomicAcrossStoreInstances() throws {
+        let dir = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("idem-race-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let stores = try (0..<32).map { _ in
+            try TokenSaverTurnBatchRuntime.FileIdempotencyStore(directory: dir)
+        }
+        let lock = NSLock()
+        var winners = 0
+
+        DispatchQueue.concurrentPerform(iterations: stores.count) { index in
+            if stores[index].tryReserve("one-approved-mutation") {
+                lock.lock()
+                winners += 1
+                lock.unlock()
+            }
+        }
+
+        XCTAssertEqual(winners, 1, "exactly one process/store instance may reserve a mutation")
     }
 
     func test_runtime_cancelTimeoutAndPerActionTimeout() {
@@ -177,7 +236,11 @@ final class TokenSaverTurnBatchPrefetchTests: XCTestCase {
         defer { try? FileManager.default.removeItem(atPath: root) }
         let runner = TokenSaverDiscoveryPrefetchRuntime.RecordingRunner()
         runner.digest = "digest-abc"
-        let pref = TokenSaverDiscoveryPrefetchRuntime(workspaceRoot: root, runner: runner)
+        let pref = TokenSaverDiscoveryPrefetchRuntime(
+            workspaceRoot: root,
+            bindingDigest: "bind",
+            runner: runner
+        )
         pref.live = true
 
         XCTAssertEqual(pref.admit(.init(name: "curl_remote")), .notAllowlisted)
@@ -209,6 +272,25 @@ final class TokenSaverTurnBatchPrefetchTests: XCTestCase {
         _ = led2.markProviderMeasured("op", experimentalPair: true, providerTokensSaved: 7, bindingDigest: "bind", evidenceDigest: "digest-abc")
         XCTAssertTrue(pref.markUsed(recipe: "fs_stat", consumedDigest: "digest-abc", ledger: led2, operationDigest: "op"))
         XCTAssertEqual(pref.usefulnessCredit(recipe: "fs_stat", ledger: led2), 7)
+        let crossBinding = TokenSaverAccountingV2.Ledger()
+        _ = crossBinding.record(TokenSaverAccountingV2.Operation(
+            digest: "cross",
+            generation: 1,
+            state: .providerApplied
+        ))
+        _ = crossBinding.markProviderMeasured(
+            "cross",
+            experimentalPair: true,
+            providerTokensSaved: 99,
+            bindingDigest: "other-bind",
+            evidenceDigest: "digest-abc"
+        )
+        XCTAssertFalse(pref.markUsed(
+            recipe: "fs_stat",
+            consumedDigest: "digest-abc",
+            ledger: crossBinding,
+            operationDigest: "cross"
+        ))
         // live=false never credits even with used receipt
         pref.live = false
         XCTAssertEqual(pref.usefulnessCredit(recipe: "fs_stat", ledger: led2), 0)

@@ -9,12 +9,14 @@ public enum TokenSaverWaveDBridge {
     public static func sharedRuntime(
         boundUserID: String,
         bindingDigest: String,
-        durableDirectory: URL
+        encryptedStore: TokenSaverEncryptedStore,
+        scope: TokenSaverEncryptedStore.Scope
     ) -> TokenSaverWaveDRuntime {
-        TokenSaverWaveDRuntime(
+        let originals = TokenSaverEncryptedOriginalStore(store: encryptedStore, scope: scope)
+        return TokenSaverWaveDRuntime(
             boundUserID: boundUserID,
             bindingDigest: bindingDigest,
-            durableDirectory: durableDirectory
+            originalStore: originals
         )
     }
 }

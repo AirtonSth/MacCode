@@ -49,4 +49,3 @@ final class TokenSaverProtocolV2Tests: XCTestCase {
         XCTAssertFalse(unsafe.isSafeRaw)
     }
 }
-

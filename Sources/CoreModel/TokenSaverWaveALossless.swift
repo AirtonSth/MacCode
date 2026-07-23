@@ -44,8 +44,11 @@ public enum TokenSaverWaveALossless {
     public final class Scoreboard: @unchecked Sendable {
         private let lock = NSLock()
         private var byKey: [ScoreKey: Scorecard] = [:]
+        private let maxEntries: Int
 
-        public init() {}
+        public init(maxEntries: Int = 4_096) {
+            self.maxEntries = max(1, maxEntries)
+        }
 
         public func snapshot(bindingDigest: String = "", trigger: Trigger) -> Scorecard {
             lock.lock(); defer { lock.unlock() }
@@ -61,11 +64,12 @@ public enum TokenSaverWaveALossless {
         ) {
             lock.lock(); defer { lock.unlock() }
             let key = ScoreKey(bindingDigest: bindingDigest, trigger: trigger)
+            if byKey[key] == nil && byKey.count >= maxEntries { return }
             var s = byKey[key] ?? Scorecard()
-            if eligible { s.eligible += 1 }
-            if attempted { s.attempted += 1 }
-            if accepted { s.accepted += 1 }
-            if attempted && !accepted { s.fallback += 1 }
+            if eligible && s.eligible < .max { s.eligible += 1 }
+            if attempted && s.attempted < .max { s.attempted += 1 }
+            if accepted && s.accepted < .max { s.accepted += 1 }
+            if attempted && !accepted && s.fallback < .max { s.fallback += 1 }
             byKey[key] = s
         }
     }

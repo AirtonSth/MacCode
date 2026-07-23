@@ -111,6 +111,22 @@ public struct TokenSaverBindingID: Sendable, Hashable, Equatable {
         ]
     }
 
+    /// Authorization and evidence paths require every semantic dimension to be present.
+    public var isComplete: Bool {
+        [
+            trigger,
+            provider,
+            providerAdapterVersion,
+            toolShape,
+            model,
+            cachePolicy,
+            triggerPolicyClassifierRecipeIndexVersion,
+            billingCohort,
+            hardwareTier,
+            consentVersion,
+        ].allSatisfy { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+    }
+
     /// Display-only projection. Must never be used for promotion or evidence reuse.
     public func displayProjection(includeFields: Set<String>? = nil) -> TokenSaverBindingIDDisplayProjection {
         let all = dimensions

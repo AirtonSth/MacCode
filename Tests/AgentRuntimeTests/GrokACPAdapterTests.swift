@@ -3,6 +3,11 @@ import XCTest
 import CoreModel
 
 final class GrokACPAdapterTests: ProviderProcessTestCase {
+    override func tearDown() {
+        TokenSaverCensusSeam.sharedStore = TokenSaverCensusStore()
+        super.tearDown()
+    }
+
     func test_newSessionStreamsPermissionAndSettlesApprovedTurn() async throws {
         let peer = try FakeGrokACPPeer(mode: .permission)
         defer { peer.remove() }
@@ -19,6 +24,32 @@ final class GrokACPAdapterTests: ProviderProcessTestCase {
         XCTAssertEqual(finished.status, .completed)
         XCTAssertEqual(finished.providerThreadId, "session-fixed")
         XCTAssertEqual(finished.finalMessage, "done")
+    }
+
+    func test_foreignRunAsDoesNotRecordTokenSaverCensus() async throws {
+        let peer = try FakeGrokACPPeer(mode: .permission)
+        defer { peer.remove() }
+        let census = TokenSaverCensusStore()
+        TokenSaverCensusSeam.sharedStore = census
+        let adapter = GrokACPAdapter(binaryNameOverride: peer.path, cancellationGracePeriod: 0.05)
+        let foreign = AgentRunAsUser(
+            generatedUID: "foreign",
+            shortName: "foreign",
+            uid: getuid() &+ 1,
+            gid: getgid(),
+            homePath: "/tmp"
+        )
+        let request = makeRequest(runAsUser: foreign)
+        let box = GrokACPEventBox()
+        _ = try await adapter.startSession(request) { box.append($0) }
+        let pending = try await box.waitForRequest(timeout: 3)
+        try await adapter.respondToRequest(
+            threadId: request.threadId,
+            requestId: pending.id,
+            response: .approve
+        )
+        _ = try await box.waitFinished(timeout: 3)
+        XCTAssertTrue(census.snapshot().isEmpty)
     }
 
     func test_cancelUsesACPNotificationAndDoesNotHardCloseFirst() async throws {
@@ -448,12 +479,13 @@ final class GrokACPAdapterTests: ProviderProcessTestCase {
         threadId: AgentThreadID? = nil,
         providerThreadId: String? = nil,
         permissionMode: AgentPermissionMode = .supervised,
-        interactionMode: AgentInteractionMode = .default
+        interactionMode: AgentInteractionMode = .default,
+        runAsUser: AgentRunAsUser? = nil
     ) -> AgentRunRequest {
         AgentRunRequest(
             threadId: threadId ?? AgentThreadID(), provider: .grok, model: "account-live-model", cwd: "/tmp",
             prompt: "hello", providerThreadId: providerThreadId, permissionMode: permissionMode,
-            interactionMode: interactionMode
+            interactionMode: interactionMode, runAsUser: runAsUser
         )
     }
 }

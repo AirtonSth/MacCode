@@ -24,6 +24,7 @@ public enum TokenSaverCensusSeam {
         _ payload: Data,
         binding: TokenSaverBindingID,
         control: TokenSaverCensusControl = .noChange,
+        eligibleTokens: Int64? = nil,
         parserMatched: Bool = true,
         streamKind: TokenSaverCensusStreamKind = .streaming,
         toolKind: TokenSaverCensusToolKind = .unknown,
@@ -35,7 +36,9 @@ public enum TokenSaverCensusSeam {
         let observation = TokenSaverCensusObservation(
             binding: binding,
             control: control,
-            eligibleTokens: Int64(payload.count),
+            eligibleBytes: Int64(payload.count),
+            eligibleTokens: eligibleTokens ?? 0,
+            hasMeasuredEligibleTokens: eligibleTokens != nil,
             parserMatched: parserMatched,
             streamKind: streamKind,
             toolKind: toolKind,

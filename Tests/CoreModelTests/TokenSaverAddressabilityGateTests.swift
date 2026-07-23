@@ -47,6 +47,15 @@ final class TokenSaverAddressabilityGateTests: XCTestCase {
         XCTAssertEqual(decision, .denyNonPositiveNetValue)
     }
 
+    func test_incompleteBindingCannotAuthorizeSlice() {
+        let incomplete = slice(trigger: " ", tokens: 10_000)
+        XCTAssertFalse(incomplete.isQualifying)
+        XCTAssertEqual(
+            TokenSaverAddressabilityGate.authorizeBuild(sortedByPriority: [incomplete]),
+            .denyIncompleteBinding
+        )
+    }
+
     func test_winner_authorizesAtMostOneNextSlice_usingCanonicalDigest() {
         let low = slice(trigger: "low", tokens: 1500, valuePerToken: 0.001)
         let high = slice(trigger: "high", tokens: 5000, valuePerToken: 0.001)

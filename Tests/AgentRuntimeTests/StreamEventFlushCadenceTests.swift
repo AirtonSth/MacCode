@@ -159,23 +159,47 @@ final class StreamEventFlushCadenceTests: XCTestCase {
         let oversized = AssistantEvent.error(message: String(repeating: "z", count: 10_000), recoverable: true)
         XCTAssertTrue(
             AgentRunCoordinator.boundedHotReplay([events[0], oversized], countLimit: 4, byteLimit: 1).isEmpty,
-            "an event that cannot fit the replay byte ceiling must never be retained above it"
+            "frames larger than the whole hot-replay window are skipped (newest-first eviction), never retained above the ceiling"
         )
+        // A normal newest event must still admit when an older oversized one is skipped.
+        let normal = AssistantEvent.turnStarted(turnId: "keep-me")
+        let mixed = AgentRunCoordinator.boundedHotReplay(
+            [oversized, normal],
+            countLimit: 4,
+            byteLimit: 2_000
+        )
+        XCTAssertEqual(mixed.count, 1)
+        if case .turnStarted(let id) = mixed[0] {
+            XCTAssertEqual(id, "keep-me", "newest-fit event must survive after skipping a pathological older frame")
+        } else {
+            XCTFail("expected turnStarted after oversized skip")
+        }
     }
 
-    func test_persistedPayloadBoundingReplacesOversizedFramesWithSmallMarkers() throws {
-        let raw = String(repeating: "z", count: 700 * 1_024)
-        let bounded = AgentRunCoordinator.boundedPersistedStreamPayload(raw)
+    func test_persistedPayloadBoundingSoftTruncatesWithoutRecoverableError() throws {
+        // Ordinary large frames (e.g. ~746 KiB Chrome dumps) must admit fully under
+        // the 16 MB ceiling — no "omitted from local history" recoverable banner.
+        let largeButAdmissible = String(repeating: "z", count: 700 * 1_024)
+        let admitted = AgentRunCoordinator.boundedPersistedStreamPayload(largeButAdmissible)
+        XCTAssertEqual(admitted, largeButAdmissible,
+                       "frames under the per-event ceiling must persist verbatim")
+
+        let pathological = String(repeating: "z", count: AgentRunCoordinator.maximumBufferedEventBytes + 50_000)
+        let bounded = AgentRunCoordinator.boundedPersistedStreamPayload(pathological)
         XCTAssertLessThanOrEqual(bounded.utf8.count, AgentRunCoordinator.maximumBufferedEventBytes)
-        XCTAssertNotEqual(bounded, raw)
+        XCTAssertNotEqual(bounded, pathological)
+        XCTAssertTrue(bounded.contains("truncated"),
+                      "only pathological frames soft-truncate; no recoverable error marker")
+        XCTAssertFalse(bounded.contains("omitted from local history"),
+                       "size pressure must never surface a user-facing omit/Retry error")
 
         let runtime = ProviderRuntimeEvent(
             id: "oversized", provider: .codex, source: "test", method: "event",
-            payloadJSON: raw, receivedAtMs: 1
+            payloadJSON: pathological, receivedAtMs: 1
         )
         let boundedRuntime = AgentRunCoordinator.boundedProviderRuntimeEvent(runtime)
         XCTAssertLessThanOrEqual(boundedRuntime.payloadJSON.utf8.count, AgentRunCoordinator.maximumBufferedEventBytes)
-        XCTAssertTrue(boundedRuntime.payloadJSON.contains("remote_code_truncated"))
+        XCTAssertTrue(boundedRuntime.payloadJSON.contains("truncated"))
     }
 
     // The last kind in the batch is the one diagnostics should report. WHY: the

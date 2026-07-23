@@ -423,6 +423,14 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
         // provider reads that user's ~/.claude (their logged-in account + MCP).
         let baseEnv = CodexRunner.processEnvironment(overrides: request.environment, purpose: .agentTurn(.claude))
         let isForeignUser = (request.runAsUser.map { $0.uid != getuid() } == true)
+        // Clear Claude's stale negative MCP-auth cache so this headless session
+        // re-probes remote OAuth MCP servers (Linear, etc.) live — terminal
+        // parity. Same-user only, fail-open. See ClaudeMCPAuthCacheReset.
+        ClaudeMCPAuthCacheReset.resetAndLog(
+            home: baseEnv["HOME"] ?? FileManager.default.homeDirectoryForCurrentUser.path,
+            isForeignUser: isForeignUser,
+            environment: baseEnv
+        )
         let foreignUserUID: uid_t? = isForeignUser ? request.runAsUser!.uid : nil
         let askpass = isForeignUser
             ? RunAsUserProcessBootstrap.materializeAskpass(targetUser: request.runAsUser!.shortName)

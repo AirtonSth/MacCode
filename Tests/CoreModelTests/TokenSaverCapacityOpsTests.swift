@@ -59,6 +59,13 @@ final class TokenSaverCapacityOpsTests: XCTestCase {
         let rt = TokenSaverCapacityOps.Runtime()
         rt.setOpsTelemetryFresh(false)
         XCTAssertTrue(rt.promotionBlockedByStaleOps())
+        XCTAssertEqual(rt.evaluate(profile: validProfile(), rss: 0, bytes: 0), .rawStaleOps)
+    }
+
+    func test_negativeCapacityMeasurementsFailRaw() {
+        let rt = TokenSaverCapacityOps.Runtime()
+        XCTAssertEqual(rt.evaluate(profile: validProfile(), rss: -1, bytes: 0), .rawBreach)
+        XCTAssertEqual(rt.evaluate(profile: validProfile(), rss: 0, bytes: -1), .rawBreach)
     }
 
     func test_deleteEpoch_fencesLateOutcomes() {

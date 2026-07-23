@@ -150,10 +150,11 @@ final class VisibleTranscriptWindowTests: XCTestCase {
                        "running with no post-cutoff entries falls back to the last two")
     }
 
-    func test_runningThread_withoutRunStartedAt_returnsAll_unchanged() {
-        // WHY (c): idle windowing must NOT leak into the running state. A transient
-        // running substate with no runStartedAt yet kept the full thread before the
-        // fix; it must still do so (only non-running status is windowed).
+    func test_runningThread_withoutRunStartedAt_usesRecentTailNotFullHistory() {
+        // WHY: status can flip to .running from stream events before runStartedAt
+        // is assigned. Returning the full thread re-expands every prior agent turn
+        // on follow-up and feels like the chat "pulled all messages". Prefer the
+        // same recent tail as idle so the live turn stays focused.
         let entries = (0..<(AgentAppView.idleTranscriptWindowCount + 50))
             .map { messageEntry(secondsSinceEpoch: TimeInterval($0)) }
 
@@ -161,8 +162,25 @@ final class VisibleTranscriptWindowTests: XCTestCase {
             entries: entries, status: .running, runStartedAt: nil
         )
 
-        XCTAssertEqual(visible.map(\.id), entries.map(\.id),
-                       "running without runStartedAt must return all entries, never the idle window")
+        XCTAssertEqual(visible.count, AgentAppView.idleTranscriptWindowCount,
+                       "running without runStartedAt must bound to the recent tail, not the full thread")
+        XCTAssertEqual(visible.map(\.id), Array(entries.suffix(AgentAppView.idleTranscriptWindowCount)).map(\.id),
+                       "the bounded tail must keep the newest entries in order")
+    }
+
+    func test_pendingThread_usesRecentTailLikeActiveFollowUp() {
+        // WHY: send → pending → running is one continuous follow-up. Pending must
+        // not paint the idle history window and then jump again when running.
+        let entries = (0..<(AgentAppView.idleTranscriptWindowCount + 20))
+            .map { messageEntry(secondsSinceEpoch: TimeInterval($0)) }
+
+        let visible = AgentAppView.visibleTranscriptWindow(
+            entries: entries, status: .pending, runStartedAt: nil
+        )
+
+        XCTAssertEqual(visible.count, AgentAppView.idleTranscriptWindowCount,
+                       "pending follow-up must stay on the recent tail")
+        XCTAssertEqual(visible.last?.id, entries.last?.id)
     }
 
     func test_runningThread_atMostTwoEntries_returnsAll_unchanged() {

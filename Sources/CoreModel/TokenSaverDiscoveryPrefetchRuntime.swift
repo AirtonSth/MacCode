@@ -97,12 +97,18 @@ public final class TokenSaverDiscoveryPrefetchRuntime: @unchecked Sendable {
     private var receipts: [String: ExecutionReceipt] = [:]
     private let runner: HostRunner
     private let workspaceRoot: String
+    private let bindingDigest: String
     public var deadlineMs: Int = TokenSaverDiscoveryPrefetchRuntime.defaultDeadlineMs
     /// Clock for deadline tests (ms since epoch).
     public var nowMs: () -> Int = { Int(Date().timeIntervalSince1970 * 1000) }
 
-    public init(workspaceRoot: String, runner: HostRunner = RecordingRunner()) {
+    public init(
+        workspaceRoot: String,
+        bindingDigest: String = "",
+        runner: HostRunner = RecordingRunner()
+    ) {
         self.workspaceRoot = Self.resolve(workspaceRoot)
+        self.bindingDigest = bindingDigest.trimmingCharacters(in: .whitespacesAndNewlines)
         self.runner = runner
     }
 
@@ -224,6 +230,8 @@ public final class TokenSaverDiscoveryPrefetchRuntime: @unchecked Sendable {
         lock.unlock()
         guard let snap = ledger.measuredSnapshot(for: operationDigest),
               snap.evidenceDigest == consumedDigest,
+              !bindingDigest.isEmpty,
+              snap.bindingDigest == bindingDigest,
               !snap.evidenceDigest.isEmpty else {
             return false
         }
@@ -267,7 +275,9 @@ public final class TokenSaverDiscoveryPrefetchRuntime: @unchecked Sendable {
         guard isLive else { return 0 }
         guard let receipt, receipt.used, !receipt.boundOperationDigest.isEmpty else { return 0 }
         guard let snap = ledger.measuredSnapshot(for: receipt.boundOperationDigest),
-              snap.evidenceDigest == receipt.digest else { return 0 }
+              snap.evidenceDigest == receipt.digest,
+              !bindingDigest.isEmpty,
+              snap.bindingDigest == bindingDigest else { return 0 }
         guard let measured = TokenSaverRecoveryProjections.ReceiptFactory.fromLocalLedger(
             ledger: ledger,
             operationDigest: receipt.boundOperationDigest
@@ -275,7 +285,7 @@ public final class TokenSaverDiscoveryPrefetchRuntime: @unchecked Sendable {
         return TokenSaverRecoveryProjections.admitPrefetchSavings(
             used: true,
             receipt: measured,
-            creditBindingDigest: measured.bindingDigest,
+            creditBindingDigest: bindingDigest,
             live: true
         )
     }

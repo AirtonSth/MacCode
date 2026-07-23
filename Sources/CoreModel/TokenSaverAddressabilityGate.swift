@@ -21,7 +21,10 @@ public enum TokenSaverAddressabilityGate {
 
         public var bindingDigestHex: String { binding.digestHex }
 
-        public init(
+        /// Internal until a trusted census adapter constructs opportunities from
+        /// provider-measured token events. External callers cannot label arbitrary
+        /// character/byte counts as eligible tokens.
+        internal init(
             binding: TokenSaverBindingID,
             absoluteEligibleTokens: Int64,
             overlapFraction: Double,
@@ -46,7 +49,10 @@ public enum TokenSaverAddressabilityGate {
         }
 
         public var isQualifying: Bool {
-            meetsAbsoluteThreshold && netExpectedValue > TokenSaverAddressabilityGate.minimumNetExpectedValue
+            binding.isComplete
+                && meetsAbsoluteThreshold
+                && netExpectedValue.isFinite
+                && netExpectedValue > TokenSaverAddressabilityGate.minimumNetExpectedValue
         }
     }
 
@@ -59,6 +65,7 @@ public enum TokenSaverAddressabilityGate {
         case authorizeNextSlice(bindingDigestHex: String)
         case denyBelowThreshold
         case denyNonPositiveNetValue
+        case denyIncompleteBinding
         case denyEmptyPortfolio
     }
 
@@ -69,6 +76,9 @@ public enum TokenSaverAddressabilityGate {
         guard !opportunities.isEmpty else { return .denyEmptyPortfolio }
         let qualifying = opportunities.filter(\.isQualifying)
         if qualifying.isEmpty {
+            if opportunities.contains(where: { $0.meetsAbsoluteThreshold && !$0.binding.isComplete }) {
+                return .denyIncompleteBinding
+            }
             if opportunities.contains(where: { $0.meetsAbsoluteThreshold }) {
                 return .denyNonPositiveNetValue
             }
@@ -169,12 +179,14 @@ public final class TokenSaverMemoryOnlyProbe: @unchecked Sendable {
         wrapperTokens: Int64,
         providerNativeTokens: Int64?
     ) -> Comparison {
+        let raw = max(0, rawTokens)
+        let wrapper = max(0, wrapperTokens)
         var arms: [ArmResult] = [
-            .init(arm: .noChange, outputTokens: rawTokens, latencyMs: 0),
-            .init(arm: .wrapperExact, outputTokens: wrapperTokens, latencyMs: 1),
+            .init(arm: .noChange, outputTokens: raw, latencyMs: 0),
+            .init(arm: .wrapperExact, outputTokens: wrapper, latencyMs: 1),
         ]
         if let native = providerNativeTokens {
-            arms.append(.init(arm: .providerNative, outputTokens: native, latencyMs: 2))
+            arms.append(.init(arm: .providerNative, outputTokens: max(0, native), latencyMs: 2))
         }
         let best = arms.min(by: { $0.outputTokens < $1.outputTokens })!.arm
         let noChange = arms.first(where: { $0.arm == .noChange })!.outputTokens

@@ -64,7 +64,36 @@ final class TokenSaverCensusSeamTests: XCTestCase {
         )
         XCTAssertEqual(written, outbound)
         XCTAssertEqual(store.snapshot().count, 1)
-        XCTAssertGreaterThan(store.snapshot()[0].eligibleTokens, 0)
+        XCTAssertEqual(store.snapshot()[0].eligibleBytes, Int64(outbound.count))
+        XCTAssertEqual(store.snapshot()[0].eligibleTokens, 0)
+        XCTAssertFalse(store.snapshot()[0].hasMeasuredEligibleTokens)
+        XCTAssertFalse(store.aggregates()[0].isValidForGate)
+    }
+
+    func test_providerMeasuredTokens_areRequiredForGateVolume() {
+        let store = TokenSaverCensusStore()
+        TokenSaverCensusSeam.sharedStore = store
+        let payload = Data("provider bytes are not provider tokens".utf8)
+        let binding = TokenSaverCensusSeam.defaultBinding(
+            trigger: "provider_outbound_user",
+            provider: "codex",
+            providerAdapterVersion: "app-server",
+            toolShape: "turn_start_json_line"
+        )
+
+        _ = TokenSaverCensusSeam.observeProviderVisiblePayload(
+            payload,
+            binding: binding,
+            eligibleTokens: 7,
+            isSameUser: true
+        )
+
+        let observation = try! XCTUnwrap(store.snapshot().first)
+        XCTAssertEqual(observation.eligibleBytes, Int64(payload.count))
+        XCTAssertEqual(observation.eligibleTokens, 7)
+        XCTAssertTrue(observation.hasMeasuredEligibleTokens)
+        XCTAssertEqual(store.aggregates().first?.absoluteEligibleTokens, 7)
+        XCTAssertEqual(store.aggregates().first?.isValidForGate, true)
     }
 
     func test_crossUser_isNotRecorded() {

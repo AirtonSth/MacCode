@@ -3,6 +3,11 @@ import XCTest
 @testable import CoreModel
 
 final class TokenSaverTypedCrushersBridgeTests: XCTestCase {
+    override func tearDown() {
+        TokenSaverTypedCrushersBridge.deactivate()
+        super.tearDown()
+    }
+
     func test_pytestFailureLines_excludesSummary() {
         let out = """
         test_a FAILED
@@ -69,5 +74,78 @@ final class TokenSaverTypedCrushersBridgeTests: XCTestCase {
             toolName: "Grep", output: "hit",
             bindingDigest: "query-scope" // missing result → empty
         )
+    }
+
+    func test_releaseActivationStoresOriginalEncrypted_andRevocationStopsIt() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("typed-bridge-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let keyProvider = TokenSaverInMemoryProjectKeyProvider()
+        let encrypted = try TokenSaverEncryptedStore(projectRoot: dir, keyProvider: keyProvider)
+        try encrypted.markMigrationComplete()
+        let scope = TokenSaverEncryptedStore.Scope(
+            uid: 501,
+            workspaceID: "w",
+            projectID: "p",
+            threadID: "t",
+            provider: "claude",
+            sessionGeneration: 1
+        )
+        let binding = TokenSaverBindingID(
+            trigger: "pytest",
+            provider: "claude",
+            providerAdapterVersion: "1",
+            toolShape: "text",
+            model: "m",
+            cachePolicy: "none",
+            triggerPolicyClassifierRecipeIndexVersion: "1",
+            billingCohort: "test",
+            hardwareTier: "apple-silicon",
+            consentVersion: "1"
+        )
+        let authority = TokenSaverAuthorityPlane.Registry()
+        authority.setReplacementAllowed(true, for: binding)
+        let manifest = TokenSaverAuthorityPlane.CoverageManifest(
+            cells: Dictionary(
+                uniqueKeysWithValues: TokenSaverAuthorityPlane.CoverageManifest.requiredCellIDs.map {
+                    ($0, .present)
+                }
+            )
+        )
+        let seal = TokenSaverAuthorityPlane.mintReleaseSeal(
+            binding: binding,
+            registry: authority,
+            manifest: manifest,
+            consent: .init(exactLossless: true, semanticLocalAI: false, isLegacyPreference: false),
+            requiresSemantic: false
+        )!
+        TokenSaverTypedCrushersBridge.activate(
+            kinds: [.pytest],
+            bindingDigest: binding.digestHex,
+            releaseSeal: seal,
+            encryptedStore: encrypted,
+            scope: scope
+        )
+
+        let first = "test_a FAILED\n===== 1 failed ====="
+        TokenSaverTypedCrushersBridge.observeToolOutput(
+            toolName: "Bash",
+            output: first,
+            bindingDigest: binding.digestHex
+        )
+        let originals = TokenSaverEncryptedOriginalStore(store: encrypted, scope: scope)
+        let firstHandle = TokenSaverTypedCrushers.handleID(for: Data(first.utf8))
+        XCTAssertEqual(originals.load(handle: "typed-crusher|\(firstHandle)"), Data(first.utf8))
+        XCTAssertFalse(encrypted.plaintextExistsOnDisk(scanning: Data(first.utf8)))
+
+        authority.revoke(binding: binding)
+        let second = "test_b FAILED\n===== 1 failed ====="
+        TokenSaverTypedCrushersBridge.observeToolOutput(
+            toolName: "Bash",
+            output: second,
+            bindingDigest: binding.digestHex
+        )
+        let secondHandle = TokenSaverTypedCrushers.handleID(for: Data(second.utf8))
+        XCTAssertNil(originals.load(handle: "typed-crusher|\(secondHandle)"))
     }
 }

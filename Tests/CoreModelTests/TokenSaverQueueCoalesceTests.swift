@@ -2,6 +2,24 @@ import XCTest
 @testable import CoreModel
 
 final class TokenSaverQueueCoalesceTests: XCTestCase {
+    private var keyProviders: [String: TokenSaverInMemoryProjectKeyProvider] = [:]
+
+    private func makeOriginalStore(at dir: URL) throws -> TokenSaverEncryptedOriginalStore {
+        let provider = keyProviders[dir.path] ?? TokenSaverInMemoryProjectKeyProvider()
+        keyProviders[dir.path] = provider
+        let store = try TokenSaverEncryptedStore(projectRoot: dir, keyProvider: provider)
+        try store.markMigrationComplete()
+        let scope = TokenSaverEncryptedStore.Scope(
+            uid: 501,
+            workspaceID: "w",
+            projectID: "p",
+            threadID: "t",
+            provider: "test",
+            sessionGeneration: 1
+        )
+        return TokenSaverEncryptedOriginalStore(store: store, scope: scope)
+    }
+
     func test_defaultOff() {
         XCTAssertFalse(TokenSaverQueueCoalesce.defaultEnabled)
         let rt = TokenSaverQueueCoalesceRuntime()
@@ -41,7 +59,10 @@ final class TokenSaverQueueCoalesceTests: XCTestCase {
 
     func test_compactionCAS_durableRelaunch_andHandles() throws {
         let dir = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("ts-c18-\(UUID().uuidString)")
-        let store = try TokenSaverQueueCoalesceRuntime.FileDurabilityStore(directory: dir)
+        let store = try TokenSaverQueueCoalesceRuntime.FileDurabilityStore(
+            directory: dir,
+            originalStore: makeOriginalStore(at: dir)
+        )
         defer { try? FileManager.default.removeItem(at: dir) }
 
         let rt = TokenSaverQueueCoalesceRuntime(store: store)
@@ -80,12 +101,37 @@ final class TokenSaverQueueCoalesceTests: XCTestCase {
         XCTAssertEqual(store.saveOmission(handle: "h1", data: Data("secret-omission".utf8)), .alreadyIdentical)
 
         // Relaunch: new runtime + same durable store recovers projection (crash matrix)
-        let rt2 = TokenSaverQueueCoalesceRuntime(store: try TokenSaverQueueCoalesceRuntime.FileDurabilityStore(directory: dir))
+        let rt2 = TokenSaverQueueCoalesceRuntime(
+            store: try TokenSaverQueueCoalesceRuntime.FileDurabilityStore(
+                directory: dir,
+                originalStore: makeOriginalStore(at: dir)
+            )
+        )
         rt2.live = true
         XCTAssertEqual(rt2.projection(for: op), .compact)
         XCTAssertEqual(rt2.retrieveOmission(handle: "h1"), Data("secret-omission".utf8))
         // Cannot re-admit already committed
         XCTAssertFalse(rt2.admitCompaction(pendingTool: false, pendingApproval: false, op: op))
+    }
+
+    func test_encryptedOriginalHandlesAreNamespacedFromRolloverLane() throws {
+        let dir = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("ts-c18-namespace-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let originals = try makeOriginalStore(at: dir)
+        let queueStore = try TokenSaverQueueCoalesceRuntime.FileDurabilityStore(
+            directory: dir,
+            originalStore: originals
+        )
+        let rolloverStore = try TokenSaverRolloverHandoffRuntime.FileDurabilityStore(
+            directory: dir,
+            originalStore: originals
+        )
+
+        XCTAssertEqual(queueStore.saveOmission(handle: "same", data: Data("queue".utf8)), .created)
+        XCTAssertTrue(rolloverStore.storeOriginal(handle: "same", data: Data("rollover".utf8)))
+        XCTAssertEqual(queueStore.loadOmission(handle: "same"), Data("queue".utf8))
+        XCTAssertEqual(rolloverStore.loadOriginal(handle: "same"), Data("rollover".utf8))
     }
 
     func test_checkpointReceiptsOnly() {
@@ -169,7 +215,11 @@ final class TokenSaverQueueCoalesceTests: XCTestCase {
             let inner: TokenSaverQueueCoalesceRuntime.MemoryDurabilityStore
             init(_ inner: TokenSaverQueueCoalesceRuntime.MemoryDurabilityStore) { self.inner = inner }
             func loadProjection(key: String) -> TokenSaverQueueCoalesceRuntime.Projection? { inner.loadProjection(key: key) }
-            func saveProjection(key: String, projection: TokenSaverQueueCoalesceRuntime.Projection) -> Bool { false }
+            func saveProjection(
+                key: String,
+                projection: TokenSaverQueueCoalesceRuntime.Projection,
+                commitment: String
+            ) -> Bool { false }
             func deleteProjection(key: String) { inner.deleteProjection(key: key) }
             func loadOmission(handle: String) -> Data? { inner.loadOmission(handle: handle) }
             func saveOmission(handle: String, data: Data) -> TokenSaverQueueCoalesceRuntime.OmissionSaveResult {
@@ -194,18 +244,24 @@ final class TokenSaverQueueCoalesceTests: XCTestCase {
         final class OrderStore: TokenSaverQueueCoalesceRuntime.DurabilityStore, @unchecked Sendable {
             private let lock = NSLock()
             var order: [String] = []
-            var projections: [String: TokenSaverQueueCoalesceRuntime.Projection] = [:]
+            var projections: [String: (TokenSaverQueueCoalesceRuntime.Projection, String)] = [:]
             var omissions: [String: Data] = [:]
             var failProjection = false
             func loadProjection(key: String) -> TokenSaverQueueCoalesceRuntime.Projection? {
-                lock.lock(); defer { lock.unlock() }; return projections[key]
+                lock.lock(); defer { lock.unlock() }; return projections[key]?.0
             }
-            func saveProjection(key: String, projection: TokenSaverQueueCoalesceRuntime.Projection) -> Bool {
+            func saveProjection(
+                key: String,
+                projection: TokenSaverQueueCoalesceRuntime.Projection,
+                commitment: String
+            ) -> Bool {
                 lock.lock(); defer { lock.unlock() }
                 order.append("proj")
                 if failProjection { return false }
-                if projections[key] != nil { return projections[key] == projection }
-                projections[key] = projection
+                if let existing = projections[key] {
+                    return existing.0 == projection && existing.1 == commitment
+                }
+                projections[key] = (projection, commitment)
                 return true
             }
             func deleteProjection(key: String) {
@@ -277,6 +333,56 @@ final class TokenSaverQueueCoalesceTests: XCTestCase {
         XCTAssertFalse(b.commit(op: op, projection: .compact, compactProjectionText: om.marker, omissions: [om]))
         XCTAssertEqual(a.projection(for: op), .raw)
         XCTAssertEqual(b.projection(for: op), .raw)
+    }
+
+    func test_concurrentCompactWriters_rejectDifferentProjectionCommitment() throws {
+        let dir = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("ts-c18-commitment-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let a = TokenSaverQueueCoalesceRuntime(
+            store: try TokenSaverQueueCoalesceRuntime.FileDurabilityStore(
+                directory: dir,
+                originalStore: makeOriginalStore(at: dir)
+            )
+        )
+        let b = TokenSaverQueueCoalesceRuntime(
+            store: try TokenSaverQueueCoalesceRuntime.FileDurabilityStore(
+                directory: dir,
+                originalStore: makeOriginalStore(at: dir)
+            )
+        )
+        a.live = true
+        b.live = true
+        a.setProviderAuthority(head: "h", generation: 1)
+        b.setProviderAuthority(head: "h", generation: 1)
+        let op = TokenSaverQueueCoalesceRuntime.CompactionOperationID(
+            providerHead: "h", generation: 1, boundary: "shared", rawHistoryDigest: "raw"
+        )
+        XCTAssertTrue(a.admitCompaction(pendingTool: false, pendingApproval: false, op: op))
+        XCTAssertTrue(b.admitCompaction(pendingTool: false, pendingApproval: false, op: op))
+
+        let first = TokenSaverQueueCoalesceRuntime.Omission(
+            handle: "first",
+            original: Data("first-original".utf8)
+        )
+        let second = TokenSaverQueueCoalesceRuntime.Omission(
+            handle: "second",
+            original: Data("second-original".utf8)
+        )
+        XCTAssertTrue(a.commit(
+            op: op,
+            projection: .compact,
+            compactProjectionText: "first \(first.marker)",
+            omissions: [first]
+        ))
+        XCTAssertFalse(b.commit(
+            op: op,
+            projection: .compact,
+            compactProjectionText: "different \(second.marker)",
+            omissions: [second]
+        ))
+        XCTAssertEqual(a.retrieveOmission(handle: "first"), first.original)
+        XCTAssertEqual(a.projection(for: op), .compact)
     }
 
     private func intent(

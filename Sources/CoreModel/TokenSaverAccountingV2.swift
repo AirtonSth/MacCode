@@ -78,20 +78,35 @@ public enum TokenSaverAccountingV2 {
     public final class Ledger: @unchecked Sendable {
         private let lock = NSLock()
         private var byDigest: [String: Operation] = [:]
+        private var deletedDigests: Set<String> = []
         private var currentGeneration: UInt64 = 1
-        public private(set) var batchPublished: Bool = false
+        private var _batchPublished: Bool = false
         private var batchOpen: Bool = false
         private var batchStaging: [String: Operation] = [:]
 
         public init() {}
 
-        public func setGeneration(_ g: UInt64) {
-            lock.lock(); currentGeneration = g; lock.unlock()
+        public var batchPublished: Bool {
+            lock.lock(); defer { lock.unlock() }
+            return _batchPublished
+        }
+
+        @discardableResult
+        public func setGeneration(_ g: UInt64) -> Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            guard g >= currentGeneration else { return false }
+            currentGeneration = g
+            return true
         }
 
         @discardableResult
         public func record(_ op: Operation) -> Result<Operation, LedgerError> {
             lock.lock(); defer { lock.unlock() }
+            guard !op.digest.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                return .failure(.invalidDigest)
+            }
+            if deletedDigests.contains(op.digest) { return .failure(.deleted) }
             if op.deleted { return .failure(.deleted) }
             // Measured savings cannot be smuggled in via record(); only markProviderMeasured writes them.
             if op.state == .providerMeasured {
@@ -123,6 +138,7 @@ public enum TokenSaverAccountingV2 {
 
         public func transition(_ digest: String, to newState: TruthState) -> Result<Operation, LedgerError> {
             lock.lock(); defer { lock.unlock() }
+            if deletedDigests.contains(digest) { return .failure(.deleted) }
             guard var op = byDigest[digest] else { return .failure(.missing) }
             if op.deleted { return .failure(.deleted) }
             // Measured savings are not a public state hop: only markProviderMeasured (internal)
@@ -151,22 +167,27 @@ public enum TokenSaverAccountingV2 {
             evidenceDigest: String = ""
         ) -> Result<Operation, LedgerError> {
             lock.lock(); defer { lock.unlock() }
+            if deletedDigests.contains(digest) { return .failure(.deleted) }
             guard var op = byDigest[digest] else { return .failure(.missing) }
             if op.deleted { return .failure(.deleted) }
             guard experimentalPair else { return .failure(.measuredRequiresPair) }
             let binding = bindingDigest.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !binding.isEmpty else { return .failure(.missingBinding) }
-            guard TokenSaverAccountingV2.canTransition(from: op.state, to: .providerMeasured)
-                || op.state == .providerMeasured else {
+            let evidence = evidenceDigest.trimmingCharacters(in: .whitespacesAndNewlines)
+            let measuredTokens = op.generation >= currentGeneration ? max(0, providerTokensSaved) : 0
+            if op.state == .providerMeasured {
+                guard op.confirmedTokensSaved == measuredTokens,
+                      op.bindingDigest == binding,
+                      op.evidenceDigest == evidence else {
+                    return .failure(.digestConflict)
+                }
+                return .success(op)
+            }
+            guard TokenSaverAccountingV2.canTransition(from: op.state, to: .providerMeasured) else {
                 return .failure(.illegalTransition)
             }
-            let evidence = evidenceDigest.trimmingCharacters(in: .whitespacesAndNewlines)
-            if op.generation >= currentGeneration {
-                op.applyMeasured(tokens: providerTokensSaved, binding: binding, evidence: evidence)
-            } else {
-                // Stale generation cannot confirm savings but may reach measured with zero.
-                op.applyMeasured(tokens: 0, binding: binding, evidence: evidence)
-            }
+            // Stale generation may reach measured for reconciliation, but confirms zero.
+            op.applyMeasured(tokens: measuredTokens, binding: binding, evidence: evidence)
             byDigest[digest] = op
             return .success(op)
         }
@@ -196,12 +217,15 @@ public enum TokenSaverAccountingV2 {
             measuredSnapshot(for: digest)?.tokens
         }
 
-        public func beginBatch() {
+        @discardableResult
+        public func beginBatch() -> Bool {
             lock.lock()
-            batchPublished = false
+            defer { lock.unlock() }
+            guard !batchOpen else { return false }
+            _batchPublished = false
             batchOpen = true
             batchStaging = [:]
-            lock.unlock()
+            return true
         }
 
         /// Abort discards only the active batch staging. Never deletes pre-existing committed ops.
@@ -217,30 +241,40 @@ public enum TokenSaverAccountingV2 {
             // Drop entire staging set (only uncommitted work).
             batchStaging = [:]
             batchOpen = false
-            batchPublished = false
+            _batchPublished = false
         }
 
-        public func commitBatch() {
+        @discardableResult
+        public func commitBatch() -> Bool {
             lock.lock(); defer { lock.unlock() }
+            guard batchOpen else { return false }
             for (k, v) in batchStaging {
-                byDigest[k] = v
+                if !deletedDigests.contains(k) {
+                    byDigest[k] = v
+                }
             }
             batchStaging = [:]
             batchOpen = false
-            batchPublished = true
+            _batchPublished = true
+            return true
         }
 
         public func markDeleted(_ digest: String) {
             lock.lock(); defer { lock.unlock() }
-            guard var op = byDigest[digest] else { return }
-            op.deleted = true
-            op.clearSavings()
-            byDigest[digest] = op
+            let canonical = digest.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !canonical.isEmpty else { return }
+            deletedDigests.insert(canonical)
+            batchStaging.removeValue(forKey: canonical)
+            if var op = byDigest[canonical] {
+                op.deleted = true
+                op.clearSavings()
+                byDigest[canonical] = op
+            }
         }
 
         public func isDeleted(_ digest: String) -> Bool {
             lock.lock(); defer { lock.unlock() }
-            return byDigest[digest]?.deleted == true
+            return deletedDigests.contains(digest) || byDigest[digest]?.deleted == true
         }
 
         /// Estimator returns non-zero only when version is valid and not expired/superseded.
@@ -256,7 +290,8 @@ public enum TokenSaverAccountingV2 {
             lock.lock(); defer { lock.unlock() }
             return byDigest.values.reduce(0) { partial, op in
                 if op.deleted { return partial }
-                return partial + op.confirmedTokensSaved
+                let (sum, overflow) = partial.addingReportingOverflow(op.confirmedTokensSaved)
+                return overflow ? .max : sum
             }
         }
 
@@ -266,6 +301,7 @@ public enum TokenSaverAccountingV2 {
 
         public enum LedgerError: Error, Equatable {
             case digestConflict, missing, measuredRequiresPair, deleted, illegalTransition, missingBinding
+            case invalidDigest
         }
     }
 }

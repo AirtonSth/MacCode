@@ -33,16 +33,17 @@ public final class TokenSaverRecoveryRuntime: @unchecked Sendable {
         handle.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    /// First store wins. Rejects rebind, overwrite, and resurrection of revoked handles.
+    /// First store wins. Same-byte/same-scope replay is idempotent; rebind,
+    /// overwrite, and resurrection of revoked handles are rejected.
     public func store(handle: String, scopeDigest: String, payload: Data) -> Bool {
         let h = Self.normalizeHandle(handle)
         let scope = scopeDigest.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !h.isEmpty, !scope.isEmpty else { return false }
         lock.lock(); defer { lock.unlock() }
         if let existing = byHandle[h] {
-            // Immutable: any second store of same handle is rejected (incl. same payload)
-            _ = existing
-            return false
+            return !existing.revoked
+                && existing.scopeDigest == scope
+                && existing.payload == payload
         }
         byHandle[h] = HandleRecord(handle: h, scopeDigest: scope, payload: payload, revoked: false)
         return true
@@ -86,13 +87,14 @@ public final class TokenSaverRecoveryRuntime: @unchecked Sendable {
     }
 
     /// Exact retrieve requires caller-supplied expected bytes matching stored payload.
-    public func retrieve(handle: String, expected: Data) -> Data? {
+    public func retrieve(handle: String, queryScopeDigest: String, expected: Data) -> Data? {
         let h = Self.normalizeHandle(handle)
+        let scope = queryScopeDigest.trimmingCharacters(in: .whitespacesAndNewlines)
         lock.lock()
         let isLive = _live
         let rec = byHandle[h]
         lock.unlock()
-        guard let rec else { return nil }
+        guard let rec, !scope.isEmpty, rec.scopeDigest == scope else { return nil }
         let ok = TokenSaverRecoveryProjections.admitRetrieve(
             bytes: rec.payload,
             original: expected,

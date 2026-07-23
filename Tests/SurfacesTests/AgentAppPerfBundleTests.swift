@@ -534,19 +534,49 @@ final class AgentAppPerfBundleTests: XCTestCase {
         XCTAssertEqual(batch.appendBounded(event: .turnStarted(turnId: "1"), run: run, threadId: tid), .scheduled)
         XCTAssertEqual(batch.appendBounded(event: .turnStarted(turnId: "2"), run: run, threadId: tid), .buffered)
         XCTAssertEqual(batch.appendBounded(event: .turnStarted(turnId: "3"), run: run, threadId: tid), .buffered)
-        XCTAssertEqual(batch.appendBounded(event: .turnStarted(turnId: "4"), run: run, threadId: tid), .saturated,
-                       "a blocked MainActor must trigger controlled stop instead of unbounded queue growth")
+        // Budget pressure drops the oldest UI event so the newest always admits.
+        XCTAssertEqual(batch.appendBounded(event: .turnStarted(turnId: "4"), run: run, threadId: tid), .bufferedAfterEviction,
+                       "a blocked MainActor must evict oldest buffered paints, not refuse the newest")
 
         let first = batch.drainQuantum()
         XCTAssertEqual(first.entries.count, 2,
                        "one MainActor application turn must never exceed the configured work quantum")
         XCTAssertTrue(first.hasMore)
+        // After eviction the queue still holds 3 events (2,3,4) — first quantum
+        // takes 2, second takes the remainder.
         let second = batch.drainQuantum()
         XCTAssertEqual(second.entries.count, 1)
         XCTAssertFalse(second.hasMore)
+        if case .turnStarted(let id) = second.entries[0].event {
+            XCTAssertEqual(id, "4", "newest event must survive eviction of the oldest")
+        } else {
+            XCTFail("expected turnStarted after eviction drain")
+        }
     }
 
-    func test_streamEventBatch_rejectsOversizedEventAndLatchesOneStopEpisode() {
+    func test_streamEventBatch_acceptsEventLargerThanDrainQuantumWithinHardCeiling() {
+        // drainBytes is a paint quantum, not an admission ceiling. A single tool
+        // payload larger than one quantum must still enter the queue so long-running
+        // Chrome/shell turns do not abort on the first large result.
+        let batch = StreamEventBatch(limits: .init(
+            maxBufferedCount: 8,
+            maxBufferedBytes: 64 * 1_024,
+            drainCount: 8,
+            drainBytes: 512
+        ))
+        let tid = AgentThreadID()
+        let run = AgentRunID()
+        let large = AssistantEvent.error(message: String(repeating: "x", count: 8_192), recoverable: true)
+
+        XCTAssertEqual(batch.appendBounded(event: large, run: run, threadId: tid), .scheduled,
+                       "an event larger than drainBytes but within maxBufferedBytes must be admitted")
+        let quantum = batch.drainQuantum()
+        XCTAssertEqual(quantum.entries.count, 1,
+                       "drainQuantum must emit a single oversized head event even when it exceeds drainBytes")
+        XCTAssertFalse(quantum.hasMore)
+    }
+
+    func test_streamEventBatch_rejectsEventAboveHardCeilingAndLatchesOneEpisode() {
         let batch = StreamEventBatch(limits: .init(
             maxBufferedCount: 8,
             maxBufferedBytes: 512,
@@ -558,10 +588,11 @@ final class AgentAppPerfBundleTests: XCTestCase {
         let oversized = AssistantEvent.error(message: String(repeating: "x", count: 8_192), recoverable: true)
 
         XCTAssertEqual(batch.appendBounded(event: oversized, run: run, threadId: tid), .saturated,
-                       "an event larger than one UI quantum must fail closed instead of exceeding the ceiling")
+                       "an event larger than maxBufferedBytes must fail closed instead of exceeding the hot-queue ceiling")
         XCTAssertEqual(batch.appendBounded(event: oversized, run: run, threadId: tid), .saturationAlreadyReported,
-                       "one saturation episode may schedule at most one controlled stop")
+                       "one saturation episode may report at most once while the hard ceiling holds")
         XCTAssertTrue(batch.drainQuantum().entries.isEmpty)
+        XCTAssertTrue(batch.isEmpty)
     }
 
     func test_streamEventBatch_finishResetsSaturationForNextRun() {
@@ -584,7 +615,7 @@ final class AgentAppPerfBundleTests: XCTestCase {
         XCTAssertEqual(
             batch.appendBounded(event: .turnStarted(turnId: "run-b"), run: runB, threadId: thread),
             .scheduled,
-            "a stopped saturation episode must not suppress the first event of the next run"
+            "a cleared saturation episode must not suppress the first event of the next run"
         )
     }
 
@@ -630,12 +661,17 @@ final class AgentAppPerfBundleTests: XCTestCase {
             )))
         }
 
-        XCTAssertGreaterThan(state.aggregateHotTextByteCount, AssistantTimelineState.aggregateHotTextByteLimit)
-        state.enforceAggregateHotTextBudget()
+        // Use an explicit sub-production ceiling so the fixture stays small/fast
+        // while still proving every hot-state class shares one budget. Production
+        // aggregateHotTextByteLimit is sized for a 16 GB MacBook and would require
+        // multi-hundred-MB fixtures here.
+        let testBudget = 256_000
+        XCTAssertGreaterThan(state.aggregateHotTextByteCount, testBudget)
+        state.enforceAggregateHotTextBudget(byteLimit: testBudget)
 
         XCTAssertLessThanOrEqual(
             state.aggregateHotTextByteCount,
-            AssistantTimelineState.aggregateHotTextByteLimit,
+            testBudget,
             "every rendered hot-state class plus collection overhead must share one hard budget"
         )
         XCTAssertEqual(state.activePlan?.steps.first?.id, "active-step")

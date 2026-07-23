@@ -49,6 +49,7 @@ final class TokenSaverCensusTests: XCTestCase {
         XCTAssertEqual(store.snapshot().count, 1)
         XCTAssertTrue(store.snapshot()[0].hasCompleteBindingID)
         XCTAssertEqual(store.snapshot()[0].bindingDimensions.count, TokenSaverBindingID.canonicalFieldOrder.count)
+        XCTAssertFalse(store.record(observation(binding: binding(trigger: "  "))))
     }
 
     func test_controls_areDistinguishable() {
@@ -59,6 +60,18 @@ final class TokenSaverCensusTests: XCTestCase {
         }
         let controls = Set(store.snapshot().map(\.control))
         XCTAssertEqual(controls, Set(TokenSaverCensusControl.allCases))
+    }
+
+    func test_recentSamplesAreBounded_withoutLosingAggregateTotals() {
+        let store = TokenSaverCensusStore(maxRecentObservations: 3)
+        let b = binding()
+        for _ in 0..<10 {
+            XCTAssertTrue(store.record(observation(binding: b, tokens: 2)))
+        }
+        XCTAssertEqual(store.snapshot().count, 3)
+        let aggregate = store.aggregates().first
+        XCTAssertEqual(aggregate?.observationCount, 10)
+        XCTAssertEqual(aggregate?.absoluteEligibleTokens, 20)
     }
 
     func test_aggregate_volume_and_invalid_rank_without_volume() {

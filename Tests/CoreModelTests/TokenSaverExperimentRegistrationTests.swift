@@ -42,6 +42,22 @@ final class TokenSaverExperimentRegistrationTests: XCTestCase {
         let reg = TokenSaverExperimentRegistration(binding: binding(), statistics: incomplete)
         XCTAssertFalse(reg.canSeal)
         XCTAssertNil(reg.sealed())
+        let incompleteBinding = TokenSaverBindingID(
+            trigger: " ",
+            provider: "claude",
+            providerAdapterVersion: "2.1.216",
+            toolShape: "mcp.json",
+            model: "claude-sonnet",
+            cachePolicy: "default",
+            triggerPolicyClassifierRecipeIndexVersion: "policy-v1",
+            billingCohort: "same-user-agent",
+            hardwareTier: "apple-silicon",
+            consentVersion: "exact-v1"
+        )
+        XCTAssertNil(TokenSaverExperimentRegistration(
+            binding: incompleteBinding,
+            statistics: completeStats()
+        ).sealed())
     }
 
     func test_missingDeltaMargins_cannotSeal() {

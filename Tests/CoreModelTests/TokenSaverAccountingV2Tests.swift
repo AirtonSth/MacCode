@@ -69,6 +69,50 @@ final class TokenSaverAccountingV2Tests: XCTestCase {
         XCTAssertNotNil(try? led.transition("a", to: .transported).get())
     }
 
+    func test_nestedBatchDoesNotDiscardStaging() {
+        let led = TokenSaverAccountingV2.Ledger()
+        XCTAssertTrue(led.beginBatch())
+        _ = led.record(.init(digest: "staged", generation: 1))
+        XCTAssertFalse(led.beginBatch(), "nested begin must not erase the active staging set")
+        XCTAssertTrue(led.commitBatch())
+        XCTAssertFalse(led.commitBatch(), "commit outside an active batch must fail closed")
+        XCTAssertEqual(
+            try? led.transition("staged", to: .transported).get().state,
+            .transported
+        )
+    }
+
+    func test_generationFenceCannotRegressAndDeleteTombstoneCannotResurrect() {
+        let led = TokenSaverAccountingV2.Ledger()
+        XCTAssertTrue(led.setGeneration(9))
+        XCTAssertFalse(led.setGeneration(2))
+
+        led.markDeleted("future")
+        XCTAssertTrue(led.isDeleted("future"))
+        XCTAssertEqual(
+            led.record(.init(digest: "future", generation: 9)),
+            .failure(.deleted)
+        )
+        XCTAssertEqual(
+            led.markProviderMeasured(
+                "future",
+                experimentalPair: true,
+                providerTokensSaved: 9,
+                bindingDigest: "bind"
+            ),
+            .failure(.deleted)
+        )
+
+        XCTAssertTrue(led.beginBatch())
+        _ = led.record(.init(digest: "staged-delete", generation: 9))
+        led.markDeleted("staged-delete")
+        XCTAssertTrue(led.commitBatch())
+        XCTAssertEqual(
+            led.record(.init(digest: "staged-delete", generation: 9)),
+            .failure(.deleted)
+        )
+    }
+
     func test_estimatorExpired_zero() {
         let led = TokenSaverAccountingV2.Ledger()
         XCTAssertEqual(led.estimator(valid: false, expired: false), 0)
@@ -83,6 +127,37 @@ final class TokenSaverAccountingV2Tests: XCTestCase {
         _ = led.markProviderMeasured("d", experimentalPair: true, providerTokensSaved: 42, bindingDigest: "bind")
         XCTAssertEqual(led.addCharacterCountSavings(9999, to: "d"), 42)
         XCTAssertEqual(led.rebuildConfirmedTotal(), 42)
+    }
+
+    func test_measuredReplayIsIdempotent_andConflictCannotRewriteCredit() {
+        let led = TokenSaverAccountingV2.Ledger()
+        _ = led.record(TokenSaverAccountingV2.Operation(digest: "d", generation: 1, state: .providerApplied))
+        XCTAssertNotNil(try? led.markProviderMeasured(
+            "d",
+            experimentalPair: true,
+            providerTokensSaved: 42,
+            bindingDigest: "bind",
+            evidenceDigest: "usage-1"
+        ).get())
+        XCTAssertNotNil(try? led.markProviderMeasured(
+            "d",
+            experimentalPair: true,
+            providerTokensSaved: 42,
+            bindingDigest: "bind",
+            evidenceDigest: "usage-1"
+        ).get())
+        XCTAssertEqual(
+            led.markProviderMeasured(
+                "d",
+                experimentalPair: true,
+                providerTokensSaved: 99,
+                bindingDigest: "other",
+                evidenceDigest: "usage-2"
+            ),
+            .failure(.digestConflict)
+        )
+        XCTAssertEqual(led.measuredSnapshot(for: "d")?.tokens, 42)
+        XCTAssertEqual(led.measuredSnapshot(for: "d")?.bindingDigest, "bind")
     }
 
     func test_deleteRemainsDeleted() {
@@ -109,6 +184,20 @@ final class TokenSaverAccountingV2Tests: XCTestCase {
         _ = led.markProviderMeasured("b", experimentalPair: true, providerTokensSaved: 5, bindingDigest: "bindB")
         XCTAssertEqual(led.rebuildConfirmedTotal(), led.storedConfirmedTotal())
         XCTAssertEqual(led.rebuildConfirmedTotal(), 15)
+    }
+
+    func test_confirmedTotalSaturatesInsteadOfCrashingProviderTurn() {
+        let led = TokenSaverAccountingV2.Ledger()
+        for digest in ["a", "b"] {
+            _ = led.record(.init(digest: digest, generation: 1, state: .providerApplied))
+            _ = led.markProviderMeasured(
+                digest,
+                experimentalPair: true,
+                providerTokensSaved: .max,
+                bindingDigest: "bind-\(digest)"
+            )
+        }
+        XCTAssertEqual(led.rebuildConfirmedTotal(), .max)
     }
 
     func test_sixTruthStates_enumerated() {

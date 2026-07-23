@@ -35,6 +35,11 @@ final class TokenSaverBindingIDTests: XCTestCase {
         XCTAssertEqual(a, b)
         XCTAssertEqual(a.digestHex.count, 64)
         XCTAssertTrue(a.digestHex.allSatisfy { $0.isHexDigit })
+        XCTAssertTrue(a.isComplete)
+    }
+
+    func test_emptySemanticDimensionIsNotComplete() {
+        XCTAssertFalse(sample(model: "  ").isComplete)
     }
 
     func test_canonicalUTF8_andDigest_areStableGolden() {

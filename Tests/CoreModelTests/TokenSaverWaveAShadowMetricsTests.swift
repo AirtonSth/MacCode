@@ -16,6 +16,21 @@ final class TokenSaverWaveAShadowMetricsTests: XCTestCase {
         XCTAssertEqual(ledger.snapshot().first?.providerRoundsAvoided, 0)
     }
 
+    func test_ledgerBoundsLongRunningShadowRecords() {
+        let ledger = TokenSaverWaveAShadowMetrics.Ledger(maxRecords: 2)
+        for _ in 0..<5 {
+            XCTAssertNotNil(TokenSaverWaveAShadowMetrics.emit(
+                bindingDigest: d1,
+                cacheVolatileTokens: 0,
+                queueCohortSize: 0,
+                pair: nil,
+                ledger: ledger
+            ))
+        }
+        XCTAssertEqual(ledger.count, 2)
+        XCTAssertEqual(ledger.droppedRecords, 3)
+    }
+
     func test_pairBoundToSameBinding() {
         let pair = TokenSaverWaveAShadowMetrics.PairedControlEvidence(
             pairID: "p1", bindingDigest: d1,

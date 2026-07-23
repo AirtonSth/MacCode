@@ -3,6 +3,11 @@ import XCTest
 @testable import CoreModel
 
 final class TokenSaverWaveAShadowBridgeTests: XCTestCase {
+    override func tearDown() {
+        TokenSaverWaveAShadowBridge.resetReplayStateForTesting()
+        super.tearDown()
+    }
+
     func test_noScoringWithoutBindingDigest() {
         let emptyBefore = TokenSaverWaveALossless.sharedScoreboard.snapshot(
             bindingDigest: "", trigger: .repeatedLog
@@ -75,5 +80,17 @@ final class TokenSaverWaveAShadowBridgeTests: XCTestCase {
             bindingDigest: d, trigger: .exactToolReplay
         )
         XCTAssertEqual(afterSecondGrep.eligible, beforeGrep.eligible + 1)
+    }
+
+    func test_exactReplayStateIsBoundedAcrossDistinctBindings() {
+        TokenSaverWaveAShadowBridge.resetReplayStateForTesting()
+        for index in 0..<2_100 {
+            TokenSaverWaveAShadowBridge.observeExactReplay(
+                bindingDigest: "binding-\(index)",
+                toolName: "Bash",
+                current: Data("payload".utf8)
+            )
+        }
+        XCTAssertLessThanOrEqual(TokenSaverWaveAShadowBridge.replayStateCountForTesting(), 2_048)
     }
 }

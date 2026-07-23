@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 
 /// Wave C queued_intent_coalescing + in_place_context_compaction + same_turn_structured_checkpoint (task-18).
 /// Default OFF / opt-in. Canonical messages stay byte-exact.
@@ -129,7 +130,7 @@ public final class TokenSaverQueueCoalesceRuntime: @unchecked Sendable {
 
     public protocol DurabilityStore: AnyObject {
         func loadProjection(key: String) -> Projection?
-        func saveProjection(key: String, projection: Projection) -> Bool
+        func saveProjection(key: String, projection: Projection, commitment: String) -> Bool
         func deleteProjection(key: String)
         func loadOmission(handle: String) -> Data?
         func saveOmission(handle: String, data: Data) -> OmissionSaveResult
@@ -144,16 +145,18 @@ public final class TokenSaverQueueCoalesceRuntime: @unchecked Sendable {
 
     public final class MemoryDurabilityStore: DurabilityStore, ProjectionDeleter, @unchecked Sendable {
         private let lock = NSLock()
-        private var projections: [String: Projection] = [:]
+        private var projections: [String: (projection: Projection, commitment: String)] = [:]
         private var omissions: [String: Data] = [:]
         public init() {}
         public func loadProjection(key: String) -> Projection? {
-            lock.lock(); defer { lock.unlock() }; return projections[key]
+            lock.lock(); defer { lock.unlock() }; return projections[key]?.projection
         }
-        public func saveProjection(key: String, projection: Projection) -> Bool {
+        public func saveProjection(key: String, projection: Projection, commitment: String) -> Bool {
             lock.lock(); defer { lock.unlock() }
-            if let existing = projections[key], existing != projection { return false }
-            projections[key] = projection
+            if let existing = projections[key] {
+                return existing.projection == projection && existing.commitment == commitment
+            }
+            projections[key] = (projection, commitment)
             return true
         }
         public func deleteProjection(key: String) {
@@ -176,41 +179,42 @@ public final class TokenSaverQueueCoalesceRuntime: @unchecked Sendable {
     }
 
     public final class FileDurabilityStore: DurabilityStore, ProjectionDeleter, @unchecked Sendable {
+        private struct DiskProjection: Codable {
+            let projection: Projection
+            let commitment: String
+        }
+
         private let lock = NSLock()
         private let root: URL
-        public init(directory: URL) throws {
+        private let originalStore: TokenSaverLossyOriginalStoring?
+        public init(directory: URL, originalStore: TokenSaverLossyOriginalStoring? = nil) throws {
             self.root = directory
+            self.originalStore = originalStore
             try FileManager.default.createDirectory(at: directory.appendingPathComponent("proj"), withIntermediateDirectories: true)
-            try FileManager.default.createDirectory(at: directory.appendingPathComponent("omit"), withIntermediateDirectories: true)
         }
         private func projURL(_ key: String) -> URL {
             let safe = Data(key.utf8).base64EncodedString().replacingOccurrences(of: "/", with: "_")
             return root.appendingPathComponent("proj").appendingPathComponent(safe)
         }
-        private func omitURL(_ handle: String) -> URL {
-            let safe = Data(handle.utf8).base64EncodedString().replacingOccurrences(of: "/", with: "_")
-            return root.appendingPathComponent("omit").appendingPathComponent(safe)
-        }
         public func loadProjection(key: String) -> Projection? {
             lock.lock(); defer { lock.unlock() }
-            guard let data = try? Data(contentsOf: projURL(key)),
-                  let s = String(data: data, encoding: .utf8) else { return nil }
-            return Projection(rawValue: s)
+            return loadProjectionUnlocked(url: projURL(key))
         }
-        public func saveProjection(key: String, projection: Projection) -> Bool {
+        public func saveProjection(key: String, projection: Projection, commitment: String) -> Bool {
             lock.lock(); defer { lock.unlock() }
             let url = projURL(key)
-            if let existing = loadProjectionUnlocked(url: url) {
+            if let existing = loadProjectionRecordUnlocked(url: url) {
                 // Idempotent only when same value; never overwrite a different projection.
-                return existing == projection
+                return existing.projection == projection && existing.commitment == commitment
             }
             // Exclusive create: withoutOverwriting fails if another writer raced in.
             do {
-                try Data(projection.rawValue.utf8).write(to: url, options: [.withoutOverwriting])
+                let record = DiskProjection(projection: projection, commitment: commitment)
+                try JSONEncoder().encode(record).write(to: url, options: [.withoutOverwriting])
                 return true
             } catch {
-                if let existing = loadProjectionUnlocked(url: url) {
-                    return existing == projection
+                if let existing = loadProjectionRecordUnlocked(url: url) {
+                    return existing.projection == projection && existing.commitment == commitment
                 }
                 return false
             }
@@ -220,36 +224,34 @@ public final class TokenSaverQueueCoalesceRuntime: @unchecked Sendable {
             try? FileManager.default.removeItem(at: projURL(key))
         }
         private func loadProjectionUnlocked(url: URL) -> Projection? {
-            guard let data = try? Data(contentsOf: url),
-                  let s = String(data: data, encoding: .utf8) else { return nil }
-            return Projection(rawValue: s)
+            loadProjectionRecordUnlocked(url: url)?.projection
+        }
+        private func loadProjectionRecordUnlocked(url: URL) -> DiskProjection? {
+            guard let data = try? Data(contentsOf: url) else { return nil }
+            if let record = try? JSONDecoder().decode(DiskProjection.self, from: data) {
+                return record
+            }
+            // N-1 files contained only the projection raw value. They remain readable,
+            // but cannot be treated as a same-byte replay without a commitment.
+            guard let s = String(data: data, encoding: .utf8) else { return nil }
+            guard let projection = Projection(rawValue: s) else { return nil }
+            return DiskProjection(projection: projection, commitment: "")
         }
         public func loadOmission(handle: String) -> Data? {
-            lock.lock(); defer { lock.unlock() }
-            return try? Data(contentsOf: omitURL(handle))
+            originalStore?.load(handle: storageHandle(handle))
         }
         public func saveOmission(handle: String, data: Data) -> OmissionSaveResult {
-            lock.lock(); defer { lock.unlock() }
-            let url = omitURL(handle)
-            if FileManager.default.fileExists(atPath: url.path) {
-                if let existing = try? Data(contentsOf: url), existing == data {
-                    return .alreadyIdentical
-                }
-                return .conflict
-            }
-            do {
-                try data.write(to: url, options: [.withoutOverwriting])
-                return .created
-            } catch {
-                if let existing = try? Data(contentsOf: url), existing == data {
-                    return .alreadyIdentical
-                }
-                return .conflict
+            switch originalStore?.save(handle: storageHandle(handle), data: data) {
+            case .created: return .created
+            case .alreadyIdentical: return .alreadyIdentical
+            case .conflict, .none: return .conflict
             }
         }
         public func deleteOmission(handle: String) {
-            lock.lock(); defer { lock.unlock() }
-            try? FileManager.default.removeItem(at: omitURL(handle))
+            originalStore?.delete(handle: storageHandle(handle))
+        }
+        private func storageHandle(_ handle: String) -> String {
+            "queue-compaction|\(handle)"
         }
     }
 
@@ -383,8 +385,17 @@ public final class TokenSaverQueueCoalesceRuntime: @unchecked Sendable {
         }
 
         // Exclusive projection publish (raw XOR compact).
-        if !store.saveProjection(key: op.storageKey, projection: projection) {
-            for w in newlyCreated { store.deleteOmission(handle: w) }
+        let commitment = Self.projectionCommitment(
+            projection: projection,
+            compactProjectionText: compactProjectionText,
+            omissions: omissions
+        )
+        if !store.saveProjection(key: op.storageKey, projection: projection, commitment: commitment) {
+            // If another writer published, its projection may reference an identical
+            // original. Preserve store-before-loss over eager orphan cleanup.
+            if store.loadProjection(key: op.storageKey) == nil {
+                for w in newlyCreated { store.deleteOmission(handle: w) }
+            }
             return false
         }
 
@@ -424,6 +435,25 @@ public final class TokenSaverQueueCoalesceRuntime: @unchecked Sendable {
             guard text.contains(o.marker) else { return false }
         }
         return true
+    }
+
+    private static func projectionCommitment(
+        projection: Projection,
+        compactProjectionText: String?,
+        omissions: [Omission]
+    ) -> String {
+        var bytes = Data(projection.rawValue.utf8)
+        func appendField(_ field: Data) {
+            var length = UInt64(field.count).bigEndian
+            withUnsafeBytes(of: &length) { bytes.append(contentsOf: $0) }
+            bytes.append(field)
+        }
+        appendField(Data((compactProjectionText ?? "").utf8))
+        for omission in omissions.sorted(by: { $0.handle < $1.handle }) {
+            appendField(Data(omission.handle.utf8))
+            appendField(Data(SHA256.hash(data: omission.original)))
+        }
+        return SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined()
     }
 
     public func projection(for op: CompactionOperationID) -> Projection? {

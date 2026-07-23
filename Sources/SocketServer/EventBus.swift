@@ -493,8 +493,15 @@ public final class EventBus: @unchecked Sendable {
 
     private func retainRecent(_ ev: Event) {
         let bytes = encodedSize(ev)
-        guard recentLimit > 0, recentByteLimit > 0, bytes <= recentByteLimit else {
-            trimRecent()
+        guard recentLimit > 0, recentByteLimit > 0 else { return }
+        // Single frame larger than the whole recent window: reclaim everything
+        // older and still admit the newest event so replay keeps progressing.
+        if bytes > recentByteLimit {
+            recent.removeAll(keepingCapacity: true)
+            recentBytes = 0
+            encodedCache.removeAll(keepingCapacity: true)
+            recent.append(ev)
+            recentBytes = bytes
             return
         }
         recent.append(ev)

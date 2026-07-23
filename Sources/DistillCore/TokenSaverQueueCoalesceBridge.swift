@@ -5,12 +5,17 @@ import CoreModel
 public enum TokenSaverQueueCoalesceBridge {
     public static let defaultEnabled = TokenSaverQueueCoalesce.defaultEnabled
 
-    public static func sharedRuntime(storeDirectory: URL? = nil) -> TokenSaverQueueCoalesceRuntime {
-        if let dir = storeDirectory,
-           let fileStore = try? TokenSaverQueueCoalesceRuntime.FileDurabilityStore(directory: dir) {
-            return TokenSaverQueueCoalesceRuntime(store: fileStore)
-        }
-        return TokenSaverQueueCoalesceRuntime()
+    public static func sharedRuntime(
+        storeDirectory: URL,
+        encryptedStore: TokenSaverEncryptedStore,
+        scope: TokenSaverEncryptedStore.Scope
+    ) -> TokenSaverQueueCoalesceRuntime? {
+        let originals = TokenSaverEncryptedOriginalStore(store: encryptedStore, scope: scope)
+        guard let fileStore = try? TokenSaverQueueCoalesceRuntime.FileDurabilityStore(
+            directory: storeDirectory,
+            originalStore: originals
+        ) else { return nil }
+        return TokenSaverQueueCoalesceRuntime(store: fileStore)
     }
 
     public static func observeCoalesce(

@@ -4,6 +4,42 @@ import Darwin
 @testable import AgentRuntime
 
 final class CodexAppServerClientTests: ProviderProcessTestCase {
+    override func tearDown() {
+        TokenSaverCensusSeam.sharedStore = TokenSaverCensusStore()
+        super.tearDown()
+    }
+
+    func test_turnStartCensus_preservesCodexWireBytesAndDoesNotInventTokens() async throws {
+        let script = try makeFakeAppServerPeer()
+        let store = TokenSaverCensusStore()
+        TokenSaverCensusSeam.sharedStore = store
+        let client = try CodexAppServerClient(
+            binary: script,
+            arguments: [],
+            cwd: FileManager.default.temporaryDirectory.path,
+            tokenSaverCensusAllowed: true
+        )
+        defer { client.stop() }
+        _ = try await client.initialize()
+        let request = AgentRunRequest(
+            threadId: AgentThreadID(),
+            provider: .codex,
+            model: "test-model",
+            cwd: FileManager.default.temporaryDirectory.path,
+            prompt: "census payload"
+        )
+
+        _ = try await client.startTurn(providerThreadId: "thread-1", for: request)
+
+        let observations = store.snapshot()
+        XCTAssertEqual(observations.count, 1, "only provider-bound turn/start is census eligible")
+        XCTAssertEqual(observations[0].bindingDimensions["provider"], "codex")
+        XCTAssertEqual(observations[0].bindingDimensions["tool_shape"], "turn_start_json_line")
+        XCTAssertGreaterThan(observations[0].eligibleBytes, 0)
+        XCTAssertFalse(observations[0].hasMeasuredEligibleTokens)
+        XCTAssertFalse(store.aggregates()[0].isValidForGate)
+    }
+
     func test_rpcDeadlineFailsAndStopsSilentAppServer() async throws {
         let script = try makeSilentAppServerPeer()
         let client = try CodexAppServerClient(

@@ -95,19 +95,20 @@ public final class TokenSaverWaveDRuntime: @unchecked Sendable {
 
     public let boundUserID: String
     public let bindingDigest: String
-    private let durableRoot: URL?
+    private let originalStore: TokenSaverLossyOriginalStoring?
     private let lock = NSLock()
     private var _live = TokenSaverWaveDFamilies.defaultEnabled
     private var validationFailed = false
-    private var structureOriginals: [String: Data] = [:]
+    private var validationProofDigest: String?
 
-    public init(boundUserID: String, bindingDigest: String, durableDirectory: URL? = nil) {
+    public init(
+        boundUserID: String,
+        bindingDigest: String,
+        originalStore: TokenSaverLossyOriginalStoring? = nil
+    ) {
         self.boundUserID = boundUserID.trimmingCharacters(in: .whitespacesAndNewlines)
         self.bindingDigest = bindingDigest.trimmingCharacters(in: .whitespacesAndNewlines)
-        self.durableRoot = durableDirectory
-        if let dir = durableDirectory {
-            try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        }
+        self.originalStore = originalStore
     }
 
     public var live: Bool {
@@ -178,19 +179,12 @@ public final class TokenSaverWaveDRuntime: @unchecked Sendable {
         // Unique handle: UUID (no collision / no overwrite of prior originals).
         let handle = UUID().uuidString
         // Durable store required for store-before-loss across relaunch.
-        guard let root = durableRoot else { return .failure(.durableRequired) }
-        let url = self.fileURL(root: root, handle: handle)
-        if FileManager.default.fileExists(atPath: url.path) { return .failure(.handleCollision) }
-        do {
-            try original.write(to: url, options: [.withoutOverwriting])
-        } catch {
+        guard let originalStore else { return .failure(.durableRequired) }
+        let storageHandle = self.storageHandle(handle)
+        guard originalStore.save(handle: storageHandle, data: original) != .conflict,
+              originalStore.load(handle: storageHandle) == original else {
             return .failure(.missingStructureOriginal)
         }
-        guard let readback = try? Data(contentsOf: url), readback == original else {
-            try? FileManager.default.removeItem(at: url)
-            return .failure(.missingStructureOriginal)
-        }
-        structureOriginals[handle] = original
         return .success(StructureView(
             handle: handle,
             marker: "[[rc:\(handle)]]",
@@ -209,16 +203,11 @@ public final class TokenSaverWaveDRuntime: @unchecked Sendable {
             return nil
         }
         let h = handle.trimmingCharacters(in: .whitespacesAndNewlines)
-        if let mem = structureOriginals[h] { return mem }
-        guard let root = durableRoot else { return nil }
-        return try? Data(contentsOf: fileURL(root: root, handle: h))
+        return originalStore?.load(handle: storageHandle(h))
     }
 
-    private func fileURL(root: URL, handle: String) -> URL {
-        // Scope durable key by user + binding so another runtime cannot read across identity.
-        let key = "\(boundUserID)|\(bindingDigest)|\(handle)"
-        let safe = Data(key.utf8).base64EncodedString().replacingOccurrences(of: "/", with: "_")
-        return root.appendingPathComponent(safe)
+    private func storageHandle(_ handle: String) -> String {
+        "wave-d|\(boundUserID)|\(bindingDigest)|\(handle)"
     }
 
     public func evidenceGraph(
@@ -256,13 +245,35 @@ public final class TokenSaverWaveDRuntime: @unchecked Sendable {
     public func mlxMayInventShell() -> Bool { false }
 
     public func recordValidationFailure() {
-        lock.lock(); validationFailed = true; lock.unlock()
+        lock.lock()
+        validationFailed = true
+        validationProofDigest = nil
+        lock.unlock()
+    }
+
+    @discardableResult
+    internal func recordValidationSuccess(
+        proofDigest: String,
+        requestingUserID: String,
+        bindingDigest: String
+    ) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard _live,
+              authorize(requestingUserID: requestingUserID, bindingDigest: bindingDigest) == nil else {
+            return false
+        }
+        let proof = proofDigest.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !proof.isEmpty else { return false }
+        validationFailed = false
+        validationProofDigest = proof
+        return true
     }
 
     public func taskDoneAllowed() -> Bool {
         lock.lock(); defer { lock.unlock() }
         if !_live { return true }
-        return !validationFailed
+        return !validationFailed && validationProofDigest != nil
     }
 
     public static let packageManagerAutoWrapEnabled = false

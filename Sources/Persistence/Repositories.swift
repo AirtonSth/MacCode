@@ -1923,7 +1923,11 @@ public final class AgentQueuedMessageRepository {
 }
 
 public final class AgentRunRepository: @unchecked Sendable {
-    public static let maximumPersistedEventRowBytes = 512 * 1_024
+    /// Absolute per-row ceiling for a 16 GB MacBook class machine. Frames under
+    /// this always admit; thread/global retention prunes oldest rows when the
+    /// cumulative budget is near full. Only pathological frames above this are
+    /// soft-truncated (no recoverable "omitted" banner).
+    public static let maximumPersistedEventRowBytes = 16 * 1_024 * 1_024
     let db: SQLiteDB
     private let globalRetentionStateLock = NSLock()
     private let globalRetentionQueue = DispatchQueue(
@@ -1936,23 +1940,36 @@ public final class AgentRunRepository: @unchecked Sendable {
     public init(db: SQLiteDB) { self.db = db }
 
     private func boundedStreamRow(kind: String, payloadJSON: String) -> (kind: String, payloadJSON: String) {
-        guard kind.utf8.count + payloadJSON.utf8.count > Self.maximumPersistedEventRowBytes else {
-            return (kind, payloadJSON)
-        }
-        let marker = AssistantEvent.error(
-            message: "A provider event was omitted from local history because it exceeded the 512 KiB event limit (\(payloadJSON.utf8.count) bytes).",
-            recoverable: true
-        )
-        let encoded = (try? JSONEncoder().encode(marker)).map { String(decoding: $0, as: UTF8.self) }
-            ?? #"{"error":{"message":"Oversized provider event omitted.","recoverable":true}}"#
-        return ("historyPayloadOmitted", encoded)
+        let kindBytes = kind.utf8.count
+        let payloadBudget = max(1, Self.maximumPersistedEventRowBytes - kindBytes)
+        let boundedPayload = Self.softTruncateUTF8Payload(payloadJSON, byteLimit: payloadBudget)
+        return (kind, boundedPayload)
     }
 
     private func boundedProviderPayload(_ payloadJSON: String) -> String {
-        guard payloadJSON.utf8.count <= Self.maximumPersistedEventRowBytes else {
-            return #"{"remote_code_truncated":true,"reason":"event_size_limit","original_bytes":\#(payloadJSON.utf8.count)}"#
+        Self.softTruncateUTF8Payload(payloadJSON, byteLimit: Self.maximumPersistedEventRowBytes)
+    }
+
+    /// Character-safe soft truncate. Shared with coordinator so persist + buffer
+    /// share one admission policy.
+    nonisolated static func softTruncateUTF8Payload(
+        _ payloadJSON: String,
+        byteLimit: Int
+    ) -> String {
+        let limit = max(1, byteLimit)
+        let originalBytes = payloadJSON.utf8.count
+        guard originalBytes > limit else { return payloadJSON }
+        let trailer = "…[truncated \(originalBytes)→\(limit) bytes]"
+        let headBudget = max(0, limit - trailer.utf8.count)
+        var consumed = 0
+        var end = payloadJSON.startIndex
+        for index in payloadJSON.indices {
+            let step = String(payloadJSON[index]).utf8.count
+            if consumed + step > headBudget { break }
+            consumed += step
+            end = payloadJSON.index(after: index)
         }
-        return payloadJSON
+        return String(payloadJSON[..<end]) + trailer
     }
 
     public func upsert(_ r: AgentRun) throws {
@@ -2025,6 +2042,21 @@ public final class AgentRunRepository: @unchecked Sendable {
         try st.bind(4, bounded.payloadJSON)
         try st.bind(5, iso.string(from: Date()))
         _ = try st.step()
+        // Single-path writers (tests + rare direct callers) must also reclaim so
+        // a large admit never relies on the batch prune cadence alone.
+        if let run = try get(id: runId) {
+            try db.performSync { database in
+                let pruned = try pruneStreamEvents(
+                    db: database,
+                    threadId: run.threadId,
+                    keepLatest: AgentEventRetentionPolicy.production.streamEventCountPerThread,
+                    maxPayloadBytes: AgentEventRetentionPolicy.production.streamEventBytesPerThread
+                )
+                if pruned {
+                    try markAgentHistoryPartial(db: database, threadId: run.threadId)
+                }
+            }
+        }
     }
 
     /// Highest durable sequence already committed for `runId`, or `0` when none.
@@ -2168,6 +2200,9 @@ public final class AgentRunRepository: @unchecked Sendable {
         retentionPolicy policy: AgentEventRetentionPolicy = .production
     ) throws {
         guard !items.isEmpty || shouldPruneStreamEvents else { return }
+        // Always reclaim after any write so a large new frame never fails closed
+        // with an "omitted" banner — older history is dropped first.
+        let shouldReclaim = !items.isEmpty || shouldPruneStreamEvents
         try db.performSync { db in
             try db.transaction {
                 for item in items {
@@ -2181,7 +2216,7 @@ public final class AgentRunRepository: @unchecked Sendable {
                         )
                     }
                 }
-                if shouldPruneStreamEvents {
+                if shouldReclaim {
                     let streamPruned = try pruneStreamEvents(
                         db: db,
                         threadId: threadId,
@@ -2200,7 +2235,7 @@ public final class AgentRunRepository: @unchecked Sendable {
                 }
             }
         }
-        if shouldPruneStreamEvents {
+        if shouldReclaim {
             scheduleGlobalEventPayloadPruning(policy: policy)
         }
     }
@@ -2227,6 +2262,11 @@ public final class AgentRunRepository: @unchecked Sendable {
         try st.bind(11, Int64(event.receivedAtMs))
         try st.bind(12, iso.string(from: Date()))
         _ = try st.step()
+        _ = try pruneProviderEventLogs(
+            threadId: threadId,
+            keepLatest: AgentEventRetentionPolicy.production.providerLogCountPerThread,
+            maxPayloadBytes: AgentEventRetentionPolicy.production.providerLogBytesPerThread
+        )
     }
 
     public func countProviderEventLogs(threadId: AgentThreadID) throws -> Int {
@@ -2327,7 +2367,9 @@ public final class AgentRunRepository: @unchecked Sendable {
             DELETE FROM agent_provider_event_logs
             WHERE id IN (
                 SELECT id FROM ranked
-                WHERE row_number > ? OR running_bytes > ?
+                -- Always keep the newest row so a large fresh event can enter;
+                -- reclaim budget by deleting older rows only.
+                WHERE row_number > ? OR (row_number > 1 AND running_bytes > ?)
             );
         """)
         try st.bind(1, threadId.value.uuidString)
@@ -2467,7 +2509,9 @@ public final class AgentRunRepository: @unchecked Sendable {
             DELETE FROM agent_stream_events
             WHERE id IN (
                 SELECT id FROM ranked
-                WHERE row_number > ? OR running_bytes > ?
+                -- Always keep the newest row so a large fresh event can enter;
+                -- reclaim budget by deleting older rows only.
+                WHERE row_number > ? OR (row_number > 1 AND running_bytes > ?)
             );
         """)
         try st.bind(1, threadId.value.uuidString)

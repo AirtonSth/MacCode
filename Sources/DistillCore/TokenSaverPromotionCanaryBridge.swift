@@ -9,12 +9,14 @@ public enum TokenSaverPromotionCanaryBridge {
     public static func sharedRuntime(
         boundUserID: String,
         bindingDigest: String,
-        durableDirectory: URL
+        encryptedStore: TokenSaverEncryptedStore,
+        scope: TokenSaverEncryptedStore.Scope
     ) -> TokenSaverPromotionCanaryRuntime {
-        TokenSaverPromotionCanaryRuntime(
+        let originals = TokenSaverEncryptedOriginalStore(store: encryptedStore, scope: scope)
+        return TokenSaverPromotionCanaryRuntime(
             boundUserID: boundUserID,
             bindingDigest: bindingDigest,
-            durableDirectory: durableDirectory
+            originalStore: originals
         )
     }
 }

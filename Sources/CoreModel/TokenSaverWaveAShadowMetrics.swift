@@ -91,9 +91,30 @@ public enum TokenSaverWaveAShadowMetrics {
     public final class Ledger: @unchecked Sendable {
         private let lock = NSLock()
         private var records: [Record] = []
-        public init() {}
-        public func append(_ r: Record) { lock.lock(); records.append(r); lock.unlock() }
-        public func snapshot() -> [Record] { lock.lock(); defer { lock.unlock() }; return records }
+        private var nextRecordIndex = 0
+        private let maxRecords: Int
+        private var _droppedRecords: Int = 0
+        public var droppedRecords: Int { lock.lock(); defer { lock.unlock() }; return _droppedRecords }
+        public init(maxRecords: Int = 4_096) {
+            self.maxRecords = max(1, maxRecords)
+        }
+        public func append(_ r: Record) {
+            lock.lock()
+            if records.count < maxRecords {
+                records.append(r)
+            } else {
+                records[nextRecordIndex] = r
+                nextRecordIndex = (nextRecordIndex + 1) % maxRecords
+                if _droppedRecords < .max { _droppedRecords += 1 }
+            }
+            lock.unlock()
+        }
+        public func snapshot() -> [Record] {
+            lock.lock()
+            defer { lock.unlock() }
+            guard records.count == maxRecords, nextRecordIndex > 0 else { return records }
+            return Array(records[nextRecordIndex...]) + Array(records[..<nextRecordIndex])
+        }
         public var count: Int { lock.lock(); defer { lock.unlock() }; return records.count }
     }
 
