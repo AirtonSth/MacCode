@@ -3960,8 +3960,8 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             // task-08: Token Saver PATH/hint only when same-user admission allows.
             let tokenSaverEnv = context.tokenSaverAgentEnvironment(provider: provider, threadId: threadId)
             if tokenSaverEnv.isEmpty {
-                // Cross-user / raw-only: no managed distill bin, no Token Saver hints.
-                return env
+                // Cross-user / raw-only: scrub Token Saver keys and managed distill PATH.
+                return Self.scrubTokenSaverEnvironment(env)
             }
             env["PATH"] = Self.providerPathWithManagedWrappers(
                 currentPath: env["PATH"] ?? ProcessInfo.processInfo.environment["PATH"] ?? "",
@@ -3969,10 +3969,30 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             )
             env.merge(tokenSaverEnv) { _, new in new }
         } else {
-            // No thread context: keep provider tag only; do not force Token Saver PATH/hint
-            // without same-user admission (task-08 fail-closed).
+            // No thread context: keep provider tag only; scrub any residual TS keys.
+            return Self.scrubTokenSaverEnvironment(env)
         }
         return env
+    }
+
+    /// Removes Token Saver env keys and managed distill bin from PATH (task-08 raw-only).
+    static func scrubTokenSaverEnvironment(_ env: [String: String]) -> [String: String] {
+        var cleaned = env
+        let keys = [
+            "RC_TOKEN_SAVER_DISTILL_HINT",
+            "RC_TOKEN_SAVER_POST_TOOL_USE",
+            "RC_TOKEN_SAVER_WORKSPACE_ID",
+            "RC_TOKEN_SAVER_PROJECT_ID",
+            "RC_TOKEN_SAVER_THREAD_ID",
+            "REMOTE_CODE_DISTILL_STATE_PATH",
+        ]
+        for k in keys { cleaned.removeValue(forKey: k) }
+        let managedBin = AgentSkillInstaller.defaultManagedCLIBinDirectory().path
+        if let path = cleaned["PATH"] {
+            let parts = path.split(separator: ":").map(String.init).filter { $0 != managedBin }
+            cleaned["PATH"] = parts.joined(separator: ":")
+        }
+        return cleaned
     }
 
     static func providerPathWithManagedWrappers(currentPath: String, managedBin: String) -> String {
