@@ -71,9 +71,11 @@ public final class TokenSaverRolloverHandoffRuntime: @unchecked Sendable {
         /// Minimum fixed-corpus size for lossy promotion (aligned with quality gates).
         public static let minimumCorpusSamples = 24
 
-        /// Mint a seal only when corpus and scope evidence meet thresholds.
-        /// Free `Bool` flags alone never produce a seal.
-        public static func seal(
+        /// **Not public.** Seals are minted only inside CoreModel (and `@testable` tests).
+        /// External modules cannot manufacture lossy admission from free scalars — a future
+        /// same-module validator adapter will mint seals after real corpus evaluation.
+        @discardableResult
+        internal static func seal(
             corpusSamples: Int,
             corpusFailures: Int,
             scopeBindingDigest: String,
@@ -86,7 +88,6 @@ public final class TokenSaverRolloverHandoffRuntime: @unchecked Sendable {
                   pinsRespected else {
                 return nil
             }
-            // Mix evidence into token so seals are not a constant singleton.
             var hasher = Hasher()
             hasher.combine(corpusSamples)
             hasher.combine(corpusFailures)

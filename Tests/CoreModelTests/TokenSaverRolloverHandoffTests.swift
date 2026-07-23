@@ -79,7 +79,8 @@ final class TokenSaverRolloverHandoffTests: XCTestCase {
         let rt = TokenSaverRolloverHandoffRuntime(boundUserID: "u")
         rt.live = true
         let original = Data("secret-bytes".utf8)
-        // Gate seal cannot be minted from undersized corpus / failures / empty scope.
+        // Public surface: LossyGate.seal is internal — external modules cannot mint seals.
+        // Thresholds still enforced for the internal mint used by tests / same-module adapters.
         XCTAssertNil(TokenSaverRolloverHandoffRuntime.LossyGate.seal(
             corpusSamples: 10, corpusFailures: 0, scopeBindingDigest: "s", pinsRespected: true
         ))
