@@ -37,17 +37,18 @@ public enum TokenSaverAdapterMatrix {
         }
     }
 
-    public static func mergeMode(cliSettingsOverlay: Bool, sdkHooks: Bool) -> MergeMode {
+    public static func mergeMode(cliSettingsOverlay: Bool, sdkHooks: Bool) -> MergeMode? {
         switch (cliSettingsOverlay, sdkHooks) {
         case (true, false): return .cliSettingsOnly
         case (false, true): return .sdkHooksOnly
         case (true, true): return .mixedIllegal
-        default: return .cliSettingsOnly
+        default: return nil // no adapter path configured
         }
     }
 
-    public static func laneAfterMerge(_ mode: MergeMode) -> LaneState {
-        mode == .mixedIllegal ? .off : .shadow
+    public static func laneAfterMerge(_ mode: MergeMode?) -> LaneState {
+        guard let mode else { return .off }
+        return mode == .mixedIllegal ? .off : .shadow
     }
 
     /// Settings files must remain byte-untouched by RemoteCode overlay.

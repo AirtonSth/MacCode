@@ -8,6 +8,11 @@ final class TokenSaverAdapterMatrixTests: XCTestCase {
         XCTAssertEqual(TokenSaverAdapterMatrix.laneAfterMerge(mode), .off)
     }
 
+    func test_noAdapterConfigured_isOff() {
+        XCTAssertNil(TokenSaverAdapterMatrix.mergeMode(cliSettingsOverlay: false, sdkHooks: false))
+        XCTAssertEqual(TokenSaverAdapterMatrix.laneAfterMerge(nil), .off)
+    }
+
     func test_settingsUntouched() {
         let d = Data("user-settings".utf8)
         XCTAssertTrue(TokenSaverAdapterMatrix.settingsUntouched(before: d, after: d))
