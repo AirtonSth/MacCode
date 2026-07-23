@@ -374,6 +374,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     // lock for nonisolated callers) and drain the whole buffer in one hop when
     // the first event of each tick schedules the flush Task.
     private let streamEventBatch = StreamEventBatch()
+    /// True when the hot UI event queue refused at least one already-durable
+    /// stream event. Cleared after a durable replay rebuilds the live timeline.
+    private var streamUIBackpressured = false
 
     // QA-MAC_AGENT-CLOCK: injectable clock so "Working for Xs" elapsed math
     // and adaptive-sidebar debounce timestamps are deterministically testable.
@@ -576,6 +579,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         messageHistoryLoadTask?.cancel()
         messageHistoryLoadTask = nil
         _ = streamEventBatch.drain()
+        streamUIBackpressured = false
         publishInterestedThreadId(nil)
         coordinator.removeObserver(self)
         // Drop the heavy transcript payload so closed tabs free memory promptly.
@@ -821,6 +825,8 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         }
         loadAllMessages(id)
         timeline = AssistantTimelineState()
+        streamUIBackpressured = false
+        _ = streamEventBatch.drain()
         let persistedEvents = coordinator.latestStreamEvents(threadId: id)
         if coordinator.hotReplayIsPartial(threadId: id) {
             statusMessage = "Showing the recent Agent history window. Earlier transcript events remain outside the hot replay budget."
@@ -1423,8 +1429,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     }
 
     // MARK: Bounded message history
-    nonisolated static let fullLoadBodyBudgetBytes = 24 * 1024 * 1024  // ~24 MB of transcript text
-    nonisolated static let messageHistoryPageLimit = 500
+    /// Hot transcript window for a 16 GB MacBook class machine (~0.6% of RAM).
+    nonisolated static let fullLoadBodyBudgetBytes = 96 * 1024 * 1024
+    nonisolated static let messageHistoryPageLimit = 2_000
 
     private func loadAllMessages(_ id: AgentThreadID) {
         // SQLite access remains on the app's established DB actor, but the query is
@@ -4578,7 +4585,12 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         }
         let quantum = streamEventBatch.drainQuantum()
         let pending = quantum.entries
-        guard !pending.isEmpty else { return }
+        if pending.isEmpty {
+            if streamUIBackpressured, let tid = selectedThreadId {
+                rehydrateTimelineAfterStreamBackpressure(threadId: tid)
+            }
+            return
+        }
         if quantum.hasMore {
             Task { @MainActor [weak self] in
                 await Task.yield()
@@ -4620,7 +4632,12 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             }
         }
         nextTimeline.enforceAggregateHotTextBudget()
-        guard appliedEvent else { return }
+        guard appliedEvent else {
+            if !quantum.hasMore, streamUIBackpressured, let tid = selectedThreadId {
+                rehydrateTimelineAfterStreamBackpressure(threadId: tid)
+            }
+            return
+        }
         // UX: transient durability banners (sqlite "database is locked", etc.)
         // stick only while the stream is still failing. Once a later event proves
         // the run continued, drop the banner so it does not outlive the outage.
@@ -4644,6 +4661,64 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         if appliedEvents.contains(where: { if case .proposedPlan = $0 { return true }; return false }) {
             scheduleFullAccessPlanAutoImplementIfNeeded()
         }
+        // After the hot queue drains, rebuild from durable stream events so any
+        // paints skipped while the MainActor was behind are restored without
+        // forcing the user to Continue / reopen the thread.
+        if !quantum.hasMore, streamUIBackpressured, let tid = selectedThreadId {
+            rehydrateTimelineAfterStreamBackpressure(threadId: tid)
+        }
+    }
+
+    /// Apply one event that the hot queue refused, without growing the queue.
+    /// Timeline caps keep the paint bounded; used for the first saturation of an
+    /// episode so a single huge tool payload still appears live.
+    private func applyRefusedStreamEventDirectly(
+        _ event: AssistantEvent,
+        run: AgentRunID,
+        threadId: AgentThreadID
+    ) {
+        guard threadId == selectedThreadId else { return }
+        if suppressStaleActivePlanUpdates, case .activePlanUpdated = event {
+            return
+        }
+        if !terminalRunIds.contains(run) {
+            currentRunId = run
+            runThreads[run] = threadId
+            if status != .running { status = .running }
+        }
+        timeline.apply(event)
+        timeline.enforceAggregateHotTextBudget()
+        if case let .error(_, recoverable) = event {
+            lastErrorRecoverable = recoverable
+        }
+        refreshSR1TranslationStateFromTimeline()
+        scheduleTimelineUpdateTick()
+        if case .proposedPlan = event {
+            scheduleFullAccessPlanAutoImplementIfNeeded()
+        }
+    }
+
+    /// Rebuild the live timeline from the durable hot-replay window after the UI
+    /// queue refused events. Idempotent: clears the backpressure flag so a quiet
+    /// stream does not keep replaying.
+    private func rehydrateTimelineAfterStreamBackpressure(threadId: AgentThreadID) {
+        guard streamUIBackpressured, selectedThreadId == threadId else { return }
+        streamUIBackpressured = false
+        let events = coordinator.latestStreamEvents(threadId: threadId)
+        var rebuilt = AssistantTimelineState()
+        for event in events {
+            if suppressStaleActivePlanUpdates, case .activePlanUpdated = event {
+                continue
+            }
+            rebuilt.apply(event)
+        }
+        rebuilt.enforceAggregateHotTextBudget()
+        timeline = rebuilt
+        rehydrateDurableActiveState(threadId: threadId)
+        lastErrorRecoverable = Self.displayedErrorIsRecoverable(in: events)
+        refreshSR1TranslationStateFromTimeline()
+        timelineItemIndex = TimelineItemIndex(turns: timeline.turns)
+        scheduleTimelineUpdateTick()
     }
 
     /// True for local durability noise that is not a provider-run failure.
@@ -4697,15 +4772,22 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 self.flushStreamEvents()
             }
         } else if outcome == .saturated {
-            // The coordinator persisted the event before observer fan-out. Stop at
-            // the durable resume cursor instead of letting a blocked MainActor
-            // create an unbounded in-memory transcript queue. Reopening/Continue
-            // replays the retained durable tail; the visible status makes the
-            // controlled stop explicit rather than silently dropping UI work.
-            c.stopRun(run)
+            // Keep the provider running under Full Access. Stopping the turn just
+            // because the MainActor paint queue is briefly behind (or because one
+            // tool payload exceeds the hot-queue hard ceiling) aborts multi-minute
+            // loops mid-work. Apply this refused event directly — timeline text
+            // caps still bound memory — and rebuild any later gaps from durable
+            // stream history once the queue drains or the run finishes.
+            let refused = event
             Task { @MainActor in
                 guard !self.isDisposed, self.selectedThreadId == threadId else { return }
-                self.statusMessage = "Agent paused because the UI event buffer reached its memory budget. Continue to resume from the saved provider cursor."
+                self.streamUIBackpressured = true
+                self.applyRefusedStreamEventDirectly(refused, run: run, threadId: threadId)
+            }
+        } else if outcome == .saturationAlreadyReported {
+            Task { @MainActor in
+                guard !self.isDisposed, self.selectedThreadId == threadId else { return }
+                self.streamUIBackpressured = true
             }
         }
     }
@@ -4746,6 +4828,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 }
             }
             if finishedTid == self.selectedThreadId {
+                if self.streamUIBackpressured {
+                    self.rehydrateTimelineAfterStreamBackpressure(threadId: finishedTid)
+                }
                 if status == .completed || status == .cancelled {
                     // A finished turn that progressed past a durability blip must
                     // not leave "database is locked" stuck under the composer.
@@ -4998,10 +5083,15 @@ final class InterestedThreadBox: @unchecked Sendable {
 // background thread (append) and the main actor (drain).
 final class StreamEventBatch: @unchecked Sendable {
     struct Limits: Equatable {
-        var maxBufferedCount: Int = 512
-        var maxBufferedBytes: Int = 4 * 1_024 * 1_024
-        var drainCount: Int = 64
-        var drainBytes: Int = 512 * 1_024
+        /// Hot UI queue only — durable stream history is bounded separately.
+        /// Sized for a 16 GB MacBook class machine: leave headroom for the OS,
+        /// Chrome, and provider processes while absorbing multi-minute tool
+        /// storms (Chrome HTML dumps, shell output) without thrashing the latch.
+        /// ~256 MB is ~1.5% of 16 GB and still fail-closed above that.
+        var maxBufferedCount: Int = 32_768
+        var maxBufferedBytes: Int = 256 * 1_024 * 1_024
+        var drainCount: Int = 512
+        var drainBytes: Int = 8 * 1_024 * 1_024
     }
 
     enum AppendOutcome: Equatable {
@@ -5039,6 +5129,12 @@ final class StreamEventBatch: @unchecked Sendable {
         )
     }
 
+    var isEmpty: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return buffer.isEmpty
+    }
+
     /// Appends an event. Returns `true` iff the caller should schedule a flush Task
     /// (i.e. the buffer was empty before this append — first event of the tick).
     func append(event: AssistantEvent, run: AgentRunID, threadId: AgentThreadID) -> Bool {
@@ -5053,10 +5149,15 @@ final class StreamEventBatch: @unchecked Sendable {
         if let saturationRunID, saturationRunID != run {
             self.saturationRunID = nil
         }
+        // drainBytes is a *paint quantum* (how much work one MainActor hop applies),
+        // not a hard admission ceiling. drainQuantum already admits a single event
+        // larger than the quantum when the buffer head is oversized. Rejecting those
+        // here used to abort long agent runs on the first large tool payload
+        // (Chrome HTML, shell dumps) even with an empty queue.
+        let eventExceedsHardCeiling = bytes > limits.maxBufferedBytes
         let wouldExceedCount = buffer.count >= limits.maxBufferedCount
         let wouldExceedBytes = bufferedBytes + bytes > limits.maxBufferedBytes
-        let eventExceedsQuantum = bytes > limits.drainBytes || bytes > limits.maxBufferedBytes
-        if eventExceedsQuantum || wouldExceedCount || wouldExceedBytes {
+        if eventExceedsHardCeiling || wouldExceedCount || wouldExceedBytes {
             if saturationRunID == run { return .saturationAlreadyReported }
             saturationRunID = run
             return .saturated

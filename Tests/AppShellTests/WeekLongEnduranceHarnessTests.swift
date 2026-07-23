@@ -352,17 +352,17 @@ final class WeekLongEnduranceHarnessTests: XCTestCase {
         XCTAssertEqual(
             batch.appendBounded(event: oversized, run: run, threadId: thread),
             .saturated,
-            "an event larger than one UI quantum must be rejected before it enters memory"
+            "an event larger than maxBufferedBytes must be rejected before it enters the hot UI queue"
         )
         XCTAssertEqual(
             batch.appendBounded(event: oversized, run: run, threadId: thread),
             .saturationAlreadyReported,
-            "one oversized-event episode may request at most one controlled stop"
+            "one hard-ceiling episode may report at most once while the refuse holds"
         )
         let oversizedDrain = batch.drainQuantum()
         XCTAssertTrue(
             oversizedDrain.entries.isEmpty,
-            "the hard ceiling must not retain the oversized payload while the stop is being reported"
+            "the hard ceiling must not retain the oversized payload in the hot queue"
         )
         XCTAssertEqual(oversizedDrain.encodedByteCount, 0)
         XCTAssertFalse(oversizedDrain.hasMore)
@@ -382,7 +382,7 @@ final class WeekLongEnduranceHarnessTests: XCTestCase {
         XCTAssertEqual(
             batch.appendBounded(event: .turnStarted(turnId: "ui-overflow-repeat"), run: run, threadId: thread),
             .saturationAlreadyReported,
-            "a full-queue episode must also request only one controlled stop"
+            "a full-queue episode must also report only once while the high-water holds"
         )
         var drained = 0
         repeat {

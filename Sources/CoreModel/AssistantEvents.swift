@@ -647,8 +647,10 @@ public struct AssistantTurnSnapshot: Codable, Sendable, Equatable {
 }
 
 public struct AssistantTimelineState: Codable, Sendable, Equatable {
-    public static let liveTextLimit = 80_000
-    public static let liveOutputLimit = 120_000
+    /// Per-item live caps for a 16 GB MacBook class machine. Large enough for
+    /// real tool dumps (Chrome HTML, shell) while still bounding SwiftUI paint cost.
+    public static let liveTextLimit = 200_000
+    public static let liveOutputLimit = 400_000
     // Memory ceiling, NOT a display window. Sized at/above the DB's per-thread stream-event
     // prune cap (~5000) so turns can never be the truncation point — reopening a long thread
     // shows 100% of its turns. The bound still exists as a pathological-OOM backstop; total
@@ -668,7 +670,9 @@ public struct AssistantTimelineState: Codable, Sendable, Equatable {
     // (per-line UUID fallbacks, items evicted by trimTurnItems) never pair, so
     // without a cap the buffer grows monotonically for the life of the timeline.
     public static let pendingItemDeltaLimit = 64
-    public static let aggregateHotTextByteLimit = 8 * 1_024 * 1_024
+    /// Aggregate live timeline text for a 16 GB MacBook class machine.
+    /// Keeps multi-turn tool storms visible without letting one tab pin multi-GB.
+    public static let aggregateHotTextByteLimit = 96 * 1_024 * 1_024
     private static let aggregateHotElementOverhead = 128
 
     public var threadId: String?

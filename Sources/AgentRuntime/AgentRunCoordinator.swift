@@ -1785,8 +1785,10 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     /// Hot replay is bounded independently by encoded bytes and row count. Durable
     /// messages and compact ActiveThreadState preserve completed output and resume
     /// correctness when the evictable event prefix is outside this window.
-    public static let hotReplayEventCount = 2_000
-    public static let hotReplayEventBytes: Int64 = 24 * 1_024 * 1_024
+    /// Sized for a 16 GB MacBook class machine so long Full Access / Chrome turns
+    /// rehydrate without clipping the recent window the UI just buffered.
+    public static let hotReplayEventCount = 16_384
+    public static let hotReplayEventBytes: Int64 = 256 * 1_024 * 1_024
 
     public func latestStreamEvents(threadId: AgentThreadID) -> [AssistantEvent] {
         (try? runRepo.listLatestStreamEvents(
