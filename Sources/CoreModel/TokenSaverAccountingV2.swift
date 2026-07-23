@@ -2,6 +2,12 @@ import Foundation
 
 /// Fase 3 accounting truth states + estimator (task-10).
 /// Confirmed savings only from ledger events / provider token-usage, never character counts alone.
+///
+/// **Forgeability invariant:** no *public* CoreModel API accepts raw token scalars and writes
+/// `providerMeasured` / confirmed savings. `Ledger.markProviderMeasured` is `internal` (visible
+/// only inside CoreModel + `@testable` tests). External modules can read `measuredSnapshot` /
+/// mint receipts only after a trusted same-module adapter (future AgentRuntime/Distill wiring)
+/// records the measurement.
 public enum TokenSaverAccountingV2 {
     public static let schemaVersion = 2
     public static let taskID = "task-10"
@@ -119,6 +125,11 @@ public enum TokenSaverAccountingV2 {
             lock.lock(); defer { lock.unlock() }
             guard var op = byDigest[digest] else { return .failure(.missing) }
             if op.deleted { return .failure(.deleted) }
+            // Measured savings are not a public state hop: only markProviderMeasured (internal)
+            // may enter providerMeasured with binding + tokens.
+            if newState == .providerMeasured {
+                return .failure(.illegalTransition)
+            }
             guard TokenSaverAccountingV2.canTransition(from: op.state, to: newState) else {
                 return .failure(.illegalTransition)
             }
@@ -127,7 +138,12 @@ public enum TokenSaverAccountingV2 {
             return .success(op)
         }
 
-        public func markProviderMeasured(
+        /// Record provider-measured savings. **Not part of the public CoreModel surface** —
+        /// `internal` so external modules cannot forge credits from raw scalars.
+        /// Production wiring must live in a trusted same-module adapter (or `@testable` tests).
+        /// Requires experimental pair, non-empty binding, and a legal applied→measured edge.
+        @discardableResult
+        internal func markProviderMeasured(
             _ digest: String,
             experimentalPair: Bool,
             providerTokensSaved: Int64 = 0,

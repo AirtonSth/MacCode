@@ -446,21 +446,32 @@ public final class TokenSaverTurnBatchRuntime: @unchecked Sendable {
     ) -> Bool {
         lock.lock()
         defer { lock.unlock() }
+        /// Mutations that may still be running after timeout/cancel must keep the
+        /// idempotency key reserved so a retry cannot double-apply (AC-07).
+        func releaseUnlessIndeterminateMutation(timedOutOrCancelled: Bool) {
+            guard let key = reservedKey, !key.isEmpty else { return }
+            if action.kind == .mutation && timedOutOrCancelled {
+                // Leave key reserved (tryReserve will fail on retry).
+                return
+            }
+            idempotency.release(key)
+        }
         // Timed out globally?
         if timedOut {
-            if let key = reservedKey, !key.isEmpty { idempotency.release(key) }
+            releaseUnlessIndeterminateMutation(timedOutOrCancelled: true)
             outcomes[action.id] = .timedOut
             receipts.append(makeReceipt(action, .timedOut, outputKnown: false))
             return true
         }
         if cancelled {
-            if let key = reservedKey, !key.isEmpty { idempotency.release(key) }
+            releaseUnlessIndeterminateMutation(timedOutOrCancelled: true)
             outcomes[action.id] = .cancelled
             receipts.append(makeReceipt(action, .cancelled, outputKnown: false))
             return true
         }
         if !execResult.success {
-            if let key = reservedKey, !key.isEmpty { idempotency.release(key) }
+            // Per-action timeout on mutations: keep reserved. Plain failures release for retry.
+            releaseUnlessIndeterminateMutation(timedOutOrCancelled: execResult.timedOut)
             let o: Outcome = execResult.timedOut ? .timedOut : .failed
             outcomes[action.id] = o
             receipts.append(makeReceipt(action, o, outputKnown: false))
