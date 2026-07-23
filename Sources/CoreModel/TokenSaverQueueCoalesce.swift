@@ -118,12 +118,21 @@ public final class TokenSaverQueueCoalesceRuntime: @unchecked Sendable {
         public let pendingMutation: Bool
     }
 
+    public enum OmissionSaveResult: Sendable, Equatable {
+        /// First durable write of this handle.
+        case created
+        /// Handle already present with identical bytes (shared / re-save); must not be rolled back.
+        case alreadyIdentical
+        /// Handle present with different bytes, or write failed.
+        case conflict
+    }
+
     public protocol DurabilityStore: AnyObject {
         func loadProjection(key: String) -> Projection?
         func saveProjection(key: String, projection: Projection) -> Bool
         func deleteProjection(key: String)
         func loadOmission(handle: String) -> Data?
-        func saveOmission(handle: String, data: Data) -> Bool
+        func saveOmission(handle: String, data: Data) -> OmissionSaveResult
         func deleteOmission(handle: String)
     }
 
@@ -153,11 +162,13 @@ public final class TokenSaverQueueCoalesceRuntime: @unchecked Sendable {
         public func loadOmission(handle: String) -> Data? {
             lock.lock(); defer { lock.unlock() }; return omissions[handle]
         }
-        public func saveOmission(handle: String, data: Data) -> Bool {
+        public func saveOmission(handle: String, data: Data) -> OmissionSaveResult {
             lock.lock(); defer { lock.unlock() }
-            if omissions[handle] != nil { return false }
+            if let existing = omissions[handle] {
+                return existing == data ? .alreadyIdentical : .conflict
+            }
             omissions[handle] = data
-            return true
+            return .created
         }
         public func deleteOmission(handle: String) {
             lock.lock(); omissions.removeValue(forKey: handle); lock.unlock()
@@ -189,11 +200,20 @@ public final class TokenSaverQueueCoalesceRuntime: @unchecked Sendable {
         public func saveProjection(key: String, projection: Projection) -> Bool {
             lock.lock(); defer { lock.unlock() }
             let url = projURL(key)
-            if let existing = loadProjectionUnlocked(url: url), existing != projection { return false }
+            if let existing = loadProjectionUnlocked(url: url) {
+                // Idempotent only when same value; never overwrite a different projection.
+                return existing == projection
+            }
+            // Exclusive create: withoutOverwriting fails if another writer raced in.
             do {
-                try Data(projection.rawValue.utf8).write(to: url, options: .atomic)
+                try Data(projection.rawValue.utf8).write(to: url, options: [.withoutOverwriting])
                 return true
-            } catch { return false }
+            } catch {
+                if let existing = loadProjectionUnlocked(url: url) {
+                    return existing == projection
+                }
+                return false
+            }
         }
         public func deleteProjection(key: String) {
             lock.lock(); defer { lock.unlock() }
@@ -208,14 +228,24 @@ public final class TokenSaverQueueCoalesceRuntime: @unchecked Sendable {
             lock.lock(); defer { lock.unlock() }
             return try? Data(contentsOf: omitURL(handle))
         }
-        public func saveOmission(handle: String, data: Data) -> Bool {
+        public func saveOmission(handle: String, data: Data) -> OmissionSaveResult {
             lock.lock(); defer { lock.unlock() }
             let url = omitURL(handle)
-            if FileManager.default.fileExists(atPath: url.path) { return false }
+            if FileManager.default.fileExists(atPath: url.path) {
+                if let existing = try? Data(contentsOf: url), existing == data {
+                    return .alreadyIdentical
+                }
+                return .conflict
+            }
             do {
-                try data.write(to: url, options: .atomic)
-                return true
-            } catch { return false }
+                try data.write(to: url, options: [.withoutOverwriting])
+                return .created
+            } catch {
+                if let existing = try? Data(contentsOf: url), existing == data {
+                    return .alreadyIdentical
+                }
+                return .conflict
+            }
         }
         public func deleteOmission(handle: String) {
             lock.lock(); defer { lock.unlock() }
@@ -298,17 +328,17 @@ public final class TokenSaverQueueCoalesceRuntime: @unchecked Sendable {
         lock.lock(); defer { lock.unlock() }
         guard _live else { return false }
         if pendingTool || pendingApproval { return false }
-        // CAS against authoritative heads (same lock as setProviderAuthority)
-        if !_providerHead.isEmpty, op.providerHead != _providerHead { return false }
-        if _generation != 0, op.generation != _generation { return false }
+        // Fail closed without initialized authority (no empty-head / zero-gen wildcards).
+        guard !_providerHead.isEmpty, _generation != 0 else { return false }
+        guard op.providerHead == _providerHead, op.generation == _generation else { return false }
         if store.loadProjection(key: op.storageKey) != nil { return false }
         admittedOps.insert(op.storageKey)
         return true
     }
 
     /// Commit exactly one projection under a single lock (check + durable write).
-    /// Compact requires [[rc:handle]] markers. Projection is written first; omissions next;
-    /// any omission failure rolls back the projection so retry is possible.
+    /// Compact: **store-before-loss** — durable originals first, then exclusive projection commit.
+    /// Markers in compact text must biject with supplied omissions (no extras, no missing).
     @discardableResult
     public func commit(
         op: CompactionOperationID,
@@ -319,38 +349,80 @@ public final class TokenSaverQueueCoalesceRuntime: @unchecked Sendable {
         lock.lock(); defer { lock.unlock() }
         guard _live else { return false }
         guard admittedOps.contains(op.storageKey) else { return false }
-        // CAS heads under same lock as durable writes
-        if !_providerHead.isEmpty, op.providerHead != _providerHead { return false }
-        if _generation != 0, op.generation != _generation { return false }
+        guard !_providerHead.isEmpty, _generation != 0 else { return false }
+        guard op.providerHead == _providerHead, op.generation == _generation else { return false }
 
-        var prepared: [(String, Data, String)] = [] // handle, data, marker check already done
+        var prepared: [(String, Data)] = []
         if projection == .compact {
             guard !omissions.isEmpty else { return false }
             guard let text = compactProjectionText, !text.isEmpty else { return false }
+            guard Self.validateCompactMarkers(text: text, omissions: omissions) else { return false }
+            var seenHandles = Set<String>()
             for o in omissions {
                 let h = o.handle.trimmingCharacters(in: .whitespacesAndNewlines)
-                guard !h.isEmpty else { return false }
-                guard text.contains(o.marker) else { return false }
-                prepared.append((h, o.original, o.marker))
+                guard !h.isEmpty, seenHandles.insert(h).inserted else { return false }
+                prepared.append((h, o.original))
             }
         }
 
-        // Projection first (authoritative choice raw XOR compact)
-        guard store.saveProjection(key: op.storageKey, projection: projection) else { return false }
-
+        // Store-before-loss: originals before compact projection becomes authoritative.
+        // Only newly-created handles are rolled back on failure (never shared pre-existing).
+        var newlyCreated: [String] = []
         if projection == .compact {
-            var written: [String] = []
-            for (h, data, _) in prepared {
-                if !store.saveOmission(handle: h, data: data) {
-                    store.deleteProjection(key: op.storageKey)
-                    for w in written { store.deleteOmission(handle: w) }
+            for (h, data) in prepared {
+                switch store.saveOmission(handle: h, data: data) {
+                case .created:
+                    newlyCreated.append(h)
+                case .alreadyIdentical:
+                    break
+                case .conflict:
+                    for w in newlyCreated { store.deleteOmission(handle: w) }
                     return false
                 }
-                written.append(h)
             }
+        }
+
+        // Exclusive projection publish (raw XOR compact).
+        if !store.saveProjection(key: op.storageKey, projection: projection) {
+            for w in newlyCreated { store.deleteOmission(handle: w) }
+            return false
         }
 
         admittedOps.remove(op.storageKey)
+        return true
+    }
+
+    /// Every well-formed `[[rc:handle]]` maps 1:1 to an omission; no extras, missing, empty, or malformed `[[rc:` stubs.
+    public static func validateCompactMarkers(text: String, omissions: [Omission]) -> Bool {
+        // Reject any `[[rc:` that is not a complete well-formed marker with non-empty handle.
+        let openCount = text.components(separatedBy: TokenSaverQueueCoalesce.handlePrefix).count - 1
+        let pattern = #"\[\[rc:([^\]]+)\]\]"#
+        guard let re = try? NSRegularExpression(pattern: pattern) else { return false }
+        let ns = text as NSString
+        let full = NSRange(location: 0, length: ns.length)
+        var textHandles: [String] = []
+        re.enumerateMatches(in: text, options: [], range: full) { match, _, _ in
+            guard let match, match.numberOfRanges >= 2 else { return }
+            let r = match.range(at: 1)
+            if r.location != NSNotFound {
+                let h = ns.substring(with: r)
+                // Empty or whitespace-only handles are malformed.
+                if !h.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    textHandles.append(h)
+                }
+            }
+        }
+        // Every `[[rc:` open must produce exactly one valid non-empty handle match.
+        guard openCount == textHandles.count else { return false }
+        let omissionHandles = omissions.map { $0.handle.trimmingCharacters(in: .whitespacesAndNewlines) }
+        guard omissionHandles.allSatisfy({ !$0.isEmpty }) else { return false }
+        guard Set(omissionHandles).count == omissionHandles.count else { return false }
+        guard Set(textHandles).count == textHandles.count else { return false }
+        guard textHandles.count == omissionHandles.count else { return false }
+        guard Set(textHandles) == Set(omissionHandles) else { return false }
+        for o in omissions {
+            guard text.contains(o.marker) else { return false }
+        }
         return true
     }
 
