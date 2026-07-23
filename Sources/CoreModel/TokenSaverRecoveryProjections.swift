@@ -19,24 +19,41 @@ public enum TokenSaverRecoveryProjections {
         }
     }
 
-    /// Only trusted adapters construct receipts — no public free-form token credits.
+    /// Only trusted adapters construct receipts — no public free-form token credits,
+    /// no caller-asserted verification booleans, and no rebinding of measured ops.
+    /// Minting requires an authoritative ledger snapshot (tokens + bindingDigest)
+    /// produced only by `markProviderMeasured`.
     public enum ReceiptFactory {
+        /// Mint from local ledger measured state. Binding comes from the ledger, not the caller.
         public static func fromLocalLedger(
-            bindingDigest: String,
-            confirmedTokens: Int64,
-            ledgerDigestMatch: Bool
+            ledger: TokenSaverAccountingV2.Ledger,
+            operationDigest: String
         ) -> MeasuredSavingsReceipt? {
-            guard !bindingDigest.isEmpty, ledgerDigestMatch, confirmedTokens >= 0 else { return nil }
-            return MeasuredSavingsReceipt(bindingDigest: bindingDigest, source: .localLedger, tokens: confirmedTokens)
+            mint(ledger: ledger, operationDigest: operationDigest, source: .localLedger)
         }
 
+        /// Mint after provider usage was recorded via `markProviderMeasured`.
+        /// Binding and tokens come only from the ledger.
         public static func fromProviderUsage(
-            bindingDigest: String,
-            providerTokensSaved: Int64,
-            usageEventPresent: Bool
+            ledger: TokenSaverAccountingV2.Ledger,
+            operationDigest: String
         ) -> MeasuredSavingsReceipt? {
-            guard !bindingDigest.isEmpty, usageEventPresent, providerTokensSaved >= 0 else { return nil }
-            return MeasuredSavingsReceipt(bindingDigest: bindingDigest, source: .providerUsage, tokens: providerTokensSaved)
+            mint(ledger: ledger, operationDigest: operationDigest, source: .providerUsage)
+        }
+
+        private static func mint(
+            ledger: TokenSaverAccountingV2.Ledger,
+            operationDigest: String,
+            source: MeasuredSavingsReceipt.Source
+        ) -> MeasuredSavingsReceipt? {
+            guard !operationDigest.isEmpty else { return nil }
+            guard let snap = ledger.measuredSnapshot(for: operationDigest) else { return nil }
+            _ = snap.evidenceDigest // available for callers that bind evidence separately
+            return MeasuredSavingsReceipt(
+                bindingDigest: snap.bindingDigest,
+                source: source,
+                tokens: snap.tokens
+            )
         }
     }
 
