@@ -11,13 +11,21 @@ final class TokenSaverAuthorityPlaneTests: XCTestCase {
         )
     }
 
+    private func fullPresentManifest() -> TokenSaverAuthorityPlane.CoverageManifest {
+        var cells: [String: TokenSaverAuthorityPlane.CoverageCellStatus] = [:]
+        for id in TokenSaverAuthorityPlane.CoverageManifest.requiredCellIDs {
+            cells[id] = .present
+        }
+        return .init(cells: cells)
+    }
+
     func test_registry_defaultOff_unknownDenies() {
         let reg = TokenSaverAuthorityPlane.Registry()
         XCTAssertFalse(reg.allowsReplacement(for: binding()))
         let decision = TokenSaverAuthorityPlane.evaluateRelease(
             binding: binding(),
             registry: reg,
-            manifest: .init(cells: ["tests": .present]),
+            manifest: fullPresentManifest(),
             consent: .init(exactLossless: true, semanticLocalAI: false, isLegacyPreference: false),
             requiresSemantic: false
         )
@@ -29,15 +37,55 @@ final class TokenSaverAuthorityPlaneTests: XCTestCase {
         let b = binding()
         reg.setReplacementAllowed(true, for: b)
         for bad in [TokenSaverAuthorityPlane.CoverageCellStatus.missing, .stale, .skipped, .inconclusive] {
+            var cells = fullPresentManifest().cells
+            cells["unit_tests"] = bad
             let decision = TokenSaverAuthorityPlane.evaluateRelease(
                 binding: b,
                 registry: reg,
-                manifest: .init(cells: ["unit": bad]),
+                manifest: .init(cells: cells),
                 consent: .init(exactLossless: true, semanticLocalAI: false, isLegacyPreference: false),
                 requiresSemantic: false
             )
             XCTAssertEqual(decision, .denyCoverage, "\(bad) must deny")
         }
+    }
+
+    func test_emptyOrPartialManifest_deniesCoverage() {
+        let reg = TokenSaverAuthorityPlane.Registry()
+        let b = binding()
+        reg.setReplacementAllowed(true, for: b)
+        XCTAssertEqual(
+            TokenSaverAuthorityPlane.evaluateRelease(
+                binding: b, registry: reg, manifest: .init(cells: [:]),
+                consent: .init(exactLossless: true, semanticLocalAI: false, isLegacyPreference: false),
+                requiresSemantic: false
+            ),
+            .denyCoverage
+        )
+        XCTAssertEqual(
+            TokenSaverAuthorityPlane.evaluateRelease(
+                binding: b, registry: reg, manifest: .init(cells: ["unit_tests": .present]),
+                consent: .init(exactLossless: true, semanticLocalAI: false, isLegacyPreference: false),
+                requiresSemantic: false
+            ),
+            .denyCoverage
+        )
+    }
+
+    func test_fullCoverage_allowsWhenRegistryOn() {
+        let reg = TokenSaverAuthorityPlane.Registry()
+        let b = binding()
+        reg.setReplacementAllowed(true, for: b)
+        let decision = TokenSaverAuthorityPlane.evaluateRelease(
+            binding: b,
+            registry: reg,
+            manifest: fullPresentManifest(),
+            consent: .init(exactLossless: true, semanticLocalAI: false, isLegacyPreference: false),
+            requiresSemantic: false
+        )
+        XCTAssertEqual(decision, .allowReplacement)
+        // Shadow path still never reports confirmed savings headline.
+        XCTAssertEqual(TokenSaverAuthorityPlane.shadowHeadlineConfirmedSavings, 0)
     }
 
     func test_legacyConsent_neverEnablesSemantic() {
@@ -77,7 +125,7 @@ final class TokenSaverAuthorityPlaneTests: XCTestCase {
         let decision = TokenSaverAuthorityPlane.evaluateRelease(
             binding: b,
             registry: reg,
-            manifest: .init(cells: ["unit": .present]),
+            manifest: fullPresentManifest(),
             consent: .init(exactLossless: true, semanticLocalAI: false, isLegacyPreference: false),
             requiresSemantic: false
         )

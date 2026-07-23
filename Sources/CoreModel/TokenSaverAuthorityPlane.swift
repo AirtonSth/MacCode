@@ -41,6 +41,16 @@ public enum TokenSaverAuthorityPlane {
     }
 
     public struct CoverageManifest: Sendable, Equatable {
+        /// Required cell IDs for a complete coverage manifest (fail-closed if any absent).
+        public static let requiredCellIDs: [String] = [
+            "unit_tests",
+            "adapter_current",
+            "adapter_n_minus_1",
+            "presentation_parity",
+            "capacity_profile",
+            "rollback_drill",
+        ]
+
         public let cells: [String: CoverageCellStatus]
 
         public init(cells: [String: CoverageCellStatus]) {
@@ -48,7 +58,12 @@ public enum TokenSaverAuthorityPlane {
         }
 
         public var hasBlockingCell: Bool {
-            cells.values.contains { $0 != .present }
+            for id in Self.requiredCellIDs {
+                guard let status = cells[id] else { return true }
+                if status != .present { return true }
+            }
+            // Any extra cell that is not present also blocks.
+            return cells.values.contains { $0 != .present }
         }
     }
 
