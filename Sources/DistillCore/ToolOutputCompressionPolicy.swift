@@ -1,4 +1,5 @@
 import Foundation
+import CoreModel
 
 public enum ToolCompressionProfile: String, Sendable, Equatable {
     case passthrough
@@ -71,8 +72,15 @@ public struct ToolOutputCompressionPolicy: Sendable, Equatable {
         toolName: String,
         output: String,
         toolArgumentsSummary: String? = nil,
-        taskSummary: String? = nil
+        taskSummary: String? = nil,
+        bindingDigest: String? = nil
     ) -> ToolCompressionDecision {
+        // Wave A shadow instrumentation (task-12): content-free scorecard; requires BindingID.
+        TokenSaverWaveAShadowBridge.failOpenObserve {
+            TokenSaverWaveAShadowBridge.observeToolOutput(
+                toolName: toolName, output: output, bindingDigest: bindingDigest
+            )
+        }
         let profile = profile(for: toolName)
         let skipReason: ToolCompressionSkipReason?
         if isExcluded(toolName) {
