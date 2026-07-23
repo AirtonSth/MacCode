@@ -133,4 +133,26 @@ final class TokenSaverAccountingV2Tests: XCTestCase {
         // via state machine only markProviderMeasured path
         XCTAssertEqual(led.measuredConfirmedTokens(for: "missing"), nil)
     }
+
+    /// Public surface: raw scalars cannot create confirmed savings without the internal measure path.
+    func test_publicAPI_cannotForgeMeasuredSavingsViaTransitionOrRecord() {
+        let led = TokenSaverAccountingV2.Ledger()
+        _ = led.record(TokenSaverAccountingV2.Operation(digest: "d", generation: 1, state: .candidate))
+        _ = led.transition("d", to: .transported)
+        _ = led.transition("d", to: .providerApplied)
+        // Public transition into providerMeasured is refused even though the legal edge exists
+        // for the internal markProviderMeasured path.
+        XCTAssertEqual(led.transition("d", to: .providerMeasured), .failure(.illegalTransition))
+        XCTAssertNil(led.measuredSnapshot(for: "d"))
+        XCTAssertEqual(led.rebuildConfirmedTotal(), 0)
+        XCTAssertNil(TokenSaverRecoveryProjections.ReceiptFactory.fromLocalLedger(ledger: led, operationDigest: "d"))
+        XCTAssertNil(TokenSaverRecoveryProjections.ReceiptFactory.fromProviderUsage(ledger: led, operationDigest: "d"))
+        // Character counts still never confirm.
+        XCTAssertEqual(led.addCharacterCountSavings(500, to: "d"), 0)
+        // Constructing Operation(state: .providerMeasured) traps / record rejects measured.
+        XCTAssertEqual(
+            led.record(TokenSaverAccountingV2.Operation(digest: "e", generation: 1, state: .providerApplied)).map { $0.confirmedTokensSaved },
+            .success(0)
+        )
+    }
 }

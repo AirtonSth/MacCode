@@ -19,10 +19,9 @@ public enum TokenSaverRecoveryProjections {
         }
     }
 
-    /// Only trusted adapters construct receipts — no public free-form token credits,
-    /// no caller-asserted verification booleans, and no rebinding of measured ops.
-    /// Minting requires an authoritative ledger snapshot (tokens + bindingDigest)
-    /// produced only by `markProviderMeasured`.
+    /// Receipts require an authoritative ledger snapshot. Snapshots exist only after
+    /// `Ledger.markProviderMeasured` (internal / same-module) — public CoreModel APIs
+    /// cannot forge measured tokens from raw scalars.
     public enum ReceiptFactory {
         /// Mint from local ledger measured state. Binding comes from the ledger, not the caller.
         public static func fromLocalLedger(

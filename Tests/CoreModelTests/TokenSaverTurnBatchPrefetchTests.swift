@@ -137,6 +137,40 @@ final class TokenSaverTurnBatchPrefetchTests: XCTestCase {
         XCTAssertEqual(r.outcomes["slow"], .timedOut)
     }
 
+    /// AC-07: mutation timeout keeps idempotency reserved so a retry cannot double-apply.
+    func test_runtime_mutationTimeout_keepsIdempotencyReservedAgainstRetry() {
+        final class SlowMut: TokenSaverTurnBatchRuntime.ActionExecutor {
+            private(set) var performCount = 0
+            func perform(_ action: TokenSaverTurnBatchRuntime.Action) -> TokenSaverTurnBatchRuntime.ExecutionResult {
+                performCount += 1
+                Thread.sleep(forTimeInterval: 0.25)
+                return .init(success: true, outputKnown: true)
+            }
+        }
+        let store = TokenSaverTurnBatchRuntime.MemoryIdempotencyStore()
+        let exec = SlowMut()
+        let rt = TokenSaverTurnBatchRuntime(idempotency: store)
+        rt.readOnlyLive = true
+        rt.mutationsEnabled = true
+        rt.executor = exec
+        let first = rt.run(actions: [
+            .init(id: "m", kind: .mutation, approved: true, idempotencyKey: "mut-once", timeoutMs: 30),
+        ])
+        XCTAssertEqual(first.outcomes["m"], .timedOut)
+        XCTAssertTrue(store.seen("mut-once"), "mutation timeout must keep key reserved")
+        // Retry with same key must be treated as duplicate, not a second perform start.
+        let rt2 = TokenSaverTurnBatchRuntime(idempotency: store)
+        rt2.readOnlyLive = true
+        rt2.mutationsEnabled = true
+        rt2.executor = exec
+        let second = rt2.run(actions: [
+            .init(id: "m", kind: .mutation, approved: true, idempotencyKey: "mut-once", timeoutMs: 30),
+        ])
+        XCTAssertEqual(second.outcomes["m"], .duplicateIdempotent)
+        // Only the first perform was started (background may still be finishing).
+        XCTAssertEqual(exec.performCount, 1)
+    }
+
     func test_prefetchRuntime_hostPathValidationAndExecute() {
         let root = NSTemporaryDirectory() + "ts-prefetch-\(UUID().uuidString)"
         try! FileManager.default.createDirectory(atPath: root, withIntermediateDirectories: true)
