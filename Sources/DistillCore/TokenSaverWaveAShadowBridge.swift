@@ -95,6 +95,13 @@ public enum TokenSaverWaveAShadowBridge {
             toolName: toolName,
             current: Data(output.utf8)
         )
+        _ = observeShadowMetrics(
+            bindingDigest: digest,
+            providerVisible: Data(output.utf8),
+            cacheVolatileTokens: 0,
+            queueCohortSize: 0,
+            pair: nil
+        )
     }
 
     public static func failOpenObserve(_ body: () throws -> Void) {
@@ -108,5 +115,26 @@ public enum TokenSaverWaveAShadowBridge {
             return nil
         }
         return String(data: out, encoding: .utf8)
+    }
+}
+
+extension TokenSaverWaveAShadowBridge {
+    /// task-13: emit shadow metrics without mutating provider payload.
+    @discardableResult
+    public static func observeShadowMetrics(
+        bindingDigest: String,
+        providerVisible: Data,
+        cacheVolatileTokens: Int,
+        queueCohortSize: Int,
+        pair: TokenSaverWaveAShadowMetrics.PairedControlEvidence?
+    ) -> Data {
+        let unchanged = TokenSaverWaveAShadowMetrics.observeWithoutMutation(providerVisible)
+        _ = TokenSaverWaveAShadowMetrics.emit(
+            bindingDigest: bindingDigest,
+            cacheVolatileTokens: cacheVolatileTokens,
+            queueCohortSize: queueCohortSize,
+            pair: pair
+        )
+        return unchanged
     }
 }
