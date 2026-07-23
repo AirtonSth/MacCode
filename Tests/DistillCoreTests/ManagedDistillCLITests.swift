@@ -255,6 +255,24 @@ final class ManagedDistillCLITests: XCTestCase {
         XCTAssertTrue(out.isEmpty)
     }
 
+    func test_hookSubcommand_neverFallsThroughToCompress() async {
+        var transportCalled = false
+        let cli = ManagedDistillCLI(
+            arguments: ["hook", "post-tool-use", "--provider", "claude"],
+            stdin: Data(#"{"tool":"bash","output":"ok"}"#.utf8),
+            state: state
+        ) { _ in
+            transportCalled = true
+            return (Data("should-not-compress".utf8), 200)
+        }
+        let (out, code) = await cli.run()
+        XCTAssertEqual(code, 1)
+        XCTAssertFalse(transportCalled, "hook must not invoke compress transport")
+        let text = String(decoding: out, as: UTF8.self)
+        XCTAssertTrue(text.contains("hook"), "reserved hook message expected")
+        XCTAssertFalse(text.contains("should-not-compress"))
+    }
+
     func test_retrieve_success_returnsOriginal() async {
         let json = #"{"handle":"h","found":true,"original":"the original bytes"}"#
         let cli = ManagedDistillCLI(arguments: ["retrieve", "h"], stdin: Data(), state: state) { request in

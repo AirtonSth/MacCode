@@ -1,5 +1,6 @@
 import Foundation
 import CryptoKit
+import CoreModel
 
 /// Core logic of the managed `distill` CLI, ported off Python to native Swift (N1)
 /// and made FAIL-OPEN (N2/N5). The shipped Python CLI failed CLOSED: on any error it
@@ -103,7 +104,10 @@ public struct ManagedDistillCLI: Sendable {
         if arguments.first == "dsl" {
             return dsl(arguments: Array(arguments.dropFirst()))
         }
-        if let command = arguments.first, Self.reservedSubcommands.contains(command) {
+        // task-07: `hook` is reserved before any prompt parsing / generic compress path.
+        if let command = arguments.first,
+           TokenSaverProtocolV2.routeCLISubcommand(command) == "hook_handler"
+            || Self.reservedSubcommands.contains(command) {
             return unsupportedReservedSubcommand(command)
         }
         let prompt = arguments.joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines)
@@ -112,7 +116,8 @@ public struct ManagedDistillCLI: Sendable {
 
     private static let reservedSubcommands: Set<String> = [
         "rank",
-        "wrap"
+        "wrap",
+        TokenSaverProtocolV2.reservedHookSubcommand
     ]
 
     private func unsupportedReservedSubcommand(_ command: String) -> (Data, Int32) {
