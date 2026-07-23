@@ -785,6 +785,13 @@ public final class AppContext {
         threadId: AgentThreadID,
         baseEnvironment: [String: String] = ProcessInfo.processInfo.environment
     ) -> [String: String] {
+        // task-08: cross-user runs get no Token Saver env/hint/PATH managed bin.
+        guard TokenSaverAdapterMatrix.tokenSaverCallbacksAllowed(
+            isSameUser: tokenSaverIsSameUser(threadId: threadId),
+            turn: .initial
+        ) else {
+            return [:]
+        }
         var env: [String: String] = [:]
         // Always expose managed distill CLI on PATH for every provider call.
         if managedDistillSkillInstallError == nil {
@@ -1298,6 +1305,13 @@ public final class AppContext {
         )
     }
 
+    /// task-08: cross-user Token Saver is raw-only for every compressor turn kind.
+    private func tokenSaverIsSameUser(threadId: AgentThreadID) -> Bool {
+        guard let thread = try? threadRepo.get(id: threadId),
+              let runAs = thread.runAsUser else { return true }
+        return runAs.uid == getuid()
+    }
+
     func tokenSaverCompress(
         prompt: String,
         provider: AgentProvider,
@@ -1305,6 +1319,14 @@ public final class AppContext {
         cacheState: String = "prompt",
         runId: AgentRunID? = nil
     ) async -> String {
+        let turn: TokenSaverAdapterMatrix.CrossUserTurn =
+            cacheState.contains("follow") ? .followUp : .initial
+        guard TokenSaverAdapterMatrix.tokenSaverCallbacksAllowed(
+            isSameUser: tokenSaverIsSameUser(threadId: threadId),
+            turn: turn
+        ) else {
+            return prompt
+        }
         guard tokenSaverProjectAdmission(threadId: threadId, lane: "deterministic_wrapper").allowed else {
             return prompt
         }
