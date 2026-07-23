@@ -103,7 +103,10 @@ public struct ManagedDistillCLI: Sendable {
         if arguments.first == "dsl" {
             return dsl(arguments: Array(arguments.dropFirst()))
         }
-        if let command = arguments.first, Self.reservedSubcommands.contains(command) {
+        // task-07: `hook` is reserved before any prompt parsing / generic compress path.
+        if let command = arguments.first,
+           TokenSaverProtocolV2.routeCLISubcommand(command) == "hook_handler"
+            || Self.reservedSubcommands.contains(command) {
             return unsupportedReservedSubcommand(command)
         }
         let prompt = arguments.joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines)
@@ -112,7 +115,8 @@ public struct ManagedDistillCLI: Sendable {
 
     private static let reservedSubcommands: Set<String> = [
         "rank",
-        "wrap"
+        "wrap",
+        TokenSaverProtocolV2.reservedHookSubcommand
     ]
 
     private func unsupportedReservedSubcommand(_ command: String) -> (Data, Int32) {
