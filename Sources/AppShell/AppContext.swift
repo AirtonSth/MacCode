@@ -343,10 +343,10 @@ public final class AppContext {
         self.coordinator.promptCompressor = { [weak self] prompt, provider, threadId, runId in
             guard let self else { return prompt }
             // task-08: cross-user raw-only before any SessionLearn/compress work.
-            guard TokenSaverAdapterMatrix.tokenSaverCallbacksAllowed(
-                isSameUser: self.tokenSaverIsSameUser(threadId: threadId),
-                turn: .initial
-            ) else { return prompt }
+            let sameUser = await MainActor.run { self.tokenSaverIsSameUser(threadId: threadId) }
+            guard TokenSaverAdapterMatrix.tokenSaverCallbacksAllowed(isSameUser: sameUser, turn: .initial) else {
+                return prompt
+            }
             let scopedPrompt = await self.tokenSaverSessionLearnPrompt(
                 prompt, provider: provider, threadId: threadId, runId: runId
             )
@@ -354,10 +354,10 @@ public final class AppContext {
         }
         self.coordinator.followUpPromptCompressor = { [weak self] prompt, provider, threadId in
             guard let self else { return prompt }
-            guard TokenSaverAdapterMatrix.tokenSaverCallbacksAllowed(
-                isSameUser: self.tokenSaverIsSameUser(threadId: threadId),
-                turn: .followUp
-            ) else { return prompt }
+            let sameUser = await MainActor.run { self.tokenSaverIsSameUser(threadId: threadId) }
+            guard TokenSaverAdapterMatrix.tokenSaverCallbacksAllowed(isSameUser: sameUser, turn: .followUp) else {
+                return prompt
+            }
             let scopedPrompt = await self.tokenSaverSessionLearnPrompt(
                 prompt, provider: provider, threadId: threadId, runId: nil
             )
@@ -365,28 +365,28 @@ public final class AppContext {
         }
         self.coordinator.finalResponseTranslator = { [weak self] response, provider, threadId, runId in
             guard let self else { return response }
-            guard TokenSaverAdapterMatrix.tokenSaverCallbacksAllowed(
-                isSameUser: self.tokenSaverIsSameUser(threadId: threadId),
-                turn: .finalResponse
-            ) else { return response }
+            let sameUser = await MainActor.run { self.tokenSaverIsSameUser(threadId: threadId) }
+            guard TokenSaverAdapterMatrix.tokenSaverCallbacksAllowed(isSameUser: sameUser, turn: .finalResponse) else {
+                return response
+            }
             return await self.tokenSaverHumanizeSR1Response(response, provider: provider, threadId: threadId, runId: runId)
         }
         // Recovered sessions rebuild their own request env in the coordinator, bypassing
         // providerEnvironment; feed them the same Token Saver env so distill survives resume.
         self.coordinator.recoveryEnvironmentProvider = { [weak self] provider, threadId in
             guard let self else { return [:] }
-            guard TokenSaverAdapterMatrix.tokenSaverCallbacksAllowed(
-                isSameUser: self.tokenSaverIsSameUser(threadId: threadId),
-                turn: .recovery
-            ) else { return [:] }
+            let sameUser = await MainActor.run { self.tokenSaverIsSameUser(threadId: threadId) }
+            guard TokenSaverAdapterMatrix.tokenSaverCallbacksAllowed(isSameUser: sameUser, turn: .recovery) else {
+                return [:]
+            }
             return await self.tokenSaverAgentEnvironment(provider: provider, threadId: threadId)
         }
         self.coordinator.runEnvironmentProvider = { [weak self] provider, threadId, base in
             guard let self else { return [:] }
-            guard TokenSaverAdapterMatrix.tokenSaverCallbacksAllowed(
-                isSameUser: self.tokenSaverIsSameUser(threadId: threadId),
-                turn: .initial
-            ) else { return [:] }
+            let sameUser = await MainActor.run { self.tokenSaverIsSameUser(threadId: threadId) }
+            guard TokenSaverAdapterMatrix.tokenSaverCallbacksAllowed(isSameUser: sameUser, turn: .initial) else {
+                return [:]
+            }
             return await self.tokenSaverAgentEnvironment(provider: provider, threadId: threadId, baseEnvironment: base)
         }
         self.coordinator.onRunPrepared = { [weak self] request, originalPrompt in
