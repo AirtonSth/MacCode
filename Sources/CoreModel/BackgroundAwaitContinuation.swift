@@ -68,11 +68,30 @@ public enum BackgroundAwaitContinuation {
     MCP tool availability: connected MCP servers in this session use credentials already cached by the CLI and work in non-interactive and autonomous runs. Do NOT assume an MCP tool needs interactive authentication, and do NOT report a server as unauthenticated or return BLOCKED for MCP authentication, merely because this session is non-interactive. When a relevant MCP tool is available, call it directly. Only treat an MCP server as needing authentication AFTER you have actually invoked one of its tools and received an explicit authentication/authorization error, and then include that exact error.
     """
 
+    /// System-prompt rule injected for the Claude provider on every run so the agent
+    /// WAITS for a remote MCP server that is still finishing its asynchronous connect
+    /// instead of reporting it as perpetually "connecting".
+    ///
+    /// WHY: remote/OAuth MCP servers (Linear, the claude.ai connectors) connect
+    /// LAZILY and asynchronously — the handshake begins only once the first turn is
+    /// submitted and completes ~10-20s later. A quick first turn races ahead of it:
+    /// the tools are not loaded yet and the CLI injects a "still connecting … will
+    /// appear shortly" reminder, which the model repeats as a final answer ("it's
+    /// connecting, try later") — the exact symptom users hit asking "is Linear
+    /// active?". The tools DO arrive within the same session; `RefreshMcpTools`
+    /// (exposed via `CLAUDE_CODE_ENABLE_REFRESH_MCP_TOOLS=1`, set for Claude turns in
+    /// CodexRunner.processEnvironment) re-queries connected servers and loads their
+    /// tools mid-turn. So the fix is to wait-and-refresh, matching what a human does
+    /// in an already-warm terminal. Reproduced + verified on claude 2.1.218.
+    public static let mcpConnectWaitDirective = """
+    MCP connection timing: remote MCP servers finish connecting a few seconds into a session, so early on their tools may not be loaded yet and a reminder may say a server is "still connecting". When your task needs such a tool — or the user asks whether an MCP server or its tools are active — do NOT answer that it is unavailable or still connecting. Wait for it: call the RefreshMcpTools tool (after a brief shell `sleep` of a few seconds if its tools are not loaded yet) and retry until the server's tools appear, which normally happens within ~20 seconds, then use them. Report a server as unavailable only after its tools stay absent despite waiting and refreshing.
+    """
+
     /// The always-on Claude system-prompt rules, injected on every Claude run via
     /// both live routes (CLI `buildStreamingArgs` and the SDK `claudeSystemPrompt`).
     /// Single source of truth so the two routes never drift: edit the directives
     /// above, not the call sites.
-    public static let alwaysOnClaudeDirectives = systemPromptDirective + "\n\n" + mcpToolAvailabilityDirective
+    public static let alwaysOnClaudeDirectives = systemPromptDirective + "\n\n" + mcpToolAvailabilityDirective + "\n\n" + mcpConnectWaitDirective
 
     /// The nudge sent to re-invoke a stalled agent. Provider-agnostic and explicit
     /// about both branches (done vs still-running) so the agent does the right

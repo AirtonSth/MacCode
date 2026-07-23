@@ -388,6 +388,13 @@ public final class CodexRunner: AgentProviderRunner, @unchecked Sendable {
         if let provider = purpose.provider {
             env["REMOTE_CODE_AGENT_PROVIDER"] = provider.rawValue
         }
+        // Expose the `RefreshMcpTools` tool for Claude turns so the agent can pick
+        // up remote MCP servers (Linear, etc.) that finish their async connect a
+        // few seconds into the session — see mcpConnectWaitDirective. A caller-set
+        // override wins (so it can be forced off).
+        if case .agentTurn(.claude) = purpose, env["CLAUDE_CODE_ENABLE_REFRESH_MCP_TOOLS"] == nil {
+            env["CLAUDE_CODE_ENABLE_REFRESH_MCP_TOOLS"] = "1"
+        }
         return env
     }
 }
