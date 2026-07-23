@@ -2017,6 +2017,25 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     }
 
     public func createAgentThread(workspace: WorkspaceID?, title: String, provider: AgentProvider, model: String, permissionMode: AgentPermissionMode, reasoningEffort: AgentReasoningEffort, serviceTier: AgentServiceTier = .auto, modelSelection: AgentModelSelection? = nil, providerInstanceId: String? = nil, runAsUser: AgentRunAsUser? = nil, surfaceID: SurfaceID? = nil) throws -> AgentThread {
+        try createAgentThread(
+            workspace: workspace,
+            title: title,
+            provider: provider,
+            model: model,
+            permissionMode: permissionMode,
+            reasoningEffort: reasoningEffort,
+            serviceTier: serviceTier,
+            modelSelection: modelSelection,
+            providerInstanceId: providerInstanceId,
+            runAsUser: runAsUser,
+            surfaceID: surfaceID,
+            routingConfiguration: nil
+        )
+    }
+
+    /// Path B / scheduled: same create as Agent App, optional Auto routing config persisted
+    /// so `startRun` admits through the shared orchestration path.
+    public func createAgentThread(workspace: WorkspaceID?, title: String, provider: AgentProvider, model: String, permissionMode: AgentPermissionMode, reasoningEffort: AgentReasoningEffort, serviceTier: AgentServiceTier = .auto, modelSelection: AgentModelSelection? = nil, providerInstanceId: String? = nil, runAsUser: AgentRunAsUser? = nil, surfaceID: SurfaceID? = nil, routingConfiguration: AgentRoutingConfiguration?) throws -> AgentThread {
         guard let ctx = context else { throw LayoutError.workspaceNotFound }
         let resolvedRunAs = resolveRunAsUser(runAsUser)
         let t = AgentThread(workspaceId: workspace, title: title, provider: provider,
@@ -2025,7 +2044,8 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                             permissionMode: permissionMode, reasoningEffort: reasoningEffort,
                             serviceTier: serviceTier,
                             modelSelection: modelSelection ?? AgentModelSelection(provider: provider, modelId: model, reasoningEffort: reasoningEffort, serviceTier: serviceTier),
-                            runAsUser: resolvedRunAs)
+                            runAsUser: resolvedRunAs,
+                            routingConfiguration: routingConfiguration)
         try ctx.threadRepo.upsert(t)
         if let workspace {
             _ = try? ctx.threadRepo.enforceWorkspaceThreadLimit(workspaceId: workspace)
@@ -2569,7 +2589,28 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             modelSelection: modelSelection,
             providerInstanceId: providerInstanceId,
             attachments: attachments,
-            queueMessageId: nil
+            queueMessageId: nil,
+            orchestrationRoutingSnapshot: nil
+        )
+    }
+
+    /// Path B / scheduled Auto: same send as Agent App, with the preflight orchestration
+    /// snapshot so admit + launch match what was verified.
+    public func sendAgentMessage(thread: AgentThreadID, text: String, provider: AgentProvider?, model: String?, permissionMode: AgentPermissionMode?, reasoningEffort: AgentReasoningEffort?, serviceTier: AgentServiceTier? = nil, interactionMode: AgentInteractionMode? = nil, modelSelection: AgentModelSelection? = nil, providerInstanceId: String? = nil, attachments: [AgentAttachment] = [], orchestrationRoutingSnapshot: AgentOrchestrationRoutingSnapshot?) async throws -> AgentMessageSendResult {
+        try await sendAgentMessage(
+            thread: thread,
+            text: text,
+            provider: provider,
+            model: model,
+            permissionMode: permissionMode,
+            reasoningEffort: reasoningEffort,
+            serviceTier: serviceTier,
+            interactionMode: interactionMode,
+            modelSelection: modelSelection,
+            providerInstanceId: providerInstanceId,
+            attachments: attachments,
+            queueMessageId: nil,
+            orchestrationRoutingSnapshot: orchestrationRoutingSnapshot
         )
     }
 
@@ -2648,10 +2689,13 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         }
     }
 
-    private func sendAgentMessage(thread: AgentThreadID, text: String, provider: AgentProvider?, model: String?, permissionMode: AgentPermissionMode?, reasoningEffort: AgentReasoningEffort?, serviceTier: AgentServiceTier?, interactionMode: AgentInteractionMode?, modelSelection: AgentModelSelection?, providerInstanceId: String?, attachments: [AgentAttachment], queueMessageId: AgentQueuedMessageID?, routingConfiguration: AgentRoutingConfiguration? = nil, routingSnapshot: AgentQueuedMessageRoutingSnapshot? = nil) async throws -> AgentMessageSendResult {
+    private func sendAgentMessage(thread: AgentThreadID, text: String, provider: AgentProvider?, model: String?, permissionMode: AgentPermissionMode?, reasoningEffort: AgentReasoningEffort?, serviceTier: AgentServiceTier?, interactionMode: AgentInteractionMode?, modelSelection: AgentModelSelection?, providerInstanceId: String?, attachments: [AgentAttachment], queueMessageId: AgentQueuedMessageID?, routingConfiguration: AgentRoutingConfiguration? = nil, routingSnapshot: AgentQueuedMessageRoutingSnapshot? = nil, orchestrationRoutingSnapshot: AgentOrchestrationRoutingSnapshot? = nil) async throws -> AgentMessageSendResult {
         guard let ctx = context else { throw LayoutError.workspaceNotFound }
         guard let existing = try ctx.threadRepo.get(id: thread) else { throw LayoutError.workspaceNotFound }
-        let effectiveRouting = routingSnapshot?.configuration ?? routingConfiguration ?? existing.routingConfiguration
+        let effectiveRouting = orchestrationRoutingSnapshot?.configuration
+            ?? routingSnapshot?.configuration
+            ?? routingConfiguration
+            ?? existing.routingConfiguration
         let autoRoutingActive = effectiveRouting?.mode == .auto
         let resolvedAttachments = try resolveInboundAgentAttachments(attachments)
         if !autoRoutingActive {
@@ -2737,12 +2781,20 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             environment: autoRoutingActive ? [:] : providerEnvironment(provider: prov, instanceId: t.providerInstanceId, threadId: thread),
             runAsUser: t.runAsUser
         )
-        let coordinatorSnapshot = routingSnapshot.map {
-            AgentOrchestrationRoutingSnapshot(
-                configuration: $0.configuration,
-                providerSnapshots: [],
-                admissionSnapshot: $0
-            )
+        // Prefer a full orchestration snapshot (scheduled Path B / Auto admit)
+        // so launch binary+catalog match preflight. Queued messages only carry
+        // the lightweight admission fields and refill provider snapshots at start.
+        let coordinatorSnapshot: AgentOrchestrationRoutingSnapshot?
+        if let orchestrationRoutingSnapshot {
+            coordinatorSnapshot = orchestrationRoutingSnapshot
+        } else {
+            coordinatorSnapshot = routingSnapshot.map {
+                AgentOrchestrationRoutingSnapshot(
+                    configuration: $0.configuration,
+                    providerSnapshots: [],
+                    admissionSnapshot: $0
+                )
+            }
         }
         let runId = try await ctx.coordinator.startRun(req, routingSnapshot: coordinatorSnapshot)
         // HC-5 (R1): a message sent from the mobile mirror / RPC must become

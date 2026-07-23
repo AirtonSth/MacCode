@@ -572,6 +572,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     public func dispose() {
         guard !isDisposed else { return }
         isDisposed = true
+        stopScheduledLivePoll()
         pendingGitRefresh?.cancel()
         pendingGitRefresh = nil
         pendingThreadReloadTask?.cancel()
@@ -817,9 +818,17 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 // thread left a stale currentRunId from the previous thread, so
                 // Stop could cancel the wrong thread's run.
                 currentRunId = trackedRunId
+                stopScheduledLivePoll()
+            } else if isScheduledThreadRunning?(id) == true {
+                // Path B: LaunchAgent owns the provider process. This process has
+                // no coordinator session, so the old branch cleared runStartedAt
+                // and the UI stuck on "Working for 0s" even while tools ran.
+                // Shared SQLite still has agent_runs.started_at + stream events.
+                bindScheduledOwnedRun(threadId: id)
             } else {
                 currentRunId = nil
                 runStartedAt = nil
+                stopScheduledLivePoll()
             }
         }
         normalizeInteractionModeForSelectedProvider()
@@ -2742,6 +2751,81 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         runThreads.first(where: { $0.value == threadId })?.key
             ?? coordinator.activeRunId(threadId: threadId)
     }
+
+    // MARK: - Path B (LaunchAgent-owned scheduled run) UI binding
+
+    /// Poll while the selected thread is owned by the LaunchAgent so stream
+    /// events written to shared SQLite keep painting without a local coordinator.
+    private var scheduledLivePollTask: Task<Void, Never>?
+    private var scheduledLiveStreamCount: Int = 0
+
+    /// Seed Working-for clock + run id from durable agent_runs and start live poll.
+    private func bindScheduledOwnedRun(threadId: AgentThreadID) {
+        let durable = try? coordinator.durableActiveRun(threadId: threadId)
+        runStartedAt = AgentAppViewModel.resolvedRunStartedAt(
+            current: runStartedAt,
+            persisted: durable?.startedAt ?? (try? coordinator.runStartedAt(threadId: threadId))
+        )
+        if let durable {
+            currentRunId = durable.id
+            runThreads[durable.id] = threadId
+            if status != .running { status = .running }
+        }
+        ensureScheduledLivePoll(for: threadId)
+    }
+
+    private func ensureScheduledLivePoll(for threadId: AgentThreadID) {
+        guard scheduledLivePollTask == nil else { return }
+        scheduledLiveStreamCount = coordinator.latestStreamEvents(threadId: threadId).count
+        scheduledLivePollTask = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(1))
+                guard let self, !Task.isCancelled, !self.isDisposed else { return }
+                self.tickScheduledLivePoll()
+            }
+        }
+    }
+
+    private func stopScheduledLivePoll() {
+        scheduledLivePollTask?.cancel()
+        scheduledLivePollTask = nil
+        scheduledLiveStreamCount = 0
+    }
+
+    private func tickScheduledLivePoll() {
+        guard let id = selectedThreadId else {
+            stopScheduledLivePoll()
+            return
+        }
+        guard isScheduledThreadRunning?(id) == true else {
+            // Run finished in the LaunchAgent; one full rebind picks up terminal state.
+            stopScheduledLivePoll()
+            selectThread(id, markRead: false)
+            return
+        }
+        let events = coordinator.latestStreamEvents(threadId: id)
+        if events.count != scheduledLiveStreamCount {
+            scheduledLiveStreamCount = events.count
+            timeline = AssistantTimelineState()
+            for event in events {
+                timeline.apply(event)
+            }
+            timeline.enforceAggregateHotTextBudget()
+            rehydrateDurableActiveState(threadId: id)
+            timelineItemIndex = TimelineItemIndex(turns: timeline.turns)
+            scheduleTimelineUpdateTick()
+        }
+        if let durable = try? coordinator.durableActiveRun(threadId: id) {
+            runStartedAt = AgentAppViewModel.resolvedRunStartedAt(
+                current: runStartedAt,
+                persisted: durable.startedAt
+            )
+            currentRunId = durable.id
+            runThreads[durable.id] = id
+            if status != .running { status = .running }
+        }
+    }
+
     public var executionLocked: Bool { providerLocked || selectedThreadRunIsStartingOrRunning }
     public var activeRunConfigurationLocked: Bool {
         selectedThreadRunIsStartingOrRunning
@@ -3677,7 +3761,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// provider. Provider commands such as `/goal` must pass through.
     public static let localSlashCommands = ["/clear", "/default", "/fork", "/model", "/plan", "/status"]
 
-    private static func localSlashCommandParts(_ raw: String) -> (command: String, argument: String)? {
+    /// Parse a local RemoteCode slash/dollar command. Public so scheduled Path B
+    /// can reject UI-only commands the same way Agent App intercepts them.
+    public static func localSlashCommandParts(_ raw: String) -> (command: String, argument: String)? {
         let line = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         // Accept `/` and `$` so autocomplete insert of `$clear` / `$plan` still
         // hits the local RemoteCode command path (parity with slash trigger).

@@ -3,6 +3,7 @@ import AppKit
 import CoreModel
 import Persistence
 import AgentRuntime
+import Surfaces
 import ServiceManagement
 import Darwin
 import os
@@ -106,6 +107,12 @@ public final class ScheduledTaskExecutor {
     }
 
     /// Create + send like a manual Agent App turn inside the LaunchAgent.
+    ///
+    /// Semantic comparator (paste+play): fresh Agent thread, task provider /
+    /// model / reasoning / run-as / workspace, Full Access + Default interaction,
+    /// normalized prompt, no attachments, local cwd — same provider turn as
+    /// Agent App Send. Differs only where unattended ownership requires it
+    /// (LaunchAgent process, surfaceID nil, XPC stop).
     /// - Parameter onThreadCreated: called after the thread row exists so the
     ///   scheduler can link `scheduled_task_runs.thread_id` before provider start.
     public func execute(
@@ -124,11 +131,36 @@ public final class ScheduledTaskExecutor {
         let providerInstanceID = prepared.routingSnapshot?.configuration.manualProviderInstanceId
             ?? task.providerInstanceID
         let runAsUser = Self.resolveRunAsUser(task: task)
+
+        // Same first-token rewrite as AgentAppViewModel.send() so `$goal` / skills
+        // mean the same thing when pasted into Schedule Tasks as in Agent App.
+        let catalogSnapshots: [AgentProviderSnapshot]
+        if let autoSnapshots = prepared.routingSnapshot?.providerSnapshots, !autoSnapshots.isEmpty {
+            catalogSnapshots = autoSnapshots
+        } else {
+            catalogSnapshots = (await router.listAgentProviderSnapshots()).filter {
+                $0.provider == task.provider && $0.id == task.providerInstanceID
+            }
+        }
+        let normalizedPrompt = AgentComposerSuggestions.normalizingComposerTriggerPrefix(
+            task.prompt,
+            localSlashCommands: AgentAppViewModel.localSlashCommands,
+            providerSlashCommands: Array(Set(
+                catalogSnapshots.flatMap(\.slashCommands)
+                    + AgentComposerSuggestions.passThroughSlashCommands
+            )),
+            skills: catalogSnapshots.flatMap(\.skills)
+        )
+        try Self.rejectUIOnlySchedulePrompt(normalizedPrompt)
+
         // Path B: still create+send (manual-shaped persistence), but ownership
         // stays in this LaunchAgent process; main UI stops via XPC.
+        // Title is the same placeholder as Agent App "New thread" so the ordinary
+        // first-message title derivation in sendAgentMessage runs. Task title
+        // remains schedule/run metadata, not an Agent-thread override.
         let thread = try router.createAgentThread(
             workspace: task.workspaceID,
-            title: task.title,
+            title: "New thread",
             provider: selection.provider,
             model: selection.effectiveModel,
             // Unattended schedules need Full Access so tools do not block on UI.
@@ -138,20 +170,31 @@ public final class ScheduledTaskExecutor {
             modelSelection: selection,
             providerInstanceId: providerInstanceID,
             runAsUser: runAsUser,
-            surfaceID: nil
+            surfaceID: nil,
+            routingConfiguration: prepared.routingSnapshot?.configuration
+                ?? Self.routingConfiguration(
+                    for: task,
+                    policyDigest: task.effectiveRoutingMode == .auto
+                        ? orchestrationRuntime.policyDigest
+                        : ""
+                )
         )
         try onThreadCreated?(thread.id)
         let send = try await router.sendAgentMessage(
             thread: thread.id,
-            text: task.prompt,
+            text: normalizedPrompt,
             provider: selection.provider,
             model: selection.effectiveModel,
             permissionMode: .fullAccess,
             reasoningEffort: selection.reasoningEffort,
             serviceTier: selection.serviceTier,
+            interactionMode: .default,
             modelSelection: selection,
             providerInstanceId: providerInstanceID,
-            attachments: []
+            attachments: [],
+            // Full preflight admit (catalog + launch binaries) must reach startRun
+            // or Auto degrades to a frozen manual model selection.
+            orchestrationRoutingSnapshot: prepared.routingSnapshot
         )
         guard let runID = send.runId else {
             throw ScheduledTaskPreflightError.invalidTask(
@@ -159,6 +202,33 @@ public final class ScheduledTaskExecutor {
             )
         }
         return (thread.id, runID)
+    }
+
+    /// Local Agent App commands that never start a provider turn. Scheduled
+    /// prompts must not silently no-op or create empty threads for these.
+    ///
+    /// nonisolated: pure string classification; catalog mirrors
+    /// `AgentAppViewModel.localSlashCommands` without MainActor hop.
+    nonisolated static func rejectUIOnlySchedulePrompt(_ text: String) throws {
+        let line = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let first = line.first, first == "/" || first == "$" else { return }
+        let parts = line.dropFirst().split(separator: " ", maxSplits: 1).map(String.init)
+        let command = (parts.first ?? "").lowercased()
+        let argument = parts.count > 1 ? parts[1].trimmingCharacters(in: .whitespaces) : ""
+        let local = Set(["clear", "default", "fork", "model", "plan", "status"])
+        guard local.contains(command) else { return }
+        // `/plan body` in Agent App switches mode then sends `body` — schedules
+        // are Default interaction only, so require a real provider prompt.
+        if command == "plan", !argument.isEmpty {
+            throw ScheduledTaskPreflightError.invalidTask(
+                "Scheduled tasks run in Default interaction mode. Remove /plan and put the work in the prompt (or use a skill like $sam-work)."
+            )
+        }
+        if argument.isEmpty {
+            throw ScheduledTaskPreflightError.invalidTask(
+                "Scheduled tasks cannot run the local Agent App command /\(command). Use a full prompt or skill ($name)."
+            )
+        }
     }
 
     private static func resolveRunAsUser(task: ScheduledTask) -> AgentRunAsUser? {

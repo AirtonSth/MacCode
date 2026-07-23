@@ -408,12 +408,28 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         lock.lock()
         let runId = activeThreads[threadId]
         lock.unlock()
-        guard let runId else { return nil }
-        return try runRepo.get(id: runId)?.startedAt
+        if let runId {
+            return try runRepo.get(id: runId)?.startedAt
+        }
+        // Path B: LaunchAgent owns the process; durable agent_runs still has the clock.
+        return try runRepo.latestActive(for: threadId)?.startedAt
     }
 
     public func runStartedAt(runId: AgentRunID) throws -> Date? {
         try runRepo.get(id: runId)?.startedAt
+    }
+
+    /// Durable active run row for a thread, including LaunchAgent-owned sessions
+    /// this process does not track in `activeThreads`.
+    public func durableActiveRun(threadId: AgentThreadID) throws -> AgentRun? {
+        lock.lock()
+        let runId = activeThreads[threadId]
+        lock.unlock()
+        if let runId, let run = try runRepo.get(id: runId),
+           run.status == .pending || run.status == .running {
+            return run
+        }
+        return try runRepo.latestActive(for: threadId)
     }
 
     /// The currently-active run id for a thread (nil when idle). Lets a surface

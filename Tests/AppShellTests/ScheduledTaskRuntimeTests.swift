@@ -116,6 +116,36 @@ final class ScheduledTaskRuntimeTests: XCTestCase {
         XCTAssertEqual(configuration.revision, 1)
     }
 
+    func test_rejectUIOnlySchedulePrompt_blocksLocalAgentCommands_becauseScheduleIsPasteAndPlay() {
+        // WHY: Agent App intercepts /clear /status etc. without a provider turn.
+        // Schedule must fail loudly instead of creating an empty headless turn.
+        XCTAssertThrowsError(try ScheduledTaskExecutor.rejectUIOnlySchedulePrompt("/clear"))
+        XCTAssertThrowsError(try ScheduledTaskExecutor.rejectUIOnlySchedulePrompt("$status"))
+        XCTAssertThrowsError(try ScheduledTaskExecutor.rejectUIOnlySchedulePrompt("/plan"))
+        XCTAssertThrowsError(try ScheduledTaskExecutor.rejectUIOnlySchedulePrompt("/plan implement the feature"))
+        XCTAssertNoThrow(try ScheduledTaskExecutor.rejectUIOnlySchedulePrompt("Ship the deploy pipeline"))
+        XCTAssertNoThrow(try ScheduledTaskExecutor.rejectUIOnlySchedulePrompt("$sam-work DEV-1"))
+        XCTAssertNoThrow(try ScheduledTaskExecutor.rejectUIOnlySchedulePrompt("/goal reduce latency"))
+    }
+
+    func test_executeUsesNewThreadTitleAndOrchestrationSnapshot_becauseParityIsPasteAndPlay() throws {
+        // Source contract: Run Now must look like Agent App create "New thread"
+        // + Full Access + Default interaction + shared send path with Auto snapshot.
+        let source = try String(
+            contentsOf: repositoryRoot.appendingPathComponent("Sources/AppShell/ScheduledTaskRuntime.swift"),
+            encoding: .utf8
+        )
+        XCTAssertTrue(source.contains("title: \"New thread\""))
+        XCTAssertTrue(source.contains("orchestrationRoutingSnapshot: prepared.routingSnapshot"))
+        XCTAssertTrue(source.contains("normalizingComposerTriggerPrefix"))
+        XCTAssertTrue(source.contains("interactionMode: .default"))
+        XCTAssertTrue(source.contains("permissionMode: .fullAccess"))
+        XCTAssertFalse(
+            source.contains("title: task.title"),
+            "task title must not override Agent thread title semantics"
+        )
+    }
+
     func test_crossUserAutoUsesOneRunnerPerProvider_becauseRoutesMustLaunchTheAdmittedCLI() {
         let id = UUID()
 

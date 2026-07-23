@@ -4652,6 +4652,74 @@ final class AgentAppViewModelTests: XCTestCase {
                       "rendering must keep long-run context/compaction telemetry visible")
     }
 
+    func test_selectThread_scheduledOwnedRun_seedsWorkingClockFromDurableAgentRun() throws {
+        // WHY: Path B LaunchAgent runs have no local coordinator session. The old
+        // selectThread branch cleared runStartedAt, so "Working for 0s" stuck while
+        // tools ran in the other process. Durable agent_runs.started_at is shared SQLite.
+        let tmp = NSTemporaryDirectory() + "rc2-vm-sched-clock-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let coord = AgentRunCoordinator(
+            runRepo: runRepo,
+            messageRepo: messageRepo,
+            threadRepo: threadRepo,
+            providers: [.codex: FakeProviderRunner(provider: .codex)]
+        )
+        let workspaceID = WorkspaceID()
+        let vm = AgentAppViewModel(
+            workspaceID: workspaceID,
+            cwd: tmp,
+            coordinator: coord,
+            threadRepo: threadRepo,
+            messageRepo: messageRepo
+        )
+        installRunnableProviderFixtures(on: vm)
+        wireCanonicalThreadRead(vm, repo: threadRepo)
+
+        var thread = AgentThread(
+            workspaceId: workspaceID,
+            title: "Elephant - Task 1",
+            provider: .codex,
+            model: "gpt-5.5"
+        )
+        thread.status = .running
+        try threadRepo.upsert(thread)
+        vm.reloadThreads()
+
+        let startedAt = Date(timeIntervalSince1970: 1_700_000_000)
+        let run = AgentRun(
+            id: AgentRunID(),
+            threadId: thread.id,
+            provider: .codex,
+            model: "gpt-5.5",
+            status: .running,
+            startedAt: startedAt
+        )
+        try runRepo.upsert(run)
+
+        // No local coordinator session — only the SQLite scheduled-ownership signal.
+        vm.isScheduledThreadRunning = { $0 == thread.id }
+        XCTAssertNil(coord.activeRunId(threadId: thread.id),
+                     "fixture must not plant a local coordinator session")
+
+        vm.selectThread(thread.id)
+
+        XCTAssertEqual(vm.runStartedAt, startedAt,
+                       "Working for Xs must count from durable agent_runs.started_at for LaunchAgent-owned runs")
+        XCTAssertEqual(vm.currentRunId, run.id,
+                       "Stop must target the durable agent run id written by the LaunchAgent")
+        XCTAssertTrue(vm.selectedThreadRunIsStartingOrRunning,
+                      "scheduled ownership alone must keep the Working/Stop chrome visible")
+
+        // Store-change rebind must not wipe the clock again.
+        vm.selectThread(thread.id, markRead: false)
+        XCTAssertEqual(vm.runStartedAt, startedAt,
+                       "re-select on scheduled store change must keep the durable start clock")
+        vm.dispose()
+    }
+
     // MARK: B3 — composer attachments
 
     func test_attachments_addDedupesAndRemove() throws {
