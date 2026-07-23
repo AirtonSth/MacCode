@@ -3978,15 +3978,9 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     /// Removes Token Saver env keys and managed distill bin from PATH (task-08 raw-only).
     static func scrubTokenSaverEnvironment(_ env: [String: String]) -> [String: String] {
         var cleaned = env
-        let keys = [
-            "RC_TOKEN_SAVER_DISTILL_HINT",
-            "RC_TOKEN_SAVER_POST_TOOL_USE",
-            "RC_TOKEN_SAVER_WORKSPACE_ID",
-            "RC_TOKEN_SAVER_PROJECT_ID",
-            "RC_TOKEN_SAVER_THREAD_ID",
-            "REMOTE_CODE_DISTILL_STATE_PATH",
-        ]
-        for k in keys { cleaned.removeValue(forKey: k) }
+        for key in env.keys where key.hasPrefix("RC_TOKEN_SAVER_") || key == "REMOTE_CODE_DISTILL_STATE_PATH" {
+            cleaned.removeValue(forKey: key)
+        }
         let managedBin = AgentSkillInstaller.defaultManagedCLIBinDirectory().path
         if let path = cleaned["PATH"] {
             let parts = path.split(separator: ":").map(String.init).filter { $0 != managedBin }
