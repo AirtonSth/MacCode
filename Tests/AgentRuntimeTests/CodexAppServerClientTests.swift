@@ -500,8 +500,10 @@ final class CodexAppServerClientTests: ProviderProcessTestCase {
             "Codex developer_instructions must always instruct `| distill`"
         )
         // Parity with Claude's per-session systemPrompt: full distill LANGUAGE spec per turn.
+        // "Registers:" is the register/prefix legend from the full distill body; a bare
+        // "| distill" pipe rule never carries it, so this proves the full spec is injected.
         XCTAssertTrue(
-            hintInstructions.contains("AR-0/AR-1"),
+            hintInstructions.contains("Registers:"),
             "Codex developer_instructions must carry the full distill language spec, not only the pipe rule"
         )
         XCTAssertEqual(

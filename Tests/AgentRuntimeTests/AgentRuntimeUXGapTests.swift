@@ -13,12 +13,12 @@ final class AgentRuntimeUXGapTests: XCTestCase {
     /// install guidance so users do not need to search externally.
     func test_missingBinaryMessage_containsInstallGuidance() {
         let msg = ClaudeRunner.missingBinaryMessage("claude")
-        XCTAssertTrue(msg.contains("npm install"),
-                      "npm install route must appear so Node.js users can fix the path")
+        XCTAssertTrue(msg.contains("install.sh"),
+                      "native installer route must appear now that Claude defaults to the CLI (no npm)")
         XCTAssertTrue(msg.contains("brew"),
                       "brew route must appear for Homebrew users")
-        XCTAssertTrue(msg.contains("PATH"),
-                      "PATH must be mentioned so users understand where the app searched")
+        XCTAssertTrue(msg.contains("Searched"),
+                      "the searched directories must be listed so users understand where the app looked")
         XCTAssertTrue(msg.contains("Settings"),
                       "Settings CTA must appear so users can set a custom binary path")
     }

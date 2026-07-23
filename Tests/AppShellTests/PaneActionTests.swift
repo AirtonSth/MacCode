@@ -211,8 +211,16 @@ final class PaneActionTests: XCTestCase {
 
         agent.viewModel.reloadThreads()
 
+        // Per-tab spinner (not workspace-wide roll-up): a tab that is NOT bound to the
+        // running thread must not spin just because the coordinator owns an active run.
+        // This is the semantics test_agentTabBusyUsesBoundThreadNotWholeWorkspace encodes.
+        XCTAssertFalse(agent.isBusy,
+                       "an Agent tab must not spin for a running thread it does not own")
+
+        // Bind this tab to the running thread → it now owns a real active run identity.
+        agent.viewModel.selectThread(thread.id)
         XCTAssertTrue(agent.isBusy,
-                      "the tab strip must spin only while the coordinator owns a real active run identity")
+                      "the tab strip must spin while THIS tab owns a real active run identity")
         ctx.coordinator.stopRun(threadId: thread.id)
     }
 
