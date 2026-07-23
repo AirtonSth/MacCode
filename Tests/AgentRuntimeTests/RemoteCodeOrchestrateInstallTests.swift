@@ -2,12 +2,29 @@ import XCTest
 @testable import AgentRuntime
 
 final class RemoteCodeOrchestrateInstallTests: XCTestCase {
+    func testWorkerPromptContractRequiresDistillForWorkersAndDescendants() throws {
+        let packageRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let promptContract = try String(
+            contentsOf: packageRoot.appendingPathComponent(
+                "Sources/AgentRuntime/Resources/remote-code-orchestrate/references/prompt-contract.md"
+            ),
+            encoding: .utf8
+        )
+
+        XCTAssertTrue(promptContract.contains("Distill:"))
+        XCTAssertTrue(promptContract.contains("| distill"))
+        XCTAssertTrue(promptContract.contains("descendants"))
+    }
+
     func testPinnedManifestMatchesVerifiedUpstream() {
         let package = AgentSkillInstaller.remoteCodeOrchestratePinnedPackage
 
         XCTAssertEqual(package.skillID, "remote-code-orchestrate")
         XCTAssertEqual(package.sourceRevision, "2c77fa48431bc20e5dc841652079594a3ea918c9")
-        XCTAssertEqual(package.sourceTreeSHA256, "75be88b77153884356338c03577d3b2ac153debdbca9c673e0ee6d7b6b5138d3")
+        XCTAssertEqual(package.sourceTreeSHA256, "c9d7eb11b83d3fd4a7be38e4de2e7acac0100be11a27441b435b41006709a0eb")
         XCTAssertEqual(package.allowedPaths, [
             "SKILL.md",
             "agents/openai.yaml",

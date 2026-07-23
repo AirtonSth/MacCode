@@ -154,7 +154,7 @@ public final class AgentSkillInstaller: @unchecked Sendable {
         skillID: "remote-code-orchestrate",
         sourceURL: "https://github.com/samuelfaj/sam-skills/tree/main/sam-orchestrate",
         sourceRevision: "2c77fa48431bc20e5dc841652079594a3ea918c9",
-        sourceTreeSHA256: "4019f53e40a89c04ba2374773ce52c3c848bdecf7ce9ab4b2054507679c0ba70",
+        sourceTreeSHA256: "c9d7eb11b83d3fd4a7be38e4de2e7acac0100be11a27441b435b41006709a0eb",
         localVersion: "1",
         allowedPaths: [
             "SKILL.md",
@@ -203,10 +203,11 @@ public final class AgentSkillInstaller: @unchecked Sendable {
     - Emit `Dict:` early only when aliases reduce repetition (never secrets/people/paths/URLs as aliases).
 
     Command-output policy (Token Saver — bias to compress; over-compressing is preferred to under-compressing):
-    - DEFAULT to piping EVERY non-interactive, non-TUI shell/tool command through the RemoteCode-managed `distill` CLI whenever its output is more than ~10 lines or ~1KB. This applies to build, test, lint, install, git, grep, rg, find, ls, cat, head, tail, curl, sed, awk, docker, kubectl, terraform, and any other command that emits bulk text.
-    - Treat piping as the norm, not the exception: if you are unsure whether output will be large, pipe it. Always pass an explicit extraction prompt so the distilled result still answers the task.
+    - DEFAULT to piping EVERY pipable, output-producing shell/tool call through the RemoteCode-managed `distill` CLI, regardless of predicted output size. This applies to build, test, lint, install, git, grep, rg, find, ls, cat, head, tail, curl, sed, awk, docker, kubectl, terraform, and any other command whose output will be read by the provider.
+    - Treat piping as the norm, not the exception. Always pass an explicit extraction prompt so the distilled result still answers the task. When the source command's exit status matters, enable shell `pipefail`.
     - Never call Node, tsx, npm, bun, or a source-checkout CLI for `distill`.
-    - Skip the pipe ONLY when you genuinely need the exact bytes (e.g. applying a patch, copying a hash/token verbatim), the output is interactive/TUI, or the local RemoteCode service is unavailable; state that you skipped and why.
+    - Skip the pipe ONLY when the call is not pipable, you genuinely need exact bytes (e.g. applying a patch, copying a hash/token verbatim), output is interactive/TUI, or the local RemoteCode service is unavailable; state that you skipped and why.
+    - Every subagent, worker, reviewer, or delegated prompt must repeat this Distill rule and require its descendants to do the same; never assume inherited context is enough.
     - If a summary includes `[[rc:<handle>]]`, recover exact bytes with `distill retrieve <handle>`.
     - Wait for `distill` before continuing.
 
@@ -227,8 +228,9 @@ public final class AgentSkillInstaller: @unchecked Sendable {
     Prefixes when used: S=state, C=context, D=action, R=risk, O=outcome, N=no-go, P=proof.
     Dict/`#` vars only when they reduce repetition. Never alias secrets, people, IDs, paths, URLs.
     Do not return a rewritten/compressed copy of the user's prompt unless explicitly asked to compress text.
-    Token Saver — bias to compress (over-compressing beats under-compressing): by DEFAULT pipe EVERY non-interactive, non-TUI command whose output exceeds ~10 lines or ~1KB through the RemoteCode-managed `distill` CLI with an explicit extraction prompt (build/test/lint/git/grep/find/ls/cat/curl/docker/kubectl/etc). If unsure it will be large, pipe it.
-    Skip `| distill` ONLY when you need exact bytes (patches, hashes/tokens), output is interactive/TUI, or the local RemoteCodeDistillService is unavailable; state the skip. Never invoke Node, tsx, npm, bun, or a source-checkout CLI for `distill`.
+    Token Saver — bias to compress: by DEFAULT pipe EVERY pipable, output-producing shell/tool call through the RemoteCode-managed `distill` CLI with an explicit extraction prompt, regardless of predicted size; use `pipefail` when source exit status matters.
+    Skip `| distill` ONLY for non-pipable calls, exact bytes (patches/hashes/tokens), interactive/TUI output, or unavailable RemoteCodeDistillService; state the skip. Never invoke Node/tsx/npm/bun or a source-checkout `distill`.
+    Every subagent, worker, reviewer, or delegated prompt MUST repeat this rule and require its descendants to do the same; never assume inheritance.
     If a summary includes `[[rc:<handle>]]`, recover exact bytes with `distill retrieve <handle>`. Wait for `distill` before continuing.
     Details and examples live in the managed `distill` SKILL.md.
     <!-- distill skill: end -->

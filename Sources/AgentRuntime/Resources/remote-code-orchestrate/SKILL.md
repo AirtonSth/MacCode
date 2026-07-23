@@ -24,6 +24,8 @@ re-reading this skill or re-prompting full history into every worker.
   dependencies, pass criteria, required proof, and a bound runtime receipt.
 - Tell every worker that other agents may share the workspace and that it must
   not revert or overwrite unrelated work.
+- Put the Distill rule in every worker/reviewer prompt: explicit `| distill` for
+  every pipable output-producing tool call, recursively required for descendants.
 - Treat every returned claim as unverified until the controller checks its
   artifact, scope, and proof (diff vs writable paths; one real TARGET proof).
 - Select capability by task risk first. Bind model/effort only from

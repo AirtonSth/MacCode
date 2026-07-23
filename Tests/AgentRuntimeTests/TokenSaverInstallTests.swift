@@ -245,7 +245,7 @@ final class TokenSaverInstallTests: XCTestCase {
         let grokText = try String(contentsOf: grokInstructions)
         XCTAssertTrue(codexText.contains(AgentSkillInstaller.distillInstructionsBeginMarker))
         XCTAssertTrue(claudeText.contains(AgentSkillInstaller.distillInstructionsEndMarker))
-        XCTAssertTrue(codexText.contains("Use `/distill` for every user-visible response"))
+        XCTAssertTrue(codexText.contains("Use `/distill` dialect for provider turns"))
         XCTAssertTrue(codexText.contains("RemoteCode-managed `distill` CLI"))
         XCTAssertTrue(codexText.contains("RemoteCodeDistillService"))
         XCTAssertFalse(codexText.contains(TokenSaverProviderSafetyABI.block))

@@ -1028,7 +1028,7 @@ final class ClaudeStreamingCLIAdapterTests: ProviderProcessTestCase {
                       "rc_configure must send a system prompt")
         XCTAssertTrue(on.contains("Background-await protocol"),
                       "the system prompt must always carry the background-await self-declaration rule")
-        XCTAssertTrue(on.contains("pipe EVERY non-interactive"),
+        XCTAssertTrue(on.contains("pipe EVERY pipable, output-producing shell/tool call"),
                       "managed Distill is always-on; system prompt carries `| distill` piping rule")
         XCTAssertTrue(on.contains("S=state"),
                       "the system prompt must carry the distill-language prefixes so user-visible replies use distill language")
@@ -1039,7 +1039,7 @@ final class ClaudeStreamingCLIAdapterTests: ProviderProcessTestCase {
                       "the background-await rule must be sent even with Token Saver off")
         XCTAssertTrue(off.contains("Background-await protocol"),
                       "the background-await self-declaration rule must be present regardless of Token Saver")
-        XCTAssertTrue(off.contains("pipe EVERY non-interactive"),
+        XCTAssertTrue(off.contains("pipe EVERY pipable, output-producing shell/tool call"),
                       "empty env still injects managed Distill for every Claude call")
     }
 
@@ -1677,9 +1677,9 @@ final class ClaudeStreamingCLIAdapterTests: ProviderProcessTestCase {
                       "rc_configure must relay the host `system_prompt` into session state (undefined keeps the SDK default empty prompt when Token Saver is off)")
     }
 
-    // Token Saver must distill EVERY tool (no 4-tool allowlist) once output passes
-    // the stated policy threshold (>~1KB OR >~10 lines), excluding only the
-    // exact-byte file tools. Locks the policy values + the no-allowlist behavior.
+    // The Claude PostToolUse fallback must distill EVERY tool (no 4-tool
+    // allowlist) once output passes its hook threshold, excluding only the
+    // exact-byte file tools. Explicit `| distill` is governed by the system prompt.
     func test_agentSDKBridgeTokenSaverCompressesAllToolsAbovePolicyThreshold() throws {
         let packageRoot = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()

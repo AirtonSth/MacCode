@@ -465,7 +465,7 @@ final class CodexAppServerClientTests: ProviderProcessTestCase {
         )
         // Parity with Claude's per-session systemPrompt: full distill LANGUAGE spec per turn.
         XCTAssertTrue(
-            hintInstructions.contains("AR-0/AR-1"),
+            hintInstructions.contains("R0 micro") && hintInstructions.contains("R1 work"),
             "Codex developer_instructions must carry the full distill language spec, not only the pipe rule"
         )
         XCTAssertEqual(
