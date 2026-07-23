@@ -19,9 +19,9 @@ public enum LocalStorageClass: String, CaseIterable, Sendable {
 
 /// One authority for evictable Agent transcript/log retention. Count protects
 /// row/decoder overhead; encoded-byte limits protect large provider payloads.
-/// Individual oversized events are replaced by a compact explicit marker before
-/// persistence, so neither a newest-row exception nor one provider frame can
-/// break the hard byte ceilings.
+/// Sized for a 16 GB MacBook class machine. When a thread or global budget is
+/// near full, oldest rows are deleted so new events always admit — never a
+/// user-facing "omitted / Retry" for ordinary large tool frames.
 public struct AgentEventRetentionPolicy: Sendable, Equatable {
     public var streamEventCountPerThread: Int
     public var streamEventBytesPerThread: Int64
@@ -33,14 +33,14 @@ public struct AgentEventRetentionPolicy: Sendable, Equatable {
     public var pruneQuantumBytes: Int64
 
     public init(
-        streamEventCountPerThread: Int = 5_000,
-        streamEventBytesPerThread: Int64 = 16 * 1_024 * 1_024,
-        providerLogCountPerThread: Int = 10_000,
-        providerLogBytesPerThread: Int64 = 16 * 1_024 * 1_024,
-        streamEventBytesGlobal: Int64 = 256 * 1_024 * 1_024,
-        providerLogBytesGlobal: Int64 = 256 * 1_024 * 1_024,
-        pruneQuantumRows: Int = 512,
-        pruneQuantumBytes: Int64 = 8 * 1_024 * 1_024
+        streamEventCountPerThread: Int = 16_384,
+        streamEventBytesPerThread: Int64 = 256 * 1_024 * 1_024,
+        providerLogCountPerThread: Int = 16_384,
+        providerLogBytesPerThread: Int64 = 256 * 1_024 * 1_024,
+        streamEventBytesGlobal: Int64 = 1_024 * 1_024 * 1_024,
+        providerLogBytesGlobal: Int64 = 1_024 * 1_024 * 1_024,
+        pruneQuantumRows: Int = 1_024,
+        pruneQuantumBytes: Int64 = 32 * 1_024 * 1_024
     ) {
         self.streamEventCountPerThread = max(1, streamEventCountPerThread)
         self.streamEventBytesPerThread = max(1, streamEventBytesPerThread)

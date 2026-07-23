@@ -375,24 +375,32 @@ final class WeekLongEnduranceHarnessTests: XCTestCase {
             )
             XCTAssertNotEqual(outcome, .saturated)
         }
+        // Full queue: admit newest by dropping oldest (no hard refuse).
         XCTAssertEqual(
             batch.appendBounded(event: .turnStarted(turnId: "ui-overflow"), run: run, threadId: thread),
-            .saturated
+            .bufferedAfterEviction
         )
         XCTAssertEqual(
             batch.appendBounded(event: .turnStarted(turnId: "ui-overflow-repeat"), run: run, threadId: thread),
-            .saturationAlreadyReported,
-            "a full-queue episode must also report only once while the high-water holds"
+            .bufferedAfterEviction,
+            "continued pressure keeps admitting newest by further oldest eviction"
         )
         var drained = 0
+        var lastTurnId: String?
         repeat {
             let quantum = batch.drainQuantum()
             XCTAssertLessThanOrEqual(quantum.entries.count, limits.drainCount)
             XCTAssertLessThanOrEqual(quantum.encodedByteCount, limits.drainBytes)
             drained += quantum.entries.count
+            if let last = quantum.entries.last, case .turnStarted(let id) = last.event {
+                lastTurnId = id
+            }
             if !quantum.hasMore { break }
         } while true
-        XCTAssertEqual(drained, limits.maxBufferedCount)
+        XCTAssertEqual(drained, limits.maxBufferedCount,
+                       "queue stays at the high-water count after oldest-eviction admits")
+        XCTAssertEqual(lastTurnId, "ui-overflow-repeat",
+                       "the newest overflow event must remain after reclaim")
     }
 
     private func exerciseSimulatedPersistenceFailures(

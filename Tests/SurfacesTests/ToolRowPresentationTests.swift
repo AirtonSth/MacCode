@@ -135,4 +135,74 @@ final class ToolRowPresentationTests: XCTestCase {
         XCTAssertEqual(AgentAppView.toolGroupSummary(items), "Running 2 commands…",
                        "a still-running burst must read as live, not as a finished count")
     }
+
+    func test_partitionLiveTurnItems_foldsSettledWorkBeforeStreamingTail() {
+        // WHY: Grok interleaves Thought between tools. Without partitioning, every
+        // completed command stays a full toolRow and the live transcript cannot
+        // collapse. Settled prefix must fold; the streaming item stays active.
+        var items: [AssistantItem] = []
+        for index in 0..<6 {
+            items.append(item(.commandExecution, id: "cmd-\(index)", state: .completed))
+            items.append(item(.reasoning, id: "thought-\(index)", state: .completed))
+        }
+        items.append(item(.commandExecution, id: "active", state: .streaming))
+
+        let (settled, active) = AgentAppView.partitionLiveTurnItems(items)
+
+        XCTAssertEqual(active.last?.id, "active",
+                       "the streaming item must stay in the active tail")
+        XCTAssertTrue(active.contains(where: { $0.id == "active" }))
+        XCTAssertFalse(settled.contains(where: { $0.id == "active" }),
+                       "the active command must not also live in the collapsed work disclosure")
+        XCTAssertEqual(settled.count + active.count, items.count,
+                       "partition must preserve every item exactly once")
+        XCTAssertGreaterThan(settled.count, 0,
+                             "completed tools/thoughts before the stream must collapse into settled work")
+        XCTAssertLessThanOrEqual(active.count, AgentAppView.liveTurnActiveTailLimit,
+                                 "active tail must stay short so the live view stays chat-dense")
+    }
+
+    func test_partitionLiveTurnItems_noStreamingKeepsOnlyNewestTail() {
+        let items = (0..<10).map { item(.tool, id: "t\($0)", state: .completed) }
+        let (settled, active) = AgentAppView.partitionLiveTurnItems(items)
+        XCTAssertEqual(active.count, AgentAppView.liveTurnActiveTailLimit)
+        XCTAssertEqual(settled.count, items.count - AgentAppView.liveTurnActiveTailLimit)
+        XCTAssertEqual(active.map(\.id), items.suffix(AgentAppView.liveTurnActiveTailLimit).map(\.id))
+    }
+
+    func test_computeTurnRenderInputs_runningTurnCollapsesSettledWork() {
+        let turnId = "live-turn"
+        var items: [AssistantItem] = (0..<5).map {
+            item(.commandExecution, id: "done-\($0)", state: .completed)
+        }
+        items.append(item(.commandExecution, id: "now", state: .streaming))
+        let turn = AssistantTurnSnapshot(turnId: turnId, items: items.map { item in
+            var copy = item
+            // turnId must match for snapshot integrity
+            return AssistantItem(
+                id: copy.id, turnId: turnId, type: copy.type, state: copy.state,
+                summary: nil, body: "", startedAtMs: 1
+            )
+        })
+        let inputs = AgentAppView.computeTurnRenderInputs(
+            turn: turn,
+            persistedAssistantTexts: [],
+            proposedPlans: [],
+            running: true
+        )
+        XCTAssertFalse(inputs.completedWorkBlocks.isEmpty,
+                       "settled work must become a collapsible work disclosure while running")
+        XCTAssertFalse(inputs.visibleBlocks.isEmpty,
+                       "the active streaming command must still paint live")
+        // Active blocks should not re-list every completed command.
+        let visibleIds = inputs.visibleBlocks.flatMap { block -> [String] in
+            switch block {
+            case .item(let i): return [i.id]
+            case .toolGroup(_, let group): return group.map(\.id)
+            }
+        }
+        XCTAssertTrue(visibleIds.contains("now"))
+        XCTAssertFalse(visibleIds.contains("done-0"),
+                       "early completed commands must not stay expanded in the live path")
+    }
 }

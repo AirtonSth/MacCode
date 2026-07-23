@@ -1460,20 +1460,19 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         var retained: [AssistantEvent] = []
         retained.reserveCapacity(min(events.count, max(1, countLimit)))
         var bytes: Int64 = 0
+        // Walk newest→oldest so budget pressure drops older history first and
+        // the live tail always wins. Never replace a large frame with a
+        // recoverable "omitted" error — skip frames that cannot fit alone.
         for event in events.reversed() {
             guard retained.count < max(1, countLimit) else { break }
-            var boundedEvent = event
-            var eventBytes = Int64((try? encoder.encode(boundedEvent).count) ?? boundedEvent.debugDescription.utf8.count)
+            let eventBytes = Int64((try? encoder.encode(event).count) ?? event.debugDescription.utf8.count)
             if eventBytes > max(1, byteLimit) {
-                boundedEvent = .error(
-                    message: "An oversized provider event was omitted from the hot replay window.",
-                    recoverable: true
-                )
-                eventBytes = Int64((try? encoder.encode(boundedEvent).count) ?? 256)
-                guard eventBytes <= max(1, byteLimit) else { continue }
+                // Pathological single frame larger than the whole window: keep
+                // walking older events rather than blocking the newest paint.
+                continue
             }
             if bytes + eventBytes > max(1, byteLimit) { break }
-            retained.append(boundedEvent)
+            retained.append(event)
             bytes += eventBytes
         }
         retained.reverse()
@@ -3636,11 +3635,14 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     /// How many buffered stream events force a flush. Bounds both the in-memory
     /// buffer and the lock-held replay size on a single flush.
     nonisolated static let streamFlushCountThreshold = 16
-    /// A handful of very large provider frames must flush before count reaches
-    /// 16. Individual frames are bounded before entering this buffer, so one
-    /// malformed provider event cannot exceed the flush or resident-memory cap.
-    nonisolated static let streamFlushByteThreshold = 512 * 1_024
-    nonisolated static let maximumBufferedEventBytes = 512 * 1_024
+    /// Large provider frames (Chrome dumps, shell output) flush by bytes before
+    /// the count threshold so the in-memory batch stays bounded.
+    nonisolated static let streamFlushByteThreshold = 8 * 1_024 * 1_024
+    /// Absolute per-frame ceiling for a 16 GB MacBook class machine (~0.1% of RAM).
+    /// Frames under this limit always admit; older history is reclaimed by
+    /// retention prune. Only pathological frames above this are soft-truncated —
+    /// never replaced with a recoverable "omitted" error banner.
+    nonisolated static let maximumBufferedEventBytes = 16 * 1_024 * 1_024
     /// Max latency (ms) a buffered stream event may wait before being flushed,
     /// so a slow trickle still reaches the DB (and survives reload/crash).
     nonisolated static let streamFlushTimeThresholdMs: Int64 = 250
@@ -3649,20 +3651,15 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         _ payloadJSON: String,
         byteLimit: Int = maximumBufferedEventBytes
     ) -> String {
-        guard payloadJSON.utf8.count > max(1, byteLimit) else { return payloadJSON }
-        let marker = AssistantEvent.error(
-            message: "A provider event was omitted from local history because it exceeded the event memory limit (\(payloadJSON.utf8.count) bytes).",
-            recoverable: true
-        )
-        return (try? JSONEncoder().encode(marker)).map { String(decoding: $0, as: UTF8.self) }
-            ?? #"{"error":{"message":"Oversized provider event omitted.","recoverable":true}}"#
+        Self.softTruncateUTF8Payload(payloadJSON, byteLimit: byteLimit)
     }
 
     nonisolated static func boundedProviderRuntimeEvent(
         _ event: ProviderRuntimeEvent,
         byteLimit: Int = maximumBufferedEventBytes
     ) -> ProviderRuntimeEvent {
-        guard event.payloadJSON.utf8.count > max(1, byteLimit) else { return event }
+        let bounded = Self.softTruncateUTF8Payload(event.payloadJSON, byteLimit: byteLimit)
+        guard bounded != event.payloadJSON else { return event }
         return ProviderRuntimeEvent(
             id: event.id,
             provider: event.provider,
@@ -3671,9 +3668,32 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             providerTurnId: event.providerTurnId,
             providerItemId: event.providerItemId,
             providerRequestId: event.providerRequestId,
-            payloadJSON: #"{"remote_code_truncated":true,"reason":"event_size_limit","original_bytes":\#(event.payloadJSON.utf8.count)}"#,
+            payloadJSON: bounded,
             receivedAtMs: event.receivedAtMs
         )
+    }
+
+    /// Soft-truncate an encoded payload at a Character-safe boundary. Prefer the
+    /// head of the frame so partial tool output remains useful; never emit a
+    /// recoverable user-facing error for size pressure.
+    nonisolated static func softTruncateUTF8Payload(
+        _ payloadJSON: String,
+        byteLimit: Int
+    ) -> String {
+        let limit = max(1, byteLimit)
+        let originalBytes = payloadJSON.utf8.count
+        guard originalBytes > limit else { return payloadJSON }
+        let trailer = "…[truncated \(originalBytes)→\(limit) bytes]"
+        let headBudget = max(0, limit - trailer.utf8.count)
+        var consumed = 0
+        var end = payloadJSON.startIndex
+        for index in payloadJSON.indices {
+            let step = String(payloadJSON[index]).utf8.count
+            if consumed + step > headBudget { break }
+            consumed += step
+            end = payloadJSON.index(after: index)
+        }
+        return String(payloadJSON[..<end]) + trailer
     }
 
     /// FIFO-set helper for correctness identifiers stored in the compact runtime

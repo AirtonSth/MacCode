@@ -288,54 +288,84 @@ final class RetentionCapTests: XCTestCase {
         XCTAssertLessThanOrEqual(try runs.providerEventPayloadBytes(threadId: thread.id), 370)
     }
 
-    func test_agentEventRetention_replacesOversizedNewestRowWithinHardCeiling() throws {
+    func test_agentEventRetention_keepsNewestAndEvictsOldestUnderByteBudget() throws {
         let db = try makeDB()
         let runs = AgentRunRepository(db: db)
         let thread = try makeThread(db: db)
         let run = try makeRun(db: db, threadId: thread.id)
+        // ~700 KiB frames must admit under the 16 MB per-row ceiling (the prior
+        // 512 KiB omit path is gone). Byte pressure reclaims OLDEST rows only.
         try runs.appendStreamEvent(
             runId: run.id,
             seq: 1,
-            kind: "oversized",
-            payloadJSON: String(repeating: "x", count: 700 * 1_024)
+            kind: "older",
+            payloadJSON: String(repeating: "x", count: 12 * 1_024)
         )
-        try runs.appendStreamEvent(runId: run.id, seq: 2, kind: "newest", payloadJSON: String(repeating: "y", count: 700 * 1_024))
+        try runs.appendStreamEvent(
+            runId: run.id,
+            seq: 2,
+            kind: "newest",
+            payloadJSON: String(repeating: "y", count: 12 * 1_024)
+        )
 
         try runs.pruneStreamEvents(threadId: thread.id, keepLatest: 10, maxPayloadBytes: 16 * 1_024)
 
-        XCTAssertLessThanOrEqual(try runs.streamEventPayloadBytes(threadId: thread.id), 16 * 1_024,
-                                 "no newest-row exception may exceed the hard byte ceiling")
-        let replay = try runs.listLatestStreamEvents(threadId: thread.id, limit: 10, strictDecoding: true)
-        XCTAssertFalse(replay.isEmpty)
-        XCTAssertTrue(replay.allSatisfy { event in
-            if case .error(let message, _) = event { return message.contains("omitted") }
-            return false
-        })
+        // Newest must survive; total may still exceed budget if the newest alone
+        // is large, but older rows must yield first.
+        let kinds = try runs.listLatestStreamEvents(threadId: thread.id, limit: 10, strictDecoding: false)
+        // Payloads are raw JSON strings of x/y, not AssistantEvent — list may fail
+        // strict decode. Use payload byte accounting + count instead.
+        XCTAssertEqual(try runs.countStreamEvents(threadId: thread.id), 1,
+                       "byte pressure must drop the older row so the newest admits")
+        XCTAssertLessThanOrEqual(try runs.streamEventPayloadBytes(threadId: thread.id), 16 * 1_024 + 64,
+                                 "after reclaim, cumulative payload stays near the budget")
+        _ = kinds
     }
 
-    func test_providerEventPersistence_replacesOversizedPayloadWithBoundedMarker() throws {
+    func test_providerEventPersistence_admitsLargeFramesAndSoftTruncatesOnlyAboveCeiling() throws {
         let db = try makeDB()
         let runs = AgentRunRepository(db: db)
         let thread = try makeThread(db: db)
         let run = try makeRun(db: db, threadId: thread.id)
+        let large = String(repeating: "p", count: 700 * 1_024)
         try runs.appendProviderEventLog(
             threadId: thread.id,
             runId: run.id,
             event: ProviderRuntimeEvent(
-                id: "oversized-provider",
+                id: "large-provider",
                 provider: .codex,
                 source: "test",
                 method: "item/completed",
-                payloadJSON: String(repeating: "p", count: 700 * 1_024),
+                payloadJSON: large,
                 receivedAtMs: 1
             )
         )
 
         let replay = try runs.listLatestProviderEventLogs(threadId: thread.id, limit: 1)
         let event = try XCTUnwrap(replay.first)
-        XCTAssertLessThanOrEqual(event.payloadJSON.utf8.count, AgentRunRepository.maximumPersistedEventRowBytes)
-        XCTAssertTrue(event.payloadJSON.contains("event_size_limit"),
-                      "an oversized provider frame must become an explicit compact marker")
+        XCTAssertEqual(event.payloadJSON, large,
+                       "700 KiB provider frames must admit fully under the 16 MB ceiling")
+        XCTAssertFalse(event.payloadJSON.contains("event_size_limit"),
+                       "no compact-error marker for admissible large frames")
+
+        let pathological = String(repeating: "q", count: AgentRunRepository.maximumPersistedEventRowBytes + 40_000)
+        try runs.appendProviderEventLog(
+            threadId: thread.id,
+            runId: run.id,
+            event: ProviderRuntimeEvent(
+                id: "pathological-provider",
+                provider: .codex,
+                source: "test",
+                method: "item/completed",
+                payloadJSON: pathological,
+                receivedAtMs: 2
+            )
+        )
+        let big = try XCTUnwrap(try runs.listLatestProviderEventLogs(threadId: thread.id, limit: 2)
+            .first(where: { $0.id == "pathological-provider" }))
+        XCTAssertLessThanOrEqual(big.payloadJSON.utf8.count, AgentRunRepository.maximumPersistedEventRowBytes)
+        XCTAssertTrue(big.payloadJSON.contains("truncated"),
+                      "only frames above the absolute ceiling are soft-truncated")
     }
 
     func test_hotReplay_appliesEncodedByteAndCountHighWaterInFIFOOrder() throws {

@@ -534,16 +534,24 @@ final class AgentAppPerfBundleTests: XCTestCase {
         XCTAssertEqual(batch.appendBounded(event: .turnStarted(turnId: "1"), run: run, threadId: tid), .scheduled)
         XCTAssertEqual(batch.appendBounded(event: .turnStarted(turnId: "2"), run: run, threadId: tid), .buffered)
         XCTAssertEqual(batch.appendBounded(event: .turnStarted(turnId: "3"), run: run, threadId: tid), .buffered)
-        XCTAssertEqual(batch.appendBounded(event: .turnStarted(turnId: "4"), run: run, threadId: tid), .saturated,
-                       "a blocked MainActor must refuse further queue growth instead of expanding unboundedly")
+        // Budget pressure drops the oldest UI event so the newest always admits.
+        XCTAssertEqual(batch.appendBounded(event: .turnStarted(turnId: "4"), run: run, threadId: tid), .bufferedAfterEviction,
+                       "a blocked MainActor must evict oldest buffered paints, not refuse the newest")
 
         let first = batch.drainQuantum()
         XCTAssertEqual(first.entries.count, 2,
                        "one MainActor application turn must never exceed the configured work quantum")
         XCTAssertTrue(first.hasMore)
+        // After eviction the queue still holds 3 events (2,3,4) — first quantum
+        // takes 2, second takes the remainder.
         let second = batch.drainQuantum()
         XCTAssertEqual(second.entries.count, 1)
         XCTAssertFalse(second.hasMore)
+        if case .turnStarted(let id) = second.entries[0].event {
+            XCTAssertEqual(id, "4", "newest event must survive eviction of the oldest")
+        } else {
+            XCTFail("expected turnStarted after eviction drain")
+        }
     }
 
     func test_streamEventBatch_acceptsEventLargerThanDrainQuantumWithinHardCeiling() {
