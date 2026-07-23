@@ -80,6 +80,8 @@ public struct ToolOutputCompressionPolicy: Sendable, Equatable {
             TokenSaverWaveAShadowBridge.observeToolOutput(
                 toolName: toolName, output: output, bindingDigest: bindingDigest
             )
+            // Wave B typed crushers (task-15): production admission probe (default OFF → no-op accept).
+            TokenSaverTypedCrushersBridge.observeToolOutput(toolName: toolName, output: output)
         }
         let profile = profile(for: toolName)
         let skipReason: ToolCompressionSkipReason?
