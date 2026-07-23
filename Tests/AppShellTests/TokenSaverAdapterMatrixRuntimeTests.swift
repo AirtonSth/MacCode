@@ -1,5 +1,6 @@
 import XCTest
 @testable import AppShell
+@testable import AgentRuntime
 import CoreModel
 
 final class TokenSaverAdapterMatrixRuntimeTests: XCTestCase {
