@@ -27,9 +27,10 @@ public final class TokenSaverWaveDRuntime: @unchecked Sendable {
         case bindingMismatch
         case missingStructureOriginal
         case missingProvenance
+        case handleCollision
+        case durableRequired
     }
 
-    /// Closed command family — not free-form argv strings from callers.
     public enum FamilyCommand: String, Sendable, CaseIterable {
         case test
         case build
@@ -37,10 +38,8 @@ public final class TokenSaverWaveDRuntime: @unchecked Sendable {
         case typecheck
         case formatCheck = "format-check"
 
-        /// Side-effect class derived from the closed family (not caller-asserted).
         public var isMutating: Bool { false }
 
-        /// Broad package-manager wrap families are intentionally absent.
         public static let packageManagerWrapCommands: Set<String> = [
             "npm", "yarn", "pnpm", "pip", "cargo", "brew", "apt", "pod"
         ]
@@ -56,19 +55,36 @@ public final class TokenSaverWaveDRuntime: @unchecked Sendable {
     public struct GraphProvenance: Sendable, Equatable {
         public let sourceDigest: String
         public let coverageDigest: String
+        public let path: String
+        public let startLine: Int
+        public let endLine: Int
         public let lspGeneration: UInt64
+
+        public var isValid: Bool {
+            let s = sourceDigest.trimmingCharacters(in: .whitespacesAndNewlines)
+            let c = coverageDigest.trimmingCharacters(in: .whitespacesAndNewlines)
+            let p = path.trimmingCharacters(in: .whitespacesAndNewlines)
+            return !s.isEmpty && !c.isEmpty && !p.isEmpty
+                && startLine > 0 && endLine >= startLine
+                && lspGeneration > 0
+        }
     }
 
     public let boundUserID: String
     public let bindingDigest: String
+    private let durableRoot: URL?
     private let lock = NSLock()
     private var _live = TokenSaverWaveDFamilies.defaultEnabled
     private var validationFailed = false
     private var structureOriginals: [String: Data] = [:]
 
-    public init(boundUserID: String, bindingDigest: String) {
+    public init(boundUserID: String, bindingDigest: String, durableDirectory: URL? = nil) {
         self.boundUserID = boundUserID.trimmingCharacters(in: .whitespacesAndNewlines)
         self.bindingDigest = bindingDigest.trimmingCharacters(in: .whitespacesAndNewlines)
+        self.durableRoot = durableDirectory
+        if let dir = durableDirectory {
+            try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        }
     }
 
     public var live: Bool {
@@ -94,7 +110,6 @@ public final class TokenSaverWaveDRuntime: @unchecked Sendable {
         if let deny = authorize(requestingUserID: requestingUserID, bindingDigest: bindingDigest) {
             return deny
         }
-        // Closed family never mutates; package-manager wrap strings are not representable.
         if FamilyCommand.packageManagerWrapCommands.contains(command.rawValue) {
             return .packageManagerAutoWrapAbsent
         }
@@ -102,7 +117,6 @@ public final class TokenSaverWaveDRuntime: @unchecked Sendable {
         return .admitted
     }
 
-    /// Reject free-form subcommand strings that look like package-manager wrap.
     public func admitRawSubcommand(
         _ subcommand: String,
         requestingUserID: String,
@@ -116,10 +130,8 @@ public final class TokenSaverWaveDRuntime: @unchecked Sendable {
         return admitCommand(cmd, requestingUserID: requestingUserID, bindingDigest: bindingDigest)
     }
 
-    /// Live terminal never buffers for compression (AC-02).
     public func mayBufferLiveTerminal() -> Bool { false }
 
-    /// Structure view requires store-before-loss of original bytes + language + line map digest.
     public func codeStructureView(
         original: Data,
         language: String,
@@ -140,12 +152,22 @@ public final class TokenSaverWaveDRuntime: @unchecked Sendable {
         guard !original.isEmpty, !lang.isEmpty, !map.isEmpty else {
             return .failure(.missingStructureOriginal)
         }
-        let handle = "struct-\(map.prefix(12))"
-        structureOriginals[handle] = original
-        // Verify store
-        guard structureOriginals[handle] == original else {
+        // Unique handle: UUID (no collision / no overwrite of prior originals).
+        let handle = UUID().uuidString
+        // Durable store required for store-before-loss across relaunch.
+        guard let root = durableRoot else { return .failure(.durableRequired) }
+        let url = self.fileURL(root: root, handle: handle)
+        if FileManager.default.fileExists(atPath: url.path) { return .failure(.handleCollision) }
+        do {
+            try original.write(to: url, options: [.withoutOverwriting])
+        } catch {
             return .failure(.missingStructureOriginal)
         }
+        guard let readback = try? Data(contentsOf: url), readback == original else {
+            try? FileManager.default.removeItem(at: url)
+            return .failure(.missingStructureOriginal)
+        }
+        structureOriginals[handle] = original
         return .success(StructureView(
             handle: handle,
             marker: "[[rc:\(handle)]]",
@@ -154,9 +176,26 @@ public final class TokenSaverWaveDRuntime: @unchecked Sendable {
         ))
     }
 
-    public func retrieveStructureOriginal(handle: String) -> Data? {
+    public func retrieveStructureOriginal(
+        handle: String,
+        requestingUserID: String,
+        bindingDigest: String
+    ) -> Data? {
         lock.lock(); defer { lock.unlock() }
-        return structureOriginals[handle]
+        if authorize(requestingUserID: requestingUserID, bindingDigest: bindingDigest) != nil {
+            return nil
+        }
+        let h = handle.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let mem = structureOriginals[h] { return mem }
+        guard let root = durableRoot else { return nil }
+        return try? Data(contentsOf: fileURL(root: root, handle: h))
+    }
+
+    private func fileURL(root: URL, handle: String) -> URL {
+        // Scope durable key by user + binding so another runtime cannot read across identity.
+        let key = "\(boundUserID)|\(bindingDigest)|\(handle)"
+        let safe = Data(key.utf8).base64EncodedString().replacingOccurrences(of: "/", with: "_")
+        return root.appendingPathComponent(safe)
     }
 
     public func evidenceGraph(
@@ -170,11 +209,7 @@ public final class TokenSaverWaveDRuntime: @unchecked Sendable {
         if let deny = authorize(requestingUserID: requestingUserID, bindingDigest: bindingDigest) {
             return deny
         }
-        guard let provenance,
-              !provenance.sourceDigest.isEmpty,
-              !provenance.coverageDigest.isEmpty else {
-            return .missingProvenance
-        }
+        guard let provenance, provenance.isValid else { return .missingProvenance }
         if lspStale { return .graphDegraded }
         return .admitted
     }
@@ -203,10 +238,9 @@ public final class TokenSaverWaveDRuntime: @unchecked Sendable {
 
     public func taskDoneAllowed() -> Bool {
         lock.lock(); defer { lock.unlock() }
-        if !_live { return true } // fail-open
+        if !_live { return true }
         return !validationFailed
     }
 
-    /// Guard: broad package-manager auto-wrap is intentionally absent (AC-08).
     public static let packageManagerAutoWrapEnabled = false
 }

@@ -4,11 +4,9 @@ import Foundation
 public enum TokenSaverPromotionCanary {
     public static let taskID = "task-21"
     public static let defaultEnabled = false
-    /// Immutable alpha-spending schedule (steps require outcomes + dwell, not time alone).
     public static let canarySteps: [Double] = [0.01, 0.05, 0.25]
     public static let minAttribution: Double = 0.99
     public static let maxReconciliation: Double = 0.02
-    /// Minimum dwell hours between steps (AC-05): 24h, 72h, 72h.
     public static let minDwellHours: [Int] = [24, 72, 72]
 }
 
@@ -22,14 +20,18 @@ public final class TokenSaverPromotionCanaryRuntime: @unchecked Sendable {
         case complete = 3
     }
 
-    /// Opaque promotion gate — only internal mint after authority evidence.
     public struct PromotionGateSeal: Sendable, Equatable {
         fileprivate let token: UInt64
-        fileprivate init(token: UInt64) { self.token = token }
+        fileprivate let bindingDigest: String
+        fileprivate let registryEpoch: UInt64
+        fileprivate init(token: UInt64, bindingDigest: String, registryEpoch: UInt64) {
+            self.token = token
+            self.bindingDigest = bindingDigest
+            self.registryEpoch = registryEpoch
+        }
     }
 
     public enum PromotionGate {
-        /// Internal mint only (public modules cannot forge promotion from free booleans).
         internal static func seal(
             coverageCellsComplete: Bool,
             presentationParityOK: Bool,
@@ -47,7 +49,11 @@ public final class TokenSaverPromotionCanaryRuntime: @unchecked Sendable {
             var h = Hasher()
             h.combine(b)
             h.combine(registryEpoch)
-            return PromotionGateSeal(token: UInt64(bitPattern: Int64(h.finalize())))
+            return PromotionGateSeal(
+                token: UInt64(bitPattern: Int64(h.finalize())),
+                bindingDigest: b,
+                registryEpoch: registryEpoch
+            )
         }
     }
 
@@ -58,21 +64,23 @@ public final class TokenSaverPromotionCanaryRuntime: @unchecked Sendable {
     private var step: CanaryStep = .one
     private var outcomesWatermark: Int = 0
     private var requiredOutcomes: [Int] = [10, 50, 200]
-    private var stepEnteredAtHours: [Int: Int] = [0: 0] // step rawValue -> clock hours when entered
-    private var clockHours: Int = 0
+    private var stepEnteredAtHours: [Int: Int] = [:]
     private var revoked = false
     private var attribution: Double = 1.0
     private var reconciliation: Double = 0.0
     private var originalViews: [String: Data] = [:]
     private let durableRoot: URL?
+    /// Injectable clock (hours since epoch). Default is wall clock. Tests may replace via @testable.
+    internal var nowHours: () -> Int = {
+        Int(Date().timeIntervalSince1970 / 3600.0)
+    }
 
-    public init(boundUserID: String, bindingDigest: String, durableDirectory: URL? = nil) {
+    public init(boundUserID: String, bindingDigest: String, durableDirectory: URL) {
         self.boundUserID = boundUserID.trimmingCharacters(in: .whitespacesAndNewlines)
         self.bindingDigest = bindingDigest.trimmingCharacters(in: .whitespacesAndNewlines)
         self.durableRoot = durableDirectory
-        if let dir = durableDirectory {
-            try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        }
+        try? FileManager.default.createDirectory(at: durableDirectory, withIntermediateDirectories: true)
+        // stepEnteredAtHours is stamped on first advanceCanary using the (possibly injected) clock.
     }
 
     public var live: Bool {
@@ -82,22 +90,13 @@ public final class TokenSaverPromotionCanaryRuntime: @unchecked Sendable {
 
     public func setAttribution(_ v: Double) { lock.lock(); attribution = v; lock.unlock() }
     public func setReconciliation(_ v: Double) { lock.lock(); reconciliation = v; lock.unlock() }
-
-    /// Advance synthetic clock for dwell proofs (tests / host). Not a free promote path.
-    public func advanceClock(hours: Int) {
-        lock.lock(); clockHours += max(0, hours); lock.unlock()
-    }
-
     public func recordOutcomes(_ n: Int) { lock.lock(); outcomesWatermark += max(0, n); lock.unlock() }
 
-    /// UI must not show positive confirmed savings copy without a delivering confirmed lane (AC-01).
     public func uiMayShowConfirmedSavingsCopy(hasDeliveringConfirmedLane: Bool) -> Bool {
         lock.lock(); let isLive = _live; lock.unlock()
         return isLive && hasDeliveringConfirmedLane
     }
 
-    /// Confirmed totals only from ledger-minted MeasuredSavingsReceipt + live + binding match.
-    /// Public PresentationReceipt free-form path removed (forgeability).
     public func confirmedTotal(
         receipt: TokenSaverRecoveryProjections.MeasuredSavingsReceipt?,
         creditBindingDigest: String
@@ -110,25 +109,21 @@ public final class TokenSaverPromotionCanaryRuntime: @unchecked Sendable {
         return max(0, receipt.tokens)
     }
 
-    /// Store-before-loss: durable write + verified readback required before success.
+    /// Store-before-loss: durable directory required; key scoped by user+binding+handle.
     public func storeOriginal(handle: String, bytes: Data, requestingUserID: String) -> Bool {
         let h = handle.trimmingCharacters(in: .whitespacesAndNewlines)
         let u = requestingUserID.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !h.isEmpty, !bytes.isEmpty, u == boundUserID, !boundUserID.isEmpty else { return false }
+        guard let root = durableRoot else { return false }
         lock.lock(); defer { lock.unlock() }
-        if originalViews[h] != nil { return false }
-        if let root = durableRoot {
-            let url = root.appendingPathComponent(Self.safeName(h))
-            if FileManager.default.fileExists(atPath: url.path) { return false }
-            do {
-                try bytes.write(to: url, options: [.withoutOverwriting])
-            } catch { return false }
-            guard let readback = try? Data(contentsOf: url), readback == bytes else { return false }
-        } else {
-            // Memory-only mode still verifies round-trip in-process.
-            originalViews[h] = bytes
-            guard originalViews[h] == bytes else { return false }
-            return true
+        let url = fileURL(root: root, handle: h)
+        if FileManager.default.fileExists(atPath: url.path) { return false }
+        do {
+            try bytes.write(to: url, options: [.withoutOverwriting])
+        } catch { return false }
+        guard let readback = try? Data(contentsOf: url), readback == bytes else {
+            try? FileManager.default.removeItem(at: url)
+            return false
         }
         originalViews[h] = bytes
         return true
@@ -146,30 +141,35 @@ public final class TokenSaverPromotionCanaryRuntime: @unchecked Sendable {
         let root = durableRoot
         lock.unlock()
         guard let root else { return nil }
-        return try? Data(contentsOf: root.appendingPathComponent(Self.safeName(h)))
+        return try? Data(contentsOf: fileURL(root: root, handle: h))
     }
 
-    private static func safeName(_ handle: String) -> String {
-        Data(handle.utf8).base64EncodedString().replacingOccurrences(of: "/", with: "_")
+    private func fileURL(root: URL, handle: String) -> URL {
+        let key = "\(boundUserID)|\(bindingDigest)|\(handle)"
+        let safe = Data(key.utf8).base64EncodedString().replacingOccurrences(of: "/", with: "_")
+        return root.appendingPathComponent(safe)
     }
 
-    /// Canary advances with outcomes watermark **and** minimum dwell hours (AC-05).
     public func advanceCanary() -> CanaryStep {
         lock.lock(); defer { lock.unlock() }
         guard _live, !revoked else { return step }
+        let now = nowHours()
+        if stepEnteredAtHours[step.rawValue] == nil {
+            stepEnteredAtHours[step.rawValue] = now
+        }
         while step.rawValue < CanaryStep.complete.rawValue {
             let idx = step.rawValue
             guard idx < requiredOutcomes.count, outcomesWatermark >= requiredOutcomes[idx] else { break }
-            let entered = stepEnteredAtHours[idx] ?? 0
+            let entered = stepEnteredAtHours[idx] ?? now
             let dwell = TokenSaverPromotionCanary.minDwellHours[idx]
-            guard clockHours - entered >= dwell else { break }
+            guard now - entered >= dwell else { break }
             if attribution < TokenSaverPromotionCanary.minAttribution ||
                 reconciliation > TokenSaverPromotionCanary.maxReconciliation {
                 return step
             }
             let next = CanaryStep(rawValue: idx + 1) ?? .complete
             step = next
-            stepEnteredAtHours[next.rawValue] = clockHours
+            stepEnteredAtHours[next.rawValue] = now
         }
         return step
     }
@@ -179,7 +179,7 @@ public final class TokenSaverPromotionCanaryRuntime: @unchecked Sendable {
         revoked = true
         step = .one
         outcomesWatermark = 0
-        stepEnteredAtHours = [0: clockHours]
+        stepEnteredAtHours = [0: nowHours()]
         lock.unlock()
     }
 
@@ -187,12 +187,13 @@ public final class TokenSaverPromotionCanaryRuntime: @unchecked Sendable {
         lock.lock(); defer { lock.unlock() }; return step
     }
 
-    /// Promotion requires internal gate seal + canary step + binding match.
     public func mayPromote(gate: PromotionGateSeal, requestingUserID: String) -> Bool {
         lock.lock(); defer { lock.unlock() }
-        _ = gate.token
         let u = requestingUserID.trimmingCharacters(in: .whitespacesAndNewlines)
         guard _live, !revoked, u == boundUserID, !bindingDigest.isEmpty else { return false }
+        // Seal must be bound to this runtime's binding digest.
+        guard gate.bindingDigest == bindingDigest, gate.registryEpoch > 0 else { return false }
+        _ = gate.token
         guard attribution >= TokenSaverPromotionCanary.minAttribution else { return false }
         guard reconciliation <= TokenSaverPromotionCanary.maxReconciliation else { return false }
         return step == .complete || step == .twentyFive
