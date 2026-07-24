@@ -13,56 +13,98 @@ final class TokenSaverBareUserEstimatorTests: XCTestCase {
         XCTAssertEqual(b.measuredToolOutput, 50_000)
         XCTAssertEqual(b.estimatedDialect, 0)
         XCTAssertEqual(b.estimatedGraphify, 0)
-        XCTAssertEqual(b.estimatedOrchestration, 0)
-        XCTAssertEqual(b.totalEstimatedVsBareUser, 50_000)
+        XCTAssertEqual(b.totalCredible, 50_000)
     }
 
-    func test_fullStack_includesDialectGraphifyOrchestration() {
-        // WHY: bare-user counterfactual must credit all RemoteCode techniques, not only pipes.
-        let used = 100_000
-        let measured = 1_000
+    func test_calibratedDialect_usesSmallOutputShareNotTwentyTwoPercent() {
+        // WHY: live coding streams show ~0.7% output share; v1's 22% invented ~56M dialect.
+        let used = 100_000_000
+        let measured = 200_000
         let b = TokenSaverBareUserEstimator.estimate(
             measuredToolOutputSaved: measured,
             actualProviderTokens: used,
             tokenSaverEnabled: true,
-            graphifyActive: true,
-            orchestrationActive: true
-        )
-        let expectedDialect = Int((Double(used) * 0.22 * 2.0).rounded())
-        let expectedGraphify = Int((Double(used) * 0.78 * 0.18).rounded())
-        let expectedOrch = Int((Double(used) * 0.08).rounded())
-        XCTAssertEqual(b.measuredToolOutput, measured)
-        XCTAssertEqual(b.estimatedDialect, expectedDialect)
-        XCTAssertEqual(b.estimatedGraphify, expectedGraphify)
-        XCTAssertEqual(b.estimatedOrchestration, expectedOrch)
-        XCTAssertEqual(
-            b.totalEstimatedVsBareUser,
-            measured + expectedDialect + expectedGraphify + expectedOrch
-        )
-        XCTAssertGreaterThan(b.totalEstimatedVsBareUser, measured)
-    }
-
-    func test_graphifyOff_zeroGraphifyComponent() {
-        let b = TokenSaverBareUserEstimator.estimate(
-            measuredToolOutputSaved: 100,
-            actualProviderTokens: 50_000,
-            tokenSaverEnabled: true,
             graphifyActive: false,
             orchestrationActive: true
         )
-        XCTAssertEqual(b.estimatedGraphify, 0)
-        XCTAssertGreaterThan(b.estimatedDialect, 0)
-        XCTAssertGreaterThan(b.estimatedOrchestration, 0)
+        // O ≈ 100M * 0.007 = 700k; dialect V=2 → ~700k before caps
+        XCTAssertLessThan(b.estimatedDialect, 2_000_000, "dialect must stay on output scale, not 44% of used")
+        XCTAssertGreaterThan(b.estimatedDialect, 100_000)
+        XCTAssertEqual(b.estimatedOrchestration, 0, "orch excluded from token total")
+        XCTAssertEqual(b.totalCredible, measured + b.estimatedDialect + b.estimatedGraphify)
+        // Attributed capped vs measured/used
+        XCTAssertLessThanOrEqual(b.attributedOnly, Int(Double(measured) * 4.0) + 1)
     }
 
-    func test_zeroUsage_noAttributedInflation() {
+    func test_graphifyRequiresSignals() {
+        let noHit = TokenSaverBareUserEstimator.estimate(
+            measuredToolOutputSaved: 100_000,
+            tokenSaverEnabled: true,
+            graphifyActive: true,
+            orchestrationActive: false,
+            observation: TokenSaverBareUserObservation(
+                windowProviderTokens: 50_000_000,
+                graphifySignalCount: 0
+            )
+        )
+        XCTAssertEqual(noHit.estimatedGraphify, 0)
+
+        let withHits = TokenSaverBareUserEstimator.estimate(
+            measuredToolOutputSaved: 100_000,
+            tokenSaverEnabled: true,
+            graphifyActive: true,
+            orchestrationActive: false,
+            observation: TokenSaverBareUserObservation(
+                windowProviderTokens: 50_000_000,
+                graphifySignalCount: 40
+            )
+        )
+        XCTAssertGreaterThan(withHits.estimatedGraphify, 0)
+        XCTAssertLessThan(withHits.estimatedGraphify, 5_000_000, "graphify must not be 18% of all input")
+    }
+
+    func test_zeroMeasured_limitsAttributedFantasy() {
+        // WHY: empty pipe day must not report tens of millions of "savings".
         let b = TokenSaverBareUserEstimator.estimate(
-            measuredToolOutputSaved: 12,
-            actualProviderTokens: 0,
+            measuredToolOutputSaved: 0,
+            actualProviderTokens: 100_000_000,
             tokenSaverEnabled: true,
             graphifyActive: true,
             orchestrationActive: true
         )
-        XCTAssertEqual(b.totalEstimatedVsBareUser, 12)
+        XCTAssertLessThanOrEqual(b.totalCredible, 2_000_000 + 1) // ≤2% of used
+    }
+
+    func test_liveSharePreferredWhenEnoughSamples() {
+        let obs = TokenSaverBareUserObservation(
+            windowProviderTokens: 10_000_000,
+            observedOutputTokens: 100_000,
+            observedInputTokens: 9_900_000,
+            observationSampleCount: 20,
+            assistantChars: 0,
+            graphifySignalCount: 0
+        )
+        let b = TokenSaverBareUserEstimator.estimate(
+            measuredToolOutputSaved: 50_000,
+            tokenSaverEnabled: true,
+            graphifyActive: false,
+            orchestrationActive: false,
+            observation: obs
+        )
+        XCTAssertFalse(b.usedCalibratedDefaults)
+        XCTAssertEqual(b.appliedOutputShare, 0.01, accuracy: 0.000_1)
+    }
+
+    func test_todayProviderTokens_filtersCalendarDay() throws {
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = try XCTUnwrap(TimeZone(secondsFromGMT: 0))
+        let today = try XCTUnwrap(DateComponents(calendar: cal, timeZone: cal.timeZone, year: 2026, month: 7, day: 24, hour: 12).date)
+        let yesterday = try XCTUnwrap(DateComponents(calendar: cal, timeZone: cal.timeZone, year: 2026, month: 7, day: 23, hour: 12).date)
+        let daily = [
+            TokenSaverDayUsage(dayStart: cal.startOfDay(for: yesterday), actualProviderTokens: 1_000),
+            TokenSaverDayUsage(dayStart: cal.startOfDay(for: today), actualProviderTokens: 5_000)
+        ]
+        XCTAssertEqual(TokenSaverBareUserEstimator.todayProviderTokens(daily: daily, now: today, calendar: cal), 5_000)
+        XCTAssertEqual(TokenSaverBareUserEstimator.weekProviderTokens(daily: daily), 6_000)
     }
 }

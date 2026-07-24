@@ -2827,7 +2827,7 @@ public struct SidebarRootView: View {
     }
 
     private var tokenSaverHelpText: String {
-        "Estimated tokens avoided vs a bare agent (no RemoteCode): tool-output compression (measured) plus dialect, Graphify, and model-auto (estimated). Not billed provider savings."
+        "Credible total vs bare agent: measured tool-output ledger + dialect (output-share calibrated ~0.7%) + Graphify when active (capped). Model-auto is not mixed into tokens. Not billed savings."
     }
 
     private var tokenSaverAccessibilityValue: String {
@@ -2916,11 +2916,22 @@ public struct SidebarRootView: View {
         }
     }
 
+    /// Window-aligned provider usage for savings math. Prefer `snapshot.daily`
+    /// buckets (same retention window as the savings ledger) — never all-time
+    /// `usedTokens` or raw session counters for Week/Today totals.
     private func tokenSaverScopeUsedTokens(in snapshot: TokenSaverUsageSnapshot, scope: TokenSaverUsageScope) -> Int {
         switch scope {
         case .currentSession:
+            let fromDaily = TokenSaverBareUserEstimator.todayProviderTokens(
+                daily: snapshot.daily,
+                now: tokenSaverNow
+            )
+            if fromDaily > 0 { return fromDaily }
+            // Fallback when daily buckets are empty: session fields (imperfect).
             return snapshot.providers.reduce(0) { $0 + $1.currentSessionTokens }
         case .week:
+            let fromDaily = TokenSaverBareUserEstimator.weekProviderTokens(daily: snapshot.daily)
+            if fromDaily > 0 { return fromDaily }
             return snapshot.usedTokens
         }
     }
@@ -2967,18 +2978,26 @@ public struct SidebarRootView: View {
         }
     }
 
-    /// Bare-user counterfactual for the selected window. Pure composition of ledger
-    /// + usage + feature gates; factors live in `TokenSaverBareUserEstimator`.
+    /// Bare-user counterfactual for the selected window. Uses same-window daily
+    /// usage + calibrated/live output share (see `TokenSaverBareUserEstimator`).
     private func tokenSaverBareUserBreakdown(
         in snapshot: TokenSaverUsageSnapshot,
         scope: TokenSaverUsageScope
     ) -> TokenSaverBareUserBreakdown {
-        TokenSaverBareUserEstimator.estimate(
+        let observation = TokenSaverBareUserObservation(
+            windowProviderTokens: tokenSaverScopeUsedTokens(in: snapshot, scope: scope),
+            // Stream-level in/out shares are not yet plumbed into the sidebar snapshot;
+            // estimator falls back to calibratedDefaultOutputShare (research ~0.7%).
+            // Graphify signals: credit only when Graphify runtime is active — full
+            // hit counts can be joined later from host telemetry without changing the formula.
+            graphifySignalCount: vm.graphifyRuntimeActive ? 40 : 0
+        )
+        return TokenSaverBareUserEstimator.estimate(
             measuredToolOutputSaved: tokenSaverMeasuredSaved(scope: scope),
-            actualProviderTokens: tokenSaverScopeUsedTokens(in: snapshot, scope: scope),
             tokenSaverEnabled: vm.tokenSaverEnabled,
             graphifyActive: vm.graphifyRuntimeActive,
-            orchestrationActive: vm.tokenSaverEnabled
+            orchestrationActive: false,
+            observation: observation
         )
     }
 
@@ -3693,7 +3712,7 @@ public struct SidebarRootView: View {
     }
 
     nonisolated public static let tokenSaverBillingEvidenceDisclaimer =
-        "Estimated tokens avoided versus a bare agent without RemoteCode (no Token Saver pipes/dialect, no Graphify, no model auto). Tool-output compressions are ledger-measured; dialect, Graphify, and orchestration use published product factors. Local estimates are diagnostic — not billed savings; billing claims require joined provider usage evidence."
+        "Credible estimate vs a bare agent (no RemoteCode). Pipes = local ledger. Dialect uses observed/calibrated output share (~0.7% of usage × verbosity). Graphify only with activity and hard caps. Model-auto is not added as tokens. Local estimates are diagnostic. They are not billed savings; billing claims require joined provider usage evidence."
 
     // Internal alias exposed for the pure seam above. Mirrors `formatTokenCount`
     // which is private; keeping it nonisolated and public lets tests call it.
