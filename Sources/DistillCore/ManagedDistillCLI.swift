@@ -86,12 +86,28 @@ public struct ManagedDistillCLI: Sendable {
         self.arguments = arguments
         self.stdin = stdin
         self.state = state
-        self.provider = provider
+        // Prefer explicit provider, then recovery-scope provider, so savings land
+        // on claude/codex/grok instead of "unknown" when only headers are set.
+        let recoveryProvider = recoveryContext?.provider
+        self.provider = Self.resolveProvider(explicit: provider, recoveryProvider: recoveryProvider)
         self.recoveryContext = recoveryContext?.hasCompleteScope == true ? recoveryContext : nil
         self.invocationID = invocationID
         self.maxOutputCharacters = max(128, maxOutputCharacters)
         self.reversibleStoreMinBytes = reversibleStoreMinBytes
         self.transport = transport
+    }
+
+    /// Pure seam: coalesce CLI env provider with recovery-scope provider.
+    /// Empty / whitespace-only values are treated as missing.
+    public static func resolveProvider(explicit: String?, recoveryProvider: String?) -> String? {
+        if let explicit = explicit?.trimmingCharacters(in: .whitespacesAndNewlines), !explicit.isEmpty {
+            return explicit
+        }
+        if let recoveryProvider = recoveryProvider?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !recoveryProvider.isEmpty {
+            return recoveryProvider
+        }
+        return nil
     }
 
     public func run() async -> (stdout: Data, exitCode: Int32) {

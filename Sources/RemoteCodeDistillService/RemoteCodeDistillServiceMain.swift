@@ -147,15 +147,19 @@ struct RemoteCodeDistillServiceMain {
     private static func runCLI(arguments: [String]) async {
         let stdin = FileHandle.standardInput.readDataToEndOfFile()
         let env = ProcessInfo.processInfo.environment
-        let provider = env["REMOTE_CODE_AGENT_PROVIDER"]?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let recoveryContext = ManagedDistillCLI.recoveryContext(environment: env)
+        let provider = ManagedDistillCLI.resolveProvider(
+            explicit: env["REMOTE_CODE_AGENT_PROVIDER"],
+            recoveryProvider: recoveryContext?.provider
+        )
         let maxChars = Int(env["REMOTE_CODE_DISTILL_MAX_OUTPUT_CHARS"] ?? "") ?? 4_000
         let session = createConfiguredURLSession()
         let cli = ManagedDistillCLI(
             arguments: arguments,
             stdin: stdin,
             state: loadCLIState(),
-            provider: (provider?.isEmpty == false) ? provider : nil,
-            recoveryContext: ManagedDistillCLI.recoveryContext(environment: env),
+            provider: provider,
+            recoveryContext: recoveryContext,
             maxOutputCharacters: maxChars
         ) { request in
             do {
@@ -181,7 +185,11 @@ struct RemoteCodeDistillServiceMain {
         let session = createConfiguredURLSession()
         let exitCode = await CommandWrapRunner.run(command: command, args: arguments) { captured, query, storeFloorBytes in
             let env = ProcessInfo.processInfo.environment
-            let provider = env["REMOTE_CODE_AGENT_PROVIDER"]?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let recoveryContext = ManagedDistillCLI.recoveryContext(environment: env)
+            let provider = ManagedDistillCLI.resolveProvider(
+                explicit: env["REMOTE_CODE_AGENT_PROVIDER"],
+                recoveryProvider: recoveryContext?.provider
+            )
             let maxChars = Int(env["REMOTE_CODE_DISTILL_MAX_OUTPUT_CHARS"] ?? "") ?? 4_000
             // Per-command extraction query: nil (no question → deterministic router) for
             // search/listings; a neutral extractive query for cat/sed so the service routes to its
@@ -190,8 +198,8 @@ struct RemoteCodeDistillServiceMain {
                 arguments: query.map { [$0] } ?? [],
                 stdin: captured,
                 state: loadCLIState(),
-                provider: (provider?.isEmpty == false) ? provider : nil,
-                recoveryContext: ManagedDistillCLI.recoveryContext(environment: env),
+                provider: provider,
+                recoveryContext: recoveryContext,
                 maxOutputCharacters: maxChars,
                 reversibleStoreMinBytes: storeFloorBytes
             ) { request in

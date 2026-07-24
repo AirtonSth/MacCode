@@ -72,6 +72,7 @@ public struct TokenSaverModeSavings: Sendable, Equatable {
 /// so the UI can show all tokens saved for the user. Daily buckets come from the
 /// retained event rows and feed the short-term reports/chart. Mode rows carry the
 /// same permanent totals split by (provider, mode) for the breakdown table.
+/// `windowByMode` is the same retained-window technique mix as `daily` (not all-time).
 public struct TokenSaverSavingsSummary: Sendable, Equatable {
     public let providers: [TokenSaverProviderSavings]
     public let daily: [TokenSaverDailySavings]
@@ -81,17 +82,22 @@ public struct TokenSaverSavingsSummary: Sendable, Equatable {
     /// collapsed `daily` is the sum of these across providers, so the windowed
     /// per-provider rows in the UI reconcile with the windowed headline.
     public let dailyByProvider: [TokenSaverProviderDailySavings]
+    /// Per-(provider, mode) totals over the retained report window only. Sum of
+    /// `savedTokens` across all rows equals sum of `daily.savedTokens` by construction.
+    public let windowByMode: [TokenSaverModeSavings]
 
     public init(
         providers: [TokenSaverProviderSavings],
         daily: [TokenSaverDailySavings],
         modes: [TokenSaverModeSavings] = [],
-        dailyByProvider: [TokenSaverProviderDailySavings] = []
+        dailyByProvider: [TokenSaverProviderDailySavings] = [],
+        windowByMode: [TokenSaverModeSavings] = []
     ) {
         self.providers = providers
         self.daily = daily
         self.modes = modes
         self.dailyByProvider = dailyByProvider
+        self.windowByMode = windowByMode
     }
 
     public var totalSavedTokens: Int { providers.reduce(0) { $0 + $1.savedTokens } }
@@ -121,7 +127,13 @@ public struct TokenSaverSavingsSummary: Sendable, Equatable {
         providers.filter { !known.contains($0.provider) }.reduce(0) { $0 + $1.runs }
     }
 
-    public static let empty = TokenSaverSavingsSummary(providers: [], daily: [], modes: [])
+    public static let empty = TokenSaverSavingsSummary(
+        providers: [],
+        daily: [],
+        modes: [],
+        dailyByProvider: [],
+        windowByMode: []
+    )
 }
 
 /// Persists Token Saver savings events to the local SQLite database, keeps event
@@ -270,14 +282,16 @@ public final class TokenSaverSavingsRepository: @unchecked Sendable {
                 ))
             }
 
-            // Bucket the retained event rows by (provider, calendar-day). The
-            // collapsed daily total is derived from the same buckets so the
-            // per-provider windowed rows always sum to the windowed headline.
+            // Bucket the retained event rows by (provider, calendar-day) and by
+            // (provider, mode). Collapsed daily and windowByMode both derive from
+            // the same event scan so technique mix reconciles with the headline.
             var providerDayBuckets: [String: [Int64: (savedTokens: Int, runs: Int)]] = [:]
+            var providerModeBuckets: [String: [String: (savedTokens: Int, runs: Int)]] = [:]
             let perDay = try database.prepare("""
                 SELECT provider,
                        created_at_ms,
-                       COALESCE(saved_tokens, 0)
+                       COALESCE(saved_tokens, 0),
+                       mode
                 FROM token_saver_savings
                 WHERE created_at_ms >= ?
                 ORDER BY created_at_ms;
@@ -288,6 +302,8 @@ public final class TokenSaverSavingsRepository: @unchecked Sendable {
                 let provider = perDay.columnText(0) ?? "unknown"
                 let createdAtMs = perDay.columnInt64(1)
                 let savedTokens = Int(perDay.columnInt64(2))
+                let mode = (perDay.columnText(3) ?? "unknown").trimmingCharacters(in: .whitespacesAndNewlines)
+                let modeKey = mode.isEmpty ? "unknown" : mode
                 let dayStartMs = self.dayStartMs(for: Date(timeIntervalSince1970: Double(createdAtMs) / 1000.0))
                 var byDay = providerDayBuckets[provider] ?? [:]
                 let current = byDay[dayStartMs] ?? (savedTokens: 0, runs: 0)
@@ -296,6 +312,14 @@ public final class TokenSaverSavingsRepository: @unchecked Sendable {
                     runs: current.runs + 1
                 )
                 providerDayBuckets[provider] = byDay
+
+                var byMode = providerModeBuckets[provider] ?? [:]
+                let modeCurrent = byMode[modeKey] ?? (savedTokens: 0, runs: 0)
+                byMode[modeKey] = (
+                    savedTokens: modeCurrent.savedTokens + savedTokens,
+                    runs: modeCurrent.runs + 1
+                )
+                providerModeBuckets[provider] = byMode
             }
             var dailyByProvider: [TokenSaverProviderDailySavings] = []
             var collapsed: [Int64: (savedTokens: Int, runs: Int)] = [:]
@@ -321,6 +345,22 @@ public final class TokenSaverSavingsRepository: @unchecked Sendable {
                 .map { TokenSaverDailySavings(dayStartMs: $0.key, savedTokens: $0.value.savedTokens, runs: $0.value.runs) }
                 .sorted { $0.dayStartMs < $1.dayStartMs }
 
+            var windowByMode: [TokenSaverModeSavings] = []
+            for (provider, byMode) in providerModeBuckets {
+                for (mode, totals) in byMode {
+                    windowByMode.append(TokenSaverModeSavings(
+                        provider: provider,
+                        mode: mode,
+                        savedTokens: totals.savedTokens,
+                        runs: totals.runs
+                    ))
+                }
+            }
+            windowByMode.sort {
+                if $0.provider != $1.provider { return $0.provider < $1.provider }
+                return $0.mode < $1.mode
+            }
+
             var modes: [TokenSaverModeSavings] = []
             let perMode = try database.prepare("""
                 SELECT provider, mode,
@@ -339,7 +379,13 @@ public final class TokenSaverSavingsRepository: @unchecked Sendable {
                 ))
             }
 
-            return TokenSaverSavingsSummary(providers: providers, daily: daily, modes: modes, dailyByProvider: dailyByProvider)
+            return TokenSaverSavingsSummary(
+                providers: providers,
+                daily: daily,
+                modes: modes,
+                dailyByProvider: dailyByProvider,
+                windowByMode: windowByMode
+            )
         }
     }
 

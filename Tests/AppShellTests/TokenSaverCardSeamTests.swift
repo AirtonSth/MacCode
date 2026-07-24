@@ -259,9 +259,9 @@ final class TokenSaverCardSeamTests: XCTestCase {
                       "Rings label must include Grok used percent: \(label)")
     }
 
-    func test_ringsAccessibilityLabel_namesProvidedTarget() {
-        // WHY: Daily and Week use different saved-token targets, so VoiceOver
-        // must name the target passed by the current tab.
+    func test_ringsAccessibilityLabel_namesAvoidanceMixNotAbsoluteGoal() {
+        // WHY: ring fill is avoidance ratio (saved/(saved+used)), not a 2M/10M goal.
+        // VoiceOver must describe the measured mix, not an aspirational absolute target.
         let label = SidebarRootView.ringsAccessibilityLabel(
             scope: "week",
             savedTokens: 10_000_000,
@@ -271,10 +271,14 @@ final class TokenSaverCardSeamTests: XCTestCase {
             codexUsedProgress: 0.2,
             grokUsedProgress: 0.1
         )
-        XCTAssertTrue(label.contains("10M target"),
-                      "Rings label must name the fixed target: \(label)")
+        XCTAssertTrue(label.lowercased().contains("measured save"),
+                      "Rings label must say measured save: \(label)")
+        XCTAssertTrue(label.contains("100%") || label.contains("~100%"),
+                      "Rings label must include avoidance percent: \(label)")
         XCTAssertFalse(label.contains("provider spend"),
                        "Rings label must not describe the old denominator: \(label)")
+        XCTAssertFalse(label.contains("10M target"),
+                       "Absolute goal target is no longer the ring metric: \(label)")
     }
 
     func test_ringsAccessibilityLabel_zeroValues_stillNonEmpty() {
@@ -393,6 +397,50 @@ final class TokenSaverCardSeamTests: XCTestCase {
             SidebarRootView.savingsToGoalProgress(savedTokens: 1, goalTokens: 0),
             1
         )
+    }
+
+    func test_savingsAvoidanceRatio_halfSavedHalfUsed_returnsHalf() {
+        // WHY: ring fill must self-normalize to saved/(saved+used), not aspirational 2M.
+        XCTAssertEqual(
+            SidebarRootView.savingsAvoidanceRatio(savedTokens: 50_000, usedTokens: 50_000),
+            0.5,
+            accuracy: 0.000_001
+        )
+    }
+
+    func test_savingsAvoidanceRatio_zeroSaved_returnsEmpty() {
+        XCTAssertEqual(SidebarRootView.savingsAvoidanceRatio(savedTokens: 0, usedTokens: 100_000), 0)
+    }
+
+    func test_savingsAvoidanceRatio_onlySaved_returnsFull() {
+        XCTAssertEqual(SidebarRootView.savingsAvoidanceRatio(savedTokens: 10, usedTokens: 0), 1)
+    }
+
+    func test_tokenSaverCardHeadline_prefersWindowedMeasuredOverLifetime() {
+        let headline = SidebarRootView.tokenSaverCardHeadline(
+            subscribed: true,
+            enabled: true,
+            sidecarStatus: .notStarted,
+            windowSavedTokens: 35_000,
+            lifetimeSavedTokens: 665_000_000,
+            usedTokens: 1_000_000
+        )
+        XCTAssertTrue(headline.lowercased().contains("measured save"))
+        XCTAssertTrue(headline.contains("35") || headline.lowercased().contains("35k"))
+        XCTAssertFalse(headline.lowercased().contains("665"),
+                       "Headline primary line is windowed, not all-time")
+    }
+
+    func test_tokenSaverCardHeadline_lifetimeFallbackWhenWindowEmpty() {
+        let headline = SidebarRootView.tokenSaverCardHeadline(
+            subscribed: true,
+            enabled: true,
+            sidecarStatus: .notStarted,
+            windowSavedTokens: 0,
+            lifetimeSavedTokens: 665_000_000,
+            usedTokens: 1_000_000
+        )
+        XCTAssertTrue(headline.lowercased().contains("all-time"))
     }
 
     func test_tokenSaverTodaySavedTokens_atOneSecondAfterMidnight_ignoresYesterday() throws {

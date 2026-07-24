@@ -210,6 +210,36 @@ final class TokenSaverSavingsRepositoryTests: XCTestCase {
                        "Today's Claude + Codex + CLI rows must equal the Today headline (collapsed daily)")
     }
 
+    func test_windowByModeReconcilesWithCollapsedDaily() throws {
+        // WHY: technique mix for Today/Week must sum to the same window as the ring.
+        let db = try makeDB()
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = try XCTUnwrap(TimeZone(secondsFromGMT: 0))
+        let repo = TokenSaverSavingsRepository(db: db, retentionDays: 7, calendar: calendar)
+        let today = try XCTUnwrap(DateComponents(
+            calendar: calendar, timeZone: calendar.timeZone,
+            year: 2026, month: 6, day: 18, hour: 12
+        ).date)
+        let yesterday = try XCTUnwrap(DateComponents(
+            calendar: calendar, timeZone: calendar.timeZone,
+            year: 2026, month: 6, day: 17, hour: 12
+        ).date)
+
+        _ = try repo.record(provider: "claude", mode: "command-output (deterministic)", inputTokens: 1000, outputTokens: 400, at: today) // 600
+        _ = try repo.record(provider: "codex", mode: "command-output (model)", inputTokens: 800, outputTokens: 300, at: today) // 500
+        _ = try repo.record(provider: "claude", mode: "sr1-humanize", inputTokens: 90, outputTokens: 30, savedTokens: 60, at: yesterday)
+
+        let s = try repo.summary(now: today)
+        let windowModeSum = s.windowByMode.reduce(0) { $0 + $1.savedTokens }
+        let dailySum = s.daily.reduce(0) { $0 + $1.savedTokens }
+        XCTAssertEqual(windowModeSum, dailySum, "windowByMode must reconcile with daily window")
+        XCTAssertEqual(s.windowByMode.count, 3)
+        XCTAssertEqual(
+            s.windowByMode.first { $0.mode == "command-output (deterministic)" }?.savedTokens,
+            600
+        )
+    }
+
     /// The Token Saver card bug: direct `distill` CLI usage is recorded as provider
     /// "unknown", so the headline total counted it but the per-provider (Claude/Codex)
     /// rows showed 0 — the numbers didn't reconcile. This proves the displayed rows

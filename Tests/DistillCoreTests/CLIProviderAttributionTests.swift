@@ -81,4 +81,30 @@ final class CLIProviderAttributionTests: XCTestCase {
         process.waitUntilExit()
         return (out, process.terminationStatus)
     }
+
+    func test_resolveProvider_prefersExplicitOverRecovery() {
+        // WHY: REMOTE_CODE_AGENT_PROVIDER must win when both are present.
+        let resolved = ManagedDistillCLI.resolveProvider(
+            explicit: "claude",
+            recoveryProvider: "codex"
+        )
+        XCTAssertEqual(resolved, "claude")
+    }
+
+    func test_resolveProvider_fallsBackToRecoveryWhenExplicitMissing() {
+        // WHY: recovery-scope provider still attributes savings when env is empty.
+        XCTAssertEqual(
+            ManagedDistillCLI.resolveProvider(explicit: nil, recoveryProvider: "grok"),
+            "grok"
+        )
+        XCTAssertEqual(
+            ManagedDistillCLI.resolveProvider(explicit: "  ", recoveryProvider: "grok"),
+            "grok"
+        )
+    }
+
+    func test_resolveProvider_nilWhenBothMissing() {
+        XCTAssertNil(ManagedDistillCLI.resolveProvider(explicit: nil, recoveryProvider: nil))
+        XCTAssertNil(ManagedDistillCLI.resolveProvider(explicit: "", recoveryProvider: "  "))
+    }
 }
