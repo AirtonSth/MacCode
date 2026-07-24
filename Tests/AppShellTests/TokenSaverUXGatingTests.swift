@@ -470,7 +470,7 @@ final class TokenSaverUXGatingTests: XCTestCase {
     }
 
     func test_tokenSaverCardHeadline_notStarted_returnsMeasuredReductionCopy() {
-        // WHY: healthy (not-yet-started) state must still show the measured reduction.
+        // WHY: healthy (not-yet-started) state must still show Estimated save.
         // If this regresses, the degraded-branch logic has overreached into
         // non-blocked states.
         let headline = SidebarRootView.tokenSaverCardHeadline(
@@ -481,8 +481,12 @@ final class TokenSaverUXGatingTests: XCTestCase {
             usedTokens: 200_000
         )
         XCTAssertTrue(
-            headline.lowercased().contains("est. save") || headline.lowercased().contains("bare agent"),
-            "Non-blocked sidecar must label bare-agent counterfactual; got: '\(headline)'"
+            headline.lowercased().contains("estimated save"),
+            "Non-blocked sidecar must keep original Estimated save design; got: '\(headline)'"
+        )
+        XCTAssertFalse(
+            headline.lowercased().contains("vs bare"),
+            "Design restore must not put bare-agent technique copy in the headline"
         )
     }
 

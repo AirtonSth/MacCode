@@ -2829,35 +2829,24 @@ public struct SidebarRootView: View {
 
     private var tokenSaverHeadline: String {
         guard let user = vm.privateAccountUser else { return "Track Claude + Codex + Grok usage" }
-        // Always the active scope (Today or Week) — same formula both ways.
+        // Design: original "Estimated save N tokens" copy.
+        // Number: scope credible total (Today/Week), not all-time pipes-only.
         let snap = tokenSaverDetailsSnapshot
         let scope = tokenSaverDetailsScope
-        let bare = tokenSaverBareUserBreakdown(in: snap, scope: scope)
-        let windowUsed = tokenSaverScopeUsedTokens(in: snap, scope: scope)
-        // Lifetime secondary: ledger pipes only (do not mix all-time M with period U).
-        let measuredLifetime = vm.tokenSaverSavingsSummary.totalSavedTokens
+        let saved = tokenSaverSavedOrPotential(in: snap, scope: scope)
+        let used = tokenSaverScopeUsedTokens(in: snap, scope: scope)
         return Self.tokenSaverCardHeadline(
             subscribed: user.subscribed,
             enabled: vm.tokenSaverEnabled,
             sidecarStatus: vm.sidecarStatus,
-            windowSavedTokens: bare.totalCredible,
-            lifetimeSavedTokens: measuredLifetime,
-            usedTokens: windowUsed
+            savedTokens: saved,
+            usedTokens: used
         )
     }
 
     private var tokenSaverSubtitle: String {
         guard let user = vm.privateAccountUser else { return "Sign in to track account usage" }
-        let snap = tokenSaverDetailsSnapshot
-        let scope = tokenSaverDetailsScope
-        let bare = tokenSaverBareUserBreakdown(in: snap, scope: scope)
-        let used = tokenSaverScopeUsedTokens(in: snap, scope: scope)
-        if user.subscribed && vm.tokenSaverEnabled {
-            if bare.totalCredible > 0 {
-                return "\(tokenSaverScopeTitle(scope)) vs bare · pipes \(Self.formatTokenCount(bare.measuredToolOutput)) · dialect \(Self.formatTokenCount(bare.estimatedDialect)) · graphify \(Self.formatTokenCount(bare.estimatedGraphify))"
-            }
-            return used > 0 ? "Used \(Self.formatTokenCount(used)) in Claude + Codex + Grok" : "Measuring vs bare agent"
-        }
+        let used = vm.tokenSaverUsageSnapshot.usedTokens
         if user.subscribed {
             return used > 0 ? "Used \(Self.formatTokenCount(used)) in Claude + Codex + Grok" : "Enable local reduction experiments"
         }
@@ -2865,7 +2854,7 @@ public struct SidebarRootView: View {
     }
 
     private var tokenSaverHelpText: String {
-        "Credible total vs bare agent: measured tool-output ledger + dialect (output-share calibrated ~0.7%) + Graphify when active (capped). Model-auto is not mixed into tokens. Not billed savings."
+        "Token Saver shows provider usage and local reduction estimates. Billing claims require joined provider usage evidence."
     }
 
     private var tokenSaverAccessibilityValue: String {
@@ -3039,7 +3028,7 @@ public struct SidebarRootView: View {
         in snapshot: TokenSaverUsageSnapshot,
         scope: TokenSaverUsageScope
     ) -> TokenSaverBareUserBreakdown {
-        // Prefer DB row for today when showing technique stack.
+        // Prefer persisted today row for the live estimator path (writes / fallbacks).
         if scope == .currentSession, let today = vm.tokenSaverDailyEconomyToday {
             return TokenSaverBareUserBreakdown(
                 measuredToolOutput: today.measuredTokens,
@@ -3134,18 +3123,11 @@ public struct SidebarRootView: View {
         for snapshot: TokenSaverUsageSnapshot,
         scope: TokenSaverUsageScope
     ) -> String {
-        let bare = tokenSaverBareUserBreakdown(in: snapshot, scope: scope)
-        let saved = bare.totalCredible
-        let used = tokenSaverScopeUsedTokens(in: snapshot, scope: scope)
-        if vm.privateAccountUser?.subscribed == true && vm.tokenSaverEnabled {
-            let ratio = Self.savingsAvoidanceRatio(savedTokens: saved, usedTokens: used)
-            let pct = Int((ratio * 100).rounded())
-            if saved > 0 {
-                return "\(tokenSaverScopeTitle(scope)) \(Self.formatTokenCount(saved)) vs bare · ~\(pct)%"
-            }
-            return "Measuring vs bare agent"
-        }
-        return "Estimated potential \(Self.formatTokenCount(saved))"
+        // Design: original "Estimated save N" legend. Number is scope credible total.
+        let prefix = vm.privateAccountUser?.subscribed == true && vm.tokenSaverEnabled
+            ? "Estimated save"
+            : "Estimated potential"
+        return "\(prefix) \(Self.formatTokenCount(tokenSaverSavedOrPotential(in: snapshot, scope: scope)))"
     }
 
     private func tokenSaverUsedLimitProgress(
@@ -3320,15 +3302,7 @@ public struct SidebarRootView: View {
 
             Divider()
 
-            // Always-on technique stack for the selected Today/Week scope (same formula).
-            tokenSaverTechniqueStackSection
-
-            Divider()
-
             VStack(alignment: .leading, spacing: DS.Space.sm) {
-                Text("Provider ledger (pipes only)")
-                    .font(DS.Font.captionStrong)
-                    .foregroundColor(DS.Palette.text)
                 // Same usage-desc order as the concentric rings (after Token Saver).
                 ForEach(tokenSaverProvidersByUsage(in: tokenSaverDetailsSnapshot, scope: tokenSaverDetailsScope), id: \.self) { provider in
                     tokenSaverProviderRow(provider: provider)
@@ -3627,7 +3601,7 @@ public struct SidebarRootView: View {
                     .lineLimit(1)
                     .minimumScaleFactor(0.82)
                     .frame(maxWidth: .infinity, alignment: .leading)
-                Text((vm.privateAccountUser?.subscribed == true && vm.tokenSaverEnabled ? "Ledger " : "Potential ") + Self.formatTokenCount(value))
+                Text((vm.privateAccountUser?.subscribed == true && vm.tokenSaverEnabled ? "Estimated save " : "Estimated potential ") + Self.formatTokenCount(value))
                     .font(DS.Font.caption)
                     .foregroundColor(DS.Palette.success)
                     .monospacedDigit()
@@ -3638,59 +3612,8 @@ public struct SidebarRootView: View {
         .accessibilityElement(children: .combine)
     }
 
-    /// Technique stack for Today/Week — always the credible formula breakdown.
-    private var tokenSaverTechniqueStackSection: some View {
-        let bare = tokenSaverBareUserBreakdown(
-            in: tokenSaverDetailsSnapshot,
-            scope: tokenSaverDetailsScope
-        )
-        return VStack(alignment: .leading, spacing: DS.Space.sm) {
-            Text("Vs bare agent (\(tokenSaverScopeTitle(tokenSaverDetailsScope)))")
-                .font(DS.Font.captionStrong)
-                .foregroundColor(DS.Palette.text)
-            tokenSaverTechniqueRow(title: "Pipes (ledger)", detail: "measured", tokens: bare.measuredToolOutput)
-            tokenSaverTechniqueRow(title: "Dialect", detail: String(format: "out share ~%.1f%%", bare.appliedOutputShare * 100), tokens: bare.estimatedDialect)
-            tokenSaverTechniqueRow(title: "Graphify", detail: bare.estimatedGraphify > 0 ? "active · capped" : "off / no signal", tokens: bare.estimatedGraphify)
-            HStack {
-                Text("Total crível")
-                    .font(DS.Font.captionStrong)
-                    .foregroundColor(DS.Palette.text)
-                Spacer(minLength: 0)
-                Text(Self.formatTokenCount(bare.totalCredible))
-                    .font(DS.Font.captionStrong)
-                    .foregroundColor(DS.Palette.success)
-                    .monospacedDigit()
-            }
-            .accessibilityElement(children: .combine)
-            .accessibilityIdentifier("sidebar.tokenSaver.technique.total")
-        }
-        .accessibilityIdentifier("sidebar.tokenSaver.techniqueStack")
-    }
-
-    private func tokenSaverTechniqueRow(title: String, detail: String, tokens: Int) -> some View {
-        HStack(alignment: .firstTextBaseline, spacing: DS.Space.sm) {
-            VStack(alignment: .leading, spacing: 1) {
-                Text(title)
-                    .font(DS.Font.captionStrong)
-                    .foregroundColor(DS.Palette.text)
-                    .lineLimit(1)
-                Text(detail)
-                    .font(DS.Font.caption2)
-                    .foregroundColor(DS.Palette.textTertiary)
-                    .lineLimit(1)
-            }
-            Spacer(minLength: 0)
-            Text(Self.formatTokenCount(tokens))
-                .font(DS.Font.caption)
-                .foregroundColor(DS.Palette.success)
-                .monospacedDigit()
-                .lineLimit(1)
-        }
-        .accessibilityElement(children: .combine)
-    }
-
     /// Reconciling row for savings not attributed to Claude/Codex/Grok — direct `distill`
-    /// CLI usage (provider "unknown"). Ledger only (does not include dialect/graphify).
+    /// CLI usage (provider "unknown"). Keeps the visible rows summing to the headline.
     private func tokenSaverOtherSavingsRow(saved: Int, runs: Int) -> some View {
         VStack(alignment: .leading, spacing: 3) {
             HStack(alignment: .firstTextBaseline, spacing: DS.Space.sm) {
@@ -3707,7 +3630,7 @@ public struct SidebarRootView: View {
                     .lineLimit(1)
                     .minimumScaleFactor(0.82)
                     .frame(maxWidth: .infinity, alignment: .leading)
-                Text("Ledger " + Self.formatTokenCount(saved))
+                Text("Estimated save " + Self.formatTokenCount(saved))
                     .font(DS.Font.caption)
                     .foregroundColor(DS.Palette.success)
                     .monospacedDigit()
@@ -3810,27 +3733,22 @@ public struct SidebarRootView: View {
     ///
     /// WHY: when the sidecar is blocked the user sees the same reduction estimate
     /// headline as when everything is healthy, giving no signal that compression
-    /// has stopped. Windowed measured savings (Today/Week) are the primary number;
-    /// all-time is secondary so the card does not disagree with the ring.
+    /// has stopped. This seam makes the degraded variant testable and explicit.
+    /// `savedTokens` is the scope credible total (Today/Week), not design-related.
     nonisolated public static func tokenSaverCardHeadline(
         subscribed: Bool,
         enabled: Bool,
         sidecarStatus: TokenSaverDistillServiceStatus,
-        windowSavedTokens: Int,
-        lifetimeSavedTokens: Int,
+        savedTokens: Int,
         usedTokens: Int
     ) -> String {
         if subscribed && enabled {
             if case .blocked = sidecarStatus {
                 return "Token Saver degraded"
             }
-            if windowSavedTokens > 0 {
-                return "Est. save \(Self.formatTokenCountPublic(windowSavedTokens)) vs bare agent"
-            }
-            if lifetimeSavedTokens > 0 {
-                return "All-time pipes \(Self.formatTokenCountPublic(lifetimeSavedTokens)) (ledger)"
-            }
-            return "Measuring vs bare agent (Today/Week)"
+            return savedTokens > 0
+                ? "Estimated save \(Self.formatTokenCountPublic(savedTokens)) tokens"
+                : "Measuring local reduction per agent run"
         }
         if subscribed {
             return "Enable Token Saver"
@@ -3841,27 +3759,8 @@ public struct SidebarRootView: View {
             : "Estimate ready"
     }
 
-    /// Compatibility overload: older call sites that only pass a single saved total
-    /// treat it as the windowed figure (no separate lifetime).
-    nonisolated public static func tokenSaverCardHeadline(
-        subscribed: Bool,
-        enabled: Bool,
-        sidecarStatus: TokenSaverDistillServiceStatus,
-        savedTokens: Int,
-        usedTokens: Int
-    ) -> String {
-        tokenSaverCardHeadline(
-            subscribed: subscribed,
-            enabled: enabled,
-            sidecarStatus: sidecarStatus,
-            windowSavedTokens: savedTokens,
-            lifetimeSavedTokens: savedTokens,
-            usedTokens: usedTokens
-        )
-    }
-
     nonisolated public static let tokenSaverBillingEvidenceDisclaimer =
-        "Credible estimate vs a bare agent (no RemoteCode). Pipes = local ledger. Dialect uses observed/calibrated output share (~0.7% of usage × verbosity). Graphify only with activity and hard caps. Model-auto is not added as tokens. Local estimates are diagnostic. They are not billed savings; billing claims require joined provider usage evidence."
+        "Local token estimates are diagnostic. They are not billed savings; billing claims require joined provider usage evidence. Experimental lanes remain off or shadow until their gates pass."
 
     // Internal alias exposed for the pure seam above. Mirrors `formatTokenCount`
     // which is private; keeping it nonisolated and public lets tests call it.

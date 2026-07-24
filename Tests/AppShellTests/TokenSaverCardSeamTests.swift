@@ -416,31 +416,34 @@ final class TokenSaverCardSeamTests: XCTestCase {
         XCTAssertEqual(SidebarRootView.savingsAvoidanceRatio(savedTokens: 10, usedTokens: 0), 1)
     }
 
-    func test_tokenSaverCardHeadline_prefersWindowedMeasuredOverLifetime() {
+    func test_tokenSaverCardHeadline_showsEstimatedSaveWithCredibleTotal() {
+        // WHY: design is the original "Estimated save N tokens" copy; only the
+        // number is the scope credible total (not a technique-stack redesign).
         let headline = SidebarRootView.tokenSaverCardHeadline(
             subscribed: true,
             enabled: true,
             sidecarStatus: .notStarted,
-            windowSavedTokens: 35_000,
-            lifetimeSavedTokens: 665_000_000,
+            savedTokens: 35_000,
             usedTokens: 1_000_000
         )
-        XCTAssertTrue(headline.lowercased().contains("est. save") || headline.lowercased().contains("bare agent"))
+        XCTAssertTrue(headline.lowercased().contains("estimated save"),
+                      "Healthy enabled state must use original Estimated save copy; got: '\(headline)'")
         XCTAssertTrue(headline.contains("35") || headline.lowercased().contains("35k"))
-        XCTAssertFalse(headline.lowercased().contains("665"),
-                       "Headline primary line is windowed, not all-time")
+        XCTAssertFalse(headline.lowercased().contains("vs bare"),
+                       "Design restore must not surface bare-agent technique copy in the headline")
     }
 
-    func test_tokenSaverCardHeadline_lifetimeFallbackWhenWindowEmpty() {
+    func test_tokenSaverCardHeadline_zeroSaved_measuringCopy() {
         let headline = SidebarRootView.tokenSaverCardHeadline(
             subscribed: true,
             enabled: true,
             sidecarStatus: .notStarted,
-            windowSavedTokens: 0,
-            lifetimeSavedTokens: 665_000_000,
+            savedTokens: 0,
             usedTokens: 1_000_000
         )
-        XCTAssertTrue(headline.lowercased().contains("all-time"))
+        XCTAssertTrue(headline.lowercased().contains("measuring"),
+                      "Zero savings must keep measuring copy; got: '\(headline)'")
+        XCTAssertFalse(headline.lowercased().contains("all-time"))
     }
 
     func test_dayAndWeek_useSameBareUserEstimatorPath() {
