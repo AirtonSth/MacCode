@@ -1,4 +1,5 @@
 import Foundation
+import CoreModel
 import CryptoKit
 import HuggingFace
 import MLX
@@ -409,22 +410,28 @@ public enum TokenEstimator {
 }
 
 public enum TokenSaverSR1SavingsEstimator {
-    /// The human-readable transcript is materially longer than a tokenizer estimate
-    /// of the displayed text, so both legs are scaled by this transcript-expansion factor.
-    public static let transcriptExpansionFactor = 3
-    /// Default-agent verbosity credit. Without Token Saver, an agent emits a markedly
-    /// more verbose answer than even the humanized transcript (≈3x). The SR1-compressed
-    /// reply therefore avoids ≈3x more tokens than the raw human-length delta implies, so
-    /// the recorded saving is credited at this factor. See plan token-saver-local-llm-savings.
-    public static let defaultAgentVerbosityFactor = 3
-    /// Combined factor applied to both legs. Exposed so tests assert the credited intent
-    /// instead of a magic literal; scaling both legs keeps `saved = input - output` and
-    /// triples the recorded saving versus the raw transcript delta.
-    public static let effectiveExpansionFactor = transcriptExpansionFactor * defaultAgentVerbosityFactor
-
+    /// Estimated tokens avoided by sending the compressed reply instead of its
+    /// humanized form, using the same deterministic estimator on both legs so the
+    /// delta stays internally consistent.
+    ///
+    /// WHY there is no expansion or verbosity multiplier any more: this used to scale
+    /// both legs by 9 — a 3x "the human transcript is longer than the displayed text"
+    /// expansion times a 3x "an agent without Token Saver would have been ~3x more
+    /// verbose" credit — and to count characters as if they were tokens. Neither
+    /// factor was ever calibrated against the current dialect, and the second is a
+    /// counterfactual: it credits savings against a reply that was never generated,
+    /// let alone measured. The one instrumentation path that could have validated it
+    /// computes zero by construction (see `AppContext.flushPendingTokenSaverUsage`,
+    /// which passes the same value for actual and estimated tokens), so the headline
+    /// figure was unfalsifiable in both directions.
+    ///
+    /// Restoring a credit requires a real baseline: the same fixed corpus run with and
+    /// without Token Saver, scored against actual provider usage rather than character
+    /// counts. Until that exists this reports only what it can defend — the estimated
+    /// token delta between the two texts the system actually produced.
     public static func estimate(sr1: String, humanized: String) -> (inputTokens: Int, outputTokens: Int, savedTokens: Int) {
-        let inputTokens = max(0, humanized.count * effectiveExpansionFactor)
-        let outputTokens = max(0, sr1.count * effectiveExpansionFactor)
+        let inputTokens = TokenEstimator.estimate(humanized)
+        let outputTokens = TokenEstimator.estimate(sr1)
         return (
             inputTokens: inputTokens,
             outputTokens: outputTokens,
@@ -631,7 +638,9 @@ private struct DistillResultCacheEntry: Sendable {
 }
 
 private enum SR1LineParser {
-    private static let semanticPrefixes = Set("SCDRONP")
+    // Single source of truth: see CoreModel.DistillSemanticPrefixes for why this
+    // must not be re-typed per module.
+    private static let semanticPrefixes = DistillSemanticPrefixes.set
     private static let variableKeyPattern = #"#[A-Za-z][0-9]+"#
 
     static func parseSemanticLine(_ line: String) -> (prefix: Character, content: String)? {
@@ -781,7 +790,7 @@ private enum SR1LineParser {
             .trimmingCharacters(in: CharacterSet(charactersIn: ".,;"))
             .trimmingCharacters(in: .whitespacesAndNewlines)
         if value.localizedCaseInsensitiveContains("dict:") ||
-            value.range(of: #"\b[ScdronpSCDRONP]\s*=\s*[A-Za-z-]+"#, options: .regularExpression) != nil {
+            value.range(of: DistillSemanticPrefixes.aliasDeclarationPattern, options: .regularExpression) != nil {
             return nil
         }
         let segments = parseSemanticSegments(value)

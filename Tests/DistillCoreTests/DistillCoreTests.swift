@@ -543,17 +543,22 @@ final class DistillCoreTests: XCTestCase {
 
         let record = DistillSavingsCalculator.record(for: request, response: response)
 
-        let factor = TokenSaverSR1SavingsEstimator.effectiveExpansionFactor
-        XCTAssertEqual(factor, 9, "agents are ~3x more verbose by default, so the SR1 saving is credited 3x the raw transcript-expansion delta")
+        // WHY no multiplier: the previous version of this test pinned a 9x credit
+        // (3x transcript expansion times a 3x "the agent would have been more verbose"
+        // counterfactual) applied to CHARACTER counts. Nothing measured either factor,
+        // and the only instrumentation that could have is a no-op, so the credited
+        // number was unfalsifiable. The estimator now reports the estimated token delta
+        // between the two texts that actually exist, via the same deterministic
+        // estimator on both legs.
         XCTAssertEqual(record?.provider, "codex")
         XCTAssertEqual(record?.mode, "sr1-humanize")
-        XCTAssertEqual(record?.inputTokens, human.count * factor,
-                       "SR1 accounting must include the avoided human-language transcript expansion at the default-agent verbosity rate, not only tokenizer-estimated display text")
-        XCTAssertEqual(record?.outputTokens, sr1.count * factor,
-                       "the emitted SR1 response is scaled with the same expansion factor so saved = input - output holds")
-        XCTAssertEqual(record?.savedTokens, max((human.count - sr1.count) * factor, 0))
-        XCTAssertEqual(record?.savedTokens, max((human.count - sr1.count) * 3, 0) * 3,
-                       "credited saving is exactly 3x the prior raw transcript delta")
+        XCTAssertEqual(record?.inputTokens, TokenEstimator.estimate(human),
+                       "input leg is the estimated token size of the humanized text, not its character count")
+        XCTAssertEqual(record?.outputTokens, TokenEstimator.estimate(sr1),
+                       "output leg uses the same estimator so saved = input - output stays consistent")
+        XCTAssertEqual(record?.savedTokens,
+                       max(TokenEstimator.estimate(human) - TokenEstimator.estimate(sr1), 0),
+                       "saved tokens is a defensible delta between two produced texts, with no counterfactual credit")
     }
 
     func test_mlxCommandOutputCollapsesDuplicatedModelBlocks() throws {

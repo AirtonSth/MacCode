@@ -2466,6 +2466,23 @@ public final class AppContext {
         backgroundWriterQueue.async { [weak self] in
             for (_, pending) in snapshots {
                 do {
+                    // NO MEASURED BASELINE EXISTS FOR THIS PATH — read before "fixing".
+                    //
+                    // `estimatedRawTokens` deliberately receives the SAME value as
+                    // `actualProviderTokens`, so `savedTokens` (which is
+                    // `max(estimated - actual, 0)`) is always 0 here. That is not an
+                    // oversight and must not be "repaired" by inventing a multiplier: the
+                    // raw cost of this turn WITHOUT the dialect injected was never
+                    // generated, so there is nothing to subtract. Any non-zero number
+                    // produced here would be a counterfactual, which is exactly the
+                    // mistake that made the sr1-humanize figure unfalsifiable (see
+                    // TokenSaverSR1SavingsEstimator).
+                    //
+                    // A real baseline needs the same fixed corpus run with and without
+                    // `distillAgentInstructionsBody` injected, compared against actual
+                    // provider usage — see Tests/DistillCoreTests/TokenSaverActionCostHarness
+                    // for the harness this feeds. Until that lands, the honest report for
+                    // provider turns is "not measured", not a number.
                     _ = try TokenSaverUsageStore(appSupportDirectory: appSupportDir).record(
                         provider: pending.provider,
                         actualProviderTokens: pending.totalTokens,

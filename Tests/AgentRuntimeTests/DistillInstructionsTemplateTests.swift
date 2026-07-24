@@ -4,14 +4,24 @@ import XCTest
 final class DistillInstructionsTemplateTests: XCTestCase {
     func test_instructionsCarryHardPipeHeuristicAndRetrieveNote() {
         let t = AgentSkillInstaller.distillAgentInstructionsTemplate
-        // WHY: predicting output size let providers omit `| distill` from most visible
-        // tool calls. Every pipable, output-producing command must default to the
-        // managed CLI; only semantic safety exceptions may bypass it.
-        XCTAssertTrue(t.contains("EVERY pipable, output-producing shell/tool call"),
-                      "all pipable output-producing tool calls default to explicit distill")
+        // WHY: the shipped policy is fidelity-based, not volume-based. An earlier
+        // revision told the provider to pipe EVERY pipable command, which compressed
+        // exactly the output the agent must consume byte-exactly next (rg/grep/sed
+        // feeding an Edit's old_string, a hash, a patch). The template now names both
+        // sides explicitly so the provider never has to guess: a noisy-output
+        // allowlist, and a never-pipe list of exact-output tools. These assertions
+        // pin that decision — they previously asserted its inverse and were red,
+        // because the template changed and the test did not.
+        XCTAssertTrue(t.contains("Good to pipe:"),
+                      "the template must name the noisy-output cases that default to the managed CLI")
+        XCTAssertTrue(t.contains("NEVER pipe `| distill` for exact-output tools"),
+                      "the template must forbid compressing output the agent consumes byte-exactly")
+        XCTAssertTrue(t.contains("rg, grep"),
+                      "the never-pipe list must name the search tools whose exact stdout the agent needs")
         XCTAssertFalse(t.contains("~10 lines or ~1KB"),
                        "the provider must not guess output size before deciding to distill")
-        XCTAssertTrue(t.lowercased().contains("bias to compress"), "explicit bias-to-compress directive present")
+        XCTAssertFalse(t.lowercased().contains("bias to compress"),
+                       "bias-to-compress was replaced by the fidelity predicate; reinstating it re-breaks exact-output tools")
         XCTAssertTrue(t.contains("subagent, worker, reviewer"),
                       "delegated prompts must carry the same distill contract")
         XCTAssertTrue(t.contains("descendants"),

@@ -114,6 +114,59 @@ final class SR1ResponseDetectorTests: XCTestCase {
                        "prose starting with a capitalized word+colon must not be mistaken for SR1")
     }
 
+    // MARK: - R0 exemption: the dialect's own chat-reply shape is not a payload
+
+    func test_isSR1_specR0Example_returnsFalse() {
+        // Verbatim from the shipped spec's R0 example (AgentSkillInstaller's
+        // distillSkillTemplate). WHY it must be false: this is the dialect telling the
+        // model how to answer a greeting. Classifying it as compressed output costs a
+        // full extra local-model humanization round trip plus a permanent "translated
+        // from compressed output" badge on the cheapest replies in the product, and it
+        // trains the user to ignore the badge that flags genuine leaks.
+        let text = "O: bem, obrigado — pronto pro próximo"
+        XCTAssertFalse(SR1ResponseDetector.isSR1(text),
+                       "the spec's own R0 reply must not be treated as a compressed payload")
+    }
+
+    func test_isSR1_loneShortOutcomeLine_returnsFalse() {
+        XCTAssertFalse(SR1ResponseDetector.isSR1("O: build passou, 2865 testes verdes"),
+                       "a lone short outcome line is an R0 chat reply, not dialect output")
+    }
+
+    func test_isSR1_loneOutcomeLineWithVariableAlias_returnsTrue() {
+        // The exemption must not apply when the line still needs Dict expansion to be
+        // readable — otherwise an unexpanded `#b1` reaches the user verbatim.
+        XCTAssertTrue(SR1ResponseDetector.isSR1("O: merged #b1 into #b2"),
+                      "an outcome line carrying #-variable aliases still needs humanization")
+    }
+
+    func test_isSR1_loneOutcomeLineWithSecondSegment_returnsTrue() {
+        // Two segments on one line is real dialect, not an R0 reply.
+        XCTAssertTrue(SR1ResponseDetector.isSR1("O: deployed. P: smoke tests green."),
+                      "an outcome line followed by another semantic segment is dialect output")
+    }
+
+    func test_isSR1_longOutcomeLine_returnsTrue() {
+        // Above the exemption length: keep humanizing rather than risk leaking a real
+        // single-line payload to the user.
+        let long = "O: " + String(repeating: "detalhe do resultado ", count: 12)
+        XCTAssertGreaterThan(long.count, SR1ResponseDetector.bareOutcomeExemptionMaxLength)
+        XCTAssertTrue(SR1ResponseDetector.isSR1(long),
+                      "only short outcome lines are exempt; long ones stay eligible for humanization")
+    }
+
+    func test_isSR1_multiLineOutcomeBlock_returnsTrue() {
+        // The exemption is single-line only: a multi-line block is dialect output even
+        // when every line is an outcome.
+        XCTAssertTrue(SR1ResponseDetector.isSR1("O: build ok\nO: testes verdes"),
+                      "the R0 exemption must not extend to multi-line semantic blocks")
+    }
+
+    func test_isSR1_loneOutcomeLineAfterExplicitMarker_returnsTrue() {
+        XCTAssertTrue(SR1ResponseDetector.isSR1("Dict: O=outcome\nO: done"),
+                      "an explicit dictionary declaration outranks the R0 exemption")
+    }
+
     func test_isSR1_markdownHeadings_returnsFalse() {
         let text = "## Summary\n\nThis PR adds a new endpoint.\n\n## Changes\n\n- Added GET /v2/items\n- Updated schema"
         XCTAssertFalse(SR1ResponseDetector.isSR1(text),

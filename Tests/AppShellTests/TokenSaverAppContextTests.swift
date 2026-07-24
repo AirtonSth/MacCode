@@ -1984,18 +1984,21 @@ final class TokenSaverAppContextTests: XCTestCase {
 
         let summary = try context.tokenSaverSavingsRepo.summary()
         let codex = try XCTUnwrap(summary.savings(for: "codex"))
-        let factor = TokenSaverSR1SavingsEstimator.effectiveExpansionFactor
-        let perInput = humanized.count * factor
-        let perOutput = sr1.count * factor
+        // WHY no expansion factor: the 9x credit this used to assert was an
+        // uncalibrated counterfactual applied to character counts. Both legs now use
+        // the same deterministic token estimator, so the recorded saving is a delta
+        // between two texts that were actually produced.
+        let perInput = TokenEstimator.estimate(humanized)
+        let perOutput = TokenEstimator.estimate(sr1)
         let expectedInput = perInput * 2
         let expectedOutput = perOutput * 2
         let expectedSaved = max(perInput - perOutput, 0) * 2
         XCTAssertEqual(codex.inputTokens, expectedInput,
-                       "SR1 humanization savings must include the avoided human-language transcript expansion at the default-agent verbosity rate")
+                       "SR1 humanization accounting records the estimated token size of the humanized text")
         XCTAssertEqual(codex.outputTokens, expectedOutput,
-                       "SR1 humanization savings must scale the emitted compressed SR1 response with the same factor")
+                       "the emitted compressed response is measured with the same estimator")
         XCTAssertEqual(codex.savedTokens, expectedSaved,
-                       "saved = scaled human length - scaled SR1 length, credited for default agent verbosity, for every sidecar call")
+                       "saved = estimated humanized tokens - estimated SR1 tokens, per sidecar call, with no credit")
         XCTAssertEqual(codex.runs, 2,
                        "every successful local sidecar humanization call must update Token Saver reports")
     }
@@ -2026,10 +2029,12 @@ final class TokenSaverAppContextTests: XCTestCase {
         let summary = try context.tokenSaverSavingsRepo.summary()
         let claude = try XCTUnwrap(summary.savings(for: "claude"),
                                    "fallback SR1 expansion still saves output tokens and must be visible in the report")
-        let factor = TokenSaverSR1SavingsEstimator.effectiveExpansionFactor
-        XCTAssertEqual(claude.inputTokens, humanized.count * factor)
-        XCTAssertEqual(claude.outputTokens, sr1.count * factor)
-        XCTAssertEqual(claude.savedTokens, max((humanized.count - sr1.count) * factor, 0))
+        // Same estimator on both legs; no expansion or verbosity credit (see the
+        // estimator's own comment for why the 9x factor was removed).
+        XCTAssertEqual(claude.inputTokens, TokenEstimator.estimate(humanized))
+        XCTAssertEqual(claude.outputTokens, TokenEstimator.estimate(sr1))
+        XCTAssertEqual(claude.savedTokens,
+                       max(TokenEstimator.estimate(humanized) - TokenEstimator.estimate(sr1), 0))
         XCTAssertEqual(claude.runs, 1)
         XCTAssertEqual(summary.modes.first?.mode, "sr1-humanize")
     }
