@@ -327,6 +327,8 @@ public final class SidebarViewModel: ObservableObject {
     @Published public private(set) var insomniaAllowSystemSleepWhenDisplayClosed: Bool = false
     @Published public private(set) var insomniaAllowScreenSaverAfter45MinutesOfInactivity: Bool = true
     @Published public private(set) var tokenSaverEnabled: Bool = false
+    /// Graphify runtime gate (Token Saver ∧ preference) for bare-user counterfactual.
+    @Published public private(set) var graphifyRuntimeActive: Bool = false
     @Published public private(set) var tokenSaverUsageSnapshot: TokenSaverUsageSnapshot = .empty()
     /// Saved-token totals from the local DB plus retained report/chart rows.
     @Published public private(set) var tokenSaverSavingsSummary: TokenSaverSavingsSummary = .empty
@@ -585,6 +587,7 @@ public final class SidebarViewModel: ObservableObject {
     private func reloadTokenSaver() {
         let settings = settingsStore.load()
         tokenSaverEnabled = settings.tokenSaverEnabled
+        graphifyRuntimeActive = settings.isGraphifyRuntimeActive
         guard let context else {
             tokenSaverHeavyReloadTask?.cancel()
             tokenSaverHeavyReloadTask = nil
@@ -779,6 +782,7 @@ public final class SidebarViewModel: ObservableObject {
     func reloadTokenSaverAndWait() async {
         let settings = settingsStore.load()
         tokenSaverEnabled = settings.tokenSaverEnabled
+        graphifyRuntimeActive = settings.isGraphifyRuntimeActive
         guard let context else {
             tokenSaverHeavyReloadTask?.cancel()
             tokenSaverHeavyReloadTask = nil
@@ -887,6 +891,7 @@ public final class SidebarViewModel: ObservableObject {
             }
             guard confirmed else { return }
             tokenSaverEnabled = false
+            graphifyRuntimeActive = false
             settingsStore.update {
                 $0.tokenSaverEnabled = false
             }
@@ -902,6 +907,7 @@ public final class SidebarViewModel: ObservableObject {
             settingsStore.update {
                 $0.tokenSaverEnabled = true
             }
+            graphifyRuntimeActive = settingsStore.load().isGraphifyRuntimeActive
             refreshTokenSaverDistillService(modelValidation: selectedValidation)
             context?.reconcileGraphifyHost()
             return
@@ -913,6 +919,7 @@ public final class SidebarViewModel: ObservableObject {
             settingsStore.update {
                 $0.tokenSaverEnabled = true
             }
+            graphifyRuntimeActive = settingsStore.load().isGraphifyRuntimeActive
             refreshTokenSaverDistillService(modelValidation: installedFallbackValidation)
             beginTokenSaverModelDownload(reason: selectedValidation.reason)
             context?.reconcileGraphifyHost()
@@ -2781,26 +2788,37 @@ public struct SidebarRootView: View {
 
     private var tokenSaverHeadline: String {
         guard let user = vm.privateAccountUser else { return "Track Claude + Codex + Grok usage" }
-        let windowSaved = tokenSaverMeasuredSaved(scope: tokenSaverDetailsScope)
+        let snap = vm.tokenSaverUsageSnapshot
+        let scope = tokenSaverDetailsScope
+        let bare = tokenSaverBareUserBreakdown(in: snap, scope: scope)
+        let measuredLifetime = vm.tokenSaverSavingsSummary.totalSavedTokens
+        let bareLifetime = TokenSaverBareUserEstimator.estimate(
+            measuredToolOutputSaved: measuredLifetime,
+            actualProviderTokens: snap.usedTokens,
+            tokenSaverEnabled: vm.tokenSaverEnabled,
+            graphifyActive: vm.graphifyRuntimeActive,
+            orchestrationActive: vm.tokenSaverEnabled
+        ).totalEstimatedVsBareUser
         return Self.tokenSaverCardHeadline(
             subscribed: user.subscribed,
             enabled: vm.tokenSaverEnabled,
             sidecarStatus: vm.sidecarStatus,
-            windowSavedTokens: windowSaved,
-            lifetimeSavedTokens: vm.tokenSaverSavingsSummary.totalSavedTokens,
-            usedTokens: vm.tokenSaverUsageSnapshot.usedTokens
+            windowSavedTokens: bare.totalEstimatedVsBareUser,
+            lifetimeSavedTokens: bareLifetime,
+            usedTokens: snap.usedTokens
         )
     }
 
     private var tokenSaverSubtitle: String {
         guard let user = vm.privateAccountUser else { return "Sign in to track account usage" }
         let used = vm.tokenSaverUsageSnapshot.usedTokens
-        let lifetime = vm.tokenSaverSavingsSummary.totalSavedTokens
+        let bare = tokenSaverBareUserBreakdown(in: vm.tokenSaverUsageSnapshot, scope: tokenSaverDetailsScope)
         if user.subscribed && vm.tokenSaverEnabled {
-            if lifetime > 0 {
-                return "All-time \(Self.formatTokenCount(lifetime)) local reductions · Used \(Self.formatTokenCount(used))"
+            let measured = bare.measuredToolOutput
+            if bare.totalEstimatedVsBareUser > 0 {
+                return "vs bare agent · pipes \(Self.formatTokenCount(measured)) · dialect/graphify/auto est. \(Self.formatTokenCount(bare.attributedOnly))"
             }
-            return used > 0 ? "Used \(Self.formatTokenCount(used)) in Claude + Codex + Grok" : "Measuring local reduction per agent run"
+            return used > 0 ? "Used \(Self.formatTokenCount(used)) in Claude + Codex + Grok" : "Measuring vs bare agent"
         }
         if user.subscribed {
             return used > 0 ? "Used \(Self.formatTokenCount(used)) in Claude + Codex + Grok" : "Enable local reduction experiments"
@@ -2809,7 +2827,7 @@ public struct SidebarRootView: View {
     }
 
     private var tokenSaverHelpText: String {
-        "Measured local reductions from tool-output compression and related Token Saver lanes. Not billed provider savings; dollars need joined provider usage evidence."
+        "Estimated tokens avoided vs a bare agent (no RemoteCode): tool-output compression (measured) plus dialect, Graphify, and model-auto (estimated). Not billed provider savings."
     }
 
     private var tokenSaverAccessibilityValue: String {
@@ -2930,15 +2948,15 @@ public struct SidebarRootView: View {
         scope: TokenSaverUsageScope
     ) -> Int {
         if vm.privateAccountUser?.subscribed == true && vm.tokenSaverEnabled {
-            return tokenSaverMeasuredSaved(scope: scope)
+            // Product number: economy vs bare agent (no RC / TS / Graphify / auto).
+            return tokenSaverBareUserBreakdown(in: snapshot, scope: scope).totalEstimatedVsBareUser
         }
         return TokenSaverUsageStore.estimatePotentialSavings(
             usedTokens: tokenSaverScopeUsedTokens(in: snapshot, scope: scope)
         )
     }
 
-    /// Saved-token totals from the DB ledger. Week shows the retained report
-    /// window; Today uses the current calendar-day bucket.
+    /// Measured tool-output ledger only (no dialect/graphify/orchestration estimates).
     private func tokenSaverMeasuredSaved(scope: TokenSaverUsageScope) -> Int {
         let summary = vm.tokenSaverSavingsSummary
         switch scope {
@@ -2947,6 +2965,21 @@ public struct SidebarRootView: View {
         case .currentSession:
             return Self.tokenSaverTodaySavedTokens(daily: summary.daily, now: tokenSaverNow)
         }
+    }
+
+    /// Bare-user counterfactual for the selected window. Pure composition of ledger
+    /// + usage + feature gates; factors live in `TokenSaverBareUserEstimator`.
+    private func tokenSaverBareUserBreakdown(
+        in snapshot: TokenSaverUsageSnapshot,
+        scope: TokenSaverUsageScope
+    ) -> TokenSaverBareUserBreakdown {
+        TokenSaverBareUserEstimator.estimate(
+            measuredToolOutputSaved: tokenSaverMeasuredSaved(scope: scope),
+            actualProviderTokens: tokenSaverScopeUsedTokens(in: snapshot, scope: scope),
+            tokenSaverEnabled: vm.tokenSaverEnabled,
+            graphifyActive: vm.graphifyRuntimeActive,
+            orchestrationActive: vm.tokenSaverEnabled
+        )
     }
 
     /// Measured saved tokens for one provider in the selected scope, read from the
@@ -2992,15 +3025,16 @@ public struct SidebarRootView: View {
         for snapshot: TokenSaverUsageSnapshot,
         scope: TokenSaverUsageScope
     ) -> String {
-        let saved = tokenSaverSavedOrPotential(in: snapshot, scope: scope)
+        let bare = tokenSaverBareUserBreakdown(in: snapshot, scope: scope)
+        let saved = bare.totalEstimatedVsBareUser
         let used = tokenSaverScopeUsedTokens(in: snapshot, scope: scope)
         if vm.privateAccountUser?.subscribed == true && vm.tokenSaverEnabled {
             let ratio = Self.savingsAvoidanceRatio(savedTokens: saved, usedTokens: used)
             let pct = Int((ratio * 100).rounded())
             if saved > 0 {
-                return "Measured \(Self.formatTokenCount(saved)) · ~\(pct)% of tool+usage mix"
+                return "Est. vs bare \(Self.formatTokenCount(saved)) · ~\(pct)% mix"
             }
-            return "Measuring local reduction"
+            return "Measuring vs bare agent"
         }
         return "Estimated potential \(Self.formatTokenCount(saved))"
     }
@@ -3623,12 +3657,12 @@ public struct SidebarRootView: View {
                 return "Token Saver degraded"
             }
             if windowSavedTokens > 0 {
-                return "Measured save \(Self.formatTokenCountPublic(windowSavedTokens)) this period"
+                return "Est. save \(Self.formatTokenCountPublic(windowSavedTokens)) vs bare agent"
             }
             if lifetimeSavedTokens > 0 {
-                return "All-time \(Self.formatTokenCountPublic(lifetimeSavedTokens)) local reductions"
+                return "All-time ~\(Self.formatTokenCountPublic(lifetimeSavedTokens)) vs bare agent"
             }
-            return "Measuring local reduction per agent run"
+            return "Measuring vs bare agent (no RemoteCode)"
         }
         if subscribed {
             return "Enable Token Saver"
@@ -3659,7 +3693,7 @@ public struct SidebarRootView: View {
     }
 
     nonisolated public static let tokenSaverBillingEvidenceDisclaimer =
-        "Measured local reductions from Token Saver compression (tool output, SR1, and related lanes). Local token estimates are diagnostic. They are not billed savings; billing claims require joined provider usage evidence. Experimental lanes stay off/shadow until their gates pass."
+        "Estimated tokens avoided versus a bare agent without RemoteCode (no Token Saver pipes/dialect, no Graphify, no model auto). Tool-output compressions are ledger-measured; dialect, Graphify, and orchestration use published product factors. Local estimates are diagnostic — not billed savings; billing claims require joined provider usage evidence."
 
     // Internal alias exposed for the pure seam above. Mirrors `formatTokenCount`
     // which is private; keeping it nonisolated and public lets tests call it.

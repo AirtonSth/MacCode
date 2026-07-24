@@ -480,8 +480,10 @@ final class TokenSaverUXGatingTests: XCTestCase {
             savedTokens: 50_000,
             usedTokens: 200_000
         )
-        XCTAssertTrue(headline.lowercased().contains("measured save"),
-                      "Non-blocked sidecar must label measured local savings; got: '\(headline)'")
+        XCTAssertTrue(
+            headline.lowercased().contains("est. save") || headline.lowercased().contains("bare agent"),
+            "Non-blocked sidecar must label bare-agent counterfactual; got: '\(headline)'"
+        )
     }
 
     func test_tokenSaverBillingEvidenceDisclaimerIsExplicit() {
@@ -516,7 +518,7 @@ final class TokenSaverUXGatingTests: XCTestCase {
             grokUsedProgress: 0.1
         )
 
-        XCTAssertTrue(label.lowercased().contains("measured save"))
+        XCTAssertTrue(label.lowercased().contains("measured save") || label.lowercased().contains("est."))
         XCTAssertTrue(label.lowercased().contains("tool-plus-usage") || label.lowercased().contains("mix"))
         XCTAssertFalse(label.lowercased().contains(": saved"))
     }

@@ -271,8 +271,8 @@ final class TokenSaverCardSeamTests: XCTestCase {
             codexUsedProgress: 0.2,
             grokUsedProgress: 0.1
         )
-        XCTAssertTrue(label.lowercased().contains("measured save"),
-                      "Rings label must say measured save: \(label)")
+        XCTAssertTrue(label.lowercased().contains("measured save") || label.lowercased().contains("est."),
+                      "Rings label must describe estimated/measured save: \(label)")
         XCTAssertTrue(label.contains("100%") || label.contains("~100%"),
                       "Rings label must include avoidance percent: \(label)")
         XCTAssertFalse(label.contains("provider spend"),
@@ -425,7 +425,7 @@ final class TokenSaverCardSeamTests: XCTestCase {
             lifetimeSavedTokens: 665_000_000,
             usedTokens: 1_000_000
         )
-        XCTAssertTrue(headline.lowercased().contains("measured save"))
+        XCTAssertTrue(headline.lowercased().contains("est. save") || headline.lowercased().contains("bare agent"))
         XCTAssertTrue(headline.contains("35") || headline.lowercased().contains("35k"))
         XCTAssertFalse(headline.lowercased().contains("665"),
                        "Headline primary line is windowed, not all-time")
@@ -441,6 +441,7 @@ final class TokenSaverCardSeamTests: XCTestCase {
             usedTokens: 1_000_000
         )
         XCTAssertTrue(headline.lowercased().contains("all-time"))
+        XCTAssertTrue(headline.lowercased().contains("bare agent"))
     }
 
     func test_tokenSaverTodaySavedTokens_atOneSecondAfterMidnight_ignoresYesterday() throws {
