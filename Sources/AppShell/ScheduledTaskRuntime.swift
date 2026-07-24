@@ -106,102 +106,88 @@ public final class ScheduledTaskExecutor {
         try await prepareExecution(task).workspace
     }
 
-    /// Create + send like a manual Agent App turn inside the LaunchAgent.
+    /// Paste+play through a real Agent App tab — same path as the user opening
+    /// Agent App, setting user/provider/model, typing the prompt, and pressing play.
     ///
-    /// Semantic comparator (paste+play): fresh Agent thread, task provider /
-    /// model / reasoning / run-as / workspace, Full Access + Default interaction,
-    /// normalized prompt, no attachments, local cwd — same provider turn as
-    /// Agent App Send. Differs only where unattended ownership requires it
-    /// (LaunchAgent process, surfaceID nil, XPC stop).
+    /// Ownership stays in the interactive app process (local coordinator). No
+    /// LaunchAgent foreign ownership or XPC stop path.
     /// - Parameter onThreadCreated: called after the thread row exists so the
     ///   scheduler can link `scheduled_task_runs.thread_id` before provider start.
     public func execute(
         _ task: ScheduledTask,
         onThreadCreated: ((AgentThreadID) throws -> Void)? = nil
     ) async throws -> (threadID: AgentThreadID, runID: AgentRunID) {
-        let prepared = try await prepareExecution(task)
-        // Prefer the Auto-resolved selection when present so the run matches what
-        // preflight admitted. Otherwise use the task's stored provider/model.
-        let selection = prepared.routingSnapshot?.configuration.manualSelection
-            ?? AgentModelSelection(
-                provider: task.provider,
-                modelId: task.model,
-                reasoningEffort: task.reasoningEffort
+        _ = try await prepareExecution(task)
+        try Self.rejectUIOnlySchedulePrompt(task.prompt)
+
+        let surface = try router.openAgentAppForSchedule(workspace: task.workspaceID)
+        let vm = surface.viewModel
+        vm.setRunAsUser(Self.resolveRunAsUser(task: task) ?? AgentRunAsUser.current())
+        // setRunAsUser kicks an async provider refresh; await a full load so the
+        // exact saved instance is present before we pin configuration.
+        await vm.loadProviderSnapshots()
+        guard vm.providerSnapshots.contains(where: {
+            $0.id == task.providerInstanceID && $0.provider == task.provider
+        }) else {
+            throw ScheduledTaskPreflightError.providerUnavailable(
+                "Provider instance \(task.providerInstanceID) is not available for \(task.runAsUser)."
             )
-        let providerInstanceID = prepared.routingSnapshot?.configuration.manualProviderInstanceId
-            ?? task.providerInstanceID
-        let runAsUser = Self.resolveRunAsUser(task: task)
-
-        // Same first-token rewrite as AgentAppViewModel.send() so `$goal` / skills
-        // mean the same thing when pasted into Schedule Tasks as in Agent App.
-        let catalogSnapshots: [AgentProviderSnapshot]
-        if let autoSnapshots = prepared.routingSnapshot?.providerSnapshots, !autoSnapshots.isEmpty {
-            catalogSnapshots = autoSnapshots
-        } else {
-            catalogSnapshots = (await router.listAgentProviderSnapshots()).filter {
-                $0.provider == task.provider && $0.id == task.providerInstanceID
-            }
         }
-        let normalizedPrompt = AgentComposerSuggestions.normalizingComposerTriggerPrefix(
-            task.prompt,
-            localSlashCommands: AgentAppViewModel.localSlashCommands,
-            providerSlashCommands: Array(Set(
-                catalogSnapshots.flatMap(\.slashCommands)
-                    + AgentComposerSuggestions.passThroughSlashCommands
-            )),
-            skills: catalogSnapshots.flatMap(\.skills)
-        )
-        try Self.rejectUIOnlySchedulePrompt(normalizedPrompt)
-
-        // Path B: still create+send (manual-shaped persistence), but ownership
-        // stays in this LaunchAgent process; main UI stops via XPC.
-        // Title is the same placeholder as Agent App "New thread" so the ordinary
-        // first-message title derivation in sendAgentMessage runs. Task title
-        // remains schedule/run metadata, not an Agent-thread override.
-        let thread = try router.createAgentThread(
-            workspace: task.workspaceID,
-            title: "New thread",
-            provider: selection.provider,
-            model: selection.effectiveModel,
-            // Unattended schedules need Full Access so tools do not block on UI.
-            permissionMode: .fullAccess,
-            reasoningEffort: selection.reasoningEffort,
-            serviceTier: selection.serviceTier,
-            modelSelection: selection,
-            providerInstanceId: providerInstanceID,
-            runAsUser: runAsUser,
-            surfaceID: nil,
-            routingConfiguration: prepared.routingSnapshot?.configuration
-                ?? Self.routingConfiguration(
-                    for: task,
-                    policyDigest: task.effectiveRoutingMode == .auto
-                        ? orchestrationRuntime.policyDigest
-                        : ""
-                )
-        )
-        try onThreadCreated?(thread.id)
-        let send = try await router.sendAgentMessage(
-            thread: thread.id,
-            text: normalizedPrompt,
-            provider: selection.provider,
-            model: selection.effectiveModel,
-            permissionMode: .fullAccess,
-            reasoningEffort: selection.reasoningEffort,
-            serviceTier: selection.serviceTier,
-            interactionMode: .default,
-            modelSelection: selection,
-            providerInstanceId: providerInstanceID,
-            attachments: [],
-            // Full preflight admit (catalog + launch binaries) must reach startRun
-            // or Auto degrades to a frozen manual model selection.
-            orchestrationRoutingSnapshot: prepared.routingSnapshot
-        )
-        guard let runID = send.runId else {
+        vm.setProviderInstance(task.providerInstanceID)
+        // New-thread creation re-applies preferred model; pin exact schedule
+        // configuration after create, then fail closed if anything drifted.
+        vm.createThread(title: "New thread")
+        guard let threadID = vm.selectedThreadId else {
             throw ScheduledTaskPreflightError.invalidTask(
-                "Scheduled task send did not start a provider run (status: \(send.status.rawValue))."
+                vm.statusMessage.isEmpty
+                    ? "Scheduled task could not create an Agent App thread."
+                    : vm.statusMessage
             )
         }
-        return (thread.id, runID)
+        try onThreadCreated?(threadID)
+
+        vm.setProviderInstance(task.providerInstanceID)
+        vm.setModel(task.model)
+        vm.setReasoningEffort(task.reasoningEffort)
+        vm.setPermissionMode(.fullAccess)
+        vm.interactionMode = .default
+        _ = vm.setAutoModelRoutingEnabled(task.effectiveRoutingMode == .auto)
+
+        if vm.providerInstanceId != task.providerInstanceID
+            || vm.provider != task.provider {
+            throw ScheduledTaskPreflightError.providerUnavailable(
+                "Could not pin provider \(task.provider.rawValue) / \(task.providerInstanceID) on the Agent App tab."
+            )
+        }
+        if task.effectiveRoutingMode != .auto, vm.model != task.model {
+            throw ScheduledTaskPreflightError.unsupportedModel(task.model)
+        }
+        if vm.permissionMode != .fullAccess {
+            throw ScheduledTaskPreflightError.invalidTask(
+                "Could not enable Full Access for the scheduled Agent App run."
+            )
+        }
+        if task.effectiveRoutingMode == .auto, vm.routingMode != .auto {
+            throw ScheduledTaskPreflightError.invalidTask(
+                "Could not enable Auto model routing for the scheduled run."
+            )
+        }
+
+        // Raw saved prompt — AgentAppViewModel.send() performs the same
+        // first-token normalization the play button uses.
+        vm.prompt = task.prompt
+        vm.attachments = []
+        await vm.send()
+
+        guard let runID = vm.currentRunId, vm.selectedThreadId == threadID else {
+            let detail = vm.statusMessage.trimmingCharacters(in: .whitespacesAndNewlines)
+            throw ScheduledTaskPreflightError.invalidTask(
+                detail.isEmpty
+                    ? "Scheduled task send did not start a provider run."
+                    : detail
+            )
+        }
+        return (threadID, runID)
     }
 
     /// Local Agent App commands that never start a provider turn. Scheduled
@@ -559,12 +545,16 @@ public final class ScheduledTaskExecutor {
 
 @MainActor
 public final class ScheduledTaskScheduler {
-    public nonisolated static let catchUpWindow: TimeInterval = 24 * 60 * 60
+    /// Legacy name retained for tests; catch-up of missed fires is intentionally disabled.
+    public nonisolated static let catchUpWindow: TimeInterval = 0
     private let store: ScheduledTaskStore
     private let context: AppContext
     private let executor: ScheduledTaskExecutor
     private let owner = UUID().uuidString.lowercased()
     private var tickTask: Task<Void, Never>?
+    /// First tick after process start skips every past-due occurrence so reopening
+    /// the app never replays work that fired while RemoteCode was closed.
+    private var didSkipMissedOnLaunch = false
 
     public init(context: AppContext, router: AppCommandRouter) {
         self.context = context
@@ -580,7 +570,11 @@ public final class ScheduledTaskScheduler {
             do {
                 try observeRunning(now: now)
                 _ = try store.recoverStaleLeases(now: now)
-                try reconcileCatchUp(now: now)
+                if !didSkipMissedOnLaunch {
+                    try skipMissedOccurrencesOnLaunch(now: now)
+                    didSkipMissedOnLaunch = true
+                }
+                try reconcileNextRunDates(now: now)
                 // Global travel kill switch — still observe/finish live runs, but
                 // do not claim new automatic occurrences while inactive.
                 let settings = SettingsStore(db: context.db).load()
@@ -631,7 +625,7 @@ public final class ScheduledTaskScheduler {
         }
     }
 
-    /// Stop a LaunchAgent-owned provider for a scheduled occurrence.
+    /// Stop a scheduled occurrence owned by this process's coordinator.
     public func stop(
         threadID: AgentThreadID,
         agentRunID: AgentRunID?,
@@ -672,6 +666,25 @@ public final class ScheduledTaskScheduler {
         }
     }
 
+    /// On cold start / reopen: advance every past-due `next_run_at` to the next
+    /// future occurrence without creating a run. Missed fires are intentionally
+    /// ignored — schedules only run while RemoteCode is open.
+    private func skipMissedOccurrencesOnLaunch(now: Date) throws {
+        for task in try store.list() where task.isEnabled {
+            guard let due = task.nextRunAt, due < now else { continue }
+            let future = task.calculatedNextRun(after: now)
+            try store.advance(
+                taskID: task.id,
+                nextRunAt: future,
+                lastRunAt: task.lastRunAt,
+                at: now
+            )
+            scheduledTaskLog.info(
+                "scheduler.skip_missed task=\(task.id.uuidString, privacy: .public) due=\(due.timeIntervalSince1970, privacy: .public)"
+            )
+        }
+    }
+
     private func observeRunning(now: Date) throws {
         for run in try store.listActiveRuns() where run.status == .running {
             try store.heartbeat(runID: run.id, at: now)
@@ -698,7 +711,7 @@ public final class ScheduledTaskScheduler {
         SystemNotifier.shared.post(title: "Scheduled task failed", body: title, category: nil)
     }
 
-    private func reconcileCatchUp(now: Date) throws {
+    private func reconcileNextRunDates(now: Date) throws {
         for task in try store.list() where task.isEnabled {
             let reconciled = Self.reconciledDueDate(task: task, now: now)
             if reconciled != task.nextRunAt {
@@ -707,17 +720,11 @@ public final class ScheduledTaskScheduler {
         }
     }
 
+    /// Keep future/just-due dates. Never collapse a backlog into a catch-up
+    /// claim — missed fires are skipped on launch via `skipMissedOccurrencesOnLaunch`.
     public nonisolated static func reconciledDueDate(task: ScheduledTask, now: Date) -> Date? {
-        guard let candidate = task.nextRunAt ?? task.calculatedNextRun(after: now.addingTimeInterval(-1)) else { return nil }
-        guard candidate <= now else { return candidate }
-        var latest = candidate
-        var iterations = 0
-        while iterations < 10_000, let next = task.calculatedNextRun(after: latest), next <= now {
-            latest = next
-            iterations += 1
-        }
-        if latest >= now.addingTimeInterval(-catchUpWindow) { return latest }
-        return task.calculatedNextRun(after: now)
+        if let next = task.nextRunAt { return next }
+        return task.calculatedNextRun(after: now.addingTimeInterval(-1))
     }
 }
 

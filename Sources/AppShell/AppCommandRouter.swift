@@ -1904,6 +1904,34 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         return descriptor
     }
 
+    /// Fresh Agent App tab for a scheduled paste+play turn. Always creates a new
+    /// surface so an automatic fire never reconfigures a tab the user is drafting in.
+    @MainActor
+    public func openAgentAppForSchedule(workspace: WorkspaceID) throws -> AgentAppSurface {
+        guard context?.state.workspaces[workspace] != nil else {
+            throw LayoutError.workspaceNotFound
+        }
+        NSApplication.shared.activate(ignoringOtherApps: true)
+        if let detachedWindow = windowController?.workspaceWindow(for: workspace) {
+            detachedWindow.makeKeyAndOrderFront(nil)
+        } else {
+            windowController?.show()
+            try selectWorkspace(workspace)
+            windowController?.presentWorkspaceContent()
+            windowController?.flushPendingRefresh()
+        }
+        let descriptor = try openAgentApp(workspace: workspace)
+        try focusSurface(workspace: workspace, surface: descriptor.id)
+        windowController?.flushPendingRefresh()
+        guard let surface = SurfaceRegistry.shared.surface(descriptor.id) as? AgentAppSurface else {
+            throw LayoutError.surfaceNotFound
+        }
+        return surface
+    }
+
+    /// In-process schedule owner (main app). Run Now / ticks call this instead of XPC.
+    public weak var scheduledTaskScheduler: ScheduledTaskScheduler?
+
     /// Open one exact agent thread in a concrete Agent App surface.
     ///
     /// This is the canonical deep-link path for system notifications and other
@@ -2015,22 +2043,14 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         return try ctx.threadRepo.list(workspaceId: workspace)
     }
 
-    /// Path B: Agent App Stop for LaunchAgent-owned scheduled runs goes over XPC.
+    /// Legacy Path B hooks (LaunchAgent foreign ownership). Schedules now run
+    /// in-process through the normal Agent App coordinator, so stop/stream use
+    /// the local session — leave these unset.
     private static func wireScheduledRunControl(on viewModel: AgentAppViewModel, db: SQLiteDB) {
-        let store = ScheduledTaskStore(db: db)
-        viewModel.isScheduledThreadRunning = { threadID in
-            (try? store.activeRun(forThreadID: threadID)) != nil
-        }
-        viewModel.stopScheduledThread = { threadID, agentRunID in
-            await withCheckedContinuation { cont in
-                ScheduledTaskAgentServiceManager().stop(
-                    threadID: threadID,
-                    agentRunID: agentRunID
-                ) { result, _ in
-                    cont.resume(returning: result.isSuccess)
-                }
-            }
-        }
+        _ = viewModel
+        _ = db
+        viewModel.isScheduledThreadRunning = nil
+        viewModel.stopScheduledThread = nil
     }
 
     public func createAgentThread(workspace: WorkspaceID?, title: String, provider: AgentProvider, model: String, permissionMode: AgentPermissionMode, reasoningEffort: AgentReasoningEffort, serviceTier: AgentServiceTier = .auto, modelSelection: AgentModelSelection? = nil, providerInstanceId: String? = nil, runAsUser: AgentRunAsUser? = nil, surfaceID: SurfaceID? = nil) throws -> AgentThread {

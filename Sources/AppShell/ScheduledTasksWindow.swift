@@ -169,7 +169,7 @@ public final class ScheduledTasksViewModel: ObservableObject {
     @Published public var selectedTaskID: UUID? { didSet { reloadRuns() } }
     @Published public var editorDraft: ScheduledTaskEditorDraft?
     @Published public var errorMessage: String?
-    @Published public private(set) var serviceStatus: String = "Checking background scheduler…"
+    @Published public private(set) var serviceStatus: String = "Runs inside RemoteCode while the app is open"
     @Published public private(set) var serviceRequiresApproval = false
     @Published public private(set) var isSavingEditor = false
     /// Global kill switch: when false, automatic scheduled occurrences do not claim/run.
@@ -179,7 +179,6 @@ public final class ScheduledTasksViewModel: ObservableObject {
     private let router: AppCommandRouter
     private let store: ScheduledTaskStore
     private let settingsStore: SettingsStore
-    private let service = ScheduledTaskAgentServiceManager()
     private var providerLoadCount = 0
     private var activeRunPollTask: Task<Void, Never>?
 
@@ -241,24 +240,15 @@ public final class ScheduledTasksViewModel: ObservableObject {
             do {
                 let task = try draft.makeTask()
                 _ = try await ScheduledTaskExecutor(context: context, router: router).preflight(task)
-                var persisted = task
-                if task.isEnabled {
-                    try service.register()
-                    if service.status == .requiresApproval {
-                        persisted.isEnabled = false
-                        persisted.nextRunAt = nil
-                    }
-                }
+                let persisted = task
                 try store.save(persisted)
                 editorDraft = nil
                 selectedTaskID = persisted.id
                 reloadTasks()
                 reloadRuns()
                 reloadServiceStatus()
-                if task.isEnabled, service.status == .requiresApproval {
-                    errorMessage = "Task saved paused. Approve RemoteCode in System Settings > General > Login Items, then resume it."
-                } else if persisted.isEnabled {
-                    service.wake { _ in }
+                if persisted.isEnabled {
+                    router.scheduledTaskScheduler?.tick()
                 }
             } catch { errorMessage = String(describing: error) }
         }
@@ -276,47 +266,38 @@ public final class ScheduledTasksViewModel: ObservableObject {
             guard let self else { return }
             do {
                 _ = try await ScheduledTaskExecutor(context: context, router: router).preflight(task)
-                try service.register()
-                reloadServiceStatus()
-                guard service.status != .requiresApproval else {
-                    errorMessage = "Approve RemoteCode in System Settings > General > Login Items before resuming this task."
-                    return
-                }
                 let next = task.calculatedNextRun(after: Date().addingTimeInterval(-0.001))
                 try store.setEnabled(id: task.id, enabled: true, nextRunAt: next)
-                service.wake { _ in }
+                router.scheduledTaskScheduler?.tick()
                 reloadTasks()
             } catch { errorMessage = String(describing: error) }
         }
     }
 
-    public func openServiceSettings() { service.openSystemSettings() }
+    public func openServiceSettings() {
+        // Legacy Login Items path no longer required; keep no-op for old UI tests.
+    }
 
     private func reloadServiceStatus() {
-        serviceStatus = service.statusDescription
-        serviceRequiresApproval = service.status == .requiresApproval
+        serviceStatus = "Runs inside RemoteCode while the app is open"
+        serviceRequiresApproval = false
     }
 
     public func runNow(_ task: ScheduledTask) {
-        do { try service.register() } catch {
-            errorMessage = "Background scheduler registration failed: \(error.localizedDescription)"
-            return
-        }
-        reloadServiceStatus()
-        guard service.status != .requiresApproval else {
-            errorMessage = "Approve RemoteCode in System Settings > General > Login Items before running this task."
-            return
-        }
         guard activeRunStatuses[task.id] == nil else {
             errorMessage = "This scheduled task already has an active run."
             return
         }
-        // Immediate feedback: claim is async over XPC, but the card should
-        // flip to Queued in the same click without waiting for the agent.
+        guard let scheduler = router.scheduledTaskScheduler else {
+            errorMessage = "The in-app scheduler is not ready yet. Keep RemoteCode open and retry."
+            return
+        }
+        // Immediate feedback: claim is async, but the card should flip to Queued
+        // in the same click.
         activeRunStatuses[task.id] = .queued
         runCounts[task.id, default: 0] += 1
         ensureActiveRunPolling()
-        service.wake(taskID: task.id) { [weak self] result in
+        scheduler.runNow(taskID: task.id) { [weak self] result in
             guard let self else { return }
             switch result {
             case .failure(let error):
@@ -459,13 +440,8 @@ public final class ScheduledTasksViewModel: ObservableObject {
     public func setSchedulerActive(_ active: Bool) {
         settingsStore.update { $0.scheduledTasksActive = active }
         schedulerActive = settingsStore.load().scheduledTasksActive
-        // Wake the LaunchAgent so its next tick sees the new flag promptly.
         if active {
-            service.wake { [weak self] result in
-                if case .failure(let error) = result {
-                    self?.errorMessage = error.localizedDescription
-                }
-            }
+            router.scheduledTaskScheduler?.tick()
         }
         ScheduledTaskCrossProcess.notifyStoreChanged(reason: active ? "global_active" : "global_paused")
     }
@@ -575,30 +551,8 @@ public struct ScheduledTasksRootView: View {
     // MARK: Service banner
 
     private var serviceBanner: some View {
-        HStack(alignment: .center, spacing: DS.Space.md) {
-            Image(systemName: "exclamationmark.triangle.fill")
-                .foregroundColor(DS.Palette.warning)
-                .accessibilityHidden(true)
-            VStack(alignment: .leading, spacing: DS.Space.xxs) {
-                Text("Background scheduler needs Login Items approval")
-                    .font(DS.Font.body.weight(.semibold))
-                    .foregroundColor(DS.Palette.text)
-                Text(vm.serviceStatus)
-                    .font(DS.Font.caption)
-                    .foregroundColor(DS.Palette.textSecondary)
-            }
-            Spacer(minLength: DS.Space.md)
-            Button("Open Login Items") { vm.openServiceSettings() }
-                .buttonStyle(DSSecondaryButtonStyle())
-                .accessibilityIdentifier("scheduledTasks.openLoginItems")
-        }
-        .padding(.horizontal, DS.Space.xxl)
-        .padding(.vertical, DS.Space.lg)
-        .background(DS.Palette.warning.opacity(0.10))
-        .overlay(alignment: .bottom) {
-            Rectangle().fill(DS.Palette.warning.opacity(0.35)).frame(height: DS.Border.hairline)
-        }
-        .accessibilityElement(children: .combine)
+        // Path B LaunchAgent Login Items banner retired — schedules run in-app.
+        EmptyView()
     }
 
     private var footerBar: some View {
