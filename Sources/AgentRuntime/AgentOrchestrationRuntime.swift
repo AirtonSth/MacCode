@@ -1154,6 +1154,7 @@ public final class AgentOrchestrationRuntime: @unchecked Sendable {
         - Controller stays LIGHT; escalate workers only after capability failure.
         - Fan-out default 2 / hard cap 3; skip REVIEWER on micro absolute/high certainty when rules allow.
         - Thin prompts (slice-only); cheap proof (scope diff + one focused command); lean table report.
+        - EVERY worker/reviewer prompt must require explicit `| distill` for each pipable output-producing tool call and propagate that rule to all descendants.
 
         \(hostBlock)
 

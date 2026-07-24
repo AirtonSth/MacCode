@@ -3,6 +3,7 @@ import AppKit
 import CoreModel
 import Persistence
 import AgentRuntime
+import Surfaces
 import ServiceManagement
 import Darwin
 import os
@@ -56,7 +57,7 @@ public enum ScheduledSystemUserCatalog {
     }
 }
 
-public enum ScheduledTaskPreflightError: Error, CustomStringConvertible, Equatable {
+public enum ScheduledTaskPreflightError: Error, CustomStringConvertible, LocalizedError, Equatable {
     case invalidTask(String)
     case missingWorkspace
     case inaccessibleWorkspace(String)
@@ -78,6 +79,11 @@ public enum ScheduledTaskPreflightError: Error, CustomStringConvertible, Equatab
         case .unsupportedReasoning(let effort): return "The selected model does not support \(effort) reasoning."
         }
     }
+
+    /// WHY: Run Now / XPC failure paths use `error.localizedDescription`. Without
+    /// LocalizedError, Foundation bridges to NSError and drops the human message
+    /// ("AppShell.ScheduledTaskPreflightError error 0.").
+    public var errorDescription: String? { description }
 }
 
 @MainActor
@@ -100,48 +106,142 @@ public final class ScheduledTaskExecutor {
         try await prepareExecution(task).workspace
     }
 
-    public func execute(_ task: ScheduledTask) async throws -> (threadID: AgentThreadID, runID: AgentRunID) {
+    /// Create + send like a manual Agent App turn inside the LaunchAgent.
+    ///
+    /// Semantic comparator (paste+play): fresh Agent thread, task provider /
+    /// model / reasoning / run-as / workspace, Full Access + Default interaction,
+    /// normalized prompt, no attachments, local cwd — same provider turn as
+    /// Agent App Send. Differs only where unattended ownership requires it
+    /// (LaunchAgent process, surfaceID nil, XPC stop).
+    /// - Parameter onThreadCreated: called after the thread row exists so the
+    ///   scheduler can link `scheduled_task_runs.thread_id` before provider start.
+    public func execute(
+        _ task: ScheduledTask,
+        onThreadCreated: ((AgentThreadID) throws -> Void)? = nil
+    ) async throws -> (threadID: AgentThreadID, runID: AgentRunID) {
         let prepared = try await prepareExecution(task)
-        let selection = AgentModelSelection(
-            provider: task.provider,
-            modelId: task.model,
-            reasoningEffort: task.reasoningEffort
-        )
-        let routingConfiguration = prepared.routingSnapshot?.configuration
-            ?? AgentRoutingConfiguration.legacyManual(
-                selection: selection,
-                providerInstanceId: task.providerInstanceID
+        // Prefer the Auto-resolved selection when present so the run matches what
+        // preflight admitted. Otherwise use the task's stored provider/model.
+        let selection = prepared.routingSnapshot?.configuration.manualSelection
+            ?? AgentModelSelection(
+                provider: task.provider,
+                modelId: task.model,
+                reasoningEffort: task.reasoningEffort
             )
-        let thread = AgentThread(
-            workspaceId: task.workspaceID,
-            title: task.title,
-            provider: task.provider,
-            providerInstanceId: task.providerInstanceID,
-            model: task.model,
+        let providerInstanceID = prepared.routingSnapshot?.configuration.manualProviderInstanceId
+            ?? task.providerInstanceID
+        let runAsUser = Self.resolveRunAsUser(task: task)
+
+        // Same first-token rewrite as AgentAppViewModel.send() so `$goal` / skills
+        // mean the same thing when pasted into Schedule Tasks as in Agent App.
+        let catalogSnapshots: [AgentProviderSnapshot]
+        if let autoSnapshots = prepared.routingSnapshot?.providerSnapshots, !autoSnapshots.isEmpty {
+            catalogSnapshots = autoSnapshots
+        } else {
+            catalogSnapshots = (await router.listAgentProviderSnapshots()).filter {
+                $0.provider == task.provider && $0.id == task.providerInstanceID
+            }
+        }
+        let normalizedPrompt = AgentComposerSuggestions.normalizingComposerTriggerPrefix(
+            task.prompt,
+            localSlashCommands: AgentAppViewModel.localSlashCommands,
+            providerSlashCommands: Array(Set(
+                catalogSnapshots.flatMap(\.slashCommands)
+                    + AgentComposerSuggestions.passThroughSlashCommands
+            )),
+            skills: catalogSnapshots.flatMap(\.skills)
+        )
+        try Self.rejectUIOnlySchedulePrompt(normalizedPrompt)
+
+        // Path B: still create+send (manual-shaped persistence), but ownership
+        // stays in this LaunchAgent process; main UI stops via XPC.
+        // Title is the same placeholder as Agent App "New thread" so the ordinary
+        // first-message title derivation in sendAgentMessage runs. Task title
+        // remains schedule/run metadata, not an Agent-thread override.
+        let thread = try router.createAgentThread(
+            workspace: task.workspaceID,
+            title: "New thread",
+            provider: selection.provider,
+            model: selection.effectiveModel,
+            // Unattended schedules need Full Access so tools do not block on UI.
             permissionMode: .fullAccess,
-            reasoningEffort: task.reasoningEffort,
-            serviceTier: .auto,
+            reasoningEffort: selection.reasoningEffort,
+            serviceTier: selection.serviceTier,
             modelSelection: selection,
-            routingConfiguration: routingConfiguration
+            providerInstanceId: providerInstanceID,
+            runAsUser: runAsUser,
+            surfaceID: nil,
+            routingConfiguration: prepared.routingSnapshot?.configuration
+                ?? Self.routingConfiguration(
+                    for: task,
+                    policyDigest: task.effectiveRoutingMode == .auto
+                        ? orchestrationRuntime.policyDigest
+                        : ""
+                )
         )
-        try context.threadRepo.upsert(thread)
-        let request = AgentRunRequest(
-            threadId: thread.id,
-            provider: task.provider,
-            providerInstanceId: task.providerInstanceID,
-            model: task.model,
-            cwd: prepared.workspace.cwd,
-            prompt: task.prompt,
+        try onThreadCreated?(thread.id)
+        let send = try await router.sendAgentMessage(
+            thread: thread.id,
+            text: normalizedPrompt,
+            provider: selection.provider,
+            model: selection.effectiveModel,
             permissionMode: .fullAccess,
-            reasoningEffort: task.reasoningEffort,
-            providerBinary: prepared.manualLaunch?.binary,
-            environment: prepared.manualLaunch?.environment ?? [:]
+            reasoningEffort: selection.reasoningEffort,
+            serviceTier: selection.serviceTier,
+            interactionMode: .default,
+            modelSelection: selection,
+            providerInstanceId: providerInstanceID,
+            attachments: [],
+            // Full preflight admit (catalog + launch binaries) must reach startRun
+            // or Auto degrades to a frozen manual model selection.
+            orchestrationRoutingSnapshot: prepared.routingSnapshot
         )
-        let runID = try await context.coordinator.startRun(
-            request,
-            routingSnapshot: prepared.routingSnapshot
-        )
+        guard let runID = send.runId else {
+            throw ScheduledTaskPreflightError.invalidTask(
+                "Scheduled task send did not start a provider run (status: \(send.status.rawValue))."
+            )
+        }
         return (thread.id, runID)
+    }
+
+    /// Local Agent App commands that never start a provider turn. Scheduled
+    /// prompts must not silently no-op or create empty threads for these.
+    ///
+    /// nonisolated: pure string classification; catalog mirrors
+    /// `AgentAppViewModel.localSlashCommands` without MainActor hop.
+    nonisolated static func rejectUIOnlySchedulePrompt(_ text: String) throws {
+        let line = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let first = line.first, first == "/" || first == "$" else { return }
+        let parts = line.dropFirst().split(separator: " ", maxSplits: 1).map(String.init)
+        let command = (parts.first ?? "").lowercased()
+        let argument = parts.count > 1 ? parts[1].trimmingCharacters(in: .whitespaces) : ""
+        let local = Set(["clear", "default", "fork", "model", "plan", "status"])
+        guard local.contains(command) else { return }
+        // `/plan body` in Agent App switches mode then sends `body` — schedules
+        // are Default interaction only, so require a real provider prompt.
+        if command == "plan", !argument.isEmpty {
+            throw ScheduledTaskPreflightError.invalidTask(
+                "Scheduled tasks run in Default interaction mode. Remove /plan and put the work in the prompt (or use a skill like $sam-work)."
+            )
+        }
+        if argument.isEmpty {
+            throw ScheduledTaskPreflightError.invalidTask(
+                "Scheduled tasks cannot run the local Agent App command /\(command). Use a full prompt or skill ($name)."
+            )
+        }
+    }
+
+    private static func resolveRunAsUser(task: ScheduledTask) -> AgentRunAsUser? {
+        guard let user = ScheduledSystemUserCatalog.user(named: task.runAsUser) else {
+            return AgentRunAsUser.current()
+        }
+        return AgentRunAsUser(
+            generatedUID: "",
+            shortName: user.name,
+            uid: user.uid,
+            gid: getgid(),
+            homePath: user.homeDirectory
+        )
     }
 
     private struct PreparedExecution {
@@ -226,7 +326,7 @@ public final class ScheduledTaskExecutor {
         }.value
         guard authenticated == true else {
             throw ScheduledTaskPreflightError.providerUnavailable(
-                "The selected provider account is unavailable for system user \(user.name). Sign in as that user and retry."
+                "The selected provider is unavailable for system user \(user.name). Sign in as that user and retry."
             )
         }
         return PreparedExecution(
@@ -266,9 +366,9 @@ public final class ScheduledTaskExecutor {
         var verifiedSnapshots: [AgentProviderSnapshot] = []
         var launches: [String: AgentOrchestrationLaunchConfiguration] = [:]
 
-        // Scheduled Auto is host-bound: only the user-chosen provider account may
-        // run. Never admit other providers or substitute another account of the
-        // same provider when the saved instance is unavailable (SCHED-005).
+        // Scheduled Auto is host-bound: only the user-chosen provider may run.
+        // Never admit other providers or substitute another host when the saved
+        // provider is unavailable (SCHED-005).
         let candidateSnapshots = snapshots.filter {
             $0.provider == task.provider
                 && $0.id == task.providerInstanceID
@@ -280,7 +380,7 @@ public final class ScheduledTaskExecutor {
         }
         guard !candidateSnapshots.isEmpty else {
             throw ScheduledTaskPreflightError.providerUnavailable(
-                "The selected provider account (\(task.provider.rawValue) · \(task.providerInstanceID)) is unavailable for Auto model routing."
+                "The selected provider (\(task.provider.rawValue.capitalized)) is unavailable for Auto model routing."
             )
         }
 
@@ -291,7 +391,7 @@ public final class ScheduledTaskExecutor {
                 do { try verifyProviderBinary(baseBinary, user: user) }
                 catch {
                     throw ScheduledTaskPreflightError.providerUnavailable(
-                        "The selected provider account is not executable as \(user.name): \(error)"
+                        "The selected provider is not executable as \(user.name): \(error)"
                     )
                 }
             }
@@ -319,7 +419,7 @@ public final class ScheduledTaskExecutor {
             }.value
             guard authenticated == true else {
                 throw ScheduledTaskPreflightError.providerUnavailable(
-                    "The selected provider account is unavailable for system user \(user.name). Sign in as that user and retry."
+                    "The selected provider is unavailable for system user \(user.name). Sign in as that user and retry."
                 )
             }
 
@@ -481,6 +581,13 @@ public final class ScheduledTaskScheduler {
                 try observeRunning(now: now)
                 _ = try store.recoverStaleLeases(now: now)
                 try reconcileCatchUp(now: now)
+                // Global travel kill switch — still observe/finish live runs, but
+                // do not claim new automatic occurrences while inactive.
+                let settings = SettingsStore(db: context.db).load()
+                guard settings.scheduledTasksActive else {
+                    scheduledTaskLog.debug("scheduler.tick_skipped global_active=false")
+                    return
+                }
                 let claims = try store.claimDue(now: now, owner: owner)
                 for claim in claims { await execute(claim) }
             } catch {
@@ -509,11 +616,59 @@ public final class ScheduledTaskScheduler {
         do {
             let next = claim.task.calculatedNextRun(after: claim.run.scheduledAt)
             try store.advance(taskID: claim.task.id, nextRunAt: next, lastRunAt: claim.task.lastRunAt)
-            let identifiers = try await executor.execute(claim.task)
+            ScheduledTaskCrossProcess.notifyStoreChanged(reason: "queued")
+            let identifiers = try await executor.execute(claim.task) { [self] threadID in
+                // Link ownership before provider start so main-app Stop can route.
+                try self.store.attachThread(runID: claim.run.id, threadID: threadID)
+                ScheduledTaskCrossProcess.notifyStoreChanged(reason: "thread_linked")
+            }
             try store.markStarted(runID: claim.run.id, threadID: identifiers.threadID, agentRunID: identifiers.runID)
+            ScheduledTaskCrossProcess.notifyStoreChanged(reason: "started")
         } catch {
             try? store.finish(runID: claim.run.id, status: .failed, errorSummary: String(describing: error))
+            ScheduledTaskCrossProcess.notifyStoreChanged(reason: "failed")
             SystemNotifier.shared.post(title: "Scheduled task failed", body: claim.task.title, category: nil)
+        }
+    }
+
+    /// Stop a LaunchAgent-owned provider for a scheduled occurrence.
+    public func stop(
+        threadID: AgentThreadID,
+        agentRunID: AgentRunID?,
+        completion: @escaping @MainActor (ScheduledTaskStopResult, String?) -> Void
+    ) {
+        Task {
+            let (result, message) = await stopOwned(threadID: threadID, agentRunID: agentRunID)
+            completion(result, message)
+        }
+    }
+
+    private func stopOwned(
+        threadID: AgentThreadID,
+        agentRunID: AgentRunID?
+    ) async -> (ScheduledTaskStopResult, String?) {
+        do {
+            guard let occurrence = try store.activeRun(forThreadID: threadID) else {
+                return (.notOwned, nil)
+            }
+            if let expected = agentRunID,
+               let owned = occurrence.agentRunID,
+               expected != owned {
+                return (.notOwned, "Active scheduled run ID does not match.")
+            }
+            if occurrence.status == .queued {
+                try store.finish(runID: occurrence.id, status: .cancelled, errorSummary: "Cancelled before start.")
+                ScheduledTaskCrossProcess.notifyStoreChanged(reason: "cancelled")
+                return (.alreadyTerminal, nil)
+            }
+            if let runID = occurrence.agentRunID ?? agentRunID {
+                context.coordinator.stopRun(runID)
+            }
+            context.coordinator.stopRun(threadId: threadID)
+            ScheduledTaskCrossProcess.notifyStoreChanged(reason: "stop_requested")
+            return (.accepted, nil)
+        } catch {
+            return (.failed, error.localizedDescription)
         }
     }
 
@@ -524,11 +679,14 @@ public final class ScheduledTaskScheduler {
             switch agentRun.status {
             case .completed:
                 try store.finish(runID: run.id, status: .completed, at: agentRun.finishedAt ?? now)
+                ScheduledTaskCrossProcess.notifyStoreChanged(reason: "completed")
             case .failed, .interrupted:
                 try store.finish(runID: run.id, status: .failed, errorSummary: agentRun.errorMessage, at: agentRun.finishedAt ?? now)
+                ScheduledTaskCrossProcess.notifyStoreChanged(reason: "failed")
                 notifyFailure(for: run)
             case .cancelled:
                 try store.finish(runID: run.id, status: .cancelled, errorSummary: agentRun.errorMessage, at: agentRun.finishedAt ?? now)
+                ScheduledTaskCrossProcess.notifyStoreChanged(reason: "cancelled")
             case .pending, .running:
                 break
             }
@@ -563,9 +721,67 @@ public final class ScheduledTaskScheduler {
     }
 }
 
+/// Cross-process result for scheduled-run stop requests (XPC-friendly strings).
+public enum ScheduledTaskStopResult: String, Sendable, Equatable {
+    case accepted
+    case alreadyTerminal
+    case notOwned
+    case failed
+
+    public var isSuccess: Bool {
+        switch self {
+        case .accepted, .alreadyTerminal: return true
+        case .notOwned, .failed: return false
+        }
+    }
+
+    public static func parse(_ raw: String?, message: String?) -> (ScheduledTaskStopResult, String?) {
+        if let raw, let known = ScheduledTaskStopResult(rawValue: raw) {
+            return (known, message)
+        }
+        return (.failed, message ?? raw ?? "Unknown stop result")
+    }
+}
+
+/// Posts/observes Darwin distributed notifications so the interactive app can
+/// reload rails after LaunchAgent SQLite commits (EventBus is in-process only).
+public enum ScheduledTaskCrossProcess {
+    public static let storeChangedName = Notification.Name("io.remotecode.scheduled-tasks.store-changed")
+
+    public static func notifyStoreChanged(reason: String) {
+        DistributedNotificationCenter.default().postNotificationName(
+            storeChangedName,
+            object: reason,
+            userInfo: nil,
+            deliverImmediately: true
+        )
+    }
+
+    @discardableResult
+    public static func observeStoreChanged(
+        queue: OperationQueue? = .main,
+        handler: @escaping (String?) -> Void
+    ) -> NSObjectProtocol {
+        DistributedNotificationCenter.default().addObserver(
+            forName: storeChangedName,
+            object: nil,
+            queue: queue
+        ) { note in
+            handler(note.object as? String)
+        }
+    }
+
+    public static func removeObserver(_ token: NSObjectProtocol) {
+        DistributedNotificationCenter.default().removeObserver(token)
+    }
+}
+
 @objc public protocol ScheduledTaskAgentXPCProtocol {
     func ping(withReply reply: @escaping (String) -> Void)
     func wake(taskID: String?, withReply reply: @escaping (Bool, String?) -> Void)
+    /// Stop a LaunchAgent-owned scheduled provider run. Replies with
+    /// (statusRaw: accepted|alreadyTerminal|notOwned|failed, message?).
+    func stop(threadID: String, agentRunID: String?, withReply reply: @escaping (String, String?) -> Void)
 }
 
 @MainActor
@@ -594,6 +810,17 @@ private final class ScheduledTaskAgentXPCEndpoint: NSObject, @preconcurrency Sch
         }
         reply(true, nil)
     }
+
+    func stop(threadID: String, agentRunID: String?, withReply reply: @escaping (String, String?) -> Void) {
+        guard let tid = UUID(uuidString: threadID).map(AgentThreadID.init) else {
+            reply(ScheduledTaskStopResult.failed.rawValue, "Invalid thread ID.")
+            return
+        }
+        let runID = agentRunID.flatMap(UUID.init(uuidString:)).map(AgentRunID.init)
+        scheduler.stop(threadID: tid, agentRunID: runID) { result, message in
+            reply(result.rawValue, message)
+        }
+    }
 }
 
 @MainActor
@@ -620,7 +847,8 @@ public final class ScheduledTaskAgentXPCListener: NSObject, @preconcurrency NSXP
 
 @MainActor
 public final class ScheduledTaskAgentServiceManager {
-    public static let protocolVersion = 1
+    /// Bump when XPC methods change. Clients re-register a mismatched agent.
+    public static let protocolVersion = 2
     public static var serviceBaseName: String { (Bundle.main.bundleIdentifier ?? "io.remotecode.desktop") + ".scheduled-tasks" }
     public static var plistName: String { serviceBaseName + ".plist" }
     public static var machServiceName: String { serviceBaseName }
@@ -669,16 +897,61 @@ public final class ScheduledTaskAgentServiceManager {
     }
 
     public func wake(taskID: UUID? = nil, completion: @escaping @MainActor (Result<Void, Error>) -> Void) {
+        withReadyProxy { proxy, connection, fail in
+            proxy.wake(taskID: taskID?.uuidString) { ok, message in
+                Task { @MainActor in
+                    if ok { completion(.success(())) }
+                    else {
+                        completion(.failure(ScheduledTaskPreflightError.invalidTask(
+                            message ?? "Background scheduler rejected the request."
+                        )))
+                    }
+                    connection.invalidate()
+                }
+            }
+        } onFailure: { error in
+            completion(.failure(error))
+        }
+    }
+
+    /// Ask the LaunchAgent to stop a scheduled provider run it owns.
+    public func stop(
+        threadID: AgentThreadID,
+        agentRunID: AgentRunID?,
+        completion: @escaping @MainActor (ScheduledTaskStopResult, String?) -> Void
+    ) {
+        withReadyProxy { proxy, connection, _ in
+            proxy.stop(
+                threadID: threadID.value.uuidString,
+                agentRunID: agentRunID?.value.uuidString
+            ) { statusRaw, message in
+                Task { @MainActor in
+                    let parsed = ScheduledTaskStopResult.parse(statusRaw, message: message)
+                    completion(parsed.0, parsed.1)
+                    connection.invalidate()
+                }
+            }
+        } onFailure: { error in
+            completion(.failed, error.localizedDescription)
+        }
+    }
+
+    private func withReadyProxy(
+        _ body: @escaping (ScheduledTaskAgentXPCProtocol, NSXPCConnection, @escaping (Error) -> Void) -> Void,
+        onFailure: @escaping @MainActor (Error) -> Void
+    ) {
         let connection = NSXPCConnection(machServiceName: Self.machServiceName, options: [])
         connection.remoteObjectInterface = NSXPCInterface(with: ScheduledTaskAgentXPCProtocol.self)
         connection.interruptionHandler = { connection.invalidate() }
         connection.invalidationHandler = {}
         connection.resume()
         let proxy = connection.remoteObjectProxyWithErrorHandler { error in
-            Task { @MainActor in completion(.failure(error)); connection.invalidate() }
+            Task { @MainActor in onFailure(error); connection.invalidate() }
         } as? ScheduledTaskAgentXPCProtocol
         guard let proxy else {
-            completion(.failure(ScheduledTaskPreflightError.providerUnavailable("Background scheduler is unavailable.")))
+            Task { @MainActor in
+                onFailure(ScheduledTaskPreflightError.providerUnavailable("Background scheduler is unavailable."))
+            }
             connection.invalidate()
             return
         }
@@ -689,23 +962,19 @@ public final class ScheduledTaskAgentServiceManager {
                         try self.unregister()
                         try self.register()
                     } catch {
-                        completion(.failure(error))
+                        onFailure(error)
                         connection.invalidate()
                         return
                     }
-                    completion(.failure(ScheduledTaskPreflightError.invalidTask(
+                    onFailure(ScheduledTaskPreflightError.invalidTask(
                         "Scheduler version mismatch. The background scheduler was re-registered; retry when its status becomes active."
-                    )))
+                    ))
                     connection.invalidate()
                     return
                 }
-                proxy.wake(taskID: taskID?.uuidString) { ok, message in
-                    Task { @MainActor in
-                        if ok { completion(.success(())) }
-                        else { completion(.failure(ScheduledTaskPreflightError.invalidTask(message ?? "Background scheduler rejected the request."))) }
-                        connection.invalidate()
-                    }
-                }
+                body(proxy, connection, { error in
+                    Task { @MainActor in onFailure(error) }
+                })
             }
         }
     }

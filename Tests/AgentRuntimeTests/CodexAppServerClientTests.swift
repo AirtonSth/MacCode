@@ -502,7 +502,7 @@ final class CodexAppServerClientTests: ProviderProcessTestCase {
         // "Registers:" is the register/prefix legend from the full distill body; a bare
         // "| distill" pipe rule never carries it, so this proves the full spec is injected.
         XCTAssertTrue(
-            hintInstructions.contains("Registers:"),
+            hintInstructions.contains("R0 micro") && hintInstructions.contains("R1 work"),
             "Codex developer_instructions must carry the full distill language spec, not only the pipe rule"
         )
         XCTAssertEqual(

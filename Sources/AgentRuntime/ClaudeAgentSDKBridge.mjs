@@ -57,9 +57,9 @@ const SUPPORTED_IMAGE_MIME_TYPES = new Set([
   'image/gif',
   'image/webp',
 ]);
-// Compress tool output once it exceeds ~1KB OR ~10 lines, matching the distill
-// policy the agent is told to follow (compress >~1KB or >~10 lines). The skip
-// guard below uses AND so output is compressed when EITHER threshold is exceeded.
+// Automatic fallback for tool calls that did not use the explicit `| distill`
+// contract. Keep small outputs raw to avoid hook overhead; the provider prompt
+// separately requires every pipable output-producing call to use the CLI.
 const TOKEN_SAVER_MIN_BYTES = 1024;
 const TOKEN_SAVER_MIN_LINES = 10;
 const TOKEN_SAVER_STORE_MIN_BYTES = 2048;

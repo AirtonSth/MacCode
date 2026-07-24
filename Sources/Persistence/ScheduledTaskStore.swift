@@ -1,7 +1,7 @@
 import Foundation
 import CoreModel
 
-public enum ScheduledTaskStoreError: Error, CustomStringConvertible {
+public enum ScheduledTaskStoreError: Error, CustomStringConvertible, LocalizedError {
     case invalidRow(String)
     case missingTask(UUID)
 
@@ -11,6 +11,10 @@ public enum ScheduledTaskStoreError: Error, CustomStringConvertible {
         case .missingTask(let id): return "Scheduled task not found: \(id.uuidString)"
         }
     }
+
+    /// WHY: LaunchAgent XPC replies use `error.localizedDescription`. Without
+    /// LocalizedError the associated message is lost over the wire.
+    public var errorDescription: String? { description }
 }
 
 public struct ScheduledTaskClaim: Sendable, Equatable {
@@ -154,6 +158,38 @@ public final class ScheduledTaskStore: @unchecked Sendable {
         }
     }
 
+    /// Active scheduled occurrence for a given agent thread, if any.
+    public func activeRun(forThreadID threadID: AgentThreadID) throws -> ScheduledTaskRun? {
+        try db.performSync { database in
+            let statement = try database.prepare(
+                Self.runSelect
+                    + " WHERE status IN ('queued', 'running') AND thread_id = ? ORDER BY queued_at DESC LIMIT 1;"
+            )
+            defer { statement.reset() }
+            try statement.bind(1, threadID.value.uuidString.lowercased())
+            guard try statement.step() else { return nil }
+            return try decodeRun(statement)
+        }
+    }
+
+    /// Thread IDs currently owned by a live scheduled occurrence (LaunchAgent).
+    /// Used so interactive launch reconciliation does not interrupt them.
+    public func activeOwnedThreadIDs() throws -> Set<AgentThreadID> {
+        try db.performSync { database in
+            let statement = try database.prepare(
+                "SELECT thread_id FROM scheduled_task_runs WHERE status IN ('queued', 'running') AND thread_id IS NOT NULL;"
+            )
+            defer { statement.reset() }
+            var result = Set<AgentThreadID>()
+            while try statement.step() {
+                if let raw = statement.columnText(0), let uuid = UUID(uuidString: raw) {
+                    result.insert(AgentThreadID(uuid))
+                }
+            }
+            return result
+        }
+    }
+
     public func runCounts() throws -> [UUID: Int] {
         try db.performSync { database in
             let statement = try database.prepare("SELECT task_id, COUNT(*) FROM scheduled_task_runs GROUP BY task_id;")
@@ -256,6 +292,51 @@ public final class ScheduledTaskStore: @unchecked Sendable {
             try statement.bind(4, taskID.uuidString.lowercased())
             _ = try statement.step()
             return ScheduledTaskClaim(task: task, run: run)
+        }
+    }
+
+    /// Link a scheduled occurrence to its agent thread before provider start so
+    /// main-app Stop can resolve ownership during the create→send window.
+    ///
+    /// Metadata-only: does **not** change status. Path B calls this while the
+    /// run is still `queued`; feeding `updateRun(status: .queued)` fails because
+    /// `canTransition` rejects queued→queued (identity is not a lifecycle step).
+    public func attachThread(runID: UUID, threadID: AgentThreadID) throws {
+        try db.performSync { database in
+            let current = try database.prepare("""
+                SELECT status, thread_id FROM scheduled_task_runs WHERE id = ? LIMIT 1;
+                """)
+            defer { current.reset() }
+            try current.bind(1, runID.uuidString.lowercased())
+            guard try current.step(), let statusRaw = current.columnText(0),
+                  let status = ScheduledTaskRunStatus(rawValue: statusRaw) else {
+                throw ScheduledTaskStoreError.invalidRow("run \(runID.uuidString) is missing")
+            }
+            guard status == .queued else {
+                throw ScheduledTaskStoreError.invalidRow(
+                    "can only attach a thread while the run is queued (current: \(status.rawValue))"
+                )
+            }
+            if let existing = current.columnText(1),
+               let existingID = UUID(uuidString: existing) {
+                if existingID == threadID.value {
+                    return // idempotent re-attach of the same thread
+                }
+                throw ScheduledTaskStoreError.invalidRow(
+                    "run already linked to a different agent thread"
+                )
+            }
+            let update = try database.prepare("""
+                UPDATE scheduled_task_runs
+                SET thread_id = ?, heartbeat_at = ?
+                WHERE id = ? AND status = 'queued';
+                """)
+            defer { update.reset() }
+            let now = Date()
+            try update.bind(1, threadID.value.uuidString.lowercased())
+            try update.bind(2, string(now))
+            try update.bind(3, runID.uuidString.lowercased())
+            _ = try update.step()
         }
     }
 

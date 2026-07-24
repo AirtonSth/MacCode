@@ -41,6 +41,10 @@ public struct AppSettings: Codable, Sendable, Equatable {
     public var insomniaAllowSystemSleepWhenDisplayClosed: Bool
     public var insomniaAllowScreenSaverAfter45MinutesOfInactivity: Bool
     public var tokenSaverEnabled: Bool
+    /// Global kill switch for automatic scheduled-task occurrences. When false,
+    /// due ticks do not claim or run tasks (travel / temporary pause). Per-task
+    /// Pause still applies independently. Default true.
+    public var scheduledTasksActive: Bool
     /// Base terminal font size in points. 0 means use Ghostty's configured default.
     public var terminalFontSize: Double
     /// P5 SessionLearn: mine a correction rule from failed/expensive runs into the managed
@@ -71,6 +75,7 @@ public struct AppSettings: Codable, Sendable, Equatable {
                 insomniaAllowSystemSleepWhenDisplayClosed: Bool = false,
                 insomniaAllowScreenSaverAfter45MinutesOfInactivity: Bool = true,
                 tokenSaverEnabled: Bool = false,
+                scheduledTasksActive: Bool = true,
                 terminalFontSize: Double = 0,
                 sessionLearnEnabled: Bool = false,
                 historyCompactionEnabled: Bool = false,
@@ -89,6 +94,7 @@ public struct AppSettings: Codable, Sendable, Equatable {
         self.insomniaAllowSystemSleepWhenDisplayClosed = insomniaAllowSystemSleepWhenDisplayClosed
         self.insomniaAllowScreenSaverAfter45MinutesOfInactivity = insomniaAllowScreenSaverAfter45MinutesOfInactivity
         self.tokenSaverEnabled = tokenSaverEnabled
+        self.scheduledTasksActive = scheduledTasksActive
         self.terminalFontSize = terminalFontSize
         self.sessionLearnEnabled = sessionLearnEnabled
         self.historyCompactionEnabled = historyCompactionEnabled
@@ -110,6 +116,7 @@ public struct AppSettings: Codable, Sendable, Equatable {
         case insomniaAllowSystemSleepWhenDisplayClosed
         case insomniaAllowScreenSaverAfter45MinutesOfInactivity
         case tokenSaverEnabled
+        case scheduledTasksActive
         case terminalFontSize
         case sessionLearnEnabled
         case historyCompactionEnabled
@@ -132,6 +139,7 @@ public struct AppSettings: Codable, Sendable, Equatable {
         insomniaAllowSystemSleepWhenDisplayClosed = try c.decodeIfPresent(Bool.self, forKey: .insomniaAllowSystemSleepWhenDisplayClosed) ?? false
         insomniaAllowScreenSaverAfter45MinutesOfInactivity = try c.decodeIfPresent(Bool.self, forKey: .insomniaAllowScreenSaverAfter45MinutesOfInactivity) ?? true
         tokenSaverEnabled = try c.decodeIfPresent(Bool.self, forKey: .tokenSaverEnabled) ?? false
+        scheduledTasksActive = try c.decodeIfPresent(Bool.self, forKey: .scheduledTasksActive) ?? true
         terminalFontSize = try c.decodeIfPresent(Double.self, forKey: .terminalFontSize) ?? 0
         sessionLearnEnabled = try c.decodeIfPresent(Bool.self, forKey: .sessionLearnEnabled) ?? false
         historyCompactionEnabled = try c.decodeIfPresent(Bool.self, forKey: .historyCompactionEnabled) ?? false

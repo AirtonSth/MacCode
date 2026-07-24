@@ -4,11 +4,18 @@ import XCTest
 final class DistillInstructionsTemplateTests: XCTestCase {
     func test_instructionsCarryHardPipeHeuristicAndRetrieveNote() {
         let t = AgentSkillInstaller.distillAgentInstructionsTemplate
-        // P1-T7: hard pipe heuristic so agents auto-capture large tool output (G5).
-        // Strengthened per "err toward more savings": default-pipe with a low threshold.
-        XCTAssertTrue(t.contains("by DEFAULT pipe EVERY"), "default-pipe heuristic present")
-        XCTAssertTrue(t.contains("~10 lines or ~1KB"), "lowered concrete size threshold present")
+        // WHY: predicting output size let providers omit `| distill` from most visible
+        // tool calls. Every pipable, output-producing command must default to the
+        // managed CLI; only semantic safety exceptions may bypass it.
+        XCTAssertTrue(t.contains("EVERY pipable, output-producing shell/tool call"),
+                      "all pipable output-producing tool calls default to explicit distill")
+        XCTAssertFalse(t.contains("~10 lines or ~1KB"),
+                       "the provider must not guess output size before deciding to distill")
         XCTAssertTrue(t.lowercased().contains("bias to compress"), "explicit bias-to-compress directive present")
+        XCTAssertTrue(t.contains("subagent, worker, reviewer"),
+                      "delegated prompts must carry the same distill contract")
+        XCTAssertTrue(t.contains("descendants"),
+                      "nested subagents must not lose the distill contract")
         // Sparse dialect: R0 micro O-only + R1 work O-first (token savings vs 6-line tax).
         XCTAssertTrue(t.contains("R0 micro"), "R0 micro register present")
         XCTAssertTrue(t.contains("R1 work"), "R1 work register present")

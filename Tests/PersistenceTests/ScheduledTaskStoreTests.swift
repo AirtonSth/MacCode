@@ -24,6 +24,25 @@ final class ScheduledTaskStoreTests: XCTestCase {
         XCTAssertEqual(statement.columnInt64(0), 51)
     }
 
+    func test_storeErrorLocalizedDescriptionPreservesMessage_becauseXPCReplyMustNotShowError0() {
+        // WHY: LaunchAgent replies with error.localizedDescription; without
+        // LocalizedError the UI only saw "Persistence.ScheduledTaskStoreError error 0".
+        let missing = UUID(uuidString: "00000000-0000-4000-8000-000000000001")!
+        let cases: [ScheduledTaskStoreError] = [
+            .invalidRow("Two scheduled task runs are already active."),
+            .missingTask(missing),
+        ]
+        for error in cases {
+            XCTAssertEqual(error.localizedDescription, error.description)
+            XCTAssertFalse(error.localizedDescription.contains("StoreError error"))
+        }
+        let asError: Error = ScheduledTaskStoreError.invalidRow("This scheduled task already has an active run.")
+        XCTAssertEqual(
+            asError.localizedDescription,
+            "Invalid scheduled task row: This scheduled task already has an active run."
+        )
+    }
+
     func test_routingMigrationKeepsExistingTasksManual_becauseUpgradesMustNotChangeExecution() throws {
         let legacyDB = try SQLiteDB(path: ":memory:")
         try Schema.migrateSteps(legacyDB, Schema.steps.filter { $0.version <= 50 })
@@ -93,6 +112,49 @@ final class ScheduledTaskStoreTests: XCTestCase {
         _ = try store.claimManual(taskID: task.id, now: Date(timeIntervalSince1970: 101), owner: "agent-a")
 
         XCTAssertThrowsError(try store.claimManual(taskID: task.id, now: Date(timeIntervalSince1970: 102), owner: "agent-b"))
+    }
+
+    func test_attachThreadLinksWhileQueuedWithoutStatusChange_becausePathBMustNotHitQueuedToQueued() throws {
+        // WHY: attachThread used updateRun(status: .queued) which canTransition
+        // rejects (queued→queued). Every Run Now then failed after createAgentThread
+        // with "invalid run status transition" and left an orphaned agent thread.
+        let task = makeTask(nextRunAt: Date(timeIntervalSince1970: 100))
+        try store.save(task)
+        let claim = try store.claimManual(taskID: task.id, now: Date(timeIntervalSince1970: 101), owner: "agent")
+        let threadID = AgentThreadID()
+
+        try store.attachThread(runID: claim.run.id, threadID: threadID)
+
+        let linked = try XCTUnwrap(store.listRuns().first { $0.id == claim.run.id })
+        XCTAssertEqual(linked.status, .queued)
+        XCTAssertEqual(linked.threadID, threadID)
+        XCTAssertNil(linked.startedAt)
+        XCTAssertNil(linked.agentRunID)
+
+        // Idempotent same-thread re-attach.
+        try store.attachThread(runID: claim.run.id, threadID: threadID)
+        XCTAssertEqual(try store.listRuns().first { $0.id == claim.run.id }?.threadID, threadID)
+
+        // Different thread while already linked must fail.
+        XCTAssertThrowsError(try store.attachThread(runID: claim.run.id, threadID: AgentThreadID()))
+
+        // Full lifecycle still works after metadata attach.
+        let agentRunID = AgentRunID()
+        try store.markStarted(runID: claim.run.id, threadID: threadID, agentRunID: agentRunID)
+        try store.finish(runID: claim.run.id, status: .completed, at: Date(timeIntervalSince1970: 102))
+        let done = try XCTUnwrap(store.listRuns().first { $0.id == claim.run.id })
+        XCTAssertEqual(done.status, .completed)
+        XCTAssertEqual(done.threadID, threadID)
+        XCTAssertEqual(done.agentRunID, agentRunID)
+    }
+
+    func test_attachThreadRejectsTerminalRuns_becauseOwnershipLinkIsPreStartOnly() throws {
+        let task = makeTask(nextRunAt: Date(timeIntervalSince1970: 100))
+        try store.save(task)
+        let claim = try store.claimManual(taskID: task.id, now: Date(timeIntervalSince1970: 101), owner: "agent")
+        try store.finish(runID: claim.run.id, status: .failed, at: Date(timeIntervalSince1970: 102))
+
+        XCTAssertThrowsError(try store.attachThread(runID: claim.run.id, threadID: AgentThreadID()))
     }
 
     func test_deleteRejectsActiveRun_becauseExecutionMustNotBecomeOrphaned() throws {

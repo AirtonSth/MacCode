@@ -173,6 +173,10 @@ public struct AgentThreadForkIntent: Codable, Sendable, Equatable {
 }
 
 public final class AgentThreadRepository {
+    /// Soft product cap: keep each workspace's thread table bounded so scheduled
+    /// runs and long sessions cannot grow SQLite without limit.
+    public static let maxThreadsPerWorkspace = 100
+
     let db: SQLiteDB
     public init(db: SQLiteDB) { self.db = db }
 
@@ -234,9 +238,13 @@ public final class AgentThreadRepository {
     }
 
     public func list(workspaceId: WorkspaceID? = nil) throws -> [AgentThread] {
+        // Rail order is pure last activity: most recently updated/completed
+        // threads float to the top. Pin is a visual/retention marker only —
+        // it does not override recency. Manual sort_order is retained for
+        // reorder APIs but no longer drives the visible rail.
         let sql = workspaceId == nil
-            ? "SELECT id, project_id, workspace_id, title, provider, provider_instance_id, model, provider_thread_id, status, created_at, updated_at, diff_additions, diff_deletions, has_unread, color, pinned, sort_order, permission_mode, reasoning_effort, execution_mode, base_branch, worktree_path, service_tier, model_selection_json, interaction_mode, run_as_user_json FROM agent_threads ORDER BY pinned DESC, sort_order ASC, updated_at DESC;"
-            : "SELECT id, project_id, workspace_id, title, provider, provider_instance_id, model, provider_thread_id, status, created_at, updated_at, diff_additions, diff_deletions, has_unread, color, pinned, sort_order, permission_mode, reasoning_effort, execution_mode, base_branch, worktree_path, service_tier, model_selection_json, interaction_mode, run_as_user_json FROM agent_threads WHERE workspace_id = ? ORDER BY pinned DESC, sort_order ASC, updated_at DESC;"
+            ? "SELECT id, project_id, workspace_id, title, provider, provider_instance_id, model, provider_thread_id, status, created_at, updated_at, diff_additions, diff_deletions, has_unread, color, pinned, sort_order, permission_mode, reasoning_effort, execution_mode, base_branch, worktree_path, service_tier, model_selection_json, interaction_mode, run_as_user_json FROM agent_threads ORDER BY updated_at DESC, id DESC;"
+            : "SELECT id, project_id, workspace_id, title, provider, provider_instance_id, model, provider_thread_id, status, created_at, updated_at, diff_additions, diff_deletions, has_unread, color, pinned, sort_order, permission_mode, reasoning_effort, execution_mode, base_branch, worktree_path, service_tier, model_selection_json, interaction_mode, run_as_user_json FROM agent_threads WHERE workspace_id = ? ORDER BY updated_at DESC, id DESC;"
         let st = try db.prepare(sql)
         if let wid = workspaceId { try st.bind(1, wid.value.uuidString) }
         var out: [AgentThread] = []
@@ -359,6 +367,47 @@ public final class AgentThreadRepository {
         let st = try db.prepare("DELETE FROM agent_threads WHERE id = ?;")
         try st.bind(1, id.value.uuidString)
         _ = try st.step()
+    }
+
+    public func count(workspaceId: WorkspaceID) throws -> Int {
+        let st = try db.prepare("SELECT COUNT(*) FROM agent_threads WHERE workspace_id = ?;")
+        try st.bind(1, workspaceId.value.uuidString)
+        guard try st.step() else { return 0 }
+        return Int(st.columnInt64(0))
+    }
+
+    /// Deletes oldest eligible threads until the workspace is at or below
+    /// `limit`. Never deletes `running`/`pending` threads. Prefers unpinned
+    /// oldest-first, then pinned non-active. Cascades messages via FK.
+    /// - Returns: ids that were deleted.
+    @discardableResult
+    public func enforceWorkspaceThreadLimit(
+        workspaceId: WorkspaceID,
+        limit: Int = AgentThreadRepository.maxThreadsPerWorkspace
+    ) throws -> [AgentThreadID] {
+        let cap = max(1, limit)
+        let total = try count(workspaceId: workspaceId)
+        guard total > cap else { return [] }
+        let excess = total - cap
+        // Prefer pruning idle unpinned history; never touch active runs.
+        let st = try db.prepare("""
+            SELECT id FROM agent_threads
+            WHERE workspace_id = ?
+              AND status NOT IN ('running', 'pending')
+            ORDER BY pinned ASC, updated_at ASC, id ASC
+            LIMIT ?;
+            """)
+        try st.bind(1, workspaceId.value.uuidString)
+        try st.bind(2, Int64(excess))
+        var victims: [AgentThreadID] = []
+        while try st.step() {
+            if let uuid = st.columnText(0).flatMap(UUID.init(uuidString:)) {
+                victims.append(AgentThreadID(uuid))
+            }
+        }
+        guard !victims.isEmpty else { return [] }
+        try delete(ids: victims)
+        return victims
     }
 
     /// Persists the complete local half of a provider-native fork as one graph.
@@ -2011,10 +2060,53 @@ public final class AgentRunRepository: @unchecked Sendable {
         )
     }
 
-    public func reconcileRunningOnLaunch() throws -> Int {
+    /// Latest non-terminal run for a thread, including LaunchAgent-owned rows.
+    ///
+    /// WHY: the main app's in-memory coordinator has no session for Path B
+    /// scheduled runs, but `agent_runs` is shared SQLite. UI needs this for
+    /// "Working for Xs" and Stop targeting without inventing a local session.
+    public func latestActive(for threadId: AgentThreadID) throws -> AgentRun? {
+        let st = try db.prepare("""
+            SELECT id, thread_id, provider, provider_instance_id, model, status, started_at, finished_at, error_message
+            FROM agent_runs
+            WHERE thread_id = ? AND status IN ('pending', 'running')
+            ORDER BY started_at DESC
+            LIMIT 1;
+        """)
+        try st.bind(1, threadId.value.uuidString)
+        guard try st.step() else { return nil }
+        return AgentRun(
+            id: AgentRunID(UUID(uuidString: st.columnText(0) ?? "") ?? UUID()),
+            threadId: AgentThreadID(UUID(uuidString: st.columnText(1) ?? "") ?? threadId.value),
+            provider: AgentProvider(rawValue: st.columnText(2) ?? "") ?? .codex,
+            providerInstanceId: st.columnText(3) ?? (AgentProvider(rawValue: st.columnText(2) ?? "") ?? .codex).rawValue,
+            model: st.columnText(4) ?? "",
+            status: AgentRunStatus(rawValue: st.columnText(5) ?? "") ?? .pending,
+            startedAt: parseDate(st.columnText(6)),
+            finishedAt: st.columnText(7).map(parseDate),
+            errorMessage: st.columnText(8)
+        )
+    }
+
+    public func reconcileRunningOnLaunch(preservingThreadIDs: Set<AgentThreadID> = []) throws -> Int {
         let countBefore = try countRunning()
-        let st = try db.prepare("UPDATE agent_runs SET status='interrupted', finished_at=? WHERE status='running';")
+        if preservingThreadIDs.isEmpty {
+            let st = try db.prepare("UPDATE agent_runs SET status='interrupted', finished_at=? WHERE status='running';")
+            try st.bind(1, iso.string(from: Date()))
+            _ = try st.step()
+            return countBefore
+        }
+        // Preserve LaunchAgent-owned scheduled runs so opening the UI does not
+        // false-interrupt a still-live provider session in the other process.
+        let placeholders = preservingThreadIDs.map { _ in "?" }.joined(separator: ",")
+        let st = try db.prepare("""
+            UPDATE agent_runs SET status='interrupted', finished_at=?
+            WHERE status='running' AND thread_id NOT IN (\(placeholders));
+            """)
         try st.bind(1, iso.string(from: Date()))
+        for (offset, threadID) in preservingThreadIDs.enumerated() {
+            try st.bind(Int32(offset + 2), threadID.value.uuidString)
+        }
         _ = try st.step()
         return countBefore
     }

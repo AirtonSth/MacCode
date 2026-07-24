@@ -22,7 +22,7 @@ final class ScheduledTaskTests: XCTestCase {
             reasoningEffort: .high, routingMode: .auto,
             recurrence: .daily(at: ScheduledLocalTime(hour: 9, minute: 0)!), timeZoneIdentifier: "UTC"
         )
-        XCTAssertTrue(missingInstance.validationErrors().contains("Provider instance is required."))
+        XCTAssertTrue(missingInstance.validationErrors().contains("Provider is required."))
         XCTAssertFalse(missingInstance.validationErrors().contains("Model is required."))
 
         let autoWithSource = ScheduledTask(

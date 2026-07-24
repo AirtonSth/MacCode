@@ -856,6 +856,8 @@ final class AgentOrchestrationRuntimeTests: XCTestCase {
         let wrapped = AgentOrchestrationRuntime.autoOrchestrateProviderPrompt(userPrompt: "fix the bug")
         XCTAssertTrue(wrapped.hasPrefix("$remote-code-orchestrate"))
         XCTAssertTrue(wrapped.contains("fix the bug"))
+        XCTAssertTrue(wrapped.contains("EVERY worker/reviewer prompt"))
+        XCTAssertTrue(wrapped.contains("| distill"))
         XCTAssertTrue(AgentOrchestrationRuntime.promptAlreadyInvokesOrchestrateSkill(wrapped))
 
         let already = "$remote-code-orchestrate\n\ndo the thing"

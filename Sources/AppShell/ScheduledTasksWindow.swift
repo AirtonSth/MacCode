@@ -160,8 +160,8 @@ public final class ScheduledTasksViewModel: ObservableObject {
     @Published public private(set) var providersLoading = false
     @Published public private(set) var users: [ScheduledSystemUser] = []
     @Published public private(set) var runCounts: [UUID: Int] = [:]
-    /// Task IDs with a queued/running agent occurrence (drives “Running” badges).
-    @Published public private(set) var runningTaskIDs: Set<UUID> = []
+    /// Live run status per task (queued / running). Drives overview + detail badges.
+    @Published public private(set) var activeRunStatuses: [UUID: ScheduledTaskRunStatus] = [:]
     /// Counts for All / Active / Paused chips (search-scoped, not status-filtered).
     @Published public private(set) var filterCounts: (all: Int, active: Int, paused: Int) = (0, 0, 0)
     @Published public var searchText: String = "" { didSet { reloadTasks() } }
@@ -172,17 +172,22 @@ public final class ScheduledTasksViewModel: ObservableObject {
     @Published public private(set) var serviceStatus: String = "Checking background scheduler…"
     @Published public private(set) var serviceRequiresApproval = false
     @Published public private(set) var isSavingEditor = false
+    /// Global kill switch: when false, automatic scheduled occurrences do not claim/run.
+    @Published public private(set) var schedulerActive: Bool = true
 
     private let context: AppContext
     private let router: AppCommandRouter
     private let store: ScheduledTaskStore
+    private let settingsStore: SettingsStore
     private let service = ScheduledTaskAgentServiceManager()
     private var providerLoadCount = 0
+    private var activeRunPollTask: Task<Void, Never>?
 
     public init(context: AppContext, router: AppCommandRouter) {
         self.context = context
         self.router = router
         self.store = ScheduledTaskStore(db: context.db)
+        self.settingsStore = SettingsStore(db: context.db)
         reload()
     }
 
@@ -192,6 +197,7 @@ public final class ScheduledTasksViewModel: ObservableObject {
         do {
             workspaces = try router.listWorkspaces()
             users = ScheduledSystemUserCatalog.eligibleUsers()
+            schedulerActive = settingsStore.load().scheduledTasksActive
             reloadTasks()
             reloadRuns()
             reloadServiceStatus()
@@ -301,10 +307,29 @@ public final class ScheduledTasksViewModel: ObservableObject {
             errorMessage = "Approve RemoteCode in System Settings > General > Login Items before running this task."
             return
         }
+        guard activeRunStatuses[task.id] == nil else {
+            errorMessage = "This scheduled task already has an active run."
+            return
+        }
+        // Immediate feedback: claim is async over XPC, but the card should
+        // flip to Queued in the same click without waiting for the agent.
+        activeRunStatuses[task.id] = .queued
+        runCounts[task.id, default: 0] += 1
+        ensureActiveRunPolling()
         service.wake(taskID: task.id) { [weak self] result in
-            if case .failure(let error) = result { self?.errorMessage = error.localizedDescription }
-            self?.reloadRuns()
-            self?.reloadServiceStatus()
+            guard let self else { return }
+            switch result {
+            case .failure(let error):
+                self.activeRunStatuses.removeValue(forKey: task.id)
+                self.runCounts[task.id, default: 1] = max(0, (self.runCounts[task.id] ?? 1) - 1)
+                self.errorMessage = error.localizedDescription
+            case .success:
+                break
+            }
+            self.reloadActiveRunStatuses()
+            self.reloadRuns()
+            self.reloadServiceStatus()
+            self.ensureActiveRunPolling()
         }
     }
 
@@ -356,18 +381,63 @@ public final class ScheduledTasksViewModel: ObservableObject {
             if let selectedTaskID, !matching.contains(where: { $0.id == selectedTaskID }) {
                 self.selectedTaskID = nil
             }
-            let activeRuns = try store.listActiveRuns()
-            runningTaskIDs = Set(activeRuns.map(\.taskID))
+            reloadActiveRunStatuses()
         } catch { errorMessage = String(describing: error) }
     }
 
     private func reloadRuns() {
         do { runs = try store.listRuns(taskID: selectedTaskID, limit: 200) }
         catch { errorMessage = String(describing: error) }
+        // Keep overview badges in sync when history refreshes (e.g. after Run Now).
+        reloadActiveRunStatuses()
+    }
+
+    private func reloadActiveRunStatuses() {
+        do {
+            let activeRuns = try store.listActiveRuns()
+            var next: [UUID: ScheduledTaskRunStatus] = [:]
+            for run in activeRuns {
+                // Prefer running over queued if both somehow exist.
+                if next[run.taskID] == .running { continue }
+                next[run.taskID] = run.status
+            }
+            // Preserve optimistic Queued until the store has the row (or failure clears it).
+            for (taskID, status) in activeRunStatuses where status == .queued && next[taskID] == nil {
+                next[taskID] = .queued
+            }
+            activeRunStatuses = next
+        } catch {
+            errorMessage = String(describing: error)
+        }
+    }
+
+    private func ensureActiveRunPolling() {
+        guard !activeRunStatuses.isEmpty else {
+            activeRunPollTask?.cancel()
+            activeRunPollTask = nil
+            return
+        }
+        guard activeRunPollTask == nil else { return }
+        activeRunPollTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+                guard let self, !Task.isCancelled else { return }
+                self.reloadActiveRunStatuses()
+                self.reloadRuns()
+                if self.activeRunStatuses.isEmpty {
+                    self.activeRunPollTask = nil
+                    return
+                }
+            }
+        }
     }
 
     public func isTaskRunning(_ taskID: UUID) -> Bool {
-        runningTaskIDs.contains(taskID)
+        activeRunStatuses[taskID] != nil
+    }
+
+    public func activeRunStatus(for taskID: UUID) -> ScheduledTaskRunStatus? {
+        activeRunStatuses[taskID]
     }
 
     public func workspaceName(for task: ScheduledTask) -> String {
@@ -386,11 +456,36 @@ public final class ScheduledTasksViewModel: ObservableObject {
         return host
     }
 
-    public var footerStatsLine: String {
+    public func setSchedulerActive(_ active: Bool) {
+        settingsStore.update { $0.scheduledTasksActive = active }
+        schedulerActive = settingsStore.load().scheduledTasksActive
+        // Wake the LaunchAgent so its next tick sees the new flag promptly.
+        if active {
+            service.wake { [weak self] result in
+                if case .failure(let error) = result {
+                    self?.errorMessage = error.localizedDescription
+                }
+            }
+        }
+        ScheduledTaskCrossProcess.notifyStoreChanged(reason: active ? "global_active" : "global_paused")
+    }
+
+    public var footerTaskCountLine: String {
         let total = filterCounts.all
         let active = filterCounts.active
-        let online = serviceRequiresApproval ? "Scheduler needs approval" : "Scheduler online"
-        return "\(total) task\(total == 1 ? "" : "s") · \(active) active · \(online)"
+        return "\(total) task\(total == 1 ? "" : "s") · \(active) active"
+    }
+
+    public var footerStatsLine: String {
+        let online: String
+        if !schedulerActive {
+            online = "Scheduler paused"
+        } else if serviceRequiresApproval {
+            online = "Scheduler needs approval"
+        } else {
+            online = "Scheduler online"
+        }
+        return "\(footerTaskCountLine) · \(online)"
     }
 }
 
@@ -507,18 +602,19 @@ public struct ScheduledTasksRootView: View {
     }
 
     private var footerBar: some View {
-        HStack(spacing: DS.Space.sm) {
-            Text(vm.footerStatsLine)
+        HStack(spacing: DS.Space.md) {
+            Text(vm.footerTaskCountLine)
+                .font(DS.Font.caption)
                 .foregroundColor(DS.Palette.textSecondary)
             if !vm.serviceRequiresApproval {
-                Circle()
-                    .fill(DS.Palette.success)
-                    .frame(width: 7, height: 7)
-                    .accessibilityHidden(true)
+                DSPill(
+                    vm.schedulerActive ? "Scheduler online" : "Scheduler paused",
+                    tone: vm.schedulerActive ? .success : .warning
+                )
+                .accessibilityHidden(true)
             }
             Spacer(minLength: DS.Space.md)
         }
-        .font(DS.Font.caption)
         .padding(.horizontal, DS.Space.xxl)
         .frame(height: 40)
         .background(DS.Palette.surface)
@@ -535,19 +631,26 @@ public struct ScheduledTasksRootView: View {
                     Text("Scheduled Tasks")
                         .font(DS.Font.title.weight(.semibold))
                         .foregroundColor(DS.Palette.text)
-                    Text("Automate recurring agent work")
+                    Text(vm.schedulerActive
+                         ? "Automate recurring agent work"
+                         : "Automatic runs paused — turn Active on when you're back")
                         .font(DS.Font.body)
-                        .foregroundColor(DS.Palette.textSecondary)
+                        .foregroundColor(vm.schedulerActive ? DS.Palette.textSecondary : DS.Palette.warning)
+                        .animation(DS.Motion.micro, value: vm.schedulerActive)
                 }
                 Spacer(minLength: DS.Space.lg)
-                Button {
-                    vm.createTask()
-                    openEditor(returnTo: .overview)
-                } label: {
-                    Label("New Task", systemImage: "plus")
+                HStack(spacing: DS.Space.md) {
+                    Button {
+                        vm.createTask()
+                        openEditor(returnTo: .overview)
+                    } label: {
+                        Label("New Task", systemImage: "plus")
+                    }
+                    .buttonStyle(DSPrimaryButtonStyle())
+                    .accessibilityIdentifier("scheduledTasks.new")
+
+                    schedulerActiveControl
                 }
-                .buttonStyle(DSPrimaryButtonStyle())
-                .accessibilityIdentifier("scheduledTasks.new")
             }
             .padding(.horizontal, DS.Space.xxl)
             .padding(.top, DS.Space.xxl)
@@ -580,7 +683,7 @@ public struct ScheduledTasksRootView: View {
                                 workspaceName: vm.workspaceName(for: task),
                                 providerLabel: shortProviderModel(task),
                                 runCount: vm.runCounts[task.id, default: 0],
-                                isRunning: vm.isTaskRunning(task.id),
+                                activeRunStatus: vm.activeRunStatus(for: task.id),
                                 onOpen: {
                                     vm.selectedTaskID = task.id
                                     screen = .detail
@@ -602,6 +705,71 @@ public struct ScheduledTasksRootView: View {
                 .accessibilityIdentifier("scheduledTasks.list")
             }
         }
+    }
+
+    /// Global kill-switch control: status chrome + switch.
+    /// State is conveyed by icon + label + tint (not color alone — WCAG 1.4.1).
+    private var schedulerActiveControl: some View {
+        let active = vm.schedulerActive
+        let tone = active ? DS.Palette.success : DS.Palette.warning
+        let icon = active ? "bolt.fill" : "pause.fill"
+        let title = active ? "Active" : "Paused"
+        let subtitle = active ? "Schedules on" : "Travel pause"
+
+        return HStack(spacing: DS.Space.md) {
+            HStack(spacing: DS.Space.sm) {
+                Image(systemName: icon)
+                    .font(.system(size: 10, weight: .bold))
+                    .foregroundColor(tone)
+                    .frame(width: 22, height: 22)
+                    .background(tone.opacity(0.16))
+                    .clipShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
+
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(title)
+                        .font(DS.Font.captionStrong)
+                        .foregroundColor(DS.Palette.text)
+                    Text(subtitle)
+                        .font(DS.Font.caption2)
+                        .foregroundColor(DS.Palette.textTertiary)
+                }
+            }
+            .accessibilityHidden(true)
+
+            Toggle(isOn: Binding(
+                get: { vm.schedulerActive },
+                set: { vm.setSchedulerActive($0) }
+            )) {
+                Text("Active")
+            }
+            .labelsHidden()
+            .toggleStyle(.switch)
+            .controlSize(.small)
+            .tint(DS.Palette.success)
+            .accessibilityIdentifier("scheduledTasks.globalActive")
+            .accessibilityLabel(active ? "Schedules active" : "Schedules paused")
+            .accessibilityValue(active ? "On" : "Off")
+            .accessibilityHint("Disables all automatic scheduled task runs without deleting tasks")
+        }
+        .padding(.leading, DS.Space.lg)
+        .padding(.trailing, DS.Space.md)
+        .padding(.vertical, DS.Space.sm)
+        .background(
+            RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
+                .fill(DS.Palette.surfaceRaised)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous)
+                .strokeBorder(
+                    active ? tone.opacity(0.45) : DS.Palette.line,
+                    lineWidth: DS.Border.hairline
+                )
+        )
+        .animation(DS.Motion.micro, value: active)
+        .help(active
+              ? "Schedules are running. Turn off to pause all automatic runs (e.g. while traveling)."
+              : "All automatic runs are paused. Turn on when you return.")
+        .contentShape(RoundedRectangle(cornerRadius: DS.Radius.control, style: .continuous))
     }
 
     private var filterChips: some View {
@@ -757,8 +925,15 @@ public struct ScheduledTasksRootView: View {
 
     @ViewBuilder
     private func statusPill(for task: ScheduledTask) -> some View {
-        if vm.isTaskRunning(task.id) {
-            DSPill("Running", tone: .warning)
+        if let status = vm.activeRunStatus(for: task.id) {
+            switch status {
+            case .queued:
+                DSPill("Queued", tone: .warning)
+            case .running:
+                DSPill("Running", tone: .warning)
+            default:
+                DSPill("Running", tone: .warning)
+            }
         } else if task.isEnabled {
             DSPill("Active", tone: .success)
         } else {
@@ -872,49 +1047,53 @@ public struct ScheduledTasksRootView: View {
 
     private func historyRow(task: ScheduledTask, run: ScheduledTaskRun) -> some View {
         let expanded = expandedRunIDs.contains(run.id)
+        let canOpenThread = run.threadID != nil
+        let canExpandDetails = run.errorSummary != nil || run.status == .failed
         return VStack(alignment: .leading, spacing: 0) {
-            Button {
-                if run.errorSummary != nil || run.status == .failed {
-                    if !expandedRunIDs.insert(run.id).inserted {
-                        expandedRunIDs.remove(run.id)
-                    }
-                }
-            } label: {
-                HStack(spacing: DS.Space.lg) {
-                    Text((run.startedAt ?? run.queuedAt).formatted(.dateTime.month(.abbreviated).day().hour().minute()))
-                        .font(DS.Font.caption)
-                        .foregroundColor(DS.Palette.text)
-                        .frame(width: 140, alignment: .leading)
-                    Text(durationLabel(run))
-                        .font(DS.Font.caption)
-                        .foregroundColor(DS.Palette.textSecondary)
-                        .frame(width: 80, alignment: .leading)
-                    runStatusPill(run.status)
-                        .frame(width: 110, alignment: .leading)
-                    if run.threadID != nil {
-                        Button(agentTaskTitle(task: task, run: run)) { vm.openThread(run) }
-                            .buttonStyle(.plain)
-                            .font(DS.Font.caption.weight(.medium))
-                            .foregroundColor(DS.Palette.accent)
-                            .frame(maxWidth: .infinity, alignment: .leading)
+            // Sibling hit targets (not nested): primary area opens the agent thread;
+            // chevron alone expands/collapses failure details. A disabled outer
+            // Button used to swallow the nested Agent Task control on completed runs.
+            HStack(spacing: DS.Space.lg) {
+                Group {
+                    if canOpenThread {
+                        Button {
+                            vm.openThread(run)
+                        } label: {
+                            historyRowPrimaryContent(task: task, run: run, linkStyle: true)
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityIdentifier("scheduledTasks.history.openThread")
+                        .accessibilityLabel("Open agent task \(agentTaskTitle(task: task, run: run))")
+                        .accessibilityHint("Opens the agent thread created by this run")
                     } else {
-                        Text(agentTaskTitle(task: task, run: run))
-                            .font(DS.Font.caption)
-                            .foregroundColor(DS.Palette.textSecondary)
-                            .frame(maxWidth: .infinity, alignment: .leading)
+                        historyRowPrimaryContent(task: task, run: run, linkStyle: false)
+                            .accessibilityElement(children: .combine)
                     }
-                    Image(systemName: expanded ? "chevron.up" : "chevron.down")
-                        .font(.system(size: 11, weight: .semibold))
-                        .foregroundColor(DS.Palette.textTertiary)
-                        .opacity(run.errorSummary != nil || run.status == .failed ? 1 : 0)
-                        .frame(width: 24)
                 }
-                .padding(.horizontal, DS.Space.lg)
-                .padding(.vertical, DS.Space.lg)
-                .contentShape(Rectangle())
+                .frame(maxWidth: .infinity, alignment: .leading)
+
+                if canExpandDetails {
+                    Button {
+                        if !expandedRunIDs.insert(run.id).inserted {
+                            expandedRunIDs.remove(run.id)
+                        }
+                    } label: {
+                        Image(systemName: expanded ? "chevron.up" : "chevron.down")
+                            .font(.system(size: 11, weight: .semibold))
+                            .foregroundColor(DS.Palette.textTertiary)
+                            .frame(width: 24, height: 24)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityIdentifier("scheduledTasks.history.toggleDetails")
+                    .accessibilityLabel(expanded ? "Hide run details" : "Show run details")
+                } else {
+                    Color.clear.frame(width: 24, height: 24)
+                        .accessibilityHidden(true)
+                }
             }
-            .buttonStyle(.plain)
-            .disabled(run.errorSummary == nil && run.status != .failed)
+            .padding(.horizontal, DS.Space.lg)
+            .padding(.vertical, DS.Space.lg)
 
             if expanded, let error = run.errorSummary {
                 HStack(alignment: .center, spacing: DS.Space.md) {
@@ -926,9 +1105,10 @@ public struct ScheduledTasksRootView: View {
                         .foregroundColor(DS.Palette.text)
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .textSelection(.enabled)
-                    if run.threadID != nil {
+                    if canOpenThread {
                         Button("Open Agent Task") { vm.openThread(run) }
                             .buttonStyle(DSSecondaryButtonStyle())
+                            .accessibilityIdentifier("scheduledTasks.history.openThreadFromDetails")
                     }
                     if run.status == .failed {
                         Button("Run Again") { vm.runNow(task) }
@@ -956,7 +1136,27 @@ public struct ScheduledTasksRootView: View {
                 .padding(.bottom, DS.Space.md)
             }
         }
-        .accessibilityElement(children: .combine)
+    }
+
+    private func historyRowPrimaryContent(task: ScheduledTask, run: ScheduledTaskRun, linkStyle: Bool) -> some View {
+        HStack(spacing: DS.Space.lg) {
+            Text((run.startedAt ?? run.queuedAt).formatted(.dateTime.month(.abbreviated).day().hour().minute()))
+                .font(DS.Font.caption)
+                .foregroundColor(DS.Palette.text)
+                .frame(width: 140, alignment: .leading)
+            Text(durationLabel(run))
+                .font(DS.Font.caption)
+                .foregroundColor(DS.Palette.textSecondary)
+                .frame(width: 80, alignment: .leading)
+            runStatusPill(run.status)
+                .frame(width: 110, alignment: .leading)
+            Text(agentTaskTitle(task: task, run: run))
+                .font(DS.Font.caption.weight(linkStyle ? .medium : .regular))
+                .foregroundColor(linkStyle ? DS.Palette.accent : DS.Palette.textSecondary)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .contentShape(Rectangle())
     }
 
     private func agentTaskTitle(task: ScheduledTask, run: ScheduledTaskRun) -> String {
@@ -996,12 +1196,14 @@ private struct ScheduledTaskCard: View {
     let workspaceName: String
     let providerLabel: String
     let runCount: Int
-    let isRunning: Bool
+    let activeRunStatus: ScheduledTaskRunStatus?
     let onOpen: () -> Void
     let onToggle: () -> Void
     let onRunNow: () -> Void
     let onEdit: () -> Void
     let onDelete: () -> Void
+
+    private var isActiveRun: Bool { activeRunStatus != nil }
 
     var body: some View {
         Button(action: onOpen) {
@@ -1045,12 +1247,12 @@ private struct ScheduledTaskCard: View {
                 .frame(width: 140, alignment: .leading)
 
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(isRunning ? "Status" : "Next run")
+                    Text(isActiveRun ? "Status" : "Next run")
                         .font(DS.Font.caption2)
                         .foregroundColor(DS.Palette.textTertiary)
                     Text(statusOrNext)
                         .font(DS.Font.caption.weight(.medium))
-                        .foregroundColor(isRunning ? DS.Palette.success : DS.Palette.text)
+                        .foregroundColor(isActiveRun ? DS.Palette.warning : DS.Palette.text)
                         .lineLimit(2)
                 }
                 .frame(width: 140, alignment: .leading)
@@ -1096,12 +1298,16 @@ private struct ScheduledTaskCard: View {
         .buttonStyle(.plain)
         .accessibilityIdentifier("scheduledTasks.task.\(task.id.uuidString.lowercased())")
         .accessibilityElement(children: .combine)
-        .accessibilityValue(isRunning ? "Running" : (task.isEnabled ? "Active" : "Paused"))
+        .accessibilityValue(accessibilityStatusValue)
     }
 
     @ViewBuilder
     private var badge: some View {
-        if isRunning {
+        if activeRunStatus == .queued {
+            DSPill("Queued", tone: .warning)
+        } else if activeRunStatus == .running {
+            DSPill("Running", tone: .warning)
+        } else if isActiveRun {
             DSPill("Running", tone: .warning)
         } else if task.isEnabled {
             DSPill("Active", tone: .success)
@@ -1111,10 +1317,17 @@ private struct ScheduledTaskCard: View {
     }
 
     private var statusOrNext: String {
-        if isRunning { return "Running now" }
+        if activeRunStatus == .queued { return "Queued" }
+        if activeRunStatus == .running || isActiveRun { return "Running now" }
         if !task.isEnabled { return "Paused" }
         guard let next = task.nextRunAt else { return "—" }
         return next.formatted(.dateTime.month(.abbreviated).day().hour().minute())
+    }
+
+    private var accessibilityStatusValue: String {
+        if activeRunStatus == .queued { return "Queued" }
+        if activeRunStatus == .running || isActiveRun { return "Running" }
+        return task.isEnabled ? "Active" : "Paused"
     }
 }
 
@@ -1242,6 +1455,9 @@ private struct ScheduledTaskEditorView: View {
                                 draft.runAsUID = vm.users.first { $0.name == name }?.uid ?? 0
                             }
                         }
+                        // Parity with Agent App: one Provider/Source picker only
+                        // (Codex / Claude / Grok). Instance id is derived from the
+                        // selected provider's primary snapshot and stays in the model.
                         formRow("Provider") {
                             Picker("Provider", selection: $draft.provider) {
                                 ForEach(AgentProvider.allCases, id: \.self) { Text($0.rawValue.capitalized).tag($0) }
@@ -1255,24 +1471,6 @@ private struct ScheduledTaskEditorView: View {
                                 }
                             }
                             .accessibilityIdentifier("scheduledTasks.editor.provider")
-                        }
-                        // Instance is part of provider binding; keep accessible picker for multi-account.
-                        formRow("Provider account") {
-                            Picker("Provider instance", selection: $draft.providerInstanceID) {
-                                ForEach(vm.providerSnapshots(for: draft.provider)) { Text($0.displayName).tag($0.id) }
-                            }
-                            .labelsHidden()
-                            .onChange(of: draft.providerInstanceID) { _, instanceID in
-                                guard let snapshot = vm.providers.first(where: {
-                                    $0.id == instanceID && $0.provider == draft.provider
-                                }) else { return }
-                                let models = snapshot.models
-                                if draft.model.isEmpty || !models.contains(where: { $0.id == draft.model }) {
-                                    draft.model = models.first?.id ?? ""
-                                    draft.reasoningEffort = models.first?.supportedReasoningEfforts.first ?? .high
-                                }
-                            }
-                            .accessibilityIdentifier("scheduledTasks.editor.providerAccount")
                         }
                         formRow("Model routing") {
                             HStack(spacing: DS.Space.sm) {
@@ -1507,9 +1705,9 @@ private struct ScheduledTaskEditorView: View {
 
     private func setAutoRoutingEnabled(_ enabled: Bool) {
         draft.routingMode = enabled ? .auto : .manual
-        // Turning Auto off must keep the chosen Source (provider + account).
-        // Only fill a missing model from the exact selected instance — never
-        // jump to the first available provider in the catalog.
+        // Turning Auto off must keep the chosen provider.
+        // Only fill a missing model from that provider's snapshot — never
+        // jump to the first available host in the catalog.
         guard !enabled,
               draft.model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             return
