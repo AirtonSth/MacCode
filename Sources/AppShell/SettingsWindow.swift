@@ -35,6 +35,11 @@ public struct AppSettingsKeys {
         "terminalFontSize",
         "sessionLearnEnabled",
         "historyCompactionEnabled",
+        "graphifyEnabled",
+        "graphifyBinaryPath",
+        "graphifyAutoEnsure",
+        "graphifyPinnedRoots",
+        "graphifyWriteInRepo",
         "petEnabled",
         "petAnimationsEnabled",
         "petReadyCounterEnabled",
@@ -242,12 +247,11 @@ public enum DistillInstallStatus: Equatable {
     case failed(String)
 
     /// A reconcile error wins (so a failure is never hidden as "off"); otherwise
-    /// `installed` when the app-private Distill package is present. The Token Saver
-    /// toggle no longer gates Distill skill install (always-on, like remote-code-orchestrate).
+    /// `installed` only while Token Saver is enabled and the Distill package is present.
+    /// Token economy is paid — Distill integration tracks the Token Saver toggle.
     public static func from(error: String?, enabled: Bool, installedCount: Int) -> DistillInstallStatus {
         if let error { return .failed(error) }
-        _ = enabled
-        if installedCount > 0 { return .installed }
+        if enabled, installedCount > 0 { return .installed }
         return .inactive
     }
 }
@@ -713,6 +717,42 @@ public final class SettingsViewModel: ObservableObject {
     public func setHistoryCompactionEnabled(_ on: Bool) {
         appSettings.historyCompactionEnabled = on
         settingsStore.update { $0.historyCompactionEnabled = on }
+    }
+
+    public func setGraphifyEnabled(_ on: Bool) {
+        appSettings.graphifyEnabled = on
+        settingsStore.update { $0.graphifyEnabled = on }
+        GraphifyWorkspaceService.shared.enabled = on
+        if on {
+            let path = appSettings.graphifyBinaryPath.trimmingCharacters(in: .whitespacesAndNewlines)
+            GraphifyWorkspaceService.shared.binaryPathOverride = path.isEmpty ? nil : path
+            GraphifyWorkspaceService.shared.autoEnsure = appSettings.graphifyAutoEnsure
+            GraphifyWorkspaceService.shared.writeInRepo = appSettings.graphifyWriteInRepo
+        }
+    }
+
+    public func setGraphifyBinaryPath(_ path: String) {
+        appSettings.graphifyBinaryPath = path
+        settingsStore.update { $0.graphifyBinaryPath = path }
+        let trimmed = path.trimmingCharacters(in: .whitespacesAndNewlines)
+        GraphifyWorkspaceService.shared.binaryPathOverride = trimmed.isEmpty ? nil : trimmed
+    }
+
+    public func setGraphifyAutoEnsure(_ on: Bool) {
+        appSettings.graphifyAutoEnsure = on
+        settingsStore.update { $0.graphifyAutoEnsure = on }
+        GraphifyWorkspaceService.shared.autoEnsure = on
+    }
+
+    public func setGraphifyPinnedRoots(_ roots: [String]) {
+        appSettings.graphifyPinnedRoots = roots
+        settingsStore.update { $0.graphifyPinnedRoots = roots }
+    }
+
+    public func setGraphifyWriteInRepo(_ on: Bool) {
+        appSettings.graphifyWriteInRepo = on
+        settingsStore.update { $0.graphifyWriteInRepo = on }
+        GraphifyWorkspaceService.shared.writeInRepo = on
     }
 
     public func setPetEnabled(_ on: Bool) {
@@ -1707,7 +1747,42 @@ public struct SettingsView: View {
                 .labelsHidden()
                 .accessibilityIdentifier("settings.advanced.historyCompaction.toggle")
             }
-            Text("Session Learn mines correction rules from failed runs into managed instructions. History Compaction stores large tool output in a structure-preserving compressed form. Both are off by default.")
+            settingRow("Graphify (code knowledge graph preflight)") {
+                Toggle("", isOn: Binding(
+                    get: { vm.appSettings.graphifyEnabled },
+                    set: { vm.setGraphifyEnabled($0) }
+                ))
+                .labelsHidden()
+                .accessibilityIdentifier("settings.advanced.graphify.enabled.toggle")
+            }
+            settingRow("Graphify auto-ensure on agent resolve") {
+                Toggle("", isOn: Binding(
+                    get: { vm.appSettings.graphifyAutoEnsure },
+                    set: { vm.setGraphifyAutoEnsure($0) }
+                ))
+                .labelsHidden()
+                .accessibilityIdentifier("settings.advanced.graphify.autoEnsure.toggle")
+            }
+            settingRow("Write graphify-out/ inside the project (opt-in)") {
+                Toggle("", isOn: Binding(
+                    get: { vm.appSettings.graphifyWriteInRepo },
+                    set: { vm.setGraphifyWriteInRepo($0) }
+                ))
+                .labelsHidden()
+                .accessibilityIdentifier("settings.advanced.graphify.writeInRepo.toggle")
+            }
+            VStack(alignment: .leading, spacing: DS.Space.xs) {
+                Text("Graphify binary path (optional absolute path)")
+                    .font(DS.Font.caption)
+                    .foregroundColor(DS.Palette.textSecondary)
+                TextField("/Users/…/.local/bin/graphify", text: Binding(
+                    get: { vm.appSettings.graphifyBinaryPath },
+                    set: { vm.setGraphifyBinaryPath($0) }
+                ))
+                .textFieldStyle(.roundedBorder)
+                .accessibilityIdentifier("settings.advanced.graphify.binaryPath.field")
+            }
+            Text("Session Learn mines correction rules from failed runs into managed instructions. History Compaction stores large tool output in a structure-preserving compressed form. Graphify is on by default and stores graphs under Application Support (not in your repo). Enable “Write graphify-out/ inside the project” only if you want the team-committed graphify-out layout.")
                 .font(DS.Font.caption)
                 .foregroundColor(DS.Palette.textTertiary)
         }

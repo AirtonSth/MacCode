@@ -54,6 +54,18 @@ public struct AppSettings: Codable, Sendable, Equatable {
     /// preserving). Off by default — opt-in, since it makes stored history lossy-recoverable.
     public var historyCompactionEnabled: Bool
 
+    /// Graphify host integration (external CLI). On by default.
+    public var graphifyEnabled: Bool
+    /// Absolute path to `graphify` binary (GUI PATH bypass). Empty = auto-resolve.
+    public var graphifyBinaryPath: String
+    /// Fire-and-forget ensure on resolve when enabled.
+    public var graphifyAutoEnsure: Bool
+    /// Absolute paths of pinned multi-repo roots for sticky bootstrap (JSON array stored as joined newlines).
+    public var graphifyPinnedRoots: [String]
+    /// When true, also write `graphify-out/` inside the user's repo. Default false:
+    /// graphs live only under Application Support (no workspace pollution).
+    public var graphifyWriteInRepo: Bool
+
     /// Floating desktop pet. On by default so it is visible without setup.
     public var petEnabled: Bool
     public var petAnimationsEnabled: Bool
@@ -79,6 +91,11 @@ public struct AppSettings: Codable, Sendable, Equatable {
                 terminalFontSize: Double = 0,
                 sessionLearnEnabled: Bool = false,
                 historyCompactionEnabled: Bool = false,
+                graphifyEnabled: Bool = true,
+                graphifyBinaryPath: String = "",
+                graphifyAutoEnsure: Bool = true,
+                graphifyPinnedRoots: [String] = [],
+                graphifyWriteInRepo: Bool = false,
                 petEnabled: Bool = true,
                 petAnimationsEnabled: Bool = true,
                 petReadyCounterEnabled: Bool = true,
@@ -98,6 +115,11 @@ public struct AppSettings: Codable, Sendable, Equatable {
         self.terminalFontSize = terminalFontSize
         self.sessionLearnEnabled = sessionLearnEnabled
         self.historyCompactionEnabled = historyCompactionEnabled
+        self.graphifyEnabled = graphifyEnabled
+        self.graphifyBinaryPath = graphifyBinaryPath
+        self.graphifyAutoEnsure = graphifyAutoEnsure
+        self.graphifyPinnedRoots = graphifyPinnedRoots
+        self.graphifyWriteInRepo = graphifyWriteInRepo
         self.petEnabled = petEnabled
         self.petAnimationsEnabled = petAnimationsEnabled
         self.petReadyCounterEnabled = petReadyCounterEnabled
@@ -120,6 +142,11 @@ public struct AppSettings: Codable, Sendable, Equatable {
         case terminalFontSize
         case sessionLearnEnabled
         case historyCompactionEnabled
+        case graphifyEnabled
+        case graphifyBinaryPath
+        case graphifyAutoEnsure
+        case graphifyPinnedRoots
+        case graphifyWriteInRepo
         case petEnabled
         case petAnimationsEnabled
         case petReadyCounterEnabled
@@ -143,6 +170,11 @@ public struct AppSettings: Codable, Sendable, Equatable {
         terminalFontSize = try c.decodeIfPresent(Double.self, forKey: .terminalFontSize) ?? 0
         sessionLearnEnabled = try c.decodeIfPresent(Bool.self, forKey: .sessionLearnEnabled) ?? false
         historyCompactionEnabled = try c.decodeIfPresent(Bool.self, forKey: .historyCompactionEnabled) ?? false
+        graphifyEnabled = try c.decodeIfPresent(Bool.self, forKey: .graphifyEnabled) ?? true
+        graphifyBinaryPath = try c.decodeIfPresent(String.self, forKey: .graphifyBinaryPath) ?? ""
+        graphifyAutoEnsure = try c.decodeIfPresent(Bool.self, forKey: .graphifyAutoEnsure) ?? true
+        graphifyPinnedRoots = try c.decodeIfPresent([String].self, forKey: .graphifyPinnedRoots) ?? []
+        graphifyWriteInRepo = try c.decodeIfPresent(Bool.self, forKey: .graphifyWriteInRepo) ?? false
         petEnabled = try c.decodeIfPresent(Bool.self, forKey: .petEnabled) ?? true
         petAnimationsEnabled = try c.decodeIfPresent(Bool.self, forKey: .petAnimationsEnabled) ?? true
         petReadyCounterEnabled = try c.decodeIfPresent(Bool.self, forKey: .petReadyCounterEnabled) ?? true

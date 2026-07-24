@@ -471,10 +471,10 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         logDiagnosticsHeartbeat(reason: "will_terminate")
         removeScheduledTaskStoreObserver()
         disableInsomniaForAppClose()
-        // Always stop the Distill MLX server on quit — multi-GB model must not
-        // Distill is always-on app-private (like remote-code-orchestrate). On terminate
-        // we still scrub any legacy ~/.claude / ~/.codex skill copies and keep the
-        // managed CLI. The MLX Token Saver sidecar is stopped separately.
+        // Always stop the Distill MLX server on quit — multi-GB model must not linger.
+        // On terminate, reconcile Distill with the Token Saver toggle (install only when
+        // enabled; otherwise scrub legacy homes + uninstall CLI/wrappers). The MLX
+        // sidecar is stopped separately.
         stopTokenSaverDistillServiceForAppTermination()
         let tokenSaverEnabled = context.map { SettingsStore(db: $0.db).load().tokenSaverEnabled } ?? false
         if ProcessInfo.processInfo.environment["RC2_DISABLE_MANAGED_DISTILL_RECONCILE"] == "1" {

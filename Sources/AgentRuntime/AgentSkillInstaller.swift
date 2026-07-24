@@ -248,16 +248,49 @@ public final class AgentSkillInstaller: @unchecked Sendable {
             .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    /// Inject managed Distill into every provider runtime prompt (Claude / Codex / Grok).
-    /// Same app-private model as `remote-code-orchestrate`: no dependency on
-    /// `~/.claude/skills` or `~/.codex/skills`. The environment flag is ignored for
-    /// injection so every provider call carries Distill language + pipe rules.
+    /// Inject managed Distill into provider runtime prompts (Claude / Codex / Grok)
+    /// only while Token Saver is active (`RC_TOKEN_SAVER_DISTILL_HINT=1`).
+    /// Token economy is the paid feature: no Distill dialect, `| distill` rules,
+    /// or safety ABI when the toggle is off.
     public static func tokenSaverProviderPrompt(_ base: String, environment: [String: String]) -> String {
-        _ = environment
-        return managedDistillProviderPrompt(base)
+        let withDistill: String
+        if environment["RC_TOKEN_SAVER_DISTILL_HINT"] == "1" {
+            withDistill = managedDistillProviderPrompt(base)
+        } else {
+            withDistill = base
+        }
+        return graphifyProviderPrompt(withDistill, environment: environment)
     }
 
-    /// Always-on Distill injection used by all RemoteCode provider adapters.
+    /// Inject Graphify query-first rules when host set `RC_GRAPHIFY_ENABLED=1`.
+    /// Optional roots/graph path from env help the model call the right CLI without user prompts.
+    public static func graphifyProviderPrompt(_ base: String, environment: [String: String]) -> String {
+        guard environment["RC_GRAPHIFY_ENABLED"] == "1" else { return base }
+        var block = GraphifyStableSkillText.agentInstructionsBody
+        if let roots = environment["RC_GRAPHIFY_ROOTS"], !roots.isEmpty {
+            block += "\nActive Graphify roots (one per line):\n\(roots)"
+        }
+        if let graph = environment["RC_GRAPHIFY_GRAPH_JSON"], !graph.isEmpty {
+            block += "\nPrimary graph JSON: \(graph)"
+        }
+        if environment["RC_GRAPHIFY_AMBIGUOUS"] == "1" {
+            block += "\nNote: multi-repo workspace is ambiguous this turn; fail open if unsure which root applies."
+        }
+        if environment["RC_GRAPHIFY_STALE"] == "1" {
+            block += "\nNote: graph is refreshing in the background this turn; fail open for broad search if query results look incomplete."
+        }
+        if base.contains(GraphifyStableSkillText.agentInstructionsBody) {
+            // Still refresh dynamic root/graph tail once: replace is complex; append compact runtime note.
+            if let graph = environment["RC_GRAPHIFY_GRAPH_JSON"], !graph.isEmpty,
+               !base.contains(graph) {
+                return base + "\n\nGraphify runtime: --graph \(graph)"
+            }
+            return base
+        }
+        return base + "\n\n" + block
+    }
+
+    /// Distill injection for Token-Saver-enabled provider adapters.
     public static func managedDistillProviderPrompt(_ base: String) -> String {
         let withDistill = base.contains(distillAgentInstructionsBody)
             ? base

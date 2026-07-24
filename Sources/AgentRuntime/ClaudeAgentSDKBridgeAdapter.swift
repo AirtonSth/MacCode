@@ -401,9 +401,15 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
 
         onEvent(.status(.running))
         do {
+            // Per-turn Graphify path hint: persistent SDK sessions do not re-apply
+            // system_prompt after creation, so App Support graph paths must ride on
+            // each turn when the host sets RC_GRAPHIFY_* on the environment.
             try write([
                 "type": "rc_turn",
-                "prompt": request.providerPrompt,
+                "prompt": GraphifyStableSkillText.augmentTurnPrompt(
+                    request.providerPrompt,
+                    environment: request.environment
+                ),
                 "attachments": Self.attachmentPayload(request.attachments),
                 "session_id": session.providerThreadId ?? request.threadId.value.uuidString
             ], to: session)
@@ -1664,9 +1670,9 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
     /// (`BackgroundAwaitContinuation.alwaysOnClaudeDirectives`: the background-await
     /// self-declaration marker + the MCP-tool-availability rule) so the agent marks
     /// any unavoidable wait with the recovery marker and does not preemptively refuse
-    /// a connected MCP tool as "unauthenticated" in a non-interactive run. Always injects managed Distill
-    /// language + pipe rules (app-private skill; all Claude turns). Codex/Grok get
-    /// the same via per-turn developer_instructions / providerPrompt injection —
+    /// a connected MCP tool as "unauthenticated" in a non-interactive run.
+    /// Managed Distill language + pipe rules only when Token Saver is active
+    /// (`RC_TOKEN_SAVER_DISTILL_HINT=1`). Codex/Grok use the same env gate —
     /// never via `~/.claude/skills` / `~/.codex/skills`.
     static func claudeSystemPrompt(environment: [String: String]) -> String {
         AgentSkillInstaller.tokenSaverProviderPrompt(

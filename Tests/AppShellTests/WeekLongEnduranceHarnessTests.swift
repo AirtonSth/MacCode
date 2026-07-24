@@ -295,6 +295,14 @@ final class WeekLongEnduranceHarnessTests: XCTestCase {
 
         let finalStore = try XCTUnwrap(store)
         XCTAssertEqual(providerAdmissionChecks, 42)
+        // start() now spawns after an off-main foreign-server sweep, so let the
+        // single deferred spawn land before asserting the resident-instance count
+        // (every later startIfEligible coalesces or sees the live process).
+        var spawnPolls = 0
+        while sidecarSpawner.spawnCount == 0, spawnPolls < 150 {
+            try? await Task.sleep(nanoseconds: 20_000_000)
+            spawnPolls += 1
+        }
         XCTAssertEqual(sidecarSpawner.spawnCount, 1, "repeated lifecycle checks must retain one sidecar instance")
         await MainActor.run { sidecar.stop() }
         XCTAssertLessThanOrEqual(try finalStore.terminals.totalBytesAllSurfaces(), globalTerminalBytes)

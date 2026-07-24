@@ -304,6 +304,10 @@ final class AgentAppViewModelTests: XCTestCase {
         for snapshot in snapshots {
             vm.providerSnapshots = [snapshot]
             vm.providerInstanceId = snapshot.id
+            // send() re-probes via loadProviderSnapshots(); with no injected loader it
+            // would fall back to the REAL machine (CLIs installed) and admit the run,
+            // making the test non-hermetic. Pin the reload to the same unrunnable snapshot.
+            vm.providerSnapshotLoader = { [snapshot] }
             vm.prompt = "must not send"
             await vm.send()
             XCTAssertFalse(vm.selectedProviderCanRun,

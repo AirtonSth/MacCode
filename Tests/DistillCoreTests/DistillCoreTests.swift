@@ -604,9 +604,9 @@ final class DistillCoreTests: XCTestCase {
         XCTAssertEqual(
             response.output,
             """
-            Resultado: Snake game criado.
-            Resultado: file: /Users/samuelfajreldines/snake.html (single-file, zero deps)
-            Prova: open: abrir snake.html no browser -> jogo roda
+            Snake game criado.
+            file: /Users/samuelfajreldines/snake.html (single-file, zero deps)
+            open: abrir snake.html no browser -> jogo roda
             """
         )
     }
@@ -626,11 +626,7 @@ final class DistillCoreTests: XCTestCase {
 
         XCTAssertEqual(
             response.output,
-            """
-            Estado: come
-            Contexto: cwd=/tmp
-            Acao: load /distill rule, then create minimal HTML snake game
-            """
+            "Nao consegui expandir a resposta comprimida."
         )
     }
 
@@ -650,8 +646,9 @@ final class DistillCoreTests: XCTestCase {
 
         XCTAssertFalse(response.output.contains("#g1"),
                        "SR1 aliases are a provider compression detail and must not be shown in the humanized answer")
-        XCTAssertTrue(response.output.contains("Acao: create Snake HTML game in one file"))
-        XCTAssertTrue(response.output.contains("Resultado: Snake HTML game ready"))
+        // O-first prose: only the outcome (O) segment survives, S/C/D chrome dropped,
+        // and the #g1 alias is expanded to its literal value.
+        XCTAssertEqual(response.output, "Snake HTML game ready")
     }
 
     func test_schedulerReportsMeasuredTokenSavingsFromRealCompression() async throws {

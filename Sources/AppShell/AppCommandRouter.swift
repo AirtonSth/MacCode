@@ -1884,7 +1884,9 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     }
 
     public func openAgentApp(workspace: WorkspaceID) throws -> SurfaceDescriptor {
-        try createSurface(workspace: workspace, type: .agentApp, paneID: nil, title: "Agent App")
+        let descriptor = try createSurface(workspace: workspace, type: .agentApp, paneID: nil, title: "Agent App")
+        softGraphifyPreflight(workspace: workspace)
+        return descriptor
     }
 
     /// Open one exact agent thread in a concrete Agent App surface.
@@ -2058,6 +2060,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         // subscribers (including Agent App surfaces that listen for thread.*)
         // see scheduled / RPC-created threads immediately.
         EventBus.shared.publish(kind: "agent.thread.created", payload: agentThreadPayload(t))
+        softGraphifyPreflight(workspace: workspace)
         return t
     }
 
@@ -2763,6 +2766,13 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         let prov = t.provider
         let m = t.model
         let cwd = try prepareAgentExecutionCwd(thread: &t)
+        // Graphify: authoritative resolve after cwd is known. Fail-open; never blocks the run.
+        let graphifyEnv = applyGraphifyOnSend(
+            thread: t,
+            cwd: cwd,
+            attachments: resolvedAttachments,
+            baseEnvironment: autoRoutingActive ? [:] : providerEnvironment(provider: prov, instanceId: t.providerInstanceId, threadId: thread)
+        )
         let req = AgentRunRequest(
             runId: queueMessageId.map { AgentRunID($0.value) } ?? AgentRunID(),
             threadId: thread,
@@ -2778,7 +2788,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             serviceTier: t.serviceTier,
             interactionMode: interactionMode ?? .default,
             providerBinary: autoRoutingActive ? nil : providerBinary(provider: prov, instanceId: t.providerInstanceId),
-            environment: autoRoutingActive ? [:] : providerEnvironment(provider: prov, instanceId: t.providerInstanceId, threadId: thread),
+            environment: graphifyEnv,
             runAsUser: t.runAsUser
         )
         // Prefer a full orchestration snapshot (scheduled Path B / Auto admit)
@@ -2964,6 +2974,77 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             code: -32000,
             message: "Provider start is unconfirmed. The message remains queued to prevent loss or duplicate execution."
         )
+    }
+
+    /// Soft Graphify preflight on Agent App open / create.
+    /// Single-repo: ensure that root. Multi-repo: sticky/pin/auto-bootstrap one child (never parent).
+    private func softGraphifyPreflight(workspace: WorkspaceID?) {
+        guard let ctx = context, let workspace else { return }
+        let settings = SettingsStore(db: ctx.db).load()
+        guard settings.graphifyEnabled else { return }
+        configureGraphifyService(from: settings)
+        let cwd = ctx.state.workspaces[workspace]?.cwd ?? FileManager.default.currentDirectoryPath
+        let set = GraphifyWorkspaceService.shared.softPreflight(
+            workspaceCwd: cwd,
+            pinnedRoots: settings.graphifyPinnedRoots
+        )
+        publishGraphifyWorkingSet(set, threadId: nil)
+    }
+
+    private func configureGraphifyService(from settings: AppSettings) {
+        let svc = GraphifyWorkspaceService.shared
+        svc.enabled = settings.graphifyEnabled
+        svc.autoEnsure = settings.graphifyAutoEnsure
+        svc.writeInRepo = settings.graphifyWriteInRepo
+        svc.pinnedRoots = settings.graphifyPinnedRoots
+        let path = settings.graphifyBinaryPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        svc.binaryPathOverride = path.isEmpty ? nil : path
+    }
+
+    /// Authoritative Graphify resolve on send (RPC path). Agent App UI uses the same
+    /// `GraphifyWorkspaceService.applyToAgentEnvironment` from AgentAppSurface.
+    private func applyGraphifyOnSend(
+        thread: AgentThread,
+        cwd: String,
+        attachments: [AgentAttachment],
+        baseEnvironment: [String: String]
+    ) -> [String: String] {
+        guard let ctx = context else { return baseEnvironment }
+        let settings = SettingsStore(db: ctx.db).load()
+        guard settings.graphifyEnabled else { return baseEnvironment }
+        configureGraphifyService(from: settings)
+
+        let workspaceCwd = ctx.state.workspaces.first { $0.value.id == thread.workspaceId }?.value.cwd ?? cwd
+        let applied = GraphifyWorkspaceService.shared.applyToAgentEnvironment(
+            base: baseEnvironment,
+            threadId: thread.id.value,
+            threadCwd: cwd,
+            worktreePath: thread.worktreePath,
+            workspaceCwd: workspaceCwd,
+            attachmentPaths: attachments.map(\.path)
+        )
+        publishGraphifyWorkingSet(applied.workingSet, threadId: thread.id)
+        return applied.environment
+    }
+
+    private func publishGraphifyWorkingSet(_ set: GraphifyThreadWorkingSet, threadId: AgentThreadID?) {
+        var payload: [String: JSONValue] = [
+            "workspace_kind": .string(set.workspaceKind),
+            "ambiguous": .bool(set.ambiguous),
+            "roots": .array(set.roots.map { binding in
+                .object([
+                    "display_root": .string(binding.checkout.displayRoot),
+                    "common_dir": .string(binding.checkout.key.commonDir),
+                    "status": .string(binding.status.rawValue),
+                    "reason": .string(binding.reason),
+                    "artifact_root": binding.artifactRoot.map { .string($0) } ?? .null
+                ])
+            })
+        ]
+        if let threadId {
+            payload["thread_id"] = .string(threadId.value.uuidString)
+        }
+        EventBus.shared.publish(kind: "graphify.thread.roots", payload: .object(payload))
     }
 
     private func prepareAgentExecutionCwd(thread: inout AgentThread) throws -> String {
@@ -4043,20 +4124,37 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         // local `distill` CLI attributes command-output savings to claude/codex/grok
         // instead of "unknown". Set unconditionally — even with no instance config.
         env["REMOTE_CODE_AGENT_PROVIDER"] = provider.rawValue
-        // Managed distill CLI on PATH for every provider call (app-private skill model).
-        env["PATH"] = Self.providerPathWithManagedWrappers(
-            currentPath: env["PATH"] ?? ProcessInfo.processInfo.environment["PATH"] ?? "",
-            managedBin: AgentSkillInstaller.defaultManagedCLIBinDirectory().path
-        )
         if let context, let threadId {
-            // Distill hint + Claude PostToolUse state; shared with session recovery.
+            // task-08: Token Saver PATH/hint only when same-user admission allows.
             let tokenSaverEnv = context.tokenSaverAgentEnvironment(provider: provider, threadId: threadId)
+            if tokenSaverEnv.isEmpty {
+                // Cross-user / raw-only: scrub Token Saver keys and managed distill PATH.
+                return Self.scrubTokenSaverEnvironment(env)
+            }
+            env["PATH"] = Self.providerPathWithManagedWrappers(
+                currentPath: env["PATH"] ?? ProcessInfo.processInfo.environment["PATH"] ?? "",
+                managedBin: AgentSkillInstaller.defaultManagedCLIBinDirectory().path
+            )
             env.merge(tokenSaverEnv) { _, new in new }
         } else {
-            // No thread context: still enable always-on Distill prompt path.
-            env["RC_TOKEN_SAVER_DISTILL_HINT"] = "1"
+            // No thread context: keep provider tag only; scrub any residual TS keys.
+            return Self.scrubTokenSaverEnvironment(env)
         }
         return env
+    }
+
+    /// Removes Token Saver env keys and managed distill bin from PATH (task-08 raw-only).
+    nonisolated static func scrubTokenSaverEnvironment(_ env: [String: String]) -> [String: String] {
+        var cleaned = env
+        for key in env.keys where key.hasPrefix("RC_TOKEN_SAVER_") || key == "REMOTE_CODE_DISTILL_STATE_PATH" {
+            cleaned.removeValue(forKey: key)
+        }
+        let managedBin = AgentSkillInstaller.defaultManagedCLIBinDirectory().path
+        if let path = cleaned["PATH"] {
+            let parts = path.split(separator: ":").map(String.init).filter { $0 != managedBin }
+            cleaned["PATH"] = parts.joined(separator: ":")
+        }
+        return cleaned
     }
 
     static func providerPathWithManagedWrappers(currentPath: String, managedBin: String) -> String {

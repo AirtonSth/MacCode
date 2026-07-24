@@ -246,6 +246,8 @@ final class SettingsPaletteGapTests: XCTestCase {
             "insomniaAllowSystemSleepWhenDisplayClosed",
             "insomniaAllowScreenSaverAfter45MinutesOfInactivity",
             "tokenSaverEnabled", "terminalFontSize", "sessionLearnEnabled", "historyCompactionEnabled",
+            "graphifyEnabled", "graphifyBinaryPath", "graphifyAutoEnsure", "graphifyPinnedRoots",
+            "graphifyWriteInRepo",
             "petEnabled", "petAnimationsEnabled", "petReadyCounterEnabled",
             "petPosition", "petSize", "petAttentionFilter", "petReduceMotion",
         ]

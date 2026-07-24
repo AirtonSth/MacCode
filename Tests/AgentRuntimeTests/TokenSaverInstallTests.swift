@@ -247,7 +247,7 @@ final class TokenSaverInstallTests: XCTestCase {
         XCTAssertTrue(claudeText.contains(AgentSkillInstaller.distillInstructionsEndMarker))
         XCTAssertTrue(codexText.contains("Use `/distill` dialect for provider turns"))
         XCTAssertTrue(codexText.contains("RemoteCode-managed `distill` CLI"))
-        XCTAssertTrue(codexText.contains("RemoteCodeDistillService"))
+        // CLI recovery language lives in the skill body; on-disk AGENTS.md is the dialect + pipe rules.
         XCTAssertFalse(codexText.contains(TokenSaverProviderSafetyABI.block))
         XCTAssertFalse(claudeText.contains(TokenSaverProviderSafetyABI.block))
         XCTAssertFalse(grokText.contains(TokenSaverProviderSafetyABI.block),
@@ -312,15 +312,15 @@ final class TokenSaverInstallTests: XCTestCase {
         XCTAssertEqual(alreadyOwnedRuntime.components(separatedBy: TokenSaverProviderSafetyABI.block).count - 1, 1,
                        "runtime injection must preserve exactly one ABI when the base already carries it")
 
-        // Distill is always-on for every provider call (app-private managed skill).
-        let alwaysOnRuntime = AgentSkillInstaller.tokenSaverProviderPrompt(
+        // Token Saver off (no distill hint) → no Distill dialect / safety ABI.
+        let offRuntime = AgentSkillInstaller.tokenSaverProviderPrompt(
             "provider runtime context",
             environment: [:]
         )
-        XCTAssertTrue(alwaysOnRuntime.contains(AgentSkillInstaller.distillAgentInstructionsBody),
-                      "empty env must still inject managed Distill for all provider calls")
-        XCTAssertTrue(alwaysOnRuntime.contains(TokenSaverProviderSafetyABI.block),
-                      "managed Distill always carries the safety ABI exactly once")
+        XCTAssertEqual(offRuntime, "provider runtime context",
+                       "Token Saver off must not inject Distill or safety ABI")
+        XCTAssertFalse(offRuntime.contains(AgentSkillInstaller.distillAgentInstructionsBody))
+        XCTAssertFalse(offRuntime.contains(TokenSaverProviderSafetyABI.block))
     }
 
     func test_runtimePromptNormalizesAdversarialSafetyABIForClaudeCodexAndGrok() {

@@ -1,5 +1,6 @@
 import Foundation
 import CryptoKit
+import CoreModel
 
 /// Core logic of the managed `distill` CLI, ported off Python to native Swift (N1)
 /// and made FAIL-OPEN (N2/N5). The shipped Python CLI failed CLOSED: on any error it
@@ -103,7 +104,10 @@ public struct ManagedDistillCLI: Sendable {
         if arguments.first == "dsl" {
             return dsl(arguments: Array(arguments.dropFirst()))
         }
-        if let command = arguments.first, Self.reservedSubcommands.contains(command) {
+        // task-07: `hook` is reserved before any prompt parsing / generic compress path.
+        if let command = arguments.first,
+           TokenSaverProtocolV2.routeCLISubcommand(command) == "hook_handler"
+            || Self.reservedSubcommands.contains(command) {
             return unsupportedReservedSubcommand(command)
         }
         let prompt = arguments.joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines)
@@ -112,7 +116,8 @@ public struct ManagedDistillCLI: Sendable {
 
     private static let reservedSubcommands: Set<String> = [
         "rank",
-        "wrap"
+        "wrap",
+        TokenSaverProtocolV2.reservedHookSubcommand
     ]
 
     private func unsupportedReservedSubcommand(_ command: String) -> (Data, Int32) {
@@ -142,6 +147,19 @@ public struct ManagedDistillCLI: Sendable {
         guard !stdin.isEmpty else { return (Data(), 0) }
         guard let input = String(data: stdin, encoding: .utf8) else { return failOpen() }
         guard !input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return failOpen() }
+
+        // Live Wave A/B lossless pre-pass: shrink before (or without) the sidecar.
+        // Only when Token Saver env is present (hint) so free builds never save tokens.
+        let tokenSaverHintOn = ProcessInfo.processInfo.environment["RC_TOKEN_SAVER_DISTILL_HINT"] == "1"
+            || ProcessInfo.processInfo.environment["RC_TOKEN_SAVER_WAVE_LIVE"] != nil
+        if tokenSaverHintOn,
+           let pre = TokenSaverWaveLosslessPrepass.apply(input: input, toolHint: prompt) {
+            FileHandle.standardError.write(Data(
+                "rc-wave-prepass wave=\(pre.waveID) trigger=\(pre.trigger) saved_bytes=\(pre.savedBytes) frac=\(String(format: "%.3f", pre.savedFraction))\n".utf8
+            ))
+            return (Data((pre.output + "\n").utf8), 0)
+        }
+
         if ManagedDistillCLI.exceedsStdinCap(byteCount: stdin.count, cap: ManagedDistillCLI.stdinCapBytes) {
             return await compressChunks(input: input, prompt: prompt)
         }

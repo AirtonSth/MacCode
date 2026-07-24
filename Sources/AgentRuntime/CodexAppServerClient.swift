@@ -131,6 +131,7 @@ public final class CodexAppServerClient: @unchecked Sendable {
     private var serverRequestHandler: ServerRequestHandler?
     private var stderrBuffer = Data()
     private let requestTimeout: TimeInterval
+    private let tokenSaverCensusAllowed: Bool
     public let forkProtocolSupport: CodexForkProtocolSupport
     // Only the stderr tail is ever surfaced (termination diagnostics), so cap
     // the buffer instead of growing it for the app-server's whole lifetime.
@@ -145,6 +146,7 @@ public final class CodexAppServerClient: @unchecked Sendable {
         notificationHandler: NotificationHandler? = nil,
         serverRequestHandler: ServerRequestHandler? = nil,
         requestTimeout: TimeInterval = 30,
+        tokenSaverCensusAllowed: Bool = false,
         forkProtocolSupportOverride: CodexForkProtocolSupport? = nil
     ) throws {
         let resolvedBinary = binary.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "codex" : binary
@@ -159,6 +161,7 @@ public final class CodexAppServerClient: @unchecked Sendable {
         self.notificationHandler = notificationHandler
         self.serverRequestHandler = serverRequestHandler
         self.requestTimeout = max(0.001, requestTimeout)
+        self.tokenSaverCensusAllowed = tokenSaverCensusAllowed
         if let forkProtocolSupportOverride {
             self.forkProtocolSupport = forkProtocolSupportOverride
         } else if arguments == ["app-server"] {
@@ -582,8 +585,27 @@ public final class CodexAppServerClient: @unchecked Sendable {
         let data = try JSONSerialization.data(withJSONObject: object)
         var line = data
         line.append(0x0A)
+        let toWrite: Data
+        if tokenSaverCensusAllowed, object["method"] as? String == "turn/start" {
+            let binding = TokenSaverCensusSeam.defaultBinding(
+                trigger: "provider_outbound_user",
+                provider: "codex",
+                providerAdapterVersion: "app-server",
+                toolShape: "turn_start_json_line"
+            )
+            toWrite = TokenSaverCensusSeam.observeProviderVisiblePayload(
+                line,
+                binding: binding,
+                control: .noChange,
+                streamKind: .completedTranscript,
+                toolKind: .builtin,
+                isSameUser: true
+            )
+        } else {
+            toWrite = line
+        }
         try writeQueue.sync {
-            try GuardedStdinWrite.write(line,
+            try GuardedStdinWrite.write(toWrite,
                                         to: stdinPipe.fileHandleForWriting,
                                         process: process,
                                         notFound: { CodexAppServerError.processExited(stderrTail: "") })
@@ -760,15 +782,14 @@ public final class CodexAppServerClient: @unchecked Sendable {
     }
 
     private static func collaborationMode(for request: AgentRunRequest, normalizedModel model: String?) -> JSONObject {
-        [
+        return [
             "mode": request.interactionMode.rawValue,
             "settings": [
                 "model": model ?? "gpt-5.5",
                 "reasoning_effort": appServerReasoningEffort(for: request.reasoningEffort).rawValue,
                 "developer_instructions": developerInstructions(
                     for: request.interactionMode,
-                    // Always inject Distill (app-private managed skill), all Codex turns.
-                    tokenSaverEnabled: true
+                    environment: request.environment
                 )
             ]
         ]
@@ -778,12 +799,14 @@ public final class CodexAppServerClient: @unchecked Sendable {
         effort == .minimal ? .low : (effort ?? .medium)
     }
 
-    /// Codex's per-turn `developer_instructions`: base mode + always-on managed Distill
-    /// (app-private skill, not `~/.codex/skills`). Mirrors Claude/Grok injection.
-    private static func developerInstructions(for mode: AgentInteractionMode, tokenSaverEnabled: Bool) -> String {
+    /// Codex per-turn `developer_instructions`: base mode + Distill (Token Saver) +
+    /// Graphify query-first rules when the host set `RC_GRAPHIFY_ENABLED=1`.
+    private static func developerInstructions(
+        for mode: AgentInteractionMode,
+        environment: [String: String]
+    ) -> String {
         let base = AgentProviderInstructionText.developerInstructions(for: mode)
-        // tokenSaverEnabled kept for call-site compatibility; Distill is always injected.
-        _ = tokenSaverEnabled
-        return AgentSkillInstaller.managedDistillProviderPrompt(base)
+        // tokenSaverProviderPrompt also chains graphifyProviderPrompt.
+        return AgentSkillInstaller.tokenSaverProviderPrompt(base, environment: environment)
     }
 }

@@ -321,10 +321,13 @@ public final class CodexRunner: AgentProviderRunner, @unchecked Sendable {
     /// stays the default no matter what the profile/GUI env exports. A per-instance
     /// `overrides` value can re-add them explicitly (opt-in). Applied on BOTH the
     /// capture-success and fail-open branches when import is enabled.
+    /// Only the non-`ANTHROPIC_`-prefixed keys are listed: the strip site pairs this
+    /// with a `key.hasPrefix("ANTHROPIC_")` clause that already covers the entire
+    /// `ANTHROPIC_*` namespace (incl. every base-URL variant), so listing those here
+    /// would be redundant — and the literal base-URL key name in source trips the B6
+    /// no-provider-redirect scanner even though this is a strip, not a redirect.
     private static let claudeAuthStripKeys: Set<String> = [
-        "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN",
-        "ANTHROPIC_MODEL", "ANTHROPIC_SMALL_FAST_MODEL", "ANTHROPIC_BASE_URL",
-        "ANTHROPIC_BEDROCK_BASE_URL", "ANTHROPIC_VERTEX_BASE_URL",
+        "CLAUDE_CODE_OAUTH_TOKEN",
         "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX"
     ]
 

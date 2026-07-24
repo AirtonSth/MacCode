@@ -358,6 +358,11 @@ public final class AppContext {
         try? tokenSaverSavingsRepo.prune()
         self.coordinator.promptCompressor = { [weak self] prompt, provider, threadId, runId in
             guard let self else { return prompt }
+            // task-08: cross-user raw-only before any SessionLearn/compress work.
+            let sameUser = await MainActor.run { self.tokenSaverIsSameUser(threadId: threadId) }
+            guard TokenSaverAdapterMatrix.tokenSaverCallbacksAllowed(isSameUser: sameUser, turn: .initial) else {
+                return prompt
+            }
             let scopedPrompt = await self.tokenSaverSessionLearnPrompt(
                 prompt, provider: provider, threadId: threadId, runId: runId
             )
@@ -365,6 +370,10 @@ public final class AppContext {
         }
         self.coordinator.followUpPromptCompressor = { [weak self] prompt, provider, threadId in
             guard let self else { return prompt }
+            let sameUser = await MainActor.run { self.tokenSaverIsSameUser(threadId: threadId) }
+            guard TokenSaverAdapterMatrix.tokenSaverCallbacksAllowed(isSameUser: sameUser, turn: .followUp) else {
+                return prompt
+            }
             let scopedPrompt = await self.tokenSaverSessionLearnPrompt(
                 prompt, provider: provider, threadId: threadId, runId: nil
             )
@@ -372,15 +381,29 @@ public final class AppContext {
         }
         self.coordinator.finalResponseTranslator = { [weak self] response, provider, threadId, runId in
             guard let self else { return response }
+            let sameUser = await MainActor.run { self.tokenSaverIsSameUser(threadId: threadId) }
+            guard TokenSaverAdapterMatrix.tokenSaverCallbacksAllowed(isSameUser: sameUser, turn: .finalResponse) else {
+                return response
+            }
             return await self.tokenSaverHumanizeSR1Response(response, provider: provider, threadId: threadId, runId: runId)
         }
         // Recovered sessions rebuild their own request env in the coordinator, bypassing
         // providerEnvironment; feed them the same Token Saver env so distill survives resume.
         self.coordinator.recoveryEnvironmentProvider = { [weak self] provider, threadId in
-            await self?.tokenSaverAgentEnvironment(provider: provider, threadId: threadId) ?? [:]
+            guard let self else { return [:] }
+            let sameUser = await MainActor.run { self.tokenSaverIsSameUser(threadId: threadId) }
+            guard TokenSaverAdapterMatrix.tokenSaverCallbacksAllowed(isSameUser: sameUser, turn: .recovery) else {
+                return [:]
+            }
+            return await self.tokenSaverAgentEnvironment(provider: provider, threadId: threadId)
         }
         self.coordinator.runEnvironmentProvider = { [weak self] provider, threadId, base in
-            await self?.tokenSaverAgentEnvironment(provider: provider, threadId: threadId, baseEnvironment: base) ?? [:]
+            guard let self else { return [:] }
+            let sameUser = await MainActor.run { self.tokenSaverIsSameUser(threadId: threadId) }
+            guard TokenSaverAdapterMatrix.tokenSaverCallbacksAllowed(isSameUser: sameUser, turn: .initial) else {
+                return [:]
+            }
+            return await self.tokenSaverAgentEnvironment(provider: provider, threadId: threadId, baseEnvironment: base)
         }
         self.coordinator.onRunPrepared = { [weak self] request, originalPrompt in
             await MainActor.run { [weak self] in
@@ -407,7 +430,14 @@ public final class AppContext {
             hasSkillsHomeOverride: agentSkillsHomeOverrideForTesting != nil,
             environment: ProcessInfo.processInfo.environment
         ) {
-            reconcileManagedDistillSkills(tokenSaverEnabled: SettingsStore(db: db).load().tokenSaverEnabled)
+            let bootSettings = SettingsStore(db: db).load()
+            reconcileManagedDistillSkills(tokenSaverEnabled: bootSettings.tokenSaverEnabled)
+            reconcileGraphifyHost(settings: bootSettings)
+        } else {
+            // Still apply Graphify defaults outside distill reconcile gate (unit tests stay quiet).
+            if !AppContext.isRunningUnitTests {
+                reconcileGraphifyHost()
+            }
         }
         // PERF (cold launch): never block AppContext.init on multi-GB MLX warmup.
         // Still kick Token Saver asynchronously when already enabled so managed
@@ -791,20 +821,38 @@ public final class AppContext {
             NSClassFromString("XCTestCase") != nil
     }
 
-    /// Distill + Token Saver environment for an agent run. Distill language and
-    /// `| distill` PATH are always-on for every provider (app-private skill model,
-    /// same idea as remote-code-orchestrate). Workspace attribution still requires
-    /// project admission when present. Single source for the normal run path and
-    /// recovered-session path.
+    /// Distill + Token Saver environment for an agent run.
+    /// Token economy is paid: Distill hint, managed-bin PATH, and Claude
+    /// PostToolUse compression are emitted only while Token Saver is enabled.
+    /// Workspace attribution still requires project admission when present.
+    /// Single source for the normal run path and recovered-session path.
     func tokenSaverAgentEnvironment(
         provider: AgentProvider,
         threadId: AgentThreadID,
         baseEnvironment: [String: String] = ProcessInfo.processInfo.environment
     ) -> [String: String] {
+        // task-08: cross-user runs get no Token Saver env/hint/PATH managed bin.
+        guard TokenSaverAdapterMatrix.tokenSaverCallbacksAllowed(
+            isSameUser: tokenSaverIsSameUser(threadId: threadId),
+            turn: .initial
+        ) else {
+            return [:]
+        }
+        // Paid feature gate: no token-economy env while Token Saver is off.
+        guard SettingsStore(db: db).load().tokenSaverEnabled else {
+            return [:]
+        }
+        // Activate waves that have passed E2E live rollout (process-local).
+        TokenSaverWaveLiveRollout.activateAll()
         var env: [String: String] = [:]
-        // Always expose managed distill CLI on PATH for every provider call.
+        // Expose managed distill CLI + wrappers on PATH only while Token Saver is on.
         if managedDistillSkillInstallError == nil {
             env["RC_TOKEN_SAVER_DISTILL_HINT"] = "1"
+            // Propagate live wave set so child `distill` CLI applies Wave A/B pre-pass.
+            let live = TokenSaverWaveLiveRollout.liveWaves.map(\.rawValue).sorted().joined(separator: ",")
+            if !live.isEmpty {
+                env["RC_TOKEN_SAVER_WAVE_LIVE"] = live
+            }
             let managedBin = AgentSkillInstaller.defaultManagedCLIBinDirectory().path
             let currentPath = baseEnvironment["PATH"] ?? ProcessInfo.processInfo.environment["PATH"] ?? ""
             let pathParts = currentPath.split(separator: ":").map(String.init).filter { $0 != managedBin }
@@ -819,8 +867,7 @@ public final class AppContext {
             env["RC_TOKEN_SAVER_THREAD_ID"] = threadId.value.uuidString
         }
         if provider == .claude {
-            // Claude PostToolUse compression hook (sidecar HTTP). Always on when
-            // managed distill installed so all Claude calls speak/compress distill.
+            // Claude PostToolUse compression hook (sidecar HTTP) — Token Saver only.
             env["RC_TOKEN_SAVER_POST_TOOL_USE"] = "1"
             env["REMOTE_CODE_DISTILL_STATE_PATH"] = appSupportDirectory
                 .appendingPathComponent("Distill", isDirectory: true)
@@ -846,33 +893,52 @@ public final class AppContext {
         return status
     }
 
-    /// Install Distill like `remote-code-orchestrate`: app-private under RemoteCode
-    /// Application Support, never into `~/.claude/skills` / `~/.codex/skills` /
-    /// `~/.grok/skills`. Always available for every provider call; Token Saver
-    /// still owns the MLX sidecar separately.
+    /// Configure Graphify host defaults (on by default). Fail-open if CLI missing —
+    /// `ensureBinaryInstalledIfNeeded` may try `uv tool install graphifyy` once.
+    public func reconcileGraphifyHost(settings: AppSettings? = nil) {
+        let s = settings ?? SettingsStore(db: db).load()
+        let svc = GraphifyWorkspaceService.shared
+        svc.enabled = s.graphifyEnabled
+        svc.autoEnsure = s.graphifyAutoEnsure
+        svc.writeInRepo = s.graphifyWriteInRepo
+        svc.pinnedRoots = s.graphifyPinnedRoots
+        let path = s.graphifyBinaryPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        svc.binaryPathOverride = path.isEmpty ? nil : path
+        guard s.graphifyEnabled else { return }
+        LoginShellEnvironment.prewarm()
+        DispatchQueue.global(qos: .utility).async {
+            _ = GraphifyWorkspaceService.shared.ensureBinaryInstalledIfNeeded()
+        }
+    }
+
+    /// Reconcile Distill integration with the Token Saver toggle (paid feature).
+    /// App-private skill package lives under Application Support only (never
+    /// `~/.claude` / `~/.codex` skill trees). CLI, command wrappers, and retrieve
+    /// MCP are installed only while Token Saver is enabled; disabled removes them
+    /// so free/unsubscribed runs never get token-economy hooks.
     public func reconcileManagedDistillSkills(tokenSaverEnabled: Bool) {
         let installer = makeAgentSkillInstaller()
         do {
-            // 1) App-private package (source of truth for the managed skill body).
-            let appPrivate = try installer.installAppPrivateDistillSkill(
-                sourceRevision: "github-main-remote-code-template-v2"
-            )
-            // 2) Remove any legacy per-provider home skill / AGENTS.md blocks.
+            // Always scrub legacy per-provider home skill / AGENTS.md blocks.
             try installer.uninstallLegacyProviderDistillSkills()
-            // 3) Keep the managed `distill` CLI on PATH so all-call instructions
-            // that require `| distill` resolve for every provider.
-            _ = try installer.installDistillCLI(appSupportDirectory: appSupportDirectory)
-            try? installer.installCommandWrappers()
-            try? installer.installRetrieveMCP()
-            // Warm the login-shell env capture at launch so agent turns get profile
-            // secret/PATH parity from turn 1 (Finder-launched apps don't source the
-            // shell profile). Non-blocking + single-flight + fail-open; a later turn
-            // still lazily triggers it if this path was skipped.
-            LoginShellEnvironment.prewarm()
-            managedDistillSkillInstallResults = [appPrivate]
-            managedDistillSkillInstallError = nil
-            // Token Saver toggle no longer installs/uninstalls home skills.
-            _ = tokenSaverEnabled
+            if tokenSaverEnabled {
+                let appPrivate = try installer.installAppPrivateDistillSkill(
+                    sourceRevision: "github-main-remote-code-template-v2"
+                )
+                _ = try installer.installDistillCLI(appSupportDirectory: appSupportDirectory)
+                try? installer.installCommandWrappers()
+                try? installer.installRetrieveMCP()
+                // Warm login-shell env so agent turns get profile secret/PATH parity.
+                LoginShellEnvironment.prewarm()
+                managedDistillSkillInstallResults = [appPrivate]
+                managedDistillSkillInstallError = nil
+            } else {
+                _ = try? installer.uninstallCommandWrappers()
+                _ = try? installer.uninstallDistillCLI()
+                try? installer.uninstallRetrieveMCP()
+                managedDistillSkillInstallResults = []
+                managedDistillSkillInstallError = nil
+            }
         } catch {
             NSLog("RemoteCode managed Distill skill reconcile failed: \(error)")
             managedDistillSkillInstallResults = []
@@ -1314,6 +1380,14 @@ public final class AppContext {
         )
     }
 
+    /// task-08: cross-user Token Saver is raw-only for every compressor turn kind.
+    /// Unknown identity fails closed (disables Token Saver callbacks) while keeping provider raw.
+    private func tokenSaverIsSameUser(threadId: AgentThreadID) -> Bool {
+        guard let thread = try? threadRepo.get(id: threadId) else { return false }
+        guard let runAs = thread.runAsUser else { return true }
+        return runAs.uid == getuid()
+    }
+
     func tokenSaverCompress(
         prompt: String,
         provider: AgentProvider,
@@ -1321,6 +1395,14 @@ public final class AppContext {
         cacheState: String = "prompt",
         runId: AgentRunID? = nil
     ) async -> String {
+        let turn: TokenSaverAdapterMatrix.CrossUserTurn =
+            cacheState.contains("follow") ? .followUp : .initial
+        guard TokenSaverAdapterMatrix.tokenSaverCallbacksAllowed(
+            isSameUser: tokenSaverIsSameUser(threadId: threadId),
+            turn: turn
+        ) else {
+            return prompt
+        }
         guard tokenSaverProjectAdmission(threadId: threadId, lane: "deterministic_wrapper").allowed else {
             return prompt
         }
@@ -2165,7 +2247,14 @@ public final class AppContext {
         if tokenSaverProjectObservation(runId: runId, lane: "session_learn").allowed {
             sessionLearnInputTokensByRun[runId, default: 0] += max(0, usage.inputTokens)
         }
-        guard tokenSaverProjectObservation(runId: runId, lane: "measurement").allowed else { return }
+        // The sidebar "used tokens" display reflects the real provider-billed count
+        // and must be recorded for every Token-Saver-enabled thread — NOT gated on
+        // the measurement lane (which requires a projectId + seeded lane rows).
+        // Normal thread creation makes projectless threads, so an outer measurement
+        // gate here left the sidebar showing 0 used tokens despite real billing. The
+        // measurement/attribution ledger stays gated: `appendTokenSaverProviderUsage`
+        // self-gates on the same measurement observation, and no other path below
+        // writes measurement/savings rows.
         appendTokenSaverProviderUsage(usage, runId: runId)
         let settings = SettingsStore(db: db).load()
         // Record only the real provider-billed token count. Savings are now

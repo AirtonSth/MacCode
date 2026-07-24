@@ -73,6 +73,33 @@ final class AgentRoutingDispatcherTests: XCTestCase {
         XCTAssertEqual(router.sendAgentMessageCallCount, 0)
     }
 
+    // Regression: a routing_revision of exactly 2^63 is a finite, integral,
+    // non-negative Double that passed the old `<= Double(Int.max)` guard (because
+    // Double(Int.max) rounds up to 2^63) and then trapped in `Int(rawRevision)`,
+    // aborting the whole host process — a remote DoS. The fix must reject it as
+    // invalidParams and leave the router unmutated (no crash).
+    func testRoutingRevisionOverflowRejectedWithoutCrash() async {
+        let router = FakeRouter()
+        let thread = AgentThread(title: "auto", provider: .codex, model: "gpt")
+        router.threadStore = [thread]
+
+        for revision in [0x1p63 /* 2^63 */, 0x1p64 /* 2^64 */, 1.5 /* fractional */, -1.0] {
+            let response = await JSONRPCDispatcher(router: router).dispatch(JSONRPCRequest(
+                jsonrpc: "2.0",
+                id: .number(1),
+                method: "agent.message.send",
+                params: [
+                    "thread_id": .string(thread.id.value.uuidString),
+                    "text": .string("hi"),
+                    "routing_mode": .string("manual"),
+                    "routing_revision": .number(revision)
+                ]
+            ))
+            XCTAssertEqual(response.error?.code, -32602, "revision \(revision) must be rejected as invalidParams")
+            XCTAssertEqual(router.sendAgentMessageCallCount, 0)
+        }
+    }
+
     func testRoutingRevisionConflictMapsToTypedJSONRPCError() {
         let error = JSONRPCDispatcher.mapDomainError(
             AgentRoutingRevisionError.conflict(expected: 2, actual: 3),

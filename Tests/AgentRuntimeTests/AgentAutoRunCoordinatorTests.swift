@@ -50,12 +50,12 @@ final class AgentAutoRunCoordinatorTests: XCTestCase {
         AgentRoutingConfiguration(
             mode: .auto,
             manualSelection: AgentModelSelection(
-                provider: .claude,
-                modelId: "claude-manual",
+                provider: .codex,
+                modelId: "gpt-5.6-sol",
                 reasoningEffort: .medium,
                 serviceTier: .fast
             ),
-            manualProviderInstanceId: "claude-manual",
+            manualProviderInstanceId: "codex-live",
             eligibleProviders: eligibleProviders,
             policyDigest: runtime.policyDigest,
             revision: 1
@@ -356,36 +356,44 @@ final class AgentAutoRunCoordinatorTests: XCTestCase {
     }
 
     func testAutoRoutingBlocksBeforeProviderStartWhenPackageIsUnavailable() async throws {
-        try await assertAutoAdmissionBlocked(
+        // Superseded semantics: package-unavailable no longer hard-blocks Auto. The
+        // coordinator DEEP-falls-back on the SAME selected Source (codex) — never
+        // cross-provider — dropping the $remote-code-orchestrate wrapper. Hard-block
+        // coverage now lives in AgentOrchestrationRuntimeTests.
+        try await assertSelectedSourceDeepStarts(
             runtime: AgentOrchestrationRuntime(
                 packageVerification: { false },
                 killSwitch: { false }
-            ),
-            snapshots: [liveSnapshot()],
-            expectedError: .packageUnavailable
+            )
         )
     }
 
     func testAutoRoutingBlocksBeforeProviderStartWhenKillSwitchIsEnabled() async throws {
-        try await assertAutoAdmissionBlocked(
+        // Superseded semantics: the kill switch no longer hard-blocks Auto — same-host
+        // DEEP fallback on the selected Source (codex), no orchestrate wrapper. Hard-block
+        // coverage now lives in AgentOrchestrationRuntimeTests.
+        try await assertSelectedSourceDeepStarts(
             runtime: AgentOrchestrationRuntime(
                 packageVerification: { true },
                 killSwitch: { true }
-            ),
-            snapshots: [liveSnapshot()],
-            expectedError: .killSwitchEnabled
+            )
         )
     }
 
     func testAutoRoutingBlocksUnknownStreamingCapabilityBeforeProviderStart() async throws {
-        try await assertAutoAdmissionBlocked(
+        let error = try await autoAdmissionError(
             runtime: AgentOrchestrationRuntime(
                 packageVerification: { true },
                 killSwitch: { false }
             ),
-            snapshots: [liveSnapshot(capabilities: .conservative)],
-            expectedError: .noEligibleProvider
+            snapshots: [liveSnapshot(capabilities: .conservative)]
         )
+        // The selected Source (codex) is present but cannot stream → fail closed on
+        // that Source; Auto must never silently route to another provider.
+        guard case .preferredSourceUnavailable(let provider, _)? = error else {
+            return XCTFail("Expected preferredSourceUnavailable, got \(String(describing: error))")
+        }
+        XCTAssertEqual(provider, .codex)
     }
 
     func testAutoRoutingBlocksWhenReceiptCannotBePersisted() async throws {
@@ -410,16 +418,64 @@ final class AgentAutoRunCoordinatorTests: XCTestCase {
         )
         let error = try await autoAdmissionError(runtime: runtime, snapshots: [])
 
-        XCTAssertEqual(try XCTUnwrap(error), .noEligibleProvider)
+        // Auto binds to the selected Source (codex). With no runnable codex snapshot it
+        // fails closed on that Source — it must never fall back to the manual provider
+        // or any other host.
+        guard case .preferredSourceUnavailable(let provider, _)? = error else {
+            return XCTFail("Expected preferredSourceUnavailable, got \(String(describing: error))")
+        }
+        XCTAssertEqual(provider, .codex)
     }
 
-    private func assertAutoAdmissionBlocked(
-        runtime: AgentOrchestrationRuntime,
-        snapshots: [AgentProviderSnapshot],
-        expectedError: AgentOrchestrationAdmissionError
+    /// DEEP fallback: when orchestration is gated (package unavailable / kill switch)
+    /// Auto still starts the SELECTED Source host (codex) on its DEEP matrix row,
+    /// without the `$remote-code-orchestrate` wrapper, and never switches provider.
+    private func assertSelectedSourceDeepStarts(
+        runtime: AgentOrchestrationRuntime
     ) async throws {
-        let error = try await autoAdmissionError(runtime: runtime, snapshots: snapshots)
-        XCTAssertEqual(try XCTUnwrap(error), expectedError)
+        let (db, root) = try database()
+        defer { try? FileManager.default.removeItem(atPath: root) }
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let thread = AgentThread(
+            title: "deep fallback auto",
+            provider: .claude,
+            model: "claude-manual",
+            routingConfiguration: autoConfiguration(runtime: runtime)
+        )
+        try threadRepo.upsert(thread)
+        let claude = RecordingProviderRunner(provider: .claude)
+        let codex = RecordingProviderRunner(provider: .codex)
+        let snapshot = liveSnapshot()
+        let coordinator = AgentRunCoordinator(
+            runRepo: runRepo,
+            messageRepo: messageRepo,
+            threadRepo: threadRepo,
+            orchestrationRuntime: runtime,
+            providerSnapshotSupplier: { [snapshot] in [snapshot] },
+            providers: [.claude: claude, .codex: codex]
+        )
+        let runId = AgentRunID()
+
+        _ = try await coordinator.startRun(request(threadId: thread.id, runId: runId))
+
+        XCTAssertEqual(claude.startCount, 0,
+                       "DEEP fallback must stay on the selected Source, never cross-provider.")
+        XCTAssertEqual(codex.startCount, 1,
+                       "DEEP fallback still starts the selected Source host.")
+        let admitted = try XCTUnwrap(codex.lastRequest)
+        XCTAssertEqual(admitted.runId, runId)
+        XCTAssertEqual(admitted.provider, .codex)
+        XCTAssertEqual(admitted.providerInstanceId, "codex-live")
+        // Codex DEEP row is sol / high (LIGHT orchestration would be luna / medium).
+        XCTAssertEqual(admitted.model, "gpt-5.6-sol")
+        XCTAssertEqual(admitted.reasoningEffort, .high)
+        XCTAssertFalse(
+            AgentOrchestrationRuntime.promptAlreadyInvokesOrchestrateSkill(admitted.prompt),
+            "DEEP fallback drops the $remote-code-orchestrate wrapper."
+        )
+        XCTAssertTrue(admitted.prompt.contains("route this run"))
     }
 
     private func autoAdmissionError(

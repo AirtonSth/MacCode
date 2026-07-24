@@ -125,7 +125,7 @@ public final class ClaudeRunner: AgentProviderRunner, @unchecked Sendable {
         // Also carries the MCP-tool-availability rule so the agent does not preemptively
         // refuse a connected MCP tool as "unauthenticated" in a non-interactive run
         // (both live via `alwaysOnClaudeDirectives`).
-        // Managed Distill language + pipe rules are always injected (app-private skill).
+        // Background-await + MCP rules always; Distill only when Token Saver hint is set.
         // `--append-system-prompt` adds to the CLI's default prompt, so it stays additive.
         let appendedSystemPrompt = AgentSkillInstaller.tokenSaverProviderPrompt(
             BackgroundAwaitContinuation.alwaysOnClaudeDirectives,

@@ -1324,11 +1324,11 @@ public final class DirectHTTPServer: @unchecked Sendable {
         case is NSNull: requestID = nil
         case let value as String: requestID = .string(value)
         case let value as NSNumber:
-            let number = value.doubleValue
-            if number.rounded(.towardZero) == number,
-               number >= Double(Int.min),
-               number <= Double(Int.max) {
-                requestID = .number(value.intValue)
+            // `Double(Int.max)` rounds up to 2^63, so a `<= Double(Int.max)` bound
+            // admits a value that overflows Int. `Int(exactly:)` accepts only an
+            // exactly-representable integer id; anything else uses the 0 sentinel.
+            if let intID = Int(exactly: value.doubleValue) {
+                requestID = .number(intID)
             } else {
                 // JSONRPCID is integer-only internally. The dispatcher does not
                 // inspect ids; the exact finite wire number is restored below.

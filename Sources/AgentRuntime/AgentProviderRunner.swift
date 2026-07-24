@@ -599,12 +599,17 @@ enum ProcessTerminator {
     // Grace window between SIGTERM and SIGKILL escalation.
     static let graceInterval: TimeInterval = 2.0
 
-    /// When `foreignUserUID` is set the root is a `sudo` wrapper (invoker uid,
-    /// directly signalable) and every descendant carries that target uid, which
-    /// this non-root app cannot `SIGKILL` and `sudo` will not relay a `SIGKILL`
-    /// for. The direct signals below still drive the graceful path — `SIGTERM`
-    /// to the `sudo` root is relayed to the child — but the `SIGKILL` escalation
-    /// of a stuck child is routed back through `sudo` as the target uid.
+    /// When `foreignUserUID` is set, `root` is EITHER the invoker-uid `sudo`
+    /// wrapper (use_pty on: a monitor parent whose target-uid children we reap)
+    /// OR, when `sudo` execs in place (use_pty off — the default on bundled
+    /// sudo < 1.9.14 and whenever an admin disables it), the target-uid provider
+    /// itself. This non-root app cannot `SIGKILL` a target-uid process directly
+    /// (EPERM) and `sudo` won't relay a `SIGKILL`, so the escalation reaps every
+    /// still-alive pid INCLUDING `root` via `sudo -u#<uid>`: in the monitor case
+    /// that sudo-kill of the invoker-uid root is a harmless EPERM no-op; in the
+    /// exec-in-place case it is the only way to reap the provider (excluding root
+    /// there orphaned it to launchd). NOTE: graceful SIGTERM for an exec-in-place
+    /// root and PID-reuse-proof identity gating remain follow-ups.
     static func terminateTree(_ process: Process, grace: TimeInterval = graceInterval, foreignUserUID: uid_t? = nil) {
         let root = process.processIdentifier
         // Enumerate the tree once (children first so leaves die before parents),
@@ -626,7 +631,7 @@ enum ProcessTerminator {
                 kill(step.pid, step.signal)
             }
             if let foreignUserUID {
-                let survivors = pids.filter { $0 != root && Self.isAlive($0) }
+                let survivors = pids.filter { Self.isAlive($0) }
                 killAsUserProvider(foreignUserUID, SIGKILL, survivors)
             }
         }
@@ -642,13 +647,14 @@ enum ProcessTerminator {
         for step in terminationPlan(pids: pids, isAlive: { _ in true }, graceElapsed: false) {
             kill(step.pid, step.signal)
         }
-        // Reap the target-uid descendants via sudo BEFORE SIGKILLing the sudo
-        // root: once sudo is killed it can neither relay signals nor reap its
-        // child, so the child would orphan to launchd. `-n` sudo is fast (no
-        // prompt) so this stays synchronous even on the app-termination path.
+        // Reap the target-uid subtree via sudo BEFORE the direct SIGKILL below:
+        // once a sudo monitor is killed it can neither relay signals nor reap its
+        // child. Include `root`: when sudo exec'd in place root IS the target-uid
+        // provider (excluding it orphaned the provider to launchd); when root is
+        // the invoker-uid monitor the sudo-kill is a harmless EPERM no-op. `-n`
+        // sudo is fast (no prompt) so this stays synchronous on app quit.
         if let foreignUserUID {
-            let targets = pids.filter { $0 != root }
-            killAsUserProvider(foreignUserUID, SIGKILL, targets)
+            killAsUserProvider(foreignUserUID, SIGKILL, pids)
         }
         for pid in pids {
             kill(pid, SIGKILL)

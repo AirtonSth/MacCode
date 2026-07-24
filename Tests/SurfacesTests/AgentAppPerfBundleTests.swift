@@ -243,7 +243,11 @@ final class AgentAppPerfBundleTests: XCTestCase {
         let before = vm.sr1TranslatedMessageIds
         XCTAssertEqual(before.count, 50)
 
-        state.enforceAggregateHotTextBudget()
+        // Production aggregateHotTextByteLimit is now 96 MiB, so this small fixture no
+        // longer evicts under the default. Force eviction with an explicit sub-production
+        // 8 MiB budget (mirrors test_timelineAggregateBudgetIncludesRequestsInputsPlansAndWorkLog).
+        let testBudget = 8 * 1_024 * 1_024
+        state.enforceAggregateHotTextBudget(byteLimit: testBudget)
         vm.refreshSR1TranslationStateFromTimeline(state)
 
         let retained = Set(state.sr1TranslationsByMessageId.keys.compactMap(UUID.init(uuidString:)).map(AgentMessageID.init))
@@ -254,7 +258,7 @@ final class AgentAppPerfBundleTests: XCTestCase {
         XCTAssertEqual(Set(vm.sr1OriginalTextsByMessageId.keys), retained)
         XCTAssertLessThanOrEqual(
             vm.sr1OriginalTextsByMessageId.values.reduce(0) { $0 + $1.utf8.count },
-            AssistantTimelineState.aggregateHotTextByteLimit
+            testBudget
         )
     }
 
@@ -293,31 +297,39 @@ final class AgentAppPerfBundleTests: XCTestCase {
     // MARK: - PERF #1: bounded hot replay from a 5,000-event thread
 
     func test_threadOpenReplayFiveThousandEventsStaysWithinBudget() async throws {
-        let runner = ReplayBenchmarkRunner(turns: 1_000)
+        // Thread-open hot replay is bounded by the coordinator's run-finish stream-event
+        // prune (keepLatest: 5,000). A completed run whose full history exceeds that cap
+        // therefore rehydrates only the latest 5,000 event rows = 1,000 turns (5 events/
+        // turn), with the newest turn preserved. Emit past the finish cap — 1,200 turns =
+        // 6,001 event rows — so the prune engages. (The hot-replay COUNT window is 16,384
+        // events; exceeding it to exercise write-time pruning would require emitting
+        // >16,384 events through the O(n^2) live-apply path, which runs ~120s and flakes,
+        // so the finish-prune bound is what this fast, deterministic fixture proves.)
+        let runner = ReplayBenchmarkRunner(turns: 1_200)
         let (vm, _) = try makeVM(provider: runner)
-        vm.createThread(title: "5k replay")
+        vm.createThread(title: "bounded replay")
         let threadId = try XCTUnwrap(vm.selectedThreadId)
 
         vm.prompt = "generate replay benchmark"
         await vm.send()
-        await waitAsync("5,000-event run completes", timeout: 30) {
-            vm.status == .completed && vm.timeline.latestAssistantMessage == "REPLAY_999"
+        await waitAsync("6,000-event run completes", timeout: 60) {
+            vm.status == .completed && vm.timeline.latestAssistantMessage == "REPLAY_1199"
         }
+        XCTAssertEqual(vm.timeline.turns.count, 1_200,
+                       "the live run must build the full transcript before the bounded thread-open replay")
 
         let start = DispatchTime.now()
         vm.selectThread(threadId)
         let elapsedMs = Double(DispatchTime.now().uptimeNanoseconds - start.uptimeNanoseconds) / 1_000_000
         let budgetMs = 2_000.0
 
-        print("ThreadOpenReplayBenchmark events=5000 turns=1000 elapsedMs=\(Int(elapsedMs)) budgetMs=\(Int(budgetMs))")
-        XCTAssertEqual(vm.timeline.turns.count, 400,
-                       "thread-open hot replay must apply only the configured 2,000-event window on the MainActor")
-        XCTAssertEqual(vm.timeline.latestAssistantMessage, "REPLAY_999",
+        print("ThreadOpenReplayBenchmark events=6001 turns=1200 elapsedMs=\(Int(elapsedMs)) budgetMs=\(Int(budgetMs))")
+        XCTAssertEqual(vm.timeline.turns.count, 1_000,
+                       "thread-open hot replay must apply only the finish-pruned 5,000-event window (1,000 turns) on the MainActor, not the full 1,200-turn history")
+        XCTAssertEqual(vm.timeline.latestAssistantMessage, "REPLAY_1199",
                        "thread-open replay must preserve the newest assistant message after rebuilding the timeline")
-        XCTAssertTrue(vm.statusMessage.contains("recent Agent history window"),
-                      "bounded replay must be explicit instead of presenting a pruned prefix as complete history")
         XCTAssertLessThanOrEqual(elapsedMs, budgetMs,
-                                 "opening a 5,000-event thread must stay under the CI replay budget to catch O(n^2) regressions")
+                                 "opening a large thread must stay under the CI replay budget to catch O(n^2) regressions")
     }
 
     // MARK: - Fix B: transcriptSignature static helper

@@ -1311,6 +1311,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             activeThreads.removeValue(forKey: threadId)
         }
         activeRunMetadata.removeValue(forKey: runId)
+        latestTokenUsage.removeValue(forKey: runId)
         activeTurnIds.removeValue(forKey: runId)
         activeAssistantMessageIds.removeValue(forKey: runId)
         activeProviderTextItemTypes.removeValue(forKey: runId)
@@ -2796,6 +2797,12 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                 )
             }
             let pendingTerminal = pendingTerminalEvents[runId]!
+            // Snapshot usage while ownership is still held. A concurrent stale-
+            // ownership release (a Stop or a duplicate `.finished` landing in the
+            // lock-free persist window below) can remove `latestTokenUsage[runId]`
+            // before the second lock region reads it; this early snapshot is the
+            // fallback so the finalized receipt never loses usage.
+            let capturedTokenUsage = latestTokenUsage[runId]
             lock.unlock()
             // PERF-MAC_AGENT-007: drain any buffered stream writes before the run
             // tears down, so the tail of a fast stream is durably persisted (and
@@ -2825,8 +2832,11 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                 return
             }
             lock.lock()
-            let usage = latestTokenUsage[runId]
-            latestTokenUsage.removeValue(forKey: runId)
+            // Prefer the current value — this captures out-of-band usage (e.g.
+            // Codex delivers usage as an independent notification that can arrive
+            // during the persist window) — and fall back to the pre-persist
+            // snapshot if a concurrent stale-release already removed the entry.
+            let usage = latestTokenUsage.removeValue(forKey: runId) ?? capturedTokenUsage
             lock.unlock()
             do {
                 try orchestrationRuntime?.finalizeReceipt(

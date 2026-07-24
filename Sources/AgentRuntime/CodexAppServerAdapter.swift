@@ -208,7 +208,8 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
                 cwd: request.cwd,
                 environment: request.environment,
                 notificationHandler: notificationHandler,
-                serverRequestHandler: serverRequestHandler
+                serverRequestHandler: serverRequestHandler,
+                tokenSaverCensusAllowed: request.runAsUser?.uid == nil || request.runAsUser?.uid == getuid()
             )
         }
     }

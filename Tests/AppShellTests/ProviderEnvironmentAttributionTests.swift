@@ -54,18 +54,27 @@ final class ProviderEnvironmentAttributionTests: XCTestCase {
         )
     }
 
-    /// Distill is always-on for every provider call (app-private managed skill).
-    /// providerEnvironment must always carry the distill hint and Claude PostToolUse.
+    /// Token economy is paid: with Token Saver off, no distill hint / PostToolUse.
+    /// With Token Saver on, every provider gets the distill hint; Claude also gets PostToolUse.
     @MainActor
-    func test_providerEnvironment_alwaysEmitsDistillHintForAllProviders() throws {
+    func test_providerEnvironment_emitsDistillHintOnlyWhenTokenSaverEnabled() throws {
         let appSupport = NSTemporaryDirectory() + "RC2ProvEnvHint-" + UUID().uuidString
         let ctx = try AppContext(channel: .debug, appSupportOverride: appSupport)
-        // Ensure managed distill reconcile succeeded so the hint is emitted.
-        ctx.reconcileManagedDistillSkills(tokenSaverEnabled: false)
         let router = AppCommandRouter(context: ctx)
         let codexThread = try admittedThread(in: ctx, provider: .codex)
         let claudeThread = try admittedThread(in: ctx, provider: .claude)
         let grokThread = try admittedThread(in: ctx, provider: .grok)
+
+        ctx.reconcileManagedDistillSkills(tokenSaverEnabled: false)
+        XCTAssertNil(
+            router.providerEnvironment(provider: .codex, instanceId: nil, threadId: codexThread.id)["RC_TOKEN_SAVER_DISTILL_HINT"]
+        )
+        XCTAssertNil(
+            router.providerEnvironment(provider: .claude, instanceId: nil, threadId: claudeThread.id)["RC_TOKEN_SAVER_POST_TOOL_USE"]
+        )
+
+        SettingsStore(db: ctx.db).update { $0.tokenSaverEnabled = true }
+        ctx.reconcileManagedDistillSkills(tokenSaverEnabled: true)
 
         XCTAssertEqual(
             router.providerEnvironment(provider: .codex, instanceId: nil, threadId: codexThread.id)["RC_TOKEN_SAVER_DISTILL_HINT"],
@@ -82,7 +91,7 @@ final class ProviderEnvironmentAttributionTests: XCTestCase {
         XCTAssertEqual(
             router.providerEnvironment(provider: .claude, instanceId: nil, threadId: claudeThread.id)["RC_TOKEN_SAVER_POST_TOOL_USE"],
             "1",
-            "Claude's PostToolUse compression hook is always on with managed Distill"
+            "Claude's PostToolUse compression hook is Token Saver only"
         )
     }
 
@@ -101,13 +110,13 @@ final class ProviderEnvironmentAttributionTests: XCTestCase {
 
         ctx.reconcileManagedDistillSkills(tokenSaverEnabled: false)
 
-        // Always-on Distill for every provider, even with Token Saver toggle off.
+        // Token Saver off → no token-economy env.
         let codexOff = ctx.tokenSaverAgentEnvironment(provider: .codex, threadId: codexThread.id)
-        XCTAssertEqual(codexOff["RC_TOKEN_SAVER_DISTILL_HINT"], "1")
-        XCTAssertNil(codexOff["RC_TOKEN_SAVER_POST_TOOL_USE"],
-                     "PostToolUse auto-compression is Claude-SDK-only; Codex must not carry it")
+        XCTAssertTrue(codexOff.isEmpty, "Token Saver off must not emit distill/hint env")
+        XCTAssertNil(codexOff["RC_TOKEN_SAVER_POST_TOOL_USE"])
 
         SettingsStore(db: ctx.db).update { $0.tokenSaverEnabled = true }
+        ctx.reconcileManagedDistillSkills(tokenSaverEnabled: true)
 
         let codex = ctx.tokenSaverAgentEnvironment(provider: .codex, threadId: codexThread.id)
         XCTAssertEqual(codex["RC_TOKEN_SAVER_DISTILL_HINT"], "1")
@@ -125,12 +134,14 @@ final class ProviderEnvironmentAttributionTests: XCTestCase {
     }
 
     /// Transparent command wrappers only help Codex/Claude provider shells if the managed bin
-    /// directory wins PATH lookup inside the provider process. providerEnvironment always
-    /// prepends managed bin so `| distill` and wrappers resolve for every provider call.
+    /// directory wins PATH lookup inside the provider process. With Token Saver on,
+    /// providerEnvironment prepends managed bin so `| distill` and wrappers resolve.
     @MainActor
     func test_providerEnvironmentPrependsManagedWrapperBinToProviderPath() throws {
         let appSupport = NSTemporaryDirectory() + "RC2TSEnvPath-" + UUID().uuidString
         let ctx = try AppContext(channel: .debug, appSupportOverride: appSupport)
+        SettingsStore(db: ctx.db).update { $0.tokenSaverEnabled = true }
+        ctx.reconcileManagedDistillSkills(tokenSaverEnabled: true)
         let router = AppCommandRouter(context: ctx)
         let codexThread = try admittedThread(in: ctx, provider: .codex)
         let claudeThread = try admittedThread(in: ctx, provider: .claude)
