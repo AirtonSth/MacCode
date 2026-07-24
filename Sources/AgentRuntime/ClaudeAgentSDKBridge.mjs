@@ -131,17 +131,51 @@ function shellCommandSegments(command) {
 }
 
 function stripShellPrefixes(segment) {
-  let text = String(segment || '').trim();
-  // Peel common launch prefixes until stable: env [-u FOO] VAR=val, FOO=bar,
-  // quoted assignments, command/builtin/exec wrappers.
-  let previous = null;
-  while (previous !== text) {
-    previous = text;
-    text = text.replace(/^env(?:\s+(?:-[a-zA-Z]\S*|--\S+))*(?:\s+[A-Za-z_][A-Za-z0-9_]*=(?:"[^"]*"|'[^']*'|\S*))*\s+/, '');
-    text = text.replace(/^(?:[A-Za-z_][A-Za-z0-9_]*=(?:"[^"]*"|'[^']*'|\S*)\s+)+/, '');
-    text = text.replace(/^(?:command|builtin|exec)\s+/, '');
+  let tokens = String(segment || '').trim().split(/\s+/).filter(Boolean);
+  // Peel common launch prefixes until stable: env [-u NAME] [-i] VAR=val,
+  // FOO=bar, command/builtin/exec wrappers.
+  let progressed = true;
+  while (progressed && tokens.length > 0) {
+    progressed = false;
+    const head = tokens[0];
+    if (head === 'env') {
+      tokens.shift();
+      while (tokens.length > 0) {
+        const t = tokens[0];
+        if (t === '-i' || t === '-0' || t === '-S' || t === '--ignore-environment') {
+          tokens.shift();
+          continue;
+        }
+        if (t === '-u' || t === '--unset') {
+          tokens.shift();
+          if (tokens.length) tokens.shift();
+          continue;
+        }
+        if (t.startsWith('-u') && t.length > 2) {
+          tokens.shift();
+          continue;
+        }
+        if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(t) || /^[A-Za-z_][A-Za-z0-9_]*="/.test(t) || /^[A-Za-z_][A-Za-z0-9_]*='/.test(t)) {
+          tokens.shift();
+          continue;
+        }
+        break;
+      }
+      progressed = true;
+      continue;
+    }
+    if (head === 'command' || head === 'builtin' || head === 'exec') {
+      tokens.shift();
+      progressed = true;
+      continue;
+    }
+    if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(head)) {
+      tokens.shift();
+      progressed = true;
+      continue;
+    }
   }
-  return text.trim();
+  return tokens.join(' ').trim();
 }
 
 function firstCommandToken(segment) {
