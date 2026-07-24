@@ -35,7 +35,7 @@ final class TokenSaverT003PersistenceTests: XCTestCase {
 
         try Schema.migrate(db)
 
-        XCTAssertEqual(Schema.currentVersion, 49)
+        XCTAssertEqual(Schema.currentVersion, 52)
         XCTAssertEqual(try count(db, table: "rc_reversible_content"), 1, "migration preserves legacy bytes for explicit user-approved reattachment")
         XCTAssertEqual(try count(db, table: "token_saver_recovery_objects"), 0, "legacy hashes never receive fabricated scope or capability")
         XCTAssertEqual(try count(db, table: "token_saver_attempts"), 0)
@@ -858,8 +858,15 @@ final class TokenSaverT003PersistenceTests: XCTestCase {
         XCTAssertEqual(states.first { $0.lane == "measurement" }?.retentionDays, 0)
         XCTAssertEqual(states.first { $0.lane == "provider_native" }?.state, "shadow_only")
         XCTAssertEqual(states.first { $0.lane == "provider_native" }?.retentionDays, 0)
-        XCTAssertTrue(states.filter { !["measurement", "provider_native"].contains($0.lane) }
-            .allSatisfy { $0.state == "off" && $0.killSwitchActive })
+        // Core tool-output wrapper keeps a recovery window and is not kill-switched
+        // by default so store-before-loss works before scorecard promotion.
+        let wrapper = try XCTUnwrap(states.first { $0.lane == "deterministic_wrapper" })
+        XCTAssertEqual(wrapper.state, "off")
+        XCTAssertEqual(wrapper.retentionDays, 7)
+        XCTAssertFalse(wrapper.killSwitchActive)
+        XCTAssertTrue(states.filter {
+            !["measurement", "provider_native", "deterministic_wrapper"].contains($0.lane)
+        }.allSatisfy { $0.state == "off" && $0.killSwitchActive })
         XCTAssertTrue(states.allSatisfy { $0.ownerRole.hasPrefix("unassigned:") })
         XCTAssertTrue(states.allSatisfy {
             !$0.attributionJoined && !$0.reconciliationPassed
@@ -985,6 +992,47 @@ final class TokenSaverT003PersistenceTests: XCTestCase {
             expiresAt: nil,
             disk: disk
         )) { XCTAssertEqual($0 as? TokenSaverRecoveryStoreError, .retentionDisabled) }
+    }
+
+    /// WHY: installs that already ran ensureDefaults before the factory-default
+    /// fix keep retention_days=0 rows (INSERT OR IGNORE). ensureDefaults + schema
+    /// step 52 must repair those so store-before-loss works after upgrade.
+    func test_ensureDefaults_repairsLegacyFactoryWrapperRetentionZero() throws {
+        let db = try makeDB()
+        // Simulate pre-fix factory seed.
+        try db.execute("""
+            INSERT INTO token_saver_lane_state
+                (project_id, lane, state, reason, evidence_level, owner_role,
+                 permission_boundary, retention_days, opted_out, kill_switch_active, updated_at_ms)
+            VALUES ('p', 'deterministic_wrapper', 'off', 'owner_and_scorecard_required',
+                    'unavailable', 'unassigned:Operations Owner', 'project', 0, 0, 1, 1);
+        """)
+        try TokenSaverLaneStateRepository(db: db).ensureDefaults(projectID: "p")
+        let row = try XCTUnwrap(try TokenSaverLaneStateRepository(db: db).get(
+            projectID: "p",
+            lane: "deterministic_wrapper"
+        ))
+        XCTAssertEqual(row.retentionDays, 7)
+        XCTAssertFalse(row.killSwitchActive)
+
+        let original = Data("legacy-repair".utf8)
+        let prepared = try TokenSaverRuntimeRecoveryWorker(db: db).prepareOriginal(
+            original,
+            scope: scope(),
+            operationID: "legacy-repair-op",
+            lane: "deterministic_wrapper",
+            expiresAt: nil,
+            disk: disk,
+            now: Date(timeIntervalSince1970: 4_000)
+        )
+        XCTAssertEqual(
+            try TokenSaverScopedRecoveryStore(db: db).retrieve(
+                capability: prepared.capability,
+                scope: scope(),
+                now: Date(timeIntervalSince1970: 4_000)
+            ),
+            original
+        )
     }
 
     func test_runtimeRecoveryUsesExactLaneRetentionAndRetentionZeroPersistsNothing() throws {

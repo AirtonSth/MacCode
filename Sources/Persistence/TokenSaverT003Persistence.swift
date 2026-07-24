@@ -1323,6 +1323,13 @@ public final class TokenSaverRuntimeRecoveryWorker: @unchecked Sendable {
                 if optedOut || reason == "project_opted_out" || reason == "verbatim_forced" {
                     return nil
                 }
+                // Integrity failures and force-verbatim set kill_switch while often
+                // leaving retention_days > 0. Kill switch must deny before we honor
+                // a positive retention value — except the factory seed reason, which
+                // historically used kill_switch=1 as a "not yet scorecarded" flag.
+                if killSwitch && reason != "owner_and_scorecard_required" {
+                    return nil
+                }
                 if retentionDays > 0 {
                     return retentionDays
                 }
@@ -2489,6 +2496,23 @@ public final class TokenSaverLaneStateRepository: @unchecked Sendable {
         try db.performSync { database in
             try database.transaction {
                 try self.insertDefaults(database: database, projectID: projectID)
+                // Upgrade pre-fix factory rows that INSERT OR IGNORE left at
+                // retention_days=0 (store-before-loss durable readback requires >0).
+                let repair = try database.prepare("""
+                    UPDATE token_saver_lane_state
+                    SET retention_days = 7,
+                        kill_switch_active = 0,
+                        updated_at_ms = ?
+                    WHERE project_id = ?
+                      AND lane = 'deterministic_wrapper'
+                      AND reason = 'owner_and_scorecard_required'
+                      AND opted_out = 0
+                      AND retention_days = 0;
+                """)
+                defer { repair.reset() }
+                try repair.bind(1, Int64(Date().timeIntervalSince1970 * 1_000))
+                try repair.bind(2, projectID)
+                _ = try repair.step()
             }
         }
     }
