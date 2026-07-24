@@ -127,12 +127,17 @@ final class ScheduledTaskRuntimeTests: XCTestCase {
     }
 
     func test_rejectUIOnlySchedulePrompt_blocksLocalAgentCommands_becauseScheduleIsPasteAndPlay() {
-        // WHY: Agent App intercepts /clear /status etc. without a provider turn.
-        // Schedule must fail loudly instead of creating an empty headless turn.
+        // WHY: Agent App intercepts /clear /status etc. without a provider turn —
+        // including argument-bearing forms like `/clear foo`.
         XCTAssertThrowsError(try ScheduledTaskExecutor.rejectUIOnlySchedulePrompt("/clear"))
+        XCTAssertThrowsError(try ScheduledTaskExecutor.rejectUIOnlySchedulePrompt("/clear history"))
         XCTAssertThrowsError(try ScheduledTaskExecutor.rejectUIOnlySchedulePrompt("$status"))
+        XCTAssertThrowsError(try ScheduledTaskExecutor.rejectUIOnlySchedulePrompt("/model gpt-5"))
+        XCTAssertThrowsError(try ScheduledTaskExecutor.rejectUIOnlySchedulePrompt("/fork"))
         XCTAssertThrowsError(try ScheduledTaskExecutor.rejectUIOnlySchedulePrompt("/plan"))
         XCTAssertThrowsError(try ScheduledTaskExecutor.rejectUIOnlySchedulePrompt("/plan implement the feature"))
+        XCTAssertThrowsError(try ScheduledTaskExecutor.rejectUIOnlySchedulePrompt("/default"))
+        XCTAssertNoThrow(try ScheduledTaskExecutor.rejectUIOnlySchedulePrompt("/default Ship the deploy pipeline"))
         XCTAssertNoThrow(try ScheduledTaskExecutor.rejectUIOnlySchedulePrompt("Ship the deploy pipeline"))
         XCTAssertNoThrow(try ScheduledTaskExecutor.rejectUIOnlySchedulePrompt("$sam-work DEV-1"))
         XCTAssertNoThrow(try ScheduledTaskExecutor.rejectUIOnlySchedulePrompt("/goal reduce latency"))
@@ -151,13 +156,15 @@ final class ScheduledTaskRuntimeTests: XCTestCase {
         XCTAssertTrue(source.contains("setPermissionMode(.fullAccess)"))
         XCTAssertTrue(source.contains("interactionMode = .default"))
         XCTAssertTrue(source.contains("skipMissedOccurrencesOnLaunch"))
+        XCTAssertTrue(source.contains("reclaimOrphanedActiveRuns"))
+        XCTAssertTrue(source.contains("waitForProviderSnapshotsIdle"))
         XCTAssertFalse(
             source.contains("router.sendAgentMessage("),
             "scheduled execute must not bypass AgentAppViewModel.send"
         )
         XCTAssertFalse(
-            source.contains("surfaceID: nil"),
-            "scheduled execute must bind a real Agent App surface"
+            source.contains("modelDiscoverySource == .live"),
+            "Auto preflight must not be stricter than Agent App (requireLiveCatalog false)"
         )
     }
 

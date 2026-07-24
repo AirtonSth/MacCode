@@ -123,9 +123,12 @@ public final class ScheduledTaskExecutor {
         let surface = try router.openAgentAppForSchedule(workspace: task.workspaceID)
         let vm = surface.viewModel
         vm.setRunAsUser(Self.resolveRunAsUser(task: task) ?? AgentRunAsUser.current())
-        // setRunAsUser kicks an async provider refresh; await a full load so the
-        // exact saved instance is present before we pin configuration.
+        // setRunAsUser and surface open both kick unstructured snapshot loads.
+        // Wait until idle, then force one authoritative load, then idle again so
+        // Auto send is not refused for providerSnapshotsLoading.
+        await Self.waitForProviderSnapshotsIdle(vm)
         await vm.loadProviderSnapshots()
+        await Self.waitForProviderSnapshotsIdle(vm)
         guard vm.providerSnapshots.contains(where: {
             $0.id == task.providerInstanceID && $0.provider == task.provider
         }) else {
@@ -201,19 +204,38 @@ public final class ScheduledTaskExecutor {
         let parts = line.dropFirst().split(separator: " ", maxSplits: 1).map(String.init)
         let command = (parts.first ?? "").lowercased()
         let argument = parts.count > 1 ? parts[1].trimmingCharacters(in: .whitespaces) : ""
-        let local = Set(["clear", "default", "fork", "model", "plan", "status"])
-        guard local.contains(command) else { return }
-        // `/plan body` in Agent App switches mode then sends `body` — schedules
-        // are Default interaction only, so require a real provider prompt.
-        if command == "plan", !argument.isEmpty {
+        // Agent App handles these locally regardless of arguments (except
+        // `/default body` / `/plan body` which switch mode then may send body).
+        // Schedules require a real provider turn.
+        let alwaysUIOnly = Set(["clear", "fork", "model", "status"])
+        if alwaysUIOnly.contains(command) {
+            throw ScheduledTaskPreflightError.invalidTask(
+                "Scheduled tasks cannot run the local Agent App command /\(command). Use a full prompt or skill ($name)."
+            )
+        }
+        if command == "plan" {
             throw ScheduledTaskPreflightError.invalidTask(
                 "Scheduled tasks run in Default interaction mode. Remove /plan and put the work in the prompt (or use a skill like $sam-work)."
             )
         }
-        if argument.isEmpty {
+        if command == "default", argument.isEmpty {
             throw ScheduledTaskPreflightError.invalidTask(
-                "Scheduled tasks cannot run the local Agent App command /\(command). Use a full prompt or skill ($name)."
+                "Scheduled tasks cannot run the local Agent App command /default. Use a full prompt or skill ($name)."
             )
+        }
+        // `/default body` is allowed — Agent App switches to Default then sends body.
+        _ = argument
+    }
+
+    /// Wait until Agent App finishes all in-flight provider snapshot loads.
+    @MainActor
+    private static func waitForProviderSnapshotsIdle(
+        _ vm: AgentAppViewModel,
+        timeoutSeconds: Double = 15
+    ) async {
+        let deadline = Date().addingTimeInterval(timeoutSeconds)
+        while vm.providerSnapshotsLoading, Date() < deadline {
+            try? await Task.sleep(for: .milliseconds(50))
         }
     }
 
@@ -355,12 +377,14 @@ public final class ScheduledTaskExecutor {
         // Scheduled Auto is host-bound: only the user-chosen provider may run.
         // Never admit other providers or substitute another host when the saved
         // provider is unavailable (SCHED-005).
+        // Match Agent App Auto admission: requireLiveCatalog is false so
+        // runnable built-in catalogs (e.g. Claude OAuth) are not rejected while
+        // the same Source would still send from the play button.
         let candidateSnapshots = snapshots.filter {
             $0.provider == task.provider
                 && $0.id == task.providerInstanceID
                 && $0.enabled
                 && $0.installed
-                && $0.modelDiscoverySource == .live
                 && $0.capabilities?.supportsStreaming == true
                 && !$0.models.isEmpty
         }
@@ -568,12 +592,15 @@ public final class ScheduledTaskScheduler {
             guard let self else { return }
             defer { tickTask = nil }
             do {
-                try observeRunning(now: now)
-                _ = try store.recoverStaleLeases(now: now)
                 if !didSkipMissedOnLaunch {
+                    // Before any heartbeat: finish prior-process orphans and skip
+                    // past-due fires so relaunch cannot pin a lease forever.
+                    try reclaimOrphanedActiveRuns(now: now)
                     try skipMissedOccurrencesOnLaunch(now: now)
                     didSkipMissedOnLaunch = true
                 }
+                try observeRunning(now: now)
+                _ = try store.recoverStaleLeases(now: now)
                 try reconcileNextRunDates(now: now)
                 // Global travel kill switch — still observe/finish live runs, but
                 // do not claim new automatic occurrences while inactive.
@@ -663,6 +690,60 @@ public final class ScheduledTaskScheduler {
             return (.accepted, nil)
         } catch {
             return (.failed, error.localizedDescription)
+        }
+    }
+
+    /// Finish scheduled runs left from a previous process (force-quit / crash).
+    /// In-process ownership means there is no foreign LaunchAgent to preserve.
+    private func reclaimOrphanedActiveRuns(now: Date) throws {
+        for run in try store.listActiveRuns() {
+            if let threadID = run.threadID {
+                let hasLocalSession = context.coordinator.hasProviderSession(threadId: threadID)
+                    || context.coordinator.activeRunId(threadId: threadID) != nil
+                if hasLocalSession { continue }
+            }
+            if let agentRunID = run.agentRunID, let agentRun = try context.runRepo.get(id: agentRunID) {
+                switch agentRun.status {
+                case .completed:
+                    try store.finish(runID: run.id, status: .completed, at: agentRun.finishedAt ?? now)
+                case .failed, .interrupted:
+                    try store.finish(
+                        runID: run.id,
+                        status: .failed,
+                        errorSummary: agentRun.errorMessage ?? "Scheduled run ended after app restart.",
+                        at: agentRun.finishedAt ?? now
+                    )
+                case .cancelled:
+                    try store.finish(
+                        runID: run.id,
+                        status: .cancelled,
+                        errorSummary: agentRun.errorMessage,
+                        at: agentRun.finishedAt ?? now
+                    )
+                case .pending, .running:
+                    try store.finish(
+                        runID: run.id,
+                        status: .failed,
+                        errorSummary: "Scheduled run did not survive app restart.",
+                        at: now
+                    )
+                }
+            } else if run.status == .queued {
+                try store.finish(
+                    runID: run.id,
+                    status: .cancelled,
+                    errorSummary: "Cancelled on app restart before start.",
+                    at: now
+                )
+            } else {
+                try store.finish(
+                    runID: run.id,
+                    status: .failed,
+                    errorSummary: "Scheduled run did not survive app restart.",
+                    at: now
+                )
+            }
+            ScheduledTaskCrossProcess.notifyStoreChanged(reason: "orphan_reclaimed")
         }
     }
 
