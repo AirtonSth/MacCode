@@ -327,9 +327,14 @@ public final class SidebarViewModel: ObservableObject {
     @Published public private(set) var insomniaAllowSystemSleepWhenDisplayClosed: Bool = false
     @Published public private(set) var insomniaAllowScreenSaverAfter45MinutesOfInactivity: Bool = true
     @Published public private(set) var tokenSaverEnabled: Bool = false
+    /// Graphify runtime gate (Token Saver ∧ preference) for bare-user counterfactual.
+    @Published public private(set) var graphifyRuntimeActive: Bool = false
     @Published public private(set) var tokenSaverUsageSnapshot: TokenSaverUsageSnapshot = .empty()
     /// Saved-token totals from the local DB plus retained report/chart rows.
     @Published public private(set) var tokenSaverSavingsSummary: TokenSaverSavingsSummary = .empty
+    /// Persisted daily credible totals (Week = Σ). Empty until first recompute.
+    @Published public private(set) var tokenSaverDailyEconomyToday: TokenSaverDailyEconomyRecord?
+    @Published public private(set) var tokenSaverDailyEconomyWeekTotal: Int = 0
     @Published public private(set) var tokenSaverProjectGovernance: [TokenSaverProjectGovernance] = []
     @Published public private(set) var tokenSaverGovernanceNotice: String?
     @Published public var showsTokenSaverModelDownload = false
@@ -585,23 +590,34 @@ public final class SidebarViewModel: ObservableObject {
     private func reloadTokenSaver() {
         let settings = settingsStore.load()
         tokenSaverEnabled = settings.tokenSaverEnabled
+        graphifyRuntimeActive = settings.isGraphifyRuntimeActive
         guard let context else {
             tokenSaverHeavyReloadTask?.cancel()
             tokenSaverHeavyReloadTask = nil
             tokenSaverUsageSnapshot = .empty()
             tokenSaverSavingsSummary = .empty
+            tokenSaverDailyEconomyToday = nil
+            tokenSaverDailyEconomyWeekTotal = 0
             return
         }
+        context.recomputeTokenSaverDailyEconomyToday()
         let appSupport = context.appSupportDirectory
-        let repo = context.tokenSaverSavingsRepo
+        let savingsRepo = context.tokenSaverSavingsRepo
+        let economyRepo = context.tokenSaverDailyEconomyRepo
         tokenSaverHeavyReloadTask?.cancel()
         tokenSaverHeavyReloadTask = Task { [weak self] in
-            let result = await Self.loadTokenSaverHeavy(appSupportDirectory: appSupport, repo: repo)
+            let result = await Self.loadTokenSaverHeavy(
+                appSupportDirectory: appSupport,
+                savingsRepo: savingsRepo,
+                economyRepo: economyRepo
+            )
             guard !Task.isCancelled else { return }
             await MainActor.run { [weak self] in
                 guard let self, !Task.isCancelled else { return }
                 self.tokenSaverUsageSnapshot = result.snapshot
                 self.tokenSaverSavingsSummary = result.summary
+                self.tokenSaverDailyEconomyToday = result.economyToday
+                self.tokenSaverDailyEconomyWeekTotal = result.economyWeekTotal
             }
         }
     }
@@ -779,19 +795,27 @@ public final class SidebarViewModel: ObservableObject {
     func reloadTokenSaverAndWait() async {
         let settings = settingsStore.load()
         tokenSaverEnabled = settings.tokenSaverEnabled
+        graphifyRuntimeActive = settings.isGraphifyRuntimeActive
         guard let context else {
             tokenSaverHeavyReloadTask?.cancel()
             tokenSaverHeavyReloadTask = nil
             tokenSaverUsageSnapshot = .empty()
             tokenSaverSavingsSummary = .empty
+            tokenSaverDailyEconomyToday = nil
+            tokenSaverDailyEconomyWeekTotal = 0
             return
         }
+        // Keep today's economy row fresh so Week = Σ dailies stays aligned.
+        context.recomputeTokenSaverDailyEconomyToday()
         let result = await Self.loadTokenSaverHeavy(
             appSupportDirectory: context.appSupportDirectory,
-            repo: context.tokenSaverSavingsRepo
+            savingsRepo: context.tokenSaverSavingsRepo,
+            economyRepo: context.tokenSaverDailyEconomyRepo
         )
         tokenSaverUsageSnapshot = result.snapshot
         tokenSaverSavingsSummary = result.summary
+        tokenSaverDailyEconomyToday = result.economyToday
+        tokenSaverDailyEconomyWeekTotal = result.economyWeekTotal
     }
 
     /// Runs the heavy Token Saver reads off the main actor. `repo` is
@@ -799,12 +823,33 @@ public final class SidebarViewModel: ObservableObject {
     /// a file, so both are safe to call on a background executor.
     private static func loadTokenSaverHeavy(
         appSupportDirectory: URL,
-        repo: TokenSaverSavingsRepository
-    ) async -> (snapshot: TokenSaverUsageSnapshot, summary: TokenSaverSavingsSummary) {
+        savingsRepo: TokenSaverSavingsRepository,
+        economyRepo: TokenSaverDailyEconomyRepository
+    ) async -> (
+        snapshot: TokenSaverUsageSnapshot,
+        summary: TokenSaverSavingsSummary,
+        economyToday: TokenSaverDailyEconomyRecord?,
+        economyWeekTotal: Int
+    ) {
         await Task.detached {
             let snapshot = TokenSaverUsageStore(appSupportDirectory: appSupportDirectory).load()
-            let summary = (try? repo.summary()) ?? .empty
-            return (snapshot, summary)
+            let summary = (try? savingsRepo.summary()) ?? .empty
+            let cal = Calendar.current
+            let now = Date()
+            let todayStart = cal.startOfDay(for: now)
+            let todayMs = Int64(todayStart.timeIntervalSince1970 * 1000)
+            let weekStart = cal.date(byAdding: .day, value: -6, to: todayStart) ?? todayStart
+            let weekStartMs = Int64(weekStart.timeIntervalSince1970 * 1000)
+            let weekEndExclusive = cal.date(byAdding: .day, value: 1, to: todayStart) ?? now
+            let weekEndMs = Int64(weekEndExclusive.timeIntervalSince1970 * 1000)
+            let economyToday = try? economyRepo.record(dayStartMs: todayMs)
+            // Hybrid week: economy days (full formula) + measured-only for pre-feature days.
+            let weekTotal = (try? economyRepo.windowTotalCredible(
+                fromDayStartMs: weekStartMs,
+                toDayStartMs: todayMs,
+                toDayEndMsExclusive: weekEndMs
+            ).total) ?? 0
+            return (snapshot, summary, economyToday, weekTotal)
         }.value
     }
 
@@ -887,6 +932,7 @@ public final class SidebarViewModel: ObservableObject {
             }
             guard confirmed else { return }
             tokenSaverEnabled = false
+            graphifyRuntimeActive = false
             settingsStore.update {
                 $0.tokenSaverEnabled = false
             }
@@ -902,6 +948,7 @@ public final class SidebarViewModel: ObservableObject {
             settingsStore.update {
                 $0.tokenSaverEnabled = true
             }
+            graphifyRuntimeActive = settingsStore.load().isGraphifyRuntimeActive
             refreshTokenSaverDistillService(modelValidation: selectedValidation)
             context?.reconcileGraphifyHost()
             return
@@ -913,6 +960,7 @@ public final class SidebarViewModel: ObservableObject {
             settingsStore.update {
                 $0.tokenSaverEnabled = true
             }
+            graphifyRuntimeActive = settingsStore.load().isGraphifyRuntimeActive
             refreshTokenSaverDistillService(modelValidation: installedFallbackValidation)
             beginTokenSaverModelDownload(reason: selectedValidation.reason)
             context?.reconcileGraphifyHost()
@@ -2091,19 +2139,25 @@ public struct TokenSaverBreakdownRow: Equatable, Sendable {
 
 /// Pure formatter: `TokenSaverSavingsSummary` -> `[TokenSaverBreakdownRow]`.
 ///
-/// Aggregates the per-(provider, mode) rows from `summary.modes` into per-mode
-/// totals (collapsing across providers), then sorts descending by savedTokens so
-/// the most impactful modes appear first. Returns an empty array when
-/// `summary.modes` is empty (zero-state).
+/// Aggregates the per-(provider, mode) rows into per-mode totals (collapsing
+/// across providers), then sorts descending by savedTokens so the most
+/// impactful modes appear first. Prefer `windowed: true` for Today/Week so the
+/// technique mix matches the ring's retained event window; all-time uses
+/// permanent totals.
 public struct TokenSaverBreakdownFormatter {
     public init() {}
 
     /// Returns one `TokenSaverBreakdownRow` per distinct mode, sorted descending
     /// by `savedTokens`. Modes with zero saved tokens are included so the UI can
     /// show them as inactive rather than absent.
-    public func rows(from summary: TokenSaverSavingsSummary) -> [TokenSaverBreakdownRow] {
+    ///
+    /// When `windowed` is nil (default), prefer retained-window technique mix when
+    /// present so Today/Week match the ring; otherwise fall back to all-time modes.
+    public func rows(from summary: TokenSaverSavingsSummary, windowed: Bool? = nil) -> [TokenSaverBreakdownRow] {
+        let useWindow = windowed ?? !summary.windowByMode.isEmpty
+        let source = useWindow ? summary.windowByMode : summary.modes
         var byMode: [String: (saved: Int, runs: Int)] = [:]
-        for m in summary.modes {
+        for m in source {
             let existing = byMode[m.mode] ?? (0, 0)
             byMode[m.mode] = (existing.saved + m.savedTokens, existing.runs + m.runs)
         }
@@ -2775,18 +2829,35 @@ public struct SidebarRootView: View {
 
     private var tokenSaverHeadline: String {
         guard let user = vm.privateAccountUser else { return "Track Claude + Codex + Grok usage" }
+        // Always the active scope (Today or Week) — same formula both ways.
+        let snap = tokenSaverDetailsSnapshot
+        let scope = tokenSaverDetailsScope
+        let bare = tokenSaverBareUserBreakdown(in: snap, scope: scope)
+        let windowUsed = tokenSaverScopeUsedTokens(in: snap, scope: scope)
+        // Lifetime secondary: ledger pipes only (do not mix all-time M with period U).
+        let measuredLifetime = vm.tokenSaverSavingsSummary.totalSavedTokens
         return Self.tokenSaverCardHeadline(
             subscribed: user.subscribed,
             enabled: vm.tokenSaverEnabled,
             sidecarStatus: vm.sidecarStatus,
-            savedTokens: vm.tokenSaverSavingsSummary.totalSavedTokens,
-            usedTokens: vm.tokenSaverUsageSnapshot.usedTokens
+            windowSavedTokens: bare.totalCredible,
+            lifetimeSavedTokens: measuredLifetime,
+            usedTokens: windowUsed
         )
     }
 
     private var tokenSaverSubtitle: String {
         guard let user = vm.privateAccountUser else { return "Sign in to track account usage" }
-        let used = vm.tokenSaverUsageSnapshot.usedTokens
+        let snap = tokenSaverDetailsSnapshot
+        let scope = tokenSaverDetailsScope
+        let bare = tokenSaverBareUserBreakdown(in: snap, scope: scope)
+        let used = tokenSaverScopeUsedTokens(in: snap, scope: scope)
+        if user.subscribed && vm.tokenSaverEnabled {
+            if bare.totalCredible > 0 {
+                return "\(tokenSaverScopeTitle(scope)) vs bare · pipes \(Self.formatTokenCount(bare.measuredToolOutput)) · dialect \(Self.formatTokenCount(bare.estimatedDialect)) · graphify \(Self.formatTokenCount(bare.estimatedGraphify))"
+            }
+            return used > 0 ? "Used \(Self.formatTokenCount(used)) in Claude + Codex + Grok" : "Measuring vs bare agent"
+        }
         if user.subscribed {
             return used > 0 ? "Used \(Self.formatTokenCount(used)) in Claude + Codex + Grok" : "Enable local reduction experiments"
         }
@@ -2794,7 +2865,7 @@ public struct SidebarRootView: View {
     }
 
     private var tokenSaverHelpText: String {
-        "Token Saver shows provider usage and local reduction estimates. Billing claims require joined provider usage evidence."
+        "Credible total vs bare agent: measured tool-output ledger + dialect (output-share calibrated ~0.7%) + Graphify when active (capped). Model-auto is not mixed into tokens. Not billed savings."
     }
 
     private var tokenSaverAccessibilityValue: String {
@@ -2883,12 +2954,18 @@ public struct SidebarRootView: View {
         }
     }
 
+    /// Window-aligned provider usage for savings math. Prefer `snapshot.daily`
+    /// buckets (same retention window as the savings ledger). When buckets are
+    /// empty, return 0 so attributed legs do not inflate from all-time/session.
     private func tokenSaverScopeUsedTokens(in snapshot: TokenSaverUsageSnapshot, scope: TokenSaverUsageScope) -> Int {
         switch scope {
         case .currentSession:
-            return snapshot.providers.reduce(0) { $0 + $1.currentSessionTokens }
+            return TokenSaverBareUserEstimator.todayProviderTokens(
+                daily: snapshot.daily,
+                now: tokenSaverNow
+            )
         case .week:
-            return snapshot.usedTokens
+            return TokenSaverBareUserEstimator.weekProviderTokens(daily: snapshot.daily)
         }
     }
 
@@ -2904,10 +2981,10 @@ public struct SidebarRootView: View {
         scope: TokenSaverUsageScope
     ) -> Double {
         let saved = tokenSaverSavedOrPotential(in: snapshot, scope: scope)
-        return Self.savingsToGoalProgress(
-            savedTokens: saved,
-            goalTokens: tokenSaverSavingsGoalTokens(for: scope)
-        )
+        let used = tokenSaverScopeUsedTokens(in: snapshot, scope: scope)
+        // Self-normalizing sellable metric: share of (saved + used) avoided locally.
+        // Replaces the aspirational 2M/10M absolute goals that left healthy days near empty.
+        return Self.savingsAvoidanceRatio(savedTokens: saved, usedTokens: used)
     }
 
     private func tokenSaverSavedOrPotential(
@@ -2915,15 +2992,15 @@ public struct SidebarRootView: View {
         scope: TokenSaverUsageScope
     ) -> Int {
         if vm.privateAccountUser?.subscribed == true && vm.tokenSaverEnabled {
-            return tokenSaverMeasuredSaved(scope: scope)
+            // Prefer persisted daily economy: Week = Σ(daily.total_credible).
+            return tokenSaverPersistedOrLiveCredible(scope: scope, snapshot: snapshot)
         }
         return TokenSaverUsageStore.estimatePotentialSavings(
             usedTokens: tokenSaverScopeUsedTokens(in: snapshot, scope: scope)
         )
     }
 
-    /// Saved-token totals from the DB ledger. Week shows the retained report
-    /// window; Today uses the current calendar-day bucket.
+    /// Measured tool-output ledger only (no dialect/graphify/orchestration estimates).
     private func tokenSaverMeasuredSaved(scope: TokenSaverUsageScope) -> Int {
         let summary = vm.tokenSaverSavingsSummary
         switch scope {
@@ -2932,6 +3009,86 @@ public struct SidebarRootView: View {
         case .currentSession:
             return Self.tokenSaverTodaySavedTokens(daily: summary.daily, now: tokenSaverNow)
         }
+    }
+
+    /// Today: today's economy row (or live recompute fallback).
+    /// Week: sum of stored daily totals + measured-only for pre-feature days.
+    private func tokenSaverPersistedOrLiveCredible(
+        scope: TokenSaverUsageScope,
+        snapshot: TokenSaverUsageSnapshot
+    ) -> Int {
+        switch scope {
+        case .currentSession:
+            if let today = vm.tokenSaverDailyEconomyToday {
+                return today.totalCredible
+            }
+            return tokenSaverBareUserBreakdown(in: snapshot, scope: scope).totalCredible
+        case .week:
+            // Hybrid sum from load path; if zero (pre-write), fall back to live estimate
+            // on the week window so UI is never empty after first day of the feature.
+            if vm.tokenSaverDailyEconomyWeekTotal > 0 {
+                return vm.tokenSaverDailyEconomyWeekTotal
+            }
+            return tokenSaverBareUserBreakdown(in: snapshot, scope: scope).totalCredible
+        }
+    }
+
+    /// Bare-user counterfactual for the selected window (live compute; also used
+    /// to **write** today's economy row). Week UI prefers Σ(DB days) when present.
+    private func tokenSaverBareUserBreakdown(
+        in snapshot: TokenSaverUsageSnapshot,
+        scope: TokenSaverUsageScope
+    ) -> TokenSaverBareUserBreakdown {
+        // Prefer DB row for today when showing technique stack.
+        if scope == .currentSession, let today = vm.tokenSaverDailyEconomyToday {
+            return TokenSaverBareUserBreakdown(
+                measuredToolOutput: today.measuredTokens,
+                estimatedDialect: today.dialectTokens,
+                estimatedGraphify: today.graphifyTokens,
+                estimatedOrchestration: today.orchestrationTokens,
+                appliedOutputShare: today.appliedOutputShare,
+                usedCalibratedDefaults: true
+            )
+        }
+        return Self.tokenSaverBareUserBreakdown(
+            measuredToolOutputSaved: tokenSaverMeasuredSaved(scope: scope),
+            windowProviderTokens: tokenSaverScopeUsedTokens(in: snapshot, scope: scope),
+            tokenSaverEnabled: vm.tokenSaverEnabled,
+            graphifyActive: vm.graphifyRuntimeActive
+        )
+    }
+
+    /// Pure seam: Day and Week must call the same estimator with window-aligned inputs.
+    ///
+    /// Graphify signals default to **0** until per-window host telemetry is plumbed.
+    /// Passing a fake soft-cap count would make graphify intensity always 1.0 whenever
+    /// the preference is on (not defensible). Prefer under-count over invented M.
+    nonisolated public static func tokenSaverBareUserBreakdown(
+        measuredToolOutputSaved: Int,
+        windowProviderTokens: Int,
+        tokenSaverEnabled: Bool,
+        graphifyActive: Bool,
+        graphifySignalCount: Int = 0,
+        assistantChars: Int = 0,
+        observedOutputTokens: Int? = nil,
+        observedInputTokens: Int? = nil,
+        observationSampleCount: Int = 0
+    ) -> TokenSaverBareUserBreakdown {
+        let observation = TokenSaverBareUserObservation(
+            windowProviderTokens: windowProviderTokens,
+            observedOutputTokens: observedOutputTokens,
+            observedInputTokens: observedInputTokens,
+            observationSampleCount: observationSampleCount,
+            assistantChars: assistantChars,
+            graphifySignalCount: graphifyActive ? max(0, graphifySignalCount) : 0
+        )
+        return TokenSaverBareUserEstimator.estimate(
+            measuredToolOutputSaved: measuredToolOutputSaved,
+            tokenSaverEnabled: tokenSaverEnabled,
+            graphifyActive: graphifyActive,
+            orchestrationActive: false,
+            observation: observation
+        )
     }
 
     /// Measured saved tokens for one provider in the selected scope, read from the
@@ -2977,10 +3134,18 @@ public struct SidebarRootView: View {
         for snapshot: TokenSaverUsageSnapshot,
         scope: TokenSaverUsageScope
     ) -> String {
-        let prefix = vm.privateAccountUser?.subscribed == true && vm.tokenSaverEnabled
-            ? "Estimated save"
-            : "Estimated potential"
-        return "\(prefix) \(Self.formatTokenCount(tokenSaverSavedOrPotential(in: snapshot, scope: scope)))"
+        let bare = tokenSaverBareUserBreakdown(in: snapshot, scope: scope)
+        let saved = bare.totalCredible
+        let used = tokenSaverScopeUsedTokens(in: snapshot, scope: scope)
+        if vm.privateAccountUser?.subscribed == true && vm.tokenSaverEnabled {
+            let ratio = Self.savingsAvoidanceRatio(savedTokens: saved, usedTokens: used)
+            let pct = Int((ratio * 100).rounded())
+            if saved > 0 {
+                return "\(tokenSaverScopeTitle(scope)) \(Self.formatTokenCount(saved)) vs bare · ~\(pct)%"
+            }
+            return "Measuring vs bare agent"
+        }
+        return "Estimated potential \(Self.formatTokenCount(saved))"
     }
 
     private func tokenSaverUsedLimitProgress(
@@ -3155,7 +3320,15 @@ public struct SidebarRootView: View {
 
             Divider()
 
+            // Always-on technique stack for the selected Today/Week scope (same formula).
+            tokenSaverTechniqueStackSection
+
+            Divider()
+
             VStack(alignment: .leading, spacing: DS.Space.sm) {
+                Text("Provider ledger (pipes only)")
+                    .font(DS.Font.captionStrong)
+                    .foregroundColor(DS.Palette.text)
                 // Same usage-desc order as the concentric rings (after Token Saver).
                 ForEach(tokenSaverProvidersByUsage(in: tokenSaverDetailsSnapshot, scope: tokenSaverDetailsScope), id: \.self) { provider in
                     tokenSaverProviderRow(provider: provider)
@@ -3454,7 +3627,7 @@ public struct SidebarRootView: View {
                     .lineLimit(1)
                     .minimumScaleFactor(0.82)
                     .frame(maxWidth: .infinity, alignment: .leading)
-                Text((vm.privateAccountUser?.subscribed == true && vm.tokenSaverEnabled ? "Estimated save " : "Estimated potential ") + Self.formatTokenCount(value))
+                Text((vm.privateAccountUser?.subscribed == true && vm.tokenSaverEnabled ? "Ledger " : "Potential ") + Self.formatTokenCount(value))
                     .font(DS.Font.caption)
                     .foregroundColor(DS.Palette.success)
                     .monospacedDigit()
@@ -3465,8 +3638,59 @@ public struct SidebarRootView: View {
         .accessibilityElement(children: .combine)
     }
 
+    /// Technique stack for Today/Week — always the credible formula breakdown.
+    private var tokenSaverTechniqueStackSection: some View {
+        let bare = tokenSaverBareUserBreakdown(
+            in: tokenSaverDetailsSnapshot,
+            scope: tokenSaverDetailsScope
+        )
+        return VStack(alignment: .leading, spacing: DS.Space.sm) {
+            Text("Vs bare agent (\(tokenSaverScopeTitle(tokenSaverDetailsScope)))")
+                .font(DS.Font.captionStrong)
+                .foregroundColor(DS.Palette.text)
+            tokenSaverTechniqueRow(title: "Pipes (ledger)", detail: "measured", tokens: bare.measuredToolOutput)
+            tokenSaverTechniqueRow(title: "Dialect", detail: String(format: "out share ~%.1f%%", bare.appliedOutputShare * 100), tokens: bare.estimatedDialect)
+            tokenSaverTechniqueRow(title: "Graphify", detail: bare.estimatedGraphify > 0 ? "active · capped" : "off / no signal", tokens: bare.estimatedGraphify)
+            HStack {
+                Text("Total crível")
+                    .font(DS.Font.captionStrong)
+                    .foregroundColor(DS.Palette.text)
+                Spacer(minLength: 0)
+                Text(Self.formatTokenCount(bare.totalCredible))
+                    .font(DS.Font.captionStrong)
+                    .foregroundColor(DS.Palette.success)
+                    .monospacedDigit()
+            }
+            .accessibilityElement(children: .combine)
+            .accessibilityIdentifier("sidebar.tokenSaver.technique.total")
+        }
+        .accessibilityIdentifier("sidebar.tokenSaver.techniqueStack")
+    }
+
+    private func tokenSaverTechniqueRow(title: String, detail: String, tokens: Int) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: DS.Space.sm) {
+            VStack(alignment: .leading, spacing: 1) {
+                Text(title)
+                    .font(DS.Font.captionStrong)
+                    .foregroundColor(DS.Palette.text)
+                    .lineLimit(1)
+                Text(detail)
+                    .font(DS.Font.caption2)
+                    .foregroundColor(DS.Palette.textTertiary)
+                    .lineLimit(1)
+            }
+            Spacer(minLength: 0)
+            Text(Self.formatTokenCount(tokens))
+                .font(DS.Font.caption)
+                .foregroundColor(DS.Palette.success)
+                .monospacedDigit()
+                .lineLimit(1)
+        }
+        .accessibilityElement(children: .combine)
+    }
+
     /// Reconciling row for savings not attributed to Claude/Codex/Grok — direct `distill`
-    /// CLI usage (provider "unknown"). Keeps the visible rows summing to the headline.
+    /// CLI usage (provider "unknown"). Ledger only (does not include dialect/graphify).
     private func tokenSaverOtherSavingsRow(saved: Int, runs: Int) -> some View {
         VStack(alignment: .leading, spacing: 3) {
             HStack(alignment: .firstTextBaseline, spacing: DS.Space.sm) {
@@ -3483,7 +3707,7 @@ public struct SidebarRootView: View {
                     .lineLimit(1)
                     .minimumScaleFactor(0.82)
                     .frame(maxWidth: .infinity, alignment: .leading)
-                Text("Estimated save " + Self.formatTokenCount(saved))
+                Text("Ledger " + Self.formatTokenCount(saved))
                     .font(DS.Font.caption)
                     .foregroundColor(DS.Palette.success)
                     .monospacedDigit()
@@ -3586,21 +3810,27 @@ public struct SidebarRootView: View {
     ///
     /// WHY: when the sidecar is blocked the user sees the same reduction estimate
     /// headline as when everything is healthy, giving no signal that compression
-    /// has stopped. This seam makes the degraded variant testable and explicit.
+    /// has stopped. Windowed measured savings (Today/Week) are the primary number;
+    /// all-time is secondary so the card does not disagree with the ring.
     nonisolated public static func tokenSaverCardHeadline(
         subscribed: Bool,
         enabled: Bool,
         sidecarStatus: TokenSaverDistillServiceStatus,
-        savedTokens: Int,
+        windowSavedTokens: Int,
+        lifetimeSavedTokens: Int,
         usedTokens: Int
     ) -> String {
         if subscribed && enabled {
             if case .blocked = sidecarStatus {
                 return "Token Saver degraded"
             }
-            return savedTokens > 0
-                ? "Estimated save \(Self.formatTokenCountPublic(savedTokens)) tokens"
-                : "Measuring local reduction per agent run"
+            if windowSavedTokens > 0 {
+                return "Est. save \(Self.formatTokenCountPublic(windowSavedTokens)) vs bare agent"
+            }
+            if lifetimeSavedTokens > 0 {
+                return "All-time pipes \(Self.formatTokenCountPublic(lifetimeSavedTokens)) (ledger)"
+            }
+            return "Measuring vs bare agent (Today/Week)"
         }
         if subscribed {
             return "Enable Token Saver"
@@ -3611,8 +3841,27 @@ public struct SidebarRootView: View {
             : "Estimate ready"
     }
 
+    /// Compatibility overload: older call sites that only pass a single saved total
+    /// treat it as the windowed figure (no separate lifetime).
+    nonisolated public static func tokenSaverCardHeadline(
+        subscribed: Bool,
+        enabled: Bool,
+        sidecarStatus: TokenSaverDistillServiceStatus,
+        savedTokens: Int,
+        usedTokens: Int
+    ) -> String {
+        tokenSaverCardHeadline(
+            subscribed: subscribed,
+            enabled: enabled,
+            sidecarStatus: sidecarStatus,
+            windowSavedTokens: savedTokens,
+            lifetimeSavedTokens: savedTokens,
+            usedTokens: usedTokens
+        )
+    }
+
     nonisolated public static let tokenSaverBillingEvidenceDisclaimer =
-        "Local token estimates are diagnostic. They are not billed savings; billing claims require joined provider usage evidence. Experimental lanes remain off or shadow until their gates pass."
+        "Credible estimate vs a bare agent (no RemoteCode). Pipes = local ledger. Dialect uses observed/calibrated output share (~0.7% of usage × verbosity). Graphify only with activity and hard caps. Model-auto is not added as tokens. Local estimates are diagnostic. They are not billed savings; billing claims require joined provider usage evidence."
 
     // Internal alias exposed for the pure seam above. Mirrors `formatTokenCount`
     // which is private; keeping it nonisolated and public lets tests call it.
@@ -3632,12 +3881,13 @@ public struct SidebarRootView: View {
         formatTokenCountPublic(value)
     }
 
+    /// Legacy absolute goals (2M day / 10M week). Kept for tests that still pin the
+    /// product rule; the live ring uses `savingsAvoidanceRatio` instead.
     nonisolated public static func tokenSaverSavingsGoalTokens(isDailyScope: Bool) -> Int {
         isDailyScope ? 2_000_000 : 10_000_000
     }
 
-    /// Ring progress for the Token Saver impact ring. Daily uses a 2M target;
-    /// Week uses a 10M target. The caller passes the target for the current tab.
+    /// Absolute goal progress (legacy). Prefer `savingsAvoidanceRatio` for UI rings.
     nonisolated public static func savingsToGoalProgress(
         savedTokens: Int,
         goalTokens: Int
@@ -3646,6 +3896,20 @@ public struct SidebarRootView: View {
         let goal = max(goalTokens, 1)
         guard saved > 0 else { return 0 }
         return min(Double(saved) / Double(goal), 1)
+    }
+
+    /// Share of the measured (saved + used) mix that was locally reduced.
+    /// Self-normalizing: a healthy day with small absolute savings still reads as a
+    /// meaningful percent instead of 1% of a 2M aspirational goal.
+    nonisolated public static func savingsAvoidanceRatio(
+        savedTokens: Int,
+        usedTokens: Int
+    ) -> Double {
+        let saved = max(0, savedTokens)
+        let used = max(0, usedTokens)
+        let denom = saved + used
+        guard saved > 0, denom > 0 else { return 0 }
+        return min(Double(saved) / Double(denom), 1)
     }
 
     nonisolated public static func tokenSaverDayStartMs(
@@ -3866,8 +4130,10 @@ public struct SidebarRootView: View {
             : savedTokens >= 1_000
                 ? String(format: "%.0fK", Double(savedTokens) / 1_000)
                 : "\(savedTokens)"
-        let goalStr = formatTokenCountPublic(max(savedGoalTokens, 1))
-        return "Token Saver rings, \(scope): estimated save \(savedStr) tokens toward \(goalStr) diagnostic target (\(savedPct)%), Claude used \(claudePct)%, Codex used \(codexPct)%, Grok used \(grokPct)%"
+        // savedProgress is the avoidance ratio (saved / (saved+used)); goal tokens are
+        // legacy a11y context only and no longer drive the ring fill.
+        _ = savedGoalTokens
+        return "Token Saver rings, \(scope): measured save \(savedStr) local tokens, ~\(savedPct)% of tool-plus-usage mix, Claude used \(claudePct)%, Codex used \(codexPct)%, Grok used \(grokPct)%"
     }
 
     /// WHY: concentric rings must read as "biggest usage outer". Token Saver is

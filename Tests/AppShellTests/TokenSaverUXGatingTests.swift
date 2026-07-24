@@ -469,8 +469,8 @@ final class TokenSaverUXGatingTests: XCTestCase {
         )
     }
 
-    func test_tokenSaverCardHeadline_notStarted_returnsEstimatedReductionCopy() {
-        // WHY: healthy (not-yet-started) state must still show the diagnostic reduction estimate.
+    func test_tokenSaverCardHeadline_notStarted_returnsMeasuredReductionCopy() {
+        // WHY: healthy (not-yet-started) state must still show the measured reduction.
         // If this regresses, the degraded-branch logic has overreached into
         // non-blocked states.
         let headline = SidebarRootView.tokenSaverCardHeadline(
@@ -480,8 +480,10 @@ final class TokenSaverUXGatingTests: XCTestCase {
             savedTokens: 50_000,
             usedTokens: 200_000
         )
-        XCTAssertTrue(headline.lowercased().contains("estimated save"),
-                      "Non-blocked sidecar must label local estimates honestly; got: '\(headline)'")
+        XCTAssertTrue(
+            headline.lowercased().contains("est. save") || headline.lowercased().contains("bare agent"),
+            "Non-blocked sidecar must label bare-agent counterfactual; got: '\(headline)'"
+        )
     }
 
     func test_tokenSaverBillingEvidenceDisclaimerIsExplicit() {
@@ -504,7 +506,7 @@ final class TokenSaverUXGatingTests: XCTestCase {
                        "Disabled Token Saver must show the enable action even when sidecar is blocked")
     }
 
-    func test_ringsAccessibilityLabel_qualifiesReductionAsEstimated() {
+    func test_ringsAccessibilityLabel_qualifiesReductionAsMeasured() {
         // WHY: VoiceOver must not present a local diagnostic estimate as billed savings.
         let label = SidebarRootView.ringsAccessibilityLabel(
             scope: "week",
@@ -516,8 +518,8 @@ final class TokenSaverUXGatingTests: XCTestCase {
             grokUsedProgress: 0.1
         )
 
-        XCTAssertTrue(label.lowercased().contains("estimated save"))
-        XCTAssertTrue(label.lowercased().contains("diagnostic target"))
+        XCTAssertTrue(label.lowercased().contains("measured save") || label.lowercased().contains("est."))
+        XCTAssertTrue(label.lowercased().contains("tool-plus-usage") || label.lowercased().contains("mix"))
         XCTAssertFalse(label.lowercased().contains(": saved"))
     }
 

@@ -895,6 +895,25 @@ public enum Schema {
           AND opted_out = 0
           AND retention_days = 0
           AND kill_switch_active = 1;
+        """),
+        // Daily credible economy vs bare agent. Week UI = SUM(total_credible).
+        // Past days without a row stay measured-only (no retroactive rewrite).
+        SchemaStep(53, """
+        CREATE TABLE IF NOT EXISTS token_saver_daily_economy (
+            day_start_ms INTEGER PRIMARY KEY,
+            measured_tokens INTEGER NOT NULL,
+            dialect_tokens INTEGER NOT NULL,
+            graphify_tokens INTEGER NOT NULL,
+            orchestration_tokens INTEGER NOT NULL DEFAULT 0,
+            total_credible INTEGER NOT NULL,
+            window_usage_tokens INTEGER NOT NULL,
+            formula_version TEXT NOT NULL,
+            applied_output_share REAL NOT NULL,
+            graphify_signal_count INTEGER NOT NULL DEFAULT 0,
+            updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_token_saver_daily_economy_updated
+            ON token_saver_daily_economy(updated_at);
         """)
     ]
 
