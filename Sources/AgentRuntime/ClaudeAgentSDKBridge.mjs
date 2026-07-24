@@ -130,12 +130,19 @@ function shellCommandSegments(command) {
     .filter(Boolean);
 }
 
+function stripShellPrefixes(segment) {
+  let text = String(segment || '').trim();
+  // env VAR=val … cmd
+  text = text.replace(/^env(?:\s+-i)?(?:\s+[A-Za-z_][A-Za-z0-9_]*=\S*)*\s+/, '');
+  // FOO=bar BAZ=1 cmd
+  text = text.replace(/^(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)+/, '');
+  return text.trim();
+}
+
 function firstCommandToken(segment) {
-  const text = String(segment || '').trim();
+  const text = stripShellPrefixes(segment);
   if (!text) return '';
-  // Strip common env prefixes: FOO=bar BAZ=1 rg pattern
-  const withoutEnv = text.replace(/^(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)+/, '');
-  const token = withoutEnv.split(/\s+/)[0] || '';
+  const token = text.split(/\s+/)[0] || '';
   // path/to/rg or /usr/bin/grep → basename
   const base = token.split(/[/\\]/).pop() || token;
   return base.toLowerCase();
@@ -144,7 +151,9 @@ function firstCommandToken(segment) {
 function gitExactOutputSubcommand(segment) {
   // git [global options]* (grep|show|cat-file|blame) ...
   // Global options that take a value: -C, -c, --git-dir, --work-tree, --namespace, ...
-  const parts = String(segment || '').trim().split(/\s+/).filter(Boolean);
+  // Apply the same env/prefix stripping as firstCommandToken so
+  // `FOO=bar git show HEAD` is recognized.
+  const parts = stripShellPrefixes(segment).split(/\s+/).filter(Boolean);
   if ((parts[0] || '').toLowerCase().split(/[/\\]/).pop() !== 'git') return null;
   const valueOptions = new Set([
     '-C', '-c', '--git-dir', '--work-tree', '--namespace',
@@ -286,10 +295,18 @@ async function postTokenSaverDistill(state, body) {
     // Preserve store-before-loss recoverability: the agent must see [[rc:handle]]
     // when the sidecar stored the original (AGENTS.md).
     let output = decoded.output;
-    if (typeof decoded.originalHandle === 'string' && decoded.originalHandle.trim()) {
-      output = `${output}\n[[rc:${decoded.originalHandle.trim()}]]`;
-    } else if (typeof decoded.original_handle === 'string' && decoded.original_handle.trim()) {
-      output = `${output}\n[[rc:${decoded.original_handle.trim()}]]`;
+    const handle = (typeof decoded.originalHandle === 'string' && decoded.originalHandle.trim())
+      || (typeof decoded.original_handle === 'string' && decoded.original_handle.trim())
+      || '';
+    if (handle && !output.includes(`[[rc:${handle}]]`)) {
+      // Append only when the marker-inclusive payload is still a net shrink.
+      // Otherwise return null so the hook fails open without replacing tool output
+      // (and without leaving the agent on a lossy body it never chose).
+      const withMarker = `${output}\n[[rc:${handle}]]`;
+      if (withMarker.length >= (body && body.input ? String(body.input).length : withMarker.length + 1)) {
+        return null;
+      }
+      output = withMarker;
     }
     return output;
   } catch (_) {
