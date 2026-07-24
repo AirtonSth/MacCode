@@ -2070,13 +2070,18 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             providerInstanceId: providerInstanceId,
             runAsUser: runAsUser,
             surfaceID: surfaceID,
-            routingConfiguration: nil
+            routingConfiguration: nil,
+            quiet: false
         )
     }
 
     /// Path B / scheduled: same create as Agent App, optional Auto routing config persisted
     /// so `startRun` admits through the shared orchestration path.
-    public func createAgentThread(workspace: WorkspaceID?, title: String, provider: AgentProvider, model: String, permissionMode: AgentPermissionMode, reasoningEffort: AgentReasoningEffort, serviceTier: AgentServiceTier = .auto, modelSelection: AgentModelSelection? = nil, providerInstanceId: String? = nil, runAsUser: AgentRunAsUser? = nil, surfaceID: SurfaceID? = nil, routingConfiguration: AgentRoutingConfiguration?) throws -> AgentThread {
+    ///
+    /// - Parameter quiet: when true (scheduled headless fires), skip rail select and
+    ///   `refreshFromState` so automatic work does not rebuild workspace UI or steal focus.
+    ///   Still persists the thread and publishes `agent.thread.created`.
+    public func createAgentThread(workspace: WorkspaceID?, title: String, provider: AgentProvider, model: String, permissionMode: AgentPermissionMode, reasoningEffort: AgentReasoningEffort, serviceTier: AgentServiceTier = .auto, modelSelection: AgentModelSelection? = nil, providerInstanceId: String? = nil, runAsUser: AgentRunAsUser? = nil, surfaceID: SurfaceID? = nil, routingConfiguration: AgentRoutingConfiguration?, quiet: Bool = false) throws -> AgentThread {
         guard let ctx = context else { throw LayoutError.workspaceNotFound }
         let resolvedRunAs = resolveRunAsUser(runAsUser)
         let t = AgentThread(workspaceId: workspace, title: title, provider: provider,
@@ -2091,10 +2096,12 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         if let workspace {
             _ = try? ctx.threadRepo.enforceWorkspaceThreadLimit(workspaceId: workspace)
         }
-        // Only bind/select the new thread on the requesting surface (if any).
-        // Without a surfaceID this just refreshes rails — a thread created from
-        // one client no longer hijacks every other open agent tab.
-        try selectAgentThread(thread: t.id, surfaceID: surfaceID)
+        if !quiet {
+            // Only bind/select the new thread on the requesting surface (if any).
+            // Without a surfaceID this just refreshes rails — a thread created from
+            // one client no longer hijacks every other open agent tab.
+            try selectAgentThread(thread: t.id, surfaceID: surfaceID)
+        }
         // After rails reload: broadcast create so iOS mirrors and any EventBus
         // subscribers (including Agent App surfaces that listen for thread.*)
         // see scheduled / RPC-created threads immediately.

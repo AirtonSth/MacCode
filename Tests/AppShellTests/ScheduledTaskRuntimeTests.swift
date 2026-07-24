@@ -168,9 +168,11 @@ final class ScheduledTaskRuntimeTests: XCTestCase {
         XCTAssertTrue(source.contains("router.createAgentThread("))
         XCTAssertTrue(source.contains("router.sendAgentMessage("))
         XCTAssertTrue(source.contains("surfaceID: nil"))
+        XCTAssertTrue(source.contains("quiet: true"))
         XCTAssertTrue(source.contains("permissionMode: .fullAccess"))
         XCTAssertTrue(source.contains("interactionMode: .default"))
         XCTAssertTrue(source.contains("orchestrationRoutingSnapshot: prepared.routingSnapshot"))
+        XCTAssertTrue(source.contains("scheduleDispatchPrompt"))
         XCTAssertTrue(source.contains("skipMissedOccurrencesOnLaunch"))
         XCTAssertTrue(source.contains("reclaimOrphanedActiveRuns"))
         XCTAssertFalse(source.contains("openAgentAppForSchedule"))
@@ -181,6 +183,53 @@ final class ScheduledTaskRuntimeTests: XCTestCase {
         XCTAssertFalse(
             source.contains("modelDiscoverySource == .live"),
             "Auto preflight must not be stricter than Agent App (requireLiveCatalog false)"
+        )
+        // Foreign-user Auto must not put the scheduled .sh wrapper in launch configs.
+        XCTAssertTrue(source.contains("launchProviderBinary"))
+        XCTAssertTrue(source.contains("allowlisted provider binary"))
+    }
+
+    func test_scheduleDispatchPrompt_matchesAgentAppFirstTokenNormalization() {
+        // WHY: headless send must not regress `/sam-work`→`$sam-work`, `$goal`→`/goal`,
+        // or `/default body`→`body` that AgentAppViewModel.send applied.
+        let skillSnapshot = AgentProviderSnapshot(
+            id: "codex",
+            provider: .codex,
+            driverKind: .codexCLI,
+            displayName: "Codex",
+            accentColor: "#2F80ED",
+            continuationGroup: "codex",
+            interactionModes: [.default],
+            permissionModes: [.fullAccess],
+            enabled: true,
+            installed: true,
+            status: .available,
+            authenticated: true,
+            binaryPath: "/usr/local/bin/codex",
+            models: [AgentModelDescriptor(id: "m", label: "M", provider: .codex)],
+            slashCommands: ["/goal"],
+            skills: ["sam-work"],
+            capabilities: .conservative
+        )
+        XCTAssertEqual(
+            ScheduledTaskExecutor.scheduleDispatchPrompt("/sam-work DEV-1", providerSnapshot: skillSnapshot),
+            "$sam-work DEV-1"
+        )
+        XCTAssertEqual(
+            ScheduledTaskExecutor.scheduleDispatchPrompt("$goal ship it", providerSnapshot: skillSnapshot),
+            "/goal ship it"
+        )
+        XCTAssertEqual(
+            ScheduledTaskExecutor.scheduleDispatchPrompt("/default Ship the pipeline", providerSnapshot: nil),
+            "Ship the pipeline"
+        )
+        XCTAssertEqual(
+            ScheduledTaskExecutor.scheduleDispatchPrompt("$sam-work DEV-1", providerSnapshot: skillSnapshot),
+            "$sam-work DEV-1"
+        )
+        XCTAssertEqual(
+            ScheduledTaskExecutor.scheduleDispatchPrompt("plain prompt", providerSnapshot: nil),
+            "plain prompt"
         )
     }
 
