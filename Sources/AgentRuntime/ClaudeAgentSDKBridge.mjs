@@ -132,10 +132,15 @@ function shellCommandSegments(command) {
 
 function stripShellPrefixes(segment) {
   let text = String(segment || '').trim();
-  // env VAR=val … cmd
-  text = text.replace(/^env(?:\s+-i)?(?:\s+[A-Za-z_][A-Za-z0-9_]*=\S*)*\s+/, '');
-  // FOO=bar BAZ=1 cmd
-  text = text.replace(/^(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)+/, '');
+  // Peel common launch prefixes until stable: env [-u FOO] VAR=val, FOO=bar,
+  // quoted assignments, command/builtin/exec wrappers.
+  let previous = null;
+  while (previous !== text) {
+    previous = text;
+    text = text.replace(/^env(?:\s+(?:-[a-zA-Z]\S*|--\S+))*(?:\s+[A-Za-z_][A-Za-z0-9_]*=(?:"[^"]*"|'[^']*'|\S*))*\s+/, '');
+    text = text.replace(/^(?:[A-Za-z_][A-Za-z0-9_]*=(?:"[^"]*"|'[^']*'|\S*)\s+)+/, '');
+    text = text.replace(/^(?:command|builtin|exec)\s+/, '');
+  }
   return text.trim();
 }
 
