@@ -133,6 +133,37 @@ final class ProviderEnvironmentAttributionTests: XCTestCase {
         XCTAssertNotNil(claude["REMOTE_CODE_DISTILL_STATE_PATH"])
     }
 
+    /// WHY: production threads are often projectless (project_id nil). Previously
+    /// recovery headers required full project admission, so PATH distill never got
+    /// scope and store-before-loss forced every compression to verbatim.
+    @MainActor
+    func test_tokenSaverAgentEnvironment_injectsWorkspaceFallbackScopeForProjectlessThread() throws {
+        let appSupport = NSTemporaryDirectory() + "RC2TSEnvProjectless-" + UUID().uuidString
+        let ctx = try AppContext(channel: .debug, appSupportOverride: appSupport)
+        SettingsStore(db: ctx.db).update { $0.tokenSaverEnabled = true }
+        ctx.reconcileManagedDistillSkills(tokenSaverEnabled: true)
+        let workspaceID = WorkspaceID()
+        let thread = AgentThread(
+            projectId: nil,
+            workspaceId: workspaceID,
+            title: "projectless",
+            provider: .codex,
+            model: "test",
+            status: .completed
+        )
+        try ctx.threadRepo.upsert(thread)
+
+        let env = ctx.tokenSaverAgentEnvironment(provider: .codex, threadId: thread.id)
+        XCTAssertEqual(env["RC_TOKEN_SAVER_DISTILL_HINT"], "1")
+        XCTAssertEqual(env["RC_TOKEN_SAVER_WORKSPACE_ID"], workspaceID.value.uuidString)
+        XCTAssertEqual(
+            env["RC_TOKEN_SAVER_PROJECT_ID"],
+            workspaceID.value.uuidString,
+            "projectless threads must use workspace id as recovery project key"
+        )
+        XCTAssertEqual(env["RC_TOKEN_SAVER_THREAD_ID"], thread.id.value.uuidString)
+    }
+
     /// Transparent command wrappers only help Codex/Claude provider shells if the managed bin
     /// directory wins PATH lookup inside the provider process. With Token Saver on,
     /// providerEnvironment prepends managed bin so `| distill` and wrappers resolve.

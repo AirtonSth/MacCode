@@ -80,6 +80,9 @@ struct RemoteCodeDistillServiceMain {
             // /v1/retrieve reads exactly what store-before-loss wrote (DB-path parity).
             let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: configuration.appSupportDirectory).run()
             let savingsRepo = TokenSaverSavingsRepository(db: db)
+            // Unscoped CCR path: command-output store-before-loss fallback when
+            // project-scoped lane retention is unavailable (projectless threads).
+            let reversibleStore = SidecarReversibleStore(store: ReversibleContentStore(db: db))
             let scopedRecoveryStore = SidecarScopedRecoveryStore(
                 worker: TokenSaverRuntimeRecoveryWorker(db: db),
                 store: TokenSaverScopedRecoveryStore(db: db),
@@ -87,7 +90,15 @@ struct RemoteCodeDistillServiceMain {
             )
             let statsProvider = SidecarDistillStatsProvider(repository: savingsRepo)
             let eventWriter = DistillSidecarEventWriter()
-            let server = DistillHTTPServer(configuration: configuration, scheduler: scheduler, scopedRecoveryStore: scopedRecoveryStore, statsProvider: statsProvider, startsReady: false, metricsRecorder: sharedMetrics) { request, response in
+            let server = DistillHTTPServer(
+                configuration: configuration,
+                scheduler: scheduler,
+                reversibleStore: reversibleStore,
+                scopedRecoveryStore: scopedRecoveryStore,
+                statsProvider: statsProvider,
+                startsReady: false,
+                metricsRecorder: sharedMetrics
+            ) { request, response in
                 guard let record = DistillSavingsCalculator.record(for: request, response: response) else {
                     return
                 }

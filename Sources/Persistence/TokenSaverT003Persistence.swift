@@ -1281,6 +1281,7 @@ public final class TokenSaverRuntimeRecoveryWorker: @unchecked Sendable {
 
     private func authoritativeRetentionDays(projectID: String, lane: String) throws -> Int? {
         try db.performSync { database in
+            // Fully promoted + scorecarded lane: authoritative product retention.
             let statement = try database.prepare("""
                 SELECT retention_days FROM token_saver_lane_state
                 WHERE project_id = ? AND state = 'promoted'
@@ -1294,7 +1295,65 @@ public final class TokenSaverRuntimeRecoveryWorker: @unchecked Sendable {
             defer { statement.reset() }
             try statement.bind(1, projectID)
             try statement.bind(2, lane)
-            return try statement.step() ? Int(statement.columnInt64(0)) : nil
+            if try statement.step() {
+                return Int(statement.columnInt64(0))
+            }
+
+            // Explicit governance without full scorecard:
+            // - project_opted_out / verbatim_forced: hard deny
+            // - factory ensureDefaults (reason=owner_and_scorecard_required,
+            //   kill_switch=1, retention=0): still allow a 7d recovery window for
+            //   deterministic_wrapper so core tool-output Token Saver works until
+            //   scorecards promote; experimental semantic lanes stay fail-closed
+            // - positive retention_days: honor even without scorecard
+            let explicit = try database.prepare("""
+                SELECT retention_days, opted_out, kill_switch_active, reason
+                FROM token_saver_lane_state
+                WHERE project_id = ? AND lane = ?
+                LIMIT 1;
+            """)
+            defer { explicit.reset() }
+            try explicit.bind(1, projectID)
+            try explicit.bind(2, lane)
+            if try explicit.step() {
+                let retentionDays = Int(explicit.columnInt64(0))
+                let optedOut = explicit.columnInt64(1) != 0
+                let killSwitch = explicit.columnInt64(2) != 0
+                let reason = (explicit.columnText(3) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+                if optedOut || reason == "project_opted_out" || reason == "verbatim_forced" {
+                    return nil
+                }
+                // Integrity failures and force-verbatim set kill_switch while often
+                // leaving retention_days > 0. Kill switch must deny before we honor
+                // a positive retention value — except the unrepaired factory seed
+                // (kill still on + retention 0 + owner_and_scorecard_required).
+                if killSwitch && !(lane == "deterministic_wrapper"
+                    && reason == "owner_and_scorecard_required"
+                    && retentionDays <= 0) {
+                    return nil
+                }
+                if retentionDays > 0 {
+                    return retentionDays
+                }
+                // Soft default only for unrepaired factory seed shape. After repair
+                // (kill off) an operator-chosen retention_days=0 stays denied.
+                if lane == "deterministic_wrapper",
+                   reason == "owner_and_scorecard_required",
+                   killSwitch {
+                    return 7
+                }
+                if killSwitch || retentionDays <= 0 {
+                    return nil
+                }
+            }
+
+            // No lane row: tool-output wrapper still gets a default recovery window
+            // so projectless threads can store-before-loss. Semantic prose stays
+            // fail-closed until promoted.
+            if lane == "deterministic_wrapper" {
+                return 7
+            }
+            return nil
         }
     }
 }
@@ -2442,6 +2501,26 @@ public final class TokenSaverLaneStateRepository: @unchecked Sendable {
         try db.performSync { database in
             try database.transaction {
                 try self.insertDefaults(database: database, projectID: projectID)
+                // Upgrade pre-fix factory rows that INSERT OR IGNORE left at
+                // retention_days=0 (store-before-loss durable readback requires >0).
+                // Only unrepaired factory seeds (kill still on + retention 0). Do not
+                // resurrect an operator-chosen retention_days=0 after kill was cleared.
+                let repair = try database.prepare("""
+                    UPDATE token_saver_lane_state
+                    SET retention_days = 7,
+                        kill_switch_active = 0,
+                        updated_at_ms = ?
+                    WHERE project_id = ?
+                      AND lane = 'deterministic_wrapper'
+                      AND reason = 'owner_and_scorecard_required'
+                      AND opted_out = 0
+                      AND retention_days = 0
+                      AND kill_switch_active = 1;
+                """)
+                defer { repair.reset() }
+                try repair.bind(1, Int64(Date().timeIntervalSince1970 * 1_000))
+                try repair.bind(2, projectID)
+                _ = try repair.step()
             }
         }
     }
@@ -2508,7 +2587,10 @@ public final class TokenSaverLaneStateRepository: @unchecked Sendable {
         let defaults: [(lane: String, state: String, reason: String, evidence: String, owner: String, retention: Int, killSwitch: Bool)] = [
             ("measurement", "shadow_only", "content_free_exact_scope_observation_only", "diagnostic_heuristic", "Measurement Owner", 0, false),
             ("provider_native", "shadow_only", "shadow_observation_no_provider_behavior_change", "unavailable", "Provider Compatibility Owner", 0, true),
-            ("deterministic_wrapper", "off", "owner_and_scorecard_required", "unavailable", "Operations Owner", 0, true),
+            // Core tool-output Token Saver must retain a recovery window even before
+            // scorecard promotion. retention=0 + kill_switch here previously made
+            // every store-before-loss prepare fail durable readback after ensureDefaults.
+            ("deterministic_wrapper", "off", "owner_and_scorecard_required", "unavailable", "Operations Owner", 7, false),
             ("exact_repetition", "off", "owner_and_scorecard_required", "unavailable", "Security Owner", 0, true),
             ("lexical_retrieval", "off", "owner_and_scorecard_required", "unavailable", "Product Owner", 0, true),
             ("rollover_capsule", "off", "owner_and_scorecard_required", "unavailable", "Provider Compatibility Owner", 0, true),

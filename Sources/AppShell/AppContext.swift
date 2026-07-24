@@ -859,12 +859,15 @@ public final class AppContext {
             let pathParts = currentPath.split(separator: ":").map(String.init).filter { $0 != managedBin }
             env["PATH"] = ([managedBin] + pathParts).joined(separator: ":")
         }
-        if tokenSaverProjectAdmission(threadId: threadId, lane: "deterministic_wrapper").allowed,
-           let thread = try? threadRepo.get(id: threadId),
-           let workspaceID = thread.workspaceId?.value.uuidString,
-           let projectID = thread.projectId?.value.uuidString {
+        // Recovery scope for store-before-loss: inject whenever Token Saver is on
+        // and the thread has a workspace. Do not wait for full project admission /
+        // scorecard promotion — that gate left projectless threads with zero
+        // recovery headers and forced every lossy distill to verbatim. When the
+        // thread has no project_id, the workspace id is the recovery project key.
+        if let thread = try? threadRepo.get(id: threadId),
+           let workspaceID = thread.workspaceId?.value.uuidString {
             env["RC_TOKEN_SAVER_WORKSPACE_ID"] = workspaceID
-            env["RC_TOKEN_SAVER_PROJECT_ID"] = projectID
+            env["RC_TOKEN_SAVER_PROJECT_ID"] = thread.projectId?.value.uuidString ?? workspaceID
             env["RC_TOKEN_SAVER_THREAD_ID"] = threadId.value.uuidString
         }
         if provider == .claude {

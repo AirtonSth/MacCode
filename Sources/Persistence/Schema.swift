@@ -9,7 +9,7 @@ public struct SchemaStep {
 }
 
 public enum Schema {
-    public static let currentVersion: Int = 51
+    public static let currentVersion: Int = 52
 
     public static let steps: [SchemaStep] = [
         SchemaStep(1, """
@@ -881,6 +881,20 @@ public enum Schema {
         ALTER TABLE scheduled_tasks
         ADD COLUMN routing_mode TEXT NOT NULL DEFAULT 'manual'
             CHECK(routing_mode IN ('manual', 'auto'));
+        """),
+        // Repair factory deterministic_wrapper rows seeded with retention_days=0
+        // (and kill_switch=1) before Token Saver store-before-loss could durable-
+        // readback. INSERT OR IGNORE never upgrades those rows; without this
+        // migration every ensureDefaults install stays permanently verbatim.
+        SchemaStep(52, """
+        UPDATE token_saver_lane_state
+        SET retention_days = 7,
+            kill_switch_active = 0
+        WHERE lane = 'deterministic_wrapper'
+          AND reason = 'owner_and_scorecard_required'
+          AND opted_out = 0
+          AND retention_days = 0
+          AND kill_switch_active = 1;
         """)
     ]
 

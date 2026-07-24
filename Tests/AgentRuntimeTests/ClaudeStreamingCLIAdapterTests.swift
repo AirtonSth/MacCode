@@ -1704,8 +1704,14 @@ final class ClaudeStreamingCLIAdapterTests: ProviderProcessTestCase {
         // small"); it must remain AND so output compresses when EITHER threshold trips.
         XCTAssertTrue(source.contains("<= TOKEN_SAVER_MIN_BYTES && lineCount(output) <= TOKEN_SAVER_MIN_LINES"),
                       "skip guard must stay AND so a >1KB OR >10-line output is compressed")
-        XCTAssertTrue(source.contains("TOKEN_SAVER_EXCLUDED_TOOLS = new Set(['read', 'edit', 'write', 'multiedit', 'notebookedit'])"),
-                      "only exact-byte file tools are exempt (compressing them would break verbatim edits)")
+        XCTAssertTrue(source.contains("TOKEN_SAVER_EXCLUDED_TOOLS = new Set(['read', 'edit', 'write', 'multiedit', 'notebookedit', 'grep'])"),
+                      "exact-byte file tools and Grep are exempt (compressing them would break line-level agent work)")
+        XCTAssertTrue(source.contains("TOKEN_SAVER_EXACT_OUTPUT_BASH"),
+                      "Bash must skip exact-output shell tools (rg/grep/sed/...) per AGENTS.md")
+        XCTAssertTrue(source.contains("isExactOutputBashCommand"),
+                      "Bash exact-output detection must inspect command segments, not only the first token")
+        XCTAssertTrue(source.contains("updatedToolOutput"),
+                      "PostToolUse must use updatedToolOutput so built-in tools actually receive compressed output")
     }
 
     func test_agentSDKBridgeRecoversRawNewlineSplitPromptCommand() throws {

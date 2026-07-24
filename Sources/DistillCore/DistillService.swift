@@ -957,28 +957,49 @@ public final class DistillHTTPServer: @unchecked Sendable {
     /// Recover a byte-exact original previously stored via store-before-loss (N5).
     /// Returns 200 {found:true, original} when present, 404 {found:false} otherwise
     /// — never empty/hang (a typed "original unavailable").
+    ///
+    /// Authorization: recovery **scope headers** are required to look up either
+    /// store. Bearer alone never authorizes raw-SHA retrieve (wave -1): when the
+    /// unscoped reversible store is configured, missing scope is 403
+    /// `recovery_scope_required`. Scoped-only deployments keep the historical
+    /// 404 miss when scope headers are absent.
     private func handleRetrieve(request: HTTPRequest, connection: NWConnection) {
         let handle = String(request.path.dropFirst("/v1/retrieve/".count))
-        guard let scopedRecoveryStore,
-              let context = recoveryContext(headers: request.headers, requiresOperationID: false),
-              !handle.isEmpty else {
+        guard !handle.isEmpty else {
+            send(status: 404, body: RetrieveResponse(handle: handle, found: false, original: nil), connection: connection)
+            return
+        }
+        guard let context = recoveryContext(headers: request.headers, requiresOperationID: false) else {
+            // Wave -1: bearer alone must not authorize raw-SHA content lookup.
             if reversibleStore != nil {
-                send(status: 403, body: ErrorBody(error: "recovery_scope_required", message: "scoped recovery capability required"), connection: connection)
+                send(
+                    status: 403,
+                    body: ErrorBody(
+                        error: "recovery_scope_required",
+                        message: "scoped recovery capability required"
+                    ),
+                    connection: connection
+                )
                 return
             }
             send(status: 404, body: RetrieveResponse(handle: handle, found: false, original: nil), connection: connection)
             return
         }
-        do {
-            guard let data = try scopedRecoveryStore.retrieveOriginal(capability: handle, context: context),
-                  let original = String(data: data, encoding: .utf8) else {
-                send(status: 404, body: RetrieveResponse(handle: handle, found: false, original: nil), connection: connection)
-                return
+        // Scoped capabilities only. Do not serve residual content-addressed SHA
+        // rows from reversibleStore: headers are not bound to those blobs, so any
+        // process with the local bearer + a predicted hash could cross-read.
+        if let scopedRecoveryStore {
+            do {
+                if let data = try scopedRecoveryStore.retrieveOriginal(capability: handle, context: context),
+                   let original = String(data: data, encoding: .utf8) {
+                    send(status: 200, body: RetrieveResponse(handle: handle, found: true, original: original), connection: connection)
+                    return
+                }
+            } catch {
+                // typed miss below
             }
-            send(status: 200, body: RetrieveResponse(handle: handle, found: true, original: original), connection: connection)
-        } catch {
-            send(status: 404, body: RetrieveResponse(handle: handle, found: false, original: nil), connection: connection)
         }
+        send(status: 404, body: RetrieveResponse(handle: handle, found: false, original: nil), connection: connection)
     }
 
     private func recoveryContext(headers: [String: String], requiresOperationID: Bool) -> TokenSaverRecoveryRequestContext? {
@@ -1055,13 +1076,13 @@ public final class DistillHTTPServer: @unchecked Sendable {
             var response = compressed
             if distillRequest.effectiveRunMode == .optimize,
                compressed.output != distillRequest.input {
-                // Store-before-loss (T-003 unscoped-loss containment): a lossy
-                // optimize output may only be served when it is backed by a
-                // scope-bound recovery handle. Any other case — no/incomplete
-                // scope, missing scoped store, a store prepare/readback/deliver
-                // failure, or a lookup error that cleared the scope above — must
-                // fail open to the byte-exact original, never an unrecoverable
-                // lossy summary. (Raw SHA is not an authorization grant.)
+                // Store-before-loss (T-003): a lossy optimize output may only be
+                // served when backed by a scope-bound recovery handle. Do NOT fall
+                // back to unscoped SHA storage after a scoped prepare failure —
+                // that would bypass opt-out / kill / retention=0 governance and
+                // emit handles that bearer-only retrieve must default-deny.
+                // Missing/incomplete scope, prepare failure, or readback failure
+                // all fail open to the byte-exact original.
                 var deliveredWithHandle = false
                 if let scopedContext, let scopedRecoveryStore {
                     do {

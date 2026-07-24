@@ -16,6 +16,10 @@ final class DistillReversibleStoreServiceTests: XCTestCase {
         private var operationIDs: [String] = []
         private var lastCapability = ""
         private(set) var preparedLane: String?
+        /// Test seam: force prepareOriginal to throw so command-output unscoped fallback runs.
+        var failPrepare = false
+
+        private struct ForcedPrepareError: Error {}
 
         var capability: String {
             lock.lock(); defer { lock.unlock() }
@@ -30,6 +34,7 @@ final class DistillReversibleStoreServiceTests: XCTestCase {
 
         func prepareOriginal(_ data: Data, context: TokenSaverRecoveryRequestContext, lane: String) throws -> TokenSaverScopedPreparation {
             lock.lock(); defer { lock.unlock() }
+            if failPrepare { throw ForcedPrepareError() }
             operationIDs.append(context.operationID)
             preparedLane = lane
             let capability = "rcv1.\(UUID().uuidString.lowercased()).\(UUID().uuidString.lowercased())"
@@ -209,6 +214,93 @@ final class DistillReversibleStoreServiceTests: XCTestCase {
         XCTAssertEqual(result.status, 200)
         XCTAssertEqual(response.output, original)
         XCTAssertNil(response.originalHandle)
+    }
+
+    /// WHY: after a scoped prepare failure (opt-out / kill / retention deny),
+    /// the server must NOT fall through to unscoped storage — that would bypass
+    /// project governance and emit unrecoverable lossy output.
+    func test_commandOutputOptimize_scopedPrepareFailure_doesNotBypassWithUnscopedStore() async throws {
+        let unscoped = InMemoryReversibleStore()
+        let scoped = InMemoryScopedStore()
+        scoped.failPrepare = true
+        let configuration = try DistillServiceConfiguration(
+            authToken: "tok",
+            appSupportDirectory: NSTemporaryDirectory()
+        )
+        let server = DistillHTTPServer(
+            configuration: configuration,
+            scheduler: DistillScheduler(runtime: DiscardingRuntime(), maxConcurrentRequests: 2),
+            reversibleStore: unscoped,
+            scopedRecoveryStore: scoped,
+            reversibleStoreMinBytes: 1
+        )
+        let ready = try await server.start()
+        defer { server.stop() }
+
+        let original = "must stay verbatim when scoped prepare is denied"
+        let scopeHeaders = [
+            "X-RemoteCode-Workspace-ID": "workspace",
+            "X-RemoteCode-Project-ID": "project",
+            "X-RemoteCode-Thread-ID": "thread",
+            "X-RemoteCode-Provider": "codex",
+            "X-RemoteCode-Attempt-ID": "attempt",
+            "X-RemoteCode-Invocation-ID": "invocation-deny",
+            "X-RemoteCode-Operation-ID": "operation-deny",
+        ]
+        let distill = try await http(
+            ready.baseURL + "/v1/distill",
+            method: "POST",
+            token: "tok",
+            body: try JSONEncoder().encode(DistillRequest(
+                mode: .commandOutput,
+                input: original,
+                runMode: .optimize,
+                maxOutputCharacters: 64
+            )),
+            headers: scopeHeaders
+        )
+        let response = try JSONDecoder().decode(DistillResponse.self, from: distill.data)
+        XCTAssertEqual(response.output, original, "governance deny must fail open to the exact original")
+        XCTAssertNil(response.originalHandle)
+        XCTAssertEqual(unscoped.storeCount, 0, "must not write unscoped after scoped prepare failure")
+    }
+
+    /// WHY: residual content-addressed SHA rows must NOT be served just because
+    /// any non-empty scope headers are present — that is not scope-bound authz.
+    func test_residualUnscopedSHA_isNotServedEvenWithFabricatedScope() async throws {
+        let unscoped = InMemoryReversibleStore()
+        let seeded = "historical unscoped original"
+        let handle = try unscoped.storeOriginal(Data(seeded.utf8))
+        let configuration = try DistillServiceConfiguration(
+            authToken: "tok",
+            appSupportDirectory: NSTemporaryDirectory()
+        )
+        let server = DistillHTTPServer(
+            configuration: configuration,
+            scheduler: DistillScheduler(runtime: LocalDistillRuntime(), maxConcurrentRequests: 1),
+            reversibleStore: unscoped,
+            scopedRecoveryStore: InMemoryScopedStore()
+        )
+        let ready = try await server.start()
+        defer { server.stop() }
+
+        let bare = try await http(ready.baseURL + "/v1/retrieve/\(handle)", token: "tok")
+        XCTAssertEqual(bare.status, 403)
+
+        let scoped = try await http(
+            ready.baseURL + "/v1/retrieve/\(handle)",
+            token: "tok",
+            headers: [
+                "X-RemoteCode-Workspace-ID": "workspace",
+                "X-RemoteCode-Project-ID": "project",
+                "X-RemoteCode-Thread-ID": "thread",
+                "X-RemoteCode-Provider": "codex",
+                "X-RemoteCode-Attempt-ID": "attempt",
+            ]
+        )
+        XCTAssertEqual(scoped.status, 404, "SHA rows are not scope-bound; do not serve them")
+        let bodyText = String(data: scoped.data, encoding: .utf8) ?? ""
+        XCTAssertFalse(bodyText.contains(seeded))
     }
 
     func test_scopedOptimizeEmitsCapabilityAndManagedCLIRetrievesWithExactFiveFieldScope() async throws {

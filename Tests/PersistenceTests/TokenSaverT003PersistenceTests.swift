@@ -35,7 +35,7 @@ final class TokenSaverT003PersistenceTests: XCTestCase {
 
         try Schema.migrate(db)
 
-        XCTAssertEqual(Schema.currentVersion, 49)
+        XCTAssertEqual(Schema.currentVersion, 52)
         XCTAssertEqual(try count(db, table: "rc_reversible_content"), 1, "migration preserves legacy bytes for explicit user-approved reattachment")
         XCTAssertEqual(try count(db, table: "token_saver_recovery_objects"), 0, "legacy hashes never receive fabricated scope or capability")
         XCTAssertEqual(try count(db, table: "token_saver_attempts"), 0)
@@ -858,8 +858,15 @@ final class TokenSaverT003PersistenceTests: XCTestCase {
         XCTAssertEqual(states.first { $0.lane == "measurement" }?.retentionDays, 0)
         XCTAssertEqual(states.first { $0.lane == "provider_native" }?.state, "shadow_only")
         XCTAssertEqual(states.first { $0.lane == "provider_native" }?.retentionDays, 0)
-        XCTAssertTrue(states.filter { !["measurement", "provider_native"].contains($0.lane) }
-            .allSatisfy { $0.state == "off" && $0.killSwitchActive })
+        // Core tool-output wrapper keeps a recovery window and is not kill-switched
+        // by default so store-before-loss works before scorecard promotion.
+        let wrapper = try XCTUnwrap(states.first { $0.lane == "deterministic_wrapper" })
+        XCTAssertEqual(wrapper.state, "off")
+        XCTAssertEqual(wrapper.retentionDays, 7)
+        XCTAssertFalse(wrapper.killSwitchActive)
+        XCTAssertTrue(states.filter {
+            !["measurement", "provider_native", "deterministic_wrapper"].contains($0.lane)
+        }.allSatisfy { $0.state == "off" && $0.killSwitchActive })
         XCTAssertTrue(states.allSatisfy { $0.ownerRole.hasPrefix("unassigned:") })
         XCTAssertTrue(states.allSatisfy {
             !$0.attributionJoined && !$0.reconciliationPassed
@@ -911,6 +918,138 @@ final class TokenSaverT003PersistenceTests: XCTestCase {
         XCTAssertTrue(try repo.delete(childThreadID: "child"))
         XCTAssertNil(try repo.get(childThreadID: "child"))
         XCTAssertFalse(try repo.delete(childThreadID: "child"))
+    }
+
+    /// WHY: with zero project lane scorecards, prepareOriginal used to throw
+    /// retentionDisabled for every deterministic_wrapper call — store-before-loss
+    /// then forced all tool-output compression to verbatim (0 savings). A default
+    /// 7-day retention for that lane (unless explicitly denied) unblocks Token Saver.
+    func test_runtimeRecovery_defaultDeterministicWrapperRetentionWithoutScorecard() throws {
+        let db = try makeDB()
+        let worker = TokenSaverRuntimeRecoveryWorker(db: db)
+        let retentionStart = Date(timeIntervalSince1970: 2_000)
+        let prepared = try worker.prepareOriginal(
+            Data("wrapper-default".utf8),
+            scope: scope(),
+            operationID: "wrapper-default-op",
+            lane: "deterministic_wrapper",
+            expiresAt: nil,
+            disk: disk,
+            now: retentionStart
+        )
+        XCTAssertEqual(
+            try scalar(db, sql: "SELECT COUNT(*) FROM token_saver_recovery_objects WHERE id = '\(prepared.objectID)';"),
+            1
+        )
+        XCTAssertEqual(
+            try scalar(db, sql: "SELECT expires_at_ms FROM token_saver_recovery_objects WHERE id = '\(prepared.objectID)';"),
+            Int(retentionStart.addingTimeInterval(7 * 86_400).timeIntervalSince1970 * 1_000)
+        )
+        XCTAssertThrowsError(try worker.prepareOriginal(
+            Data("semantic-default".utf8),
+            scope: scope(),
+            operationID: "semantic-default-op",
+            lane: "semantic_prose",
+            expiresAt: Date().addingTimeInterval(60),
+            disk: disk,
+            now: retentionStart
+        )) { XCTAssertEqual($0 as? TokenSaverRecoveryStoreError, .retentionDisabled) }
+    }
+
+    /// WHY: ensureDefaults used to insert deterministic_wrapper with retention=0,
+    /// which made store-before-loss prepare fail durable readback (retrieve SQL
+    /// requires retention_days > 0). Factory defaults must keep a 7d recovery window.
+    func test_runtimeRecovery_factoryDefaultsAllowWrapperPrepareAndReadback() throws {
+        let db = try makeDB()
+        try TokenSaverLaneStateRepository(db: db).ensureDefaults(projectID: "p")
+        let worker = TokenSaverRuntimeRecoveryWorker(db: db)
+        let original = Data("factory-default-wrapper".utf8)
+        let prepared = try worker.prepareOriginal(
+            original,
+            scope: scope(),
+            operationID: "factory-wrapper-op",
+            lane: "deterministic_wrapper",
+            expiresAt: nil,
+            disk: disk,
+            now: Date(timeIntervalSince1970: 3_000)
+        )
+        XCTAssertFalse(prepared.capability.isEmpty)
+        XCTAssertEqual(
+            try TokenSaverScopedRecoveryStore(db: db).retrieve(
+                capability: prepared.capability,
+                scope: scope(),
+                now: Date(timeIntervalSince1970: 3_000)
+            ),
+            original
+        )
+
+        try TokenSaverLaneStateRepository(db: db).forceVerbatim(projectID: "p")
+        XCTAssertThrowsError(try worker.prepareOriginal(
+            Data("forced-verbatim".utf8),
+            scope: scope(),
+            operationID: "forced-op",
+            lane: "deterministic_wrapper",
+            expiresAt: nil,
+            disk: disk
+        )) { XCTAssertEqual($0 as? TokenSaverRecoveryStoreError, .retentionDisabled) }
+    }
+
+    /// WHY: installs that already ran ensureDefaults before the factory-default
+    /// fix keep retention_days=0 rows (INSERT OR IGNORE). ensureDefaults + schema
+    /// step 52 must repair those so store-before-loss works after upgrade.
+    func test_ensureDefaults_repairsLegacyFactoryWrapperRetentionZero() throws {
+        let db = try makeDB()
+        // Simulate pre-fix factory seed.
+        try db.execute("""
+            INSERT INTO token_saver_lane_state
+                (project_id, lane, state, reason, evidence_level, owner_role,
+                 permission_boundary, retention_days, opted_out, kill_switch_active, updated_at_ms)
+            VALUES ('p', 'deterministic_wrapper', 'off', 'owner_and_scorecard_required',
+                    'unavailable', 'unassigned:Operations Owner', 'project', 0, 0, 1, 1);
+        """)
+        try TokenSaverLaneStateRepository(db: db).ensureDefaults(projectID: "p")
+        let row = try XCTUnwrap(try TokenSaverLaneStateRepository(db: db).get(
+            projectID: "p",
+            lane: "deterministic_wrapper"
+        ))
+        XCTAssertEqual(row.retentionDays, 7)
+        XCTAssertFalse(row.killSwitchActive)
+
+        let original = Data("legacy-repair".utf8)
+        let prepared = try TokenSaverRuntimeRecoveryWorker(db: db).prepareOriginal(
+            original,
+            scope: scope(),
+            operationID: "legacy-repair-op",
+            lane: "deterministic_wrapper",
+            expiresAt: nil,
+            disk: disk,
+            now: Date(timeIntervalSince1970: 4_000)
+        )
+        XCTAssertEqual(
+            try TokenSaverScopedRecoveryStore(db: db).retrieve(
+                capability: prepared.capability,
+                scope: scope(),
+                now: Date(timeIntervalSince1970: 4_000)
+            ),
+            original
+        )
+
+        // Operator-chosen retention=0 after repair must NOT be re-opened by ensureDefaults.
+        try TokenSaverLaneStateRepository(db: db).setRetentionDays(projectID: "p", days: 0)
+        try TokenSaverLaneStateRepository(db: db).ensureDefaults(projectID: "p")
+        let afterUserZero = try XCTUnwrap(try TokenSaverLaneStateRepository(db: db).get(
+            projectID: "p",
+            lane: "deterministic_wrapper"
+        ))
+        XCTAssertEqual(afterUserZero.retentionDays, 0)
+        XCTAssertThrowsError(try TokenSaverRuntimeRecoveryWorker(db: db).prepareOriginal(
+            Data("user-zero".utf8),
+            scope: scope(),
+            operationID: "user-zero-op",
+            lane: "deterministic_wrapper",
+            expiresAt: nil,
+            disk: disk
+        )) { XCTAssertEqual($0 as? TokenSaverRecoveryStoreError, .retentionDisabled) }
     }
 
     func test_runtimeRecoveryUsesExactLaneRetentionAndRetentionZeroPersistsNothing() throws {

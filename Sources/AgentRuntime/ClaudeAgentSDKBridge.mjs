@@ -67,12 +67,17 @@ const TOKEN_SAVER_HOOK_TIMEOUT_MS = 1000;
 // Exact-byte tools are the ONLY carve-out: distilling file content / edit echoes
 // would break the agent's verbatim edits (the distill policy itself says "skip
 // when you need the exact bytes"). Every OTHER tool is compressed (no allowlist).
-const TOKEN_SAVER_EXCLUDED_TOOLS = new Set(['read', 'edit', 'write', 'multiedit', 'notebookedit']);
+const TOKEN_SAVER_EXCLUDED_TOOLS = new Set(['read', 'edit', 'write', 'multiedit', 'notebookedit', 'grep']);
+// AGENTS.md: never distill exact-output shell tools. Bash commands whose primary
+// binary is one of these must stay full stdout for line slices / matches.
+const TOKEN_SAVER_EXACT_OUTPUT_BASH = new Set([
+  'rg', 'grep', 'sed', 'awk', 'cat', 'head', 'tail', 'nl', 'cut', 'tr', 'diff',
+  'jq', 'yq',
+]);
 // Per-tool compression contracts. Tools not listed here fall back to
 // TOKEN_SAVER_DEFAULT_PROFILE — i.e. EVERY non-excluded tool is distilled.
 const TOKEN_SAVER_DEFAULT_PROFILE = 'moderate';
 const TOKEN_SAVER_PROFILES = new Map([
-  ['grep', 'conservative'],
   ['glob', 'conservative'],
   ['bash', 'moderate'],
   ['webfetch', 'aggressive'],
@@ -116,13 +121,129 @@ function replaceToolOutputText(value, text) {
   return text;
 }
 
-function tokenSaverToolDecision(toolName, output) {
+function shellCommandSegments(command) {
+  // Split on shell separators (including newlines) so compound / multi-line
+  // Bash still skips exact-output tools in any segment.
+  return String(command || '')
+    .split(/(?:&&|\|\||;|\||\r?\n)+/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+function stripShellPrefixes(segment) {
+  let tokens = String(segment || '').trim().split(/\s+/).filter(Boolean);
+  // Peel common launch prefixes until stable: env [-u NAME] [-i] VAR=val,
+  // FOO=bar, command/builtin/exec wrappers.
+  let progressed = true;
+  while (progressed && tokens.length > 0) {
+    progressed = false;
+    const head = tokens[0];
+    if (head === 'env') {
+      tokens.shift();
+      while (tokens.length > 0) {
+        const t = tokens[0];
+        if (t === '-i' || t === '-0' || t === '-S' || t === '--ignore-environment') {
+          tokens.shift();
+          continue;
+        }
+        if (t === '-u' || t === '--unset') {
+          tokens.shift();
+          if (tokens.length) tokens.shift();
+          continue;
+        }
+        if (t.startsWith('-u') && t.length > 2) {
+          tokens.shift();
+          continue;
+        }
+        if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(t) || /^[A-Za-z_][A-Za-z0-9_]*="/.test(t) || /^[A-Za-z_][A-Za-z0-9_]*='/.test(t)) {
+          tokens.shift();
+          continue;
+        }
+        break;
+      }
+      progressed = true;
+      continue;
+    }
+    if (head === 'command' || head === 'builtin' || head === 'exec') {
+      tokens.shift();
+      progressed = true;
+      continue;
+    }
+    if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(head)) {
+      tokens.shift();
+      progressed = true;
+      continue;
+    }
+  }
+  return tokens.join(' ').trim();
+}
+
+function firstCommandToken(segment) {
+  const text = stripShellPrefixes(segment);
+  if (!text) return '';
+  const token = text.split(/\s+/)[0] || '';
+  // path/to/rg or /usr/bin/grep → basename
+  const base = token.split(/[/\\]/).pop() || token;
+  return base.toLowerCase();
+}
+
+function gitExactOutputSubcommand(segment) {
+  // git [global options]* (grep|show|cat-file|blame) ...
+  // Global options that take a value: -C, -c, --git-dir, --work-tree, --namespace, ...
+  // Apply the same env/prefix stripping as firstCommandToken so
+  // `FOO=bar git show HEAD` is recognized.
+  const parts = stripShellPrefixes(segment).split(/\s+/).filter(Boolean);
+  if ((parts[0] || '').toLowerCase().split(/[/\\]/).pop() !== 'git') return null;
+  const valueOptions = new Set([
+    '-C', '-c', '--git-dir', '--work-tree', '--namespace',
+    '--config-env', '--super-prefix',
+  ]);
+  let i = 1;
+  while (i < parts.length) {
+    const p = parts[i];
+    if (valueOptions.has(p) || p.startsWith('--git-dir=') || p.startsWith('--work-tree=')
+        || p.startsWith('--namespace=') || p.startsWith('-c')) {
+      // `--git-dir=foo` is one token; `-C path` / `--git-dir path` consume next.
+      if (p.includes('=') || p.startsWith('-c') && p.length > 2) {
+        i += 1;
+      } else if (valueOptions.has(p)) {
+        i += 2;
+      } else {
+        i += 1;
+      }
+      continue;
+    }
+    if (p.startsWith('-')) {
+      i += 1;
+      continue;
+    }
+    return p.toLowerCase();
+  }
+  return null;
+}
+
+function isExactOutputBashCommand(toolInput) {
+  if (!toolInput || typeof toolInput !== 'object') return false;
+  const command = typeof toolInput.command === 'string' ? toolInput.command : '';
+  for (const segment of shellCommandSegments(command)) {
+    const primary = firstCommandToken(segment);
+    if (TOKEN_SAVER_EXACT_OUTPUT_BASH.has(primary)) return true;
+    const gitSub = gitExactOutputSubcommand(segment);
+    if (gitSub === 'grep' || gitSub === 'show' || gitSub === 'cat-file' || gitSub === 'blame') {
+      return true;
+    }
+  }
+  return false;
+}
+
+function tokenSaverToolDecision(toolName, toolInput, output) {
   const normalized = normalizeToolName(toolName);
   // Every tool compresses (no allowlist); only the exact-byte tools and
   // sub-threshold output are skipped.
   const profile = TOKEN_SAVER_PROFILES.get(normalized) || TOKEN_SAVER_DEFAULT_PROFILE;
   let skipReason = null;
   if (TOKEN_SAVER_EXCLUDED_TOOLS.has(normalized)) skipReason = 'excluded_tool';
+  else if (normalized === 'bash' && isExactOutputBashCommand(toolInput)) skipReason = 'exact_output_shell';
   else if (Buffer.byteLength(output || '', 'utf8') <= TOKEN_SAVER_MIN_BYTES && lineCount(output) <= TOKEN_SAVER_MIN_LINES) skipReason = 'below_threshold';
   return { profile, shouldCompress: skipReason == null, skipReason };
 }
@@ -169,23 +290,64 @@ function loadTokenSaverState() {
   return null;
 }
 
+function tokenSaverRecoveryHeaders(env) {
+  // Store-before-loss requires complete recovery scope. Injected by AppContext
+  // into the provider process env; without these headers every lossy optimize
+  // is rewritten to verbatim and Claude records zero savings.
+  const headers = {};
+  const map = [
+    ['RC_TOKEN_SAVER_WORKSPACE_ID', 'X-RemoteCode-Workspace-ID'],
+    ['RC_TOKEN_SAVER_PROJECT_ID', 'X-RemoteCode-Project-ID'],
+    ['RC_TOKEN_SAVER_THREAD_ID', 'X-RemoteCode-Thread-ID'],
+    ['RC_TOKEN_SAVER_ATTEMPT_ID', 'X-RemoteCode-Attempt-ID'],
+    ['REMOTE_CODE_AGENT_PROVIDER', 'X-RemoteCode-Provider'],
+  ];
+  for (const [envKey, header] of map) {
+    const value = env && typeof env[envKey] === 'string' ? env[envKey].trim() : '';
+    if (value) headers[header] = value;
+  }
+  return headers;
+}
+
 async function postTokenSaverDistill(state, body) {
   if (typeof fetch !== 'function') return null;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), TOKEN_SAVER_HOOK_TIMEOUT_MS);
   try {
+    const invocationID = typeof body.id === 'string' && body.id ? body.id : randomUUID();
+    const headers = {
+      authorization: `Bearer ${state.authToken}`,
+      'content-type': 'application/json',
+      ...tokenSaverRecoveryHeaders(current.env),
+      'X-RemoteCode-Invocation-ID': invocationID,
+      'X-RemoteCode-Operation-ID': `ptuhook1.${invocationID}`,
+    };
     const response = await fetch(`${state.baseURL}/v1/distill`, {
       method: 'POST',
-      headers: {
-        authorization: `Bearer ${state.authToken}`,
-        'content-type': 'application/json',
-      },
+      headers,
       body: JSON.stringify(body),
       signal: controller.signal,
     });
     if (!response.ok) return null;
     const decoded = await response.json();
-    return typeof decoded.output === 'string' ? decoded.output : null;
+    if (typeof decoded.output !== 'string') return null;
+    // Preserve store-before-loss recoverability: the agent must see [[rc:handle]]
+    // when the sidecar stored the original (AGENTS.md).
+    let output = decoded.output;
+    const handle = (typeof decoded.originalHandle === 'string' && decoded.originalHandle.trim())
+      || (typeof decoded.original_handle === 'string' && decoded.original_handle.trim())
+      || '';
+    if (handle && !output.includes(`[[rc:${handle}]]`)) {
+      // Append only when the marker-inclusive payload is still a net shrink.
+      // Otherwise return null so the hook fails open without replacing tool output
+      // (and without leaving the agent on a lossy body it never chose).
+      const withMarker = `${output}\n[[rc:${handle}]]`;
+      if (withMarker.length >= (body && body.input ? String(body.input).length : withMarker.length + 1)) {
+        return null;
+      }
+      output = withMarker;
+    }
+    return output;
   } catch (_) {
     return null;
   } finally {
@@ -197,7 +359,7 @@ async function tokenSaverPostToolUse(input) {
   if (current.env.RC_TOKEN_SAVER_POST_TOOL_USE !== '1') return {};
   if (!input || input.hook_event_name !== 'PostToolUse') return {};
   const rawOutput = extractToolOutputText(input.tool_response);
-  const decision = tokenSaverToolDecision(input.tool_name, rawOutput);
+  const decision = tokenSaverToolDecision(input.tool_name, input.tool_input, rawOutput);
   if (!decision.shouldCompress) return {};
   const state = loadTokenSaverState();
   if (!state) return {};
@@ -211,6 +373,10 @@ async function tokenSaverPostToolUse(input) {
     input: rawOutput,
     question: tokenSaverContractQuestion(input.tool_name, input.tool_input, decision.profile),
     provider: current.env.REMOTE_CODE_AGENT_PROVIDER || 'claude',
+    // Savings are measured on the sidecar for the compressed body (before the
+    // client appends [[rc:handle]]). We only apply the replacement when the
+    // marker-inclusive output is still shorter than raw, so the common path is
+    // honest; rare edge cases where the marker tips length are fail-open.
     recordSavings: true,
     runMode: 'optimize',
     maxOutputCharacters: Math.max(512, Math.min(rawOutput.length, 12000)),
@@ -218,11 +384,15 @@ async function tokenSaverPostToolUse(input) {
     reversibleStoreMinBytes: TOKEN_SAVER_STORE_MIN_BYTES,
   });
   if (!output || output.length >= rawOutput.length) return {};
+  const replaced = replaceToolOutputText(input.tool_response, output);
+  // SDK: updatedToolOutput works for all tools; updatedMCPToolOutput is MCP-only.
+  // Set both so Bash/Grep/etc. are actually replaced while MCP still works.
   return {
     continue: true,
     hookSpecificOutput: {
       hookEventName: 'PostToolUse',
-      updatedMCPToolOutput: replaceToolOutputText(input.tool_response, output),
+      updatedToolOutput: replaced,
+      updatedMCPToolOutput: replaced,
     },
   };
 }
