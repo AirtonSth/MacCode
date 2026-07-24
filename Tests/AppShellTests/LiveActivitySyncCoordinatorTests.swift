@@ -894,7 +894,7 @@ private final class StartRemapCountingPrivateAccountAPI: PrivateAccountAPI, @unc
     }
     func deliverAlert(
         accessToken: String, title: String, body: String, data: [String: String],
-        pushToken: String, pushTokenType: String, idempotencyKey: String, silent: Bool
+        pushToken: String, pushTokenType: String, idempotencyKey: String
     ) async throws -> PrivatePushDeliveryResult {
         throw PrivateAccountAPIError.invalidResponse
     }
