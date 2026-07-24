@@ -989,18 +989,36 @@ public final class PrivateNotificationBridge: @unchecked Sendable {
             }
         } catch {
             Self.log.error("Private push delivery failed: \(String(describing: error), privacy: .public)")
+            // Alert failed: still attempt a silent wake so iOS can catch up.
+            await deliverSilentCatchUp(
+                hostHint: content.userInfo["workspaceId"] ?? content.identifier,
+                force: true
+            )
             return
         }
-        // Also send a silent content-available wake so iOS can catch up the
-        // mirror without requiring the user to open the alert.
-        await deliverSilentCatchUp(hostHint: content.userInfo["workspaceId"] ?? content.identifier)
+        // Prefer silent wake coalescing over a second full alert. The visible
+        // alert already notified the user; silent catch-up reuses a 30s bucket
+        // so we do not double the push rate on every outcome.
+        await deliverSilentCatchUp(
+            hostHint: content.userInfo["workspaceId"] ?? content.identifier,
+            force: false
+        )
     }
 
+    private static let silentCatchUpDefaultsKey = "private.silentCatchUp.lastBucket"
+
     /// Silent APNs background wake: iOS `didReceiveRemoteNotification` runs
-    /// `BackgroundSyncCoordinator` catch-up. Coalesced per host via idempotency.
-    public func deliverSilentCatchUp(hostHint: String = "host") async {
+    /// `BackgroundSyncCoordinator` catch-up. Coalesced per 30s bucket to stay
+    /// under private push rate limits when many runs finish in a burst.
+    public func deliverSilentCatchUp(hostHint: String = "host", force: Bool = false) async {
         guard let session = accountStore.load(), session.user.subscribed,
               let target = pushTargetStore.load() else { return }
+        let bucket = Int(Date().timeIntervalSince1970 / 30)
+        let defaults = UserDefaults.standard
+        if !force, defaults.integer(forKey: Self.silentCatchUpDefaultsKey) == bucket {
+            return
+        }
+        defaults.set(bucket, forKey: Self.silentCatchUpDefaultsKey)
         do {
             let result = try await sessionRefresher.perform(session: session) { accessToken in
                 try await self.api.deliverAlert(
@@ -1008,12 +1026,11 @@ public final class PrivateNotificationBridge: @unchecked Sendable {
                     title: "",
                     body: "",
                     data: [
-                        "rc2_catch_up": "1",
-                        "content-available": "1"
+                        "rc2_catch_up": "1"
                     ],
                     pushToken: target.pushToken,
                     pushTokenType: target.pushTokenType,
-                    idempotencyKey: "catchup.\(hostHint).\(Int(Date().timeIntervalSince1970 / 30))",
+                    idempotencyKey: "catchup.\(hostHint).\(bucket)",
                     silent: true
                 )
             }
