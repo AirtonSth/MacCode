@@ -572,13 +572,18 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         for workspace in workspaces {
             var descriptors: [SurfaceDescriptor] = []
             forEachSurface(in: workspace.layout) { descriptors.append($0) }
-            surfaceGroups.append(ConnectionSnapshotWorkspaceItems(
-                workspaceId: workspace.id.value.uuidString,
-                items: descriptors.map(Self.connectionSnapshotSurface)
-            ))
             let workspaceThreads = threads
                 .filter { $0.workspaceId == workspace.id }
                 .sorted { $0.id.value.uuidString < $1.id.value.uuidString }
+            // Drop dangling selected_thread metadata so iOS snapshot validation
+            // does not reject the whole connection when a bound thread is gone.
+            let validThreadIds = Set(workspaceThreads.map { $0.id.value.uuidString })
+            surfaceGroups.append(ConnectionSnapshotWorkspaceItems(
+                workspaceId: workspace.id.value.uuidString,
+                items: descriptors.map {
+                    Self.connectionSnapshotSurface($0, validSelectedThreadIds: validThreadIds)
+                }
+            ))
             threadGroups.append(ConnectionSnapshotWorkspaceItems(
                 workspaceId: workspace.id.value.uuidString,
                 items: workspaceThreads.map(Self.connectionSnapshotThread)
@@ -640,10 +645,20 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         return .object(object)
     }
 
-    nonisolated private static func connectionSnapshotSurface(_ surface: SurfaceDescriptor) -> JSONValue {
+    nonisolated private static func connectionSnapshotSurface(
+        _ surface: SurfaceDescriptor,
+        validSelectedThreadIds: Set<String> = []
+    ) -> JSONValue {
         guard case .object(var object) = connectionSnapshotJSON(surface) else { return .null }
         object["id"] = .string(surface.id.value.uuidString)
         object["type"] = .string(surface.type.rawValue)
+        if case .object(var metadata) = object["metadata"],
+           case .string(let selected) = metadata["selected_thread"],
+           !selected.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+           !validSelectedThreadIds.contains(selected) {
+            metadata.removeValue(forKey: "selected_thread")
+            object["metadata"] = .object(metadata)
+        }
         return .object(object)
     }
 
