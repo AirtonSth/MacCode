@@ -571,10 +571,11 @@ public final class AppContext {
                     EventBus.shared.publish(kind: "agent.item.completed",
                                             payload: .object(["thread_id": .string(t), "item_id": .string(itemId)]))
                 }
+                // Fail only — do not finalize on itemState.completed (can race
+                // before final output deltas). Success path: itemCompleted or
+                // itemStarted(tool_result, state=completed, output set).
                 if state == .failed || state == .cancelled {
                     self.failGraphifyUsageItem(itemId: itemId, runId: runId)
-                } else if state == .completed {
-                    self.finalizeGraphifyUsageItem(itemId: itemId, runId: runId)
                 }
             case .itemProgress(let itemId, let progress):
                 var p: [String: JSONValue] = ["thread_id": .string(t), "item_id": .string(itemId)]
