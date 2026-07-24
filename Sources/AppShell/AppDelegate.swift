@@ -96,8 +96,11 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
     private var diagnosticsHeartbeatTimer: Timer?
     private var tokenSaverAccountUsageRefreshTimer: Timer?
     private var lifecycleRecorder: AppLifecycleRecorder?
-    /// Distributed-notification observer: LaunchAgent SQLite commits → rail reload.
+    /// Distributed-notification observer: schedule store commits → rail reload.
     private var scheduledTaskStoreObserver: NSObjectProtocol?
+    private var scheduledTaskScheduler: ScheduledTaskScheduler?
+    private var scheduledTaskTimer: Timer?
+    private var scheduledTaskNotificationTokens: [(NotificationCenter, NSObjectProtocol)] = []
     /// Menu items whose keyEquivalent is controlled by keybindings.json.
     /// Populated by installMainMenu(); refreshed by reapplyKeybindingOverrides().
     private var keybindableMenuItems: [(item: NSMenuItem, command: String)] = []
@@ -231,8 +234,9 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         windowController = MainWindowController(context: context, router: router, updater: updater)
         router.windowController = windowController
         settings = SettingsWindowController(context: context, updater: updater)
-        // LaunchAgent owns scheduled runs (path B). Observe store invalidation
-        // so Agent App rails reload when the agent commits threads/runs.
+        // Schedules run in-process (paste+play Agent App). Unregister any legacy
+        // LaunchAgent so it cannot dual-claim after upgrade.
+        startInProcessScheduledTaskScheduler()
         installScheduledTaskStoreObserver()
         startPetController()
 
@@ -432,8 +436,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         petController = nil
     }
 
-    /// LaunchAgent posts when it mutates scheduled runs / agent threads. The UI
-    /// process reloads Agent App rails from SQLite (EventBus is not cross-process).
+    /// Schedule store commits (including Run Now) reload Agent App rails.
     func installScheduledTaskStoreObserver() {
         removeScheduledTaskStoreObserver()
         scheduledTaskStoreObserver = ScheduledTaskCrossProcess.observeStoreChanged { [weak self] _ in
@@ -448,12 +451,51 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         }
     }
 
+    private func startInProcessScheduledTaskScheduler() {
+        // Best-effort: leftover LaunchAgent must not own provider turns anymore.
+        try? ScheduledTaskAgentServiceManager().unregister()
+        let scheduler = ScheduledTaskScheduler(context: context, router: router)
+        scheduledTaskScheduler = scheduler
+        router.scheduledTaskScheduler = scheduler
+        scheduledTaskTimer?.invalidate()
+        scheduledTaskTimer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak scheduler] _ in
+            Task { @MainActor in scheduler?.tick() }
+        }
+        let wakeToken = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didWakeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak scheduler] _ in
+            Task { @MainActor in scheduler?.tick() }
+        }
+        scheduledTaskNotificationTokens.append((NSWorkspace.shared.notificationCenter, wakeToken))
+        for name: Notification.Name in [.NSSystemClockDidChange, .NSSystemTimeZoneDidChange] {
+            let token = NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { [weak scheduler] _ in
+                Task { @MainActor in scheduler?.tick() }
+            }
+            scheduledTaskNotificationTokens.append((NotificationCenter.default, token))
+        }
+        // First tick skips past-due occurrences (app was closed), then claims
+        // only work that becomes due while the app stays open.
+        scheduler.tick()
+    }
+
+    private func stopInProcessScheduledTaskScheduler() {
+        scheduledTaskTimer?.invalidate()
+        scheduledTaskTimer = nil
+        for (center, token) in scheduledTaskNotificationTokens {
+            center.removeObserver(token)
+        }
+        scheduledTaskNotificationTokens.removeAll()
+        router?.scheduledTaskScheduler = nil
+        scheduledTaskScheduler = nil
+    }
+
     private func reloadAgentSurfacesFromScheduledStoreChange() {
         for surface in SurfaceRegistry.shared.all() {
             guard let agent = surface as? AgentAppSurface else { continue }
             let selected = agent.viewModel.selectedThreadId
             agent.viewModel.reloadThreads()
-            // Re-bind the open thread so status/transcript pick up LaunchAgent writes.
             if let selected {
                 agent.viewModel.selectThread(selected, markRead: false)
             }
@@ -469,6 +511,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         appLifecycleLog.info("app.will_terminate pid=\(ProcessInfo.processInfo.processIdentifier, privacy: .public)")
         lifecycleRecorder?.endRunCleanly(reason: "applicationWillTerminate")
         logDiagnosticsHeartbeat(reason: "will_terminate")
+        stopInProcessScheduledTaskScheduler()
         removeScheduledTaskStoreObserver()
         disableInsomniaForAppClose()
         // Always stop the Distill MLX server on quit — multi-GB model must not linger.

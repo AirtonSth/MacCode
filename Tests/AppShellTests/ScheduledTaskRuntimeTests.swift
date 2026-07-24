@@ -4,22 +4,32 @@ import ServiceManagement
 @testable import AppShell
 
 final class ScheduledTaskRuntimeTests: XCTestCase {
-    func test_catchUpKeepsOnlyMostRecentOccurrenceWithin24Hours_becauseWakeMustNotReplayBacklog() {
+    func test_reconciledDueDateLeavesPastDueUnchanged_becauseMissedFiresAreSkippedOnlyOnLaunch() {
+        // WHY: while the app is open, claimDue must still see next_run_at <= now.
+        // Catch-up compression of a multi-day backlog is intentionally gone.
         let now = Date(timeIntervalSince1970: 10 * 24 * 60 * 60)
-        let task = makeHourly(nextRunAt: Date(timeIntervalSince1970: 0))
+        let past = Date(timeIntervalSince1970: 0)
+        let task = makeHourly(nextRunAt: past)
 
         let reconciled = ScheduledTaskScheduler.reconciledDueDate(task: task, now: now)
 
-        XCTAssertEqual(reconciled, now)
+        XCTAssertEqual(reconciled, past)
     }
 
-    func test_catchUpSkipsExpiredOnceOccurrence_becauseOldOneShotWorkMustNotRunUnexpectedly() {
+    func test_reconciledDueDateFillsMissingNextRun_becauseEnabledTasksNeedASchedulePointer() {
         let now = Date(timeIntervalSince1970: 3 * 24 * 60 * 60)
         var task = makeHourly(nextRunAt: nil)
         task.recurrence = .once(at: Date(timeIntervalSince1970: 0))
-        task.nextRunAt = Date(timeIntervalSince1970: 0)
+        task.nextRunAt = nil
 
+        // Once-in-the-past with nil next: calculatedNextRun returns nil.
         XCTAssertNil(ScheduledTaskScheduler.reconciledDueDate(task: task, now: now))
+    }
+
+    func test_catchUpWindowIsZero_becauseMissedFiresMustNotReplayOnRelaunch() {
+        // WHY: product decision — schedules only run while RemoteCode is open;
+        // reopening must not claim backlog within a 24h window.
+        XCTAssertEqual(ScheduledTaskScheduler.catchUpWindow, 0)
     }
 
     func test_eligibleUsersIncludesCurrentNonRootUser_becauseEditorMustOfferRunnableIdentity() throws {
@@ -117,33 +127,72 @@ final class ScheduledTaskRuntimeTests: XCTestCase {
     }
 
     func test_rejectUIOnlySchedulePrompt_blocksLocalAgentCommands_becauseScheduleIsPasteAndPlay() {
-        // WHY: Agent App intercepts /clear /status etc. without a provider turn.
-        // Schedule must fail loudly instead of creating an empty headless turn.
+        // WHY: Agent App intercepts /clear /status etc. without a provider turn —
+        // including argument-bearing forms like `/clear foo`.
         XCTAssertThrowsError(try ScheduledTaskExecutor.rejectUIOnlySchedulePrompt("/clear"))
+        XCTAssertThrowsError(try ScheduledTaskExecutor.rejectUIOnlySchedulePrompt("/clear history"))
         XCTAssertThrowsError(try ScheduledTaskExecutor.rejectUIOnlySchedulePrompt("$status"))
+        XCTAssertThrowsError(try ScheduledTaskExecutor.rejectUIOnlySchedulePrompt("/model gpt-5"))
+        XCTAssertThrowsError(try ScheduledTaskExecutor.rejectUIOnlySchedulePrompt("/fork"))
         XCTAssertThrowsError(try ScheduledTaskExecutor.rejectUIOnlySchedulePrompt("/plan"))
         XCTAssertThrowsError(try ScheduledTaskExecutor.rejectUIOnlySchedulePrompt("/plan implement the feature"))
+        XCTAssertThrowsError(try ScheduledTaskExecutor.rejectUIOnlySchedulePrompt("/default"))
+        XCTAssertNoThrow(try ScheduledTaskExecutor.rejectUIOnlySchedulePrompt("/default Ship the deploy pipeline"))
         XCTAssertNoThrow(try ScheduledTaskExecutor.rejectUIOnlySchedulePrompt("Ship the deploy pipeline"))
         XCTAssertNoThrow(try ScheduledTaskExecutor.rejectUIOnlySchedulePrompt("$sam-work DEV-1"))
         XCTAssertNoThrow(try ScheduledTaskExecutor.rejectUIOnlySchedulePrompt("/goal reduce latency"))
     }
 
-    func test_executeUsesNewThreadTitleAndOrchestrationSnapshot_becauseParityIsPasteAndPlay() throws {
-        // Source contract: Run Now must look like Agent App create "New thread"
-        // + Full Access + Default interaction + shared send path with Auto snapshot.
+    func test_executeUsesAgentAppPasteAndPlay_becauseParityRequiresViewModelSend() throws {
+        // Source contract: Run Now must open a real Agent App tab, create
+        // "New thread", pin Full Access + Default, and call viewModel.send().
         let source = try String(
             contentsOf: repositoryRoot.appendingPathComponent("Sources/AppShell/ScheduledTaskRuntime.swift"),
             encoding: .utf8
         )
-        XCTAssertTrue(source.contains("title: \"New thread\""))
-        XCTAssertTrue(source.contains("orchestrationRoutingSnapshot: prepared.routingSnapshot"))
-        XCTAssertTrue(source.contains("normalizingComposerTriggerPrefix"))
-        XCTAssertTrue(source.contains("interactionMode: .default"))
-        XCTAssertTrue(source.contains("permissionMode: .fullAccess"))
+        XCTAssertTrue(source.contains("openAgentAppForSchedule"))
+        XCTAssertTrue(source.contains("createThread(title: \"New thread\")"))
+        XCTAssertTrue(source.contains("await vm.send()"))
+        XCTAssertTrue(source.contains("setPermissionMode(.fullAccess)"))
+        XCTAssertTrue(source.contains("interactionMode = .default"))
+        XCTAssertTrue(source.contains("skipMissedOccurrencesOnLaunch"))
+        XCTAssertTrue(source.contains("reclaimOrphanedActiveRuns"))
+        XCTAssertTrue(source.contains("waitForProviderSnapshotsIdle"))
         XCTAssertFalse(
-            source.contains("title: task.title"),
-            "task title must not override Agent thread title semantics"
+            source.contains("router.sendAgentMessage("),
+            "scheduled execute must not bypass AgentAppViewModel.send"
         )
+        XCTAssertFalse(
+            source.contains("modelDiscoverySource == .live"),
+            "Auto preflight must not be stricter than Agent App (requireLiveCatalog false)"
+        )
+    }
+
+    func test_mainAppOwnsScheduler_becauseLaunchAgentMustNotDualClaim() throws {
+        let main = try String(
+            contentsOf: repositoryRoot.appendingPathComponent("Sources/AppShell/Main.swift"),
+            encoding: .utf8
+        )
+        let delegate = try String(
+            contentsOf: repositoryRoot.appendingPathComponent("Sources/AppShell/AppDelegate.swift"),
+            encoding: .utf8
+        )
+        XCTAssertTrue(main.contains("background agent unregistered"))
+        XCTAssertFalse(main.contains("ScheduledTaskAgentAppDelegate("))
+        XCTAssertTrue(delegate.contains("startInProcessScheduledTaskScheduler"))
+        XCTAssertTrue(delegate.contains("ScheduledTaskAgentServiceManager().unregister()"))
+        XCTAssertTrue(delegate.contains("router.scheduledTaskScheduler = scheduler"))
+    }
+
+    func test_runNowUsesInProcessScheduler_becauseXPCIsRetired() throws {
+        let source = try String(
+            contentsOf: repositoryRoot.appendingPathComponent("Sources/AppShell/ScheduledTasksWindow.swift"),
+            encoding: .utf8
+        )
+        XCTAssertTrue(source.contains("router.scheduledTaskScheduler"))
+        XCTAssertTrue(source.contains("scheduler.runNow(taskID:"))
+        XCTAssertFalse(source.contains("service.wake(taskID:"))
+        XCTAssertFalse(source.contains("try service.register()"))
     }
 
     func test_crossUserAutoUsesOneRunnerPerProvider_becauseRoutesMustLaunchTheAdmittedCLI() {
@@ -155,18 +204,6 @@ final class ScheduledTaskRuntimeTests: XCTestCase {
         XCTAssertNotEqual(codex, grok)
         XCTAssertTrue(codex.hasSuffix("-codex-primary.sh"))
         XCTAssertTrue(grok.hasSuffix("-grok-primary.sh"))
-    }
-
-    func test_executorPassesImmutableAutoSnapshotToCoordinator_becauseScheduledRunsMustActuallyRoute() throws {
-        let source = try String(contentsOf: repositoryRoot.appendingPathComponent("Sources/AppShell/ScheduledTaskRuntime.swift"))
-
-        // Auto still resolves through orchestrationRuntime.route in prepareExecution;
-        // the admitted selection is then sent via the Agent App path (not a bare
-        // coordinator.startRun) so Stop / rail match manual threads.
-        XCTAssertTrue(source.contains("prepared.routingSnapshot?.configuration.manualSelection"))
-        XCTAssertTrue(source.contains("launchConfigurations: launches"))
-        XCTAssertTrue(source.contains("orchestrationRuntime.route("))
-        XCTAssertTrue(source.contains("router.sendAgentMessage("))
     }
 
     func test_autoRoutingIsBoundToSavedProviderAccount_becauseScheduledRunsMustNotSubstituteSource() throws {
@@ -184,19 +221,6 @@ final class ScheduledTaskRuntimeTests: XCTestCase {
         XCTAssertTrue(source.contains("ProviderCLIProbe.authenticated("))
         XCTAssertTrue(source.contains("probeEnvironment = user.name == NSUserName()"))
         XCTAssertTrue(source.contains("The selected provider is unavailable for system user"))
-    }
-
-    func test_xpcChecksBundleAndProtocolVersion_becauseUpdatesMustReplaceStaleHelpers() throws {
-        let source = try String(contentsOf: repositoryRoot.appendingPathComponent("Sources/AppShell/ScheduledTaskRuntime.swift"))
-
-        XCTAssertTrue(source.contains("public static let protocolVersion = 2"))
-        XCTAssertTrue(source.contains("proxy.ping { version in"))
-        XCTAssertTrue(source.contains("version == Self.serviceVersion"))
-        XCTAssertTrue(source.contains("Scheduler version mismatch"))
-        XCTAssertTrue(source.contains("try self.unregister()"))
-        XCTAssertTrue(source.contains("try self.register()"))
-        XCTAssertTrue(source.contains("func stop(threadID:"))
-        XCTAssertTrue(source.contains("ScheduledTaskStopResult"))
     }
 
     func test_helperPostsFailureNotifications_becauseUnattendedErrorsMustBeVisible() throws {

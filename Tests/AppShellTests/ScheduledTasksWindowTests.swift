@@ -61,11 +61,14 @@ final class ScheduledTasksWindowTests: XCTestCase {
                       "editor must bind the optional draft without force-unwrap after save clears it")
     }
 
-    func test_savePreflightsAndPausesForApproval_becauseBlockedTasksMustNotClaimActive() throws {
+    func test_savePreflightsBeforePersist_becauseInvalidTasksMustNotBeSavedActive() throws {
         let source = try String(contentsOf: sourceURL("Sources/AppShell/ScheduledTasksWindow.swift"), encoding: .utf8)
+        // WHY: save still preflights provider/workspace before persisting. Login
+        // Items approval is retired — schedules run in-process while the app is open.
         XCTAssertTrue(source.contains(".preflight(task)"))
-        XCTAssertTrue(source.contains("Task saved paused."))
-        XCTAssertTrue(source.contains("scheduledTasks.openLoginItems"))
+        XCTAssertTrue(source.contains("router.scheduledTaskScheduler"))
+        XCTAssertFalse(source.contains("scheduledTasks.openLoginItems"))
+        XCTAssertFalse(source.contains("Task saved paused."))
     }
 
     func test_failureDetailsCanExpand_becauseSafeHistoryErrorsMustRemainInspectable() throws {
@@ -105,21 +108,25 @@ final class ScheduledTasksWindowTests: XCTestCase {
         let runtime = try String(contentsOf: sourceURL("Sources/AppShell/ScheduledTaskRuntime.swift"), encoding: .utf8)
         let main = try String(contentsOf: sourceURL("Sources/AppShell/AppDelegate.swift"), encoding: .utf8)
         let router = try String(contentsOf: sourceURL("Sources/AppShell/AppCommandRouter.swift"), encoding: .utf8)
-        // Path B: LaunchAgent is sole executor; UI stops via XPC; rails reload
-        // on distributed store invalidation (not a second in-process scheduler).
-        XCTAssertTrue(runtime.contains("router.createAgentThread("))
-        XCTAssertTrue(runtime.contains("router.sendAgentMessage("))
+        // In-process paste+play: open Agent App tab, createThread, viewModel.send().
+        // Main app owns the scheduler; legacy LaunchAgent is unregistered.
+        XCTAssertTrue(runtime.contains("openAgentAppForSchedule"))
+        XCTAssertTrue(runtime.contains("await vm.send()"))
+        XCTAssertTrue(runtime.contains("createThread(title: \"New thread\")"))
         XCTAssertTrue(runtime.contains("func stop(threadID:"))
         XCTAssertTrue(runtime.contains("ScheduledTaskCrossProcess.notifyStoreChanged"))
-        XCTAssertTrue(runtime.contains("protocolVersion = 2"))
-        XCTAssertFalse(runtime.contains("ScheduledTaskInProcessHost"),
-                       "path B must not dual-host an in-process scheduler")
+        XCTAssertTrue(runtime.contains("skipMissedOccurrencesOnLaunch"))
+        XCTAssertTrue(main.contains("startInProcessScheduledTaskScheduler"))
         XCTAssertTrue(main.contains("installScheduledTaskStoreObserver"))
-        XCTAssertTrue(router.contains("wireScheduledRunControl"))
-        XCTAssertTrue(router.contains("stopScheduledThread"))
+        XCTAssertTrue(router.contains("openAgentAppForSchedule"))
+        XCTAssertTrue(router.contains("scheduledTaskScheduler"))
+        XCTAssertFalse(
+            runtime.contains("router.sendAgentMessage("),
+            "scheduled execute must use AgentAppViewModel.send, not router bypass"
+        )
         XCTAssertFalse(
             runtime.contains("context.coordinator.startRun("),
-            "scheduled execute still uses create+send inside the agent process"
+            "scheduled execute must not start the provider outside Agent App send"
         )
     }
 
@@ -131,7 +138,7 @@ final class ScheduledTasksWindowTests: XCTestCase {
         XCTAssertTrue(source.contains("DSEmptyState("))
         XCTAssertTrue(source.contains("dsPanel("))
         XCTAssertTrue(source.contains("serviceRequiresApproval"))
-        XCTAssertTrue(source.contains("Open Login Items"))
+        XCTAssertTrue(source.contains("Runs inside RemoteCode while the app is open"))
         // Plan-faithful chrome: full-width card list + full-page editor groups.
         XCTAssertTrue(source.contains("ScheduledTaskCard("))
         XCTAssertTrue(source.contains("Automate recurring agent work"))
@@ -141,6 +148,8 @@ final class ScheduledTasksWindowTests: XCTestCase {
         XCTAssertTrue(source.contains("Save Task"))
         XCTAssertFalse(source.contains("HSplitView"),
                        "plan mockups use a single-column stack, not master-detail split")
+        XCTAssertFalse(source.contains("Open Login Items"),
+                       "Login Items approval is retired with LaunchAgent Path B")
     }
 
     func test_overviewExposesGlobalActiveToggle_becauseTravelPauseMustStopAllSchedules() throws {
@@ -198,10 +207,13 @@ final class ScheduledTasksWindowTests: XCTestCase {
         XCTAssertFalse(source.contains("vm.providers.first(where: { $0.enabled && $0.installed }) ?? vm.providers.first"))
     }
 
-    func test_mainDisablesManagedDistillInScheduledAgent_becauseHeadlessRunsMustNotMutateShellSkills() throws {
+    func test_mainUnregistersLegacyScheduledAgent_becauseSchedulesRunInProcess() throws {
         let source = try String(contentsOf: sourceURL("Sources/AppShell/Main.swift"), encoding: .utf8)
-        XCTAssertTrue(source.contains("setenv(\"RC2_DISABLE_MANAGED_DISTILL_RECONCILE\", \"1\", 1)"))
+        // WHY: leftover LaunchAgent installs must not dual-claim after upgrade.
         XCTAssertTrue(source.contains("--scheduled-task-agent"))
+        XCTAssertTrue(source.contains("ScheduledTaskAgentServiceManager().unregister()"))
+        XCTAssertTrue(source.contains("background agent unregistered"))
+        XCTAssertFalse(source.contains("ScheduledTaskAgentAppDelegate("))
     }
 
     private func sourceURL(_ relative: String) -> URL {
