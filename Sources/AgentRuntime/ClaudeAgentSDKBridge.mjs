@@ -67,12 +67,17 @@ const TOKEN_SAVER_HOOK_TIMEOUT_MS = 1000;
 // Exact-byte tools are the ONLY carve-out: distilling file content / edit echoes
 // would break the agent's verbatim edits (the distill policy itself says "skip
 // when you need the exact bytes"). Every OTHER tool is compressed (no allowlist).
-const TOKEN_SAVER_EXCLUDED_TOOLS = new Set(['read', 'edit', 'write', 'multiedit', 'notebookedit']);
+const TOKEN_SAVER_EXCLUDED_TOOLS = new Set(['read', 'edit', 'write', 'multiedit', 'notebookedit', 'grep']);
+// AGENTS.md: never distill exact-output shell tools. Bash commands whose primary
+// binary is one of these must stay full stdout for line slices / matches.
+const TOKEN_SAVER_EXACT_OUTPUT_BASH = new Set([
+  'rg', 'grep', 'sed', 'awk', 'cat', 'head', 'tail', 'nl', 'cut', 'tr', 'diff',
+  'jq', 'yq',
+]);
 // Per-tool compression contracts. Tools not listed here fall back to
 // TOKEN_SAVER_DEFAULT_PROFILE — i.e. EVERY non-excluded tool is distilled.
 const TOKEN_SAVER_DEFAULT_PROFILE = 'moderate';
 const TOKEN_SAVER_PROFILES = new Map([
-  ['grep', 'conservative'],
   ['glob', 'conservative'],
   ['bash', 'moderate'],
   ['webfetch', 'aggressive'],
@@ -116,13 +121,39 @@ function replaceToolOutputText(value, text) {
   return text;
 }
 
-function tokenSaverToolDecision(toolName, output) {
+function firstBashCommandToken(command) {
+  const text = String(command || '').trim();
+  if (!text) return '';
+  // Strip common env prefixes: FOO=bar BAZ=1 rg pattern
+  const withoutEnv = text.replace(/^(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)+/, '');
+  const token = withoutEnv.split(/\s+/)[0] || '';
+  // path/to/rg or /usr/bin/grep → basename
+  const base = token.split(/[/\\]/).pop() || token;
+  return base.toLowerCase();
+}
+
+function isExactOutputBashCommand(toolInput) {
+  if (!toolInput || typeof toolInput !== 'object') return false;
+  const command = typeof toolInput.command === 'string' ? toolInput.command : '';
+  const primary = firstBashCommandToken(command);
+  if (TOKEN_SAVER_EXACT_OUTPUT_BASH.has(primary)) return true;
+  // git grep|show|cat-file|blame
+  if (primary === 'git') {
+    const parts = String(command).trim().split(/\s+/).filter(Boolean);
+    const sub = (parts[1] || '').toLowerCase();
+    return sub === 'grep' || sub === 'show' || sub === 'cat-file' || sub === 'blame';
+  }
+  return false;
+}
+
+function tokenSaverToolDecision(toolName, toolInput, output) {
   const normalized = normalizeToolName(toolName);
   // Every tool compresses (no allowlist); only the exact-byte tools and
   // sub-threshold output are skipped.
   const profile = TOKEN_SAVER_PROFILES.get(normalized) || TOKEN_SAVER_DEFAULT_PROFILE;
   let skipReason = null;
   if (TOKEN_SAVER_EXCLUDED_TOOLS.has(normalized)) skipReason = 'excluded_tool';
+  else if (normalized === 'bash' && isExactOutputBashCommand(toolInput)) skipReason = 'exact_output_shell';
   else if (Buffer.byteLength(output || '', 'utf8') <= TOKEN_SAVER_MIN_BYTES && lineCount(output) <= TOKEN_SAVER_MIN_LINES) skipReason = 'below_threshold';
   return { profile, shouldCompress: skipReason == null, skipReason };
 }
@@ -230,7 +261,7 @@ async function tokenSaverPostToolUse(input) {
   if (current.env.RC_TOKEN_SAVER_POST_TOOL_USE !== '1') return {};
   if (!input || input.hook_event_name !== 'PostToolUse') return {};
   const rawOutput = extractToolOutputText(input.tool_response);
-  const decision = tokenSaverToolDecision(input.tool_name, rawOutput);
+  const decision = tokenSaverToolDecision(input.tool_name, input.tool_input, rawOutput);
   if (!decision.shouldCompress) return {};
   const state = loadTokenSaverState();
   if (!state) return {};
@@ -244,6 +275,10 @@ async function tokenSaverPostToolUse(input) {
     input: rawOutput,
     question: tokenSaverContractQuestion(input.tool_name, input.tool_input, decision.profile),
     provider: current.env.REMOTE_CODE_AGENT_PROVIDER || 'claude',
+    // Savings are measured on the sidecar for the compressed body (before the
+    // client appends [[rc:handle]]). We only apply the replacement when the
+    // marker-inclusive output is still shorter than raw, so the common path is
+    // honest; rare edge cases where the marker tips length are fail-open.
     recordSavings: true,
     runMode: 'optimize',
     maxOutputCharacters: Math.max(512, Math.min(rawOutput.length, 12000)),
