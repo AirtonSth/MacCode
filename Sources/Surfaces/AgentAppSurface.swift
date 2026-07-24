@@ -3945,6 +3945,8 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     }
 
     public func send() async {
+        let originalPrompt = prompt
+        let sendThreadId = selectedThreadId
         let trimmed = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty || !attachments.isEmpty else { return }
         // Auto is still resolving providers/models — refuse send (button is also
@@ -3959,6 +3961,11 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             statusMessage = "Automatic model routing is still loading. Try again in a moment."
             return
         }
+        // Clear the composer immediately on send so the textarea empties before
+        // snapshot load / provider start / queue admission. Capture attachments
+        // first; restore the draft only if the turn never starts.
+        let attachedForSend = attachments
+        prompt = ""
         // Snapshots can still be empty on first send (seed/load race). Load once
         // before the fail-closed gate so a ready Grok/Codex install is not blocked.
         // Also needed before `$goal` → `/goal` rewrite so provider slash catalogs
@@ -3985,12 +3992,13 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             await loadProviderSnapshots()
             if !selectedProviderCanRun {
                 statusMessage = providerExecutionUnavailableReason ?? "The selected provider is unavailable."
+                restoreComposerPromptAfterFailedSend(originalPrompt, expectedThreadId: sendThreadId)
                 return
             }
         }
         // A real turn "uses" the active model — new threads reopen on it.
         rememberCurrentModel()
-        lastSentAttachmentCount = attachments.count
+        lastSentAttachmentCount = attachedForSend.count
         recordPromptHistory(text)
         clearVisibleErrorForNewUserMessage()
         if let slash = Self.localSlashCommandParts(text),
@@ -4006,26 +4014,45 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             // A failed/unavailable enqueue must fall through to a real run —
             // returning anyway silently dropped the user's prompt.
             if selectedThreadCanQueuePrompt,
-               await enqueuePromptWhileRunning(text: slash.argument, attached: attachments) {
+               await enqueuePromptWhileRunning(text: slash.argument, attached: attachedForSend) {
                 return
             }
-            _ = await startProviderRun(
+            if await startProviderRun(
                 text: slash.argument,
-                attached: attachments,
+                attached: attachedForSend,
                 recordHistory: false,
                 interactionMode: interactionMode
-            )
+            ) == nil {
+                restoreComposerPromptAfterFailedSend(originalPrompt, expectedThreadId: sendThreadId)
+            }
             return
         }
         if (text.hasPrefix("/") || text.hasPrefix("$")), handleSlashCommand(text) {
-            prompt = ""
             return
         }
         if selectedThreadCanQueuePrompt,
-           await enqueuePromptWhileRunning(text: text, attached: attachments) {
+           await enqueuePromptWhileRunning(text: text, attached: attachedForSend) {
             return
         }
-        _ = await startProviderRun(text: text, attached: attachments, recordHistory: false, interactionMode: interactionMode)
+        if await startProviderRun(
+            text: text,
+            attached: attachedForSend,
+            recordHistory: false,
+            interactionMode: interactionMode
+        ) == nil {
+            restoreComposerPromptAfterFailedSend(originalPrompt, expectedThreadId: sendThreadId)
+        }
+    }
+
+    /// Puts the draft back only when send never started a turn and the composer
+    /// is still empty on the same thread (user did not type or switch away).
+    private func restoreComposerPromptAfterFailedSend(
+        _ original: String,
+        expectedThreadId: AgentThreadID?
+    ) {
+        guard prompt.isEmpty else { return }
+        if let expectedThreadId, selectedThreadId != expectedThreadId { return }
+        prompt = original
     }
 
     /// UX-MAC_AGENT-BG-AWAIT / incomplete-turn: manually resume a thread that
