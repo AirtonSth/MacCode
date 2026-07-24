@@ -166,6 +166,8 @@ final class AgentAppQueuedMessageAndHelperTests: XCTestCase {
         XCTAssertEqual(try queuedRepo.list(threadId: thread.id).map(\.text), ["queue exactly once"])
         XCTAssertTrue(try messageRepo.list(threadId: thread.id).isEmpty,
                       "queueing behind the live adapter turn must not persist a second user bubble")
+        XCTAssertFalse(vm.messages.contains { $0.role == .user && $0.content == "queue exactly once" },
+                       "queued follow-ups must stay out of the transcript until the turn starts")
         XCTAssertEqual(vm.queueStatusMessage, "Queued — will run after the current turn.")
         XCTAssertFalse(vm.statusMessage.contains("Failed to start"))
         adapter.stopAll()

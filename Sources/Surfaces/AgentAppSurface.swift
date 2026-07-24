@@ -873,8 +873,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         rehydrateDurableActiveState(threadId: id)
         // A pending follow-up means the user already superseded the prior Active
         // plan; keep it cleared across select/reopen until the next run starts.
-        // Also re-mirror queued text into the transcript so the bubble survives
-        // a thread switch (messages were reloaded from durable storage only).
+        // Queued text stays in the queue UI only until drain starts the turn.
         restoreQueuedFollowupTranscriptPresentation(threadId: id)
         refreshSR1TranslationStateFromTimeline(preservingExisting: true)
         // PERF: rebuild the O(1) item index once over the fully-replayed timeline so
@@ -997,15 +996,8 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 queueStatusMessage = nil
                 self.editingQueuedMessage = nil
                 queuedMessageDraft = ""
-                let display = updated.attachments.isEmpty ? updated.text
-                    : updated.text + "\n\n📎 " + updated.attachments.map(\.displayName).joined(separator: ", ")
-                presentOutgoingUserMessage(
-                    threadId: updated.threadId,
-                    messageId: AgentMessageID(updated.id.value),
-                    display: display,
-                    attachments: updated.attachments,
-                    bumpFocus: false
-                )
+                // Queue edits stay in the queue UI only. The transcript bubble is
+                // created when the message drains and the provider turn starts.
                 reloadQueuedMessages()
                 onQueuedMessageEvent?(AgentQueueEventKinds.updated, updated)
             } else {
@@ -1167,8 +1159,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                     editingQueuedMessage = nil
                     queuedMessageDraft = ""
                 }
-                // Optimistic bubble id == queued id; remove only if not yet
-                // durable under that same id (drain/start persist uses it).
+                // Defensive: remove any leftover in-memory mirror from older
+                // builds that mirrored queued text into the transcript. Only
+                // drop when not yet durable under that id (drain/start persist).
                 let mirrorId = AgentMessageID(cancelled.id.value)
                 if (try? messageRepo.get(id: mirrorId)) == nil,
                    let idx = messages.firstIndex(where: { $0.id == mirrorId }) {
@@ -1487,8 +1480,8 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 threadId: id
             )
             self.messageHistoryIsPartial = loaded?.hasMoreOlder ?? false
-            // Queue rows may not be in the durable message page yet — restore
-            // their transcript presentation after the merge.
+            // Queue rows are not transcript bubbles; only re-apply plan
+            // suppression after the durable message merge.
             self.restoreQueuedFollowupTranscriptPresentation(threadId: id)
             if self.messageHistoryIsPartial {
                 NSLog("[AgentApp] recent message page loaded: \(self.messages.count) rows; older durable messages remain outside the hot UI window")
@@ -1513,11 +1506,12 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         return loadedRows + mirrors
     }
 
-    /// Shared UX for every user send path (immediate start and mid-run queue):
-    /// show the bubble now, drop the previous turn's Active plan, and re-pin
-    /// the transcript to the bottom. `messageId` must be the durable identity
-    /// (`AgentMessageID(runId)` / `AgentMessageID(queued.id)`) so later persist
-    /// and drain do not double the bubble.
+    /// Shared UX for an outgoing user turn that is actually starting now:
+    /// show the bubble, drop the previous turn's Active plan, and re-pin the
+    /// transcript to the bottom. `messageId` must be the durable identity
+    /// (`AgentMessageID(runId)` / `AgentMessageID(queued.id)` on drain) so later
+    /// persist does not double the bubble. Mid-run queue inserts must not call
+    /// this — they stay in the queue UI until the turn starts.
     private func presentOutgoingUserMessage(
         threadId: AgentThreadID,
         messageId: AgentMessageID,
@@ -1530,7 +1524,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         suppressStaleActivePlanUpdates = true
         resetTimelineUpdateTick()
         if let idx = messages.firstIndex(where: { $0.id == messageId }) {
-            // Queue edit / re-present: refresh content under the stable id.
+            // Re-present under the stable id (e.g. resume / already mirrored).
             messages[idx] = AgentMessage(
                 id: messageId,
                 threadId: threadId,
@@ -1552,22 +1546,12 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     }
 
     /// After a durable message-page load / timeline rehydrate, re-apply the
-    /// user-visible contract for pending queue rows: bubble + cleared plan.
+    /// user-visible contract for pending queue rows: keep the prior Active plan
+    /// cleared. Queued text itself stays out of the transcript until drain.
     private func restoreQueuedFollowupTranscriptPresentation(threadId: AgentThreadID) {
-        guard !queuedMessages.isEmpty else { return }
+        guard queuedMessages.contains(where: { $0.threadId == threadId }) else { return }
         suppressStaleActivePlanUpdates = true
         timeline.clearActivePlan()
-        for queued in queuedMessages where queued.threadId == threadId {
-            let display = queued.attachments.isEmpty ? queued.text
-                : queued.text + "\n\n📎 " + queued.attachments.map(\.displayName).joined(separator: ", ")
-            presentOutgoingUserMessage(
-                threadId: threadId,
-                messageId: AgentMessageID(queued.id.value),
-                display: display,
-                attachments: queued.attachments,
-                bumpFocus: false
-            )
-        }
     }
 
     /// Test seam: awaits the off-main message-history page kicked off by
@@ -4071,18 +4055,15 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 interactionMode: mode,
                 queuedRoutingSnapshot: AgentQueuedMessageRoutingSnapshot(configuration: routing)
             )
-            let display = attached.isEmpty ? text
-                : text + "\n\n📎 " + attached.map(\.displayName).joined(separator: ", ")
-            // Mirror the bubble + clear Active plan immediately even though the
-            // provider turn is still in flight. The queue section alone is not the
-            // transcript contract users expect for "I sent a message."
-            // Identity = queued id = future run id on drain (AgentRunID(queued.id)).
-            presentOutgoingUserMessage(
-                threadId: selectedThreadId,
-                messageId: AgentMessageID(queued.id.value),
-                display: display,
-                attachments: attached
-            )
+            // Queued follow-ups live only in the queue UI until drain starts the
+            // provider turn. Do not mirror a transcript bubble yet — that would
+            // look like the agent already received the message. Identity is still
+            // queued id = future run id on drain (AgentRunID(queued.id)), so the
+            // bubble appears once via startProviderRun when the turn actually starts.
+            // Still clear the prior Active plan: the user has superseded it.
+            timeline.clearActivePlan()
+            suppressStaleActivePlanUpdates = true
+            resetTimelineUpdateTick()
             prompt = ""
             attachments = []
             clearComposerDraftMemory(threadId: selectedThreadId, providerInstanceId: providerInstanceId)

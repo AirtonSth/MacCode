@@ -2382,10 +2382,12 @@ final class AgentAppViewModelTests: XCTestCase {
                       "the user bubble must appear in the transcript immediately on send")
     }
 
-    func test_queuedFollowupShowsUserBubbleAndClearsActivePlan() async throws {
+    func test_queuedFollowupStaysOutOfTranscriptAndClearsActivePlan() async throws {
         // WHY: while a provider turn is live, follow-ups enqueue instead of
-        // starting. Users still expect their message to appear in the transcript
-        // and the prior Active plan checklist to leave the bottom of the view.
+        // starting. The queue UI is the only place they should appear until
+        // drain starts the turn — a transcript bubble would look like the agent
+        // already received the message. The prior Active plan still leaves the
+        // bottom of the view because the user has superseded it.
         let tmp = NSTemporaryDirectory() + "rc2-vm-agent-queue-plan-" + UUID().uuidString
         let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
         let threadRepo = AgentThreadRepository(db: db)
@@ -2425,8 +2427,11 @@ final class AgentAppViewModelTests: XCTestCase {
 
         XCTAssertEqual((try? queuedRepo.list(threadId: id).map(\.text)) ?? [], ["follow up after current run"],
                        "follow-up must still enqueue while the provider turn is active")
-        XCTAssertTrue(vm.messages.contains { $0.role == .user && $0.content == "follow up after current run" },
-                      "queued follow-ups must still render as a user bubble immediately")
+        XCTAssertEqual(vm.queuedMessages.map(\.text), ["follow up after current run"],
+                       "queued follow-ups must render in the queue UI")
+        XCTAssertFalse(vm.messages.contains { $0.role == .user && $0.content == "follow up after current run" },
+                       "queued follow-ups must not appear as a transcript bubble until the turn starts")
+        XCTAssertEqual(vm.queueStatusMessage, "Queued — will run after the current turn.")
         XCTAssertNil(vm.activePlan,
                      "sending a follow-up must clear the prior turn's Active plan even when the turn is still running")
 
