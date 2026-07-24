@@ -414,7 +414,7 @@ public protocol PrivateAccountAPI: Sendable {
     func logout(refreshToken: String) async throws
     func billingOverview(accessToken: String) async throws -> PrivateBillingOverview
     func createPortal(accessToken: String) async throws -> URL
-    func deliverAlert(accessToken: String, title: String, body: String, data: [String: String], pushToken: String, pushTokenType: String, idempotencyKey: String) async throws -> PrivatePushDeliveryResult
+    func deliverAlert(accessToken: String, title: String, body: String, data: [String: String], pushToken: String, pushTokenType: String, idempotencyKey: String, silent: Bool) async throws -> PrivatePushDeliveryResult
     func deliverLiveActivity(accessToken: String, event: String, contentState: PrivateLiveActivityContentState, timestampSeconds: Int64, liveActivityToken: String, pushToken: String, pushTokenType: String, idempotencyKey: String) async throws -> PrivatePushDeliveryResult
     func registerLiveActivityTokenV2(accessToken: String, registration: PrivateLiveActivityV2TokenRegistration) async throws -> PrivateLiveActivityV2TokenRegistrationAck
     func deliverLiveActivityV2(accessToken: String, request: PrivateLiveActivityV2DeliveryRequest, idempotencyKey: String) async throws -> PrivateLiveActivityV2DeliveryAck
@@ -489,12 +489,13 @@ public final class URLSessionPrivateAccountAPI: PrivateAccountAPI, @unchecked Se
         return response.portalUrl
     }
 
-    public func deliverAlert(accessToken: String, title: String, body: String, data: [String: String], pushToken: String, pushTokenType: String, idempotencyKey: String) async throws -> PrivatePushDeliveryResult {
+    public func deliverAlert(accessToken: String, title: String, body: String, data: [String: String], pushToken: String, pushTokenType: String, idempotencyKey: String, silent: Bool = false) async throws -> PrivatePushDeliveryResult {
         struct Body: Encodable {
             let body: String
             let data: [String: String]?
             let pushToken: String
             let pushTokenType: String
+            let silent: Bool?
             let title: String
         }
         return try await request(
@@ -506,6 +507,7 @@ public final class URLSessionPrivateAccountAPI: PrivateAccountAPI, @unchecked Se
                 data: data.isEmpty ? nil : data,
                 pushToken: pushToken,
                 pushTokenType: pushTokenType,
+                silent: silent ? true : nil,
                 title: title
             ),
             idempotencyKey: idempotencyKey
@@ -978,7 +980,8 @@ public final class PrivateNotificationBridge: @unchecked Sendable {
                     data: content.userInfo,
                     pushToken: target.pushToken,
                     pushTokenType: target.pushTokenType,
-                    idempotencyKey: content.identifier
+                    idempotencyKey: content.identifier,
+                    silent: false
                 )
             }
             if result.shouldDropSubscription {
@@ -987,6 +990,38 @@ public final class PrivateNotificationBridge: @unchecked Sendable {
         } catch {
             Self.log.error("Private push delivery failed: \(String(describing: error), privacy: .public)")
             return
+        }
+        // Also send a silent content-available wake so iOS can catch up the
+        // mirror without requiring the user to open the alert.
+        await deliverSilentCatchUp(hostHint: content.userInfo["workspaceId"] ?? content.identifier)
+    }
+
+    /// Silent APNs background wake: iOS `didReceiveRemoteNotification` runs
+    /// `BackgroundSyncCoordinator` catch-up. Coalesced per host via idempotency.
+    public func deliverSilentCatchUp(hostHint: String = "host") async {
+        guard let session = accountStore.load(), session.user.subscribed,
+              let target = pushTargetStore.load() else { return }
+        do {
+            let result = try await sessionRefresher.perform(session: session) { accessToken in
+                try await self.api.deliverAlert(
+                    accessToken: accessToken,
+                    title: "",
+                    body: "",
+                    data: [
+                        "rc2_catch_up": "1",
+                        "content-available": "1"
+                    ],
+                    pushToken: target.pushToken,
+                    pushTokenType: target.pushTokenType,
+                    idempotencyKey: "catchup.\(hostHint).\(Int(Date().timeIntervalSince1970 / 30))",
+                    silent: true
+                )
+            }
+            if result.shouldDropSubscription {
+                pushTargetStore.clear()
+            }
+        } catch {
+            Self.log.error("Silent catch-up push failed: \(String(describing: error), privacy: .public)")
         }
     }
 

@@ -1162,7 +1162,7 @@ private class RecordingPrivateAccountAPI: PrivateAccountAPI, @unchecked Sendable
         return URL(string: "https://apps.apple.com/account/subscriptions")!
     }
 
-    func deliverAlert(accessToken: String, title: String, body: String, data: [String: String], pushToken: String, pushTokenType: String, idempotencyKey: String) async throws -> PrivatePushDeliveryResult {
+    func deliverAlert(accessToken: String, title: String, body: String, data: [String: String], pushToken: String, pushTokenType: String, idempotencyKey: String, silent: Bool = false) async throws -> PrivatePushDeliveryResult {
         alertRequests.append((accessToken, title, body, data, pushToken, pushTokenType, idempotencyKey))
         return PrivatePushDeliveryResult(delivered: true, errorCode: nil, shouldDropSubscription: false)
     }
@@ -1254,7 +1254,8 @@ private final class ConcurrentExpiryPrivateAccountAPI: RecordingPrivateAccountAP
         data: [String: String],
         pushToken: String,
         pushTokenType: String,
-        idempotencyKey: String
+        idempotencyKey: String,
+        silent: Bool = false
     ) async throws -> PrivatePushDeliveryResult {
         if accessToken == "access-token" {
             await gate.arrive()
