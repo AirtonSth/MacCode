@@ -121,8 +121,16 @@ function replaceToolOutputText(value, text) {
   return text;
 }
 
-function firstBashCommandToken(command) {
-  const text = String(command || '').trim();
+function shellCommandSegments(command) {
+  // Split on shell separators so `cd x && rg y` / pipelines still skip exact-output tools.
+  return String(command || '')
+    .split(/(?:&&|\|\||;|\|)/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+function firstCommandToken(segment) {
+  const text = String(segment || '').trim();
   if (!text) return '';
   // Strip common env prefixes: FOO=bar BAZ=1 rg pattern
   const withoutEnv = text.replace(/^(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)+/, '');
@@ -132,16 +140,36 @@ function firstBashCommandToken(command) {
   return base.toLowerCase();
 }
 
+function gitExactOutputSubcommand(segment) {
+  // git [-C path] [-c key=val]* (grep|show|cat-file|blame) ...
+  const parts = String(segment || '').trim().split(/\s+/).filter(Boolean);
+  if ((parts[0] || '').toLowerCase().split(/[/\\]/).pop() !== 'git') return null;
+  let i = 1;
+  while (i < parts.length) {
+    const p = parts[i];
+    if (p === '-C' || p === '-c') {
+      i += 2;
+      continue;
+    }
+    if (p.startsWith('-')) {
+      i += 1;
+      continue;
+    }
+    return p.toLowerCase();
+  }
+  return null;
+}
+
 function isExactOutputBashCommand(toolInput) {
   if (!toolInput || typeof toolInput !== 'object') return false;
   const command = typeof toolInput.command === 'string' ? toolInput.command : '';
-  const primary = firstBashCommandToken(command);
-  if (TOKEN_SAVER_EXACT_OUTPUT_BASH.has(primary)) return true;
-  // git grep|show|cat-file|blame
-  if (primary === 'git') {
-    const parts = String(command).trim().split(/\s+/).filter(Boolean);
-    const sub = (parts[1] || '').toLowerCase();
-    return sub === 'grep' || sub === 'show' || sub === 'cat-file' || sub === 'blame';
+  for (const segment of shellCommandSegments(command)) {
+    const primary = firstCommandToken(segment);
+    if (TOKEN_SAVER_EXACT_OUTPUT_BASH.has(primary)) return true;
+    const gitSub = gitExactOutputSubcommand(segment);
+    if (gitSub === 'grep' || gitSub === 'show' || gitSub === 'cat-file' || gitSub === 'blame') {
+      return true;
+    }
   }
   return false;
 }
