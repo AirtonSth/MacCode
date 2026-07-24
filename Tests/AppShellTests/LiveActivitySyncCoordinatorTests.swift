@@ -81,12 +81,32 @@ final class LiveActivitySyncCoordinatorTests: XCTestCase {
         )
         let run = ("10000000-0000-0000-0000-000000000001", "20000000-0000-0000-0000-000000000001")
         sync.submit(active([run]), cause: .started, now: Date(timeIntervalSince1970: 200))
+        // Coalesce window is 120s; pure keepalives sooner than that are no-ops.
         sync.submitHeartbeat(now: Date(timeIntervalSince1970: 260))
+        sync.submitHeartbeat(now: Date(timeIntervalSince1970: 330))
         await sync.flush()
 
-        XCTAssertEqual(recorder.deliveries.map(\.event), [.start, .update])
+        XCTAssertEqual(recorder.deliveries.map(\.event), [.start, .update],
+                       "heartbeat before 120s must be coalesced; later heartbeat emits update")
         XCTAssertEqual(recorder.deliveries.map(\.projection.revision), [1, 2])
-        XCTAssertEqual(recorder.deliveries.last?.projection.updatedAt, 260)
+        XCTAssertEqual(recorder.deliveries.last?.projection.updatedAt, 330)
+    }
+
+    func testHeartbeatIsCoalescedWithinMinInterval() async {
+        let recorder = DeliveryRecorder()
+        let sync = LiveActivitySyncCoordinator(
+            serverId: "server-1", bootEpoch: 7, initialActivityGeneration: 2,
+            deliver: { delivery in await recorder.append(delivery) },
+            heartbeatIntervalNanoseconds: 60_000_000_000_000,
+            minHeartbeatEmitInterval: 120
+        )
+        let run = ("10000000-0000-0000-0000-000000000001", "20000000-0000-0000-0000-000000000001")
+        sync.submit(active([run]), cause: .started, now: Date(timeIntervalSince1970: 1000))
+        sync.submitHeartbeat(now: Date(timeIntervalSince1970: 1050))
+        sync.submitHeartbeat(now: Date(timeIntervalSince1970: 1110))
+        await sync.flush()
+        XCTAssertEqual(recorder.deliveries.map(\.event), [.start],
+                       "pure heartbeats inside the 120s window must not spam APNs updates")
     }
 
     func testLaunchReconciliationEmitsEmptyCorrection() async {
@@ -729,6 +749,74 @@ final class LiveActivitySyncCoordinatorTests: XCTestCase {
                        "legacy devices must not receive the new contract until they advertise the capability")
     }
 
+    func testStartRefreshRemapRetriesAfterFailureThenCoalescesAfterSuccess() async throws {
+        let tmp = NSTemporaryDirectory() + "rc2-start-remap-rate-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let settings = SettingsRepository(db: db)
+        let accountStore = PrivateAccountSessionStore(repo: settings)
+        accountStore.save(PrivateAccountSession(
+            accessToken: "access",
+            refreshToken: "refresh",
+            user: PrivateAccountUser(
+                daysRemaing: nil,
+                daysRemaining: 30,
+                email: "t@example.com",
+                id: "user-1",
+                subscribed: true
+            )
+        ))
+        let targetStore = PrivatePushTargetStore(repo: settings)
+        let startA = PrivatePushTargetRecord(
+            deviceId: "device-a", serverId: "server-1", purpose: .pushToStart,
+            environment: .sandbox, token: "start-token-a",
+            contractVersion: 2, capabilities: ["live_activity_v2"]
+        )
+        let startB = PrivatePushTargetRecord(
+            deviceId: "device-b", serverId: "server-1", purpose: .pushToStart,
+            environment: .sandbox, token: "start-token-b",
+            contractVersion: 2, capabilities: ["live_activity_v2"]
+        )
+        try targetStore.upsert(startA)
+        try targetStore.upsert(startB)
+        let api = StartRemapCountingPrivateAccountAPI(failuresBeforeSuccess: 1)
+        let bridge = PrivateNotificationBridge(
+            accountStore: accountStore,
+            pushTargetStore: targetStore,
+            api: api
+        )
+        let update = makeDelivery(event: .update, generation: 1, revision: 2)
+        let recordA = LiveActivityAcceptanceRecord(delivery: update, target: .v2(startA))
+        // Failed attempt must NOT soft-ack — outbox must be able to retry.
+        do {
+            _ = try await bridge.sendLiveActivityAcceptance(recordA)
+            XCTFail("first start-refresh must surface the backend failure")
+        } catch {
+            // expected
+        }
+        XCTAssertEqual(api.deliverLiveActivityV2Calls, 1)
+        // Retry after failure should hit the backend again and succeed.
+        let recovered = try await bridge.sendLiveActivityAcceptance(recordA)
+        XCTAssertTrue(recovered.isAccepted)
+        XCTAssertEqual(api.deliverLiveActivityV2Calls, 2,
+                       "failed start-refresh must not consume rate-limit budget")
+        // After success, further remaps for the same target soft-ack without spam.
+        let coalesced = try await bridge.sendLiveActivityAcceptance(recordA)
+        XCTAssertEqual(coalesced.status, "delivered")
+        XCTAssertEqual(api.deliverLiveActivityV2Calls, 2,
+                       "successful start-refresh must rate-limit subsequent remaps for same target")
+        // Different device on the same host must still enqueue (not host-wide soft-ack).
+        let recordB = LiveActivityAcceptanceRecord(delivery: update, target: .v2(startB))
+        _ = try await bridge.sendLiveActivityAcceptance(recordB)
+        XCTAssertEqual(api.deliverLiveActivityV2Calls, 3,
+                       "second device must not be soft-acked by another device's rate limit")
+        // Newer revision for device A must still deliver.
+        let newer = makeDelivery(event: .update, generation: 1, revision: 5)
+        let recordANewer = LiveActivityAcceptanceRecord(delivery: newer, target: .v2(startA))
+        _ = try await bridge.sendLiveActivityAcceptance(recordANewer)
+        XCTAssertEqual(api.deliverLiveActivityV2Calls, 4,
+                       "newer revision must not be discarded by equal-or-older rate-limit budget")
+    }
+
     func testHTTPPortOverrideIsSharedByListenerBonjourAndPairing() {
         XCTAssertEqual(DirectAccessConfiguration.port(environment: [:]), 18217)
         XCTAssertEqual(DirectAccessConfiguration.port(environment: ["RC2_HTTP_PORT": "18218"]), 18218)
@@ -775,6 +863,72 @@ final class LiveActivitySyncCoordinatorTests: XCTestCase {
             contractVersion: 2,
             capabilities: ["live_activity_v2"]
         ))
+    }
+}
+
+/// Counts Live Activity v2 delivery attempts; fails the first N then accepts.
+private final class StartRemapCountingPrivateAccountAPI: PrivateAccountAPI, @unchecked Sendable {
+    private let lock = NSLock()
+    private let failuresBeforeSuccess: Int
+    private(set) var deliverLiveActivityV2Calls = 0
+
+    init(failuresBeforeSuccess: Int = 0) {
+        self.failuresBeforeSuccess = failuresBeforeSuccess
+    }
+
+    func login(email: String, password: String) async throws -> PrivateAccountSession {
+        throw PrivateAccountAPIError.invalidResponse
+    }
+    func currentUser(accessToken: String) async throws -> PrivateAccountUser {
+        throw PrivateAccountAPIError.invalidResponse
+    }
+    func refresh(refreshToken: String) async throws -> PrivateAccountSession {
+        throw PrivateAccountAPIError.invalidResponse
+    }
+    func logout(refreshToken: String) async throws {}
+    func billingOverview(accessToken: String) async throws -> PrivateBillingOverview {
+        throw PrivateAccountAPIError.invalidResponse
+    }
+    func createPortal(accessToken: String) async throws -> URL {
+        throw PrivateAccountAPIError.invalidResponse
+    }
+    func deliverAlert(
+        accessToken: String, title: String, body: String, data: [String: String],
+        pushToken: String, pushTokenType: String, idempotencyKey: String
+    ) async throws -> PrivatePushDeliveryResult {
+        throw PrivateAccountAPIError.invalidResponse
+    }
+    func deliverLiveActivity(
+        accessToken: String, event: String, contentState: PrivateLiveActivityContentState,
+        timestampSeconds: Int64, liveActivityToken: String, pushToken: String,
+        pushTokenType: String, idempotencyKey: String
+    ) async throws -> PrivatePushDeliveryResult {
+        throw PrivateAccountAPIError.invalidResponse
+    }
+    func registerLiveActivityTokenV2(
+        accessToken: String,
+        registration: PrivateLiveActivityV2TokenRegistration
+    ) async throws -> PrivateLiveActivityV2TokenRegistrationAck {
+        throw PrivateAccountAPIError.invalidResponse
+    }
+    func deliverLiveActivityV2(
+        accessToken: String,
+        request: PrivateLiveActivityV2DeliveryRequest,
+        idempotencyKey: String
+    ) async throws -> PrivateLiveActivityV2DeliveryAck {
+        lock.lock()
+        deliverLiveActivityV2Calls += 1
+        let call = deliverLiveActivityV2Calls
+        lock.unlock()
+        if call <= failuresBeforeSuccess {
+            throw PrivateAccountAPIError.http(500)
+        }
+        return PrivateLiveActivityV2DeliveryAck(
+            id: idempotencyKey,
+            status: "delivered",
+            attempts: 1,
+            nextAttemptAt: nil
+        )
     }
 }
 

@@ -262,9 +262,12 @@ public final class LiveActivitySyncCoordinator: @unchecked Sendable {
     private var worker: Task<Void, Never>?
     private var heartbeatTask: Task<Void, Never>?
 
-    /// Keep remote Live Activities under ActivityKit stale budget while runs are
-    /// active — even when no turn.completed event arrives for a long stretch.
+    /// Tick interval for the keepalive loop. Actual pure-heartbeat APNs emits
+    /// are coalesced to `minHeartbeatEmitInterval` so we stay under FrequentUpdates
+    /// budget while still refreshing well before ActivityKit's ~480s stale window.
     public static let heartbeatIntervalNanoseconds: UInt64 = 30_000_000_000
+    /// Minimum gap between pure-heartbeat (no content change) APNs updates.
+    public static let minHeartbeatEmitInterval: TimeInterval = 120
 
     public init(
         serverId: String,
@@ -275,7 +278,8 @@ public final class LiveActivitySyncCoordinator: @unchecked Sendable {
         onTokenRegistrationError: @escaping TokenRegistrationError = { _, _ in },
         onDeliveryError: @escaping DeliveryError = { _, _ in },
         deliver: @escaping Delivery,
-        heartbeatIntervalNanoseconds: UInt64 = LiveActivitySyncCoordinator.heartbeatIntervalNanoseconds
+        heartbeatIntervalNanoseconds: UInt64 = LiveActivitySyncCoordinator.heartbeatIntervalNanoseconds,
+        minHeartbeatEmitInterval: TimeInterval = LiveActivitySyncCoordinator.minHeartbeatEmitInterval
     ) {
         let tokenScopeBinder = LiveActivityTokenScopeBinder(
             serverId: serverId,
@@ -293,6 +297,7 @@ public final class LiveActivitySyncCoordinator: @unchecked Sendable {
             var wasPresent = false
             var activityGeneration = initialActivityGeneration
             var stateRevision: UInt64 = 0
+            var lastEmitAt: Date = .distantPast
 
             func presentNow() -> Bool {
                 surface != nil || latest.activeRunCount > 0
@@ -320,6 +325,7 @@ public final class LiveActivitySyncCoordinator: @unchecked Sendable {
                 )
                 do {
                     try await deliver(delivery)
+                    lastEmitAt = now
                 } catch {
                     onDeliveryError(error, delivery)
                 }
@@ -382,6 +388,12 @@ public final class LiveActivitySyncCoordinator: @unchecked Sendable {
                     await emit(event: event, cause: .changed, now: now)
                 case .heartbeat(let now):
                     guard presentNow() else { continue }
+                    // Coalesce pure keepalives: real projection/surface emits reset
+                    // lastEmitAt. Only push another APNs update when the gap is large
+                    // enough that ActivityKit would otherwise approach stale.
+                    guard now.timeIntervalSince(lastEmitAt) >= minHeartbeatEmitInterval else {
+                        continue
+                    }
                     await emit(event: .update, cause: .changed, now: now)
                 case .flush(let barrier):
                     barrier.resume()
