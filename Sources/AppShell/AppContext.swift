@@ -2669,7 +2669,19 @@ public final class AppContext {
         )
         if let s = summary, !s.isEmpty { buf.summary = s }
         if let b = bodyAppend { buf.body += b }
-        if let o = outputAppend { buf.output += o }
+        if let o = outputAppend {
+            // Claude streams tool *input* as input_json_delta → outputAppend.
+            // Real tool stdout for Claude is delivered as tool_result itemStarted
+            // (summary "result", output set) — not as mid-stream deltas on tool_use.
+            // Fold all non-result stream chunks into body so we never finalize
+            // with partial input JSON as "answer" tokens.
+            let resultPhase = (summary == "result") || (buf.summary == "result")
+            if resultPhase {
+                buf.output += o
+            } else {
+                buf.body += o
+            }
+        }
         graphifyItemBuffers[bufferKey] = buf
         graphifyItemBuffersLock.unlock()
 
