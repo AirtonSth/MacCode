@@ -63,6 +63,42 @@ final class TokenSaverBareUserEstimatorTests: XCTestCase {
         XCTAssertLessThan(withHits.estimatedGraphify, 5_000_000, "graphify must not be 18% of all input")
     }
 
+    func test_graphifyPhase2_minOfShareAndMeasuredAvoided() {
+        // WHY: when answer sizes are known, counterfactual must not exceed share-model
+        // and must use measured avoided exploration — never preference-on alone.
+        let used = 10_000_000
+        let share = TokenSaverBareUserEstimator.calibratedDefaultOutputShare
+        let shareOnly = TokenSaverBareUserEstimator.estimateGraphifyRaw(
+            signalCount: 10,
+            used: used,
+            share: share,
+            answerTokensSum: 0,
+            medianExplorationTokens: 2_000
+        )
+        XCTAssertGreaterThan(shareOnly, 0)
+
+        // Huge answers → avoided near 0 → min pulls graphify down.
+        let hugeAnswers = TokenSaverBareUserEstimator.estimateGraphifyRaw(
+            signalCount: 10,
+            used: used,
+            share: share,
+            answerTokensSum: 10 * 50_000,
+            medianExplorationTokens: 2_000
+        )
+        XCTAssertLessThanOrEqual(hugeAnswers, shareOnly)
+        XCTAssertEqual(hugeAnswers, 0, "if answers ≥ replaced exploration, no graphify credit")
+
+        let modest = TokenSaverBareUserEstimator.estimateGraphifyRaw(
+            signalCount: 10,
+            used: used,
+            share: share,
+            answerTokensSum: 500,
+            medianExplorationTokens: 2_000
+        )
+        XCTAssertGreaterThan(modest, 0)
+        XCTAssertLessThanOrEqual(modest, shareOnly)
+    }
+
     func test_zeroMeasured_limitsAttributedFantasy() {
         // WHY: empty pipe day must not report tens of millions of "savings".
         let b = TokenSaverBareUserEstimator.estimate(

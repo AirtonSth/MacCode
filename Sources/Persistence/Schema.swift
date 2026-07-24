@@ -9,7 +9,8 @@ public struct SchemaStep {
 }
 
 public enum Schema {
-    public static let currentVersion: Int = 52
+    /// Must equal the highest SchemaStep version (step 53 economy + 54 graphify usage).
+    public static let currentVersion: Int = 54
 
     public static let steps: [SchemaStep] = [
         SchemaStep(1, """
@@ -914,6 +915,27 @@ public enum Schema {
         );
         CREATE INDEX IF NOT EXISTS idx_token_saver_daily_economy_updated
             ON token_saver_daily_economy(updated_at);
+        """),
+        // Measured Graphify CLI uses (query|path|explain) + exploration samples
+        // for bare-user counterfactual. Not mixed into token_saver_savings pipes.
+        SchemaStep(54, """
+        CREATE TABLE IF NOT EXISTS graphify_usage_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at_ms INTEGER NOT NULL,
+            provider TEXT NOT NULL,
+            run_id TEXT NOT NULL,
+            item_id TEXT NOT NULL,
+            subcommand TEXT NOT NULL,
+            answer_tokens INTEGER NOT NULL DEFAULT 0,
+            source TEXT NOT NULL DEFAULT 'event_stream',
+            ok INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_graphify_usage_dedupe
+            ON graphify_usage_events(run_id, item_id, subcommand);
+        CREATE INDEX IF NOT EXISTS idx_graphify_usage_created
+            ON graphify_usage_events(created_at_ms);
+        CREATE INDEX IF NOT EXISTS idx_graphify_usage_ok_created
+            ON graphify_usage_events(ok, created_at_ms);
         """)
     ]
 

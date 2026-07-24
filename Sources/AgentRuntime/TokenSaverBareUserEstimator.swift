@@ -79,6 +79,11 @@ public struct TokenSaverBareUserObservation: Sendable, Equatable {
     public let assistantChars: Int
     /// Graphify-related activity signals in window (queries/events). 0 = no credit.
     public let graphifySignalCount: Int
+    /// Sum of Graphify tool-result tokens in the window (Phase 2 measured leg).
+    public let graphifyAnswerTokens: Int
+    /// Median tokens of local Read/Grep/Glob exploration samples (Phase 2).
+    /// nil → use calibrated exploration fallback (still clamped).
+    public let medianExplorationTokens: Int?
 
     public init(
         windowProviderTokens: Int,
@@ -86,7 +91,9 @@ public struct TokenSaverBareUserObservation: Sendable, Equatable {
         observedInputTokens: Int? = nil,
         observationSampleCount: Int = 0,
         assistantChars: Int = 0,
-        graphifySignalCount: Int = 0
+        graphifySignalCount: Int = 0,
+        graphifyAnswerTokens: Int = 0,
+        medianExplorationTokens: Int? = nil
     ) {
         self.windowProviderTokens = max(0, windowProviderTokens)
         self.observedOutputTokens = observedOutputTokens.map { max(0, $0) }
@@ -94,6 +101,8 @@ public struct TokenSaverBareUserObservation: Sendable, Equatable {
         self.observationSampleCount = max(0, observationSampleCount)
         self.assistantChars = max(0, assistantChars)
         self.graphifySignalCount = max(0, graphifySignalCount)
+        self.graphifyAnswerTokens = max(0, graphifyAnswerTokens)
+        self.medianExplorationTokens = medianExplorationTokens.map { max(0, $0) }
     }
 
     public static let empty = TokenSaverBareUserObservation(windowProviderTokens: 0)
@@ -128,6 +137,16 @@ public enum TokenSaverBareUserEstimator {
 
     /// Soft-cap graphify intensity: hits / this → intensity ∈ (0,1].
     public static let graphifySignalSoftCap: Double = 40
+
+    /// Bare-agent reads replaced per Graphify query (documented constant k=2).
+    public static let graphifyReplacedExplorationFactor: Double = 2.0
+
+    /// Fallback median exploration tokens when fewer than minSamples exist.
+    public static let graphifyDefaultExplorationTokens: Int = 2_000
+
+    /// Clamp band for per-query replaced exploration tokens.
+    public static let graphifyExplorationMinTokens: Int = 400
+    public static let graphifyExplorationMaxTokens: Int = 8_000
 
     /// Attributed (dialect+graphify) ≤ max(measured × this, …).
     public static let attributedCapMultipleOfMeasured: Double = 4.0
@@ -183,9 +202,13 @@ public enum TokenSaverBareUserEstimator {
 
         let graphifyRaw: Int
         if graphifyActive, observation.graphifySignalCount > 0, used > 0 {
-            let intensity = min(1.0, Double(observation.graphifySignalCount) / graphifySignalSoftCap)
-            let inputTokens = Double(used) * (1.0 - share)
-            graphifyRaw = Int((inputTokens * graphifyInputAvoidanceRate * intensity).rounded())
+            graphifyRaw = estimateGraphifyRaw(
+                signalCount: observation.graphifySignalCount,
+                used: used,
+                share: share,
+                answerTokensSum: observation.graphifyAnswerTokens,
+                medianExplorationTokens: observation.medianExplorationTokens
+            )
         } else {
             graphifyRaw = 0
         }
@@ -273,6 +296,45 @@ public enum TokenSaverBareUserEstimator {
         // Prefer max(share-scaled usage, assistant floor) so a quiet stream day
         // with real assistant text still gets some dialect credit.
         return max(0, max(fromShare, fromAssistant))
+    }
+
+    /// Share-model ceiling + measured-anchored counterfactual (Phase 2).
+    ///
+    /// ```
+    /// shareModel = input × 0.04 × intensity(count/40)
+    /// avoided    = max(0, count × replacedExploration − answerTokensSum)
+    /// graphify   = min(shareModel, avoided) when answer sum > 0, else shareModel
+    /// ```
+    /// Prefer under-count: no answer data → share model only (never invent answers).
+    public static func estimateGraphifyRaw(
+        signalCount: Int,
+        used: Int,
+        share: Double,
+        answerTokensSum: Int,
+        medianExplorationTokens: Int?
+    ) -> Int {
+        let count = max(0, signalCount)
+        guard count > 0, used > 0 else { return 0 }
+        let intensity = min(1.0, Double(count) / graphifySignalSoftCap)
+        let inputTokens = Double(used) * (1.0 - min(max(share, 0), 1))
+        let shareModel = Int((inputTokens * graphifyInputAvoidanceRate * intensity).rounded())
+        guard shareModel > 0 else { return 0 }
+
+        let median = medianExplorationTokens ?? graphifyDefaultExplorationTokens
+        let replacedPerQuery = clampExploration(
+            Int((Double(median) * graphifyReplacedExplorationFactor).rounded())
+        )
+        let avoided = max(0, count * replacedPerQuery - max(0, answerTokensSum))
+        // When we have no measured answers yet, keep share-model only so a day of
+        // pending tool_results does not get full exploration credit by accident.
+        if answerTokensSum > 0 {
+            return min(shareModel, avoided)
+        }
+        return shareModel
+    }
+
+    public static func clampExploration(_ tokens: Int) -> Int {
+        min(max(tokens, graphifyExplorationMinTokens), graphifyExplorationMaxTokens)
     }
 
     static func applyAttributedCaps(

@@ -3049,15 +3049,16 @@ public struct SidebarRootView: View {
 
     /// Pure seam: Day and Week must call the same estimator with window-aligned inputs.
     ///
-    /// Graphify signals default to **0** until per-window host telemetry is plumbed.
-    /// Passing a fake soft-cap count would make graphify intensity always 1.0 whenever
-    /// the preference is on (not defensible). Prefer under-count over invented M.
+    /// Graphify credit requires measured `graphifySignalCount` (CLI query|path|explain).
+    /// Prefer under-count: never invent signals from preference-on alone.
     nonisolated public static func tokenSaverBareUserBreakdown(
         measuredToolOutputSaved: Int,
         windowProviderTokens: Int,
         tokenSaverEnabled: Bool,
         graphifyActive: Bool,
         graphifySignalCount: Int = 0,
+        graphifyAnswerTokens: Int = 0,
+        medianExplorationTokens: Int? = nil,
         assistantChars: Int = 0,
         observedOutputTokens: Int? = nil,
         observedInputTokens: Int? = nil,
@@ -3069,7 +3070,9 @@ public struct SidebarRootView: View {
             observedInputTokens: observedInputTokens,
             observationSampleCount: observationSampleCount,
             assistantChars: assistantChars,
-            graphifySignalCount: graphifyActive ? max(0, graphifySignalCount) : 0
+            graphifySignalCount: graphifyActive ? max(0, graphifySignalCount) : 0,
+            graphifyAnswerTokens: graphifyActive ? max(0, graphifyAnswerTokens) : 0,
+            medianExplorationTokens: graphifyActive ? medianExplorationTokens : nil
         )
         return TokenSaverBareUserEstimator.estimate(
             measuredToolOutputSaved: measuredToolOutputSaved,
