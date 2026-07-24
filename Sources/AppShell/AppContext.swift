@@ -2676,7 +2676,9 @@ public final class AppContext {
         graphifyItemBuffersLock.unlock()
         backgroundWriterQueue.async { [weak self] in
             try? self?.graphifyUsageRepo.deleteItem(runId: runKey, itemId: itemId)
-            self?.recomputeTokenSaverDailyEconomyToday()
+            DispatchQueue.main.async { [weak self] in
+                self?.recomputeTokenSaverDailyEconomyToday()
+            }
         }
     }
 
@@ -2754,7 +2756,9 @@ public final class AppContext {
             graphifyItemBuffersLock.unlock()
             backgroundWriterQueue.async { [weak self] in
                 try? self?.graphifyUsageRepo.deleteItem(runId: runKey, itemId: itemId)
-                self?.recomputeTokenSaverDailyEconomyToday()
+                DispatchQueue.main.async { [weak self] in
+                    self?.recomputeTokenSaverDailyEconomyToday()
+                }
             }
             return
         }
@@ -2767,7 +2771,9 @@ public final class AppContext {
                 itemId: itemId,
                 answerTokens: answerTokens
             )
-            self.recomputeTokenSaverDailyEconomyToday()
+            DispatchQueue.main.async { [weak self] in
+                self?.recomputeTokenSaverDailyEconomyToday()
+            }
         }
         graphifyItemBuffersLock.lock()
         graphifyItemBuffers.removeValue(forKey: bufferKey)
