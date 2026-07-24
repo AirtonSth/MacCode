@@ -211,6 +211,77 @@ final class DistillReversibleStoreServiceTests: XCTestCase {
         XCTAssertNil(response.originalHandle)
     }
 
+    /// WHY: projectless agent threads had no recovery headers and no promoted
+    /// lane scorecard, so every lossy command-output optimize was forced to
+    /// verbatim (0 savings). Command-output must fall back to the unscoped
+    /// reversible store when scoped prepare is unavailable.
+    func test_commandOutputOptimize_usesUnscopedStoreWhenScopedRecoveryMissing() async throws {
+        let store = InMemoryReversibleStore()
+        let configuration = try DistillServiceConfiguration(
+            authToken: "tok",
+            appSupportDirectory: NSTemporaryDirectory()
+        )
+        let server = DistillHTTPServer(
+            configuration: configuration,
+            scheduler: DistillScheduler(runtime: DiscardingRuntime(), maxConcurrentRequests: 2),
+            reversibleStore: store,
+            reversibleStoreMinBytes: 8
+        )
+        let ready = try await server.start()
+        defer { server.stop() }
+
+        let original = "command output that must shrink and still be recoverable"
+        let request = DistillRequest(
+            mode: .commandOutput,
+            input: original,
+            runMode: .optimize,
+            cacheState: "tool_output_oneshot",
+            maxOutputCharacters: 64
+        )
+        let result = try await http(
+            ready.baseURL + "/v1/distill",
+            method: "POST",
+            token: "tok",
+            body: try JSONEncoder().encode(request)
+        )
+        XCTAssertEqual(result.status, 200)
+        let response = try JSONDecoder().decode(DistillResponse.self, from: result.data)
+        XCTAssertEqual(response.output, "X", "lossy command-output must be delivered when unscoped store backs it")
+        XCTAssertNotNil(response.originalHandle, "store-before-loss requires a recovery handle")
+        XCTAssertEqual(store.storeCount, 1)
+        let handle = try XCTUnwrap(response.originalHandle)
+        XCTAssertEqual(try store.retrieveOriginal(handle), Data(original.utf8))
+    }
+
+    /// WHY: semantic longText remains quarantined from unscoped recovery so we
+    /// never re-open unscoped-loss for prompt-side compression.
+    func test_longTextOptimize_stillQuarantinesUnscopedStore() async throws {
+        let store = InMemoryReversibleStore()
+        let configuration = try DistillServiceConfiguration(
+            authToken: "tok",
+            appSupportDirectory: NSTemporaryDirectory()
+        )
+        let server = DistillHTTPServer(
+            configuration: configuration,
+            scheduler: DistillScheduler(runtime: DiscardingRuntime(), maxConcurrentRequests: 2),
+            reversibleStore: store,
+            reversibleStoreMinBytes: 1
+        )
+        let ready = try await server.start()
+        defer { server.stop() }
+        let original = "semantic prompt that must not use unscoped recovery"
+        let result = try await http(
+            ready.baseURL + "/v1/distill",
+            method: "POST",
+            token: "tok",
+            body: try JSONEncoder().encode(DistillRequest(mode: .longText, input: original, runMode: .optimize))
+        )
+        let response = try JSONDecoder().decode(DistillResponse.self, from: result.data)
+        XCTAssertEqual(response.output, original)
+        XCTAssertNil(response.originalHandle)
+        XCTAssertEqual(store.storeCount, 0)
+    }
+
     func test_scopedOptimizeEmitsCapabilityAndManagedCLIRetrievesWithExactFiveFieldScope() async throws {
         let store = InMemoryScopedStore()
         let configuration = try DistillServiceConfiguration(authToken: "tok", appSupportDirectory: NSTemporaryDirectory())

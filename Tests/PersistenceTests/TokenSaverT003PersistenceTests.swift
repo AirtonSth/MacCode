@@ -913,6 +913,42 @@ final class TokenSaverT003PersistenceTests: XCTestCase {
         XCTAssertFalse(try repo.delete(childThreadID: "child"))
     }
 
+    /// WHY: with zero project lane scorecards, prepareOriginal used to throw
+    /// retentionDisabled for every deterministic_wrapper call — store-before-loss
+    /// then forced all tool-output compression to verbatim (0 savings). A default
+    /// 7-day retention for that lane (unless explicitly denied) unblocks Token Saver.
+    func test_runtimeRecovery_defaultDeterministicWrapperRetentionWithoutScorecard() throws {
+        let db = try makeDB()
+        let worker = TokenSaverRuntimeRecoveryWorker(db: db)
+        let retentionStart = Date(timeIntervalSince1970: 2_000)
+        let prepared = try worker.prepareOriginal(
+            Data("wrapper-default".utf8),
+            scope: scope(),
+            operationID: "wrapper-default-op",
+            lane: "deterministic_wrapper",
+            expiresAt: nil,
+            disk: disk,
+            now: retentionStart
+        )
+        XCTAssertEqual(
+            try scalar(db, sql: "SELECT COUNT(*) FROM token_saver_recovery_objects WHERE id = '\(prepared.objectID)';"),
+            1
+        )
+        XCTAssertEqual(
+            try scalar(db, sql: "SELECT expires_at_ms FROM token_saver_recovery_objects WHERE id = '\(prepared.objectID)';"),
+            Int(retentionStart.addingTimeInterval(7 * 86_400).timeIntervalSince1970 * 1_000)
+        )
+        XCTAssertThrowsError(try worker.prepareOriginal(
+            Data("semantic-default".utf8),
+            scope: scope(),
+            operationID: "semantic-default-op",
+            lane: "semantic_prose",
+            expiresAt: Date().addingTimeInterval(60),
+            disk: disk,
+            now: retentionStart
+        )) { XCTAssertEqual($0 as? TokenSaverRecoveryStoreError, .retentionDisabled) }
+    }
+
     func test_runtimeRecoveryUsesExactLaneRetentionAndRetentionZeroPersistsNothing() throws {
         let db = try makeDB()
         let lanes = TokenSaverLaneStateRepository(db: db)

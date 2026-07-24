@@ -128,6 +128,35 @@ public struct TokenSaverProviderUsage: Codable, Sendable, Equatable {
         return weeklyUsedPercent
     }
 
+    /// Session rate-limit % for display after discarding expired / bare-zero noise.
+    ///
+    /// WHY: account probes and inactive-provider clears often leave
+    /// `currentSessionUsedPercent = 0` without a live session window. Treating that
+    /// as real data painted every Today ring as "0% used" even when weekly was 84%+.
+    /// An unexpired `currentSessionResetsAt` keeps a true mid-window 0%; otherwise
+    /// bare zero is treated as missing so the UI can fall back to weekly %.
+    public func effectiveSessionUsedPercent(now: Date = Date()) -> Double? {
+        Self.effectiveSessionUsedPercent(
+            currentSessionUsedPercent: currentSessionUsedPercent,
+            currentSessionResetsAt: currentSessionResetsAt,
+            now: now
+        )
+    }
+
+    nonisolated public static func effectiveSessionUsedPercent(
+        currentSessionUsedPercent: Double?,
+        currentSessionResetsAt: Date?,
+        now: Date = Date()
+    ) -> Double? {
+        guard let currentSessionUsedPercent else { return nil }
+        if let currentSessionResetsAt {
+            if currentSessionResetsAt <= now { return nil }
+            return currentSessionUsedPercent
+        }
+        if currentSessionUsedPercent <= 0 { return nil }
+        return currentSessionUsedPercent
+    }
+
     private static func clampedPercent(_ value: Double?) -> Double? {
         guard let value, value.isFinite else { return nil }
         return min(max(value, 0), 100)

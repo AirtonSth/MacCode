@@ -1057,10 +1057,12 @@ public final class DistillHTTPServer: @unchecked Sendable {
                compressed.output != distillRequest.input {
                 // Store-before-loss (T-003 unscoped-loss containment): a lossy
                 // optimize output may only be served when it is backed by a
-                // scope-bound recovery handle. Any other case — no/incomplete
-                // scope, missing scoped store, a store prepare/readback/deliver
-                // failure, or a lookup error that cleared the scope above — must
-                // fail open to the byte-exact original, never an unrecoverable
+                // recoverable handle. Prefer exact project-scoped recovery; for
+                // command-output (PATH wrap / tool oneshot) fall back to the
+                // unscoped reversible store so missing lane scorecards or
+                // projectless threads do not permanently zero Token Saver.
+                // Semantic longText stays scoped-only. If neither store works,
+                // fail open to the byte-exact original — never an unrecoverable
                 // lossy summary. (Raw SHA is not an authorization grant.)
                 var deliveredWithHandle = false
                 if let scopedContext, let scopedRecoveryStore {
@@ -1090,6 +1092,24 @@ public final class DistillHTTPServer: @unchecked Sendable {
                         deliveredWithHandle = true
                     } catch {
                         deliveredWithHandle = false
+                    }
+                }
+                if !deliveredWithHandle,
+                   distillRequest.mode == .commandOutput,
+                   let reversibleStore {
+                    let inputData = Data(distillRequest.input.utf8)
+                    let floor = distillRequest.reversibleStoreMinBytes ?? reversibleStoreMinBytes
+                    if inputData.count >= floor {
+                        do {
+                            let handle = try reversibleStore.storeOriginal(inputData)
+                            guard try reversibleStore.retrieveOriginal(handle) == inputData else {
+                                throw DistillError.invalidOutput
+                            }
+                            response = compressed.withOriginalHandle(handle)
+                            deliveredWithHandle = true
+                        } catch {
+                            deliveredWithHandle = false
+                        }
                     }
                 }
                 if !deliveredWithHandle {

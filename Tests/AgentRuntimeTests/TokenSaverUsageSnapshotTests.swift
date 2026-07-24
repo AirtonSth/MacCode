@@ -156,4 +156,45 @@ final class TokenSaverUsageSnapshotTests: XCTestCase {
         XCTAssertEqual(by[.claude]?.weeklyUsedPercent, 0)
         XCTAssertEqual(by[.codex]?.weeklyUsedPercent, 23)
     }
+
+    /// WHY: bare session 0% from a probe miss painted every Today ring as empty
+    /// even when weekly usage was 80%+. Only a live unexpired session window may
+    /// keep a true 0%; otherwise session % is missing so the UI can fall back.
+    func test_effectiveSessionUsedPercent_ignoresBareZeroWithoutLiveWindow() {
+        let now = Date(timeIntervalSince1970: 2_000_000)
+        XCTAssertNil(
+            TokenSaverProviderUsage.effectiveSessionUsedPercent(
+                currentSessionUsedPercent: 0,
+                currentSessionResetsAt: nil,
+                now: now
+            ),
+            "bare 0 without a session reset window must not paint Today as 0% used"
+        )
+        XCTAssertNil(
+            TokenSaverProviderUsage.effectiveSessionUsedPercent(
+                currentSessionUsedPercent: 0,
+                currentSessionResetsAt: Date(timeIntervalSince1970: 1_500_000),
+                now: now
+            ),
+            "expired session window must not keep a frozen 0%"
+        )
+        XCTAssertEqual(
+            TokenSaverProviderUsage.effectiveSessionUsedPercent(
+                currentSessionUsedPercent: 0,
+                currentSessionResetsAt: Date(timeIntervalSince1970: 2_500_000),
+                now: now
+            ),
+            0,
+            "true mid-window 0% with a future reset must still display as 0%"
+        )
+        XCTAssertEqual(
+            TokenSaverProviderUsage.effectiveSessionUsedPercent(
+                currentSessionUsedPercent: 37,
+                currentSessionResetsAt: nil,
+                now: now
+            ),
+            37,
+            "positive session % without reset metadata remains usable"
+        )
+    }
 }

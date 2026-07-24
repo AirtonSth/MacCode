@@ -2990,8 +2990,15 @@ public struct SidebarRootView: View {
     ) -> Double? {
         switch scope {
         case .currentSession:
-            if let currentSessionUsedPercent = usage.currentSessionUsedPercent {
+            // Prefer a live session %; bare 0 without an unexpired window is
+            // treated as missing (probe miss / clear) so Today does not stick at 0%.
+            if let currentSessionUsedPercent = usage.effectiveSessionUsedPercent() {
                 return min(max(currentSessionUsedPercent / 100.0, 0), 1)
+            }
+            // Fall back to the weekly rate-limit % when session data is absent —
+            // that is still honest provider usage, and matches what users check.
+            if let weeklyUsedPercent = usage.effectiveWeeklyUsedPercent() {
+                return min(max(weeklyUsedPercent / 100.0, 0), 1)
             }
             guard usage.currentSessionLimitTokens > 0 else { return nil }
             return tokenSaverRingProgress(
@@ -3029,8 +3036,13 @@ public struct SidebarRootView: View {
     ) -> String {
         switch scope {
         case .currentSession:
-            if let currentSessionUsedPercent = usage.currentSessionUsedPercent {
+            if let currentSessionUsedPercent = usage.effectiveSessionUsedPercent() {
                 return "Session used \(Self.formatPercent(currentSessionUsedPercent / 100.0))"
+            }
+            // When session probe is missing/bare-zero, surface weekly % under a
+            // honest label instead of painting "Session used 0%".
+            if let weeklyUsedPercent = usage.effectiveWeeklyUsedPercent() {
+                return "Week used \(Self.formatPercent(weeklyUsedPercent / 100.0))"
             }
             guard usage.currentSessionLimitTokens > 0 else { return "Session usage not loaded" }
             let usedProgress = tokenSaverRingProgress(

@@ -1281,6 +1281,7 @@ public final class TokenSaverRuntimeRecoveryWorker: @unchecked Sendable {
 
     private func authoritativeRetentionDays(projectID: String, lane: String) throws -> Int? {
         try db.performSync { database in
+            // Fully promoted + scorecarded lane: authoritative product retention.
             let statement = try database.prepare("""
                 SELECT retention_days FROM token_saver_lane_state
                 WHERE project_id = ? AND state = 'promoted'
@@ -1294,7 +1295,38 @@ public final class TokenSaverRuntimeRecoveryWorker: @unchecked Sendable {
             defer { statement.reset() }
             try statement.bind(1, projectID)
             try statement.bind(2, lane)
-            return try statement.step() ? Int(statement.columnInt64(0)) : nil
+            if try statement.step() {
+                return Int(statement.columnInt64(0))
+            }
+
+            // Explicit governance row can still deny retention (opt-out / kill /
+            // retention=0) even when scorecard promotion is incomplete.
+            let explicit = try database.prepare("""
+                SELECT retention_days, opted_out, kill_switch_active
+                FROM token_saver_lane_state
+                WHERE project_id = ? AND lane = ?
+                LIMIT 1;
+            """)
+            defer { explicit.reset() }
+            try explicit.bind(1, projectID)
+            try explicit.bind(2, lane)
+            if try explicit.step() {
+                let retentionDays = Int(explicit.columnInt64(0))
+                let optedOut = explicit.columnInt64(1) != 0
+                let killSwitch = explicit.columnInt64(2) != 0
+                if optedOut || killSwitch || retentionDays <= 0 {
+                    return nil
+                }
+            }
+
+            // Default for the tool-output wrapper lane: Token Saver ON without a
+            // project scorecard must still be able to store-before-loss so
+            // command-output compression is not forced to permanent verbatim.
+            // Semantic prose stays fail-closed until promoted.
+            if lane == "deterministic_wrapper" {
+                return 7
+            }
+            return nil
         }
     }
 }
