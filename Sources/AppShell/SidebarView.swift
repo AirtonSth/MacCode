@@ -332,6 +332,9 @@ public final class SidebarViewModel: ObservableObject {
     @Published public private(set) var tokenSaverUsageSnapshot: TokenSaverUsageSnapshot = .empty()
     /// Saved-token totals from the local DB plus retained report/chart rows.
     @Published public private(set) var tokenSaverSavingsSummary: TokenSaverSavingsSummary = .empty
+    /// Persisted daily credible totals (Week = Σ). Empty until first recompute.
+    @Published public private(set) var tokenSaverDailyEconomyToday: TokenSaverDailyEconomyRecord?
+    @Published public private(set) var tokenSaverDailyEconomyWeekTotal: Int = 0
     @Published public private(set) var tokenSaverProjectGovernance: [TokenSaverProjectGovernance] = []
     @Published public private(set) var tokenSaverGovernanceNotice: String?
     @Published public var showsTokenSaverModelDownload = false
@@ -593,18 +596,28 @@ public final class SidebarViewModel: ObservableObject {
             tokenSaverHeavyReloadTask = nil
             tokenSaverUsageSnapshot = .empty()
             tokenSaverSavingsSummary = .empty
+            tokenSaverDailyEconomyToday = nil
+            tokenSaverDailyEconomyWeekTotal = 0
             return
         }
+        context.recomputeTokenSaverDailyEconomyToday()
         let appSupport = context.appSupportDirectory
-        let repo = context.tokenSaverSavingsRepo
+        let savingsRepo = context.tokenSaverSavingsRepo
+        let economyRepo = context.tokenSaverDailyEconomyRepo
         tokenSaverHeavyReloadTask?.cancel()
         tokenSaverHeavyReloadTask = Task { [weak self] in
-            let result = await Self.loadTokenSaverHeavy(appSupportDirectory: appSupport, repo: repo)
+            let result = await Self.loadTokenSaverHeavy(
+                appSupportDirectory: appSupport,
+                savingsRepo: savingsRepo,
+                economyRepo: economyRepo
+            )
             guard !Task.isCancelled else { return }
             await MainActor.run { [weak self] in
                 guard let self, !Task.isCancelled else { return }
                 self.tokenSaverUsageSnapshot = result.snapshot
                 self.tokenSaverSavingsSummary = result.summary
+                self.tokenSaverDailyEconomyToday = result.economyToday
+                self.tokenSaverDailyEconomyWeekTotal = result.economyWeekTotal
             }
         }
     }
@@ -788,14 +801,21 @@ public final class SidebarViewModel: ObservableObject {
             tokenSaverHeavyReloadTask = nil
             tokenSaverUsageSnapshot = .empty()
             tokenSaverSavingsSummary = .empty
+            tokenSaverDailyEconomyToday = nil
+            tokenSaverDailyEconomyWeekTotal = 0
             return
         }
+        // Keep today's economy row fresh so Week = Σ dailies stays aligned.
+        context.recomputeTokenSaverDailyEconomyToday()
         let result = await Self.loadTokenSaverHeavy(
             appSupportDirectory: context.appSupportDirectory,
-            repo: context.tokenSaverSavingsRepo
+            savingsRepo: context.tokenSaverSavingsRepo,
+            economyRepo: context.tokenSaverDailyEconomyRepo
         )
         tokenSaverUsageSnapshot = result.snapshot
         tokenSaverSavingsSummary = result.summary
+        tokenSaverDailyEconomyToday = result.economyToday
+        tokenSaverDailyEconomyWeekTotal = result.economyWeekTotal
     }
 
     /// Runs the heavy Token Saver reads off the main actor. `repo` is
@@ -803,12 +823,33 @@ public final class SidebarViewModel: ObservableObject {
     /// a file, so both are safe to call on a background executor.
     private static func loadTokenSaverHeavy(
         appSupportDirectory: URL,
-        repo: TokenSaverSavingsRepository
-    ) async -> (snapshot: TokenSaverUsageSnapshot, summary: TokenSaverSavingsSummary) {
+        savingsRepo: TokenSaverSavingsRepository,
+        economyRepo: TokenSaverDailyEconomyRepository
+    ) async -> (
+        snapshot: TokenSaverUsageSnapshot,
+        summary: TokenSaverSavingsSummary,
+        economyToday: TokenSaverDailyEconomyRecord?,
+        economyWeekTotal: Int
+    ) {
         await Task.detached {
             let snapshot = TokenSaverUsageStore(appSupportDirectory: appSupportDirectory).load()
-            let summary = (try? repo.summary()) ?? .empty
-            return (snapshot, summary)
+            let summary = (try? savingsRepo.summary()) ?? .empty
+            let cal = Calendar.current
+            let now = Date()
+            let todayStart = cal.startOfDay(for: now)
+            let todayMs = Int64(todayStart.timeIntervalSince1970 * 1000)
+            let weekStart = cal.date(byAdding: .day, value: -6, to: todayStart) ?? todayStart
+            let weekStartMs = Int64(weekStart.timeIntervalSince1970 * 1000)
+            let weekEndExclusive = cal.date(byAdding: .day, value: 1, to: todayStart) ?? now
+            let weekEndMs = Int64(weekEndExclusive.timeIntervalSince1970 * 1000)
+            let economyToday = try? economyRepo.record(dayStartMs: todayMs)
+            // Hybrid week: economy days (full formula) + measured-only for pre-feature days.
+            let weekTotal = (try? economyRepo.windowTotalCredible(
+                fromDayStartMs: weekStartMs,
+                toDayStartMs: todayMs,
+                toDayEndMsExclusive: weekEndMs
+            ).total) ?? 0
+            return (snapshot, summary, economyToday, weekTotal)
         }.value
     }
 
@@ -2951,8 +2992,8 @@ public struct SidebarRootView: View {
         scope: TokenSaverUsageScope
     ) -> Int {
         if vm.privateAccountUser?.subscribed == true && vm.tokenSaverEnabled {
-            // Always totalCredible for Today and Week (same estimator, windowed inputs).
-            return tokenSaverBareUserBreakdown(in: snapshot, scope: scope).totalCredible
+            // Prefer persisted daily economy: Week = Σ(daily.total_credible).
+            return tokenSaverPersistedOrLiveCredible(scope: scope, snapshot: snapshot)
         }
         return TokenSaverUsageStore.estimatePotentialSavings(
             usedTokens: tokenSaverScopeUsedTokens(in: snapshot, scope: scope)
@@ -2970,13 +3011,46 @@ public struct SidebarRootView: View {
         }
     }
 
-    /// Bare-user counterfactual for the selected window. **Today and Week share
-    /// this single path** — only measured ledger + windowed usage differ by scope.
+    /// Today: today's economy row (or live recompute fallback).
+    /// Week: sum of stored daily totals + measured-only for pre-feature days.
+    private func tokenSaverPersistedOrLiveCredible(
+        scope: TokenSaverUsageScope,
+        snapshot: TokenSaverUsageSnapshot
+    ) -> Int {
+        switch scope {
+        case .currentSession:
+            if let today = vm.tokenSaverDailyEconomyToday {
+                return today.totalCredible
+            }
+            return tokenSaverBareUserBreakdown(in: snapshot, scope: scope).totalCredible
+        case .week:
+            // Hybrid sum from load path; if zero (pre-write), fall back to live estimate
+            // on the week window so UI is never empty after first day of the feature.
+            if vm.tokenSaverDailyEconomyWeekTotal > 0 {
+                return vm.tokenSaverDailyEconomyWeekTotal
+            }
+            return tokenSaverBareUserBreakdown(in: snapshot, scope: scope).totalCredible
+        }
+    }
+
+    /// Bare-user counterfactual for the selected window (live compute; also used
+    /// to **write** today's economy row). Week UI prefers Σ(DB days) when present.
     private func tokenSaverBareUserBreakdown(
         in snapshot: TokenSaverUsageSnapshot,
         scope: TokenSaverUsageScope
     ) -> TokenSaverBareUserBreakdown {
-        Self.tokenSaverBareUserBreakdown(
+        // Prefer DB row for today when showing technique stack.
+        if scope == .currentSession, let today = vm.tokenSaverDailyEconomyToday {
+            return TokenSaverBareUserBreakdown(
+                measuredToolOutput: today.measuredTokens,
+                estimatedDialect: today.dialectTokens,
+                estimatedGraphify: today.graphifyTokens,
+                estimatedOrchestration: today.orchestrationTokens,
+                appliedOutputShare: today.appliedOutputShare,
+                usedCalibratedDefaults: true
+            )
+        }
+        return Self.tokenSaverBareUserBreakdown(
             measuredToolOutputSaved: tokenSaverMeasuredSaved(scope: scope),
             windowProviderTokens: tokenSaverScopeUsedTokens(in: snapshot, scope: scope),
             tokenSaverEnabled: vm.tokenSaverEnabled,

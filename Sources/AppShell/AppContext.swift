@@ -127,6 +127,7 @@ public final class AppContext {
     public let proposedPlanRepo: AgentProposedPlanRepository
     public let turnCheckpointRepo: AgentTurnCheckpointRepository
     public let tokenSaverSavingsRepo: TokenSaverSavingsRepository
+    public let tokenSaverDailyEconomyRepo: TokenSaverDailyEconomyRepository
     public let tokenSaverAttemptLedger: TokenSaverAttemptLedger
     public let tokenSaverSessionLearnRepo: TokenSaverSessionLearnRepository
     public let tokenSaverLaneStateRepo: TokenSaverLaneStateRepository
@@ -235,6 +236,7 @@ public final class AppContext {
         self.proposedPlanRepo = AgentProposedPlanRepository(db: db)
         self.turnCheckpointRepo = AgentTurnCheckpointRepository(db: db)
         self.tokenSaverSavingsRepo = TokenSaverSavingsRepository(db: db)
+        self.tokenSaverDailyEconomyRepo = TokenSaverDailyEconomyRepository(db: db)
         self.tokenSaverAttemptLedger = TokenSaverAttemptLedger(db: db)
         self.tokenSaverSessionLearnRepo = TokenSaverSessionLearnRepository(db: db)
         self.tokenSaverLaneStateRepo = TokenSaverLaneStateRepository(db: db)
@@ -2437,6 +2439,7 @@ public final class AppContext {
                 }
             }
             DispatchQueue.main.async { [weak self] in
+                self?.recomputeTokenSaverDailyEconomyToday()
                 self?.scheduleTokenSaverUsageChangedNotification()
             }
         }
@@ -2484,9 +2487,55 @@ public final class AppContext {
                 savedTokens: savedTokens,
                 cacheState: cacheState
             )
+            recomputeTokenSaverDailyEconomyToday()
             NotificationCenter.default.post(name: .rc2TokenSaverUsageChanged, object: nil)
         } catch {
             NSLog("RemoteCode Token Saver sidecar savings persist failed: \(error)")
+        }
+    }
+
+    /// Persist today's credible total so Week = Σ(daily.total_credible).
+    /// Past days are never rewritten; only the current calendar day is upserted.
+    public func recomputeTokenSaverDailyEconomyToday(now: Date = Date()) {
+        let settings = SettingsStore(db: db).load()
+        let usage = TokenSaverUsageStore(appSupportDirectory: appSupportDirectory).load()
+        let windowUsage = TokenSaverBareUserEstimator.todayProviderTokens(daily: usage.daily, now: now)
+        let dayStartMs = tokenSaverDailyEconomyRepo.dayStartMs(for: now)
+        let dayEndMs = tokenSaverDailyEconomyRepo.dayEndMsExclusive(for: now)
+        do {
+            let measured = try tokenSaverDailyEconomyRepo.measuredPipes(
+                dayStartMs: dayStartMs,
+                dayEndMsExclusive: dayEndMs
+            )
+            let breakdown = TokenSaverBareUserEstimator.estimate(
+                measuredToolOutputSaved: measured,
+                tokenSaverEnabled: settings.tokenSaverEnabled,
+                graphifyActive: settings.isGraphifyRuntimeActive,
+                orchestrationActive: false,
+                observation: TokenSaverBareUserObservation(
+                    windowProviderTokens: windowUsage,
+                    graphifySignalCount: 0
+                )
+            )
+            let iso = ISO8601DateFormatter().string(from: now)
+            _ = try tokenSaverDailyEconomyRepo.upsert(
+                TokenSaverDailyEconomyRecord(
+                    dayStartMs: dayStartMs,
+                    measuredTokens: breakdown.measuredToolOutput,
+                    dialectTokens: breakdown.estimatedDialect,
+                    graphifyTokens: breakdown.estimatedGraphify,
+                    orchestrationTokens: breakdown.estimatedOrchestration,
+                    totalCredible: breakdown.totalCredible,
+                    windowUsageTokens: windowUsage,
+                    formulaVersion: TokenSaverDailyEconomyRepository.formulaVersion,
+                    appliedOutputShare: breakdown.appliedOutputShare,
+                    graphifySignalCount: 0,
+                    updatedAt: iso
+                )
+            )
+        } catch {
+            // Fail open: UI can still compute in-memory; persistence is best-effort.
+            NSLog("RemoteCode Token Saver daily economy upsert failed: \(error)")
         }
     }
 
