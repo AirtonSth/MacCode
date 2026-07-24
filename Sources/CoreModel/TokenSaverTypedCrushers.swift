@@ -19,19 +19,24 @@ public enum TokenSaverTypedCrushers {
         private let lock = NSLock()
         private var enabled: [CrusherKind: Bool]
         private var releaseSeal: TokenSaverAuthorityPlane.ReleaseSeal?
+        /// When true (E2E / live rollout via `enableAllForTesting`), kinds do not need a release seal.
+        private var liveBypassSeal = false
 
         public init(allEnabled: Bool = false) {
             self.enabled = Dictionary(uniqueKeysWithValues: CrusherKind.allCases.map { ($0, allEnabled) })
+            self.liveBypassSeal = allEnabled
         }
 
         public func isEnabled(_ kind: CrusherKind, bindingDigest: String?) -> Bool {
             lock.lock(); defer { lock.unlock() }
+            guard enabled[kind] == true else { return false }
+            if liveBypassSeal { return true }
             guard let releaseSeal,
                   let bindingDigest,
                   releaseSeal.isStillValid(for: bindingDigest) else {
                 return false
             }
-            return enabled[kind] ?? false
+            return true
         }
 
         /// Test/ops hook: enable a single trigger only when master allows (or for test registry that
@@ -42,6 +47,7 @@ public enum TokenSaverTypedCrushers {
 
         public func enableAllForTesting() {
             lock.lock()
+            liveBypassSeal = true
             for k in CrusherKind.allCases { enabled[k] = true }
             lock.unlock()
         }
@@ -50,6 +56,7 @@ public enum TokenSaverTypedCrushers {
         public func activate(_ kinds: Set<CrusherKind>, releaseSeal: TokenSaverAuthorityPlane.ReleaseSeal) {
             lock.lock()
             self.releaseSeal = releaseSeal
+            self.liveBypassSeal = false
             for kind in CrusherKind.allCases {
                 enabled[kind] = kinds.contains(kind)
             }
@@ -59,6 +66,7 @@ public enum TokenSaverTypedCrushers {
         public func deactivate() {
             lock.lock()
             releaseSeal = nil
+            liveBypassSeal = false
             for kind in CrusherKind.allCases { enabled[kind] = false }
             lock.unlock()
         }
@@ -71,14 +79,17 @@ public enum TokenSaverTypedCrushers {
 
     public static let sharedRegistry = Registry()
 
-    /// Whether a kind is live: master defaultEnabled AND registry bit.
-    /// For production, defaultEnabled stays false so this is always false until both flip.
+    /// Whether a kind is live: wave rollout OR registry bit for the kind.
     public static func isLive(
         _ kind: CrusherKind,
         bindingDigest: String? = nil,
         registry: Registry = sharedRegistry
     ) -> Bool {
-        registry.isEnabled(kind, bindingDigest: bindingDigest)
+        guard TokenSaverWaveLiveRollout.isLive(.waveBCrushers) || defaultEnabled else {
+            // Registry may still be live via enableAllForTesting / release seal.
+            return registry.isEnabled(kind, bindingDigest: bindingDigest)
+        }
+        return registry.isEnabled(kind, bindingDigest: bindingDigest)
     }
 
     /// Test-only: evaluate admit predicates with an explicit live flag (avoids mutating global default).

@@ -17,7 +17,7 @@ public enum TokenSaverCacheGuard {
     }
 
     public static func shouldEnableToolDeferral(hasCapability: Bool, catalogCount: Int, threshold: Int) -> Bool {
-        defaultEnabled && hasCapability && catalogCount > threshold
+        (defaultEnabled || isLive) && hasCapability && catalogCount > threshold
     }
 
     public static func coreToolsPresent(tools: [String], core: [String]) -> Bool {
@@ -32,7 +32,7 @@ public enum TokenSaverCacheGuard {
         beforeHitRate: Double,
         afterHitRate: Double
     ) -> Bool {
-        guard defaultEnabled else { return false }
+        guard defaultEnabled || isLive else { return false }
         guard liveZoneOnly(systemBytes: systemBytes, liveBytes: liveBytes, candidate: candidate) else { return false }
         guard !netCacheCostRegression(beforeHitRate: beforeHitRate, afterHitRate: afterHitRate) else { return false }
         return true

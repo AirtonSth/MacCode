@@ -833,10 +833,17 @@ public final class AppContext {
         guard SettingsStore(db: db).load().tokenSaverEnabled else {
             return [:]
         }
+        // Activate waves that have passed E2E live rollout (process-local).
+        TokenSaverWaveLiveRollout.activateAll()
         var env: [String: String] = [:]
         // Expose managed distill CLI + wrappers on PATH only while Token Saver is on.
         if managedDistillSkillInstallError == nil {
             env["RC_TOKEN_SAVER_DISTILL_HINT"] = "1"
+            // Propagate live wave set so child `distill` CLI applies Wave A/B pre-pass.
+            let live = TokenSaverWaveLiveRollout.liveWaves.map(\.rawValue).sorted().joined(separator: ",")
+            if !live.isEmpty {
+                env["RC_TOKEN_SAVER_WAVE_LIVE"] = live
+            }
             let managedBin = AgentSkillInstaller.defaultManagedCLIBinDirectory().path
             let currentPath = baseEnvironment["PATH"] ?? ProcessInfo.processInfo.environment["PATH"] ?? ""
             let pathParts = currentPath.split(separator: ":").map(String.init).filter { $0 != managedBin }

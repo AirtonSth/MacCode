@@ -15,10 +15,11 @@ public enum TokenSaverWaveALossless {
 
     public enum Mode: String, Sendable { case off, shadow, active }
 
-    /// Defaults: shadow only — never active promotion.
-    public static var defaults: [Trigger: Mode] {
-        Dictionary(uniqueKeysWithValues: Trigger.allCases.map { ($0, .shadow) })
-    }
+    /// Defaults: shadow only until `TokenSaverWaveLiveRollout.activate(.waveA)`.
+    /// Mutable so production / E2E can flip triggers to `.active` without rebuild hacks.
+    public static var defaults: [Trigger: Mode] = Dictionary(
+        uniqueKeysWithValues: Trigger.allCases.map { ($0, .shadow) }
+    )
 
     public static let promotionDefaultOff = true
 

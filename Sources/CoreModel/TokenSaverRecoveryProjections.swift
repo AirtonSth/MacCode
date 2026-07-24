@@ -61,7 +61,9 @@ public enum TokenSaverRecoveryProjections {
         resultScopeDigest: String,
         live: Bool = defaultEnabled
     ) -> Bool {
-        live && !queryScopeDigest.isEmpty && queryScopeDigest == resultScopeDigest
+        // Rollout OR explicit live flag (callers may pass `isLive` after activate).
+        let on = live || isLive
+        return on && !queryScopeDigest.isEmpty && queryScopeDigest == resultScopeDigest
     }
 
     public static func retrieveExact(bytes: Data, original: Data) -> Bool {
@@ -75,8 +77,9 @@ public enum TokenSaverRecoveryProjections {
         revoked: Bool = false,
         live: Bool = defaultEnabled
     ) -> Bool {
+        let on = live || isLive
         let handleOK = !handle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        return live && handleOK && !revoked && retrieveExact(bytes: bytes, original: original)
+        return on && handleOK && !revoked && retrieveExact(bytes: bytes, original: original)
     }
 
     public static func manifestKeepsCore(systemUntouched: Bool, coreToolsPresent: Bool) -> Bool {
