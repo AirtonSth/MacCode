@@ -428,6 +428,9 @@ final class AppIdentityNotificationTests: XCTestCase {
         accountStore.save(api.session)
         targetStore.save(pushToken: "apns-token", pushTokenType: "apns", liveActivityToken: nil, deviceId: "device-1")
         let bridge = PrivateNotificationBridge(accountStore: accountStore, pushTargetStore: targetStore, api: api)
+        // Silent catch-up coalesces via process-wide UserDefaults; clear so this
+        // case is not starved by earlier suite tests in the same 30s bucket.
+        UserDefaults.standard.removeObject(forKey: "private.silentCatchUp.lastBucket")
 
         let content = try XCTUnwrap(RemoteCodeNotificationContent.threadOutcome(
             threadId: "thread-1",
@@ -437,18 +440,26 @@ final class AppIdentityNotificationTests: XCTestCase {
         ))
         await bridge.deliver(content)
 
-        XCTAssertEqual(api.alertRequests.count, 1)
-        XCTAssertEqual(api.alertRequests.first?.accessToken, "access-token")
-        XCTAssertEqual(api.alertRequests.first?.pushToken, "apns-token")
-        XCTAssertEqual(api.alertRequests.first?.idempotencyKey, "thread.thread-1.completed")
-        XCTAssertEqual(api.alertRequests.first?.title, "Thread finished")
-        XCTAssertEqual(api.alertRequests.first?.body, "Build fix response is ready.",
+        // Visible alert + coalesced silent catch-up wake for iOS auto-sync.
+        XCTAssertEqual(api.alertRequests.count, 2)
+        let alert = try XCTUnwrap(api.alertRequests.first)
+        XCTAssertEqual(alert.accessToken, "access-token")
+        XCTAssertEqual(alert.pushToken, "apns-token")
+        XCTAssertEqual(alert.idempotencyKey, "thread.thread-1.completed")
+        XCTAssertEqual(alert.title, "Thread finished")
+        XCTAssertEqual(alert.body, "Build fix response is ready.",
                        "terminal outcome notifications must be sent to the private backend with the paired iOS push target")
         // The push must carry routing keys so a tap opens the exact thread, not
         // the default screen. workspaceId + threadId drive AppRouter.routeIntent.
-        XCTAssertEqual(api.alertRequests.first?.data["workspaceId"], "ws-1")
-        XCTAssertEqual(api.alertRequests.first?.data["threadId"], "thread-1")
-        XCTAssertEqual(api.alertRequests.first?.data["category"], "RemoteCodeThreadUpdate")
+        XCTAssertEqual(alert.data["workspaceId"], "ws-1")
+        XCTAssertEqual(alert.data["threadId"], "thread-1")
+        XCTAssertEqual(alert.data["category"], "RemoteCodeThreadUpdate")
+        XCTAssertEqual(alert.silent, false)
+
+        let silent = try XCTUnwrap(api.alertRequests.last)
+        XCTAssertTrue(silent.silent, "second request must be the silent content-available catch-up")
+        XCTAssertEqual(silent.data["rc2_catch_up"], "1")
+        XCTAssertTrue(silent.idempotencyKey.hasPrefix("catchup."))
     }
 
     func testLiveActivitySnapshotContentStateMatchesOnDeviceSchemaKeys() throws {
@@ -1094,7 +1105,7 @@ private class RecordingPrivateAccountAPI: PrivateAccountAPI, @unchecked Sendable
         )
     )
     var loginRequests: [[String: String]] = []
-    var alertRequests: [(accessToken: String, title: String, body: String, data: [String: String], pushToken: String, pushTokenType: String, idempotencyKey: String)] = []
+    var alertRequests: [(accessToken: String, title: String, body: String, data: [String: String], pushToken: String, pushTokenType: String, idempotencyKey: String, silent: Bool)] = []
     var liveActivityRequests: [(accessToken: String, event: String, contentState: PrivateLiveActivityContentState, liveActivityToken: String, pushToken: String, pushTokenType: String, idempotencyKey: String)] = []
     var liveActivityV2TokenRegistrations: [(accessToken: String, registration: PrivateLiveActivityV2TokenRegistration)] = []
     var liveActivityV2Deliveries: [(accessToken: String, request: PrivateLiveActivityV2DeliveryRequest, idempotencyKey: String)] = []
@@ -1163,7 +1174,7 @@ private class RecordingPrivateAccountAPI: PrivateAccountAPI, @unchecked Sendable
     }
 
     func deliverAlert(accessToken: String, title: String, body: String, data: [String: String], pushToken: String, pushTokenType: String, idempotencyKey: String, silent: Bool = false) async throws -> PrivatePushDeliveryResult {
-        alertRequests.append((accessToken, title, body, data, pushToken, pushTokenType, idempotencyKey))
+        alertRequests.append((accessToken, title, body, data, pushToken, pushTokenType, idempotencyKey, silent))
         return PrivatePushDeliveryResult(delivered: true, errorCode: nil, shouldDropSubscription: false)
     }
 

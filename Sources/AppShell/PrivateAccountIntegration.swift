@@ -970,6 +970,7 @@ public final class PrivateNotificationBridge: @unchecked Sendable {
     public func deliver(_ content: RemoteCodeNotificationContent) async {
         guard let session = accountStore.load(), session.user.subscribed,
               let target = pushTargetStore.load() else { return }
+        var alertDelivered = false
         do {
             let result = try await sessionRefresher.perform(session: session) { accessToken in
                 try await self.api.deliverAlert(
@@ -987,6 +988,7 @@ public final class PrivateNotificationBridge: @unchecked Sendable {
             if result.shouldDropSubscription {
                 pushTargetStore.clear()
             }
+            alertDelivered = result.delivered
         } catch {
             Self.log.error("Private push delivery failed: \(String(describing: error), privacy: .public)")
             // Alert failed: still attempt a silent wake so iOS can catch up.
@@ -996,16 +998,17 @@ public final class PrivateNotificationBridge: @unchecked Sendable {
             )
             return
         }
-        // Prefer silent wake coalescing over a second full alert. The visible
-        // alert already notified the user; silent catch-up reuses a 30s bucket
-        // so we do not double the push rate on every outcome.
+        // Prefer silent wake coalescing over a second full alert. Force the
+        // wake when the visible alert was not delivered so a rate-limited
+        // bucket cannot swallow the only remaining catch-up path.
         await deliverSilentCatchUp(
             hostHint: content.userInfo["workspaceId"] ?? content.identifier,
-            force: false
+            force: !alertDelivered
         )
     }
 
     private static let silentCatchUpDefaultsKey = "private.silentCatchUp.lastBucket"
+    private static let silentCatchUpLock = NSLock()
 
     /// Silent APNs background wake: iOS `didReceiveRemoteNotification` runs
     /// `BackgroundSyncCoordinator` catch-up. Coalesced per 30s bucket to stay
@@ -1014,11 +1017,18 @@ public final class PrivateNotificationBridge: @unchecked Sendable {
         guard let session = accountStore.load(), session.user.subscribed,
               let target = pushTargetStore.load() else { return }
         let bucket = Int(Date().timeIntervalSince1970 / 30)
-        let defaults = UserDefaults.standard
-        if !force, defaults.integer(forKey: Self.silentCatchUpDefaultsKey) == bucket {
-            return
-        }
-        defaults.set(bucket, forKey: Self.silentCatchUpDefaultsKey)
+        // Serialize check/set: concurrent run outcomes must not both send.
+        Self.silentCatchUpLock.lock()
+        let shouldSend: Bool = {
+            let defaults = UserDefaults.standard
+            if !force, defaults.integer(forKey: Self.silentCatchUpDefaultsKey) == bucket {
+                return false
+            }
+            defaults.set(bucket, forKey: Self.silentCatchUpDefaultsKey)
+            return true
+        }()
+        Self.silentCatchUpLock.unlock()
+        guard shouldSend else { return }
         do {
             let result = try await sessionRefresher.perform(session: session) { accessToken in
                 try await self.api.deliverAlert(
