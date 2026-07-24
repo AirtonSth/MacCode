@@ -60,6 +60,83 @@ final class SSHEmbeddedTerminalContractTests: XCTestCase {
         )
     }
 
+    func testOuterTabHideParksEmbeddedTerminalAndRevealRehostsIt() async throws {
+        // WHY: PaneTabs only rehosts the registered SSHSurface view. Parking
+        // reparents the unregistered embedded terminal into a hidden window; on
+        // tab return the wrapper must reinstall it or the Connected pane stays blank.
+        let surface = try makeSurface()
+        try await surface.installEmbeddedPlaceholderForTesting()
+        let terminal = try XCTUnwrap(surface.embeddedTerminalForTesting)
+
+        let host = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 900, height: 700),
+            styleMask: [.titled, .closable],
+            backing: .buffered,
+            defer: false
+        )
+        host.isReleasedWhenClosed = false
+        let content = NSView(frame: host.contentView?.bounds ?? .zero)
+        content.autoresizingMask = [.width, .height]
+        host.contentView = content
+        surface.view.translatesAutoresizingMaskIntoConstraints = false
+        content.addSubview(surface.view)
+        NSLayoutConstraint.activate([
+            surface.view.topAnchor.constraint(equalTo: content.topAnchor),
+            surface.view.bottomAnchor.constraint(equalTo: content.bottomAnchor),
+            surface.view.leadingAnchor.constraint(equalTo: content.leadingAnchor),
+            surface.view.trailingAnchor.constraint(equalTo: content.trailingAnchor)
+        ])
+        host.orderFront(nil)
+        defer { host.close() }
+
+        XCTAssertTrue(
+            terminal.view.isDescendant(of: surface.view),
+            "embedded terminal must start hosted under the SSH hierarchy"
+        )
+        XCTAssertEqual(terminal.runtimeHealth().renderDiagnostics?.parked, false)
+
+        // Real tab switch: hide first, then detach only the outer registered view.
+        surface.didBecomeHidden()
+        surface.view.removeFromSuperview()
+
+        let parked = await waitUntilAsync(timeout: 2) {
+            terminal.runtimeHealth().renderDiagnostics?.parked == true
+        }
+        XCTAssertTrue(parked, "detached hidden SSH terminal must park Ghostty in a hidden host")
+        XCTAssertFalse(
+            terminal.view.isDescendant(of: surface.view),
+            "parking must reparent the embedded terminal out of the outer SSH view"
+        )
+
+        // PaneTabs rehosts only the outer surface, then reveals visibility.
+        content.addSubview(surface.view)
+        NSLayoutConstraint.activate([
+            surface.view.topAnchor.constraint(equalTo: content.topAnchor),
+            surface.view.bottomAnchor.constraint(equalTo: content.bottomAnchor),
+            surface.view.leadingAnchor.constraint(equalTo: content.leadingAnchor),
+            surface.view.trailingAnchor.constraint(equalTo: content.trailingAnchor)
+        ])
+        surface.didBecomeVisible()
+
+        XCTAssertEqual(
+            surface.embeddedTerminalLogicalVisibleForTesting,
+            true,
+            "wrapper reveal must forward visibility to the embedded terminal"
+        )
+        XCTAssertTrue(
+            terminal.view.isDescendant(of: surface.view),
+            "wrapper reveal must rehost the parked embedded terminal under the SSH hierarchy"
+        )
+        let unparked = await waitUntilAsync(timeout: 2) {
+            terminal.runtimeHealth().renderDiagnostics?.parked == false
+                && terminal.runtimeHealth().renderDiagnostics?.windowAttached == true
+        }
+        XCTAssertTrue(
+            unparked,
+            "rehost must leave the parking window so Ghostty paints in the live pane"
+        )
+    }
+
     func testEmbeddedOutputAndGeometryUseOuterSurfaceID() async throws {
         // WHY: macOS mirror events are routed by the layout descriptor ID. An
         // independent inner ID makes both output and resize frames invisible to iOS.
