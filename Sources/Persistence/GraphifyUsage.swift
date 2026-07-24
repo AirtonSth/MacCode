@@ -9,6 +9,8 @@ public struct GraphifyUsageEvent: Sendable, Equatable {
     public let subcommand: String
     public let answerTokens: Int
     public let source: String
+    /// 1 only after a non-failed tool result (or successful empty output).
+    public let ok: Bool
 
     public init(
         createdAtMs: Int64,
@@ -17,7 +19,8 @@ public struct GraphifyUsageEvent: Sendable, Equatable {
         itemId: String,
         subcommand: String,
         answerTokens: Int = 0,
-        source: String = "event_stream"
+        source: String = "event_stream",
+        ok: Bool = false
     ) {
         self.createdAtMs = createdAtMs
         self.provider = provider
@@ -26,6 +29,7 @@ public struct GraphifyUsageEvent: Sendable, Equatable {
         self.subcommand = subcommand
         self.answerTokens = max(0, answerTokens)
         self.source = source
+        self.ok = ok
     }
 }
 
@@ -42,14 +46,14 @@ public final class GraphifyUsageRepository: @unchecked Sendable {
         self.calendar = calendar
     }
 
-    /// Insert a Graphify signal. Idempotent on (run_id, item_id, subcommand).
+    /// Insert a Graphify signal (pending until marked ok). Idempotent on (run,item,sub).
     @discardableResult
     public func insert(_ event: GraphifyUsageEvent) throws -> Bool {
         try db.performSync { database in
             let stmt = try database.prepare("""
                 INSERT OR IGNORE INTO graphify_usage_events (
-                    created_at_ms, provider, run_id, item_id, subcommand, answer_tokens, source
-                ) VALUES (?, ?, ?, ?, ?, ?, ?);
+                    created_at_ms, provider, run_id, item_id, subcommand, answer_tokens, source, ok
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?);
             """)
             defer { stmt.reset() }
             try stmt.bind(1, event.createdAtMs)
@@ -59,25 +63,38 @@ public final class GraphifyUsageRepository: @unchecked Sendable {
             try stmt.bind(5, event.subcommand)
             try stmt.bind(6, Int64(event.answerTokens))
             try stmt.bind(7, event.source)
+            try stmt.bind(8, event.ok ? 1 : 0)
             _ = try stmt.step()
-            // INSERT OR IGNORE: callers treat success as "attempted"; dedupe is the contract.
             return true
         }
     }
 
-    /// Update answer token size when the tool result arrives for a known item
-    /// (Graphify signals and exploration samples share item ids with tool_use).
-    public func updateAnswerTokens(runId: String, itemId: String, answerTokens: Int) throws {
+    /// Mark tool result success: set answer size and ok=1.
+    public func markSucceeded(runId: String, itemId: String, answerTokens: Int) throws {
         try db.performSync { database in
             let stmt = try database.prepare("""
                 UPDATE graphify_usage_events
-                SET answer_tokens = ?
+                SET answer_tokens = ?, ok = 1
                 WHERE run_id = ? AND item_id = ?;
             """)
             defer { stmt.reset() }
             try stmt.bind(1, Int64(max(0, answerTokens)))
             try stmt.bind(2, runId)
             try stmt.bind(3, itemId)
+            _ = try stmt.step()
+        }
+    }
+
+    /// Drop pending/failed rows for an item (command not found, cancelled, failed state).
+    public func deleteItem(runId: String, itemId: String) throws {
+        try db.performSync { database in
+            let stmt = try database.prepare("""
+                DELETE FROM graphify_usage_events
+                WHERE run_id = ? AND item_id = ?;
+            """)
+            defer { stmt.reset() }
+            try stmt.bind(1, runId)
+            try stmt.bind(2, itemId)
             _ = try stmt.step()
         }
     }
@@ -90,7 +107,8 @@ public final class GraphifyUsageRepository: @unchecked Sendable {
         runId: String,
         itemId: String,
         answerTokens: Int,
-        toolName: String
+        toolName: String,
+        ok: Bool = false
     ) throws -> Bool {
         let event = GraphifyUsageEvent(
             createdAtMs: createdAtMs,
@@ -99,18 +117,20 @@ public final class GraphifyUsageRepository: @unchecked Sendable {
             itemId: itemId,
             subcommand: "exploration:\(toolName.lowercased())",
             answerTokens: answerTokens,
-            source: "exploration_sample"
+            source: "exploration_sample",
+            ok: ok
         )
         return try insert(event)
     }
 
-    /// Count of real Graphify query|path|explain signals in [start, end).
+    /// Count of **successful** Graphify query|path|explain signals in [start, end).
     public func signalCount(fromMs: Int64, toMsExclusive: Int64) throws -> Int {
         try db.performSync { database in
             let stmt = try database.prepare("""
                 SELECT COUNT(*)
                 FROM graphify_usage_events
                 WHERE created_at_ms >= ? AND created_at_ms < ?
+                  AND ok = 1
                   AND subcommand IN ('query', 'path', 'explain');
             """)
             defer { stmt.reset() }
@@ -121,13 +141,14 @@ public final class GraphifyUsageRepository: @unchecked Sendable {
         }
     }
 
-    /// Sum of answer tokens for Graphify signals in the window.
+    /// Sum of answer tokens for successful Graphify signals in the window.
     public func answerTokensSum(fromMs: Int64, toMsExclusive: Int64) throws -> Int {
         try db.performSync { database in
             let stmt = try database.prepare("""
                 SELECT COALESCE(SUM(answer_tokens), 0)
                 FROM graphify_usage_events
                 WHERE created_at_ms >= ? AND created_at_ms < ?
+                  AND ok = 1
                   AND subcommand IN ('query', 'path', 'explain');
             """)
             defer { stmt.reset() }
@@ -138,7 +159,7 @@ public final class GraphifyUsageRepository: @unchecked Sendable {
         }
     }
 
-    /// Median answer_tokens of exploration samples in the last N days.
+    /// Median answer_tokens of successful exploration samples in the last N days.
     /// Returns nil when fewer than `minSamples` rows exist.
     public func medianExplorationTokens(
         nowMs: Int64,
@@ -152,6 +173,7 @@ public final class GraphifyUsageRepository: @unchecked Sendable {
                 FROM graphify_usage_events
                 WHERE created_at_ms >= ? AND created_at_ms <= ?
                   AND source = 'exploration_sample'
+                  AND ok = 1
                   AND answer_tokens > 0
                 ORDER BY answer_tokens ASC;
             """)

@@ -927,12 +927,15 @@ public enum Schema {
             item_id TEXT NOT NULL,
             subcommand TEXT NOT NULL,
             answer_tokens INTEGER NOT NULL DEFAULT 0,
-            source TEXT NOT NULL DEFAULT 'event_stream'
+            source TEXT NOT NULL DEFAULT 'event_stream',
+            ok INTEGER NOT NULL DEFAULT 0
         );
         CREATE UNIQUE INDEX IF NOT EXISTS idx_graphify_usage_dedupe
             ON graphify_usage_events(run_id, item_id, subcommand);
         CREATE INDEX IF NOT EXISTS idx_graphify_usage_created
             ON graphify_usage_events(created_at_ms);
+        CREATE INDEX IF NOT EXISTS idx_graphify_usage_ok_created
+            ON graphify_usage_events(ok, created_at_ms);
         """)
     ]
 

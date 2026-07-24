@@ -33,8 +33,9 @@ final class GraphifyUsageRepositoryTests: XCTestCase {
         XCTAssertEqual(count, 1)
     }
 
-    func test_insertDedupeAndDayCount() throws {
+    func test_insertDedupeAndDayCount_onlySuccessful() throws {
         // WHY: Claude may replay tool blocks; (run,item,sub) must count once.
+        // Pending (ok=0) must not inflate the day signal count.
         let dayStart: Int64 = 1_700_000_000_000
         let e1 = GraphifyUsageEvent(
             createdAtMs: dayStart + 1_000,
@@ -42,10 +43,12 @@ final class GraphifyUsageRepositoryTests: XCTestCase {
             runId: "run-1",
             itemId: "tool-1",
             subcommand: "query",
-            answerTokens: 0
+            answerTokens: 0,
+            ok: false
         )
         try repo.insert(e1)
         try repo.insert(e1) // duplicate
+        try repo.markSucceeded(runId: "run-1", itemId: "tool-1", answerTokens: 10)
         try repo.insert(
             GraphifyUsageEvent(
                 createdAtMs: dayStart + 2_000,
@@ -53,7 +56,19 @@ final class GraphifyUsageRepositoryTests: XCTestCase {
                 runId: "run-1",
                 itemId: "tool-2",
                 subcommand: "path",
-                answerTokens: 50
+                answerTokens: 50,
+                ok: true
+            )
+        )
+        // Pending third signal — not yet ok.
+        try repo.insert(
+            GraphifyUsageEvent(
+                createdAtMs: dayStart + 2_500,
+                provider: "claude",
+                runId: "run-1",
+                itemId: "tool-2b",
+                subcommand: "explain",
+                ok: false
             )
         )
         // Exploration sample must not count as signal.
@@ -63,16 +78,17 @@ final class GraphifyUsageRepositoryTests: XCTestCase {
             runId: "run-1",
             itemId: "tool-3",
             answerTokens: 2_000,
-            toolName: "Read"
+            toolName: "Read",
+            ok: true
         )
 
         let count = try repo.signalCount(fromMs: dayStart, toMsExclusive: dayStart + 86_400_000)
         XCTAssertEqual(count, 2)
         let answers = try repo.answerTokensSum(fromMs: dayStart, toMsExclusive: dayStart + 86_400_000)
-        XCTAssertEqual(answers, 50)
+        XCTAssertEqual(answers, 60)
     }
 
-    func test_updateAnswerTokens() throws {
+    func test_deleteItem_removesFailed() throws {
         try repo.insert(
             GraphifyUsageEvent(
                 createdAtMs: 100,
@@ -80,10 +96,28 @@ final class GraphifyUsageRepositoryTests: XCTestCase {
                 runId: "r",
                 itemId: "i",
                 subcommand: "query",
-                answerTokens: 0
+                ok: false
             )
         )
-        try repo.updateAnswerTokens(runId: "r", itemId: "i", answerTokens: 420)
+        try repo.deleteItem(runId: "r", itemId: "i")
+        XCTAssertEqual(try repo.signalCount(fromMs: 0, toMsExclusive: 1_000), 0)
+    }
+
+    func test_markSucceeded_countsAndSums() throws {
+        try repo.insert(
+            GraphifyUsageEvent(
+                createdAtMs: 100,
+                provider: "claude",
+                runId: "r",
+                itemId: "i",
+                subcommand: "query",
+                answerTokens: 0,
+                ok: false
+            )
+        )
+        XCTAssertEqual(try repo.signalCount(fromMs: 0, toMsExclusive: 1_000), 0)
+        try repo.markSucceeded(runId: "r", itemId: "i", answerTokens: 420)
+        XCTAssertEqual(try repo.signalCount(fromMs: 0, toMsExclusive: 1_000), 1)
         XCTAssertEqual(try repo.answerTokensSum(fromMs: 0, toMsExclusive: 1_000), 420)
     }
 
@@ -96,7 +130,8 @@ final class GraphifyUsageRepositoryTests: XCTestCase {
                 runId: "r\(i)",
                 itemId: "i\(i)",
                 answerTokens: 1_000 + i * 100,
-                toolName: "Read"
+                toolName: "Read",
+                ok: true
             )
         }
         XCTAssertNil(try repo.medianExplorationTokens(nowMs: now, minSamples: 8))
@@ -107,7 +142,8 @@ final class GraphifyUsageRepositoryTests: XCTestCase {
             runId: "r8",
             itemId: "i8",
             answerTokens: 2_000,
-            toolName: "Grep"
+            toolName: "Grep",
+            ok: true
         )
         let median = try repo.medianExplorationTokens(nowMs: now, minSamples: 8)
         XCTAssertNotNil(median)
@@ -123,7 +159,8 @@ final class GraphifyUsageRepositoryTests: XCTestCase {
                 provider: "claude",
                 runId: "old",
                 itemId: "old",
-                subcommand: "query"
+                subcommand: "query",
+                ok: true
             )
         )
         try repo.insert(
@@ -132,7 +169,8 @@ final class GraphifyUsageRepositoryTests: XCTestCase {
                 provider: "claude",
                 runId: "new",
                 itemId: "new",
-                subcommand: "query"
+                subcommand: "query",
+                ok: true
             )
         )
         try repo.prune(nowMs: now)
