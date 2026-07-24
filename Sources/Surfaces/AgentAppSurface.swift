@@ -4309,9 +4309,10 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             resetTimelineUpdateTick()
             focusTick &+= 1
         }
-        // A real provider start is about to own plan progress for this turn —
-        // accept subsequent activePlanUpdated events from this run.
-        suppressStaleActivePlanUpdates = false
+        // UX-MAC_AGENT-PLAN-FRESH: keep suppressStaleActivePlanUpdates = true until a
+        // *fresh* activePlanUpdated for this follow-up arrives (see flushStreamEvents).
+        // Clearing suppress here immediately re-painted the prior turn's completed
+        // checklist under the new user bubble (late events + durable rehydrate).
         persistThreadConfig()
         let launchConfig = providerLaunchConfig?(runProvider, runProviderInstanceId)
         let threadRunAsUser = threads.first(where: { $0.id == tid })?.runAsUser ?? runAsUser
@@ -4782,10 +4783,21 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         appliedEvents.reserveCapacity(pending.count)
         for (event, run, threadId) in pending {
             guard threadId == self.selectedThreadId else { continue }
-            // User already sent a follow-up: drop plan progress from the prior
-            // turn so the checklist cannot reappear under the new user bubble.
-            if suppressStaleActivePlanUpdates, case .activePlanUpdated = event {
-                continue
+            // User already sent a follow-up: drop *stale* plan progress from the
+            // prior turn so the checklist cannot reappear under the new user bubble.
+            // Accept only a plan whose updatedAtMs is at/after the follow-up anchor
+            // (newest user message / runStartedAt), then lift suppress for this run.
+            if suppressStaleActivePlanUpdates, case .activePlanUpdated(let plan) = event {
+                let newestUserAt = self.messages.last(where: { $0.role == .user })?.createdAt
+                if AgentAppView.isActivePlanFreshForFollowUp(
+                    plan: plan,
+                    newestUserMessageAt: newestUserAt,
+                    runStartedAt: self.runStartedAt
+                ) {
+                    self.suppressStaleActivePlanUpdates = false
+                } else {
+                    continue
+                }
             }
             appliedEvent = true
             appliedEvents.append(event)
@@ -4860,8 +4872,17 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         threadId: AgentThreadID
     ) {
         guard threadId == selectedThreadId else { return }
-        if suppressStaleActivePlanUpdates, case .activePlanUpdated = event {
-            return
+        if suppressStaleActivePlanUpdates, case .activePlanUpdated(let plan) = event {
+            let newestUserAt = messages.last(where: { $0.role == .user })?.createdAt
+            if AgentAppView.isActivePlanFreshForFollowUp(
+                plan: plan,
+                newestUserMessageAt: newestUserAt,
+                runStartedAt: runStartedAt
+            ) {
+                suppressStaleActivePlanUpdates = false
+            } else {
+                return
+            }
         }
         if !terminalRunIds.contains(run) {
             currentRunId = run
@@ -4888,9 +4909,18 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         streamUIBackpressured = false
         let events = coordinator.latestStreamEvents(threadId: threadId)
         var rebuilt = AssistantTimelineState()
+        let newestUserAt = messages.last(where: { $0.role == .user })?.createdAt
         for event in events {
-            if suppressStaleActivePlanUpdates, case .activePlanUpdated = event {
-                continue
+            if suppressStaleActivePlanUpdates, case .activePlanUpdated(let plan) = event {
+                if AgentAppView.isActivePlanFreshForFollowUp(
+                    plan: plan,
+                    newestUserMessageAt: newestUserAt,
+                    runStartedAt: runStartedAt
+                ) {
+                    suppressStaleActivePlanUpdates = false
+                } else {
+                    continue
+                }
             }
             rebuilt.apply(event)
         }
@@ -6514,6 +6544,9 @@ public struct AgentAppView: View {
         var turnPlans: [AssistantProposedPlan]
         var visibleBlocks: [TurnRenderBlock]
         var completedWorkBlocks: [TurnRenderBlock]
+        /// Block count for the collapsed "Work so far" label — available even when
+        /// `completedWorkBlocks` is empty (lazy: full blocks only when expanded).
+        var completedWorkBlockCount: Int
         var hiddenLiveItemCount: Int
         var shouldRenderFinal: Bool
     }
@@ -6521,7 +6554,8 @@ public struct AgentAppView: View {
     static func computeTurnRenderInputs(turn: AssistantTurnSnapshot,
                                         persistedAssistantTexts: [String],
                                         proposedPlans allPlans: [AssistantProposedPlan],
-                                        running: Bool) -> TurnRenderInputs {
+                                        running: Bool,
+                                        expandCompletedWork: Bool = false) -> TurnRenderInputs {
         let turnPlans = allPlans.filter {
             $0.turnId == turn.turnId && !$0.markdown.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         }
@@ -6537,10 +6571,16 @@ public struct AgentAppView: View {
             let (settled, active) = partitionLiveTurnItems(renderable)
             let activeVisible = visibleLiveTurnItems(active, running: true)
             let hiddenLiveItemCount = max(0, renderable.count - settled.count - activeVisible.count)
+            // PERF: the collapsed disclosure only needs a count. Building full
+            // TurnRenderBlock trees for 200+ settled tools on every body pass was
+            // a main-thread tax during long live turns.
+            let workCount = turnRenderBlockCount(settled)
+            let workBlocks = expandCompletedWork ? turnRenderBlocks(settled) : []
             return TurnRenderInputs(
                 turnPlans: turnPlans,
                 visibleBlocks: turnRenderBlocks(activeVisible),
-                completedWorkBlocks: turnRenderBlocks(settled),
+                completedWorkBlocks: workBlocks,
+                completedWorkBlockCount: workCount,
                 hiddenLiveItemCount: hiddenLiveItemCount,
                 shouldRenderFinal: false
             )
@@ -6551,14 +6591,37 @@ public struct AgentAppView: View {
         let workItems = turn.finished ? renderable.filter { !finalIDs.contains($0.id) } : []
         let visibleAssistant = turn.finished ? renderable.filter { finalIDs.contains($0.id) } : renderable
         let visibleBlocks = turnRenderBlocks(visibleAssistant)
-        let completedWorkBlocks = turnRenderBlocks(workItems)
+        let workCount = turnRenderBlockCount(workItems)
+        let completedWorkBlocks = expandCompletedWork ? turnRenderBlocks(workItems) : []
         let shouldRenderFinal = turn.finalAssistantMessage != nil
             && shouldRenderFinalAssistantMessage(turn, persistedAssistantTexts: persistedAssistantTexts)
         return TurnRenderInputs(turnPlans: turnPlans,
                                 visibleBlocks: visibleBlocks,
                                 completedWorkBlocks: completedWorkBlocks,
+                                completedWorkBlockCount: workCount,
                                 hiddenLiveItemCount: 0,
                                 shouldRenderFinal: shouldRenderFinal)
+    }
+
+    /// Count-only twin of `turnRenderBlocks` — same grouping rules, no block allocs.
+    static func turnRenderBlockCount(_ items: [AssistantItem], groupThreshold: Int = 2) -> Int {
+        var count = 0
+        var run = 0
+        func flushRun() {
+            guard run > 0 else { return }
+            count += run >= groupThreshold ? 1 : run
+            run = 0
+        }
+        for item in items {
+            if isGroupableTool(item.type) {
+                run += 1
+            } else {
+                flushRun()
+                count += 1
+            }
+        }
+        flushRun()
+        return count
     }
 
     /// Split a live turn into settled work (already done — collapse) vs the active
@@ -6772,6 +6835,9 @@ public struct AgentAppView: View {
     // slice stays one tap away via the existing "earlier transcript items" reveal.
     nonisolated static let idleTranscriptWindowCount = 30
     nonisolated static let hiddenTranscriptRevealPageCount = 50
+    /// Entries kept *before* the newest user message during a follow-up.
+    /// 0 = start clean at the user's bubble (prior history via reveal row).
+    nonisolated static let followUpPrecedingContextCount = 0
     static let liveTurnRenderableItemLimit = 48
     /// How many trailing items stay expanded while a turn is still running.
     /// Everything older folds into the "Work so far" disclosure so Thought-
@@ -7012,11 +7078,11 @@ public struct AgentAppView: View {
 
     /// Pure seam: which transcript entries the eager VStack renders.
     ///
-    /// - Running: the time-cutoff live window (entries at/after `runStartedAt`
-    ///   minus `runningSlack`), with a 2-entry floor. If `runStartedAt` is not
-    ///   set yet (race between status=.running and the start timestamp), fall
-    ///   back to the idle tail — never the full thread — so a follow-up does not
-    ///   flash every historical agent turn expanded.
+    /// - Running / pending: prefer the slice from the newest user message
+    ///   (optional short preceding context) so a follow-up starts clean under
+    ///   the user's bubble instead of re-expanding prior turns. Fallbacks:
+    ///   time-cutoff live window when no user message exists and `runStartedAt`
+    ///   is set; otherwise the recent idle tail — never the full thread.
     /// - Idle/completed: the most recent `idleWindowCount` entries when the thread
     ///   is longer than that, so a huge thread no longer re-renders in full on
     ///   every invalidation. The pre-window slice is surfaced by the existing
@@ -7026,13 +7092,20 @@ public struct AgentAppView: View {
         status: AgentRunStatus,
         runStartedAt: Date?,
         idleWindowCount: Int = idleTranscriptWindowCount,
-        runningSlack: TimeInterval = runningTranscriptContextSlack
+        runningSlack: TimeInterval = runningTranscriptContextSlack,
+        precedingContextCount: Int = followUpPrecedingContextCount
     ) -> [TranscriptEntry] {
         // Pending is part of the active follow-up lifecycle (composer send →
         // provider start). Treat it like a live turn so we never flash the
         // idle "last 30" history between send and running.
         if status == .running || status == .pending {
             guard entries.count > 2 else { return entries }
+            if let anchored = followUpAnchoredWindow(
+                entries: entries,
+                precedingContextCount: precedingContextCount
+            ) {
+                return anchored
+            }
             guard status == .running, let startedAt = runStartedAt else {
                 // Pending, or running before runStartedAt is assigned: keep the
                 // chat focused on the newest segment, not the whole thread.
@@ -7044,6 +7117,63 @@ public struct AgentAppView: View {
         }
         guard entries.count > idleWindowCount else { return entries }
         return Array(entries.suffix(idleWindowCount))
+    }
+
+    /// Entries from the last user message (minus optional preceding context) to end.
+    /// Returns nil when no user message is present so callers keep their fallback.
+    nonisolated static func followUpAnchoredWindow(
+        entries: [TranscriptEntry],
+        precedingContextCount: Int = followUpPrecedingContextCount
+    ) -> [TranscriptEntry]? {
+        guard let anchor = entries.lastIndex(where: {
+            if case .message(let message) = $0 { return message.role == .user }
+            return false
+        }) else { return nil }
+        let start = max(0, anchor - max(0, precedingContextCount))
+        let window = Array(entries[start...])
+        return window.isEmpty ? nil : window
+    }
+
+    /// Whether an Active plan belongs to the current follow-up (not a prior turn).
+    /// Pure seam used by stream gating and the view paint gate.
+    nonisolated static func isActivePlanFreshForFollowUp(
+        plan: AssistantActivePlan,
+        newestUserMessageAt: Date?,
+        runStartedAt: Date?,
+        slack: TimeInterval = runningTranscriptContextSlack
+    ) -> Bool {
+        let planSeconds = TimeInterval(plan.updatedAtMs) / 1000
+        var anchor: TimeInterval = 0
+        if let runStartedAt {
+            anchor = max(anchor, runStartedAt.timeIntervalSince1970)
+        }
+        if let newestUserMessageAt {
+            anchor = max(anchor, newestUserMessageAt.timeIntervalSince1970)
+        }
+        guard anchor > 0 else { return true }
+        return planSeconds >= anchor - slack
+    }
+
+    /// View-level paint gate for the inline / sidebar Active plan card.
+    /// Hides fully-done plans when idle, and any plan older than the follow-up
+    /// anchor — without mutating timeline state (agent functionality unchanged).
+    nonisolated static func shouldRenderActivePlan(
+        plan: AssistantActivePlan?,
+        status: AgentRunStatus,
+        runStartedAt: Date?,
+        newestUserMessageAt: Date?,
+        slack: TimeInterval = runningTranscriptContextSlack
+    ) -> Bool {
+        guard let plan, !plan.steps.isEmpty else { return false }
+        let runActive = status == .running || status == .pending
+        let allDone = plan.steps.allSatisfy { $0.status == .completed }
+        if allDone && !runActive { return false }
+        return isActivePlanFreshForFollowUp(
+            plan: plan,
+            newestUserMessageAt: newestUserMessageAt,
+            runStartedAt: runStartedAt,
+            slack: slack
+        )
     }
 
     /// Cheap identity signature: changes only when a message/turn is added,
@@ -7138,15 +7268,21 @@ public struct AgentAppView: View {
     /// turns are computed fresh every pass.
     private func turnRenderInputs(for turn: AssistantTurnSnapshot) -> TurnRenderInputs {
         let running = vm.selectedThreadRunIsStartingOrRunning
+        let expandWork = expandedCompletedWorkTurns.contains(turn.turnId)
         guard turn.finished else {
-            return computeTurnRenderInputsCounted(turn: turn, running: running)
+            return computeTurnRenderInputsCounted(turn: turn, running: running, expandCompletedWork: expandWork)
         }
         let plansKey = "\(vm.timeline.proposedPlans.count)|\(vm.timeline.proposedPlans.last?.id ?? "-")"
-        let signature = Self.finishedTurnRenderSignature(turn: turn, assistantTextsKey: assistantTextsKey, plansKey: plansKey)
+        let signature = Self.finishedTurnRenderSignature(
+            turn: turn,
+            assistantTextsKey: assistantTextsKey,
+            plansKey: plansKey,
+            expandCompletedWork: expandWork
+        )
         if let cached = turnRenderCache.entries[turn.turnId], cached.signature == signature {
             return cached.value
         }
-        let value = computeTurnRenderInputsCounted(turn: turn, running: running)
+        let value = computeTurnRenderInputsCounted(turn: turn, running: running, expandCompletedWork: expandWork)
         // Bound the cache: a hard cap keeps it from growing with total finished turns
         // over a very long session (entries rebuild on demand if cleared).
         if turnRenderCache.entries.count > 1_024 { turnRenderCache.entries.removeAll(keepingCapacity: true) }
@@ -7158,13 +7294,20 @@ public struct AgentAppView: View {
     /// immutable, so (turnId, items.count) is a stable content key; the persisted
     /// assistant texts and proposed plans are external dependencies that change the
     /// answer-vs-worklog split and the plan rows, so they fold into the key too.
+    /// `expandCompletedWork` is included so collapsed (count-only) and expanded
+    /// (full blocks) inputs do not share a stale cache entry.
     nonisolated static func finishedTurnRenderSignature(turn: AssistantTurnSnapshot,
                                                         assistantTextsKey: String,
-                                                        plansKey: String) -> String {
-        "\(turn.turnId)|i\(turn.items.count)|\(assistantTextsKey)|pl\(plansKey)"
+                                                        plansKey: String,
+                                                        expandCompletedWork: Bool = false) -> String {
+        "\(turn.turnId)|i\(turn.items.count)|\(assistantTextsKey)|pl\(plansKey)|w\(expandCompletedWork ? 1 : 0)"
     }
 
-    private func computeTurnRenderInputsCounted(turn: AssistantTurnSnapshot, running: Bool) -> TurnRenderInputs {
+    private func computeTurnRenderInputsCounted(
+        turn: AssistantTurnSnapshot,
+        running: Bool,
+        expandCompletedWork: Bool
+    ) -> TurnRenderInputs {
         #if DEBUG
         Self.turnRenderComputeCountForTesting &+= 1
         #endif
@@ -7172,7 +7315,8 @@ public struct AgentAppView: View {
             turn: turn,
             persistedAssistantTexts: persistedAssistantTexts,
             proposedPlans: vm.timeline.proposedPlans,
-            running: running
+            running: running,
+            expandCompletedWork: expandCompletedWork
         )
     }
 
@@ -7915,7 +8059,12 @@ public struct AgentAppView: View {
                                     turnView(turn)
                                 }
                             }
-                            if let plan = vm.activePlan {
+                            if Self.shouldRenderActivePlan(
+                                plan: vm.activePlan,
+                                status: vm.status,
+                                runStartedAt: vm.runStartedAt,
+                                newestUserMessageAt: vm.messages.last(where: { $0.role == .user })?.createdAt
+                            ), let plan = vm.activePlan {
                                 activePlanRow(plan)
                             }
                             if vm.messages.isEmpty && vm.timeline.turns.isEmpty && vm.timeline.error == nil {
@@ -7985,7 +8134,12 @@ public struct AgentAppView: View {
                 }
             }
             .onAppear { scheduleTimelineScrollToBottom(proxy) }
-            .onChange(of: vm.focusTick) { _ in scheduleTimelineScrollToBottom(proxy, force: true) }
+            .onChange(of: vm.focusTick) { _ in
+                // focusTick bumps on outgoing user send — collapse before the
+                // new turn paints so pending follow-ups do not keep prior expands.
+                collapseTranscriptForNewTurn()
+                scheduleTimelineScrollToBottom(proxy, force: true)
+            }
             .onChange(of: vm.messages.count) { _ in
                 scheduleTimelineScrollToBottom(proxy)
             }
@@ -7999,17 +8153,18 @@ public struct AgentAppView: View {
                     pruneExpandedItemIds()
                 }
             }
-            .onChange(of: vm.status) { _ in scheduleTimelineScrollToBottom(proxy) }
+            .onChange(of: vm.status) { newStatus in
+                if newStatus == .pending || newStatus == .running {
+                    collapseTranscriptForNewTurn()
+                }
+                scheduleTimelineScrollToBottom(proxy)
+            }
             // P1: collapse revealed history + open work/tool disclosures whenever
             // a new run starts so a follow-up reads as a fresh chat turn, not a
             // re-expansion of every prior command.
             .onChange(of: vm.runStartedAt) { newValue in
                 if newValue != nil {
-                    transcriptHistoryRevealCount = 0
-                    expandedCompletedWorkTurns = []
-                    expandedTools = []
-                    expandedToolGroups = []
-                    expandedReasoning = []
+                    collapseTranscriptForNewTurn()
                 }
             }
             // PERF-MAC_AGENT-023: also collapse on thread switch. Idle threads now
@@ -8755,12 +8910,12 @@ public struct AgentAppView: View {
         nextCount: Int
     ) -> String {
         if revealedCount <= 0 {
-            return "\(count) earlier transcript items hidden - tap to view \(nextCount)"
+            return "Earlier in this thread · show \(nextCount) more"
         }
         if revealedCount < count {
-            return "\(revealedCount) of \(count) earlier transcript items visible - tap to view more"
+            return "Earlier in this thread · \(revealedCount) of \(count) shown · show more"
         }
-        return "\(count) earlier transcript items visible, read-only"
+        return "Earlier in this thread · \(count) shown, read-only"
     }
 
     nonisolated static func hiddenTranscriptRevealAccessibilityLabel(
@@ -8768,12 +8923,12 @@ public struct AgentAppView: View {
         revealedCount: Int
     ) -> String {
         if revealedCount <= 0 {
-            return "\(count) earlier transcript items hidden"
+            return "\(count) earlier items in this thread hidden"
         }
         if revealedCount < count {
-            return "\(revealedCount) of \(count) earlier transcript items visible"
+            return "\(revealedCount) of \(count) earlier items in this thread visible"
         }
-        return "\(count) earlier transcript items visible, read-only"
+        return "\(count) earlier items in this thread visible, read-only"
     }
 
     private func hiddenLiveTurnItemsRow(_ count: Int) -> some View {
@@ -8990,7 +9145,7 @@ public struct AgentAppView: View {
     ) -> String {
         if live {
             if workBlockCount > 1 {
-                return "Work so far · \(workBlockCount) steps"
+                return "Work so far · \(workBlockCount) steps in this turn"
             }
             return "Work so far"
         }
@@ -8998,6 +9153,16 @@ public struct AgentAppView: View {
             return "Worked for \(duration)"
         }
         return "Worked"
+    }
+
+    /// Collapse reveal + open disclosures so a new follow-up paints like a
+    /// fresh chat turn. @State only — no model mutation.
+    private func collapseTranscriptForNewTurn() {
+        transcriptHistoryRevealCount = 0
+        expandedCompletedWorkTurns = []
+        expandedTools = []
+        expandedToolGroups = []
+        expandedReasoning = []
     }
 
     /// Shared chrome for user prompt bubbles (text + padding + fill). Sized by
@@ -9139,10 +9304,11 @@ public struct AgentAppView: View {
             // Finished turns and live turns both fold settled work into one
             // disclosure so follow-ups read as chat (answer + compact work), not
             // a re-expanded command dump of the whole turn.
-            if !inputs.completedWorkBlocks.isEmpty {
+            if inputs.completedWorkBlockCount > 0 {
                 completedWorkDisclosure(
                     turn: turn,
                     blocks: inputs.completedWorkBlocks,
+                    workBlockCount: inputs.completedWorkBlockCount,
                     live: !turn.finished
                 )
             }
@@ -9187,6 +9353,7 @@ public struct AgentAppView: View {
     private func completedWorkDisclosure(
         turn: AssistantTurnSnapshot,
         blocks: [TurnRenderBlock],
+        workBlockCount: Int,
         live: Bool = false
     ) -> some View {
         let expanded = expandedCompletedWorkTurns.contains(turn.turnId)
@@ -9206,7 +9373,7 @@ public struct AgentAppView: View {
                             .font(.system(size: 11, weight: .semibold))
                             .foregroundColor(DS.Palette.textTertiary)
                     }
-                    Text(Self.completedWorkLabel(turn, live: live, workBlockCount: blocks.count))
+                    Text(Self.completedWorkLabel(turn, live: live, workBlockCount: workBlockCount))
                         .font(DS.Font.body.weight(.medium))
                         .foregroundColor(DS.Palette.textTertiary)
                     Image(systemName: expanded ? "chevron.down" : "chevron.right")
@@ -11017,7 +11184,12 @@ public struct AgentAppView: View {
                 }
             ))
             Rectangle().fill(DS.Palette.line).frame(height: DS.Border.hairline)
-            if let plan = vm.activePlan {
+            if Self.shouldRenderActivePlan(
+                plan: vm.activePlan,
+                status: vm.status,
+                runStartedAt: vm.runStartedAt,
+                newestUserMessageAt: vm.messages.last(where: { $0.role == .user })?.createdAt
+            ), let plan = vm.activePlan {
                 activePlanSidebarCard(plan)
                 Rectangle().fill(DS.Palette.line).frame(height: DS.Border.hairline)
             }

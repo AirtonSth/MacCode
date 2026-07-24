@@ -6722,7 +6722,8 @@ final class AgentAppViewModelTests: XCTestCase {
             finished: true
         )
         let inputs = AgentAppView.computeTurnRenderInputs(
-            turn: turn, persistedAssistantTexts: [], proposedPlans: [], running: false)
+            turn: turn, persistedAssistantTexts: [], proposedPlans: [], running: false,
+            expandCompletedWork: true)
 
         let renderable = AgentAppView.renderableItems(in: turn)
         let expectedVisible = AgentAppView.turnRenderBlocks(
@@ -6734,12 +6735,22 @@ final class AgentAppViewModelTests: XCTestCase {
                        "visible blocks must match turnRenderBlocks(completedVisibleAssistantItems)")
         XCTAssertEqual(inputs.completedWorkBlocks, expectedWork,
                        "work blocks must match turnRenderBlocks(completedWorkItems) — the finalIDs split is computed once but identically")
+        XCTAssertEqual(inputs.completedWorkBlockCount, expectedWork.count,
+                       "work block count must match the expanded work list")
         XCTAssertEqual(inputs.shouldRenderFinal,
                        AgentAppView.shouldRenderFinalAssistantMessage(turn, persistedAssistantTexts: []),
                        "shouldRenderFinal must match the helper — here the last item already renders the answer, so the separate final block is suppressed (no double answer)")
         XCTAssertFalse(inputs.shouldRenderFinal,
                        "when the final text equals the last visible assistant item, the separate final block must not render")
         XCTAssertEqual(inputs.hiddenLiveItemCount, 0, "finished turns hide nothing as live overflow")
+
+        let collapsed = AgentAppView.computeTurnRenderInputs(
+            turn: turn, persistedAssistantTexts: [], proposedPlans: [], running: false,
+            expandCompletedWork: false)
+        XCTAssertTrue(collapsed.completedWorkBlocks.isEmpty,
+                      "collapsed finished work skips full block materialization")
+        XCTAssertEqual(collapsed.completedWorkBlockCount, expectedWork.count,
+                       "collapsed finished work still reports the correct step count")
     }
 
     func test_computeTurnRenderInputs_runningTurnKeepsLiveItemsAndNoFinal() {
@@ -6752,6 +6763,7 @@ final class AgentAppViewModelTests: XCTestCase {
             turn: turn, persistedAssistantTexts: [], proposedPlans: [], running: true)
         XCTAssertEqual(inputs.visibleBlocks.count, 1, "a running turn shows its live item")
         XCTAssertTrue(inputs.completedWorkBlocks.isEmpty, "a running turn has no completed work disclosure")
+        XCTAssertEqual(inputs.completedWorkBlockCount, 0, "no settled work when only the live item exists")
         XCTAssertFalse(inputs.shouldRenderFinal, "a running turn has no final answer yet")
     }
 
