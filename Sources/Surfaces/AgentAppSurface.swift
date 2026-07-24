@@ -4288,6 +4288,16 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         let providerThreadId = persistedThread?.provider == runProvider
             ? persistedThread?.providerThreadId
             : nil
+        // Graphify: same host path as AppCommandRouter RPC send — resolve roots,
+        // kick refresh, inject RC_GRAPHIFY_* into provider environment (fail-open).
+        let graphifyEnv = GraphifyWorkspaceService.shared.applyToAgentEnvironment(
+            base: launchConfig?.environment ?? [:],
+            threadId: tid.value,
+            threadCwd: cwd,
+            worktreePath: persistedThread?.worktreePath,
+            workspaceCwd: cwd,
+            attachmentPaths: attached.map(\.path)
+        ).environment
         let req = AgentRunRequest(
             runId: runId,
             threadId: tid,
@@ -4304,7 +4314,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             serviceTier: runServiceTier,
             interactionMode: interactionMode,
             providerBinary: launchConfig?.binary,
-            environment: launchConfig?.environment ?? [:],
+            environment: graphifyEnv,
             runAsUser: threadRunAsUser
         )
         do {

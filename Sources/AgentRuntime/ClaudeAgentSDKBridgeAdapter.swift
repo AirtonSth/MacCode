@@ -401,9 +401,15 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
 
         onEvent(.status(.running))
         do {
+            // Per-turn Graphify path hint: persistent SDK sessions do not re-apply
+            // system_prompt after creation, so App Support graph paths must ride on
+            // each turn when the host sets RC_GRAPHIFY_* on the environment.
             try write([
                 "type": "rc_turn",
-                "prompt": request.providerPrompt,
+                "prompt": GraphifyStableSkillText.augmentTurnPrompt(
+                    request.providerPrompt,
+                    environment: request.environment
+                ),
                 "attachments": Self.attachmentPayload(request.attachments),
                 "session_id": session.providerThreadId ?? request.threadId.value.uuidString
             ], to: session)

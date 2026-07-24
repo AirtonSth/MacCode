@@ -430,7 +430,14 @@ public final class AppContext {
             hasSkillsHomeOverride: agentSkillsHomeOverrideForTesting != nil,
             environment: ProcessInfo.processInfo.environment
         ) {
-            reconcileManagedDistillSkills(tokenSaverEnabled: SettingsStore(db: db).load().tokenSaverEnabled)
+            let bootSettings = SettingsStore(db: db).load()
+            reconcileManagedDistillSkills(tokenSaverEnabled: bootSettings.tokenSaverEnabled)
+            reconcileGraphifyHost(settings: bootSettings)
+        } else {
+            // Still apply Graphify defaults outside distill reconcile gate (unit tests stay quiet).
+            if !AppContext.isRunningUnitTests {
+                reconcileGraphifyHost()
+            }
         }
         // PERF (cold launch): never block AppContext.init on multi-GB MLX warmup.
         // Still kick Token Saver asynchronously when already enabled so managed
@@ -884,6 +891,24 @@ public final class AppContext {
         let status = installer.remoteCodeOrchestrateStatus()
         remoteCodeOrchestrateStatus = status
         return status
+    }
+
+    /// Configure Graphify host defaults (on by default). Fail-open if CLI missing —
+    /// `ensureBinaryInstalledIfNeeded` may try `uv tool install graphifyy` once.
+    public func reconcileGraphifyHost(settings: AppSettings? = nil) {
+        let s = settings ?? SettingsStore(db: db).load()
+        let svc = GraphifyWorkspaceService.shared
+        svc.enabled = s.graphifyEnabled
+        svc.autoEnsure = s.graphifyAutoEnsure
+        svc.writeInRepo = s.graphifyWriteInRepo
+        svc.pinnedRoots = s.graphifyPinnedRoots
+        let path = s.graphifyBinaryPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        svc.binaryPathOverride = path.isEmpty ? nil : path
+        guard s.graphifyEnabled else { return }
+        LoginShellEnvironment.prewarm()
+        DispatchQueue.global(qos: .utility).async {
+            _ = GraphifyWorkspaceService.shared.ensureBinaryInstalledIfNeeded()
+        }
     }
 
     /// Reconcile Distill integration with the Token Saver toggle (paid feature).

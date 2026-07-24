@@ -782,7 +782,6 @@ public final class CodexAppServerClient: @unchecked Sendable {
     }
 
     private static func collaborationMode(for request: AgentRunRequest, normalizedModel model: String?) -> JSONObject {
-        let tokenSaverEnabled = request.environment["RC_TOKEN_SAVER_DISTILL_HINT"] == "1"
         return [
             "mode": request.interactionMode.rawValue,
             "settings": [
@@ -790,7 +789,7 @@ public final class CodexAppServerClient: @unchecked Sendable {
                 "reasoning_effort": appServerReasoningEffort(for: request.reasoningEffort).rawValue,
                 "developer_instructions": developerInstructions(
                     for: request.interactionMode,
-                    tokenSaverEnabled: tokenSaverEnabled
+                    environment: request.environment
                 )
             ]
         ]
@@ -800,11 +799,14 @@ public final class CodexAppServerClient: @unchecked Sendable {
         effort == .minimal ? .low : (effort ?? .medium)
     }
 
-    /// Codex's per-turn `developer_instructions`: base mode + Distill only when
-    /// Token Saver is active (paid token-economy feature).
-    private static func developerInstructions(for mode: AgentInteractionMode, tokenSaverEnabled: Bool) -> String {
+    /// Codex per-turn `developer_instructions`: base mode + Distill (Token Saver) +
+    /// Graphify query-first rules when the host set `RC_GRAPHIFY_ENABLED=1`.
+    private static func developerInstructions(
+        for mode: AgentInteractionMode,
+        environment: [String: String]
+    ) -> String {
         let base = AgentProviderInstructionText.developerInstructions(for: mode)
-        guard tokenSaverEnabled else { return base }
-        return AgentSkillInstaller.managedDistillProviderPrompt(base)
+        // tokenSaverProviderPrompt also chains graphifyProviderPrompt.
+        return AgentSkillInstaller.tokenSaverProviderPrompt(base, environment: environment)
     }
 }

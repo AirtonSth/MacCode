@@ -253,10 +253,41 @@ public final class AgentSkillInstaller: @unchecked Sendable {
     /// Token economy is the paid feature: no Distill dialect, `| distill` rules,
     /// or safety ABI when the toggle is off.
     public static func tokenSaverProviderPrompt(_ base: String, environment: [String: String]) -> String {
-        guard environment["RC_TOKEN_SAVER_DISTILL_HINT"] == "1" else {
+        let withDistill: String
+        if environment["RC_TOKEN_SAVER_DISTILL_HINT"] == "1" {
+            withDistill = managedDistillProviderPrompt(base)
+        } else {
+            withDistill = base
+        }
+        return graphifyProviderPrompt(withDistill, environment: environment)
+    }
+
+    /// Inject Graphify query-first rules when host set `RC_GRAPHIFY_ENABLED=1`.
+    /// Optional roots/graph path from env help the model call the right CLI without user prompts.
+    public static func graphifyProviderPrompt(_ base: String, environment: [String: String]) -> String {
+        guard environment["RC_GRAPHIFY_ENABLED"] == "1" else { return base }
+        var block = GraphifyStableSkillText.agentInstructionsBody
+        if let roots = environment["RC_GRAPHIFY_ROOTS"], !roots.isEmpty {
+            block += "\nActive Graphify roots (one per line):\n\(roots)"
+        }
+        if let graph = environment["RC_GRAPHIFY_GRAPH_JSON"], !graph.isEmpty {
+            block += "\nPrimary graph JSON: \(graph)"
+        }
+        if environment["RC_GRAPHIFY_AMBIGUOUS"] == "1" {
+            block += "\nNote: multi-repo workspace is ambiguous this turn; fail open if unsure which root applies."
+        }
+        if environment["RC_GRAPHIFY_STALE"] == "1" {
+            block += "\nNote: graph is refreshing in the background this turn; fail open for broad search if query results look incomplete."
+        }
+        if base.contains(GraphifyStableSkillText.agentInstructionsBody) {
+            // Still refresh dynamic root/graph tail once: replace is complex; append compact runtime note.
+            if let graph = environment["RC_GRAPHIFY_GRAPH_JSON"], !graph.isEmpty,
+               !base.contains(graph) {
+                return base + "\n\nGraphify runtime: --graph \(graph)"
+            }
             return base
         }
-        return managedDistillProviderPrompt(base)
+        return base + "\n\n" + block
     }
 
     /// Distill injection for Token-Saver-enabled provider adapters.
