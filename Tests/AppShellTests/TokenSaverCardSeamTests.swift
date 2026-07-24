@@ -441,7 +441,32 @@ final class TokenSaverCardSeamTests: XCTestCase {
             usedTokens: 1_000_000
         )
         XCTAssertTrue(headline.lowercased().contains("all-time"))
-        XCTAssertTrue(headline.lowercased().contains("bare agent"))
+    }
+
+    func test_dayAndWeek_useSameBareUserEstimatorPath() {
+        // WHY: Today and Week must only differ by windowed M and U inputs.
+        let day = SidebarRootView.tokenSaverBareUserBreakdown(
+            measuredToolOutputSaved: 250_000,
+            windowProviderTokens: 150_000_000,
+            tokenSaverEnabled: true,
+            graphifyActive: true,
+            graphifySignalCount: 0
+        )
+        let week = SidebarRootView.tokenSaverBareUserBreakdown(
+            measuredToolOutputSaved: 22_000_000,
+            windowProviderTokens: 1_200_000_000,
+            tokenSaverEnabled: true,
+            graphifyActive: true,
+            graphifySignalCount: 0
+        )
+        XCTAssertEqual(day.totalCredible, day.measuredToolOutput + day.estimatedDialect + day.estimatedGraphify)
+        XCTAssertEqual(week.totalCredible, week.measuredToolOutput + week.estimatedDialect + week.estimatedGraphify)
+        XCTAssertEqual(day.estimatedGraphify, 0, "no fake graphify signals")
+        XCTAssertEqual(day.estimatedOrchestration, 0)
+        XCTAssertEqual(week.estimatedOrchestration, 0)
+        // dialect ≈ 0.007 * U capped by 4*M → day ~ min(1.05M, 1M) + M
+        XCTAssertLessThan(day.totalCredible, 2_000_000, "day must stay credible, not 66% of usage")
+        XCTAssertGreaterThan(week.totalCredible, day.totalCredible)
     }
 
     func test_tokenSaverTodaySavedTokens_atOneSecondAfterMidnight_ignoresYesterday() throws {
