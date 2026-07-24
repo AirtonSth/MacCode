@@ -122,9 +122,10 @@ function replaceToolOutputText(value, text) {
 }
 
 function shellCommandSegments(command) {
-  // Split on shell separators so `cd x && rg y` / pipelines still skip exact-output tools.
+  // Split on shell separators (including newlines) so compound / multi-line
+  // Bash still skips exact-output tools in any segment.
   return String(command || '')
-    .split(/(?:&&|\|\||;|\|)/)
+    .split(/(?:&&|\|\||;|\||\r?\n)+/)
     .map((s) => s.trim())
     .filter(Boolean);
 }
@@ -141,14 +142,27 @@ function firstCommandToken(segment) {
 }
 
 function gitExactOutputSubcommand(segment) {
-  // git [-C path] [-c key=val]* (grep|show|cat-file|blame) ...
+  // git [global options]* (grep|show|cat-file|blame) ...
+  // Global options that take a value: -C, -c, --git-dir, --work-tree, --namespace, ...
   const parts = String(segment || '').trim().split(/\s+/).filter(Boolean);
   if ((parts[0] || '').toLowerCase().split(/[/\\]/).pop() !== 'git') return null;
+  const valueOptions = new Set([
+    '-C', '-c', '--git-dir', '--work-tree', '--namespace',
+    '--config-env', '--super-prefix',
+  ]);
   let i = 1;
   while (i < parts.length) {
     const p = parts[i];
-    if (p === '-C' || p === '-c') {
-      i += 2;
+    if (valueOptions.has(p) || p.startsWith('--git-dir=') || p.startsWith('--work-tree=')
+        || p.startsWith('--namespace=') || p.startsWith('-c')) {
+      // `--git-dir=foo` is one token; `-C path` / `--git-dir path` consume next.
+      if (p.includes('=') || p.startsWith('-c') && p.length > 2) {
+        i += 1;
+      } else if (valueOptions.has(p)) {
+        i += 2;
+      } else {
+        i += 1;
+      }
       continue;
     }
     if (p.startsWith('-')) {
