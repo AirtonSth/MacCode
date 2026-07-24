@@ -766,12 +766,18 @@ final class LiveActivitySyncCoordinatorTests: XCTestCase {
             )
         ))
         let targetStore = PrivatePushTargetStore(repo: settings)
-        let start = PrivatePushTargetRecord(
-            deviceId: "device-1", serverId: "server-1", purpose: .pushToStart,
-            environment: .sandbox, token: "start-token",
+        let startA = PrivatePushTargetRecord(
+            deviceId: "device-a", serverId: "server-1", purpose: .pushToStart,
+            environment: .sandbox, token: "start-token-a",
             contractVersion: 2, capabilities: ["live_activity_v2"]
         )
-        try targetStore.upsert(start)
+        let startB = PrivatePushTargetRecord(
+            deviceId: "device-b", serverId: "server-1", purpose: .pushToStart,
+            environment: .sandbox, token: "start-token-b",
+            contractVersion: 2, capabilities: ["live_activity_v2"]
+        )
+        try targetStore.upsert(startA)
+        try targetStore.upsert(startB)
         let api = StartRemapCountingPrivateAccountAPI(failuresBeforeSuccess: 1)
         let bridge = PrivateNotificationBridge(
             accountStore: accountStore,
@@ -779,25 +785,36 @@ final class LiveActivitySyncCoordinatorTests: XCTestCase {
             api: api
         )
         let update = makeDelivery(event: .update, generation: 1, revision: 2)
-        let record = LiveActivityAcceptanceRecord(delivery: update, target: .v2(start))
+        let recordA = LiveActivityAcceptanceRecord(delivery: update, target: .v2(startA))
         // Failed attempt must NOT soft-ack — outbox must be able to retry.
         do {
-            _ = try await bridge.sendLiveActivityAcceptance(record)
+            _ = try await bridge.sendLiveActivityAcceptance(recordA)
             XCTFail("first start-refresh must surface the backend failure")
         } catch {
             // expected
         }
         XCTAssertEqual(api.deliverLiveActivityV2Calls, 1)
         // Retry after failure should hit the backend again and succeed.
-        let recovered = try await bridge.sendLiveActivityAcceptance(record)
+        let recovered = try await bridge.sendLiveActivityAcceptance(recordA)
         XCTAssertTrue(recovered.isAccepted)
         XCTAssertEqual(api.deliverLiveActivityV2Calls, 2,
                        "failed start-refresh must not consume rate-limit budget")
-        // After success, further remaps within the window soft-ack without spam.
-        let coalesced = try await bridge.sendLiveActivityAcceptance(record)
+        // After success, further remaps for the same target soft-ack without spam.
+        let coalesced = try await bridge.sendLiveActivityAcceptance(recordA)
         XCTAssertEqual(coalesced.status, "delivered")
         XCTAssertEqual(api.deliverLiveActivityV2Calls, 2,
-                       "successful start-refresh must rate-limit subsequent remaps")
+                       "successful start-refresh must rate-limit subsequent remaps for same target")
+        // Different device on the same host must still enqueue (not host-wide soft-ack).
+        let recordB = LiveActivityAcceptanceRecord(delivery: update, target: .v2(startB))
+        _ = try await bridge.sendLiveActivityAcceptance(recordB)
+        XCTAssertEqual(api.deliverLiveActivityV2Calls, 3,
+                       "second device must not be soft-acked by another device's rate limit")
+        // Newer revision for device A must still deliver.
+        let newer = makeDelivery(event: .update, generation: 1, revision: 5)
+        let recordANewer = LiveActivityAcceptanceRecord(delivery: newer, target: .v2(startA))
+        _ = try await bridge.sendLiveActivityAcceptance(recordANewer)
+        XCTAssertEqual(api.deliverLiveActivityV2Calls, 4,
+                       "newer revision must not be discarded by equal-or-older rate-limit budget")
     }
 
     func testHTTPPortOverrideIsSharedByListenerBonjourAndPairing() {

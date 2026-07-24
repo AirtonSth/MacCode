@@ -961,7 +961,9 @@ public final class PrivateNotificationBridge: @unchecked Sendable {
     private let api: PrivateAccountAPI
     private let sessionRefresher: PrivatePushSessionRefresher
     private let startRemapLock = NSLock()
-    private var lastStartRemapAtByHost: [String: Date] = [:]
+    /// Per-target budget (host|deviceIdentity). Host-only keys would soft-ack
+    /// device B after device A succeeded, dropping undelivered outbox work.
+    private var lastStartRemapByTarget: [String: (at: Date, revision: Int64)] = [:]
 
     public init(accountStore: PrivateAccountSessionStore, pushTargetStore: PrivatePushTargetStore, api: PrivateAccountAPI = URLSessionPrivateAccountAPI()) {
         self.accountStore = accountStore
@@ -970,22 +972,46 @@ public final class PrivateNotificationBridge: @unchecked Sendable {
         self.sessionRefresher = PrivatePushSessionRefresher(accountStore: accountStore, api: api)
     }
 
-    /// True when a start-remap was *successfully* sent within the min interval.
-    /// Do not reserve budget before success — a failed attempt must still retry.
-    private func shouldSkipStartRemap(hostId: String, now: Date = Date()) -> Bool {
-        startRemapLock.lock()
-        defer { startRemapLock.unlock() }
-        if let last = lastStartRemapAtByHost[hostId],
-           now.timeIntervalSince(last) < Self.startRemapMinInterval {
-            return true
-        }
-        return false
+    private func startRemapKey(hostId: String, target: LiveActivityAcceptanceTarget) -> String {
+        "\(hostId)|\(target.deviceIdentity)"
     }
 
-    private func recordStartRemapSuccess(hostId: String, now: Date = Date()) {
+    /// Soft-ack coalesce only for the same target when a successful remap already
+    /// covered this revision (or newer) within the min interval.
+    private func shouldSoftAckStartRemap(
+        hostId: String,
+        target: LiveActivityAcceptanceTarget,
+        revision: Int64,
+        now: Date = Date()
+    ) -> Bool {
+        let key = startRemapKey(hostId: hostId, target: target)
         startRemapLock.lock()
         defer { startRemapLock.unlock() }
-        lastStartRemapAtByHost[hostId] = now
+        guard let last = lastStartRemapByTarget[key],
+              now.timeIntervalSince(last.at) < Self.startRemapMinInterval,
+              revision <= last.revision else {
+            return false
+        }
+        return true
+    }
+
+    private func recordStartRemapSuccess(
+        hostId: String,
+        target: LiveActivityAcceptanceTarget,
+        revision: Int64,
+        now: Date = Date()
+    ) {
+        let key = startRemapKey(hostId: hostId, target: target)
+        startRemapLock.lock()
+        defer { startRemapLock.unlock() }
+        if let existing = lastStartRemapByTarget[key] {
+            lastStartRemapByTarget[key] = (
+                at: now,
+                revision: max(existing.revision, revision)
+            )
+        } else {
+            lastStartRemapByTarget[key] = (at: now, revision: revision)
+        }
     }
 
     public func deliver(_ content: RemoteCodeNotificationContent) async {
@@ -1176,11 +1202,16 @@ public final class PrivateNotificationBridge: @unchecked Sendable {
         let delivery = Self.effectiveDelivery(for: record)
         let isStartRefresh = delivery.event == .start
             && delivery.idempotencyKey.hasSuffix(".start-refresh")
-        // Soft-ack only when a successful start-remap landed recently (coalesce).
-        // Never mark delivered after a failed attempt — that blocked real retries.
-        if isStartRefresh, shouldSkipStartRemap(hostId: delivery.projection.hostId) {
+        // Soft-ack only for the same target when a recent success already covered
+        // this revision — never host-wide (would drop other devices' outbox rows).
+        if isStartRefresh,
+           shouldSoftAckStartRemap(
+            hostId: delivery.projection.hostId,
+            target: record.target,
+            revision: delivery.projection.revision
+           ) {
             Self.log.info(
-                "live-activity start-refresh suppressed (rate limit) host=\(delivery.projection.hostId, privacy: .public)"
+                "live-activity start-refresh suppressed (rate limit) target=\(record.target.deviceIdentity, privacy: .public)"
             )
             return PrivateLiveActivityV2DeliveryAck(
                 id: delivery.idempotencyKey,
@@ -1217,7 +1248,11 @@ public final class PrivateNotificationBridge: @unchecked Sendable {
                 )
             }
             if isStartRefresh {
-                recordStartRemapSuccess(hostId: delivery.projection.hostId)
+                recordStartRemapSuccess(
+                    hostId: delivery.projection.hostId,
+                    target: record.target,
+                    revision: delivery.projection.revision
+                )
             }
             return PrivateLiveActivityV2DeliveryAck(
                 id: delivery.idempotencyKey,
@@ -1239,7 +1274,11 @@ public final class PrivateNotificationBridge: @unchecked Sendable {
                     throw LiveActivityAcceptanceOutboxError.backendDidNotAccept(ack.status)
                 }
                 if isStartRefresh || delivery.idempotencyKey.hasSuffix(".dismiss-reopen") {
-                    recordStartRemapSuccess(hostId: delivery.projection.hostId)
+                    recordStartRemapSuccess(
+                        hostId: delivery.projection.hostId,
+                        target: record.target,
+                        revision: delivery.projection.revision
+                    )
                 }
                 return ack
             } catch {
@@ -1250,7 +1289,13 @@ public final class PrivateNotificationBridge: @unchecked Sendable {
                 if target.purpose == .activityUpdate,
                    delivery.event == .update || delivery.event == .start,
                    let startTarget = (try? pushTargetStore.records()).flatMap({ records in
+                       // Prefer same deviceId so multi-phone hosts reopen the right card.
                        records.first(where: {
+                           $0.supportsLiveActivityV2 &&
+                           $0.purpose == .pushToStart &&
+                           $0.serverId == delivery.projection.hostId &&
+                           $0.deviceId == target.deviceId
+                       }) ?? records.first(where: {
                            $0.supportsLiveActivityV2 &&
                            $0.purpose == .pushToStart &&
                            $0.serverId == delivery.projection.hostId
@@ -1258,9 +1303,14 @@ public final class PrivateNotificationBridge: @unchecked Sendable {
                            $0.supportsLiveActivityV2 && $0.purpose == .pushToStart
                        })
                    }) {
-                    if shouldSkipStartRemap(hostId: delivery.projection.hostId) {
+                    let startTargetAcceptance = LiveActivityAcceptanceTarget.v2(startTarget)
+                    if shouldSoftAckStartRemap(
+                        hostId: delivery.projection.hostId,
+                        target: startTargetAcceptance,
+                        revision: delivery.projection.revision
+                    ) {
                         Self.log.info(
-                            "live-activity dismiss-reopen suppressed (rate limit) host=\(delivery.projection.hostId, privacy: .public)"
+                            "live-activity dismiss-reopen suppressed (rate limit) target=\(startTargetAcceptance.deviceIdentity, privacy: .public)"
                         )
                         throw error
                     }
@@ -1272,7 +1322,7 @@ public final class PrivateNotificationBridge: @unchecked Sendable {
                     )
                     let startRecord = LiveActivityAcceptanceRecord(
                         delivery: startDelivery,
-                        target: .v2(startTarget)
+                        target: startTargetAcceptance
                     )
                     Self.log.info(
                         "live-activity update failed; reopening via push-to-start key=\(startDelivery.idempotencyKey, privacy: .public)"
