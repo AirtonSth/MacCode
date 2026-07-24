@@ -60,8 +60,14 @@ final class GraphifyUsageDetectorTests: XCTestCase {
         XCTAssertEqual(GraphifyUsageDetector.tokensFromUTF8Count(400), 100)
     }
 
-    func test_looksLikeFailure() {
+    func test_looksLikeFailure_highConfidenceOnly() {
+        // WHY: legit graphify/code output often contains "error:" / "fatal:" / "not found".
         XCTAssertTrue(GraphifyUsageDetector.looksLikeFailure(output: "graphify: command not found"))
+        XCTAssertTrue(GraphifyUsageDetector.looksLikeFailure(output: "bash: graphify: command not found\n"))
         XCTAssertFalse(GraphifyUsageDetector.looksLikeFailure(output: "NODE SidebarView …"))
+        XCTAssertFalse(
+            GraphifyUsageDetector.looksLikeFailure(output: "error: no such module 'Foo'\nfatal: path not found"),
+            "Must not delete successful tool results that merely mention errors in content"
+        )
     }
 }

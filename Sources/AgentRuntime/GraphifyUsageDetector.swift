@@ -71,19 +71,25 @@ public enum GraphifyUsageDetector {
         return max(0, Int((Double(utf8Count) / charsPerToken).rounded()))
     }
 
-    /// True when tool output looks like a failed shell invocation (no savings credit).
+    /// True when tool output is a **high-confidence** shell failure (no savings credit).
+    ///
+    /// Prefer under-count over false deletes: legit Graphify/code output often
+    /// contains "error:", "fatal:", "not found" in snippets. Only treat as failed
+    /// when the shell clearly could not run graphify.
     public static func looksLikeFailure(output: String?) -> Bool {
         guard let o = output?.lowercased(), !o.isEmpty else { return false }
+        let head = String(o.prefix(400))
         let needles = [
             "command not found",
-            "not found:",
-            "no such file",
-            "permission denied",
-            "error: ",
-            "fatal:",
-            "traceback (most recent call last)"
+            "not found in path",
+            "no such file or directory",
+            "executable file not found",
+            "is not recognized as an internal or external command",
+            "permission denied: graphify",
+            "graphify: command not found",
+            "graphifyy: command not found",
         ]
-        return needles.contains { o.contains($0) }
+        return needles.contains { head.contains($0) || o.contains($0) }
     }
 
     // MARK: - Internals

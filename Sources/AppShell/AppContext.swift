@@ -556,13 +556,15 @@ public final class AppContext {
                 if let o = outputAppend { p["output_append"] = .string(o) }
                 if let s = summary { p["summary"] = .string(s) }
                 EventBus.shared.publish(kind: "agent.item.delta", payload: .object(p))
+                // Accumulate only — never finalize on partial stream chunks.
                 self.recordGraphifyUsageFromItemDelta(
                     itemId: itemId,
                     bodyAppend: bodyAppend,
                     outputAppend: outputAppend,
                     summary: summary,
                     threadId: tid,
-                    runId: runId
+                    runId: runId,
+                    finalize: false
                 )
             case .itemState(let itemId, let state):
                 if state != .streaming {
@@ -571,6 +573,8 @@ public final class AppContext {
                 }
                 if state == .failed || state == .cancelled {
                     self.failGraphifyUsageItem(itemId: itemId, runId: runId)
+                } else if state == .completed {
+                    self.finalizeGraphifyUsageItem(itemId: itemId, runId: runId)
                 }
             case .itemProgress(let itemId, let progress):
                 var p: [String: JSONValue] = ["thread_id": .string(t), "item_id": .string(itemId)]
@@ -581,6 +585,8 @@ public final class AppContext {
                                         payload: .object(["thread_id": .string(t), "item_id": .string(itemId), "state": .string(state.rawValue)]))
                 if state == .failed || state == .cancelled {
                     self.failGraphifyUsageItem(itemId: itemId, runId: runId)
+                } else if state == .completed {
+                    self.finalizeGraphifyUsageItem(itemId: itemId, runId: runId)
                 }
             case .turnCompleted(let turnId, let final):
                 var p: [String: JSONValue] = ["thread_id": .string(t), "turn_id": .string(turnId)]
@@ -2622,22 +2628,28 @@ public final class AppContext {
         graphifyItemBuffers[bufferKey] = buf
         graphifyItemBuffersLock.unlock()
 
+        // Claude often delivers full tool_result in one itemStarted (output set).
+        // Streaming providers finalize on itemCompleted instead.
+        let finalizeNow = item.output != nil && item.state == .completed
         processGraphifyBuffer(
             bufferKey: bufferKey,
             itemId: item.id,
             runKey: runKey,
-            finalizeOutput: item.output != nil
+            finalizeOutput: finalizeNow
         )
     }
 
     /// Codex/Grok often stream command text and output via itemDelta only.
+    /// `finalize` must stay false for deltas — only itemCompleted / completed
+    /// itemStarted (Claude tool_result) may flip ok=1.
     func recordGraphifyUsageFromItemDelta(
         itemId: String,
         bodyAppend: String?,
         outputAppend: String?,
         summary: String?,
         threadId: AgentThreadID,
-        runId: AgentRunID
+        runId: AgentRunID,
+        finalize: Bool = false
     ) {
         let settings = SettingsStore(db: db).load()
         guard settings.tokenSaverEnabled, settings.isGraphifyRuntimeActive else { return }
@@ -2664,7 +2676,19 @@ public final class AppContext {
             bufferKey: bufferKey,
             itemId: itemId,
             runKey: runKey,
-            finalizeOutput: outputAppend != nil && !(outputAppend?.isEmpty ?? true)
+            finalizeOutput: finalize
+        )
+    }
+
+    /// Complete a successful tool item: mark pending graphify/exploration rows ok.
+    func finalizeGraphifyUsageItem(itemId: String, runId: AgentRunID) {
+        let runKey = runId.value.uuidString
+        let bufferKey = "\(runKey)|\(itemId)"
+        processGraphifyBuffer(
+            bufferKey: bufferKey,
+            itemId: itemId,
+            runKey: runKey,
+            finalizeOutput: true
         )
     }
 
@@ -2689,7 +2713,7 @@ public final class AppContext {
         finalizeOutput: Bool
     ) {
         graphifyItemBuffersLock.lock()
-        guard var buf = graphifyItemBuffers[bufferKey] else {
+        guard let buf = graphifyItemBuffers[bufferKey] else {
             graphifyItemBuffersLock.unlock()
             return
         }
@@ -2705,13 +2729,17 @@ public final class AppContext {
         let combinedBody = GraphifyUsageDetector.commandText(fromBody: body)
         let haystackBody = [body, combinedBody].joined(separator: "\n")
         let invocations = GraphifyUsageDetector.detect(summary: summary, body: haystackBody)
+        // Exploration name is known on tool_use; result summary is often "result".
         let exploration = GraphifyUsageDetector.isExplorationTool(summary: summary)
+            || alreadyExploration
 
         // Pending insert (ok=0) so success path can flip ok=1; never count until then.
         if (!alreadyInvocation && !invocations.isEmpty) || (!alreadyExploration && exploration) {
+            let willRecordInvocation = !alreadyInvocation && !invocations.isEmpty
+            let willRecordExploration = !alreadyExploration && GraphifyUsageDetector.isExplorationTool(summary: summary)
             backgroundWriterQueue.async { [weak self] in
                 guard let self else { return }
-                if !alreadyInvocation {
+                if willRecordInvocation {
                     for inv in invocations {
                         try? self.graphifyUsageRepo.insert(
                             GraphifyUsageEvent(
@@ -2727,7 +2755,7 @@ public final class AppContext {
                         )
                     }
                 }
-                if !alreadyExploration && exploration {
+                if willRecordExploration {
                     try? self.graphifyUsageRepo.insertExplorationSample(
                         createdAtMs: createdAtMs,
                         provider: provider,
@@ -2741,8 +2769,8 @@ public final class AppContext {
             }
             graphifyItemBuffersLock.lock()
             if var b = graphifyItemBuffers[bufferKey] {
-                if !invocations.isEmpty { b.recordedInvocation = true }
-                if exploration { b.recordedExploration = true }
+                if willRecordInvocation { b.recordedInvocation = true }
+                if willRecordExploration { b.recordedExploration = true }
                 graphifyItemBuffers[bufferKey] = b
             }
             graphifyItemBuffersLock.unlock()
@@ -2750,7 +2778,23 @@ public final class AppContext {
 
         guard finalizeOutput else { return }
 
-        if GraphifyUsageDetector.looksLikeFailure(output: output) {
+        // Re-read buffer after possible flag updates.
+        graphifyItemBuffersLock.lock()
+        let finalBuf = graphifyItemBuffers[bufferKey]
+        let hadInterest = (finalBuf?.recordedInvocation == true)
+            || (finalBuf?.recordedExploration == true)
+            || !invocations.isEmpty
+        let finalOutput = finalBuf?.output ?? output
+        graphifyItemBuffersLock.unlock()
+
+        guard hadInterest else {
+            graphifyItemBuffersLock.lock()
+            graphifyItemBuffers.removeValue(forKey: bufferKey)
+            graphifyItemBuffersLock.unlock()
+            return
+        }
+
+        if GraphifyUsageDetector.looksLikeFailure(output: finalOutput) {
             graphifyItemBuffersLock.lock()
             graphifyItemBuffers.removeValue(forKey: bufferKey)
             graphifyItemBuffersLock.unlock()
@@ -2763,7 +2807,8 @@ public final class AppContext {
             return
         }
 
-        let answerTokens = GraphifyUsageDetector.tokensFromUTF8Count(output.utf8.count)
+        let answerTokens = GraphifyUsageDetector.tokensFromUTF8Count(finalOutput.utf8.count)
+        // Enqueue after pending inserts (serial queue) so markSucceeded finds rows.
         backgroundWriterQueue.async { [weak self] in
             guard let self else { return }
             try? self.graphifyUsageRepo.markSucceeded(
