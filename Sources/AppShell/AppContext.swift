@@ -2795,6 +2795,12 @@ public final class AppContext {
             return
         }
 
+        // Claude emits itemCompleted on tool_use *before* tool_result. Keep the
+        // buffer and leave ok=0 until we have real output (tool_result / stream end).
+        if finalOutput.isEmpty {
+            return
+        }
+
         if GraphifyUsageDetector.looksLikeFailure(output: finalOutput) {
             graphifyItemBuffersLock.lock()
             graphifyItemBuffers.removeValue(forKey: bufferKey)
