@@ -32,6 +32,27 @@ final class GraphifyWorkspaceServiceTests: XCTestCase {
         XCTAssertTrue(a.path.contains(checkout.artifactDirectoryName))
     }
 
+    func test_applyToAgentEnvironmentStripsGraphifyWhenDisabled() {
+        // WHY: Token Saver / Graphify off must not leave RC_GRAPHIFY_* that re-enable prompts.
+        service.enabled = false
+        let applied = service.applyToAgentEnvironment(
+            base: [
+                "RC_GRAPHIFY_ENABLED": "1",
+                "RC_GRAPHIFY_GRAPH_JSON": "/stale/graph.json",
+                "PATH": "/usr/bin"
+            ],
+            threadId: nil,
+            threadCwd: tempRoot.path,
+            worktreePath: nil,
+            workspaceCwd: tempRoot.path,
+            attachmentPaths: []
+        )
+        XCTAssertNil(applied.environment["RC_GRAPHIFY_ENABLED"])
+        XCTAssertNil(applied.environment["RC_GRAPHIFY_GRAPH_JSON"])
+        XCTAssertEqual(applied.environment["PATH"], "/usr/bin")
+        XCTAssertEqual(applied.workingSet.workspaceKind, "disabled")
+    }
+
     func test_verifyMissingBinaryIsUnavailable() {
         service.binaryPathOverride = "/nonexistent/graphify-\(UUID().uuidString)"
         let checkout = GraphifyCheckout(key: GraphifyRepoKey(commonDir: "/x/.git"), displayRoot: "/x")
@@ -101,12 +122,50 @@ final class GraphifyWorkspaceServiceTests: XCTestCase {
         let on = AgentSkillInstaller.graphifyProviderPrompt(base, environment: [
             "RC_GRAPHIFY_ENABLED": "1",
             "RC_GRAPHIFY_GRAPH_JSON": "/tmp/g.json",
-            "RC_GRAPHIFY_ROOTS": "/repo/a"
+            "RC_GRAPHIFY_ROOTS": "/repo/a",
+            "RC_GRAPHIFY_ARTIFACT_ROOT": "/tmp/artifacts/a"
         ])
         XCTAssertTrue(on.contains("Graphify"), on)
         XCTAssertTrue(on.contains("graphify query"), on)
         XCTAssertTrue(on.contains("/tmp/g.json"), on)
         XCTAssertTrue(on.contains("/repo/a"), on)
+        // WHY: agents must not treat missing repo graphify-out/ as "no graph".
+        XCTAssertTrue(on.contains("RC_GRAPHIFY_GRAPH_JSON"), on)
+        XCTAssertTrue(on.contains("NOT `./graphify-out/`") || on.contains("not repo graphify-out"), on)
+        XCTAssertTrue(on.contains("/tmp/artifacts/a"), on)
+    }
+
+    func test_graphifyStableSkillTextPointsAtCanonicalPathNotRepoOut() {
+        let body = GraphifyStableSkillText.agentInstructionsBody
+        XCTAssertTrue(body.contains("RC_GRAPHIFY_GRAPH_JSON"), body)
+        XCTAssertTrue(body.contains("Application Support") || body.contains("NOT `./graphify-out/`"), body)
+        XCTAssertTrue(body.contains("Never answer \"no graph\"") || body.contains("does NOT mean there is no graph"), body)
+
+        let withGraph = GraphifyStableSkillText.augmentTurnPrompt("hi", environment: [
+            "RC_GRAPHIFY_ENABLED": "1",
+            "RC_GRAPHIFY_GRAPH_JSON": "/tmp/canonical/graph.json"
+        ])
+        // Banner must lead the prompt (models ignore trailing rules).
+        XCTAssertTrue(withGraph.hasPrefix("HOST GRAPHIFY STATUS"), withGraph)
+        XCTAssertTrue(withGraph.contains("Graph EXISTS at absolute path: /tmp/canonical/graph.json"), withGraph)
+        XCTAssertTrue(withGraph.contains("not repo ./graphify-out") || withGraph.contains("NOT repo ./graphify-out"), withGraph)
+
+        let noPath = GraphifyStableSkillText.augmentTurnPrompt("hi", environment: [
+            "RC_GRAPHIFY_ENABLED": "1"
+        ])
+        XCTAssertTrue(noPath.contains("HOST GRAPHIFY STATUS"), noPath)
+        XCTAssertTrue(noPath.contains("do NOT answer") || noPath.contains("NORMAL"), noPath)
+
+        let injected = AgentSkillInstaller.graphifyProviderPrompt(
+            "User request:\ntem graph aqui?",
+            environment: [
+                "RC_GRAPHIFY_ENABLED": "1",
+                "RC_GRAPHIFY_GRAPH_JSON": "/tmp/canonical/graph.json"
+            ]
+        )
+        XCTAssertTrue(injected.hasPrefix("HOST GRAPHIFY STATUS"), injected)
+        XCTAssertTrue(injected.contains("/tmp/canonical/graph.json"), injected)
+        XCTAssertTrue(injected.contains("tem graph aqui?"), injected)
     }
 
     func test_tokenSaverProviderPromptAlsoChainsGraphify() {

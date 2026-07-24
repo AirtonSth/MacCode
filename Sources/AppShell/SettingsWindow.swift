@@ -684,6 +684,8 @@ public final class SettingsViewModel: ObservableObject {
     public func setTokenSaverEnabled(_ on: Bool) {
         appSettings.tokenSaverEnabled = on
         settingsStore.update { $0.tokenSaverEnabled = on }
+        // Graphify is a Token Saver sub-capability — re-apply host gate immediately.
+        context.reconcileGraphifyHost(settings: appSettings)
     }
 
     /// Mirrors AppContext's last managed-distill reconcile into a published status
@@ -722,37 +724,31 @@ public final class SettingsViewModel: ObservableObject {
     public func setGraphifyEnabled(_ on: Bool) {
         appSettings.graphifyEnabled = on
         settingsStore.update { $0.graphifyEnabled = on }
-        GraphifyWorkspaceService.shared.enabled = on
-        if on {
-            let path = appSettings.graphifyBinaryPath.trimmingCharacters(in: .whitespacesAndNewlines)
-            GraphifyWorkspaceService.shared.binaryPathOverride = path.isEmpty ? nil : path
-            GraphifyWorkspaceService.shared.autoEnsure = appSettings.graphifyAutoEnsure
-            GraphifyWorkspaceService.shared.writeInRepo = appSettings.graphifyWriteInRepo
-        }
+        context.reconcileGraphifyHost(settings: appSettings)
     }
 
     public func setGraphifyBinaryPath(_ path: String) {
         appSettings.graphifyBinaryPath = path
         settingsStore.update { $0.graphifyBinaryPath = path }
-        let trimmed = path.trimmingCharacters(in: .whitespacesAndNewlines)
-        GraphifyWorkspaceService.shared.binaryPathOverride = trimmed.isEmpty ? nil : trimmed
+        context.reconcileGraphifyHost(settings: appSettings)
     }
 
     public func setGraphifyAutoEnsure(_ on: Bool) {
         appSettings.graphifyAutoEnsure = on
         settingsStore.update { $0.graphifyAutoEnsure = on }
-        GraphifyWorkspaceService.shared.autoEnsure = on
+        context.reconcileGraphifyHost(settings: appSettings)
     }
 
     public func setGraphifyPinnedRoots(_ roots: [String]) {
         appSettings.graphifyPinnedRoots = roots
         settingsStore.update { $0.graphifyPinnedRoots = roots }
+        context.reconcileGraphifyHost(settings: appSettings)
     }
 
     public func setGraphifyWriteInRepo(_ on: Bool) {
         appSettings.graphifyWriteInRepo = on
         settingsStore.update { $0.graphifyWriteInRepo = on }
-        GraphifyWorkspaceService.shared.writeInRepo = on
+        context.reconcileGraphifyHost(settings: appSettings)
     }
 
     public func setPetEnabled(_ on: Bool) {
@@ -1747,12 +1743,13 @@ public struct SettingsView: View {
                 .labelsHidden()
                 .accessibilityIdentifier("settings.advanced.historyCompaction.toggle")
             }
-            settingRow("Graphify (code knowledge graph preflight)") {
+            settingRow("Graphify (requires Token Saver)") {
                 Toggle("", isOn: Binding(
                     get: { vm.appSettings.graphifyEnabled },
                     set: { vm.setGraphifyEnabled($0) }
                 ))
                 .labelsHidden()
+                .disabled(!vm.appSettings.tokenSaverEnabled)
                 .accessibilityIdentifier("settings.advanced.graphify.enabled.toggle")
             }
             settingRow("Graphify auto-ensure on agent resolve") {
@@ -1761,6 +1758,7 @@ public struct SettingsView: View {
                     set: { vm.setGraphifyAutoEnsure($0) }
                 ))
                 .labelsHidden()
+                .disabled(!vm.appSettings.isGraphifyRuntimeActive)
                 .accessibilityIdentifier("settings.advanced.graphify.autoEnsure.toggle")
             }
             settingRow("Write graphify-out/ inside the project (opt-in)") {
@@ -1769,6 +1767,7 @@ public struct SettingsView: View {
                     set: { vm.setGraphifyWriteInRepo($0) }
                 ))
                 .labelsHidden()
+                .disabled(!vm.appSettings.isGraphifyRuntimeActive)
                 .accessibilityIdentifier("settings.advanced.graphify.writeInRepo.toggle")
             }
             VStack(alignment: .leading, spacing: DS.Space.xs) {
@@ -1780,9 +1779,10 @@ public struct SettingsView: View {
                     set: { vm.setGraphifyBinaryPath($0) }
                 ))
                 .textFieldStyle(.roundedBorder)
+                .disabled(!vm.appSettings.isGraphifyRuntimeActive)
                 .accessibilityIdentifier("settings.advanced.graphify.binaryPath.field")
             }
-            Text("Session Learn mines correction rules from failed runs into managed instructions. History Compaction stores large tool output in a structure-preserving compressed form. Graphify is on by default and stores graphs under Application Support (not in your repo). Enable “Write graphify-out/ inside the project” only if you want the team-committed graphify-out layout.")
+            Text("Session Learn mines correction rules from failed runs into managed instructions. History Compaction stores large tool output in a structure-preserving compressed form. Graphify is a Token Saver capability: it only preflights, ensures, and injects query-first prompts while Token Saver is on (and the Graphify preference is on). Graphs store under Application Support by default. Enable “Write graphify-out/ inside the project” only if you want the team-committed graphify-out layout.")
                 .font(DS.Font.caption)
                 .foregroundColor(DS.Palette.textTertiary)
         }

@@ -9,6 +9,8 @@
 ## Token Saver / Distill rules
 
 - Token Saver is the only paid token-economy feature. No Distill dialect injection, `| distill` PATH/wrappers, PostToolUse compression, prompt compression, or SR1 humanize may run while `tokenSaverEnabled` is false.
+- Never distill exact-output shell tools: the agent needs full stdout for line slices and matches. Skip `| distill` (and do not PATH-wrap) for `rg`/`grep`/`sed`/`awk`/`cat`/`head`/`tail`/`nl`/`cut`/`tr`/`diff`/`jq`/`yq` and `git grep|show|cat-file|blame`. Prefer distill for noisy builds, tests, logs, large listings, and summary-friendly git/CI output only.
+- Graphify is a Token Saver sub-capability. Host preflight, ensure/update, `RC_GRAPHIFY_*` injection, and query-first agent prompts must not run unless `tokenSaverEnabled && graphifyEnabled` (`AppSettings.isGraphifyRuntimeActive`). When Token Saver is off, fail open: no Graphify env, no ensure, no FSEvents watchers, no query-first nudge.
 - Token Saver must fail open for provider turns: if the local Distill sidecar is unavailable, over deadline, or rejects output, preserve the original provider input.
 - Never introduce Python, Rust, external headroom code, or an HTTP provider proxy for Token Saver. Prefer native Swift, Core ML/MLX, deterministic parsers, and explicit localhost endpoints.
 - ONNX Runtime C++ is fallback-only and needs an explicit benchmark/licensing decision before any dependency is added; Core ML/MLX remains the default native path.

@@ -202,19 +202,26 @@ public final class AgentSkillInstaller: @unchecked Sendable {
     - Do not output a rewritten/compressed version of the latest user prompt unless the user explicitly asks to compress text.
     - Emit `Dict:` early only when aliases reduce repetition (never secrets/people/paths/URLs as aliases).
 
-    Command-output policy (Token Saver — bias to compress; over-compressing is preferred to under-compressing):
-    - DEFAULT to piping EVERY pipable, output-producing shell/tool call through the RemoteCode-managed `distill` CLI, regardless of predicted output size. This applies to build, test, lint, install, git, grep, rg, find, ls, cat, head, tail, curl, sed, awk, docker, kubectl, terraform, and any other command whose output will be read by the provider.
-    - Treat piping as the norm, not the exception. Always pass an explicit extraction prompt so the distilled result still answers the task. When the source command's exit status matters, enable shell `pipefail`.
+    Command-output policy (Token Saver — compress noisy output; never distill exact-payload tools):
+    - DEFAULT: pipe high-volume / noisy, pipable commands through the RemoteCode-managed `distill` CLI with an explicit extraction prompt and `pipefail` when exit status matters.
+      Good for: build, test, lint, install, docker, kubectl, terraform, find, ls (large listings), git log/status/diff (summaries), long CI logs.
+    - NEVER pipe `| distill` for exact-output commands — the agent needs the full stdout for the next step:
+      search/match: rg, grep, egrep, fgrep, ag, ugrep, git grep
+      line/stream edit or dump: sed, awk, cat, head, tail, nl, cut, tr, paste
+      exact compare/bytes: diff, cmp, od, hexdump, xxd, base64
+      structure extractors when parsing: jq, yq
+      Also skip for: patches/apply, hash/token copy, interactive/TUI, non-pipable calls, or unavailable RemoteCodeDistillService.
     - Never call Node, tsx, npm, bun, or a source-checkout CLI for `distill`.
-    - Skip the pipe ONLY when the call is not pipable, you genuinely need exact bytes (e.g. applying a patch, copying a hash/token verbatim), output is interactive/TUI, or the local RemoteCode service is unavailable; state that you skipped and why.
+    - When you skip `| distill`, state that briefly (e.g. skip: exact sed/rg output).
     - Every subagent, worker, reviewer, or delegated prompt must repeat this Distill rule and require its descendants to do the same; never assume inherited context is enough.
     - If a summary includes `[[rc:<handle>]]`, recover exact bytes with `distill retrieve <handle>`.
-    - Wait for `distill` before continuing.
+    - Wait for `distill` before continuing when you did pipe it.
 
     Examples:
     - `bun test 2>&1 | distill "Did tests pass? Return PASS or FAIL, followed by failing test names if any."`
-    - `git diff | distill "What changed? Return only files changed and one-line summary for each."`
-    - `terraform plan 2>&1 | distill "Is this safe? Return SAFE, REVIEW, or UNSAFE, followed by risky changes."`
+    - `git log --oneline -50 | distill "Summarize recent commits by theme."`
+    - `rg -n "func applyGraphify" Sources`  # skip distill — need every match line
+    - `sed -n '100,180p' Sources/Foo.swift`  # skip distill — need exact slice
 
     Source reference:
     - https://github.com/samuelfaj/distill/blob/main/skills/distill/SKILL.md
@@ -228,10 +235,12 @@ public final class AgentSkillInstaller: @unchecked Sendable {
     Prefixes when used: S=state, C=context, D=action, R=risk, O=outcome, N=no-go, P=proof.
     Dict/`#` vars only when they reduce repetition. Never alias secrets, people, IDs, paths, URLs.
     Do not return a rewritten/compressed copy of the user's prompt unless explicitly asked to compress text.
-    Token Saver — bias to compress: by DEFAULT pipe EVERY pipable, output-producing shell/tool call through the RemoteCode-managed `distill` CLI with an explicit extraction prompt, regardless of predicted size; use `pipefail` when source exit status matters.
-    Skip `| distill` ONLY for non-pipable calls, exact bytes (patches/hashes/tokens), interactive/TUI output, or unavailable RemoteCodeDistillService; state the skip. Never invoke Node/tsx/npm/bun or a source-checkout `distill`.
+    Token Saver — compress noisy output via managed `distill` CLI with an explicit extraction prompt; use `pipefail` when exit status matters.
+    Good to pipe: build/test/lint/install/docker/kubectl/terraform, large find/ls, git log/status/diff summaries, long logs.
+    NEVER pipe `| distill` for exact-output tools (agent needs full stdout): rg, grep, egrep, fgrep, sed, awk, cat, head, tail, nl, cut, tr, diff, jq, yq, git grep/show/cat-file/blame; also patches/hashes/tokens, interactive/TUI, non-pipable, or service unavailable — state the skip briefly.
+    Never invoke Node/tsx/npm/bun or a source-checkout `distill`.
     Every subagent, worker, reviewer, or delegated prompt MUST repeat this rule and require its descendants to do the same; never assume inheritance.
-    If a summary includes `[[rc:<handle>]]`, recover exact bytes with `distill retrieve <handle>`. Wait for `distill` before continuing.
+    If a summary includes `[[rc:<handle>]]`, recover exact bytes with `distill retrieve <handle>`. Wait for `distill` before continuing when used.
     Details and examples live in the managed `distill` SKILL.md.
     <!-- distill skill: end -->
     """
@@ -266,12 +275,29 @@ public final class AgentSkillInstaller: @unchecked Sendable {
     /// Optional roots/graph path from env help the model call the right CLI without user prompts.
     public static func graphifyProviderPrompt(_ base: String, environment: [String: String]) -> String {
         guard environment["RC_GRAPHIFY_ENABLED"] == "1" else { return base }
+        let banner = GraphifyStableSkillText.runtimeStatusBanner(environment: environment) ?? ""
+
+        // Already fully injected (stable body present): still force absolute path banner first.
+        if base.contains(GraphifyStableSkillText.agentInstructionsBody) {
+            if let graph = environment["RC_GRAPHIFY_GRAPH_JSON"], !graph.isEmpty, !base.contains(graph) {
+                let note = GraphifyStableSkillText.runtimeStatusBanner(environment: environment) ?? "Graphify runtime: --graph \(graph)"
+                return note + "\n\n" + base
+            }
+            if !banner.isEmpty, !base.contains("HOST GRAPHIFY STATUS") {
+                return banner + "\n\n" + base
+            }
+            return base
+        }
+
         var block = GraphifyStableSkillText.agentInstructionsBody
         if let roots = environment["RC_GRAPHIFY_ROOTS"], !roots.isEmpty {
             block += "\nActive Graphify roots (one per line):\n\(roots)"
         }
         if let graph = environment["RC_GRAPHIFY_GRAPH_JSON"], !graph.isEmpty {
-            block += "\nPrimary graph JSON: \(graph)"
+            block += "\nPrimary graph JSON (canonical; use --graph with this path): \(graph)"
+        }
+        if let artifact = environment["RC_GRAPHIFY_ARTIFACT_ROOT"], !artifact.isEmpty {
+            block += "\nGraphify artifact root (Application Support; not repo graphify-out/): \(artifact)"
         }
         if environment["RC_GRAPHIFY_AMBIGUOUS"] == "1" {
             block += "\nNote: multi-repo workspace is ambiguous this turn; fail open if unsure which root applies."
@@ -279,15 +305,11 @@ public final class AgentSkillInstaller: @unchecked Sendable {
         if environment["RC_GRAPHIFY_STALE"] == "1" {
             block += "\nNote: graph is refreshing in the background this turn; fail open for broad search if query results look incomplete."
         }
-        if base.contains(GraphifyStableSkillText.agentInstructionsBody) {
-            // Still refresh dynamic root/graph tail once: replace is complex; append compact runtime note.
-            if let graph = environment["RC_GRAPHIFY_GRAPH_JSON"], !graph.isEmpty,
-               !base.contains(graph) {
-                return base + "\n\nGraphify runtime: --graph \(graph)"
-            }
-            return base
+        // Banner FIRST (before user request) so "tem graph?" cannot be answered from repo graphify-out alone.
+        if banner.isEmpty {
+            return base + "\n\n" + block
         }
-        return base + "\n\n" + block
+        return banner + "\n\n" + base + "\n\n" + block
     }
 
     /// Distill injection for Token-Saver-enabled provider adapters.
@@ -503,19 +525,21 @@ public final class AgentSkillInstaller: @unchecked Sendable {
         return .notPresent
     }
 
-    /// Install the RTK-style transparent command wrappers: a symlink per wrapped command in the
-    /// managed bin dir (`~/.remote-code/bin`, which is PREPENDED to the agent PATH but not on the
-    /// user's interactive shell PATH — so only agents get wrappers) pointing at the
-    /// RemoteCodeDistillService binary, which detects its basename and enters wrap mode. A wrapper
-    /// is installed ONLY when the real command exists on the system, so a missing command (e.g.
-    /// `rg` not installed) is never shadowed by a wrapper that would then fail. Returns the
-    /// commands wrapped. Best-effort symmetry with `installDistillCLI`.
+    /// Install the RTK-style transparent command wrappers: a symlink per *compressible*
+    /// wrapped command in the managed bin dir (`~/.remote-code/bin`, PREPENDED to the agent
+    /// PATH only). Exact-output tools (sed, rg, grep, cat, …) are never wrapped — agents
+    /// need full stdout. Also removes any legacy exact-output symlinks from older installs.
     @discardableResult
     public func installCommandWrappers(serviceBinaryURL: URL? = nil) throws -> [String] {
         try fileManager.createDirectory(at: cliBinDirectory, withIntermediateDirectories: true)
         guard let binary = serviceBinaryURL ?? Self.resolveServiceBinary(fileManager: fileManager) else {
             throw AgentSkillCLIError.serviceBinaryUnavailable
         }
+        // Drop exact-output wrappers left by older catalogs (sed/rg/cat/…).
+        _ = try removeManagedWrapperSymlinks(
+            basenames: WrappedCommandCatalog.exactOutputCommands,
+            binaryPath: binary.path
+        )
         let searchDirectories = systemCommandSearchDirectories()
         var installed: [String] = []
         for command in WrappedCommandCatalog.commands {
@@ -536,14 +560,24 @@ public final class AgentSkillInstaller: @unchecked Sendable {
 
     /// Remove the command-wrapper symlinks — but only those still pointing at our service binary,
     /// so a user's own command on the managed path (unexpected) is never deleted.
+    /// Includes legacy exact-output basenames so Token Saver off cleans old sed/rg wrappers.
     @discardableResult
     public func uninstallCommandWrappers() throws -> [String] {
         let binaryPath = Self.resolveServiceBinary(fileManager: fileManager)?.path
+        return try removeManagedWrapperSymlinks(
+            basenames: WrappedCommandCatalog.symlinkBasenamesToRemove,
+            binaryPath: binaryPath
+        )
+    }
+
+    private func removeManagedWrapperSymlinks(basenames: [String], binaryPath: String?) throws -> [String] {
         var removed: [String] = []
-        for command in WrappedCommandCatalog.commands {
+        for command in basenames {
             let link = cliBinDirectory.appendingPathComponent(command)
             guard let dest = try? fileManager.destinationOfSymbolicLink(atPath: link.path) else { continue }
-            guard dest == binaryPath || (dest as NSString).lastPathComponent == "RemoteCodeDistillService" else { continue }
+            let pointsAtService = dest == binaryPath
+                || (dest as NSString).lastPathComponent == "RemoteCodeDistillService"
+            guard pointsAtService else { continue }
             try fileManager.removeItem(at: link)
             removed.append(command)
         }

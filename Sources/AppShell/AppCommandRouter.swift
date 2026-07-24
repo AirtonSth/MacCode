@@ -2981,7 +2981,8 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     private func softGraphifyPreflight(workspace: WorkspaceID?) {
         guard let ctx = context, let workspace else { return }
         let settings = SettingsStore(db: ctx.db).load()
-        guard settings.graphifyEnabled else { return }
+        // Token Saver is the paid gate; Graphify is a sub-capability under it.
+        guard settings.isGraphifyRuntimeActive else { return }
         configureGraphifyService(from: settings)
         let cwd = ctx.state.workspaces[workspace]?.cwd ?? FileManager.default.currentDirectoryPath
         let set = GraphifyWorkspaceService.shared.softPreflight(
@@ -2993,12 +2994,14 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
 
     private func configureGraphifyService(from settings: AppSettings) {
         let svc = GraphifyWorkspaceService.shared
-        svc.enabled = settings.graphifyEnabled
-        svc.autoEnsure = settings.graphifyAutoEnsure
+        let active = settings.isGraphifyRuntimeActive
+        svc.enabled = active
+        svc.autoEnsure = active && settings.graphifyAutoEnsure
         svc.writeInRepo = settings.graphifyWriteInRepo
         svc.pinnedRoots = settings.graphifyPinnedRoots
         let path = settings.graphifyBinaryPath.trimmingCharacters(in: .whitespacesAndNewlines)
         svc.binaryPathOverride = path.isEmpty ? nil : path
+        if !active { svc.stopWatchingAll() }
     }
 
     /// Authoritative Graphify resolve on send (RPC path). Agent App UI uses the same
@@ -3011,7 +3014,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     ) -> [String: String] {
         guard let ctx = context else { return baseEnvironment }
         let settings = SettingsStore(db: ctx.db).load()
-        guard settings.graphifyEnabled else { return baseEnvironment }
+        guard settings.isGraphifyRuntimeActive else { return baseEnvironment }
         configureGraphifyService(from: settings)
 
         let workspaceCwd = ctx.state.workspaces.first { $0.value.id == thread.workspaceId }?.value.cwd ?? cwd

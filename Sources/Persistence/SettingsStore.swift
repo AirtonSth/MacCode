@@ -54,17 +54,25 @@ public struct AppSettings: Codable, Sendable, Equatable {
     /// preserving). Off by default — opt-in, since it makes stored history lossy-recoverable.
     public var historyCompactionEnabled: Bool
 
-    /// Graphify host integration (external CLI). On by default.
+    /// Graphify host integration (external CLI). Preference on by default, but
+    /// runtime is gated by Token Saver — see `isGraphifyRuntimeActive`.
     public var graphifyEnabled: Bool
     /// Absolute path to `graphify` binary (GUI PATH bypass). Empty = auto-resolve.
     public var graphifyBinaryPath: String
-    /// Fire-and-forget ensure on resolve when enabled.
+    /// Fire-and-forget ensure on resolve when Graphify runtime is active.
     public var graphifyAutoEnsure: Bool
     /// Absolute paths of pinned multi-repo roots for sticky bootstrap (JSON array stored as joined newlines).
     public var graphifyPinnedRoots: [String]
     /// When true, also write `graphify-out/` inside the user's repo. Default false:
     /// graphs live only under Application Support (no workspace pollution).
     public var graphifyWriteInRepo: Bool
+
+    /// Host Graphify preflight/ensure/env/prompt injection is a Token Saver
+    /// capability: both toggles must be on. Fail-open when Token Saver is off
+    /// (no RC_GRAPHIFY_*, no ensure, no query-first nudge).
+    public var isGraphifyRuntimeActive: Bool {
+        tokenSaverEnabled && graphifyEnabled
+    }
 
     /// Floating desktop pet. On by default so it is visible without setup.
     public var petEnabled: Bool

@@ -7,18 +7,22 @@ import Foundation
 /// executable; everything here is pure so the decisions are unit-tested without spawning a
 /// process or touching the filesystem.
 ///
-/// The wrappers exist because Codex (app-server) has no automatic tool-output compression
-/// hook the way the Claude SDK bridge does, so `sed`/`rg`/etc. output was only ever
-/// compressed when the agent chose to pipe `| distill` — and agents skip that for these
-/// commands (the "exact bytes" carve-out reads a file slice / match list as exact bytes).
-/// Wrapping the commands compresses their output for EVERY provider without agent cooperation.
+/// Wrappers cover high-volume / noisy commands (find, ls, git log/status, builds, CI).
+/// Exact-output tools (sed, rg, grep, cat, head, tail, awk, …) are intentionally NOT
+/// wrapped: agents need full line lists and file slices; distill would drop payload lines.
 public enum CommandWrapPolicy {
-    /// The read/search command family RTK targets that is safe to compress (canonical list in
-    /// `CoreModel.WrappedCommandCatalog`, shared with the installer that creates the symlinks).
+    /// Compressible wrap targets only (canonical list in `CoreModel.WrappedCommandCatalog`).
     public static var wrappedCommands: Set<String> { WrappedCommandCatalog.commandSet }
+
+    /// Basenames that must never be auto-compressed (wrap install or `| distill`).
+    public static var exactOutputCommands: Set<String> { WrappedCommandCatalog.exactOutputCommandSet }
 
     public static func isWrapped(_ command: String) -> Bool {
         wrappedCommands.contains(commandBasename(command))
+    }
+
+    public static func isExactOutputCommand(_ command: String) -> Bool {
+        WrappedCommandCatalog.isExactOutputCommand(command)
     }
 
     /// basename without directory, so `/bin/cat` and `cat` both resolve to `cat`.
@@ -61,15 +65,33 @@ public enum CommandWrapPolicy {
     public static func passthroughReason(command: String, args: [String], environment: [String: String]) -> String? {
         if isDisabled(environment: environment) { return "disabled" }
         let name = commandBasename(command)
+        // Defense in depth: even if an old symlink still exists for an exact-output
+        // command, never compress its stdout.
+        if isExactOutputCommand(name) {
+            return "exact_output_command"
+        }
         // `sed -i` / `sed -i.bak` / `sed --in-place[=SUFFIX]` edits files in place — its stdout
         // is not review output, so never compress it.
         if name == "sed", args.contains(where: Self.isSedInPlaceFlag) {
             return "sed_in_place"
         }
+        // git grep/show/cat-file dump match lines or object bytes — treat as exact payload.
+        if name == "git", isExactGitSubcommand(args) {
+            return "exact_output_subcommand"
+        }
         if requiresReadOnlySubcommand(name), !isAllowedReadOnlyInvocation(command: name, args: args) {
             return "mutating_subcommand"
         }
         return nil
+    }
+
+    /// Subcommands whose full stdout is the agent payload (matches / blob text).
+    static func isExactGitSubcommand(_ args: [String]) -> Bool {
+        let positional = args
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
+            .filter { !$0.isEmpty && !$0.hasPrefix("-") }
+        guard let sub = positional.first else { return false }
+        return ["grep", "show", "cat-file", "blame"].contains(sub)
     }
 
     static func isSedInPlaceFlag(_ arg: String) -> Bool {

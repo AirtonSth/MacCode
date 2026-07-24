@@ -87,18 +87,43 @@ final class ManagedDistillCLIInstallTests: XCTestCase {
         let installer = AgentSkillInstaller(homeDirectory: home)
 
         let installed = try installer.installCommandWrappers(serviceBinaryURL: binary)
-        // cat and ls exist on every macOS system, so they must be wrapped and point at our binary.
-        XCTAssertTrue(installed.contains("cat") && installed.contains("ls"))
-        for command in ["cat", "ls"] {
-            let link = home.appendingPathComponent(".remote-code/bin/\(command)")
-            XCTAssertEqual(try FileManager.default.destinationOfSymbolicLink(atPath: link.path), binary.path)
-        }
+        // ls exists on every macOS system and is compressible; cat is exact-output and must not wrap.
+        XCTAssertTrue(installed.contains("ls"))
+        XCTAssertFalse(installed.contains("cat"))
+        XCTAssertFalse(installed.contains("sed"))
+        XCTAssertFalse(installed.contains("rg"))
+        let lsLink = home.appendingPathComponent(".remote-code/bin/ls")
+        XCTAssertEqual(try FileManager.default.destinationOfSymbolicLink(atPath: lsLink.path), binary.path)
         // Idempotent: a second install keeps the same links, no throw.
         XCTAssertEqual(Set(try installer.installCommandWrappers(serviceBinaryURL: binary)), Set(installed))
 
         let removed = try installer.uninstallCommandWrappers()
-        XCTAssertTrue(removed.contains("cat") && removed.contains("ls"))
-        XCTAssertNil(try? FileManager.default.destinationOfSymbolicLink(atPath: home.appendingPathComponent(".remote-code/bin/cat").path))
+        XCTAssertTrue(removed.contains("ls"))
+        XCTAssertNil(try? FileManager.default.destinationOfSymbolicLink(atPath: lsLink.path))
+    }
+
+    func test_installCommandWrappers_removesLegacyExactOutputSymlinks() throws {
+        let home = tempHome(); defer { try? FileManager.default.removeItem(at: home) }
+        let binary = try fakeServiceBinary(in: home)
+        let binDir = home.appendingPathComponent(".remote-code/bin", isDirectory: true)
+        try FileManager.default.createDirectory(at: binDir, withIntermediateDirectories: true)
+        // Simulate older install that wrapped sed/rg/cat.
+        for legacy in ["sed", "rg", "cat"] {
+            try FileManager.default.createSymbolicLink(
+                at: binDir.appendingPathComponent(legacy),
+                withDestinationURL: binary
+            )
+        }
+        let installer = AgentSkillInstaller(homeDirectory: home)
+        _ = try installer.installCommandWrappers(serviceBinaryURL: binary)
+        for legacy in ["sed", "rg", "cat"] {
+            XCTAssertNil(
+                try? FileManager.default.destinationOfSymbolicLink(
+                    atPath: binDir.appendingPathComponent(legacy).path
+                ),
+                "legacy exact-output wrapper \(legacy) must be unlinked on install"
+            )
+        }
     }
 
     func test_installCommandWrappers_neverShadowsAMissingCommand() throws {
@@ -117,8 +142,8 @@ final class ManagedDistillCLIInstallTests: XCTestCase {
         let home = tempHome(); defer { try? FileManager.default.removeItem(at: home) }
         let binDir = home.appendingPathComponent(".remote-code/bin", isDirectory: true)
         try FileManager.default.createDirectory(at: binDir, withIntermediateDirectories: true)
-        // A real (non-symlink) file the user placed at our managed path for `cat`.
-        let userFile = binDir.appendingPathComponent("cat")
+        // A real (non-symlink) file the user placed at our managed path for `ls`.
+        let userFile = binDir.appendingPathComponent("ls")
         try Data("not ours".utf8).write(to: userFile)
         let installer = AgentSkillInstaller(homeDirectory: home)
         _ = try installer.uninstallCommandWrappers()

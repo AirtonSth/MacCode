@@ -35,6 +35,45 @@ public struct ActiveRunProjection: Equatable, Sendable {
     public var primaryRunId: AgentRunID? { runs.first?.runId }
 }
 
+/// Merge provider launch env with host-injected keys from the pre-route request.
+/// Auto-orchestration previously used `launch?.environment ?? request.environment`,
+/// which **dropped** `RC_GRAPHIFY_*` (and Token Saver) when a launch config existed —
+/// agents then saw BANNER_MISSING / NO_RC_GRAPHIFY_ENV despite host preflight.
+public enum AgentHostEnvironmentMerge {
+    public static func preserveHostInjects(
+        launch: [String: String]?,
+        request: [String: String]
+    ) -> [String: String] {
+        // Start from launch (or request if no launch), strip host-owned keys so a
+        // stale RC_GRAPHIFY_* in launch cannot resurrect Graphify when the
+        // authoritative request has none (Token Saver / Graphify off).
+        var env = stripHostInjects(from: launch ?? request)
+        for (key, value) in request where isHostInjectedKey(key) {
+            env[key] = value
+        }
+        if launch == nil {
+            // Pure request path: still strip-then-reapply so only request host keys remain.
+            return env
+        }
+        return env
+    }
+
+    public static func stripHostInjects(from environment: [String: String]) -> [String: String] {
+        var env = environment
+        for key in environment.keys where isHostInjectedKey(key) {
+            env.removeValue(forKey: key)
+        }
+        return env
+    }
+
+    public static func isHostInjectedKey(_ key: String) -> Bool {
+        key.hasPrefix("RC_GRAPHIFY_")
+            || key.hasPrefix("RC_TOKEN_SAVER_")
+            || key == "RC_TOKEN_SAVER_DISTILL_HINT"
+            || key.hasPrefix("RC_DISTILL_")
+    }
+}
+
 public enum ActiveRunProjectionCause: Equatable, Sendable {
     case started
     case finished(AgentRunStatus)
@@ -798,7 +837,10 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                 serviceTier: admission.route.selection.serviceTier,
                 interactionMode: request.interactionMode,
                 providerBinary: launch?.binary ?? request.providerBinary,
-                environment: launch?.environment ?? request.environment,
+                environment: AgentHostEnvironmentMerge.preserveHostInjects(
+                    launch: launch?.environment,
+                    request: request.environment
+                ),
                 extraArgs: request.extraArgs,
                 runAsUser: request.runAsUser
             )
@@ -883,7 +925,10 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             serviceTier: route.selection.serviceTier,
             interactionMode: request.interactionMode,
             providerBinary: launch?.binary ?? request.providerBinary,
-            environment: launch?.environment ?? request.environment,
+            environment: AgentHostEnvironmentMerge.preserveHostInjects(
+                launch: launch?.environment,
+                request: request.environment
+            ),
             extraArgs: request.extraArgs,
             runAsUser: request.runAsUser
         )

@@ -892,6 +892,8 @@ public final class SidebarViewModel: ObservableObject {
             }
             context?.tokenSaverDistillServiceController.stop()
             context?.reconcileManagedDistillSkills(tokenSaverEnabled: false)
+            // Graphify is Token-Saver-gated — drop ensure/env inject immediately.
+            context?.reconcileGraphifyHost()
             return
         }
         let selectedValidation = validateTokenSaverModel(requireSelectedModel: true)
@@ -901,6 +903,7 @@ public final class SidebarViewModel: ObservableObject {
                 $0.tokenSaverEnabled = true
             }
             refreshTokenSaverDistillService(modelValidation: selectedValidation)
+            context?.reconcileGraphifyHost()
             return
         }
 
@@ -912,6 +915,7 @@ public final class SidebarViewModel: ObservableObject {
             }
             refreshTokenSaverDistillService(modelValidation: installedFallbackValidation)
             beginTokenSaverModelDownload(reason: selectedValidation.reason)
+            context?.reconcileGraphifyHost()
             return
         }
 
@@ -1051,6 +1055,7 @@ public final class SidebarViewModel: ObservableObject {
             $0.tokenSaverEnabled = true
         }
         refreshTokenSaverDistillService(modelValidation: .installed)
+        context?.reconcileGraphifyHost()
     }
 
     private func validateTokenSaverModel(requireSelectedModel: Bool = false) -> TokenSaverModelValidation {
@@ -1114,6 +1119,7 @@ public final class SidebarViewModel: ObservableObject {
                     $0.tokenSaverEnabled = true
                 }
                 self.refreshTokenSaverDistillService(modelValidation: validation)
+                self.context?.reconcileGraphifyHost()
                 return manifest
             } catch is CancellationError {
                 self.tokenSaverModelDownloadState = TokenSaverModelDownloadState(

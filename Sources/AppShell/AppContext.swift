@@ -893,18 +893,25 @@ public final class AppContext {
         return status
     }
 
-    /// Configure Graphify host defaults (on by default). Fail-open if CLI missing —
-    /// `ensureBinaryInstalledIfNeeded` may try `uv tool install graphifyy` once.
+    /// Configure Graphify host. Runtime is active only when Token Saver AND the
+    /// Graphify preference are on (`AppSettings.isGraphifyRuntimeActive`). When
+    /// inactive, fail-open: no ensure, no RC_GRAPHIFY_*, no FSEvents watchers.
+    /// If CLI is missing while active, `ensureBinaryInstalledIfNeeded` may try
+    /// `uv tool install graphifyy` once.
     public func reconcileGraphifyHost(settings: AppSettings? = nil) {
         let s = settings ?? SettingsStore(db: db).load()
+        let active = s.isGraphifyRuntimeActive
         let svc = GraphifyWorkspaceService.shared
-        svc.enabled = s.graphifyEnabled
-        svc.autoEnsure = s.graphifyAutoEnsure
+        svc.enabled = active
+        svc.autoEnsure = active && s.graphifyAutoEnsure
         svc.writeInRepo = s.graphifyWriteInRepo
         svc.pinnedRoots = s.graphifyPinnedRoots
         let path = s.graphifyBinaryPath.trimmingCharacters(in: .whitespacesAndNewlines)
         svc.binaryPathOverride = path.isEmpty ? nil : path
-        guard s.graphifyEnabled else { return }
+        guard active else {
+            svc.stopWatchingAll()
+            return
+        }
         LoginShellEnvironment.prewarm()
         DispatchQueue.global(qos: .utility).async {
             _ = GraphifyWorkspaceService.shared.ensureBinaryInstalledIfNeeded()

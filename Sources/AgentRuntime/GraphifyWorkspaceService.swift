@@ -28,8 +28,10 @@ public final class GraphifyWorkspaceService: @unchecked Sendable {
 
     public var appSupportDirectory: URL
     public var binaryPathOverride: String?
-    public var enabled: Bool = true
-    public var autoEnsure: Bool = true
+    /// Runtime authority. Default false until AppContext/settings reconcile
+    /// `isGraphifyRuntimeActive` (Token Saver ∧ Graphify preference).
+    public var enabled: Bool = false
+    public var autoEnsure: Bool = false
     /// When false (default), graphs are written only under Application Support via
     /// `GRAPHIFY_OUT` and never create `graphify-out/` in the user's working tree.
     public var writeInRepo: Bool = false
@@ -490,6 +492,9 @@ public final class GraphifyWorkspaceService: @unchecked Sendable {
         attachmentPaths: [String]
     ) -> (environment: [String: String], workingSet: GraphifyThreadWorkingSet) {
         var env = base
+        // Fail-open when inactive: never leave stale/user-supplied RC_GRAPHIFY_* that
+        // would re-enable query-first prompts without Token Saver.
+        env = Self.stripGraphifyKeys(from: env)
         guard enabled else {
             return (env, GraphifyThreadWorkingSet(threadId: threadId, workspaceKind: "disabled", roots: [], ambiguous: false))
         }
@@ -506,23 +511,19 @@ public final class GraphifyWorkspaceService: @unchecked Sendable {
         if !set.roots.isEmpty {
             env["RC_GRAPHIFY_ROOTS"] = set.roots.map(\.checkout.displayRoot).joined(separator: "\n")
             if let first = set.roots.first {
-                if let artifact = first.artifactRoot {
-                    env["RC_GRAPHIFY_ARTIFACT_ROOT"] = artifact
+                let artifact = first.artifactRoot ?? artifactRoot(for: first.checkout).path
+                env["RC_GRAPHIFY_ARTIFACT_ROOT"] = artifact
+                // Always expose on-disk graph when present — even for missing/error/ambiguous
+                // status — so agents cannot false-negative by checking only repo graphify-out/.
+                let graphJSON = graphJSONPath(for: first.checkout).path
+                if FileManager.default.fileExists(atPath: graphJSON) {
+                    env["RC_GRAPHIFY_GRAPH_JSON"] = graphJSON
                 }
                 switch first.status {
                 case .fresh:
-                    let graphJSON = graphJSONPath(for: first.checkout).path
-                    if FileManager.default.fileExists(atPath: graphJSON) {
-                        env["RC_GRAPHIFY_GRAPH_JSON"] = graphJSON
-                    }
+                    break
                 case .stale, .building:
                     env["RC_GRAPHIFY_STALE"] = "1"
-                    // Still expose last-known graph path so multi-turn agents can try query;
-                    // instructions say fail-open if results look incomplete.
-                    let graphJSON = graphJSONPath(for: first.checkout).path
-                    if FileManager.default.fileExists(atPath: graphJSON) {
-                        env["RC_GRAPHIFY_GRAPH_JSON"] = graphJSON
-                    }
                 case .missing, .error, .unavailable, .ambiguous:
                     break
                 }
@@ -532,6 +533,15 @@ public final class GraphifyWorkspaceService: @unchecked Sendable {
             env["RC_GRAPHIFY_AMBIGUOUS"] = "1"
         }
         return (env, set)
+    }
+
+    /// Remove host-owned Graphify env keys (reserved namespace).
+    public static func stripGraphifyKeys(from environment: [String: String]) -> [String: String] {
+        var env = environment
+        for key in environment.keys where key.hasPrefix("RC_GRAPHIFY_") {
+            env.removeValue(forKey: key)
+        }
+        return env
     }
 
     /// Publish graph.json without a missing-file window. Returns false on failure.
