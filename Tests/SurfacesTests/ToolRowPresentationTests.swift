@@ -184,18 +184,31 @@ final class ToolRowPresentationTests: XCTestCase {
                 summary: nil, body: "", startedAtMs: 1
             )
         })
-        let inputs = AgentAppView.computeTurnRenderInputs(
+        let collapsed = AgentAppView.computeTurnRenderInputs(
             turn: turn,
             persistedAssistantTexts: [],
             proposedPlans: [],
-            running: true
+            running: true,
+            expandCompletedWork: false
         )
-        XCTAssertFalse(inputs.completedWorkBlocks.isEmpty,
-                       "settled work must become a collapsible work disclosure while running")
-        XCTAssertFalse(inputs.visibleBlocks.isEmpty,
+        XCTAssertGreaterThan(collapsed.completedWorkBlockCount, 0,
+                             "settled work must become a collapsible work disclosure while running")
+        XCTAssertTrue(collapsed.completedWorkBlocks.isEmpty,
+                      "collapsed live work must not materialize full blocks (PERF)")
+        let expanded = AgentAppView.computeTurnRenderInputs(
+            turn: turn,
+            persistedAssistantTexts: [],
+            proposedPlans: [],
+            running: true,
+            expandCompletedWork: true
+        )
+        XCTAssertFalse(expanded.completedWorkBlocks.isEmpty,
+                       "expanded live work materializes the settled blocks for the disclosure body")
+        XCTAssertEqual(expanded.completedWorkBlockCount, expanded.completedWorkBlocks.count)
+        XCTAssertFalse(collapsed.visibleBlocks.isEmpty,
                        "the active streaming command must still paint live")
         // Active blocks should not re-list every completed command.
-        let visibleIds = inputs.visibleBlocks.flatMap { block -> [String] in
+        let visibleIds = collapsed.visibleBlocks.flatMap { block -> [String] in
             switch block {
             case .item(let i): return [i.id]
             case .toolGroup(_, let group): return group.map(\.id)
@@ -204,5 +217,26 @@ final class ToolRowPresentationTests: XCTestCase {
         XCTAssertTrue(visibleIds.contains("now"))
         XCTAssertFalse(visibleIds.contains("done-0"),
                        "early completed commands must not stay expanded in the live path")
+    }
+
+    func test_turnRenderBlockCount_matchesTurnRenderBlocksCount() {
+        // WHY: collapsed "Work so far" uses count-only grouping; it must agree
+        // with the full block list so the label never lies about step count.
+        let items: [AssistantItem] = (0..<5).map {
+            AssistantItem(id: "c-\($0)", turnId: "t", type: .commandExecution,
+                          state: .completed, body: "", startedAtMs: Int64($0))
+        } + [
+            AssistantItem(id: "r", turnId: "t", type: .reasoning, state: .completed,
+                          body: "thought", startedAtMs: 10),
+            AssistantItem(id: "t1", turnId: "t", type: .tool, state: .completed,
+                          body: "", startedAtMs: 11),
+            AssistantItem(id: "t2", turnId: "t", type: .tool, state: .completed,
+                          body: "", startedAtMs: 12),
+        ]
+        XCTAssertEqual(
+            AgentAppView.turnRenderBlockCount(items),
+            AgentAppView.turnRenderBlocks(items).count,
+            "count-only path must equal full grouping length"
+        )
     }
 }
