@@ -97,6 +97,20 @@ final class AgentAppFollowUpUXSeamTests: XCTestCase {
         XCTAssertEqual(visible.map(\.id), live.map(\.id))
     }
 
+    func test_twoEntryPending_anchorsAtUserMessage_notPriorAssistant() {
+        // WHY: the old count<=2 early-return bypassed k=0 and re-showed the
+        // prior assistant answer next to the new user bubble.
+        let entries = [
+            assistantMessage(seconds: 1),
+            userMessage(seconds: 2, text: "follow up"),
+        ]
+        let visible = AgentAppView.visibleTranscriptWindow(
+            entries: entries, status: .pending, runStartedAt: nil
+        )
+        XCTAssertEqual(visible.map(\.id), [entries[1].id],
+                       "two-entry pending follow-up must show only the new user bubble")
+    }
+
     // MARK: Active plan paint gate
 
     func test_shouldRenderActivePlan_hidesAllDoneWhenIdle() {

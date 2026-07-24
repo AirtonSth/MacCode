@@ -4419,6 +4419,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 self.currentRunId = nil
                 self.runThreads[runId] = nil
                 self.runStartedAt = nil
+                self.clearActivePlanFollowUpSuppressionIfSafe()
                 self.reloadThreads()
                 self.onRunStateChange?()
             }
@@ -4785,9 +4786,15 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             guard threadId == self.selectedThreadId else { continue }
             // User already sent a follow-up: drop *stale* plan progress from the
             // prior turn so the checklist cannot reappear under the new user bubble.
+            // While a follow-up is only queued (not yet a transcript bubble), the
+            // newest user message still belongs to the *prior* turn — so timestamp
+            // freshness alone would wrongly accept live plan updates from that run.
             // Accept only a plan whose updatedAtMs is at/after the follow-up anchor
-            // (newest user message / runStartedAt), then lift suppress for this run.
+            // once the new turn owns the transcript, then lift suppress for this run.
             if suppressStaleActivePlanUpdates, case .activePlanUpdated(let plan) = event {
+                if self.hasQueuedFollowUpOnSelectedThread() {
+                    continue
+                }
                 let newestUserAt = self.messages.last(where: { $0.role == .user })?.createdAt
                 if AgentAppView.isActivePlanFreshForFollowUp(
                     plan: plan,
@@ -4873,6 +4880,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     ) {
         guard threadId == selectedThreadId else { return }
         if suppressStaleActivePlanUpdates, case .activePlanUpdated(let plan) = event {
+            if hasQueuedFollowUpOnSelectedThread() {
+                return
+            }
             let newestUserAt = messages.last(where: { $0.role == .user })?.createdAt
             if AgentAppView.isActivePlanFreshForFollowUp(
                 plan: plan,
@@ -4901,6 +4911,22 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         }
     }
 
+    /// True when the selected thread still has a follow-up that has not become a
+    /// transcript bubble yet. Plan events during this window belong to the prior
+    /// still-running turn and must not lift follow-up plan suppress.
+    private func hasQueuedFollowUpOnSelectedThread() -> Bool {
+        guard let selectedThreadId else { return false }
+        return queuedMessages.contains { $0.threadId == selectedThreadId }
+    }
+
+    /// Lift follow-up plan suppress only when no queued successor is waiting.
+    /// Clearing on predecessor terminal while a queue row exists would re-paint
+    /// the prior checklist before drain starts the new turn.
+    private func clearActivePlanFollowUpSuppressionIfSafe() {
+        guard !hasQueuedFollowUpOnSelectedThread() else { return }
+        suppressStaleActivePlanUpdates = false
+    }
+
     /// Rebuild the live timeline from the durable hot-replay window after the UI
     /// queue refused events. Idempotent: clears the backpressure flag so a quiet
     /// stream does not keep replaying.
@@ -4912,6 +4938,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         let newestUserAt = messages.last(where: { $0.role == .user })?.createdAt
         for event in events {
             if suppressStaleActivePlanUpdates, case .activePlanUpdated(let plan) = event {
+                if hasQueuedFollowUpOnSelectedThread() {
+                    continue
+                }
                 if AgentAppView.isActivePlanFreshForFollowUp(
                     plan: plan,
                     newestUserMessageAt: newestUserAt,
@@ -5126,6 +5155,12 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 self.status = status
                 self.currentRunId = nil
                 self.runStartedAt = nil
+                // UX-MAC_AGENT-PLAN-FRESH: end-of-run lifts follow-up plan suppress so a
+                // later turn (or durable rehydrate) is not permanently latched off when
+                // the provider never emitted a fresh plan this run. Paint gate still
+                // hides stale/all-done checklists independently. Keep suppress if a
+                // queued successor is waiting (prior plan must not reappear mid-queue).
+                self.clearActivePlanFollowUpSuppressionIfSafe()
                 self.isStopping = false  // UX-MAC_AGENT-STOP: run finished; clear stopping flag
             }
             // Coalesce N same-workspace Agent App tabs into one reload per surface.
@@ -5183,6 +5218,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                         self.terminalRunIds = Self.boundedTerminalRunIds(existing: self.terminalRunIds, adding: runId)
                         self.currentRunId = nil
                         self.runStartedAt = nil
+                        self.clearActivePlanFollowUpSuppressionIfSafe()
                         self.runThreads[runId] = nil
                         self.isStopping = false  // UX-MAC_AGENT-STOP: terminal; clear stopping flag
                     }
@@ -7099,13 +7135,15 @@ public struct AgentAppView: View {
         // provider start). Treat it like a live turn so we never flash the
         // idle "last 30" history between send and running.
         if status == .running || status == .pending {
-            guard entries.count > 2 else { return entries }
+            // Anchor first so k=0 is not bypassed by the tiny-thread early return
+            // (e.g. [old assistant, new user] must not re-show the prior answer).
             if let anchored = followUpAnchoredWindow(
                 entries: entries,
                 precedingContextCount: precedingContextCount
             ) {
                 return anchored
             }
+            guard entries.count > 2 else { return entries }
             guard status == .running, let startedAt = runStartedAt else {
                 // Pending, or running before runStartedAt is assigned: keep the
                 // chat focused on the newest segment, not the whole thread.

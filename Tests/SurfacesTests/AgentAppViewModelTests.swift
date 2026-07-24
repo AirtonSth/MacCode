@@ -2493,19 +2493,21 @@ final class AgentAppViewModelTests: XCTestCase {
         XCTAssertNil(vm.activePlan,
                      "sending a follow-up must clear the prior turn's Active plan even when the turn is still running")
 
-        // Stale plan events from the still-running turn must not resurrect the checklist
-        // via the stream observer path (flushStreamEvents filter).
+        // Plan events from the still-running prior turn must not resurrect the
+        // checklist while a follow-up is only queued — even with a *current*
+        // updatedAtMs (timestamp freshness alone is not run ownership).
+        let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
         vm.runCoordinator(
             vm.coordinator,
             didReceive: .activePlanUpdated(AssistantActivePlan(
-                explanation: "stale stream plan",
-                steps: [AssistantPlanStep(id: "sx", title: "Should not show", status: .pending)],
-                updatedAtMs: 101
+                explanation: "live plan from still-running prior turn",
+                steps: [AssistantPlanStep(id: "sx", title: "Should not show", status: .inProgress)],
+                updatedAtMs: nowMs
             )),
             run: try XCTUnwrap(vm.currentRunId),
             threadId: id
         )
-        await waitAsync("stale plan stream events are suppressed") {
+        await waitAsync("queued-follow-up suppresses prior-turn plan stream events") {
             vm.activePlan == nil
         }
 
