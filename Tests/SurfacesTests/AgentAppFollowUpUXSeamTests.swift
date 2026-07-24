@@ -126,12 +126,44 @@ final class AgentAppFollowUpUXSeamTests: XCTestCase {
         )
     }
 
+    func test_shouldRenderActivePlan_hidesAllDoneEvenWhileRunning() {
+        // WHY: screenshot regression — all-Done prior checklist reappeared under a
+        // new user bubble while the next run was already "Working for Ns".
+        let userAt = Date(timeIntervalSince1970: 10_000)
+        let allDone = AssistantActivePlan(
+            steps: [
+                AssistantPlanStep(id: "1", title: "Old", status: .completed),
+                AssistantPlanStep(id: "2", title: "Also old", status: .completed),
+            ],
+            // Even a re-stamped "now" timestamp must not resurrect a finished plan.
+            updatedAtMs: Int64(userAt.timeIntervalSince1970 * 1000) + 5_000
+        )
+        XCTAssertFalse(
+            AgentAppView.shouldRenderActivePlan(
+                plan: allDone,
+                status: .running,
+                runStartedAt: userAt,
+                newestUserMessageAt: userAt
+            ),
+            "all-Done plans are history — never paint under a live follow-up"
+        )
+        XCTAssertFalse(
+            AgentAppView.shouldAcceptActivePlanForFollowUp(
+                plan: allDone,
+                newestUserMessageAt: userAt,
+                runStartedAt: userAt,
+                hasQueuedFollowUp: false
+            ),
+            "stream must not re-admit all-Done plans after a follow-up clear"
+        )
+    }
+
     func test_shouldRenderActivePlan_hidesStalePlanUnderNewUserMessage() {
         let userAt = Date(timeIntervalSince1970: 10_000)
         let stale = AssistantActivePlan(
             steps: [
-                AssistantPlanStep(id: "1", title: "Old", status: .completed),
-                AssistantPlanStep(id: "2", title: "Also old", status: .completed),
+                AssistantPlanStep(id: "1", title: "Old", status: .pending),
+                AssistantPlanStep(id: "2", title: "Also old", status: .inProgress),
             ],
             updatedAtMs: 1_000 // long before the user message
         )
@@ -164,6 +196,52 @@ final class AgentAppFollowUpUXSeamTests: XCTestCase {
             ),
             "a plan updated after the follow-up anchor must still render"
         )
+    }
+
+    func test_itemsAfterFollowUpAnchor_dropsPriorTurnTools() {
+        // WHY: long provider turns keep pre-message tools in the same turnId;
+        // chat UX must only count work that started after the user spoke.
+        var items: [AssistantItem] = [
+            AssistantItem(id: "old-1", turnId: "t", type: .commandExecution, state: .completed,
+                          body: "", startedAtMs: 1_000),
+            AssistantItem(id: "old-2", turnId: "t", type: .tool, state: .completed,
+                          body: "", startedAtMs: 2_000),
+        ]
+        // Enough post-anchor completed tools that the live tail (3) leaves settled work.
+        for i in 0..<5 {
+            items.append(AssistantItem(
+                id: "new-\(i)", turnId: "t", type: .commandExecution, state: .completed,
+                body: "", startedAtMs: 10_000 + Int64(i)
+            ))
+        }
+        items.append(AssistantItem(
+            id: "new-stream", turnId: "t", type: .tool, state: .streaming,
+            body: "", startedAtMs: 20_000
+        ))
+        let scoped = AgentAppView.itemsAfterFollowUpAnchor(items, anchorMs: 9_500)
+        XCTAssertEqual(scoped.count, 6, "only the six post-anchor items remain")
+        XCTAssertFalse(scoped.contains { $0.id == "old-1" })
+
+        let turn = AssistantTurnSnapshot(turnId: "t", items: items, finished: false)
+        let inputs = AgentAppView.computeTurnRenderInputs(
+            turn: turn,
+            persistedAssistantTexts: [],
+            proposedPlans: [],
+            running: true,
+            expandCompletedWork: false,
+            followUpWorkAnchorMs: 9_500
+        )
+        XCTAssertGreaterThan(inputs.completedWorkBlockCount, 0,
+                             "post-anchor settled tools must count toward Work so far")
+        let visibleIds = inputs.visibleBlocks.flatMap { block -> [String] in
+            switch block {
+            case .item(let i): return [i.id]
+            case .toolGroup(_, let group): return group.map(\.id)
+            }
+        }
+        XCTAssertTrue(visibleIds.contains("new-stream"))
+        XCTAssertFalse(visibleIds.contains("old-1"),
+                       "pre-anchor tools must never paint under the new user message")
     }
 
     func test_isActivePlanFreshForFollowUp_acceptsPlanAtAnchorMinusSlack() {
