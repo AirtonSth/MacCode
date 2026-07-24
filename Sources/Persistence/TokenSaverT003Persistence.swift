@@ -1299,10 +1299,15 @@ public final class TokenSaverRuntimeRecoveryWorker: @unchecked Sendable {
                 return Int(statement.columnInt64(0))
             }
 
-            // Explicit governance row can still deny retention (opt-out / kill /
-            // retention=0) even when scorecard promotion is incomplete.
+            // Explicit governance without full scorecard:
+            // - project_opted_out / verbatim_forced: hard deny
+            // - factory ensureDefaults (reason=owner_and_scorecard_required,
+            //   kill_switch=1, retention=0): still allow a 7d recovery window for
+            //   deterministic_wrapper so core tool-output Token Saver works until
+            //   scorecards promote; experimental semantic lanes stay fail-closed
+            // - positive retention_days: honor even without scorecard
             let explicit = try database.prepare("""
-                SELECT retention_days, opted_out, kill_switch_active
+                SELECT retention_days, opted_out, kill_switch_active, reason
                 FROM token_saver_lane_state
                 WHERE project_id = ? AND lane = ?
                 LIMIT 1;
@@ -1314,15 +1319,25 @@ public final class TokenSaverRuntimeRecoveryWorker: @unchecked Sendable {
                 let retentionDays = Int(explicit.columnInt64(0))
                 let optedOut = explicit.columnInt64(1) != 0
                 let killSwitch = explicit.columnInt64(2) != 0
-                if optedOut || killSwitch || retentionDays <= 0 {
+                let reason = (explicit.columnText(3) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+                if optedOut || reason == "project_opted_out" || reason == "verbatim_forced" {
+                    return nil
+                }
+                if retentionDays > 0 {
+                    return retentionDays
+                }
+                if lane == "deterministic_wrapper",
+                   reason == "owner_and_scorecard_required" {
+                    return 7
+                }
+                if killSwitch || retentionDays <= 0 {
                     return nil
                 }
             }
 
-            // Default for the tool-output wrapper lane: Token Saver ON without a
-            // project scorecard must still be able to store-before-loss so
-            // command-output compression is not forced to permanent verbatim.
-            // Semantic prose stays fail-closed until promoted.
+            // No lane row: tool-output wrapper still gets a default recovery window
+            // so projectless threads can store-before-loss. Semantic prose stays
+            // fail-closed until promoted.
             if lane == "deterministic_wrapper" {
                 return 7
             }
@@ -2540,7 +2555,10 @@ public final class TokenSaverLaneStateRepository: @unchecked Sendable {
         let defaults: [(lane: String, state: String, reason: String, evidence: String, owner: String, retention: Int, killSwitch: Bool)] = [
             ("measurement", "shadow_only", "content_free_exact_scope_observation_only", "diagnostic_heuristic", "Measurement Owner", 0, false),
             ("provider_native", "shadow_only", "shadow_observation_no_provider_behavior_change", "unavailable", "Provider Compatibility Owner", 0, true),
-            ("deterministic_wrapper", "off", "owner_and_scorecard_required", "unavailable", "Operations Owner", 0, true),
+            // Core tool-output Token Saver must retain a recovery window even before
+            // scorecard promotion. retention=0 + kill_switch here previously made
+            // every store-before-loss prepare fail durable readback after ensureDefaults.
+            ("deterministic_wrapper", "off", "owner_and_scorecard_required", "unavailable", "Operations Owner", 7, false),
             ("exact_repetition", "off", "owner_and_scorecard_required", "unavailable", "Security Owner", 0, true),
             ("lexical_retrieval", "off", "owner_and_scorecard_required", "unavailable", "Product Owner", 0, true),
             ("rollover_capsule", "off", "owner_and_scorecard_required", "unavailable", "Provider Compatibility Owner", 0, true),

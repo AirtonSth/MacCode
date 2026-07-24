@@ -16,6 +16,10 @@ final class DistillReversibleStoreServiceTests: XCTestCase {
         private var operationIDs: [String] = []
         private var lastCapability = ""
         private(set) var preparedLane: String?
+        /// Test seam: force prepareOriginal to throw so command-output unscoped fallback runs.
+        var failPrepare = false
+
+        private struct ForcedPrepareError: Error {}
 
         var capability: String {
             lock.lock(); defer { lock.unlock() }
@@ -30,6 +34,7 @@ final class DistillReversibleStoreServiceTests: XCTestCase {
 
         func prepareOriginal(_ data: Data, context: TokenSaverRecoveryRequestContext, lane: String) throws -> TokenSaverScopedPreparation {
             lock.lock(); defer { lock.unlock() }
+            if failPrepare { throw ForcedPrepareError() }
             operationIDs.append(context.operationID)
             preparedLane = lane
             let capability = "rcv1.\(UUID().uuidString.lowercased()).\(UUID().uuidString.lowercased())"
@@ -211,12 +216,13 @@ final class DistillReversibleStoreServiceTests: XCTestCase {
         XCTAssertNil(response.originalHandle)
     }
 
-    /// WHY: projectless agent threads had no recovery headers and no promoted
-    /// lane scorecard, so every lossy command-output optimize was forced to
-    /// verbatim (0 savings). Command-output must fall back to the unscoped
-    /// reversible store when scoped prepare is unavailable.
-    func test_commandOutputOptimize_usesUnscopedStoreWhenScopedRecoveryMissing() async throws {
-        let store = InMemoryReversibleStore()
+    /// WHY: after a scoped prepare failure (opt-out / kill / retention deny),
+    /// the server must NOT fall through to unscoped storage — that would bypass
+    /// project governance and emit unrecoverable lossy output.
+    func test_commandOutputOptimize_scopedPrepareFailure_doesNotBypassWithUnscopedStore() async throws {
+        let unscoped = InMemoryReversibleStore()
+        let scoped = InMemoryScopedStore()
+        scoped.failPrepare = true
         let configuration = try DistillServiceConfiguration(
             authToken: "tok",
             appSupportDirectory: NSTemporaryDirectory()
@@ -224,62 +230,79 @@ final class DistillReversibleStoreServiceTests: XCTestCase {
         let server = DistillHTTPServer(
             configuration: configuration,
             scheduler: DistillScheduler(runtime: DiscardingRuntime(), maxConcurrentRequests: 2),
-            reversibleStore: store,
-            reversibleStoreMinBytes: 8
-        )
-        let ready = try await server.start()
-        defer { server.stop() }
-
-        let original = "command output that must shrink and still be recoverable"
-        let request = DistillRequest(
-            mode: .commandOutput,
-            input: original,
-            runMode: .optimize,
-            cacheState: "tool_output_oneshot",
-            maxOutputCharacters: 64
-        )
-        let result = try await http(
-            ready.baseURL + "/v1/distill",
-            method: "POST",
-            token: "tok",
-            body: try JSONEncoder().encode(request)
-        )
-        XCTAssertEqual(result.status, 200)
-        let response = try JSONDecoder().decode(DistillResponse.self, from: result.data)
-        XCTAssertEqual(response.output, "X", "lossy command-output must be delivered when unscoped store backs it")
-        XCTAssertNotNil(response.originalHandle, "store-before-loss requires a recovery handle")
-        XCTAssertEqual(store.storeCount, 1)
-        let handle = try XCTUnwrap(response.originalHandle)
-        XCTAssertEqual(try store.retrieveOriginal(handle), Data(original.utf8))
-    }
-
-    /// WHY: semantic longText remains quarantined from unscoped recovery so we
-    /// never re-open unscoped-loss for prompt-side compression.
-    func test_longTextOptimize_stillQuarantinesUnscopedStore() async throws {
-        let store = InMemoryReversibleStore()
-        let configuration = try DistillServiceConfiguration(
-            authToken: "tok",
-            appSupportDirectory: NSTemporaryDirectory()
-        )
-        let server = DistillHTTPServer(
-            configuration: configuration,
-            scheduler: DistillScheduler(runtime: DiscardingRuntime(), maxConcurrentRequests: 2),
-            reversibleStore: store,
+            reversibleStore: unscoped,
+            scopedRecoveryStore: scoped,
             reversibleStoreMinBytes: 1
         )
         let ready = try await server.start()
         defer { server.stop() }
-        let original = "semantic prompt that must not use unscoped recovery"
-        let result = try await http(
+
+        let original = "must stay verbatim when scoped prepare is denied"
+        let scopeHeaders = [
+            "X-RemoteCode-Workspace-ID": "workspace",
+            "X-RemoteCode-Project-ID": "project",
+            "X-RemoteCode-Thread-ID": "thread",
+            "X-RemoteCode-Provider": "codex",
+            "X-RemoteCode-Attempt-ID": "attempt",
+            "X-RemoteCode-Invocation-ID": "invocation-deny",
+            "X-RemoteCode-Operation-ID": "operation-deny",
+        ]
+        let distill = try await http(
             ready.baseURL + "/v1/distill",
             method: "POST",
             token: "tok",
-            body: try JSONEncoder().encode(DistillRequest(mode: .longText, input: original, runMode: .optimize))
+            body: try JSONEncoder().encode(DistillRequest(
+                mode: .commandOutput,
+                input: original,
+                runMode: .optimize,
+                maxOutputCharacters: 64
+            )),
+            headers: scopeHeaders
         )
-        let response = try JSONDecoder().decode(DistillResponse.self, from: result.data)
-        XCTAssertEqual(response.output, original)
+        let response = try JSONDecoder().decode(DistillResponse.self, from: distill.data)
+        XCTAssertEqual(response.output, original, "governance deny must fail open to the exact original")
         XCTAssertNil(response.originalHandle)
-        XCTAssertEqual(store.storeCount, 0)
+        XCTAssertEqual(unscoped.storeCount, 0, "must not write unscoped after scoped prepare failure")
+    }
+
+    /// WHY: residual unscoped SHA rows (historical) must remain recoverable when
+    /// the agent presents complete recovery scope — without re-opening bearer-only
+    /// raw-SHA retrieve (wave -1).
+    func test_residualUnscopedHandle_isRetrievableOnlyWithRecoveryScope() async throws {
+        let unscoped = InMemoryReversibleStore()
+        let seeded = "historical unscoped original"
+        let handle = try unscoped.storeOriginal(Data(seeded.utf8))
+        let configuration = try DistillServiceConfiguration(
+            authToken: "tok",
+            appSupportDirectory: NSTemporaryDirectory()
+        )
+        let server = DistillHTTPServer(
+            configuration: configuration,
+            scheduler: DistillScheduler(runtime: LocalDistillRuntime(), maxConcurrentRequests: 1),
+            reversibleStore: unscoped,
+            scopedRecoveryStore: InMemoryScopedStore()
+        )
+        let ready = try await server.start()
+        defer { server.stop() }
+
+        let bare = try await http(ready.baseURL + "/v1/retrieve/\(handle)", token: "tok")
+        XCTAssertEqual(bare.status, 403)
+
+        let scoped = try await http(
+            ready.baseURL + "/v1/retrieve/\(handle)",
+            token: "tok",
+            headers: [
+                "X-RemoteCode-Workspace-ID": "workspace",
+                "X-RemoteCode-Project-ID": "project",
+                "X-RemoteCode-Thread-ID": "thread",
+                "X-RemoteCode-Provider": "codex",
+                "X-RemoteCode-Attempt-ID": "attempt",
+            ]
+        )
+        XCTAssertEqual(scoped.status, 200)
+        let body = try JSONDecoder().decode(Retrieved.self, from: scoped.data)
+        XCTAssertEqual(body.found, true)
+        XCTAssertEqual(body.original, seeded)
     }
 
     func test_scopedOptimizeEmitsCapabilityAndManagedCLIRetrievesWithExactFiveFieldScope() async throws {

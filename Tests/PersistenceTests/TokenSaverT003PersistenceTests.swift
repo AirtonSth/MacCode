@@ -949,6 +949,44 @@ final class TokenSaverT003PersistenceTests: XCTestCase {
         )) { XCTAssertEqual($0 as? TokenSaverRecoveryStoreError, .retentionDisabled) }
     }
 
+    /// WHY: ensureDefaults used to insert deterministic_wrapper with retention=0,
+    /// which made store-before-loss prepare fail durable readback (retrieve SQL
+    /// requires retention_days > 0). Factory defaults must keep a 7d recovery window.
+    func test_runtimeRecovery_factoryDefaultsAllowWrapperPrepareAndReadback() throws {
+        let db = try makeDB()
+        try TokenSaverLaneStateRepository(db: db).ensureDefaults(projectID: "p")
+        let worker = TokenSaverRuntimeRecoveryWorker(db: db)
+        let original = Data("factory-default-wrapper".utf8)
+        let prepared = try worker.prepareOriginal(
+            original,
+            scope: scope(),
+            operationID: "factory-wrapper-op",
+            lane: "deterministic_wrapper",
+            expiresAt: nil,
+            disk: disk,
+            now: Date(timeIntervalSince1970: 3_000)
+        )
+        XCTAssertFalse(prepared.capability.isEmpty)
+        XCTAssertEqual(
+            try TokenSaverScopedRecoveryStore(db: db).retrieve(
+                capability: prepared.capability,
+                scope: scope(),
+                now: Date(timeIntervalSince1970: 3_000)
+            ),
+            original
+        )
+
+        try TokenSaverLaneStateRepository(db: db).forceVerbatim(projectID: "p")
+        XCTAssertThrowsError(try worker.prepareOriginal(
+            Data("forced-verbatim".utf8),
+            scope: scope(),
+            operationID: "forced-op",
+            lane: "deterministic_wrapper",
+            expiresAt: nil,
+            disk: disk
+        )) { XCTAssertEqual($0 as? TokenSaverRecoveryStoreError, .retentionDisabled) }
+    }
+
     func test_runtimeRecoveryUsesExactLaneRetentionAndRetentionZeroPersistsNothing() throws {
         let db = try makeDB()
         let lanes = TokenSaverLaneStateRepository(db: db)

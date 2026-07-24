@@ -169,23 +169,56 @@ function loadTokenSaverState() {
   return null;
 }
 
+function tokenSaverRecoveryHeaders(env) {
+  // Store-before-loss requires complete recovery scope. Injected by AppContext
+  // into the provider process env; without these headers every lossy optimize
+  // is rewritten to verbatim and Claude records zero savings.
+  const headers = {};
+  const map = [
+    ['RC_TOKEN_SAVER_WORKSPACE_ID', 'X-RemoteCode-Workspace-ID'],
+    ['RC_TOKEN_SAVER_PROJECT_ID', 'X-RemoteCode-Project-ID'],
+    ['RC_TOKEN_SAVER_THREAD_ID', 'X-RemoteCode-Thread-ID'],
+    ['RC_TOKEN_SAVER_ATTEMPT_ID', 'X-RemoteCode-Attempt-ID'],
+    ['REMOTE_CODE_AGENT_PROVIDER', 'X-RemoteCode-Provider'],
+  ];
+  for (const [envKey, header] of map) {
+    const value = env && typeof env[envKey] === 'string' ? env[envKey].trim() : '';
+    if (value) headers[header] = value;
+  }
+  return headers;
+}
+
 async function postTokenSaverDistill(state, body) {
   if (typeof fetch !== 'function') return null;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), TOKEN_SAVER_HOOK_TIMEOUT_MS);
   try {
+    const invocationID = typeof body.id === 'string' && body.id ? body.id : randomUUID();
+    const headers = {
+      authorization: `Bearer ${state.authToken}`,
+      'content-type': 'application/json',
+      ...tokenSaverRecoveryHeaders(current.env),
+      'X-RemoteCode-Invocation-ID': invocationID,
+      'X-RemoteCode-Operation-ID': `ptuhook1.${invocationID}`,
+    };
     const response = await fetch(`${state.baseURL}/v1/distill`, {
       method: 'POST',
-      headers: {
-        authorization: `Bearer ${state.authToken}`,
-        'content-type': 'application/json',
-      },
+      headers,
       body: JSON.stringify(body),
       signal: controller.signal,
     });
     if (!response.ok) return null;
     const decoded = await response.json();
-    return typeof decoded.output === 'string' ? decoded.output : null;
+    if (typeof decoded.output !== 'string') return null;
+    // Preserve store-before-loss recoverability: the agent must see [[rc:handle]]
+    // when the sidecar stored the original (AGENTS.md).
+    let output = decoded.output;
+    if (typeof decoded.originalHandle === 'string' && decoded.originalHandle.trim()) {
+      output = `${output}\n[[rc:${decoded.originalHandle.trim()}]]`;
+    } else if (typeof decoded.original_handle === 'string' && decoded.original_handle.trim()) {
+      output = `${output}\n[[rc:${decoded.original_handle.trim()}]]`;
+    }
+    return output;
   } catch (_) {
     return null;
   } finally {
