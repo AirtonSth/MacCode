@@ -749,6 +749,47 @@ final class LiveActivitySyncCoordinatorTests: XCTestCase {
                        "legacy devices must not receive the new contract until they advertise the capability")
     }
 
+    func testStartRefreshRemapIsRateLimitedPerHost() async throws {
+        let tmp = NSTemporaryDirectory() + "rc2-start-remap-rate-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let settings = SettingsRepository(db: db)
+        let accountStore = PrivateAccountSessionStore(repo: settings)
+        accountStore.save(PrivateAccountSession(
+            accessToken: "access",
+            refreshToken: "refresh",
+            user: PrivateAccountUser(
+                daysRemaing: nil,
+                daysRemaining: 30,
+                email: "t@example.com",
+                id: "user-1",
+                subscribed: true
+            )
+        ))
+        let targetStore = PrivatePushTargetStore(repo: settings)
+        let start = PrivatePushTargetRecord(
+            deviceId: "device-1", serverId: "server-1", purpose: .pushToStart,
+            environment: .sandbox, token: "start-token",
+            contractVersion: 2, capabilities: ["live_activity_v2"]
+        )
+        try targetStore.upsert(start)
+        let failingAPI = StartRemapCountingPrivateAccountAPI()
+        let bridge = PrivateNotificationBridge(
+            accountStore: accountStore,
+            pushTargetStore: targetStore,
+            api: failingAPI
+        )
+        let update = makeDelivery(event: .update, generation: 1, revision: 2)
+        let record = LiveActivityAcceptanceRecord(delivery: update, target: .v2(start))
+        // First start-refresh remap is allowed (budget consumed even if API fails).
+        _ = try? await bridge.sendLiveActivityAcceptance(record)
+        // Immediate second remap for the same host is soft-accepted without a second send.
+        let second = try await bridge.sendLiveActivityAcceptance(record)
+        XCTAssertEqual(second.status, "delivered",
+                       "rate-limited start-refresh must soft-ack so the outbox does not retry-storm")
+        XCTAssertLessThanOrEqual(failingAPI.deliverLiveActivityV2Calls, 1,
+                                 "second start-refresh within 60s must not hit the backend")
+    }
+
     func testHTTPPortOverrideIsSharedByListenerBonjourAndPairing() {
         XCTAssertEqual(DirectAccessConfiguration.port(environment: [:]), 18217)
         XCTAssertEqual(DirectAccessConfiguration.port(environment: ["RC2_HTTP_PORT": "18218"]), 18218)
@@ -795,6 +836,57 @@ final class LiveActivitySyncCoordinatorTests: XCTestCase {
             contractVersion: 2,
             capabilities: ["live_activity_v2"]
         ))
+    }
+}
+
+/// Counts Live Activity v2 delivery attempts and always fails them so rate-limit
+/// soft-acks can be observed without a network.
+private final class StartRemapCountingPrivateAccountAPI: PrivateAccountAPI, @unchecked Sendable {
+    private let lock = NSLock()
+    private(set) var deliverLiveActivityV2Calls = 0
+
+    func login(email: String, password: String) async throws -> PrivateAccountSession {
+        throw PrivateAccountAPIError.invalidResponse
+    }
+    func currentUser(accessToken: String) async throws -> PrivateAccountUser {
+        throw PrivateAccountAPIError.invalidResponse
+    }
+    func refresh(refreshToken: String) async throws -> PrivateAccountSession {
+        throw PrivateAccountAPIError.invalidResponse
+    }
+    func logout(refreshToken: String) async throws {}
+    func billingOverview(accessToken: String) async throws -> PrivateBillingOverview {
+        throw PrivateAccountAPIError.invalidResponse
+    }
+    func createPortal(accessToken: String) async throws -> URL {
+        throw PrivateAccountAPIError.invalidResponse
+    }
+    func deliverAlert(
+        accessToken: String, title: String, body: String, data: [String: String],
+        pushToken: String, pushTokenType: String, idempotencyKey: String, silent: Bool
+    ) async throws -> PrivatePushDeliveryResult {
+        throw PrivateAccountAPIError.invalidResponse
+    }
+    func deliverLiveActivity(
+        accessToken: String, event: String, contentState: PrivateLiveActivityContentState,
+        timestampSeconds: Int64, liveActivityToken: String, pushToken: String,
+        pushTokenType: String, idempotencyKey: String
+    ) async throws -> PrivatePushDeliveryResult {
+        throw PrivateAccountAPIError.invalidResponse
+    }
+    func registerLiveActivityTokenV2(
+        accessToken: String,
+        registration: PrivateLiveActivityV2TokenRegistration
+    ) async throws -> PrivateLiveActivityV2TokenRegistrationAck {
+        throw PrivateAccountAPIError.invalidResponse
+    }
+    func deliverLiveActivityV2(
+        accessToken: String,
+        request: PrivateLiveActivityV2DeliveryRequest,
+        idempotencyKey: String
+    ) async throws -> PrivateLiveActivityV2DeliveryAck {
+        lock.lock(); deliverLiveActivityV2Calls += 1; lock.unlock()
+        throw PrivateAccountAPIError.http(500)
     }
 }
 

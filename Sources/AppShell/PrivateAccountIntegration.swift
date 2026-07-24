@@ -1133,7 +1133,15 @@ public final class PrivateNotificationBridge: @unchecked Sendable {
             }
             if !exact.isEmpty { return exact.map(LiveActivityAcceptanceTarget.v2) }
             // Stale ownership after Mac relaunch: still try the newest update token.
-            if let newest = preferred.max(by: { $0.updatedAt < $1.updatedAt }) {
+            // Tie-break equal timestamps by generation then activityId so two
+            // upserts in the same wall-clock second stay deterministic.
+            if let newest = preferred.max(by: { lhs, rhs in
+                if lhs.updatedAt != rhs.updatedAt { return lhs.updatedAt < rhs.updatedAt }
+                let lg = lhs.activityGeneration ?? 0
+                let rg = rhs.activityGeneration ?? 0
+                if lg != rg { return lg < rg }
+                return (lhs.activityId ?? "") < (rhs.activityId ?? "")
+            }) {
                 return [.v2(newest)]
             }
             // No update token yet (iOS app never opened after remote start): use
