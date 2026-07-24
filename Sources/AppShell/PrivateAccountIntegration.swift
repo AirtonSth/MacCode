@@ -953,16 +953,33 @@ private actor PrivatePushSessionRefresher {
 
 public final class PrivateNotificationBridge: @unchecked Sendable {
     private static let log = Logger(subsystem: "io.remotecode.app", category: "private-push")
+    /// Cap update→start fail-open remaps so a dead activity_update token cannot
+    /// spam push-to-start (duplicate cards / FrequentUpdates burn).
+    public static let startRemapMinInterval: TimeInterval = 60
     private let accountStore: PrivateAccountSessionStore
     private let pushTargetStore: PrivatePushTargetStore
     private let api: PrivateAccountAPI
     private let sessionRefresher: PrivatePushSessionRefresher
+    private let startRemapLock = NSLock()
+    private var lastStartRemapAtByHost: [String: Date] = [:]
 
     public init(accountStore: PrivateAccountSessionStore, pushTargetStore: PrivatePushTargetStore, api: PrivateAccountAPI = URLSessionPrivateAccountAPI()) {
         self.accountStore = accountStore
         self.pushTargetStore = pushTargetStore
         self.api = api
         self.sessionRefresher = PrivatePushSessionRefresher(accountStore: accountStore, api: api)
+    }
+
+    /// Returns true when a start-remap is allowed for this host (and records it).
+    private func consumeStartRemapBudget(hostId: String, now: Date = Date()) -> Bool {
+        startRemapLock.lock()
+        defer { startRemapLock.unlock() }
+        if let last = lastStartRemapAtByHost[hostId],
+           now.timeIntervalSince(last) < Self.startRemapMinInterval {
+            return false
+        }
+        lastStartRemapAtByHost[hostId] = now
+        return true
     }
 
     public func deliver(_ content: RemoteCodeNotificationContent) async {
@@ -1143,6 +1160,21 @@ public final class PrivateNotificationBridge: @unchecked Sendable {
         _ record: LiveActivityAcceptanceRecord
     ) async throws -> PrivateLiveActivityV2DeliveryAck {
         let delivery = Self.effectiveDelivery(for: record)
+        // Rate-limit pure start-refresh remaps (update via push-to-start only).
+        // Return a soft-accepted ack so the outbox does not retry-storm.
+        if delivery.event == .start,
+           delivery.idempotencyKey.hasSuffix(".start-refresh"),
+           !consumeStartRemapBudget(hostId: delivery.projection.hostId) {
+            Self.log.info(
+                "live-activity start-refresh suppressed (rate limit) host=\(delivery.projection.hostId, privacy: .public)"
+            )
+            return PrivateLiveActivityV2DeliveryAck(
+                id: delivery.idempotencyKey,
+                status: "delivered",
+                attempts: 1,
+                nextAttemptAt: nil
+            )
+        }
         guard let session = accountStore.load(), session.user.subscribed else {
             throw PrivateAccountAPIError.http(401)
         }
@@ -1206,6 +1238,12 @@ public final class PrivateNotificationBridge: @unchecked Sendable {
                            $0.supportsLiveActivityV2 && $0.purpose == .pushToStart
                        })
                    }) {
+                    guard consumeStartRemapBudget(hostId: delivery.projection.hostId) else {
+                        Self.log.info(
+                            "live-activity dismiss-reopen suppressed (rate limit) host=\(delivery.projection.hostId, privacy: .public)"
+                        )
+                        throw error
+                    }
                     let startDelivery = LiveActivitySyncDelivery(
                         event: .start,
                         projection: delivery.projection,

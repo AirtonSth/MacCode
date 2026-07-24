@@ -81,12 +81,32 @@ final class LiveActivitySyncCoordinatorTests: XCTestCase {
         )
         let run = ("10000000-0000-0000-0000-000000000001", "20000000-0000-0000-0000-000000000001")
         sync.submit(active([run]), cause: .started, now: Date(timeIntervalSince1970: 200))
+        // Coalesce window is 120s; pure keepalives sooner than that are no-ops.
         sync.submitHeartbeat(now: Date(timeIntervalSince1970: 260))
+        sync.submitHeartbeat(now: Date(timeIntervalSince1970: 330))
         await sync.flush()
 
-        XCTAssertEqual(recorder.deliveries.map(\.event), [.start, .update])
+        XCTAssertEqual(recorder.deliveries.map(\.event), [.start, .update],
+                       "heartbeat before 120s must be coalesced; later heartbeat emits update")
         XCTAssertEqual(recorder.deliveries.map(\.projection.revision), [1, 2])
-        XCTAssertEqual(recorder.deliveries.last?.projection.updatedAt, 260)
+        XCTAssertEqual(recorder.deliveries.last?.projection.updatedAt, 330)
+    }
+
+    func testHeartbeatIsCoalescedWithinMinInterval() async {
+        let recorder = DeliveryRecorder()
+        let sync = LiveActivitySyncCoordinator(
+            serverId: "server-1", bootEpoch: 7, initialActivityGeneration: 2,
+            deliver: { delivery in await recorder.append(delivery) },
+            heartbeatIntervalNanoseconds: 60_000_000_000_000,
+            minHeartbeatEmitInterval: 120
+        )
+        let run = ("10000000-0000-0000-0000-000000000001", "20000000-0000-0000-0000-000000000001")
+        sync.submit(active([run]), cause: .started, now: Date(timeIntervalSince1970: 1000))
+        sync.submitHeartbeat(now: Date(timeIntervalSince1970: 1050))
+        sync.submitHeartbeat(now: Date(timeIntervalSince1970: 1110))
+        await sync.flush()
+        XCTAssertEqual(recorder.deliveries.map(\.event), [.start],
+                       "pure heartbeats inside the 120s window must not spam APNs updates")
     }
 
     func testLaunchReconciliationEmitsEmptyCorrection() async {
