@@ -251,11 +251,15 @@ async function tokenSaverPostToolUse(input) {
     reversibleStoreMinBytes: TOKEN_SAVER_STORE_MIN_BYTES,
   });
   if (!output || output.length >= rawOutput.length) return {};
+  const replaced = replaceToolOutputText(input.tool_response, output);
+  // SDK: updatedToolOutput works for all tools; updatedMCPToolOutput is MCP-only.
+  // Set both so Bash/Grep/etc. are actually replaced while MCP still works.
   return {
     continue: true,
     hookSpecificOutput: {
       hookEventName: 'PostToolUse',
-      updatedMCPToolOutput: replaceToolOutputText(input.tool_response, output),
+      updatedToolOutput: replaced,
+      updatedMCPToolOutput: replaced,
     },
   };
 }

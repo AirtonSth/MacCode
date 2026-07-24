@@ -1325,16 +1325,21 @@ public final class TokenSaverRuntimeRecoveryWorker: @unchecked Sendable {
                 }
                 // Integrity failures and force-verbatim set kill_switch while often
                 // leaving retention_days > 0. Kill switch must deny before we honor
-                // a positive retention value — except the factory seed reason, which
-                // historically used kill_switch=1 as a "not yet scorecarded" flag.
-                if killSwitch && reason != "owner_and_scorecard_required" {
+                // a positive retention value — except the unrepaired factory seed
+                // (kill still on + retention 0 + owner_and_scorecard_required).
+                if killSwitch && !(lane == "deterministic_wrapper"
+                    && reason == "owner_and_scorecard_required"
+                    && retentionDays <= 0) {
                     return nil
                 }
                 if retentionDays > 0 {
                     return retentionDays
                 }
+                // Soft default only for unrepaired factory seed shape. After repair
+                // (kill off) an operator-chosen retention_days=0 stays denied.
                 if lane == "deterministic_wrapper",
-                   reason == "owner_and_scorecard_required" {
+                   reason == "owner_and_scorecard_required",
+                   killSwitch {
                     return 7
                 }
                 if killSwitch || retentionDays <= 0 {
@@ -2498,6 +2503,8 @@ public final class TokenSaverLaneStateRepository: @unchecked Sendable {
                 try self.insertDefaults(database: database, projectID: projectID)
                 // Upgrade pre-fix factory rows that INSERT OR IGNORE left at
                 // retention_days=0 (store-before-loss durable readback requires >0).
+                // Only unrepaired factory seeds (kill still on + retention 0). Do not
+                // resurrect an operator-chosen retention_days=0 after kill was cleared.
                 let repair = try database.prepare("""
                     UPDATE token_saver_lane_state
                     SET retention_days = 7,
@@ -2507,7 +2514,8 @@ public final class TokenSaverLaneStateRepository: @unchecked Sendable {
                       AND lane = 'deterministic_wrapper'
                       AND reason = 'owner_and_scorecard_required'
                       AND opted_out = 0
-                      AND retention_days = 0;
+                      AND retention_days = 0
+                      AND kill_switch_active = 1;
                 """)
                 defer { repair.reset() }
                 try repair.bind(1, Int64(Date().timeIntervalSince1970 * 1_000))

@@ -985,21 +985,12 @@ public final class DistillHTTPServer: @unchecked Sendable {
             send(status: 404, body: RetrieveResponse(handle: handle, found: false, original: nil), connection: connection)
             return
         }
+        // Scoped capabilities only. Do not serve residual content-addressed SHA
+        // rows from reversibleStore: headers are not bound to those blobs, so any
+        // process with the local bearer + a predicted hash could cross-read.
         if let scopedRecoveryStore {
             do {
                 if let data = try scopedRecoveryStore.retrieveOriginal(capability: handle, context: context),
-                   let original = String(data: data, encoding: .utf8) {
-                    send(status: 200, body: RetrieveResponse(handle: handle, found: true, original: original), connection: connection)
-                    return
-                }
-            } catch {
-                // Fall through to unscoped SHA lookup for residual handles written
-                // before delivery was scoped-only.
-            }
-        }
-        if let reversibleStore {
-            do {
-                if let data = try reversibleStore.retrieveOriginal(handle),
                    let original = String(data: data, encoding: .utf8) {
                     send(status: 200, body: RetrieveResponse(handle: handle, found: true, original: original), connection: connection)
                     return

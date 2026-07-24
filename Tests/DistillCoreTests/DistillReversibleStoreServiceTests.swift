@@ -265,10 +265,9 @@ final class DistillReversibleStoreServiceTests: XCTestCase {
         XCTAssertEqual(unscoped.storeCount, 0, "must not write unscoped after scoped prepare failure")
     }
 
-    /// WHY: residual unscoped SHA rows (historical) must remain recoverable when
-    /// the agent presents complete recovery scope — without re-opening bearer-only
-    /// raw-SHA retrieve (wave -1).
-    func test_residualUnscopedHandle_isRetrievableOnlyWithRecoveryScope() async throws {
+    /// WHY: residual content-addressed SHA rows must NOT be served just because
+    /// any non-empty scope headers are present — that is not scope-bound authz.
+    func test_residualUnscopedSHA_isNotServedEvenWithFabricatedScope() async throws {
         let unscoped = InMemoryReversibleStore()
         let seeded = "historical unscoped original"
         let handle = try unscoped.storeOriginal(Data(seeded.utf8))
@@ -299,10 +298,9 @@ final class DistillReversibleStoreServiceTests: XCTestCase {
                 "X-RemoteCode-Attempt-ID": "attempt",
             ]
         )
-        XCTAssertEqual(scoped.status, 200)
-        let body = try JSONDecoder().decode(Retrieved.self, from: scoped.data)
-        XCTAssertEqual(body.found, true)
-        XCTAssertEqual(body.original, seeded)
+        XCTAssertEqual(scoped.status, 404, "SHA rows are not scope-bound; do not serve them")
+        let bodyText = String(data: scoped.data, encoding: .utf8) ?? ""
+        XCTAssertFalse(bodyText.contains(seeded))
     }
 
     func test_scopedOptimizeEmitsCapabilityAndManagedCLIRetrievesWithExactFiveFieldScope() async throws {

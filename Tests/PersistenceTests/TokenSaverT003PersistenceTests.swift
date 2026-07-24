@@ -1033,6 +1033,23 @@ final class TokenSaverT003PersistenceTests: XCTestCase {
             ),
             original
         )
+
+        // Operator-chosen retention=0 after repair must NOT be re-opened by ensureDefaults.
+        try TokenSaverLaneStateRepository(db: db).setRetentionDays(projectID: "p", days: 0)
+        try TokenSaverLaneStateRepository(db: db).ensureDefaults(projectID: "p")
+        let afterUserZero = try XCTUnwrap(try TokenSaverLaneStateRepository(db: db).get(
+            projectID: "p",
+            lane: "deterministic_wrapper"
+        ))
+        XCTAssertEqual(afterUserZero.retentionDays, 0)
+        XCTAssertThrowsError(try TokenSaverRuntimeRecoveryWorker(db: db).prepareOriginal(
+            Data("user-zero".utf8),
+            scope: scope(),
+            operationID: "user-zero-op",
+            lane: "deterministic_wrapper",
+            expiresAt: nil,
+            disk: disk
+        )) { XCTAssertEqual($0 as? TokenSaverRecoveryStoreError, .retentionDisabled) }
     }
 
     func test_runtimeRecoveryUsesExactLaneRetentionAndRetentionZeroPersistsNothing() throws {

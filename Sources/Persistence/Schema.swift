@@ -893,7 +893,8 @@ public enum Schema {
         WHERE lane = 'deterministic_wrapper'
           AND reason = 'owner_and_scorecard_required'
           AND opted_out = 0
-          AND retention_days = 0;
+          AND retention_days = 0
+          AND kill_switch_active = 1;
         """)
     ]
 
