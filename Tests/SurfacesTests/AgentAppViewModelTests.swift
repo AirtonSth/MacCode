@@ -401,6 +401,64 @@ final class AgentAppViewModelTests: XCTestCase {
                       "a marker-declared stall must surface as awaiting regardless of phrasing")
     }
 
+    func test_composerPlaceholder_reflectsIncompleteTurnStateInsteadOfReadingFinished() throws {
+        // UX-MAC_AGENT-BG-AWAIT: the reported defect — a run that ended still awaiting
+        // background work presented a normal "Ask <Provider> for changes…" composer, so
+        // the thread read as finished. The composer placeholder must instead reflect the
+        // incomplete state (background-await vs mid-workflow), while staying a redirect,
+        // and must revert to the neutral prompt for genuinely finished / running threads.
+        let (vm, _) = try makeVM()
+        let neutral = "Ask \(vm.provider.rawValue.capitalized) for changes…"
+
+        // Genuinely finished turn → neutral composer (regression guard for the else branch).
+        vm.status = .completed
+        vm.timeline.apply(.turnStarted(turnId: "done"))
+        vm.timeline.apply(.turnCompleted(turnId: "done", finalMessage: "All steps are done; the build is green and the PR is open."))
+        XCTAssertEqual(vm.composerPlaceholder, neutral,
+                       "a real final answer must keep the normal composer prompt")
+
+        // Background-await stall → awaiting-specific copy, not the finished-state default.
+        vm.timeline.apply(.turnStarted(turnId: "await"))
+        vm.timeline.apply(.turnCompleted(turnId: "await", finalMessage: "Standing by for the demo recording to complete."))
+        XCTAssertEqual(vm.composerPlaceholder, "Waiting on a background task — send to redirect…",
+                       "an awaiting run must make the composer read as not-finished so the user does not mistake it for a done thread")
+
+        // Mid multi-phase workflow handoff → handoff-specific copy.
+        vm.timeline.apply(.turnStarted(turnId: "phase"))
+        vm.timeline.apply(.turnCompleted(turnId: "phase", finalMessage: "Phase 2 done.\nNext: Phase 3 — Review"))
+        XCTAssertEqual(vm.composerPlaceholder, "Paused mid-workflow — send to redirect…",
+                       "a run stopped between numbered workflow phases must say so in the composer, not invite a fresh unrelated ask")
+
+        // A running turn is never incomplete: incompleteTurnReason is nil (its own
+        // status==.completed guard), so the composer returns to the neutral prompt.
+        vm.status = .running
+        XCTAssertEqual(vm.composerPlaceholder, neutral,
+                       "a running thread must not show the awaiting placeholder")
+    }
+
+    func test_composerPlaceholder_staysNeutralWhenRunIsLiveDespiteStaleCompletedStatus() throws {
+        // The load-bearing `!selectedThreadRunIsStartingOrRunning` guard: this VM's
+        // `status` can be a stale `.completed` (e.g. a run started/owned elsewhere —
+        // a scheduled LaunchAgent run or another tab sharing the thread) while a run is
+        // actually live. In that state `incompleteTurnReason` is non-nil (status is
+        // completed) yet the thread is NOT idle, so the composer must stay neutral — an
+        // "awaiting/redirect" prompt on top of a live run would be wrong. Removing the
+        // guard from composerPlaceholder makes this assertion fail.
+        let (vm, _) = try makeVM()
+        vm.createThread(title: "live in another tab")
+        vm.isScheduledThreadRunning = { _ in true }   // force selectedThreadRunIsStartingOrRunning == true
+        vm.status = .completed                          // stale completed status
+        vm.timeline.apply(.turnStarted(turnId: "await"))
+        vm.timeline.apply(.turnCompleted(turnId: "await", finalMessage: "Standing by for the demo recording to complete."))
+
+        XCTAssertNotNil(vm.incompleteTurnReason,
+                        "precondition: the stale-completed final message classifies as incomplete")
+        XCTAssertTrue(vm.selectedThreadRunIsStartingOrRunning,
+                      "precondition: a live/scheduled run is tracked for the selected thread")
+        XCTAssertEqual(vm.composerPlaceholder, "Ask \(vm.provider.rawValue.capitalized) for changes…",
+                       "a live run must keep the neutral composer even when status is a stale completed with an awaiting final message")
+    }
+
     func test_renameThread_trimsUpdatesAndPersists() throws {
         let (vm, repo) = try makeVM()
         vm.createThread(title: "first")

@@ -1677,6 +1677,29 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         return IncompleteTurnContinuation.classify(latestFinalAssistantMessage)
     }
 
+    /// UX-MAC_AGENT-BG-AWAIT: composer placeholder. When the selected thread ended
+    /// while still incomplete (awaiting a background job, or paused mid multi-phase
+    /// workflow), the placeholder reflects that state instead of the neutral
+    /// "Ask <Provider> for changes…" — otherwise the composer reads as a finished,
+    /// idle turn even though the run is not done (the reported defect). Typing and
+    /// sending stay enabled: a send redirects the thread; the co-visible
+    /// `backgroundAwaitBanner` directly above carries the Continue (resume) action.
+    /// Copy is deliberately short and positionless — the editor draws the
+    /// placeholder without wrapping, so long/position-coupled copy would clip. The
+    /// `!selectedThreadRunIsStartingOrRunning` guard keeps the neutral copy during
+    /// the brief window a resume run is starting.
+    public var composerPlaceholder: String {
+        let defaultPlaceholder = "Ask \(provider.rawValue.capitalized) for changes…"
+        guard !selectedThreadRunIsStartingOrRunning,
+              let reason = incompleteTurnReason else { return defaultPlaceholder }
+        switch reason {
+        case .backgroundAwait:
+            return "Waiting on a background task — send to redirect…"
+        case .workflowHandoff:
+            return "Paused mid-workflow — send to redirect…"
+        }
+    }
+
     /// P2: threads visible in the rail after applying the search query.
     /// Empty query returns all threads (no filtering).
     public var filteredThreads: [AgentThread] {
@@ -9744,7 +9767,7 @@ public struct AgentAppView: View {
                 text: Binding(get: { vm.prompt }, set: { vm.prompt = $0 }),
                 height: $composerEditorHeight,
                 focusTick: vm.focusTick,
-                placeholder: "Ask \(vm.provider.rawValue.capitalized) for changes…",
+                placeholder: vm.composerPlaceholder,
                 onSend: { Task { await vm.send() } },
                 onPreviousHistory: { vm.recallPreviousPrompt() },
                 onNextHistory: { vm.recallNextPrompt() },
