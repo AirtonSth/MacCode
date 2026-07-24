@@ -128,6 +128,7 @@ public final class AppContext {
     public let turnCheckpointRepo: AgentTurnCheckpointRepository
     public let tokenSaverSavingsRepo: TokenSaverSavingsRepository
     public let tokenSaverDailyEconomyRepo: TokenSaverDailyEconomyRepository
+    public let graphifyUsageRepo: GraphifyUsageRepository
     public let tokenSaverAttemptLedger: TokenSaverAttemptLedger
     public let tokenSaverSessionLearnRepo: TokenSaverSessionLearnRepository
     public let tokenSaverLaneStateRepo: TokenSaverLaneStateRepository
@@ -237,6 +238,7 @@ public final class AppContext {
         self.turnCheckpointRepo = AgentTurnCheckpointRepository(db: db)
         self.tokenSaverSavingsRepo = TokenSaverSavingsRepository(db: db)
         self.tokenSaverDailyEconomyRepo = TokenSaverDailyEconomyRepository(db: db)
+        self.graphifyUsageRepo = GraphifyUsageRepository(db: db)
         self.tokenSaverAttemptLedger = TokenSaverAttemptLedger(db: db)
         self.tokenSaverSessionLearnRepo = TokenSaverSessionLearnRepository(db: db)
         self.tokenSaverLaneStateRepo = TokenSaverLaneStateRepository(db: db)
@@ -529,6 +531,11 @@ public final class AppContext {
             case .itemStarted(let item):
                 EventBus.shared.publish(kind: "agent.item.started",
                                         payload: .object(["thread_id": .string(t), "item": itemJSON(item)]))
+                self.recordGraphifyUsageFromAssistantItem(
+                    item: item,
+                    threadId: tid,
+                    runId: runId
+                )
             case .itemDelta(let itemId, let bodyAppend, let outputAppend, let summary):
                 var p: [String: JSONValue] = ["thread_id": .string(t), "item_id": .string(itemId)]
                 if let b = bodyAppend { p["body_append"] = .string(b) }
@@ -2507,6 +2514,15 @@ public final class AppContext {
                 dayStartMs: dayStartMs,
                 dayEndMsExclusive: dayEndMs
             )
+            // Real Graphify CLI uses only — never invent signals from preference-on.
+            let signalCount = try graphifyUsageRepo.signalCount(fromMs: dayStartMs, toMsExclusive: dayEndMs)
+            let answerSum = try graphifyUsageRepo.answerTokensSum(fromMs: dayStartMs, toMsExclusive: dayEndMs)
+            let nowMs = Int64(now.timeIntervalSince1970 * 1000)
+            let medianExploration = try graphifyUsageRepo.medianExplorationTokens(
+                nowMs: nowMs,
+                minSamples: TokenSaverBareUserEstimator.minSamplesForLiveShare
+            )
+            try? graphifyUsageRepo.prune(nowMs: nowMs)
             let breakdown = TokenSaverBareUserEstimator.estimate(
                 measuredToolOutputSaved: measured,
                 tokenSaverEnabled: settings.tokenSaverEnabled,
@@ -2514,7 +2530,9 @@ public final class AppContext {
                 orchestrationActive: false,
                 observation: TokenSaverBareUserObservation(
                     windowProviderTokens: windowUsage,
-                    graphifySignalCount: 0
+                    graphifySignalCount: signalCount,
+                    graphifyAnswerTokens: answerSum,
+                    medianExplorationTokens: medianExploration
                 )
             )
             let iso = ISO8601DateFormatter().string(from: now)
@@ -2529,13 +2547,97 @@ public final class AppContext {
                     windowUsageTokens: windowUsage,
                     formulaVersion: TokenSaverDailyEconomyRepository.formulaVersion,
                     appliedOutputShare: breakdown.appliedOutputShare,
-                    graphifySignalCount: 0,
+                    graphifySignalCount: signalCount,
                     updatedAt: iso
                 )
             )
         } catch {
             // Fail open: UI can still compute in-memory; persistence is best-effort.
             NSLog("RemoteCode Token Saver daily economy upsert failed: \(error)")
+        }
+    }
+
+    /// Record Graphify CLI uses (and exploration samples) from assistant tool events.
+    /// Fail-open: never blocks the event funnel. Writes on backgroundWriterQueue.
+    func recordGraphifyUsageFromAssistantItem(
+        item: AssistantItem,
+        threadId: AgentThreadID,
+        runId: AgentRunID
+    ) {
+        // Only tools/command executions can carry a graphify shell invocation.
+        switch item.type {
+        case .tool, .commandExecution, .mcpToolCall, .dynamicToolCall:
+            break
+        default:
+            return
+        }
+        let settings = SettingsStore(db: db).load()
+        // Gate: Token Saver + Graphify runtime. Prefer under-count when off.
+        guard settings.tokenSaverEnabled, settings.isGraphifyRuntimeActive else { return }
+
+        let provider = (try? threadRepo.get(id: threadId))?.provider.rawValue ?? "unknown"
+        let runKey = runId.value.uuidString
+        let createdAtMs = item.startedAtMs > 0
+            ? item.startedAtMs
+            : Int64(Date().timeIntervalSince1970 * 1000)
+
+        // tool_result path: same item id, output filled, summary often "result".
+        if let output = item.output, !output.isEmpty {
+            let answerTokens = GraphifyUsageDetector.tokensFromUTF8Count(output.utf8.count)
+            let failed = GraphifyUsageDetector.looksLikeFailure(output: output)
+            backgroundWriterQueue.async { [weak self] in
+                guard let self else { return }
+                if failed {
+                    // Leave answer_tokens at 0 so failed invocations do not inflate savings.
+                    return
+                }
+                try? self.graphifyUsageRepo.updateAnswerTokens(
+                    runId: runKey,
+                    itemId: item.id,
+                    answerTokens: answerTokens
+                )
+                self.recomputeTokenSaverDailyEconomyToday()
+            }
+            return
+        }
+
+        // tool_use path: detect graphify in summary/body; seed exploration samples.
+        let combinedBody = GraphifyUsageDetector.commandText(fromBody: item.body)
+        let haystackSummary = item.summary
+        let haystackBody = [item.body, combinedBody].joined(separator: "\n")
+        let invocations = GraphifyUsageDetector.detect(summary: haystackSummary, body: haystackBody)
+        let exploration = GraphifyUsageDetector.isExplorationTool(summary: item.summary)
+        guard !invocations.isEmpty || exploration else { return }
+
+        backgroundWriterQueue.async { [weak self] in
+            guard let self else { return }
+            for inv in invocations {
+                try? self.graphifyUsageRepo.insert(
+                    GraphifyUsageEvent(
+                        createdAtMs: createdAtMs,
+                        provider: provider,
+                        runId: runKey,
+                        itemId: item.id,
+                        subcommand: inv.subcommand,
+                        answerTokens: 0,
+                        source: "event_stream"
+                    )
+                )
+            }
+            // Seed exploration row on tool_use (name known here); size filled on result.
+            if exploration {
+                try? self.graphifyUsageRepo.insertExplorationSample(
+                    createdAtMs: createdAtMs,
+                    provider: provider,
+                    runId: runKey,
+                    itemId: item.id,
+                    answerTokens: 0,
+                    toolName: item.summary ?? "tool"
+                )
+            }
+            if !invocations.isEmpty {
+                self.recomputeTokenSaverDailyEconomyToday()
+            }
         }
     }
 
