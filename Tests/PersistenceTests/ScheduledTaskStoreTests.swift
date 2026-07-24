@@ -294,6 +294,66 @@ final class ScheduledTaskStoreTests: XCTestCase {
         XCTAssertNil(stored.nextRunAt)
     }
 
+    func test_dateRoundTripFloorsSubseconds_becauseOccurrenceKeysMustStayStable() throws {
+        // WHY: default ISO8601 without fractions + raw subsecond anchors caused
+        // hourly next_run_at to re-select the spent slot after claim.
+        let fractional = Date(timeIntervalSince1970: 1_700_000_000.824)
+        let task = makeHourlyTask(nextRunAt: fractional, anchor: fractional, intervalHours: 2)
+        try store.save(task)
+
+        let stored = try XCTUnwrap(store.get(id: task.id))
+        let expected = Date(timeIntervalSince1970: 1_700_000_000)
+        XCTAssertEqual(stored.nextRunAt, expected)
+        if case .hourly(let anchor, let hours) = stored.recurrence {
+            XCTAssertEqual(anchor, expected)
+            XCTAssertEqual(hours, 2)
+        } else {
+            XCTFail("expected hourly")
+        }
+    }
+
+    func test_duplicateOccurrenceAdvancesPastSpentHourly_becauseStallLoopMustSelfHeal() throws {
+        // WHY: after a fire, if next_run_at is still the spent slot (legacy bug or
+        // crash mid-advance), claimDue must not spin forever on occurrence_key.
+        let anchor = Date(timeIntervalSince1970: 1_700_000_000.824)
+        let spent = Date(timeIntervalSince1970: 1_700_000_000)
+        let task = makeHourlyTask(nextRunAt: spent, anchor: anchor, intervalHours: 2)
+        try store.save(task)
+
+        let first = try store.claimDue(now: Date(timeIntervalSince1970: 1_700_000_010), owner: "agent-a")
+        XCTAssertEqual(first.count, 1)
+        XCTAssertEqual(first.first?.run.scheduledAt, spent)
+
+        // Simulate execute advancing incorrectly to the same spent second (legacy).
+        try store.advance(taskID: task.id, nextRunAt: spent, lastRunAt: spent, at: Date(timeIntervalSince1970: 1_700_000_020))
+        try store.finish(runID: first[0].run.id, status: .completed, at: Date(timeIntervalSince1970: 1_700_000_030))
+
+        // Next claim hits duplicate occurrence_key and must jump to anchor+2h.
+        let second = try store.claimDue(now: Date(timeIntervalSince1970: 1_700_000_040), owner: "agent-b")
+        XCTAssertTrue(second.isEmpty, "duplicate path claims nothing; it only advances next")
+        let healed = try XCTUnwrap(store.get(id: task.id))
+        XCTAssertEqual(healed.nextRunAt, Date(timeIntervalSince1970: 1_700_000_000 + 2 * 3600))
+
+        // Future due time claims the advanced slot once.
+        let third = try store.claimDue(
+            now: Date(timeIntervalSince1970: 1_700_000_000 + 2 * 3600 + 5),
+            owner: "agent-c"
+        )
+        XCTAssertEqual(third.count, 1)
+        XCTAssertEqual(third.first?.run.scheduledAt, Date(timeIntervalSince1970: 1_700_000_000 + 2 * 3600))
+        XCTAssertNotEqual(third.first?.run.occurrenceKey, first.first?.run.occurrenceKey)
+    }
+
+    func test_calculatedNextRunAfterSpentOnTask_matchesStoreHealPath() throws {
+        let anchor = Date(timeIntervalSince1970: 1_700_000_000.5)
+        let spent = Date(timeIntervalSince1970: 1_700_000_000)
+        let task = makeHourlyTask(nextRunAt: spent, anchor: anchor, intervalHours: 1)
+        XCTAssertEqual(
+            task.calculatedNextRunAfterSpent(spent),
+            Date(timeIntervalSince1970: 1_700_000_000 + 3600)
+        )
+    }
+
     func test_deleteTaskDoesNotDeleteAgentThread_becauseRunHistoryLinksAreNotOwnership() throws {
         let task = makeTask(nextRunAt: Date(timeIntervalSince1970: 100))
         try store.save(task)
@@ -318,6 +378,24 @@ final class ScheduledTaskStoreTests: XCTestCase {
             model: "gpt-5", reasoningEffort: .high,
             recurrence: .daily(at: ScheduledLocalTime(hour: 8, minute: 15)!),
             timeZoneIdentifier: "America/Asuncion", isEnabled: true,
+            nextRunAt: nextRunAt, createdAt: created, updatedAt: created
+        )
+    }
+
+    private func makeHourlyTask(
+        id: UUID = UUID(),
+        nextRunAt: Date?,
+        anchor: Date,
+        intervalHours: Int
+    ) -> ScheduledTask {
+        let created = Date(timeIntervalSince1970: 10)
+        return ScheduledTask(
+            id: id, title: "Hourly", prompt: "Inspect the workspace", workspaceID: WorkspaceID(),
+            workspacePathSnapshot: "/tmp", runAsUser: "sam", runAsUID: 501,
+            provider: .codex, providerInstanceID: "codex-primary",
+            model: "gpt-5", reasoningEffort: .high,
+            recurrence: .hourly(anchor: anchor, intervalHours: intervalHours),
+            timeZoneIdentifier: "UTC", isEnabled: true,
             nextRunAt: nextRunAt, createdAt: created, updatedAt: created
         )
     }

@@ -104,15 +104,16 @@ final class ScheduledTasksWindowTests: XCTestCase {
         XCTAssertTrue(source.contains("ensureActiveRunPolling"))
     }
 
-    func test_scheduledExecutionUsesAgentAppSendPath_becauseStopAndRailMustMatchManualThreads() throws {
+    func test_scheduledExecutionUsesHeadlessSendPath_becauseSchedulesMustNotStealFocus() throws {
         let runtime = try String(contentsOf: sourceURL("Sources/AppShell/ScheduledTaskRuntime.swift"), encoding: .utf8)
         let main = try String(contentsOf: sourceURL("Sources/AppShell/AppDelegate.swift"), encoding: .utf8)
         let router = try String(contentsOf: sourceURL("Sources/AppShell/AppCommandRouter.swift"), encoding: .utf8)
-        // In-process paste+play: open Agent App tab, createThread, viewModel.send().
+        // Headless in-process: createAgentThread(surfaceID: nil) + sendAgentMessage.
         // Main app owns the scheduler; legacy LaunchAgent is unregistered.
-        XCTAssertTrue(runtime.contains("openAgentAppForSchedule"))
-        XCTAssertTrue(runtime.contains("await vm.send()"))
-        XCTAssertTrue(runtime.contains("createThread(title: \"New thread\")"))
+        // openAgentAppForSchedule remains for intentional focus deep-links only.
+        XCTAssertTrue(runtime.contains("router.createAgentThread("))
+        XCTAssertTrue(runtime.contains("router.sendAgentMessage("))
+        XCTAssertTrue(runtime.contains("surfaceID: nil"))
         XCTAssertTrue(runtime.contains("func stop(threadID:"))
         XCTAssertTrue(runtime.contains("ScheduledTaskCrossProcess.notifyStoreChanged"))
         XCTAssertTrue(runtime.contains("skipMissedOccurrencesOnLaunch"))
@@ -120,13 +121,11 @@ final class ScheduledTasksWindowTests: XCTestCase {
         XCTAssertTrue(main.contains("installScheduledTaskStoreObserver"))
         XCTAssertTrue(router.contains("openAgentAppForSchedule"))
         XCTAssertTrue(router.contains("scheduledTaskScheduler"))
-        XCTAssertFalse(
-            runtime.contains("router.sendAgentMessage("),
-            "scheduled execute must use AgentAppViewModel.send, not router bypass"
-        )
+        XCTAssertFalse(runtime.contains("openAgentAppForSchedule"))
+        XCTAssertFalse(runtime.contains("await vm.send()"))
         XCTAssertFalse(
             runtime.contains("context.coordinator.startRun("),
-            "scheduled execute must not start the provider outside Agent App send"
+            "scheduled execute must start via sendAgentMessage, not a raw coordinator call"
         )
     }
 

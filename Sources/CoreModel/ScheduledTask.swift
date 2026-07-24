@@ -125,6 +125,16 @@ public struct ScheduledTask: Codable, Sendable, Equatable, Identifiable {
             calendar: Calendar(identifier: .gregorian)
         )
     }
+
+    /// Next pointer after a claimed/spent occurrence (never re-selects that slot).
+    public func calculatedNextRunAfterSpent(_ scheduledAt: Date) -> Date? {
+        guard let timeZone = TimeZone(identifier: timeZoneIdentifier) else { return nil }
+        return ScheduledTaskOccurrenceCalculator.nextOccurrenceAfterSpent(
+            scheduledAt: scheduledAt,
+            recurrence: recurrence,
+            timeZone: timeZone
+        )
+    }
 }
 
 public struct ScheduledTaskRun: Codable, Sendable, Equatable, Identifiable {

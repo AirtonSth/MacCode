@@ -32,6 +32,20 @@ final class ScheduledTaskRuntimeTests: XCTestCase {
         XCTAssertEqual(ScheduledTaskScheduler.catchUpWindow, 0)
     }
 
+    func test_executeAdvancesWithSpentOccurrenceHelper_becauseTruncationMustNotRestall() throws {
+        // WHY: source contract — after claim, next pointer must use afterSpent
+        // (+1s), not bare calculatedNextRun(after: scheduledAt).
+        let source = try String(
+            contentsOf: repositoryRoot.appendingPathComponent("Sources/AppShell/ScheduledTaskRuntime.swift"),
+            encoding: .utf8
+        )
+        XCTAssertTrue(source.contains("calculatedNextRunAfterSpent"))
+        XCTAssertFalse(
+            source.contains("calculatedNextRun(after: claim.run.scheduledAt)"),
+            "execute must not advance with the raw spent scheduledAt"
+        )
+    }
+
     func test_eligibleUsersIncludesCurrentNonRootUser_becauseEditorMustOfferRunnableIdentity() throws {
         let user = try XCTUnwrap(ScheduledSystemUserCatalog.user(named: NSUserName()))
         XCTAssertNotEqual(user.uid, 0)
@@ -143,28 +157,81 @@ final class ScheduledTaskRuntimeTests: XCTestCase {
         XCTAssertNoThrow(try ScheduledTaskExecutor.rejectUIOnlySchedulePrompt("/goal reduce latency"))
     }
 
-    func test_executeUsesAgentAppPasteAndPlay_becauseParityRequiresViewModelSend() throws {
-        // Source contract: Run Now must open a real Agent App tab, create
-        // "New thread", pin Full Access + Default, and call viewModel.send().
+    func test_executeRunsHeadlessWithoutUIFocus_becauseSchedulesMustNotHijackTheUser() throws {
+        // Source contract: scheduled fires create a durable thread + start via
+        // sendAgentMessage. They must not activate the app, switch workspaces,
+        // focus Agent App, write the composer, or depend on viewModel.send().
         let source = try String(
             contentsOf: repositoryRoot.appendingPathComponent("Sources/AppShell/ScheduledTaskRuntime.swift"),
             encoding: .utf8
         )
-        XCTAssertTrue(source.contains("openAgentAppForSchedule"))
-        XCTAssertTrue(source.contains("createThread(title: \"New thread\")"))
-        XCTAssertTrue(source.contains("await vm.send()"))
-        XCTAssertTrue(source.contains("setPermissionMode(.fullAccess)"))
-        XCTAssertTrue(source.contains("interactionMode = .default"))
+        XCTAssertTrue(source.contains("router.createAgentThread("))
+        XCTAssertTrue(source.contains("router.sendAgentMessage("))
+        XCTAssertTrue(source.contains("surfaceID: nil"))
+        XCTAssertTrue(source.contains("quiet: true"))
+        XCTAssertTrue(source.contains("permissionMode: .fullAccess"))
+        XCTAssertTrue(source.contains("interactionMode: .default"))
+        XCTAssertTrue(source.contains("orchestrationRoutingSnapshot: prepared.routingSnapshot"))
+        XCTAssertTrue(source.contains("scheduleDispatchPrompt"))
         XCTAssertTrue(source.contains("skipMissedOccurrencesOnLaunch"))
         XCTAssertTrue(source.contains("reclaimOrphanedActiveRuns"))
-        XCTAssertTrue(source.contains("waitForProviderSnapshotsIdle"))
-        XCTAssertFalse(
-            source.contains("router.sendAgentMessage("),
-            "scheduled execute must not bypass AgentAppViewModel.send"
-        )
+        XCTAssertFalse(source.contains("openAgentAppForSchedule"))
+        XCTAssertFalse(source.contains("await vm.send()"))
+        XCTAssertFalse(source.contains("createThread(title: \"New thread\")"))
+        XCTAssertFalse(source.contains("NSApplication.shared.activate"))
+        XCTAssertFalse(source.contains("selectWorkspace("))
         XCTAssertFalse(
             source.contains("modelDiscoverySource == .live"),
             "Auto preflight must not be stricter than Agent App (requireLiveCatalog false)"
+        )
+        // Foreign-user Auto must not put the scheduled .sh wrapper in launch configs.
+        XCTAssertTrue(source.contains("launchProviderBinary"))
+        XCTAssertTrue(source.contains("allowlisted provider binary"))
+        // Snapshot discovery must probe as the scheduled run-as user, not app owner.
+        XCTAssertTrue(source.contains("listAgentProviderSnapshots(runAsUser:"))
+    }
+
+    func test_scheduleDispatchPrompt_matchesAgentAppFirstTokenNormalization() {
+        // WHY: headless send must not regress `/sam-work`→`$sam-work`, `$goal`→`/goal`,
+        // or `/default body`→`body` that AgentAppViewModel.send applied.
+        let skillSnapshot = AgentProviderSnapshot(
+            id: "codex",
+            provider: .codex,
+            driverKind: .codexCLI,
+            displayName: "Codex",
+            accentColor: "#2F80ED",
+            continuationGroup: "codex",
+            interactionModes: [.default],
+            permissionModes: [.fullAccess],
+            enabled: true,
+            installed: true,
+            status: .available,
+            authenticated: true,
+            binaryPath: "/usr/local/bin/codex",
+            models: [AgentModelDescriptor(id: "m", label: "M", provider: .codex)],
+            slashCommands: ["/goal"],
+            skills: ["sam-work"],
+            capabilities: .conservative
+        )
+        XCTAssertEqual(
+            ScheduledTaskExecutor.scheduleDispatchPrompt("/sam-work DEV-1", providerSnapshot: skillSnapshot),
+            "$sam-work DEV-1"
+        )
+        XCTAssertEqual(
+            ScheduledTaskExecutor.scheduleDispatchPrompt("$goal ship it", providerSnapshot: skillSnapshot),
+            "/goal ship it"
+        )
+        XCTAssertEqual(
+            ScheduledTaskExecutor.scheduleDispatchPrompt("/default Ship the pipeline", providerSnapshot: nil),
+            "Ship the pipeline"
+        )
+        XCTAssertEqual(
+            ScheduledTaskExecutor.scheduleDispatchPrompt("$sam-work DEV-1", providerSnapshot: skillSnapshot),
+            "$sam-work DEV-1"
+        )
+        XCTAssertEqual(
+            ScheduledTaskExecutor.scheduleDispatchPrompt("plain prompt", providerSnapshot: nil),
+            "plain prompt"
         )
     }
 

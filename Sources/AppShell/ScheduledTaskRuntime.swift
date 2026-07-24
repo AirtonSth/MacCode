@@ -106,91 +106,93 @@ public final class ScheduledTaskExecutor {
         try await prepareExecution(task).workspace
     }
 
-    /// Paste+play through a real Agent App tab — same path as the user opening
-    /// Agent App, setting user/provider/model, typing the prompt, and pressing play.
+    /// Headless in-process run: create a durable agent thread and start the
+    /// provider through the shared coordinator (`sendAgentMessage`), without
+    /// activating RemoteCode, switching workspaces, focusing Agent App tabs,
+    /// writing the composer textarea, or depending on a UI "play" click.
     ///
     /// Ownership stays in the interactive app process (local coordinator). No
-    /// LaunchAgent foreign ownership or XPC stop path.
+    /// LaunchAgent foreign ownership or XPC stop path. Rails refresh when a
+    /// surface already shows the workspace; the user's current focus is not
+    /// stolen.
     /// - Parameter onThreadCreated: called after the thread row exists so the
     ///   scheduler can link `scheduled_task_runs.thread_id` before provider start.
     public func execute(
         _ task: ScheduledTask,
         onThreadCreated: ((AgentThreadID) throws -> Void)? = nil
     ) async throws -> (threadID: AgentThreadID, runID: AgentRunID) {
-        _ = try await prepareExecution(task)
+        let prepared = try await prepareExecution(task)
         try Self.rejectUIOnlySchedulePrompt(task.prompt)
+        // Match AgentAppViewModel.send: $goal→/goal, /sam-work→$sam-work, /default body→body.
+        let dispatchPrompt = Self.scheduleDispatchPrompt(
+            task.prompt,
+            providerSnapshot: prepared.providerSnapshot
+        )
 
-        let surface = try router.openAgentAppForSchedule(workspace: task.workspaceID)
-        let vm = surface.viewModel
-        vm.setRunAsUser(Self.resolveRunAsUser(task: task) ?? AgentRunAsUser.current())
-        // setRunAsUser and surface open both kick unstructured snapshot loads.
-        // Wait until idle, then force one authoritative load, then idle again so
-        // Auto send is not refused for providerSnapshotsLoading.
-        await Self.waitForProviderSnapshotsIdle(vm)
-        await vm.loadProviderSnapshots()
-        await Self.waitForProviderSnapshotsIdle(vm)
-        guard vm.providerSnapshots.contains(where: {
-            $0.id == task.providerInstanceID && $0.provider == task.provider
-        }) else {
-            throw ScheduledTaskPreflightError.providerUnavailable(
-                "Provider instance \(task.providerInstanceID) is not available for \(task.runAsUser)."
-            )
+        let runAs = Self.resolveRunAsUser(task: task)
+        let modelSelection = AgentModelSelection(
+            provider: task.provider,
+            modelId: task.model,
+            reasoningEffort: task.reasoningEffort
+        )
+        let routingConfiguration: AgentRoutingConfiguration?
+        if task.effectiveRoutingMode == .auto {
+            routingConfiguration = prepared.routingSnapshot?.configuration
+                ?? Self.routingConfiguration(
+                    for: task,
+                    policyDigest: orchestrationRuntime.policyDigest,
+                    eligibleProviders: [task.provider]
+                )
+        } else {
+            routingConfiguration = nil
         }
-        vm.setProviderInstance(task.providerInstanceID)
-        // New-thread creation re-applies preferred model; pin exact schedule
-        // configuration after create, then fail closed if anything drifted.
-        vm.createThread(title: "New thread")
-        guard let threadID = vm.selectedThreadId else {
+
+        // surfaceID: nil + quiet: create durable row without selecting tabs or
+        // rebuilding workspace UI (no focus/workspace yank).
+        let thread = try router.createAgentThread(
+            workspace: task.workspaceID,
+            title: task.title,
+            provider: task.provider,
+            model: task.model.isEmpty ? modelSelection.effectiveModel : task.model,
+            permissionMode: .fullAccess,
+            reasoningEffort: task.reasoningEffort,
+            modelSelection: modelSelection,
+            providerInstanceId: task.providerInstanceID,
+            runAsUser: runAs,
+            surfaceID: nil,
+            routingConfiguration: routingConfiguration,
+            quiet: true
+        )
+        try onThreadCreated?(thread.id)
+
+        let sendResult = try await router.sendAgentMessage(
+            thread: thread.id,
+            text: dispatchPrompt,
+            provider: task.provider,
+            model: task.model.isEmpty ? nil : task.model,
+            permissionMode: .fullAccess,
+            reasoningEffort: task.reasoningEffort,
+            interactionMode: .default,
+            modelSelection: modelSelection,
+            providerInstanceId: task.providerInstanceID,
+            attachments: [],
+            orchestrationRoutingSnapshot: prepared.routingSnapshot
+        )
+
+        switch sendResult.status {
+        case .started:
+            guard let runID = sendResult.runId else {
+                throw ScheduledTaskPreflightError.invalidTask(
+                    "Scheduled task send did not return a provider run id."
+                )
+            }
+            return (thread.id, runID)
+        case .queued:
+            // Brand-new thread must never queue behind another run.
             throw ScheduledTaskPreflightError.invalidTask(
-                vm.statusMessage.isEmpty
-                    ? "Scheduled task could not create an Agent App thread."
-                    : vm.statusMessage
+                "Scheduled task was queued instead of started. Retry when no other run is active on the thread."
             )
         }
-        try onThreadCreated?(threadID)
-
-        vm.setProviderInstance(task.providerInstanceID)
-        vm.setModel(task.model)
-        vm.setReasoningEffort(task.reasoningEffort)
-        vm.setPermissionMode(.fullAccess)
-        vm.interactionMode = .default
-        _ = vm.setAutoModelRoutingEnabled(task.effectiveRoutingMode == .auto)
-
-        if vm.providerInstanceId != task.providerInstanceID
-            || vm.provider != task.provider {
-            throw ScheduledTaskPreflightError.providerUnavailable(
-                "Could not pin provider \(task.provider.rawValue) / \(task.providerInstanceID) on the Agent App tab."
-            )
-        }
-        if task.effectiveRoutingMode != .auto, vm.model != task.model {
-            throw ScheduledTaskPreflightError.unsupportedModel(task.model)
-        }
-        if vm.permissionMode != .fullAccess {
-            throw ScheduledTaskPreflightError.invalidTask(
-                "Could not enable Full Access for the scheduled Agent App run."
-            )
-        }
-        if task.effectiveRoutingMode == .auto, vm.routingMode != .auto {
-            throw ScheduledTaskPreflightError.invalidTask(
-                "Could not enable Auto model routing for the scheduled run."
-            )
-        }
-
-        // Raw saved prompt — AgentAppViewModel.send() performs the same
-        // first-token normalization the play button uses.
-        vm.prompt = task.prompt
-        vm.attachments = []
-        await vm.send()
-
-        guard let runID = vm.currentRunId, vm.selectedThreadId == threadID else {
-            let detail = vm.statusMessage.trimmingCharacters(in: .whitespacesAndNewlines)
-            throw ScheduledTaskPreflightError.invalidTask(
-                detail.isEmpty
-                    ? "Scheduled task send did not start a provider run."
-                    : detail
-            )
-        }
-        return (threadID, runID)
     }
 
     /// Local Agent App commands that never start a provider turn. Scheduled
@@ -223,20 +225,43 @@ public final class ScheduledTaskExecutor {
                 "Scheduled tasks cannot run the local Agent App command /default. Use a full prompt or skill ($name)."
             )
         }
-        // `/default body` is allowed — Agent App switches to Default then sends body.
+        // `/default body` is allowed — scheduleDispatchPrompt strips the command.
         _ = argument
     }
 
-    /// Wait until Agent App finishes all in-flight provider snapshot loads.
-    @MainActor
-    private static func waitForProviderSnapshotsIdle(
-        _ vm: AgentAppViewModel,
-        timeoutSeconds: Double = 15
-    ) async {
-        let deadline = Date().addingTimeInterval(timeoutSeconds)
-        while vm.providerSnapshotsLoading, Date() < deadline {
-            try? await Task.sleep(for: .milliseconds(50))
+    /// Same first-token rewrite Agent App applies before provider dispatch.
+    /// - `$goal` / `/goal` → command form `/goal`
+    /// - `/sam-work` / `$sam-work` → skill form `$sam-work` when registered as skill
+    /// - `/default body` → `body` (schedules already run in Default mode)
+    /// Mirrors `AgentAppViewModel.localSlashCommands` without MainActor hop.
+    nonisolated private static let scheduleLocalSlashCommands = [
+        "/clear", "/default", "/fork", "/model", "/plan", "/status"
+    ]
+
+    nonisolated static func scheduleDispatchPrompt(
+        _ raw: String,
+        providerSnapshot: AgentProviderSnapshot?
+    ) -> String {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        let normalized = AgentComposerSuggestions.normalizingComposerTriggerPrefix(
+            trimmed,
+            localSlashCommands: scheduleLocalSlashCommands,
+            providerSlashCommands: Array(Set(
+                (providerSnapshot?.slashCommands ?? [])
+                    + AgentComposerSuggestions.passThroughSlashCommands
+            )),
+            skills: providerSnapshot?.skills ?? []
+        )
+        // Agent App switches to Default then sends body; headless is already Default.
+        if let first = normalized.first, first == "/" || first == "$" {
+            let parts = normalized.dropFirst().split(separator: " ", maxSplits: 1).map(String.init)
+            let command = (parts.first ?? "").lowercased()
+            let argument = parts.count > 1 ? parts[1].trimmingCharacters(in: .whitespaces) : ""
+            if command == "default", !argument.isEmpty {
+                return argument
+            }
         }
+        return normalized
     }
 
     private static func resolveRunAsUser(task: ScheduledTask) -> AgentRunAsUser? {
@@ -256,6 +281,8 @@ public final class ScheduledTaskExecutor {
         let workspace: Workspace
         let manualLaunch: AgentOrchestrationLaunchConfiguration?
         let routingSnapshot: AgentOrchestrationRoutingSnapshot?
+        /// Snapshot for the scheduled provider instance — composer normalization.
+        let providerSnapshot: AgentProviderSnapshot?
     }
 
     private func prepareExecution(_ task: ScheduledTask) async throws -> PreparedExecution {
@@ -282,16 +309,23 @@ public final class ScheduledTaskExecutor {
         }
         if user.name != NSUserName() { try verifyPasswordlessSudo(user: user) }
 
-        let snapshots = await router.listAgentProviderSnapshots()
+        // Discover install/auth/binary as the account that will actually run the
+        // provider (sudo -u target). App-owner snapshots reject valid foreign-user CLIs.
+        let runAsForProbe = Self.resolveRunAsUser(task: task)
+        let snapshots = await router.listAgentProviderSnapshots(runAsUser: runAsForProbe)
         if task.effectiveRoutingMode == .auto {
+            let autoSnapshot = try await autoRoutingSnapshot(
+                task: task,
+                user: user,
+                snapshots: snapshots
+            )
             return PreparedExecution(
                 workspace: workspace,
                 manualLaunch: nil,
-                routingSnapshot: try await autoRoutingSnapshot(
-                    task: task,
-                    user: user,
-                    snapshots: snapshots
-                )
+                routingSnapshot: autoSnapshot,
+                providerSnapshot: autoSnapshot.providerSnapshots.first {
+                    $0.id == task.providerInstanceID && $0.provider == task.provider
+                } ?? autoSnapshot.providerSnapshots.first
             )
         }
 
@@ -343,7 +377,8 @@ public final class ScheduledTaskExecutor {
                 binary: probeBinary,
                 environment: probeEnvironment
             ),
-            routingSnapshot: nil
+            routingSnapshot: nil,
+            providerSnapshot: snapshot
         )
     }
 
@@ -405,9 +440,12 @@ public final class ScheduledTaskExecutor {
                     )
                 }
             }
-            let launchBinary: String
+            // Probe may use a foreign-user `.sh` wrapper for passwordless sudo auth.
+            // Coordinator launch configs must use the allowlisted provider binary so
+            // RunAsUserProcessBootstrap performs the single sudo transition.
+            let probeBinary: String
             do {
-                launchBinary = try executionBinary(
+                probeBinary = try executionBinary(
                     task: task,
                     baseBinary: baseBinary,
                     providerInstanceID: snapshot.id
@@ -423,7 +461,7 @@ public final class ScheduledTaskExecutor {
             let authenticated = await Task.detached {
                 ProviderCLIProbe.authenticated(
                     provider: snapshot.provider,
-                    binaryPath: launchBinary,
+                    binaryPath: probeBinary,
                     environment: environment
                 )
             }.value
@@ -445,8 +483,15 @@ public final class ScheduledTaskExecutor {
                 throw ScheduledTaskPreflightError.providerUnavailable(String(describing: error))
             }
             verifiedSnapshots.append(verified)
+            let launchProviderBinary: String = {
+                if let path = snapshot.binaryPath?.trimmingCharacters(in: .whitespacesAndNewlines),
+                   !path.isEmpty {
+                    return path
+                }
+                return baseBinary
+            }()
             launches[snapshot.id] = AgentOrchestrationLaunchConfiguration(
-                binary: launchBinary,
+                binary: launchProviderBinary,
                 environment: environment
             )
         }
@@ -635,7 +680,9 @@ public final class ScheduledTaskScheduler {
 
     private func execute(_ claim: ScheduledTaskClaim) async {
         do {
-            let next = claim.task.calculatedNextRun(after: claim.run.scheduledAt)
+            // Spent-slot advance (+1s) so whole-second persistence / subsecond
+            // anchors cannot re-select the occurrence that just claimed.
+            let next = claim.task.calculatedNextRunAfterSpent(claim.run.scheduledAt)
             try store.advance(taskID: claim.task.id, nextRunAt: next, lastRunAt: claim.task.lastRunAt)
             ScheduledTaskCrossProcess.notifyStoreChanged(reason: "queued")
             let identifiers = try await executor.execute(claim.task) { [self] threadID in
