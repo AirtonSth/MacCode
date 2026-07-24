@@ -1,5 +1,8 @@
 import Foundation
 import CoreModel
+import os
+
+private let claudeStreamLog = Logger(subsystem: "io.remotecode.agent", category: "claude.stream")
 
 /// Surfaces the actionable "install the Claude CLI" guidance verbatim (no error
 /// prefix) when the `claude` binary is absent, since the CLI adapter is now the
@@ -10,6 +13,15 @@ struct ClaudeCLIUnavailableError: Error, CustomStringConvertible {
 }
 
 public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked Sendable {
+    /// A turn `result` that arrived while the CLI still had background work
+    /// running. Carries `runId` so a late event can never finish a newer run.
+    struct DeferredFinish {
+        let status: AgentRunStatus
+        let finalMessage: String?
+        let providerThreadId: String?
+        let runId: AgentRunID?
+    }
+
     private final class Session: @unchecked Sendable {
         let threadId: AgentThreadID
         let process: Process
@@ -41,6 +53,21 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
         var pendingUserInputIds = Set<String>()
         var environment: [String: String] = [:]
         var cancellationRequested = false
+        /// CLAUDE-BG-LIFECYCLE: task ids the CLI reports as still running —
+        /// background shells (`task_type: local_bash`) and async subagents
+        /// (`local_agent`). Authoritative snapshot from
+        /// `system/background_tasks_changed`; `task_started` also seeds it so a
+        /// `result` that races ahead of the first snapshot still sees "busy".
+        /// Non-empty ⇒ the provider is NOT idle and a turn `result` is premature.
+        var pendingBackgroundTaskIds = Set<String>()
+        /// A turn `result` withheld because background work was still pending.
+        /// Re-armed by every later `result`; only the one observed while the
+        /// pending set is empty becomes the run's single terminal event.
+        var deferredFinish: DeferredFinish?
+        /// Liveness bound for a deferral (reset on any stream line). Guarantees a
+        /// terminal state even if the CLI never resumes; on expiry the withheld
+        /// finish is emitted so the awaiting-banner fallback can take over.
+        var deferralWatchdog: DispatchWorkItem?
         // PERF-008 / F4: signature of the last emitted snapshot state (the state
         // fields only, reason excluded) so identical snapshots fired by
         // high-frequency tool deltas are coalesced. F4 computes this directly from
@@ -83,11 +110,18 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
     // Cleared when sendTurn begins a new session for that thread. Guarded by `lock`.
     private var interruptedThreadIds: Set<AgentThreadID> = []
 
-    public init(binaryNameOverride: String? = nil, maxReadableEvents: Int = 5_000, transcriptStore: ClaudeTranscriptStore = ClaudeTranscriptStore(), interruptGracePeriod: TimeInterval = 2) {
+    /// CLAUDE-BG-LIFECYCLE: liveness bound for a withheld finish, reset by any
+    /// stream line. Generous by default (a quiet background job emits nothing
+    /// until it ends); on expiry the run still reaches a terminal state instead of
+    /// hanging non-terminal forever. Injectable so tests can drive it in ms.
+    private let deferredFinishInactivityTimeout: TimeInterval
+
+    public init(binaryNameOverride: String? = nil, maxReadableEvents: Int = 5_000, transcriptStore: ClaudeTranscriptStore = ClaudeTranscriptStore(), interruptGracePeriod: TimeInterval = 2, deferredFinishInactivityTimeout: TimeInterval = 900) {
         self.binaryNameOverride = binaryNameOverride
         self.maxReadableEvents = max(1, maxReadableEvents)
         self.transcriptStore = transcriptStore
         self.interruptGracePeriod = max(0, interruptGracePeriod)
+        self.deferredFinishInactivityTimeout = max(0.01, deferredFinishInactivityTimeout)
     }
 
     public func listModels() async -> [AgentModelDescriptor] {
@@ -107,6 +141,11 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
             // actionable message instead of a bare "CLI not found in PATH".
             throw ClaudeCLIUnavailableError(message: ClaudeRunner.missingBinaryMessage(binary))
         }
+        // CLAUDE-BG-LIFECYCLE: a run whose finish is withheld still owns
+        // `inFlightRunId`, which would make the guard below reject the user's next
+        // message. Settle the old run first so sending stays possible (and so the
+        // deferral can never bleed into a newer run).
+        flushDeferredFinish(session: session, reason: "new_turn")
         lock.lock()
         if session.inFlightRunId != nil {
             lock.unlock()
@@ -567,6 +606,15 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
             session.lastAssistantUuid = assistantUuid
             lock.unlock()
         }
+        if let rawObject {
+            // CLAUDE-BG-LIFECYCLE: keep the pending-background-work view current
+            // BEFORE the parser's turn events are processed below, so a `result`
+            // in this same batch is judged against the up-to-date set.
+            trackBackgroundWork(in: rawObject, session: session)
+        }
+        // Any stream line is liveness: a deferral must not time out while the CLI
+        // is still talking to us.
+        refreshDeferralWatchdog(session: session)
         if let rawObject,
            let runtimeEvent = ProviderRuntimeEvent.fromJSONObject(rawObject, provider: .claude, source: "claude.stream-json") {
             emit(.event(.providerRuntime(runtimeEvent)), session: session)
@@ -633,21 +681,159 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
                     lock.unlock()
                     emitSessionSnapshot(session: session, reason: "turn_completed")
                 }
-                lock.lock()
-                let status: AgentRunStatus = session.cancellationRequested ? .cancelled : (session.sawError ? .failed : .completed)
-                session.status = status
-                let providerThreadId = session.providerThreadId
-                lock.unlock()
-                emit(.status(status), session: session)
-                emit(.finished(status, finalMessage: finalMessage, providerThreadId: providerThreadId), session: session)
-                lock.lock()
-                session.inFlightRunId = nil
-                session.onEvent = nil
-                session.sawError = false
-                session.pendingRequestIds.removeAll()
-                session.pendingUserInputIds.removeAll()
-                lock.unlock()
+                concludeTurn(finalMessage: finalMessage, session: session, allowDeferral: true)
             }
+        }
+    }
+
+    /// CLAUDE-BG-LIFECYCLE — the fix for "thread reads as finished while a
+    /// background task or subagent is still running".
+    ///
+    /// The CLI ends a *turn* (`result`) as soon as the model stops talking, even
+    /// when it left a background shell or an async subagent running; it then
+    /// finishes that work, RESUMES the agent by itself, and emits another
+    /// `result`. Treating the first `result` as the run's terminal state (and
+    /// tearing down `onEvent`) reported the thread as completed and discarded the
+    /// real answer that arrives later. Mirrors the Codex adapter's
+    /// defer-until-provider-idle contract, using `background_tasks_changed` as
+    /// the idle signal instead of Codex's thread status.
+    ///
+    /// Withhold the terminal while work is pending; the LAST `result` — the one
+    /// observed with an empty pending set — is the single `.finished`. Deferral is
+    /// skipped for a cancelled/failed turn (those are terminal regardless) and
+    /// when the process is gone (`allowDeferral: false`), so pending work can
+    /// never be reported as `.completed`.
+    ///
+    /// The heuristic `[[RC_AWAITING]]` marker + auto-nudge stay in place as the
+    /// fallback for routes without these events; they cannot double-drive this
+    /// route because they require a `.completed` run, which a live deferral
+    /// prevents by construction.
+    private func concludeTurn(finalMessage: String?, session: Session, allowDeferral: Bool) {
+        lock.lock()
+        let status: AgentRunStatus = session.cancellationRequested ? .cancelled : (session.sawError ? .failed : .completed)
+        session.status = status
+        let providerThreadId = session.providerThreadId
+        let pending = session.pendingBackgroundTaskIds
+        let runId = session.inFlightRunId
+        let shouldDefer = allowDeferral && status == .completed && !pending.isEmpty
+        if shouldDefer {
+            session.deferredFinish = DeferredFinish(
+                status: status,
+                finalMessage: finalMessage,
+                providerThreadId: providerThreadId,
+                runId: runId
+            )
+        } else {
+            session.deferredFinish = nil
+        }
+        lock.unlock()
+
+        if shouldDefer {
+            claudeStreamLog.info("claude.turn.deferred pendingTasks=\(pending.count, privacy: .public)")
+            // Deliberately keep `onEvent` and `inFlightRunId` alive: the CLI is
+            // still streaming on this session and will resume on its own.
+            emitSessionSnapshot(session: session, reason: "background_work_pending")
+            refreshDeferralWatchdog(session: session)
+            return
+        }
+        emitTerminal(status: status, finalMessage: finalMessage, providerThreadId: providerThreadId, session: session)
+    }
+
+    /// Emits the run's single terminal pair and releases per-run session state.
+    private func emitTerminal(
+        status: AgentRunStatus,
+        finalMessage: String?,
+        providerThreadId: String?,
+        session: Session
+    ) {
+        lock.lock()
+        session.deferralWatchdog?.cancel()
+        session.deferralWatchdog = nil
+        session.deferredFinish = nil
+        lock.unlock()
+        emit(.status(status), session: session)
+        emit(.finished(status, finalMessage: finalMessage, providerThreadId: providerThreadId), session: session)
+        lock.lock()
+        session.inFlightRunId = nil
+        session.onEvent = nil
+        session.sawError = false
+        session.pendingRequestIds.removeAll()
+        session.pendingUserInputIds.removeAll()
+        session.pendingBackgroundTaskIds.removeAll()
+        lock.unlock()
+    }
+
+    /// Flushes a withheld finish for `session`, if one is still valid. Used by the
+    /// liveness watchdog and before a new turn reuses the session.
+    private func flushDeferredFinish(session: Session, reason: String) {
+        lock.lock()
+        guard let deferred = session.deferredFinish,
+              deferred.runId == session.inFlightRunId else {
+            session.deferredFinish = nil
+            session.deferralWatchdog?.cancel()
+            session.deferralWatchdog = nil
+            lock.unlock()
+            return
+        }
+        lock.unlock()
+        claudeStreamLog.info("claude.turn.deferred.flushed reason=\(reason, privacy: .public)")
+        emitTerminal(
+            status: deferred.status,
+            finalMessage: deferred.finalMessage,
+            providerThreadId: deferred.providerThreadId,
+            session: session
+        )
+    }
+
+    /// (Re)arms the deferral liveness bound. No-op unless a finish is withheld.
+    private func refreshDeferralWatchdog(session: Session) {
+        lock.lock()
+        guard session.deferredFinish != nil else {
+            lock.unlock()
+            return
+        }
+        session.deferralWatchdog?.cancel()
+        let item = DispatchWorkItem { [weak self, weak session] in
+            guard let self, let session else { return }
+            self.flushDeferredFinish(session: session, reason: "watchdog_inactivity")
+        }
+        session.deferralWatchdog = item
+        let delay = deferredFinishInactivityTimeout
+        lock.unlock()
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + delay, execute: item)
+    }
+
+    /// Updates the pending-background-work set from one raw stream line.
+    ///
+    /// `background_tasks_changed.tasks` is an authoritative snapshot, so it
+    /// REPLACES the set (never merges). `task_started` seeds the set defensively
+    /// for the ordering race where a `result` could precede the first snapshot,
+    /// and a `task_updated` patch carrying a terminal status removes that id.
+    private func trackBackgroundWork(in obj: [String: Any], session: Session) {
+        guard (obj["type"] as? String) == "system",
+              let subtype = obj["subtype"] as? String else { return }
+        switch subtype {
+        case "background_tasks_changed":
+            let ids = (obj["tasks"] as? [[String: Any]])?
+                .compactMap { $0["task_id"] as? String } ?? []
+            lock.lock()
+            session.pendingBackgroundTaskIds = Set(ids)
+            lock.unlock()
+        case "task_started":
+            guard let id = obj["task_id"] as? String else { return }
+            lock.lock()
+            session.pendingBackgroundTaskIds.insert(id)
+            lock.unlock()
+        case "task_updated", "task_notification":
+            guard let id = obj["task_id"] as? String else { return }
+            let status = (obj["patch"] as? [String: Any])?["status"] as? String
+                ?? obj["status"] as? String
+            guard let status, ["completed", "failed", "killed", "cancelled"].contains(status) else { return }
+            lock.lock()
+            session.pendingBackgroundTaskIds.remove(id)
+            lock.unlock()
+        default:
+            return
         }
     }
 
@@ -681,6 +867,13 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
         }
         let shouldFinish = session.inFlightRunId != nil
         session.inFlightRunId = nil
+        // CLAUDE-BG-LIFECYCLE: the process is gone, so a withheld finish can never
+        // be resumed. Drop it — the terminal below reports cancelled/failed, never
+        // `.completed`, so unresolved background work is never called done.
+        session.deferredFinish = nil
+        session.deferralWatchdog?.cancel()
+        session.deferralWatchdog = nil
+        session.pendingBackgroundTaskIds.removeAll()
         let status: AgentRunStatus = session.cancellationRequested ? .cancelled : .failed
         session.status = status
         let onEvent = session.onEvent
@@ -716,21 +909,9 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
         lock.unlock()
         emitSessionSnapshot(session: session, reason: "turn_completed")
 
-        lock.lock()
-        let status: AgentRunStatus = session.cancellationRequested ? .cancelled : (session.sawError ? .failed : .completed)
-        session.status = status
-        let providerThreadId = session.providerThreadId
-        lock.unlock()
-        emit(.status(status), session: session)
-        emit(.finished(status, finalMessage: finalMessage, providerThreadId: providerThreadId), session: session)
-
-        lock.lock()
-        session.inFlightRunId = nil
-        session.onEvent = nil
-        session.sawError = false
-        session.pendingRequestIds.removeAll()
-        session.pendingUserInputIds.removeAll()
-        lock.unlock()
+        // Reached only while finalizing a dead/closing stream: the CLI can no
+        // longer resume, so this turn is terminal and must not be deferred.
+        concludeTurn(finalMessage: finalMessage, session: session, allowDeferral: false)
     }
 
     private func terminate(session: Session, status: AgentRunStatus) {

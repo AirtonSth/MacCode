@@ -1876,6 +1876,194 @@ final class ClaudeStreamingCLIAdapterTests: ProviderProcessTestCase {
         XCTAssertTrue(ClaudeAgentSDKBridgeAdapter.installedSDKPackage(at: packageJSON, matches: ClaudeAgentSDKBridgeAdapter.defaultSDKPackageSpec))
     }
 
+    // MARK: - CLAUDE-BG-LIFECYCLE (background tasks + async subagents)
+
+    /// Writes a fake `claude` that replays the REAL wire sequence captured from
+    /// `claude --print --input-format stream-json --output-format stream-json`
+    /// (CLI 2.1.219) when a turn ends while async work is still running: the CLI
+    /// emits a premature `result`, later reports the task list empty, RESUMES the
+    /// agent on its own, and emits a second `result` carrying the real answer.
+    ///
+    /// `taskType` is `local_bash` for a background shell and `local_agent` for an
+    /// async subagent — the two cases users hit. `neverCompletes` drops the
+    /// idle snapshot + resumed turn to model a background job that never returns.
+    private func writeBackgroundLifecycleFakeClaude(
+        at script: URL,
+        taskType: String,
+        neverCompletes: Bool = false
+    ) throws {
+        // Built line-by-line with explicit indentation: interpolating an indented
+        // multi-line chunk into a Python loop body silently produces invalid
+        // indentation (the script then dies and the test measures the wrong thing).
+        let body = "    "
+        var lines: [String] = [
+            "#!/usr/bin/env python3",
+            "import json, sys, time",
+            "S = \"claude-bg-session\"",
+            "def e(o):",
+            "    print(json.dumps(o), flush=True)",
+            "e({\"type\":\"system\",\"subtype\":\"init\",\"session_id\":S})",
+            "for line in sys.stdin:",
+            body + "if not line.strip():",
+            body + "    continue",
+            // turn 1: dispatch async work, then end the turn early (the CLI's real behaviour)
+            body + "e({\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"tool_use\",\"id\":\"toolu_bg\",\"name\":\"Bash\",\"input\":{\"command\":\"sleep 30\",\"run_in_background\":True}}]},\"session_id\":S})",
+            body + "e({\"type\":\"system\",\"subtype\":\"background_tasks_changed\",\"tasks\":[{\"task_id\":\"T1\",\"task_type\":\"\(taskType)\",\"description\":\"work\"}],\"session_id\":S})",
+            body + "e({\"type\":\"system\",\"subtype\":\"task_started\",\"task_id\":\"T1\",\"task_type\":\"\(taskType)\",\"session_id\":S})",
+            body + "e({\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"PREMATURE_STANDING_BY\"}]},\"session_id\":S})",
+            body + "e({\"type\":\"result\",\"subtype\":\"success\",\"is_error\":False,\"result\":\"PREMATURE_STANDING_BY\",\"session_id\":S})",
+        ]
+        if !neverCompletes {
+            lines += [
+                body + "time.sleep(0.25)",
+                // provider goes idle, then resumes the agent on its own
+                body + "e({\"type\":\"system\",\"subtype\":\"background_tasks_changed\",\"tasks\":[],\"session_id\":S})",
+                body + "e({\"type\":\"system\",\"subtype\":\"task_updated\",\"task_id\":\"T1\",\"patch\":{\"status\":\"completed\"},\"session_id\":S})",
+                body + "e({\"type\":\"system\",\"subtype\":\"task_notification\",\"task_id\":\"T1\",\"status\":\"completed\",\"session_id\":S})",
+                body + "e({\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"REAL_ANSWER_AFTER_BG\"}]},\"session_id\":S})",
+                body + "e({\"type\":\"result\",\"subtype\":\"success\",\"is_error\":False,\"result\":\"REAL_ANSWER_AFTER_BG\",\"session_id\":S})",
+            ]
+        }
+        try lines.joined(separator: "\n").write(to: script, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: script.path)
+    }
+
+    private func runBackgroundLifecycleTurn(
+        taskType: String,
+        neverCompletes: Bool = false,
+        inactivityTimeout: TimeInterval = 900
+    ) async throws -> [AgentRunEvent] {
+        let tmp = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("rc2-claude-bg-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
+        let script = tmp.appendingPathComponent("fake-claude")
+        try writeBackgroundLifecycleFakeClaude(at: script, taskType: taskType, neverCompletes: neverCompletes)
+
+        let adapter = ClaudeStreamingCLIAdapter(
+            binaryNameOverride: script.path,
+            deferredFinishInactivityTimeout: inactivityTimeout
+        )
+        let threadId = AgentThreadID()
+        let sink = EventSink()
+        _ = try await adapter.sendTurn(AgentRunRequest(
+            threadId: threadId,
+            provider: .claude,
+            model: "claude-haiku-4-5-20251001",
+            cwd: tmp.path,
+            prompt: "launch background work"
+        )) { event in
+            Task { await sink.record(event) }
+        }
+        let deadline = Date().addingTimeInterval(4)
+        while Date() < deadline {
+            let finished = await sink.snapshot().contains { if case .finished = $0 { return true }; return false }
+            if finished { break }
+            try? await Task.sleep(nanoseconds: 30_000_000)
+        }
+        // Settle briefly so a (wrong) second terminal would be observed too.
+        try? await Task.sleep(nanoseconds: 250_000_000)
+        let events = await sink.snapshot()
+        try? adapter.stopSession(threadId: threadId)
+        return events
+    }
+
+    private static func finishedPairs(_ events: [AgentRunEvent]) -> [(AgentRunStatus, String?)] {
+        events.compactMap {
+            if case .finished(let status, let final, _) = $0 { return (status, final) }
+            return nil
+        }
+    }
+
+    func test_backgroundTaskDoesNotEndThreadUntilProviderIsIdle() async throws {
+        // THE REPORTED BUG: the agent launched a background shell and ended its
+        // turn; the app took that first `result` as terminal, reported the thread
+        // as completed (so it read as finished and invited a new message) and threw
+        // away the real answer the CLI streamed after the task finished.
+        let events = try await runBackgroundLifecycleTurn(taskType: "local_bash")
+        let finishes = Self.finishedPairs(events)
+
+        XCTAssertEqual(finishes.count, 1,
+                       "a run that left a background task running must produce exactly ONE terminal event, not one per provider `result`")
+        XCTAssertEqual(finishes.first?.1, "REAL_ANSWER_AFTER_BG",
+                       "the terminal must carry the answer the agent gave AFTER the background task completed — finishing on the premature `result` is what made the thread read as done while work was still running")
+        XCTAssertFalse(finishes.contains { $0.1 == "PREMATURE_STANDING_BY" },
+                       "the premature `result` emitted while background_tasks_changed still listed a task must never terminate the run")
+    }
+
+    func test_asyncSubagentDoesNotEndThreadUntilProviderIsIdle() async throws {
+        // Same defect for the other case the user hit: an async subagent (the CLI
+        // reports it as task_type `local_agent` and keeps streaming the subagent's
+        // own work after the parent turn's `result`).
+        let events = try await runBackgroundLifecycleTurn(taskType: "local_agent")
+        let finishes = Self.finishedPairs(events)
+
+        XCTAssertEqual(finishes.count, 1,
+                       "dispatching an async subagent must not make the run terminal until the subagent is done")
+        XCTAssertEqual(finishes.first?.1, "REAL_ANSWER_AFTER_BG",
+                       "the run must finish on the parent turn that follows the subagent's completion, carrying its real answer")
+    }
+
+    func test_deferredFinishStillReachesTerminalWhenBackgroundWorkNeverCompletes() async throws {
+        // Liveness bound (Codex advisory): withholding the finish must never let a
+        // run hang non-terminal forever. If the provider never reports idle, the
+        // watchdog releases the withheld finish so the thread still settles (and
+        // the awaiting-banner fallback can drive it), instead of spinning as
+        // "working" with no way out.
+        let events = try await runBackgroundLifecycleTurn(
+            taskType: "local_bash",
+            neverCompletes: true,
+            inactivityTimeout: 0.3
+        )
+        let finishes = Self.finishedPairs(events)
+
+        XCTAssertEqual(finishes.count, 1,
+                       "the inactivity watchdog must emit exactly one terminal when the provider never goes idle")
+        XCTAssertEqual(finishes.first?.1, "PREMATURE_STANDING_BY",
+                       "with no resumed turn to supersede it, the withheld finish is what settles the run")
+    }
+
+    func test_turnWithoutBackgroundWorkFinishesImmediately() async throws {
+        // Regression guard for the deferral gate: an ordinary turn (no background
+        // task ever reported) must still finish on its first `result` — the fix
+        // must not delay or double-emit the terminal for normal runs.
+        let tmp = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("rc2-claude-nobg-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
+        let script = tmp.appendingPathComponent("fake-claude")
+        try """
+        #!/usr/bin/env python3
+        import json, sys
+        S = "claude-nobg-session"
+        def e(o):
+            print(json.dumps(o), flush=True)
+        e({"type":"system","subtype":"init","session_id":S})
+        for line in sys.stdin:
+            if not line.strip():
+                continue
+            e({"type":"assistant","message":{"content":[{"type":"text","text":"PLAIN_ANSWER"}]},"session_id":S})
+            e({"type":"result","subtype":"success","is_error":False,"result":"PLAIN_ANSWER","session_id":S})
+        """.write(to: script, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: script.path)
+
+        let adapter = ClaudeStreamingCLIAdapter(binaryNameOverride: script.path)
+        let threadId = AgentThreadID()
+        let sink = EventSink()
+        _ = try await adapter.sendTurn(AgentRunRequest(
+            threadId: threadId,
+            provider: .claude,
+            model: "claude-haiku-4-5-20251001",
+            cwd: tmp.path,
+            prompt: "plain"
+        )) { event in
+            Task { await sink.record(event) }
+        }
+        try await waitForFinish(in: sink, expected: "PLAIN_ANSWER")
+        let plainEvents = await sink.snapshot()
+        XCTAssertEqual(Self.finishedPairs(plainEvents).count, 1,
+                       "a turn with no background work must emit exactly one terminal, unchanged by the deferral gate")
+        try adapter.stopSession(threadId: threadId)
+    }
+
     private func waitForFinish(in sink: EventSink, expected: String) async throws {
         let deadline = Date().addingTimeInterval(3)
         while Date() < deadline {
