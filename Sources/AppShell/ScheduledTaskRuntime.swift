@@ -309,7 +309,10 @@ public final class ScheduledTaskExecutor {
         }
         if user.name != NSUserName() { try verifyPasswordlessSudo(user: user) }
 
-        let snapshots = await router.listAgentProviderSnapshots()
+        // Discover install/auth/binary as the account that will actually run the
+        // provider (sudo -u target). App-owner snapshots reject valid foreign-user CLIs.
+        let runAsForProbe = Self.resolveRunAsUser(task: task)
+        let snapshots = await router.listAgentProviderSnapshots(runAsUser: runAsForProbe)
         if task.effectiveRoutingMode == .auto {
             let autoSnapshot = try await autoRoutingSnapshot(
                 task: task,

@@ -187,6 +187,8 @@ final class ScheduledTaskRuntimeTests: XCTestCase {
         // Foreign-user Auto must not put the scheduled .sh wrapper in launch configs.
         XCTAssertTrue(source.contains("launchProviderBinary"))
         XCTAssertTrue(source.contains("allowlisted provider binary"))
+        // Snapshot discovery must probe as the scheduled run-as user, not app owner.
+        XCTAssertTrue(source.contains("listAgentProviderSnapshots(runAsUser:"))
     }
 
     func test_scheduleDispatchPrompt_matchesAgentAppFirstTokenNormalization() {
