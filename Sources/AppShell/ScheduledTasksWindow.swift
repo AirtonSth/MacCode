@@ -100,7 +100,7 @@ public struct ScheduledTaskEditorDraft: Identifiable, Equatable {
         let recurrence: ScheduledTaskRecurrence
         switch frequency {
         case .once:
-            recurrence = .once(at: scheduledDate)
+            recurrence = .once(at: ScheduledTaskOccurrenceCalculator.canonicalInstant(scheduledDate))
         case .hourly:
             guard let value = ScheduledTaskRecurrence.makeHourly(anchor: scheduledDate, intervalHours: intervalHours) else {
                 throw ScheduledTaskPreflightError.invalidTask("Hourly interval must be between 1 and 24.")

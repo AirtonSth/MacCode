@@ -32,7 +32,11 @@ public final class ScheduledTaskStore: @unchecked Sendable {
         self.db = db
         self.encoder = JSONEncoder()
         self.decoder = JSONDecoder()
+        // Whole-second ISO8601 (no fractional seconds). Matches
+        // ScheduledTaskOccurrenceCalculator.canonicalInstant so next_run_at /
+        // scheduled_at / occurrence keys stay on the same precision.
         self.dates = ISO8601DateFormatter()
+        self.dates.formatOptions = [.withInternetDateTime]
     }
 
     public func list(search: String = "") throws -> [ScheduledTask] {
@@ -241,7 +245,15 @@ public final class ScheduledTaskStore: @unchecked Sendable {
                     heartbeatAt: now
                 )
                 guard try insertRunIfNew(run) else {
-                    try advance(taskID: task.id, nextRunAt: task.calculatedNextRun(after: scheduledAt), lastRunAt: task.lastRunAt, at: now)
+                    // Duplicate occurrence_key: advance past the spent slot
+                    // (not `after: scheduledAt` alone — subsecond truncation
+                    // would re-select the same hourly/once instant forever).
+                    try advance(
+                        taskID: task.id,
+                        nextRunAt: task.calculatedNextRunAfterSpent(scheduledAt),
+                        lastRunAt: task.lastRunAt,
+                        at: now
+                    )
                     continue
                 }
                 let update = try db.prepare("""
@@ -613,8 +625,13 @@ public final class ScheduledTaskStore: @unchecked Sendable {
         return try decoder.decode(ScheduledTaskRecurrence.self, from: data)
     }
 
-    private func string(_ date: Date?) -> String? { date.map(dates.string(from:)) }
-    private func date(_ string: String?) -> Date? { string.flatMap(dates.date(from:)) }
+    private func string(_ date: Date?) -> String? {
+        date.map { dates.string(from: ScheduledTaskOccurrenceCalculator.canonicalInstant($0)) }
+    }
+
+    private func date(_ string: String?) -> Date? {
+        string.flatMap(dates.date(from:)).map(ScheduledTaskOccurrenceCalculator.canonicalInstant)
+    }
 
     private static func safeErrorSummary(_ value: String?, removingPrompt prompt: String? = nil) -> String? {
         guard let value else { return nil }

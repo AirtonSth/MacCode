@@ -60,7 +60,9 @@ public enum ScheduledTaskRecurrence: Codable, Sendable, Equatable, Hashable {
     /// - Returns: `nil` when `intervalHours` is outside `1...24`.
     public static func makeHourly(anchor: Date, intervalHours: Int) -> ScheduledTaskRecurrence? {
         guard (1...24).contains(intervalHours) else { return nil }
-        return .hourly(anchor: anchor, intervalHours: intervalHours)
+        // Whole-second anchors: schedule storage is ISO8601 without fractional
+        // seconds; subsecond anchors re-select the spent slot after a fire.
+        return .hourly(anchor: ScheduledTaskOccurrenceCalculator.canonicalInstant(anchor), intervalHours: intervalHours)
     }
 
     /// - Returns: `nil` when `days` is empty or contains duplicates.
@@ -114,7 +116,9 @@ public enum ScheduledTaskRecurrence: Codable, Sendable, Equatable, Hashable {
         let kind = try c.decode(Kind.self, forKey: .kind)
         switch kind {
         case .once:
-            self = .once(at: try c.decode(Date.self, forKey: .at))
+            // Floor legacy subsecond instants so spent-occurrence advance cannot
+            // re-select the same once slot after whole-second persistence.
+            self = .once(at: ScheduledTaskOccurrenceCalculator.canonicalInstant(try c.decode(Date.self, forKey: .at)))
         case .hourly:
             let interval = try c.decode(Int.self, forKey: .intervalHours)
             guard (1...24).contains(interval) else {
@@ -124,7 +128,8 @@ public enum ScheduledTaskRecurrence: Codable, Sendable, Equatable, Hashable {
                     debugDescription: "hourly intervalHours must be in 1...24"
                 )
             }
-            self = .hourly(anchor: try c.decode(Date.self, forKey: .anchor), intervalHours: interval)
+            let anchor = ScheduledTaskOccurrenceCalculator.canonicalInstant(try c.decode(Date.self, forKey: .anchor))
+            self = .hourly(anchor: anchor, intervalHours: interval)
         case .daily:
             self = .daily(at: try Self.decodeLocalTime(from: c))
         case .weekdays:
@@ -157,10 +162,10 @@ public enum ScheduledTaskRecurrence: Codable, Sendable, Equatable, Hashable {
         switch self {
         case .once(let date):
             try c.encode(Kind.once, forKey: .kind)
-            try c.encode(date, forKey: .at)
+            try c.encode(ScheduledTaskOccurrenceCalculator.canonicalInstant(date), forKey: .at)
         case .hourly(let anchor, let intervalHours):
             try c.encode(Kind.hourly, forKey: .kind)
-            try c.encode(anchor, forKey: .anchor)
+            try c.encode(ScheduledTaskOccurrenceCalculator.canonicalInstant(anchor), forKey: .anchor)
             try c.encode(intervalHours, forKey: .intervalHours)
         case .daily(let time):
             try c.encode(Kind.daily, forKey: .kind)
@@ -210,6 +215,21 @@ public enum ScheduledTaskRecurrence: Codable, Sendable, Equatable, Hashable {
 /// - DST spring gap: prefer the next valid local time that day (`.nextTime`).
 /// - DST repeated time: prefer the first occurrence only (`.first`).
 public enum ScheduledTaskOccurrenceCalculator {
+    /// Schedule-domain instants are whole seconds. Subsecond precision is not a
+    /// product requirement (UI is minute-oriented) and ISO8601 persistence without
+    /// fractional seconds would otherwise re-select a spent hourly/once slot.
+    public static func canonicalInstant(_ date: Date) -> Date {
+        Date(timeIntervalSince1970: floor(date.timeIntervalSince1970))
+    }
+
+    /// Lower bound used after a claimed/spent occurrence so the next pointer never
+    /// lands on the same slot even when storage truncated subseconds.
+    ///
+    /// One second is safe: minimum hourly step is 1h; civil recurrences are minute+
+    /// apart; `.once` has no successor. Do **not** use this for editor "next preview"
+    /// or launch skip (`after: now`) — only after a real spent occurrence.
+    public static let spentOccurrenceAdvance: TimeInterval = 1
+
     /// First occurrence strictly after `date` for `recurrence` in `timeZone`.
     ///
     /// - Parameters:
@@ -229,11 +249,16 @@ public enum ScheduledTaskOccurrenceCalculator {
 
         switch recurrence {
         case .once(let at):
-            return at > date ? at : nil
+            let instant = canonicalInstant(at)
+            return instant > date ? instant : nil
 
         case .hourly(let anchor, let intervalHours):
             guard ScheduledTaskRecurrence.isValidHourlyInterval(intervalHours) else { return nil }
-            return nextHourly(after: date, anchor: anchor, intervalHours: intervalHours)
+            return nextHourly(
+                after: date,
+                anchor: canonicalInstant(anchor),
+                intervalHours: intervalHours
+            )
 
         case .daily(let time):
             return nextMatching(
@@ -268,8 +293,23 @@ public enum ScheduledTaskOccurrenceCalculator {
 
     /// Stable occurrence identity: task UUID + scheduled UTC epoch milliseconds.
     public static func occurrenceKey(taskID: UUID, scheduledAt: Date) -> String {
-        let millis = utcMilliseconds(scheduledAt)
+        let millis = utcMilliseconds(canonicalInstant(scheduledAt))
         return "\(taskID.uuidString.lowercased()):\(millis)"
+    }
+
+    /// Next occurrence after a claimed fire. Always strictly past the spent slot.
+    public static func nextOccurrenceAfterSpent(
+        scheduledAt: Date,
+        recurrence: ScheduledTaskRecurrence,
+        timeZone: TimeZone,
+        calendar: Calendar = Calendar(identifier: .gregorian)
+    ) -> Date? {
+        nextOccurrence(
+            after: canonicalInstant(scheduledAt).addingTimeInterval(spentOccurrenceAdvance),
+            recurrence: recurrence,
+            timeZone: timeZone,
+            calendar: calendar
+        )
     }
 
     // MARK: Private
@@ -277,6 +317,7 @@ public enum ScheduledTaskOccurrenceCalculator {
     private static func nextHourly(after date: Date, anchor: Date, intervalHours: Int) -> Date? {
         let step = TimeInterval(intervalHours) * 3600
         guard step > 0 else { return nil }
+        let anchor = canonicalInstant(anchor)
         if anchor > date { return anchor }
         let elapsed = date.timeIntervalSince(anchor)
         let steps = floor(elapsed / step)

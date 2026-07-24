@@ -3,7 +3,6 @@ import AppKit
 import CoreModel
 import Persistence
 import AgentRuntime
-import Surfaces
 import ServiceManagement
 import Darwin
 import os
@@ -106,91 +105,87 @@ public final class ScheduledTaskExecutor {
         try await prepareExecution(task).workspace
     }
 
-    /// Paste+play through a real Agent App tab — same path as the user opening
-    /// Agent App, setting user/provider/model, typing the prompt, and pressing play.
+    /// Headless in-process run: create a durable agent thread and start the
+    /// provider through the shared coordinator (`sendAgentMessage`), without
+    /// activating RemoteCode, switching workspaces, focusing Agent App tabs,
+    /// writing the composer textarea, or depending on a UI "play" click.
     ///
     /// Ownership stays in the interactive app process (local coordinator). No
-    /// LaunchAgent foreign ownership or XPC stop path.
+    /// LaunchAgent foreign ownership or XPC stop path. Rails refresh when a
+    /// surface already shows the workspace; the user's current focus is not
+    /// stolen.
     /// - Parameter onThreadCreated: called after the thread row exists so the
     ///   scheduler can link `scheduled_task_runs.thread_id` before provider start.
     public func execute(
         _ task: ScheduledTask,
         onThreadCreated: ((AgentThreadID) throws -> Void)? = nil
     ) async throws -> (threadID: AgentThreadID, runID: AgentRunID) {
-        _ = try await prepareExecution(task)
+        let prepared = try await prepareExecution(task)
         try Self.rejectUIOnlySchedulePrompt(task.prompt)
 
-        let surface = try router.openAgentAppForSchedule(workspace: task.workspaceID)
-        let vm = surface.viewModel
-        vm.setRunAsUser(Self.resolveRunAsUser(task: task) ?? AgentRunAsUser.current())
-        // setRunAsUser and surface open both kick unstructured snapshot loads.
-        // Wait until idle, then force one authoritative load, then idle again so
-        // Auto send is not refused for providerSnapshotsLoading.
-        await Self.waitForProviderSnapshotsIdle(vm)
-        await vm.loadProviderSnapshots()
-        await Self.waitForProviderSnapshotsIdle(vm)
-        guard vm.providerSnapshots.contains(where: {
-            $0.id == task.providerInstanceID && $0.provider == task.provider
-        }) else {
-            throw ScheduledTaskPreflightError.providerUnavailable(
-                "Provider instance \(task.providerInstanceID) is not available for \(task.runAsUser)."
-            )
-        }
-        vm.setProviderInstance(task.providerInstanceID)
-        // New-thread creation re-applies preferred model; pin exact schedule
-        // configuration after create, then fail closed if anything drifted.
-        vm.createThread(title: "New thread")
-        guard let threadID = vm.selectedThreadId else {
-            throw ScheduledTaskPreflightError.invalidTask(
-                vm.statusMessage.isEmpty
-                    ? "Scheduled task could not create an Agent App thread."
-                    : vm.statusMessage
-            )
-        }
-        try onThreadCreated?(threadID)
-
-        vm.setProviderInstance(task.providerInstanceID)
-        vm.setModel(task.model)
-        vm.setReasoningEffort(task.reasoningEffort)
-        vm.setPermissionMode(.fullAccess)
-        vm.interactionMode = .default
-        _ = vm.setAutoModelRoutingEnabled(task.effectiveRoutingMode == .auto)
-
-        if vm.providerInstanceId != task.providerInstanceID
-            || vm.provider != task.provider {
-            throw ScheduledTaskPreflightError.providerUnavailable(
-                "Could not pin provider \(task.provider.rawValue) / \(task.providerInstanceID) on the Agent App tab."
-            )
-        }
-        if task.effectiveRoutingMode != .auto, vm.model != task.model {
-            throw ScheduledTaskPreflightError.unsupportedModel(task.model)
-        }
-        if vm.permissionMode != .fullAccess {
-            throw ScheduledTaskPreflightError.invalidTask(
-                "Could not enable Full Access for the scheduled Agent App run."
-            )
-        }
-        if task.effectiveRoutingMode == .auto, vm.routingMode != .auto {
-            throw ScheduledTaskPreflightError.invalidTask(
-                "Could not enable Auto model routing for the scheduled run."
-            )
+        let runAs = Self.resolveRunAsUser(task: task)
+        let modelSelection = AgentModelSelection(
+            provider: task.provider,
+            modelId: task.model,
+            reasoningEffort: task.reasoningEffort
+        )
+        let routingConfiguration: AgentRoutingConfiguration?
+        if task.effectiveRoutingMode == .auto {
+            routingConfiguration = prepared.routingSnapshot?.configuration
+                ?? Self.routingConfiguration(
+                    for: task,
+                    policyDigest: orchestrationRuntime.policyDigest,
+                    eligibleProviders: [task.provider]
+                )
+        } else {
+            routingConfiguration = nil
         }
 
-        // Raw saved prompt — AgentAppViewModel.send() performs the same
-        // first-token normalization the play button uses.
-        vm.prompt = task.prompt
-        vm.attachments = []
-        await vm.send()
+        // surfaceID: nil → createAgentThread refreshes rails only; it does not
+        // select the new thread on any open Agent App tab (no focus yank).
+        let thread = try router.createAgentThread(
+            workspace: task.workspaceID,
+            title: task.title,
+            provider: task.provider,
+            model: task.model.isEmpty ? modelSelection.effectiveModel : task.model,
+            permissionMode: .fullAccess,
+            reasoningEffort: task.reasoningEffort,
+            modelSelection: modelSelection,
+            providerInstanceId: task.providerInstanceID,
+            runAsUser: runAs,
+            surfaceID: nil,
+            routingConfiguration: routingConfiguration
+        )
+        try onThreadCreated?(thread.id)
 
-        guard let runID = vm.currentRunId, vm.selectedThreadId == threadID else {
-            let detail = vm.statusMessage.trimmingCharacters(in: .whitespacesAndNewlines)
+        let sendResult = try await router.sendAgentMessage(
+            thread: thread.id,
+            text: task.prompt,
+            provider: task.provider,
+            model: task.model.isEmpty ? nil : task.model,
+            permissionMode: .fullAccess,
+            reasoningEffort: task.reasoningEffort,
+            interactionMode: .default,
+            modelSelection: modelSelection,
+            providerInstanceId: task.providerInstanceID,
+            attachments: [],
+            orchestrationRoutingSnapshot: prepared.routingSnapshot
+        )
+
+        switch sendResult.status {
+        case .started:
+            guard let runID = sendResult.runId else {
+                throw ScheduledTaskPreflightError.invalidTask(
+                    "Scheduled task send did not return a provider run id."
+                )
+            }
+            return (thread.id, runID)
+        case .queued:
+            // Brand-new thread must never queue behind another run.
             throw ScheduledTaskPreflightError.invalidTask(
-                detail.isEmpty
-                    ? "Scheduled task send did not start a provider run."
-                    : detail
+                "Scheduled task was queued instead of started. Retry when no other run is active on the thread."
             )
         }
-        return (threadID, runID)
     }
 
     /// Local Agent App commands that never start a provider turn. Scheduled
@@ -225,18 +220,6 @@ public final class ScheduledTaskExecutor {
         }
         // `/default body` is allowed — Agent App switches to Default then sends body.
         _ = argument
-    }
-
-    /// Wait until Agent App finishes all in-flight provider snapshot loads.
-    @MainActor
-    private static func waitForProviderSnapshotsIdle(
-        _ vm: AgentAppViewModel,
-        timeoutSeconds: Double = 15
-    ) async {
-        let deadline = Date().addingTimeInterval(timeoutSeconds)
-        while vm.providerSnapshotsLoading, Date() < deadline {
-            try? await Task.sleep(for: .milliseconds(50))
-        }
     }
 
     private static func resolveRunAsUser(task: ScheduledTask) -> AgentRunAsUser? {
@@ -635,7 +618,9 @@ public final class ScheduledTaskScheduler {
 
     private func execute(_ claim: ScheduledTaskClaim) async {
         do {
-            let next = claim.task.calculatedNextRun(after: claim.run.scheduledAt)
+            // Spent-slot advance (+1s) so whole-second persistence / subsecond
+            // anchors cannot re-select the occurrence that just claimed.
+            let next = claim.task.calculatedNextRunAfterSpent(claim.run.scheduledAt)
             try store.advance(taskID: claim.task.id, nextRunAt: next, lastRunAt: claim.task.lastRunAt)
             ScheduledTaskCrossProcess.notifyStoreChanged(reason: "queued")
             let identifiers = try await executor.execute(claim.task) { [self] threadID in

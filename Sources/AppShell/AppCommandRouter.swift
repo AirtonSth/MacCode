@@ -1904,8 +1904,12 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         return descriptor
     }
 
-    /// Fresh Agent App tab for a scheduled paste+play turn. Always creates a new
-    /// surface so an automatic fire never reconfigures a tab the user is drafting in.
+    /// Legacy helper: open + focus an Agent App tab for a workspace.
+    ///
+    /// Scheduled fires no longer call this — they run headless via
+    /// `createAgentThread` + `sendAgentMessage` so automatic work does not
+    /// activate the app, switch workspaces, or steal the composer.
+    /// Kept for manual deep-link / debug callers that intentionally want focus.
     @MainActor
     public func openAgentAppForSchedule(workspace: WorkspaceID) throws -> AgentAppSurface {
         guard context?.state.workspaces[workspace] != nil else {
