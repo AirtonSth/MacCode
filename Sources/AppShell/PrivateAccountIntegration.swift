@@ -970,16 +970,22 @@ public final class PrivateNotificationBridge: @unchecked Sendable {
         self.sessionRefresher = PrivatePushSessionRefresher(accountStore: accountStore, api: api)
     }
 
-    /// Returns true when a start-remap is allowed for this host (and records it).
-    private func consumeStartRemapBudget(hostId: String, now: Date = Date()) -> Bool {
+    /// True when a start-remap was *successfully* sent within the min interval.
+    /// Do not reserve budget before success — a failed attempt must still retry.
+    private func shouldSkipStartRemap(hostId: String, now: Date = Date()) -> Bool {
         startRemapLock.lock()
         defer { startRemapLock.unlock() }
         if let last = lastStartRemapAtByHost[hostId],
            now.timeIntervalSince(last) < Self.startRemapMinInterval {
-            return false
+            return true
         }
+        return false
+    }
+
+    private func recordStartRemapSuccess(hostId: String, now: Date = Date()) {
+        startRemapLock.lock()
+        defer { startRemapLock.unlock() }
         lastStartRemapAtByHost[hostId] = now
-        return true
     }
 
     public func deliver(_ content: RemoteCodeNotificationContent) async {
@@ -1168,11 +1174,11 @@ public final class PrivateNotificationBridge: @unchecked Sendable {
         _ record: LiveActivityAcceptanceRecord
     ) async throws -> PrivateLiveActivityV2DeliveryAck {
         let delivery = Self.effectiveDelivery(for: record)
-        // Rate-limit pure start-refresh remaps (update via push-to-start only).
-        // Return a soft-accepted ack so the outbox does not retry-storm.
-        if delivery.event == .start,
-           delivery.idempotencyKey.hasSuffix(".start-refresh"),
-           !consumeStartRemapBudget(hostId: delivery.projection.hostId) {
+        let isStartRefresh = delivery.event == .start
+            && delivery.idempotencyKey.hasSuffix(".start-refresh")
+        // Soft-ack only when a successful start-remap landed recently (coalesce).
+        // Never mark delivered after a failed attempt — that blocked real retries.
+        if isStartRefresh, shouldSkipStartRemap(hostId: delivery.projection.hostId) {
             Self.log.info(
                 "live-activity start-refresh suppressed (rate limit) host=\(delivery.projection.hostId, privacy: .public)"
             )
@@ -1210,6 +1216,9 @@ public final class PrivateNotificationBridge: @unchecked Sendable {
                     result.errorCode ?? "legacy_rejected"
                 )
             }
+            if isStartRefresh {
+                recordStartRemapSuccess(hostId: delivery.projection.hostId)
+            }
             return PrivateLiveActivityV2DeliveryAck(
                 id: delivery.idempotencyKey,
                 status: "delivered",
@@ -1229,6 +1238,9 @@ public final class PrivateNotificationBridge: @unchecked Sendable {
                 guard ack.isAccepted else {
                     throw LiveActivityAcceptanceOutboxError.backendDidNotAccept(ack.status)
                 }
+                if isStartRefresh || delivery.idempotencyKey.hasSuffix(".dismiss-reopen") {
+                    recordStartRemapSuccess(hostId: delivery.projection.hostId)
+                }
                 return ack
             } catch {
                 // User dismissed the Lock Screen card or ActivityKit ended it: the
@@ -1246,7 +1258,7 @@ public final class PrivateNotificationBridge: @unchecked Sendable {
                            $0.supportsLiveActivityV2 && $0.purpose == .pushToStart
                        })
                    }) {
-                    guard consumeStartRemapBudget(hostId: delivery.projection.hostId) else {
+                    if shouldSkipStartRemap(hostId: delivery.projection.hostId) {
                         Self.log.info(
                             "live-activity dismiss-reopen suppressed (rate limit) host=\(delivery.projection.hostId, privacy: .public)"
                         )
@@ -1265,6 +1277,7 @@ public final class PrivateNotificationBridge: @unchecked Sendable {
                     Self.log.info(
                         "live-activity update failed; reopening via push-to-start key=\(startDelivery.idempotencyKey, privacy: .public)"
                     )
+                    // recordStartRemapSuccess happens inside the recursive success path.
                     return try await sendLiveActivityAcceptance(startRecord)
                 }
                 throw error

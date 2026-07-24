@@ -749,7 +749,7 @@ final class LiveActivitySyncCoordinatorTests: XCTestCase {
                        "legacy devices must not receive the new contract until they advertise the capability")
     }
 
-    func testStartRefreshRemapIsRateLimitedPerHost() async throws {
+    func testStartRefreshRemapRetriesAfterFailureThenCoalescesAfterSuccess() async throws {
         let tmp = NSTemporaryDirectory() + "rc2-start-remap-rate-" + UUID().uuidString
         let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
         let settings = SettingsRepository(db: db)
@@ -772,22 +772,32 @@ final class LiveActivitySyncCoordinatorTests: XCTestCase {
             contractVersion: 2, capabilities: ["live_activity_v2"]
         )
         try targetStore.upsert(start)
-        let failingAPI = StartRemapCountingPrivateAccountAPI()
+        let api = StartRemapCountingPrivateAccountAPI(failuresBeforeSuccess: 1)
         let bridge = PrivateNotificationBridge(
             accountStore: accountStore,
             pushTargetStore: targetStore,
-            api: failingAPI
+            api: api
         )
         let update = makeDelivery(event: .update, generation: 1, revision: 2)
         let record = LiveActivityAcceptanceRecord(delivery: update, target: .v2(start))
-        // First start-refresh remap is allowed (budget consumed even if API fails).
-        _ = try? await bridge.sendLiveActivityAcceptance(record)
-        // Immediate second remap for the same host is soft-accepted without a second send.
-        let second = try await bridge.sendLiveActivityAcceptance(record)
-        XCTAssertEqual(second.status, "delivered",
-                       "rate-limited start-refresh must soft-ack so the outbox does not retry-storm")
-        XCTAssertLessThanOrEqual(failingAPI.deliverLiveActivityV2Calls, 1,
-                                 "second start-refresh within 60s must not hit the backend")
+        // Failed attempt must NOT soft-ack — outbox must be able to retry.
+        do {
+            _ = try await bridge.sendLiveActivityAcceptance(record)
+            XCTFail("first start-refresh must surface the backend failure")
+        } catch {
+            // expected
+        }
+        XCTAssertEqual(api.deliverLiveActivityV2Calls, 1)
+        // Retry after failure should hit the backend again and succeed.
+        let recovered = try await bridge.sendLiveActivityAcceptance(record)
+        XCTAssertTrue(recovered.isAccepted)
+        XCTAssertEqual(api.deliverLiveActivityV2Calls, 2,
+                       "failed start-refresh must not consume rate-limit budget")
+        // After success, further remaps within the window soft-ack without spam.
+        let coalesced = try await bridge.sendLiveActivityAcceptance(record)
+        XCTAssertEqual(coalesced.status, "delivered")
+        XCTAssertEqual(api.deliverLiveActivityV2Calls, 2,
+                       "successful start-refresh must rate-limit subsequent remaps")
     }
 
     func testHTTPPortOverrideIsSharedByListenerBonjourAndPairing() {
@@ -839,11 +849,15 @@ final class LiveActivitySyncCoordinatorTests: XCTestCase {
     }
 }
 
-/// Counts Live Activity v2 delivery attempts and always fails them so rate-limit
-/// soft-acks can be observed without a network.
+/// Counts Live Activity v2 delivery attempts; fails the first N then accepts.
 private final class StartRemapCountingPrivateAccountAPI: PrivateAccountAPI, @unchecked Sendable {
     private let lock = NSLock()
+    private let failuresBeforeSuccess: Int
     private(set) var deliverLiveActivityV2Calls = 0
+
+    init(failuresBeforeSuccess: Int = 0) {
+        self.failuresBeforeSuccess = failuresBeforeSuccess
+    }
 
     func login(email: String, password: String) async throws -> PrivateAccountSession {
         throw PrivateAccountAPIError.invalidResponse
@@ -885,8 +899,19 @@ private final class StartRemapCountingPrivateAccountAPI: PrivateAccountAPI, @unc
         request: PrivateLiveActivityV2DeliveryRequest,
         idempotencyKey: String
     ) async throws -> PrivateLiveActivityV2DeliveryAck {
-        lock.lock(); deliverLiveActivityV2Calls += 1; lock.unlock()
-        throw PrivateAccountAPIError.http(500)
+        lock.lock()
+        deliverLiveActivityV2Calls += 1
+        let call = deliverLiveActivityV2Calls
+        lock.unlock()
+        if call <= failuresBeforeSuccess {
+            throw PrivateAccountAPIError.http(500)
+        }
+        return PrivateLiveActivityV2DeliveryAck(
+            id: idempotencyKey,
+            status: "delivered",
+            attempts: 1,
+            nextAttemptAt: nil
+        )
     }
 }
 
