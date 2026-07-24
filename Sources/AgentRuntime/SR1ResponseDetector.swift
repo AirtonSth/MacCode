@@ -1,4 +1,5 @@
 import Foundation
+import CoreModel
 
 public struct SR1ClassifierDecision: Equatable, Sendable {
     public let isSR1: Bool
@@ -17,9 +18,15 @@ public struct SR1ClassifierDecision: Equatable, Sendable {
 public typealias SR1ResponseClassifier = @Sendable (String) -> SR1ClassifierDecision?
 
 public enum SR1ResponseDetector {
-    private static let semanticPrefixes = Set("SCDRONP")
+    // Single source of truth: see CoreModel.DistillSemanticPrefixes for why this
+    // must not be re-typed per module.
+    private static let semanticPrefixes = DistillSemanticPrefixes.set
     private static let variableKeyPattern = #"#[A-Za-z][0-9]+"#
     public static let classifierConfidenceThreshold = 0.82
+
+    /// Longest bare `O:` line still treated as an R0 chat reply rather than a
+    /// compressed dialect payload. See `isBareShortOutcomeLine`.
+    static let bareOutcomeExemptionMaxLength = 120
 
     public static func parseSemanticLine(_ line: String) -> (prefix: Character, content: String)? {
         let trimmed = line.trimmingCharacters(in: .whitespaces)
@@ -123,6 +130,13 @@ public enum SR1ResponseDetector {
         if inlineSegments.count >= 2, startsWithSemanticMarker(trimmed) {
             return true
         }
+        // R0 exemption: a lone short `O:` line is the dialect's own chat-reply
+        // shape, not a compressed payload. Must come before the single-line and
+        // all-lines-semantic branches below, both of which would otherwise
+        // classify it as SR1.
+        if lines.count == 1, isBareShortOutcomeLine(trimmed) {
+            return false
+        }
         if lines.count == 1, isSingleSemanticLine(trimmed) {
             return true
         }
@@ -153,6 +167,35 @@ public enum SR1ResponseDetector {
         if dictionaryLineCount >= 2, semanticLineCount >= 1 { return true }
         return semanticLineCount >= 3 &&
             (delimitedSemanticLineCount > 0 || semanticPrefixesSeen.count >= 2)
+    }
+
+    /// A lone, short, colon-delimited `O:` line is the dialect's own R0 chat reply
+    /// (the spec's own example is `O: bem, obrigado — pronto pro próximo`), not a
+    /// compressed dialect payload.
+    ///
+    /// WHY this exemption exists: classifying that shape as SR1 costs a full extra
+    /// local-model humanization round trip plus a permanent "translated from
+    /// compressed output" badge on the cheapest replies in the product — the exact
+    /// replies Token Saver is supposed to make cheapest — and it trains the user to
+    /// ignore the badge that exists to flag genuine leaks.
+    ///
+    /// Deliberately narrow so a real payload is never exempted: one semantic
+    /// segment only (so `O: x. P: y.` stays SR1), prefix must be `O` (an
+    /// outcome-only line carries no ops fields needing expansion), colon or equals
+    /// delimited (a space-delimited lone outcome already returns false today),
+    /// bounded length, and no `#`-variable alias, which would still need `Dict:`
+    /// expansion to be readable by a human.
+    static func isBareShortOutcomeLine(_ trimmed: String) -> Bool {
+        guard !trimmed.contains(where: \.isNewline),
+              trimmed.count <= bareOutcomeExemptionMaxLength,
+              isDelimitedSemanticLine(trimmed),
+              let parsed = parseSemanticLine(trimmed),
+              parsed.prefix == "O",
+              parseSemanticSegmentsInLine(trimmed).count <= 1,
+              trimmed.range(of: variableKeyPattern, options: .regularExpression) == nil else {
+            return false
+        }
+        return true
     }
 
     private static func parseSemanticSegmentsInLine(_ rawLine: String) -> [(prefix: Character, content: String)] {
@@ -284,7 +327,7 @@ public enum SR1ResponseDetector {
             .trimmingCharacters(in: CharacterSet(charactersIn: ".,;"))
             .trimmingCharacters(in: .whitespacesAndNewlines)
         if value.localizedCaseInsensitiveContains("dict:") ||
-            value.range(of: #"\b[ScdronpSCDRONP]\s*=\s*[A-Za-z-]+"#, options: .regularExpression) != nil {
+            value.range(of: DistillSemanticPrefixes.aliasDeclarationPattern, options: .regularExpression) != nil {
             return nil
         }
         let segments = parseSemanticSegments(value)

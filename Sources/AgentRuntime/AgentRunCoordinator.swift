@@ -3473,7 +3473,8 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         let lower = trimmed.lowercased()
         if lower.hasPrefix("sr1") || lower.hasPrefix("dict") { return true }
         guard let first = trimmed.first?.uppercased().first,
-              "SCDRONP".contains(first) else {
+              // Single source of truth: see CoreModel.DistillSemanticPrefixes.
+              DistillSemanticPrefixes.set.contains(first) else {
             return false
         }
         let rest = trimmed.dropFirst()
@@ -3487,6 +3488,15 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             return true
         }
         let allowOutcomeSpace = runUsesDistillOutputMode(runId)
+        // R0 exemption: a lone short `O:` line is the dialect's own chat-reply shape,
+        // so translating it buys an extra local-model round trip plus a "translated"
+        // badge on the cheapest replies. Only exempt while this run has not already
+        // produced real dialect output — once it has, a bare outcome line is far more
+        // likely to be a continuation of that dialect than a greeting.
+        if !allowOutcomeSpace,
+           SR1ResponseDetector.isBareShortOutcomeLine(text.trimmingCharacters(in: .whitespacesAndNewlines)) {
+            return false
+        }
         if SR1ResponseDetector.isSingleSemanticLine(text, allowSpaceDelimitedOutcome: allowOutcomeSpace) {
             markDistillOutputMode(runId)
             return true
