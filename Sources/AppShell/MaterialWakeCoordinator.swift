@@ -3,7 +3,8 @@ import os
 import SocketServer
 
 /// S-005a: expand silent catch-up emission for Phase A material kinds.
-/// Subscribes to EventBus; never pushes stream_only kinds. Behind `wake_phase_a` flag (default off).
+/// Subscribes to EventBus; never pushes stream_only kinds. Gated by `wake_phase_a`
+/// (default **on**; kill via UserDefaults false).
 public final class MaterialWakeCoordinator: @unchecked Sendable {
     public static let shared = MaterialWakeCoordinator()
     private static let log = Logger(subsystem: "io.remotecode.app", category: "material-wake")
