@@ -1766,7 +1766,7 @@ final class BonjourDelegate: NSObject, NetServiceDelegate {
     }
     func netService(_ sender: NetService, didNotPublish errorDict: [String: NSNumber]) {
         NSLog("Bonjour: FAILED to publish \(sender.name): \(errorDict)")
-        onFailure(NSError(domain: "Bonjour", code: (errorDict[NetService.errorCode] as? NSNumber)?.intValue ?? -1, userInfo: errorDict))
+        onFailure(NSError(domain: "Bonjour", code: errorDict[NetService.errorCode]?.intValue ?? -1, userInfo: errorDict))
     }
 }
 
