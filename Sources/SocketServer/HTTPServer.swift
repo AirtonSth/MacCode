@@ -352,12 +352,26 @@ public final class DirectHTTPServer: @unchecked Sendable {
     /// Clamp an optional client proposal into the host profile offer.
     /// Client proposes (headers or policy); host accepts within profile, or counters
     /// by the profile ceiling. Missing proposal → host profile defaults.
+    ///
+    /// Full-content fidelity (filter `.full`) must not force Wi‑Fi liveness when
+    /// the client proposes cellular-scale budgets (4G+Tailscale street path).
     nonisolated static func negotiateHeartbeatProfile(
         filter: EventStreamFilter,
         proposedIntervalMs: Int64?,
         proposedTimeoutMs: Int64?
     ) -> WebSocketHeartbeatProfile {
-        let offer = heartbeatProfile(forWSFilter: filter)
+        let filterOffer = heartbeatProfile(forWSFilter: filter)
+        // If the client asks for ≥ cellular timeout (60s+), raise the ceiling to
+        // the cellular profile even when content filter stays full fidelity.
+        let offer: WebSocketHeartbeatProfile
+        if let proposedTimeoutMs, proposedTimeoutMs >= 60_000 {
+            offer = WebSocketHeartbeatProfile(
+                interval: max(filterOffer.interval, wsHeartbeatProfileCellular.interval),
+                timeout: max(filterOffer.timeout, wsHeartbeatProfileCellular.timeout)
+            )
+        } else {
+            offer = filterOffer
+        }
         let minInterval: TimeInterval = 1
         let interval: TimeInterval
         if let proposedIntervalMs, proposedIntervalMs > 0 {

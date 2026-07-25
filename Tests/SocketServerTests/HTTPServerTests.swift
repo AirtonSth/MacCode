@@ -508,6 +508,18 @@ final class HTTPServerTests: XCTestCase {
             proposedTimeoutMs: nil
         )
         XCTAssertEqual(wifi, DirectHTTPServer.wsHeartbeatProfileWiFi)
+
+        // Full content fidelity + cellular-scale client proposal (street 4G):
+        // must not clamp to Wi‑Fi 10s/30s liveness.
+        let fullWithCellularProposal = DirectHTTPServer.negotiateHeartbeatProfile(
+            filter: .full,
+            proposedIntervalMs: 25_000,
+            proposedTimeoutMs: 90_000
+        )
+        XCTAssertEqual(fullWithCellularProposal.interval, 25,
+                       "full filter must still accept cellular interval proposals")
+        XCTAssertEqual(fullWithCellularProposal.timeout, 90,
+                       "full filter must still accept cellular timeout proposals on 4G")
     }
 
     func test_webSocketLiveness_requiresExactPongPayloadByDeadline() {
