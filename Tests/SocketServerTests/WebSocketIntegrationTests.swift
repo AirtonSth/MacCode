@@ -11,6 +11,44 @@ import CoreModel
 @MainActor
 final class WebSocketIntegrationTests: XCTestCase {
 
+    func testResumeCursorRequiresMatchingHostAndBootEpoch() {
+        XCTAssertEqual(
+            DirectHTTPServer.acceptedResumeSequence(
+                requestedSinceSequence: 12,
+                requestedResumeHost: "host-a",
+                requestedResumeBootEpoch: 7,
+                serverId: "host-a",
+                bootEpoch: 7,
+                currentSequence: 20
+            ),
+            12
+        )
+        XCTAssertEqual(
+            DirectHTTPServer.acceptedResumeSequence(
+                requestedSinceSequence: 12,
+                requestedResumeHost: "host-a",
+                requestedResumeBootEpoch: 6,
+                serverId: "host-a",
+                bootEpoch: 7,
+                currentSequence: 20
+            ),
+            0,
+            "a Mac restart must force a fresh baseline instead of replaying a prior epoch"
+        )
+        XCTAssertEqual(
+            DirectHTTPServer.acceptedResumeSequence(
+                requestedSinceSequence: 12,
+                requestedResumeHost: nil,
+                requestedResumeBootEpoch: nil,
+                serverId: "host-a",
+                bootEpoch: 7,
+                currentSequence: 20
+            ),
+            12,
+            "legacy clients without the optional envelope retain the since-seq contract"
+        )
+    }
+
     private func startServer(
         clientReceiveTimeoutSeconds: Int = 20,
         webSocketOutboundMaxQueuedBytes: Int = DirectHTTPServer.maxWebSocketOutboundQueuedBytes,

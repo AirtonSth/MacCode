@@ -488,6 +488,23 @@ public final class DirectHTTPServer: @unchecked Sendable {
         return min(wsSnapshotTimeoutMaxMs, max(wsSnapshotTimeoutMinMs, proposedMs))
     }
 
+    /// Pure resume-contract seam. A cursor is usable only when the optional
+    /// envelope is absent (legacy client) or matches this host's identity and
+    /// current boot epoch; stale envelopes deliberately start at zero.
+    public static func acceptedResumeSequence(
+        requestedSinceSequence: Int64,
+        requestedResumeHost: String?,
+        requestedResumeBootEpoch: Int64?,
+        serverId: String,
+        bootEpoch: Int64,
+        currentSequence: Int64
+    ) -> Int64 {
+        let hasEnvelope = requestedResumeHost != nil || requestedResumeBootEpoch != nil
+        let matches = requestedResumeHost == serverId && requestedResumeBootEpoch == bootEpoch
+        guard !hasEnvelope || matches else { return 0 }
+        return min(max(0, requestedSinceSequence), max(0, currentSequence))
+    }
+
     /// Clamp an optional client proposal into the host profile offer.
     /// Client proposes (headers or policy); host accepts within profile, or counters
     /// by the profile ceiling. Missing proposal → host profile defaults.
@@ -1291,16 +1308,14 @@ public final class DirectHTTPServer: @unchecked Sendable {
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             let requestedResumeBootEpoch = headers["x-rc2-resume-boot-epoch"]
                 .flatMap { Int64($0.trimmingCharacters(in: .whitespaces)) }
-            let hasResumeEnvelope = requestedResumeHost != nil || requestedResumeBootEpoch != nil
-            let resumeMatchesHost = requestedResumeHost == serverId
-                && requestedResumeBootEpoch == Int64(bootEpoch)
-            // A cursor is trusted only when its host and boot epoch match this
-            // process. A stale envelope therefore gets a fresh baseline while
-            // legacy clients that send only X-RC2-Since-Seq remain compatible.
-            let resumeAccepted = !hasResumeEnvelope || resumeMatchesHost
-            let wsSinceSeq = resumeAccepted
-                ? min(max(0, requestedSinceSequence), eventSnapshot.sequence)
-                : 0
+            let wsSinceSeq = Self.acceptedResumeSequence(
+                requestedSinceSequence: requestedSinceSequence,
+                requestedResumeHost: requestedResumeHost,
+                requestedResumeBootEpoch: requestedResumeBootEpoch,
+                serverId: serverId,
+                bootEpoch: Int64(bootEpoch),
+                currentSequence: eventSnapshot.sequence
+            )
             let sequenceWatermark = ConnectionSequenceWatermark(initialSequence: wsSinceSeq)
             let welcome = ConnectionTransportFrame.welcome(ConnectionWelcomeFrame(
                 protocolVersion: ConnectionTransportFrame.protocolVersion,
