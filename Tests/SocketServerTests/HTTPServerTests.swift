@@ -64,6 +64,39 @@ final class HTTPServerTests: XCTestCase {
         super.tearDown()
     }
 
+    // MARK: - urlHostLiteral / endpointURLString (IPv6 zone-id URL hosts)
+
+    func test_urlHostLiteral_encodes_bracketed_ipv6_zone_id() {
+        // WHY: Link-local peers arrive already-bracketed from some callers;
+        // bare `%en0` is illegal in a URL host and must become `%25en0`.
+        XCTAssertEqual(urlHostLiteral("[fe80::1%en0]"), "[fe80::1%25en0]")
+        XCTAssertEqual(
+            endpointURLString(scheme: "http", host: "[fe80::1%en0]", port: 18217),
+            "http://[fe80::1%25en0]:18217/"
+        )
+    }
+
+    func test_urlHostLiteral_does_not_double_encode_percent25_zone() {
+        // WHY: Re-encoding `%25` → `%2525` breaks already-correct URL hosts and
+        // would make dual-stack / AWDL discovery strings unroutable.
+        XCTAssertEqual(urlHostLiteral("[fe80::1%25en0]"), "[fe80::1%25en0]")
+        XCTAssertEqual(urlHostLiteral("fe80::1%25en0"), "[fe80::1%25en0]")
+    }
+
+    func test_urlHostLiteral_preserves_global_and_plain_bracketed_ipv6() {
+        // WHY: Global unicast and already-correct bracketed hosts must pass
+        // through without invented zone IDs or extra percent sequences.
+        XCTAssertEqual(urlHostLiteral("[2001:db8::1]"), "[2001:db8::1]")
+        XCTAssertEqual(urlHostLiteral("2001:db8::1"), "[2001:db8::1]")
+        XCTAssertEqual(urlHostLiteral("fe80::1%en0"), "[fe80::1%25en0]")
+        XCTAssertEqual(urlHostLiteral("127.0.0.1"), "127.0.0.1")
+        XCTAssertEqual(urlHostLiteral("localhost"), "localhost")
+        XCTAssertEqual(
+            endpointURLString(scheme: "ws", host: "2001:db8::1", port: 443, path: "/v1/ws"),
+            "ws://[2001:db8::1]:443/v1/ws"
+        )
+    }
+
     @MainActor
     func test_health_and_discovery_loopback() throws {
         let port = UInt16.random(in: 33000...44000)

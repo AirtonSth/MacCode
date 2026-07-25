@@ -134,6 +134,117 @@ public func serverListenerEventPayload(bound: Bool, address: String, port: UInt1
     ]
 }
 
+/// Observable publication lifecycle for the TCP listener (and Bonjour supervisors
+/// that mirror the same states). Bounded retries use `ListenerRetryPolicy`.
+public enum ListenerPublicationState: String, Sendable, Equatable {
+    case idle
+    case publishing
+    case published
+    case failed
+}
+
+/// Bounded listen/publish retry schedule. Exhaustion is explicit (`nil` delay)
+/// so supervisors never storm with infinite tight loops.
+public struct ListenerRetryPolicy: Sendable, Equatable {
+    public let delaysSeconds: [TimeInterval]
+
+    /// Default: 1s, 2s, 4s — matches the historical supervisor ladder without
+    /// continuing forever after the third failure.
+    public static let `default` = ListenerRetryPolicy(delaysSeconds: [1, 2, 4])
+
+    public init(delaysSeconds: [TimeInterval]) {
+        self.delaysSeconds = delaysSeconds.filter { $0 >= 0 }
+    }
+
+    public var maxAttempts: Int { delaysSeconds.count }
+
+    /// 0-based failure index → delay before the next attempt, or nil when exhausted.
+    public func delayAfterFailure(attemptIndex: Int) -> TimeInterval? {
+        guard attemptIndex >= 0, attemptIndex < delaysSeconds.count else { return nil }
+        return delaysSeconds[attemptIndex]
+    }
+
+    public func isExhausted(afterFailureCount failures: Int) -> Bool {
+        failures >= delaysSeconds.count
+    }
+}
+
+/// Extended listener publication payload (diagnostics / UI). Does not replace
+/// the stable three-key `serverListenerEventPayload` contract.
+public func listenerPublicationStatusPayload(
+    state: ListenerPublicationState,
+    bound: Bool,
+    address: String,
+    port: UInt16,
+    attempt: Int,
+    maxAttempts: Int,
+    nextRetryMs: Int? = nil,
+    errorCode: Int? = nil
+) -> [String: Any] {
+    var payload: [String: Any] = [
+        "state": state.rawValue,
+        "bound": bound,
+        "address": address,
+        "port": Int(port),
+        "attempt": attempt,
+        "max_attempts": maxAttempts
+    ]
+    if let nextRetryMs { payload["next_retry_ms"] = nextRetryMs }
+    if let errorCode { payload["error_code"] = errorCode }
+    return payload
+}
+
+/// Bracket IPv6 literals (and percent-encode zone IDs) for URL host components.
+/// IPv4 and hostnames pass through unchanged. Does not invent relays.
+///
+/// Already-bracketed hosts still get zone-id encoding (`[fe80::1%en0]` →
+/// `[fe80::1%25en0]`) without double-encoding an existing `%25`.
+public func urlHostLiteral(_ host: String) -> String {
+    if host.hasPrefix("[") {
+        guard host.hasSuffix("]") else { return host }
+        let inner = String(host.dropFirst().dropLast())
+        return "[\(encodeIPv6ZoneIDForURL(inner))]"
+    }
+    // Scope id: fe80::1%en0 → fe80::1%25en0 inside brackets.
+    if host.contains(":") {
+        return "[\(encodeIPv6ZoneIDForURL(host))]"
+    }
+    return host
+}
+
+/// Percent-encode bare IPv6 zone-id `%` for URL hosts; leave existing `%25` alone.
+private func encodeIPv6ZoneIDForURL(_ host: String) -> String {
+    guard host.contains("%") else { return host }
+    var out = String()
+    out.reserveCapacity(host.count + 4)
+    var i = host.startIndex
+    while i < host.endIndex {
+        if host[i] == "%" {
+            let after = host.index(after: i)
+            // Already percent-encoded zone separator: keep "%25" intact.
+            if after < host.endIndex,
+               host[after] == "2",
+               host.index(after: after) < host.endIndex,
+               host[host.index(after: after)] == "5" {
+                out.append(contentsOf: "%25")
+                i = host.index(i, offsetBy: 3)
+            } else {
+                out.append(contentsOf: "%25")
+                i = after
+            }
+        } else {
+            out.append(host[i])
+            i = host.index(after: i)
+        }
+    }
+    return out
+}
+
+public func endpointURLString(scheme: String, host: String, port: UInt16, path: String = "/") -> String {
+    let normalizedPath = path.hasPrefix("/") ? path : "/" + path
+    return "\(scheme)://\(urlHostLiteral(host)):\(port)\(normalizedPath)"
+}
+
 /// Pure helper: builds the JSON error body for pairing HTTP error responses.
 /// CONTRACT (:23):
 ///   - HTTP status caller must use: 503 for pairing_disabled, 410 for code_expired / code_invalid,
@@ -285,8 +396,36 @@ public final class DirectHTTPServer: @unchecked Sendable {
     /// 25 MiB decoded attachment + base64 expansion + bounded JSON envelope.
     /// The dispatcher/store still enforce the authoritative decoded-byte cap.
     static let maxAttachmentUploadRequestBodyBytes = 36 * 1024 * 1024
-    static let maxClientFramePayloadBytes = 1024 * 1024
+    static let maxClientFramePayloadBytes = WebSocketClientFrameAssembler.maxFragmentedMessageBytes
     public static let maxWebSocketOutboundQueuedBytes = 1024 * 1024
+
+    /// Baseline welcome capabilities required by old and new peers. Optional
+    /// negotiated controls (e.g. `stream.interest.v1`) are appended only when
+    /// the host actually implements them — see `welcomeCapabilities(streamInterestSupported:)`.
+    public static let baselineWelcomeCapabilities: [String] = [
+        "events.replay", "jsonrpc.batch", "snapshot.v3",
+        "rpc.websocket", "snapshot.incremental",
+    ]
+
+    /// Wire name for mid-session interest control (iOS sends `rc2.interest` only
+    /// after seeing this capability on welcome).
+    public static let streamInterestCapability = "stream.interest.v1"
+
+    /// Mac implements `EventStreamFilter.parseInterestControl` + live filter update.
+    public static var supportsStreamInterestControl: Bool { true }
+
+    /// Welcome capability list: baseline always present; `stream.interest.v1`
+    /// only when the host can apply interest control (preserves old-peer shape
+    /// when the flag is false).
+    public static func welcomeCapabilities(
+        streamInterestSupported: Bool = DirectHTTPServer.supportsStreamInterestControl
+    ) -> [String] {
+        var caps = baselineWelcomeCapabilities
+        if streamInterestSupported {
+            caps.append(streamInterestCapability)
+        }
+        return caps
+    }
     /// Wi-Fi / unmetered default: snappy dead-peer detection without thrashing radio idle.
     public static let wsHeartbeatProfileWiFi = WebSocketHeartbeatProfile(interval: 10, timeout: 30)
     /// Cellular / Low Data (`X-RC2-WS-Filter: cellular-safe`): tolerate 3G RRC promotion
@@ -465,14 +604,30 @@ public final class DirectHTTPServer: @unchecked Sendable {
     private let webSocketOutboundMaxQueuedBytes: Int
 
     private var listenFD: Int32 = -1
+    /// Optional dual-stack IPv6 listener. Failure to bind IPv6 never tears down IPv4.
+    private var listenFD6: Int32 = -1
     private var accept: Thread?
+    private var accept6: Thread?
     private let acceptedSockets = AcceptedSocketRegistry()
+    private let listenerStateLock = NSLock()
+    private var _listenerPublicationState: ListenerPublicationState = .idle
+    private var _listenerPublishAttempt: Int = 0
+    private let listenerRetryPolicy = ListenerRetryPolicy.default
 
     static let maximumAcceptedConnections = AcceptedSocketRegistry.defaultMaximumDescriptors
     var acceptedSocketCountForTests: Int { acceptedSockets.count }
     var afterWelcomeWriteForTests: ((String) -> Void)?
     var acceptedFDObserverForTesting: (@Sendable (Int32) -> Void)?
     var connectionReadWaitObserverForTesting: (@Sendable (Int32, ConnectionReadWaitStageForTesting) -> Void)?
+
+    /// Explicit publication state for diagnostics (idle/publishing/published/failed).
+    public var listenerPublicationState: ListenerPublicationState {
+        listenerStateLock.lock(); defer { listenerStateLock.unlock() }
+        return _listenerPublicationState
+    }
+
+    /// True when the IPv6 listener is bound (dual-stack path active).
+    public var isIPv6ListenerBound: Bool { listenFD6 >= 0 }
 
     public init(port: UInt16 = 18217, loopbackOnly: Bool = true, dispatcher: JSONRPCDispatcher, auth: DirectAuthProvider? = nil, serverId: String = ProcessInfo.processInfo.globallyUniqueString, bootEpoch: UInt64, clientReceiveTimeoutSeconds: Int = DirectHTTPServer.httpKeepAliveIdleTimeoutSeconds, webSocketOutboundMaxQueuedBytes: Int = DirectHTTPServer.maxWebSocketOutboundQueuedBytes) {
         self.port = port
@@ -487,8 +642,20 @@ public final class DirectHTTPServer: @unchecked Sendable {
     }
 
     public func start() throws {
+        setListenerState(.publishing, attempt: 1)
+        publishListenerStatus(
+            state: .publishing,
+            bound: false,
+            attempt: 1,
+            nextRetryMs: nil,
+            errorCode: nil
+        )
+
         listenFD = socket(AF_INET, SOCK_STREAM, 0)
-        if listenFD < 0 { throw POSIXError(.EIO) }
+        if listenFD < 0 {
+            markListenerFailed(errorCode: Int(errno))
+            throw POSIXError(.EIO)
+        }
         // Close-on-exec: forkpty terminal shells (and any other spawned child)
         // must not inherit the listener, or an orphaned child keeps port 18217
         // bound after the app stops and every rebind fails EADDRINUSE while
@@ -497,6 +664,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
             let savedErrno = errno
             close(listenFD)
             listenFD = -1
+            markListenerFailed(errorCode: Int(savedErrno))
             throw POSIXError(POSIXErrorCode(rawValue: savedErrno) ?? .EIO)
         }
         var yes: Int32 = 1
@@ -522,13 +690,20 @@ public final class DirectHTTPServer: @unchecked Sendable {
                 if let s = v as? String { return .string(s) }
                 return .string("\(v)")
             }))
+            markListenerFailed(errorCode: Int(savedErrno))
             throw NSError(domain: "RC2.HTTP", code: Int(savedErrno), userInfo: [NSLocalizedDescriptionKey: msg])
         }
         if Darwin.listen(listenFD, 32) < 0 {
             let savedErrno = errno
             close(listenFD); listenFD = -1
+            markListenerFailed(errorCode: Int(savedErrno))
             throw POSIXError(POSIXErrorCode(rawValue: savedErrno) ?? .EIO)
         }
+
+        // Dual-stack: optional IPv6 listener. Failure is non-fatal so IPv4
+        // clients keep working (do not invent a relay or break v4-only paths).
+        listenFD6 = Self.bindIPv6Listener(port: port, loopbackOnly: bindLoopbackOnly)
+
         let acceptanceGeneration = acceptedSockets.activate()
         let listenerDescriptor = listenFD
         let t = Thread { [weak self] in
@@ -540,6 +715,20 @@ public final class DirectHTTPServer: @unchecked Sendable {
         t.name = "RC2.HTTPAccept"
         t.start()
         accept = t
+
+        if listenFD6 >= 0 {
+            let v6 = listenFD6
+            let t6 = Thread { [weak self] in
+                self?.acceptLoop(
+                    listenerDescriptor: v6,
+                    acceptanceGeneration: acceptanceGeneration
+                )
+            }
+            t6.name = "RC2.HTTPAccept6"
+            t6.start()
+            accept6 = t6
+        }
+
         let bindAddr = bindLoopbackOnly ? "127.0.0.1" : "0.0.0.0"
         let successPayload = serverListenerEventPayload(bound: true, address: bindAddr, port: port)
         EventBus.shared.publish(kind: "server.listener", payload: .object(successPayload.mapValues { v in
@@ -548,6 +737,14 @@ public final class DirectHTTPServer: @unchecked Sendable {
             if let s = v as? String { return .string(s) }
             return .string("\(v)")
         }))
+        setListenerState(.published, attempt: 1)
+        publishListenerStatus(
+            state: .published,
+            bound: true,
+            attempt: 1,
+            nextRetryMs: nil,
+            errorCode: nil
+        )
     }
 
     public func stop() {
@@ -560,14 +757,121 @@ public final class DirectHTTPServer: @unchecked Sendable {
             close(listenFD)
             listenFD = -1
         }
+        if listenFD6 >= 0 {
+            shutdown(listenFD6, SHUT_RDWR)
+            close(listenFD6)
+            listenFD6 = -1
+        }
+        accept6 = nil
+        setListenerState(.idle, attempt: 0)
+    }
+
+    /// Pure helper used by supervisors: next delay after `failureCount` failures,
+    /// or nil when the bounded policy is exhausted (no infinite storm).
+    public func nextListenerRetryDelayMs(afterFailureCount failureCount: Int) -> Int? {
+        guard let delay = listenerRetryPolicy.delayAfterFailure(attemptIndex: failureCount) else {
+            return nil
+        }
+        return Int((delay * 1000).rounded())
+    }
+
+    private func setListenerState(_ state: ListenerPublicationState, attempt: Int) {
+        listenerStateLock.lock()
+        _listenerPublicationState = state
+        _listenerPublishAttempt = attempt
+        listenerStateLock.unlock()
+    }
+
+    private func markListenerFailed(errorCode: Int) {
+        let attempt: Int = {
+            listenerStateLock.lock(); defer { listenerStateLock.unlock() }
+            return max(1, _listenerPublishAttempt)
+        }()
+        let next = nextListenerRetryDelayMs(afterFailureCount: attempt - 1)
+        setListenerState(.failed, attempt: attempt)
+        publishListenerStatus(
+            state: .failed,
+            bound: false,
+            attempt: attempt,
+            nextRetryMs: next,
+            errorCode: errorCode
+        )
+    }
+
+    private func publishListenerStatus(
+        state: ListenerPublicationState,
+        bound: Bool,
+        attempt: Int,
+        nextRetryMs: Int?,
+        errorCode: Int?
+    ) {
+        let address = bindLoopbackOnly ? "127.0.0.1" : "0.0.0.0"
+        let raw = listenerPublicationStatusPayload(
+            state: state,
+            bound: bound,
+            address: address,
+            port: port,
+            attempt: attempt,
+            maxAttempts: listenerRetryPolicy.maxAttempts + 1,
+            nextRetryMs: nextRetryMs,
+            errorCode: errorCode
+        )
+        // Correlation id only — never tokens, raw peer content, or credentials.
+        let correlationId = ConnectionTelemetryRedactor.makeCorrelationId()
+        var payload = raw.mapValues { v -> JSONValue in
+            if let b = v as? Bool { return .bool(b) }
+            if let i = v as? Int { return .number(Double(i)) }
+            if let s = v as? String { return .string(s) }
+            return .string("\(v)")
+        }
+        payload["correlation_id"] = .string(correlationId)
+        EventBus.shared.publish(kind: "server.listener.publication", payload: .object(payload))
+    }
+
+    /// Bind an IPv6 listener with `IPV6_V6ONLY` so IPv4-mapped accepts stay on
+    /// the AF_INET socket. Returns -1 when IPv6 is unavailable (non-fatal).
+    static func bindIPv6Listener(port: UInt16, loopbackOnly: Bool) -> Int32 {
+        let fd = socket(AF_INET6, SOCK_STREAM, 0)
+        guard fd >= 0 else { return -1 }
+        guard enableCloseOnExec(fd) else {
+            close(fd)
+            return -1
+        }
+        var yes: Int32 = 1
+        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, socklen_t(MemoryLayout<Int32>.size))
+        // Keep v6-only so dual listeners do not fight over IPv4-mapped traffic.
+        setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &yes, socklen_t(MemoryLayout<Int32>.size))
+
+        var addr6 = sockaddr_in6()
+        addr6.sin6_len = UInt8(MemoryLayout<sockaddr_in6>.size)
+        addr6.sin6_family = sa_family_t(AF_INET6)
+        addr6.sin6_port = in_port_t(port).bigEndian
+        addr6.sin6_addr = loopbackOnly ? in6addr_loopback : in6addr_any
+        let len = socklen_t(MemoryLayout<sockaddr_in6>.size)
+        let rc = withUnsafePointer(to: &addr6) { ptr -> Int32 in
+            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { Darwin.bind(fd, $0, len) }
+        }
+        if rc < 0 {
+            close(fd)
+            return -1
+        }
+        if Darwin.listen(fd, 32) < 0 {
+            close(fd)
+            return -1
+        }
+        return fd
     }
 
     private func acceptLoop(listenerDescriptor: Int32, acceptanceGeneration: UInt64) {
         let registry = acceptedSockets
         while registry.isAccepting(generation: acceptanceGeneration) {
-            var caddr = sockaddr()
-            var clen = socklen_t(MemoryLayout<sockaddr>.size)
-            let fd = Darwin.accept(listenerDescriptor, &caddr, &clen)
+            var storage = sockaddr_storage()
+            var clen = socklen_t(MemoryLayout<sockaddr_storage>.size)
+            let fd = withUnsafeMutablePointer(to: &storage) { ptr -> Int32 in
+                ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                    Darwin.accept(listenerDescriptor, $0, &clen)
+                }
+            }
             if fd < 0 {
                 if !registry.isAccepting(generation: acceptanceGeneration) { return }
                 continue
@@ -579,7 +883,8 @@ public final class DirectHTTPServer: @unchecked Sendable {
                 shutdown(fd, SHUT_RDWR)
                 close(fd)
                 EventBus.shared.publish(kind: "diagnostic.http_cloexec_failed", payload: .object([
-                    "errno": .number(Double(savedErrno))
+                    "errno": .number(Double(savedErrno)),
+                    "correlation_id": .string(ConnectionTelemetryRedactor.makeCorrelationId())
                 ]))
                 continue
             }
@@ -593,12 +898,13 @@ public final class DirectHTTPServer: @unchecked Sendable {
                 if shouldPublishDiagnostic {
                     EventBus.shared.publish(kind: "diagnostic.http_connection_limit", payload: .object([
                         "active_connections": .number(Double(active)),
-                        "maximum_connections": .number(Double(limit))
+                        "maximum_connections": .number(Double(limit)),
+                        "correlation_id": .string(ConnectionTelemetryRedactor.makeCorrelationId())
                     ]))
                 }
                 continue
             }
-            let peer = Self.peerIP(caddr)
+            let peer = Self.peerIP(storage)
             acceptedFDObserverForTesting?(fd)
             // C-25: dedicated Thread per accepted connection (not GCD global).
             // WS sessions park for minutes; HTTP keep-alive can too. Pool workers
@@ -725,14 +1031,40 @@ public final class DirectHTTPServer: @unchecked Sendable {
     /// Numeric source IP of an accepted connection, used as the throttle key.
     /// Falls back to "unknown" so a peer we can't parse still shares a single
     /// throttle bucket rather than bypassing the limiter.
+    ///
+    /// IPv6 link-local addresses keep their zone/scope suffix when the kernel
+    /// provides `sin6_scope_id` (e.g. `fe80::1%en0`) so dual-stack / AWDL
+    /// endpoints are not stripped to an unroutable bare address.
     static func peerIP(_ addr: sockaddr) -> String {
-        var addr = addr
-        var host = [CChar](repeating: 0, count: Int(NI_MAXHOST))
-        let len = socklen_t(addr.sa_len)
-        let rc = withUnsafePointer(to: &addr) { ptr in
-            getnameinfo(ptr, len, &host, socklen_t(host.count), nil, 0, NI_NUMERICHOST)
+        var storage = sockaddr_storage()
+        withUnsafeMutableBytes(of: &storage) { dst in
+            withUnsafeBytes(of: addr) { src in
+                let n = min(src.count, dst.count)
+                dst.copyMemory(from: UnsafeRawBufferPointer(start: src.baseAddress, count: n))
+            }
         }
-        return rc == 0 ? String(cString: host) : "unknown"
+        return peerIP(storage)
+    }
+
+    static func peerIP(_ storage: sockaddr_storage) -> String {
+        var storage = storage
+        var host = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+        let family = Int32(storage.ss_family)
+        let len: socklen_t
+        if storage.ss_len > 0 {
+            len = socklen_t(storage.ss_len)
+        } else if family == AF_INET6 {
+            len = socklen_t(MemoryLayout<sockaddr_in6>.size)
+        } else {
+            len = socklen_t(MemoryLayout<sockaddr_in>.size)
+        }
+        let rc = withUnsafePointer(to: &storage) { ptr -> Int32 in
+            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                getnameinfo($0, len, &host, socklen_t(host.count), nil, 0, NI_NUMERICHOST)
+            }
+        }
+        guard rc == 0 else { return "unknown" }
+        return String(cString: host)
     }
 
     private func handle(fd: Int32, peer: String) {
@@ -971,10 +1303,9 @@ public final class DirectHTTPServer: @unchecked Sendable {
                 oldestReplaySequence: eventSnapshot.oldestReplaySequence,
                 // Wave 4: rpc.websocket + snapshot.incremental advertised so
                 // clients can hydrate without new TCP and request domain deltas.
-                capabilities: [
-                    "events.replay", "jsonrpc.batch", "snapshot.v3",
-                    "rpc.websocket", "snapshot.incremental",
-                ]
+                // stream.interest.v1 only when the host applies rc2.interest
+                // (see welcomeCapabilities); old peers ignore unknown caps.
+                capabilities: Self.welcomeCapabilities()
             ))
             activeWebSocketConnections.insert(
                 connectionId,
@@ -1589,9 +1920,14 @@ public final class DirectHTTPServer: @unchecked Sendable {
                 "auth_mode": bindLoopbackOnly ? "loopback-anonymous" : "token-required",
                 "transports": ["http", "ws"],
                 "host": bindLoopbackOnly ? "127.0.0.1" : "0.0.0.0",
+                // Dual-stack advertisement; clients may prefer v6 without a relay.
+                "host_v6": bindLoopbackOnly ? "::1" : "::",
+                "ipv6_listener": listenFD6 >= 0,
                 "port": port,
                 "vpn_required": !bindLoopbackOnly,
                 "relay": false,
+                // Optional stream control negotiated on welcome, not here.
+                "stream_interest_v1": Self.supportsStreamInterestControl,
                 // IMP-MAC_SERVER_SYNC-001: anchor for client clock-drift /
                 // freshness math. Pairs with the WS `heartbeat` frame (ts) so
                 // the client can show an honest "live / last synced Ns ago".
@@ -2167,6 +2503,9 @@ public final class DirectHTTPServer: @unchecked Sendable {
         var offset = 0
         var tmp = [UInt8](repeating: 0, count: 4096)
         var liveFilter = initialFilter
+        // RFC6455 reassembly lives in WebSocketClientFrameAssembler (FIN/
+        // continuation, interleaved control, 1 MiB aggregate, UTF-8).
+        var assembler = WebSocketClientFrameAssembler()
         while acceptedSockets.isActive(fd) {
             connectionReadWaitObserverForTesting?(fd, .webSocket)
             let n = Self.readRetryingInterrupts {
@@ -2189,14 +2528,37 @@ public final class DirectHTTPServer: @unchecked Sendable {
             // Any bytes from the peer prove the path is live (C-06 traffic liveness).
             liveness.noteInboundTraffic(now: Date().timeIntervalSinceReferenceDate)
             buf.append(contentsOf: tmp[0..<n])
-            while let (frame, consumed) = parseClientFrame(buf, from: offset) {
-                offset += consumed
-                switch frame.opcode {
-                case 0x8: // close
+            parseFrames: while offset < buf.count {
+                let (event, consumed) = assembler.consume(buf: buf, from: offset)
+                switch event {
+                case .needMore:
+                    break parseFrames
+                case .fragmentProgress:
+                    offset += consumed
+                    continue
+                case .peerClose:
+                    offset += consumed
                     _ = outbound.terminate(errorData: nil, closingData: nil, reason: "peerClose")
                     return
-                case 0x9: // ping -> pong
-                    guard frame.payload.count <= 125 else {
+                case .mustClose(let closeCode):
+                    offset += consumed
+                    _ = outbound.terminate(
+                        errorData: nil,
+                        closingData: connectionClosingData(
+                            connectionId: connectionId,
+                            reason: "protocolError",
+                            code: Int(closeCode),
+                            retryable: false,
+                            retryAfterMs: nil
+                        ),
+                        reason: "protocolError"
+                    )
+                    return
+                case .ping(let payload):
+                    offset += consumed
+                    // Assembler already rejects control payloads > 125 / fragmented
+                    // control with mustClose(1002); keep defensive cap for safety.
+                    guard payload.count <= 125 else {
                         _ = outbound.terminate(
                             errorData: nil,
                             closingData: connectionClosingData(
@@ -2210,18 +2572,20 @@ public final class DirectHTTPServer: @unchecked Sendable {
                         )
                         return
                     }
-                    _ = outbound.enqueueControl(opcode: 0xA, data: frame.payload)
-                case 0xA: // pong
+                    _ = outbound.enqueueControl(opcode: 0xA, data: payload)
+                case .pong(let payload):
+                    offset += consumed
                     _ = liveness.acceptPong(
-                        frame.payload,
+                        payload,
                         now: Date().timeIntervalSinceReferenceDate
                     )
                     continue
-                case 0x1:
+                case .text(let payload):
+                    offset += consumed
                     // Wave 4: JSON-RPC over the existing WebSocket (capability
                     // `rpc.websocket`). Transport control frames remain rejected.
-                    if Self.looksLikeJSONRPCRequest(frame.payload) {
-                        let body = frame.payload
+                    if Self.looksLikeJSONRPCRequest(payload) {
+                        let body = payload
                         let fingerprint = ownerFingerprint
                         Task { [weak self] in
                             guard let self else { return }
@@ -2244,7 +2608,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
                     // Mid-session interest: update cellular-safe admission without
                     // tearing down the socket. Unknown to older clients; ignored
                     // when filter is full (fail open).
-                    if let interestIds = EventStreamFilter.parseInterestControl(frame.payload) {
+                    if let interestIds = EventStreamFilter.parseInterestControl(payload) {
                         liveFilter = liveFilter.applyingInterestThreadIds(interestIds)
                         if let subId = subscriberIDBox?.value {
                             EventBus.shared.updateSubscriberFilter(subId, filter: liveFilter)
@@ -2253,7 +2617,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
                     }
                     let code: String
                     do {
-                        _ = try ConnectionTransportFrame.decodeStrict(frame.payload)
+                        _ = try ConnectionTransportFrame.decodeStrict(payload)
                         code = "unsupportedMessage"
                     } catch {
                         code = "protocolError"
@@ -2270,25 +2634,13 @@ public final class DirectHTTPServer: @unchecked Sendable {
                         reason: "protocolError"
                     )
                     return
-                case 0x2:
+                case .binary:
+                    offset += consumed
                     _ = outbound.terminate(
                         errorData: connectionErrorData(
                             connectionId: connectionId,
                             code: "protocolError"
                         ),
-                        closingData: connectionClosingData(
-                            connectionId: connectionId,
-                            reason: "protocolError",
-                            code: 1002,
-                            retryable: false,
-                            retryAfterMs: nil
-                        ),
-                        reason: "protocolError"
-                    )
-                    return
-                default:
-                    _ = outbound.terminate(
-                        errorData: nil,
                         closingData: connectionClosingData(
                             connectionId: connectionId,
                             reason: "protocolError",
@@ -2314,8 +2666,6 @@ public final class DirectHTTPServer: @unchecked Sendable {
         }
     }
 
-    private struct WSFrame { let opcode: UInt8; let payload: Data }
-
     /// Pure frame-header parse result. No I/O, no actor. `internal` for unit tests.
     ///
     /// - `shouldReject`: true when the frame is invalid regardless of masking
@@ -2333,6 +2683,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
 
     /// Parses the two-byte fixed header plus extended-length fields from `buf`
     /// starting at `start`. Returns nil when more bytes are needed.
+    /// Kept for unit tests; the live path uses `WebSocketClientFrameAssembler`.
     static func wsFrameHeader(buf: [UInt8], from start: Int) -> WSFrameHeader? {
         let available = buf.count - start
         guard available >= 2 else { return nil }
@@ -2365,36 +2716,6 @@ public final class DirectHTTPServer: @unchecked Sendable {
         }
         return WSFrameHeader(opcode: opcode, masked: masked,
                              payloadLen: len, headerEnd: idx, shouldReject: false)
-    }
-
-    private func parseClientFrame(_ buf: [UInt8], from start: Int) -> (WSFrame, Int)? {
-        guard let hdr = Self.wsFrameHeader(buf: buf, from: start) else { return nil }
-
-        // Oversized / overflow -- close regardless of masking.
-        if hdr.shouldReject {
-            return (WSFrame(opcode: 0x8, payload: Data()), hdr.headerEnd)
-        }
-
-        // RFC6455 s5.3: clients MUST mask all frames sent to the server.
-        // An unmasked client frame is a protocol error; close with 1002.
-        guard hdr.masked else {
-            return (WSFrame(opcode: 0x8, payload: Data()), hdr.headerEnd)
-        }
-
-        var idx = hdr.headerEnd
-        let available = buf.count - start
-        var maskKey: [UInt8] = [0, 0, 0, 0]
-        guard available >= idx + 4 else { return nil }
-        for i in 0..<4 { maskKey[i] = buf[start + idx + i] }
-        idx += 4
-
-        guard available >= idx + hdr.payloadLen else { return nil }
-        let payloadStart = start + idx
-        var payload = [UInt8](repeating: 0, count: hdr.payloadLen)
-        for i in 0..<hdr.payloadLen {
-            payload[i] = buf[payloadStart + i] ^ maskKey[i & 3]
-        }
-        return (WSFrame(opcode: hdr.opcode, payload: Data(payload)), idx + hdr.payloadLen)
     }
 
     static func pongFrame(payload: Data) -> Data {
