@@ -2930,8 +2930,10 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
                        "marker must appear exactly once in finished finalMessage")
     }
 
-    /// Non-detaching commands and deferred / failed turns must never be stamped.
-    func test_nonDetachingDeferredAndFailedTurns_doNotStampAwaitingMarker() async throws {
+    /// Non-detaching commands and failed turns must never be stamped. Deferred
+    /// detach stamping is covered by
+    /// `test_shellDetachedCommandExecution_deferredReleaseCarriesAwaitingMarker`.
+    func test_nonDetachingAndFailedTurns_doNotStampAwaitingMarker() async throws {
         let marker = BackgroundAwaitContinuation.awaitingMarker
 
         // 1) Ordinary non-detaching command.
@@ -2973,68 +2975,7 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
             XCTAssertFalse(finish.1?.contains(marker) == true)
         }
 
-        // 2) Detaching command but thread status active → PendingFinish deferral;
-        //    must NOT stamp (deferral is the stronger signal).
-        do {
-            let client = MockCodexAppServerClient(autoComplete: false)
-            let adapter = CodexAppServerAdapter { _, notificationHandler, _ in
-                client.notificationHandler = notificationHandler
-                return client
-            }
-            let threadId = AgentThreadID()
-            let sink = EventSink()
-            _ = try await adapter.sendTurn(AgentRunRequest(
-                threadId: threadId,
-                provider: .codex,
-                model: "gpt-5.5",
-                cwd: "/tmp/remotecode-app-server-adapter",
-                prompt: "deferred detach"
-            )) { event in
-                Task { await sink.record(event) }
-            }
-            client.notificationHandler?("thread/status/changed", [
-                "threadId": "codex-thread-1",
-                "status": ["type": "active", "activeFlags": ["runningCommand"]]
-            ])
-            client.notificationHandler?("item/started", [
-                "threadId": "codex-thread-1",
-                "turnId": "turn-deferred-detach",
-                "item": [
-                    "id": "cmd-deferred",
-                    "type": "commandExecution",
-                    "command": "sleep 30 &\nPID=$!\necho started",
-                    "status": "inProgress"
-                ]
-            ])
-            client.notificationHandler?("turn/completed", [
-                "threadId": "codex-thread-1",
-                "turnId": "turn-deferred-detach",
-                "finalMessage": "still working"
-            ])
-            try await Task.sleep(nanoseconds: 50_000_000)
-            let premature = await sink.finish
-            XCTAssertNil(premature,
-                         "active thread status must defer finish")
-            let midEvents = await sink.snapshot()
-            let midFinals = midEvents.compactMap { event -> String? in
-                if case .turnCompleted(_, let msg) = event { return msg }
-                return nil
-            }
-            XCTAssertTrue(midFinals.contains(where: { $0 == "still working" }),
-                          "deferred turnCompleted must keep unmarked finalMessage; got \(midFinals)")
-            XCTAssertFalse(midFinals.contains(where: { $0.contains(marker) }),
-                           "must not stamp when PendingFinish deferral is armed")
-            // Release deferral — still no stamp on the PendingFinish path.
-            client.notificationHandler?("thread/status/changed", [
-                "threadId": "codex-thread-1",
-                "status": ["type": "idle"]
-            ])
-            let finish = try await waitForFinish(in: sink, timeout: 3)
-            XCTAssertEqual(finish.1, "still working",
-                           "deferred release must not retroactively stamp detached work")
-        }
-
-        // 3) turn/failed is never stamped.
+        // 2) turn/failed is never stamped (even with a detaching command item).
         do {
             let client = MockCodexAppServerClient(autoComplete: false)
             let adapter = CodexAppServerAdapter { _, notificationHandler, _ in
@@ -3072,6 +3013,174 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
             XCTAssertFalse(finish.1?.contains(marker) == true,
                            "turn/failed must never stamp [[RC_AWAITING]]")
         }
+    }
+
+    /// Detaching command_execution while thread status is ACTIVE arms PendingFinish
+    /// and must STILL stamp [[RC_AWAITING]] onto the canonical final: deferral and
+    /// detach evidence are orthogonal. Both `.turnCompleted` and the later idle
+    /// `.finished` release must carry the marker (UI reads turnCompleted; nudge
+    /// reads finished).
+    func test_shellDetachedCommandExecution_deferredReleaseCarriesAwaitingMarker() async throws {
+        let marker = BackgroundAwaitContinuation.awaitingMarker
+        let client = MockCodexAppServerClient(autoComplete: false)
+        let adapter = CodexAppServerAdapter { _, notificationHandler, _ in
+            client.notificationHandler = notificationHandler
+            return client
+        }
+        let threadId = AgentThreadID()
+        let sink = EventSink()
+        _ = try await adapter.sendTurn(AgentRunRequest(
+            threadId: threadId,
+            provider: .codex,
+            model: "gpt-5.5",
+            cwd: "/tmp/remotecode-app-server-adapter",
+            prompt: "deferred detach"
+        )) { event in
+            Task { await sink.record(event) }
+        }
+        client.notificationHandler?("thread/status/changed", [
+            "threadId": "codex-thread-1",
+            "status": ["type": "active", "activeFlags": ["runningCommand"]]
+        ])
+        client.notificationHandler?("item/started", [
+            "threadId": "codex-thread-1",
+            "turnId": "turn-deferred-detach",
+            "item": [
+                "id": "cmd-deferred",
+                "type": "commandExecution",
+                "command": "sleep 30 &\nPID=$!\necho started",
+                "status": "inProgress"
+            ]
+        ])
+        client.notificationHandler?("turn/completed", [
+            "threadId": "codex-thread-1",
+            "turnId": "turn-deferred-detach",
+            "finalMessage": "still working"
+        ])
+        try await Task.sleep(nanoseconds: 50_000_000)
+        let premature = await sink.finish
+        XCTAssertNil(premature,
+                     "active thread status must defer finish (no immediate .finished)")
+        let midEvents = await sink.snapshot()
+        let midFinals = midEvents.compactMap { event -> String? in
+            if case .turnCompleted(_, let msg) = event { return msg }
+            return nil
+        }
+        XCTAssertTrue(midFinals.contains(where: { $0.contains(marker) && $0.contains("still working") }),
+                      "deferred turnCompleted must carry [[RC_AWAITING]] on the canonical final; got \(midFinals)")
+        // Release PendingFinish via idle thread status — same stamped final.
+        client.notificationHandler?("thread/status/changed", [
+            "threadId": "codex-thread-1",
+            "status": ["type": "idle"]
+        ])
+        let finish = try await waitForFinish(in: sink, timeout: 3)
+        XCTAssertEqual(finish.0, .completed)
+        XCTAssertTrue(finish.1?.contains(marker) == true,
+                      "deferred .finished release must carry [[RC_AWAITING]]; got \(finish.1 ?? "nil")")
+        XCTAssertTrue(finish.1?.contains("still working") == true)
+        let finished = try XCTUnwrap(finish.1)
+        XCTAssertEqual(finished.components(separatedBy: marker).count - 1, 1,
+                       "marker must appear exactly once on deferred finished finalMessage")
+    }
+
+    /// Cross-turn isolation: turn A detaches + defers; turn B completes without
+    /// detaching before idle release. B must overwrite the single PendingFinish
+    /// slot and the released `.finished` must carry B's unmarked final — never A's.
+    func test_deferredDetachThenNonDetachTurn_finishedCarriesLaterUnmarkedFinal() async throws {
+        let marker = BackgroundAwaitContinuation.awaitingMarker
+        let client = MockCodexAppServerClient(autoComplete: false)
+        let adapter = CodexAppServerAdapter { _, notificationHandler, _ in
+            client.notificationHandler = notificationHandler
+            return client
+        }
+        let threadId = AgentThreadID()
+        let sink = EventSink()
+        _ = try await adapter.sendTurn(AgentRunRequest(
+            threadId: threadId,
+            provider: .codex,
+            model: "gpt-5.5",
+            cwd: "/tmp/remotecode-app-server-adapter",
+            prompt: "cross-turn detach"
+        )) { event in
+            Task { await sink.record(event) }
+        }
+
+        // Turn A: detach + active thread → PendingFinish armed with stamped final.
+        client.notificationHandler?("thread/status/changed", [
+            "threadId": "codex-thread-1",
+            "status": ["type": "active", "activeFlags": ["runningCommand"]]
+        ])
+        client.notificationHandler?("item/started", [
+            "threadId": "codex-thread-1",
+            "turnId": "turn-A",
+            "item": [
+                "id": "cmd-A",
+                "type": "commandExecution",
+                "command": "sleep 30 &\nPID=$!\necho started",
+                "status": "inProgress"
+            ]
+        ])
+        client.notificationHandler?("turn/completed", [
+            "threadId": "codex-thread-1",
+            "turnId": "turn-A",
+            "finalMessage": "turn-A-detached"
+        ])
+        try await Task.sleep(nanoseconds: 50_000_000)
+        let prematureA = await sink.finish
+        XCTAssertNil(prematureA, "turn A must defer finish while thread is active")
+        let afterA = await sink.snapshot()
+        let aFinals = afterA.compactMap { event -> String? in
+            if case .turnCompleted(let turnId, let msg) = event, turnId == "turn-A" { return msg }
+            return nil
+        }
+        XCTAssertTrue(aFinals.contains(where: { $0.contains(marker) && $0.contains("turn-A-detached") }),
+                      "turn A turnCompleted must be marked; got \(aFinals)")
+
+        // Turn B: starts (resets per-turn detach flag) and completes without detach.
+        // Still active → overwrites the single PendingFinish slot with B's unmarked final.
+        client.notificationHandler?("turn/started", [
+            "threadId": "codex-thread-1",
+            "turnId": "turn-B"
+        ])
+        client.notificationHandler?("item/started", [
+            "threadId": "codex-thread-1",
+            "turnId": "turn-B",
+            "item": [
+                "id": "cmd-B",
+                "type": "commandExecution",
+                "command": "echo only-foreground",
+                "status": "inProgress"
+            ]
+        ])
+        client.notificationHandler?("turn/completed", [
+            "threadId": "codex-thread-1",
+            "turnId": "turn-B",
+            "finalMessage": "turn-B-clean"
+        ])
+        try await Task.sleep(nanoseconds: 50_000_000)
+        let prematureB = await sink.finish
+        XCTAssertNil(prematureB, "turn B must also defer while thread stays active")
+        let afterB = await sink.snapshot()
+        let bFinals = afterB.compactMap { event -> String? in
+            if case .turnCompleted(let turnId, let msg) = event, turnId == "turn-B" { return msg }
+            return nil
+        }
+        XCTAssertTrue(bFinals.contains(where: { $0 == "turn-B-clean" }),
+                      "turn B turnCompleted must stay unmarked; got \(bFinals)")
+        XCTAssertFalse(bFinals.contains(where: { $0.contains(marker) }),
+                       "turn B must not inherit turn A's detach stamp")
+
+        // Idle release: single-slot PendingFinish holds B only.
+        client.notificationHandler?("thread/status/changed", [
+            "threadId": "codex-thread-1",
+            "status": ["type": "idle"]
+        ])
+        let finish = try await waitForFinish(in: sink, timeout: 3)
+        XCTAssertEqual(finish.0, .completed)
+        XCTAssertEqual(finish.1, "turn-B-clean",
+                       "released .finished must carry B's unmarked final, never A's; got \(finish.1 ?? "nil")")
+        XCTAssertFalse(finish.1?.contains(marker) == true)
+        XCTAssertFalse(finish.1?.contains("turn-A-detached") == true)
     }
 }
 

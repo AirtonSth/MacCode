@@ -412,8 +412,8 @@ public final class ClaudeParser {
         var out = completedRuntimeItem(
             id: stringValue(obj["id"]) ?? stringValue(obj["task_id"]) ?? "\(subtype)-\(now)",
             type: .tool,
-            summary: stringValue(obj["title"]) ?? stringValue(obj["task"]) ?? "Claude task",
-            body: stringValue(obj["message"]) ?? stringValue(obj["notification"]) ?? jsonString(obj),
+            summary: taskSummaryLabel(from: obj),
+            body: taskBody(from: obj, subtype: subtype),
             now: now
         )
         if let progress = Self.progressValue(obj), let id = firstStartedItemId(in: out) {
@@ -422,13 +422,67 @@ public final class ClaudeParser {
         return out
     }
 
+    /// Human label for background task rows. Prefer an explicit title/task when
+    /// present; otherwise map known `task_type` values from the live CLI.
+    private func taskSummaryLabel(from obj: [String: Any]) -> String {
+        if let titled = stringValue(obj["title"]) ?? stringValue(obj["task"]), !titled.isEmpty {
+            return titled
+        }
+        switch stringValue(obj["task_type"]) {
+        case "local_bash":
+            return "Background shell"
+        case "local_agent":
+            return "Background agent"
+        default:
+            return "Claude task"
+        }
+    }
+
+    /// Prefer human-readable fields already on the wire (`description`, notification
+    /// `status` / non-empty `output_file`). Raw JSON is last-resort only so unknown
+    /// future payloads still render something.
+    private func taskBody(from obj: [String: Any], subtype: String) -> String? {
+        if let description = stringValue(obj["description"]), !description.isEmpty {
+            return description
+        }
+        if subtype == "task_notification" {
+            var parts: [String] = []
+            if let status = stringValue(obj["status"]), !status.isEmpty {
+                parts.append(status)
+            }
+            if let outputFile = stringValue(obj["output_file"]), !outputFile.isEmpty {
+                parts.append(outputFile)
+            }
+            if !parts.isEmpty {
+                return parts.joined(separator: " · ")
+            }
+        }
+        if let message = stringValue(obj["message"]), !message.isEmpty {
+            return message
+        }
+        if let notification = stringValue(obj["notification"]), !notification.isEmpty {
+            return notification
+        }
+        return jsonString(obj)
+    }
+
     private func progressItem(from obj: [String: Any], defaultSummary: String, now: Int64) -> [AssistantEvent]? {
         let id = stringValue(obj["id"]) ?? stringValue(obj["tool_use_id"]) ?? stringValue(obj["item_id"]) ?? "tool-progress-\(now)"
+        let body: String?
+        if boolValue(obj["heartbeat"]) == true {
+            if let elapsed = intValue(obj["elapsed_time_seconds"]) {
+                body = "Running · \(elapsed)s elapsed"
+            } else {
+                body = "Running"
+            }
+        } else {
+            body = stringValue(obj["message"]) ?? stringValue(obj["summary"]) ?? jsonString(obj)
+        }
         var out = completedRuntimeItem(
             id: id,
             type: .tool,
             summary: stringValue(obj["name"]) ?? stringValue(obj["tool_name"]) ?? defaultSummary,
-            body: stringValue(obj["message"]) ?? stringValue(obj["summary"]) ?? jsonString(obj),
+            body: body,
             now: now
         )
         if let progress = Self.progressValue(obj) {

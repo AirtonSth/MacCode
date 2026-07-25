@@ -101,20 +101,20 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         var turnReconcileGeneration: Int
         /// Shell-detached work the app-server does NOT track as an active thread:
         /// a command_execution item whose command backgrounds children with
-        /// `&` / `nohup` / `setsid` / `disown`. When set and the turn would complete
-        /// without PendingFinish deferral, we prefix `[[RC_AWAITING]]` so the host's
-        /// existing marker path surfaces awaiting + auto-nudge — but we do NOT
-        /// defer the terminal (Codex never auto-resumes shell-detached children;
-        /// withholding would hang until thread status flips or the watchdog).
+        /// `&` / `nohup` / `setsid` / `disown`. When set at turn completion we
+        /// prefix `[[RC_AWAITING]]` on the canonical final so the host's marker
+        /// path surfaces awaiting + auto-nudge on both `.turnCompleted` and
+        /// `.finished` — including the deferred PendingFinish release path.
+        /// We still do NOT defer the terminal for detached work (Codex never
+        /// auto-resumes shell-detached children; withholding would hang until
+        /// thread status flips or the watchdog).
         ///
         /// Accepted false-positive: a turn that backgrounds a long-lived process
         /// as the deliverable (e.g. starts a dev server) is marked awaiting once;
         /// one bounded auto-nudge then clears the streak. Preferred over silently
-        /// reporting orchestration threads as finished.
-        ///
-        /// Accepted limitation: if PendingFinish deferral IS armed (thread status
-        /// still active) we do not stamp; if that deferral later releases while
-        /// detached work is still around, recovery falls to the phrase backstop.
+        /// reporting orchestration threads as finished. Same class applies when
+        /// a detached process already exited before turn end, or when the UI
+        /// shows awaiting during an active-thread PendingFinish deferral.
         var sawDetachedShellSpawn: Bool
     }
 
@@ -1428,13 +1428,21 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
                     events.append(.proposedPlan(AssistantProposedPlan(id: planId, turnId: turnId.isEmpty ? nil : turnId, markdown: markdown)))
                 }
             }
-            // Stamp [[RC_AWAITING]] when shell-detached work was observed and the
-            // turn will finish immediately (no PendingFinish deferral). Do NOT stamp
-            // when deferring: thread-status deferral is the stronger signal. Do NOT
-            // add deferral for detached work — Codex never auto-resumes a detached
-            // process; withholding the terminal would hang until idle/watchdog.
+            // Stamp [[RC_AWAITING]] whenever this turn observed shell-detached work.
+            // PendingFinish deferral (thread still active) and detach evidence are
+            // orthogonal: deferral answers "is the app-server THREAD still active?";
+            // the marker answers "did the agent leave shell work the app-server
+            // never tracks?". Both can be true. Stamp the one canonical `final` so
+            // the marker rides both `.turnCompleted` and the later deferred
+            // `.finished` release (which does not re-emit turnCompleted). Still do
+            // NOT add deferral for detached work — Codex never auto-resumes a
+            // detached process; withholding the terminal would hang until idle/
+            // watchdog. Accepted false-positive: process already exited before
+            // turn end still stamps; during deferral the UI may show awaiting
+            // while Codex is still active (same class as non-deferred; bounded
+            // nudge self-corrects on the next unmarked completion).
             let deferring = shouldDeferFinishUntilIdle(threadId: threadId)
-            if !deferring, sawDetachedShellSpawn(threadId: threadId) {
+            if sawDetachedShellSpawn(threadId: threadId) {
                 if let marked = BackgroundAwaitContinuation.prefixingAwaitingMarker(final.isEmpty ? nil : final) {
                     final = marked
                 }

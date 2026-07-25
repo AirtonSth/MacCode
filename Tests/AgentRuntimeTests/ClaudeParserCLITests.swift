@@ -353,6 +353,71 @@ final class ClaudeParserCLITests: XCTestCase {
         }, "Claude rate_limit_event must not render as an agent error when the turn later succeeds")
     }
 
+    /// Live Claude CLI (2.1.219) task / heartbeat payloads put human text on
+    /// `description` / `task_type` / `status` / `elapsed_time_seconds` — not on
+    /// the older `title`/`message` keys. Rows must not fall back to raw JSON.
+    func test_backgroundTaskAndHeartbeatPayloads_renderHumanReadableText() {
+        // Real captured payloads (claude CLI 2.1.219), wrapped as the stream
+        // delivers them: task_* as system subtypes, tool_progress as top-level.
+        let taskStarted = #"{"type":"system","description":"Check C-04 and poll for new completions","session_id":"sess-bg","subtype":"task_started","task_id":"bjl1462g4","task_type":"local_bash","tool_use_id":"toolu_01B3YGG"}"#
+        let taskNotification = #"{"type":"system","output_file":"","session_id":"sess-bg","status":"completed","subtype":"task_notification","task_id":"bjl1462g4"}"#
+        let heartbeat = #"{"type":"tool_progress","elapsed_time_seconds":30,"heartbeat":true,"parent_tool_use_id":"toolu_01B3YGG","session_id":"sess-bg"}"#
+        let sparseUnknown = #"{"type":"system","subtype":"task_started","task_id":"sparse-1"}"#
+
+        let startedEvs = collect([taskStarted])
+        let started = startedEvs.compactMap { event -> AssistantItem? in
+            if case .itemStarted(let item) = event { return item }
+            return nil
+        }.first
+        XCTAssertEqual(started?.summary, "Background shell",
+                       "local_bash task_started must label as a background shell")
+        XCTAssertEqual(started?.body, "Check C-04 and poll for new completions",
+                       "task_started body must prefer description over raw JSON")
+        XCTAssertFalse(started?.body.contains("session_id") == true)
+        XCTAssertFalse(started?.body.contains("subtype") == true)
+        XCTAssertFalse(started?.body.contains("tool_use_id") == true)
+
+        let notifEvs = collect([taskNotification])
+        let notif = notifEvs.compactMap { event -> AssistantItem? in
+            if case .itemStarted(let item) = event { return item }
+            return nil
+        }.first
+        XCTAssertTrue(notif?.body.contains("completed") == true,
+                      "task_notification body must surface status; got \(notif?.body ?? "nil")")
+        XCTAssertFalse(notif?.body.contains("session_id") == true)
+        XCTAssertFalse(notif?.body.contains("subtype") == true)
+        XCTAssertFalse(notif?.body.contains("\"status\"") == true,
+                       "status must be human text, not a raw JSON key fragment")
+
+        let beatEvs = collect([heartbeat])
+        let beat = beatEvs.compactMap { event -> AssistantItem? in
+            if case .itemStarted(let item) = event { return item }
+            return nil
+        }.first
+        XCTAssertTrue(beat?.body.contains("30") == true,
+                      "heartbeat tool_progress must surface elapsed_time_seconds; got \(beat?.body ?? "nil")")
+        XCTAssertTrue(
+            beat?.body.localizedCaseInsensitiveContains("elapsed") == true
+                || beat?.body.localizedCaseInsensitiveContains("running") == true,
+            "heartbeat body must read as running/elapsed human text; got \(beat?.body ?? "nil")"
+        )
+        XCTAssertFalse(beat?.body.contains("session_id") == true)
+        XCTAssertFalse(beat?.body.contains("parent_tool_use_id") == true)
+        XCTAssertFalse(beat?.body.contains("\"heartbeat\"") == true)
+
+        // Last-resort: sparse/unknown task payload still yields a non-empty body
+        // (jsonString fallback) so the row is not blank.
+        let sparseEvs = collect([sparseUnknown])
+        let sparse = sparseEvs.compactMap { event -> AssistantItem? in
+            if case .itemStarted(let item) = event { return item }
+            return nil
+        }.first
+        XCTAssertEqual(sparse?.summary, "Claude task",
+                       "unrecognised/missing task_type falls back to generic label")
+        XCTAssertFalse(sparse?.body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == true,
+                       "sparse task payload must keep a non-empty last-resort body")
+    }
+
     func test_claudeSdkPermissionLifecycleBecomesApprovalRequest() {
         let evs = collect([
             #"{"type":"system","subtype":"init","session_id":"s10"}"#,
