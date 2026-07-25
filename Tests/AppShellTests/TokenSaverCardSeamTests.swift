@@ -259,9 +259,8 @@ final class TokenSaverCardSeamTests: XCTestCase {
                       "Rings label must include Grok used percent: \(label)")
     }
 
-    func test_ringsAccessibilityLabel_namesAvoidanceMixNotAbsoluteGoal() {
-        // WHY: ring fill is avoidance ratio (saved/(saved+used)), not a 2M/10M goal.
-        // VoiceOver must describe the measured mix, not an aspirational absolute target.
+    func test_ringsAccessibilityLabel_namesFixedGoalProgress() {
+        // WHY: product rule is fixed 2M/day and 10M/week goals for the green ring.
         let label = SidebarRootView.ringsAccessibilityLabel(
             scope: "week",
             savedTokens: 10_000_000,
@@ -274,11 +273,11 @@ final class TokenSaverCardSeamTests: XCTestCase {
         XCTAssertTrue(label.lowercased().contains("measured save") || label.lowercased().contains("est."),
                       "Rings label must describe estimated/measured save: \(label)")
         XCTAssertTrue(label.contains("100%") || label.contains("~100%"),
-                      "Rings label must include avoidance percent: \(label)")
+                      "Rings label must include goal percent: \(label)")
+        XCTAssertTrue(label.lowercased().contains("goal") || label.contains("10M"),
+                      "Rings label must name the fixed goal: \(label)")
         XCTAssertFalse(label.contains("provider spend"),
                        "Rings label must not describe the old denominator: \(label)")
-        XCTAssertFalse(label.contains("10M target"),
-                       "Absolute goal target is no longer the ring metric: \(label)")
     }
 
     func test_ringsAccessibilityLabel_zeroValues_stillNonEmpty() {

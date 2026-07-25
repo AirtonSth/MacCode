@@ -523,7 +523,7 @@ final class TokenSaverUXGatingTests: XCTestCase {
         )
 
         XCTAssertTrue(label.lowercased().contains("measured save") || label.lowercased().contains("est."))
-        XCTAssertTrue(label.lowercased().contains("tool-plus-usage") || label.lowercased().contains("mix"))
+        XCTAssertTrue(label.lowercased().contains("goal") || label.contains("%"))
         XCTAssertFalse(label.lowercased().contains(": saved"))
     }
 
