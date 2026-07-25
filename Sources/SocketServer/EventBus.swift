@@ -75,7 +75,7 @@ public final class EventBus: @unchecked Sendable {
         shell: 0, surfaces: 0, agentThreads: 0, browser: 0, files: 0
     )
     private struct Subscriber {
-        let filter: EventStreamFilter
+        var filter: EventStreamFilter
         /// Called with the seq of an event this subscriber's filter dropped,
         /// so per-connection gap detection can account for the hole.
         let onFilteredEvent: (Int64) -> Void
@@ -384,6 +384,28 @@ public final class EventBus: @unchecked Sendable {
         }
     }
 
+    /// Mid-session interest update: replace the subscriber filter without
+    /// reconnecting. No-op when the id is unknown (fail open).
+    public func updateSubscriberFilter(_ id: UUID, filter: EventStreamFilter) {
+        if DispatchQueue.getSpecific(key: deliveryQueueKey) != nil {
+            updateSubscriberFilterSerialized(id, filter: filter)
+        } else {
+            deliveryQueue.sync { updateSubscriberFilterSerialized(id, filter: filter) }
+        }
+    }
+
+    private func updateSubscriberFilterSerialized(_ id: UUID, filter: EventStreamFilter) {
+        lock.lock()
+        guard var sub = subscribers[id] else {
+            lock.unlock()
+            return
+        }
+        sub.filter = filter
+        subscribers[id] = sub
+        subscribersSnapshot = Array(subscribers.values)
+        lock.unlock()
+    }
+
     private func unsubscribeSerialized(_ id: UUID) {
         lock.lock()
         subscribers.removeValue(forKey: id)
@@ -590,6 +612,39 @@ public enum EventStreamFilter: Sendable, Equatable {
                 .filter { !$0.isEmpty }
         )
         return .cellularSafe(interestThreadIds: ids)
+    }
+
+    /// Mid-session interest control wire type (client → host over live WS).
+    public static let interestControlType = "rc2.interest"
+
+    /// Parse `{"type":"rc2.interest","thread_ids":[…]}`. Returns nil when the
+    /// payload is not this control (caller must not treat as protocol error).
+    public static func parseInterestControl(_ data: Data) -> Set<String>? {
+        guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let type = root["type"] as? String,
+              type == interestControlType else {
+            return nil
+        }
+        guard let raw = root["thread_ids"] as? [Any] else {
+            return []
+        }
+        let ids = raw.compactMap { value -> String? in
+            guard let s = value as? String else { return nil }
+            let trimmed = s.trimmingCharacters(in: .whitespacesAndNewlines)
+            return trimmed.isEmpty ? nil : trimmed
+        }
+        return Set(ids)
+    }
+
+    /// Apply mid-session interest onto an existing filter. Full filters stay
+    /// full (fail open — interest only gates cellular-safe admissions).
+    public func applyingInterestThreadIds(_ ids: Set<String>) -> EventStreamFilter {
+        switch self {
+        case .full:
+            return .full
+        case .cellularSafe:
+            return .cellularSafe(interestThreadIds: ids)
+        }
     }
 
     public func allows(_ event: EventBus.Event) -> Bool {

@@ -1283,7 +1283,9 @@ public final class DirectHTTPServer: @unchecked Sendable {
                 connectionId: connectionId,
                 outbound: outbound,
                 liveness: liveness,
-                ownerFingerprint: webSocketOwnerFingerprint
+                ownerFingerprint: webSocketOwnerFingerprint,
+                subscriberIDBox: subIDBox,
+                initialFilter: wsFilter
             )
             heartbeatTimer.cancel()
             batcher.stop()
@@ -2147,7 +2149,9 @@ public final class DirectHTTPServer: @unchecked Sendable {
         connectionId: String,
         outbound: WebSocketOutboundQueue,
         liveness: WebSocketLivenessState,
-        ownerFingerprint: String
+        ownerFingerprint: String,
+        subscriberIDBox: LockedSubscriberID? = nil,
+        initialFilter: EventStreamFilter = .full
     ) {
         // PERF-009: keep a contiguous [UInt8] buffer with a read offset
         // instead of Data + removeFirst(consumed). removeFirst is O(n) per
@@ -2162,6 +2166,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
         var buf = [UInt8]()
         var offset = 0
         var tmp = [UInt8](repeating: 0, count: 4096)
+        var liveFilter = initialFilter
         while acceptedSockets.isActive(fd) {
             connectionReadWaitObserverForTesting?(fd, .webSocket)
             let n = Self.readRetryingInterrupts {
@@ -2233,6 +2238,16 @@ public final class DirectHTTPServer: @unchecked Sendable {
                                 _ = outbound.degrade()
                                 _ = outbound.enqueueControl(opcode: 0x1, data: response)
                             }
+                        }
+                        continue
+                    }
+                    // Mid-session interest: update cellular-safe admission without
+                    // tearing down the socket. Unknown to older clients; ignored
+                    // when filter is full (fail open).
+                    if let interestIds = EventStreamFilter.parseInterestControl(frame.payload) {
+                        liveFilter = liveFilter.applyingInterestThreadIds(interestIds)
+                        if let subId = subscriberIDBox?.value {
+                            EventBus.shared.updateSubscriberFilter(subId, filter: liveFilter)
                         }
                         continue
                     }
