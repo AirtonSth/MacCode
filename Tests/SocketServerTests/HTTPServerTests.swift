@@ -466,6 +466,23 @@ final class HTTPServerTests: XCTestCase {
         )
     }
 
+    func test_httpKeepAliveIdleResolvesFromExperimentFlag() {
+        XCTAssertEqual(
+            DirectHTTPServer.resolvedHttpKeepAliveIdleTimeoutSeconds(experimentEnabled: false),
+            DirectHTTPServer.httpKeepAliveIdleTimeoutSeconds
+        )
+        XCTAssertEqual(
+            DirectHTTPServer.resolvedHttpKeepAliveIdleTimeoutSeconds(experimentEnabled: true),
+            DirectHTTPServer.httpKeepAliveIdleTimeoutExperimentSeconds
+        )
+        XCTAssertEqual(DirectHTTPServer.httpKeepAliveIdleTimeoutExperimentSeconds, 25,
+                       "U-002 budget covers typical cellular RRC idle without indefinite hold")
+        XCTAssertGreaterThan(
+            DirectHTTPServer.httpKeepAliveIdleTimeoutExperimentSeconds,
+            DirectHTTPServer.httpKeepAliveIdleTimeoutSeconds
+        )
+    }
+
     func test_heartbeatNegotiationAcceptsClientProposalWithinProfile() {
         let accepted = DirectHTTPServer.negotiateHeartbeatProfile(
             filter: .cellularSafe,

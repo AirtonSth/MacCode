@@ -958,16 +958,27 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         guard let context, let router, let auth = localAuth else { return }
         let loopbackOnly = !remoteEnabled
         let dispatcher = JSONRPCDispatcher(router: router)
-        let http = DirectHTTPServer(port: port, loopbackOnly: loopbackOnly,
-                                    dispatcher: dispatcher, auth: auth, serverId: serverId,
-                                    bootEpoch: context.liveActivityHostIdentity.bootEpoch)
+        let keepAliveSeconds = DirectHTTPServer.resolvedHttpKeepAliveIdleTimeoutSeconds(
+            experimentEnabled: ConnectionFeatureFlags.transportKeepaliveExperimentEnabled
+        )
+        let http = DirectHTTPServer(
+            port: port,
+            loopbackOnly: loopbackOnly,
+            dispatcher: dispatcher,
+            auth: auth,
+            serverId: serverId,
+            bootEpoch: context.liveActivityHostIdentity.bootEpoch,
+            clientReceiveTimeoutSeconds: keepAliveSeconds
+        )
         try http.start()
         httpServer = http
         try? Self.resolvePetServerFailure(
             server: "HTTP server",
             repository: NotificationRepository(db: context.db)
         )
-        NSLog("Direct HTTP server listening on \(loopbackOnly ? "127.0.0.1" : "0.0.0.0"):\(port) (loopback=\(loopbackOnly))")
+        NSLog(
+            "Direct HTTP server listening on \(loopbackOnly ? "127.0.0.1" : "0.0.0.0"):\(port) (loopback=\(loopbackOnly) keepAliveIdle=\(keepAliveSeconds)s wakePhaseA=\(ConnectionFeatureFlags.wakePhaseAEnabled))"
+        )
         if loopbackOnly {
             NSLog("Bonjour not published: remote access is disabled")
         }

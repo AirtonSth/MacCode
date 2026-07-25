@@ -55,19 +55,46 @@ final class MaterialWakeCoordinatorTests: XCTestCase {
         XCTAssertTrue(on.allowed)
     }
 
-    func testFeatureFlagsDefaultOff() {
+    func testFeatureFlagsDefaultsPhaseAAndKeepaliveOn() {
         let defaults = UserDefaults.standard
         defaults.removeObject(forKey: ConnectionFeatureFlags.wakePhaseAKey)
         defaults.removeObject(forKey: ConnectionFeatureFlags.wakePhaseBGitKey)
         defaults.removeObject(forKey: ConnectionFeatureFlags.wakeOutboxKey)
         defaults.removeObject(forKey: ConnectionFeatureFlags.selectiveCatchUpKey)
         defaults.removeObject(forKey: ConnectionFeatureFlags.transportKeepaliveExpKey)
-        XCTAssertFalse(ConnectionFeatureFlags.wakePhaseAEnabled)
+        XCTAssertTrue(
+            ConnectionFeatureFlags.wakePhaseAEnabled,
+            "wake_phase_a defaults on so material silent wakes ship without a canary flip"
+        )
+        XCTAssertTrue(
+            ConnectionFeatureFlags.transportKeepaliveExperimentEnabled,
+            "transport keepalive defaults on (25s HTTP idle) for 3G RRC"
+        )
         XCTAssertFalse(ConnectionFeatureFlags.wakePhaseBGitEnabled)
         XCTAssertFalse(ConnectionFeatureFlags.wakeOutboxEnabled)
         XCTAssertFalse(ConnectionFeatureFlags.selectiveCatchUpEnabled)
-        XCTAssertFalse(ConnectionFeatureFlags.transportKeepaliveExperimentEnabled)
         XCTAssertEqual(ConnectionFeatureFlags.inventory().count, 5)
+
+        // Kill switch: explicit false must win over default-on.
+        defaults.set(false, forKey: ConnectionFeatureFlags.wakePhaseAKey)
+        defaults.set(false, forKey: ConnectionFeatureFlags.transportKeepaliveExpKey)
+        XCTAssertFalse(ConnectionFeatureFlags.wakePhaseAEnabled)
+        XCTAssertFalse(ConnectionFeatureFlags.transportKeepaliveExperimentEnabled)
+        defaults.removeObject(forKey: ConnectionFeatureFlags.wakePhaseAKey)
+        defaults.removeObject(forKey: ConnectionFeatureFlags.transportKeepaliveExpKey)
+    }
+
+    func testFlagValueUnsetUsesDefaultOn() {
+        let defaults = UserDefaults.standard
+        let key = "connection.flag.test_default_on_\(UUID().uuidString)"
+        defaults.removeObject(forKey: key)
+        XCTAssertTrue(ConnectionFeatureFlags.flagValue(key: key, defaultOn: true, defaults: defaults))
+        XCTAssertFalse(ConnectionFeatureFlags.flagValue(key: key, defaultOn: false, defaults: defaults))
+        defaults.set(false, forKey: key)
+        XCTAssertFalse(ConnectionFeatureFlags.flagValue(key: key, defaultOn: true, defaults: defaults))
+        defaults.set(true, forKey: key)
+        XCTAssertTrue(ConnectionFeatureFlags.flagValue(key: key, defaultOn: false, defaults: defaults))
+        defaults.removeObject(forKey: key)
     }
 
     func testSilentPayloadIncludesWatermarkSinceSeqAndBootEpoch() {

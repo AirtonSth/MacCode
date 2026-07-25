@@ -308,10 +308,19 @@ public final class DirectHTTPServer: @unchecked Sendable {
     /// kernel. Large frames on slow uplinks may take longer than 5 s wall time;
     /// progress (any short write) resets the idle clock. Not a total duration budget.
     static let writeProgressIdleTimeout: TimeInterval = 60
-    /// C-07: default idle between keep-alive HTTP requests when the server is
-    /// constructed without an explicit `clientReceiveTimeoutSeconds`. ~5s closes
-    /// abandoned sockets quickly while still covering typical mobile RRC gaps.
+    /// C-07: baseline idle between keep-alive HTTP requests (~5s closes abandoned
+    /// sockets quickly). U-002 experiment lengthens this for 3G RRC gaps.
     public static let httpKeepAliveIdleTimeoutSeconds = 5
+    /// U-002 / plan-connection: longer keep-alive when transport keepalive exp is on.
+    /// Covers typical cellular RRC idle without holding dead clients forever.
+    public static let httpKeepAliveIdleTimeoutExperimentSeconds = 25
+
+    /// Pure seam: pick HTTP keep-alive idle budget from experiment flag.
+    public static func resolvedHttpKeepAliveIdleTimeoutSeconds(experimentEnabled: Bool) -> Int {
+        experimentEnabled
+            ? httpKeepAliveIdleTimeoutExperimentSeconds
+            : httpKeepAliveIdleTimeoutSeconds
+    }
 
     /// Select the host heartbeat offer from the client's WS filter proposal.
     /// `cellular-safe` → cellular budget; otherwise Wi-Fi. Pure for unit tests.

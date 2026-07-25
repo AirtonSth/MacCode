@@ -1,7 +1,13 @@
 import Foundation
 
 /// Phased connection dual-track flags (plan-connection S-009 inventory).
-/// Default **off** until S-008 gates pass. Host-local UserDefaults — not remote config.
+/// Host-local UserDefaults — not remote config.
+///
+/// Defaults (when key is unset):
+/// - `wake_phase_a` **on** — material silent wakes for Phase A kinds
+/// - `transport_keepalive_exp` **on** — longer HTTP keep-alive for 3G RRC
+/// - `wake_phase_b_git`, `wake_outbox`, `selective_catchup` **off** until canary
+/// Explicit UserDefaults writes still override (kill switch = set false).
 public enum ConnectionFeatureFlags {
     public static let wakePhaseAKey = "connection.flag.wake_phase_a"
     public static let wakePhaseBGitKey = "connection.flag.wake_phase_b_git"
@@ -9,28 +15,34 @@ public enum ConnectionFeatureFlags {
     public static let selectiveCatchUpKey = "connection.flag.selective_catchup"
     public static let transportKeepaliveExpKey = "connection.flag.transport_keepalive_exp"
 
+    /// Read a flag: missing key → `defaultOn`; explicit bool wins (including false kill).
+    public static func flagValue(key: String, defaultOn: Bool, defaults: UserDefaults = .standard) -> Bool {
+        guard defaults.object(forKey: key) != nil else { return defaultOn }
+        return defaults.bool(forKey: key)
+    }
+
     public static var wakePhaseAEnabled: Bool {
-        get { UserDefaults.standard.bool(forKey: wakePhaseAKey) }
+        get { flagValue(key: wakePhaseAKey, defaultOn: true) }
         set { UserDefaults.standard.set(newValue, forKey: wakePhaseAKey) }
     }
 
     public static var wakePhaseBGitEnabled: Bool {
-        get { UserDefaults.standard.bool(forKey: wakePhaseBGitKey) }
+        get { flagValue(key: wakePhaseBGitKey, defaultOn: false) }
         set { UserDefaults.standard.set(newValue, forKey: wakePhaseBGitKey) }
     }
 
     public static var wakeOutboxEnabled: Bool {
-        get { UserDefaults.standard.bool(forKey: wakeOutboxKey) }
+        get { flagValue(key: wakeOutboxKey, defaultOn: false) }
         set { UserDefaults.standard.set(newValue, forKey: wakeOutboxKey) }
     }
 
     public static var selectiveCatchUpEnabled: Bool {
-        get { UserDefaults.standard.bool(forKey: selectiveCatchUpKey) }
+        get { flagValue(key: selectiveCatchUpKey, defaultOn: false) }
         set { UserDefaults.standard.set(newValue, forKey: selectiveCatchUpKey) }
     }
 
     public static var transportKeepaliveExperimentEnabled: Bool {
-        get { UserDefaults.standard.bool(forKey: transportKeepaliveExpKey) }
+        get { flagValue(key: transportKeepaliveExpKey, defaultOn: true) }
         set { UserDefaults.standard.set(newValue, forKey: transportKeepaliveExpKey) }
     }
 
