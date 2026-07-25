@@ -51,7 +51,7 @@ final class WebSocketEventBatcher: @unchecked Sendable {
         self.delay = max(0, delay)
         // C-14/C-15: cellular gets the longer caller-supplied window (100–150ms);
         // Wi-Fi keeps the short cross-kind default so interactive latency stays low.
-        self.nilKeyDelay = filter == .cellularSafe ? max(0, delay) : Self.crossKindDelay
+        self.nilKeyDelay = filter.isCellularSafe ? max(0, delay) : Self.crossKindDelay
         self.coalescesStreamingDeltas = coalescesStreamingDeltas
         self.onCoalescedAway = onCoalescedAway
         self.send = send

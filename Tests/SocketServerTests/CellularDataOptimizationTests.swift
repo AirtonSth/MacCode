@@ -151,7 +151,7 @@ final class CellularDataOptimizationTests: XCTestCase {
         var full: [String] = []
         var filtered: [String] = []
         _ = bus.subscribe(since: nil) { full.append($0.kind) }
-        _ = bus.subscribe(since: nil, filter: .cellularSafe) { filtered.append($0.kind) }
+        _ = bus.subscribe(since: nil, filter: .cellularSafe()) { filtered.append($0.kind) }
 
         bus.publish(kind: "diagnostic.tick", payload: .object(["sample": .string(String(repeating: "x", count: 200))]))
         bus.publish(kind: "surface.output", payload: .object([
@@ -182,7 +182,7 @@ final class CellularDataOptimizationTests: XCTestCase {
         var gaps: [ConnectionSequenceRecordResult] = []
         _ = bus.subscribeDetectingReplayExpiry(
             since: 0,
-            filter: .cellularSafe,
+            filter: .cellularSafe(),
             onReplayExpired: { _ in XCTFail("a fresh bus must not report replay expiry") },
             onFilteredEvent: { watermark.recordFilteredEvent(sequence: $0) }
         ) { event in
@@ -212,7 +212,7 @@ final class CellularDataOptimizationTests: XCTestCase {
             "base64": .string(Data("abc".utf8).base64EncodedString())
         ]), ts: 0)
 
-        let mapped = EventStreamFilter.cellularSafe.map(source)
+        let mapped = EventStreamFilter.cellularSafe().map(source)
         let payload = mapped?.payload.objectValue
 
         XCTAssertEqual(mapped?.kind, "surface.output.summary")
@@ -233,7 +233,7 @@ final class CellularDataOptimizationTests: XCTestCase {
             "cols": .number(132)
         ]), ts: 0)
 
-        let mapped = EventStreamFilter.cellularSafe.map(source)
+        let mapped = EventStreamFilter.cellularSafe().map(source)
 
         XCTAssertEqual(mapped?.kind, source.kind)
         XCTAssertEqual(mapped?.seq, source.seq)
@@ -243,7 +243,7 @@ final class CellularDataOptimizationTests: XCTestCase {
 
     func testCellularWebSocketBatcherCoalescesTerminalSummariesPerSurface() {
         let sent = LockedStrings()
-        let batcher = WebSocketEventBatcher(enabled: true, filter: .cellularSafe, delay: 10) { data in
+        let batcher = WebSocketEventBatcher(enabled: true, filter: .cellularSafe(), delay: 10) { data in
             sent.append(String(decoding: data, as: UTF8.self))
         }
 
@@ -272,7 +272,7 @@ final class CellularDataOptimizationTests: XCTestCase {
         let sent = LockedStrings()
         let batcher = WebSocketEventBatcher(
             enabled: true,
-            filter: .cellularSafe,
+            filter: .cellularSafe(),
             delay: 10,
             onCoalescedAway: { data in
                 coalesced.append(String(decoding: data, as: UTF8.self))
@@ -380,12 +380,77 @@ final class CellularDataOptimizationTests: XCTestCase {
             ts: 0
         )
         XCTAssertEqual(
-            EventStreamFilter.cellularSafe.coalescingKey(for: event),
+            EventStreamFilter.cellularSafe().coalescingKey(for: event),
             "agent.item.delta:item-9"
         )
-        XCTAssertTrue(EventStreamFilter.cellularSafe.coalescingMergesByConcatenation(for: event))
+        XCTAssertTrue(EventStreamFilter.cellularSafe().coalescingMergesByConcatenation(for: event))
         XCTAssertNil(EventStreamFilter.full.coalescingKey(for: event),
                      "Wi-Fi uses nil-key streaming coalesce + flush-time concat, not LWW keys")
+    }
+
+    func testCellularSafeInterestParseAndAdmission() {
+        // WHY: on-screen interest must drop high-volume deltas for other threads
+        // without disabling cellular-safe coalescing when interest is non-empty.
+        let empty = EventStreamFilter.parse(filterHeader: "cellular-safe", interestThreadHeader: nil)
+        XCTAssertTrue(empty.isCellularSafe)
+        XCTAssertEqual(empty, .cellularSafe(interestThreadIds: []))
+
+        let interested = EventStreamFilter.parse(
+            filterHeader: "cellular-safe",
+            interestThreadHeader: " t-live , t-live "
+        )
+        guard case .cellularSafe(let ids) = interested else {
+            return XCTFail("expected cellularSafe")
+        }
+        XCTAssertEqual(ids, ["t-live"])
+        XCTAssertTrue(interested.isCellularSafe,
+                      "non-empty interest must still be isCellularSafe (not == .cellularSafe only)")
+
+        let deltaOther = EventBus.Event(
+            seq: 1,
+            kind: "agent.item.delta",
+            payload: .object([
+                "thread_id": .string("t-other"),
+                "item_id": .string("i1"),
+                "body_append": .string("x"),
+            ]),
+            ts: 0
+        )
+        let deltaLive = EventBus.Event(
+            seq: 2,
+            kind: "agent.item.delta",
+            payload: .object([
+                "thread_id": .string("t-live"),
+                "item_id": .string("i2"),
+                "body_append": .string("y"),
+            ]),
+            ts: 0
+        )
+        let completedOther = EventBus.Event(
+            seq: 3,
+            kind: "agent.run.completed",
+            payload: .object(["thread_id": .string("t-other")]),
+            ts: 0
+        )
+
+        XCTAssertNil(interested.map(deltaOther), "non-interest delta must drop")
+        XCTAssertEqual(interested.map(deltaLive)?.kind, "agent.item.delta")
+        XCTAssertEqual(interested.map(completedOther)?.kind, "agent.run.completed",
+                       "lifecycle still passes for non-selected threads")
+        XCTAssertEqual(empty.map(deltaOther)?.kind, "agent.item.delta",
+                       "empty interest fails open to prior cellular-safe behavior")
+    }
+
+    func testIsCellularSafeIgnoresInterestEqualityTrap() {
+        // WHY: `filter == .cellularSafe` only matches empty interest Set default
+        // and would disable coalescing/heartbeat cellular profiles after interest.
+        let withInterest = EventStreamFilter.cellularSafe(interestThreadIds: ["t1"])
+        XCTAssertTrue(withInterest.isCellularSafe)
+        XCTAssertNotEqual(withInterest, .cellularSafe())
+        XCTAssertEqual(
+            DirectHTTPServer.heartbeatProfile(forWSFilter: withInterest),
+            DirectHTTPServer.heartbeatProfile(forWSFilter: .cellularSafe())
+        )
     }
 }
 

@@ -560,11 +560,36 @@ public final class EventBus: @unchecked Sendable {
 
 public enum EventStreamFilter: Sendable, Equatable {
     case full
-    case cellularSafe
+    /// Cellular volume filter. Optional interest thread ids drop high-volume
+    /// agent deltas for other threads (fail open when interest is empty).
+    case cellularSafe(interestThreadIds: Set<String> = [])
+
+    /// True for any cellular-safe filter regardless of interest set.
+    /// Prefer this over `== .cellularSafe` (associated value breaks equality).
+    public var isCellularSafe: Bool {
+        if case .cellularSafe = self { return true }
+        return false
+    }
 
     public static func parse(_ raw: String?) -> EventStreamFilter {
-        guard raw?.lowercased().contains("cellular-safe") == true else { return .full }
-        return .cellularSafe
+        parse(filterHeader: raw, interestThreadHeader: nil)
+    }
+
+    /// Parse filter + optional interest header (`thread-a,thread-b`).
+    public static func parse(
+        filterHeader: String?,
+        interestThreadHeader: String?
+    ) -> EventStreamFilter {
+        guard filterHeader?.lowercased().contains("cellular-safe") == true else {
+            return .full
+        }
+        let ids = Set(
+            (interestThreadHeader ?? "")
+                .split(separator: ",")
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .filter { !$0.isEmpty }
+        )
+        return .cellularSafe(interestThreadIds: ids)
     }
 
     public func allows(_ event: EventBus.Event) -> Bool {
@@ -572,7 +597,7 @@ public enum EventStreamFilter: Sendable, Equatable {
     }
 
     public func coalescingKey(for event: EventBus.Event) -> String? {
-        guard self == .cellularSafe else { return nil }
+        guard case .cellularSafe = self else { return nil }
         guard case .object(let payload) = event.payload else { return nil }
         // C-14: last-write-wins for terminal summaries (seq + byte counts only).
         if event.kind == "surface.output.summary",
@@ -597,7 +622,7 @@ public enum EventStreamFilter: Sendable, Equatable {
         switch self {
         case .full:
             return event
-        case .cellularSafe:
+        case .cellularSafe(let interestThreadIds):
             // `reducerRequired` means the *content* is required on the client,
             // not that every micro-token must be its own WS frame (C-16).
             let classification = EventStreamClassification.classify(kind: event.kind)
@@ -606,6 +631,15 @@ public enum EventStreamFilter: Sendable, Equatable {
                     return event
                 }
                 return Self.terminalOutputSummary(from: event)
+            }
+            // On-screen interest: drop high-volume agent deltas for other threads.
+            // Fail open when interest set is empty.
+            if !interestThreadIds.isEmpty,
+               event.kind == "agent.item.delta" || event.kind == "agent.item.progress",
+               case .object(let payload) = event.payload,
+               let threadId = payload["thread_id"]?.stringValue ?? payload["threadId"]?.stringValue,
+               !interestThreadIds.contains(threadId) {
+                return nil
             }
             guard classification.reducerRequired || classification.priority == .critical else { return nil }
             return event

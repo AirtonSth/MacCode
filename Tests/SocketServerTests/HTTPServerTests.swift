@@ -461,7 +461,7 @@ final class HTTPServerTests: XCTestCase {
             DirectHTTPServer.wsHeartbeatProfileWiFi
         )
         XCTAssertEqual(
-            DirectHTTPServer.heartbeatProfile(forWSFilter: .cellularSafe),
+            DirectHTTPServer.heartbeatProfile(forWSFilter: .cellularSafe()),
             DirectHTTPServer.wsHeartbeatProfileCellular
         )
     }
@@ -485,7 +485,7 @@ final class HTTPServerTests: XCTestCase {
 
     func test_heartbeatNegotiationAcceptsClientProposalWithinProfile() {
         let accepted = DirectHTTPServer.negotiateHeartbeatProfile(
-            filter: .cellularSafe,
+            filter: .cellularSafe(),
             proposedIntervalMs: 25_000,
             proposedTimeoutMs: 90_000
         )
@@ -493,7 +493,7 @@ final class HTTPServerTests: XCTestCase {
         XCTAssertEqual(accepted.timeout, 90)
 
         let countered = DirectHTTPServer.negotiateHeartbeatProfile(
-            filter: .cellularSafe,
+            filter: .cellularSafe(),
             proposedIntervalMs: 60_000,
             proposedTimeoutMs: 120_000
         )

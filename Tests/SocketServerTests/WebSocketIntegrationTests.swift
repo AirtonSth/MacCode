@@ -184,11 +184,11 @@ final class WebSocketIntegrationTests: XCTestCase {
             15_000
         )
         XCTAssertEqual(
-            DirectHTTPServer.negotiateSnapshotTimeoutMs(filter: .cellularSafe, proposedMs: nil),
+            DirectHTTPServer.negotiateSnapshotTimeoutMs(filter: .cellularSafe(), proposedMs: nil),
             45_000
         )
         XCTAssertEqual(
-            DirectHTTPServer.negotiateSnapshotTimeoutMs(filter: .cellularSafe, proposedMs: 60_000),
+            DirectHTTPServer.negotiateSnapshotTimeoutMs(filter: .cellularSafe(), proposedMs: 60_000),
             60_000
         )
         XCTAssertEqual(

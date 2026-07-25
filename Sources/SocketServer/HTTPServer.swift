@@ -342,7 +342,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
         filter: EventStreamFilter,
         proposedMs: Int64?
     ) -> Int64 {
-        let offer: Int64 = filter == .cellularSafe
+        let offer: Int64 = filter.isCellularSafe
             ? wsSnapshotTimeoutCellularMs
             : wsSnapshotTimeoutWiFiMs
         guard let proposedMs, proposedMs > 0 else { return offer }
@@ -893,7 +893,10 @@ public final class DirectHTTPServer: @unchecked Sendable {
                 .split(separator: ",")
                 .map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
                 .contains(PayloadCodec.lzfse.wireName) == true
-            let wsFilter = EventStreamFilter.parse(headers["x-rc2-ws-filter"])
+            let wsFilter = EventStreamFilter.parse(
+                filterHeader: headers["x-rc2-ws-filter"],
+                interestThreadHeader: headers["x-rc2-ws-interest-threads"]
+            )
             // C-06: client proposes via filter (+ optional heartbeat headers); host
             // accepts within the network profile or counters with the profile ceiling.
             let proposedIntervalMs = headers["x-rc2-heartbeat-interval-ms"]
@@ -1097,9 +1100,9 @@ public final class DirectHTTPServer: @unchecked Sendable {
             // terminal.output.summary per surface → ≥5× fewer summaries/sec).
             // C-15: coalesce agent.item.delta on all links; cellular uses a longer
             // window (100ms) so ~10× fewer frames than one-frame-per-token.
-            let coalescingDelayMs = wsFilter == .cellularSafe ? 100 : 15
+            let coalescingDelayMs = wsFilter.isCellularSafe ? 100 : 15
             let batcher = WebSocketEventBatcher(
-                enabled: wsFilter == .cellularSafe,
+                enabled: wsFilter.isCellularSafe,
                 filter: wsFilter,
                 delay: TimeInterval(coalescingDelayMs) / 1000.0,
                 // PERF: coalesce per-token agent.item.delta frames; non-delta
