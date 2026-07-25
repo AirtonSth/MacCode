@@ -69,4 +69,28 @@ final class MaterialWakeCoordinatorTests: XCTestCase {
         XCTAssertFalse(ConnectionFeatureFlags.transportKeepaliveExperimentEnabled)
         XCTAssertEqual(ConnectionFeatureFlags.inventory().count, 5)
     }
+
+    func testSilentPayloadIncludesWatermarkSinceSeqAndBootEpoch() {
+        let payload = MaterialWakeCoordinator.makeSilentPayload(
+            eventSeq: 77,
+            reason: "agent.run.completed",
+            bootEpoch: "12",
+            watermark: "80"
+        )
+        let data = payload.asPushData()
+        XCTAssertEqual(data["rc2_catch_up"], "1")
+        XCTAssertEqual(data["rc2_since_seq"], "77")
+        XCTAssertEqual(data["rc2_boot_epoch"], "12")
+        XCTAssertEqual(data["rc2_wm"], "80")
+        XCTAssertEqual(data["rc2_schema"], SilentCatchUpV1.schemaVersion)
+        // Privacy: free-form agent text cannot be smuggled via wm.
+        let scrubbed = MaterialWakeCoordinator.makeSilentPayload(
+            eventSeq: 1,
+            reason: "x",
+            bootEpoch: "not-a-number",
+            watermark: "agent said hello"
+        )
+        XCTAssertNil(scrubbed.bootEpoch)
+        XCTAssertNil(scrubbed.watermark)
+    }
 }

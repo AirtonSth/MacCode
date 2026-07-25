@@ -11,12 +11,23 @@ public final class MaterialWakeCoordinator: @unchecked Sendable {
     private let lock = NSLock()
     private var subscriptionToken: UUID?
     private weak var bridge: PrivateNotificationBridge?
+    private var bootEpochProvider: (() -> String?)?
+    private var watermarkProvider: (() -> String?)?
 
     private init() {}
 
-    public func start(bridge: PrivateNotificationBridge) {
+    /// - Parameters:
+    ///   - bootEpochProvider: host boot epoch for silent_catchup.v1 (S-006).
+    ///   - watermarkProvider: monotonic event bus seq string for `rc2_wm`.
+    public func start(
+        bridge: PrivateNotificationBridge,
+        bootEpochProvider: @escaping () -> String? = { nil },
+        watermarkProvider: @escaping () -> String? = { String(EventBus.shared.currentSeq) }
+    ) {
         lock.lock()
         self.bridge = bridge
+        self.bootEpochProvider = bootEpochProvider
+        self.watermarkProvider = watermarkProvider
         if subscriptionToken == nil {
             subscriptionToken = EventBus.shared.subscribe(since: nil) { [weak self] event in
                 self?.handle(event: event)
@@ -33,7 +44,25 @@ public final class MaterialWakeCoordinator: @unchecked Sendable {
             subscriptionToken = nil
         }
         bridge = nil
+        bootEpochProvider = nil
+        watermarkProvider = nil
         lock.unlock()
+    }
+
+    /// Pure seam: build v1 payload for a material event (tests assert fields).
+    public static func makeSilentPayload(
+        eventSeq: Int64,
+        reason: String,
+        bootEpoch: String?,
+        watermark: String?
+    ) -> SilentCatchUpV1 {
+        SilentCatchUpV1(
+            catchUp: true,
+            watermark: watermark ?? String(eventSeq),
+            sinceSeq: String(eventSeq),
+            bootEpoch: bootEpoch,
+            reason: reason
+        )
     }
 
     /// Pure seam for tests: should this event produce a silent wake under current flags?
@@ -73,9 +102,16 @@ public final class MaterialWakeCoordinator: @unchecked Sendable {
         guard decision.allowed else { return }
         lock.lock()
         let bridge = self.bridge
+        let bootEpoch = bootEpochProvider?()
+        let watermark = watermarkProvider?()
         lock.unlock()
         guard let bridge else { return }
-        let payload = SilentCatchUpV1(reason: decision.reason)
+        let payload = Self.makeSilentPayload(
+            eventSeq: event.seq,
+            reason: decision.reason,
+            bootEpoch: bootEpoch,
+            watermark: watermark
+        )
         let force = decision.force
         Task {
             await bridge.deliverSilentCatchUp(
