@@ -83,6 +83,37 @@ final class WebSocketOutboundQueue: @unchecked Sendable {
         case closed
     }
 
+    /// Result of a backpressure degrade pass. Callers use this to account for
+    /// discarded sequences (`recordFilteredEvent`) and to emit at most one
+    /// in-band `baseline_required` without closing the socket.
+    struct DegradeOutcome: Equatable {
+        var freedBytes: Int
+        var freedFrames: Int
+        /// Sequences of application event frames removed from the outbound queue.
+        /// These were previously accepted; the caller must recover via
+        /// `baseline_required` (watermark already advanced past them).
+        var droppedEventSequences: [Int64]
+        var coalescedAwayFrames: Int
+        var discardedBulkFrames: Int
+        /// True when any kept-but-dropped content requires client rebaseline.
+        var needsBaselineRequired: Bool
+
+        static let empty = DegradeOutcome(
+            freedBytes: 0,
+            freedFrames: 0,
+            droppedEventSequences: [],
+            coalescedAwayFrames: 0,
+            discardedBulkFrames: 0,
+            needsBaselineRequired: false
+        )
+    }
+
+    /// Target backlog duration used to size the queue from measured drain rate.
+    static let targetBacklogSeconds: TimeInterval = 8
+    static let minimumQueuedBytes = 64 * 1_024
+    /// Hard ceiling so a fast Wi-Fi drain estimate cannot grow unbounded.
+    static let maximumQueuedBytesCeiling = 4 * 1_024 * 1_024
+
     private enum State: Equatable {
         case open
         case terminalReserved
@@ -92,7 +123,8 @@ final class WebSocketOutboundQueue: @unchecked Sendable {
     }
 
     private let queue: DispatchQueue
-    private let maxQueuedBytes: Int
+    /// Configured starting budget / soft ceiling floor for cold start.
+    private let configuredMaxQueuedBytes: Int
     private let maxQueuedFrames: Int
     private let lock = NSLock()
     private var queuedBytes = 0
@@ -112,6 +144,10 @@ final class WebSocketOutboundQueue: @unchecked Sendable {
     private let didSendTerminal: @Sendable () -> Void
     private let acceptedSubmissionHook: @Sendable () -> Void
     private let terminationAttemptHook: @Sendable () -> Void
+    /// EMA of observed application+control drain rate (bytes/sec).
+    private var measuredDrainBytesPerSecond: Double = 0
+    private var lastDrainAt: TimeInterval = 0
+    private var lastDrainByteSample = 0
 
     init(
         label: String = "rc2.ws.outbound",
@@ -126,7 +162,7 @@ final class WebSocketOutboundQueue: @unchecked Sendable {
         terminationAttemptHook: @escaping @Sendable () -> Void = {}
     ) {
         self.queue = DispatchQueue(label: label)
-        self.maxQueuedBytes = max(1, maxQueuedBytes)
+        self.configuredMaxQueuedBytes = max(1, maxQueuedBytes)
         self.maxQueuedFrames = max(1, maxQueuedFrames)
         self.applicationWriter = applicationWriter
         self.controlWriter = controlWriter
@@ -166,12 +202,22 @@ final class WebSocketOutboundQueue: @unchecked Sendable {
         return queuedFrames
     }
 
+    /// Effective byte budget: seconds of backlog at the measured drain rate,
+    /// clamped to [minimumQueuedBytes, ceiling]. Cold start (no samples) uses
+    /// the configured budget so unit tests with tiny ceilings stay deterministic.
+    var effectiveMaxQueuedBytes: Int {
+        lock.lock(); defer { lock.unlock() }
+        return effectiveMaxQueuedBytesLocked()
+    }
+
+    var measuredDrainBytesPerSecondForTests: Double {
+        lock.lock(); defer { lock.unlock() }
+        return measuredDrainBytesPerSecond
+    }
+
     func enqueue(_ data: Data) -> EnqueueResult {
-        let result = enqueueApplication(data)
-        if result == .queueFull {
-            _ = terminate(errorData: nil, closingData: nil, reason: "queue_full")
-        }
-        return result
+        // C-04: overflow is a degrade signal, never an implicit close.
+        enqueueApplication(data)
     }
 
     func enqueueApplication(_ data: Data) -> EnqueueResult {
@@ -181,9 +227,10 @@ final class WebSocketOutboundQueue: @unchecked Sendable {
             lock.unlock()
             return .closed
         }
+        let budget = effectiveMaxQueuedBytesLocked()
         guard queuedFrames < maxQueuedFrames,
-              data.count <= maxQueuedBytes - queuedBytes else {
-            state = .terminalReserved
+              data.count <= budget - queuedBytes else {
+            // Stay open so the caller can degrade() and keep the socket alive.
             lock.unlock()
             return .queueFull
         }
@@ -202,11 +249,12 @@ final class WebSocketOutboundQueue: @unchecked Sendable {
             lock.unlock()
             return .closed
         }
+        let budget = effectiveMaxQueuedBytesLocked()
         guard queuedFrames < maxQueuedFrames,
-              data.count <= maxQueuedBytes - queuedBytes else {
-            state = .terminalReserved
+              data.count <= budget - queuedBytes else {
+            // Control overflow used to terminate; that killed healthy 3G sessions
+            // under event load. Degrade path owns recovery — stay open.
             lock.unlock()
-            _ = terminate(errorData: nil, closingData: nil, reason: "queue_full")
             return .queueFull
         }
         queuedBytes += data.count
@@ -216,6 +264,179 @@ final class WebSocketOutboundQueue: @unchecked Sendable {
         queue.async { [weak self] in self?.writeNextPendingFrame() }
         lock.unlock()
         return .accepted
+    }
+
+    /// Backpressure ladder (C-04): coalesce by key → discard bulk/diagnostic
+    /// application frames → report that a focused `baseline_required` is needed.
+    /// Never closes the socket. Control frames are preserved.
+    @discardableResult
+    func degrade() -> DegradeOutcome {
+        lock.lock()
+        guard state == .open else {
+            lock.unlock()
+            return .empty
+        }
+
+        var frames: [Data] = []
+        while let frame = pendingApplicationFrames.popFirst() {
+            frames.append(frame)
+        }
+        guard !frames.isEmpty else {
+            lock.unlock()
+            return .empty
+        }
+
+        let beforeBytes = frames.reduce(0) { $0 + $1.count }
+        let beforeCount = frames.count
+
+        let coalesced = Self.coalesceApplicationFrames(frames)
+        let coalescedAway = beforeCount - coalesced.count
+
+        var kept: [Data] = []
+        var droppedSequences: [Int64] = []
+        var discardedBulk = 0
+        kept.reserveCapacity(coalesced.count)
+        for frame in coalesced {
+            if Self.isSheddableApplicationFrame(frame) {
+                discardedBulk += 1
+                if let sequence = Self.eventSequence(in: frame) {
+                    droppedSequences.append(sequence)
+                }
+                continue
+            }
+            kept.append(frame)
+        }
+
+        // If coalescing alone made room and nothing bulk was shed, still report
+        // sequences lost to last-write-wins coalesce so the caller can baseline.
+        if discardedBulk == 0, coalescedAway > 0 {
+            let keptSequences = Set(kept.compactMap { Self.eventSequence(in: $0) })
+            for frame in frames {
+                guard let sequence = Self.eventSequence(in: frame),
+                      !keptSequences.contains(sequence) else { continue }
+                droppedSequences.append(sequence)
+            }
+        }
+
+        let afterBytes = kept.reduce(0) { $0 + $1.count }
+        let controlBytes = queuedBytes - beforeBytes
+        let controlFrames = queuedFrames - beforeCount
+        queuedBytes = max(0, controlBytes) + afterBytes
+        queuedFrames = max(0, controlFrames) + kept.count
+        for frame in kept {
+            pendingApplicationFrames.append(frame)
+        }
+
+        let freedBytes = max(0, beforeBytes - afterBytes)
+        let freedFrames = max(0, beforeCount - kept.count)
+        let outcome = DegradeOutcome(
+            freedBytes: freedBytes,
+            freedFrames: freedFrames,
+            droppedEventSequences: droppedSequences,
+            coalescedAwayFrames: max(0, coalescedAway),
+            discardedBulkFrames: discardedBulk,
+            needsBaselineRequired: freedFrames > 0
+        )
+        lock.unlock()
+        return outcome
+    }
+
+    /// Whether an encoded application frame is safe to shed under pressure.
+    static func isSheddableApplicationFrame(_ data: Data) -> Bool {
+        guard let kind = eventKind(in: data) else { return false }
+        return isSheddableKind(kind)
+    }
+
+    static func isSheddableKind(_ kind: String) -> Bool {
+        if kind.hasPrefix("diagnostic.") || kind.hasPrefix("metrics.") {
+            return true
+        }
+        switch kind {
+        case "surface.output", "surface.output.summary", "agent.item.delta":
+            return true
+        default:
+            return false
+        }
+    }
+
+    static func eventSequence(in data: Data) -> Int64? {
+        guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              (object["type"] as? String) == "event" else { return nil }
+        if let n = object["sequence"] as? Int64 { return n }
+        if let n = object["sequence"] as? Int { return Int64(n) }
+        if let n = object["sequence"] as? Double { return Int64(n) }
+        return nil
+    }
+
+    static func eventKind(in data: Data) -> String? {
+        guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              (object["type"] as? String) == "event" else { return nil }
+        return object["kind"] as? String
+    }
+
+    static func coalescingKey(for data: Data) -> String? {
+        guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              (object["type"] as? String) == "event",
+              let kind = object["kind"] as? String else { return nil }
+        let payload = object["payload"] as? [String: Any]
+        switch kind {
+        case "surface.output", "surface.output.summary", "surface.browser":
+            if let sid = payload?["surface_id"] as? String {
+                return "\(kind):\(sid)"
+            }
+        case "agent.item.delta":
+            if let item = payload?["item_id"] as? String {
+                return "\(kind):\(item)"
+            }
+            if let thread = payload?["thread_id"] as? String {
+                return "\(kind):\(thread)"
+            }
+        default:
+            break
+        }
+        return nil
+    }
+
+    /// Coalesce per key: LWW for summaries/geometry; **concatenate** for
+    /// `agent.item.delta` (C-16 — LWW would drop tokens and corrupt text).
+    /// Non-keyed frames keep arrival order.
+    static func coalesceApplicationFrames(_ frames: [Data]) -> [Data] {
+        guard !frames.isEmpty else { return [] }
+        var result: [Data] = []
+        var keySlots: [String: Int] = [:]
+
+        for frame in frames {
+            guard let key = coalescingKey(for: frame) else {
+                result.append(frame)
+                continue
+            }
+            if let index = keySlots[key] {
+                if key.hasPrefix("agent.item.delta:"),
+                   let merged = WebSocketEventBatcher.mergeAgentItemDeltaFrames(result[index], frame) {
+                    result[index] = merged
+                } else {
+                    result[index] = frame
+                }
+            } else {
+                keySlots[key] = result.count
+                result.append(frame)
+            }
+        }
+        return result
+    }
+
+    private func effectiveMaxQueuedBytesLocked() -> Int {
+        let ceiling = min(
+            Self.maximumQueuedBytesCeiling,
+            max(configuredMaxQueuedBytes, Self.minimumQueuedBytes)
+        )
+        // No drain samples yet: honor the configured budget (keeps unit tests
+        // with tiny maxQueuedBytes deterministic).
+        guard measuredDrainBytesPerSecond >= 1_000 else {
+            return max(1, configuredMaxQueuedBytes)
+        }
+        let dynamic = Int(measuredDrainBytesPerSecond * Self.targetBacklogSeconds)
+        return min(ceiling, max(Self.minimumQueuedBytes, dynamic))
     }
 
     @discardableResult
@@ -279,7 +500,7 @@ final class WebSocketOutboundQueue: @unchecked Sendable {
             return
         }
         let succeeded = applicationWriter(data)
-        removeQueuedItem(byteCount: data.count)
+        removeQueuedItem(byteCount: data.count, countAsDrain: succeeded)
         if !succeeded { terminateImmediatelyAfterWriteFailure() }
     }
 
@@ -289,7 +510,7 @@ final class WebSocketOutboundQueue: @unchecked Sendable {
             return
         }
         let succeeded = controlWriter(opcode, data)
-        removeQueuedItem(byteCount: data.count)
+        removeQueuedItem(byteCount: data.count, countAsDrain: succeeded)
         if !succeeded { terminateImmediatelyAfterWriteFailure() }
     }
 
@@ -305,11 +526,33 @@ final class WebSocketOutboundQueue: @unchecked Sendable {
         return true
     }
 
-    private func removeQueuedItem(byteCount: Int) {
+    private func removeQueuedItem(byteCount: Int, countAsDrain: Bool = false) {
         lock.lock()
         queuedBytes = max(0, queuedBytes - byteCount)
         queuedFrames = max(0, queuedFrames - 1)
+        if countAsDrain, byteCount > 0 {
+            noteDrainLocked(bytes: byteCount)
+        }
         lock.unlock()
+    }
+
+    private func noteDrainLocked(bytes: Int) {
+        let now = Date().timeIntervalSinceReferenceDate
+        if lastDrainAt > 0 {
+            let dt = now - lastDrainAt
+            if dt > 0.000_5 {
+                // Attribute the previous sample's bytes over the inter-write gap.
+                let instant = Double(lastDrainByteSample) / dt
+                if measuredDrainBytesPerSecond <= 0 {
+                    measuredDrainBytesPerSecond = instant
+                } else {
+                    measuredDrainBytesPerSecond =
+                        measuredDrainBytesPerSecond * 0.8 + instant * 0.2
+                }
+            }
+        }
+        lastDrainAt = now
+        lastDrainByteSample = bytes
     }
 
     private func terminateImmediatelyAfterWriteFailure() {
@@ -339,6 +582,27 @@ final class LockedSubscriberID: @unchecked Sendable {
         set {
             lock.lock(); storage = newValue; lock.unlock()
         }
+    }
+}
+
+/// Rate-limits in-band `baseline_required` emissions under outbound pressure
+/// so a busy agent cannot flood the client (acceptance: ≤1/s).
+final class OutboundPressureBaselineGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var lastEmitAt: TimeInterval = 0
+    private let minInterval: TimeInterval
+
+    init(minInterval: TimeInterval = 1.0) {
+        self.minInterval = max(0, minInterval)
+    }
+
+    func tryAcquire(now: TimeInterval = Date().timeIntervalSinceReferenceDate) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        if lastEmitAt > 0, now - lastEmitAt < minInterval {
+            return false
+        }
+        lastEmitAt = now
+        return true
     }
 }
 

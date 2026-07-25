@@ -181,6 +181,7 @@ final class ConnectionSnapshotPhase3Tests: XCTestCase {
         let connectionID = try XCTUnwrap(welcome["connectionId"] as? String)
         XCTAssertEqual(welcome["capabilities"] as? [String], [
             "events.replay", "jsonrpc.batch", "snapshot.v3",
+            "rpc.websocket", "snapshot.incremental",
         ])
 
         let validParams: [String: Any] = [

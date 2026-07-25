@@ -68,7 +68,9 @@ final class EventBusTests: XCTestCase {
                       "when replay cannot prove complete terminal output, iOS must be told to fetch a snapshot or show partial state")
     }
 
-    func test_webSocketOutboundQueueClosesSlowClientBeforeMemoryCanGrowUnbounded() {
+    func test_webSocketOutboundQueueReportsFullWithoutClosingSlowClient() {
+        // C-04: overflow is a degrade signal, not a hard close. Memory stays
+        // bounded by the budget; the socket stays open so 3G clients can recover.
         let closed = LockedStrings()
         let queue = WebSocketOutboundQueue(maxQueuedBytes: 8, writer: { _ in
             Thread.sleep(forTimeInterval: 0.03)
@@ -79,9 +81,15 @@ final class EventBusTests: XCTestCase {
 
         XCTAssertEqual(queue.enqueue(Data("12345678".utf8)), .accepted)
         XCTAssertEqual(queue.enqueue(Data("9".utf8)), .queueFull,
-                       "a stalled iOS socket must be disconnected/downgraded instead of letting host terminal output queue forever")
+                       "a stalled iOS socket must signal pressure instead of growing unbounded")
+        XCTAssertEqual(closed.values(), [],
+                       "queue_full must not terminate the connection (C-04)")
+        let outcome = queue.degrade()
+        // No parseable event frames in this synthetic blob queue — degrade is a no-op
+        // or frees nothing, but the socket remains open for a later retry.
+        _ = outcome
         queue.drain()
-        XCTAssertEqual(closed.values(), ["queue_full"])
+        XCTAssertEqual(closed.values(), [])
     }
 
     func test_subscriberSnapshotConsistencyAfterAddAndRemove() {

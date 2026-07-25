@@ -432,8 +432,8 @@ final class ConnectionLifecyclePhase0Tests: XCTestCase {
                        "every blocking worker loop must be gated by descriptor ownership")
         XCTAssertEqual(
             source.components(separatedBy: "while acceptedSockets.isActive(fd)").count - 1,
-            3,
-            "header, body, and WebSocket reads must each use the generation-aware registry gate"
+            4,
+            "keep-alive session, header, body, and WebSocket reads must each use the generation-aware registry gate"
         )
         XCTAssertEqual(
             source.components(separatedBy: "Self.readRetryingInterrupts").count - 1,
@@ -590,20 +590,31 @@ final class ConnectionLifecyclePhase0Tests: XCTestCase {
             DirectHTTPServer.maximumAcceptedConnections
         )
 
+        // Old-generation workers must release during stop/start.
         for (name, descriptor) in [
             ("partial-header", partialHeaderClient),
             ("partial-body", partialBodyClient),
             ("old-websocket", webSocketClient),
-            ("current-health", currentClient),
         ] {
             XCTAssertTrue(
                 waitForPeerClosure(descriptor, timeout: 1),
                 "\(name) worker must release its peer during generation transition"
             )
         }
-        XCTAssertTrue(waitUntil(timeout: 2) { server.acceptedSocketCountForTests == 0 })
+        // C-07: current-health may stay open (HTTP keep-alive idle). It is
+        // only required to drop on the next stop, not immediately after 200.
+        XCTAssertTrue(
+            waitUntil(timeout: 1) { server.acceptedSocketCountForTests >= 1 },
+            "keep-alive should retain the current-generation health connection until stop or idle timeout"
+        )
 
         server.stop()
+        XCTAssertTrue(
+            waitForPeerClosure(currentClient, timeout: 1),
+            "stop must reclaim the keep-alive health connection"
+        )
+        XCTAssertTrue(waitUntil(timeout: 2) { server.acceptedSocketCountForTests == 0 })
+
         for descriptor in clients { Darwin.close(descriptor) }
         clients.removeAll()
         XCTAssertTrue(
