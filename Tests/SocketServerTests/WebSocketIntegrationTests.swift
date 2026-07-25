@@ -122,10 +122,8 @@ final class WebSocketIntegrationTests: XCTestCase {
         XCTAssertNotEqual((obj["snapshotTimeoutMs"] as? NSNumber)?.int64Value,
                           (obj["heartbeatTimeoutMs"] as? NSNumber)?.int64Value,
                           "C-03: snapshotTimeoutMs must not equal heartbeatTimeoutMs")
-        XCTAssertEqual(obj["capabilities"] as? [String], [
-            "events.replay", "jsonrpc.batch", "snapshot.v3",
-            "rpc.websocket", "snapshot.incremental",
-        ])
+        XCTAssertEqual(obj["capabilities"] as? [String], DirectHTTPServer.welcomeCapabilities(),
+                       "the integration contract must track the server's negotiated capability set")
     }
 
     func test_C06_cellularFilterNegotiatesExtendedHeartbeatBudget() async throws {
