@@ -186,6 +186,39 @@ RemoteCode is split into focused modules:
 3. Drag tabs into the layout that fits the task.
 4. Use tab context actions to clean up finished work quickly.
 
+## Connection dual-track (plan-connection)
+
+Host flags for material silent wakes and transport keep-alive live in
+`UserDefaults` (see `ConnectionFeatureFlags`). Defaults when the key is
+**unset**:
+
+| Key | Default | Effect |
+|---|---|---|
+| `connection.flag.wake_phase_a` | **on** | Material agent/lifecycle events may emit silent APNs catch-up (`silent_catchup.v1`) |
+| `connection.flag.transport_keepalive_exp` | **on** | HTTP keep-alive idle **25s** (vs 5s baseline) for cellular RRC gaps |
+| `connection.flag.wake_phase_b_git` | off | Git material silent wakes |
+| `connection.flag.wake_outbox` | off | Durable silent outbox |
+| `connection.flag.selective_catchup` | off | Host-side selective catch-up experiment inventory |
+
+**Kill switch** (explicit `false` always wins; restart RemoteCode after change):
+
+```bash
+# Bundle id may be io.remotecode.app or your signed product id — check Activity Monitor / Info.plist
+defaults write io.remotecode.app connection.flag.wake_phase_a -bool false
+defaults write io.remotecode.app connection.flag.transport_keepalive_exp -bool false
+```
+
+Unset restores default-on for those two:
+
+```bash
+defaults delete io.remotecode.app connection.flag.wake_phase_a
+defaults delete io.remotecode.app connection.flag.transport_keepalive_exp
+```
+
+On HTTP server start the log should show `keepAliveIdle=25s wakePhaseA=true`
+when defaults are unset. iOS client docs: `ios-app/docs/RUNBOOKS.md` (RB-8),
+`ios-app/docs/BACKGROUND-LIMITS.md`.
+
 ## Build And Test
 
 ```bash
