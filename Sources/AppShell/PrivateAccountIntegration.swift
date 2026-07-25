@@ -1013,7 +1013,12 @@ public final class PrivateNotificationBridge: @unchecked Sendable {
     /// Silent APNs background wake: iOS `didReceiveRemoteNotification` runs
     /// `BackgroundSyncCoordinator` catch-up. Coalesced per 30s bucket to stay
     /// under private push rate limits when many runs finish in a burst.
-    public func deliverSilentCatchUp(hostHint: String = "host", force: Bool = false) async {
+    /// Payload is `silent_catchup.v1` only (no agent text/titles in data).
+    public func deliverSilentCatchUp(
+        hostHint: String = "host",
+        force: Bool = false,
+        payload: SilentCatchUpV1 = SilentCatchUpV1(reason: "catch_up")
+    ) async {
         guard let session = accountStore.load(), session.user.subscribed,
               let target = pushTargetStore.load() else { return }
         let bucket = Int(Date().timeIntervalSince1970 / 30)
@@ -1029,15 +1034,16 @@ public final class PrivateNotificationBridge: @unchecked Sendable {
         }()
         Self.silentCatchUpLock.unlock()
         guard shouldSend else { return }
+        var contract = payload
+        contract.catchUp = true
+        let data = contract.asPushData()
         do {
             let result = try await sessionRefresher.perform(session: session) { accessToken in
                 try await self.api.deliverAlert(
                     accessToken: accessToken,
                     title: "",
                     body: "",
-                    data: [
-                        "rc2_catch_up": "1"
-                    ],
+                    data: data,
                     pushToken: target.pushToken,
                     pushTokenType: target.pushTokenType,
                     idempotencyKey: "catchup.\(hostHint).\(bucket)",
