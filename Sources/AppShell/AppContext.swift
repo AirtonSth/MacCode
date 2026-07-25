@@ -271,6 +271,8 @@ public final class AppContext {
             pushTargetStore: privatePushTargetStore
         )
         self.privateNotificationBridge = privateNotificationBridge
+        // S-005a: Phase A material silent wakes (flag connection.flag.wake_phase_a, default off).
+        MaterialWakeCoordinator.shared.start(bridge: privateNotificationBridge)
         let liveActivityIdentity = try LiveActivityIdentityStore.beginBoot(settings: self.settingsRepo)
         self.liveActivityHostIdentity = liveActivityIdentity
         let settingsRepo = self.settingsRepo
