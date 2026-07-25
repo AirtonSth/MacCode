@@ -1033,10 +1033,14 @@ public final class PrivateNotificationBridge: @unchecked Sendable {
             return true
         }()
         Self.silentCatchUpLock.unlock()
-        guard shouldSend else { return }
+        if !shouldSend {
+            HostWakeMetrics.shared.increment(.outboxCoalesced)
+            return
+        }
         var contract = payload
         contract.catchUp = true
         let data = contract.asPushData()
+        HostWakeMetrics.shared.increment(.silentAttempt)
         do {
             let result = try await sessionRefresher.perform(session: session) { accessToken in
                 try await self.api.deliverAlert(
@@ -1053,7 +1057,14 @@ public final class PrivateNotificationBridge: @unchecked Sendable {
             if result.shouldDropSubscription {
                 pushTargetStore.clear()
             }
+            if result.delivered {
+                HostWakeMetrics.shared.increment(.silentSent)
+            } else {
+                // Backend may signal rate limit via non-delivered without throw.
+                HostWakeMetrics.shared.increment(.silent429)
+            }
         } catch {
+            HostWakeMetrics.shared.increment(.silentFailed)
             Self.log.error("Silent catch-up push failed: \(String(describing: error), privacy: .public)")
         }
     }
