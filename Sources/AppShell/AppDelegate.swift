@@ -90,6 +90,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
     private var bonjourDelegate: BonjourDelegate?
     private var bonjourPublishRetryWorkItem: DispatchWorkItem?
     private var bonjourPublishRetryAttempt = 0
+    private var bonjourPublicationGeneration = UUID()
     public private(set) var bonjourPublicationState: BonjourPublicationState = .stopped
     private var directAccessSupervisor: DirectAccessLifecycleSupervisor?
     public var palette: CommandPalette?
@@ -1698,6 +1699,8 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
     /// Mac on the LAN. TXT carries the stable identity + version so the
     /// client can show it before connecting.
     private func publishBonjour(serverId: String, port: UInt16) {
+        let generation = UUID()
+        bonjourPublicationGeneration = generation
         bonjourPublishRetryWorkItem?.cancel()
         bonjourPublishRetryWorkItem = nil
         bonjourPublishRetryAttempt = 0
@@ -1708,12 +1711,16 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         svc.setTXTRecord(NetService.data(fromTXTRecord: txt))
         let delegate = BonjourDelegate(
             onPublished: { [weak self] in
-                self?.bonjourPublicationState = .published
-                self?.bonjourPublishRetryAttempt = 0
+                guard let self, self.bonjourPublicationGeneration == generation else { return }
+                self.bonjourPublicationState = .published
+                self.bonjourPublishRetryAttempt = 0
             },
             onFailure: { [weak self] error in
-                self?.bonjourPublicationState = .failed
-                self?.scheduleBonjourPublicationRetry(serverId: serverId, port: port, error: error)
+                guard let self, self.bonjourPublicationGeneration == generation else { return }
+                self.bonjourPublicationState = .failed
+                self.scheduleBonjourPublicationRetry(
+                    serverId: serverId, port: port, generation: generation, error: error
+                )
             }
         )
         bonjourDelegate = delegate
@@ -1730,10 +1737,16 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         bonjour?.stop()
         bonjour = nil
         bonjourDelegate = nil
+        bonjourPublicationGeneration = UUID()
         bonjourPublicationState = .stopped
     }
 
-    private func scheduleBonjourPublicationRetry(serverId: String, port: UInt16, error: Error) {
+    private func scheduleBonjourPublicationRetry(
+        serverId: String,
+        port: UInt16,
+        generation: UUID,
+        error: Error
+    ) {
         guard bonjourPublicationState == .failed else { return }
         let base = min(pow(2, Double(bonjourPublishRetryAttempt)), 30)
         bonjourPublishRetryAttempt += 1
@@ -1741,7 +1754,9 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         let nsError = error as NSError
         NSLog("Bonjour retry scheduled attempt=\(bonjourPublishRetryAttempt) delay=\(delay)s reason=\(nsError.domain):\(nsError.code)")
         let work = DispatchWorkItem { [weak self] in
-            guard let self, self.bonjourPublicationState == .failed else { return }
+            guard let self,
+                  self.bonjourPublicationGeneration == generation,
+                  self.bonjourPublicationState == .failed else { return }
             self.publishBonjour(serverId: serverId, port: port)
         }
         bonjourPublishRetryWorkItem = work
