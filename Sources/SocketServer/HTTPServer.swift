@@ -404,7 +404,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
     /// the host actually implements them — see `welcomeCapabilities(streamInterestSupported:)`.
     public static let baselineWelcomeCapabilities: [String] = [
         "events.replay", "jsonrpc.batch", "snapshot.v3",
-        "rpc.websocket", "snapshot.incremental",
+        "rpc.websocket", "snapshot.incremental", "resume.v1",
     ]
 
     /// Wire name for mid-session interest control (iOS sends `rc2.interest` only
@@ -1287,7 +1287,20 @@ public final class DirectHTTPServer: @unchecked Sendable {
             let eventSnapshot = EventBus.shared.snapshotMetadata()
             let requestedSinceSequence = headers["x-rc2-since-seq"]
                 .flatMap { Int64($0.trimmingCharacters(in: .whitespaces)) } ?? 0
-            let wsSinceSeq = min(max(0, requestedSinceSequence), eventSnapshot.sequence)
+            let requestedResumeHost = headers["x-rc2-resume-host-id"]?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let requestedResumeBootEpoch = headers["x-rc2-resume-boot-epoch"]
+                .flatMap { Int64($0.trimmingCharacters(in: .whitespaces)) }
+            let hasResumeEnvelope = requestedResumeHost != nil || requestedResumeBootEpoch != nil
+            let resumeMatchesHost = requestedResumeHost == serverId
+                && requestedResumeBootEpoch == Int64(bootEpoch)
+            // A cursor is trusted only when its host and boot epoch match this
+            // process. A stale envelope therefore gets a fresh baseline while
+            // legacy clients that send only X-RC2-Since-Seq remain compatible.
+            let resumeAccepted = !hasResumeEnvelope || resumeMatchesHost
+            let wsSinceSeq = resumeAccepted
+                ? min(max(0, requestedSinceSequence), eventSnapshot.sequence)
+                : 0
             let sequenceWatermark = ConnectionSequenceWatermark(initialSequence: wsSinceSeq)
             let welcome = ConnectionTransportFrame.welcome(ConnectionWelcomeFrame(
                 protocolVersion: ConnectionTransportFrame.protocolVersion,
