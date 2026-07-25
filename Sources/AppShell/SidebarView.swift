@@ -2970,10 +2970,11 @@ public struct SidebarRootView: View {
         scope: TokenSaverUsageScope
     ) -> Double {
         let saved = tokenSaverSavedOrPotential(in: snapshot, scope: scope)
-        let used = tokenSaverScopeUsedTokens(in: snapshot, scope: scope)
-        // Self-normalizing sellable metric: share of (saved + used) avoided locally.
-        // Replaces the aspirational 2M/10M absolute goals that left healthy days near empty.
-        return Self.savingsAvoidanceRatio(savedTokens: saved, usedTokens: used)
+        // Fixed product goals: 2M today / 10M week (not avoidance share of traffic).
+        return Self.savingsToGoalProgress(
+            savedTokens: saved,
+            goalTokens: tokenSaverSavingsGoalTokens(for: scope)
+        )
     }
 
     private func tokenSaverSavedOrPotential(
@@ -3784,12 +3785,12 @@ public struct SidebarRootView: View {
     }
 
     /// Legacy absolute goals (2M day / 10M week). Kept for tests that still pin the
-    /// product rule; the live ring uses `savingsAvoidanceRatio` instead.
+    /// product rule: fixed 2M/day and 10M/week goals for the green Token Saver ring.
     nonisolated public static func tokenSaverSavingsGoalTokens(isDailyScope: Bool) -> Int {
         isDailyScope ? 2_000_000 : 10_000_000
     }
 
-    /// Absolute goal progress (legacy). Prefer `savingsAvoidanceRatio` for UI rings.
+    /// Absolute goal progress for the green Token Saver ring (2M today / 10M week).
     nonisolated public static func savingsToGoalProgress(
         savedTokens: Int,
         goalTokens: Int
@@ -4032,10 +4033,10 @@ public struct SidebarRootView: View {
             : savedTokens >= 1_000
                 ? String(format: "%.0fK", Double(savedTokens) / 1_000)
                 : "\(savedTokens)"
-        // savedProgress is the avoidance ratio (saved / (saved+used)); goal tokens are
-        // legacy a11y context only and no longer drive the ring fill.
-        _ = savedGoalTokens
-        return "Token Saver rings, \(scope): measured save \(savedStr) local tokens, ~\(savedPct)% of tool-plus-usage mix, Claude used \(claudePct)%, Codex used \(codexPct)%, Grok used \(grokPct)%"
+        let goalStr = savedGoalTokens >= 1_000_000
+            ? String(format: "%.0fM", Double(savedGoalTokens) / 1_000_000)
+            : "\(savedGoalTokens)"
+        return "Token Saver rings, \(scope): measured save \(savedStr) local tokens, ~\(savedPct)% of \(goalStr) goal, Claude used \(claudePct)%, Codex used \(codexPct)%, Grok used \(grokPct)%"
     }
 
     /// WHY: concentric rings must read as "biggest usage outer". Token Saver is
