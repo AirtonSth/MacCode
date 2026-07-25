@@ -81,8 +81,8 @@ final class PayloadCodecLZFSETests: XCTestCase {
         XCTAssertNil(result, "below threshold must return nil (no compression)")
     }
 
-    func test_selectResponseCodec_atThreshold_returnsLZFSE() {
-        // WHY: at exactly threshold lzfse must be selected as the preferred (lower-CPU) codec
+    func test_selectResponseCodec_atThreshold_returnsGzipFirst() {
+        // WHY (C-23): single selector prefers better ratio (gzip) for client bandwidth
         let acceptBoth = "\(PayloadCodec.gzip.wireName), \(PayloadCodec.lzfse.wireName)"
         let result = PayloadCodec.selectResponseCodec(
             payloadSize: 128,
@@ -90,11 +90,11 @@ final class PayloadCodecLZFSETests: XCTestCase {
             threshold: 128
         )
         XCTAssertNotNil(result)
-        XCTAssertEqual(result!.wireName, PayloadCodec.lzfse.wireName)
+        XCTAssertEqual(result!.wireName, PayloadCodec.gzip.wireName)
     }
 
-    func test_selectResponseCodec_aboveThreshold_lzfseAccepted_returnsLZFSE() {
-        // WHY: primary P3 rule — lzfse wins over gzip when client accepts it and payload is large
+    func test_selectResponseCodec_aboveThreshold_prefersGzipOverLZFSE() {
+        // WHY (C-23): gzip-first policy — 3G uplink is the bottleneck, not host CPU
         let acceptBoth = "\(PayloadCodec.gzip.wireName), \(PayloadCodec.lzfse.wireName)"
         let result = PayloadCodec.selectResponseCodec(
             payloadSize: 50_000,
@@ -102,7 +102,7 @@ final class PayloadCodecLZFSETests: XCTestCase {
             threshold: 128
         )
         XCTAssertNotNil(result)
-        XCTAssertEqual(result!.wireName, PayloadCodec.lzfse.wireName)
+        XCTAssertEqual(result!.wireName, PayloadCodec.gzip.wireName)
     }
 
     func test_selectResponseCodec_aboveThreshold_onlyGzipAccepted_returnsGzip() {
@@ -161,15 +161,26 @@ final class PayloadCodecLZFSETests: XCTestCase {
         )
         XCTAssertNil(belowDefault)
         XCTAssertNotNil(atDefault)
-        XCTAssertEqual(atDefault!.wireName, PayloadCodec.lzfse.wireName)
+        XCTAssertEqual(atDefault!.wireName, PayloadCodec.gzip.wireName)
     }
 
-    // MARK: preferredResponseCodec unchanged
+    // MARK: preferredResponseCodec is the single policy (C-23)
 
-    func test_preferredResponseCodec_unchanged_gzipFirst() {
-        // WHY: existing callers rely on gzip-first order; must not break after adding new API
+    func test_preferredResponseCodec_gzipFirst() {
+        // WHY (C-23): one selector; prefer compression ratio for client bandwidth
         let acceptBoth = "\(PayloadCodec.gzip.wireName), \(PayloadCodec.lzfse.wireName)"
         let result = PayloadCodec.preferredResponseCodec(acceptEncoding: acceptBoth)
         XCTAssertEqual(result?.wireName, PayloadCodec.gzip.wireName)
+    }
+
+    func test_selectResponseCodec_matchesPreferredWhenAboveThreshold() {
+        // WHY (C-23): size-gated API must not reverse codec priority
+        let acceptBoth = "\(PayloadCodec.gzip.wireName), \(PayloadCodec.lzfse.wireName)"
+        let preferred = PayloadCodec.preferredResponseCodec(acceptEncoding: acceptBoth)
+        let selected = PayloadCodec.selectResponseCodec(
+            payloadSize: 1_024,
+            acceptEncoding: acceptBoth
+        )
+        XCTAssertEqual(selected?.wireName, preferred?.wireName)
     }
 }

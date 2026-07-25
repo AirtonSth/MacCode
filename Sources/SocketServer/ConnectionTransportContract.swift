@@ -15,6 +15,10 @@ public struct ConnectionDomainRevisions: Codable, Equatable, Sendable {
         self.files = files
     }
 
+    public static let zero = ConnectionDomainRevisions(
+        shell: 0, surfaces: 0, agentThreads: 0, browser: 0, files: 0
+    )
+
     var jsonValue: JSONValue {
         .object([
             "shell": .number(Double(shell)),
@@ -23,6 +27,39 @@ public struct ConnectionDomainRevisions: Codable, Equatable, Sendable {
             "browser": .number(Double(browser)),
             "files": .number(Double(files)),
         ])
+    }
+
+    /// Domains whose host revision is strictly ahead of `known` (Wave 4 incremental).
+    public func domainsChanged(since known: ConnectionDomainRevisions) -> Set<String> {
+        var out = Set<String>()
+        if shell > known.shell { out.insert("shell") }
+        if surfaces > known.surfaces { out.insert("surfaces") }
+        if agentThreads > known.agentThreads { out.insert("agentThreads") }
+        if browser > known.browser { out.insert("browser") }
+        if files > known.files { out.insert("files") }
+        return out
+    }
+
+    public static func parse(_ any: Any?) -> ConnectionDomainRevisions? {
+        guard let object = any as? [String: Any] else { return nil }
+        func rev(_ key: String) -> Int64? {
+            guard let number = object[key] as? NSNumber,
+                  CFGetTypeID(number) != CFBooleanGetTypeID(),
+                  !CFNumberIsFloatType(number) else { return nil }
+            return Int64(truncating: number)
+        }
+        guard let shell = rev("shell"),
+              let surfaces = rev("surfaces"),
+              let agentThreads = rev("agentThreads"),
+              let browser = rev("browser"),
+              let files = rev("files") else { return nil }
+        return ConnectionDomainRevisions(
+            shell: shell,
+            surfaces: surfaces,
+            agentThreads: agentThreads,
+            browser: browser,
+            files: files
+        )
     }
 }
 
@@ -85,15 +122,54 @@ public struct ConnectionSnapshotReadState: Equatable, Sendable {
     }
 
     func jsonValue(domainRevisions: ConnectionDomainRevisions) -> JSONValue {
-        .object([
-            "selectedWorkspaceId": selectedWorkspaceId.map(JSONValue.string) ?? .null,
-            "workspaces": .array(workspaces),
-            "surfaces": .array(surfaces.map(\.jsonValue)),
-            "agentThreads": .array(agentThreads.map(\.jsonValue)),
-            "browserStates": .array(browserStates.map(\.jsonValue)),
-            "filesStates": .array(filesStates.map(\.jsonValue)),
+        jsonValue(domainRevisions: domainRevisions, includeDomains: nil)
+    }
+
+    /// Wave 4: when `includeDomains` is non-nil, only those domains are emitted
+    /// (plus `domainRevisions` / `partial` / `includedDomains` metadata).
+    /// `nil` means full snapshot (backward compatible exact key set).
+    func jsonValue(
+        domainRevisions: ConnectionDomainRevisions,
+        includeDomains: Set<String>?
+    ) -> JSONValue {
+        let all: Set<String> = ["shell", "surfaces", "agentThreads", "browser", "files"]
+        let include = includeDomains ?? all
+        let partial = includeDomains != nil && include != all
+
+        if !partial {
+            return .object([
+                "selectedWorkspaceId": selectedWorkspaceId.map(JSONValue.string) ?? .null,
+                "workspaces": .array(workspaces),
+                "surfaces": .array(surfaces.map(\.jsonValue)),
+                "agentThreads": .array(agentThreads.map(\.jsonValue)),
+                "browserStates": .array(browserStates.map(\.jsonValue)),
+                "filesStates": .array(filesStates.map(\.jsonValue)),
+                "domainRevisions": domainRevisions.jsonValue,
+            ])
+        }
+
+        var object: [String: JSONValue] = [
+            "partial": .bool(true),
+            "includedDomains": .array(include.sorted().map(JSONValue.string)),
             "domainRevisions": domainRevisions.jsonValue,
-        ])
+        ]
+        if include.contains("shell") {
+            object["selectedWorkspaceId"] = selectedWorkspaceId.map(JSONValue.string) ?? .null
+            object["workspaces"] = .array(workspaces)
+        }
+        if include.contains("surfaces") {
+            object["surfaces"] = .array(surfaces.map(\.jsonValue))
+        }
+        if include.contains("agentThreads") {
+            object["agentThreads"] = .array(agentThreads.map(\.jsonValue))
+        }
+        if include.contains("browser") {
+            object["browserStates"] = .array(browserStates.map(\.jsonValue))
+        }
+        if include.contains("files") {
+            object["filesStates"] = .array(filesStates.map(\.jsonValue))
+        }
+        return .object(object)
     }
 }
 
@@ -131,6 +207,8 @@ struct ConnectionWelcomeFrame: Codable, Equatable, Sendable {
     let serverTimeEpochMs: Int64
     let heartbeatIntervalMs: Int64
     let heartbeatTimeoutMs: Int64
+    /// Progress-idle budget for snapshot transfer (ms). Independent of heartbeat (C-03).
+    let snapshotTimeoutMs: Int64
     let currentSequence: Int64
     let oldestReplaySequence: Int64
     let capabilities: [String]
@@ -314,6 +392,7 @@ enum ConnectionTransportFrame: Equatable, Sendable {
             allowedKeys = [
                 "protocolVersion", "type", "connectionId", "hostId", "bootEpoch",
                 "serverTimeEpochMs", "heartbeatIntervalMs", "heartbeatTimeoutMs",
+                "snapshotTimeoutMs",
                 "currentSequence", "oldestReplaySequence", "capabilities",
             ]
         case "heartbeat":
@@ -421,7 +500,8 @@ enum ConnectionTransportFrame: Equatable, Sendable {
         case "welcome":
             requiredKeys = [
                 "bootEpoch", "serverTimeEpochMs", "heartbeatIntervalMs",
-                "heartbeatTimeoutMs", "currentSequence", "oldestReplaySequence",
+                "heartbeatTimeoutMs", "snapshotTimeoutMs",
+                "currentSequence", "oldestReplaySequence",
             ]
         case "heartbeat":
             requiredKeys = ["bootEpoch", "sentAtEpochMs", "lastReceivedSequence"]
@@ -471,10 +551,13 @@ enum ConnectionTransportFrame: Equatable, Sendable {
             hostId: frame.hostId,
             bootEpoch: frame.bootEpoch
         )
+        // C-06: welcome may advertise Wi-Fi (10s/30s) or cellular (25s/90s) profiles.
+        // C-03: snapshotTimeoutMs is an independent progress-idle transfer budget.
         guard frame.serverTimeEpochMs >= 0,
-              (1...5_000).contains(frame.heartbeatIntervalMs),
+              (1...25_000).contains(frame.heartbeatIntervalMs),
               frame.heartbeatTimeoutMs > frame.heartbeatIntervalMs,
-              frame.heartbeatTimeoutMs <= 10_000,
+              frame.heartbeatTimeoutMs <= 90_000,
+              (5_000...60_000).contains(frame.snapshotTimeoutMs),
               frame.currentSequence >= 0,
               frame.oldestReplaySequence >= 0,
               frame.oldestReplaySequence <= frame.currentSequence,
@@ -600,8 +683,12 @@ enum ConnectionTransportFrame: Equatable, Sendable {
     }
 
     private static func isValidSnapshotState(_ value: JSONValue) -> Bool {
-        guard case .object(let state) = value,
-              Set(state.keys) == [
+        guard case .object(let state) = value else { return false }
+        // Wave 4 partial snapshots: subset of domains + metadata.
+        if case .bool(true)? = state["partial"] {
+            return isValidPartialSnapshotState(state)
+        }
+        guard Set(state.keys) == [
                   "selectedWorkspaceId", "workspaces", "surfaces", "agentThreads",
                   "browserStates", "filesStates", "domainRevisions",
               ] else {
@@ -664,6 +751,47 @@ enum ConnectionTransportFrame: Equatable, Sendable {
             guard case .number(let revision) = value else { return false }
             return revision.isFinite && revision >= 0 && revision.rounded(.towardZero) == revision
         }
+    }
+
+    /// Wave 4 partial: requires domainRevisions + includedDomains + only those domain keys.
+    private static func isValidPartialSnapshotState(_ state: [String: JSONValue]) -> Bool {
+        guard case .object(let revisions)? = state["domainRevisions"],
+              Set(revisions.keys) == ["shell", "surfaces", "agentThreads", "browser", "files"],
+              revisions.values.allSatisfy({ value in
+                  guard case .number(let revision) = value else { return false }
+                  return revision.isFinite && revision >= 0 && revision.rounded(.towardZero) == revision
+              }),
+              case .array(let includedRaw)? = state["includedDomains"] else {
+            return false
+        }
+        let allowed = Set(["shell", "surfaces", "agentThreads", "browser", "files"])
+        var included = Set<String>()
+        for value in includedRaw {
+            guard case .string(let name) = value, allowed.contains(name) else { return false }
+            guard included.insert(name).inserted else { return false }
+        }
+        // Required metadata keys only + domain payloads that are included.
+        var expected: Set<String> = ["partial", "includedDomains", "domainRevisions"]
+        if included.contains("shell") {
+            expected.formUnion(["selectedWorkspaceId", "workspaces"])
+        }
+        if included.contains("surfaces") { expected.insert("surfaces") }
+        if included.contains("agentThreads") { expected.insert("agentThreads") }
+        if included.contains("browser") { expected.insert("browserStates") }
+        if included.contains("files") { expected.insert("filesStates") }
+        guard Set(state.keys) == expected else { return false }
+        // Lightweight presence checks (full structural validation still runs on
+        // full snapshots; partials are merged client-side into a prior baseline).
+        if included.contains("shell") {
+            guard state["selectedWorkspaceId"] == .null
+                    || state["selectedWorkspaceId"]?.stringValue != nil,
+                  case .array? = state["workspaces"] else { return false }
+        }
+        if included.contains("surfaces"), state["surfaces"]?.arrayValue == nil { return false }
+        if included.contains("agentThreads"), state["agentThreads"]?.arrayValue == nil { return false }
+        if included.contains("browser"), state["browserStates"]?.arrayValue == nil { return false }
+        if included.contains("files"), state["filesStates"]?.arrayValue == nil { return false }
+        return true
     }
 
     private static func validateWorkspaceItems(

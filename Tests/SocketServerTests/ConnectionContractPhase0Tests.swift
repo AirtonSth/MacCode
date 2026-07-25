@@ -54,9 +54,11 @@ final class ConnectionContractPhase0Tests: XCTestCase {
         try assertRejected("welcome") { $0["hostId"] = "" }
         try assertRejected("welcome") { $0["serverTimeEpochMs"] = -1 }
         try assertRejected("welcome") { $0["heartbeatIntervalMs"] = 0 }
-        try assertRejected("welcome") { $0["heartbeatIntervalMs"] = 5001 }
+        try assertRejected("welcome") { $0["heartbeatIntervalMs"] = 25_001 }
         try assertRejected("welcome") { $0["heartbeatTimeoutMs"] = $0["heartbeatIntervalMs"] }
-        try assertRejected("welcome") { $0["heartbeatTimeoutMs"] = 10001 }
+        try assertRejected("welcome") { $0["heartbeatTimeoutMs"] = 90_001 }
+        try assertRejected("welcome") { $0["snapshotTimeoutMs"] = 4_999 }
+        try assertRejected("welcome") { $0["snapshotTimeoutMs"] = 60_001 }
         try assertRejected("welcome") { $0["currentSequence"] = -1 }
         try assertRejected("welcome") { $0["oldestReplaySequence"] = 1043 }
         try assertRejected("welcome") { $0["capabilities"] = [] }
@@ -151,7 +153,8 @@ final class ConnectionContractPhase0Tests: XCTestCase {
         let fields: [String: [String]] = [
             "welcome": [
                 "bootEpoch", "serverTimeEpochMs", "heartbeatIntervalMs",
-                "heartbeatTimeoutMs", "currentSequence", "oldestReplaySequence",
+                "heartbeatTimeoutMs", "snapshotTimeoutMs",
+                "currentSequence", "oldestReplaySequence",
             ],
             "heartbeat": ["bootEpoch", "sentAtEpochMs", "lastReceivedSequence"],
             "closing": ["bootEpoch", "code", "retryAfterMs"],

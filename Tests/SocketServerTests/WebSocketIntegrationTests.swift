@@ -115,11 +115,92 @@ final class WebSocketIntegrationTests: XCTestCase {
         XCTAssertNotNil(obj["connectionId"] as? String)
         XCTAssertEqual((obj["currentSequence"] as? NSNumber)?.int64Value, baseline)
         XCTAssertNotNil(obj["oldestReplaySequence"])
-        XCTAssertEqual((obj["heartbeatIntervalMs"] as? NSNumber)?.int64Value, 5_000)
-        XCTAssertEqual((obj["heartbeatTimeoutMs"] as? NSNumber)?.int64Value, 10_000)
+        XCTAssertEqual((obj["heartbeatIntervalMs"] as? NSNumber)?.int64Value, 10_000)
+        XCTAssertEqual((obj["heartbeatTimeoutMs"] as? NSNumber)?.int64Value, 30_000)
+        XCTAssertEqual((obj["snapshotTimeoutMs"] as? NSNumber)?.int64Value, 15_000,
+                       "C-03: Wi-Fi welcome advertises 15s snapshot progress budget, not heartbeat")
+        XCTAssertNotEqual((obj["snapshotTimeoutMs"] as? NSNumber)?.int64Value,
+                          (obj["heartbeatTimeoutMs"] as? NSNumber)?.int64Value,
+                          "C-03: snapshotTimeoutMs must not equal heartbeatTimeoutMs")
         XCTAssertEqual(obj["capabilities"] as? [String], [
             "events.replay", "jsonrpc.batch", "snapshot.v3",
+            "rpc.websocket", "snapshot.incremental",
         ])
+    }
+
+    func test_C06_cellularFilterNegotiatesExtendedHeartbeatBudget() async throws {
+        let (server, port) = try startServer()
+        defer { server.stop() }
+        try await Task.sleep(nanoseconds: 80_000_000)
+
+        var req = URLRequest(url: URL(string: "ws://127.0.0.1:\(port)/v1/ws")!)
+        req.setValue("\(EventBus.shared.currentSeq)", forHTTPHeaderField: "x-rc2-since-seq")
+        req.setValue("cellular-safe", forHTTPHeaderField: "X-RC2-WS-Filter")
+        req.setValue("25000", forHTTPHeaderField: "X-RC2-Heartbeat-Interval-Ms")
+        req.setValue("90000", forHTTPHeaderField: "X-RC2-Heartbeat-Timeout-Ms")
+        let task = URLSession.shared.webSocketTask(with: req)
+        task.resume()
+        defer { task.cancel(with: .normalClosure, reason: nil) }
+
+        let welcome = try object(from: await receiveWithTimeout(task))
+        XCTAssertEqual(welcome["type"] as? String, "welcome")
+        XCTAssertEqual((welcome["heartbeatIntervalMs"] as? NSNumber)?.int64Value, 25_000,
+                       "cellular-safe clients must receive the 25s cellular interval")
+        XCTAssertEqual((welcome["heartbeatTimeoutMs"] as? NSNumber)?.int64Value, 90_000,
+                       "cellular-safe clients must receive the 90s cellular timeout (C-06)")
+        XCTAssertEqual((welcome["snapshotTimeoutMs"] as? NSNumber)?.int64Value, 45_000,
+                       "C-03: cellular-safe default snapshot budget is 45s, independent of heartbeat")
+    }
+
+    func test_C03_clientProposedSnapshotTimeoutIsAcceptedSeparatelyFromHeartbeat() async throws {
+        let (server, port) = try startServer()
+        defer { server.stop() }
+        try await Task.sleep(nanoseconds: 80_000_000)
+
+        var req = URLRequest(url: URL(string: "ws://127.0.0.1:\(port)/v1/ws")!)
+        req.setValue("\(EventBus.shared.currentSeq)", forHTTPHeaderField: "x-rc2-since-seq")
+        req.setValue("cellular-safe", forHTTPHeaderField: "X-RC2-WS-Filter")
+        req.setValue("25000", forHTTPHeaderField: "X-RC2-Heartbeat-Interval-Ms")
+        req.setValue("90000", forHTTPHeaderField: "X-RC2-Heartbeat-Timeout-Ms")
+        // Low Data client proposes 60s snapshot progress budget.
+        req.setValue("60000", forHTTPHeaderField: "X-RC2-Snapshot-Timeout-Ms")
+        let task = URLSession.shared.webSocketTask(with: req)
+        task.resume()
+        defer { task.cancel(with: .normalClosure, reason: nil) }
+
+        let welcome = try object(from: await receiveWithTimeout(task))
+        XCTAssertEqual((welcome["heartbeatTimeoutMs"] as? NSNumber)?.int64Value, 90_000)
+        XCTAssertEqual((welcome["snapshotTimeoutMs"] as? NSNumber)?.int64Value, 60_000,
+                       "C-03: host must accept client snapshotTimeoutMs proposal (clamped to 60s max)")
+        XCTAssertNotEqual(
+            (welcome["snapshotTimeoutMs"] as? NSNumber)?.int64Value,
+            (welcome["heartbeatTimeoutMs"] as? NSNumber)?.int64Value
+        )
+    }
+
+    func test_C03_negotiateSnapshotTimeoutPureHelper() {
+        XCTAssertEqual(
+            DirectHTTPServer.negotiateSnapshotTimeoutMs(filter: .full, proposedMs: nil),
+            15_000
+        )
+        XCTAssertEqual(
+            DirectHTTPServer.negotiateSnapshotTimeoutMs(filter: .cellularSafe, proposedMs: nil),
+            45_000
+        )
+        XCTAssertEqual(
+            DirectHTTPServer.negotiateSnapshotTimeoutMs(filter: .cellularSafe, proposedMs: 60_000),
+            60_000
+        )
+        XCTAssertEqual(
+            DirectHTTPServer.negotiateSnapshotTimeoutMs(filter: .full, proposedMs: 1_000),
+            5_000,
+            "below minimum clamps up to 5s"
+        )
+        XCTAssertEqual(
+            DirectHTTPServer.negotiateSnapshotTimeoutMs(filter: .full, proposedMs: 120_000),
+            60_000,
+            "above maximum clamps down to 60s"
+        )
     }
 
     func testWebSocketSendsImmediateFrameBeforeReceiveTimeout() async throws {
@@ -335,10 +416,11 @@ final class WebSocketIntegrationTests: XCTestCase {
         let task = wsTask(port: port, sinceSeq: EventBus.shared.currentSeq)
         defer { task.cancel(with: .normalClosure, reason: nil) }
         let welcome = try object(from: await receiveWithTimeout(task))
-        XCTAssertEqual((welcome["heartbeatTimeoutMs"] as? NSNumber)?.int64Value, 10_000)
+        XCTAssertEqual((welcome["heartbeatTimeoutMs"] as? NSNumber)?.int64Value, 30_000)
         let connectionId = try XCTUnwrap(welcome["connectionId"] as? String)
 
-        let heartbeat = try object(from: await receiveWithTimeout(task, seconds: 6))
+        // Wi-Fi profile interval is 10s; allow a little scheduling slack.
+        let heartbeat = try object(from: await receiveWithTimeout(task, seconds: 12))
         XCTAssertEqual(heartbeat["type"] as? String, "heartbeat")
         XCTAssertEqual(heartbeat["connectionId"] as? String, connectionId)
         XCTAssertEqual(heartbeat["hostId"] as? String, welcome["hostId"] as? String)
@@ -376,41 +458,51 @@ final class WebSocketIntegrationTests: XCTestCase {
                       "closing a live WS task must unsubscribe from EventBus so repeated mobile reconnects do not leak subscribers")
     }
 
-    func testSlowClientQueueFullClosesLiveWebSocketWithTypedClosingFrame() async throws {
+    func testSlowClientQueueFullDegradesWithoutClosing() async throws {
+        // C-04: a tiny outbound budget under a large event must degrade (or
+        // shed) instead of close(1013 queue_full). Socket stays open.
         let (server, port) = try startServer(webSocketOutboundMaxQueuedBytes: 128)
         defer { server.stop() }
         try await Task.sleep(nanoseconds: 80_000_000)
 
         let task = wsTask(port: port, sinceSeq: EventBus.shared.currentSeq)
         defer { task.cancel(with: .normalClosure, reason: nil) }
-        try await Task.sleep(nanoseconds: 150_000_000)
+
+        // Welcome proves the connection is established before pressure.
+        let welcome = try object(from: await receiveWithTimeout(task, seconds: 2))
+        XCTAssertEqual(welcome["type"] as? String, "welcome")
 
         let kind = uniqueEventKind("test.ws.queuefull")
+        // Bulk payloads that exceed the 128-byte queue budget.
+        for i in 0..<4 {
+            EventBus.shared.publish(kind: "agent.item.delta", payload: .object([
+                "item_id": .string("i1"),
+                "n": .number(Double(i)),
+                "blob": .string(String(repeating: "x", count: 4_096))
+            ]))
+        }
         EventBus.shared.publish(kind: kind, payload: .object([
-            "blob": .string(String(repeating: "x", count: 4_096))
+            "blob": .string(String(repeating: "y", count: 4_096))
         ]))
 
-        for _ in 0..<10 {
-            let message = try await receiveWithTimeout(task, seconds: 2)
-            let data: Data
-            switch message {
-            case .data(let d): data = d
-            case .string(let s): data = Data(s.utf8)
-            @unknown default: continue
-            }
-            guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { continue }
-            if obj["type"] as? String == "closing" {
-                XCTAssertEqual(obj["reason"] as? String, "queue_full",
-                               "live WS slow-client close must carry the stable queue_full reason")
-                XCTAssertEqual(obj["retryable"] as? Bool, true,
-                               "client recovery must be explicit after a queue_full close")
-                let dropped = await waitUntil { server.wsTracker.slowClientDrops >= 1 }
-                XCTAssertTrue(dropped, "live queue_full close must increment slow-client diagnostics")
-                return
-            }
-        }
+        // Let pressure land, then prove the connection was not closed for queue_full.
+        // (Avoid multiple concurrent receiveWithTimeout calls — a timed-out
+        // receive can leave an orphaned task.receive that deadlocks the next one.)
+        try await Task.sleep(nanoseconds: 300_000_000)
 
-        XCTFail("live queue_full path must send a typed closing frame before shutting down the socket")
+        XCTAssertEqual(server.wsTracker.slowClientDrops, 0,
+                       "C-04: queue pressure must never increment slow-client drop / close")
+        // Active clients still tracked (connection not torn down by pressure).
+        XCTAssertGreaterThanOrEqual(server.wsTracker.activeClients, 1,
+                                    "WS client must remain connected under queue pressure")
+        // A subsequent control-level ping must still be accepted (socket open).
+        let pingOK = expectation(description: "post-pressure ping")
+        task.sendPing { error in
+            XCTAssertNil(error, "post-pressure ping must succeed when socket stayed open")
+            pingOK.fulfill()
+        }
+        await fulfillment(of: [pingOK], timeout: 2.0)
+        _ = kind
     }
 
     /// WHY: a fresh app launch sends x-rc2-since-seq=0, which is expired whenever

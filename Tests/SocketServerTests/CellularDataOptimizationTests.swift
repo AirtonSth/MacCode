@@ -263,6 +263,130 @@ final class CellularDataOptimizationTests: XCTestCase {
         XCTAssertEqual(sent.values, ["new-terminal-1", "critical"],
                        "on cellular WS, repeated terminal summaries for the same surface should collapse to the newest frame before critical events are sent")
     }
+
+    func testCellularWebSocketBatcherReportsCoalescedAwayFramesForGapAccounting() {
+        // WHY (C-14): last-write-wins collapses intermediate surface.output.summary
+        // frames. Without onCoalescedAway → recordFilteredEvent, the host watermark
+        // sees a hole and closes 1012 during cellular soak.
+        let coalesced = LockedStrings()
+        let sent = LockedStrings()
+        let batcher = WebSocketEventBatcher(
+            enabled: true,
+            filter: .cellularSafe,
+            delay: 10,
+            onCoalescedAway: { data in
+                coalesced.append(String(decoding: data, as: UTF8.self))
+            },
+            send: { data in
+                sent.append(String(decoding: data, as: UTF8.self))
+            }
+        )
+
+        batcher.enqueue(event: EventBus.Event(seq: 10, kind: "surface.output.summary", payload: .object([
+            "surface_id": .string("t1"),
+            "seq": .number(1)
+        ]), ts: 0), data: Data("summary-v1".utf8))
+        batcher.enqueue(event: EventBus.Event(seq: 11, kind: "surface.output.summary", payload: .object([
+            "surface_id": .string("t1"),
+            "seq": .number(2)
+        ]), ts: 0), data: Data("summary-v2".utf8))
+        batcher.enqueue(event: EventBus.Event(seq: 12, kind: "surface.output.summary", payload: .object([
+            "surface_id": .string("t1"),
+            "seq": .number(3)
+        ]), ts: 0), data: Data("summary-v3".utf8))
+        batcher.flush()
+
+        XCTAssertEqual(coalesced.values, ["summary-v1", "summary-v2"],
+                       "each superseded summary must be reported so the gap watermark can advance")
+        XCTAssertEqual(sent.values, ["summary-v3"],
+                       "only the newest summary for the surface should leave the batcher")
+    }
+
+    func testCellularNilKeyWindowUsesCallerDelayNotCrossKindDefault() {
+        // WHY (C-14/C-15): on cellular the nil-key window must use the longer
+        // caller delay (100ms), not the 15ms Wi-Fi crossKindDelay — otherwise
+        // agent.item.delta bursts barely coalesce and frames/sec stay high.
+        XCTAssertEqual(WebSocketEventBatcher.crossKindDelay, 0.015)
+        // Pure model: a 100ms window groups events that a 15ms window would split.
+        let events: [(key: String?, data: Data, t: TimeInterval)] = [
+            (nil, Data("a".utf8), 0.000),
+            (nil, Data("b".utf8), 0.050),
+            (nil, Data("c".utf8), 0.090),
+        ]
+        let short = WebSocketEventBatcher.groupFlushes(events: events, window: 0.015)
+        let long = WebSocketEventBatcher.groupFlushes(events: events, window: 0.100)
+        XCTAssertGreaterThan(short.count, 1,
+                             "15ms window must split a 90ms burst so the cellular delay is load-bearing")
+        XCTAssertEqual(long.count, 1,
+                       "100ms cellular window must hold the same burst as one flush group")
+    }
+
+    func test_C16_agentItemDeltaMerge_concatenatesBodyNotLastWriteWins() throws {
+        // WHY (C-16): cellular aggregation must preserve every token; LWW corrupts text.
+        func frame(seq: Int64, body: String) throws -> Data {
+            let object: [String: Any] = [
+                "protocolVersion": 3,
+                "type": "event",
+                "connectionId": "c1",
+                "hostId": "h1",
+                "bootEpoch": 1,
+                "sequence": seq,
+                "eventId": "1:\(seq)",
+                "occurredAtEpochMs": 0,
+                "kind": "agent.item.delta",
+                "payload": [
+                    "thread_id": "t1",
+                    "item_id": "i1",
+                    "body_append": body,
+                ],
+            ]
+            return try JSONSerialization.data(withJSONObject: object)
+        }
+        let a = try frame(seq: 10, body: "Hello")
+        let b = try frame(seq: 11, body: " world")
+        let c = try frame(seq: 12, body: "!")
+        let merged = try XCTUnwrap(
+            WebSocketEventBatcher.mergeAgentItemDeltaFrames(
+                try XCTUnwrap(WebSocketEventBatcher.mergeAgentItemDeltaFrames(a, b)),
+                c
+            )
+        )
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: merged) as? [String: Any]
+        )
+        let payload = try XCTUnwrap(object["payload"] as? [String: Any])
+        XCTAssertEqual(payload["body_append"] as? String, "Hello world!")
+        XCTAssertEqual(object["sequence"] as? Int, 12)
+
+        let (frames, absorbed) = WebSocketEventBatcher.mergeAgentItemDeltasInOrder([a, b, c])
+        XCTAssertEqual(frames.count, 1, "same item_id deltas collapse to one frame")
+        XCTAssertEqual(absorbed.count, 2, "absorbed frames report their sequences for gap accounting")
+        let outPayload = try XCTUnwrap(
+            (JSONSerialization.jsonObject(with: frames[0]) as? [String: Any])?["payload"] as? [String: Any]
+        )
+        XCTAssertEqual(outPayload["body_append"] as? String, "Hello world!",
+                       "rendered text must be byte-identical to unaggregated stream")
+    }
+
+    func test_C16_cellularCoalescingKey_includesAgentItemDelta() {
+        // WHY: without a key, cellular keyed batching cannot concat per item_id.
+        let event = EventBus.Event(
+            seq: 1,
+            kind: "agent.item.delta",
+            payload: .object([
+                "item_id": .string("item-9"),
+                "body_append": .string("x"),
+            ]),
+            ts: 0
+        )
+        XCTAssertEqual(
+            EventStreamFilter.cellularSafe.coalescingKey(for: event),
+            "agent.item.delta:item-9"
+        )
+        XCTAssertTrue(EventStreamFilter.cellularSafe.coalescingMergesByConcatenation(for: event))
+        XCTAssertNil(EventStreamFilter.full.coalescingKey(for: event),
+                     "Wi-Fi uses nil-key streaming coalesce + flush-time concat, not LWW keys")
+    }
 }
 
 private final class LockedStrings: @unchecked Sendable {

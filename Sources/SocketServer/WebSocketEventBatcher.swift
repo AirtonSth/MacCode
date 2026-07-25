@@ -1,27 +1,34 @@
 import Foundation
 
 final class WebSocketEventBatcher: @unchecked Sendable {
-    /// Short window applied to nil-key (non-coalescing) events so high-frequency
-    /// cross-kind events accumulate into fewer WS frames. Must stay small to avoid
-    /// perceptible latency; keyed-batch events use the larger `delay` window.
+    /// Default short window for nil-key (non-coalescing) events on Wi-Fi so
+    /// high-frequency cross-kind events accumulate into fewer WS frames without
+    /// perceptible latency. Cellular uses the larger `delay` window (100ms).
     static let crossKindDelay: TimeInterval = 0.015
 
     /// PERF (token-delta frame churn): high-frequency streaming kinds that are
-    /// safe to hold for the short cross-kind window on .full connections. One
-    /// provider token = one agent.item.delta event; without buffering, every
-    /// token wakes the socket with its own frame. Ordering is preserved (all
-    /// frames flow through the same nil-key buffer) and any non-delta event
-    /// flushes the buffer immediately, so interactive events are never delayed.
+    /// safe to hold for the coalesce window. One provider token = one
+    /// agent.item.delta event; without buffering, every token wakes the socket
+    /// with its own frame. Ordering is preserved (all frames flow through the
+    /// same nil-key buffer) and any non-delta event flushes the buffer
+    /// immediately when only streaming coalescing is active.
     static let fullStreamCoalescedKinds: Set<String> = ["agent.item.delta"]
 
     private let enabled: Bool
     private let filter: EventStreamFilter
     private let delay: TimeInterval
-    /// When true (full-filter connections), agent.item.delta frames buffer for
-    /// `crossKindDelay` and everything else flushes the buffer then sends
+    /// Window for nil-key / streaming-delta batching. Wi-Fi: 15ms; cellular: the
+    /// configured `delay` (typically 100ms) so agent.item.delta bursts collapse.
+    private let nilKeyDelay: TimeInterval
+    /// When true, agent.item.delta frames buffer for `nilKeyDelay` and (when
+    /// batching is otherwise off) everything else flushes the buffer then sends
     /// immediately. Independent of `enabled`, which drives the cellular-safe
     /// keyed/nil-key batching.
     private let coalescesStreamingDeltas: Bool
+    /// Called when keyed last-write-wins drops a previously buffered frame.
+    /// C-14: caller must `recordFilteredEvent` so collapsed summary seqs do not
+    /// surface as spurious 1012 gaps.
+    private let onCoalescedAway: (@Sendable (Data) -> Void)?
     private let send: @Sendable (Data) -> Void
     private let queue = DispatchQueue(label: "io.remotecode.ws-event-batcher")
     // Keyed (coalescing) state
@@ -37,11 +44,16 @@ final class WebSocketEventBatcher: @unchecked Sendable {
          filter: EventStreamFilter,
          delay: TimeInterval = 0.075,
          coalescesStreamingDeltas: Bool = false,
+         onCoalescedAway: (@Sendable (Data) -> Void)? = nil,
          send: @escaping @Sendable (Data) -> Void) {
         self.enabled = enabled
         self.filter = filter
         self.delay = max(0, delay)
+        // C-14/C-15: cellular gets the longer caller-supplied window (100–150ms);
+        // Wi-Fi keeps the short cross-kind default so interactive latency stays low.
+        self.nilKeyDelay = filter == .cellularSafe ? max(0, delay) : Self.crossKindDelay
         self.coalescesStreamingDeltas = coalescesStreamingDeltas
+        self.onCoalescedAway = onCoalescedAway
         self.send = send
     }
 
@@ -60,7 +72,7 @@ final class WebSocketEventBatcher: @unchecked Sendable {
                     self.nilKeyQueue.append(data)
                     guard !self.nilKeyScheduled else { return }
                     self.nilKeyScheduled = true
-                    self.queue.asyncAfter(deadline: .now() + Self.crossKindDelay) {
+                    self.queue.asyncAfter(deadline: .now() + self.nilKeyDelay) {
                         self.flushLocked()
                     }
                 }
@@ -79,10 +91,23 @@ final class WebSocketEventBatcher: @unchecked Sendable {
         if let key = filter.coalescingKey(for: event) {
             queue.async {
                 guard !self.stopped else { return }
-                if self.pending[key] == nil {
+                if let previous = self.pending[key] {
+                    if self.filter.coalescingMergesByConcatenation(for: event),
+                       let merged = Self.mergeAgentItemDeltaFrames(previous, data) {
+                        // C-16: absorb previous sequence via onCoalescedAway so the
+                        // client watermark advances without a 1012 gap, then keep
+                        // the higher-sequence merged frame.
+                        self.onCoalescedAway?(previous)
+                        self.pending[key] = merged
+                    } else {
+                        // Last-write-wins: superseded summary never hits the socket.
+                        self.onCoalescedAway?(previous)
+                        self.pending[key] = data
+                    }
+                } else {
                     self.order.append(key)
+                    self.pending[key] = data
                 }
-                self.pending[key] = data
                 guard !self.scheduled else { return }
                 self.scheduled = true
                 self.queue.asyncAfter(deadline: .now() + self.delay) {
@@ -90,14 +115,15 @@ final class WebSocketEventBatcher: @unchecked Sendable {
                 }
             }
         } else {
-            // No coalescing key: buffer for the short cross-kind window so
-            // bursts of mixed events coalesce into fewer frames.
+            // No coalescing key: buffer for the nil-key window so bursts of
+            // mixed events (incl. agent.item.delta on Wi-Fi) coalesce into
+            // fewer frames; C-16 also concatenates same-item deltas on flush.
             queue.async {
                 guard !self.stopped else { return }
                 self.nilKeyQueue.append(data)
                 guard !self.nilKeyScheduled else { return }
                 self.nilKeyScheduled = true
-                self.queue.asyncAfter(deadline: .now() + Self.crossKindDelay) {
+                self.queue.asyncAfter(deadline: .now() + self.nilKeyDelay) {
                     self.flushLocked()
                 }
             }
@@ -126,25 +152,109 @@ final class WebSocketEventBatcher: @unchecked Sendable {
         scheduled = false
         nilKeyScheduled = false
 
-        // Keyed (coalescing) frames first, preserving arrival order of keys.
+        var frames: [Data] = []
         if !pending.isEmpty {
             let keys = order
-            let frames = keys.compactMap { pending[$0] }
+            frames.append(contentsOf: keys.compactMap { pending[$0] })
             pending.removeAll(keepingCapacity: true)
             order.removeAll(keepingCapacity: true)
-            for frame in frames {
-                send(frame)
+        }
+        if !nilKeyQueue.isEmpty {
+            // C-16 (Wi-Fi / nil-key path): concatenate same item_id deltas that
+            // landed in one window so N tokens become one frame before send.
+            let (merged, absorbed) = Self.mergeAgentItemDeltasInOrder(nilKeyQueue)
+            for dropped in absorbed {
+                onCoalescedAway?(dropped)
             }
+            frames.append(contentsOf: merged)
+            nilKeyQueue.removeAll(keepingCapacity: true)
+        }
+        // C-14: emit by event sequence when present so keyed LWW + nil-key
+        // events in the same window cannot invent host-side 1012 gaps.
+        // Frames without a parseable sequence keep relative order (stable sort).
+        frames.sort { lhs, rhs in
+            let l = WebSocketOutboundQueue.eventSequence(in: lhs) ?? Int64.max
+            let r = WebSocketOutboundQueue.eventSequence(in: rhs) ?? Int64.max
+            return l < r
+        }
+        for frame in frames {
+            send(frame)
+        }
+    }
+
+    // MARK: - C-16 agent.item.delta concatenation
+
+    /// Merge two encoded `agent.item.delta` frames for the same `item_id` by
+    /// concatenating append fields. Returns nil when kinds/ids do not match.
+    /// WHY: last-write-wins would drop tokens and corrupt agent text.
+    static func mergeAgentItemDeltaFrames(_ earlier: Data, _ later: Data) -> Data? {
+        guard var left = parseEventObject(earlier),
+              var right = parseEventObject(later),
+              (left["kind"] as? String) == "agent.item.delta",
+              (right["kind"] as? String) == "agent.item.delta",
+              var leftPayload = left["payload"] as? [String: Any],
+              var rightPayload = right["payload"] as? [String: Any] else {
+            return nil
+        }
+        let leftItem = leftPayload["item_id"] as? String
+        let rightItem = rightPayload["item_id"] as? String
+        guard let leftItem, leftItem == rightItem else { return nil }
+
+        for field in ["body_append", "output_append", "text"] {
+            let a = leftPayload[field] as? String ?? ""
+            let b = rightPayload[field] as? String ?? ""
+            if !a.isEmpty || !b.isEmpty {
+                rightPayload[field] = a + b
+            }
+        }
+        // summary / progress: last write wins (non-append semantics).
+        right["payload"] = rightPayload
+        // Keep the later (higher) sequence / eventId so the client watermark
+        // advances once; earlier seq is reported via onCoalescedAway.
+        guard let data = try? JSONSerialization.data(withJSONObject: right) else {
+            return nil
+        }
+        return data
+    }
+
+    /// Walk frames in arrival order; concatenate consecutive same-item deltas.
+    /// Returns (frames to send, frames absorbed whose sequences must be filtered).
+    static func mergeAgentItemDeltasInOrder(_ frames: [Data]) -> (merged: [Data], absorbed: [Data]) {
+        var result: [Data] = []
+        var absorbed: [Data] = []
+        var pendingDelta: Data?
+
+        func flushPending() {
+            if let pendingDelta {
+                result.append(pendingDelta)
+            }
+            pendingDelta = nil
         }
 
-        // Then nil-key frames in arrival order.
-        if !nilKeyQueue.isEmpty {
-            let frames = nilKeyQueue
-            nilKeyQueue.removeAll(keepingCapacity: true)
-            for frame in frames {
-                send(frame)
+        for frame in frames {
+            guard let object = parseEventObject(frame),
+                  (object["kind"] as? String) == "agent.item.delta" else {
+                flushPending()
+                result.append(frame)
+                continue
+            }
+            if let current = pendingDelta,
+               let merged = mergeAgentItemDeltaFrames(current, frame) {
+                absorbed.append(current)
+                pendingDelta = merged
+            } else {
+                flushPending()
+                pendingDelta = frame
             }
         }
+        flushPending()
+        return (result, absorbed)
+    }
+
+    private static func parseEventObject(_ data: Data) -> [String: Any]? {
+        guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              (object["type"] as? String) == "event" else { return nil }
+        return object
     }
 
     // MARK: - Testable grouping helper

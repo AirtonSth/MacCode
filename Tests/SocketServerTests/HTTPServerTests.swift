@@ -337,6 +337,68 @@ final class HTTPServerTests: XCTestCase {
                       "server must close/reset a slow-loris partial-header connection; read result=\(n), errno=\(errno)")
     }
 
+    /// C-07: one TCP connection must serve multiple HTTP requests (keep-alive).
+    /// WHY: cold-start used to open 11+ TCP connections because every response
+    /// sent `Connection: close`. Reusing one socket is the highest-ROI latency
+    /// cut on 3G (skips SYN/FIN per RPC after the first).
+    @MainActor
+    func test_httpKeepAlive_reusesOneTCPConnectionAndIdlesOut() throws {
+        let port = UInt16.random(in: 33000...44000)
+        let dispatcher = JSONRPCDispatcher(router: FakeRouter())
+        let s = DirectHTTPServer(
+            port: port,
+            loopbackOnly: true,
+            dispatcher: dispatcher,
+            bootEpoch: 1,
+            clientReceiveTimeoutSeconds: 1
+        )
+        try s.start()
+        defer { s.stop() }
+        Thread.sleep(forTimeInterval: 0.05)
+
+        let fd = try connectLocalhost(port: port)
+        defer { Darwin.close(fd) }
+
+        try writeAll(fd: fd, data: Data(
+            "GET /healthz HTTP/1.1\r\nHost: 127.0.0.1:\(port)\r\n\r\n".utf8
+        ))
+        let first = try readFullHTTPResponse(fd: fd, timeout: 2)
+        XCTAssertTrue(first.contains("HTTP/1.1 200"), "first keep-alive response must be 200, got: \(first.prefix(120))")
+        XCTAssertTrue(first.lowercased().contains("connection: keep-alive"),
+                      "responses must advertise keep-alive so clients reuse the socket")
+        XCTAssertTrue(first.contains("ok\n"), "healthz body must be present on first response")
+
+        // Second request on the SAME fd — proves the server did not FIN after response 1.
+        try writeAll(fd: fd, data: Data(
+            "GET /v1/discovery HTTP/1.1\r\nHost: 127.0.0.1:\(port)\r\n\r\n".utf8
+        ))
+        let second = try readFullHTTPResponse(fd: fd, timeout: 2)
+        XCTAssertTrue(second.contains("HTTP/1.1 200"), "second keep-alive response must be 200, got: \(second.prefix(120))")
+        XCTAssertTrue(second.contains("remotecode"),
+                      "second request on the same TCP connection must reach discovery")
+
+        // Idle SO_RCVTIMEO (1s) must reclaim the connection (no cleanup regression).
+        let idleDeadline = Date().addingTimeInterval(2.5)
+        var closed = false
+        var bytes = [UInt8](repeating: 0, count: 64)
+        while Date() < idleDeadline {
+            let n = Darwin.recv(fd, &bytes, bytes.count, MSG_DONTWAIT)
+            if n == 0 { closed = true; break }
+            if n < 0, errno == ECONNRESET || errno == ENOTCONN { closed = true; break }
+            Thread.sleep(forTimeInterval: 0.01)
+        }
+        XCTAssertTrue(closed, "server must close an idle keep-alive connection via SO_RCVTIMEO")
+    }
+
+    func test_httpClientRequestsClose_parsesConnectionHeader() {
+        XCTAssertFalse(DirectHTTPServer.httpClientRequestsClose([:]),
+                       "HTTP/1.1 default is keep-alive when Connection is absent")
+        XCTAssertFalse(DirectHTTPServer.httpClientRequestsClose(["connection": "keep-alive"]))
+        XCTAssertTrue(DirectHTTPServer.httpClientRequestsClose(["connection": "close"]))
+        XCTAssertTrue(DirectHTTPServer.httpClientRequestsClose(["connection": "Keep-Alive, close"]),
+                      "comma-separated tokens must honor an explicit close")
+    }
+
     func test_webSocketPongFrameClampsOversizedPingPayload() {
         let frame = DirectHTTPServer.pongFrame(payload: Data(repeating: 0x41, count: 300))
 
@@ -379,56 +441,139 @@ final class HTTPServerTests: XCTestCase {
         XCTAssertEqual(group.wait(timeout: .now() + 1), .success)
     }
 
-    func test_webSocketLivenessPolicyUsesCanonicalFiveAndTenSecondDeadlines() {
-        XCTAssertEqual(DirectHTTPServer.wsHeartbeatInterval, 5,
-                       "welcome must advertise the canonical RFC ping interval")
-        XCTAssertEqual(DirectHTTPServer.wsHeartbeatTimeout, 10,
-                       "a receive black hole must be detected within ten seconds")
+    func test_webSocketLivenessPolicyUsesWiFiAndCellularProfiles() {
+        XCTAssertEqual(DirectHTTPServer.wsHeartbeatInterval, 10,
+                       "default / Wi-Fi welcome advertises a 10s ping interval")
+        XCTAssertEqual(DirectHTTPServer.wsHeartbeatTimeout, 30,
+                       "default / Wi-Fi black-hole budget is 30s")
+        XCTAssertEqual(DirectHTTPServer.wsHeartbeatProfileCellular.interval, 25)
+        XCTAssertEqual(DirectHTTPServer.wsHeartbeatProfileCellular.timeout, 90)
         XCTAssertGreaterThan(DirectHTTPServer.wsHeartbeatTimeout,
                              DirectHTTPServer.wsHeartbeatInterval)
         XCTAssertGreaterThan(DirectHTTPServer.wsSocketReadTimeout,
-                             DirectHTTPServer.wsHeartbeatTimeout,
-                             "socket read timeout is a fallback; matching RFC pong owns liveness")
+                             DirectHTTPServer.wsHeartbeatProfileCellular.timeout,
+                             "socket read timeout is a fallback; RFC pong / traffic owns liveness")
     }
 
-    func test_webSocketLiveness_requiresExactPongPayloadByTenSecondDeadline() {
+    func test_heartbeatProfileSelectionTracksWSFilter() {
+        XCTAssertEqual(
+            DirectHTTPServer.heartbeatProfile(forWSFilter: .full),
+            DirectHTTPServer.wsHeartbeatProfileWiFi
+        )
+        XCTAssertEqual(
+            DirectHTTPServer.heartbeatProfile(forWSFilter: .cellularSafe),
+            DirectHTTPServer.wsHeartbeatProfileCellular
+        )
+    }
+
+    func test_heartbeatNegotiationAcceptsClientProposalWithinProfile() {
+        let accepted = DirectHTTPServer.negotiateHeartbeatProfile(
+            filter: .cellularSafe,
+            proposedIntervalMs: 25_000,
+            proposedTimeoutMs: 90_000
+        )
+        XCTAssertEqual(accepted.interval, 25)
+        XCTAssertEqual(accepted.timeout, 90)
+
+        let countered = DirectHTTPServer.negotiateHeartbeatProfile(
+            filter: .cellularSafe,
+            proposedIntervalMs: 60_000,
+            proposedTimeoutMs: 120_000
+        )
+        XCTAssertEqual(countered.interval, 25,
+                       "host counters interval proposals above the cellular ceiling")
+        XCTAssertEqual(countered.timeout, 90,
+                       "host counters timeout proposals above the cellular ceiling")
+
+        let wifi = DirectHTTPServer.negotiateHeartbeatProfile(
+            filter: .full,
+            proposedIntervalMs: nil,
+            proposedTimeoutMs: nil
+        )
+        XCTAssertEqual(wifi, DirectHTTPServer.wsHeartbeatProfileWiFi)
+    }
+
+    func test_webSocketLiveness_requiresExactPongPayloadByDeadline() {
         let nonce = Data("server-nonce".utf8)
         let state = WebSocketLivenessState(
             now: 0,
-            interval: 5,
-            timeout: 10,
+            interval: 10,
+            timeout: 30,
             nonce: { nonce }
         )
 
-        XCTAssertEqual(state.nextAction(now: 4.99), .none)
-        XCTAssertEqual(state.nextAction(now: 5), .ping(nonce))
-        XCTAssertFalse(state.acceptPong(Data("wrong".utf8), now: 6),
-                       "an unrelated pong must not prove this connection is live")
         XCTAssertEqual(state.nextAction(now: 9.99), .none)
-        XCTAssertEqual(state.nextAction(now: 10), .timedOut)
+        XCTAssertEqual(state.nextAction(now: 10), .ping(nonce))
+        XCTAssertFalse(state.acceptPong(Data("wrong".utf8), now: 11),
+                       "an unrelated pong must not prove this connection is live")
+        XCTAssertEqual(state.nextAction(now: 29.99), .none)
+        XCTAssertEqual(state.nextAction(now: 30), .timedOut)
 
         let late = WebSocketLivenessState(
             now: 0,
-            interval: 5,
-            timeout: 10,
+            interval: 10,
+            timeout: 30,
             nonce: { nonce }
         )
-        XCTAssertEqual(late.nextAction(now: 5), .ping(nonce))
-        XCTAssertFalse(late.acceptPong(nonce, now: 10),
+        XCTAssertEqual(late.nextAction(now: 10), .ping(nonce))
+        XCTAssertFalse(late.acceptPong(nonce, now: 30),
                        "a matching pong at or after the deadline must not revive the connection")
-        XCTAssertEqual(late.nextAction(now: 10), .timedOut)
+        XCTAssertEqual(late.nextAction(now: 30), .timedOut)
 
         let matched = WebSocketLivenessState(
             now: 0,
-            interval: 5,
-            timeout: 10,
+            interval: 10,
+            timeout: 30,
             nonce: { nonce }
         )
-        XCTAssertEqual(matched.nextAction(now: 5), .ping(nonce))
-        XCTAssertTrue(matched.acceptPong(nonce, now: 6))
-        XCTAssertEqual(matched.nextAction(now: 10.99), .none)
-        XCTAssertEqual(matched.nextAction(now: 11), .ping(nonce),
+        XCTAssertEqual(matched.nextAction(now: 10), .ping(nonce))
+        XCTAssertTrue(matched.acceptPong(nonce, now: 16))
+        XCTAssertEqual(matched.nextAction(now: 25.99), .none)
+        XCTAssertEqual(matched.nextAction(now: 26), .ping(nonce),
                        "a matching pong resets proof and schedules the next server ping")
+    }
+
+    func test_webSocketLiveness_inboundTrafficCountsAsProofAndSuppressesPing() {
+        let nonce = Data("server-nonce".utf8)
+        let state = WebSocketLivenessState(
+            now: 0,
+            interval: 10,
+            timeout: 30,
+            nonce: { nonce }
+        )
+        XCTAssertEqual(state.nextAction(now: 10), .ping(nonce))
+        state.noteInboundTraffic(now: 12)
+        XCTAssertEqual(state.nextAction(now: 21.99), .none,
+                       "real traffic must suppress the next ping until a full interval elapses")
+        XCTAssertEqual(state.nextAction(now: 22), .ping(nonce))
+        state.noteInboundTraffic(now: 25)
+        // Traffic at t=25 clears outstanding and restarts the interval clock.
+        XCTAssertEqual(state.nextAction(now: 35), .ping(nonce))
+        XCTAssertEqual(state.nextAction(now: 54.99), .none,
+                       "while a ping is outstanding the scheduler waits for proof or timeout")
+        XCTAssertEqual(state.nextAction(now: 55), .timedOut,
+                       "traffic only delays the hard timeout; silence still closes at the deadline")
+    }
+
+    func test_webSocketLiveness_nextWakeDelay_schedulesInterestNotPoll() {
+        // WHY (C-19): host must wake once per interval (~12/min on Wi-Fi), not 4×/s.
+        let nonce = Data("server-nonce".utf8)
+        let state = WebSocketLivenessState(
+            now: 0,
+            interval: 10,
+            timeout: 30,
+            nonce: { nonce }
+        )
+        XCTAssertEqual(state.nextWakeDelay(now: 0), 10, accuracy: 0.001,
+                       "fresh connection next interest is the first ping")
+        XCTAssertEqual(state.nextWakeDelay(now: 3), 7, accuracy: 0.001)
+        _ = state.nextAction(now: 10)
+        // Outstanding ping: next interest is the hard timeout from last proof (t=0).
+        XCTAssertEqual(state.nextWakeDelay(now: 10), 20, accuracy: 0.001,
+                       "while awaiting pong, wake only at timeout")
+        XCTAssertTrue(state.acceptPong(nonce, now: 12))
+        XCTAssertEqual(state.nextWakeDelay(now: 12), 10, accuracy: 0.001,
+                       "after pong, next wake is interval from proof")
     }
 
     func test_connectionOutboundOwner_ordersAcceptedWorkThenTerminalAndRejectsLaterFrames() throws {
@@ -587,6 +732,82 @@ final class HTTPServerTests: XCTestCase {
                        "a reused queue must release every drained storage slot")
     }
 
+    /// C-04: degrade ladder coalesces by key then sheds bulk without closing.
+    func test_connectionOutboundOwner_degradeCoalescesAndDiscardsBulkWithoutTerminate() throws {
+        let stall = DispatchSemaphore(value: 0)
+        let release = DispatchSemaphore(value: 0)
+        let owner = WebSocketOutboundQueue(
+            maxQueuedBytes: 64 * 1024,
+            applicationWriter: { data in
+                if String(decoding: data, as: UTF8.self).contains("\"sequence\":1") {
+                    stall.signal()
+                    _ = release.wait(timeout: .now() + 2)
+                }
+                return true
+            },
+            controlWriter: { _, _ in true },
+            writeFailureClosingData: Data(),
+            onTerminal: { _ in XCTFail("degrade must never terminate") },
+            didSendTerminal: { XCTFail("degrade must never shut down") }
+        )
+
+        func eventFrame(seq: Int64, kind: String, payload: [String: Any]) throws -> Data {
+            let object: [String: Any] = [
+                "protocolVersion": 3,
+                "type": "event",
+                "connectionId": "c",
+                "hostId": "h",
+                "bootEpoch": 1,
+                "sequence": seq,
+                "eventId": "1:\(seq)",
+                "occurredAtEpochMs": 0,
+                "kind": kind,
+                "payload": payload,
+            ]
+            return try JSONSerialization.data(withJSONObject: object)
+        }
+
+        let first = try eventFrame(seq: 1, kind: "agent.item.delta", payload: [
+            "item_id": "i1", "text": "a",
+        ])
+        XCTAssertEqual(owner.enqueueApplication(first), .accepted)
+        XCTAssertEqual(stall.wait(timeout: .now() + 2), .success)
+
+        for seq in 2...6 {
+            let frame = try eventFrame(seq: Int64(seq), kind: "agent.item.delta", payload: [
+                "item_id": "i1", "text": "t\(seq)",
+            ])
+            XCTAssertEqual(owner.enqueueApplication(frame), .accepted)
+        }
+        let critical = try eventFrame(seq: 7, kind: "agent.run.completed", payload: [
+            "thread_id": "t1",
+        ])
+        XCTAssertEqual(owner.enqueueApplication(critical), .accepted)
+
+        let before = owner.queuedFrameCountForTests
+        XCTAssertGreaterThan(before, 1)
+        let outcome = owner.degrade()
+        XCTAssertTrue(outcome.needsBaselineRequired || outcome.discardedBulkFrames > 0
+                      || outcome.coalescedAwayFrames > 0,
+                      "degrade must free or mark pressure")
+        XCTAssertLessThan(owner.queuedFrameCountForTests, before,
+                          "coalesce/discard must reduce queued frames")
+        XCTAssertEqual(owner.enqueueApplication(Data("tiny".utf8)), .accepted,
+                       "queue must stay open after degrade")
+
+        release.signal()
+        owner.finish()
+    }
+
+    func test_outboundPressureBaselineGate_rateLimitsToOnePerSecond() {
+        let gate = OutboundPressureBaselineGate(minInterval: 1.0)
+        XCTAssertTrue(gate.tryAcquire(now: 100))
+        XCTAssertFalse(gate.tryAcquire(now: 100.5),
+                       "second acquire inside 1s must be rejected")
+        XCTAssertTrue(gate.tryAcquire(now: 101.0),
+                      "acquire at the interval boundary must succeed")
+    }
+
     func test_connectionOutboundOwner_writeFailureClosesOnceAndClearsQueueAccounting() {
         let recorded = RecordedFrames()
         let owner = WebSocketOutboundQueue(
@@ -652,8 +873,10 @@ final class HTTPServerTests: XCTestCase {
         XCTAssertEqual(owner.queuedFrameCountForTests, 4)
 
         XCTAssertEqual(owner.enqueueControl(opcode: 0xA, data: Data("full".utf8)), .queueFull)
-        XCTAssertEqual(owner.enqueueControl(opcode: 0xA, data: Data()), .closed)
-        XCTAssertEqual(recorded.snapshot.filter { $0 == "terminal:queue_full" }.count, 1)
+        // C-04: control overflow reports queueFull but stays open (no terminate).
+        XCTAssertEqual(owner.enqueueControl(opcode: 0xA, data: Data("x".utf8)), .queueFull)
+        XCTAssertEqual(recorded.snapshot.filter { $0.hasPrefix("terminal:") }.count, 0,
+                       "queue_full must not terminate; degrade owns recovery")
         XCTAssertLessThanOrEqual(owner.queuedByteCount, 16)
         XCTAssertLessThanOrEqual(owner.queuedFrameCountForTests, 4)
 
@@ -662,8 +885,8 @@ final class HTTPServerTests: XCTestCase {
 
         XCTAssertEqual(owner.queuedByteCount, 0)
         XCTAssertEqual(owner.queuedFrameCountForTests, 0)
-        XCTAssertEqual(recorded.snapshot.filter { $0 == "terminal:queue_full" }.count, 1)
-        XCTAssertEqual(recorded.snapshot.filter { $0 == "shutdown" }.count, 1)
+        XCTAssertEqual(recorded.snapshot.filter { $0.hasPrefix("terminal:") }.count, 0)
+        XCTAssertEqual(recorded.snapshot.filter { $0 == "shutdown" }.count, 0)
     }
 
     // MARK: - Auth-gate coverage (T010-T012, T006) — loopbackOnly: false
@@ -812,6 +1035,63 @@ final class HTTPServerTests: XCTestCase {
             if out.range(of: Data("\r\n\r\n".utf8)) != nil { break }
         }
         return String(decoding: out, as: UTF8.self)
+    }
+
+    /// Read one full HTTP/1.1 response (headers + Content-Length body) so a
+    /// keep-alive test can issue a second request on the same socket without
+    /// leaving unread body bytes that would desync framing.
+    private func readFullHTTPResponse(fd: Int32, timeout: TimeInterval) throws -> String {
+        let deadline = Date().addingTimeInterval(timeout)
+        var out = Data()
+        var buf = [UInt8](repeating: 0, count: 4096)
+        var headerEnd: Range<Data.Index>?
+        while headerEnd == nil {
+            if Date() >= deadline {
+                throw POSIXError(.ETIMEDOUT)
+            }
+            let n = Darwin.recv(fd, &buf, buf.count, MSG_DONTWAIT)
+            if n > 0 {
+                out.append(buf, count: n)
+                headerEnd = out.range(of: Data("\r\n\r\n".utf8))
+            } else if n == 0 {
+                throw POSIXError(.ECONNRESET)
+            } else if errno != EAGAIN && errno != EWOULDBLOCK {
+                throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+            } else {
+                Thread.sleep(forTimeInterval: 0.005)
+            }
+        }
+        let headerData = out.subdata(in: out.startIndex..<headerEnd!.lowerBound)
+        let headerStr = String(decoding: headerData, as: UTF8.self)
+        var contentLength = 0
+        for line in headerStr.split(separator: "\r\n", omittingEmptySubsequences: false).dropFirst() {
+            if line.lowercased().hasPrefix("content-length:") {
+                let raw = line.dropFirst("content-length:".count).trimmingCharacters(in: .whitespaces)
+                contentLength = Int(raw) ?? 0
+            }
+        }
+        let bodyStart = headerEnd!.upperBound
+        while out.count - bodyStart < contentLength {
+            if Date() >= deadline {
+                throw POSIXError(.ETIMEDOUT)
+            }
+            let n = Darwin.recv(fd, &buf, buf.count, MSG_DONTWAIT)
+            if n > 0 {
+                out.append(buf, count: n)
+            } else if n == 0 {
+                throw POSIXError(.ECONNRESET)
+            } else if errno != EAGAIN && errno != EWOULDBLOCK {
+                throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+            } else {
+                Thread.sleep(forTimeInterval: 0.005)
+            }
+        }
+        // Truncate to one message so pipelined extra bytes stay for next call.
+        let end = bodyStart + contentLength
+        if end < out.count {
+            // Should not happen on a non-pipelined client; keep full buffer.
+        }
+        return String(decoding: out.prefix(end), as: UTF8.self)
     }
 
     private func assertConcurrentTerminateCannotOvertake(

@@ -574,9 +574,23 @@ public enum EventStreamFilter: Sendable, Equatable {
     public func coalescingKey(for event: EventBus.Event) -> String? {
         guard self == .cellularSafe else { return nil }
         guard case .object(let payload) = event.payload else { return nil }
-        guard event.kind == "surface.output.summary",
-              let surfaceID = payload["surface_id"]?.stringValue else { return nil }
-        return "\(event.kind):\(surfaceID)"
+        // C-14: last-write-wins for terminal summaries (seq + byte counts only).
+        if event.kind == "surface.output.summary",
+           let surfaceID = payload["surface_id"]?.stringValue {
+            return "\(event.kind):\(surfaceID)"
+        }
+        // C-16: same item_id merges by *concat* of append fields (not LWW) so
+        // agent text stays byte-identical to the unaggregated stream.
+        if event.kind == "agent.item.delta",
+           let itemID = payload["item_id"]?.stringValue {
+            return "\(event.kind):\(itemID)"
+        }
+        return nil
+    }
+
+    /// Whether a coalescing key uses concatenate-merge (C-16) instead of LWW.
+    public func coalescingMergesByConcatenation(for event: EventBus.Event) -> Bool {
+        event.kind == "agent.item.delta"
     }
 
     public func map(_ event: EventBus.Event) -> EventBus.Event? {
@@ -584,6 +598,8 @@ public enum EventStreamFilter: Sendable, Equatable {
         case .full:
             return event
         case .cellularSafe:
+            // `reducerRequired` means the *content* is required on the client,
+            // not that every micro-token must be its own WS frame (C-16).
             let classification = EventStreamClassification.classify(kind: event.kind)
             if event.kind == "surface.output" {
                 if Self.isGeometryOnlyTerminalOutput(event) {
