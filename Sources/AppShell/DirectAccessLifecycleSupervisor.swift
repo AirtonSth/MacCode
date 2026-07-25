@@ -19,6 +19,7 @@ final class DirectAccessLifecycleSupervisor {
     private let publishBonjour: () -> Void
     private let stopBonjour: () -> Void
     private let retryDelays: [TimeInterval]
+    private let continueRetryingAfterDelays: Bool
     private let scheduleRetry: RetryScheduler
     private let retryLogger: (_ attempt: Int, _ delay: TimeInterval, _ error: Error) -> Void
     private var state: State = .stopped
@@ -38,6 +39,7 @@ final class DirectAccessLifecycleSupervisor {
         publishBonjour: @escaping () -> Void,
         stopBonjour: @escaping () -> Void,
         retryDelays: [TimeInterval] = [1, 2, 4],
+        continueRetryingAfterDelays: Bool = false,
         scheduleRetry: @escaping RetryScheduler = DirectAccessLifecycleSupervisor.defaultRetryScheduler,
         retryLogger: @escaping (_ attempt: Int, _ delay: TimeInterval, _ error: Error) -> Void = { _, _, _ in }
     ) {
@@ -46,6 +48,7 @@ final class DirectAccessLifecycleSupervisor {
         self.publishBonjour = publishBonjour
         self.stopBonjour = stopBonjour
         self.retryDelays = retryDelays
+        self.continueRetryingAfterDelays = continueRetryingAfterDelays
         self.scheduleRetry = scheduleRetry
         self.retryLogger = retryLogger
     }
@@ -97,8 +100,9 @@ final class DirectAccessLifecycleSupervisor {
     }
 
     private func scheduleNextRetry(remoteEnabled: Bool, error: Error) {
-        guard retryIndex < retryDelays.count else { return }
-        let delay = retryDelays[retryIndex]
+        guard !retryDelays.isEmpty else { return }
+        guard continueRetryingAfterDelays || retryIndex < retryDelays.count else { return }
+        let delay = retryDelays[min(retryIndex, retryDelays.count - 1)]
         retryIndex += 1
         retryLogger(retryIndex, delay, error)
         let generation = retryGeneration

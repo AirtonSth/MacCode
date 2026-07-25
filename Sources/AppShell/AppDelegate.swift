@@ -11,6 +11,13 @@ import os
 
 private let appLifecycleLog = Logger(subsystem: "io.remotecode.app", category: "lifecycle")
 
+public enum BonjourPublicationState: String, Sendable {
+    case stopped
+    case publishing
+    case published
+    case failed
+}
+
 @MainActor
 func flushPersistedTerminalHistoryForRegisteredSurfaces(
     timeout: TimeInterval = 2
@@ -80,7 +87,10 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
     /// is ever removed.
     var authProviderIsRetained: Bool { authProvider != nil }
     private var bonjour: NetService?
-    private let bonjourDelegate = BonjourDelegate()
+    private var bonjourDelegate: BonjourDelegate?
+    private var bonjourPublishRetryWorkItem: DispatchWorkItem?
+    private var bonjourPublishRetryAttempt = 0
+    public private(set) var bonjourPublicationState: BonjourPublicationState = .stopped
     private var directAccessSupervisor: DirectAccessLifecycleSupervisor?
     public var palette: CommandPalette?
     public var settings: SettingsWindowController?
@@ -937,9 +947,10 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
                     self?.publishBonjour(serverId: serverId, port: port)
                 },
                 stopBonjour: { [weak self] in
-                    self?.bonjour?.stop()
-                    self?.bonjour = nil
+                    self?.stopBonjourPublication()
                 },
+                retryDelays: [1, 2, 4, 8, 16, 30],
+                continueRetryingAfterDelays: true,
                 retryLogger: { attempt, delay, error in
                     let nsError = error as NSError
                     NSLog("Direct HTTP retry scheduled attempt=\(attempt) delay=\(delay)s reason=\(nsError.domain):\(nsError.code)")
@@ -1687,25 +1698,75 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
     /// Mac on the LAN. TXT carries the stable identity + version so the
     /// client can show it before connecting.
     private func publishBonjour(serverId: String, port: UInt16) {
+        bonjourPublishRetryWorkItem?.cancel()
+        bonjourPublishRetryWorkItem = nil
+        bonjourPublishRetryAttempt = 0
+        bonjour?.stop()
         let name = Host.current().localizedName ?? ProcessInfo.processInfo.hostName
         let svc = NetService(domain: "", type: "_remotecode._tcp.", name: name, port: Int32(port))
         let txt = Self.bonjourTXTRecord(serverId: serverId, version: AppVersion.short)
         svc.setTXTRecord(NetService.data(fromTXTRecord: txt))
-        svc.delegate = bonjourDelegate
+        let delegate = BonjourDelegate(
+            onPublished: { [weak self] in
+                self?.bonjourPublicationState = .published
+                self?.bonjourPublishRetryAttempt = 0
+            },
+            onFailure: { [weak self] error in
+                self?.bonjourPublicationState = .failed
+                self?.scheduleBonjourPublicationRetry(serverId: serverId, port: port, error: error)
+            }
+        )
+        bonjourDelegate = delegate
+        svc.delegate = delegate
+        bonjourPublicationState = .publishing
         svc.publish()
         bonjour = svc
         NSLog("Bonjour published: \(name) _remotecode._tcp:\(port)")
+    }
+
+    private func stopBonjourPublication() {
+        bonjourPublishRetryWorkItem?.cancel()
+        bonjourPublishRetryWorkItem = nil
+        bonjour?.stop()
+        bonjour = nil
+        bonjourDelegate = nil
+        bonjourPublicationState = .stopped
+    }
+
+    private func scheduleBonjourPublicationRetry(serverId: String, port: UInt16, error: Error) {
+        guard bonjourPublicationState == .failed else { return }
+        let base = min(pow(2, Double(bonjourPublishRetryAttempt)), 30)
+        bonjourPublishRetryAttempt += 1
+        let delay = base + Double.random(in: 0...(base * 0.25))
+        let nsError = error as NSError
+        NSLog("Bonjour retry scheduled attempt=\(bonjourPublishRetryAttempt) delay=\(delay)s reason=\(nsError.domain):\(nsError.code)")
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, self.bonjourPublicationState == .failed else { return }
+            self.publishBonjour(serverId: serverId, port: port)
+        }
+        bonjourPublishRetryWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
     }
 }
 
 /// Logs Bonjour publish outcome; a publish failure must be loud, not
 /// silent, or the iOS app simply never sees this Mac (Rule 6).
 final class BonjourDelegate: NSObject, NetServiceDelegate {
+    private let onPublished: () -> Void
+    private let onFailure: (Error) -> Void
+
+    init(onPublished: @escaping () -> Void, onFailure: @escaping (Error) -> Void) {
+        self.onPublished = onPublished
+        self.onFailure = onFailure
+    }
+
     func netServiceDidPublish(_ sender: NetService) {
         NSLog("Bonjour: did publish \(sender.name)")
+        onPublished()
     }
     func netService(_ sender: NetService, didNotPublish errorDict: [String: NSNumber]) {
         NSLog("Bonjour: FAILED to publish \(sender.name): \(errorDict)")
+        onFailure(NSError(domain: "Bonjour", code: (errorDict[NetService.errorCode] as? NSNumber)?.intValue ?? -1, userInfo: errorDict))
     }
 }
 

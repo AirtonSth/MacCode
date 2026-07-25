@@ -171,6 +171,36 @@ final class DirectAccessLifecycleSupervisorTests: XCTestCase {
         XCTAssertEqual(publishes, 0, "repeated bind failures must never advertise Bonjour")
     }
 
+    func test_productionModeContinuesAtCappedDelayUntilListenerRecovers() {
+        var starts = 0
+        var delays: [TimeInterval] = []
+        var scheduled: [@MainActor () -> Void] = []
+        let supervisor = DirectAccessLifecycleSupervisor(
+            startServer: { _ in
+                starts += 1
+                throw TestError.bindFailed
+            },
+            stopServer: {},
+            publishBonjour: {},
+            stopBonjour: {},
+            retryDelays: [0.25, 0.5],
+            continueRetryingAfterDelays: true,
+            scheduleRetry: { delay, action in
+                delays.append(delay)
+                scheduled.append(action)
+                return {}
+            }
+        )
+
+        XCTAssertThrowsError(try supervisor.configure(remoteEnabled: true))
+        scheduled.removeFirst()()
+        scheduled.removeFirst()()
+        scheduled.removeFirst()()
+
+        XCTAssertEqual(starts, 4, "listener recovery must keep retrying while remote access remains enabled")
+        XCTAssertEqual(delays, [0.25, 0.5, 0.5, 0.5], "retry cadence must be capped instead of growing without bound")
+    }
+
     func test_suspendAndShutdown_cancelPendingRetry() {
         var suspendCancellations = 0
         let suspended = DirectAccessLifecycleSupervisor(
