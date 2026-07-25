@@ -80,10 +80,25 @@ struct RemoteCodeDistillServiceMain {
             // /v1/retrieve reads exactly what store-before-loss wrote (DB-path parity).
             let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: configuration.appSupportDirectory).run()
             let savingsRepo = TokenSaverSavingsRepository(db: db)
+            // Unscoped CCR path: command-output store-before-loss fallback when
+            // project-scoped lane retention is unavailable (projectless threads).
             let reversibleStore = SidecarReversibleStore(store: ReversibleContentStore(db: db))
+            let scopedRecoveryStore = SidecarScopedRecoveryStore(
+                worker: TokenSaverRuntimeRecoveryWorker(db: db),
+                store: TokenSaverScopedRecoveryStore(db: db),
+                appSupportDirectory: configuration.appSupportDirectory
+            )
             let statsProvider = SidecarDistillStatsProvider(repository: savingsRepo)
             let eventWriter = DistillSidecarEventWriter()
-            let server = DistillHTTPServer(configuration: configuration, scheduler: scheduler, reversibleStore: reversibleStore, statsProvider: statsProvider, startsReady: false, metricsRecorder: sharedMetrics) { request, response in
+            let server = DistillHTTPServer(
+                configuration: configuration,
+                scheduler: scheduler,
+                reversibleStore: reversibleStore,
+                scopedRecoveryStore: scopedRecoveryStore,
+                statsProvider: statsProvider,
+                startsReady: false,
+                metricsRecorder: sharedMetrics
+            ) { request, response in
                 guard let record = DistillSavingsCalculator.record(for: request, response: response) else {
                     return
                 }
@@ -140,10 +155,13 @@ struct RemoteCodeDistillServiceMain {
             stdin: stdin,
             state: loadCLIState(),
             provider: (provider?.isEmpty == false) ? provider : nil,
+            recoveryContext: ManagedDistillCLI.recoveryContext(environment: env),
             maxOutputCharacters: maxChars
         ) { request in
             do {
-                let (data, response) = try await session.data(for: request)
+                var scopedRequest = request
+                applyRecoveryHeaders(to: &scopedRequest, environment: env)
+                let (data, response) = try await session.data(for: scopedRequest)
                 return (data, (response as? HTTPURLResponse)?.statusCode ?? 0)
             } catch {
                 return nil
@@ -173,11 +191,14 @@ struct RemoteCodeDistillServiceMain {
                 stdin: captured,
                 state: loadCLIState(),
                 provider: (provider?.isEmpty == false) ? provider : nil,
+                recoveryContext: ManagedDistillCLI.recoveryContext(environment: env),
                 maxOutputCharacters: maxChars,
                 reversibleStoreMinBytes: storeFloorBytes
             ) { request in
                 do {
-                    let (data, response) = try await session.data(for: request)
+                    var scopedRequest = request
+                    applyRecoveryHeaders(to: &scopedRequest, environment: env)
+                    let (data, response) = try await session.data(for: scopedRequest)
                     return (data, (response as? HTTPURLResponse)?.statusCode ?? 0)
                 } catch {
                     return nil
@@ -198,11 +219,14 @@ struct RemoteCodeDistillServiceMain {
     private static func runMCP() async {
         let state = loadCLIState()
         let session = createConfiguredURLSession()
+        let environment = ProcessInfo.processInfo.environment
         let server = ManagedRetrieveMCP(
             retrieve: { handle in
                 guard let state, let url = URL(string: state.baseURL + "/v1/retrieve/\(handle)") else { return nil }
                 var request = URLRequest(url: url)
                 request.setValue("Bearer \(state.authToken)", forHTTPHeaderField: "Authorization")
+                applyRecoveryHeaders(to: &request, environment: environment)
+                request.setValue(ManagedDistillCLI.recoveryOperationID(kind: "retrieve", canonicalPayload: Data(handle.utf8)), forHTTPHeaderField: "X-RemoteCode-Operation-ID")
                 guard let (data, response) = try? await session.data(for: request),
                       (response as? HTTPURLResponse)?.statusCode == 200,
                       let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -227,13 +251,21 @@ struct RemoteCodeDistillServiceMain {
                 request.httpMethod = "POST"
                 request.setValue("Bearer \(state.authToken)", forHTTPHeaderField: "Authorization")
                 request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-                request.httpBody = try? JSONEncoder().encode(distillRequest)
+                applyRecoveryHeaders(to: &request, environment: environment)
+                let encoder = JSONEncoder()
+                encoder.outputFormatting = [.sortedKeys]
+                request.httpBody = try? encoder.encode(distillRequest)
+                if let body = request.httpBody {
+                    request.setValue(distillRequest.id.uuidString.lowercased(), forHTTPHeaderField: "X-RemoteCode-Invocation-ID")
+                    request.setValue(ManagedDistillCLI.recoveryOperationID(kind: "distill", canonicalPayload: body), forHTTPHeaderField: "X-RemoteCode-Operation-ID")
+                }
                 guard let (data, response) = try? await session.data(for: request),
                       (response as? HTTPURLResponse)?.statusCode == 200 else {
                     return nil
                 }
                 return try? JSONDecoder().decode(DistillResponse.self, from: data)
-            }
+            },
+            scopedRecoveryAvailable: hasCompleteRecoveryScope(environment: environment)
         )
         while let line = readLine(strippingNewline: true) {
             if let response = await server.handle(line) {
@@ -247,6 +279,33 @@ struct RemoteCodeDistillServiceMain {
         config.timeoutIntervalForRequest = 20
         config.timeoutIntervalForResource = 60
         return URLSession(configuration: config)
+    }
+
+    private static func applyRecoveryHeaders(to request: inout URLRequest, environment: [String: String]) {
+        let mappings = [
+            ("RC_TOKEN_SAVER_WORKSPACE_ID", "X-RemoteCode-Workspace-ID"),
+            ("RC_TOKEN_SAVER_PROJECT_ID", "X-RemoteCode-Project-ID"),
+            ("RC_TOKEN_SAVER_THREAD_ID", "X-RemoteCode-Thread-ID"),
+            ("REMOTE_CODE_AGENT_PROVIDER", "X-RemoteCode-Provider"),
+            ("RC_TOKEN_SAVER_ATTEMPT_ID", "X-RemoteCode-Attempt-ID"),
+        ]
+        for (environmentKey, header) in mappings {
+            guard let value = environment[environmentKey]?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !value.isEmpty else { continue }
+            request.setValue(value, forHTTPHeaderField: header)
+        }
+    }
+
+    private static func hasCompleteRecoveryScope(environment: [String: String]) -> Bool {
+        [
+            "RC_TOKEN_SAVER_WORKSPACE_ID",
+            "RC_TOKEN_SAVER_PROJECT_ID",
+            "RC_TOKEN_SAVER_THREAD_ID",
+            "REMOTE_CODE_AGENT_PROVIDER",
+            "RC_TOKEN_SAVER_ATTEMPT_ID",
+        ].allSatisfy {
+            environment[$0]?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+        }
     }
 
     private static func loadCLIState() -> ManagedDistillCLI.State? {
@@ -329,6 +388,80 @@ private struct SidecarReversibleStore: ReversibleStoring {
     let store: ReversibleContentStore
     func storeOriginal(_ data: Data) throws -> String { try store.store(data) }
     func retrieveOriginal(_ handle: String) throws -> Data? { try store.retrieve(handle) }
+}
+
+private struct SidecarScopedRecoveryStore: TokenSaverScopedRecoveryStoring {
+    let worker: TokenSaverRuntimeRecoveryWorker
+    let store: TokenSaverScopedRecoveryStore
+    let appSupportDirectory: String
+
+    func lookupInvocation(context: TokenSaverRecoveryRequestContext) throws -> TokenSaverScopedInvocationState? {
+        guard let state = try worker.invocationState(
+            scope: scope(context),
+            invocationID: context.invocationID,
+            operationID: context.operationID
+        ) else { return nil }
+        return .init(
+            state: TokenSaverScopedRecoveryState(rawValue: state.state.rawValue) ?? .acked,
+            transportOutcome: TokenSaverScopedDeliveryOutcome(rawValue: state.transportOutcome.rawValue) ?? .acked
+        )
+    }
+
+    func prepareOriginal(_ data: Data, context: TokenSaverRecoveryRequestContext, lane: String) throws -> TokenSaverScopedPreparation {
+        let prepared = try worker.prepareOriginal(
+            data,
+            scope: scope(context),
+            operationID: context.operationID,
+            invocationID: context.invocationID,
+            lane: lane,
+            expiresAt: nil,
+            disk: try diskSnapshot()
+        )
+        return .init(
+            capability: prepared.capability,
+            idempotencyKey: prepared.idempotencyKey,
+            readBackVerified: prepared.readBackVerified
+        )
+    }
+
+    func retrieveOriginal(capability: String, context: TokenSaverRecoveryRequestContext) throws -> Data? {
+        try store.retrieve(capability: capability, scope: scope(context))
+    }
+
+    func markDelivered(capability: String, idempotencyKey: String, context: TokenSaverRecoveryRequestContext, outcome: TokenSaverScopedDeliveryOutcome) throws -> Bool {
+        let mapped = TokenSaverRecoveryTransportOutcome(rawValue: outcome.rawValue) ?? .failed
+        return try store.markDelivered(
+            capability: capability,
+            scope: scope(context),
+            idempotencyKey: idempotencyKey,
+            outcome: mapped
+        )
+    }
+
+    func ack(capability: String, idempotencyKey: String, context: TokenSaverRecoveryRequestContext) throws -> Bool {
+        try store.ack(capability: capability, scope: scope(context), idempotencyKey: idempotencyKey)
+    }
+
+    private func scope(_ context: TokenSaverRecoveryRequestContext) -> TokenSaverPersistentScope {
+        .init(
+            workspaceID: context.workspaceID,
+            projectID: context.projectID,
+            threadID: context.threadID,
+            provider: context.provider,
+            attemptID: context.attemptID
+        )
+    }
+
+    private func diskSnapshot() throws -> TokenSaverRecoveryDiskSnapshot {
+        let values = try URL(fileURLWithPath: appSupportDirectory).resourceValues(forKeys: [
+            .volumeAvailableCapacityForImportantUsageKey,
+            .volumeTotalCapacityKey,
+        ])
+        return .init(
+            freeBytes: values.volumeAvailableCapacityForImportantUsage ?? 0,
+            totalBytes: Int64(values.volumeTotalCapacity ?? 0)
+        )
+    }
 }
 
 private struct SidecarDistillStatsProvider: DistillStatsProviding {

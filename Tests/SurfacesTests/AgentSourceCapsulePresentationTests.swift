@@ -84,7 +84,7 @@ final class AgentSourceCapsulePresentationTests: XCTestCase {
                 providerLocked: false,
                 runLocked: false
             ),
-            "a single source must render as provenance, not a fake switcher"
+            "a single source must not enable mutation rows (popover still opens to explain)"
         )
         XCTAssertFalse(
             AgentSourceCapsulePresentation.isInteractive(
@@ -104,6 +104,21 @@ final class AgentSourceCapsulePresentationTests: XCTestCase {
         )
     }
 
+    func test_isInteractive_runLockedMeansActiveRunOnly() {
+        // Regression: treating "current provider cannot run" as runLocked made
+        // the Source capsule a dead control — click did nothing and the user
+        // could not switch away from an unauthenticated/unavailable account.
+        // Call sites pass only selectedThreadRunIsStartingOrRunning here.
+        XCTAssertTrue(
+            AgentSourceCapsulePresentation.isInteractive(
+                enabledSourceCount: 3,
+                providerLocked: false,
+                runLocked: false
+            ),
+            "an unauthenticated current provider must not be modeled as runLocked; the menu stays switchable"
+        )
+    }
+
     func test_menuEntries_keepSelectedDisabledSnapshotVisible() {
         let personal = makeSnapshot(id: "codex-personal", provider: .codex, displayName: "Codex Personal", enabled: true)
         let work = makeSnapshot(id: "codex-work", provider: .codex, displayName: "Codex Work", enabled: false)
@@ -113,8 +128,13 @@ final class AgentSourceCapsulePresentationTests: XCTestCase {
             selectedProvider: .codex,
             providerDisplayName: { $0.rawValue.capitalized }
         )
-        XCTAssertEqual(entries.map(\.id), ["codex-personal", "codex-work"],
-                       "a thread bound to a now-disabled instance must still show that account so it is not silently rewritten")
+        let ids = entries.map(\.id)
+        XCTAssertTrue(ids.contains("codex-personal") && ids.contains("codex-work"),
+                      "a thread bound to a now-disabled instance must still show that account so it is not silently rewritten")
+        // Claude/Grok are appended when discovery only returned Codex instances
+        // so the pre-thread switcher never collapses to a single dead row.
+        XCTAssertTrue(ids.contains("claude") && ids.contains("grok"),
+                      "missing providers are still offered alongside codex instances")
         XCTAssertEqual(entries.first(where: { $0.id == "codex-work" })?.isSelected, true)
         XCTAssertEqual(entries.first(where: { $0.id == "codex-personal" })?.isSelected, false)
     }
@@ -129,6 +149,30 @@ final class AgentSourceCapsulePresentationTests: XCTestCase {
         XCTAssertEqual(entries.map(\.id), AgentProvider.allCases.map(\.rawValue),
                        "before snapshots load, the capsule must still offer the built-in provider set")
         XCTAssertEqual(entries.first(where: { $0.id == "claude" })?.isSelected, true)
+    }
+
+    func test_menuEntries_alwaysOfferEveryProviderOnCodexOnlyDiscovery() {
+        // Regression (Airton): empty Agent App / no threads, discovery only
+        // returned Codex. The Source capsule collapsed to a non-interactive
+        // single label ("click does nothing") because enabledSourceCount == 1.
+        // Missing providers must still appear so Claude/Grok remain selectable
+        // before the first message.
+        let codexOnly = makeSnapshot(id: "codex-cli", provider: .codex, displayName: "Codex", enabled: true)
+        let entries = AgentSourceCapsulePresentation.menuEntries(
+            snapshots: [codexOnly],
+            selectedSnapshotId: "codex-cli",
+            selectedProvider: .codex,
+            providerDisplayName: { $0.rawValue.capitalized }
+        )
+        let ids = Set(entries.map(\.id))
+        XCTAssertTrue(ids.contains("codex-cli"), "Codex instance row must remain")
+        XCTAssertTrue(ids.contains("claude") || entries.contains(where: { $0.title == "Claude" }),
+                      "Claude must appear even when discovery returned Codex only")
+        XCTAssertTrue(ids.contains("grok") || entries.contains(where: { $0.title == "Grok" }),
+                      "Grok must appear even when discovery returned Codex only")
+        XCTAssertGreaterThan(entries.count, 1,
+                             "more than one source is required for an interactive pre-thread switcher")
+        XCTAssertEqual(entries.first(where: { $0.id == "codex-cli" })?.isSelected, true)
     }
 
     private func makeSnapshot(

@@ -1,4 +1,5 @@
 import Foundation
+import CoreModel
 
 public struct ReadLifecycleObservation: Sendable, Equatable, Identifiable {
     public let id: String
@@ -53,7 +54,8 @@ public enum ReadLifecycleMasker {
         _ observations: [ReadLifecycleObservation],
         keepLastTurns: Int = 2,
         enabled: Bool = false,
-        mcpRetrieveAvailable: Bool = true
+        mcpRetrieveAvailable: Bool = true,
+        bindingDigest: String? = nil
     ) -> [ReadLifecycleMaskResult] {
         guard enabled else {
             return observations.map { result($0, masked: false, reason: "masking_disabled") }
@@ -74,6 +76,27 @@ public enum ReadLifecycleMasker {
             }
             guard let newer = observations.first(where: { supersedes(candidate: $0, older: observation) }) else {
                 return result(observation, masked: false, reason: "not_superseded")
+            }
+            // Wave A (task-12): shadow scorecard for unchanged reread; active mode can deny mask.
+            let sameRange = observation.startLine == newer.startLine
+                && observation.endLine == newer.endLine
+            let waveAAllows = TokenSaverWaveALossless.unchangedRereadAllows(
+                samePath: observation.realpath == newer.realpath,
+                sameHash: observation.contentHash == newer.contentHash,
+                sameRange: sameRange,
+                handlePresent: observation.retrieveHandle != nil,
+                retrievalActive: mcpRetrieveAvailable
+            )
+            if let digest = bindingDigest, !digest.isEmpty {
+                TokenSaverWaveALossless.observeShadow(
+                    trigger: .unchangedFileReread,
+                    eligible: true,
+                    wouldAccept: waveAAllows,
+                    bindingDigest: digest
+                )
+            }
+            if TokenSaverWaveALossless.defaults[.unchangedFileReread] == .active, !waveAAllows {
+                return result(observation, masked: false, reason: "wave_a_reread_denied")
             }
             return ReadLifecycleMaskResult(
                 observation: observation,

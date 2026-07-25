@@ -1315,6 +1315,13 @@ final class SSHSurface: NSObject, SSHTransferSurface, TerminalRuntimeRoutingSurf
 
     func didBecomeVisible() {
         isVisible = true
+        // Parking reparents the unregistered embedded TerminalSurface into a
+        // hidden NSWindow. PaneTabs only rehosts this outer SSHSurface.view, so
+        // reinstall the terminal when it is parked/orphaned or the Connected
+        // pane stays blank until reconnect.
+        if let terminal, terminal.view.superview !== terminalContainer {
+            installTerminal(terminal.view)
+        }
         terminal?.didBecomeVisible()
     }
 

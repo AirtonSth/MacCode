@@ -227,6 +227,45 @@ final class GrokACPProtocolTests: XCTestCase {
         ), "unverified agent versions must still reject images when advertisement is false")
     }
 
+    func test_promptBlocksInjectTokenSaverSafetyABIExactlyOnceForGrokACP() throws {
+        let request = AgentRunRequest(
+            threadId: AgentThreadID(),
+            provider: .grok,
+            model: "grok-4.5",
+            cwd: "/tmp",
+            prompt: "inspect",
+            environment: ["RC_TOKEN_SAVER_DISTILL_HINT": "1"]
+        )
+        let blocks = try GrokACPClient.promptBlocks(
+            for: request,
+            capabilities: .init(protocolVersion: 1, loadSession: true, embeddedContext: true)
+        )
+        let prompt = try XCTUnwrap(blocks.first?["text"] as? String)
+        XCTAssertEqual(prompt.components(separatedBy: TokenSaverProviderSafetyABI.block).count - 1, 1)
+        XCTAssertEqual(
+            (AgentSkillInstaller.distillAgentInstructionsTemplate + "\n\n" + prompt)
+                .components(separatedBy: TokenSaverProviderSafetyABI.block).count - 1,
+            1,
+            "Grok ACP effective disk plus runtime context receives the safety ABI exactly once"
+        )
+
+        // Token Saver off → no Distill / safety ABI on Grok ACP.
+        let emptyEnvRequest = AgentRunRequest(
+            threadId: AgentThreadID(),
+            provider: .grok,
+            model: "grok-4.5",
+            cwd: "/tmp",
+            prompt: "inspect"
+        )
+        let emptyEnvBlocks = try GrokACPClient.promptBlocks(
+            for: emptyEnvRequest,
+            capabilities: .init(protocolVersion: 1, loadSession: true, embeddedContext: true)
+        )
+        let emptyEnvPrompt = try XCTUnwrap(emptyEnvBlocks.first?["text"] as? String)
+        XCTAssertFalse(emptyEnvPrompt.contains(TokenSaverProviderSafetyABI.block))
+        XCTAssertFalse(emptyEnvPrompt.contains("| distill"))
+    }
+
     func test_mapperStreamsThoughtTextToolsPlanAndKeepsLastTextPhaseFinal() {
         let mapper = GrokACPEventMapper(sessionId: "grok-session")
         var events: [AssistantEvent] = []

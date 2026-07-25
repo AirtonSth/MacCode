@@ -153,6 +153,13 @@ fi
 #   Contents/Resources/RemoteCode_AppShell.bundle
 # Do NOT require an app-root copy: codesign rejects unsealed root contents, and
 # production code must not use SPM Bundle.module (it fatalErrors for customers).
+CLAUDE_SDK_BRIDGE="$APP/Contents/Resources/ClaudeAgentSDKBridge.mjs"
+if [ ! -f "$CLAUDE_SDK_BRIDGE" ]; then
+  fail "missing Claude Agent SDK bridge at $CLAUDE_SDK_BRIDGE (Claude provider fails on customer machines without it)"
+else
+  note "Claude Agent SDK bridge present under Contents/Resources"
+fi
+
 PET_DIR="$APP/Contents/Resources/RemoteCode_AppShell.bundle/Pet"
 PET_ATLAS="$PET_DIR/remote-code-black-cat-atlas.png"
 PET_MANIFEST="$PET_DIR/remote-code-black-cat-atlas-v3.json"
@@ -205,9 +212,40 @@ else
   fi
 fi
 
+# 7b. The remote-code-orchestrate skill must ship inside the AgentRuntime
+# resource bundle. Same launch crash class as the pet atlas: SwiftPM tests
+# resolve local .build products even when packaging forgets the bundle, so only
+# this structural check protects the distributable .app (v2.0.85–v2.0.87
+# shipped without it and aborted every launch via SPM Bundle.module).
+AGENT_RUNTIME_BUNDLE="$APP/Contents/Resources/RemoteCode_AgentRuntime.bundle"
+ORCHESTRATE_SKILL="$AGENT_RUNTIME_BUNDLE/remote-code-orchestrate/SKILL.md"
+if [ ! -d "$AGENT_RUNTIME_BUNDLE" ]; then
+  fail "missing AgentRuntime resources at $AGENT_RUNTIME_BUNDLE (launch crash class without AgentRuntimeResourceBundle)"
+elif [ ! -f "$ORCHESTRATE_SKILL" ]; then
+  fail "missing orchestrate skill at $ORCHESTRATE_SKILL (reconcile fails on every customer machine without it)"
+else
+  note "AgentRuntime resource bundle ships remote-code-orchestrate"
+  # Pinned source validation rejects any non-allowlisted entry, so a stray
+  # .DS_Store inside the bundle silently kills the skill install for customers.
+  if find "$AGENT_RUNTIME_BUNDLE" -name '.DS_Store' -print -quit | grep -q .; then
+    fail "AgentRuntime bundle contains .DS_Store (pinned source validation rejects unexpected entries)"
+  else
+    note "AgentRuntime bundle contains no .DS_Store"
+  fi
+fi
+
+# 7c. Surfaces resources (ghostty) must ship too; the copy is glob-driven in
+# package-app.sh, so presence is asserted here rather than at copy time.
+SURFACES_BUNDLE="$APP/Contents/Resources/RemoteCode_Surfaces.bundle"
+if [ ! -d "$SURFACES_BUNDLE" ]; then
+  fail "missing Surfaces resources at $SURFACES_BUNDLE"
+else
+  note "Surfaces resource bundle present under Contents/Resources"
+fi
+
 # 6b. Forbid app-root resource bundles (codesign: "unsealed contents present
 # in the bundle root"). Packaging must never reintroduce them.
-for root_bundle in RemoteCode_AppShell.bundle RemoteCode_Surfaces.bundle; do
+for root_bundle in RemoteCode_AppShell.bundle RemoteCode_Surfaces.bundle RemoteCode_AgentRuntime.bundle; do
   if [ -e "$APP/$root_bundle" ]; then
     fail "forbidden unsealed app-root bundle $APP/$root_bundle (breaks codesign; use Contents/Resources only)"
   fi

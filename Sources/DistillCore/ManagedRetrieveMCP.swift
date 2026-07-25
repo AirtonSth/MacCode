@@ -21,17 +21,20 @@ public struct ManagedRetrieveMCP: Sendable {
     private let search: SearchFn
     private let stats: StatsFn
     private let compress: CompressFn?
+    private let scopedRecoveryAvailable: Bool
 
     public init(
         retrieve: @escaping RetrieveFn,
         search: @escaping SearchFn = { _, _ in [] },
         stats: @escaping StatsFn = { nil },
-        compress: CompressFn? = nil
+        compress: CompressFn? = nil,
+        scopedRecoveryAvailable: Bool = false
     ) {
         self.retrieve = retrieve
         self.search = search
         self.stats = stats
         self.compress = compress
+        self.scopedRecoveryAvailable = scopedRecoveryAvailable
     }
 
     /// Handle one JSON-RPC request line. Returns the response line, or nil for notifications
@@ -59,52 +62,50 @@ public struct ManagedRetrieveMCP: Sendable {
                 "serverInfo": ["name": "remotecode-distill-retrieve", "version": "1"],
             ])
         case "tools/list":
-            return reply(id: id, result: [
-                "tools": [[
+            var tools: [[String: Any]] = [[
+                "name": Self.statsToolName,
+                "description": "Return local RemoteCode Token Saver measurement stats with their evidence labels.",
+                "inputSchema": [
+                    "type": "object",
+                    "properties": [String: Any](),
+                ],
+            ]]
+            if scopedRecoveryAvailable {
+                tools.append([
                     "name": Self.toolName,
-                    "description": "Retrieve the byte-exact original text behind a [[rc:HANDLE]] marker produced by RemoteCode Token Saver.",
+                    "description": "Retrieve a scoped byte-exact original using the current runtime scope.",
                     "inputSchema": [
                         "type": "object",
-                        "properties": ["handle": ["type": "string", "description": "The handle from a [[rc:HANDLE]] marker."]],
+                        "properties": ["handle": ["type": "string"]],
                         "required": ["handle"],
                     ],
-                ], [
-                    "name": Self.searchToolName,
-                    "description": "Search stored RemoteCode Token Saver originals by query and return read-only retrieve handles.",
-                    "inputSchema": [
-                        "type": "object",
-                        "properties": [
-                            "query": ["type": "string", "description": "Search query."],
-                            "topK": ["type": "integer", "description": "Maximum result count."],
+                ])
+                if compress != nil {
+                    tools.append([
+                        "name": Self.compressToolName,
+                        "description": "Compress input only after scoped durable recovery succeeds.",
+                        "inputSchema": [
+                            "type": "object",
+                            "properties": ["input": ["type": "string"]],
+                            "required": ["input"],
                         ],
-                        "required": ["query"],
-                    ],
-                ], [
-                    "name": Self.statsToolName,
-                    "description": "Return local RemoteCode Token Saver savings stats.",
-                    "inputSchema": [
-                        "type": "object",
-                        "properties": [String: Any](),
-                    ],
-                ], [
-                    "name": Self.compressToolName,
-                    "description": "Compress text only when estimated savings exceed the MCP tool round-trip cost; returns a retrieve handle when available.",
-                    "inputSchema": [
-                        "type": "object",
-                        "properties": [
-                            "input": ["type": "string", "description": "Text to compress."],
-                            "question": ["type": "string", "description": "Extraction/compression contract."],
-                            "estimatedInputTokens": ["type": "integer", "description": "Estimated raw input tokens."],
-                            "toolRoundTripTokens": ["type": "integer", "description": "Estimated MCP call overhead."],
-                        ],
-                        "required": ["input"],
-                    ],
-                ]],
+                    ])
+                }
+            }
+            return reply(id: id, result: [
+                "tools": tools,
             ])
         case "tools/call":
             let params = msg["params"] as? [String: Any]
             let args = params?["arguments"] as? [String: Any]
             let name = params?["name"] as? String
+            guard name == Self.statsToolName || (scopedRecoveryAvailable && (name == Self.toolName || name == Self.compressToolName)) else {
+                return errorReply(
+                    id: id,
+                    code: -32602,
+                    message: "tool unavailable: scoped recovery capability required"
+                )
+            }
             if name == Self.statsToolName {
                 guard let snapshot = await stats() else {
                     return reply(id: id, result: [

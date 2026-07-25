@@ -41,6 +41,10 @@ public struct AppSettings: Codable, Sendable, Equatable {
     public var insomniaAllowSystemSleepWhenDisplayClosed: Bool
     public var insomniaAllowScreenSaverAfter45MinutesOfInactivity: Bool
     public var tokenSaverEnabled: Bool
+    /// Global kill switch for automatic scheduled-task occurrences. When false,
+    /// due ticks do not claim or run tasks (travel / temporary pause). Per-task
+    /// Pause still applies independently. Default true.
+    public var scheduledTasksActive: Bool
     /// Base terminal font size in points. 0 means use Ghostty's configured default.
     public var terminalFontSize: Double
     /// P5 SessionLearn: mine a correction rule from failed/expensive runs into the managed
@@ -49,6 +53,26 @@ public struct AppSettings: Codable, Sendable, Equatable {
     /// P3: compact large tool output in persisted stream events (CCR-backed, structure-
     /// preserving). Off by default — opt-in, since it makes stored history lossy-recoverable.
     public var historyCompactionEnabled: Bool
+
+    /// Graphify host integration (external CLI). Preference on by default, but
+    /// runtime is gated by Token Saver — see `isGraphifyRuntimeActive`.
+    public var graphifyEnabled: Bool
+    /// Absolute path to `graphify` binary (GUI PATH bypass). Empty = auto-resolve.
+    public var graphifyBinaryPath: String
+    /// Fire-and-forget ensure on resolve when Graphify runtime is active.
+    public var graphifyAutoEnsure: Bool
+    /// Absolute paths of pinned multi-repo roots for sticky bootstrap (JSON array stored as joined newlines).
+    public var graphifyPinnedRoots: [String]
+    /// When true, also write `graphify-out/` inside the user's repo. Default false:
+    /// graphs live only under Application Support (no workspace pollution).
+    public var graphifyWriteInRepo: Bool
+
+    /// Host Graphify preflight/ensure/env/prompt injection is a Token Saver
+    /// capability: both toggles must be on. Fail-open when Token Saver is off
+    /// (no RC_GRAPHIFY_*, no ensure, no query-first nudge).
+    public var isGraphifyRuntimeActive: Bool {
+        tokenSaverEnabled && graphifyEnabled
+    }
 
     /// Floating desktop pet. On by default so it is visible without setup.
     public var petEnabled: Bool
@@ -71,9 +95,15 @@ public struct AppSettings: Codable, Sendable, Equatable {
                 insomniaAllowSystemSleepWhenDisplayClosed: Bool = false,
                 insomniaAllowScreenSaverAfter45MinutesOfInactivity: Bool = true,
                 tokenSaverEnabled: Bool = false,
+                scheduledTasksActive: Bool = true,
                 terminalFontSize: Double = 0,
                 sessionLearnEnabled: Bool = false,
                 historyCompactionEnabled: Bool = false,
+                graphifyEnabled: Bool = true,
+                graphifyBinaryPath: String = "",
+                graphifyAutoEnsure: Bool = true,
+                graphifyPinnedRoots: [String] = [],
+                graphifyWriteInRepo: Bool = false,
                 petEnabled: Bool = true,
                 petAnimationsEnabled: Bool = true,
                 petReadyCounterEnabled: Bool = true,
@@ -89,9 +119,15 @@ public struct AppSettings: Codable, Sendable, Equatable {
         self.insomniaAllowSystemSleepWhenDisplayClosed = insomniaAllowSystemSleepWhenDisplayClosed
         self.insomniaAllowScreenSaverAfter45MinutesOfInactivity = insomniaAllowScreenSaverAfter45MinutesOfInactivity
         self.tokenSaverEnabled = tokenSaverEnabled
+        self.scheduledTasksActive = scheduledTasksActive
         self.terminalFontSize = terminalFontSize
         self.sessionLearnEnabled = sessionLearnEnabled
         self.historyCompactionEnabled = historyCompactionEnabled
+        self.graphifyEnabled = graphifyEnabled
+        self.graphifyBinaryPath = graphifyBinaryPath
+        self.graphifyAutoEnsure = graphifyAutoEnsure
+        self.graphifyPinnedRoots = graphifyPinnedRoots
+        self.graphifyWriteInRepo = graphifyWriteInRepo
         self.petEnabled = petEnabled
         self.petAnimationsEnabled = petAnimationsEnabled
         self.petReadyCounterEnabled = petReadyCounterEnabled
@@ -110,9 +146,15 @@ public struct AppSettings: Codable, Sendable, Equatable {
         case insomniaAllowSystemSleepWhenDisplayClosed
         case insomniaAllowScreenSaverAfter45MinutesOfInactivity
         case tokenSaverEnabled
+        case scheduledTasksActive
         case terminalFontSize
         case sessionLearnEnabled
         case historyCompactionEnabled
+        case graphifyEnabled
+        case graphifyBinaryPath
+        case graphifyAutoEnsure
+        case graphifyPinnedRoots
+        case graphifyWriteInRepo
         case petEnabled
         case petAnimationsEnabled
         case petReadyCounterEnabled
@@ -132,9 +174,15 @@ public struct AppSettings: Codable, Sendable, Equatable {
         insomniaAllowSystemSleepWhenDisplayClosed = try c.decodeIfPresent(Bool.self, forKey: .insomniaAllowSystemSleepWhenDisplayClosed) ?? false
         insomniaAllowScreenSaverAfter45MinutesOfInactivity = try c.decodeIfPresent(Bool.self, forKey: .insomniaAllowScreenSaverAfter45MinutesOfInactivity) ?? true
         tokenSaverEnabled = try c.decodeIfPresent(Bool.self, forKey: .tokenSaverEnabled) ?? false
+        scheduledTasksActive = try c.decodeIfPresent(Bool.self, forKey: .scheduledTasksActive) ?? true
         terminalFontSize = try c.decodeIfPresent(Double.self, forKey: .terminalFontSize) ?? 0
         sessionLearnEnabled = try c.decodeIfPresent(Bool.self, forKey: .sessionLearnEnabled) ?? false
         historyCompactionEnabled = try c.decodeIfPresent(Bool.self, forKey: .historyCompactionEnabled) ?? false
+        graphifyEnabled = try c.decodeIfPresent(Bool.self, forKey: .graphifyEnabled) ?? true
+        graphifyBinaryPath = try c.decodeIfPresent(String.self, forKey: .graphifyBinaryPath) ?? ""
+        graphifyAutoEnsure = try c.decodeIfPresent(Bool.self, forKey: .graphifyAutoEnsure) ?? true
+        graphifyPinnedRoots = try c.decodeIfPresent([String].self, forKey: .graphifyPinnedRoots) ?? []
+        graphifyWriteInRepo = try c.decodeIfPresent(Bool.self, forKey: .graphifyWriteInRepo) ?? false
         petEnabled = try c.decodeIfPresent(Bool.self, forKey: .petEnabled) ?? true
         petAnimationsEnabled = try c.decodeIfPresent(Bool.self, forKey: .petAnimationsEnabled) ?? true
         petReadyCounterEnabled = try c.decodeIfPresent(Bool.self, forKey: .petReadyCounterEnabled) ?? true
@@ -216,6 +264,84 @@ public final class SettingsStore {
             // A failed read must not turn into defaults and overwrite valid settings.
             onWriteError?(error)
         }
+    }
+}
+
+/// Remembers the last model the user selected per provider so new threads
+/// reopen on that model instead of a stale built-in default.
+public final class AgentLastModelStore: @unchecked Sendable {
+    public static let shared = AgentLastModelStore()
+
+    private let defaults: UserDefaults
+    private let key = "agent.lastModel.byProvider.v1"
+
+    public init(defaults: UserDefaults = .standard) {
+        self.defaults = defaults
+    }
+
+    public func model(for provider: AgentProvider) -> String? {
+        let value = dict()[provider.rawValue]?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return value.isEmpty ? nil : value
+    }
+
+    public func remember(model: String, for provider: AgentProvider) {
+        let trimmed = model.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        var values = dict()
+        values[provider.rawValue] = trimmed
+        defaults.set(values, forKey: key)
+    }
+
+    private func dict() -> [String: String] {
+        defaults.dictionary(forKey: key) as? [String: String] ?? [:]
+    }
+}
+
+public struct AgentNewThreadDefaults: Codable, Sendable, Equatable {
+    public var routingMode: AgentRoutingMode
+    public var runAsUser: AgentRunAsUser?
+    public var provider: AgentProvider
+    public var providerInstanceId: String
+    public var model: String
+    public var reasoningEffort: AgentReasoningEffort
+
+    public init(
+        routingMode: AgentRoutingMode,
+        runAsUser: AgentRunAsUser?,
+        provider: AgentProvider,
+        providerInstanceId: String,
+        model: String,
+        reasoningEffort: AgentReasoningEffort
+    ) {
+        self.routingMode = routingMode
+        self.runAsUser = runAsUser
+        self.provider = provider
+        self.providerInstanceId = providerInstanceId
+        self.model = model
+        self.reasoningEffort = reasoningEffort
+    }
+}
+
+/// Persists the user's last explicit Agent picker choices so every fresh
+/// surface and subsequent thread starts from the same configuration.
+public final class AgentNewThreadDefaultsStore: @unchecked Sendable {
+    public static let shared = AgentNewThreadDefaultsStore()
+
+    private let defaults: UserDefaults
+    private let key = "agent.newThreadDefaults.v1"
+
+    public init(defaults: UserDefaults = .standard) {
+        self.defaults = defaults
+    }
+
+    public func load() -> AgentNewThreadDefaults? {
+        guard let data = defaults.data(forKey: key) else { return nil }
+        return try? JSONDecoder().decode(AgentNewThreadDefaults.self, from: data)
+    }
+
+    public func save(_ value: AgentNewThreadDefaults) {
+        guard let data = try? JSONEncoder().encode(value) else { return }
+        defaults.set(data, forKey: key)
     }
 }
 

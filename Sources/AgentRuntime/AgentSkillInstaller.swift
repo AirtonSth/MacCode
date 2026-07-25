@@ -48,10 +48,99 @@ public enum AgentSkillUninstallResult: String, Sendable, Equatable {
     case notPresent
 }
 
+public struct RemoteCodeOrchestrateFile: Codable, Sendable, Equatable {
+    public let relativePath: String
+    public let byteCount: Int
+    public let sha256: String
+
+    public init(relativePath: String, byteCount: Int, sha256: String) {
+        self.relativePath = relativePath
+        self.byteCount = byteCount
+        self.sha256 = sha256
+    }
+}
+
+public struct RemoteCodeOrchestratePackage: Sendable, Equatable {
+    public let skillID: String
+    public let sourceURL: String
+    public let sourceRevision: String
+    public let sourceTreeSHA256: String
+    public let localVersion: String
+    public let allowedPaths: [String]
+
+    public init(
+        skillID: String,
+        sourceURL: String,
+        sourceRevision: String,
+        sourceTreeSHA256: String,
+        localVersion: String,
+        allowedPaths: [String]
+    ) {
+        self.skillID = skillID
+        self.sourceURL = sourceURL
+        self.sourceRevision = sourceRevision
+        self.sourceTreeSHA256 = sourceTreeSHA256
+        self.localVersion = localVersion
+        self.allowedPaths = allowedPaths.sorted()
+    }
+}
+
+public struct RemoteCodeOrchestrateManifest: Codable, Sendable, Equatable {
+    public let schemaVersion: Int
+    public let managedBy: String
+    public let skillID: String
+    public let sourceURL: String
+    public let sourceRevision: String
+    public let sourceTreeSHA256: String
+    public let localVersion: String
+    public let installPath: String
+    public let installedAt: Date
+    public let files: [RemoteCodeOrchestrateFile]
+}
+
+public struct RemoteCodeOrchestrateInstallResult: Sendable, Equatable {
+    public enum Action: String, Sendable {
+        case installed
+        case skipped
+        case updated
+        case repaired
+    }
+
+    public let action: Action
+    public let manifest: RemoteCodeOrchestrateManifest
+}
+
+public struct RemoteCodeOrchestrateStatus: Sendable, Equatable {
+    public enum State: String, Sendable {
+        case notInstalled
+        case ready
+        case updateRequired
+        case repairRequired
+        case unmanagedCollision
+    }
+
+    public let state: State
+    public let manifest: RemoteCodeOrchestrateManifest?
+    public let lastKnownGoodAvailable: Bool
+    public let repairReason: String?
+}
+
+public enum RemoteCodeOrchestrateInstallError: Error, Sendable, Equatable {
+    case sourceMissing(String)
+    case unsafeRelativePath(String)
+    case symbolicLink(String)
+    case unexpectedEntry(String)
+    case missingRequiredFile(String)
+    case sourceTreeDigestMismatch(expected: String, actual: String)
+    case unmanagedCollision(String)
+    case invalidManagedPackage(String)
+    case lastKnownGoodUnavailable
+}
+
 public final class AgentSkillInstaller: @unchecked Sendable {
     public static let distillSkillID = "distill"
     public static let distillSourceURL = "https://github.com/samuelfaj/distill/blob/main/skills/distill/SKILL.md"
-    public static let distillLocalVersion = "5"
+    public static let distillLocalVersion = "6"
     public static let distillInstructionsBeginMarker = "<!-- distill skill: begin -->"
     public static let distillInstructionsEndMarker = "<!-- distill skill: end -->"
     public static let distillCLIBeginMarker = "# RemoteCode managed distill CLI: begin"
@@ -59,6 +148,25 @@ public final class AgentSkillInstaller: @unchecked Sendable {
     public static let mcpBeginMarker = "# RemoteCode managed MCP: begin"
     public static let mcpEndMarker = "# RemoteCode managed MCP: end"
     public static let retrieveMCPName = "remotecode-distill-retrieve"
+    public static let remoteCodeOrchestrateManifestName = ".remote-code-install.json"
+    public static let remoteCodeOrchestrateRuntimeManifestName = "manifest.json"
+    public static let remoteCodeOrchestratePinnedPackage = RemoteCodeOrchestratePackage(
+        skillID: "remote-code-orchestrate",
+        sourceURL: "https://github.com/samuelfaj/sam-skills/tree/main/sam-orchestrate",
+        sourceRevision: "2c77fa48431bc20e5dc841652079594a3ea918c9",
+        sourceTreeSHA256: "c9d7eb11b83d3fd4a7be38e4de2e7acac0100be11a27441b435b41006709a0eb",
+        localVersion: "1",
+        allowedPaths: [
+            "SKILL.md",
+            "agents/openai.yaml",
+            "references/host-runtime-matrix.md",
+            "references/output-contract.md",
+            "references/prompt-contract.md",
+            "references/routing-policy.md",
+            "scripts/test_orchestration_harness.py",
+            "scripts/validate_orchestration.py"
+        ]
+    )
 
     public static let distillSkillTemplate = """
     ---
@@ -75,37 +183,45 @@ public final class AgentSkillInstaller: @unchecked Sendable {
     Do not return the user's prompt compressed as an artifact.
     Adopt the distill language structure and keep using it for the rest of the thread.
 
-    Core behavior:
-    - English only unless the user explicitly requests another language.
-    - Military English + AR-0/AR-1 baseline.
-    - Short command lines.
-    - Fixed semantic prefixes: S=state, C=context, D=action, R=risk, O=outcome, N=no-go, P=proof.
-    - Semantic atoms over natural phrases.
-    - One idea per line.
-    - Explicit constraints and pass criteria.
-    - Exact paths, commands, env vars, IDs when useful.
-    - No filler.
-    - No cryptic code.
-    - No long prose unless the user asks for explanation.
-    - Write surfaced reasoning/thinking in distill structure (semantic S/C/D/R/O/N/P lines), not prose; keep secrets out of it.
+    Core behavior (token-efficient dialect — sparse by default):
+    - Registers: R0 micro | R1 work | R2 tool (tool path is `| distill`, not chat prefixes).
+    - R0 micro (greeting, yes/no, trivial status, conversational only): **O-only**.
+      One short line in the user's language. No S/C/D/R/N/P. No restating the user. No English meta.
+      Example: `O: bem, obrigado — pronto pro próximo`
+    - R1 work (code, PR, debug, plan, multi-step): **O-first**, sparse optional fields.
+      Prefixes (use only when needed): S=state, C=context, D=action, R=risk, N=no-go, P=proof.
+      Never pad to six lines. Do not restate the user prompt in C. One idea per line.
+      Prefer short atoms over prose. Exact paths/commands/IDs when useful.
+    - Do not use Military English boilerplate on R0. On R1 keep short command-style English for ops fields; put user-facing answer in O (user language when the user wrote non-English).
+    - No filler. No long prose unless the user asks for explanation.
+    - Surfaced thinking: R0 none; R1 sparse distill lines only; keep secrets out.
+    - Hard caps: R0 ≤2 lines / ~60 tokens; R1 status ≤4 lines; R1 implement ≤12 lines unless user asks for detail.
 
     Thread behavior:
-    - Use distill structure for reasoning, thinking, status updates, plans, summaries, reviews, and final answers.
+    - Prefer R0 for micro chat. Escalate to R1 only when the turn does real work.
     - Do not output a rewritten/compressed version of the latest user prompt unless the user explicitly asks to compress text.
-    - Emit `Dict:` early when aliases or prefixes matter.
+    - Emit `Dict:` early only when aliases reduce repetition (never secrets/people/paths/URLs as aliases).
 
-    Command-output policy (Token Saver — bias to compress; over-compressing is preferred to under-compressing):
-    - DEFAULT to piping EVERY non-interactive, non-TUI shell/tool command through the RemoteCode-managed `distill` CLI whenever its output is more than ~10 lines or ~1KB. This applies to build, test, lint, install, git, grep, rg, find, ls, cat, head, tail, curl, sed, awk, docker, kubectl, terraform, and any other command that emits bulk text.
-    - Treat piping as the norm, not the exception: if you are unsure whether output will be large, pipe it. Always pass an explicit extraction prompt so the distilled result still answers the task.
+    Command-output policy (Token Saver — compress noisy output; never distill exact-payload tools):
+    - DEFAULT: pipe high-volume / noisy, pipable commands through the RemoteCode-managed `distill` CLI with an explicit extraction prompt and `pipefail` when exit status matters.
+      Good for: build, test, lint, install, docker, kubectl, terraform, find, ls (large listings), git log/status/diff (summaries), long CI logs.
+    - NEVER pipe `| distill` for exact-output commands — the agent needs the full stdout for the next step:
+      search/match: rg, grep, egrep, fgrep, ag, ugrep, git grep
+      line/stream edit or dump: sed, awk, cat, head, tail, nl, cut, tr, paste
+      exact compare/bytes: diff, cmp, od, hexdump, xxd, base64
+      structure extractors when parsing: jq, yq
+      Also skip for: patches/apply, hash/token copy, interactive/TUI, non-pipable calls, or unavailable RemoteCodeDistillService.
     - Never call Node, tsx, npm, bun, or a source-checkout CLI for `distill`.
-    - Skip the pipe ONLY when you genuinely need the exact bytes (e.g. applying a patch, copying a hash/token verbatim), the output is interactive/TUI, or the local RemoteCode service is unavailable; state that you skipped and why.
+    - When you skip `| distill`, state that briefly (e.g. skip: exact sed/rg output).
+    - Every subagent, worker, reviewer, or delegated prompt must repeat this Distill rule and require its descendants to do the same; never assume inherited context is enough.
     - If a summary includes `[[rc:<handle>]]`, recover exact bytes with `distill retrieve <handle>`.
-    - Wait for `distill` before continuing.
+    - Wait for `distill` before continuing when you did pipe it.
 
     Examples:
     - `bun test 2>&1 | distill "Did tests pass? Return PASS or FAIL, followed by failing test names if any."`
-    - `git diff | distill "What changed? Return only files changed and one-line summary for each."`
-    - `terraform plan 2>&1 | distill "Is this safe? Return SAFE, REVIEW, or UNSAFE, followed by risky changes."`
+    - `git log --oneline -50 | distill "Summarize recent commits by theme."`
+    - `rg -n "func applyGraphify" Sources`  # skip distill — need every match line
+    - `sed -n '100,180p' Sources/Foo.swift`  # skip distill — need exact slice
 
     Source reference:
     - https://github.com/samuelfaj/distill/blob/main/skills/distill/SKILL.md
@@ -113,13 +229,18 @@ public final class AgentSkillInstaller: @unchecked Sendable {
 
     public static let distillAgentInstructionsTemplate = """
     <!-- distill skill: begin -->
-    CRITICAL: Use `/distill` for every user-visible response and your reasoning/thinking: English Military English + AR-0/AR-1, short command lines, explicit constraints, explicit pass criteria, no filler.
-    Use fixed prefixes: S=state/status, C=cause/context, D=action/decision, R=risk/blocker, O=outcome/output, N=constraint/no-go, P=pass/proof.
-    Use Dict/inline `#` variables only when they reduce repetition. Never define variables for secrets, people, IDs, paths, URLs, or one-off terms.
+    CRITICAL: Use `/distill` dialect for provider turns — **sparse, O-first, mode-aware** (not a fixed 6-line S/C/D tax).
+    Registers: **R0 micro** (greeting/yes-no/trivial status) = `O:` only, user language, ≤2 lines; no S/C/D/R/N/P, no user restatement.
+    **R1 work** (code/PR/debug/plan) = O-first; add S/C/D/R/N/P only when needed; never pad to six lines; short atoms; caps: status ≤4 lines, implement ≤12 unless asked.
+    Prefixes when used: S=state, C=context, D=action, R=risk, O=outcome, N=no-go, P=proof.
+    Dict/`#` vars only when they reduce repetition. Never alias secrets, people, IDs, paths, URLs.
     Do not return a rewritten/compressed copy of the user's prompt unless explicitly asked to compress text.
-    Token Saver — bias to compress (over-compressing beats under-compressing): by DEFAULT pipe EVERY non-interactive, non-TUI command whose output exceeds ~10 lines or ~1KB through the RemoteCode-managed `distill` CLI with an explicit extraction prompt (build/test/lint/git/grep/find/ls/cat/curl/docker/kubectl/etc). If unsure it will be large, pipe it.
-    Skip `| distill` ONLY when you need exact bytes (patches, hashes/tokens), output is interactive/TUI, or the local RemoteCodeDistillService is unavailable; state the skip. Never invoke Node, tsx, npm, bun, or a source-checkout CLI for `distill`.
-    If a summary includes `[[rc:<handle>]]`, recover exact bytes with `distill retrieve <handle>`. Wait for `distill` before continuing.
+    Token Saver — compress noisy output via managed `distill` CLI with an explicit extraction prompt; use `pipefail` when exit status matters.
+    Good to pipe: build/test/lint/install/docker/kubectl/terraform, large find/ls, git log/status/diff summaries, long logs.
+    NEVER pipe `| distill` for exact-output tools (agent needs full stdout): rg, grep, egrep, fgrep, sed, awk, cat, head, tail, nl, cut, tr, diff, jq, yq, git grep/show/cat-file/blame; also patches/hashes/tokens, interactive/TUI, non-pipable, or service unavailable — state the skip briefly.
+    Never invoke Node/tsx/npm/bun or a source-checkout `distill`.
+    Every subagent, worker, reviewer, or delegated prompt MUST repeat this rule and require its descendants to do the same; never assume inheritance.
+    If a summary includes `[[rc:<handle>]]`, recover exact bytes with `distill retrieve <handle>`. Wait for `distill` before continuing when used.
     Details and examples live in the managed `distill` SKILL.md.
     <!-- distill skill: end -->
     """
@@ -127,12 +248,126 @@ public final class AgentSkillInstaller: @unchecked Sendable {
     /// The distill agent instructions with the begin/end HTML markers stripped. The markers
     /// only matter for the in-place upsert/removal inside CLAUDE.md/AGENTS.md; this marker-free
     /// body is what gets injected as an authoritative system prompt (Claude SDK bridge), where
-    /// the surrounding CLAUDE.md is easily buried. Single source of truth with the installed text.
+    /// the surrounding CLAUDE.md is easily buried. The runtime adapter appends the safety ABI
+    /// separately so mutable on-disk instructions cannot duplicate that contract.
     public static var distillAgentInstructionsBody: String {
         distillAgentInstructionsTemplate
             .replacingOccurrences(of: distillInstructionsBeginMarker, with: "")
             .replacingOccurrences(of: distillInstructionsEndMarker, with: "")
             .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// Inject managed Distill into provider runtime prompts (Claude / Codex / Grok)
+    /// only while Token Saver is active (`RC_TOKEN_SAVER_DISTILL_HINT=1`).
+    /// Token economy is the paid feature: no Distill dialect, `| distill` rules,
+    /// or safety ABI when the toggle is off.
+    public static func tokenSaverProviderPrompt(_ base: String, environment: [String: String]) -> String {
+        let withDistill: String
+        if environment["RC_TOKEN_SAVER_DISTILL_HINT"] == "1" {
+            withDistill = managedDistillProviderPrompt(base)
+        } else {
+            withDistill = base
+        }
+        return graphifyProviderPrompt(withDistill, environment: environment)
+    }
+
+    /// Inject Graphify query-first rules when host set `RC_GRAPHIFY_ENABLED=1`.
+    /// Optional roots/graph path from env help the model call the right CLI without user prompts.
+    public static func graphifyProviderPrompt(_ base: String, environment: [String: String]) -> String {
+        guard environment["RC_GRAPHIFY_ENABLED"] == "1" else { return base }
+        let banner = GraphifyStableSkillText.runtimeStatusBanner(environment: environment) ?? ""
+
+        // Already fully injected (stable body present): still force absolute path banner first.
+        if base.contains(GraphifyStableSkillText.agentInstructionsBody) {
+            if let graph = environment["RC_GRAPHIFY_GRAPH_JSON"], !graph.isEmpty, !base.contains(graph) {
+                let note = GraphifyStableSkillText.runtimeStatusBanner(environment: environment) ?? "Graphify runtime: --graph \(graph)"
+                return note + "\n\n" + base
+            }
+            if !banner.isEmpty, !base.contains("HOST GRAPHIFY STATUS") {
+                return banner + "\n\n" + base
+            }
+            return base
+        }
+
+        var block = GraphifyStableSkillText.agentInstructionsBody
+        if let roots = environment["RC_GRAPHIFY_ROOTS"], !roots.isEmpty {
+            block += "\nActive Graphify roots (one per line):\n\(roots)"
+        }
+        if let graph = environment["RC_GRAPHIFY_GRAPH_JSON"], !graph.isEmpty {
+            block += "\nPrimary graph JSON (canonical; use --graph with this path): \(graph)"
+        }
+        if let artifact = environment["RC_GRAPHIFY_ARTIFACT_ROOT"], !artifact.isEmpty {
+            block += "\nGraphify artifact root (Application Support; not repo graphify-out/): \(artifact)"
+        }
+        if environment["RC_GRAPHIFY_AMBIGUOUS"] == "1" {
+            block += "\nNote: multi-repo workspace is ambiguous this turn; fail open if unsure which root applies."
+        }
+        if environment["RC_GRAPHIFY_STALE"] == "1" {
+            block += "\nNote: graph is refreshing in the background this turn; fail open for broad search if query results look incomplete."
+        }
+        // Banner FIRST (before user request) so "tem graph?" cannot be answered from repo graphify-out alone.
+        if banner.isEmpty {
+            return base + "\n\n" + block
+        }
+        return banner + "\n\n" + base + "\n\n" + block
+    }
+
+    /// Distill injection for Token-Saver-enabled provider adapters.
+    public static func managedDistillProviderPrompt(_ base: String) -> String {
+        let withDistill = base.contains(distillAgentInstructionsBody)
+            ? base
+            : base + "\n\n" + distillAgentInstructionsBody
+        return TokenSaverProviderSafetyABI.appendingExactlyOnce(to: withDistill, enabled: true)
+    }
+
+    /// App-private Distill package directory (mirrors remote-code-orchestrate layout).
+    public func distillAppPrivateDirectory() -> URL {
+        appPrivateSkillsRoot.appendingPathComponent(Self.distillSkillID, isDirectory: true)
+    }
+
+    /// Install Distill into RemoteCode Application Support only — never into
+    /// `~/.claude/skills`, `~/.codex/skills`, or `~/.grok/skills`.
+    @discardableResult
+    public func installAppPrivateDistillSkill(
+        sourceRevision: String = "github-main-remote-code-template-v2",
+        installedAt: Date = Date()
+    ) throws -> AgentSkillInstallResult {
+        try fileManager.createDirectory(at: appPrivateSkillsRoot, withIntermediateDirectories: true)
+        let directory = distillAppPrivateDirectory()
+        try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
+        let skillURL = directory.appendingPathComponent("SKILL.md")
+        let manifestURL = directory.appendingPathComponent("manifest.json")
+        let data = Data(Self.distillSkillTemplate.utf8)
+        let checksum = Self.sha256Hex(data)
+        let manifest = AgentSkillManifest(
+            provider: .claude, // app-private; provider field is historical on the manifest
+            skillID: Self.distillSkillID,
+            sourceURL: Self.distillSourceURL,
+            sourceRevision: sourceRevision,
+            localVersion: Self.distillLocalVersion,
+            sha256: checksum,
+            installPath: skillURL.path,
+            installedAt: installedAt
+        )
+        if let existingData = try? Data(contentsOf: skillURL),
+           Self.sha256Hex(existingData) == checksum,
+           let manifestData = try? Data(contentsOf: manifestURL),
+           let existingManifest = try? decoder.decode(AgentSkillManifest.self, from: manifestData),
+           existingManifest.sourceRevision == sourceRevision,
+           existingManifest.localVersion == Self.distillLocalVersion {
+            return AgentSkillInstallResult(action: .skipped, manifest: existingManifest)
+        }
+        try data.write(to: skillURL, options: .atomic)
+        try encoder.encode(manifest).write(to: manifestURL, options: .atomic)
+        return AgentSkillInstallResult(action: .installed, manifest: manifest)
+    }
+
+    /// Remove legacy Distill copies that used to live in each provider's home skill tree.
+    public func uninstallLegacyProviderDistillSkills() throws {
+        for provider in AgentProvider.allCases {
+            _ = try uninstallDistillSkill(for: provider)
+            _ = try uninstallDistillInstructions(for: provider)
+        }
     }
 
     private let claudeSkillsRoot: URL
@@ -141,13 +376,15 @@ public final class AgentSkillInstaller: @unchecked Sendable {
     private let codexInstructionsURL: URL
     private let cliBinDirectory: URL
     private let pathBinDirectory: URL
+    private let appPrivateSkillsRoot: URL
+    private let remoteCodeOrchestratePackage: RemoteCodeOrchestratePackage
     private let fileManager: FileManager
     private let encoder = JSONEncoder()
     private let decoder = JSONDecoder()
 
-    /// Skills must live where each agent actually scans for them, not in RemoteCode's
-    /// private app-support: the Claude Agent SDK reads `~/.claude/skills` (via the
-    /// `user` setting source) and Codex reads `$CODEX_HOME/skills` (default `~/.codex/skills`).
+    /// Distill + remote-code-orchestrate are app-private under RemoteCode Application
+    /// Support and injected at runtime. Legacy provider-home skill roots are still
+    /// accepted for cleanup of older installs and tests.
     public init(
         claudeSkillsRoot: URL = AgentSkillInstaller.defaultClaudeSkillsRoot(),
         codexSkillsRoot: URL = AgentSkillInstaller.defaultCodexSkillsRoot(),
@@ -155,6 +392,8 @@ public final class AgentSkillInstaller: @unchecked Sendable {
         codexInstructionsURL: URL = AgentSkillInstaller.defaultCodexInstructionsURL(),
         cliBinDirectory: URL = AgentSkillInstaller.defaultManagedCLIBinDirectory(),
         pathBinDirectory: URL = AgentSkillInstaller.defaultPathBinDirectory(),
+        appPrivateSkillsRoot: URL = AgentSkillInstaller.defaultAppPrivateSkillsRoot(),
+        remoteCodeOrchestratePackage: RemoteCodeOrchestratePackage = AgentSkillInstaller.remoteCodeOrchestratePinnedPackage,
         fileManager: FileManager = .default
     ) {
         self.claudeSkillsRoot = claudeSkillsRoot
@@ -163,6 +402,8 @@ public final class AgentSkillInstaller: @unchecked Sendable {
         self.codexInstructionsURL = codexInstructionsURL
         self.cliBinDirectory = cliBinDirectory
         self.pathBinDirectory = pathBinDirectory
+        self.appPrivateSkillsRoot = appPrivateSkillsRoot
+        self.remoteCodeOrchestratePackage = remoteCodeOrchestratePackage
         self.fileManager = fileManager
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         encoder.dateEncodingStrategy = .iso8601
@@ -179,6 +420,7 @@ public final class AgentSkillInstaller: @unchecked Sendable {
             codexInstructionsURL: homeDirectory.appendingPathComponent(".codex/AGENTS.md"),
             cliBinDirectory: homeDirectory.appendingPathComponent(".remote-code/bin", isDirectory: true),
             pathBinDirectory: homeDirectory.appendingPathComponent(".local/bin", isDirectory: true),
+            appPrivateSkillsRoot: homeDirectory.appendingPathComponent(".remote-code/app-private-skills", isDirectory: true),
             fileManager: fileManager
         )
     }
@@ -219,6 +461,13 @@ public final class AgentSkillInstaller: @unchecked Sendable {
             .appendingPathComponent(".local/bin", isDirectory: true)
     }
 
+    public static func defaultAppPrivateSkillsRoot() -> URL {
+        AgentOrchestrationRuntime.defaultPackageURL().deletingLastPathComponent()
+    }
+
+    /// Legacy provider-home install path. Prefer `installAppPrivateDistillSkill`.
+    /// Kept for tests that exercise the old root; production reconcile no longer
+    /// writes into `~/.claude/skills` / `~/.codex/skills` / `~/.grok/skills`.
     public func installDistillSkill(
         for provider: AgentProvider,
         sourceRevision: String,
@@ -276,19 +525,21 @@ public final class AgentSkillInstaller: @unchecked Sendable {
         return .notPresent
     }
 
-    /// Install the RTK-style transparent command wrappers: a symlink per wrapped command in the
-    /// managed bin dir (`~/.remote-code/bin`, which is PREPENDED to the agent PATH but not on the
-    /// user's interactive shell PATH — so only agents get wrappers) pointing at the
-    /// RemoteCodeDistillService binary, which detects its basename and enters wrap mode. A wrapper
-    /// is installed ONLY when the real command exists on the system, so a missing command (e.g.
-    /// `rg` not installed) is never shadowed by a wrapper that would then fail. Returns the
-    /// commands wrapped. Best-effort symmetry with `installDistillCLI`.
+    /// Install the RTK-style transparent command wrappers: a symlink per *compressible*
+    /// wrapped command in the managed bin dir (`~/.remote-code/bin`, PREPENDED to the agent
+    /// PATH only). Exact-output tools (sed, rg, grep, cat, …) are never wrapped — agents
+    /// need full stdout. Also removes any legacy exact-output symlinks from older installs.
     @discardableResult
     public func installCommandWrappers(serviceBinaryURL: URL? = nil) throws -> [String] {
         try fileManager.createDirectory(at: cliBinDirectory, withIntermediateDirectories: true)
         guard let binary = serviceBinaryURL ?? Self.resolveServiceBinary(fileManager: fileManager) else {
             throw AgentSkillCLIError.serviceBinaryUnavailable
         }
+        // Drop exact-output wrappers left by older catalogs (sed/rg/cat/…).
+        _ = try removeManagedWrapperSymlinks(
+            basenames: WrappedCommandCatalog.exactOutputCommands,
+            binaryPath: binary.path
+        )
         let searchDirectories = systemCommandSearchDirectories()
         var installed: [String] = []
         for command in WrappedCommandCatalog.commands {
@@ -309,14 +560,24 @@ public final class AgentSkillInstaller: @unchecked Sendable {
 
     /// Remove the command-wrapper symlinks — but only those still pointing at our service binary,
     /// so a user's own command on the managed path (unexpected) is never deleted.
+    /// Includes legacy exact-output basenames so Token Saver off cleans old sed/rg wrappers.
     @discardableResult
     public func uninstallCommandWrappers() throws -> [String] {
         let binaryPath = Self.resolveServiceBinary(fileManager: fileManager)?.path
+        return try removeManagedWrapperSymlinks(
+            basenames: WrappedCommandCatalog.symlinkBasenamesToRemove,
+            binaryPath: binaryPath
+        )
+    }
+
+    private func removeManagedWrapperSymlinks(basenames: [String], binaryPath: String?) throws -> [String] {
         var removed: [String] = []
-        for command in WrappedCommandCatalog.commands {
+        for command in basenames {
             let link = cliBinDirectory.appendingPathComponent(command)
             guard let dest = try? fileManager.destinationOfSymbolicLink(atPath: link.path) else { continue }
-            guard dest == binaryPath || (dest as NSString).lastPathComponent == "RemoteCodeDistillService" else { continue }
+            let pointsAtService = dest == binaryPath
+                || (dest as NSString).lastPathComponent == "RemoteCodeDistillService"
+            guard pointsAtService else { continue }
             try fileManager.removeItem(at: link)
             removed.append(command)
         }
@@ -650,6 +911,487 @@ public final class AgentSkillInstaller: @unchecked Sendable {
             return
         }
         try? fileManager.removeItem(at: link)
+    }
+
+    @discardableResult
+    public func reconcileRemoteCodeOrchestrate(
+        installedAt: Date = Date()
+    ) throws -> RemoteCodeOrchestrateInstallResult {
+        // Never SPM Bundle.module here: its generated accessor only checks the
+        // .app root and a hardcoded builder .build path, then fatalErrors —
+        // v2.0.85–v2.0.87 crashed every packaged launch through this call.
+        let resourceBundle: Bundle
+        do {
+            resourceBundle = try AgentRuntimeResourceBundle.bundle(fileManager: fileManager)
+        } catch {
+            throw RemoteCodeOrchestrateInstallError.sourceMissing(
+                "Embedded resource bundle: \(AgentRuntimeResourceBundle.bundleFileName)"
+            )
+        }
+        guard let embeddedDirectory = resourceBundle.url(
+            forResource: remoteCodeOrchestratePackage.skillID,
+            withExtension: nil
+        ) else {
+            throw RemoteCodeOrchestrateInstallError.sourceMissing(
+                "Embedded resource: \(remoteCodeOrchestratePackage.skillID)"
+            )
+        }
+        return try installRemoteCodeOrchestrate(from: embeddedDirectory, installedAt: installedAt)
+    }
+
+    public func remoteCodeOrchestrateDirectory() -> URL {
+        appPrivateSkillsRoot.appendingPathComponent(remoteCodeOrchestratePackage.skillID, isDirectory: true)
+    }
+
+    public func remoteCodeOrchestrateLastKnownGoodDirectory() -> URL {
+        appPrivateSkillsRoot.appendingPathComponent(
+            "\(remoteCodeOrchestratePackage.skillID).last-known-good",
+            isDirectory: true
+        )
+    }
+
+    public func installRemoteCodeOrchestrate(
+        from sourceDirectory: URL,
+        installedAt: Date = Date()
+    ) throws -> RemoteCodeOrchestrateInstallResult {
+        let sourceFiles = try validatedRemoteCodeOrchestrateSource(
+            at: sourceDirectory,
+            package: remoteCodeOrchestratePackage
+        )
+        try prepareAppPrivateSkillsRoot()
+
+        let destination = remoteCodeOrchestrateDirectory()
+        let current = inspectManagedPackage(at: destination)
+        switch current {
+        case .unmanaged:
+            throw RemoteCodeOrchestrateInstallError.unmanagedCollision(destination.path)
+        case .valid(let manifest) where manifestMatchesPinnedPackage(manifest):
+            return RemoteCodeOrchestrateInstallResult(action: .skipped, manifest: manifest)
+        default:
+            break
+        }
+
+        // Both RemoteCode.app and the scheduled-task LaunchAgent reconcile at
+        // login; the loser of that race can fail the staging/move below after
+        // the winner installed the identical pinned package. Losing is success:
+        // re-inspect and report .skipped instead of surfacing a session-long
+        // install error. Source validation and the unmanaged-collision guard
+        // above stay OUTSIDE this catch so a corrupted shipped bundle or a
+        // user-owned destination can never be masked by an existing install.
+        do {
+            return try stageAndActivateRemoteCodeOrchestrate(
+                sourceDirectory: sourceDirectory,
+                sourceFiles: sourceFiles,
+                current: current,
+                destination: destination,
+                installedAt: installedAt
+            )
+        } catch {
+            if case .valid(let manifest) = inspectManagedPackage(at: destination),
+               manifestMatchesPinnedPackage(manifest) {
+                return RemoteCodeOrchestrateInstallResult(action: .skipped, manifest: manifest)
+            }
+            throw error
+        }
+    }
+
+    private func stageAndActivateRemoteCodeOrchestrate(
+        sourceDirectory: URL,
+        sourceFiles: [RemoteCodeOrchestrateFile],
+        current: ManagedPackageInspection,
+        destination: URL,
+        installedAt: Date
+    ) throws -> RemoteCodeOrchestrateInstallResult {
+        let stagingRoot = appPrivateSkillsRoot.appendingPathComponent(".staging", isDirectory: true)
+        try prepareOwnedDirectory(stagingRoot)
+        let staged = stagingRoot.appendingPathComponent(
+            "\(remoteCodeOrchestratePackage.skillID)-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        try fileManager.createDirectory(at: staged, withIntermediateDirectories: false)
+        defer { try? fileManager.removeItem(at: staged) }
+
+        for file in sourceFiles {
+            let source = sourceDirectory.appendingPathComponent(file.relativePath)
+            let target = staged.appendingPathComponent(file.relativePath)
+            try fileManager.createDirectory(at: target.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try fileManager.copyItem(at: source, to: target)
+        }
+
+        let stagedFiles = try validatedRemoteCodeOrchestrateSource(
+            at: staged,
+            package: remoteCodeOrchestratePackage
+        )
+        let manifest = RemoteCodeOrchestrateManifest(
+            schemaVersion: 1,
+            managedBy: "RemoteCode",
+            skillID: remoteCodeOrchestratePackage.skillID,
+            sourceURL: remoteCodeOrchestratePackage.sourceURL,
+            sourceRevision: remoteCodeOrchestratePackage.sourceRevision,
+            sourceTreeSHA256: remoteCodeOrchestratePackage.sourceTreeSHA256,
+            localVersion: remoteCodeOrchestratePackage.localVersion,
+            installPath: destination.path,
+            installedAt: installedAt,
+            files: stagedFiles
+        )
+        try encoder.encode(manifest).write(
+            to: staged.appendingPathComponent(Self.remoteCodeOrchestrateManifestName),
+            options: .atomic
+        )
+        let runtimeManifest = RemoteCodeOrchestrateRuntimeManifest(
+            schemaVersion: 1,
+            packageID: remoteCodeOrchestratePackage.skillID,
+            sourceRevision: remoteCodeOrchestratePackage.sourceRevision,
+            files: Dictionary(uniqueKeysWithValues: stagedFiles.map { ($0.relativePath, $0.sha256) })
+        )
+        try encoder.encode(runtimeManifest).write(
+            to: staged.appendingPathComponent(Self.remoteCodeOrchestrateRuntimeManifestName),
+            options: .atomic
+        )
+        _ = try validateManagedPackage(at: staged)
+
+        let action: RemoteCodeOrchestrateInstallResult.Action
+        switch current {
+        case .absent:
+            try fileManager.moveItem(at: staged, to: destination)
+            action = .installed
+        case .valid:
+            try replaceActivePackage(with: staged, preserveCurrentAsLastKnownGood: true)
+            action = .updated
+        case .invalidManaged:
+            try replaceActivePackage(with: staged, preserveCurrentAsLastKnownGood: false)
+            action = .repaired
+        case .unmanaged:
+            throw RemoteCodeOrchestrateInstallError.unmanagedCollision(destination.path)
+        }
+
+        let activated = try validateManagedPackage(at: destination)
+        return RemoteCodeOrchestrateInstallResult(action: action, manifest: activated)
+    }
+
+    public func remoteCodeOrchestrateStatus() -> RemoteCodeOrchestrateStatus {
+        let lastKnownGoodAvailable: Bool
+        if case .valid = inspectManagedPackage(at: remoteCodeOrchestrateLastKnownGoodDirectory()) {
+            lastKnownGoodAvailable = true
+        } else {
+            lastKnownGoodAvailable = false
+        }
+
+        switch inspectManagedPackage(at: remoteCodeOrchestrateDirectory()) {
+        case .absent:
+            return RemoteCodeOrchestrateStatus(
+                state: .notInstalled,
+                manifest: nil,
+                lastKnownGoodAvailable: lastKnownGoodAvailable,
+                repairReason: nil
+            )
+        case .unmanaged:
+            return RemoteCodeOrchestrateStatus(
+                state: .unmanagedCollision,
+                manifest: nil,
+                lastKnownGoodAvailable: lastKnownGoodAvailable,
+                repairReason: "The app-private skill path contains content not owned by RemoteCode."
+            )
+        case .invalidManaged(let reason):
+            return RemoteCodeOrchestrateStatus(
+                state: .repairRequired,
+                manifest: nil,
+                lastKnownGoodAvailable: lastKnownGoodAvailable,
+                repairReason: reason
+            )
+        case .valid(let manifest):
+            return RemoteCodeOrchestrateStatus(
+                state: manifestMatchesPinnedPackage(manifest) ? .ready : .updateRequired,
+                manifest: manifest,
+                lastKnownGoodAvailable: lastKnownGoodAvailable,
+                repairReason: nil
+            )
+        }
+    }
+
+    @discardableResult
+    public func restoreRemoteCodeOrchestrateLastKnownGood() throws -> RemoteCodeOrchestrateManifest {
+        let lastKnownGood = remoteCodeOrchestrateLastKnownGoodDirectory()
+        guard case .valid(let manifest) = inspectManagedPackage(at: lastKnownGood) else {
+            throw RemoteCodeOrchestrateInstallError.lastKnownGoodUnavailable
+        }
+
+        let destination = remoteCodeOrchestrateDirectory()
+        if case .unmanaged = inspectManagedPackage(at: destination) {
+            throw RemoteCodeOrchestrateInstallError.unmanagedCollision(destination.path)
+        }
+
+        let displaced = appPrivateSkillsRoot.appendingPathComponent(
+            ".repair-displaced-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        let destinationExists = pathEntryExists(destination)
+        if destinationExists {
+            try fileManager.moveItem(at: destination, to: displaced)
+        }
+        do {
+            try fileManager.moveItem(at: lastKnownGood, to: destination)
+        } catch {
+            if destinationExists {
+                try? fileManager.moveItem(at: displaced, to: destination)
+            }
+            throw error
+        }
+        if destinationExists {
+            try fileManager.removeItem(at: displaced)
+        }
+        let activated = try validateManagedPackage(at: destination)
+        guard activated == manifest else {
+            throw RemoteCodeOrchestrateInstallError.invalidManagedPackage(
+                "restored package changed during activation"
+            )
+        }
+        return activated
+    }
+
+    static func remoteCodeOrchestrateTreeDigest(_ files: [RemoteCodeOrchestrateFile]) -> String {
+        let canonical = files.sorted { $0.relativePath < $1.relativePath }.map {
+            "\($0.relativePath)\t\($0.byteCount)\t\($0.sha256)\n"
+        }.joined()
+        return sha256Hex(Data(canonical.utf8))
+    }
+
+    private enum ManagedPackageInspection {
+        case absent
+        case unmanaged
+        case invalidManaged(String)
+        case valid(RemoteCodeOrchestrateManifest)
+    }
+
+    private struct RemoteCodeOrchestrateRuntimeManifest: Codable {
+        let schemaVersion: Int
+        let packageID: String
+        let sourceRevision: String
+        let files: [String: String]
+    }
+
+    private func inspectManagedPackage(at directory: URL) -> ManagedPackageInspection {
+        guard pathEntryExists(directory) else { return .absent }
+        guard !isSymbolicLink(directory), isDirectory(directory) else { return .unmanaged }
+        let manifestURL = directory.appendingPathComponent(Self.remoteCodeOrchestrateManifestName)
+        guard pathEntryExists(manifestURL), !isSymbolicLink(manifestURL) else {
+            return .unmanaged
+        }
+        do {
+            return .valid(try validateManagedPackage(at: directory))
+        } catch {
+            return .invalidManaged(String(describing: error))
+        }
+    }
+
+    private func validatedRemoteCodeOrchestrateSource(
+        at directory: URL,
+        package: RemoteCodeOrchestratePackage,
+        ignoredPaths: Set<String> = []
+    ) throws -> [RemoteCodeOrchestrateFile] {
+        if isSymbolicLink(directory) {
+            throw RemoteCodeOrchestrateInstallError.symbolicLink(".")
+        }
+        guard fileManager.fileExists(atPath: directory.path), isDirectory(directory) else {
+            throw RemoteCodeOrchestrateInstallError.sourceMissing(directory.path)
+        }
+
+        let allowedPaths = package.allowedPaths
+        for path in allowedPaths {
+            try validateSafeRelativePath(path)
+        }
+        guard Set(allowedPaths).count == allowedPaths.count else {
+            throw RemoteCodeOrchestrateInstallError.invalidManagedPackage("duplicate allowed path")
+        }
+        let allowed = Set(allowedPaths)
+        let allowedDirectories = Set(allowedPaths.flatMap(Self.parentDirectories))
+        var found: [RemoteCodeOrchestrateFile] = []
+        var foundPaths = Set<String>()
+        let keys: [URLResourceKey] = [.isDirectoryKey, .isRegularFileKey, .isSymbolicLinkKey]
+        guard let enumerator = fileManager.enumerator(
+            at: directory,
+            includingPropertiesForKeys: keys,
+            options: [],
+            errorHandler: { _, _ in false }
+        ) else {
+            throw RemoteCodeOrchestrateInstallError.sourceMissing(directory.path)
+        }
+
+        for case let item as URL in enumerator {
+            let relativePath = try relativePath(of: item, under: directory)
+            let values = try item.resourceValues(forKeys: Set(keys))
+            if values.isSymbolicLink == true {
+                throw RemoteCodeOrchestrateInstallError.symbolicLink(relativePath)
+            }
+            if values.isDirectory == true {
+                guard allowedDirectories.contains(relativePath) else {
+                    throw RemoteCodeOrchestrateInstallError.unexpectedEntry(relativePath)
+                }
+                continue
+            }
+            if ignoredPaths.contains(relativePath) {
+                guard values.isRegularFile == true else {
+                    throw RemoteCodeOrchestrateInstallError.unexpectedEntry(relativePath)
+                }
+                continue
+            }
+            guard values.isRegularFile == true, allowed.contains(relativePath) else {
+                throw RemoteCodeOrchestrateInstallError.unexpectedEntry(relativePath)
+            }
+            let data = try Data(contentsOf: item, options: [.mappedIfSafe])
+            found.append(RemoteCodeOrchestrateFile(
+                relativePath: relativePath,
+                byteCount: data.count,
+                sha256: Self.sha256Hex(data)
+            ))
+            foundPaths.insert(relativePath)
+        }
+
+        if let missing = allowed.subtracting(foundPaths).sorted().first {
+            throw RemoteCodeOrchestrateInstallError.missingRequiredFile(missing)
+        }
+        let actualDigest = Self.remoteCodeOrchestrateTreeDigest(found)
+        guard actualDigest == package.sourceTreeSHA256 else {
+            throw RemoteCodeOrchestrateInstallError.sourceTreeDigestMismatch(
+                expected: package.sourceTreeSHA256,
+                actual: actualDigest
+            )
+        }
+        return found.sorted { $0.relativePath < $1.relativePath }
+    }
+
+    private func validateManagedPackage(at directory: URL) throws -> RemoteCodeOrchestrateManifest {
+        let manifestURL = directory.appendingPathComponent(Self.remoteCodeOrchestrateManifestName)
+        let manifest = try decoder.decode(RemoteCodeOrchestrateManifest.self, from: Data(contentsOf: manifestURL))
+        guard manifest.schemaVersion == 1,
+              manifest.managedBy == "RemoteCode",
+              manifest.skillID == remoteCodeOrchestratePackage.skillID else {
+            throw RemoteCodeOrchestrateInstallError.invalidManagedPackage("ownership manifest mismatch")
+        }
+        let package = RemoteCodeOrchestratePackage(
+            skillID: manifest.skillID,
+            sourceURL: manifest.sourceURL,
+            sourceRevision: manifest.sourceRevision,
+            sourceTreeSHA256: manifest.sourceTreeSHA256,
+            localVersion: manifest.localVersion,
+            allowedPaths: manifest.files.map(\.relativePath)
+        )
+        let files = try validatedRemoteCodeOrchestrateSource(
+            at: directory,
+            package: package,
+            ignoredPaths: [
+                Self.remoteCodeOrchestrateManifestName,
+                Self.remoteCodeOrchestrateRuntimeManifestName
+            ]
+        )
+        guard files == manifest.files.sorted(by: { $0.relativePath < $1.relativePath }) else {
+            throw RemoteCodeOrchestrateInstallError.invalidManagedPackage("file manifest mismatch")
+        }
+        let runtimeManifestURL = directory.appendingPathComponent(Self.remoteCodeOrchestrateRuntimeManifestName)
+        let runtimeManifest = try decoder.decode(
+            RemoteCodeOrchestrateRuntimeManifest.self,
+            from: Data(contentsOf: runtimeManifestURL)
+        )
+        guard runtimeManifest.schemaVersion == 1,
+              runtimeManifest.packageID == manifest.skillID,
+              runtimeManifest.sourceRevision == manifest.sourceRevision,
+              runtimeManifest.files == Dictionary(
+                uniqueKeysWithValues: files.map { ($0.relativePath, $0.sha256) }
+              ) else {
+            throw RemoteCodeOrchestrateInstallError.invalidManagedPackage("runtime manifest mismatch")
+        }
+        return manifest
+    }
+
+    private func manifestMatchesPinnedPackage(_ manifest: RemoteCodeOrchestrateManifest) -> Bool {
+        manifest.skillID == remoteCodeOrchestratePackage.skillID
+            && manifest.sourceURL == remoteCodeOrchestratePackage.sourceURL
+            && manifest.sourceRevision == remoteCodeOrchestratePackage.sourceRevision
+            && manifest.sourceTreeSHA256 == remoteCodeOrchestratePackage.sourceTreeSHA256
+            && manifest.localVersion == remoteCodeOrchestratePackage.localVersion
+    }
+
+    private func replaceActivePackage(with staged: URL, preserveCurrentAsLastKnownGood: Bool) throws {
+        let destination = remoteCodeOrchestrateDirectory()
+        let lastKnownGood = remoteCodeOrchestrateLastKnownGoodDirectory()
+        if preserveCurrentAsLastKnownGood {
+            switch inspectManagedPackage(at: lastKnownGood) {
+            case .absent:
+                break
+            case .valid:
+                try fileManager.removeItem(at: lastKnownGood)
+            case .invalidManaged, .unmanaged:
+                throw RemoteCodeOrchestrateInstallError.unmanagedCollision(lastKnownGood.path)
+            }
+            let stagedLastKnownGood = appPrivateSkillsRoot.appendingPathComponent(
+                ".last-known-good-\(UUID().uuidString)",
+                isDirectory: true
+            )
+            defer { try? fileManager.removeItem(at: stagedLastKnownGood) }
+            try fileManager.copyItem(at: destination, to: stagedLastKnownGood)
+            _ = try validateManagedPackage(at: stagedLastKnownGood)
+            try fileManager.moveItem(at: stagedLastKnownGood, to: lastKnownGood)
+        }
+
+        _ = try fileManager.replaceItemAt(
+            destination,
+            withItemAt: staged,
+            backupItemName: nil,
+            options: []
+        )
+    }
+
+    private func prepareAppPrivateSkillsRoot() throws {
+        try prepareOwnedDirectory(appPrivateSkillsRoot)
+    }
+
+    private func prepareOwnedDirectory(_ directory: URL) throws {
+        if pathEntryExists(directory) {
+            guard !isSymbolicLink(directory), isDirectory(directory) else {
+                throw RemoteCodeOrchestrateInstallError.unmanagedCollision(directory.path)
+            }
+        } else {
+            try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
+        }
+    }
+
+    private func relativePath(of item: URL, under root: URL) throws -> String {
+        let rootPath = root.standardizedFileURL.path
+        let itemPath = item.standardizedFileURL.path
+        guard itemPath.hasPrefix(rootPath + "/") else {
+            throw RemoteCodeOrchestrateInstallError.unsafeRelativePath(itemPath)
+        }
+        let relativePath = String(itemPath.dropFirst(rootPath.count + 1))
+        try validateSafeRelativePath(relativePath)
+        return relativePath
+    }
+
+    private func validateSafeRelativePath(_ path: String) throws {
+        let components = path.split(separator: "/", omittingEmptySubsequences: false)
+        guard !path.isEmpty,
+              !path.hasPrefix("/"),
+              components.allSatisfy({ !$0.isEmpty && $0 != "." && $0 != ".." }) else {
+            throw RemoteCodeOrchestrateInstallError.unsafeRelativePath(path)
+        }
+    }
+
+    private static func parentDirectories(_ path: String) -> [String] {
+        let components = path.split(separator: "/")
+        guard components.count > 1 else { return [] }
+        return (1..<components.count).map { components.prefix($0).joined(separator: "/") }
+    }
+
+    private func isDirectory(_ url: URL) -> Bool {
+        (try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true
+    }
+
+    private func isSymbolicLink(_ url: URL) -> Bool {
+        guard let attributes = try? fileManager.attributesOfItem(atPath: url.path) else { return false }
+        return attributes[.type] as? FileAttributeType == .typeSymbolicLink
+    }
+
+    private func pathEntryExists(_ url: URL) -> Bool {
+        fileManager.fileExists(atPath: url.path) || isSymbolicLink(url)
     }
 
     public func installSkill(

@@ -90,11 +90,17 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
     public let channel: ReleaseChannel
     private let appSupportOverride: String?
     private let dbOverride: String?
+    private let physicalMemoryBytesProvider: @Sendable () -> UInt64
     private var providerSessionReaperTimer: Timer?
     private var ccrRetentionTimer: Timer?
     private var diagnosticsHeartbeatTimer: Timer?
     private var tokenSaverAccountUsageRefreshTimer: Timer?
     private var lifecycleRecorder: AppLifecycleRecorder?
+    /// Distributed-notification observer: schedule store commits → rail reload.
+    private var scheduledTaskStoreObserver: NSObjectProtocol?
+    private var scheduledTaskScheduler: ScheduledTaskScheduler?
+    private var scheduledTaskTimer: Timer?
+    private var scheduledTaskNotificationTokens: [(NotificationCenter, NSObjectProtocol)] = []
     /// Menu items whose keyEquivalent is controlled by keybindings.json.
     /// Populated by installMainMenu(); refreshed by reapplyKeybindingOverrides().
     private var keybindableMenuItems: [(item: NSMenuItem, command: String)] = []
@@ -115,11 +121,23 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
     /// via `AppDelegate.shared?.serverStartupFailures` after the post.
     public static let serverStartupFailureNotification = Notification.Name("io.remotecode.serverStartupFailure")
 
-    public init(channel: ReleaseChannel = .debug, appSupportOverride: String? = nil, dbOverride: String? = nil) {
+    public init(
+        channel: ReleaseChannel = .debug,
+        appSupportOverride: String? = nil,
+        dbOverride: String? = nil,
+        physicalMemoryBytesProvider: @escaping @Sendable () -> UInt64 = {
+            ProcessInfo.processInfo.physicalMemory
+        }
+    ) {
         self.channel = channel
         self.appSupportOverride = appSupportOverride
         self.dbOverride = dbOverride
+        self.physicalMemoryBytesProvider = physicalMemoryBytesProvider
         super.init()
+    }
+
+    var managedProcessMemoryProfile: ManagedProcessMemoryProfile {
+        ManagedProcessMemoryProfile.resolve(physicalMemoryBytes: physicalMemoryBytesProvider())
     }
 
     public func applicationDidFinishLaunching(_ notification: Notification) {
@@ -158,6 +176,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
             NSApp.terminate(nil)
             return
         }
+        configureManagedProviderAdmission()
 
         // UX-MAC_PERSISTENCE-P1: inform the user when a corrupt database was
         // silently quarantined so they know prior data was preserved as a backup.
@@ -215,6 +234,10 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         windowController = MainWindowController(context: context, router: router, updater: updater)
         router.windowController = windowController
         settings = SettingsWindowController(context: context, updater: updater)
+        // Schedules run in-process (paste+play Agent App). Unregister any legacy
+        // LaunchAgent so it cannot dual-claim after upgrade.
+        startInProcessScheduledTaskScheduler()
+        installScheduledTaskStoreObserver()
         startPetController()
 
         // start unix socket server
@@ -319,9 +342,9 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         }
     }
 
-    /// One-time explanation for Files and Folders TCC. macOS cannot grant all
-    /// folder permissions in one API call. Every alert button marks onboarding
-    /// *handled* (not “permissions granted”) so launch never nags in a loop.
+    /// One-time Full Disk Access tip. Launch never probes Desktop/Documents/
+    /// Downloads (that forced multi-folder TCC spam). Every button marks
+    /// onboarding *handled* (not “permissions granted”) so launch never nags.
     func presentHostFileAccessOnboardingIfNeeded() {
         guard let context else { return }
         let repo = SettingsRepository(db: context.db)
@@ -336,19 +359,15 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
             alert.informativeText += "\n\n" + warning
         }
         alert.alertStyle = .informational
-        alert.addButton(withTitle: "Continue")
-        alert.addButton(withTitle: "Open System Settings")
-        alert.addButton(withTitle: "Not Now")
+        alert.addButton(withTitle: HostFileAccessCopy.openFullDiskAccessButton)
+        alert.addButton(withTitle: HostFileAccessCopy.notNowButton)
         let response = alert.runModal()
         do {
             try HostFileAccessOnboarding.handleAlertResponse(
                 response,
                 markHandled: { try HostFileAccessOnboarding.markHandled(repo: repo) },
-                openSystemSettings: {
-                    NSWorkspace.shared.open(HostFileAccessSystemSettings.filesAndFoldersURL)
-                },
-                checkFolderAccess: {
-                    _ = HostFileAccessProber.probeStandardTargets()
+                openFullDiskAccess: {
+                    NSWorkspace.shared.open(HostFileAccessSystemSettings.fullDiskAccessURL)
                 }
             )
         } catch {
@@ -363,7 +382,9 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
     /// payloads, and reinstantiating restored surfaces (a PTY spawn per restored
     /// terminal). Runs after the first frame so launch is not blocked.
     private func runDeferredStartup() {
-        terminateOrphanedProviderRuntimes(reason: "launch")
+        // Off MainActor: process scan + optional SIGTERM grace sleeps must not
+        // hitch the first interactive frame after cold launch.
+        scheduleOrphanRuntimeSweep(reason: "launch")
 
         if let log = context?.eventLog {
             do {
@@ -415,6 +436,73 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         petController = nil
     }
 
+    /// Schedule store commits (including Run Now) reload Agent App rails.
+    func installScheduledTaskStoreObserver() {
+        removeScheduledTaskStoreObserver()
+        scheduledTaskStoreObserver = ScheduledTaskCrossProcess.observeStoreChanged { [weak self] _ in
+            self?.reloadAgentSurfacesFromScheduledStoreChange()
+        }
+    }
+
+    func removeScheduledTaskStoreObserver() {
+        if let scheduledTaskStoreObserver {
+            ScheduledTaskCrossProcess.removeObserver(scheduledTaskStoreObserver)
+            self.scheduledTaskStoreObserver = nil
+        }
+    }
+
+    private func startInProcessScheduledTaskScheduler() {
+        // Best-effort: leftover LaunchAgent must not own provider turns anymore.
+        try? ScheduledTaskAgentServiceManager().unregister()
+        let scheduler = ScheduledTaskScheduler(context: context, router: router)
+        scheduledTaskScheduler = scheduler
+        router.scheduledTaskScheduler = scheduler
+        scheduledTaskTimer?.invalidate()
+        scheduledTaskTimer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak scheduler] _ in
+            Task { @MainActor in scheduler?.tick() }
+        }
+        let wakeToken = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didWakeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak scheduler] _ in
+            Task { @MainActor in scheduler?.tick() }
+        }
+        scheduledTaskNotificationTokens.append((NSWorkspace.shared.notificationCenter, wakeToken))
+        for name: Notification.Name in [.NSSystemClockDidChange, .NSSystemTimeZoneDidChange] {
+            let token = NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { [weak scheduler] _ in
+                Task { @MainActor in scheduler?.tick() }
+            }
+            scheduledTaskNotificationTokens.append((NotificationCenter.default, token))
+        }
+        // First tick skips past-due occurrences (app was closed), then claims
+        // only work that becomes due while the app stays open.
+        scheduler.tick()
+    }
+
+    private func stopInProcessScheduledTaskScheduler() {
+        scheduledTaskTimer?.invalidate()
+        scheduledTaskTimer = nil
+        for (center, token) in scheduledTaskNotificationTokens {
+            center.removeObserver(token)
+        }
+        scheduledTaskNotificationTokens.removeAll()
+        router?.scheduledTaskScheduler = nil
+        scheduledTaskScheduler = nil
+    }
+
+    private func reloadAgentSurfacesFromScheduledStoreChange() {
+        for surface in SurfaceRegistry.shared.all() {
+            guard let agent = surface as? AgentAppSurface else { continue }
+            let selected = agent.viewModel.selectedThreadId
+            agent.viewModel.reloadThreads()
+            if let selected {
+                agent.viewModel.selectThread(selected, markRead: false)
+            }
+        }
+        windowController?.refreshSurfaceRuntimeState()
+    }
+
     public func checkForUpdatesAfterOpeningApp() {
         updater?.checkForUpdates()
     }
@@ -423,19 +511,20 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         appLifecycleLog.info("app.will_terminate pid=\(ProcessInfo.processInfo.processIdentifier, privacy: .public)")
         lifecycleRecorder?.endRunCleanly(reason: "applicationWillTerminate")
         logDiagnosticsHeartbeat(reason: "will_terminate")
+        stopInProcessScheduledTaskScheduler()
+        removeScheduledTaskStoreObserver()
         disableInsomniaForAppClose()
-        // Only tear down the managed distill integration when Token Saver is already
-        // disabled. When it is enabled the integration (PATH symlink + skills) should
-        // survive app-quit so the user's shell keeps working between runs. On the next
-        // launch AppContext.init reconciles again and reinstalls whatever is needed.
+        // Always stop the Distill MLX server on quit — multi-GB model must not linger.
+        // On terminate, reconcile Distill with the Token Saver toggle (install only when
+        // enabled; otherwise scrub legacy homes + uninstall CLI/wrappers). The MLX
+        // sidecar is stopped separately.
+        stopTokenSaverDistillServiceForAppTermination()
         let tokenSaverEnabled = context.map { SettingsStore(db: $0.db).load().tokenSaverEnabled } ?? false
         if ProcessInfo.processInfo.environment["RC2_DISABLE_MANAGED_DISTILL_RECONCILE"] == "1" {
             appLifecycleLog.info("app.will_terminate distill_integration=unchanged isolated_process=true")
-        } else if tokenSaverEnabled {
-            appLifecycleLog.info("app.will_terminate distill_integration=retained token_saver=enabled")
         } else {
-            appLifecycleLog.info("app.will_terminate distill_integration=removing token_saver=disabled")
-            context?.reconcileManagedDistillSkills(tokenSaverEnabled: false)
+            appLifecycleLog.info("app.will_terminate distill_integration=app_private_retained distill_server=stopped token_saver=\(tokenSaverEnabled ? "enabled" : "disabled")")
+            context?.reconcileManagedDistillSkills(tokenSaverEnabled: tokenSaverEnabled)
         }
         persistRestorableStateBeforeUpdate()
         stopPetController()
@@ -449,6 +538,24 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         tokenSaverAccountUsageRefreshTimer?.invalidate()
         NotificationCenter.default.removeObserver(self)
         NSWorkspace.shared.notificationCenter.removeObserver(self)
+    }
+
+    /// Quit contract: stop the controller-owned sidecar and reap any foreign
+    /// Distill MLX servers so only zero servers remain after RemoteCode exits.
+    private func stopTokenSaverDistillServiceForAppTermination() {
+        guard Self.shouldStopDistillServerOnTerminate(
+            tokenSaverEnabled: context.map { SettingsStore(db: $0.db).load().tokenSaverEnabled } ?? false
+        ) else { return }
+        context?.tokenSaverDistillServiceController.stop()
+    }
+
+    /// Pure quit policy: Distill MLX server always stops on terminate regardless
+    /// of Token Saver toggle (skills/PATH may still be retained when enabled).
+    nonisolated static func shouldStopDistillServerOnTerminate(tokenSaverEnabled: Bool) -> Bool {
+        // tokenSaverEnabled is accepted for call-site clarity / future gating;
+        // the process always dies with the app.
+        _ = tokenSaverEnabled
+        return true
     }
 
     private func disableInsomniaForAppClose() {
@@ -467,6 +574,33 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         let completed = closeSurfacesForApplicationTermination(SurfaceRegistry.shared.all())
         if !completed {
             appLifecycleLog.error("app.will_terminate terminal_disposition=incomplete")
+        }
+    }
+
+    private func configureManagedProviderAdmission() {
+        let profile = managedProcessMemoryProfile
+        let gate = ManagedProviderAdmissionGate()
+        // Best-effort accounting only: never refuse a user-started provider for
+        // session count, memory ceilings, incomplete scans, or store errors.
+        context.coordinator.providerAdmissionCheck = { provider, threadId in
+            guard let store = ProviderProcessOwnership.shared.store() else { return }
+            let scan: ManagedProcessScan
+            let appFootprintKB: Int?
+            do {
+                (scan, appFootprintKB) = try await Task.detached(priority: .userInitiated) {
+                    let scan = try ProviderProcessSweeper.managedProcessScan(store: store)
+                    let footprint = AppDiagnostics.currentProcessFootprintKB()
+                    return (scan, footprint >= 0 ? footprint : nil)
+                }.value
+            } catch {
+                return
+            }
+            _ = await gate.decide(
+                profile: profile,
+                scan: scan,
+                appFootprintKB: appFootprintKB,
+                key: ManagedProviderAdmissionKey(provider: provider, threadId: threadId)
+            )
         }
     }
 
@@ -498,10 +632,18 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
     }
 
     private func logDiagnosticsHeartbeat(reason: String) {
-        terminateOrphanedProviderRuntimes(reason: "periodic")
+        // Periodic heartbeats must never block MainActor on process scans or
+        // SIGTERM grace sleeps — that freezes the whole UI every 60s once orphans
+        // accumulate. App termination is the only path that still reaps inline.
+        if reason == "will_terminate" {
+            reconcilePersistedProcessOwnership(reason: reason)
+        } else {
+            scheduleOrphanRuntimeSweep(reason: reason)
+        }
         AppDiagnostics.heartbeat(
             reason: reason,
             activeAgentThreads: context?.coordinator.activeThreadIdsSnapshot().count ?? 0,
+            profile: managedProcessMemoryProfile,
             lifecycleRecorder: lifecycleRecorder
         )
     }
@@ -523,18 +665,71 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
         lifecycleRecorder = recorder
     }
 
-    private func terminateOrphanedProviderRuntimes(reason: String) {
+    /// F9-adjacent: orphan reaping used Thread.sleep grace windows on MainActor
+    /// (via the 60s diagnostics heartbeat). Latch + detached Task keep the UI
+    /// responsive while still reaping provider + Distill orphans in the background.
+    @MainActor private var orphanSweepInFlight = false
+
+    /// Pure decision for the background-sweep latch (testable without timers).
+    enum OrphanSweepDecision: Equatable {
+        case start
+        case skipInFlight
+    }
+
+    @MainActor
+    static func beginOrphanSweepForTests(_ inFlight: inout Bool) -> OrphanSweepDecision {
+        beginOrphanSweep(inFlight: &inFlight)
+    }
+
+    @MainActor
+    private static func beginOrphanSweep(inFlight: inout Bool) -> OrphanSweepDecision {
+        guard !inFlight else { return .skipInFlight }
+        inFlight = true
+        return .start
+    }
+
+    @MainActor
+    private func scheduleOrphanRuntimeSweep(reason: String) {
+        if Self.beginOrphanSweep(inFlight: &orphanSweepInFlight) == .skipInFlight {
+            appLifecycleLog.info("provider.orphan_sweep reason=\(reason, privacy: .public) result=skipped_in_flight")
+            return
+        }
+        let minAge: TimeInterval = reason == "launch" ? 0 : ProcessSpawnTagger.defaultMinAge
+        Task.detached(priority: .utility) { [weak self] in
+            defer {
+                Task { @MainActor in
+                    self?.orphanSweepInFlight = false
+                }
+            }
+            // nonisolated static body — never hop back to MainActor for the
+            // process scan / SIGTERM grace sleeps that freeze the UI.
+            Self.performOrphanRuntimeSweep(reason: reason, minAge: minAge)
+        }
+    }
+
+    private func reconcilePersistedProcessOwnership(reason: String) {
+        let minAge: TimeInterval = reason == "launch" ? 0 : ProcessSpawnTagger.defaultMinAge
+        Self.performOrphanRuntimeSweep(reason: reason, minAge: minAge)
+    }
+
+    /// Blocking implementation. Call only from a background queue (periodic/launch)
+    /// or during applicationWillTerminate where the UI is already shutting down.
+    /// nonisolated so Task.detached can run the process-table reaper without
+    /// MainActor isolation (process I/O + Thread.sleep must stay off the UI thread).
+    nonisolated private static func performOrphanRuntimeSweep(reason: String, minAge: TimeInterval) {
         do {
             let result = try ProviderProcessSweeper.terminatePersistedOrphanedProviderRuntimes(
-                minAge: reason == "launch" ? 0 : ProcessSpawnTagger.defaultMinAge
+                minAge: minAge
             )
-            guard !result.orphanRootPIDs.isEmpty || !result.failedPIDs.isEmpty else { return }
-            appLifecycleLog.info("provider.orphan_sweep reason=\(reason, privacy: .public) roots=\(result.orphanRootPIDs.count, privacy: .public) terminated=\(result.terminatedPIDs.count, privacy: .public) failed=\(result.failedPIDs.count, privacy: .public)")
+            if !result.orphanRootPIDs.isEmpty || !result.failedPIDs.isEmpty {
+                appLifecycleLog.info("provider.orphan_sweep reason=\(reason, privacy: .public) roots=\(result.orphanRootPIDs.count, privacy: .public) terminated=\(result.terminatedPIDs.count, privacy: .public) failed=\(result.failedPIDs.count, privacy: .public)")
+            }
         } catch {
             // The ledger remains intact. Surface the failed audit instead of
             // reporting the indistinguishable all-clear result used previously.
             appLifecycleLog.fault("provider.orphan_sweep_failed reason=\(reason, privacy: .public) error=\(error.localizedDescription, privacy: .public)")
         }
+
     }
 
     public func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
@@ -588,7 +783,9 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValid
 
     private func reapIdleProviderSessions() {
         do {
-            let result = try context.reapIdleProviderSessions()
+            let result = try context.reapIdleProviderSessions(
+                idleAge: managedProcessMemoryProfile.idleReleaseAge
+            )
             if !result.stoppedThreadIds.isEmpty {
                 NSLog("Stopped \(result.stoppedThreadIds.count) idle provider session runtime(s).")
             }

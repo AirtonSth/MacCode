@@ -444,11 +444,18 @@ public struct DistillSpawnResult: @unchecked Sendable {
     public let process: Process
     public let stdoutHandle: FileHandle
     public let stderrHandle: FileHandle
+    public let ownershipTag: SpawnedProcessTag?
 
-    public init(process: Process, stdoutHandle: FileHandle, stderrHandle: FileHandle) {
+    public init(
+        process: Process,
+        stdoutHandle: FileHandle,
+        stderrHandle: FileHandle,
+        ownershipTag: SpawnedProcessTag? = nil
+    ) {
         self.process = process
         self.stdoutHandle = stdoutHandle
         self.stderrHandle = stderrHandle
+        self.ownershipTag = ownershipTag
     }
 }
 
@@ -480,10 +487,12 @@ public struct RealDistillProcessSpawner: DistillProcessSpawning, Sendable {
         process.standardError = stderr
         process.arguments = arguments
         try process.run()
+        let ownershipTag = try ProcessSpawnTagger.tagProcess(process, managedKind: .sidecar)
         return DistillSpawnResult(
             process: process,
             stdoutHandle: stdout.fileHandleForReading,
-            stderrHandle: stderr.fileHandleForReading
+            stderrHandle: stderr.fileHandleForReading,
+            ownershipTag: ownershipTag
         )
     }
 }
@@ -491,6 +500,9 @@ public struct RealDistillProcessSpawner: DistillProcessSpawning, Sendable {
 @MainActor
 public final class TokenSaverDistillServiceController {
     public typealias ExecutableURLResolver = @MainActor () -> URL?
+    /// Reconcile exact persisted ownership before a sidecar launch. Injectable so
+    /// unit tests never signal a developer's real sidecar.
+    public typealias ForeignServerTerminator = @Sendable (Int32?) -> ProviderProcessSweepResult
 
     public private(set) var status: TokenSaverDistillServiceStatus = .notStarted {
         didSet {
@@ -506,7 +518,20 @@ public final class TokenSaverDistillServiceController {
     private let appSupportDirectory: URL
     private let executableURLResolver: ExecutableURLResolver
     private let processSpawner: any DistillProcessSpawning
+    private let terminateForeignServers: ForeignServerTerminator
+    private let memoryProfileProvider: @Sendable () -> ManagedProcessMemoryProfile
+    private let ownedProcessTerminationTimeout: TimeInterval
     private var process: Process?
+    private var processOwnershipTag: SpawnedProcessTag?
+    private var terminatingProcess: Process?
+    private var terminationTask: Task<Void, Never>?
+    private var pendingStartAfterTermination = false
+    // Desired lifecycle state (a start request wants the sidecar running) plus a
+    // latch for the in-flight off-main foreign-server sweep. The sweep completes
+    // on the MainActor and re-checks `shouldRun` before spawning, so an
+    // overlapping stop()/termination cannot leave a stale sidecar running.
+    private var shouldRun = false
+    private var foreignSweepInFlight = false
     private var readyOutputHandle: FileHandle?
     private var stderrOutputHandle: FileHandle?
     private var readyOutputBuffer = Data()
@@ -535,16 +560,101 @@ public final class TokenSaverDistillServiceController {
         appSupportDirectory: URL,
         executableURLResolver: @escaping ExecutableURLResolver = TokenSaverDistillServiceController.defaultExecutableURL,
         idleTimeoutMS: Int = 300_000,
-        processSpawner: any DistillProcessSpawning = RealDistillProcessSpawner()
+        processSpawner: any DistillProcessSpawning = RealDistillProcessSpawner(),
+        terminateForeignServers: @escaping ForeignServerTerminator = { TokenSaverDistillServiceController.defaultTerminateForeignServers(keeping: $0) },
+        ownedProcessTerminationTimeout: TimeInterval = 2.5,
+        memoryProfileProvider: @escaping @Sendable () -> ManagedProcessMemoryProfile = {
+            ManagedProcessMemoryProfile.resolve(physicalMemoryBytes: ProcessInfo.processInfo.physicalMemory)
+        }
     ) {
         self.appSupportDirectory = appSupportDirectory
         self.executableURLResolver = executableURLResolver
         self.idleTimeoutMS = idleTimeoutMS
         self.processSpawner = processSpawner
+        self.terminateForeignServers = terminateForeignServers
+        self.ownedProcessTerminationTimeout = max(0.1, ownedProcessTerminationTimeout)
+        self.memoryProfileProvider = memoryProfileProvider
+    }
+
+    /// Production ownership reconciliation. No-ops under XCTest so suite
+    /// start/stop never signals a developer's real sidecar; tests inject a spy.
+    ///
+    /// Also reaps live HTTP/MLX Distill servers found via process table that are
+    /// not the keepPID. Worktree/manual sidecars are often absent from the
+    /// ownership ledger, and leaving them alive breaks the multi-GB singleton
+    /// gate (second spawn fails or competes for unified memory).
+    /// Never signals `mcp` helpers (multi-instance CLI path).
+    nonisolated public static func defaultTerminateForeignServers(
+        keeping keepPID: Int32?
+    ) -> ProviderProcessSweepResult {
+        if ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil {
+            return ProviderProcessSweepResult(orphanRootPIDs: [], terminatedPIDs: [], failedPIDs: [])
+        }
+        var orphanRootPIDs: [Int32] = []
+        var terminatedPIDs: [Int32] = []
+        var failedPIDs: [Int32] = []
+        do {
+            let ledger = try ProviderProcessSweeper.terminatePersistedOrphanedProviderRuntimes(minAge: 0)
+            orphanRootPIDs.append(contentsOf: ledger.orphanRootPIDs)
+            terminatedPIDs.append(contentsOf: ledger.terminatedPIDs)
+            failedPIDs.append(contentsOf: ledger.failedPIDs)
+        } catch {
+            // Fall through to process-table reaping; ledger absence must not
+            // leave a multi-GB foreign Distill HTTP server alive.
+        }
+        let table = reapForeignHTTPDistillServers(keeping: keepPID)
+        orphanRootPIDs.append(contentsOf: table.orphanRootPIDs)
+        terminatedPIDs.append(contentsOf: table.terminatedPIDs)
+        failedPIDs.append(contentsOf: table.failedPIDs)
+        return ProviderProcessSweepResult(
+            orphanRootPIDs: orphanRootPIDs,
+            terminatedPIDs: terminatedPIDs,
+            failedPIDs: failedPIDs
+        )
+    }
+
+    /// TERM then brief wait then KILL for HTTP Distill servers only (`mcp` excluded).
+    nonisolated private static func reapForeignHTTPDistillServers(
+        keeping keepPID: Int32?
+    ) -> ProviderProcessSweepResult {
+        guard let rows = try? ProviderProcessSweeper.psRowsThrowing() else {
+            return ProviderProcessSweepResult(orphanRootPIDs: [], terminatedPIDs: [], failedPIDs: [])
+        }
+        var orphans: [Int32] = []
+        var terminated: [Int32] = []
+        var failed: [Int32] = []
+        for row in rows {
+            guard ProviderProcessSweeper.isRemoteCodeDistillServerCommand(row.command) else { continue }
+            if let keepPID, row.pid == keepPID { continue }
+            orphans.append(row.pid)
+            let pid = row.pid
+            guard pid > 1 else { continue }
+            _ = Darwin.kill(pid, SIGTERM)
+            Thread.sleep(forTimeInterval: 0.25)
+            if processIsAlive(pid) {
+                _ = Darwin.kill(pid, SIGKILL)
+                Thread.sleep(forTimeInterval: 0.05)
+            }
+            if processIsAlive(pid) {
+                failed.append(pid)
+            } else {
+                terminated.append(pid)
+            }
+        }
+        return ProviderProcessSweepResult(
+            orphanRootPIDs: orphans,
+            terminatedPIDs: terminated,
+            failedPIDs: failed
+        )
+    }
+
+    nonisolated private static func processIsAlive(_ pid: Int32) -> Bool {
+        Darwin.kill(pid, 0) == 0 || errno == EPERM
     }
 
     deinit {
         process?.terminate()
+        terminatingProcess?.terminate()
     }
 
     public func startIfEligible(
@@ -573,6 +683,7 @@ public final class TokenSaverDistillServiceController {
 
     public func stop() {
         isStopping = true
+        shouldRun = false
         restartTask?.cancel()
         restartTask = nil
         restartAttempts = 0
@@ -584,13 +695,13 @@ public final class TokenSaverDistillServiceController {
         stderrOutputBuffer.removeAll(keepingCapacity: false)
         lastStderrLine = nil
         removeCLIState()
+        pendingStartAfterTermination = false
         if let process {
             process.terminationHandler = nil
-            if process.isRunning {
-                process.terminate()
-            }
+            beginBoundedTermination(of: process, ownershipTag: processOwnershipTag)
         }
         process = nil
+        processOwnershipTag = nil
         bearerToken = nil
         // Reset from EVERY state (.starting/.failed/.running) so a stuck status
         // never survives a stop()/eligibility change.
@@ -601,6 +712,47 @@ public final class TokenSaverDistillServiceController {
         )
         status = decision.nextStatus
         isStopping = false
+    }
+
+    private func beginBoundedTermination(
+        of process: Process,
+        ownershipTag: SpawnedProcessTag?
+    ) {
+        guard process.isRunning else {
+            if let ownershipTag {
+                try? ProviderProcessOwnership.shared.store()?.removeExact(ownershipTag)
+            }
+            return
+        }
+        let expectedIdentity = ownershipTag?.startIdentity
+            ?? ProviderProcessStartIdentity.read(pid: process.processIdentifier)
+        terminatingProcess = process
+        let timeout = ownedProcessTerminationTimeout
+        terminationTask = Task.detached(priority: .userInitiated) { [weak self, weak process] in
+            guard let process else { return }
+            let stopped = ProcessSpawnTagger.terminateExactOwnedProcessAndWait(
+                process,
+                expectedStartIdentity: expectedIdentity,
+                timeout: timeout
+            )
+            if stopped, let ownershipTag {
+                try? ProviderProcessOwnership.shared.store()?.removeExact(ownershipTag)
+            }
+            await MainActor.run { [weak self, weak process] in
+                guard let self, let process, self.terminatingProcess === process else { return }
+                self.terminatingProcess = nil
+                self.terminationTask = nil
+                let shouldRestart = self.pendingStartAfterTermination
+                self.pendingStartAfterTermination = false
+                guard stopped else {
+                    self.status = .failed("Previous RemoteCodeDistillService did not stop within the bounded handoff window")
+                    return
+                }
+                if shouldRestart {
+                    self.start()
+                }
+            }
+        }
     }
 
     /// Called from the process termination handler on the MainActor.
@@ -659,7 +811,18 @@ public final class TokenSaverDistillServiceController {
     }
 
     private func start() {
+        // A start request wants the sidecar running; the off-main sweep below can
+        // overlap with stop()/termination, so its completion re-checks this latch.
+        shouldRun = true
         if let process, process.isRunning {
+            return
+        }
+        if terminatingProcess != nil {
+            pendingStartAfterTermination = true
+            return
+        }
+        // A sweep is already running; its MainActor completion spawns exactly once.
+        if foreignSweepInFlight {
             return
         }
         // A live launch supersedes any pending backoff retry.
@@ -670,6 +833,29 @@ public final class TokenSaverDistillServiceController {
             return
         }
 
+        // Single-instance gate: never spawn a second multi-GB MLX server while any
+        // other Distill server still holds the model (orphans / prior runs). The
+        // sweep does blocking `ps` execs + SIGTERM grace sleeps, so it must run OFF
+        // the main actor — running it inline here froze the UI (F3). It still
+        // completes BEFORE the spawn, so two model-holding servers never overlap.
+        foreignSweepInFlight = true
+        let terminate = terminateForeignServers
+        Task.detached(priority: .userInitiated) {
+            _ = terminate(nil)
+            await MainActor.run { [weak self] in
+                guard let self else { return }
+                self.foreignSweepInFlight = false
+                // stop()/termination/an existing process may have intervened
+                // during the sweep; never spawn against the current intent.
+                guard self.shouldRun,
+                      !(self.process?.isRunning ?? false),
+                      self.terminatingProcess == nil else { return }
+                self.performSpawn(executableURL: executableURL)
+            }
+        }
+    }
+
+    private func performSpawn(executableURL: URL) {
         let token = UUID().uuidString
         stderrOutputHandle?.readabilityHandler = nil
         stderrOutputHandle = nil
@@ -679,6 +865,7 @@ public final class TokenSaverDistillServiceController {
         let model = manifest.flatMap {
             TokenSaverApprovedModels.approved(id: $0.modelID, url: $0.modelURL, runtime: $0.runtime)
         } ?? TokenSaverApprovedModels.defaultModel
+        let memoryProfile = memoryProfileProvider()
         let arguments = [
             "--auth-token", token,
             "--app-support-dir", appSupportDirectory.path,
@@ -687,8 +874,8 @@ public final class TokenSaverDistillServiceController {
             "--runtime", model.runtime,
             "--model-id", model.id,
             "--model-url", model.url,
-            "--max-concurrent-requests", "8",
-            "--max-queue-depth", "64",
+            "--max-concurrent-requests", String(memoryProfile.sidecarMaxConcurrentRequests),
+            "--max-queue-depth", String(memoryProfile.sidecarMaxQueueDepth),
             "--idle-timeout-ms", String(idleTimeoutMS)
         ]
 
@@ -696,6 +883,7 @@ public final class TokenSaverDistillServiceController {
             let spawned = try processSpawner.spawn(executableURL: executableURL, arguments: arguments)
             let process = spawned.process
             self.process = process
+            self.processOwnershipTag = spawned.ownershipTag
             self.bearerToken = token
             self.status = .starting
             // Supervise: when the sidecar exits unexpectedly, downgrade status
@@ -723,6 +911,7 @@ public final class TokenSaverDistillServiceController {
             self.status = .failed("RemoteCodeDistillService launch failed")
             self.bearerToken = nil
             self.process = nil
+            self.processOwnershipTag = nil
         }
     }
 

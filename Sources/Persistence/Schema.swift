@@ -9,7 +9,7 @@ public struct SchemaStep {
 }
 
 public enum Schema {
-    public static let currentVersion: Int = 44
+    public static let currentVersion: Int = 52
 
     public static let steps: [SchemaStep] = [
         SchemaStep(1, """
@@ -631,6 +631,270 @@ public enum Schema {
         ON scheduled_task_runs(task_id, queued_at DESC);
         CREATE INDEX IF NOT EXISTS idx_scheduled_task_runs_status
         ON scheduled_task_runs(status, queued_at);
+        """),
+        SchemaStep(45, """
+        CREATE TABLE IF NOT EXISTS token_saver_attempts (
+            id TEXT PRIMARY KEY,
+            run_id TEXT NOT NULL,
+            provider TEXT NOT NULL,
+            adapter_version TEXT NOT NULL,
+            provider_version TEXT NOT NULL,
+            model TEXT NOT NULL,
+            cache_state TEXT NOT NULL,
+            language TEXT NOT NULL,
+            hardware_class TEXT NOT NULL,
+            workload TEXT NOT NULL,
+            task_class TEXT NOT NULL,
+            evidence_level TEXT NOT NULL,
+            unavailable_fields_json TEXT NOT NULL DEFAULT '[]',
+            created_at_ms INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_token_saver_attempts_run ON token_saver_attempts(run_id, created_at_ms);
+
+        CREATE TABLE IF NOT EXISTS token_saver_attempt_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            attempt_id TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            payload_json TEXT NOT NULL,
+            created_at_ms INTEGER NOT NULL,
+            FOREIGN KEY(attempt_id) REFERENCES token_saver_attempts(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_token_saver_attempt_events_attempt ON token_saver_attempt_events(attempt_id, id);
+
+        CREATE TABLE IF NOT EXISTS token_saver_input_components (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            attempt_id TEXT NOT NULL,
+            category TEXT NOT NULL,
+            tokens INTEGER NOT NULL,
+            cost_micros INTEGER NOT NULL,
+            created_at_ms INTEGER NOT NULL,
+            FOREIGN KEY(attempt_id) REFERENCES token_saver_attempts(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_token_saver_input_components_attempt ON token_saver_input_components(attempt_id, category);
+
+        CREATE TABLE IF NOT EXISTS token_saver_recovery_objects (
+            id TEXT PRIMARY KEY,
+            workspace_id TEXT NOT NULL,
+            project_id TEXT NOT NULL,
+            thread_id TEXT NOT NULL,
+            provider TEXT NOT NULL,
+            attempt_id TEXT NOT NULL,
+            integrity_sha256 TEXT NOT NULL,
+            original BLOB NOT NULL,
+            byte_count INTEGER NOT NULL,
+            state TEXT NOT NULL,
+            expires_at_ms INTEGER,
+            tombstoned_at_ms INTEGER,
+            created_at_ms INTEGER NOT NULL,
+            last_access_ms INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_token_saver_recovery_scope
+        ON token_saver_recovery_objects(workspace_id, project_id, thread_id, provider, attempt_id);
+        CREATE INDEX IF NOT EXISTS idx_token_saver_recovery_expiry
+        ON token_saver_recovery_objects(expires_at_ms, tombstoned_at_ms);
+
+        CREATE TABLE IF NOT EXISTS token_saver_recovery_capabilities (
+            capability_hash TEXT PRIMARY KEY,
+            object_id TEXT NOT NULL,
+            revoked_at_ms INTEGER,
+            created_at_ms INTEGER NOT NULL,
+            FOREIGN KEY(object_id) REFERENCES token_saver_recovery_objects(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_token_saver_recovery_capability_object
+        ON token_saver_recovery_capabilities(object_id);
+
+        CREATE TABLE IF NOT EXISTS token_saver_recovery_outbox (
+            object_id TEXT PRIMARY KEY,
+            state TEXT NOT NULL,
+            transport_outcome TEXT NOT NULL,
+            idempotency_key TEXT NOT NULL UNIQUE,
+            updated_at_ms INTEGER NOT NULL,
+            FOREIGN KEY(object_id) REFERENCES token_saver_recovery_objects(id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS token_saver_recovery_references (
+            id TEXT PRIMARY KEY,
+            object_id TEXT NOT NULL,
+            owner_kind TEXT NOT NULL,
+            owner_id TEXT NOT NULL,
+            expires_at_ms INTEGER,
+            created_at_ms INTEGER NOT NULL,
+            FOREIGN KEY(object_id) REFERENCES token_saver_recovery_objects(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_token_saver_recovery_references_owner
+        ON token_saver_recovery_references(owner_kind, owner_id);
+
+        CREATE TABLE IF NOT EXISTS token_saver_lane_state (
+            project_id TEXT NOT NULL,
+            lane TEXT NOT NULL,
+            state TEXT NOT NULL,
+            reason TEXT NOT NULL,
+            evidence_level TEXT NOT NULL,
+            owner_role TEXT NOT NULL,
+            permission_boundary TEXT NOT NULL,
+            retention_days INTEGER NOT NULL,
+            opted_out INTEGER NOT NULL,
+            kill_switch_active INTEGER NOT NULL,
+            updated_at_ms INTEGER NOT NULL,
+            PRIMARY KEY(project_id, lane)
+        );
+
+        CREATE TABLE IF NOT EXISTS token_saver_owner_signoffs (
+            role TEXT PRIMARY KEY,
+            owner_name TEXT NOT NULL,
+            signed_at_ms INTEGER NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS token_saver_session_learn_records (
+            id TEXT PRIMARY KEY,
+            workspace_id TEXT NOT NULL,
+            project_id TEXT NOT NULL,
+            thread_id TEXT NOT NULL,
+            provider TEXT NOT NULL,
+            attempt_id TEXT NOT NULL,
+            text TEXT NOT NULL,
+            created_at_ms INTEGER NOT NULL,
+            expires_at_ms INTEGER,
+            tombstoned_at_ms INTEGER
+        );
+        CREATE INDEX IF NOT EXISTS idx_token_saver_session_learn_scope
+        ON token_saver_session_learn_records(workspace_id, project_id, thread_id, provider, attempt_id);
+
+        CREATE TABLE IF NOT EXISTS token_saver_rollover_capsules (
+            id TEXT PRIMARY KEY,
+            parent_thread_id TEXT NOT NULL,
+            child_thread_id TEXT NOT NULL,
+            scope_transition_json TEXT,
+            capsule_sha256 TEXT NOT NULL,
+            capsule_text TEXT NOT NULL,
+            created_at_ms INTEGER NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS token_saver_audit_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_kind TEXT NOT NULL,
+            project_id TEXT,
+            thread_id TEXT,
+            attempt_id TEXT,
+            object_id TEXT,
+            count_value INTEGER,
+            reason TEXT,
+            created_at_ms INTEGER NOT NULL
+        );
+        """),
+        SchemaStep(46, """
+        ALTER TABLE token_saver_recovery_objects
+        ADD COLUMN operation_id TEXT;
+        ALTER TABLE token_saver_recovery_objects
+        ADD COLUMN lane TEXT NOT NULL DEFAULT 'semantic_prose';
+        ALTER TABLE token_saver_session_learn_records
+        ADD COLUMN lane TEXT NOT NULL DEFAULT 'session_learn';
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_token_saver_recovery_operation
+        ON token_saver_recovery_objects(
+            workspace_id, project_id, thread_id, provider, attempt_id, operation_id
+        ) WHERE operation_id IS NOT NULL;
+        """),
+        SchemaStep(47, """
+        ALTER TABLE token_saver_recovery_objects
+        ADD COLUMN invocation_id TEXT;
+        DROP INDEX IF EXISTS idx_token_saver_recovery_operation;
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_token_saver_recovery_invocation
+        ON token_saver_recovery_objects(
+            workspace_id, project_id, thread_id, provider, attempt_id, invocation_id
+        ) WHERE invocation_id IS NOT NULL;
+
+        ALTER TABLE token_saver_lane_state
+        ADD COLUMN attribution_joined INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE token_saver_lane_state
+        ADD COLUMN reconciliation_passed INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE token_saver_lane_state
+        ADD COLUMN usage_semantics_available INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE token_saver_lane_state
+        ADD COLUMN scorecard_id TEXT NOT NULL DEFAULT '';
+        """),
+        SchemaStep(48, """
+        CREATE TABLE IF NOT EXISTS agent_thread_routing (
+            thread_id TEXT PRIMARY KEY,
+            mode TEXT NOT NULL CHECK(mode IN ('manual', 'auto')),
+            configuration_json TEXT NOT NULL,
+            revision INTEGER NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY(thread_id) REFERENCES agent_threads(id) ON DELETE CASCADE
+        );
+        CREATE TABLE IF NOT EXISTS agent_queued_message_routing (
+            queued_message_id TEXT PRIMARY KEY,
+            configuration_json TEXT NOT NULL,
+            revision INTEGER NOT NULL,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(queued_message_id) REFERENCES agent_queued_messages(id) ON DELETE CASCADE
+        );
+        """),
+        SchemaStep(49, """
+        ALTER TABLE agent_queued_message_routing ADD COLUMN deadline_at TEXT;
+        ALTER TABLE agent_queued_message_routing ADD COLUMN budget_tokens INTEGER;
+        ALTER TABLE agent_queued_message_routing ADD COLUMN budget_cost_micros INTEGER;
+        ALTER TABLE agent_queued_message_routing ADD COLUMN reservation_id TEXT;
+        ALTER TABLE agent_queued_message_routing ADD COLUMN reserved_tokens INTEGER;
+        ALTER TABLE agent_queued_message_routing ADD COLUMN reserved_cost_micros INTEGER;
+        ALTER TABLE agent_queued_message_routing ADD COLUMN admission_receipt_id TEXT;
+        """),
+        SchemaStep(50, """
+        CREATE TABLE IF NOT EXISTS storage_usage_counters (
+            storage_class TEXT PRIMARY KEY,
+            payload_bytes INTEGER NOT NULL DEFAULT 0
+        );
+        INSERT OR REPLACE INTO storage_usage_counters(storage_class, payload_bytes)
+        SELECT 'stream_events', COALESCE(SUM(
+            LENGTH(CAST(event_kind AS BLOB)) + LENGTH(CAST(payload_json AS BLOB))
+        ), 0) FROM agent_stream_events;
+        INSERT OR REPLACE INTO storage_usage_counters(storage_class, payload_bytes)
+        SELECT 'provider_logs', COALESCE(SUM(
+            LENGTH(CAST(source AS BLOB)) + LENGTH(CAST(method AS BLOB)) + LENGTH(CAST(payload_json AS BLOB))
+        ), 0) FROM agent_provider_event_logs;
+
+        CREATE TRIGGER IF NOT EXISTS trg_stream_usage_insert
+        AFTER INSERT ON agent_stream_events BEGIN
+            UPDATE storage_usage_counters
+            SET payload_bytes = payload_bytes + LENGTH(CAST(NEW.event_kind AS BLOB)) + LENGTH(CAST(NEW.payload_json AS BLOB))
+            WHERE storage_class = 'stream_events';
+        END;
+        CREATE TRIGGER IF NOT EXISTS trg_stream_usage_delete
+        AFTER DELETE ON agent_stream_events BEGIN
+            UPDATE storage_usage_counters
+            SET payload_bytes = MAX(0, payload_bytes - LENGTH(CAST(OLD.event_kind AS BLOB)) - LENGTH(CAST(OLD.payload_json AS BLOB)))
+            WHERE storage_class = 'stream_events';
+        END;
+        CREATE TRIGGER IF NOT EXISTS trg_provider_usage_insert
+        AFTER INSERT ON agent_provider_event_logs BEGIN
+            UPDATE storage_usage_counters
+            SET payload_bytes = payload_bytes + LENGTH(CAST(NEW.source AS BLOB)) + LENGTH(CAST(NEW.method AS BLOB)) + LENGTH(CAST(NEW.payload_json AS BLOB))
+            WHERE storage_class = 'provider_logs';
+        END;
+        CREATE TRIGGER IF NOT EXISTS trg_provider_usage_delete
+        AFTER DELETE ON agent_provider_event_logs BEGIN
+            UPDATE storage_usage_counters
+            SET payload_bytes = MAX(0, payload_bytes - LENGTH(CAST(OLD.source AS BLOB)) - LENGTH(CAST(OLD.method AS BLOB)) - LENGTH(CAST(OLD.payload_json AS BLOB)))
+            WHERE storage_class = 'provider_logs';
+        END;
+        """),
+        SchemaStep(51, """
+        ALTER TABLE scheduled_tasks
+        ADD COLUMN routing_mode TEXT NOT NULL DEFAULT 'manual'
+            CHECK(routing_mode IN ('manual', 'auto'));
+        """),
+        // Repair factory deterministic_wrapper rows seeded with retention_days=0
+        // (and kill_switch=1) before Token Saver store-before-loss could durable-
+        // readback. INSERT OR IGNORE never upgrades those rows; without this
+        // migration every ensureDefaults install stays permanently verbatim.
+        SchemaStep(52, """
+        UPDATE token_saver_lane_state
+        SET retention_days = 7,
+            kill_switch_active = 0
+        WHERE lane = 'deterministic_wrapper'
+          AND reason = 'owner_and_scorecard_required'
+          AND opted_out = 0
+          AND retention_days = 0
+          AND kill_switch_active = 1;
         """)
     ]
 

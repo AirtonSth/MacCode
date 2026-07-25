@@ -72,7 +72,7 @@ public struct TokenSaverMemoryStore: Sendable, Equatable {
     }
 
     private func sameProject(_ lhs: TokenSaverMemoryScope, _ rhs: TokenSaverMemoryScope) -> Bool {
-        lhs.projectPath == rhs.projectPath
+        lhs == rhs
     }
 }
 

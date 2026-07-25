@@ -200,8 +200,132 @@ final class ScheduledTaskScheduleTests: XCTestCase {
         let recurrence = ScheduledTaskRecurrence.makeHourly(anchor: anchor, intervalHours: 1)!
         XCTAssertEqual(
             next(after: before, recurrence, timeZone: TimeZone(secondsFromGMT: 0)!),
-            anchor
+            ScheduledTaskOccurrenceCalculator.canonicalInstant(anchor)
         )
+    }
+
+    func test_hourly_makeHourlyFloorsSubsecondAnchor_becausePersistenceIsWholeSecond() {
+        // WHY: subsecond anchors re-select the spent slot after ISO8601 truncation.
+        let raw = Date(timeIntervalSince1970: 1_700_000_000.824)
+        let recurrence = ScheduledTaskRecurrence.makeHourly(anchor: raw, intervalHours: 2)!
+        if case .hourly(let anchor, let hours) = recurrence {
+            XCTAssertEqual(anchor, Date(timeIntervalSince1970: 1_700_000_000))
+            XCTAssertEqual(hours, 2)
+        } else {
+            XCTFail("expected hourly recurrence")
+        }
+    }
+
+    func test_nextAfterSpentAdvancesAllRecurrenceKinds_becauseClaimedSlotsMustNeverRepeat() {
+        // WHY: both claim success and duplicate-occurrence paths must advance past
+        // the spent fire for every supported schedule kind (not only hourly).
+        let tz = TimeZone(secondsFromGMT: 0)!
+        let cal = Calendar(identifier: .gregorian)
+
+        // once → nil (disable)
+        let onceAt = Date(timeIntervalSince1970: 1_700_000_000)
+        XCTAssertNil(
+            ScheduledTaskOccurrenceCalculator.nextOccurrenceAfterSpent(
+                scheduledAt: onceAt,
+                recurrence: .once(at: onceAt),
+                timeZone: tz,
+                calendar: cal
+            )
+        )
+
+        // hourly interval 2, including legacy subsecond anchor + whole-second spent
+        let fractionalAnchor = Date(timeIntervalSince1970: 1_700_000_000.824)
+        let spentTruncated = Date(timeIntervalSince1970: 1_700_000_000)
+        let hourly = ScheduledTaskRecurrence.makeHourly(anchor: fractionalAnchor, intervalHours: 2)!
+        let nextHourly = ScheduledTaskOccurrenceCalculator.nextOccurrenceAfterSpent(
+            scheduledAt: spentTruncated,
+            recurrence: hourly,
+            timeZone: tz,
+            calendar: cal
+        )
+        XCTAssertEqual(nextHourly, Date(timeIntervalSince1970: 1_700_000_000 + 2 * 3600))
+        // Same task id: keys must differ for spent vs next
+        let taskID = UUID()
+        XCTAssertNotEqual(
+            ScheduledTaskOccurrenceCalculator.occurrenceKey(taskID: taskID, scheduledAt: spentTruncated),
+            ScheduledTaskOccurrenceCalculator.occurrenceKey(taskID: taskID, scheduledAt: nextHourly!)
+        )
+
+        // daily / weekdays / weekly / monthly: next > spent and different occurrence keys
+        let dailySpent = localDate(2025, 6, 10, 9, 0, timeZone: ny)
+        let dailyNext = ScheduledTaskOccurrenceCalculator.nextOccurrenceAfterSpent(
+            scheduledAt: dailySpent,
+            recurrence: .daily(at: ScheduledLocalTime(hour: 9, minute: 0)!),
+            timeZone: ny,
+            calendar: cal
+        )
+        XCTAssertEqual(dailyNext, localDate(2025, 6, 11, 9, 0, timeZone: ny))
+        XCTAssertGreaterThan(dailyNext!, dailySpent)
+
+        let weekdaySpent = localDate(2025, 6, 13, 9, 0, timeZone: ny) // Friday
+        let weekdayNext = ScheduledTaskOccurrenceCalculator.nextOccurrenceAfterSpent(
+            scheduledAt: weekdaySpent,
+            recurrence: .weekdays(at: ScheduledLocalTime(hour: 9, minute: 0)!),
+            timeZone: ny,
+            calendar: cal
+        )
+        XCTAssertEqual(weekdayNext, localDate(2025, 6, 16, 9, 0, timeZone: ny)) // Monday
+
+        let weeklySpent = localDate(2025, 6, 10, 9, 0, timeZone: ny) // Tuesday
+        let weeklyNext = ScheduledTaskOccurrenceCalculator.nextOccurrenceAfterSpent(
+            scheduledAt: weeklySpent,
+            recurrence: .weekly(on: [.tuesday], at: ScheduledLocalTime(hour: 9, minute: 0)!),
+            timeZone: ny,
+            calendar: cal
+        )
+        XCTAssertEqual(weeklyNext, localDate(2025, 6, 17, 9, 0, timeZone: ny))
+
+        let monthlySpent = localDate(2025, 6, 10, 9, 0, timeZone: ny)
+        let monthlyNext = ScheduledTaskOccurrenceCalculator.nextOccurrenceAfterSpent(
+            scheduledAt: monthlySpent,
+            recurrence: .monthly(day: 10, at: ScheduledLocalTime(hour: 9, minute: 0)!),
+            timeZone: ny,
+            calendar: cal
+        )
+        XCTAssertEqual(monthlyNext, localDate(2025, 7, 10, 9, 0, timeZone: ny))
+    }
+
+    func test_nextAfterSpentDoesNotReSelectTruncatedHourlySlot_becauseThatStalledSchedules() {
+        // WHY: proven production bug — fractional anchor + whole-second spent next_run_at
+        // re-selected the same slot (occurrence_key loop). Floor + afterSpent both defend.
+        let tz = TimeZone(secondsFromGMT: 0)!
+        let fractionalAnchor = Date(timeIntervalSince1970: 1_700_000_000.824)
+        let recurrence = ScheduledTaskRecurrence.hourly(anchor: fractionalAnchor, intervalHours: 2)
+        let spent = Date(timeIntervalSince1970: 1_700_000_000)
+
+        // Canonical floor alone: nextOccurrence floors the anchor, so spent == floor(anchor)
+        // advances one interval under strict-after.
+        let afterFloor = ScheduledTaskOccurrenceCalculator.nextOccurrence(
+            after: spent,
+            recurrence: recurrence,
+            timeZone: tz,
+            calendar: Calendar(identifier: .gregorian)
+        )
+        XCTAssertEqual(afterFloor, Date(timeIntervalSince1970: 1_700_000_000 + 2 * 3600))
+
+        // Defense in depth: afterSpent (+1s) still used by claim/execute paths.
+        let afterSpent = ScheduledTaskOccurrenceCalculator.nextOccurrenceAfterSpent(
+            scheduledAt: spent,
+            recurrence: recurrence,
+            timeZone: tz
+        )
+        XCTAssertEqual(afterSpent, Date(timeIntervalSince1970: 1_700_000_000 + 2 * 3600))
+        XCTAssertGreaterThan(afterSpent!, spent)
+
+        // Subsecond spent that truncates BELOW a non-floored mental model of the slot
+        // must not re-fire when using afterSpent.
+        let spentWithFraction = Date(timeIntervalSince1970: 1_700_000_000.1)
+        let next = ScheduledTaskOccurrenceCalculator.nextOccurrenceAfterSpent(
+            scheduledAt: spentWithFraction,
+            recurrence: recurrence,
+            timeZone: tz
+        )
+        XCTAssertEqual(next, Date(timeIntervalSince1970: 1_700_000_000 + 2 * 3600))
     }
 
     // MARK: - Daily / weekdays / weekly / monthly (civil calendar)
@@ -325,15 +449,20 @@ final class ScheduledTaskScheduleTests: XCTestCase {
 
     func test_occurrenceKey_isStableForSameTaskAndInstant() {
         // WHY: dedupe/idempotency keys must be deterministic across processes.
+        // Schedule-domain keys use whole-second canonical instants so ISO8601
+        // persistence without fractional seconds cannot split one logical fire.
         let taskID = UUID(uuidString: "A0A0A0A0-A0A0-40A0-A0A0-A0A0A0A0A0A0")!
         let date = Date(timeIntervalSince1970: 1_700_000_000.5)
+        let whole = Date(timeIntervalSince1970: 1_700_000_000)
         let a = ScheduledTaskOccurrenceCalculator.occurrenceKey(taskID: taskID, scheduledAt: date)
         let b = ScheduledTaskOccurrenceCalculator.occurrenceKey(taskID: taskID, scheduledAt: date)
+        let c = ScheduledTaskOccurrenceCalculator.occurrenceKey(taskID: taskID, scheduledAt: whole)
         XCTAssertEqual(a, b, "same task + same instant must yield identical occurrence keys")
+        XCTAssertEqual(a, c, "subsecond noise must collapse to the same whole-second key")
         XCTAssertTrue(a.contains(taskID.uuidString.lowercased()),
                       "key must embed the task UUID for correlation")
-        XCTAssertTrue(a.hasSuffix(":1700000000500") || a.contains("1700000000500"),
-                      "key must embed truncated UTC milliseconds of the scheduled instant")
+        XCTAssertTrue(a.hasSuffix(":1700000000000") || a.contains("1700000000000"),
+                      "key must embed whole-second UTC milliseconds of the scheduled instant")
     }
 
     func test_occurrenceKey_differsAcrossTaskOrInstant() {

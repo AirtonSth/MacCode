@@ -303,8 +303,9 @@ public enum HostFileAccessProber {
 
 /// One-time host file-access onboarding *handled* state.
 ///
-/// "Handled" means the user saw the explanation and chose Continue / System
-/// Settings / Not Now — **not** that macOS granted every folder permission.
+/// "Handled" means the user saw the explanation and chose Open Full Disk
+/// Access / Not Now — **not** that macOS granted Full Disk Access or every
+/// folder permission. Opening System Settings never proves a grant.
 public enum HostFileAccessOnboarding {
     public static let settingsKey = "host_file_access_onboarding_handled"
 
@@ -342,21 +343,19 @@ public enum HostFileAccessOnboarding {
         shouldPresent(handled: completed)
     }
 
-    /// Resolves the durable write for any of the three alert buttons.
-    /// All three must mark handled to avoid a launch nag loop.
+    /// Resolves the durable write for either onboarding button.
+    /// Both must mark handled to avoid a launch nag loop. Does **not** probe
+    /// protected folders — launch must never force multi-folder TCC dialogs.
     public static func handleAlertResponse(
         _ response: NSApplication.ModalResponse,
         markHandled: () throws -> Void,
-        openSystemSettings: () -> Void,
-        checkFolderAccess: () -> Void
+        openFullDiskAccess: () -> Void
     ) rethrows {
         // Persist first so a crash mid-side-effect does not re-nag forever.
         try markHandled()
         switch response {
         case .alertFirstButtonReturn:
-            checkFolderAccess()
-        case .alertSecondButtonReturn:
-            openSystemSettings()
+            openFullDiskAccess()
         default:
             break // Not Now — handled only.
         }
@@ -366,25 +365,28 @@ public enum HostFileAccessOnboarding {
 // MARK: - User-facing copy
 
 public enum HostFileAccessCopy {
-    public static let onboardingTitle = "Folder access on macOS"
+    public static let onboardingTitle = "Fewer folder permission prompts"
     public static let onboardingMessage = """
-    RemoteCode opens project folders for agents, terminals, and file tools.
+    RemoteCode needs project folders for agents, terminals, and file tools.
 
-    macOS asks separately for Desktop, Documents, Downloads, network volumes, and removable volumes. \
-    There is no single API that grants every folder permission at once.
+    macOS normally asks separately for Desktop, Documents, Downloads, and other protected locations. \
+    Enabling Full Disk Access once in System Settings avoids most of those repeated prompts.
 
-    When macOS asks, choose Allow. Grants stick for this signed build. \
-    Ad-hoc (unsigned daily) rebuilds can look like a new app and ask again.
+    This is not a root grant: camera, microphone, and screen recording stay separate and are only \
+    requested if you use those features.
 
-    Continue checks common folders now. Open System Settings to review Files & Folders. Not Now dismisses this tip.
+    Open Full Disk Access to review the toggle. Not Now dismisses this tip — we will not ask again at launch.
     """
-    public static let settingsSectionTitle = "Files & Folders"
+    public static let settingsSectionTitle = "Disk access"
     public static let settingsExplanation = """
-    When macOS asks to access Desktop, Documents, Downloads, or a network volume, choose Allow so RemoteCode can keep working. \
-    “Check folder access” touches those locations once so any pending system dialog can appear. \
+    For the fewest prompts, enable Full Disk Access for RemoteCode in System Settings. \
+    That covers most project folders without asking Desktop, Documents, and Downloads one by one.
+
+    “Check folder access” is optional: it touches common folders once and may show system dialogs for any still-pending grants. \
     If you previously chose Don’t Allow, macOS will not re-prompt — open System Settings to change the grant.
     """
     public static let requestAccessButton = "Check folder access"
     public static let openFilesAndFoldersButton = "Open Files & Folders settings"
-    public static let openFullDiskAccessButton = "Open Full Disk Access settings"
+    public static let openFullDiskAccessButton = "Open Full Disk Access"
+    public static let notNowButton = "Not Now"
 }

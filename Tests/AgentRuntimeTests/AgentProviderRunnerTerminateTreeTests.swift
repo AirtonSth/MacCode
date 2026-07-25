@@ -11,6 +11,15 @@ import Darwin
 ///   3. not gate the death of a cooperative (TERM-honoring) process on the grace window.
 final class AgentProviderRunnerTerminateTreeTests: XCTestCase {
 
+    /// Returns `children` for one specific parent pid and nothing for any other,
+    /// so a real (dynamically-assigned) root pid can be given synthetic
+    /// descendants without touching the OS process table.
+    private struct SingleParentFakeChildProvider: ProcessTerminator.ChildPIDProviding {
+        let parent: Int32
+        let children: [Int32]
+        func directChildren(of pid: Int32) -> [Int32] { pid == parent ? children : [] }
+    }
+
     private func spawnShell(_ script: String) throws -> Process {
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: "/bin/sh")
@@ -65,6 +74,38 @@ final class AgentProviderRunnerTerminateTreeTests: XCTestCase {
         XCTAssertFalse(proc.isRunning,
                        "SIGTERM must be delivered synchronously — a cooperative process has to exit " +
                        "well before the 5s grace window, otherwise graceful shutdown was deferred too")
+    }
+
+    func test_terminateTreeImmediately_routesForeignUserDescendantsThroughSudoBeforeKillingRoot() throws {
+        // WHY: a run-as-user provider's subtree carries the TARGET uid — direct
+        // SIGKILL EPERMs and sudo won't relay it, so the whole subtree is reaped
+        // via sudo-as-target-uid BEFORE the direct SIGKILL below. `root` is
+        // included: when `sudo` execs in place (use_pty off — default on bundled
+        // sudo < 1.9.14) root IS the target-uid provider, and excluding it
+        // orphaned the provider to launchd; when root is the invoker-uid `sudo`
+        // monitor the sudo-kill of root is a harmless EPERM no-op. Real signals
+        // to the fake descendant pids are harmless: they don't exist (ESRCH).
+        let proc = try spawnShell("sleep 5")
+        defer { kill(proc.processIdentifier, SIGKILL) }
+        let root = proc.processIdentifier
+        let fakeDescendants: [Int32] = [99990, 99991]
+        ProcessTerminator.childPIDProvider = SingleParentFakeChildProvider(parent: root, children: fakeDescendants)
+        var captured: [(uid_t, Int32, [pid_t])] = []
+        ProcessTerminator.killAsUserProvider = { uid, signal, pids in captured.append((uid, signal, pids)) }
+        defer {
+            ProcessTerminator.childPIDProvider = ProcessTerminator.LibprocChildPIDProvider()
+            ProcessTerminator.killAsUserProvider = ProcessTerminator.defaultKillAsUserProvider
+        }
+
+        ProcessTerminator.terminateTreeImmediately(proc, foreignUserUID: 502)
+
+        XCTAssertEqual(captured.count, 1, "foreign-user teardown must route exactly one sudo kill")
+        XCTAssertEqual(captured.first?.0, 502, "must reap AS the target uid")
+        XCTAssertEqual(captured.first?.1, SIGKILL)
+        XCTAssertEqual(captured.first?.2.sorted(), (fakeDescendants + [root]).sorted(),
+                       "the entire target-uid subtree — including root, which may be the exec-in-place provider — is sudo-routed")
+        XCTAssertTrue(captured.first?.2.contains(root) ?? false,
+                       "root must be sudo-routed too: excluding it orphaned an exec-in-place provider to launchd")
     }
 
     func test_terminateTreeImmediatelyKillsTermIgnoringProviderBeforeAppCanExit() throws {

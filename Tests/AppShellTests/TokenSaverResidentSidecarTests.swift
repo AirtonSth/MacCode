@@ -59,7 +59,7 @@ final class TokenSaverResidentSidecarTests: XCTestCase {
         )
     }
 
-    func test_start_forwardsConfiguredIdleTimeoutToSidecar_soServerReclaimsModelRAM() {
+    func test_start_forwardsConfiguredIdleTimeoutToSidecar_soServerReclaimsModelRAM() async {
         let spawner = CapturingSpawner()
         let controller = TokenSaverDistillServiceController(
             appSupportDirectory: URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true),
@@ -75,11 +75,42 @@ final class TokenSaverResidentSidecarTests: XCTestCase {
         )
         defer { controller.stop() }
 
+        // start() now sweeps foreign servers off the main actor before spawning,
+        // so await the deferred spawn before inspecting the captured argv.
+        _ = await waitUntil(timeout: 2) { !spawner.capturedArguments.isEmpty }
         let args = spawner.capturedArguments
         let idx = args.firstIndex(of: "--idle-timeout-ms")
         let value = idx.flatMap { args.indices.contains(args.index(after: $0)) ? args[args.index(after: $0)] : nil }
         XCTAssertEqual(value, "123000",
             "the controller must forward its configured idle-timeout to the sidecar: the SERVER reclaims model RAM on queue-drain while the controller keeps the process resident so terminal | distill always reaches a live server")
+    }
+
+    func test_lowMemoryProfileBoundsSidecarConcurrencyAndQueue() async {
+        let spawner = CapturingSpawner()
+        let controller = TokenSaverDistillServiceController(
+            appSupportDirectory: URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true),
+            executableURLResolver: { URL(fileURLWithPath: "/bin/sh") },
+            processSpawner: spawner,
+            memoryProfileProvider: {
+                ManagedProcessMemoryProfile.resolve(
+                    physicalMemoryBytes: UInt64(8) * 1_024 * 1_024 * 1_024
+                )
+            }
+        )
+
+        controller.startIfEligible(
+            session: paidSession(),
+            settings: AppSettings(tokenSaverEnabled: true),
+            modelValidation: .installed
+        )
+        defer { controller.stop() }
+
+        _ = await waitUntil(timeout: 2) { !spawner.capturedArguments.isEmpty }
+        let args = spawner.capturedArguments
+        let requestIndex = args.firstIndex(of: "--max-concurrent-requests")
+        let queueIndex = args.firstIndex(of: "--max-queue-depth")
+        XCTAssertEqual(requestIndex.map { args[$0 + 1] }, "1")
+        XCTAssertEqual(queueIndex.map { args[$0 + 1] }, "4")
     }
 
     func test_savingsRecordedEvent_refreshesTokenSaverUI() {
@@ -112,5 +143,16 @@ final class TokenSaverResidentSidecarTests: XCTestCase {
         controller.handleRunningOutputLine(Data(#"{"event":"heartbeat"}"#.utf8))
         controller.handleRunningOutputLine(Data("not json".utf8))
         XCTAssertFalse(fired, "non-savings sidecar output must not trigger a Token Saver UI refresh")
+    }
+
+    private func waitUntil(
+        timeout: TimeInterval,
+        condition: @escaping () -> Bool
+    ) async -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while !condition(), Date() < deadline {
+            try? await Task.sleep(nanoseconds: 20_000_000)
+        }
+        return condition()
     }
 }

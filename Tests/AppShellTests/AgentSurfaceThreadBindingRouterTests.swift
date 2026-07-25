@@ -260,7 +260,16 @@ final class AgentSurfaceThreadBindingRouterTests: XCTestCase {
         )
         target.hasUnread = true
         try ctx.threadRepo.upsert(target)
-        XCTAssertTrue(agentSurfaces(in: workspace.id).isEmpty)
+        // New workspaces open with a default Agent App tab already registered.
+        // Tear it down so this case still proves create-on-open when none remain.
+        for surface in agentSurfaces(in: workspace.id) {
+            try router.closeSurface(workspace: workspace.id, surface: surface.descriptor.id)
+            surface.close()
+            SurfaceRegistry.shared.unregister(surface.descriptor.id)
+        }
+        controller.flushPendingRefresh()
+        XCTAssertTrue(agentSurfaces(in: workspace.id).isEmpty,
+                      "precondition: no Agent App surfaces before the open route")
         var readEvents: [EventBus.Event] = []
         let token = EventBus.shared.subscribe(since: EventBus.shared.currentSeq) { event in
             guard event.kind == "agent.thread.read",
@@ -281,6 +290,46 @@ final class AgentSurfaceThreadBindingRouterTests: XCTestCase {
             "a successful route requested with markRead must clear unread state")
         XCTAssertEqual(readEvents.count, 1,
             "verified routing must broadcast exactly one canonical read event")
+    }
+
+    func test_openAgentThread_fromScheduledTasksShell_mountsAgentAppInWorkspace() throws {
+        // WHY: Schedule Tasks replaces workspaceContent. Opening a run-history
+        // thread must leave that shell destination, mount Agent App in the
+        // workspace, and succeed with markRead — not throw surfaceNotFound
+        // because surface.view.window was nil while Schedule Tasks stayed up.
+        let dir = NSTemporaryDirectory() + "RC2Bind-OpenFromSchedule-" + UUID().uuidString
+        let (ctx, router) = try makeRouter(dir)
+        let controller = MainWindowController(context: ctx, router: router)
+        router.windowController = controller
+        router.destinationWindowIsKeyForTests = { $0 === controller.window }
+        defer { controller.window.orderOut(nil) }
+
+        let workspace = try router.createWorkspace(name: "SCHEDULE-OPEN", cwd: NSTemporaryDirectory())
+        defer { closeAndUnregisterAgentSurfaces(workspace: workspace.id) }
+        var target = try router.createAgentThread(
+            workspace: workspace.id,
+            title: "scheduled-run",
+            provider: .codex,
+            model: "fake-model",
+            permissionMode: .supervised,
+            reasoningEffort: .medium
+        )
+        target.hasUnread = true
+        try ctx.threadRepo.upsert(target)
+
+        // Same workspace already selected + Schedule Tasks shell mounted is the
+        // failing production path (selectWorkspace no-ops, panes stay unmounted).
+        controller.presentScheduledTasksInMainContent()
+        XCTAssertEqual(ctx.state.window.selectedWorkspaceID, workspace.id)
+
+        let routed = try router.openAgentThread(thread: target.id, markRead: true)
+        let surface = try XCTUnwrap(SurfaceRegistry.shared.surface(routed.id) as? AgentAppSurface)
+
+        XCTAssertEqual(surface.viewModel.selectedThreadId, target.id)
+        XCTAssertTrue(surface.view.window === controller.window,
+                      "Agent App must be mounted in the main window after leaving Schedule Tasks")
+        XCTAssertFalse(try XCTUnwrap(ctx.threadRepo.get(id: target.id)).hasUnread,
+                       "markRead only after the surface is visibly attached")
     }
 
     func test_openAgentThread_missingDestinationWindowPreservesUnread() throws {
@@ -499,5 +548,87 @@ final class AgentSurfaceThreadBindingRouterTests: XCTestCase {
         }
         XCTAssertTrue(updates.isEmpty,
                       "a failed write must not advertise notes that the host cannot read back after restart")
+    }
+
+    // MARK: Bug C — RPC/iOS reply must not yank sibling Agent App tabs
+
+    /// Regression for: replying in one Agent App thread (via agent.message.send /
+    /// iOS / CLI) force-selected that thread on every open Agent App tab, so a
+    /// response in thread A appeared to affect thread B's tab as well.
+    func test_sendAgentMessage_doesNotYankSiblingAgentTabSelection() async throws {
+        let dir = NSTemporaryDirectory() + "RC2Bind-SendYank-" + UUID().uuidString
+        let (ctx, router) = try makeRouter(dir)
+
+        ctx.coordinator.replaceProvider(
+            .codex,
+            runner: FakeProviderRunner(provider: .codex, scenario: .simpleAssistant(reply: "ok"))
+        )
+
+        let ws = try router.createWorkspace(name: "SEND-YANK", cwd: NSTemporaryDirectory())
+        defer { closeAndUnregisterAgentSurfaces(workspace: ws.id) }
+
+        let threadA = try router.createAgentThread(
+            workspace: ws.id,
+            title: "Thread A",
+            provider: .codex,
+            model: "fake-model",
+            permissionMode: .supervised,
+            reasoningEffort: .medium
+        )
+        let threadB = try router.createAgentThread(
+            workspace: ws.id,
+            title: "Thread B",
+            provider: .codex,
+            model: "fake-model",
+            permissionMode: .supervised,
+            reasoningEffort: .medium
+        )
+
+        // S1 and S3 view A; S2 views B. A remote reply to A must refresh S1/S3
+        // but leave S2 on B.
+        let d1 = try router.createSurface(workspace: ws.id, type: .agentApp, paneID: nil, title: "S1")
+        let d2 = try router.createSurface(workspace: ws.id, type: .agentApp, paneID: nil, title: "S2")
+        let d3 = try router.createSurface(workspace: ws.id, type: .agentApp, paneID: nil, title: "S3")
+        let s1 = try XCTUnwrap(SurfaceRegistry.shared.surface(d1.id) as? AgentAppSurface)
+        let s2 = try XCTUnwrap(SurfaceRegistry.shared.surface(d2.id) as? AgentAppSurface)
+        let s3 = try XCTUnwrap(SurfaceRegistry.shared.surface(d3.id) as? AgentAppSurface)
+        s1.viewModel.selectThread(threadA.id)
+        s2.viewModel.selectThread(threadB.id)
+        s3.viewModel.selectThread(threadA.id)
+
+        XCTAssertEqual(s1.viewModel.selectedThreadId, threadA.id)
+        XCTAssertEqual(s2.viewModel.selectedThreadId, threadB.id)
+        XCTAssertEqual(s3.viewModel.selectedThreadId, threadA.id)
+
+        let result = try await router.sendAgentMessage(
+            thread: threadA.id,
+            text: "reply only on A",
+            provider: nil,
+            model: nil,
+            permissionMode: nil,
+            reasoningEffort: nil
+        )
+        XCTAssertEqual(result.status, .started,
+                       "the remote send must start a provider run on thread A")
+
+        XCTAssertEqual(s1.viewModel.selectedThreadId, threadA.id,
+                       "S1 was already on A and must stay on A")
+        XCTAssertEqual(s2.viewModel.selectedThreadId, threadB.id,
+                       "S2 is bound to B — an RPC reply on A must not yank it onto A (Bug C / residual Bug B)")
+        XCTAssertEqual(s3.viewModel.selectedThreadId, threadA.id,
+                       "S3 was already on A and must stay on A")
+
+        // Durable messages for B must not include A's remote prompt; the send
+        // path must target only the requested thread id.
+        let messagesOnB = try router.listAgentMessages(thread: threadB.id, limit: 50)
+        XCTAssertFalse(
+            messagesOnB.contains(where: { $0.content.contains("reply only on A") }),
+            "thread B's durable transcript must not receive the user message sent to thread A"
+        )
+        let messagesOnA = try router.listAgentMessages(thread: threadA.id, limit: 50)
+        XCTAssertTrue(
+            messagesOnA.contains(where: { $0.content.contains("reply only on A") }),
+            "thread A must own the remote user message"
+        )
     }
 }

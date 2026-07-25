@@ -18,17 +18,60 @@ final class ScheduledTaskStoreTests: XCTestCase {
     }
 
     func test_schemaVersionIncludesScheduledTables_becauseUpgradesMustBeAtomic() throws {
-        XCTAssertEqual(Schema.currentVersion, 44)
+        XCTAssertEqual(Schema.currentVersion, 52)
         let statement = try db.prepare("SELECT MAX(version) FROM schema_meta;")
         XCTAssertTrue(try statement.step())
-        XCTAssertEqual(statement.columnInt64(0), 44)
+        XCTAssertEqual(statement.columnInt64(0), 52)
+    }
+
+    func test_storeErrorLocalizedDescriptionPreservesMessage_becauseXPCReplyMustNotShowError0() {
+        // WHY: LaunchAgent replies with error.localizedDescription; without
+        // LocalizedError the UI only saw "Persistence.ScheduledTaskStoreError error 0".
+        let missing = UUID(uuidString: "00000000-0000-4000-8000-000000000001")!
+        let cases: [ScheduledTaskStoreError] = [
+            .invalidRow("Two scheduled task runs are already active."),
+            .missingTask(missing),
+        ]
+        for error in cases {
+            XCTAssertEqual(error.localizedDescription, error.description)
+            XCTAssertFalse(error.localizedDescription.contains("StoreError error"))
+        }
+        let asError: Error = ScheduledTaskStoreError.invalidRow("This scheduled task already has an active run.")
+        XCTAssertEqual(
+            asError.localizedDescription,
+            "Invalid scheduled task row: This scheduled task already has an active run."
+        )
+    }
+
+    func test_routingMigrationKeepsExistingTasksManual_becauseUpgradesMustNotChangeExecution() throws {
+        let legacyDB = try SQLiteDB(path: ":memory:")
+        try Schema.migrateSteps(legacyDB, Schema.steps.filter { $0.version <= 50 })
+        try legacyDB.execute("""
+            INSERT INTO scheduled_tasks(
+                id, title, prompt, workspace_id, workspace_path_snapshot, run_as_user, run_as_uid,
+                provider, provider_instance_id, model, reasoning_effort, recurrence_json, timezone_id,
+                enabled, created_at, updated_at
+            ) VALUES(
+                'legacy', 'Legacy', 'Run', 'workspace', '/tmp', 'sam', 501,
+                'codex', 'codex', 'gpt-5', 'high', '{"kind":"daily","hour":9,"minute":0}',
+                'UTC', 1, '2026-07-22T00:00:00Z', '2026-07-22T00:00:00Z'
+            );
+        """)
+
+        try Schema.migrate(legacyDB)
+
+        let statement = try legacyDB.prepare("SELECT routing_mode FROM scheduled_tasks WHERE id = 'legacy';")
+        XCTAssertTrue(try statement.step())
+        XCTAssertEqual(statement.columnText(0), "manual")
     }
 
     func test_saveAndListRoundTripEveryExecutionField_becauseAgentRunsMustBeExact() throws {
-        let task = makeTask(nextRunAt: Date(timeIntervalSince1970: 100))
+        var task = makeTask(nextRunAt: Date(timeIntervalSince1970: 100))
+        task.routingMode = .auto
         try store.save(task)
 
         XCTAssertEqual(try store.list(), [task])
+        XCTAssertEqual(try store.get(id: task.id)?.effectiveRoutingMode, .auto)
     }
 
     func test_claimDueDeduplicatesOccurrenceAndBlocksSameTaskOverlap_becauseCrashesMustNotDoubleRun() throws {
@@ -69,6 +112,49 @@ final class ScheduledTaskStoreTests: XCTestCase {
         _ = try store.claimManual(taskID: task.id, now: Date(timeIntervalSince1970: 101), owner: "agent-a")
 
         XCTAssertThrowsError(try store.claimManual(taskID: task.id, now: Date(timeIntervalSince1970: 102), owner: "agent-b"))
+    }
+
+    func test_attachThreadLinksWhileQueuedWithoutStatusChange_becausePathBMustNotHitQueuedToQueued() throws {
+        // WHY: attachThread used updateRun(status: .queued) which canTransition
+        // rejects (queued→queued). Every Run Now then failed after createAgentThread
+        // with "invalid run status transition" and left an orphaned agent thread.
+        let task = makeTask(nextRunAt: Date(timeIntervalSince1970: 100))
+        try store.save(task)
+        let claim = try store.claimManual(taskID: task.id, now: Date(timeIntervalSince1970: 101), owner: "agent")
+        let threadID = AgentThreadID()
+
+        try store.attachThread(runID: claim.run.id, threadID: threadID)
+
+        let linked = try XCTUnwrap(store.listRuns().first { $0.id == claim.run.id })
+        XCTAssertEqual(linked.status, .queued)
+        XCTAssertEqual(linked.threadID, threadID)
+        XCTAssertNil(linked.startedAt)
+        XCTAssertNil(linked.agentRunID)
+
+        // Idempotent same-thread re-attach.
+        try store.attachThread(runID: claim.run.id, threadID: threadID)
+        XCTAssertEqual(try store.listRuns().first { $0.id == claim.run.id }?.threadID, threadID)
+
+        // Different thread while already linked must fail.
+        XCTAssertThrowsError(try store.attachThread(runID: claim.run.id, threadID: AgentThreadID()))
+
+        // Full lifecycle still works after metadata attach.
+        let agentRunID = AgentRunID()
+        try store.markStarted(runID: claim.run.id, threadID: threadID, agentRunID: agentRunID)
+        try store.finish(runID: claim.run.id, status: .completed, at: Date(timeIntervalSince1970: 102))
+        let done = try XCTUnwrap(store.listRuns().first { $0.id == claim.run.id })
+        XCTAssertEqual(done.status, .completed)
+        XCTAssertEqual(done.threadID, threadID)
+        XCTAssertEqual(done.agentRunID, agentRunID)
+    }
+
+    func test_attachThreadRejectsTerminalRuns_becauseOwnershipLinkIsPreStartOnly() throws {
+        let task = makeTask(nextRunAt: Date(timeIntervalSince1970: 100))
+        try store.save(task)
+        let claim = try store.claimManual(taskID: task.id, now: Date(timeIntervalSince1970: 101), owner: "agent")
+        try store.finish(runID: claim.run.id, status: .failed, at: Date(timeIntervalSince1970: 102))
+
+        XCTAssertThrowsError(try store.attachThread(runID: claim.run.id, threadID: AgentThreadID()))
     }
 
     func test_deleteRejectsActiveRun_becauseExecutionMustNotBecomeOrphaned() throws {
@@ -208,6 +294,66 @@ final class ScheduledTaskStoreTests: XCTestCase {
         XCTAssertNil(stored.nextRunAt)
     }
 
+    func test_dateRoundTripFloorsSubseconds_becauseOccurrenceKeysMustStayStable() throws {
+        // WHY: default ISO8601 without fractions + raw subsecond anchors caused
+        // hourly next_run_at to re-select the spent slot after claim.
+        let fractional = Date(timeIntervalSince1970: 1_700_000_000.824)
+        let task = makeHourlyTask(nextRunAt: fractional, anchor: fractional, intervalHours: 2)
+        try store.save(task)
+
+        let stored = try XCTUnwrap(store.get(id: task.id))
+        let expected = Date(timeIntervalSince1970: 1_700_000_000)
+        XCTAssertEqual(stored.nextRunAt, expected)
+        if case .hourly(let anchor, let hours) = stored.recurrence {
+            XCTAssertEqual(anchor, expected)
+            XCTAssertEqual(hours, 2)
+        } else {
+            XCTFail("expected hourly")
+        }
+    }
+
+    func test_duplicateOccurrenceAdvancesPastSpentHourly_becauseStallLoopMustSelfHeal() throws {
+        // WHY: after a fire, if next_run_at is still the spent slot (legacy bug or
+        // crash mid-advance), claimDue must not spin forever on occurrence_key.
+        let anchor = Date(timeIntervalSince1970: 1_700_000_000.824)
+        let spent = Date(timeIntervalSince1970: 1_700_000_000)
+        let task = makeHourlyTask(nextRunAt: spent, anchor: anchor, intervalHours: 2)
+        try store.save(task)
+
+        let first = try store.claimDue(now: Date(timeIntervalSince1970: 1_700_000_010), owner: "agent-a")
+        XCTAssertEqual(first.count, 1)
+        XCTAssertEqual(first.first?.run.scheduledAt, spent)
+
+        // Simulate execute advancing incorrectly to the same spent second (legacy).
+        try store.advance(taskID: task.id, nextRunAt: spent, lastRunAt: spent, at: Date(timeIntervalSince1970: 1_700_000_020))
+        try store.finish(runID: first[0].run.id, status: .completed, at: Date(timeIntervalSince1970: 1_700_000_030))
+
+        // Next claim hits duplicate occurrence_key and must jump to anchor+2h.
+        let second = try store.claimDue(now: Date(timeIntervalSince1970: 1_700_000_040), owner: "agent-b")
+        XCTAssertTrue(second.isEmpty, "duplicate path claims nothing; it only advances next")
+        let healed = try XCTUnwrap(store.get(id: task.id))
+        XCTAssertEqual(healed.nextRunAt, Date(timeIntervalSince1970: 1_700_000_000 + 2 * 3600))
+
+        // Future due time claims the advanced slot once.
+        let third = try store.claimDue(
+            now: Date(timeIntervalSince1970: 1_700_000_000 + 2 * 3600 + 5),
+            owner: "agent-c"
+        )
+        XCTAssertEqual(third.count, 1)
+        XCTAssertEqual(third.first?.run.scheduledAt, Date(timeIntervalSince1970: 1_700_000_000 + 2 * 3600))
+        XCTAssertNotEqual(third.first?.run.occurrenceKey, first.first?.run.occurrenceKey)
+    }
+
+    func test_calculatedNextRunAfterSpentOnTask_matchesStoreHealPath() throws {
+        let anchor = Date(timeIntervalSince1970: 1_700_000_000.5)
+        let spent = Date(timeIntervalSince1970: 1_700_000_000)
+        let task = makeHourlyTask(nextRunAt: spent, anchor: anchor, intervalHours: 1)
+        XCTAssertEqual(
+            task.calculatedNextRunAfterSpent(spent),
+            Date(timeIntervalSince1970: 1_700_000_000 + 3600)
+        )
+    }
+
     func test_deleteTaskDoesNotDeleteAgentThread_becauseRunHistoryLinksAreNotOwnership() throws {
         let task = makeTask(nextRunAt: Date(timeIntervalSince1970: 100))
         try store.save(task)
@@ -232,6 +378,24 @@ final class ScheduledTaskStoreTests: XCTestCase {
             model: "gpt-5", reasoningEffort: .high,
             recurrence: .daily(at: ScheduledLocalTime(hour: 8, minute: 15)!),
             timeZoneIdentifier: "America/Asuncion", isEnabled: true,
+            nextRunAt: nextRunAt, createdAt: created, updatedAt: created
+        )
+    }
+
+    private func makeHourlyTask(
+        id: UUID = UUID(),
+        nextRunAt: Date?,
+        anchor: Date,
+        intervalHours: Int
+    ) -> ScheduledTask {
+        let created = Date(timeIntervalSince1970: 10)
+        return ScheduledTask(
+            id: id, title: "Hourly", prompt: "Inspect the workspace", workspaceID: WorkspaceID(),
+            workspacePathSnapshot: "/tmp", runAsUser: "sam", runAsUID: 501,
+            provider: .codex, providerInstanceID: "codex-primary",
+            model: "gpt-5", reasoningEffort: .high,
+            recurrence: .hourly(anchor: anchor, intervalHours: intervalHours),
+            timeZoneIdentifier: "UTC", isEnabled: true,
             nextRunAt: nextRunAt, createdAt: created, updatedAt: created
         )
     }

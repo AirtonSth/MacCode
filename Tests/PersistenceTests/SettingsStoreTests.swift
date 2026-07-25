@@ -22,6 +22,8 @@ final class SettingsStoreTests: XCTestCase {
         XCTAssertFalse(d.insomniaAllowSystemSleepWhenDisplayClosed)
         XCTAssertTrue(d.insomniaAllowScreenSaverAfter45MinutesOfInactivity)
         XCTAssertFalse(d.tokenSaverEnabled)
+        XCTAssertTrue(d.graphifyEnabled, "Graphify must default ON so Agent App indexes without user opt-in")
+        XCTAssertFalse(d.graphifyWriteInRepo, "Graphs must default to App Support only (no repo pollution)")
         XCTAssertEqual(d.terminalFontSize, 0)
         XCTAssertTrue(d.petEnabled, "a fresh install must show the pet without requiring setup")
         XCTAssertTrue(d.petAnimationsEnabled)

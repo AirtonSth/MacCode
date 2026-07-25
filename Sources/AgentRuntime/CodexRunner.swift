@@ -49,6 +49,30 @@ public enum ProcessLocator {
         return nil
     }
 
+    /// Binary resolution for Auto admission + sudo -u execution (same rules).
+    /// 1) Absolute Settings path when executable (e.g. /Users/airtonjunior/.local/bin/claude)
+    /// 2) Target run-as-user home search
+    /// 3) Current user home / PATH search
+    /// So Auto can admit the same CLI the streaming adapter will spawn.
+    public static func resolveForRunAsUser(
+        _ name: String,
+        runAsUser: AgentRunAsUser?,
+        currentUID: uid_t = getuid()
+    ) -> String? {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        if trimmed.contains("/") {
+            let expanded = (trimmed as NSString).expandingTildeInPath
+            return FileManager.default.isExecutableFile(atPath: expanded) ? expanded : nil
+        }
+        if let runAsUser, runAsUser.uid != currentUID {
+            if let target = resolve(trimmed, environmentPath: nil, homeDirectory: runAsUser.homePath) {
+                return target
+            }
+        }
+        return resolve(trimmed)
+    }
+
     public static func expandedPath(environmentPath: String?, homeDirectory: String) -> String {
         searchPath(environmentPath: environmentPath, homeDirectory: homeDirectory).joined(separator: ":")
     }
@@ -88,6 +112,7 @@ public final class CodexRunner: AgentProviderRunner, @unchecked Sendable {
         // `codex --model …` fail with no output.
         [
             AgentModelDescriptor(id: "", label: "Default (account)", provider: .codex, supportsReasoning: true, supportsServiceTier: true, supportsCustomModel: true),
+            AgentModelDescriptor(id: "gpt-5.6-sol", label: "GPT-5.6-Sol", provider: .codex, supportsReasoning: true, supportsServiceTier: true, supportsCustomModel: true),
             AgentModelDescriptor(id: "gpt-5.5", label: "GPT-5.5", provider: .codex, supportsReasoning: true, supportsServiceTier: true, supportsCustomModel: true),
             AgentModelDescriptor(id: "gpt-5.4", label: "GPT-5.4", provider: .codex, supportsReasoning: true, supportsServiceTier: true, supportsCustomModel: true),
             AgentModelDescriptor(id: "gpt-5.4-mini", label: "GPT-5.4-Mini", provider: .codex, supportsReasoning: true, supportsServiceTier: true, supportsCustomModel: true),
@@ -150,7 +175,7 @@ public final class CodexRunner: AgentProviderRunner, @unchecked Sendable {
         }
 
         let args = Self.buildArgs(request)
-        let environment = Self.processEnvironment(overrides: request.environment, provider: .codex)
+        let environment = Self.processEnvironment(overrides: request.environment, purpose: .agentTurn(.codex))
         let launchPlan: RunAsUserProcessBootstrap.LaunchPlan
         do {
             launchPlan = try RunAsUserProcessBootstrap.plan(
@@ -256,16 +281,122 @@ public final class CodexRunner: AgentProviderRunner, @unchecked Sendable {
         ProviderStderrClassifier.displayableStderr(raw, provider: .codex)
     }
 
+    /// Why a spawn's environment is being built. REQUIRED (no default) so every call
+    /// site is forced by the compiler to classify itself — a spawn that runs user
+    /// agent-turn code (`.agentTurn`) imports the login-shell env; a support/helper
+    /// spawn (`.supportProcess`: model discovery, capability probe, node/npm helpers,
+    /// usage refreshers) must NOT, so profile secrets never reach non-turn processes.
+    public enum EnvironmentPurpose {
+        case agentTurn(AgentProvider)
+        case supportProcess
+
+        var provider: AgentProvider? {
+            if case .agentTurn(let p) = self { return p }
+            return nil
+        }
+        var importsLoginEnvironment: Bool {
+            if case .agentTurn = self { return true }
+            return false
+        }
+    }
+
+    /// GUI/launchd owns these — never overlay them from the login shell (identity +
+    /// sandbox/XPC transport). Exact keys + prefixes.
+    private static let guiOwnedExactKeys: Set<String> = [
+        "HOME", "USER", "LOGNAME", "SHELL", "TMPDIR",
+        "TERM", "COLORTERM", "TERM_PROGRAM", "TERM_SESSION_ID"
+    ]
+    private static let guiOwnedPrefixes = ["XPC_", "__CF", "APP_SANDBOX_"]
+    /// Shell-local vars that describe the capture shell, not the provider process.
+    private static let volatileDropKeys: Set<String> = ["PWD", "OLDPWD", "SHLVL", "_"]
+    /// Execution/loader controls: a profile export here could inject code or MITM a
+    /// credentialed agent + its MCP/hook children. Prefix-matched so unknown future
+    /// variants (e.g. a new DYLD_*) are also removed (fail-safe), plus exact names.
+    private static let loaderControlPrefixes = ["DYLD_", "LD_"]
+    private static let loaderControlExactKeys: Set<String> = [
+        "NODE_OPTIONS", "BASH_ENV", "ENV", "NODE_EXTRA_CA_CERTS",
+        "SSL_CERT_FILE", "SSL_CERT_DIR", "GIT_SSH_COMMAND", "PERL5OPT", "PYTHONSTARTUP"
+    ]
+    /// Claude auth-routing keys deleted for provider `.claude` so claude.ai OAuth
+    /// stays the default no matter what the profile/GUI env exports. A per-instance
+    /// `overrides` value can re-add them explicitly (opt-in). Applied on BOTH the
+    /// capture-success and fail-open branches when import is enabled.
+    /// Only the non-`ANTHROPIC_`-prefixed keys are listed: the strip site pairs this
+    /// with a `key.hasPrefix("ANTHROPIC_")` clause that already covers the entire
+    /// `ANTHROPIC_*` namespace (incl. every base-URL variant), so listing those here
+    /// would be redundant — and the literal base-URL key name in source trips the B6
+    /// no-provider-redirect scanner even though this is a strip, not a redirect.
+    private static let claudeAuthStripKeys: Set<String> = [
+        "CLAUDE_CODE_OAUTH_TOKEN",
+        "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX"
+    ]
+
+    private static func isGuiOwned(_ key: String) -> Bool {
+        guiOwnedExactKeys.contains(key) || guiOwnedPrefixes.contains { key.hasPrefix($0) }
+    }
+    private static func isLoaderControl(_ key: String) -> Bool {
+        loaderControlExactKeys.contains(key) || loaderControlPrefixes.contains { key.hasPrefix($0) }
+    }
+
     public static func processEnvironment(
         overrides: [String: String],
-        base: [String: String] = ProcessInfo.processInfo.environment,
-        provider: AgentProvider? = nil
+        purpose: EnvironmentPurpose,
+        base gui: [String: String] = ProcessInfo.processInfo.environment
     ) -> [String: String] {
+        // Login-shell env import applies only to real agent turns, and only when the
+        // kill-switch is not off (default ON). When inactive, behavior is identical
+        // to the pre-parity implementation (GUI env, no strips).
+        let importEnabled = (gui["RC_LOGIN_SHELL_ENV_IMPORT"] ?? "1") != "0"
+        let active = purpose.importsLoginEnvironment && importEnabled
+        let login: [String: String]? = active
+            ? LoginShellEnvironment.current(parentEnvironment: gui)
+            : nil
+
+        var base = gui
+        if let login {
+            // delta-over-GUI: overlay login keys that differ/are new, except the
+            // GUI-owned identity/sandbox keys; drop shell-local volatile keys.
+            for (key, value) in login where !isGuiOwned(key) {
+                base[key] = value
+            }
+            for key in volatileDropKeys { base.removeValue(forKey: key) }
+        }
+        if active {
+            // Fail-safe strips on BOTH branches (login imported OR capture-not-ready).
+            for key in Array(base.keys) where isLoaderControl(key) {
+                base.removeValue(forKey: key)
+            }
+            if case .agentTurn(.claude) = purpose {
+                // Fail-safe: strip the whole ANTHROPIC_* namespace (catches unknown
+                // future auth/routing keys) plus the exact CLAUDE_CODE_* auth keys.
+                for key in Array(base.keys)
+                where key.hasPrefix("ANTHROPIC_") || claudeAuthStripKeys.contains(key) {
+                    base.removeValue(forKey: key)
+                }
+            }
+        }
+
         var env = base.merging(overrides) { _, override in override }
+
         let home = env["HOME"] ?? FileManager.default.homeDirectoryForCurrentUser.path
+        // Prepend the login PATH so profile PATH additions resolve; expandedPath then
+        // fronts the managed-wrapper dir (~/.remote-code/bin) + standard fallbacks.
+        // (Duplicate entries with the override PATH are harmless.)
+        if let loginPath = login?["PATH"], !loginPath.isEmpty {
+            let existing = env["PATH"].flatMap { $0.isEmpty ? nil : loginPath + ":" + $0 } ?? loginPath
+            env["PATH"] = existing
+        }
         env["PATH"] = ProcessLocator.expandedPath(environmentPath: env["PATH"], homeDirectory: home)
-        if let provider {
+
+        if let provider = purpose.provider {
             env["REMOTE_CODE_AGENT_PROVIDER"] = provider.rawValue
+        }
+        // Expose the `RefreshMcpTools` tool for Claude turns so the agent can pick
+        // up remote MCP servers (Linear, etc.) that finish their async connect a
+        // few seconds into the session — see mcpConnectWaitDirective. A caller-set
+        // override wins (so it can be forced off).
+        if case .agentTurn(.claude) = purpose, env["CLAUDE_CODE_ENABLE_REFRESH_MCP_TOOLS"] == nil {
+            env["CLAUDE_CODE_ENABLE_REFRESH_MCP_TOOLS"] = "1"
         }
         return env
     }

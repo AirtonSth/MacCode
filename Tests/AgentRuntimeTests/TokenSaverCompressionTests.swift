@@ -10,6 +10,9 @@ private final class PromptCapturingRunner: AgentProviderRunner, @unchecked Senda
     let provider: AgentProvider
     private let lock = NSLock()
     private var _captured: String?
+    private var _capturedEnvironment: [String: String] = [:]
+    /// At most one waiter; taken under lock so resume runs at most once.
+    private var _promptWaiter: CheckedContinuation<Void, Never>?
 
     init(provider: AgentProvider = .codex) { self.provider = provider }
 
@@ -18,10 +21,37 @@ private final class PromptCapturingRunner: AgentProviderRunner, @unchecked Senda
         return _captured
     }
 
+    var capturedEnvironment: [String: String] {
+        lock.lock(); defer { lock.unlock() }
+        return _capturedEnvironment
+    }
+
+    /// Suspend until `startRun` has stored a prompt. Race-safe whether capture
+    /// happens before or after this call; never resumes a continuation twice.
+    func waitForPromptCapture() async {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            lock.lock()
+            if _captured != nil {
+                lock.unlock()
+                continuation.resume()
+                return
+            }
+            precondition(_promptWaiter == nil, "PromptCapturingRunner supports a single prompt waiter")
+            _promptWaiter = continuation
+            lock.unlock()
+        }
+    }
+
     func listModels() async -> [AgentModelDescriptor] { [] }
 
     func startRun(_ request: AgentRunRequest, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) async throws -> AgentRunHandle {
-        lock.lock(); _captured = request.prompt; lock.unlock()
+        lock.lock()
+        _captured = request.prompt
+        _capturedEnvironment = request.environment
+        let waiter = _promptWaiter
+        _promptWaiter = nil
+        lock.unlock()
+        waiter?.resume()
         let handle = AgentRunHandle(runId: request.runId, process: nil) {}
         let tid = request.providerThreadId ?? UUID().uuidString
         Task.detached {
@@ -178,6 +208,96 @@ private final class UserInputCapturingAdapter: AgentProviderAdapter, @unchecked 
     func streamEvents(threadId: AgentThreadID, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) throws {}
 }
 
+private final class ScopeRefreshingAdapter: AgentProviderAdapter, @unchecked Sendable {
+    let provider: AgentProvider
+    private let lock = NSLock()
+    private var sessions: [AgentThreadID: AgentProviderSessionSummary] = [:]
+    private(set) var requests: [AgentRunRequest] = []
+    private(set) var retiredEnvironments: [[String: String]] = []
+    private(set) var stopSessionCalls = 0
+
+    init(provider: AgentProvider) {
+        self.provider = provider
+    }
+
+    /// Seeds a resident idle session the coordinator can observe via `hasSession`
+    /// without a durable provider thread id (the pre-continuity Token Saver case).
+    func seedIdleSession(
+        threadId: AgentThreadID,
+        providerThreadId: String? = nil,
+        status: AgentRunStatus = .completed
+    ) {
+        lock.lock()
+        sessions[threadId] = .init(
+            threadId: threadId,
+            provider: provider,
+            status: status,
+            providerThreadId: providerThreadId
+        )
+        lock.unlock()
+    }
+
+    func listModels() async -> [AgentModelDescriptor] { [] }
+
+    func startSession(
+        _ request: AgentRunRequest,
+        onEvent: @escaping @Sendable (AgentRunEvent) -> Void
+    ) async throws -> AgentRunHandle {
+        try await sendTurn(request, onEvent: onEvent)
+    }
+
+    func sendTurn(
+        _ request: AgentRunRequest,
+        onEvent: @escaping @Sendable (AgentRunEvent) -> Void
+    ) async throws -> AgentRunHandle {
+        let providerThreadID = request.providerThreadId ?? "continuity-\(provider.rawValue)"
+        lock.lock()
+        requests.append(request)
+        sessions[request.threadId] = .init(
+            threadId: request.threadId,
+            provider: provider,
+            status: .completed,
+            providerThreadId: providerThreadID
+        )
+        lock.unlock()
+        Task.detached {
+            onEvent(.event(.threadStarted(threadId: providerThreadID, providerThreadId: providerThreadID)))
+            onEvent(.finished(.completed, finalMessage: "done", providerThreadId: providerThreadID))
+        }
+        return AgentRunHandle(runId: request.runId, process: nil) {}
+    }
+
+    func interruptTurn(threadId: AgentThreadID) throws {}
+    func respondToRequest(threadId: AgentThreadID, requestId: String, response: AgentProviderRequestResponse) async throws {}
+    func respondToUserInput(threadId: AgentThreadID, requestId: String, text: String) throws {}
+
+    func stopSession(threadId: AgentThreadID) throws {
+        lock.lock()
+        stopSessionCalls += 1
+        if let request = requests.last(where: { $0.threadId == threadId }) {
+            retiredEnvironments.append(request.environment)
+        }
+        sessions.removeValue(forKey: threadId)
+        lock.unlock()
+    }
+
+    func recoverSession(_ request: AgentRunRequest, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) async throws {}
+    func listSessions() -> [AgentProviderSessionSummary] {
+        lock.lock()
+        defer { lock.unlock() }
+        return Array(sessions.values)
+    }
+    func hasSession(threadId: AgentThreadID) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return sessions[threadId] != nil
+    }
+    func readThread(threadId: AgentThreadID) async throws -> [AssistantEvent] { [] }
+    func rollbackThread(threadId: AgentThreadID, toTurnId: String) async throws {}
+    func stopAll() {}
+    func streamEvents(threadId: AgentThreadID, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) throws {}
+}
+
 private extension AssistantEvent {
     var bodyAppendForTest: String? {
         if case .itemDelta(_, let bodyAppend, _, _) = self {
@@ -212,24 +332,178 @@ final class TokenSaverCompressionTests: XCTestCase {
     }
 
     private func waitForPrompt(_ runner: PromptCapturingRunner) async {
+        await runner.waitForPromptCapture()
+    }
+
+    private func waitForRun(
+        _ runID: AgentRunID,
+        in repository: AgentRunRepository
+    ) async throws {
         let deadline = Date().addingTimeInterval(3)
-        while Date() < deadline, runner.capturedPrompt == nil {
+        while Date() < deadline {
+            if let run = try repository.get(id: runID), run.status == .completed {
+                return
+            }
             try? await Task.sleep(nanoseconds: 10_000_000)
         }
+        XCTFail("run did not complete")
+    }
+
+    func test_reusedProviderSessionsRefreshExactTurnScopeForClaudeCodexAndGrok() async throws {
+        // WHY: a resident provider process cannot mutate its environment. Every
+        // Token Saver attempt must launch with the current exact scope while the
+        // provider thread id preserves conversation continuity.
+        for provider in [AgentProvider.claude, .codex, .grok] {
+            let tmp = NSTemporaryDirectory() + "rc2-ts-scope-refresh-" + provider.rawValue + "-" + UUID().uuidString
+            let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+            let threadRepo = AgentThreadRepository(db: db)
+            let messageRepo = AgentMessageRepository(db: db)
+            let runRepo = AgentRunRepository(db: db)
+            let thread = AgentThread(title: "scope", provider: provider, model: "test")
+            try threadRepo.upsert(thread)
+            let adapter = ScopeRefreshingAdapter(provider: provider)
+            let coordinator = AgentRunCoordinator(
+                runRepo: runRepo,
+                messageRepo: messageRepo,
+                threadRepo: threadRepo,
+                providerAdapters: [provider: adapter]
+            )
+            coordinator.runEnvironmentProvider = { selectedProvider, selectedThread, _ in
+                [
+                    "RC_TOKEN_SAVER_DISTILL_HINT": "1",
+                    "RC_TOKEN_SAVER_WORKSPACE_ID": "workspace-2",
+                    "RC_TOKEN_SAVER_PROJECT_ID": "project-2",
+                    "RC_TOKEN_SAVER_THREAD_ID": selectedThread.value.uuidString,
+                    "REMOTE_CODE_AGENT_PROVIDER": selectedProvider.rawValue,
+                ]
+            }
+
+            let firstRunID = AgentRunID()
+            _ = try await coordinator.startRun(.init(
+                runId: firstRunID,
+                threadId: thread.id,
+                provider: provider,
+                model: "test",
+                cwd: tmp,
+                prompt: "first"
+            ))
+            try await waitForRun(firstRunID, in: runRepo)
+
+            let continuedThread = try XCTUnwrap(try threadRepo.get(id: thread.id))
+            let providerThreadID = try XCTUnwrap(continuedThread.providerThreadId)
+            let secondRunID = AgentRunID()
+            _ = try await coordinator.startRun(.init(
+                runId: secondRunID,
+                threadId: thread.id,
+                provider: provider,
+                model: "test",
+                cwd: tmp,
+                prompt: "second",
+                providerThreadId: providerThreadID
+            ))
+            try await waitForRun(secondRunID, in: runRepo)
+
+            XCTAssertEqual(adapter.requests.count, 2, "\(provider.rawValue) must execute both turns")
+            let firstEnvironment = adapter.requests[0].environment
+            let secondEnvironment = adapter.requests[1].environment
+            XCTAssertEqual(firstEnvironment["RC_TOKEN_SAVER_ATTEMPT_ID"], firstRunID.value.uuidString)
+            XCTAssertEqual(secondEnvironment["RC_TOKEN_SAVER_ATTEMPT_ID"], secondRunID.value.uuidString)
+            XCTAssertNotEqual(firstEnvironment["RC_TOKEN_SAVER_ATTEMPT_ID"], secondEnvironment["RC_TOKEN_SAVER_ATTEMPT_ID"])
+            XCTAssertEqual(adapter.retiredEnvironments, [firstEnvironment], "\(provider.rawValue) must deny reuse of the run-1 process scope")
+            XCTAssertEqual(adapter.requests[1].providerThreadId, providerThreadID, "\(provider.rawValue) must preserve provider conversation continuity")
+        }
+    }
+
+    func test_startRun_refusesStaleTokenSaverScopeWhenLiveSessionLacksDurableProviderThreadId() async throws {
+        // WHY: provider process env is immutable after launch. A live adapter
+        // session with no durable providerThreadId has no safe resume handle, so
+        // a new Token Saver admission scope cannot reuse that process (wrong
+        // workspace/project/attempt isolation) and also cannot stop+restart it
+        // without losing continuity. Refuse the run instead of silently reusing
+        // or incorrectly tearing down the stale session.
+        let tmp = NSTemporaryDirectory() + "rc2-ts-scope-refuse-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let thread = AgentThread(title: "stale-scope", provider: .claude, model: "test")
+        try threadRepo.upsert(thread)
+
+        let adapter = ScopeRefreshingAdapter(provider: .claude)
+        // Live idle session, no durable provider continuity id, no prior coordinator scope.
+        adapter.seedIdleSession(threadId: thread.id, providerThreadId: nil, status: .completed)
+        XCTAssertTrue(adapter.hasSession(threadId: thread.id))
+
+        let coordinator = AgentRunCoordinator(
+            runRepo: runRepo,
+            messageRepo: messageRepo,
+            threadRepo: threadRepo,
+            providerAdapters: [.claude: adapter]
+        )
+        coordinator.runEnvironmentProvider = { selectedProvider, selectedThread, _ in
+            [
+                "RC_TOKEN_SAVER_DISTILL_HINT": "1",
+                "RC_TOKEN_SAVER_WORKSPACE_ID": "workspace-new",
+                "RC_TOKEN_SAVER_PROJECT_ID": "project-new",
+                "RC_TOKEN_SAVER_THREAD_ID": selectedThread.value.uuidString,
+                "REMOTE_CODE_AGENT_PROVIDER": selectedProvider.rawValue,
+            ]
+        }
+
+        let safetyMessage =
+            "Provider process scope changed before a durable provider thread id was available; refusing to reuse stale Token Saver scope."
+
+        do {
+            _ = try await coordinator.startRun(.init(
+                threadId: thread.id,
+                provider: .claude,
+                model: "test",
+                cwd: tmp,
+                prompt: "must not reuse stale scope",
+                providerThreadId: nil
+            ))
+            XCTFail("startRun must refuse when Token Saver scope arrives against a live session without durable providerThreadId")
+        } catch let error as AgentProviderAdapterError {
+            guard case .unsupported(let detail) = error else {
+                return XCTFail("expected .unsupported safety refusal, got \(error)")
+            }
+            XCTAssertEqual(detail, safetyMessage,
+                           "refusal must carry the exact stale Token Saver scope safety intent")
+        }
+
+        XCTAssertTrue(adapter.hasSession(threadId: thread.id),
+                      "refusal must leave the resident session in place — stopping without a resume handle drops continuity incorrectly")
+        XCTAssertEqual(adapter.stopSessionCalls, 0,
+                       "must not stopSession on scope refusal without a durable providerThreadId")
+        XCTAssertTrue(adapter.requests.isEmpty,
+                      "must not reuse the stale live session by sending a turn under the new Token Saver scope")
+        XCTAssertTrue(adapter.retiredEnvironments.isEmpty)
+        XCTAssertNil(try threadRepo.get(id: thread.id)?.providerThreadId,
+                     "coordinator must not invent a providerThreadId when continuity was never established")
     }
 
     func test_promptCompressorTransformsOutboundButPreservesDisplayedMessage() async throws {
         let (coordinator, messageRepo, thread, tmp, runner) = try makeCoordinator()
-        coordinator.promptCompressor = { prompt, _, _ in "COMPRESSED::" + prompt.uppercased() }
+        coordinator.promptCompressor = { prompt, _, _, _ in "COMPRESSED::" + prompt.uppercased() }
+        coordinator.runEnvironmentProvider = { _, _, _ in
+            [
+                "RC_TOKEN_SAVER_DISTILL_HINT": "1",
+                "RC_TOKEN_SAVER_WORKSPACE_ID": "workspace",
+                "RC_TOKEN_SAVER_PROJECT_ID": "project",
+                "RC_TOKEN_SAVER_THREAD_ID": thread.id.value.uuidString,
+            ]
+        }
 
         let original = "Please refactor the widget renderer in file Foo.swift, keep ID abc-123"
+        let runID = AgentRunID()
         _ = try await coordinator.startRun(AgentRunRequest(
-            threadId: thread.id, provider: .codex, model: "fake-model", cwd: tmp, prompt: original
+            runId: runID, threadId: thread.id, provider: .codex, model: "fake-model", cwd: tmp, prompt: original
         ))
         await waitForPrompt(runner)
 
         XCTAssertEqual(runner.capturedPrompt, "COMPRESSED::" + original.uppercased(),
                        "the provider must receive the compressed prompt")
+        XCTAssertEqual(runner.capturedEnvironment["RC_TOKEN_SAVER_ATTEMPT_ID"], runID.value.uuidString)
         let messages = (try? messageRepo.list(threadId: thread.id)) ?? []
         XCTAssertEqual(messages.first(where: { $0.role == .user })?.content, original,
                        "the displayed user message must remain the original, uncompressed text")
@@ -250,7 +524,7 @@ final class TokenSaverCompressionTests: XCTestCase {
             threadRepo: threadRepo,
             providerAdapters: [.claude: adapter]
         )
-        coordinator.promptCompressor = { _, _, _ in
+        coordinator.promptCompressor = { _, _, _, _ in
             XCTFail("free-form follow-up answers should use followUpPromptCompressor when present")
             return "WRONG"
         }
@@ -286,7 +560,7 @@ final class TokenSaverCompressionTests: XCTestCase {
     func test_failOpenCompressorReturningInputLeavesPromptIntact() async throws {
         let (coordinator, messageRepo, thread, tmp, runner) = try makeCoordinator()
         // Fail-open contract: compressor returns its input on any failure.
-        coordinator.promptCompressor = { prompt, _, _ in prompt }
+        coordinator.promptCompressor = { prompt, _, _, _ in prompt }
         let original = "explain this stack trace and fix the crash"
         _ = try await coordinator.startRun(AgentRunRequest(
             threadId: thread.id, provider: .codex, model: "fake-model", cwd: tmp, prompt: original

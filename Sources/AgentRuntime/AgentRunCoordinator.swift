@@ -35,6 +35,45 @@ public struct ActiveRunProjection: Equatable, Sendable {
     public var primaryRunId: AgentRunID? { runs.first?.runId }
 }
 
+/// Merge provider launch env with host-injected keys from the pre-route request.
+/// Auto-orchestration previously used `launch?.environment ?? request.environment`,
+/// which **dropped** `RC_GRAPHIFY_*` (and Token Saver) when a launch config existed —
+/// agents then saw BANNER_MISSING / NO_RC_GRAPHIFY_ENV despite host preflight.
+public enum AgentHostEnvironmentMerge {
+    public static func preserveHostInjects(
+        launch: [String: String]?,
+        request: [String: String]
+    ) -> [String: String] {
+        // Start from launch (or request if no launch), strip host-owned keys so a
+        // stale RC_GRAPHIFY_* in launch cannot resurrect Graphify when the
+        // authoritative request has none (Token Saver / Graphify off).
+        var env = stripHostInjects(from: launch ?? request)
+        for (key, value) in request where isHostInjectedKey(key) {
+            env[key] = value
+        }
+        if launch == nil {
+            // Pure request path: still strip-then-reapply so only request host keys remain.
+            return env
+        }
+        return env
+    }
+
+    public static func stripHostInjects(from environment: [String: String]) -> [String: String] {
+        var env = environment
+        for key in environment.keys where isHostInjectedKey(key) {
+            env.removeValue(forKey: key)
+        }
+        return env
+    }
+
+    public static func isHostInjectedKey(_ key: String) -> Bool {
+        key.hasPrefix("RC_GRAPHIFY_")
+            || key.hasPrefix("RC_TOKEN_SAVER_")
+            || key == "RC_TOKEN_SAVER_DISTILL_HINT"
+            || key.hasPrefix("RC_DISTILL_")
+    }
+}
+
 public enum ActiveRunProjectionCause: Equatable, Sendable {
     case started
     case finished(AgentRunStatus)
@@ -48,17 +87,47 @@ public protocol AgentRunObserver: AnyObject {
 }
 
 public final class AgentRunCoordinator: @unchecked Sendable {
+    private struct ProviderTurnScope: Equatable {
+        let tokenSaverEnabled: Bool
+        let workspaceID: String?
+        let projectID: String?
+        let threadID: String?
+        let provider: String?
+        let attemptID: String?
+
+        init(environment: [String: String]) {
+            tokenSaverEnabled = environment["RC_TOKEN_SAVER_DISTILL_HINT"] == "1"
+            workspaceID = environment["RC_TOKEN_SAVER_WORKSPACE_ID"]
+            projectID = environment["RC_TOKEN_SAVER_PROJECT_ID"]
+            threadID = environment["RC_TOKEN_SAVER_THREAD_ID"]
+            provider = environment["REMOTE_CODE_AGENT_PROVIDER"]
+            attemptID = environment["RC_TOKEN_SAVER_ATTEMPT_ID"]
+        }
+
+        var carriesTokenSaverScope: Bool {
+            tokenSaverEnabled || workspaceID != nil || projectID != nil || threadID != nil || attemptID != nil
+        }
+    }
+
     private let runRepo: AgentRunRepository
     private let messageRepo: AgentMessageRepository
     private let threadRepo: AgentThreadRepository
     private let providerSessionRepo: ProviderSessionRuntimeRepository?
     private let checkpointRepo: AgentTurnCheckpointRepository?
+    private let orchestrationRuntime: AgentOrchestrationRuntime?
+    private let providerSnapshotSupplier: (@Sendable () async throws -> [AgentProviderSnapshot])?
     private var providers: [AgentProvider: AgentProviderAdapter]
     private var active: [AgentRunID: AgentRunHandle] = [:]
     private var activeThreads: [AgentThreadID: AgentRunID] = [:]
     private typealias RunMetadata = (provider: AgentProvider, providerInstanceId: String?, model: String, cwd: String, serviceTier: AgentServiceTier, runtimeMode: AgentPermissionMode, interactionMode: AgentInteractionMode, adapterKey: String, binaryIdentity: String?)
     private var activeRunMetadata: [AgentRunID: RunMetadata] = [:]
+    /// Process environments are immutable after launch. Resident provider adapters
+    /// therefore retain the exact scope of the process that owns their idle session.
+    /// A changed attempt/admission scope forces a process refresh before the next turn.
+    private var providerTurnScopes: [AgentThreadID: ProviderTurnScope] = [:]
     private var activeTurnIds: [AgentRunID: String] = [:]
+    private var latestTokenUsage: [AgentRunID: AssistantTokenUsage] = [:]
+    private var orchestrationDeadlineWorkItems: [AgentRunID: DispatchWorkItem] = [:]
     private var activeAssistantMessageIds: [AgentRunID: AgentMessageID] = [:]
     private var activeProviderTextItemTypes: [AgentRunID: [String: AssistantItemType]] = [:]
     private var bufferedProviderTextItems: [AgentRunID: [String: BufferedProviderTextItem]] = [:]
@@ -114,11 +183,12 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     /// honestly certify a watermark for that thread. Retain the first failure
     /// and fail recovery loudly instead of silently advancing iOS past the gap.
     private var mirrorPersistenceFailures: [AgentThreadID: Error] = [:]
-    // UX-MAC_AGENT-BG-AWAIT: per-thread consecutive auto-continuation count and a
-    // monotonic token used to cancel a scheduled continuation when the thread is
-    // stopped or a fresh run starts. Both touched under `lock`. See
-    // BackgroundAwaitContinuation: a full-access run that stalls awaiting a
-    // background job it launched is auto-nudged (bounded) so it actually finishes.
+    // UX-MAC_AGENT-BG-AWAIT / incomplete-turn: per-thread consecutive auto-continuation
+    // count and a monotonic token used to cancel a scheduled continuation when the
+    // thread is stopped or a fresh run starts. Both touched under `lock`. Covers
+    // background-await stalls and multi-phase workflow handoffs (see
+    // IncompleteTurnContinuation) so full-access runs are not left green-"completed"
+    // while unfinished.
     private var autoContinuationCounts: [AgentThreadID: Int] = [:]
     private var autoContinuationTokens: [AgentThreadID: Int] = [:]
     // PERF-MAC_AGENT-006: last assistant text persisted per thread, to dedup the
@@ -159,11 +229,17 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     public var onMessageAppended: ((AgentMessage) -> Void)?
     public var onPersistenceIssue: ((String, AgentThreadID, AgentRunID) -> Void)?
 
+    /// Host-injected provider admission gate. AppShell owns memory/process policy;
+    /// AgentRuntime only enforces its fail-closed decision before any provider
+    /// spawn or pending run/message persistence. The default preserves existing
+    /// tests and hosts that do not install a policy.
+    public var providerAdmissionCheck: @Sendable (AgentProvider, AgentThreadID) async throws -> Void = { _, _ in }
+
     /// Token Saver hook: async transform applied to the outbound provider
     /// prompt only. The original text is always preserved as the displayed
     /// user message. Must be fail-open — return the input unchanged on any
     /// error or when Token Saver is disabled.
-    public var promptCompressor: (@Sendable (_ prompt: String, _ provider: AgentProvider, _ threadId: AgentThreadID) async -> String)?
+    public var promptCompressor: (@Sendable (_ prompt: String, _ provider: AgentProvider, _ threadId: AgentThreadID, _ runId: AgentRunID?) async -> String)?
     /// Token Saver hook for free-form follow-up answers. Defaults to
     /// `promptCompressor` when nil, but app shells can provide a separate hook
     /// to tag telemetry as `prompt_followup`.
@@ -191,7 +267,15 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     /// `providerEnvironment`. Without this the recovered run loses `RC_TOKEN_SAVER_DISTILL_HINT`
     /// and silently stops piping `| distill` / speaking distill even with Token Saver on. Returns
     /// the Token Saver env vars to merge for the given provider; nil/empty => pre-fix behavior.
-    public var recoveryEnvironmentProvider: (@Sendable (_ provider: AgentProvider) async -> [String: String])?
+    public var recoveryEnvironmentProvider: (@Sendable (_ provider: AgentProvider, _ threadId: AgentThreadID) async -> [String: String])?
+    /// Exact-thread provider environment overlay for every fresh turn. The app
+    /// shell uses this to avoid leaking project-scoped Token Saver hints into
+    /// provider probes or unrelated threads.
+    public var runEnvironmentProvider: (@Sendable (_ provider: AgentProvider, _ threadId: AgentThreadID, _ base: [String: String]) async -> [String: String])?
+    /// Fires after the exact run/thread graph is durable and before provider
+    /// start. Payload consumers must remain content-free or store only scoped,
+    /// retention-governed data.
+    public var onRunPrepared: (@Sendable (_ request: AgentRunRequest, _ originalPrompt: String) async -> Void)?
 
     /// Fired (on an arbitrary executor) when a final assistant message was SR1-translated
     /// and persisted. Callers can use the id to badge the message in the UI.
@@ -204,6 +288,8 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         threadRepo: AgentThreadRepository,
         providerSessionRepo: ProviderSessionRuntimeRepository? = nil,
         checkpointRepo: AgentTurnCheckpointRepository? = nil,
+        orchestrationRuntime: AgentOrchestrationRuntime? = nil,
+        providerSnapshotSupplier: (@Sendable () async throws -> [AgentProviderSnapshot])? = nil,
         providers: [AgentProvider: AgentProviderRunner]
     ) {
         self.runRepo = runRepo
@@ -211,6 +297,8 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         self.threadRepo = threadRepo
         self.providerSessionRepo = providerSessionRepo
         self.checkpointRepo = checkpointRepo
+        self.orchestrationRuntime = orchestrationRuntime
+        self.providerSnapshotSupplier = providerSnapshotSupplier
         self.providers = providers.mapValues { OneShotProviderAdapter(runner: $0) }
     }
 
@@ -220,6 +308,8 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         threadRepo: AgentThreadRepository,
         providerSessionRepo: ProviderSessionRuntimeRepository? = nil,
         checkpointRepo: AgentTurnCheckpointRepository? = nil,
+        orchestrationRuntime: AgentOrchestrationRuntime? = nil,
+        providerSnapshotSupplier: (@Sendable () async throws -> [AgentProviderSnapshot])? = nil,
         providerAdapters: [AgentProvider: AgentProviderAdapter]
     ) {
         self.init(
@@ -228,6 +318,8 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             threadRepo: threadRepo,
             providerSessionRepo: providerSessionRepo,
             checkpointRepo: checkpointRepo,
+            orchestrationRuntime: orchestrationRuntime,
+            providerSnapshotSupplier: providerSnapshotSupplier,
             providers: [:]
         )
         self.providers = providerAdapters
@@ -252,10 +344,49 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         lock.unlock()
     }
 
-    public func reconcileOnLaunch() throws {
-        _ = try runRepo.reconcileRunningOnLaunch()
+    /// Drop a closed Agent App surface immediately so multi-tab sessions do not
+    /// keep fan-out stream/status work onto a disposed view-model until ARC
+    /// reaps the weak slot on the next observersSnapshot().
+    public func removeObserver(_ observer: AgentRunObserver) {
+        lock.lock()
+        observerRefs.removeAll { $0.value == nil || $0.value === observer }
+        lock.unlock()
+    }
+
+    /// Marks orphaned in-process runs/threads interrupted after relaunch.
+    /// - Parameter preservingThreadIDs: threads owned by another process
+    ///   (e.g. scheduled-task LaunchAgent) that must stay durable-running.
+    public func reconcileOnLaunch(preservingThreadIDs: Set<AgentThreadID> = []) throws {
+        _ = try runRepo.reconcileRunningOnLaunch(preservingThreadIDs: preservingThreadIDs)
+        try orchestrationRuntime?.reconcileReceipts(
+            statusForRun: { [runRepo] runId in
+                try runRepo.get(id: runId)?.status
+            },
+            usageForRun: { [runRepo] runId in
+                guard let run = try runRepo.get(id: runId) else { return nil }
+                return try runRepo.listLatestStreamEvents(threadId: run.threadId, limit: .max)
+                    .reversed()
+                    .compactMap { event in
+                        if case .tokenUsage(let usage) = event { return usage }
+                        return nil
+                    }
+                    .first
+            },
+            qualityOutcomeForRun: { [messageRepo, runRepo] runId, status in
+                guard status == .completed, let run = try runRepo.get(id: runId) else {
+                    return AgentOrchestrationRuntime.qualityOutcome(status: status, finalMessage: nil)
+                }
+                let hasOutput = try messageRepo.list(threadId: run.threadId).contains {
+                    $0.role == .assistant && !$0.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                }
+                return hasOutput
+                    ? "verified:output-present"
+                    : "rejected:missing-output"
+            }
+        )
         let now = Date()
         for thread in try threadRepo.list() where thread.status == .running {
+            if preservingThreadIDs.contains(thread.id) { continue }
             var copy = thread
             copy.status = .interrupted
             copy.hasUnread = Self.hasUnread(for: .interrupted)
@@ -265,6 +396,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         if let providerSessionRepo {
             let future = Date.distantFuture
             for session in try providerSessionRepo.list(status: .running, updatedBefore: future) {
+                if preservingThreadIDs.contains(session.threadId) { continue }
                 // A stale running session on an already-terminal thread is not a
                 // relaunch interrupt. Align the session to the thread so pet/open
                 // does not show "interrupted by an app restart" for finished work.
@@ -315,12 +447,28 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         lock.lock()
         let runId = activeThreads[threadId]
         lock.unlock()
-        guard let runId else { return nil }
-        return try runRepo.get(id: runId)?.startedAt
+        if let runId {
+            return try runRepo.get(id: runId)?.startedAt
+        }
+        // Path B: LaunchAgent owns the process; durable agent_runs still has the clock.
+        return try runRepo.latestActive(for: threadId)?.startedAt
     }
 
     public func runStartedAt(runId: AgentRunID) throws -> Date? {
         try runRepo.get(id: runId)?.startedAt
+    }
+
+    /// Durable active run row for a thread, including LaunchAgent-owned sessions
+    /// this process does not track in `activeThreads`.
+    public func durableActiveRun(threadId: AgentThreadID) throws -> AgentRun? {
+        lock.lock()
+        let runId = activeThreads[threadId]
+        lock.unlock()
+        if let runId, let run = try runRepo.get(id: runId),
+           run.status == .pending || run.status == .running {
+            return run
+        }
+        return try runRepo.latestActive(for: threadId)
     }
 
     /// The currently-active run id for a thread (nil when idle). Lets a surface
@@ -334,6 +482,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     @discardableResult
     public func startRun(
         _ request: AgentRunRequest,
+        routingSnapshot: AgentOrchestrationRoutingSnapshot? = nil,
         isAutoContinuation: Bool = false,
         recordUserMessage: Bool = true
     ) async throws -> AgentRunID {
@@ -345,6 +494,9 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         }
         try beginExclusiveThreadMutation(request.threadId, operation: "provider run start")
         defer { endExclusiveThreadMutation(request.threadId) }
+        guard !hasProviderSession(threadId: request.threadId) else {
+            throw AgentProviderAdapterError.unsupported("Provider session already has an in-flight turn")
+        }
         lock.lock()
         let pendingStartFailureRunIds = pendingStartFailures.compactMap { runId, pending in
             pending.request.threadId == request.threadId ? runId : nil
@@ -378,6 +530,8 @@ public final class AgentRunCoordinator: @unchecked Sendable {
            let error = flushPendingStreamWritesResult(runId: priorBufferedRunId, threadId: request.threadId) {
             throw error
         }
+        let admittedDeadlineAt = routingSnapshot?.admissionSnapshot?.deadlineAt
+        let request = try await requestAdmittingAutoRoute(request, routingSnapshot: routingSnapshot)
         // A user-initiated run ends any background-await auto-continuation streak;
         // the auto-nudge path passes `isAutoContinuation: true` to preserve the bound.
         // F37: it must also invalidate any ALREADY-SCHEDULED continuation (same
@@ -396,7 +550,13 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         let preservedUserContent = request.userMessageContent ?? request.prompt
         var outboundPrompt = request.prompt
         if let promptCompressor {
-            outboundPrompt = await promptCompressor(request.prompt, request.provider, request.threadId)
+            outboundPrompt = await promptCompressor(request.prompt, request.provider, request.threadId, request.runId)
+        }
+        var effectiveEnvironment = request.environment
+        let scopedEnvironment = await runEnvironmentProvider?(request.provider, request.threadId, request.environment) ?? [:]
+        effectiveEnvironment.merge(scopedEnvironment) { _, scoped in scoped }
+        if effectiveEnvironment["RC_TOKEN_SAVER_DISTILL_HINT"] == "1" {
+            effectiveEnvironment["RC_TOKEN_SAVER_ATTEMPT_ID"] = request.runId.value.uuidString
         }
         let effectiveRequest = AgentRunRequest(
             runId: request.runId,
@@ -414,15 +574,17 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             serviceTier: recoveryContext?.serviceTier ?? request.serviceTier,
             interactionMode: recoveryContext?.interactionMode ?? request.interactionMode,
             providerBinary: request.providerBinary,
-            environment: request.environment,
+            environment: effectiveEnvironment,
             extraArgs: request.extraArgs,
             runAsUser: request.runAsUser
         )
         guard let runner = providers[effectiveRequest.provider] else {
             throw AgentRunError.missingBinary(effectiveRequest.provider.rawValue)
         }
+        try await providerAdmissionCheck(effectiveRequest.provider, effectiveRequest.threadId)
         let adapterKey = providerAdapterKey(runner)
         let binaryIdentity = providerBinaryIdentity(effectiveRequest.provider, adapter: runner)
+        try refreshProviderProcessIfScopeChanged(runner, request: effectiveRequest)
         // persist user message
         if recordUserMessage {
             let userMsg = AgentMessage(
@@ -463,6 +625,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             lastEventKind: "run.pending",
             runtimePayloadJSON: existingRuntimePayload
         ))
+        await onRunPrepared?(effectiveRequest, preservedUserContent)
         agentRunLog.info("run.started thread=\(effectiveRequest.threadId.value.uuidString, privacy: .public) run=\(effectiveRequest.runId.value.uuidString, privacy: .public) provider=\(effectiveRequest.provider.rawValue, privacy: .public) model=\(effectiveRequest.model, privacy: .public)")
 
         let runId = effectiveRequest.runId
@@ -477,6 +640,9 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             handle = try await runner.sendTurn(effectiveRequest) { ev in
                 coordinator.handle(event: ev, runId: runId, threadId: effectiveRequest.threadId)
             }
+            lock.lock()
+            providerTurnScopes[effectiveRequest.threadId] = ProviderTurnScope(environment: effectiveRequest.environment)
+            lock.unlock()
         } catch {
             clearDistillOutputMode(runId)
             markStartFailure(
@@ -563,8 +729,209 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             onRunStarted?(effectiveRequest.threadId, effectiveRequest.runId)
             onActiveRunProjectionChanged?(activeProjection, .started)
         }
+        if terminalStatus == nil {
+            scheduleOrchestrationDeadline(admittedDeadlineAt, runId: runId)
+        }
         if shouldCancel { handle.cancel() }
         return runId
+    }
+
+    private func scheduleOrchestrationDeadline(_ deadlineAt: Date?, runId: AgentRunID) {
+        guard let deadlineAt else { return }
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.lock.lock()
+            let isActive = self.active[runId] != nil
+            self.lock.unlock()
+            if isActive { self.stopRun(runId) }
+        }
+        lock.lock()
+        orchestrationDeadlineWorkItems[runId]?.cancel()
+        orchestrationDeadlineWorkItems[runId] = workItem
+        lock.unlock()
+        let delay = max(0, deadlineAt.timeIntervalSinceNow)
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + delay, execute: workItem)
+    }
+
+    private func requestAdmittingAutoRoute(
+        _ request: AgentRunRequest,
+        routingSnapshot suppliedSnapshot: AgentOrchestrationRoutingSnapshot?
+    ) async throws -> AgentRunRequest {
+        let routingSnapshot: AgentOrchestrationRoutingSnapshot
+        if let suppliedSnapshot {
+            if suppliedSnapshot.providerSnapshots.isEmpty,
+               let providerSnapshotSupplier {
+                routingSnapshot = AgentOrchestrationRoutingSnapshot(
+                    configuration: suppliedSnapshot.configuration,
+                    providerSnapshots: try await providerSnapshotSupplier(),
+                    launchConfigurations: suppliedSnapshot.launchConfigurations,
+                    admissionSnapshot: suppliedSnapshot.admissionSnapshot
+                )
+            } else {
+                routingSnapshot = suppliedSnapshot
+            }
+        } else {
+            guard let thread = try threadRepo.get(id: request.threadId),
+                  thread.effectiveRoutingConfiguration.mode == .auto else {
+                return request
+            }
+            guard let providerSnapshotSupplier else {
+                throw AgentOrchestrationAdmissionError.noEligibleProvider
+            }
+            routingSnapshot = AgentOrchestrationRoutingSnapshot(
+                configuration: thread.effectiveRoutingConfiguration,
+                providerSnapshots: try await providerSnapshotSupplier()
+            )
+        }
+        guard routingSnapshot.configuration.mode == .auto else {
+            return request
+        }
+        guard let orchestrationRuntime else {
+            // No orchestration runtime: still never switch provider — DEEP on Source.
+            return try Self.autoDeepFallbackRequest(
+                request,
+                configuration: routingSnapshot.configuration,
+                providerSnapshots: routingSnapshot.providerSnapshots,
+                launchConfigurations: routingSnapshot.launchConfigurations
+            )
+        }
+        do {
+            let admission = try orchestrationRuntime.admit(
+                runId: request.runId,
+                threadId: request.threadId,
+                configuration: routingSnapshot.configuration,
+                providerSnapshots: routingSnapshot.providerSnapshots,
+                interactionMode: request.interactionMode,
+                permissionMode: request.permissionMode,
+                attachments: request.attachments,
+                receiptId: routingSnapshot.admissionSnapshot?.admissionReceiptId,
+                deadlineAt: routingSnapshot.admissionSnapshot?.deadlineAt,
+                budgetTokens: routingSnapshot.admissionSnapshot?.budgetTokens,
+                budgetCostMicros: routingSnapshot.admissionSnapshot?.budgetCostMicros,
+                reservationId: routingSnapshot.admissionSnapshot?.reservationId,
+                reservedTokens: routingSnapshot.admissionSnapshot?.reservedTokens,
+                reservedCostMicros: routingSnapshot.admissionSnapshot?.reservedCostMicros
+            )
+            let launch = routingSnapshot.launchConfigurations[admission.route.providerInstanceId]
+            // Display the user's words unchanged; wrap only the provider-bound prompt
+            // so Auto always enters $remote-code-orchestrate with the host receipt
+            // the app already admitted (provider/model) — skill must not re-guess.
+            let displayPrompt = request.userMessageContent ?? request.prompt
+            let orchestratedPrompt = AgentOrchestrationRuntime.autoOrchestrateProviderPrompt(
+                userPrompt: request.prompt,
+                admittedRoute: admission.route
+            )
+            return AgentRunRequest(
+                runId: request.runId,
+                threadId: request.threadId,
+                provider: admission.route.provider,
+                providerInstanceId: admission.route.providerInstanceId,
+                model: admission.route.selection.effectiveModel,
+                cwd: request.cwd,
+                prompt: orchestratedPrompt,
+                userMessageContent: displayPrompt,
+                attachments: request.attachments,
+                providerThreadId: request.providerThreadId,
+                permissionMode: request.permissionMode,
+                reasoningEffort: admission.route.selection.reasoningEffort,
+                serviceTier: admission.route.selection.serviceTier,
+                interactionMode: request.interactionMode,
+                providerBinary: launch?.binary ?? request.providerBinary,
+                environment: AgentHostEnvironmentMerge.preserveHostInjects(
+                    launch: launch?.environment,
+                    request: request.environment
+                ),
+                extraArgs: request.extraArgs,
+                runAsUser: request.runAsUser
+            )
+        } catch let error as AgentOrchestrationAdmissionError {
+            // Same-host only. Orchestration gates may drop the skill wrap and
+            // use DEEP; never switch Claude → Codex (or any other cross-host).
+            switch error {
+            case .packageUnavailable, .rolloutDisabled, .killSwitchEnabled, .invalidPolicy:
+                return try Self.autoDeepFallbackRequest(
+                    request,
+                    configuration: routingSnapshot.configuration,
+                    providerSnapshots: routingSnapshot.providerSnapshots,
+                    launchConfigurations: routingSnapshot.launchConfigurations,
+                    runtime: orchestrationRuntime
+                )
+            case .preferredSourceUnavailable, .noEligibleProvider, .invalidRoutingMode,
+                 .deadlineExpired, .invalidBudget, .costBudgetUnavailable, .quotaExceeded,
+                 .receiptPersistenceFailed:
+                throw error
+            }
+        }
+    }
+
+    /// Auto without orchestration: bind Source picker host to DEEP (opus/sol/grok-4.5 high).
+    private static func autoDeepFallbackRequest(
+        _ request: AgentRunRequest,
+        configuration: AgentRoutingConfiguration,
+        providerSnapshots: [AgentProviderSnapshot],
+        launchConfigurations: [String: AgentOrchestrationLaunchConfiguration],
+        runtime: AgentOrchestrationRuntime? = nil
+    ) throws -> AgentRunRequest {
+        let route: AgentOrchestrationRoute
+        if let runtime {
+            route = try runtime.routeDeepFallback(
+                configuration: configuration,
+                providerSnapshots: providerSnapshots
+            )
+        } else {
+            let preferred = configuration.manualSelection.provider
+            guard let snapshot = AgentOrchestrationRuntime.autoAdmitSnapshot(
+                provider: preferred,
+                preferredInstanceId: configuration.manualProviderInstanceId,
+                providerSnapshots: providerSnapshots,
+                requireLiveCatalog: false
+            ) else {
+                throw AgentOrchestrationAdmissionError.preferredSourceUnavailable(
+                    preferred,
+                    detail: AgentOrchestrationRuntime.preferredSourceUnavailabilityDetail(
+                        provider: preferred,
+                        preferredInstanceId: configuration.manualProviderInstanceId,
+                        providerSnapshots: providerSnapshots
+                    )
+                )
+            }
+            let selection = AgentOrchestrationRuntime.deepControllerSelection(
+                provider: preferred,
+                availableModels: snapshot.models
+            )
+            route = AgentOrchestrationRoute(
+                provider: preferred,
+                providerInstanceId: snapshot.id,
+                capabilitySnapshotId: "deep-fallback",
+                selection: selection
+            )
+        }
+        let launch = launchConfigurations[route.providerInstanceId]
+        let displayPrompt = request.userMessageContent ?? request.prompt
+        // No $remote-code-orchestrate — single-agent DEEP on the selected Source.
+        return AgentRunRequest(
+            runId: request.runId,
+            threadId: request.threadId,
+            provider: route.provider,
+            providerInstanceId: route.providerInstanceId,
+            model: route.selection.effectiveModel,
+            cwd: request.cwd,
+            prompt: request.prompt,
+            userMessageContent: displayPrompt,
+            attachments: request.attachments,
+            providerThreadId: request.providerThreadId,
+            permissionMode: request.permissionMode,
+            reasoningEffort: route.selection.reasoningEffort,
+            serviceTier: route.selection.serviceTier,
+            interactionMode: request.interactionMode,
+            providerBinary: launch?.binary ?? request.providerBinary,
+            environment: AgentHostEnvironmentMerge.preserveHostInjects(
+                launch: launch?.environment,
+                request: request.environment
+            ),
+            extraArgs: request.extraArgs,
+            runAsUser: request.runAsUser
+        )
     }
 
     public func stopRun(_ runId: AgentRunID) {
@@ -777,8 +1144,9 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         }
     }
 
-    /// Internal proof seam used by lifecycle tests.
-    func hasProviderSession(threadId: AgentThreadID) -> Bool {
+    /// Provider-authoritative busy state. This remains true when a surface or
+    /// coordinator projection is stale but the adapter still owns a live turn.
+    public func hasProviderSession(threadId: AgentThreadID) -> Bool {
         guard let adapter = try? adapterForThread(threadId) else { return false }
         return providerSessionIsLive(adapter, threadId: threadId)
     }
@@ -789,7 +1157,13 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     ) -> Bool {
         guard adapter.hasSession(threadId: threadId) else { return false }
         guard let summary = adapter.listSessions().first(where: { $0.threadId == threadId }) else {
-            return true
+            // A session the adapter cannot summarize proves nothing about an
+            // in-flight turn. Treating it as live routed composer sends into
+            // the queue on an IDLE thread ("will run after the current turn"
+            // with no turn), and with no queue repo wired the prompt was
+            // silently dropped. Runs stay serialized by the coordinator's
+            // exclusive thread mutation either way.
+            return false
         }
         return summary.status == .running || summary.status == .pending
     }
@@ -808,6 +1182,9 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         guard let adapter = try? adapterForThread(threadId),
               adapter.hasSession(threadId: threadId) else { return }
         try? adapter.stopSession(threadId: threadId)
+        lock.lock()
+        providerTurnScopes.removeValue(forKey: threadId)
+        lock.unlock()
         try? providerSessionRepo?.markStopped(threadId: threadId)
     }
 
@@ -819,7 +1196,21 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         // double-fire didChangeStatus/onRunFinished for the same run (duplicate
         // notifications, two concurrent queue drains), so a run that is already
         // terminal is done.
-        if let runId, (try? runRepo.get(id: runId))?.finishedAt != nil {
+        //
+        // Exception: durable terminal + leftover in-memory ownership (partial
+        // finish / multi-process reconcile race). Release the ghost active run so
+        // Stop/Working cannot stick after finishedAt is already set.
+        if let runId, let row = try? runRepo.get(id: runId), row.finishedAt != nil {
+            _ = releaseStaleInMemoryOwnershipIfDurableTerminal(
+                runId: runId,
+                threadId: threadId,
+                preferredStatus: row.status,
+                finalMessage: nil,
+                providerThreadId: nil
+            )
+            if let adapter = try? adapterForThread(threadId), adapter.hasSession(threadId: threadId) {
+                try? adapter.stopSession(threadId: threadId)
+            }
             return
         }
         if let runId {
@@ -830,8 +1221,15 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             // commits. This prevents Stop-first from evicting active ownership or
             // publishing `.cancelled` while SQLite still holds uncommitted events.
             lock.lock()
-            guard !finishingRuns.contains(runId), pendingTerminalEvents[runId] == nil else {
+            let durabilityPending = finishingRuns.contains(runId) || pendingTerminalEvents[runId] != nil
+            guard !durabilityPending else {
+                let needsRetry = pendingTerminalEvents[runId] != nil
                 lock.unlock()
+                // Already finishing: re-arm durability retry so a stuck flush cannot
+                // leave activeThreads owned forever after the user hits Stop.
+                if needsRetry {
+                    scheduleTerminalDurabilityRetry(runId: runId, threadId: threadId)
+                }
                 return
             }
             finishingRuns.insert(runId)
@@ -933,6 +1331,76 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         lock.unlock()
     }
 
+    /// When SQLite already has a terminal run row but this process still lists the
+    /// run in `active` / `activeThreads`, release in-memory ownership and fan out
+    /// `didFinish` exactly once. No-op when the run is not owned in memory (avoids
+    /// double-notifying a fully completed finish path).
+    @discardableResult
+    private func releaseStaleInMemoryOwnershipIfDurableTerminal(
+        runId: AgentRunID,
+        threadId: AgentThreadID,
+        preferredStatus: AgentRunStatus?,
+        finalMessage: String?,
+        providerThreadId: String?
+    ) -> Bool {
+        lock.lock()
+        let ownsRun = active[runId] != nil || activeThreads[threadId] == runId
+        guard ownsRun else {
+            lock.unlock()
+            return false
+        }
+        // Cancel any still-registered handle so provider processes do not outlive
+        // the durable terminal row (Stop-after-partial-finish path).
+        let handle = active.removeValue(forKey: runId)
+        if activeThreads[threadId] == runId {
+            activeThreads.removeValue(forKey: threadId)
+        }
+        activeRunMetadata.removeValue(forKey: runId)
+        latestTokenUsage.removeValue(forKey: runId)
+        activeTurnIds.removeValue(forKey: runId)
+        activeAssistantMessageIds.removeValue(forKey: runId)
+        activeProviderTextItemTypes.removeValue(forKey: runId)
+        bufferedProviderTextItems.removeValue(forKey: runId)
+        activeDistillOutputRuns.remove(runId)
+        finishingRuns.remove(runId)
+        pendingTerminalEvents.removeValue(forKey: runId)
+        terminalRetryScheduled.remove(runId)
+        deferredProviderTerminalEvents.removeValue(forKey: runId)
+        providerTextTranslationsInFlight.removeValue(forKey: runId)
+        pendingGracefulStopFallbacks.remove(runId)
+        awaitingTerminationRuns.remove(runId)
+        providerTerminatedRuns.remove(runId)
+        pendingThreadStops.remove(threadId)
+        orchestrationDeadlineWorkItems.removeValue(forKey: runId)?.cancel()
+        seq.removeValue(forKey: runId)
+        lastPersistedAssistantContent.removeValue(forKey: threadId)
+        autoContinuationCounts.removeValue(forKey: threadId)
+        autoContinuationTokens[threadId] = (autoContinuationTokens[threadId] ?? 0) + 1
+        let projection = activeRunProjectionLocked()
+        lock.unlock()
+
+        handle?.cancel()
+        let status = preferredStatus
+            ?? (try? runRepo.get(id: runId))?.status
+            ?? .cancelled
+        agentRunLog.info(
+            "run.stale_ownership_released thread=\(threadId.value.uuidString, privacy: .public) run=\(runId.value.uuidString, privacy: .public) status=\(status.rawValue, privacy: .public)"
+        )
+        onActiveRunProjectionChanged?(projection, .finished(status))
+        for observer in observersSnapshot() {
+            observer.runCoordinator(
+                self,
+                didFinish: runId,
+                threadId: threadId,
+                status: status,
+                finalMessage: finalMessage,
+                providerThreadId: providerThreadId
+            )
+        }
+        onRunFinished?(threadId, runId, status)
+        return true
+    }
+
     #if DEBUG
     // Test-only seam for the F9 per-thread eviction: seed and observe the
     // auto-continuation bookkeeping without driving a full stalled autonomous run.
@@ -960,9 +1428,9 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         lock.unlock()
     }
 
-    /// Decide, at run finish, whether a full-access run stalled awaiting a
-    /// background job and should be auto-nudged to resume; if so, schedule a
-    /// bounded re-invocation after `backgroundAwaitContinuationDelay`.
+    /// Decide, at run finish, whether a full-access run ended incomplete (background
+    /// await or multi-phase workflow handoff) and should be auto-nudged; if so,
+    /// schedule a bounded re-invocation with a reason-specific delay/prompt.
     private func maybeScheduleBackgroundAwaitContinuation(
         threadId: AgentThreadID,
         status: AgentRunStatus,
@@ -974,7 +1442,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         lock.lock()
         let prior = autoContinuationCounts[threadId] ?? 0
         lock.unlock()
-        guard BackgroundAwaitContinuation.shouldAutoContinue(
+        guard let reason = IncompleteTurnContinuation.shouldAutoContinue(
             status: status,
             finalMessage: finalMessage,
             isAutonomous: isAutonomous,
@@ -992,9 +1460,17 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         autoContinuationTokens[threadId] = token
         lock.unlock()
         let attempt = prior + 1
-        let delay = backgroundAwaitContinuationDelay
-        let request = backgroundAwaitContinuationRequest(threadId: threadId, runMetadata: runMetadata, resumeCursor: resumeCursor)
-        agentRunLog.info("run.autoContinue.scheduled thread=\(threadId.value.uuidString, privacy: .public) attempt=\(attempt, privacy: .public)")
+        let delay = IncompleteTurnContinuation.delay(
+            for: reason,
+            backgroundDelay: backgroundAwaitContinuationDelay
+        )
+        let request = incompleteTurnContinuationRequest(
+            threadId: threadId,
+            runMetadata: runMetadata,
+            resumeCursor: resumeCursor,
+            reason: reason
+        )
+        agentRunLog.info("run.autoContinue.scheduled thread=\(threadId.value.uuidString, privacy: .public) attempt=\(attempt, privacy: .public) reason=\(reason.rawValue, privacy: .public)")
         Task { [weak self] in
             guard let self else { return }
             if delay > 0 {
@@ -1018,12 +1494,13 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         return (try? threadRepo.get(id: threadId))?.status == .completed
     }
 
-    private func backgroundAwaitContinuationRequest(
+    private func incompleteTurnContinuationRequest(
         threadId: AgentThreadID,
         runMetadata: RunMetadata,
-        resumeCursor: String?
+        resumeCursor: String?,
+        reason: IncompleteTurnContinuationReason
     ) -> AgentRunRequest {
-        let prompt = BackgroundAwaitContinuation.continuationPrompt
+        let prompt = IncompleteTurnContinuation.prompt(for: reason)
         let runAsUser = (try? threadRepo.get(id: threadId))?.runAsUser
         return AgentRunRequest(
             threadId: threadId,
@@ -1113,7 +1590,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         if let followUpPromptCompressor {
             outboundText = await followUpPromptCompressor(text, adapter.provider, threadId)
         } else if let promptCompressor {
-            outboundText = await promptCompressor(text, adapter.provider, threadId)
+            outboundText = await promptCompressor(text, adapter.provider, threadId, nil)
         } else {
             outboundText = text
         }
@@ -1128,7 +1605,50 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     public func readThread(threadId: AgentThreadID) async throws -> [AssistantEvent] {
         let adapter = try adapterForThread(threadId)
         try await recoverAdapterSessionIfNeeded(threadId: threadId, adapter: adapter)
-        return try await adapter.readThread(threadId: threadId)
+        return Self.boundedHotReplay(try await adapter.readThread(threadId: threadId))
+    }
+
+    public static func boundedHotReplay(
+        _ events: [AssistantEvent],
+        countLimit: Int = hotReplayEventCount,
+        byteLimit: Int64 = hotReplayEventBytes
+    ) -> [AssistantEvent] {
+        let encoder = JSONEncoder()
+        var retained: [AssistantEvent] = []
+        retained.reserveCapacity(min(events.count, max(1, countLimit)))
+        var bytes: Int64 = 0
+        // Walk newest→oldest so budget pressure drops older history first and
+        // the live tail always wins. Never replace a large frame with a
+        // recoverable "omitted" error — skip frames that cannot fit alone.
+        for event in events.reversed() {
+            guard retained.count < max(1, countLimit) else { break }
+            let eventBytes = Int64((try? encoder.encode(event).count) ?? event.debugDescription.utf8.count)
+            if eventBytes > max(1, byteLimit) {
+                // Pathological single frame larger than the whole window: keep
+                // walking older events rather than blocking the newest paint.
+                continue
+            }
+            if bytes + eventBytes > max(1, byteLimit) { break }
+            retained.append(event)
+            bytes += eventBytes
+        }
+        retained.reverse()
+        return retained
+    }
+
+    /// Correctness-critical state is stored in the compact provider-session row,
+    /// independently of the evictable stream transcript.
+    public func durableActiveThreadState(threadId: AgentThreadID) -> AgentActiveThreadState? {
+        guard let providerSessionRepo,
+              let session = try? providerSessionRepo.get(threadId: threadId) else { return nil }
+        let payload = ProviderSessionRuntimePayload.decode(session.runtimePayloadJSON)
+        return AgentActiveThreadState(
+            resumeCursor: session.resumeCursor ?? payload.providerThreadId,
+            activeTurnId: payload.activeTurnId,
+            activePlan: payload.activePlan,
+            pendingApprovalRequestIds: payload.pendingApprovalRequestIds,
+            pendingUserInputRequestIds: payload.pendingUserInputRequestIds
+        )
     }
 
     @discardableResult
@@ -1418,11 +1938,26 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         return checkpoint
     }
 
-    /// Replay the ENTIRE persisted thread, not just the last 500 events. The DB is already
-    /// pruned to ~5000 events/thread (pruneStreamEvents), so this is bounded; capping the
-    /// replay at 500 here was truncating the reopened transcript to its last few turns.
+    /// Hot replay is bounded independently by encoded bytes and row count. Durable
+    /// messages and compact ActiveThreadState preserve completed output and resume
+    /// correctness when the evictable event prefix is outside this window.
+    /// Sized for a 16 GB MacBook class machine so long Full Access / Chrome turns
+    /// rehydrate without clipping the recent window the UI just buffered.
+    public static let hotReplayEventCount = 16_384
+    public static let hotReplayEventBytes: Int64 = 256 * 1_024 * 1_024
+
     public func latestStreamEvents(threadId: AgentThreadID) -> [AssistantEvent] {
-        (try? runRepo.listLatestStreamEvents(threadId: threadId, limit: .max)) ?? []
+        (try? runRepo.listLatestStreamEvents(
+            threadId: threadId,
+            limit: Self.hotReplayEventCount,
+            maxPayloadBytes: Self.hotReplayEventBytes
+        )) ?? []
+    }
+
+    public func hotReplayIsPartial(threadId: AgentThreadID) -> Bool {
+        ((try? runRepo.streamHistoryWasPruned(threadId: threadId)) ?? false)
+            || ((try? runRepo.countStreamEvents(threadId: threadId)) ?? 0) > Self.hotReplayEventCount
+            || ((try? runRepo.streamEventPayloadBytes(threadId: threadId)) ?? 0) > Self.hotReplayEventBytes
     }
 
     /// Returns the exact locally-processed AssistantEvent snapshot while
@@ -1576,6 +2111,29 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         return adapterType
     }
 
+    private func refreshProviderProcessIfScopeChanged(
+        _ adapter: AgentProviderAdapter,
+        request: AgentRunRequest
+    ) throws {
+        guard adapter.hasSession(threadId: request.threadId) else { return }
+        let nextScope = ProviderTurnScope(environment: request.environment)
+        lock.lock()
+        let priorScope = providerTurnScopes[request.threadId]
+        lock.unlock()
+        let scopeChanged = priorScope.map { $0 != nextScope }
+            ?? nextScope.carriesTokenSaverScope
+        guard scopeChanged else { return }
+        guard request.providerThreadId?.isEmpty == false else {
+            throw AgentProviderAdapterError.unsupported(
+                "Provider process scope changed before a durable provider thread id was available; refusing to reuse stale Token Saver scope."
+            )
+        }
+        try adapter.stopSession(threadId: request.threadId)
+        lock.lock()
+        providerTurnScopes.removeValue(forKey: request.threadId)
+        lock.unlock()
+    }
+
     private func recoverAdapterSessionIfNeeded(threadId: AgentThreadID, adapter: AgentProviderAdapter) async throws {
         guard !adapter.hasSession(threadId: threadId) else { return }
         guard let thread = try threadRepo.get(id: threadId) else {
@@ -1595,9 +2153,14 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         // Recovered sessions are rebuilt here, bypassing the app shell's providerEnvironment, so
         // re-derive the Token Saver env or distill silently turns off on resume. Always keep the
         // provider tag so `| distill` savings attribute to claude/codex (not "unknown").
-        var environment = await recoveryEnvironmentProvider?(thread.provider) ?? [:]
+        var environment = await recoveryEnvironmentProvider?(thread.provider, threadId) ?? [:]
         environment["REMOTE_CODE_AGENT_PROVIDER"] = thread.provider.rawValue
+        let recoveryRunID = AgentRunID()
+        if environment["RC_TOKEN_SAVER_DISTILL_HINT"] == "1" {
+            environment["RC_TOKEN_SAVER_ATTEMPT_ID"] = recoveryRunID.value.uuidString
+        }
         let request = AgentRunRequest(
+            runId: recoveryRunID,
             threadId: threadId,
             provider: thread.provider,
             providerInstanceId: thread.providerInstanceId,
@@ -1614,6 +2177,9 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             runAsUser: thread.runAsUser
         )
         try await adapter.recoverSession(request) { _ in }
+        lock.lock()
+        providerTurnScopes[threadId] = ProviderTurnScope(environment: request.environment)
+        lock.unlock()
     }
 
     private func providerBinaryIdentity(_ provider: AgentProvider, adapter: AgentProviderAdapter) -> String? {
@@ -1779,9 +2345,15 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             payload.claudeResumeSessionAt = snapshot["resumeSessionAt"] as? String
                 ?? snapshot["lastAssistantUuid"] as? String
                 ?? payload.claudeResumeSessionAt
-            payload.claudeInFlightToolIds = snapshot["inFlightToolIds"] as? [String] ?? payload.claudeInFlightToolIds
-            payload.pendingApprovalRequestIds = snapshot["pendingApprovalRequestIds"] as? [String] ?? payload.pendingApprovalRequestIds
-            payload.pendingUserInputRequestIds = snapshot["pendingUserInputRequestIds"] as? [String] ?? payload.pendingUserInputRequestIds
+            payload.claudeInFlightToolIds = Self.boundedRuntimeIdentifiers(
+                snapshot["inFlightToolIds"] as? [String] ?? payload.claudeInFlightToolIds
+            )
+            payload.pendingApprovalRequestIds = Self.boundedRuntimeIdentifiers(
+                snapshot["pendingApprovalRequestIds"] as? [String] ?? payload.pendingApprovalRequestIds
+            )
+            payload.pendingUserInputRequestIds = Self.boundedRuntimeIdentifiers(
+                snapshot["pendingUserInputRequestIds"] as? [String] ?? payload.pendingUserInputRequestIds
+            )
             payload.updatedAtMs = Int64(Date().timeIntervalSince1970 * 1000)
         }
     }
@@ -1866,6 +2438,11 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         switch event {
         case .event(let rawEvent):
             let ev = sanitizeFinalAssistantEvent(rawEvent)
+            if case .tokenUsage(let usage) = ev {
+                lock.lock()
+                latestTokenUsage[runId] = usage
+                lock.unlock()
+            }
             if allowFinalResponseTranslation,
                case .turnCompleted(let turnId, let finalMessage) = ev,
                let finalMessage,
@@ -1955,6 +2532,27 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                     threadId: threadId
                 )
             }
+            // A failed SQLite flush must not turn the retry prefix into an
+            // unbounded spool. Before accepting another provider event, retry a
+            // prefix that already reached either high-water mark. If it is still
+            // locked, stop the provider at the durable resume cursor and fail
+            // loud; the retained prefix remains available for a later retry.
+            lock.lock()
+            let saturatedRetry = pendingStreamWrites[threadId].map {
+                Self.shouldFlushStreamBatch(
+                    pendingCount: $0.count,
+                    pendingBytes: $0.encodedByteCount,
+                    sinceLastFlushMs: 0
+                )
+            } ?? false
+            lock.unlock()
+            if saturatedRetry,
+               let retryError = flushPendingStreamWritesResult(runId: runId, threadId: threadId) {
+                recordMirrorPersistenceFailure(retryError, threadId: threadId)
+                emitPersistenceIssue("run.stream_event.retry_saturated", error: retryError, runId: runId, threadId: threadId)
+                stopRun(runId)
+                return
+            }
             lock.lock()
             let s = allocateStreamSequenceLocked(runId: runId, threadId: threadId)
             lock.unlock()
@@ -1972,9 +2570,13 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             // are coalesced into the flush. The payload compactor runs outside the
             // lock (as before) since it is an external, structure-preserving call.
             if let data, let json = String(data: data, encoding: .utf8) {
-                let payloadJSON = streamPayloadCompactor?(json) ?? json
+                let payloadJSON = Self.boundedPersistedStreamPayload(
+                    streamPayloadCompactor?(json) ?? json
+                )
                 let providerEvent: ProviderRuntimeEvent?
-                if case .providerRuntime(let runtimeEvent) = ev { providerEvent = runtimeEvent } else { providerEvent = nil }
+                if case .providerRuntime(let runtimeEvent) = ev {
+                    providerEvent = Self.boundedProviderRuntimeEvent(runtimeEvent)
+                } else { providerEvent = nil }
                 lock.lock()
                 if let owner = pendingStreamRunIds[threadId], owner != runId {
                     lock.unlock()
@@ -2000,7 +2602,11 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                 let lastMs = lastStreamFlushMs[threadId] ?? nowMs
                 lastStreamFlushMs[threadId] = lastStreamFlushMs[threadId] ?? nowMs
                 var flushNow: BatchFlush?
-                if Self.shouldFlushStreamBatch(pendingCount: batch.count, sinceLastFlushMs: nowMs - lastMs) || pruneDue {
+                if Self.shouldFlushStreamBatch(
+                    pendingCount: batch.count,
+                    pendingBytes: batch.encodedByteCount,
+                    sinceLastFlushMs: nowMs - lastMs
+                ) || pruneDue {
                     flushNow = takeStreamFlushLocked(threadId: threadId, pruneDue: pruneDue, nowMs: nowMs)
                 }
                 lock.unlock()
@@ -2041,9 +2647,10 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                 }
             case .requestOpened(let request):
                 updateProviderRuntimePayload(threadId: threadId, runId: runId) { payload in
-                    if !payload.pendingApprovalRequestIds.contains(request.id) {
-                        payload.pendingApprovalRequestIds.append(request.id)
-                    }
+                    payload.pendingApprovalRequestIds = Self.boundedRuntimeIdentifiers(
+                        existing: payload.pendingApprovalRequestIds,
+                        adding: request.id
+                    )
                     payload.updatedAtMs = Int64(Date().timeIntervalSince1970 * 1000)
                 }
             case .requestResolved(let requestId, _):
@@ -2053,9 +2660,10 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                 }
             case .userInputRequested(let request):
                 updateProviderRuntimePayload(threadId: threadId, runId: runId) { payload in
-                    if !payload.pendingUserInputRequestIds.contains(request.id) {
-                        payload.pendingUserInputRequestIds.append(request.id)
-                    }
+                    payload.pendingUserInputRequestIds = Self.boundedRuntimeIdentifiers(
+                        existing: payload.pendingUserInputRequestIds,
+                        adding: request.id
+                    )
                     payload.updatedAtMs = Int64(Date().timeIntervalSince1970 * 1000)
                 }
             case .userInputResolved(let requestId, _):
@@ -2072,6 +2680,27 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                     lock.lock()
                     activeAssistantMessageIds[runId] = persisted.id
                     lock.unlock()
+                }
+                if finalMessage?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false {
+                    updateProviderRuntimePayload(threadId: threadId, runId: runId) { payload in
+                        payload.activePlan = nil
+                        payload.updatedAtMs = Int64(Date().timeIntervalSince1970 * 1000)
+                    }
+                }
+            case .activePlanUpdated(let plan):
+                guard Self.activePlanFitsCompactBudget(plan) else {
+                    let error = NSError(
+                        domain: "RemoteCode.AgentRunCoordinator",
+                        code: 413,
+                        userInfo: [NSLocalizedDescriptionKey: "Active plan exceeds the compact recovery-state budget."]
+                    )
+                    emitPersistenceIssue("provider_session.active_plan.budget", error: error, runId: runId, threadId: threadId)
+                    stopRun(runId)
+                    return
+                }
+                updateProviderRuntimePayload(threadId: threadId, runId: runId) { payload in
+                    payload.activePlan = plan
+                    payload.updatedAtMs = Int64(Date().timeIntervalSince1970 * 1000)
                 }
             default:
                 break
@@ -2119,6 +2748,17 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             }
             lock.unlock()
             if let row = try? runRepo.get(id: runId), row.finishedAt != nil {
+                // Durable row is terminal (possibly written by another process's
+                // launch reconciliation or a partial finish). If this process still
+                // owns the run in memory, release it and fan out didFinish once so
+                // Working/Stop cannot stick after finishedAt is set.
+                _ = releaseStaleInMemoryOwnershipIfDurableTerminal(
+                    runId: runId,
+                    threadId: threadId,
+                    preferredStatus: status,
+                    finalMessage: sanitizeFinalAssistantText(rawFinalMessage),
+                    providerThreadId: providerThreadId
+                )
                 return
             }
             lock.lock()
@@ -2202,6 +2842,12 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                 )
             }
             let pendingTerminal = pendingTerminalEvents[runId]!
+            // Snapshot usage while ownership is still held. A concurrent stale-
+            // ownership release (a Stop or a duplicate `.finished` landing in the
+            // lock-free persist window below) can remove `latestTokenUsage[runId]`
+            // before the second lock region reads it; this early snapshot is the
+            // fallback so the finalized receipt never loses usage.
+            let capturedTokenUsage = latestTokenUsage[runId]
             lock.unlock()
             // PERF-MAC_AGENT-007: drain any buffered stream writes before the run
             // tears down, so the tail of a fast stream is durably persisted (and
@@ -2230,6 +2876,31 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                 scheduleTerminalDurabilityRetry(runId: runId, threadId: threadId)
                 return
             }
+            lock.lock()
+            // Prefer the current value — this captures out-of-band usage (e.g.
+            // Codex delivers usage as an independent notification that can arrive
+            // during the persist window) — and fall back to the pre-persist
+            // snapshot if a concurrent stale-release already removed the entry.
+            let usage = latestTokenUsage.removeValue(forKey: runId) ?? capturedTokenUsage
+            lock.unlock()
+            do {
+                try orchestrationRuntime?.finalizeReceipt(
+                    runId: runId,
+                    status: status,
+                    usage: usage,
+                    qualityOutcome: AgentOrchestrationRuntime.qualityOutcome(
+                        status: status,
+                        finalMessage: pendingTerminal.finalMessage
+                    )
+                )
+            } catch {
+                emitPersistenceIssue(
+                    "orchestration.receipt.finalize",
+                    error: error,
+                    runId: runId,
+                    threadId: threadId
+                )
+            }
             let runMetadata = terminalPersistence.runMetadata
             let completedTurnId = terminalPersistence.completedTurnId
             let assistantMessageId = terminalPersistence.assistantMessageId
@@ -2247,18 +2918,8 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                     assistantMessageId: assistantMessageId
                 )
             }
-            // UX-MAC_AGENT-BG-AWAIT: a full-access run that ends still awaiting a
-            // background job it launched is auto-nudged (bounded) so it actually
-            // finishes instead of silently sitting at "completed". Decided before
-            // the run metadata is evicted below.
-            maybeScheduleBackgroundAwaitContinuation(
-                threadId: threadId,
-                status: status,
-                finalMessage: finalMessage,
-                runMetadata: runMetadata,
-                resumeCursor: resumeCursor
-            )
             lock.lock()
+            orchestrationDeadlineWorkItems.removeValue(forKey: runId)?.cancel()
             active.removeValue(forKey: runId)
             activeThreads.removeValue(forKey: threadId)
             activeRunMetadata.removeValue(forKey: runId)
@@ -2291,6 +2952,17 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             lastPersistedAssistantContent.removeValue(forKey: threadId)
             let activeProjection = activeRunProjectionLocked()
             lock.unlock()
+            // UX-MAC_AGENT-BG-AWAIT / incomplete-turn: schedule only AFTER the
+            // finishing run is removed from activeThreads. Zero-delay workflow
+            // continuations would otherwise fail the idle validity check and
+            // never start (silent green "completed").
+            maybeScheduleBackgroundAwaitContinuation(
+                threadId: threadId,
+                status: status,
+                finalMessage: finalMessage,
+                runMetadata: runMetadata,
+                resumeCursor: resumeCursor
+            )
             onActiveRunProjectionChanged?(activeProjection, .finished(status))
             if pendingPrune {
                 do {
@@ -2546,6 +3218,24 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                 providerSession: providerSession,
                 streamEvent: pending.streamEvent
             )
+            do {
+                lock.lock()
+                let usage = latestTokenUsage.removeValue(forKey: runId)
+                lock.unlock()
+                try orchestrationRuntime?.finalizeReceipt(
+                    runId: runId,
+                    status: .failed,
+                    usage: usage,
+                    qualityOutcome: AgentOrchestrationRuntime.qualityOutcome(status: .failed, finalMessage: nil)
+                )
+            } catch {
+                emitPersistenceIssue(
+                    "orchestration.receipt.finalize",
+                    error: error,
+                    runId: runId,
+                    threadId: pending.request.threadId
+                )
+            }
         } catch {
             emitPersistenceIssue(
                 "run.start_failure.terminal_graph.commit",
@@ -3017,6 +3707,10 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         var kind: String
         var payloadJSON: String
         var providerEvent: ProviderRuntimeEvent?
+
+        var encodedByteCount: Int {
+            kind.utf8.count + payloadJSON.utf8.count + (providerEvent?.payloadJSON.utf8.count ?? 0)
+        }
     }
 
     struct StreamWriteBatch {
@@ -3024,6 +3718,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
 
         var isEmpty: Bool { items.isEmpty }
         var count: Int { items.count }
+        var encodedByteCount: Int { items.reduce(0) { $0 + $1.encodedByteCount } }
         var highestSeq: Int { items.map(\.seq).max() ?? 0 }
 
         mutating func append(_ item: StreamWriteItem) {
@@ -3117,21 +3812,122 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     /// How many buffered stream events force a flush. Bounds both the in-memory
     /// buffer and the lock-held replay size on a single flush.
     nonisolated static let streamFlushCountThreshold = 16
+    /// Large provider frames (Chrome dumps, shell output) flush by bytes before
+    /// the count threshold so the in-memory batch stays bounded.
+    nonisolated static let streamFlushByteThreshold = 8 * 1_024 * 1_024
+    /// Absolute per-frame ceiling for a 16 GB MacBook class machine (~0.1% of RAM).
+    /// Frames under this limit always admit; older history is reclaimed by
+    /// retention prune. Only pathological frames above this are soft-truncated —
+    /// never replaced with a recoverable "omitted" error banner.
+    nonisolated static let maximumBufferedEventBytes = 16 * 1_024 * 1_024
     /// Max latency (ms) a buffered stream event may wait before being flushed,
     /// so a slow trickle still reaches the DB (and survives reload/crash).
     nonisolated static let streamFlushTimeThresholdMs: Int64 = 250
+
+    nonisolated static func boundedPersistedStreamPayload(
+        _ payloadJSON: String,
+        byteLimit: Int = maximumBufferedEventBytes
+    ) -> String {
+        Self.softTruncateUTF8Payload(payloadJSON, byteLimit: byteLimit)
+    }
+
+    nonisolated static func boundedProviderRuntimeEvent(
+        _ event: ProviderRuntimeEvent,
+        byteLimit: Int = maximumBufferedEventBytes
+    ) -> ProviderRuntimeEvent {
+        let bounded = Self.softTruncateUTF8Payload(event.payloadJSON, byteLimit: byteLimit)
+        guard bounded != event.payloadJSON else { return event }
+        return ProviderRuntimeEvent(
+            id: event.id,
+            provider: event.provider,
+            source: event.source,
+            method: event.method,
+            providerTurnId: event.providerTurnId,
+            providerItemId: event.providerItemId,
+            providerRequestId: event.providerRequestId,
+            payloadJSON: bounded,
+            receivedAtMs: event.receivedAtMs
+        )
+    }
+
+    /// Soft-truncate an encoded payload at a Character-safe boundary. Prefer the
+    /// head of the frame so partial tool output remains useful; never emit a
+    /// recoverable user-facing error for size pressure.
+    nonisolated static func softTruncateUTF8Payload(
+        _ payloadJSON: String,
+        byteLimit: Int
+    ) -> String {
+        let limit = max(1, byteLimit)
+        let originalBytes = payloadJSON.utf8.count
+        guard originalBytes > limit else { return payloadJSON }
+        let trailer = "…[truncated \(originalBytes)→\(limit) bytes]"
+        let headBudget = max(0, limit - trailer.utf8.count)
+        var consumed = 0
+        var end = payloadJSON.startIndex
+        for index in payloadJSON.indices {
+            let step = String(payloadJSON[index]).utf8.count
+            if consumed + step > headBudget { break }
+            consumed += step
+            end = payloadJSON.index(after: index)
+        }
+        return String(payloadJSON[..<end]) + trailer
+    }
+
+    /// FIFO-set helper for correctness identifiers stored in the compact runtime
+    /// payload. The newest identifier is always retained; old resolved/stale IDs
+    /// are evicted from this diagnostic index, while their durable callback rows
+    /// remain authoritative.
+    nonisolated static func boundedRuntimeIdentifiers(
+        existing: [String],
+        adding identifier: String,
+        countLimit: Int = 128,
+        byteLimit: Int = 32 * 1_024
+    ) -> [String] {
+        boundedRuntimeIdentifiers(existing.filter { $0 != identifier } + [identifier], countLimit: countLimit, byteLimit: byteLimit)
+    }
+
+    nonisolated static func boundedRuntimeIdentifiers(
+        _ identifiers: [String],
+        countLimit: Int = 128,
+        byteLimit: Int = 32 * 1_024
+    ) -> [String] {
+        var result = identifiers
+        var bytes = result.reduce(0) { $0 + $1.utf8.count }
+        while result.count > max(1, countLimit)
+            || (bytes > max(1, byteLimit) && result.count > 1) {
+            bytes -= result.removeFirst().utf8.count
+        }
+        return result
+    }
+
+    nonisolated static let compactActivePlanStepLimit = 512
+    nonisolated static let compactActivePlanByteLimit = 256 * 1_024
+
+    nonisolated static func activePlanFitsCompactBudget(
+        _ plan: AssistantActivePlan,
+        stepLimit: Int = compactActivePlanStepLimit,
+        byteLimit: Int = compactActivePlanByteLimit
+    ) -> Bool {
+        guard plan.steps.count <= max(1, stepLimit),
+              let bytes = try? JSONEncoder().encode(plan).count else { return false }
+        return bytes <= max(1, byteLimit)
+    }
 
     /// Pure flush-cadence decision: flush when there is pending work AND either the
     /// count cap is reached or the time budget has elapsed. nonisolated so it is
     /// directly unit-testable without standing up a coordinator.
     nonisolated static func shouldFlushStreamBatch(
         pendingCount: Int,
+        pendingBytes: Int = 0,
         sinceLastFlushMs: Int64,
         countThreshold: Int = streamFlushCountThreshold,
+        byteThreshold: Int = streamFlushByteThreshold,
         timeThresholdMs: Int64 = streamFlushTimeThresholdMs
     ) -> Bool {
         guard pendingCount > 0 else { return false }
-        return pendingCount >= countThreshold || sinceLastFlushMs >= timeThresholdMs
+        return pendingCount >= countThreshold
+            || pendingBytes >= byteThreshold
+            || sinceLastFlushMs >= timeThresholdMs
     }
 
     private func captureFileDiffs(files: [AgentTurnCheckpointFile], cwd: String) -> [AgentTurnCheckpointFileDiff] {
@@ -3472,6 +4268,7 @@ private struct ProviderSessionRuntimePayload: Codable, Equatable {
     var runtimeMode: AgentPermissionMode?
     var interactionMode: AgentInteractionMode?
     var activeTurnId: String?
+    var activePlan: AssistantActivePlan?
     var pendingApprovalRequestIds: [String] = []
     var pendingUserInputRequestIds: [String] = []
     var claudeResumeSessionAt: String?
@@ -3479,7 +4276,7 @@ private struct ProviderSessionRuntimePayload: Codable, Equatable {
     var updatedAtMs: Int64?
 
     private enum CodingKeys: String, CodingKey {
-        case providerThreadId, lastCompletedTurnId, turnCount, model, serviceTier, runtimeMode, interactionMode, activeTurnId, pendingApprovalRequestIds, pendingUserInputRequestIds, claudeResumeSessionAt, claudeInFlightToolIds, updatedAtMs
+        case providerThreadId, lastCompletedTurnId, turnCount, model, serviceTier, runtimeMode, interactionMode, activeTurnId, activePlan, pendingApprovalRequestIds, pendingUserInputRequestIds, claudeResumeSessionAt, claudeInFlightToolIds, updatedAtMs
     }
 
     init(turnCount: Int = 0) {
@@ -3496,6 +4293,7 @@ private struct ProviderSessionRuntimePayload: Codable, Equatable {
         runtimeMode = try container.decodeIfPresent(AgentPermissionMode.self, forKey: .runtimeMode)
         interactionMode = try container.decodeIfPresent(AgentInteractionMode.self, forKey: .interactionMode)
         activeTurnId = try container.decodeIfPresent(String.self, forKey: .activeTurnId)
+        activePlan = try container.decodeIfPresent(AssistantActivePlan.self, forKey: .activePlan)
         pendingApprovalRequestIds = try container.decodeIfPresent([String].self, forKey: .pendingApprovalRequestIds) ?? []
         pendingUserInputRequestIds = try container.decodeIfPresent([String].self, forKey: .pendingUserInputRequestIds) ?? []
         claudeResumeSessionAt = try container.decodeIfPresent(String.self, forKey: .claudeResumeSessionAt)

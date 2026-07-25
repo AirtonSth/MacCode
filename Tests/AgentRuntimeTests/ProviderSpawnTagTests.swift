@@ -12,7 +12,7 @@ import CoreModel
 //   setpgid(pid, 0) makes the child its own process-group leader; a periodic
 //   sweeper can match by pgid even after reparenting, and the age gate prevents
 //   killing a process that is legitimately still running its first turn.
-final class ProviderSpawnTagTests: XCTestCase {
+final class ProviderSpawnTagTests: ProviderProcessTestCase {
 
     func test_installedProviderRootsAreReapedFromPersistedLedgerAfterForceQuit() throws {
         guard ProcessInfo.processInfo.environment["RC_REAL_PROVIDER_SWEEP_GATE"] == "1" else {
@@ -205,6 +205,95 @@ final class ProviderSpawnTagTests: XCTestCase {
         try store.replace([tag])
         XCTAssertEqual(try store.load(), [tag],
                        "kernel start identity must survive the exact JSON ledger round trip used across app relaunches")
+    }
+
+    func test_realSidecarTagPersistsExactManagedKindAndLifetime() throws {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/sleep")
+        process.arguments = ["30"]
+        try process.run()
+        defer { if process.isRunning { process.terminate() } }
+
+        let tag = try ProcessSpawnTagger.tagProcess(process, managedKind: .sidecar)
+
+        XCTAssertEqual(tag.managedKind, .sidecar)
+        XCTAssertNil(tag.provider)
+        XCTAssertNotNil(tag.startIdentity)
+        XCTAssertEqual(tag.isolatedProcessGroup, process.processIdentifier)
+        XCTAssertTrue(
+            try XCTUnwrap(ProviderProcessOwnership.shared.store()).load().contains(tag),
+            "the sidecar must enter the same durable exact-identity ledger used for provider crash recovery"
+        )
+    }
+
+    func test_foreignUserLaunchStillCapturesRealIdentityWhenChildIsReadable() throws {
+        // WHY: the run-as-user relaxation must only DROP TO owner-anchoring when the
+        // child is genuinely unreadable. A readable child (same-user, e.g. a dev
+        // machine where sudo isn't yet gating uid) must still get its exact kernel
+        // identity + exec path recorded, so the flag never silently weakens a row
+        // that could have been fully certified.
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/sleep")
+        process.arguments = ["30"]
+        try process.run()
+        defer { if process.isRunning { process.terminate() } }
+
+        let tag = try XCTUnwrap(
+            ProcessSpawnTagger.tagProcess(process, provider: .claude, foreignUserLaunch: true)
+        )
+        let kernelIdentity = try XCTUnwrap(
+            ProviderProcessStartIdentity.read(pid: process.processIdentifier)
+        )
+        XCTAssertEqual(tag.startIdentity, kernelIdentity,
+                       "a readable child must keep its exact lifetime even under foreignUserLaunch")
+        XCTAssertEqual(tag.executablePath, "/bin/sleep")
+        XCTAssertNotNil(tag.isolatedProcessGroup,
+                        "a readable child's isolated group must still be certified")
+    }
+
+    func test_ownerAnchoredForeignUserRowIsRetainedNotReapedAfterOwnerCrash() throws {
+        // WHY: a run-as-user (sudo) child yields an owner-anchored row with no child
+        // start identity. After an app crash the sweep MUST NOT signal a PID it
+        // cannot identify — the recovered lifetime could belong to anyone by then.
+        // The guarantee is fail-safe retention, never mis-reap.
+        let file = FileManager.default.temporaryDirectory.appendingPathComponent("owner-anchored-\(UUID().uuidString).json")
+        let store = ProviderProcessOwnershipStore(fileURL: file)
+        let old = Date(timeIntervalSince1970: 100)
+        let ownerAnchored = SpawnedProcessTag(
+            pgid: 4242,
+            spawnedAt: old,
+            ownerPID: 900,
+            ownerStartIdentity: ProviderProcessStartIdentity(seconds: 5, microseconds: 5),
+            provider: .claude,
+            executablePath: "",
+            startIdentity: nil,
+            isolatedProcessGroup: nil
+        )
+        try store.replace([ownerAnchored])
+        var signals: [(pid_t, Int32)] = []
+
+        let result = try ProviderProcessSweeper.sweepPersistedOrphans(
+            store: store,
+            currentPID: 1,
+            minAge: 30,
+            now: Date(timeIntervalSince1970: 200),
+            ownerIsAlive: { _ in false },              // owner (app) crashed
+            ownerStartIdentity: { _ in nil },
+            processCommand: { _ in "/usr/bin/sudo -u dev -- claude --print" },
+            processStartIdentity: { _ in ProviderProcessStartIdentity(seconds: 42, microseconds: 42) },
+            descendantPIDs: { _ in [] },
+            processIsAlive: { $0 == 4242 },            // root still alive
+            graceInterval: 0,
+            wait: { _ in },
+            sendSignal: { pid, signal in signals.append((pid, signal)); return true }
+        )
+
+        XCTAssertTrue(signals.isEmpty,
+                      "an unidentifiable owner-anchored root must never be signalled")
+        XCTAssertEqual(result.terminatedPIDs, [])
+        XCTAssertEqual(result.failedPIDs, [4242])
+        XCTAssertEqual(try store.load(), [ownerAnchored],
+                       "the fail-safe row must survive so a later relaunch can retry")
     }
 
     func test_unconfiguredOwnershipStoreFailsClosed() throws {
@@ -705,6 +794,7 @@ final class ProviderSpawnTagTests: XCTestCase {
             tags: [],   // no tags -> nothing eligible
             minAge: 30,
             isAlive: { _ in true },
+            processStartIdentity: { _ in nil },
             now: now,
             terminate: { _ in true }
         )
@@ -770,11 +860,12 @@ final class ProviderSpawnTagTests: XCTestCase {
         // ineligible tags in a mixed batch (old vs fresh, alive vs dead).
         let base = Date(timeIntervalSince1970: 0)
         let now = Date(timeIntervalSince1970: 120)
+        let identity = ProviderProcessStartIdentity(seconds: 1, microseconds: 1)
 
         let tags: [SpawnedProcessTag] = [
-            SpawnedProcessTag(pgid: 10, spawnedAt: base),           // old + alive -> reap
-            SpawnedProcessTag(pgid: 20, spawnedAt: Date(timeIntervalSince1970: 110)), // fresh -> skip
-            SpawnedProcessTag(pgid: 30, spawnedAt: base),           // old + dead -> skip
+            SpawnedProcessTag(pgid: 10, spawnedAt: base, startIdentity: identity),
+            SpawnedProcessTag(pgid: 20, spawnedAt: Date(timeIntervalSince1970: 110), startIdentity: identity),
+            SpawnedProcessTag(pgid: 30, spawnedAt: base, startIdentity: identity),
         ]
 
         let aliveSet: Set<pid_t> = [10, 20] // 30 is dead
@@ -784,6 +875,7 @@ final class ProviderSpawnTagTests: XCTestCase {
             tags: tags,
             minAge: 30,
             isAlive: { aliveSet.contains($0) },
+            processStartIdentity: { aliveSet.contains($0) ? identity : nil },
             now: now,
             terminate: { pid in terminated.append(pid); return true }
         )
@@ -801,12 +893,14 @@ final class ProviderSpawnTagTests: XCTestCase {
         // the caller can log/retry; it must NOT appear in terminatedPIDs.
         let base = Date(timeIntervalSince1970: 0)
         let now = Date(timeIntervalSince1970: 120)
-        let tags = [SpawnedProcessTag(pgid: 99, spawnedAt: base)]
+        let identity = ProviderProcessStartIdentity(seconds: 1, microseconds: 1)
+        let tags = [SpawnedProcessTag(pgid: 99, spawnedAt: base, startIdentity: identity)]
 
         let result = ProviderProcessSweeper.sweepTaggedOrphans(
             tags: tags,
             minAge: 30,
             isAlive: { _ in true },
+            processStartIdentity: { _ in identity },
             now: now,
             terminate: { _ in false } // simulate killpg failure
         )
@@ -820,16 +914,18 @@ final class ProviderSpawnTagTests: XCTestCase {
         // WHY: deterministic output simplifies logging and idempotent retry logic.
         let base = Date(timeIntervalSince1970: 0)
         let now = Date(timeIntervalSince1970: 120)
+        let identity = ProviderProcessStartIdentity(seconds: 1, microseconds: 1)
         let tags = [
-            SpawnedProcessTag(pgid: 300, spawnedAt: base),
-            SpawnedProcessTag(pgid: 100, spawnedAt: base),
-            SpawnedProcessTag(pgid: 200, spawnedAt: base),
+            SpawnedProcessTag(pgid: 300, spawnedAt: base, startIdentity: identity),
+            SpawnedProcessTag(pgid: 100, spawnedAt: base, startIdentity: identity),
+            SpawnedProcessTag(pgid: 200, spawnedAt: base, startIdentity: identity),
         ]
 
         let result = ProviderProcessSweeper.sweepTaggedOrphans(
             tags: tags,
             minAge: 30,
             isAlive: { _ in true },
+            processStartIdentity: { _ in identity },
             now: now,
             terminate: { _ in true }
         )

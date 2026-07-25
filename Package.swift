@@ -47,7 +47,10 @@ let package = Package(
         ),
         .target(
             name: "CoreModel",
-            path: "Sources/CoreModel"
+            path: "Sources/CoreModel",
+            linkerSettings: [
+                .linkedFramework("Security")
+            ]
         ),
         .target(
             name: "Persistence",
@@ -60,7 +63,10 @@ let package = Package(
         .target(
             name: "AgentRuntime",
             dependencies: ["CoreModel", "Persistence", "RemoteCodeCSystem"],
-            path: "Sources/AgentRuntime"
+            path: "Sources/AgentRuntime",
+            resources: [
+                .copy("Resources/remote-code-orchestrate")
+            ]
         ),
         .target(
             name: "DistillCore",

@@ -2,6 +2,7 @@ import Foundation
 import Darwin
 import CryptoKit
 import Persistence
+import AgentRuntime
 
 /// Minimal HTTP/1.1 + WebSocket-stub server used as the desktop-side
 /// foundation for a future direct-VPN/LAN mobile client. The intent is
@@ -1206,7 +1207,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
                 "ssh": [
                     "methods": ["ssh.host.list", "ssh.host.upsert", "ssh.host.delete", "ssh.connect", "ssh.disconnect", "ssh.transfer.upload", "ssh.transfer.download", "ssh.files.local.list", "ssh.files.remote.list"]
                 ],
-                "agent": ["providers": ["codex", "claude", "grok"], "supports_stream_events": true, "supports_resume": true],
+                "agent": ["providers": ["codex", "claude", "grok"], "supports_stream_events": true, "supports_resume": true, "model_routing": ["auto": true, "admission_receipts": true, "rollout_enabled": AgentOrchestrationRuntime.defaultRolloutEnabled()]],
                 "browser_automation": [
                     "p0": ["navigate", "back", "forward", "reload", "url.get", "mirror_url.get"],
                     "p1": ["click", "fill", "type", "focus", "hover", "check", "uncheck", "select", "eval", "snapshot", "screenshot", "wait"],
@@ -1323,11 +1324,11 @@ public final class DirectHTTPServer: @unchecked Sendable {
         case is NSNull: requestID = nil
         case let value as String: requestID = .string(value)
         case let value as NSNumber:
-            let number = value.doubleValue
-            if number.rounded(.towardZero) == number,
-               number >= Double(Int.min),
-               number <= Double(Int.max) {
-                requestID = .number(value.intValue)
+            // `Double(Int.max)` rounds up to 2^63, so a `<= Double(Int.max)` bound
+            // admits a value that overflows Int. `Int(exactly:)` accepts only an
+            // exactly-representable integer id; anything else uses the 0 sentinel.
+            if let intID = Int(exactly: value.doubleValue) {
+                requestID = .number(intID)
             } else {
                 // JSONRPCID is integer-only internally. The dispatcher does not
                 // inspect ids; the exact finite wire number is restored below.

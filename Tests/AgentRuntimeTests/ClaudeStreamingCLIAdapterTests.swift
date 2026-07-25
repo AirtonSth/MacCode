@@ -1028,39 +1028,48 @@ final class ClaudeStreamingCLIAdapterTests: ProviderProcessTestCase {
                       "rc_configure must send a system prompt")
         XCTAssertTrue(on.contains("Background-await protocol"),
                       "the system prompt must always carry the background-await self-declaration rule")
-        XCTAssertTrue(on.contains("pipe EVERY non-interactive"),
-                      "with Token Saver on, the system prompt must also carry the canonical `| distill` piping rule")
+        XCTAssertTrue(on.contains("pipe EVERY pipable, output-producing shell/tool call"),
+                      "Token Saver on: system prompt carries `| distill` piping rule")
         XCTAssertTrue(on.contains("S=state"),
-                      "the system prompt must carry the distill-language prefixes so user-visible replies use distill language")
+                      "Token Saver on: system prompt carries distill-language prefixes")
 
         let off = try await configureCommand(tokenSaverOn: false)
-        // UX-MAC_AGENT-BG-AWAIT: the background-await rule rides on EVERY run, so the
-        // SDK system prompt is now always present — but Token Saver's distill rules
-        // must still be gated out when the managed CLI is uninstalled.
+        // Background-await stays; Distill is paid (Token Saver only).
         XCTAssertTrue(off.contains("\"system_prompt\""),
                       "the background-await rule must be sent even with Token Saver off")
         XCTAssertTrue(off.contains("Background-await protocol"),
                       "the background-await self-declaration rule must be present regardless of Token Saver")
-        XCTAssertFalse(off.contains("pipe EVERY non-interactive"),
-                       "no Token Saver hint (managed distill CLI uninstalled) must leave the distill rules out of the system prompt")
+        XCTAssertFalse(off.contains("pipe EVERY pipable, output-producing shell/tool call"),
+                       "Token Saver off must not inject Distill pipe rules")
+        XCTAssertFalse(off.contains("| distill"),
+                       "Token Saver off must not inject Distill pipe rules")
     }
 
-    func test_claudeSystemPrompt_alwaysCarriesBackgroundAwaitRule_distillOnlyWithTokenSaver() {
-        // Fast, direct contract for the SDK session system prompt (no bridge spawn):
-        // the background-await self-declaration rule rides on EVERY run so the agent
-        // can mark an unavoidable wait with the recovery marker; the distill rules are
-        // gated on Token Saver (the managed CLI exists) so they vanish when it is off.
-        let off = ClaudeAgentSDKBridgeAdapter.claudeSystemPrompt(environment: [:])
-        XCTAssertTrue(off.contains(BackgroundAwaitContinuation.awaitingMarker),
-                      "the background-await rule must be present even with Token Saver off")
-        XCTAssertFalse(off.contains("| distill"),
-                       "distill rules must be gated out when Token Saver is off")
+    func test_claudeSystemPrompt_backgroundAwaitAlways_distillOnlyWithTokenSaver() {
+        // Background-await always; Distill only when Token Saver hint is present.
+        let emptyEnv = ClaudeAgentSDKBridgeAdapter.claudeSystemPrompt(environment: [:])
+        XCTAssertTrue(emptyEnv.contains(BackgroundAwaitContinuation.awaitingMarker),
+                      "the background-await rule must be present on every Claude call")
+        XCTAssertFalse(emptyEnv.contains("| distill"),
+                       "Token Saver off must not inject Distill")
+        XCTAssertFalse(emptyEnv.contains(TokenSaverProviderSafetyABI.block),
+                       "Token Saver off must not inject safety ABI")
 
         let on = ClaudeAgentSDKBridgeAdapter.claudeSystemPrompt(environment: ["RC_TOKEN_SAVER_DISTILL_HINT": "1"])
         XCTAssertTrue(on.contains(BackgroundAwaitContinuation.awaitingMarker),
                       "the background-await rule must remain present with Token Saver on")
         XCTAssertTrue(on.contains("| distill"),
-                      "Token Saver on must also carry the distill piping rule")
+                      "Token Saver hint carries the distill piping rule")
+        XCTAssertEqual(on.components(separatedBy: TokenSaverProviderSafetyABI.block).count - 1, 1,
+                       "Claude receives the versioned Token Saver safety ABI exactly once")
+        XCTAssertEqual(
+            (AgentSkillInstaller.distillAgentInstructionsTemplate + "\n\n" + on)
+                .components(separatedBy: TokenSaverProviderSafetyABI.block).count - 1,
+            1,
+            "Claude SDK effective disk plus runtime context receives the safety ABI exactly once"
+        )
+        XCTAssertEqual(emptyEnv.components(separatedBy: TokenSaverProviderSafetyABI.block).count - 1, 0,
+                       "Token Saver off must not inject the safety ABI")
     }
 
     func test_agentSDKBridgeAdapterFinalizesAssistantTextWhenBridgeExitsWithoutResult() async throws {
@@ -1486,12 +1495,27 @@ final class ClaudeStreamingCLIAdapterTests: ProviderProcessTestCase {
         let bridge = tmp.appendingPathComponent("ClaudeAgentSDKBridge.mjs")
         let commandLog = tmp.appendingPathComponent("commands.jsonl")
         let npmLog = tmp.appendingPathComponent("npm.jsonl")
+        // Honor the hardened completeness contract (runtimeTreeComplete): create a
+        // versioned package.json for EVERY installed spec, plus the native
+        // `claude` executable for the platform package. A bare SDK stub is
+        // rejected as an incomplete tree.
         try """
         #!/usr/bin/env bash
         set -euo pipefail
         printf '{"argv":%s,"cwd":"%s"}\\n' "$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1:]))' "$@")" "$PWD" >> "\(npmLog.path)"
-        mkdir -p node_modules/@anthropic-ai/claude-agent-sdk
-        printf '{"name":"@anthropic-ai/claude-agent-sdk"}\\n' > node_modules/@anthropic-ai/claude-agent-sdk/package.json
+        # Only `install` provisions the tree. `npm view` (peer-range resolution)
+        # is a no-op so the adapter falls back to its default pinned peers and
+        # never creates node_modules in the caller's cwd.
+        [ "${1:-}" = "install" ] || exit 0
+        for arg in "$@"; do
+          case "$arg" in -*|install) continue;; esac
+          name="${arg%@*}"
+          version="${arg##*@}"
+          [ -z "$name" ] && continue
+          mkdir -p "node_modules/$name"
+          printf '{"name":"%s","version":"%s"}\\n' "$name" "$version" > "node_modules/$name/package.json"
+          case "$name" in *claude-agent-sdk-*) printf '#!/bin/sh\\n' > "node_modules/$name/claude"; chmod +x "node_modules/$name/claude";; esac
+        done
         """.write(to: bin.appendingPathComponent("npm"), atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: bin.appendingPathComponent("npm").path)
         try """
@@ -1655,9 +1679,9 @@ final class ClaudeStreamingCLIAdapterTests: ProviderProcessTestCase {
                       "rc_configure must relay the host `system_prompt` into session state (undefined keeps the SDK default empty prompt when Token Saver is off)")
     }
 
-    // Token Saver must distill EVERY tool (no 4-tool allowlist) once output passes
-    // the stated policy threshold (>~1KB OR >~10 lines), excluding only the
-    // exact-byte file tools. Locks the policy values + the no-allowlist behavior.
+    // The Claude PostToolUse fallback must distill EVERY tool (no 4-tool
+    // allowlist) once output passes its hook threshold, excluding only the
+    // exact-byte file tools. Explicit `| distill` is governed by the system prompt.
     func test_agentSDKBridgeTokenSaverCompressesAllToolsAbovePolicyThreshold() throws {
         let packageRoot = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
@@ -1680,8 +1704,14 @@ final class ClaudeStreamingCLIAdapterTests: ProviderProcessTestCase {
         // small"); it must remain AND so output compresses when EITHER threshold trips.
         XCTAssertTrue(source.contains("<= TOKEN_SAVER_MIN_BYTES && lineCount(output) <= TOKEN_SAVER_MIN_LINES"),
                       "skip guard must stay AND so a >1KB OR >10-line output is compressed")
-        XCTAssertTrue(source.contains("TOKEN_SAVER_EXCLUDED_TOOLS = new Set(['read', 'edit', 'write', 'multiedit', 'notebookedit'])"),
-                      "only exact-byte file tools are exempt (compressing them would break verbatim edits)")
+        XCTAssertTrue(source.contains("TOKEN_SAVER_EXCLUDED_TOOLS = new Set(['read', 'edit', 'write', 'multiedit', 'notebookedit', 'grep'])"),
+                      "exact-byte file tools and Grep are exempt (compressing them would break line-level agent work)")
+        XCTAssertTrue(source.contains("TOKEN_SAVER_EXACT_OUTPUT_BASH"),
+                      "Bash must skip exact-output shell tools (rg/grep/sed/...) per AGENTS.md")
+        XCTAssertTrue(source.contains("isExactOutputBashCommand"),
+                      "Bash exact-output detection must inspect command segments, not only the first token")
+        XCTAssertTrue(source.contains("updatedToolOutput"),
+                      "PostToolUse must use updatedToolOutput so built-in tools actually receive compressed output")
     }
 
     func test_agentSDKBridgeRecoversRawNewlineSplitPromptCommand() throws {
@@ -1844,6 +1874,194 @@ final class ClaudeStreamingCLIAdapterTests: ProviderProcessTestCase {
         try #"{"name":"@anthropic-ai/claude-agent-sdk","version":"0.3.157"}"#
             .write(to: packageJSON, atomically: true, encoding: .utf8)
         XCTAssertTrue(ClaudeAgentSDKBridgeAdapter.installedSDKPackage(at: packageJSON, matches: ClaudeAgentSDKBridgeAdapter.defaultSDKPackageSpec))
+    }
+
+    // MARK: - CLAUDE-BG-LIFECYCLE (background tasks + async subagents)
+
+    /// Writes a fake `claude` that replays the REAL wire sequence captured from
+    /// `claude --print --input-format stream-json --output-format stream-json`
+    /// (CLI 2.1.219) when a turn ends while async work is still running: the CLI
+    /// emits a premature `result`, later reports the task list empty, RESUMES the
+    /// agent on its own, and emits a second `result` carrying the real answer.
+    ///
+    /// `taskType` is `local_bash` for a background shell and `local_agent` for an
+    /// async subagent — the two cases users hit. `neverCompletes` drops the
+    /// idle snapshot + resumed turn to model a background job that never returns.
+    private func writeBackgroundLifecycleFakeClaude(
+        at script: URL,
+        taskType: String,
+        neverCompletes: Bool = false
+    ) throws {
+        // Built line-by-line with explicit indentation: interpolating an indented
+        // multi-line chunk into a Python loop body silently produces invalid
+        // indentation (the script then dies and the test measures the wrong thing).
+        let body = "    "
+        var lines: [String] = [
+            "#!/usr/bin/env python3",
+            "import json, sys, time",
+            "S = \"claude-bg-session\"",
+            "def e(o):",
+            "    print(json.dumps(o), flush=True)",
+            "e({\"type\":\"system\",\"subtype\":\"init\",\"session_id\":S})",
+            "for line in sys.stdin:",
+            body + "if not line.strip():",
+            body + "    continue",
+            // turn 1: dispatch async work, then end the turn early (the CLI's real behaviour)
+            body + "e({\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"tool_use\",\"id\":\"toolu_bg\",\"name\":\"Bash\",\"input\":{\"command\":\"sleep 30\",\"run_in_background\":True}}]},\"session_id\":S})",
+            body + "e({\"type\":\"system\",\"subtype\":\"background_tasks_changed\",\"tasks\":[{\"task_id\":\"T1\",\"task_type\":\"\(taskType)\",\"description\":\"work\"}],\"session_id\":S})",
+            body + "e({\"type\":\"system\",\"subtype\":\"task_started\",\"task_id\":\"T1\",\"task_type\":\"\(taskType)\",\"session_id\":S})",
+            body + "e({\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"PREMATURE_STANDING_BY\"}]},\"session_id\":S})",
+            body + "e({\"type\":\"result\",\"subtype\":\"success\",\"is_error\":False,\"result\":\"PREMATURE_STANDING_BY\",\"session_id\":S})",
+        ]
+        if !neverCompletes {
+            lines += [
+                body + "time.sleep(0.25)",
+                // provider goes idle, then resumes the agent on its own
+                body + "e({\"type\":\"system\",\"subtype\":\"background_tasks_changed\",\"tasks\":[],\"session_id\":S})",
+                body + "e({\"type\":\"system\",\"subtype\":\"task_updated\",\"task_id\":\"T1\",\"patch\":{\"status\":\"completed\"},\"session_id\":S})",
+                body + "e({\"type\":\"system\",\"subtype\":\"task_notification\",\"task_id\":\"T1\",\"status\":\"completed\",\"session_id\":S})",
+                body + "e({\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"REAL_ANSWER_AFTER_BG\"}]},\"session_id\":S})",
+                body + "e({\"type\":\"result\",\"subtype\":\"success\",\"is_error\":False,\"result\":\"REAL_ANSWER_AFTER_BG\",\"session_id\":S})",
+            ]
+        }
+        try lines.joined(separator: "\n").write(to: script, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: script.path)
+    }
+
+    private func runBackgroundLifecycleTurn(
+        taskType: String,
+        neverCompletes: Bool = false,
+        inactivityTimeout: TimeInterval = 900
+    ) async throws -> [AgentRunEvent] {
+        let tmp = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("rc2-claude-bg-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
+        let script = tmp.appendingPathComponent("fake-claude")
+        try writeBackgroundLifecycleFakeClaude(at: script, taskType: taskType, neverCompletes: neverCompletes)
+
+        let adapter = ClaudeStreamingCLIAdapter(
+            binaryNameOverride: script.path,
+            deferredFinishInactivityTimeout: inactivityTimeout
+        )
+        let threadId = AgentThreadID()
+        let sink = EventSink()
+        _ = try await adapter.sendTurn(AgentRunRequest(
+            threadId: threadId,
+            provider: .claude,
+            model: "claude-haiku-4-5-20251001",
+            cwd: tmp.path,
+            prompt: "launch background work"
+        )) { event in
+            Task { await sink.record(event) }
+        }
+        let deadline = Date().addingTimeInterval(4)
+        while Date() < deadline {
+            let finished = await sink.snapshot().contains { if case .finished = $0 { return true }; return false }
+            if finished { break }
+            try? await Task.sleep(nanoseconds: 30_000_000)
+        }
+        // Settle briefly so a (wrong) second terminal would be observed too.
+        try? await Task.sleep(nanoseconds: 250_000_000)
+        let events = await sink.snapshot()
+        try? adapter.stopSession(threadId: threadId)
+        return events
+    }
+
+    private static func finishedPairs(_ events: [AgentRunEvent]) -> [(AgentRunStatus, String?)] {
+        events.compactMap {
+            if case .finished(let status, let final, _) = $0 { return (status, final) }
+            return nil
+        }
+    }
+
+    func test_backgroundTaskDoesNotEndThreadUntilProviderIsIdle() async throws {
+        // THE REPORTED BUG: the agent launched a background shell and ended its
+        // turn; the app took that first `result` as terminal, reported the thread
+        // as completed (so it read as finished and invited a new message) and threw
+        // away the real answer the CLI streamed after the task finished.
+        let events = try await runBackgroundLifecycleTurn(taskType: "local_bash")
+        let finishes = Self.finishedPairs(events)
+
+        XCTAssertEqual(finishes.count, 1,
+                       "a run that left a background task running must produce exactly ONE terminal event, not one per provider `result`")
+        XCTAssertEqual(finishes.first?.1, "REAL_ANSWER_AFTER_BG",
+                       "the terminal must carry the answer the agent gave AFTER the background task completed — finishing on the premature `result` is what made the thread read as done while work was still running")
+        XCTAssertFalse(finishes.contains { $0.1 == "PREMATURE_STANDING_BY" },
+                       "the premature `result` emitted while background_tasks_changed still listed a task must never terminate the run")
+    }
+
+    func test_asyncSubagentDoesNotEndThreadUntilProviderIsIdle() async throws {
+        // Same defect for the other case the user hit: an async subagent (the CLI
+        // reports it as task_type `local_agent` and keeps streaming the subagent's
+        // own work after the parent turn's `result`).
+        let events = try await runBackgroundLifecycleTurn(taskType: "local_agent")
+        let finishes = Self.finishedPairs(events)
+
+        XCTAssertEqual(finishes.count, 1,
+                       "dispatching an async subagent must not make the run terminal until the subagent is done")
+        XCTAssertEqual(finishes.first?.1, "REAL_ANSWER_AFTER_BG",
+                       "the run must finish on the parent turn that follows the subagent's completion, carrying its real answer")
+    }
+
+    func test_deferredFinishStillReachesTerminalWhenBackgroundWorkNeverCompletes() async throws {
+        // Liveness bound (Codex advisory): withholding the finish must never let a
+        // run hang non-terminal forever. If the provider never reports idle, the
+        // watchdog releases the withheld finish so the thread still settles (and
+        // the awaiting-banner fallback can drive it), instead of spinning as
+        // "working" with no way out.
+        let events = try await runBackgroundLifecycleTurn(
+            taskType: "local_bash",
+            neverCompletes: true,
+            inactivityTimeout: 0.3
+        )
+        let finishes = Self.finishedPairs(events)
+
+        XCTAssertEqual(finishes.count, 1,
+                       "the inactivity watchdog must emit exactly one terminal when the provider never goes idle")
+        XCTAssertEqual(finishes.first?.1, "PREMATURE_STANDING_BY",
+                       "with no resumed turn to supersede it, the withheld finish is what settles the run")
+    }
+
+    func test_turnWithoutBackgroundWorkFinishesImmediately() async throws {
+        // Regression guard for the deferral gate: an ordinary turn (no background
+        // task ever reported) must still finish on its first `result` — the fix
+        // must not delay or double-emit the terminal for normal runs.
+        let tmp = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("rc2-claude-nobg-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
+        let script = tmp.appendingPathComponent("fake-claude")
+        try """
+        #!/usr/bin/env python3
+        import json, sys
+        S = "claude-nobg-session"
+        def e(o):
+            print(json.dumps(o), flush=True)
+        e({"type":"system","subtype":"init","session_id":S})
+        for line in sys.stdin:
+            if not line.strip():
+                continue
+            e({"type":"assistant","message":{"content":[{"type":"text","text":"PLAIN_ANSWER"}]},"session_id":S})
+            e({"type":"result","subtype":"success","is_error":False,"result":"PLAIN_ANSWER","session_id":S})
+        """.write(to: script, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: script.path)
+
+        let adapter = ClaudeStreamingCLIAdapter(binaryNameOverride: script.path)
+        let threadId = AgentThreadID()
+        let sink = EventSink()
+        _ = try await adapter.sendTurn(AgentRunRequest(
+            threadId: threadId,
+            provider: .claude,
+            model: "claude-haiku-4-5-20251001",
+            cwd: tmp.path,
+            prompt: "plain"
+        )) { event in
+            Task { await sink.record(event) }
+        }
+        try await waitForFinish(in: sink, expected: "PLAIN_ANSWER")
+        let plainEvents = await sink.snapshot()
+        XCTAssertEqual(Self.finishedPairs(plainEvents).count, 1,
+                       "a turn with no background work must emit exactly one terminal, unchanged by the deferral gate")
+        try adapter.stopSession(threadId: threadId)
     }
 
     private func waitForFinish(in sink: EventSink, expected: String) async throws {

@@ -605,6 +605,121 @@ private final class TerminalReaderWillPublishHook: @unchecked Sendable {
     }
 }
 
+/// Process-wide hot-memory authority for open terminals. Entries hold owners
+/// weakly and callbacks also capture them weakly, so a missed explicit unregister
+/// cannot turn this registry into a lifetime leak. Enforcement reclaims hidden
+/// surfaces first, then least-recently-used visible surfaces, and the focused
+/// terminal last. Priority affects order, never grants an unbounded exemption.
+@MainActor
+final class TerminalMemoryBudgetAuthority {
+    static let shared = TerminalMemoryBudgetAuthority(maxRetainedBytes: 64 * 1024 * 1024)
+
+    private final class Entry {
+        weak var owner: AnyObject?
+        let retainedBytes: () -> Int
+        let priority: () -> Int
+        let reclaim: () -> Void
+        var lastTouched: UInt64
+
+        init(
+            owner: AnyObject,
+            retainedBytes: @escaping () -> Int,
+            priority: @escaping () -> Int,
+            reclaim: @escaping () -> Void,
+            lastTouched: UInt64
+        ) {
+            self.owner = owner
+            self.retainedBytes = retainedBytes
+            self.priority = priority
+            self.reclaim = reclaim
+            self.lastTouched = lastTouched
+        }
+    }
+
+    let maxRetainedBytes: Int
+    private var entries: [UUID: Entry] = [:]
+    private var clock: UInt64 = 0
+
+    init(maxRetainedBytes: Int) {
+        self.maxRetainedBytes = max(0, maxRetainedBytes)
+    }
+
+    @discardableResult
+    func register(
+        owner: AnyObject,
+        retainedBytes: @escaping () -> Int,
+        priority: @escaping () -> Int,
+        reclaim: @escaping () -> Void
+    ) -> UUID {
+        purgeReleasedOwners()
+        clock &+= 1
+        let token = UUID()
+        entries[token] = Entry(
+            owner: owner,
+            retainedBytes: retainedBytes,
+            priority: priority,
+            reclaim: reclaim,
+            lastTouched: clock
+        )
+        return token
+    }
+
+    func unregister(_ token: UUID) {
+        entries.removeValue(forKey: token)
+    }
+
+    func touch(_ token: UUID, enforce: Bool = true) {
+        purgeReleasedOwners()
+        if let entry = entries[token] {
+            clock &+= 1
+            entry.lastTouched = clock
+        }
+        if enforce { enforceBudget() }
+    }
+
+    func enforceBudget() {
+        purgeReleasedOwners()
+        var attempted = Set<UUID>()
+        while retainedBytesForTesting > maxRetainedBytes {
+            guard let candidate = entries
+                .filter({ token, entry in
+                    !attempted.contains(token) && entry.owner != nil
+                })
+                .min(by: { lhs, rhs in
+                    let lhsPriority = lhs.value.priority()
+                    let rhsPriority = rhs.value.priority()
+                    if lhsPriority != rhsPriority { return lhsPriority < rhsPriority }
+                    return lhs.value.lastTouched < rhs.value.lastTouched
+                }) else {
+                return
+            }
+            attempted.insert(candidate.key)
+            let before = max(0, candidate.value.retainedBytes())
+            candidate.value.reclaim()
+            let after = max(0, candidate.value.retainedBytes())
+            if after < before {
+                attempted.removeAll(keepingCapacity: true)
+            }
+        }
+    }
+
+    var retainedBytesForTesting: Int {
+        entries.values.reduce(into: 0) { total, entry in
+            guard entry.owner != nil else { return }
+            total += max(0, entry.retainedBytes())
+        }
+    }
+
+    var registeredCountForTesting: Int {
+        purgeReleasedOwners()
+        return entries.count
+    }
+
+    private func purgeReleasedOwners() {
+        entries = entries.filter { $0.value.owner != nil }
+    }
+}
+
 /// PTY-backed shell surface. Spawns the user's shell via `forkpty(3)`
 /// and renders its output through `ANSIRenderer`. The terminal view is
 /// directly interactive — no separate input field (cmux model).
@@ -685,6 +800,12 @@ public final class TerminalSurface: NSObject, Surface, TerminalHistoryCoordinato
     private var lastOutputAt: Date?
     private var inputPump: TerminalInputPump?
     private var readSource: DispatchSourceRead?
+    private var historyReplayBackpressureActive = false
+    private var readSourceSuspendedForHistoryReplay = false
+    private var deferredUnhostedGhosttyReplay: Data?
+    private var ownedGhosttyReplayOutput: [Data] = []
+    private var ownedGhosttyReplayOutputBytes = 0
+    private static let maxOwnedGhosttyReplayOutputBytes = 4 * 1024 * 1024
     private var applicationTerminationBarrier: SurfaceTerminationBarrier?
     private var runtimeRestartRequiredHistoryBarrier: SurfaceTerminationBarrier?
     private var runtimeDispositionBarrierFactoryForTesting:
@@ -695,11 +816,23 @@ public final class TerminalSurface: NSObject, Surface, TerminalHistoryCoordinato
     private let childReapCompletionHook = TerminalReaderMainHandoffHook()
     private var processTreeSignalCountForTesting = 0
     private var publishesRuntimeHealth = true
+    private static let activeANSIScrollbackRows = 2_000
+    private static let reclaimedANSIScrollbackRows = 128
     private var renderer = ANSIRenderer(
         rows: TerminalViewportGeometry.fallbackSize.rows,
-        cols: TerminalViewportGeometry.fallbackSize.cols
+        cols: TerminalViewportGeometry.fallbackSize.cols,
+        scrollbackLimit: activeANSIScrollbackRows
     )
     private var terminalSize = TerminalViewportGeometry.fallbackSize
+    /// Last geometry actually pushed to the live PTY via `TIOCSWINSZ`.
+    /// Distinct from `terminalSize` so Ghostty/ANSI can track intermediate
+    /// AppKit frames while we freeze the shell's idea of COLUMNS/LINES during
+    /// hide/park/layout thrash (workspace switch garbling).
+    private var lastCommittedPTYSize: TerminalViewportSize?
+    private var pendingPTYWinsize: TerminalViewportSize?
+    private var ptyWinsizeDebounceWorkItem: DispatchWorkItem?
+    private var ptyWinsizeCommitCountForTestingValue = 0
+    private static let ptyWinsizeDebounceInterval: TimeInterval = 0.05
     private var savedSSHPassword: String?
     private var didSendSavedSSHPassword = false
     private var passwordPromptCount = 0
@@ -800,12 +933,190 @@ public final class TerminalSurface: NSObject, Surface, TerminalHistoryCoordinato
         pendingRendererEvents.removeAll(keepingCapacity: true)
         pendingRendererByteCount = 0
     }
+
+    /// Conservative accounting for the large screen-retention owners controlled
+    /// by this surface. Cached UTF-8 snapshots and ANSI cells count alongside raw
+    /// queues and Ghostty's native scrollback.
+    private var terminalMemoryRetainedBytes: Int {
+        let populatedRows = renderer.rows + renderer.scrollbackCount
+        let cellBytes = populatedRows * renderer.cols * MemoryLayout<ANSIRenderer.Cell>.stride
+        let retainedRowSlots: Int
+        if terminalMemoryIsDormant {
+            retainedRowSlots = 1
+        } else if terminalMemoryUsesCompactRenderer {
+            retainedRowSlots = Self.reclaimedANSIScrollbackRows
+        } else {
+            retainedRowSlots = Self.activeANSIScrollbackRows
+        }
+        let rowSlots = retainedRowSlots * MemoryLayout<[ANSIRenderer.Cell]>.stride
+        let cachedBytes: Int
+        if let cachedTextSnapshot {
+            cachedBytes = cachedTextSnapshot.value.text.utf8.count
+                + (cachedTextSnapshot.value.ansiText?.utf8.count ?? 0)
+                + (cachedTextSnapshot.viewportText?.utf8.count ?? 0)
+        } else {
+            cachedBytes = 0
+        }
+        return ghosttyView.retainedTerminalBytesEstimate
+            + cellBytes
+            + rowSlots
+            + pendingRendererByteCount
+            + hiddenRendererBuffer.count
+            + (deferredUnhostedGhosttyReplay?.count ?? 0)
+            + ownedGhosttyReplayOutputBytes
+            + cachedBytes
+    }
+
+    private func touchTerminalMemoryBudget(addedBytes: Int = 0, force: Bool = true) {
+        guard let terminalMemoryBudgetToken else { return }
+        terminalMemoryBytesSinceBudgetCheck += max(0, addedBytes)
+        guard force || terminalMemoryBytesSinceBudgetCheck >= 256 * 1024 else { return }
+        terminalMemoryBytesSinceBudgetCheck = 0
+        TerminalMemoryBudgetAuthority.shared.touch(terminalMemoryBudgetToken)
+    }
+
+    private var terminalMemoryReclaimPriority: Int {
+        if historyReplayBackpressureActive { return 3 }
+        guard isVisible else { return 0 }
+        return view.window?.firstResponder === ghosttyView ? 2 : 1
+    }
+
+    /// Reclaims a terminal according to its visibility. Hidden terminals can
+    /// release the native surface entirely. Visible terminals retain their PTY
+    /// and current frame, but rebuild Ghostty from that bounded frame so old
+    /// native scrollback/caches cannot bypass the process-wide hard ceiling.
+    private func reclaimTerminalMemoryUnderPressure() {
+        guard !isClosing,
+              !historyReplayBackpressureActive else { return }
+        if isVisible {
+            compactVisibleTerminalMemory()
+            return
+        }
+        if terminalMemoryIsDormant {
+            ghosttyView.releaseForTerminalMemoryBudget()
+            terminalMemoryWasReclaimed = true
+            return
+        }
+        ensureRendererCurrent()
+        if terminalMemoryWasReclaimed {
+            // Extreme fan-out fallback: once every old tab is already compact,
+            // make the least-recently-used one dormant. Durable history remains
+            // authoritative; only its old on-screen cache is discarded.
+            renderer = ANSIRenderer(rows: 1, cols: 1, scrollbackLimit: 0)
+            rendererMutationCount &+= 1
+            pendingRendererEvents.removeAll(keepingCapacity: false)
+            pendingRendererByteCount = 0
+            cachedTextSnapshot = nil
+            terminalMemoryIsDormant = true
+            return
+        }
+        let currentFrame = renderer.ansiSnapshot(includeScrollback: false)
+        let compact = ANSIRenderer(
+            rows: terminalSize.rows,
+            cols: terminalSize.cols,
+            scrollbackLimit: Self.reclaimedANSIScrollbackRows
+        )
+        if let data = currentFrame.data(using: .utf8), !data.isEmpty {
+            compact.feed(data)
+        }
+        renderer = compact
+        terminalMemoryUsesCompactRenderer = true
+        rendererMutationCount &+= 1
+        pendingRendererEvents.removeAll(keepingCapacity: false)
+        pendingRendererByteCount = 0
+        hiddenRendererBuffer = Data()
+        cachedTextSnapshot = nil
+        ghosttyView.releaseForTerminalMemoryBudget()
+        terminalMemoryWasReclaimed = true
+        outputPartial = true
+        if outputPartialReason == nil || outputPartialReason == "history_replay_failed" {
+            outputPartialReason = "terminal_memory_retention_cap"
+        }
+    }
+
+    private func compactVisibleTerminalMemory() {
+        ensureRendererCurrent()
+        let currentFrame: String
+        if let viewport = ghosttyView.readViewportText(), !viewport.isEmpty {
+            currentFrame = viewport
+        } else {
+            currentFrame = renderer.ansiSnapshot(includeScrollback: false)
+        }
+        let replay = Data(currentFrame.utf8)
+        guard replay.count <= GhosttyTerminalView.maxPendingOutputBytes else {
+            outputPartial = true
+            outputPartialReason = "terminal_memory_replay_cap"
+            return
+        }
+        if terminalMemoryUsesCompactRenderer {
+            // Second pressure pass: the visible Ghostty viewport remains the
+            // responsive current frame, so the duplicate ANSI mirror can become
+            // dormant. readText still prefers the live viewport; SQLite owns old
+            // transcript recovery.
+            renderer = ANSIRenderer(rows: 1, cols: 1, scrollbackLimit: 0)
+            terminalMemoryIsDormant = true
+        } else {
+            let compact = ANSIRenderer(
+                rows: terminalSize.rows,
+                cols: terminalSize.cols,
+                scrollbackLimit: Self.reclaimedANSIScrollbackRows
+            )
+            if !replay.isEmpty { compact.feed(replay) }
+            renderer = compact
+            terminalMemoryUsesCompactRenderer = true
+        }
+        rendererMutationCount &+= 1
+        pendingRendererEvents.removeAll(keepingCapacity: false)
+        pendingRendererByteCount = 0
+        hiddenRendererBuffer = Data()
+        cachedTextSnapshot = nil
+        outputPartial = true
+        if outputPartialReason == nil || outputPartialReason == "history_replay_failed" {
+            outputPartialReason = "terminal_memory_retention_cap"
+        }
+        // This is the same ordered/backpressured parser rebuild used for durable
+        // history replay. The PTY session remains alive and input callbacks stay
+        // installed; only old on-screen scrollback is discarded.
+        beginGhosttyHistoryReplay(replay)
+    }
+
+    private func restoreReclaimedTerminalMemoryIfNeeded() {
+        guard terminalMemoryWasReclaimed else { return }
+        ensureRendererCurrent()
+        let recentANSI = renderer.ansiSnapshot(includeScrollback: true)
+        let expanded = ANSIRenderer(
+            rows: terminalSize.rows,
+            cols: terminalSize.cols,
+            scrollbackLimit: Self.activeANSIScrollbackRows
+        )
+        let replay = Data(recentANSI.utf8)
+        if !replay.isEmpty {
+            expanded.feed(replay)
+        }
+        renderer = expanded
+        rendererMutationCount &+= 1
+        cachedTextSnapshot = nil
+        terminalMemoryWasReclaimed = false
+        terminalMemoryIsDormant = false
+        terminalMemoryUsesCompactRenderer = false
+        if replay.count <= GhosttyTerminalView.maxPendingOutputBytes {
+            beginGhosttyHistoryReplay(replay)
+        } else {
+            outputPartial = true
+            outputPartialReason = "terminal_memory_replay_cap"
+        }
+    }
     // Cached result of readTextSnapshot(). Invalidated when either the renderer
     // mutation count or the ghostty viewport text changes (see snapshotCacheValid).
     private var cachedTextSnapshot: (rendererVersion: UInt64, viewportText: String?, stateSignature: String, value: TerminalTextSnapshot)?
     private var parkingWindow: NSWindow?
     private var parkingConstraints: [NSLayoutConstraint] = []
     private var restartBannerButton: NSButton?
+    private var terminalMemoryBudgetToken: UUID?
+    private var terminalMemoryWasReclaimed = false
+    private var terminalMemoryIsDormant = false
+    private var terminalMemoryUsesCompactRenderer = false
+    private var terminalMemoryBytesSinceBudgetCheck = 0
 
     /// Bell preferences, configurable by the user. Defaults to silent (no sound,
     /// no flash) so new installs do not produce unexpected audio or visual output.
@@ -887,6 +1198,10 @@ public final class TerminalSurface: NSObject, Surface, TerminalHistoryCoordinato
         historyCoordinator.replayInFlight
     }
 
+    var historyReplayDeferredForTesting: Bool {
+        historyCoordinator.isReplayDeferredForTesting
+    }
+
     var historyPreparationStateForTesting: TerminalHistoryCoordinator.PreparationState {
         historyCoordinator.preparationStateForTesting
     }
@@ -903,6 +1218,36 @@ public final class TerminalSurface: NSObject, Surface, TerminalHistoryCoordinato
     var inputPumpConfiguredForTesting: Bool { inputPump != nil }
     func drainInputPumpForTesting() { inputPump?.drain() }
     var readerConfiguredForTesting: Bool { readSource != nil }
+    var readerPausedForHistoryReplayForTesting: Bool {
+        historyReplayBackpressureActive && readSourceSuspendedForHistoryReplay
+    }
+    var ghosttyReplayInProgressForTesting: Bool {
+        ghosttyView.historyReplayDrainInProgressForTesting
+    }
+    var ghosttyMaximumPendingOutputBytesForTesting: Int {
+        ghosttyView.maximumPendingOutputBytesObservedForTesting
+    }
+    var ghosttyPendingOutputBytesForTesting: Int {
+        ghosttyView.pendingOutputDiagnosticsForTesting.logicalBytes
+    }
+    var ghosttySurfaceCreationCountForTesting: Int {
+        ghosttyView.surfaceCreationCountForTesting
+    }
+    var ghosttyHasLiveSurfaceForTesting: Bool {
+        ghosttyView.hasLiveSurfaceForTesting
+    }
+    var ownedGhosttyReplayOutputBytesForTesting: Int {
+        ownedGhosttyReplayOutputBytes
+    }
+    var hasDeferredUnhostedGhosttyReplayForTesting: Bool {
+        deferredUnhostedGhosttyReplay != nil
+    }
+    var terminalMemoryRetainedBytesForTesting: Int { terminalMemoryRetainedBytes }
+    var terminalMemoryWasReclaimedForTesting: Bool { terminalMemoryWasReclaimed }
+    static var aggregateTerminalMemoryLimitForTesting: Int {
+        TerminalMemoryBudgetAuthority.shared.maxRetainedBytes
+    }
+    func reclaimTerminalMemoryForTesting() { reclaimTerminalMemoryUnderPressure() }
     var childPIDForTesting: pid_t { childPID }
     var masterFDForTesting: Int32 { masterFD }
     var processTreeSignalCountForTestingValue: Int { processTreeSignalCountForTesting }
@@ -911,10 +1256,57 @@ public final class TerminalSurface: NSObject, Surface, TerminalHistoryCoordinato
         readerAllowsRender
     }
 
+    /// Whether Ghostty still has an owner input callback (PTY write path live).
+    var ghosttyInputHandlerPresentForTesting: Bool {
+        ghosttyView.hasInputDataHandlerForTesting
+    }
+
+    /// Drive the history-replay surface recreate path without a disk restore.
+    func replayResetSurfaceOutputForTesting(_ data: Data) {
+        beginGhosttyHistoryReplay(data)
+    }
+
+    /// Capture Ghostty→owner input writes (tests only).
+    func replaceInputCaptureForTesting(_ handler: @escaping (Data) -> Void) {
+        ghosttyView.onInputData = handler
+    }
+
+    /// Simulate Ghostty's io_write callback after surface recreate.
+    func injectGhosttyInputWriteForTesting(_ data: Data) {
+        ghosttyView.writeInputData(data)
+    }
+
+    var ptyWinsizeCommitCountForTesting: Int {
+        ptyWinsizeCommitCountForTestingValue
+    }
+
+    var lastCommittedPTYSizeForTesting: TerminalViewportSize? {
+        lastCommittedPTYSize
+    }
+
+    /// Test seam: drive the same size path Ghostty uses on layout/reattach.
+    /// `force` mirrors the spawn one-shot path (commit even if not yet visible).
+    func applyViewportSizeForTesting(_ size: TerminalViewportSize, force: Bool = false) {
+        applyTerminalSize(size, sendToPTY: true, force: force)
+    }
+
+    /// Flush a pending debounced PTY winsize commit immediately (tests).
+    func flushPendingPTYWinsizeForTesting() {
+        flushPendingPTYWinsize()
+    }
+
     /// Inject bytes on the live PTY reader path so tests can exercise hidden
     /// mirror pending/force-flush accounting without `forkpty` (sandbox).
     func injectReaderOutputForTesting(_ data: Data) {
         appendDataAsync(data, renderAllowedAtRead: readerAllowsRender)
+    }
+
+    /// Exercise the EOF ordering seam without reaping the test fixture's live
+    /// shell. Production reaches the same reader-cancellation and banner paths
+    /// from `handlePTYEOF` and its bounded reaper completion.
+    func simulateReaderEOFAndExitBannerForTesting(rawStatus: Int32 = 0) {
+        cancelPTYReader(preserveHistoryReplayOwnership: historyReplayBackpressureActive)
+        appendProcessExitedBannerIfNeeded(rawStatus: rawStatus)
     }
 
     /// Raw mirror-side retention (pending force-flush queue + legacy heal buffer).
@@ -1224,7 +1616,14 @@ public final class TerminalSurface: NSObject, Surface, TerminalHistoryCoordinato
         isVisible = startsVisible
         readerAllowsRender = startsVisible
         terminalView.setOcclusion(visible: startsVisible)
-        historyCoordinator.prepare(restored: restoredSurfaceID != nil)
+        // PERF (cold launch): restored tabs start hidden. Defer disk history
+        // replay until the surface becomes visible (or another demand path)
+        // so multi-terminal restore does not fan out N concurrent SQLite
+        // reads + Ghostty resets during `reinstantiateRestoredSurfaces`.
+        historyCoordinator.prepare(
+            restored: restoredSurfaceID != nil,
+            deferReplay: restoredSurfaceID != nil
+        )
 
         terminalView.onInputData = { [weak self] data in
             guard let self else { return }
@@ -1242,6 +1641,12 @@ public final class TerminalSurface: NSObject, Surface, TerminalHistoryCoordinato
         // Audit #4: let the view distinguish a legitimate teardown from a stray close
         // of a still-visible instance. A deallocated owner reports "closing" (true).
         terminalView.ownerIsClosing = { [weak self] in self?.isClosing ?? true }
+        terminalView.onHistoryReplayDrainCompleted = { [weak self] in
+            self?.endGhosttyHistoryReplayBackpressure()
+        }
+        terminalView.nextHistoryReplayContinuation = { [weak self] in
+            self?.takeNextOwnedGhosttyReplayOutput()
+        }
         // Forward paste-confirmation requests from the Ghostty view to any
         // app-level handler wired on this surface (e.g. AppCommandRouter).
         terminalView.onPasteNeedsConfirm = { [weak self] (text: String) in
@@ -1268,6 +1673,12 @@ public final class TerminalSurface: NSObject, Surface, TerminalHistoryCoordinato
         container.onWindowChanged = { [weak self] window in
             self?.handleContainerWindowChanged(window)
         }
+        terminalMemoryBudgetToken = TerminalMemoryBudgetAuthority.shared.register(
+            owner: self,
+            retainedBytes: { [weak self] in self?.terminalMemoryRetainedBytes ?? 0 },
+            priority: { [weak self] in self?.terminalMemoryReclaimPriority ?? 0 },
+            reclaim: { [weak self] in self?.reclaimTerminalMemoryUnderPressure() }
+        )
         applyTerminalSize(TerminalViewportGeometry.fallbackSize, sendToPTY: false, force: true)
         replayPersistedHistoryIfNeeded()
 
@@ -1396,7 +1807,9 @@ public final class TerminalSurface: NSObject, Surface, TerminalHistoryCoordinato
         // events are queued, this resize must be applied AFTER them, otherwise the
         // already-received bytes would be reflowed at the wrong dimensions. Record
         // it in the same ordered buffer. When nothing is pending, apply now
-        // (current behavior, safe). gh/PTY winsize stay immediate either way.
+        // (current behavior, safe). Ghostty/ANSI track size immediately; PTY
+        // winsize is gated separately so hide/park/layout thrash cannot SIGWINCH
+        // the shell into prompt-spam garbling.
         if pendingRendererEvents.isEmpty {
             renderer.resize(rows: size.rows, cols: size.cols)
         } else {
@@ -1410,9 +1823,79 @@ public final class TerminalSurface: NSObject, Surface, TerminalHistoryCoordinato
         }
         rendererMutationCount &+= 1
         outputBus.emitGeometry(descriptor.id, rows: size.rows, cols: size.cols)
-        if sendToPTY, masterFD >= 0 {
-            _ = rc2_set_winsize(masterFD, Int32(size.rows), Int32(size.cols))
+        guard sendToPTY else { return }
+        if force {
+            // Spawn / explicit one-shot paths (initial geometry) may commit even
+            // when the surface is not yet registry-visible.
+            commitPTYWinsize(size)
+            return
         }
+        let parked = view.window != nil && view.window === parkingWindow
+        let hasUsableBounds = view.bounds.width > 1 && view.bounds.height > 1
+        guard Self.shouldPropagateInteractiveWinsize(
+            isVisible: isVisible,
+            parked: parked,
+            hasUsableBounds: hasUsableBounds
+        ) else {
+            // Drop any in-flight interactive commit while hidden/parked so a
+            // stale intermediate size cannot land after didBecomeHidden.
+            cancelPendingPTYWinsize()
+            return
+        }
+        scheduleDebouncedPTYWinsize(size)
+    }
+
+    /// Whether an interactive (layout/reattach-driven) geometry change may push
+    /// `TIOCSWINSZ` to the live PTY. Frozen while hidden or parked so workspace
+    /// switch teardown does not SIGWINCH-storm the shell into prompt garbling.
+    nonisolated static func shouldPropagateInteractiveWinsize(
+        isVisible: Bool,
+        parked: Bool,
+        hasUsableBounds: Bool
+    ) -> Bool {
+        isVisible && !parked && hasUsableBounds
+    }
+
+    private func scheduleDebouncedPTYWinsize(_ size: TerminalViewportSize) {
+        pendingPTYWinsize = size
+        ptyWinsizeDebounceWorkItem?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            self?.flushPendingPTYWinsize()
+        }
+        ptyWinsizeDebounceWorkItem = work
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + Self.ptyWinsizeDebounceInterval,
+            execute: work
+        )
+    }
+
+    private func cancelPendingPTYWinsize() {
+        ptyWinsizeDebounceWorkItem?.cancel()
+        ptyWinsizeDebounceWorkItem = nil
+        pendingPTYWinsize = nil
+    }
+
+    private func flushPendingPTYWinsize() {
+        ptyWinsizeDebounceWorkItem = nil
+        guard let size = pendingPTYWinsize else { return }
+        pendingPTYWinsize = nil
+        let parked = view.window != nil && view.window === parkingWindow
+        let hasUsableBounds = view.bounds.width > 1 && view.bounds.height > 1
+        guard Self.shouldPropagateInteractiveWinsize(
+            isVisible: isVisible,
+            parked: parked,
+            hasUsableBounds: hasUsableBounds
+        ) else { return }
+        commitPTYWinsize(size)
+    }
+
+    private func commitPTYWinsize(_ size: TerminalViewportSize) {
+        guard lastCommittedPTYSize != size else { return }
+        lastCommittedPTYSize = size
+        ptyWinsizeCommitCountForTestingValue &+= 1
+        cancelPendingPTYWinsize()
+        guard masterFD >= 0 else { return }
+        _ = rc2_set_winsize(masterFD, Int32(size.rows), Int32(size.cols))
     }
 
     private func startReader() {
@@ -1503,14 +1986,131 @@ public final class TerminalSurface: NSObject, Surface, TerminalHistoryCoordinato
                 }
             }
         }
-        src.resume()
+        if historyReplayBackpressureActive {
+            // Dispatch sources are created suspended. Leave this one suspended
+            // until the bounded Ghostty replay finishes; the PTY kernel then
+            // supplies the backpressure without a second userspace byte queue.
+            readSourceSuspendedForHistoryReplay = true
+        } else {
+            src.resume()
+        }
+    }
+
+    private func beginGhosttyHistoryReplay(_ data: Data) {
+        // A correctness-demand read can arrive while a restored terminal has no
+        // pane/window. Give it a hidden AppKit host when possible. If Ghostty
+        // still cannot create a parser (for example, display asleep or native
+        // rendering disabled in tests), retain the bounded canonical stream and
+        // keep the PTY reader moving; attachment will retry later.
+        if !ghosttyView.hasLiveSurfaceForTesting, view.window == nil, !isVisible {
+            parkInHiddenWindowIfNeeded()
+        }
+        guard ghosttyView.prepareHistoryReplayHost() else {
+            deferredUnhostedGhosttyReplay = data
+            return
+        }
+        deferredUnhostedGhosttyReplay = nil
+        historyReplayBackpressureActive = true
+        if let readSource, !readSourceSuspendedForHistoryReplay {
+            readSource.suspend()
+            readSourceSuspendedForHistoryReplay = true
+        }
+        guard ghosttyView.resetSurfaceOutput(data) else {
+            endGhosttyHistoryReplayBackpressure()
+            return
+        }
+        if !ghosttyView.historyReplayDrainInProgressForTesting {
+            endGhosttyHistoryReplayBackpressure()
+        }
+    }
+
+    private func endGhosttyHistoryReplayBackpressure() {
+        historyReplayBackpressureActive = false
+        defer { touchTerminalMemoryBudget() }
+        guard readSourceSuspendedForHistoryReplay else { return }
+        readSourceSuspendedForHistoryReplay = false
+        readSource?.resume()
+    }
+
+    private func takeNextOwnedGhosttyReplayOutput() -> Data? {
+        guard !ownedGhosttyReplayOutput.isEmpty else { return nil }
+        let next = ownedGhosttyReplayOutput.removeFirst()
+        ownedGhosttyReplayOutputBytes -= next.count
+        return next
+    }
+
+    private func processGhosttyOutput(_ data: Data, render: Bool) {
+        // Once a handoff is owner-held, it is the FIFO gate. Offering a newer
+        // chunk directly to Ghostty after one 8 KiB replay slice frees capacity
+        // would allow that newer chunk to parse before the older handoff.
+        if !ownedGhosttyReplayOutput.isEmpty {
+            retainGhosttyReplayOutput(data)
+            return
+        }
+        guard !ghosttyView.processOutput(data, render: render) else { return }
+        retainGhosttyReplayOutput(data)
+    }
+
+    private func retainGhosttyReplayOutput(_ data: Data) {
+        // Replay backpressure owns every rejected handoff explicitly. The PTY
+        // reader is suspended, so production can contribute at most one 256 KiB
+        // batch; local notices stay ordered behind it and are transferred back
+        // to Ghostty whole by `nextHistoryReplayContinuation`.
+        guard historyReplayBackpressureActive else {
+            outputPartial = true
+            outputPartialReason = outputPartialReason ?? "ghostty_unowned_output"
+            terminalLog.error("terminal.ghostty_output_unowned surface=\(self.descriptor.id.value.uuidString, privacy: .public) bytes=\(data.count, privacy: .public)")
+            return
+        }
+        guard data.count <= Self.maxOwnedGhosttyReplayOutputBytes - ownedGhosttyReplayOutputBytes else {
+            // App-generated notices can still arrive while the PTY reader is
+            // suspended. Bound that auxiliary queue too and fail loudly rather
+            // than turning a replay fix into another weeks-long memory leak.
+            outputPartial = true
+            outputPartialReason = outputPartialReason ?? "ghostty_replay_owner_cap"
+            terminalLog.error("terminal.ghostty_replay_owner_cap surface=\(self.descriptor.id.value.uuidString, privacy: .public) bytes=\(data.count, privacy: .public) ownedBytes=\(self.ownedGhosttyReplayOutputBytes, privacy: .public)")
+            return
+        }
+        ownedGhosttyReplayOutput.append(data)
+        ownedGhosttyReplayOutputBytes += data.count
+    }
+
+    private func extendDeferredUnhostedReplay(_ data: Data) {
+        guard var deferred = deferredUnhostedGhosttyReplay else { return }
+        let remaining = max(
+            0,
+            TerminalHistoryCoordinator.maxCanonicalReplayBytes - deferred.count
+        )
+        guard data.count <= remaining else {
+            deferredUnhostedGhosttyReplay = nil
+            outputPartial = true
+            outputPartialReason = outputPartialReason ?? "history_replay_live_cap"
+            return
+        }
+        deferred.append(data)
+        deferredUnhostedGhosttyReplay = deferred
+    }
+
+    private func cancelPTYReader(preserveHistoryReplayOwnership: Bool = false) {
+        if !preserveHistoryReplayOwnership {
+            historyReplayBackpressureActive = false
+        }
+        if readSourceSuspendedForHistoryReplay {
+            // A suspended DispatchSource must be balanced before cancellation
+            // can deliver its cancel handler and release the file descriptor.
+            readSourceSuspendedForHistoryReplay = false
+            readSource?.resume()
+        }
+        readSource?.cancel()
+        readSource = nil
     }
 
     private func handlePTYEOF() {
         terminalLog.info("terminal.pty_eof surface=\(self.descriptor.id.value.uuidString, privacy: .public) pid=\(self.childPID, privacy: .public)")
         let foregroundPGID = foregroundProcessGroup()
-        readSource?.cancel()   // cancel handler closes the fd on the source's queue
-        readSource = nil
+        cancelPTYReader(
+            preserveHistoryReplayOwnership: historyReplayBackpressureActive
+        )   // cancel handler closes the fd on the source's queue
         masterFD = -1
         let pid = childPID
         markTerminalDead(reason: "process_exited", exitStatus: nil, appendExitBanner: false)
@@ -1680,14 +2280,15 @@ public final class TerminalSurface: NSObject, Surface, TerminalHistoryCoordinato
         ) {
             ensureRendererCurrent()
         }
+        extendDeferredUnhostedReplay(data)
         if renderAllowedAtRead, renderDiagnostics().canRender {
-            ghosttyView.processOutput(data)
+            processGhosttyOutput(data, render: true)
         } else {
             outputPendingBytes += data.count
             // Process THIS chunk into the surface BEFORE the drain may force-complete
             // (#5): completeHiddenBacklogDrain refreshes, and refreshing before the
             // chunk is fed would paint a frame missing the latest bytes.
-            ghosttyView.processOutput(data, render: false)
+            processGhosttyOutput(data, render: false)
             continueHiddenBacklogDrainIfNeeded()
         }
         if ghosttyView.droppedOutputBytes > 0 {
@@ -1696,6 +2297,7 @@ public final class TerminalSurface: NSObject, Surface, TerminalHistoryCoordinato
                 outputPartialReason = "ghostty_buffer_cap"
             }
         }
+        touchTerminalMemoryBudget(addedBytes: data.count, force: false)
         scheduleBusyStateRefresh()
     }
 
@@ -1717,12 +2319,14 @@ public final class TerminalSurface: NSObject, Surface, TerminalHistoryCoordinato
         }
         lastOutputAt = Date()
         outputBus.emit(descriptor.id, data)
+        extendDeferredUnhostedReplay(data)
         if renderDiagnostics().canRender {
-            ghosttyView.processOutput(data)
+            processGhosttyOutput(data, render: true)
         } else {
             outputPendingBytes += data.count
-            ghosttyView.processOutput(data, render: false)
+            processGhosttyOutput(data, render: false)
         }
+        touchTerminalMemoryBudget(addedBytes: data.count, force: false)
     }
 
     private func renderDiagnostics() -> TerminalRenderDiagnostics {
@@ -1742,8 +2346,14 @@ public final class TerminalSurface: NSObject, Surface, TerminalHistoryCoordinato
         guard !isClosing else { return }
         if let window, window !== parkingWindow {
             closeParkingWindowIfNeeded()
+            if let deferredUnhostedGhosttyReplay {
+                beginGhosttyHistoryReplay(deferredUnhostedGhosttyReplay)
+            }
             if isVisible {
                 ghosttyView.refreshSurfaceOnly()
+                // Reattach after parking often leaves AppKit firstResponder on the
+                // window chrome; without a force repair, keys never hit Ghostty.
+                repairTerminalFocus(reason: "window_reattach", force: true)
             }
             replayPersistedHistoryIfNeeded()
             return
@@ -1760,6 +2370,8 @@ public final class TerminalSurface: NSObject, Surface, TerminalHistoryCoordinato
     }
 
     private func replayPersistedHistoryIfNeeded() {
+        // Passive path: respects cold-start deferral. Demand paths call
+        // `requestReplayIfNeeded` (visibility / transcript read).
         historyCoordinator.replayIfNeeded()
     }
 
@@ -1880,7 +2492,12 @@ public final class TerminalSurface: NSObject, Surface, TerminalHistoryCoordinato
         didPrepareReplay canonical: Data
     ) {
         guard !canonical.isEmpty else { return }
-        renderer = ANSIRenderer(rows: terminalSize.rows, cols: terminalSize.cols)
+        renderer = ANSIRenderer(
+            rows: terminalSize.rows,
+            cols: terminalSize.cols,
+            scrollbackLimit: Self.activeANSIScrollbackRows
+        )
+        terminalMemoryUsesCompactRenderer = false
         renderer.feed(canonical)
         pendingRendererEvents.removeAll(keepingCapacity: true)
         pendingRendererByteCount = 0
@@ -1889,7 +2506,7 @@ public final class TerminalSurface: NSObject, Surface, TerminalHistoryCoordinato
         hiddenMirrorAcceptedBytes = 0
         rendererMutationCount &+= 1
         cachedTextSnapshot = nil
-        ghosttyView.resetSurfaceOutput(canonical)
+        beginGhosttyHistoryReplay(canonical)
     }
 
     public func appendSystemText(_ raw: String) {
@@ -2094,6 +2711,10 @@ public final class TerminalSurface: NSObject, Surface, TerminalHistoryCoordinato
     }
 
     public func readTextSnapshot() -> TerminalTextSnapshot {
+        // Correctness demand: iOS/mirror/automation may read a restored terminal
+        // before the tab is selected. Kick cold-start history replay (async) so
+        // subsequent snapshots include the persisted prefix.
+        historyCoordinator.requestReplayIfNeeded()
         // Flush any deferred visible feed/resize events into `renderer` FIRST
         // (PERF-136), before the cache check, so rendererMutationCount and the
         // renderer's actual state agree for every read site below.
@@ -2601,6 +3222,11 @@ public final class TerminalSurface: NSObject, Surface, TerminalHistoryCoordinato
     public func didBecomeVisible() {
         guard !isVisible else { return }
         isVisible = true
+        restoreReclaimedTerminalMemoryIfNeeded()
+        // Demand-start cold-start history replay for restored tabs (prepare may
+        // have completed while hidden with deferReplay). Live capture continues
+        // during deferral; this merges persisted prefix + live tail once.
+        historyCoordinator.requestReplayIfNeeded()
         // Defensive (PERF-136): drain any deferred visible events before the hidden
         // heal feeds directly into `renderer`, so the heal bytes stay ordered after
         // them. didBecomeHidden already flushes, so this is normally a no-op.
@@ -2629,6 +3255,14 @@ public final class TerminalSurface: NSObject, Surface, TerminalHistoryCoordinato
         // (UX-013).
         ghosttyView.forceRefresh()
         scheduleVisibleRefresh()
+        // Commit the settled post-reveal geometry once (debounced through layout).
+        // Hidden/park size thrash never reached the PTY; the shell gets a single
+        // SIGWINCH only if the visible size actually differs from the last commit.
+        scheduleDebouncedPTYWinsize(terminalSize)
+        // Workspace switch rebuild races focus repair ahead of reattach. Re-drive
+        // firstResponder after reveal so keyDown reaches Ghostty again.
+        repairTerminalFocus(reason: "became_visible", force: true)
+        touchTerminalMemoryBudget()
     }
 
     /// Replays bytes buffered while `isVisible == false` into the ANSI mirror
@@ -2680,12 +3314,16 @@ public final class TerminalSurface: NSObject, Surface, TerminalHistoryCoordinato
         stuckHiddenHealScheduled = false
         isDrainingHiddenBacklog = false
         hiddenBacklogDrainDeadline = nil
+        // Drop any debounced interactive winsize so park/teardown frames cannot
+        // SIGWINCH the shell after the surface is already hidden.
+        cancelPendingPTYWinsize()
         // Fresh hidden period: clear legacy heal buffer and recoverability budget.
         hiddenRendererBuffer = Data()
         hiddenRendererBufferOverflowed = false
         hiddenMirrorAcceptedBytes = 0
         ghosttyView.setOcclusion(visible: false)
         scheduleParkingIfDetached()
+        touchTerminalMemoryBudget()
     }
 
     private func beginHiddenBacklogDrain() {
@@ -2871,6 +3509,14 @@ public final class TerminalSurface: NSObject, Surface, TerminalHistoryCoordinato
             }
         }
         isClosing = true
+        if let terminalMemoryBudgetToken {
+            TerminalMemoryBudgetAuthority.shared.unregister(terminalMemoryBudgetToken)
+            self.terminalMemoryBudgetToken = nil
+        }
+        deferredUnhostedGhosttyReplay = nil
+        ownedGhosttyReplayOutput.removeAll(keepingCapacity: false)
+        ownedGhosttyReplayOutputBytes = 0
+        cancelPendingPTYWinsize()
         let deferredHistoryState = TerminalDeferredTerminationState()
         let readerClosingSnapshot = readerHandoffState.beginClosing {
             if reason == .appTermination {
@@ -2899,8 +3545,7 @@ public final class TerminalSurface: NSObject, Surface, TerminalHistoryCoordinato
         childReapForegroundGroup = foregroundGroup
         lastCapturedForegroundGroup = nil
         inputPump?.stop(reason: .processExited)
-        readSource?.cancel()
-        readSource = nil
+        cancelPTYReader()
         if reason == .appTermination || reason == .runtimeRestart {
             // Reader and writer both use the lease lock, so app termination can
             // close the PTY synchronously without waiting for a reader that may

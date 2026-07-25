@@ -389,6 +389,7 @@ public final class GrokACPClient: @unchecked Sendable {
     private var pending: [Int: Pending] = [:]
     private var stderrBuffer = Data()
     private var stopped = false
+    private let tokenSaverCensusAllowed: Bool
     private static let stderrLimit = 8_192
 
     public var notificationHandler: NotificationHandler?
@@ -402,16 +403,18 @@ public final class GrokACPClient: @unchecked Sendable {
         environment: [String: String] = [:],
         tagProcess: Bool = true,
         notificationHandler: NotificationHandler? = nil,
-        serverRequestHandler: ServerRequestHandler? = nil
+        serverRequestHandler: ServerRequestHandler? = nil,
+        tokenSaverCensusAllowed: Bool = false
     ) throws {
         let resolved = binary.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "grok" : binary
         guard let path = ProcessLocator.resolve(resolved) else { throw GrokACPError.missingBinary(resolved) }
         self.notificationHandler = notificationHandler
         self.serverRequestHandler = serverRequestHandler
+        self.tokenSaverCensusAllowed = tokenSaverCensusAllowed
         process.executableURL = URL(fileURLWithPath: path)
         process.arguments = ["agent", "stdio"]
         process.currentDirectoryURL = URL(fileURLWithPath: cwd)
-        process.environment = CodexRunner.processEnvironment(overrides: environment, provider: .grok)
+        process.environment = CodexRunner.processEnvironment(overrides: environment, purpose: .agentTurn(.grok))
         process.standardInput = stdinPipe
         process.standardOutput = stdoutPipe
         process.standardError = stderrPipe
@@ -531,7 +534,11 @@ public final class GrokACPClient: @unchecked Sendable {
 
     public static func promptBlocks(for request: AgentRunRequest, capabilities: GrokACPInitializeResult) throws -> [JSONObject] {
         var blocks: [JSONObject] = []
-        if !request.providerPrompt.isEmpty { blocks.append(["type": "text", "text": request.providerPrompt]) }
+        let providerPrompt = AgentSkillInstaller.tokenSaverProviderPrompt(
+            request.providerPrompt,
+            environment: request.environment
+        )
+        if !providerPrompt.isEmpty { blocks.append(["type": "text", "text": providerPrompt]) }
         for attachment in request.attachments {
             switch attachment.kind {
             case .image:
@@ -661,9 +668,28 @@ public final class GrokACPClient: @unchecked Sendable {
         let data = try JSONSerialization.data(withJSONObject: object)
         var line = data
         line.append(0x0A)
+        let toWrite: Data
+        if tokenSaverCensusAllowed, object["method"] as? String == "session/prompt" {
+            let binding = TokenSaverCensusSeam.defaultBinding(
+                trigger: "provider_outbound_user",
+                provider: "grok",
+                providerAdapterVersion: "acp-jsonrpc",
+                toolShape: "session_prompt_jsonrpc_line"
+            )
+            toWrite = TokenSaverCensusSeam.observeProviderVisiblePayload(
+                line,
+                binding: binding,
+                control: .noChange,
+                streamKind: .completedTranscript,
+                toolKind: .builtin,
+                isSameUser: true
+            )
+        } else {
+            toWrite = line
+        }
         try writeQueue.sync {
             try GuardedStdinWrite.write(
-                line, to: stdinPipe.fileHandleForWriting, process: process,
+                toWrite, to: stdinPipe.fileHandleForWriting, process: process,
                 notFound: { GrokACPError.processExited(reason: .exit, status: -1, stderrTail: "") }
             )
         }

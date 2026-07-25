@@ -3,259 +3,312 @@ import XCTest
 
 final class ProviderProcessSweeperTests: XCTestCase {
     func test_parsePSRowPreservesCommandWithSpaces() {
-        let row: Substring = "  101     1  22048 /opt/homebrew/bin/node /Users/me/Library/Application Support/RemoteCode/AgentRuntime/ClaudeAgentSDKBridge/ClaudeAgentSDKBridge.mjs"
+        let row: Substring = "  101     1  101  22048 /opt/homebrew/bin/node /Users/me/Library/Application Support/RemoteCode/AgentRuntime/ClaudeAgentSDKBridge/ClaudeAgentSDKBridge.mjs"
 
         let process = ProviderProcessSweeper.parsePSRow(row)
 
         XCTAssertEqual(process, ProviderRuntimeProcess(
             pid: 101,
             ppid: 1,
+            pgid: 101,
             rssKB: 22048,
             command: "/opt/homebrew/bin/node /Users/me/Library/Application Support/RemoteCode/AgentRuntime/ClaudeAgentSDKBridge/ClaudeAgentSDKBridge.mjs"
         ), "provider cleanup depends on matching full command paths that contain spaces")
     }
 
-    func test_orphanSweepTerminatesRemoteCodeProviderTreesOnly() {
-        let currentPID: Int32 = 500
-        let processes = [
-            ProviderRuntimeProcess(
-                pid: 101,
-                ppid: 1,
-                rssKB: 22_000,
-                command: "/opt/homebrew/bin/node /Users/me/Library/Application Support/RemoteCode/AgentRuntime/ClaudeAgentSDKBridge/ClaudeAgentSDKBridge.mjs"
-            ),
-            ProviderRuntimeProcess(
-                pid: 102,
-                ppid: 101,
-                rssKB: 220_000,
-                command: "/Users/me/Library/Application Support/RemoteCode/AgentRuntime/ClaudeAgentSDKBridge/node_modules/@anthropic-ai/claude-agent-sdk-darwin-arm64/claude --output-format stream-json"
-            ),
-            ProviderRuntimeProcess(
-                pid: 201,
-                ppid: currentPID,
-                rssKB: 25_000,
-                command: "/opt/homebrew/bin/node /Users/me/Library/Application Support/RemoteCode/AgentRuntime/ClaudeAgentSDKBridge/ClaudeAgentSDKBridge.mjs"
-            ),
-            ProviderRuntimeProcess(
-                pid: 202,
-                ppid: 201,
-                rssKB: 210_000,
-                command: "/Users/me/Library/Application Support/RemoteCode/AgentRuntime/ClaudeAgentSDKBridge/node_modules/@anthropic-ai/claude-agent-sdk-darwin-arm64/claude --output-format stream-json"
-            ),
-            ProviderRuntimeProcess(
-                pid: 301,
-                ppid: 1,
-                rssKB: 45_000,
-                command: "/opt/homebrew/bin/codex app-server"
-            ),
-            ProviderRuntimeProcess(
-                pid: 401,
-                ppid: 1,
-                rssKB: 18_000,
-                command: "claude --dangerously-skip-permissions"
-            )
+    func test_distillServerPolicy_classifiesServerVersusMCP() {
+        let server = "/App/RemoteCodeDistillService --auth-token ABC --host 127.0.0.1 --port 0"
+        let mcp = "/App/RemoteCodeDistillService mcp"
+        XCTAssertTrue(ProviderProcessSweeper.isRemoteCodeDistillService(server))
+        XCTAssertTrue(ProviderProcessSweeper.isRemoteCodeDistillServerCommand(server),
+                      "MLX HTTP sidecar is the singleton server role")
+        XCTAssertFalse(ProviderProcessSweeper.isRemoteCodeDistillMCPCommand(server))
+        XCTAssertTrue(ProviderProcessSweeper.isRemoteCodeDistillMCPCommand(mcp),
+                      "managed | distill helper is mcp mode")
+        XCTAssertFalse(ProviderProcessSweeper.isRemoteCodeDistillServerCommand(mcp),
+                       "mcp helpers must not be swept by the single-server policy")
+    }
+
+    func test_managedScanRequiresExactOwnershipAndSeparatesProviderFromSidecar() {
+        let providerIdentity = ProviderProcessStartIdentity(seconds: 10, microseconds: 1)
+        let sidecarIdentity = ProviderProcessStartIdentity(seconds: 20, microseconds: 1)
+        let tags = [
+            SpawnedProcessTag(pgid: 101, spawnedAt: Date(), provider: .codex,
+                              managedKind: .provider, executablePath: "/opt/codex",
+                              startIdentity: providerIdentity, isolatedProcessGroup: 101),
+            SpawnedProcessTag(pgid: 201, spawnedAt: Date(), managedKind: .sidecar,
+                              executablePath: "/opt/RemoteCodeDistillService",
+                              startIdentity: sidecarIdentity, isolatedProcessGroup: 201)
         ]
-        var terminated: [Int32] = []
-
-        let result = ProviderProcessSweeper.terminateOrphanedProviderRuntimes(
-            processes: processes,
-            currentPID: currentPID
-        ) { pid in
-            terminated.append(pid)
-            return true
-        }
-
-        XCTAssertEqual(result.orphanRootPIDs, [101, 301],
-                       "only RemoteCode-owned provider roots reparented to launchd should be cleanup candidates")
-        XCTAssertEqual(Set(result.terminatedPIDs), Set([101, 102, 301]))
-        XCTAssertEqual(Set(terminated), Set([101, 102, 301]))
-        XCTAssertFalse(terminated.contains(201),
-                       "current app child bridge must survive the orphan sweep")
-        XCTAssertFalse(terminated.contains(202),
-                       "current app child Claude process must survive the orphan sweep")
-        XCTAssertFalse(terminated.contains(401),
-                       "user-owned terminal Claude commands must not be killed just because their parent is launchd")
-    }
-
-    func test_providerRuntimeDetectionIgnoresPromptTranscriptFalsePositives() {
-        let currentPID: Int32 = 500
-        let unrelatedComputerUseProcess = ProviderRuntimeProcess(
-            pid: 600,
-            ppid: 1,
-            rssKB: 45_000,
-            command: "/Applications/Codex Computer Use.app/Contents/MacOS/SkyComputerUseClient prompt mentions codex app-server and ClaudeAgentSDKBridge.mjs"
-        )
-
-        XCTAssertFalse(
-            ProviderProcessSweeper.isRemoteCodeProviderRuntime(unrelatedComputerUseProcess, currentPID: currentPID),
-            "provider cleanup must not match arbitrary prompt text embedded in another process command line"
-        )
-    }
-
-    func test_currentProviderProcessesHandlesCyclicProcessSnapshots() {
-        let currentPID: Int32 = 500
         let processes = [
-            ProviderRuntimeProcess(
-                pid: 201,
-                ppid: currentPID,
-                rssKB: 25_000,
-                command: "/opt/homebrew/bin/codex app-server"
-            ),
-            ProviderRuntimeProcess(
-                pid: 202,
-                ppid: 201,
-                rssKB: 25_000,
-                command: "child"
-            ),
-            ProviderRuntimeProcess(
-                pid: 201,
-                ppid: 202,
-                rssKB: 25_000,
-                command: "/opt/homebrew/bin/codex app-server"
-            )
+            ProviderRuntimeProcess(pid: 101, ppid: 1, pgid: 101, rssKB: 100, command: "/opt/codex app-server"),
+            ProviderRuntimeProcess(pid: 102, ppid: 101, pgid: 101, rssKB: 200, command: "provider-child --secret omitted"),
+            ProviderRuntimeProcess(pid: 201, ppid: 1, pgid: 201, rssKB: 300, command: "/opt/RemoteCodeDistillService --auth-token hidden"),
+            ProviderRuntimeProcess(pid: 999, ppid: 1, pgid: 999, rssKB: 900, command: "/opt/codex app-server")
         ]
 
-        let providerProcesses = ProviderProcessSweeper.currentProviderProcesses(
+        let scan = ProviderProcessSweeper.managedProcessScan(
+            tags: tags,
             processes: processes,
-            currentPID: currentPID
+            processStartIdentity: { [101: providerIdentity, 201: sidecarIdentity][$0] }
         )
 
-        XCTAssertEqual(providerProcesses.map(\.pid), [201, 201, 202],
-                       "telemetry must return bounded results even if a mocked process snapshot contains a cycle")
+        XCTAssertTrue(scan.isComplete)
+        XCTAssertEqual(scan.providerProcesses.map(\.pid), [101, 102])
+        XCTAssertEqual(scan.sidecarProcesses.map(\.pid), [201])
+        XCTAssertEqual(scan.providerRootCount, 1)
+        XCTAssertEqual(scan.sidecarRootCount, 1)
+        XCTAssertFalse(scan.providerProcesses.map(\.pid).contains(999),
+                       "command text without a persisted lifetime must never grant ownership")
     }
 
-    func test_currentProviderFilterIncludesCurrentRuntimeButExcludesSelf() {
-        let currentPID: Int32 = 500
-        let currentApp = ProviderRuntimeProcess(
-            pid: currentPID,
-            ppid: 1,
-            rssKB: 200_000,
-            command: "/Applications/RemoteCode.app/Contents/MacOS/RemoteCode"
-        )
-        let provider = ProviderRuntimeProcess(
-            pid: 201,
-            ppid: currentPID,
-            rssKB: 25_000,
-            command: "/opt/homebrew/bin/node /Users/me/Library/Application Support/RemoteCode/AgentRuntime/ClaudeAgentSDKBridge/ClaudeAgentSDKBridge.mjs"
+    func test_managedScanRejectsPIDReuseAndKeepsLateGroupDescendant() {
+        let oldIdentity = ProviderProcessStartIdentity(seconds: 10, microseconds: 1)
+        let newIdentity = ProviderProcessStartIdentity(seconds: 30, microseconds: 1)
+        let tags = [
+            SpawnedProcessTag(pgid: 101, spawnedAt: Date(), provider: .codex,
+                              managedKind: .provider, executablePath: "/opt/codex",
+                              startIdentity: oldIdentity, isolatedProcessGroup: 101),
+            SpawnedProcessTag(pgid: 201, spawnedAt: Date(), managedKind: .sidecar,
+                              executablePath: "/opt/RemoteCodeDistillService",
+                              startIdentity: oldIdentity, isolatedProcessGroup: 201)
+        ]
+        let processes = [
+            ProviderRuntimeProcess(pid: 101, ppid: 1, pgid: 101, rssKB: 100, command: "/opt/codex app-server"),
+            ProviderRuntimeProcess(pid: 202, ppid: 1, pgid: 201, rssKB: 300, command: "late-sidecar-child")
+        ]
+
+        let scan = ProviderProcessSweeper.managedProcessScan(
+            tags: tags,
+            processes: processes,
+            processStartIdentity: { $0 == 101 ? newIdentity : nil }
         )
 
-        XCTAssertFalse(ProviderProcessSweeper.isRemoteCodeProviderRuntime(currentApp, currentPID: currentPID),
-                       "heartbeat provider counts must not include the app process itself")
-        XCTAssertTrue(ProviderProcessSweeper.isRemoteCodeProviderRuntime(provider, currentPID: currentPID),
-                      "heartbeat must include live RemoteCode provider runtimes so 24h sessions show real RSS")
+        XCTAssertTrue(scan.isComplete)
+        XCTAssertTrue(scan.providerProcesses.isEmpty,
+                      "a reused root PID must not inherit the old provider ownership")
+        XCTAssertEqual(scan.sidecarProcesses.map(\.pid), [202],
+                       "a certified process group retains a late descendant after the root exits")
     }
 
-    func test_currentProviderProcessesIncludesProviderDescendantsForMemoryTelemetry() {
-        let currentPID: Int32 = 500
+    func test_managedScanMarksLegacyUnverifiableOwnershipIncomplete() {
+        let legacy = SpawnedProcessTag(pgid: 101, spawnedAt: Date(), provider: nil)
+        let scan = ProviderProcessSweeper.managedProcessScan(
+            tags: [legacy],
+            processes: [],
+            processStartIdentity: { _ in nil }
+        )
+        XCTAssertFalse(scan.isComplete)
+        XCTAssertEqual(scan.incompleteRootPIDs, [101])
+    }
+
+    /// WHY: a run-as-user Claude turn writes an owner-anchored tag with no child
+    /// start identity (root `sudo` child metadata is EPERM to a non-root parent).
+    /// Before the fix, that single row marked every scan incomplete, so ANY later
+    /// provider start failed with processAccountingUnavailable ("Failed to
+    /// start") — the exact 2.0.88 field report from the airtonempath profile.
+    func test_managedScanAccountsLiveRunAsUserRowWithoutPoisoningCompleteness() {
+        let foreign = SpawnedProcessTag(
+            pgid: 101, spawnedAt: Date(), provider: .claude,
+            managedKind: .provider, executablePath: "",
+            startIdentity: nil, isolatedProcessGroup: nil
+        )
+        let processes = [
+            ProviderRuntimeProcess(pid: 101, ppid: 1, pgid: 50, rssKB: 100, command: "sudo -u other claude"),
+            ProviderRuntimeProcess(pid: 102, ppid: 101, pgid: 50, rssKB: 200, command: "claude --print"),
+            ProviderRuntimeProcess(pid: 999, ppid: 1, pgid: 999, rssKB: 900, command: "unrelated")
+        ]
+
+        let scan = ProviderProcessSweeper.managedProcessScan(
+            tags: [foreign],
+            processes: processes,
+            processStartIdentity: { _ in nil }
+        )
+
+        XCTAssertTrue(scan.isComplete, "a run-as-user row must never block admission for everyone")
+        XCTAssertEqual(scan.providerRootCount, 1)
+        XCTAssertEqual(scan.providerProcesses.map(\.pid), [101, 102],
+                       "live sudo root and its descendants are accounted conservatively")
+        XCTAssertFalse(scan.providerProcesses.map(\.pid).contains(999))
+    }
+
+    /// Integration proof of the field failure path: a foreign row persisted in a
+    /// REAL on-disk ledger, scanned against the REAL process table with a REAL
+    /// live child — end-to-end through JSON decode → ps parse → scan. Locks the
+    /// full pipeline the app's admission check uses, not just the pure function.
+    func test_endToEnd_realLedgerForeignRowScansCompleteAgainstRealProcessTable() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("rc2-ownership-e2e-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let store = ProviderProcessOwnershipStore(fileURL: dir.appendingPathComponent("ownership.json"))
+
+        let child = Process()
+        child.executableURL = URL(fileURLWithPath: "/bin/sleep")
+        child.arguments = ["30"]
+        try child.run()
+        defer { child.terminate() }
+
+        try store.append(SpawnedProcessTag(
+            pgid: child.processIdentifier, spawnedAt: Date(), provider: .claude,
+            managedKind: .provider, executablePath: "",
+            startIdentity: nil, isolatedProcessGroup: nil
+        ))
+
+        let scan = try ProviderProcessSweeper.managedProcessScan(store: store)
+
+        XCTAssertTrue(scan.isComplete,
+                      "a persisted run-as-user row must scan complete against the live process table")
+        XCTAssertTrue(scan.providerProcesses.contains { $0.pid == child.processIdentifier },
+                      "the live foreign root must be accounted, not ignored")
+        XCTAssertEqual(scan.providerRootCount, 1)
+    }
+
+    func test_managedScanTreatsExitedRunAsUserRowAsZeroContribution() {
+        let foreign = SpawnedProcessTag(
+            pgid: 101, spawnedAt: Date(), provider: .claude,
+            managedKind: .provider, executablePath: "",
+            startIdentity: nil, isolatedProcessGroup: nil
+        )
+
+        let scan = ProviderProcessSweeper.managedProcessScan(
+            tags: [foreign],
+            processes: [ProviderRuntimeProcess(pid: 999, ppid: 1, pgid: 999, rssKB: 900, command: "unrelated")],
+            processStartIdentity: { _ in nil }
+        )
+
+        XCTAssertTrue(scan.isComplete)
+        XCTAssertEqual(scan.providerRootCount, 0)
+        XCTAssertTrue(scan.providerProcesses.isEmpty,
+                      "an exited run-as-user turn contributes nothing and blocks nothing")
+    }
+
+    /// WHY: Codex and many Homebrew CLIs are `#!/usr/bin/env node` scripts. The
+    /// ownership ledger can store `/usr/bin/env` (or the script path) while `ps`
+    /// later shows `node …/codex app-server`. Before this fix that path drift
+    /// marked the scan incomplete and blocked every provider start with
+    /// processAccountingUnavailable — not just Codex, and on every Mac that
+    /// hit the race.
+    func test_managedScanAccountsShebangReExecWithoutPoisoningCompleteness() {
+        let identity = ProviderProcessStartIdentity(seconds: 50, microseconds: 2)
+        let tags = [
+            SpawnedProcessTag(
+                pgid: 101, spawnedAt: Date(), provider: .codex,
+                managedKind: .provider, executablePath: "/usr/bin/env",
+                startIdentity: identity, isolatedProcessGroup: 101
+            ),
+            SpawnedProcessTag(
+                pgid: 201, spawnedAt: Date(), provider: .grok,
+                managedKind: .provider, executablePath: "/opt/grok",
+                startIdentity: ProviderProcessStartIdentity(seconds: 60, microseconds: 1),
+                isolatedProcessGroup: 201
+            )
+        ]
         let processes = [
             ProviderRuntimeProcess(
-                pid: currentPID,
-                ppid: 1,
-                rssKB: 200_000,
-                command: "/Applications/RemoteCode.app/Contents/MacOS/RemoteCode"
+                pid: 101, ppid: 1, pgid: 101, rssKB: 120,
+                command: "node /opt/homebrew/bin/codex app-server"
             ),
             ProviderRuntimeProcess(
-                pid: 201,
-                ppid: currentPID,
-                rssKB: 25_000,
-                command: "/opt/homebrew/bin/node /Users/me/Library/Application Support/RemoteCode/AgentRuntime/ClaudeAgentSDKBridge/ClaudeAgentSDKBridge.mjs"
+                pid: 102, ppid: 101, pgid: 101, rssKB: 80,
+                command: "codex-worker --session"
             ),
             ProviderRuntimeProcess(
-                pid: 202,
-                ppid: 201,
-                rssKB: 210_000,
-                command: "/Users/me/Library/Application Support/RemoteCode/AgentRuntime/ClaudeAgentSDKBridge/node_modules/@anthropic-ai/claude-agent-sdk-darwin-arm64/claude --output-format stream-json"
-            ),
-            ProviderRuntimeProcess(
-                pid: 401,
-                ppid: 1,
-                rssKB: 18_000,
-                command: "claude --dangerously-skip-permissions"
+                pid: 201, ppid: 1, pgid: 201, rssKB: 90,
+                command: "/opt/grok agent stdio"
             )
         ]
 
-        let providerProcesses = ProviderProcessSweeper.currentProviderProcesses(
+        let scan = ProviderProcessSweeper.managedProcessScan(
+            tags: tags,
             processes: processes,
-            currentPID: currentPID
+            processStartIdentity: {
+                $0 == 101 ? identity
+                    : $0 == 201 ? ProviderProcessStartIdentity(seconds: 60, microseconds: 1)
+                    : nil
+            }
         )
 
-        XCTAssertEqual(providerProcesses.map(\.pid), [201, 202],
-                       "heartbeat provider RSS must include the spawned Claude child without counting the app or user terminal Claude")
+        XCTAssertTrue(scan.isComplete,
+                      "shebang re-exec path drift must never block provider admission")
+        XCTAssertEqual(scan.incompleteRootPIDs, [])
+        XCTAssertEqual(scan.providerRootCount, 2)
+        XCTAssertEqual(scan.providerProcesses.map(\.pid), [101, 102, 201])
     }
 
-    func test_currentSidecarProcessesIncludesRemoteCodeDistillServiceTreeOnly() {
-        let currentPID: Int32 = 500
+    /// WHY: identity still gates ownership — a reused PID with a different start
+    /// identity must not inherit the old env-tagged Codex row even after the
+    /// shebang fix relaxes executable matching.
+    func test_managedScanStillRejectsPIDReuseAfterShebangRelaxation() {
+        let oldIdentity = ProviderProcessStartIdentity(seconds: 10, microseconds: 1)
+        let newIdentity = ProviderProcessStartIdentity(seconds: 99, microseconds: 9)
+        let tags = [
+            SpawnedProcessTag(
+                pgid: 101, spawnedAt: Date(), provider: .codex,
+                managedKind: .provider, executablePath: "/usr/bin/env",
+                startIdentity: oldIdentity, isolatedProcessGroup: 101
+            )
+        ]
         let processes = [
             ProviderRuntimeProcess(
-                pid: currentPID,
-                ppid: 1,
-                rssKB: 200_000,
-                command: "/Applications/RemoteCode.app/Contents/MacOS/RemoteCode"
-            ),
-            ProviderRuntimeProcess(
-                pid: 301,
-                ppid: currentPID,
-                rssKB: 4_700_000,
-                command: "/Applications/RemoteCode.app/Contents/MacOS/RemoteCodeDistillService --runtime mlx"
-            ),
-            ProviderRuntimeProcess(
-                pid: 302,
-                ppid: 301,
-                rssKB: 25_000,
-                command: "/Applications/RemoteCode.app/Contents/MacOS/RemoteCodeDistillService mcp"
-            ),
-            ProviderRuntimeProcess(
-                pid: 401,
-                ppid: 1,
-                rssKB: 1_000_000,
-                command: "claude --dangerously-skip-permissions --chrome"
+                pid: 101, ppid: 1, pgid: 101, rssKB: 50,
+                command: "node /opt/homebrew/bin/codex app-server"
             )
         ]
 
-        let sidecars = ProviderProcessSweeper.currentSidecarProcesses(
+        let scan = ProviderProcessSweeper.managedProcessScan(
+            tags: tags,
             processes: processes,
-            currentPID: currentPID
+            processStartIdentity: { _ in newIdentity }
         )
 
-        XCTAssertEqual(sidecars.map(\.pid), [301, 302],
-                       "Token Saver diagnostics must separate RemoteCode sidecar RSS from Agent App RSS, provider bridge RSS, and user-shell Claude RSS")
+        XCTAssertTrue(scan.isComplete)
+        XCTAssertTrue(scan.providerProcesses.isEmpty)
+        XCTAssertEqual(scan.providerRootCount, 0)
     }
 
-    func test_currentProviderProcessesDoesNotBlockOnLargeProcessLists() {
-        let currentPID: Int32 = 500
-        let processes = [
-            ProviderRuntimeProcess(
-                pid: currentPID,
-                ppid: 1,
-                rssKB: 200_000,
-                command: "/Applications/RemoteCode.app/Contents/MacOS/RemoteCode"
-            ),
-            ProviderRuntimeProcess(
-                pid: 201,
-                ppid: currentPID,
-                rssKB: 25_000,
-                command: "/opt/homebrew/bin/codex app-server"
-            ),
-            ProviderRuntimeProcess(
-                pid: 202,
-                ppid: 201,
-                rssKB: 20_000,
-                command: "codex child"
-            )
-        ] + (0..<5_000).map { index in
-            ProviderRuntimeProcess(
-                pid: Int32(10_000 + index),
-                ppid: 1,
-                rssKB: 1_000,
-                command: "unrelated-\(index)"
-            )
-        }
+}
 
-        let providerProcesses = ProviderProcessSweeper.currentProviderProcesses(
-            processes: processes,
-            currentPID: currentPID
+final class ProcessSpawnTaggerExecutablePathTests: XCTestCase {
+    func test_preferredOwnershipExecutablePathPrefersLiveNonEnvPath() {
+        XCTAssertEqual(
+            ProcessSpawnTagger.preferredOwnershipExecutablePath(
+                livePath: "/opt/homebrew/Cellar/node/26.3.1/bin/node",
+                launchedPath: "/opt/homebrew/bin/codex"
+            ),
+            "/opt/homebrew/Cellar/node/26.3.1/bin/node"
         )
+    }
 
-        XCTAssertEqual(providerProcesses.map(\.pid), [201, 202])
+    func test_preferredOwnershipExecutablePathFallsBackFromEnvLauncher() {
+        // WHY: tagging during the `env` trampoline would otherwise store
+        // `/usr/bin/env` and later poison managed-process scans for every Mac.
+        XCTAssertEqual(
+            ProcessSpawnTagger.preferredOwnershipExecutablePath(
+                livePath: "/usr/bin/env",
+                launchedPath: "/opt/homebrew/bin/codex"
+            ),
+            "/opt/homebrew/bin/codex"
+        )
+        XCTAssertEqual(
+            ProcessSpawnTagger.preferredOwnershipExecutablePath(
+                livePath: nil,
+                launchedPath: "/opt/homebrew/bin/codex"
+            ),
+            "/opt/homebrew/bin/codex"
+        )
+        XCTAssertEqual(
+            ProcessSpawnTagger.preferredOwnershipExecutablePath(
+                livePath: "/usr/bin/env",
+                launchedPath: nil
+            ),
+            "/usr/bin/env"
+        )
+        XCTAssertNil(
+            ProcessSpawnTagger.preferredOwnershipExecutablePath(
+                livePath: nil,
+                launchedPath: nil
+            )
+        )
     }
 }

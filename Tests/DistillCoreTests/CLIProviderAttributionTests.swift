@@ -26,7 +26,11 @@ final class CLIProviderAttributionTests: XCTestCase {
         let capture = RecordCapture()
         let config = try DistillServiceConfiguration(authToken: "tok", appSupportDirectory: NSTemporaryDirectory())
         let scheduler = DistillScheduler(runtime: LocalDistillRuntime(), maxConcurrentRequests: 2)
-        let server = DistillHTTPServer(configuration: config, scheduler: scheduler) { request, response in
+        let server = DistillHTTPServer(
+            configuration: config,
+            scheduler: scheduler,
+            scopedRecoveryStore: TestScopedRecoveryStore()
+        ) { request, response in
             await capture.add(request, response)
         }
         let ready = try await server.start()
@@ -39,7 +43,14 @@ final class CLIProviderAttributionTests: XCTestCase {
         let (_, code) = try runProcess(
             binary,
             ["cli", "Did it pass? Return PASS or FAIL only."],
-            env: ["REMOTE_CODE_DISTILL_STATE_PATH": stateURL.path, "REMOTE_CODE_AGENT_PROVIDER": "claude"],
+            env: [
+                "REMOTE_CODE_DISTILL_STATE_PATH": stateURL.path,
+                "REMOTE_CODE_AGENT_PROVIDER": "claude",
+                "RC_TOKEN_SAVER_WORKSPACE_ID": "workspace-attribution",
+                "RC_TOKEN_SAVER_PROJECT_ID": "project-attribution",
+                "RC_TOKEN_SAVER_THREAD_ID": "thread-attribution",
+                "RC_TOKEN_SAVER_ATTEMPT_ID": "attempt-attribution"
+            ],
             stdin: "build passed\n0 failures"
         )
         XCTAssertEqual(code, 0)

@@ -22,15 +22,16 @@ public enum RunAsUserProcessBootstrapError: Error, LocalizedError, Equatable {
 }
 
 /// Rewrites a provider Process launch so it runs as another macOS user via the
-/// privileged trampoline helper (setuid/root LaunchDaemon install). Stdio is
-/// preserved because the helper `exec`s into the provider in-process tree.
+/// system `sudo -u` (already present on macOS — no helper install required).
+/// Stdio is preserved because `sudo` execs the provider in the same process
+/// tree. Becoming another user needs privilege, so `sudo` authenticates the
+/// CURRENT user; a graphical askpass (`-A` + `SUDO_ASKPASS`) supplies the
+/// password without a tty. Without an askpass we fall back to `-n`
+/// (non-interactive) which succeeds only on a cached sudo timestamp.
 public enum RunAsUserProcessBootstrap {
-    public static let helperExecutableNames = [
-        "RemoteCodeRunAsUserHelper",
-        "io.remotecode.RunAsUserHelper"
-    ]
+    public static let sudoPath = "/usr/bin/sudo"
 
-    /// Basenames allowed through the privileged trampoline.
+    /// Basenames allowed through the elevated launch.
     public static let allowlistedBasenames: Set<String> = [
         "codex",
         "claude",
@@ -61,13 +62,22 @@ public enum RunAsUserProcessBootstrap {
         }
     }
 
+    /// Builds the launch plan. When `runAsUser` is nil or the current user, this
+    /// is a passthrough. Otherwise it rewrites to
+    /// `sudo [-A|-n] -u <shortName> -H -- <binary> <args>`:
+    /// `-H` sets HOME to the target's home so the provider reads THAT user's
+    /// config (e.g. `~/.claude` = the account/MCP/skills that user is logged in
+    /// with); `-A` uses the graphical askpass at `askpassPath`; without an
+    /// askpass we use `-n` so a missing credential fails loudly instead of
+    /// hanging on a tty prompt.
     public static func plan(
         executablePath: String,
         arguments: [String],
         environment: [String: String],
         currentDirectory: String,
         runAsUser: AgentRunAsUser?,
-        helperLocator: (String) -> String? = { ProcessLocator.resolve($0) },
+        askpassPath: String? = nil,
+        sudoPathOverride: String? = nil,
         currentUID: uid_t = getuid()
     ) throws -> LaunchPlan {
         guard let runAsUser, runAsUser.uid != currentUID else {
@@ -91,41 +101,93 @@ public enum RunAsUserProcessBootstrap {
             throw RunAsUserProcessBootstrapError.binaryNotAllowlisted(base)
         }
 
-        guard let helper = helperExecutableNames.compactMap(helperLocator).first else {
-            throw RunAsUserProcessBootstrapError.helperUnavailable(
-                "install RemoteCodeRunAsUserHelper (privileged) or ensure it is on PATH"
-            )
-        }
-
-        // Helper argv: exec --uid N --gid N --home H --user NAME --cwd C -- binary args...
-        var helperArgs: [String] = [
-            "exec",
-            "--uid", "\(runAsUser.uid)",
-            "--gid", "\(runAsUser.gid)",
-            "--home", runAsUser.homePath,
-            "--user", runAsUser.shortName,
-            "--cwd", currentDirectory,
+        // sudo argv: sudo [-A|-n] --preserve-env=PATH -u <name> -H -- <binary> <args>
+        // `--preserve-env=PATH` keeps the app's PATH (Homebrew, /usr/bin, …) so the
+        // provider can still find node/git/rg after sudo's env_reset; `-H` sets the
+        // target's HOME so it reads THAT user's ~/.claude.
+        let authFlag = (askpassPath?.isEmpty == false) ? "-A" : "-n"
+        var sudoArgs: [String] = [
+            authFlag,
+            "--preserve-env=PATH",
+            "-u", runAsUser.shortName,
+            "-H",
             "--",
             executablePath
         ]
-        helperArgs.append(contentsOf: arguments)
+        sudoArgs.append(contentsOf: arguments)
 
-        // Environment for the helper process itself (root phase). The helper
-        // rebuilds a clean user environment after setuid.
-        var helperEnv = environment
-        helperEnv["HOME"] = runAsUser.homePath
-        helperEnv["USER"] = runAsUser.shortName
-        helperEnv["LOGNAME"] = runAsUser.shortName
-        helperEnv["RC_RUN_AS_USER"] = runAsUser.shortName
-        helperEnv["RC_RUN_AS_UID"] = "\(runAsUser.uid)"
+        // SUDO_ASKPASS must be in the INVOKING environment (read before sudo
+        // resets env). `-H` handles the target HOME; do not preset HOME here.
+        var sudoEnv = environment
+        if let askpassPath, !askpassPath.isEmpty {
+            sudoEnv["SUDO_ASKPASS"] = askpassPath
+        }
 
         return LaunchPlan(
-            executablePath: helper,
-            arguments: helperArgs,
-            environment: helperEnv,
+            executablePath: sudoPathOverride ?? sudoPath,
+            arguments: sudoArgs,
+            environment: sudoEnv,
             currentDirectory: currentDirectory,
             usesHelper: true
         )
+    }
+
+    /// Builds the argv for a best-effort, non-interactive `sudo` that signals
+    /// `pids` AS the target uid. A run-as-user provider's real child (`claude`
+    /// and its descendants) carries the TARGET user's uid, so this non-root app
+    /// gets EPERM signalling them directly and `sudo` never relays `SIGKILL`;
+    /// reaping them requires re-entering the target uid via `sudo`. Uses `-n`
+    /// (never prompt) so teardown never pops a password dialog — it succeeds only
+    /// on the sudo credential cached by the spawn-time askpass and otherwise fails
+    /// silently, leaving the orphan we already could not signal. Returns nil when
+    /// there is nothing to signal.
+    public static func sudoKillArguments(
+        uid: uid_t,
+        signal: Int32,
+        pids: [pid_t],
+        killPath: String = "/bin/kill",
+        sudoPathOverride: String? = nil
+    ) -> (executablePath: String, arguments: [String])? {
+        let targets = pids.filter { $0 > 0 }
+        guard !targets.isEmpty else { return nil }
+        var arguments = ["-n", "-u#\(uid)", "--", killPath, "-\(signal)"]
+        arguments.append(contentsOf: targets.map(String.init))
+        return (sudoPathOverride ?? sudoPath, arguments)
+    }
+
+    /// The graphical askpass script body. `sudo -A` runs this and reads the
+    /// password from stdout; a macOS dialog collects it (hidden answer). Cancel
+    /// prints nothing → sudo auth fails loudly. Contains no secret itself.
+    public static func askpassScriptBody(targetUser: String) -> String {
+        // Sanitize the user name before it enters the osascript string literal —
+        // a macOS short name is `[A-Za-z0-9_.-]`, so anything else is dropped to
+        // block AppleScript/shell injection via a pathological account name.
+        let safe = targetUser.filter { $0.isLetter || $0.isNumber || $0 == "_" || $0 == "." || $0 == "-" }
+        let who = safe.isEmpty ? "another user" : safe
+        return """
+        #!/bin/sh
+        /usr/bin/osascript \
+          -e 'display dialog "RemoteCode needs your macOS password to run the agent as \(who)." with title "RemoteCode" default answer "" with hidden answer with icon caution' \
+          -e 'text returned of result' 2>/dev/null
+        """
+    }
+
+    /// Writes the askpass script for `targetUser` to a user-scoped temp path
+    /// (mode 0700 dir, 0755 file), returning its absolute path. Rewritten each
+    /// call so the dialog names the current target. Returns nil on write
+    /// failure so the caller can fall back to `-n`.
+    public static func materializeAskpass(
+        targetUser: String,
+        directory: URL = FileManager.default.temporaryDirectory
+    ) -> String? {
+        let path = directory.appendingPathComponent("remotecode-sudo-askpass.sh")
+        do {
+            try askpassScriptBody(targetUser: targetUser).write(to: path, atomically: true, encoding: .utf8)
+            try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: path.path)
+            return path.path
+        } catch {
+            return nil
+        }
     }
 
     /// Applies a launch plan onto a Foundation Process.

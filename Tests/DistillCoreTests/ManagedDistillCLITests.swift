@@ -23,6 +23,32 @@ final class ManagedDistillCLITests: XCTestCase {
         }
     }
 
+    private actor HeaderRecorder {
+        private var operationIDs: [String] = []
+        private var invocationIDs: [String] = []
+
+        func append(_ request: URLRequest) {
+            operationIDs.append(request.value(forHTTPHeaderField: "X-RemoteCode-Operation-ID") ?? "")
+            invocationIDs.append(request.value(forHTTPHeaderField: "X-RemoteCode-Invocation-ID") ?? "")
+        }
+
+        func all() -> [String] { operationIDs }
+        func invocations() -> [String] { invocationIDs }
+    }
+
+    private actor ScopeHeaderRecorder {
+        private var values: [[String: String]] = []
+
+        func append(_ request: URLRequest) {
+            let names = ["Workspace-ID", "Project-ID", "Thread-ID", "Provider", "Attempt-ID"]
+            values.append(Dictionary(uniqueKeysWithValues: names.map {
+                ($0, request.value(forHTTPHeaderField: "X-RemoteCode-\($0)") ?? "")
+            }))
+        }
+
+        func all() -> [[String: String]] { values }
+    }
+
     private let state = ManagedDistillCLI.State(baseURL: "http://127.0.0.1:9", authToken: "t")
 
     func test_compress_success_emitsOutputAndHandleMarker() async {
@@ -36,12 +62,101 @@ final class ManagedDistillCLITests: XCTestCase {
         XCTAssertTrue(s.contains("[[rc:abc123]]"), "handle marker embedded so the agent can retrieve the original")
     }
 
+    func test_compressDerivesStableDistinctOperationIDsPerCanonicalRequest() async throws {
+        let recorder = HeaderRecorder()
+        let response = DistillResponse(requestID: UUID(), output: "compressed", inputCharacters: 10, originalHandle: "h")
+        let data = try JSONEncoder().encode(response)
+
+        func run(_ input: String) async {
+            let cli = ManagedDistillCLI(arguments: ["keep errors"], stdin: Data(input.utf8), state: state) { request in
+                await recorder.append(request)
+                return (data, 200)
+            }
+            _ = await cli.run()
+        }
+
+        await run("request one")
+        await run("request two")
+        await run("request one")
+
+        let ids = await recorder.all()
+        let invocations = await recorder.invocations()
+        XCTAssertEqual(ids.count, 3)
+        XCTAssertFalse(ids[0].isEmpty)
+        XCTAssertNotEqual(ids[0], ids[1], "distinct requests in one provider attempt need distinct mutation identities")
+        XCTAssertEqual(ids[0], ids[2], "a byte-identical canonical retry must reuse its operation identity")
+        XCTAssertEqual(Set(invocations).count, 3, "independent CLI calls need unique invocation identities even for identical bytes")
+    }
+
+    func test_completeEnvironmentEmitsExactScopeForClaudeCodexAndGrok() async throws {
+        let recorder = ScopeHeaderRecorder()
+        let response = try JSONEncoder().encode(DistillResponse(
+            requestID: UUID(), output: "compressed", inputCharacters: 20,
+            originalHandle: "h", routeStage: .deterministic
+        ))
+        for provider in ["claude", "codex", "grok"] {
+            let environment = [
+                "RC_TOKEN_SAVER_WORKSPACE_ID": "workspace",
+                "RC_TOKEN_SAVER_PROJECT_ID": "project",
+                "RC_TOKEN_SAVER_THREAD_ID": "thread",
+                "REMOTE_CODE_AGENT_PROVIDER": provider,
+                "RC_TOKEN_SAVER_ATTEMPT_ID": "attempt",
+            ]
+            let cli = ManagedDistillCLI(
+                arguments: [], stdin: Data("provider input".utf8), state: state,
+                provider: provider,
+                recoveryContext: ManagedDistillCLI.recoveryContext(environment: environment)
+            ) { request in
+                await recorder.append(request)
+                return (response, 200)
+            }
+            _ = await cli.run()
+        }
+
+        let scopes = await recorder.all()
+        XCTAssertEqual(scopes.map { $0["Provider"] ?? "" }, ["claude", "codex", "grok"])
+        XCTAssertTrue(scopes.allSatisfy {
+            $0["Workspace-ID"] == "workspace" && $0["Project-ID"] == "project"
+                && $0["Thread-ID"] == "thread" && $0["Attempt-ID"] == "attempt"
+        })
+        XCTAssertNil(ManagedDistillCLI.recoveryContext(environment: [
+            "RC_TOKEN_SAVER_WORKSPACE_ID": "workspace",
+            "REMOTE_CODE_AGENT_PROVIDER": "codex",
+        ]))
+    }
+
     func test_compress_noState_failsOpenToRawStdin() async {
         let raw = Data("the exact tool output that must NOT be lost".utf8)
         let cli = ManagedDistillCLI(arguments: [], stdin: raw, state: nil) { _ in nil }
         let (out, code) = await cli.run()
         XCTAssertEqual(code, 0)
         XCTAssertEqual(out, raw, "no state => echo raw stdin verbatim, never lose piped data")
+    }
+
+    func test_compress_nonemptyWhitespace_returnsExactRawBytesWithoutTransport() async {
+        let raw = Data([0x20, 0x09, 0x0A, 0x0D, 0x20])
+        let cli = ManagedDistillCLI(arguments: [], stdin: raw, state: state) { _ in
+            XCTFail("whitespace-only stdin must not be sent to the optimizer")
+            return nil
+        }
+
+        let (out, code) = await cli.run()
+
+        XCTAssertEqual(code, 0)
+        XCTAssertEqual(out, raw)
+    }
+
+    func test_compress_invalidUTF8_returnsExactRawBytesWithoutTransport() async {
+        let raw = Data([0x66, 0x80, 0xFF, 0x00, 0xFE])
+        let cli = ManagedDistillCLI(arguments: [], stdin: raw, state: state) { _ in
+            XCTFail("undecodable stdin must not be replacement-decoded or transported")
+            return nil
+        }
+
+        let (out, code) = await cli.run()
+
+        XCTAssertEqual(code, 0)
+        XCTAssertEqual(out, raw)
     }
 
     func test_compress_transportFailure_failsOpen() async {
@@ -138,6 +253,24 @@ final class ManagedDistillCLITests: XCTestCase {
         let (out, code) = await cli.run()
         XCTAssertEqual(code, 0)
         XCTAssertTrue(out.isEmpty)
+    }
+
+    func test_hookSubcommand_neverFallsThroughToCompress() async {
+        var transportCalled = false
+        let cli = ManagedDistillCLI(
+            arguments: ["hook", "post-tool-use", "--provider", "claude"],
+            stdin: Data(#"{"tool":"bash","output":"ok"}"#.utf8),
+            state: state
+        ) { _ in
+            transportCalled = true
+            return (Data("should-not-compress".utf8), 200)
+        }
+        let (out, code) = await cli.run()
+        XCTAssertEqual(code, 1)
+        XCTAssertFalse(transportCalled, "hook must not invoke compress transport")
+        let text = String(decoding: out, as: UTF8.self)
+        XCTAssertTrue(text.contains("hook"), "reserved hook message expected")
+        XCTAssertFalse(text.contains("should-not-compress"))
     }
 
     func test_retrieve_success_returnsOriginal() async {

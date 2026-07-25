@@ -126,6 +126,39 @@ final class AppShellResourceBundleTests: XCTestCase {
         )
     }
 
+    /// WHY: Claude Agent SDK bridge must ship under Contents/Resources (Airton
+    /// CI-path bake-in class). Contract-test the packaging scripts like Pet.
+    func test_packageScriptsShipClaudeAgentSDKBridge() throws {
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let packageApp = try String(
+            contentsOf: root.appendingPathComponent("scripts/package-app.sh"),
+            encoding: .utf8
+        )
+        let checkBundle = try String(
+            contentsOf: root.appendingPathComponent("scripts/check-app-bundle.sh"),
+            encoding: .utf8
+        )
+        XCTAssertTrue(
+            packageApp.contains("Contents/Resources/ClaudeAgentSDKBridge.mjs"),
+            "package-app must copy ClaudeAgentSDKBridge.mjs into Contents/Resources"
+        )
+        XCTAssertTrue(
+            packageApp.contains("Sources/AgentRuntime/ClaudeAgentSDKBridge.mjs"),
+            "package-app must source the bridge from AgentRuntime sources"
+        )
+        XCTAssertTrue(
+            checkBundle.contains("ClaudeAgentSDKBridge.mjs"),
+            "check-app-bundle must fail closed when the Claude bridge is missing"
+        )
+        XCTAssertTrue(
+            checkBundle.contains("Claude provider fails on customer machines"),
+            "missing-bridge failure message must name the customer impact class"
+        )
+    }
+
     // MARK: - fixtures
 
     private func makeTempApp(withResourcesMirror: Bool, withAppRootMirror: Bool) throws -> URL {

@@ -4,6 +4,42 @@ import Darwin
 @testable import AgentRuntime
 
 final class CodexAppServerClientTests: ProviderProcessTestCase {
+    override func tearDown() {
+        TokenSaverCensusSeam.sharedStore = TokenSaverCensusStore()
+        super.tearDown()
+    }
+
+    func test_turnStartCensus_preservesCodexWireBytesAndDoesNotInventTokens() async throws {
+        let script = try makeFakeAppServerPeer()
+        let store = TokenSaverCensusStore()
+        TokenSaverCensusSeam.sharedStore = store
+        let client = try CodexAppServerClient(
+            binary: script,
+            arguments: [],
+            cwd: FileManager.default.temporaryDirectory.path,
+            tokenSaverCensusAllowed: true
+        )
+        defer { client.stop() }
+        _ = try await client.initialize()
+        let request = AgentRunRequest(
+            threadId: AgentThreadID(),
+            provider: .codex,
+            model: "test-model",
+            cwd: FileManager.default.temporaryDirectory.path,
+            prompt: "census payload"
+        )
+
+        _ = try await client.startTurn(providerThreadId: "thread-1", for: request)
+
+        let observations = store.snapshot()
+        XCTAssertEqual(observations.count, 1, "only provider-bound turn/start is census eligible")
+        XCTAssertEqual(observations[0].bindingDimensions["provider"], "codex")
+        XCTAssertEqual(observations[0].bindingDimensions["tool_shape"], "turn_start_json_line")
+        XCTAssertGreaterThan(observations[0].eligibleBytes, 0)
+        XCTAssertFalse(observations[0].hasMeasuredEligibleTokens)
+        XCTAssertFalse(store.aggregates()[0].isValidForGate)
+    }
+
     func test_rpcDeadlineFailsAndStopsSilentAppServer() async throws {
         let script = try makeSilentAppServerPeer()
         let client = try CodexAppServerClient(
@@ -444,10 +480,8 @@ final class CodexAppServerClientTests: ProviderProcessTestCase {
         defer { client.stop() }
         _ = try await client.initialize()
 
-        // WHY: Codex has no automatic tool-output compression (Claude-SDK-only). The Token Saver
-        // env hint (set by providerEnvironment when enabled) is the signal that makes Codex's
-        // per-turn developer_instructions instruct `| distill`; without it Codex never compresses
-        // command output, so Token Saver savings for Codex stay flat.
+        // WHY: Distill is paid (Token Saver). developer_instructions carry language +
+        // `| distill` only when RC_TOKEN_SAVER_DISTILL_HINT=1 — never via ~/.codex/skills.
         let withHint = try await client.startTurn(
             providerThreadId: "thread-app-server-1",
             for: AgentRunRequest(
@@ -462,18 +496,28 @@ final class CodexAppServerClientTests: ProviderProcessTestCase {
         let hintInstructions = try XCTUnwrap(collaborationSettings(from: withHint)["developer_instructions"] as? String)
         XCTAssertTrue(
             hintInstructions.contains("| distill"),
-            "the Token Saver env hint must drive Codex developer_instructions to pipe `| distill`"
+            "Token Saver on: Codex developer_instructions must instruct `| distill`"
         )
-        // Parity with Claude's per-session systemPrompt: Codex must also receive the full distill
-        // LANGUAGE spec per turn, not just the pipe rule — otherwise it depends solely on the
-        // easily-buried ~/.codex/AGENTS.md to speak distill. "AR-0/AR-1" is unique to the full body.
+        // Parity with Claude's per-session systemPrompt: full distill LANGUAGE spec per turn.
+        // "Registers:" is the register/prefix legend from the full distill body; a bare
+        // "| distill" pipe rule never carries it, so this proves the full spec is injected.
         XCTAssertTrue(
-            hintInstructions.contains("AR-0/AR-1"),
-            "Codex developer_instructions must carry the full distill language spec when Token Saver is on, not only the pipe rule"
+            hintInstructions.contains("R0 micro") && hintInstructions.contains("R1 work"),
+            "Codex developer_instructions must carry the full distill language spec, not only the pipe rule"
+        )
+        XCTAssertEqual(
+            hintInstructions.components(separatedBy: TokenSaverProviderSafetyABI.block).count - 1,
+            1,
+            "Codex receives the versioned Token Saver safety ABI exactly once"
+        )
+        XCTAssertEqual(
+            (AgentSkillInstaller.distillAgentInstructionsTemplate + "\n\n" + hintInstructions)
+                .components(separatedBy: TokenSaverProviderSafetyABI.block).count - 1,
+            1,
+            "Codex effective disk plus runtime context receives the safety ABI exactly once"
         )
 
-        // No hint => Token Saver off => the managed distill CLI is uninstalled, so Codex must NOT
-        // be told to pipe through a binary that no longer exists.
+        // Token Saver off → base mode instructions only, no Distill.
         let withoutHint = try await client.startTurn(
             providerThreadId: "thread-app-server-1",
             for: AgentRunRequest(
@@ -484,9 +528,16 @@ final class CodexAppServerClientTests: ProviderProcessTestCase {
                 prompt: "explore"
             )
         )
+        let emptyEnvInstructions = try XCTUnwrap(
+            try collaborationSettings(from: withoutHint)["developer_instructions"] as? String
+        )
         XCTAssertFalse(
-            (try collaborationSettings(from: withoutHint)["developer_instructions"] as? String)?.contains("distill") == true,
-            "without the Token Saver hint Codex must not be instructed to pipe through the uninstalled distill CLI"
+            emptyEnvInstructions.contains("| distill"),
+            "Token Saver off must not inject Distill into Codex"
+        )
+        XCTAssertFalse(
+            emptyEnvInstructions.contains(TokenSaverProviderSafetyABI.block),
+            "Token Saver off must not inject safety ABI"
         )
     }
 

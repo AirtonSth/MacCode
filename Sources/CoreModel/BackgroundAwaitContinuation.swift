@@ -47,8 +47,51 @@ public enum BackgroundAwaitContinuation {
     /// user" so the host never auto-nudges those (auto-nudging a user-wait in
     /// full-access mode could make the agent act without the approval it awaits).
     public static let systemPromptDirective = """
-    Background-await protocol: if you end your turn while still waiting on background or asynchronous work to finish — a deploy, build, CI job, poller, recording, download, or anything that completes later and is expected to resume you — you MUST begin that final message with the exact marker \(awaitingMarker) on its own first line. Emit the marker ONLY when you are genuinely blocked waiting on such work; never when the task is actually finished, and never when you are waiting on the user. Prefer to keep working, or to poll the task to completion within this turn, rather than stopping — use the marker only when stopping is truly unavoidable.
+    Background-await protocol: if you end your turn while still waiting on background or asynchronous work to finish — a deploy, build, CI job, poller, recording, download, or anything that completes later and is expected to resume you — you MUST begin that final message with the exact marker \(awaitingMarker) on its own first line. Emit the marker ONLY when you are genuinely blocked waiting on such external work; never when the task is actually finished, never when you are waiting on the user, and never for multi-phase skill handoffs (e.g. "Proceeding to Phase N", "Next: Phase N", "PHASE N RESULT"). Prefer to keep working across phases in one turn, or to poll external work to completion within this turn, rather than stopping — use the marker only when stopping on external async work is truly unavoidable.
     """
+
+    /// System-prompt rule injected for the Claude provider on every run so the agent
+    /// does not PREEMPTIVELY refuse a connected MCP tool in a non-interactive run.
+    ///
+    /// WHY: in `--print` / autonomous mode the model tends to *assume* that an OAuth
+    /// MCP server (Linear, Slack, etc.) needs an interactive browser auth it "cannot
+    /// do here" and return BLOCKED — WITHOUT ever calling the tool. Observed live: a
+    /// run loaded `mcp__linear__get_issue` via ToolSearch (twice) yet never invoked
+    /// it and declared "Linear requires authentication unavailable in this
+    /// non-interactive session," while the same tool succeeds headlessly (the OAuth
+    /// token is cached in the login Keychain the CLI already reads). The failure is a
+    /// false model assumption, not missing auth — so the fix is a prompt rule, not an
+    /// infra change. Deliberately CONDITIONAL: it does not claim every server is
+    /// authenticated (a token can genuinely be expired/absent); it only forbids
+    /// declaring an MCP auth block *before* an actual tool call returned an auth error.
+    public static let mcpToolAvailabilityDirective = """
+    MCP tool availability: connected MCP servers in this session use credentials already cached by the CLI and work in non-interactive and autonomous runs. Do NOT assume an MCP tool needs interactive authentication, and do NOT report a server as unauthenticated or return BLOCKED for MCP authentication, merely because this session is non-interactive. When a relevant MCP tool is available, call it directly. Only treat an MCP server as needing authentication AFTER you have actually invoked one of its tools and received an explicit authentication/authorization error, and then include that exact error.
+    """
+
+    /// System-prompt rule injected for the Claude provider on every run so the agent
+    /// WAITS for a remote MCP server that is still finishing its asynchronous connect
+    /// instead of reporting it as perpetually "connecting".
+    ///
+    /// WHY: remote/OAuth MCP servers (Linear, the claude.ai connectors) connect
+    /// LAZILY and asynchronously — the handshake begins only once the first turn is
+    /// submitted and completes ~10-20s later. A quick first turn races ahead of it:
+    /// the tools are not loaded yet and the CLI injects a "still connecting … will
+    /// appear shortly" reminder, which the model repeats as a final answer ("it's
+    /// connecting, try later") — the exact symptom users hit asking "is Linear
+    /// active?". The tools DO arrive within the same session; `RefreshMcpTools`
+    /// (exposed via `CLAUDE_CODE_ENABLE_REFRESH_MCP_TOOLS=1`, set for Claude turns in
+    /// CodexRunner.processEnvironment) re-queries connected servers and loads their
+    /// tools mid-turn. So the fix is to wait-and-refresh, matching what a human does
+    /// in an already-warm terminal. Reproduced + verified on claude 2.1.218.
+    public static let mcpConnectWaitDirective = """
+    MCP connection timing: remote MCP servers finish connecting a few seconds into a session, so early on their tools may not be loaded yet and a reminder may say a server is "still connecting". When your task needs such a tool — or the user asks whether an MCP server or its tools are active — do NOT answer that it is unavailable or still connecting. Wait for it: call the RefreshMcpTools tool (after a brief shell `sleep` of a few seconds if its tools are not loaded yet) and retry until the server's tools appear, which normally happens within ~20 seconds, then use them. Report a server as unavailable only after its tools stay absent despite waiting and refreshing.
+    """
+
+    /// The always-on Claude system-prompt rules, injected on every Claude run via
+    /// both live routes (CLI `buildStreamingArgs` and the SDK `claudeSystemPrompt`).
+    /// Single source of truth so the two routes never drift: edit the directives
+    /// above, not the call sites.
+    public static let alwaysOnClaudeDirectives = systemPromptDirective + "\n\n" + mcpToolAvailabilityDirective + "\n\n" + mcpConnectWaitDirective
 
     /// The nudge sent to re-invoke a stalled agent. Provider-agnostic and explicit
     /// about both branches (done vs still-running) so the agent does the right

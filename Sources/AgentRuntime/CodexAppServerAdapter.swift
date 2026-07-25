@@ -95,6 +95,10 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         var startedItemIds: Set<String>
         var streamedItemIds: Set<String>
         var permissionMode: AgentPermissionMode
+        /// Generation for the single active turn/read reconciliation loop so
+        /// missing item/completed or turn/completed notifications cannot leave
+        /// the coordinator owning a turn the server already considers finished.
+        var turnReconcileGeneration: Int
     }
 
     private struct PendingFinish {
@@ -204,7 +208,8 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
                 cwd: request.cwd,
                 environment: request.environment,
                 notificationHandler: notificationHandler,
-                serverRequestHandler: serverRequestHandler
+                serverRequestHandler: serverRequestHandler,
+                tokenSaverCensusAllowed: request.runAsUser?.uid == nil || request.runAsUser?.uid == getuid()
             )
         }
     }
@@ -1050,6 +1055,9 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
                     startedAtMs: now
                 )))
             }
+            if Self.assistantItemType(for: rawType) == .commandExecution {
+                scheduleTurnReconciliation(threadId: threadId, turnId: turnId)
+            }
         case "item/autoApprovalReview/started", "item.autoApprovalReview.started", "item/autoApprovalReview/completed", "item.autoApprovalReview.completed":
             let review = payload["review"] as? [String: Any] ?? payload["autoApprovalReview"] as? [String: Any] ?? payload
             let turnId = string(payload, "turnId") ?? string(payload, "turn_id") ?? activeTurnId(threadId: threadId) ?? ""
@@ -1117,6 +1125,12 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
                 ))
             }
             events.append(.itemCompleted(itemId: itemId, finalState: Self.itemState(for: string(item, "status"))))
+            // Codex can complete a final_answer item without ever emitting
+            // turn/completed. Arm a single thread/read reconcile loop so the run
+            // only finishes when the server authoritatively reports the turn idle.
+            if Self.isFinalAnswerPhaseItem(item, type: rawType) {
+                scheduleTurnReconciliation(threadId: threadId, turnId: turnId)
+            }
         case "item/agentMessage/delta", "item.agentMessage.delta":
             let itemId = string(payload, "itemId") ?? string(payload, "item_id") ?? UUID().uuidString
             let turnId = string(payload, "turnId") ?? string(payload, "turn_id") ?? activeTurnId(threadId: threadId) ?? ""
@@ -1576,7 +1590,8 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
             emittedProposedPlanIds: [],
             startedItemIds: [],
             streamedItemIds: [],
-            permissionMode: permissionMode
+            permissionMode: permissionMode,
+            turnReconcileGeneration: 0
         )
         lock.unlock()
     }
@@ -1683,12 +1698,106 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         return sessions[threadId]?.finalAssistantMessage ?? ""
     }
 
+    /// Wait briefly for the normal notification path, then authoritatively
+    /// reconcile via thread/read. One generation remains active per turn, so a
+    /// long command is polled without accumulating watchdog tasks.
+    private func scheduleTurnReconciliation(threadId: AgentThreadID, turnId: String) {
+        lock.lock()
+        guard sessions[threadId] != nil else {
+            lock.unlock()
+            return
+        }
+        let generation = (sessions[threadId]?.turnReconcileGeneration ?? 0) &+ 1
+        sessions[threadId]?.turnReconcileGeneration = generation
+        lock.unlock()
+        Task { [weak self] in
+            // Let a racing item/completed or turn/completed win first.
+            try? await Task.sleep(nanoseconds: 2_000_000_000)
+            while let self {
+                let finished = await self.reconcileTurnIfStillOpen(
+                    threadId: threadId,
+                    expectedTurnId: turnId,
+                    generation: generation
+                )
+                if finished { return }
+                try? await Task.sleep(nanoseconds: 15_000_000_000)
+            }
+        }
+    }
+
+    /// Returns true when this watchdog is obsolete or the turn was reconciled.
+    private func reconcileTurnIfStillOpen(
+        threadId: AgentThreadID,
+        expectedTurnId: String,
+        generation: Int
+    ) async -> Bool {
+        let snapshot: (client: CodexAppServerControlling, providerThreadId: String)? = {
+            lock.lock(); defer { lock.unlock() }
+            guard let session = sessions[threadId],
+                  session.turnReconcileGeneration == generation,
+                  session.status == .running || session.activeTurnId != nil
+            else { return nil }
+            return (session.client, session.providerThreadId)
+        }()
+        guard let snapshot else { return true }
+
+        let response: CodexAppServerClient.JSONObject
+        do {
+            response = try await snapshot.client.readThread(
+                providerThreadId: snapshot.providerThreadId,
+                includeTurns: true
+            )
+        } catch {
+            return false
+        }
+
+        let turnId = expectedTurnId.isEmpty
+            ? (Self.turnIds(fromThreadReadResponse: response).last ?? "")
+            : expectedTurnId
+        guard !turnId.isEmpty,
+              Self.turnIsAuthoritativelyTerminal(in: response, turnId: turnId)
+        else {
+            return false
+        }
+
+        let bufferedFinal: String? = {
+            lock.lock(); defer { lock.unlock() }
+            guard let live = sessions[threadId],
+                  live.turnReconcileGeneration == generation,
+                  live.status == .running || live.activeTurnId != nil
+            else { return nil }
+            return live.finalAssistantMessage
+        }()
+        guard let bufferedFinal else { return true }
+
+        mergeCompletedTurnIds(threadId: threadId, turnIds: Self.turnIds(fromThreadReadResponse: response))
+        let final = Self.finalMessageFromThreadRead(response, turnId: turnId)
+            ?? (bufferedFinal.isEmpty ? nil : bufferedFinal)
+        emit([.turnCompleted(turnId: turnId, finalMessage: final)], threadId: threadId)
+        markFinished(threadId: threadId, status: .completed, turnId: turnId)
+        SessionEventEmitter(onEvent: onEventCallback(threadId: threadId))
+            .broadcastEvent(
+                .finished(
+                    .completed,
+                    finalMessage: final,
+                    providerThreadId: snapshot.providerThreadId
+                )
+            )
+        return true
+    }
+
     private func markFinished(threadId: AgentThreadID, status: AgentRunStatus, turnId: String?) {
         lock.lock()
         sessions[threadId]?.status = status
         sessions[threadId]?.activeTurnId = nil
         sessions[threadId]?.threadStatusType = nil
         sessions[threadId]?.pendingFinish = nil
+        // Invalidate the pending reconciliation loop so it cannot finish a turn
+        // that already completed via the normal notification path.
+        if var session = sessions[threadId] {
+            session.turnReconcileGeneration &+= 1
+            sessions[threadId] = session
+        }
         if let turnId, !turnId.isEmpty, sessions[threadId]?.completedTurnIds.contains(turnId) == false {
             sessions[threadId]?.completedTurnIds.append(turnId)
         }
@@ -2384,6 +2493,57 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         return !isUserMessageItem(item, type: type)
     }
 
+    /// True only when Codex marks the item as the terminal final_answer phase.
+    /// Never infer completion from ordinary assistantMessage text alone.
+    nonisolated static func isFinalAnswerPhaseItem(_ item: [String: Any], type: String) -> Bool {
+        guard isAssistantMessageItem(item, type: type) else { return false }
+        let phase = (string(item, "phase") ?? string(item, "phaseType") ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        return phase == "final_answer" || phase == "finalanswer"
+    }
+
+    /// Authoritative turn terminal check from a thread/read response.
+    nonisolated static func turnIsAuthoritativelyTerminal(
+        in response: CodexAppServerClient.JSONObject,
+        turnId: String
+    ) -> Bool {
+        let thread = response["thread"] as? [String: Any] ?? response
+        let turns = thread["turns"] as? [[String: Any]] ?? []
+        guard let turn = turns.first(where: { string($0, "id") == turnId }) else {
+            // No turn id match: still allow idle thread status as authority.
+            let state = (string(thread, "status") ?? string(thread, "state") ?? "").lowercased()
+            return isIdleThreadStatus(state)
+        }
+        let status = (string(turn, "status") ?? "").lowercased()
+        if status == "completed" || status == "failed" || status == "cancelled" || status == "interrupted" {
+            return true
+        }
+        let state = (string(thread, "status") ?? string(thread, "state") ?? "").lowercased()
+        return isIdleThreadStatus(state)
+    }
+
+    /// Final assistant text from an authoritative thread/read snapshot.
+    nonisolated static func finalMessageFromThreadRead(
+        _ response: CodexAppServerClient.JSONObject,
+        turnId: String
+    ) -> String? {
+        let thread = response["thread"] as? [String: Any] ?? response
+        let turns = thread["turns"] as? [[String: Any]] ?? []
+        let turn = turns.first(where: { string($0, "id") == turnId }) ?? turns.last
+        guard let turn else { return nil }
+        let items = turn["items"] as? [[String: Any]] ?? []
+        for item in items.reversed() {
+            let type = string(item, "type") ?? ""
+            if isAssistantMessageItem(item, type: type),
+               let text = body(for: item, type: type)?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !text.isEmpty {
+                return text
+            }
+        }
+        return nil
+    }
+
     private static func isRawResponseItemType(_ type: String) -> Bool {
         [
             "agentMessage", "assistantMessage", "agent_message", "assistant_message",
@@ -2601,7 +2761,8 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         let totalTokens = int(source["totalTokens"]) ?? int(source["total_tokens"]) ?? int(container["usedTokens"]) ?? (input + output)
         guard totalTokens > 0 || input > 0 || output > 0 else { return nil }
         let contextWindow = int(container["modelContextWindow"]) ?? int(container["contextWindow"]) ?? int(container["maxTokens"])
-        return AssistantTokenUsage(inputTokens: input, outputTokens: output, totalTokens: totalTokens, contextWindow: contextWindow, compactsAutomatically: true)
+        let reportedCostMicros = costMicros(from: source) ?? costMicros(from: container)
+        return AssistantTokenUsage(inputTokens: input, outputTokens: output, totalTokens: totalTokens, contextWindow: contextWindow, compactsAutomatically: true, reportedCostMicros: reportedCostMicros)
     }
 
     private static func goalDetail(from payload: [String: Any]) -> String {
@@ -2709,6 +2870,22 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         if let value = value as? Double { return value }
         if let value = value as? Int { return Double(value) }
         if let value = value as? String { return Double(value) }
+        return nil
+    }
+
+    private static func costMicros(from payload: [String: Any]) -> Int? {
+        if let usd = double(payload["costUSD"] ?? payload["cost_usd"] ?? payload["totalCostUSD"] ?? payload["total_cost_usd"]),
+           usd.isFinite, usd >= 0 {
+            let micros = (usd * 1_000_000).rounded()
+            guard micros <= Double(Int.max) else { return nil }
+            return Int(micros)
+        }
+        if let ticks = double(payload["cost_in_usd_ticks"] ?? payload["costInUsdTicks"]),
+           ticks.isFinite, ticks >= 0 {
+            let micros = (ticks / 10_000).rounded()
+            guard micros <= Double(Int.max) else { return nil }
+            return Int(micros)
+        }
         return nil
     }
 

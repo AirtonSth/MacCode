@@ -106,6 +106,57 @@ public struct TokenSaverProviderUsage: Codable, Sendable, Equatable {
         weeklyUsedPercent.map { max(0, 100 - $0) }
     }
 
+    /// Weekly used % for display after applying window expiry.
+    /// When `weeklyResetsAt` is in the past the provider window has rolled over —
+    /// stale cached percent (e.g. Claude stuck at 45% after the week reset / account
+    /// inactive) must read as 0 until a live probe rewrites it.
+    public func effectiveWeeklyUsedPercent(now: Date = Date()) -> Double? {
+        Self.effectiveWeeklyUsedPercent(
+            weeklyUsedPercent: weeklyUsedPercent,
+            weeklyResetsAt: weeklyResetsAt,
+            now: now
+        )
+    }
+
+    nonisolated public static func effectiveWeeklyUsedPercent(
+        weeklyUsedPercent: Double?,
+        weeklyResetsAt: Date?,
+        now: Date = Date()
+    ) -> Double? {
+        guard let weeklyUsedPercent else { return nil }
+        if let weeklyResetsAt, weeklyResetsAt <= now { return 0 }
+        return weeklyUsedPercent
+    }
+
+    /// Session rate-limit % for display after discarding expired / bare-zero noise.
+    ///
+    /// WHY: account probes and inactive-provider clears often leave
+    /// `currentSessionUsedPercent = 0` without a live session window. Treating that
+    /// as real data painted every Today ring as "0% used" even when weekly was 84%+.
+    /// An unexpired `currentSessionResetsAt` keeps a true mid-window 0%; otherwise
+    /// bare zero is treated as missing so the UI can fall back to weekly %.
+    public func effectiveSessionUsedPercent(now: Date = Date()) -> Double? {
+        Self.effectiveSessionUsedPercent(
+            currentSessionUsedPercent: currentSessionUsedPercent,
+            currentSessionResetsAt: currentSessionResetsAt,
+            now: now
+        )
+    }
+
+    nonisolated public static func effectiveSessionUsedPercent(
+        currentSessionUsedPercent: Double?,
+        currentSessionResetsAt: Date?,
+        now: Date = Date()
+    ) -> Double? {
+        guard let currentSessionUsedPercent else { return nil }
+        if let currentSessionResetsAt {
+            if currentSessionResetsAt <= now { return nil }
+            return currentSessionUsedPercent
+        }
+        if currentSessionUsedPercent <= 0 { return nil }
+        return currentSessionUsedPercent
+    }
+
     private static func clampedPercent(_ value: Double?) -> Double? {
         guard let value, value.isFinite else { return nil }
         return min(max(value, 0), 100)
@@ -222,7 +273,107 @@ public final class TokenSaverUsageStore: @unchecked Sendable {
         }
         // Older usage.json files predate Grok; ensure every managed agent provider
         // has a row so Token Saver rings never look like the provider is missing.
-        return Self.ensuringManagedProviders(snapshot)
+        // Also fold expired weekly windows to 0 so inactive providers do not stay
+        // locked on a pre-reset percentage (Claude 45% after the week rolls).
+        return Self.expiringStaleWeeklyUsage(
+            Self.ensuringManagedProviders(snapshot),
+            now: now()
+        )
+    }
+
+    /// Zero weekly/session account-usage percents whose reset time is already past.
+    public static func expiringStaleWeeklyUsage(
+        _ snapshot: TokenSaverUsageSnapshot,
+        now: Date = Date()
+    ) -> TokenSaverUsageSnapshot {
+        let providers = snapshot.providers.map { usage -> TokenSaverProviderUsage in
+            var next = usage
+            if let resets = next.weeklyResetsAt, resets <= now {
+                next.weeklyUsedPercent = 0
+            }
+            if let sessionResets = next.currentSessionResetsAt, sessionResets <= now {
+                next.currentSessionUsedPercent = 0
+            }
+            return next
+        }
+        return TokenSaverUsageSnapshot(period: snapshot.period, providers: providers, daily: snapshot.daily)
+    }
+
+    /// Providers that a partial account-usage refresh successfully updated.
+    /// Missing managed providers are treated as inactive/unreachable and must not
+    /// keep a frozen weekly % from an earlier probe.
+    public static func providersMissingFromAccountUsageRefresh(
+        returned: [AgentProvider],
+        managed: [AgentProvider] = [.claude, .codex, .grok]
+    ) -> [AgentProvider] {
+        let present = Set(returned)
+        return managed.filter { !present.contains($0) }
+    }
+
+    /// Subset of missing providers that should actually have their cached weekly %
+    /// cleared after a partial account-usage refresh.
+    ///
+    /// WHY: a flaky probe (or Grok billing-log window miss) must not wipe a still-
+    /// valid weekly window. Grok often sits at a real 40–70% while the log scan
+    /// briefly returns nil; clearing it painted the purple ring as 0%. Only clear
+    /// when there is no unexpired `weeklyResetsAt` protecting the last probe.
+    /// Expired windows already read as 0% via `effectiveWeeklyUsedPercent`.
+    public static func providersToClearAfterPartialAccountUsageRefresh(
+        returned: [AgentProvider],
+        existing: [TokenSaverProviderUsage],
+        now: Date = Date(),
+        managed: [AgentProvider] = [.claude, .codex, .grok]
+    ) -> [AgentProvider] {
+        let missing = providersMissingFromAccountUsageRefresh(returned: returned, managed: managed)
+        let byProvider = Dictionary(uniqueKeysWithValues: existing.map { ($0.provider, $0) })
+        return missing.filter { provider in
+            guard let usage = byProvider[provider] else { return true }
+            if let resetsAt = usage.weeklyResetsAt, resetsAt > now {
+                return false
+            }
+            return true
+        }
+    }
+
+    /// Clears live rate-limit percents for a provider while keeping Token Saver
+    /// savings counters. Used when a refresh no longer sees the provider (signed
+    /// out / inactive) so the ring drops to 0% instead of locking on last known %.
+    @discardableResult
+    public func clearAccountUsagePercentages(
+        provider: AgentProvider,
+        period: TokenSaverPeriod = .sevenDays
+    ) throws -> TokenSaverUsageSnapshot {
+        Self.ioLock.lock()
+        defer { Self.ioLock.unlock() }
+        let snapshot = load(period: period)
+        var providers = snapshot.providers
+        if let index = providers.firstIndex(where: { $0.provider == provider }) {
+            let current = providers[index]
+            providers[index] = TokenSaverProviderUsage(
+                provider: provider,
+                actualProviderTokens: current.actualProviderTokens,
+                estimatedRawTokens: current.estimatedRawTokens,
+                actualProviderBilledTokenUnits: current.actualProviderBilledTokenUnits,
+                estimatedRawBilledTokenUnits: current.estimatedRawBilledTokenUnits,
+                eligibleRuns: current.eligibleRuns,
+                currentSessionTokens: current.currentSessionTokens,
+                currentSessionLimitTokens: current.currentSessionLimitTokens,
+                currentSessionUsedPercent: 0,
+                currentSessionResetsAt: current.currentSessionResetsAt,
+                weeklyUsedPercent: 0,
+                weeklyWindowDurationMinutes: current.weeklyWindowDurationMinutes,
+                weeklyResetsAt: current.weeklyResetsAt
+            )
+        } else {
+            providers.append(TokenSaverProviderUsage(
+                provider: provider,
+                currentSessionUsedPercent: 0,
+                weeklyUsedPercent: 0
+            ))
+        }
+        let updated = TokenSaverUsageSnapshot(period: period, providers: providers, daily: snapshot.daily)
+        try save(updated)
+        return updated
     }
 
     /// Inserts zero rows for claude/codex/grok when a loaded snapshot omits them.

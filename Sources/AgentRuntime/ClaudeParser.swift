@@ -499,8 +499,12 @@ public final class ClaudeParser {
             var read = 0
             var output = 0
             var window: Int?
+            var modelCostUSD = 0.0
+            var modelCostComplete = true
+            var modelCount = 0
             for value in modelUsage.values {
                 guard let usage = value as? [String: Any] else { continue }
+                modelCount += 1
                 // Record the three cache buckets SEPARATELY (G3): folding them into one
                 // number made net dollars uncomputable (a cache read is ~0.1x an uncached
                 // token). inputTokens below stays the billed total for back-compat.
@@ -508,6 +512,11 @@ public final class ClaudeParser {
                 creation += intValue(usage["cacheCreationInputTokens"]) ?? intValue(usage["cache_creation_input_tokens"]) ?? 0
                 read += intValue(usage["cacheReadInputTokens"]) ?? intValue(usage["cache_read_input_tokens"]) ?? 0
                 output += intValue(usage["outputTokens"]) ?? intValue(usage["output_tokens"]) ?? 0
+                if let cost = doubleValue(usage["costUSD"] ?? usage["cost_usd"]) {
+                    modelCostUSD += cost
+                } else {
+                    modelCostComplete = false
+                }
                 if let contextWindow = intValue(usage["contextWindow"]) ?? intValue(usage["context_window"]) {
                     window = max(window ?? 0, contextWindow)
                 }
@@ -515,6 +524,10 @@ public final class ClaudeParser {
             let input = uncached + creation + read
             let total = input + output
             guard total > 0 || window != nil else { return nil }
+            let reportedCostMicros = costMicros(
+                fromUSD: doubleValue(obj["total_cost_usd"] ?? obj["totalCostUSD"])
+                    ?? (modelCount > 0 && modelCostComplete ? modelCostUSD : nil)
+            )
             return AssistantTokenUsage(
                 inputTokens: input,
                 outputTokens: output,
@@ -523,7 +536,8 @@ public final class ClaudeParser {
                 compactsAutomatically: nil,
                 uncachedInputTokens: uncached,
                 cacheCreationInputTokens: creation,
-                cacheReadInputTokens: read
+                cacheReadInputTokens: read,
+                reportedCostMicros: reportedCostMicros
             )
         }
         let usage = obj["usage"] as? [String: Any] ?? obj["token_usage"] as? [String: Any] ?? obj
@@ -533,14 +547,26 @@ public final class ClaudeParser {
         let window = intValue(usage["context_window"]) ?? intValue(usage["contextWindow"])
         guard input > 0 || output > 0 || total > 0 || window != nil else { return nil }
         let compactsAutomatically = usage["compacts_automatically"] as? Bool ?? usage["compactsAutomatically"] as? Bool
+        let reportedCostMicros = costMicros(
+            fromUSD: doubleValue(obj["total_cost_usd"] ?? obj["totalCostUSD"])
+                ?? doubleValue(usage["costUSD"] ?? usage["cost_usd"])
+        )
         return AssistantTokenUsage(
             inputTokens: input,
             outputTokens: output,
             totalTokens: total,
             contextWindow: window,
             compactsAutomatically: compactsAutomatically,
-            uncachedInputTokens: input
+            uncachedInputTokens: input,
+            reportedCostMicros: reportedCostMicros
         )
+    }
+
+    private func costMicros(fromUSD value: Double?) -> Int? {
+        guard let value, value.isFinite, value >= 0 else { return nil }
+        let micros = (value * 1_000_000).rounded()
+        guard micros <= Double(Int.max) else { return nil }
+        return Int(micros)
     }
 
     private func permissionRequest(from obj: [String: Any], now: Int64) -> AssistantPendingRequest? {

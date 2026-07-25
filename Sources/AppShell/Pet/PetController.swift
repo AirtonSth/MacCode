@@ -750,6 +750,9 @@ public final class PetController {
     private func markAllViewed() {
         do {
             _ = try attentionStore.markAllRead()
+            model.routeError = nil
+            // Mark + dismiss only. Do not open Remote Code or re-present Ready for you.
+            windowController?.closePopover(restoringPreviousKeyWindow: false)
             refreshAttentionNow()
         } catch {
             model.routeError = "Ready items could not be updated."

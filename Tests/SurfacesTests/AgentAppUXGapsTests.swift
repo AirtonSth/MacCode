@@ -17,6 +17,13 @@ import AgentRuntime
 ///  UX-SR1-BADGE — showsTranslatedBadge: true=>true, false=>false
 @MainActor
 final class AgentAppUXGapsTests: XCTestCase {
+
+    override func setUp() {
+        super.setUp()
+        // Isolate from model choices remembered by earlier test runs via
+        // AgentLastModelStore.shared (runner-level UserDefaults leak).
+        UserDefaults.standard.removeObject(forKey: "agent.lastModel.byProvider.v1")
+    }
     func test_imageViewPresentationUsesBasenameAndKeepsPrivateActionURL() throws {
         let item = AssistantItem(
             id: "generated-image",
@@ -36,6 +43,33 @@ final class AgentAppUXGapsTests: XCTestCase {
         XCTAssertFalse(timeline.label.contains("/Users/private"),
                        "normal transcript text must never expose the private image path")
         XCTAssertFalse(timeline.detail?.contains("/Users/private") == true)
+    }
+
+    /// WHY: "Running 2 images…" groups must surface thumbnails without expand.
+    /// Presentations for the strip are pure so the group row can render them.
+    func test_imagePresentationsInGroup_collectsResolvableImageViewsOnly() {
+        let img1 = AssistantItem(
+            id: "i1", turnId: "t", type: .imageView, state: .completed,
+            summary: "a.png", resourcePath: "/tmp/a.png", startedAtMs: 1, finishedAtMs: 2
+        )
+        let img2 = AssistantItem(
+            id: "i2", turnId: "t", type: .imageView, state: .completed,
+            summary: "b.png", resourcePath: "/tmp/b.png", startedAtMs: 3, finishedAtMs: 4
+        )
+        let cmd = AssistantItem(
+            id: "c1", turnId: "t", type: .commandExecution, state: .completed,
+            body: #"{"command":"ls"}"#, startedAtMs: 5, finishedAtMs: 6
+        )
+        let baseless = AssistantItem(
+            id: "i3", turnId: "t", type: .imageView, state: .completed,
+            summary: "orphan.png", startedAtMs: 7, finishedAtMs: 8
+        )
+        let found = AgentImageViewPresentation.presentations(in: [img1, cmd, img2, baseless])
+        XCTAssertEqual(found.map(\.displayName), ["a.png", "b.png"],
+                       "only imageView items with absolute resource paths feed the thumbnail strip")
+        XCTAssertEqual(AgentImageViewPresentation.absoluteFilePath(from: "~/Desktop/x.png")?.hasSuffix("/Desktop/x.png"), true)
+        XCTAssertNil(AgentImageViewPresentation.absoluteFilePath(from: "relative.png"),
+                     "basename-only tokens must not invent a CWD path for thumbnails")
     }
 
     func test_statusAndEmptyQueueErrorsRemainRenderEligible() {
@@ -355,8 +389,8 @@ final class AgentAppUXGapsTests: XCTestCase {
     func test_fullAccessScopeCopy_matchesPersistedThreadSetting() {
         XCTAssertEqual(
             AgentAppView.fullAccessScopeDescription,
-            "The agent runs tools and edits without asking for this thread until you change it.",
-            "full-access copy must describe the persisted thread scope instead of promising a process session scope"
+            "The agent runs tools, edits, and proposed plans without asking for this thread until you change it.",
+            "full-access copy must describe the persisted thread scope — including that proposed plans auto-implement — instead of promising a process session scope"
         )
         XCTAssertEqual(
             AgentAppView.sessionApprovalHelp,

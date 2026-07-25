@@ -250,6 +250,72 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
         XCTAssertTrue(events.contains { if case .providerRuntime(let event) = $0 { return event.source == "codex.app-server" && event.method == "turn/completed" } else { return false } })
     }
 
+    func test_adapterReconcilesTerminalThreadWhenCommandCompletionNotificationsAreLost() async throws {
+        let client = MockCodexAppServerClient(autoComplete: false)
+        client.readResponse = [
+            "thread": [
+                "id": "codex-thread-1",
+                "status": ["type": "idle"],
+                "turns": [[
+                    "id": "turn-app-server-1",
+                    "status": "completed",
+                    "items": [
+                        [
+                            "id": "cmd-1",
+                            "type": "commandExecution",
+                            "command": "sed -n '1,260p' SKILL.md",
+                            "status": "completed",
+                            "aggregatedOutput": "done"
+                        ],
+                        [
+                            "id": "answer-1",
+                            "type": "agentMessage",
+                            "text": "SEO skill reviewed."
+                        ]
+                    ]
+                ]]
+            ]
+        ]
+        let adapter = CodexAppServerAdapter { _, notificationHandler, _ in
+            client.notificationHandler = notificationHandler
+            return client
+        }
+        let threadId = AgentThreadID()
+        let sink = EventSink()
+
+        _ = try await adapter.sendTurn(AgentRunRequest(
+            threadId: threadId,
+            provider: .codex,
+            model: "gpt-5.5",
+            cwd: "/tmp/remotecode-app-server-adapter",
+            prompt: "review the skill"
+        )) { event in
+            Task { await sink.record(event) }
+        }
+        client.notificationHandler?("item/started", [
+            "threadId": "codex-thread-1",
+            "turnId": "turn-app-server-1",
+            "item": [
+                "id": "cmd-1",
+                "type": "commandExecution",
+                "command": "sed -n '1,260p' SKILL.md",
+                "status": "inProgress"
+            ]
+        ])
+
+        let deadline = Date().addingTimeInterval(3)
+        while Date() < deadline, await sink.finish == nil {
+            try? await Task.sleep(nanoseconds: 20_000_000)
+        }
+
+        let finish = await sink.finish
+        XCTAssertEqual(finish?.0, .completed)
+        XCTAssertEqual(finish?.1, "SEO skill reviewed.")
+        XCTAssertEqual(finish?.2, "codex-thread-1")
+        XCTAssertFalse(client.readCalls.isEmpty,
+                       "a quiet command item must reconcile against thread/read so lost terminal notifications cannot leave Working stuck")
+    }
+
     func test_followUpTurnReusesLiveAppServerClientInsteadOfResumingInSecondProcess() async throws {
         let client = MockCodexAppServerClient(autoComplete: false)
         let factoryCallCount = LockedCounter()
@@ -2287,7 +2353,7 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
             "turnId": "turn-app-server-1",
             "tokenUsage": [
                 "total": ["inputTokens": 11833, "outputTokens": 6, "totalTokens": 11839],
-                "last": ["inputTokens": 120, "outputTokens": 6, "totalTokens": 126],
+                "last": ["inputTokens": 120, "outputTokens": 6, "totalTokens": 126, "costUSD": 0.0042],
                 "modelContextWindow": 258400
             ]
         ])
@@ -2309,6 +2375,8 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
         XCTAssertEqual(usage.inputTokens, 120)
         XCTAssertEqual(usage.outputTokens, 6)
         XCTAssertEqual(usage.totalTokens, 126)
+        XCTAssertEqual(usage.reportedCostMicros, 4_200,
+                       "Codex monetary receipts must be preserved when the app-server provides one")
         XCTAssertEqual(usage.contextWindow, 258400)
         XCTAssertEqual(usage.compactsAutomatically, true,
                        "Codex app-server context windows auto-compact; RemoteCode must preserve that capability in the same context status surface as T3Code")

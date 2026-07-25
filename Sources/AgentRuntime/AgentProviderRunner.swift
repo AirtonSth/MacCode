@@ -30,12 +30,18 @@ public struct ProviderProcessStartIdentity: Codable, Sendable, Equatable {
     }
 }
 
+public enum ManagedProcessKind: String, Codable, Sendable, Equatable {
+    case provider
+    case sidecar
+}
+
 public struct SpawnedProcessTag: Codable, Sendable, Equatable {
     public let pgid: pid_t
     public let spawnedAt: Date
     public let ownerPID: pid_t
     public let ownerStartIdentity: ProviderProcessStartIdentity?
     public let provider: AgentProvider?
+    public let managedKind: ManagedProcessKind?
     public let executablePath: String
     public let startIdentity: ProviderProcessStartIdentity?
     /// Present only when the spawned root was verified as the leader of its own
@@ -49,6 +55,7 @@ public struct SpawnedProcessTag: Codable, Sendable, Equatable {
         ownerPID: pid_t = ProcessInfo.processInfo.processIdentifier,
         ownerStartIdentity: ProviderProcessStartIdentity? = nil,
         provider: AgentProvider? = nil,
+        managedKind: ManagedProcessKind? = nil,
         executablePath: String = "",
         startIdentity: ProviderProcessStartIdentity? = nil,
         isolatedProcessGroup: pid_t? = nil
@@ -58,6 +65,7 @@ public struct SpawnedProcessTag: Codable, Sendable, Equatable {
         self.ownerPID = ownerPID
         self.ownerStartIdentity = ownerStartIdentity
         self.provider = provider
+        self.managedKind = managedKind
         self.executablePath = executablePath
         self.startIdentity = startIdentity
         self.isolatedProcessGroup = isolatedProcessGroup
@@ -70,33 +78,129 @@ public enum ProcessSpawnTagger {
     /// Default minimum age before a tagged process is eligible for reap.
     public static let defaultMinAge: TimeInterval = 30.0
 
+    /// Terminate one controller-owned process lifetime without command matching
+    /// or PID-only signalling. Intended for bounded sidecar handoff and app quit.
+    public static func terminateExactOwnedProcessAndWait(
+        _ process: Process,
+        expectedStartIdentity: ProviderProcessStartIdentity?,
+        graceInterval: TimeInterval = 0.25,
+        timeout: TimeInterval = 2.5
+    ) -> Bool {
+        guard process.isRunning else { return true }
+        let pid = process.processIdentifier
+        guard let expectedStartIdentity,
+              ProviderProcessStartIdentity.read(pid: pid) == expectedStartIdentity else {
+            return false
+        }
+
+        let exactTargets: () -> [(pid: pid_t, identity: ProviderProcessStartIdentity)] = {
+            guard ProviderProcessStartIdentity.read(pid: pid) == expectedStartIdentity else {
+                return []
+            }
+            return ProcessTerminator.processTreePIDs(root: pid).compactMap { target in
+                ProviderProcessStartIdentity.read(pid: target).map { (target, $0) }
+            }
+        }
+        var targets = exactTargets()
+        guard targets.contains(where: { $0.pid == pid && $0.identity == expectedStartIdentity }) else {
+            return false
+        }
+        for target in targets where ProviderProcessStartIdentity.read(pid: target.pid) == target.identity {
+            _ = Darwin.kill(target.pid, SIGTERM)
+        }
+
+        let grace = max(0, min(graceInterval, timeout))
+        let start = Date()
+        let escalationAt = start.addingTimeInterval(grace)
+        let deadline = start.addingTimeInterval(max(0, timeout))
+        var escalated = false
+        while Date() < deadline {
+            if !escalated, Date() >= escalationAt {
+                if ProviderProcessStartIdentity.read(pid: pid) == expectedStartIdentity {
+                    let currentTargets = exactTargets()
+                    let newTargets = currentTargets.filter { candidate in
+                        !targets.contains {
+                            $0.pid == candidate.pid && $0.identity == candidate.identity
+                        }
+                    }
+                    targets += newTargets
+                }
+                for target in targets where ProviderProcessStartIdentity.read(pid: target.pid) == target.identity {
+                    _ = Darwin.kill(target.pid, SIGKILL)
+                }
+                escalated = true
+            }
+            let survivors = targets.contains {
+                ProviderProcessStartIdentity.read(pid: $0.pid) == $0.identity
+            }
+            if !survivors { return true }
+            Thread.sleep(forTimeInterval: 0.01)
+        }
+        return !targets.contains {
+            ProviderProcessStartIdentity.read(pid: $0.pid) == $0.identity
+        }
+    }
+
     /// Call immediately after `process.run()` to persist exact ownership.
     /// Foundation exposes no pre-exec group hook, so the post-spawn `setpgid`
     /// attempt is accepted only when the kernel immediately certifies the root
     /// as its own group leader. Failure kills the tree before any ledger row is
     /// written; availability never overrides complete crash-recovery ownership.
+    ///
+    /// `foreignUserLaunch` relaxes the child-metadata reads for a provider run as
+    /// another macOS user via `sudo` (see `RunAsUserProcessBootstrap`): the spawned
+    /// child is a root-owned `sudo`, whose `proc_pidinfo`/`proc_pidpath` are
+    /// unreadable to this non-root parent (EPERM). We keep the row anchored on the
+    /// always-readable OWNER identity (this app's own pid) plus the child pid, and
+    /// tolerate a nil child start identity / exec path / process group. Live
+    /// teardown is handled separately: the `sudo` root (invoker uid) is signalled
+    /// directly and its target-uid descendants are reaped via `ProcessTerminator`'s
+    /// sudo-routed path (a non-root app cannot signal a different-uid `claude`
+    /// directly). The cost is only crash-recovery reach: the sweep fail-safes such
+    /// a row (never signals a PID it cannot identify), so a cross-user orphan
+    /// surviving an app crash is retained, never mis-reaped. For a same-user launch
+    /// (`foreignUserLaunch: false`) every read stays a hard gate.
     @discardableResult
     public static func tagProcess(
         _ process: Process,
         provider: AgentProvider? = nil,
+        managedKind: ManagedProcessKind = .provider,
+        foreignUserLaunch: Bool = false,
         now: Date = Date()
     ) throws -> SpawnedProcessTag {
         let pid = process.processIdentifier
-        guard pid > 0,
-              let startIdentity = ProviderProcessStartIdentity.read(pid: pid) else {
+        guard pid > 0 else {
             ProcessTerminator.terminateTreeImmediately(process)
             throw ProviderProcessOwnershipError.startIdentityUnavailable(pid)
         }
+        // The owner is always this app's own process, so its kernel metadata is
+        // readable and anchors the row for crash recovery even when the child is not.
         let ownerPID = ProcessInfo.processInfo.processIdentifier
         guard let ownerStartIdentity = ProviderProcessStartIdentity.read(pid: ownerPID) else {
             ProcessTerminator.terminateTreeImmediately(process)
             throw ProviderProcessOwnershipError.startIdentityUnavailable(ownerPID)
         }
-        guard let executablePath = ProviderProcessExecutablePath.read(pid: pid) else {
+        let startIdentity = ProviderProcessStartIdentity.read(pid: pid)
+        guard startIdentity != nil || foreignUserLaunch else {
+            ProcessTerminator.terminateTreeImmediately(process)
+            throw ProviderProcessOwnershipError.startIdentityUnavailable(pid)
+        }
+        // Prefer the durable launch path over a transient shebang interpreter.
+        // `#!/usr/bin/env node` scripts (Codex via Homebrew, many npm CLIs) race
+        // `proc_pidpath` toward `/usr/bin/env` or `node` before the scan; the
+        // Process.executableURL is the operator-intended binary and survives that
+        // re-exec for ownership corroboration.
+        let livePath = ProviderProcessExecutablePath.read(pid: pid)
+        let launchedPath = process.executableURL?.path
+        let executablePath = Self.preferredOwnershipExecutablePath(
+            livePath: livePath,
+            launchedPath: launchedPath
+        )
+        guard executablePath != nil || foreignUserLaunch else {
             ProcessTerminator.terminateTreeImmediately(process)
             throw ProviderProcessOwnershipError.executablePathUnavailable(pid)
         }
-        let processGroup: pid_t
+        let processGroup: pid_t?
         do {
             processGroup = try certifyIsolatedProcessGroup(
                 pid: pid,
@@ -104,8 +208,14 @@ public enum ProcessSpawnTagger {
                 processGroup: Darwin.getpgid
             )
         } catch {
-            ProcessTerminator.terminateTreeImmediately(process)
-            throw error
+            // A root `sudo` child's group cannot always be certified from a
+            // non-root parent; leave the row owner-anchored without it. For a
+            // same-user launch an uncertifiable group is still fail-closed.
+            guard foreignUserLaunch else {
+                ProcessTerminator.terminateTreeImmediately(process)
+                throw error
+            }
+            processGroup = nil
         }
         let tag = SpawnedProcessTag(
             pgid: pid,
@@ -113,7 +223,8 @@ public enum ProcessSpawnTagger {
             ownerPID: ownerPID,
             ownerStartIdentity: ownerStartIdentity,
             provider: provider,
-            executablePath: executablePath,
+            managedKind: managedKind,
+            executablePath: executablePath ?? "",
             startIdentity: startIdentity,
             isolatedProcessGroup: processGroup
         )
@@ -155,6 +266,30 @@ public enum ProcessSpawnTagger {
     ) -> Bool {
         guard isAlive(pgid) else { return false }
         return now.timeIntervalSince(spawnedAt) >= minAge
+    }
+
+    /// Choose the path stored in the ownership ledger for a just-spawned process.
+    /// Prefer a non-env live `proc_pidpath` result; fall back to the Process launch
+    /// URL when the kernel still reports the shebang trampoline (`env`) so Codex
+    /// and other `#!/usr/bin/env node` CLIs do not permanently poison accounting.
+    public static func preferredOwnershipExecutablePath(
+        livePath: String?,
+        launchedPath: String?
+    ) -> String? {
+        if let livePath, !livePath.isEmpty, !isEnvStyleLauncher(livePath) {
+            return livePath
+        }
+        if let launchedPath, !launchedPath.isEmpty {
+            return launchedPath
+        }
+        if let livePath, !livePath.isEmpty {
+            return livePath
+        }
+        return nil
+    }
+
+    static func isEnvStyleLauncher(_ path: String) -> Bool {
+        URL(fileURLWithPath: path).lastPathComponent == "env"
     }
 }
 
@@ -328,16 +463,25 @@ public final class OneShotProviderAdapter: AgentProviderAdapter, @unchecked Send
     }
 
     public func sendTurn(_ request: AgentRunRequest, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) async throws -> AgentRunHandle {
-        lock.lock()
-        sessions[request.threadId] = AgentProviderSessionSummary(threadId: request.threadId, provider: provider, status: .running, providerThreadId: request.providerThreadId)
-        lock.unlock()
-        let handle = try await runner.startRun(request) { [weak self] event in
-            self?.record(event: event, threadId: request.threadId)
-            onEvent(event)
+        lock.withLock {
+            sessions[request.threadId] = AgentProviderSessionSummary(threadId: request.threadId, provider: provider, status: .running, providerThreadId: request.providerThreadId)
         }
-        lock.lock()
-        handles[request.threadId] = handle
-        lock.unlock()
+        let handle: AgentRunHandle
+        do {
+            handle = try await runner.startRun(request) { [weak self] event in
+                self?.record(event: event, threadId: request.threadId)
+                onEvent(event)
+            }
+        } catch {
+            lock.withLock {
+                sessions.removeValue(forKey: request.threadId)
+                handles.removeValue(forKey: request.threadId)
+            }
+            throw error
+        }
+        lock.withLock {
+            handles[request.threadId] = handle
+        }
         return handle
     }
 
@@ -455,7 +599,18 @@ enum ProcessTerminator {
     // Grace window between SIGTERM and SIGKILL escalation.
     static let graceInterval: TimeInterval = 2.0
 
-    static func terminateTree(_ process: Process, grace: TimeInterval = graceInterval) {
+    /// When `foreignUserUID` is set, `root` is EITHER the invoker-uid `sudo`
+    /// wrapper (use_pty on: a monitor parent whose target-uid children we reap)
+    /// OR, when `sudo` execs in place (use_pty off — the default on bundled
+    /// sudo < 1.9.14 and whenever an admin disables it), the target-uid provider
+    /// itself. This non-root app cannot `SIGKILL` a target-uid process directly
+    /// (EPERM) and `sudo` won't relay a `SIGKILL`, so the escalation reaps every
+    /// still-alive pid INCLUDING `root` via `sudo -u#<uid>`: in the monitor case
+    /// that sudo-kill of the invoker-uid root is a harmless EPERM no-op; in the
+    /// exec-in-place case it is the only way to reap the provider (excluding root
+    /// there orphaned it to launchd). NOTE: graceful SIGTERM for an exec-in-place
+    /// root and PID-reuse-proof identity gating remain follow-ups.
+    static func terminateTree(_ process: Process, grace: TimeInterval = graceInterval, foreignUserUID: uid_t? = nil) {
         let root = process.processIdentifier
         // Enumerate the tree once (children first so leaves die before parents),
         // including the root, then signal each node.
@@ -475,6 +630,10 @@ enum ProcessTerminator {
             for step in escalation {
                 kill(step.pid, step.signal)
             }
+            if let foreignUserUID {
+                let survivors = pids.filter { Self.isAlive($0) }
+                killAsUserProvider(foreignUserUID, SIGKILL, survivors)
+            }
         }
     }
 
@@ -482,15 +641,48 @@ enum ProcessTerminator {
     /// process may exit before its asyncAfter block runs, leaving a provider
     /// child alive for the next launch to rejoin. Preserve TERM-before-KILL,
     /// but deliver both phases synchronously without sleeping on the main actor.
-    static func terminateTreeImmediately(_ process: Process) {
-        let pids = processTreePIDs(root: process.processIdentifier)
+    static func terminateTreeImmediately(_ process: Process, foreignUserUID: uid_t? = nil) {
+        let root = process.processIdentifier
+        let pids = processTreePIDs(root: root)
         for step in terminationPlan(pids: pids, isAlive: { _ in true }, graceElapsed: false) {
             kill(step.pid, step.signal)
+        }
+        // Reap the target-uid subtree via sudo BEFORE the direct SIGKILL below:
+        // once a sudo monitor is killed it can neither relay signals nor reap its
+        // child. Include `root`: when sudo exec'd in place root IS the target-uid
+        // provider (excluding it orphaned the provider to launchd); when root is
+        // the invoker-uid monitor the sudo-kill is a harmless EPERM no-op. `-n`
+        // sudo is fast (no prompt) so this stays synchronous on app quit.
+        if let foreignUserUID {
+            killAsUserProvider(foreignUserUID, SIGKILL, pids)
         }
         for pid in pids {
             kill(pid, SIGKILL)
         }
     }
+
+    /// The real sudo-routed reaper. Named so tests can restore it after swapping
+    /// in a capture double (mirrors `LibprocChildPIDProvider` for childPIDProvider).
+    static let defaultKillAsUserProvider: (uid_t, Int32, [pid_t]) -> Void = { uid, signal, pids in
+        guard let plan = RunAsUserProcessBootstrap.sudoKillArguments(uid: uid, signal: signal, pids: pids) else { return }
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: plan.executablePath)
+        process.arguments = plan.arguments
+        process.standardInput = FileHandle.nullDevice
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        do {
+            try process.run()
+            process.waitUntilExit()
+        } catch {
+            // Best-effort teardown; a failed reap leaves an orphan we could not
+            // have signalled directly anyway.
+        }
+    }
+
+    /// Delivers `signal` to `pids` as the target uid via non-interactive `sudo`.
+    /// Injectable so tests can assert the routing without spawning `sudo`.
+    static var killAsUserProvider: (uid_t, Int32, [pid_t]) -> Void = defaultKillAsUserProvider
 
     // Pure helper: builds the signal plan for a set of pids.
     // graceElapsed == false  -> phase 1: SIGTERM every pid.

@@ -146,9 +146,14 @@ public enum AssistantAccountUsageParser {
 
     /// Scans a Grok unified log file (newest first within the last `maxBytes`) for
     /// the freshest `billing: fetched credits config` entry.
+    ///
+    /// WHY maxBytes defaults to 4 MiB: real `unified.jsonl` files routinely put
+    /// more than 512 KiB of non-billing traffic between credit snapshots (observed
+    /// gaps > 800 KiB). A too-small window returns nil, the partial account-usage
+    /// refresh treats Grok as missing, and Token Saver falsely paints Grok at 0%.
     public static func grokFromBillingLogFile(
         at url: URL,
-        maxBytes: Int = 512 * 1024
+        maxBytes: Int = 4 * 1024 * 1024
     ) -> AssistantAccountUsage? {
         guard FileManager.default.fileExists(atPath: url.path) else { return nil }
         guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
@@ -441,7 +446,7 @@ public final class TokenSaverAccountUsageRefresher: TokenSaverAccountUsageRefres
             return nil
         }
 
-        var environment = CodexRunner.processEnvironment(overrides: request.environment)
+        var environment = CodexRunner.processEnvironment(overrides: request.environment, purpose: .supportProcess)
         environment["TERM"] = "xterm-256color"
         environment["LANG"] = environment["LANG"] ?? "C.UTF-8"
         environment["LC_ALL"] = environment["LC_ALL"] ?? "C.UTF-8"
@@ -607,7 +612,7 @@ public final class TokenSaverAccountUsageRefresher: TokenSaverAccountUsageRefres
         proc.executableURL = URL(fileURLWithPath: path)
         proc.arguments = arguments
         proc.currentDirectoryURL = URL(fileURLWithPath: cwd)
-        proc.environment = CodexRunner.processEnvironment(overrides: environment)
+        proc.environment = CodexRunner.processEnvironment(overrides: environment, purpose: .supportProcess)
         proc.standardInput = FileHandle.nullDevice
         let out = Pipe()
         proc.standardOutput = out

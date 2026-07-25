@@ -82,6 +82,91 @@ final class FakeRunnerTests: XCTestCase {
         XCTFail("assistant reply must persist from the turn completion event")
     }
 
+    func test_providerAdmissionFailure_preventsSpawnAndPendingPersistence() async throws {
+        let tmp = NSTemporaryDirectory() + "rc2-provider-admission-" + UUID().uuidString
+        defer { try? FileManager.default.removeItem(atPath: tmp) }
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let thread = AgentThread(title: "admission", provider: .codex, model: "fake-model")
+        try threadRepo.upsert(thread)
+        let coordinator = AgentRunCoordinator(
+            runRepo: runRepo,
+            messageRepo: messageRepo,
+            threadRepo: threadRepo,
+            providers: [.codex: FakeProviderRunner(scenario: .simpleAssistant(reply: "must-not-run"))]
+        )
+        coordinator.providerAdmissionCheck = { _, _ in
+            throw NSError(
+                domain: "RemoteCode.ProviderAdmission",
+                code: 429,
+                userInfo: [NSLocalizedDescriptionKey: "provider cap reached"]
+            )
+        }
+        let request = AgentRunRequest(
+            threadId: thread.id,
+            provider: .codex,
+            model: "fake-model",
+            cwd: tmp,
+            prompt: "do not persist"
+        )
+
+        do {
+            _ = try await coordinator.startRun(request)
+            XCTFail("a blocked low-memory admission must fail closed")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("provider cap"))
+        }
+        XCTAssertNil(try runRepo.get(id: request.runId),
+                     "admission runs before the pending run graph is written")
+        XCTAssertEqual(try messageRepo.count(threadId: thread.id), 0,
+                       "a rejected provider spawn must not leave a user message that was never sent")
+    }
+
+    func test_compactActiveThreadState_survivesCoordinatorRestart() throws {
+        let tmp = NSTemporaryDirectory() + "rc2-active-state-restart-" + UUID().uuidString
+        defer { try? FileManager.default.removeItem(atPath: tmp) }
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let sessionRepo = ProviderSessionRuntimeRepository(db: db)
+        let thread = AgentThread(title: "active state", provider: .codex, model: "fake-model")
+        try threadRepo.upsert(thread)
+        let plan = AssistantActivePlan(
+            explanation: "resume this plan",
+            steps: [.init(id: "step-1", title: "Keep correctness state", status: .inProgress)],
+            updatedAtMs: 123
+        )
+        let state = AgentActiveThreadState(
+            resumeCursor: "cursor-1",
+            activeTurnId: "turn-1",
+            activePlan: plan,
+            pendingApprovalRequestIds: ["approval-1"],
+            pendingUserInputRequestIds: ["input-1"]
+        )
+        let json = String(decoding: try JSONEncoder().encode(state), as: UTF8.self)
+        try sessionRepo.upsert(ProviderSessionRuntime(
+            threadId: thread.id,
+            provider: .codex,
+            status: .interrupted,
+            resumeCursor: "cursor-1",
+            runtimePayloadJSON: json
+        ))
+
+        let restarted = AgentRunCoordinator(
+            runRepo: runRepo,
+            messageRepo: messageRepo,
+            threadRepo: threadRepo,
+            providerSessionRepo: sessionRepo,
+            providers: [.codex: FakeProviderRunner(scenario: .simpleAssistant(reply: "unused"))]
+        )
+        let recovered = try XCTUnwrap(restarted.durableActiveThreadState(threadId: thread.id))
+        XCTAssertEqual(recovered, state,
+                       "active plan, approval, input, turn, and resume cursor must not depend on retained transcript rows")
+    }
+
     func test_coordinator_preservesProviderAndModelWhenRunFinishes() async throws {
         let tmp = NSTemporaryDirectory() + "rc2-coordinator-provider-model-" + UUID().uuidString
         let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
@@ -768,6 +853,62 @@ final class FakeRunnerTests: XCTestCase {
 
         XCTAssertEqual(adapter.lastProviderThreadId, "live-session-1",
                        "live adapter sessions must be adopted before declaring missing durable resume data unrecoverable")
+    }
+
+    func test_coordinatorRejectsOrphanedLiveAdapterTurnBeforePersistingDuplicateRun() async throws {
+        // WHY: a surface/coordinator can lose its in-memory active-run projection
+        // while the provider adapter still owns a running turn. A second start must
+        // fail before it persists another user bubble or invokes the provider.
+        let tmp = NSTemporaryDirectory() + "rc2-coordinator-orphaned-live-turn-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let thread = AgentThread(
+            title: "orphaned live turn",
+            provider: .codex,
+            model: "gpt-5.5",
+            providerThreadId: "live-session-1"
+        )
+        try threadRepo.upsert(thread)
+        let adapter = SpyProviderAdapter(provider: .codex, finishImmediately: false)
+        adapter.sessionSummaries = [
+            AgentProviderSessionSummary(
+                threadId: thread.id,
+                provider: .codex,
+                status: .running,
+                providerThreadId: "live-session-1"
+            )
+        ]
+        let coordinator = AgentRunCoordinator(
+            runRepo: runRepo,
+            messageRepo: messageRepo,
+            threadRepo: threadRepo,
+            providerAdapters: [.codex: adapter]
+        )
+        let attemptedRunId = AgentRunID()
+
+        do {
+            _ = try await coordinator.startRun(AgentRunRequest(
+                runId: attemptedRunId,
+                threadId: thread.id,
+                provider: .codex,
+                model: "gpt-5.5",
+                cwd: tmp,
+                prompt: "must not duplicate",
+                providerThreadId: "live-session-1"
+            ))
+            XCTFail("a running adapter session must block a second coordinator start")
+        } catch {
+            XCTAssertTrue(String(describing: error).contains("in-flight turn"))
+        }
+
+        XCTAssertEqual(adapter.sendTurnCount, 0,
+                       "the coordinator guard must stop before asking the adapter to reject the duplicate")
+        XCTAssertTrue(try messageRepo.list(threadId: thread.id).isEmpty,
+                      "a rejected duplicate start must not persist another user message")
+        XCTAssertNil(try runRepo.get(id: attemptedRunId),
+                     "a rejected duplicate start must not create a failed phantom run")
     }
 
     func test_coordinatorFailsLoudWhenActiveRuntimeSessionHasNoLiveSessionOrCursor() async throws {

@@ -102,7 +102,7 @@ final class CodexRunnerArgsTests: XCTestCase {
         let models = await CodexRunner().listModels()
         let ids = Set(models.map(\.id))
         XCTAssertTrue(ids.contains(""), "account default must stay (always works)")
-        for real in ["gpt-5.5", "gpt-5.4", "gpt-5.4-mini",
+        for real in ["gpt-5.6-sol", "gpt-5.5", "gpt-5.4", "gpt-5.4-mini",
                      "gpt-5.3-codex", "gpt-5.3-codex-spark", "gpt-5.2"] {
             XCTAssertTrue(ids.contains(real), "missing real codex model \(real)")
         }
@@ -151,8 +151,10 @@ final class CodexRunnerArgsTests: XCTestCase {
     func test_processEnvironmentMergesProviderInstanceHomeWithoutDroppingPath() {
         let env = CodexRunner.processEnvironment(
             overrides: ["CODEX_HOME": "/tmp/codex-work", "REMOTE_CODE_INSTANCE": "work"],
-            base: ["PATH": "/usr/bin", "HOME": "/tmp/remote-code-home", "CODEX_HOME": "/tmp/default"],
-            provider: .codex
+            purpose: .agentTurn(.codex),
+            // RC_LOGIN_SHELL_ENV_IMPORT=0 keeps this a deterministic pure-merge test
+            // (no real login-shell capture); parity import is exercised separately.
+            base: ["PATH": "/usr/bin", "HOME": "/tmp/remote-code-home", "CODEX_HOME": "/tmp/default", "RC_LOGIN_SHELL_ENV_IMPORT": "0"]
         )
 
         let path = env["PATH"]?.split(separator: ":").map(String.init) ?? []
@@ -230,6 +232,47 @@ final class CodexRunnerArgsTests: XCTestCase {
         XCTAssertEqual(event.source, "codex.exec.stderr")
         XCTAssertTrue(event.payloadJSON.contains("websocket closed unexpectedly"),
                       "fatal Codex stderr must be stored as raw provider runtime evidence for later debugging")
+    }
+
+    /// WHY: Auto admission and ClaudeStreamingCLIAdapter must share the same
+    /// binary resolution for run-as-user (Settings absolute path + target home).
+    func test_processLocatorResolveForRunAsUserPrefersAbsoluteThenTargetHome() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("rc-resolve-runas-\(UUID().uuidString)", isDirectory: true)
+        let juniorBin = root.appendingPathComponent("junior/.local/bin", isDirectory: true)
+        let empatBin = root.appendingPathComponent("empat/.local/bin", isDirectory: true)
+        try FileManager.default.createDirectory(at: juniorBin, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: empatBin, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let juniorClaude = juniorBin.appendingPathComponent("claude")
+        FileManager.default.createFile(atPath: juniorClaude.path, contents: Data("#!/bin/sh\n".utf8))
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: juniorClaude.path)
+
+        let empatClaude = empatBin.appendingPathComponent("claude")
+        FileManager.default.createFile(atPath: empatClaude.path, contents: Data("#!/bin/sh\n".utf8))
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: empatClaude.path)
+
+        let foreign = AgentRunAsUser(
+            generatedUID: "g",
+            shortName: "airtonempat",
+            uid: 1601,
+            gid: 20,
+            homePath: root.appendingPathComponent("empat").path,
+            fullName: nil
+        )
+        XCTAssertNotEqual(foreign.uid, getuid())
+
+        // Absolute Settings path (junior) wins even when run-as-user is empat.
+        XCTAssertEqual(
+            ProcessLocator.resolveForRunAsUser(juniorClaude.path, runAsUser: foreign),
+            juniorClaude.path
+        )
+        // Bare name searches target home first.
+        XCTAssertEqual(
+            ProcessLocator.resolveForRunAsUser("claude", runAsUser: foreign),
+            empatClaude.path
+        )
     }
 
     // MARK: - ProcessLocator pure fixture tests

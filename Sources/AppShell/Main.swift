@@ -33,17 +33,14 @@ struct RemoteCodeMain {
         let isScheduledTaskAgent = CommandLine.arguments.contains("--scheduled-task-agent")
             || ProcessInfo.processInfo.environment["RC2_SCHEDULED_TASK_AGENT"] == "1"
         if isScheduledTaskAgent {
-            // Headless LaunchAgent must not mutate managed ~/.claude / ~/.codex distill
-            // skills for the interactive app session. Fail closed before AppContext init.
-            setenv("RC2_DISABLE_MANAGED_DISTILL_RECONCILE", "1", 1)
-            app.setActivationPolicy(.prohibited)
-            let delegate = ScheduledTaskAgentAppDelegate(
-                channel: channel,
-                appSupportOverride: appSupportOverride,
-                dbOverride: dbOverride
-            )
-            app.delegate = delegate
-            withExtendedLifetime(delegate) { app.run() }
+            // Schedules run in-process in the interactive app. A leftover LaunchAgent
+            // install must not dual-claim: unregister and exit immediately.
+            do {
+                try ScheduledTaskAgentServiceManager().unregister()
+                print("Scheduled Tasks now run inside RemoteCode; background agent unregistered.")
+            } catch {
+                fputs("Unable to unregister legacy Scheduled Tasks agent: \(error)\n", stderr)
+            }
             return
         }
         app.setActivationPolicy(.regular)

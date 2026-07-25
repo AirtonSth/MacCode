@@ -94,7 +94,14 @@ public final class ClaudeRunner: AgentProviderRunner, @unchecked Sendable {
             "--input-format", "stream-json",
             "--output-format", "stream-json",
             "--verbose",
-            "--replay-user-messages"
+            "--replay-user-messages",
+            // Load the SAME filesystem settings an interactive `claude` session
+            // does: user + project + local. Without this, `--print` mode ignores
+            // ~/.claude and ./.claude entirely, so project/user SKILLS and custom
+            // slash commands (e.g. `/task`), MCP servers, agents, and hooks are
+            // all invisible — the agent could not run a skill the user sees in
+            // interactive claude. Matches the old SDK bridge's settingSources.
+            "--setting-sources", "user,project,local"
         ]
         args.append(contentsOf: ["--model", request.model])
         args.append(contentsOf: effortArgs(request.reasoningEffort))
@@ -114,15 +121,16 @@ public final class ClaudeRunner: AgentProviderRunner, @unchecked Sendable {
             }
         }
         // UX-MAC_AGENT-BG-AWAIT: always make the agent self-declare a background-await
-        // stall with `awaitingMarker` so the host recovers it regardless of phrasing
-        // (independent of Token Saver). Token Saver parity rides in the same flag: when
-        // the host signals Token Saver is on (and the managed `distill` CLI therefore
-        // exists), append the canonical distill instructions too. `--append-system-prompt`
-        // adds to the CLI's default prompt, so it stays additive.
-        var appendedSystemPrompt = BackgroundAwaitContinuation.systemPromptDirective
-        if request.environment["RC_TOKEN_SAVER_DISTILL_HINT"] == "1" {
-            appendedSystemPrompt += "\n\n" + AgentSkillInstaller.distillAgentInstructionsBody
-        }
+        // stall with `awaitingMarker` so the host recovers it regardless of phrasing.
+        // Also carries the MCP-tool-availability rule so the agent does not preemptively
+        // refuse a connected MCP tool as "unauthenticated" in a non-interactive run
+        // (both live via `alwaysOnClaudeDirectives`).
+        // Background-await + MCP rules always; Distill only when Token Saver hint is set.
+        // `--append-system-prompt` adds to the CLI's default prompt, so it stays additive.
+        let appendedSystemPrompt = AgentSkillInstaller.tokenSaverProviderPrompt(
+            BackgroundAwaitContinuation.alwaysOnClaudeDirectives,
+            environment: request.environment
+        )
         args.append(contentsOf: ["--append-system-prompt", appendedSystemPrompt])
         args.append(contentsOf: request.extraArgs)
         return args
@@ -132,10 +140,10 @@ public final class ClaudeRunner: AgentProviderRunner, @unchecked Sendable {
     /// Includes the most common install paths so users can diagnose the issue
     /// without opening a terminal.
     nonisolated static func missingBinaryMessage(_ binary: String) -> String {
-        "\(binary) not found in PATH. Install it with: npm install -g @anthropic-ai/claude-code  " +
-        "or: brew install claude-code  " +
-        "Searched: ~/.remote-code/bin, /opt/homebrew/bin, ~/.local/bin, ~/.npm-global/bin. " +
-        "Open Settings to set a custom path."
+        "\(binary) not found. Install the Claude CLI (native installer: " +
+        "curl -fsSL https://claude.ai/install.sh | bash, or Homebrew), then reopen the app. " +
+        "Searched: ~/.remote-code/bin, /opt/homebrew/bin, /usr/local/bin, ~/.local/bin, ~/.npm-global/bin. " +
+        "Or set a custom path in Settings \u{2192} Diagnostics."
     }
 
     public func startRun(_ request: AgentRunRequest, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) async throws -> AgentRunHandle {
@@ -147,7 +155,7 @@ public final class ClaudeRunner: AgentProviderRunner, @unchecked Sendable {
         }
 
         let args = Self.buildArgs(request)
-        let environment = CodexRunner.processEnvironment(overrides: request.environment, provider: .claude)
+        let environment = CodexRunner.processEnvironment(overrides: request.environment, purpose: .agentTurn(.claude))
         let launchPlan: RunAsUserProcessBootstrap.LaunchPlan
         do {
             launchPlan = try RunAsUserProcessBootstrap.plan(

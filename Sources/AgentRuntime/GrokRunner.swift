@@ -55,7 +55,11 @@ public final class GrokRunner: AgentProviderRunner, @unchecked Sendable {
 
     /// Builds `grok` argv for a one-shot headless turn. Pure + static for tests.
     public static func buildArgs(_ request: AgentRunRequest, newSessionId: String? = nil) -> [String] {
-        var args: [String] = ["-p", request.providerPrompt, "--output-format", "streaming-json"]
+        let providerPrompt = AgentSkillInstaller.tokenSaverProviderPrompt(
+            request.providerPrompt,
+            environment: request.environment
+        )
+        var args: [String] = ["-p", providerPrompt, "--output-format", "streaming-json"]
         let model = request.model.trimmingCharacters(in: .whitespacesAndNewlines)
         if !model.isEmpty {
             args.append(contentsOf: ["--model", model])
@@ -149,7 +153,7 @@ public final class GrokRunner: AgentProviderRunner, @unchecked Sendable {
             ? request.providerThreadId
             : UUID().uuidString.lowercased()
         let args = Self.buildArgs(request, newSessionId: request.providerThreadId == nil ? preassignedSessionId : nil)
-        let environment = CodexRunner.processEnvironment(overrides: request.environment, provider: .grok)
+        let environment = CodexRunner.processEnvironment(overrides: request.environment, purpose: .agentTurn(.grok))
         let launchPlan: RunAsUserProcessBootstrap.LaunchPlan
         do {
             launchPlan = try RunAsUserProcessBootstrap.plan(

@@ -32,6 +32,34 @@ enum ClaudeForkReconciliationError: Error, Equatable, CustomStringConvertible {
 public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked Sendable {
     static let defaultSDKPackageSpec = "@anthropic-ai/claude-agent-sdk@0.3.157"
     static let bridgeProtocolVersion = 3
+    static let defaultSDKVersion = "0.3.157"
+    // The SDK's real runtime dependencies are declared as peerDependencies plus
+    // a platform-gated native optionalDependency (the ~205MB `claude` engine).
+    // npm does NOT install these deterministically across versions/configs, so
+    // we name them EXPLICITLY and pin the exact versions that
+    // @anthropic-ai/claude-agent-sdk@<defaultSDKVersion> resolves to. These pins
+    // are SDK-version-derived (identical on every machine) — NOT machine-specific.
+    // The platform-native package name is computed from the running Node's
+    // process.platform/arch at runtime (see nodePlatformArch), never hardcoded.
+    static let defaultRuntimePeerSpecs = [
+        "zod@4.4.3",
+        "@anthropic-ai/sdk@0.98.0",
+        "@modelcontextprotocol/sdk@1.29.0",
+    ]
+    static let minimumNodeMajorVersion = 18
+    // Process-lifetime memoization for stable machine facts so provisioning
+    // checks do not re-spawn `node`/`npm` or re-glob version-manager dirs on
+    // every turn.
+    private static let runtimeResolveLock = NSLock()
+    private static var resolvedToolPaths: [String: String] = [:]
+    private static var cachedPlatformArch: [String: String] = [:]
+    private static var cachedPeerSpecs: [String: [String]] = [:]
+    private static var cachedNodeMajor: [String: Int] = [:]
+    // No-progress (stall) install timeout in seconds: the deadline resets on npm
+    // output, so a slow-but-progressing 205MB fetch is not killed, while a truly
+    // hung fetch is. Backstop bounds total wall-clock.
+    nonisolated static func installStallSeconds() -> Double { 90 }
+    nonisolated static func installBackstopSeconds() -> Double { 900 }
 
     private final class Session: @unchecked Sendable {
         let threadId: AgentThreadID
@@ -65,6 +93,18 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
         var bridgeUserInputSchemas: [String: [String: Any]] = [:]
         var cancellationRequested = false
         let claudeExecutablePath: String?
+        // Bounded raw stderr tail, retained so the terminal diagnostic can carry
+        // the REAL Node failure reason (e.g. ERR_MODULE_NOT_FOUND / native binary
+        // not found) instead of a bare "exited with status N". Caller guards
+        // access with the adapter lock.
+        var recentStderr = Data()
+        func appendStderr(_ data: Data) {
+            recentStderr.append(data)
+            let cap = 8192
+            if recentStderr.count > cap {
+                recentStderr.removeFirst(recentStderr.count - cap)
+            }
+        }
 
         init(threadId: AgentThreadID,
              process: Process,
@@ -93,11 +133,18 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
 
     public let provider: AgentProvider = .claude
     private let nodeBinary: String
-    private let bridgeScriptPath: String
+    /// Optional explicit path (tests / RC_CLAUDE_AGENT_SDK_BRIDGE). Never store
+    /// a compile-time `#filePath` default — that bakes CI absolute paths into
+    /// release binaries and breaks customer machines.
+    private let bridgeScriptPathOverride: String?
     private let binaryNameOverride: String?
     private let maxReadableEvents: Int
     private let interruptGracePeriod: TimeInterval
     private let sessionMutator: ClaudeSDKSessionMutating?
+    /// Single-flight first-run `npm install` per cache directory + package spec
+    /// so concurrent Claude starts cannot interleave node_modules.
+    private static let sdkInstallTasksLock = NSLock()
+    private static var sdkInstallTasks: [String: Task<Void, Error>] = [:]
     private let lock = NSLock()
     private let cancellationQueue = DispatchQueue(
         label: "io.remotecode.agent.claude-sdk-cancellation",
@@ -135,13 +182,18 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
         sessionMutator: ClaudeSDKSessionMutating?
     ) {
         self.nodeBinary = nodeBinary
-        self.bridgeScriptPath = bridgeScriptPath
+        self.bridgeScriptPathOverride = bridgeScriptPath
             ?? ProcessInfo.processInfo.environment["RC_CLAUDE_AGENT_SDK_BRIDGE"]
-            ?? URL(fileURLWithPath: #filePath).deletingLastPathComponent().appendingPathComponent("ClaudeAgentSDKBridge.mjs").path
         self.binaryNameOverride = binaryNameOverride
         self.maxReadableEvents = max(1, maxReadableEvents)
         self.interruptGracePeriod = max(0, interruptGracePeriod)
         self.sessionMutator = sessionMutator
+    }
+
+    /// Runtime-resolved source path for the Node bridge script.
+    private var bridgeScriptPath: String {
+        ClaudeAgentSDKBridgeLocator.resolvePath(override: bridgeScriptPathOverride)
+            ?? ClaudeAgentSDKBridgeLocator.notFoundMessage(override: bridgeScriptPathOverride)
     }
 
     public func listModels() async -> [AgentModelDescriptor] {
@@ -149,7 +201,7 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
     }
 
     public var forkSafety: AgentProviderForkSafety {
-        guard sessionMutator != nil || Self.installedForkProtocolSupported(bridgeScriptPath: bridgeScriptPath) else {
+        guard sessionMutator != nil || Self.installedForkProtocolSupported(bridgeScriptPath: bridgeScriptPathOverride) else {
             return .unsupported
         }
         return .keyedIdempotent(compensationSupported: true)
@@ -250,10 +302,12 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
     }
 
     public static func installedForkProtocolSupported(bridgeScriptPath: String? = nil) -> Bool {
-        let configuredBridge = bridgeScriptPath
-            ?? ProcessInfo.processInfo.environment["RC_CLAUDE_AGENT_SDK_BRIDGE"]
-            ?? URL(fileURLWithPath: #filePath).deletingLastPathComponent().appendingPathComponent("ClaudeAgentSDKBridge.mjs").path
-        guard bridgeSupportsNativeSessionMutation(at: configuredBridge) else { return false }
+        let configuredBridge = ClaudeAgentSDKBridgeLocator.resolvePath(
+            override: bridgeScriptPath
+                ?? ProcessInfo.processInfo.environment["RC_CLAUDE_AGENT_SDK_BRIDGE"]
+        )
+        guard let configuredBridge,
+              bridgeSupportsNativeSessionMutation(at: configuredBridge) else { return false }
         let bridgeURL = URL(fileURLWithPath: configuredBridge)
         let localSDK = bridgeURL.deletingLastPathComponent()
             .appendingPathComponent("node_modules/@anthropic-ai/claude-agent-sdk", isDirectory: true)
@@ -347,9 +401,15 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
 
         onEvent(.status(.running))
         do {
+            // Per-turn Graphify path hint: persistent SDK sessions do not re-apply
+            // system_prompt after creation, so App Support graph paths must ride on
+            // each turn when the host sets RC_GRAPHIFY_* on the environment.
             try write([
                 "type": "rc_turn",
-                "prompt": request.providerPrompt,
+                "prompt": GraphifyStableSkillText.augmentTurnPrompt(
+                    request.providerPrompt,
+                    environment: request.environment
+                ),
                 "attachments": Self.attachmentPayload(request.attachments),
                 "session_id": session.providerThreadId ?? request.threadId.value.uuidString
             ], to: session)
@@ -706,9 +766,7 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
         guard Self.bridgeSupportsNativeSessionMutation(at: script) else {
             throw AgentProviderAdapterError.unsupported("Claude SDK bridge session mutation schema is unavailable")
         }
-        guard let node = ProcessLocator.resolve(nodeBinary) else {
-            throw AgentRunError.missingBinary(nodeBinary)
-        }
+        let node = try resolvedNodeForLaunch()
         let requestId = UUID().uuidString
         var operation = operation
         operation["request_id"] = requestId
@@ -732,7 +790,7 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
         let stderrPipe = Pipe()
         process.executableURL = URL(fileURLWithPath: node)
         process.arguments = [script]
-        process.environment = CodexRunner.processEnvironment(overrides: [:], provider: .claude)
+        process.environment = CodexRunner.processEnvironment(overrides: [:], purpose: .supportProcess)
         process.standardInput = stdinPipe
         process.standardOutput = stdoutPipe
         process.standardError = stderrPipe
@@ -772,11 +830,11 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
     // Shared session spawn logic — validates binary, wires pipes, starts process, registers session.
     private func spawnSession(_ request: AgentRunRequest, bridgeScriptPath: String) throws -> Session {
         guard FileManager.default.isReadableFile(atPath: bridgeScriptPath) else {
-            throw AgentProviderAdapterError.unsupported("Claude Agent SDK bridge script not found: \(bridgeScriptPath)")
+            throw AgentProviderAdapterError.unsupported(
+                ClaudeAgentSDKBridgeLocator.notFoundMessage(override: bridgeScriptPathOverride)
+            )
         }
-        guard let node = ProcessLocator.resolve(nodeBinary) else {
-            throw AgentRunError.missingBinary(nodeBinary)
-        }
+        let node = try resolvedNodeForLaunch()
         let process = Process()
         let stdinPipe = Pipe()
         let stdoutPipe = Pipe()
@@ -784,7 +842,7 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
         process.executableURL = URL(fileURLWithPath: node)
         process.arguments = [bridgeScriptPath] + request.extraArgs
         process.currentDirectoryURL = URL(fileURLWithPath: request.cwd)
-        process.environment = CodexRunner.processEnvironment(overrides: request.environment, provider: .claude)
+        process.environment = CodexRunner.processEnvironment(overrides: request.environment, purpose: .agentTurn(.claude))
         process.standardInput = stdinPipe
         process.standardOutput = stdoutPipe
         process.standardError = stderrPipe
@@ -843,38 +901,377 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
         return session
     }
 
-    private func resolvedBridgeScriptPath(onProgress: (@Sendable (AgentRunEvent) -> Void)? = nil) async throws -> String {
-        guard let components = try resolvedBridgeScriptComponents() else { return bridgeScriptPath }
-        if !Self.installedSDKPackage(at: components.cacheDir.appendingPathComponent("node_modules/@anthropic-ai/claude-agent-sdk/package.json"), matches: components.packageSpec) {
-            try await installSDKPackage(in: components.cacheDir, packageSpec: components.packageSpec, onProgress: onProgress)
-        }
-        return components.cachedBridgePath
+    // A machine-agnostic description of exactly what the runtime cache must
+    // contain for the bridge to launch and run on THIS machine.
+    struct RuntimeProvisionPlan {
+        let cacheDir: URL
+        let cachedBridgePath: String
+        let sdkSpec: String
+        let sdkVersion: String
+        let nativePackageName: String   // @anthropic-ai/claude-agent-sdk-<platform>-<arch>
+        let specs: [String]             // exact-pinned install argv: sdk + native + peers
     }
 
-    // Returns (cacheDir, cachedBridgePath, packageSpec) when install may be needed,
-    // or nil when the local/existing bridge script is already usable.
-    private func resolvedBridgeScriptComponents() throws -> (cacheDir: URL, cachedBridgePath: String, packageSpec: String)? {
-        let url = URL(fileURLWithPath: bridgeScriptPath)
-        guard FileManager.default.isReadableFile(atPath: url.path) else {
-            return nil
+    private func resolvedBridgeScriptPath(onProgress: (@Sendable (AgentRunEvent) -> Void)? = nil) async throws -> String {
+        guard let sourcePath = ClaudeAgentSDKBridgeLocator.resolvePath(override: bridgeScriptPathOverride) else {
+            throw AgentProviderAdapterError.unsupported(
+                ClaudeAgentSDKBridgeLocator.notFoundMessage(override: bridgeScriptPathOverride)
+            )
         }
+        guard let plan = try runtimeProvisionPlan(sourcePath: sourcePath) else {
+            // Bridge sits beside a complete local node_modules (developer
+            // checkout) — usable in place, no provisioning.
+            return sourcePath
+        }
+        if !Self.runtimeTreeComplete(plan) {
+            try await installRuntime(plan, onProgress: onProgress)
+        }
+        return plan.cachedBridgePath
+    }
+
+    /// Builds the provisioning plan, or nil when the bridge's source directory
+    /// already carries a complete node_modules (used in place).
+    private func runtimeProvisionPlan(sourcePath: String) throws -> RuntimeProvisionPlan? {
+        let url = URL(fileURLWithPath: sourcePath)
+        guard FileManager.default.isReadableFile(atPath: url.path) else { return nil }
         let source = (try? String(contentsOf: url, encoding: .utf8)) ?? ""
-        guard source.contains("@anthropic-ai/claude-agent-sdk") else {
-            return nil
-        }
+        guard source.contains("@anthropic-ai/claude-agent-sdk") else { return nil }
         let localPackage = url.deletingLastPathComponent()
             .appendingPathComponent("node_modules/@anthropic-ai/claude-agent-sdk/package.json")
         if FileManager.default.isReadableFile(atPath: localPackage.path) {
             return nil
         }
+        let nodePath = try resolvedNodeForLaunch()
+        guard let npmPath = resolveNpmExecutable() else {
+            throw AgentRunError.missingBinary("npm")
+        }
         let cache = try sdkRuntimeCacheDirectory()
-        let cachedBridge = cache.appendingPathComponent("ClaudeAgentSDKBridge.mjs")
+        let cachedBridge = cache.appendingPathComponent(ClaudeAgentSDKBridgeLocator.fileName)
         if !FileManager.default.isReadableFile(atPath: cachedBridge.path)
             || ((try? String(contentsOf: cachedBridge, encoding: .utf8)) != source) {
             try source.write(to: cachedBridge, atomically: true, encoding: .utf8)
         }
-        let packageSpec = Self.sdkPackageSpec()
-        return (cache, cachedBridge.path, packageSpec)
+        let sdkSpec = Self.sdkPackageSpec()
+        let sdkVersion = Self.pinnedNPMVersion(in: sdkSpec) ?? Self.defaultSDKVersion
+        // Computed from Node's OWN platform/arch (matches the SDK's
+        // getDefaultExecutable resolution) — never a hardcoded arch.
+        let platformArch = Self.nodePlatformArch(nodePath: nodePath)
+        let nativePackageName = "@anthropic-ai/claude-agent-sdk-\(platformArch)"
+        var specs = [sdkSpec, "\(nativePackageName)@\(sdkVersion)"]
+        specs.append(contentsOf: Self.runtimePeerSpecs(sdkSpec: sdkSpec, npmPath: npmPath))
+        return RuntimeProvisionPlan(
+            cacheDir: cache,
+            cachedBridgePath: cachedBridge.path,
+            sdkSpec: sdkSpec,
+            sdkVersion: sdkVersion,
+            nativePackageName: nativePackageName,
+            specs: specs
+        )
+    }
+
+    // MARK: Machine facts (resolved once per process)
+
+    /// Node resolved against `minimumNodeMajorVersion`. The bridge is an ES
+    /// module (`.mjs`); a Node older than that runs it through the CommonJS
+    /// loader and dies with `ERR_REQUIRE_ESM` instead of a usable error — the
+    /// crash a stale system/nvm Node produced on customer machines.
+    enum NodeResolution: Equatable {
+        case ok(String)                        // usable Node >= minimum
+        case tooOld(path: String, major: Int)  // a Node exists but is too old
+        case missing                           // no Node found at all
+    }
+
+    /// Returns a Node that can actually run the ES-module bridge. Prefers the
+    /// PATH Node when it qualifies; otherwise falls back to the newest
+    /// version-manager Node that qualifies; otherwise reports the newest too-old
+    /// Node so the caller can tell the user to upgrade rather than surfacing a
+    /// cryptic Node stack trace. Only a successful resolution is memoized, so a
+    /// mid-session Node upgrade is picked up on the next turn.
+    static func resolveNode(binary: String = "node") -> NodeResolution {
+        let cacheKey = "node-ok:" + binary
+        runtimeResolveLock.lock()
+        if let cached = resolvedToolPaths[cacheKey] { runtimeResolveLock.unlock(); return .ok(cached) }
+        runtimeResolveLock.unlock()
+        let resolved = selectNode(candidates: nodeCandidatePaths(binary: binary),
+                                  majorVersion: { nodeMajorVersion(at: $0) })
+        if case .ok(let path) = resolved {
+            runtimeResolveLock.lock(); resolvedToolPaths[cacheKey] = path; runtimeResolveLock.unlock()
+        }
+        return resolved
+    }
+
+    /// Ordered, de-duplicated Node candidates. An explicit path override is used
+    /// as-is; otherwise EVERY `node` on the search path is enumerated in PATH
+    /// order (not just the first — an old `node` earlier in PATH must not hide a
+    /// modern one in a later dir like /opt/homebrew/bin), then the newest
+    /// version-manager Node as a final fallback.
+    static func nodeCandidatePaths(binary: String) -> [String] {
+        if binary.contains("/") {
+            return [ProcessLocator.resolve(binary)].compactMap { $0 }
+        }
+        let env = ProcessInfo.processInfo.environment["PATH"]
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        let dirs = ProcessLocator.expandedPath(environmentPath: env, homeDirectory: home).split(separator: ":")
+        var candidates: [String] = []
+        var seen = Set<String>()
+        let fm = FileManager.default
+        for dir in dirs {
+            let path = String(dir) + "/" + binary
+            if fm.isExecutableFile(atPath: path), seen.insert(path).inserted { candidates.append(path) }
+        }
+        if let vm = versionManagerBinary("node"), seen.insert(vm).inserted { candidates.append(vm) }
+        return candidates
+    }
+
+    /// Pure selection over ordered candidate paths (PATH first, then
+    /// version-manager). Returns the first candidate that meets the minimum;
+    /// else the newest too-old candidate; else `.missing`. Extracted so the
+    /// version-gate logic is unit-testable without spawning `node`.
+    static func selectNode(candidates: [String], majorVersion: (String) -> Int?) -> NodeResolution {
+        var newestTooOld: (path: String, major: Int)?
+        for path in candidates {
+            guard let major = majorVersion(path) else { continue }
+            if major >= minimumNodeMajorVersion { return .ok(path) }
+            if newestTooOld == nil || major > newestTooOld!.major { newestTooOld = (path, major) }
+        }
+        if let old = newestTooOld { return .tooOld(path: old.path, major: old.major) }
+        return .missing
+    }
+
+    /// Major version of a Node binary via `node --version` (works on every Node,
+    /// including too-old ones — it is not an ES-module invocation). Memoized per
+    /// path so provisioning does not re-spawn `node` every turn.
+    static func nodeMajorVersion(at path: String) -> Int? {
+        runtimeResolveLock.lock()
+        if let cached = cachedNodeMajor[path] { runtimeResolveLock.unlock(); return cached }
+        runtimeResolveLock.unlock()
+        guard let major = queryNodeMajorVersion(at: path) else { return nil }
+        runtimeResolveLock.lock(); cachedNodeMajor[path] = major; runtimeResolveLock.unlock()
+        return major
+    }
+
+    private static func queryNodeMajorVersion(at path: String) -> Int? {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: path)
+        process.arguments = ["--version"]
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = Pipe()
+        process.environment = CodexRunner.processEnvironment(overrides: [:], purpose: .supportProcess)
+        do {
+            try process.run()
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            process.waitUntilExit()
+            guard process.terminationStatus == 0 else { return nil }
+            let text = String(decoding: data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+            return versionKey(text).first   // versionKey strips a leading 'v'
+        } catch { return nil }
+    }
+
+    /// Actionable message shown when the only Node on the machine is too old to
+    /// run the bridge — replaces the raw `ERR_REQUIRE_ESM` Node stack trace.
+    static func nodeTooOldMessage(path: String, major: Int) -> String {
+        "Claude needs Node.js \(minimumNodeMajorVersion) or newer, but the Node found on this Mac is v\(major) "
+            + "(\(scrubPathsForDisplay(path))). Install a current Node — nodejs.org or `brew install node` — "
+            + "then reopen the app."
+    }
+
+    /// Node path for launch, or a loud, actionable error. A too-old Node throws
+    /// the upgrade message; a missing Node throws the standard missing-binary
+    /// error. Never returns a Node that would crash the bridge.
+    private func resolvedNodeForLaunch() throws -> String {
+        switch Self.resolveNode(binary: nodeBinary) {
+        case .ok(let path): return path
+        case .tooOld(let path, let major):
+            throw AgentProviderAdapterError.unsupported(Self.nodeTooOldMessage(path: path, major: major))
+        case .missing:
+            throw AgentRunError.missingBinary(nodeBinary)
+        }
+    }
+    private func resolveNpmExecutable() -> String? { Self.resolveTool("npm", vmName: "npm") }
+
+    static func resolveTool(_ name: String, vmName: String) -> String? {
+        runtimeResolveLock.lock()
+        if let cached = resolvedToolPaths[name] { runtimeResolveLock.unlock(); return cached }
+        runtimeResolveLock.unlock()
+        let path = ProcessLocator.resolve(name) ?? versionManagerBinary(vmName)
+        if let path {
+            runtimeResolveLock.lock(); resolvedToolPaths[name] = path; runtimeResolveLock.unlock()
+        }
+        return path
+    }
+
+    /// Discovers a real Node/npm BINARY from common version-manager install
+    /// roots (nvm/volta/fnm) for GUI-launched apps whose PATH omits them.
+    /// Enumerates installed binaries only — never executes a version-manager
+    /// shim (a shim would re-exec a per-project pinned Node and could diverge
+    /// from what the bridge later spawns).
+    static func versionManagerBinary(_ name: String) -> String? {
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        let fm = FileManager.default
+        let roots: [(URL, [String])] = [
+            (home.appendingPathComponent(".nvm/versions/node"), ["bin"]),
+            (home.appendingPathComponent(".volta/tools/image/node"), ["bin"]),
+            (home.appendingPathComponent(".fnm/node-versions"), ["installation", "bin"]),
+        ]
+        var candidates: [(key: [Int], path: String)] = []
+        for (root, tail) in roots {
+            guard let entries = try? fm.contentsOfDirectory(at: root, includingPropertiesForKeys: nil) else { continue }
+            for entry in entries {
+                var dir = entry
+                for component in tail { dir = dir.appendingPathComponent(component) }
+                let binary = dir.appendingPathComponent(name)
+                if fm.isExecutableFile(atPath: binary.path) {
+                    candidates.append((versionKey(entry.lastPathComponent), binary.path))
+                }
+            }
+        }
+        return candidates.sorted { $0.key.lexicographicallyPrecedes($1.key) }.last?.path
+    }
+
+    static func versionKey(_ name: String) -> [Int] {
+        let trimmed = name.hasPrefix("v") ? String(name.dropFirst()) : name
+        return trimmed.split(separator: ".").map { Int($0.prefix(while: { $0.isNumber })) ?? 0 }
+    }
+
+    /// Node's own platform-arch (e.g. "darwin-arm64"), matching the SDK's native
+    /// package resolution. Memoized per process; falls back to the host values.
+    static func nodePlatformArch(nodePath: String) -> String {
+        runtimeResolveLock.lock()
+        if let cached = cachedPlatformArch[nodePath] { runtimeResolveLock.unlock(); return cached }
+        runtimeResolveLock.unlock()
+        let computed = computeNodePlatformArch(nodePath: nodePath) ?? hostPlatformArch()
+        runtimeResolveLock.lock(); cachedPlatformArch[nodePath] = computed; runtimeResolveLock.unlock()
+        return computed
+    }
+
+    private static func computeNodePlatformArch(nodePath: String) -> String? {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: nodePath)
+        process.arguments = ["-p", "process.platform + '-' + process.arch"]
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = Pipe()
+        process.environment = CodexRunner.processEnvironment(overrides: [:], purpose: .supportProcess)
+        do {
+            try process.run()
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            process.waitUntilExit()
+            let value = String(decoding: data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+            if process.terminationStatus == 0, value.contains("-") { return value }
+        } catch {}
+        return nil
+    }
+
+    static func hostPlatformArch() -> String {
+        #if os(macOS)
+        let platform = "darwin"
+        #elseif os(Linux)
+        let platform = "linux"
+        #else
+        let platform = "unknown"
+        #endif
+        #if arch(arm64)
+        let arch = "arm64"
+        #elseif arch(x86_64)
+        let arch = "x64"
+        #else
+        let arch = "unknown"
+        #endif
+        return "\(platform)-\(arch)"
+    }
+
+    /// Exact-pinned peer specs. For the default SDK these are the versions it
+    /// resolves to. For an RC_CLAUDE_AGENT_SDK_PACKAGE override we resolve the
+    /// overridden SDK's declared peer ranges to concrete versions via `npm view`
+    /// (best-effort, bounded); on failure we fall back to the default pins so
+    /// provisioning still runs and completeness fails loud rather than caching a
+    /// broken tree. Memoized per process.
+    static func runtimePeerSpecs(sdkSpec: String, npmPath: String) -> [String] {
+        if sdkSpec == defaultSDKPackageSpec { return defaultRuntimePeerSpecs }
+        runtimeResolveLock.lock()
+        if let cached = cachedPeerSpecs[sdkSpec] { runtimeResolveLock.unlock(); return cached }
+        runtimeResolveLock.unlock()
+        let resolved = resolveOverridePeerSpecs(sdkSpec: sdkSpec, npmPath: npmPath) ?? defaultRuntimePeerSpecs
+        runtimeResolveLock.lock(); cachedPeerSpecs[sdkSpec] = resolved; runtimeResolveLock.unlock()
+        return resolved
+    }
+
+    private static func resolveOverridePeerSpecs(sdkSpec: String, npmPath: String) -> [String]? {
+        guard let json = npmView(npmPath: npmPath, args: [sdkSpec, "peerDependencies", "--json"]),
+              let data = json.data(using: .utf8),
+              let ranges = try? JSONSerialization.jsonObject(with: data) as? [String: String],
+              !ranges.isEmpty else { return nil }
+        var specs: [String] = []
+        for (name, range) in ranges {
+            guard let version = npmView(npmPath: npmPath, args: ["\(name)@\(range)", "version"])?
+                .split(whereSeparator: \.isNewline).last.map(String.init)?
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+                  !version.isEmpty else { return nil }
+            specs.append("\(name)@\(version)")
+        }
+        return specs
+    }
+
+    private static func npmView(npmPath: String, args: [String]) -> String? {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: npmPath)
+        process.arguments = ["view", "--fetch-timeout=15000"] + args
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = Pipe()
+        process.environment = CodexRunner.processEnvironment(overrides: [:], purpose: .supportProcess)
+        let deadline = Date().addingTimeInterval(20)
+        do {
+            try process.run()
+        } catch { return nil }
+        let killer = Task.detached {
+            while process.isRunning {
+                if Date() > deadline { ProcessTerminator.terminateTree(process); break }
+                try? await Task.sleep(nanoseconds: 500_000_000)
+            }
+        }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        killer.cancel()
+        guard process.terminationStatus == 0 else { return nil }
+        let text = String(decoding: data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+        return text.isEmpty ? nil : text
+    }
+
+    // MARK: Completeness (checked every start; self-healing)
+
+    /// True iff the cache already contains every required package at its pinned
+    /// version AND the platform-matched native `claude` binary is present and
+    /// executable. Cheap (a few package.json reads + one stat), so a partial /
+    /// interrupted / omit-optional tree is never treated as complete; when it is
+    /// not complete, provisioning re-runs `npm install` which reconciles the
+    /// tree in place (no destructive wipe of a working install).
+    static func runtimeTreeComplete(_ plan: RuntimeProvisionPlan) -> Bool {
+        let modules = plan.cacheDir.appendingPathComponent("node_modules")
+        for spec in plan.specs {
+            guard let parsed = parseSpec(spec) else { continue }
+            let packageJSON = modules.appendingPathComponent(parsed.name).appendingPathComponent("package.json")
+            guard installedPackageVersion(at: packageJSON) == parsed.version else { return false }
+        }
+        let binary = modules.appendingPathComponent(plan.nativePackageName).appendingPathComponent("claude")
+        return FileManager.default.isExecutableFile(atPath: binary.path)
+    }
+
+    /// Splits `name@version`, tolerating scoped names (@scope/name@version) by
+    /// using the LAST '@'.
+    static func parseSpec(_ spec: String) -> (name: String, version: String)? {
+        guard let at = spec.lastIndex(of: "@"), at != spec.startIndex else { return nil }
+        let name = String(spec[spec.startIndex..<at])
+        let version = String(spec[spec.index(after: at)...])
+        guard !name.isEmpty, !version.isEmpty else { return nil }
+        return (name, version)
+    }
+
+    static func installedPackageVersion(at packageJSON: URL) -> String? {
+        guard let data = try? Data(contentsOf: packageJSON),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+        return object["version"] as? String
     }
 
     static func sdkPackageSpec() -> String {
@@ -929,37 +1326,147 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
         return cache
     }
 
-    // Async install — suspends the Swift task instead of pinning a cooperative-pool thread.
-    private func installSDKPackage(in directory: URL,
-                                   packageSpec: String,
-                                   onProgress: (@Sendable (AgentRunEvent) -> Void)? = nil) async throws {
-        let (process, outputPipe, outputBuffer) = try Self.makeNpmInstallProcess(in: directory, packageSpec: packageSpec, onProgress: onProgress)
+    // Async single-flight install (per cache dir + spec set) so concurrent
+    // Claude starts within this process cannot interleave node_modules.
+    private func installRuntime(_ plan: RuntimeProvisionPlan,
+                                onProgress: (@Sendable (AgentRunEvent) -> Void)? = nil) async throws {
+        let key = plan.cacheDir.standardizedFileURL.path + "\0" + plan.specs.joined(separator: " ")
+        let task: Task<Void, Error> = {
+            Self.sdkInstallTasksLock.lock()
+            if let existing = Self.sdkInstallTasks[key] {
+                Self.sdkInstallTasksLock.unlock()
+                return existing
+            }
+            let created = Task {
+                defer {
+                    Self.sdkInstallTasksLock.lock()
+                    Self.sdkInstallTasks[key] = nil
+                    Self.sdkInstallTasksLock.unlock()
+                }
+                try await self.performRuntimeInstall(plan, onProgress: onProgress)
+            }
+            Self.sdkInstallTasks[key] = created
+            Self.sdkInstallTasksLock.unlock()
+            return created
+        }()
+        try await task.value
+    }
+
+    private func performRuntimeInstall(_ plan: RuntimeProvisionPlan,
+                                       onProgress: (@Sendable (AgentRunEvent) -> Void)?) async throws {
+        // Re-check after waiting for another installer's flight.
+        if Self.runtimeTreeComplete(plan) { return }
+        let (process, outputPipe, outputBuffer, lastProgress) = try Self.makeRuntimeInstallProcess(plan: plan, onProgress: onProgress)
         // Wait for termination via a continuation; the cooperative-pool thread is NOT blocked.
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             process.terminationHandler = { proc in
                 outputPipe.fileHandleForReading.readabilityHandler = nil
-                if proc.isRunning {
-                    // Should not happen since handler fires after exit, but guard defensively.
-                    ProcessTerminator.terminateTree(proc)
-                    continuation.resume(throwing: AgentProviderAdapterError.unsupported("Claude Agent SDK package install timed out"))
-                    return
-                }
                 if proc.terminationStatus != 0 {
                     let text = Self.npmInstallFailureText(buffered: outputBuffer, outputPipe: outputPipe)
-                    continuation.resume(throwing: AgentProviderAdapterError.unsupported("Claude Agent SDK package install failed: \(text)"))
+                    continuation.resume(throwing: AgentProviderAdapterError.unsupported("Claude Agent SDK runtime install failed: \(text)"))
                 } else {
                     continuation.resume()
                 }
             }
-            // 120 s hard timeout via a background task so install can't run indefinitely.
+            // No-progress (stall) watchdog: reset on npm output, absolute backstop.
+            // The 205MB native binary can take minutes on a slow-but-working link,
+            // so a flat wall-clock cap is wrong — only a genuinely hung fetch is killed.
             let proc = process
+            let progress = lastProgress
             Task.detached {
-                try? await Task.sleep(nanoseconds: Self.sdkInstallTimeoutNanoseconds())
-                if proc.isRunning {
-                    ProcessTerminator.terminateTree(proc)
+                let stall = Self.installStallSeconds()
+                let backstop = Self.installBackstopSeconds()
+                let start = Date()
+                while proc.isRunning {
+                    try? await Task.sleep(nanoseconds: 2_000_000_000)
+                    if !proc.isRunning { break }
+                    let now = Date()
+                    if now.timeIntervalSince(progress.value) > stall || now.timeIntervalSince(start) > backstop {
+                        ProcessTerminator.terminateTree(proc)
+                        break
+                    }
                 }
             }
         }
+        // Post-verify: npm can exit 0 while silently skipping the optional native
+        // binary (omit=optional / tolerated fetch failure). Never cache such a
+        // tree as usable — fail LOUD with the captured npm output instead.
+        guard Self.runtimeTreeComplete(plan) else {
+            let text = Self.npmInstallFailureText(buffered: outputBuffer, outputPipe: outputPipe)
+            throw AgentProviderAdapterError.unsupported(
+                "Claude Agent SDK runtime incomplete after install (a required package or the native CLI binary is missing — check network / registry / npm optional-dependency settings). \(text)"
+            )
+        }
+    }
+
+    // Mutable, lock-guarded timestamp so the install watchdog can tell a slow but
+    // progressing fetch from a genuinely hung one.
+    final class LockedTimestamp: @unchecked Sendable {
+        private let lock = NSLock()
+        private var date: Date
+        init(_ date: Date) { self.date = date }
+        var value: Date { lock.lock(); defer { lock.unlock() }; return date }
+        func touch(_ date: Date) { lock.lock(); self.date = date; lock.unlock() }
+    }
+
+    // Builds the reconcile-install process: names the SDK + platform-matched
+    // native package + exact-pinned peers, and forces optional inclusion so a
+    // user .npmrc `omit=optional` cannot silently drop the native CLI binary.
+    static func makeRuntimeInstallProcess(plan: RuntimeProvisionPlan,
+                                          onProgress: (@Sendable (AgentRunEvent) -> Void)?)
+        throws -> (Process, Pipe, LockedDataBuffer, LockedTimestamp) {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: try resolvedNpmForInstall())
+        process.arguments = ["install", "--no-fund", "--no-audit", "--ignore-scripts", "--include=optional"] + plan.specs
+        process.currentDirectoryURL = plan.cacheDir
+        process.environment = CodexRunner.processEnvironment(overrides: [:], purpose: .supportProcess)
+        let outputPipe = Pipe()
+        process.standardOutput = outputPipe
+        process.standardError = outputPipe
+        let outputBuffer = LockedDataBuffer()
+        let lastProgress = LockedTimestamp(Date())
+        // Always drain (even without onProgress) so the failure text and the
+        // stall watchdog have the real npm output.
+        outputPipe.fileHandleForReading.readabilityHandler = { handle in
+            let data = handle.availableData
+            guard !data.isEmpty else { return }
+            outputBuffer.append(data)
+            lastProgress.touch(Date())
+            guard let onProgress, let text = String(data: data, encoding: .utf8) else { return }
+            for line in text.components(separatedBy: "\n") {
+                guard let parsed = NpmInstallProgressParser.parse(line: line) else { continue }
+                onProgress(Self.provisioningEvent(payload: Self.provisioningPayload(stage: parsed.stage, progress: parsed.progress, packageSpec: plan.sdkSpec)))
+            }
+        }
+        if let onProgress {
+            onProgress(Self.provisioningEvent(payload: Self.provisioningPayload(stage: "starting", progress: 0.0, packageSpec: plan.sdkSpec)))
+        }
+        do {
+            try process.run()
+        } catch {
+            outputPipe.fileHandleForReading.readabilityHandler = nil
+            throw AgentRunError.spawnFailed(error.localizedDescription)
+        }
+        return (process, outputPipe, outputBuffer, lastProgress)
+    }
+
+    private static func resolvedNpmForInstall() throws -> String {
+        guard let npm = resolveTool("npm", vmName: "npm") else { throw AgentRunError.missingBinary("npm") }
+        return npm
+    }
+
+    /// Strips CI/build absolute paths (the Airton-class `/.gitlab-runner/builds/…`
+    /// leak the locator redaction guards against) and the user's home prefix from
+    /// free-form Node stderr before it is shown to the user.
+    static func scrubPathsForDisplay(_ raw: String) -> String {
+        var text = raw
+        text = text.replacingOccurrences(
+            of: #"/[^\s'"]*\.gitlab-runner/builds/[^\s'"]*"#,
+            with: "<build>",
+            options: .regularExpression)
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        if !home.isEmpty { text = text.replacingOccurrences(of: home, with: "~") }
+        return text.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     // Pure helper — returns the install timeout; extracted for testability.
@@ -1003,9 +1510,11 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
         }
         let process = Process()
         process.executableURL = URL(fileURLWithPath: npm)
-        process.arguments = ["install", "--no-fund", "--no-audit", packageSpec]
+        // --ignore-scripts: do not run package lifecycle scripts from the
+        // Application Support cache (same-user / PATH npm supply-chain residual).
+        process.arguments = ["install", "--no-fund", "--no-audit", "--ignore-scripts", packageSpec]
         process.currentDirectoryURL = directory
-        process.environment = CodexRunner.processEnvironment(overrides: [:])
+        process.environment = CodexRunner.processEnvironment(overrides: [:], purpose: .supportProcess)
         let outputPipe = Pipe()
         process.standardOutput = outputPipe
         process.standardError = outputPipe
@@ -1157,20 +1666,19 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
     /// `systemPrompt` string does not introduce the `claude_code` preset; the agent
     /// behaviour rides on the separate `tools` preset, so this never strips it).
     ///
-    /// Always carries the background-await self-declaration rule
-    /// (`BackgroundAwaitContinuation.systemPromptDirective`) so the agent marks any
-    /// unavoidable wait with the recovery marker independent of Token Saver. When
-    /// Token Saver is on (`RC_TOKEN_SAVER_DISTILL_HINT`, set by providerEnvironment
-    /// iff the managed `distill` CLI exists) it also carries the canonical distill
-    /// rules — the same visible behavior Codex gets via per-turn developer_instructions
-    /// and `~/.codex/AGENTS.md`. Fixed for the session's life (the SDK query is
-    /// long-lived); a mid-session Token Saver toggle takes effect on the next session.
+    /// Always carries the always-on Claude rules
+    /// (`BackgroundAwaitContinuation.alwaysOnClaudeDirectives`: the background-await
+    /// self-declaration marker + the MCP-tool-availability rule) so the agent marks
+    /// any unavoidable wait with the recovery marker and does not preemptively refuse
+    /// a connected MCP tool as "unauthenticated" in a non-interactive run.
+    /// Managed Distill language + pipe rules only when Token Saver is active
+    /// (`RC_TOKEN_SAVER_DISTILL_HINT=1`). Codex/Grok use the same env gate —
+    /// never via `~/.claude/skills` / `~/.codex/skills`.
     static func claudeSystemPrompt(environment: [String: String]) -> String {
-        var prompt = BackgroundAwaitContinuation.systemPromptDirective
-        if environment["RC_TOKEN_SAVER_DISTILL_HINT"] == "1" {
-            prompt += "\n\n" + AgentSkillInstaller.distillAgentInstructionsBody
-        }
-        return prompt
+        AgentSkillInstaller.tokenSaverProviderPrompt(
+            BackgroundAwaitContinuation.alwaysOnClaudeDirectives,
+            environment: environment
+        )
     }
 
     private func effectiveProviderThreadId(for request: AgentRunRequest) -> String? {
@@ -1254,6 +1762,9 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
 
     private func handleStderr(_ data: Data, session: Session) {
         let raw = String(data: data, encoding: .utf8) ?? ""
+        // Retain the raw tail (even lines the classifier drops) so the terminal
+        // diagnostic can carry the real Node failure reason, not a bare status.
+        lock.lock(); session.appendStderr(data); lock.unlock()
         // The bridge is a Node process: it prints Deprecation/Experimental
         // warnings to stderr during normal successful runs. Only lines the
         // classifier keeps may surface as a fatal error — the same gate as
@@ -1304,12 +1815,17 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
         lock.unlock()
         if shouldFinish {
             if !session.cancellationRequested {
-                let diagnostic: String
+                let base: String
                 if session.process.terminationReason == .uncaughtSignal {
-                    diagnostic = "Claude Agent SDK bridge crashed with signal \(session.process.terminationStatus)."
+                    base = "Claude Agent SDK bridge crashed with signal \(session.process.terminationStatus)."
                 } else {
-                    diagnostic = "Claude Agent SDK bridge exited with status \(session.process.terminationStatus)."
+                    base = "Claude Agent SDK bridge exited with status \(session.process.terminationStatus)."
                 }
+                // Merge the real reason (scrubbed of CI/build + home absolute
+                // paths) so the user never sees a bare "exited with status N".
+                lock.lock(); let tailData = session.recentStderr; lock.unlock()
+                let tail = Self.scrubPathsForDisplay(String(decoding: tailData, as: UTF8.self))
+                let diagnostic = tail.isEmpty ? base : "\(base)\n\(tail)"
                 callback?(.error(diagnostic))
             }
             callback?(.status(status))

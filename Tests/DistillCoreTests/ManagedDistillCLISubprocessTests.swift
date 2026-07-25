@@ -22,7 +22,11 @@ final class ManagedDistillCLISubprocessTests: XCTestCase {
 
         let config = try DistillServiceConfiguration(authToken: "tok", appSupportDirectory: NSTemporaryDirectory())
         let scheduler = DistillScheduler(runtime: LocalDistillRuntime(), maxConcurrentRequests: 2)
-        let server = DistillHTTPServer(configuration: config, scheduler: scheduler)
+        let server = DistillHTTPServer(
+            configuration: config,
+            scheduler: scheduler,
+            scopedRecoveryStore: TestScopedRecoveryStore()
+        )
         let ready = try await server.start()
         defer { server.stop() }
 
@@ -35,7 +39,14 @@ final class ManagedDistillCLISubprocessTests: XCTestCase {
         let ok = try runProcess(
             binary,
             ["cli", "Did the build pass? Return PASS or FAIL only."],
-            env: ["REMOTE_CODE_DISTILL_STATE_PATH": stateURL.path],
+            env: [
+                "REMOTE_CODE_DISTILL_STATE_PATH": stateURL.path,
+                "REMOTE_CODE_AGENT_PROVIDER": "codex",
+                "RC_TOKEN_SAVER_WORKSPACE_ID": "workspace-subprocess",
+                "RC_TOKEN_SAVER_PROJECT_ID": "project-subprocess",
+                "RC_TOKEN_SAVER_THREAD_ID": "thread-subprocess",
+                "RC_TOKEN_SAVER_ATTEMPT_ID": "attempt-subprocess"
+            ],
             stdin: "build passed\n0 failures"
         )
         XCTAssertEqual(ok.code, 0)

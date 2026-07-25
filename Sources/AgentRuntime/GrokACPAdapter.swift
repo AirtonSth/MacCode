@@ -446,7 +446,8 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
                 environment: request.environment,
                 notificationHandler: { method, params in
                     bufferedNotifications.append(method: method, params: params)
-                }
+                },
+                tokenSaverCensusAllowed: request.runAsUser?.uid == nil || request.runAsUser?.uid == getuid()
             )
         } catch {
             throw GrokACPFailureTaxonomy.normalize(

@@ -71,7 +71,7 @@ final class ClaudeParserCLITests: XCTestCase {
         let evs = collect([
             #"{"type":"system","subtype":"init","session_id":"s-usage"}"#,
             #"{"type":"assistant","message":{"content":[{"type":"text","text":"S: ready"}]}}"#,
-            #"{"type":"result","subtype":"success","result":"S: ready","modelUsage":{"claude-haiku-4-5-20251001":{"inputTokens":510,"outputTokens":13,"cacheCreationInputTokens":0,"cacheReadInputTokens":0,"contextWindow":200000},"claude-sonnet-4-6":{"inputTokens":6,"outputTokens":175,"cacheCreationInputTokens":22947,"cacheReadInputTokens":22517,"contextWindow":200000}}}"#
+            #"{"type":"result","subtype":"success","result":"S: ready","total_cost_usd":0.012345,"modelUsage":{"claude-haiku-4-5-20251001":{"inputTokens":510,"outputTokens":13,"cacheCreationInputTokens":0,"cacheReadInputTokens":0,"contextWindow":200000},"claude-sonnet-4-6":{"inputTokens":6,"outputTokens":175,"cacheCreationInputTokens":22947,"cacheReadInputTokens":22517,"contextWindow":200000}}}"#
         ])
 
         let usage = evs.compactMap { event -> AssistantTokenUsage? in
@@ -89,6 +89,8 @@ final class ClaudeParserCLITests: XCTestCase {
         XCTAssertEqual(usage?.uncachedInputTokens, 516)
         XCTAssertEqual(usage?.cacheCreationInputTokens, 22_947)
         XCTAssertEqual(usage?.cacheReadInputTokens, 22_517)
+        XCTAssertEqual(usage?.reportedCostMicros, 12_345,
+                       "Claude total_cost_usd must become an exact integer-micros receipt")
         XCTAssertEqual(
             (usage?.uncachedInputTokens ?? 0) + (usage?.cacheCreationInputTokens ?? 0) + (usage?.cacheReadInputTokens ?? 0),
             usage?.inputTokens,

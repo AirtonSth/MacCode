@@ -179,6 +179,9 @@ public struct DistillResponse: Codable, Sendable, Equatable {
     /// (small/lossless). Optional + synthesized Codable => decode tolerates older
     /// payloads that omit the key (version-skew safe).
     public let originalHandle: String?
+    /// Stable mutation identity for the scoped recovery outbox. Optional for
+    /// backward-compatible decoding from older sidecars and absent on verbatim paths.
+    public let recoveryIdempotencyKey: String?
     public let runMode: DistillRunMode?
     public let auditReport: DistillAuditReport?
     /// Which engine produced this output (deterministic router / BERT encoder lane /
@@ -193,6 +196,7 @@ public struct DistillResponse: Codable, Sendable, Equatable {
         inputTokens: Int = 0,
         outputTokens: Int = 0,
         originalHandle: String? = nil,
+        recoveryIdempotencyKey: String? = nil,
         runMode: DistillRunMode = .optimize,
         auditReport: DistillAuditReport? = nil,
         routeStage: TokenSaverRouteStage? = nil
@@ -204,6 +208,7 @@ public struct DistillResponse: Codable, Sendable, Equatable {
         self.inputTokens = max(0, inputTokens)
         self.outputTokens = max(0, outputTokens)
         self.originalHandle = originalHandle
+        self.recoveryIdempotencyKey = recoveryIdempotencyKey
         self.runMode = runMode
         self.auditReport = auditReport
         self.routeStage = routeStage
@@ -233,7 +238,7 @@ public struct DistillResponse: Codable, Sendable, Equatable {
     }
 
     /// Copy carrying the CCR handle to the stored original.
-    public func withOriginalHandle(_ handle: String?) -> DistillResponse {
+    public func withOriginalHandle(_ handle: String?, idempotencyKey: String? = nil) -> DistillResponse {
         DistillResponse(
             requestID: requestID,
             output: output,
@@ -241,6 +246,7 @@ public struct DistillResponse: Codable, Sendable, Equatable {
             inputTokens: inputTokens,
             outputTokens: outputTokens,
             originalHandle: handle,
+            recoveryIdempotencyKey: idempotencyKey,
             runMode: runMode ?? .optimize,
             auditReport: auditReport,
             routeStage: routeStage
@@ -1263,40 +1269,41 @@ public struct LocalDistillRuntime: DistillRuntime {
     static func humanizeSR1Fallback(_ input: String, maxOutputCharacters: Int) -> String {
         let portuguese = input.localizedCaseInsensitiveContains("portuguese") ||
             input.localizedCaseInsensitiveContains("português")
-        let source = input.components(separatedBy: "SR1_RESPONSE:").last ?? input
-        let labels: [Character: String] = portuguese
-            ? ["S": "Estado", "C": "Contexto", "D": "Acao", "R": "Risco", "O": "Resultado", "N": "Nao fazer", "P": "Prova"]
-            : ["S": "State", "C": "Context", "D": "Action", "R": "Risk", "O": "Outcome", "N": "Do not do", "P": "Proof"]
-        let lines = source
-            .split(whereSeparator: \.isNewline)
-            .flatMap { raw -> [String] in
-                let line = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-                guard !line.isEmpty else { return [] }
-                let lower = line.lowercased()
-                guard lower != "sr1",
-                      lower != "dict",
-                      lower != "dict:",
-                      !lower.hasPrefix("s=state"),
-                      !lower.hasPrefix("c=context"),
-                      !lower.hasPrefix("d=action"),
-                      !lower.hasPrefix("r=risk"),
-                      !lower.hasPrefix("o=outcome"),
-                      !lower.hasPrefix("n=no-go"),
-                      !lower.hasPrefix("p=proof") else {
-                    return []
-                }
-                let segments = SR1LineParser.parseSemanticSegments(line)
-                guard !segments.isEmpty else {
-                    return [line]
-                }
-                return segments.map { parsed in
-                    guard let label = labels[parsed.prefix] else { return parsed.content }
-                    return "\(label): \(parsed.content)"
+        var source = input
+        if let range = input.range(of: "SR1_RESPONSE:", options: [.caseInsensitive]) {
+            source = String(input[range.upperBound...])
+        }
+        source = source.trimmingCharacters(in: .whitespacesAndNewlines)
+        // O-first prose: surface outcome lines; drop S/C/D/N chrome.
+        var outcomes: [String] = []
+        var extras: [String] = []
+        for raw in source.split(whereSeparator: \.isNewline) {
+            let line = String(raw).trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !line.isEmpty else { continue }
+            let lower = line.lowercased()
+            if lower == "sr1" || lower == "dict" || lower.hasPrefix("dict:")
+                || lower.hasPrefix("s=state") || lower.hasPrefix("c=context") {
+                continue
+            }
+            let segments = SR1LineParser.parseSemanticSegments(line)
+            if segments.isEmpty {
+                if !line.hasPrefix("|") { extras.append(line) }
+                continue
+            }
+            for parsed in segments {
+                let content = parsed.content.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !content.isEmpty else { continue }
+                if parsed.prefix == "O" {
+                    outcomes.append(content)
+                } else if parsed.prefix == "R" || parsed.prefix == "P" {
+                    extras.append(content)
                 }
             }
-        let output = lines.isEmpty
+        }
+        let pieces = outcomes.isEmpty ? extras : (outcomes + extras.prefix(2))
+        let output = pieces.isEmpty
             ? (portuguese ? "Nao consegui expandir a resposta comprimida." : "I could not expand the compressed response.")
-            : lines.joined(separator: "\n")
+            : pieces.joined(separator: "\n")
         let expanded = SR1LineParser.expandVariables(in: output, from: source)
         return String(expanded.prefix(maxOutputCharacters))
     }
@@ -1387,10 +1394,11 @@ public struct MLXDistillRuntime: DistillRuntime {
     /// fast while capping steady-state growth; `reclaimIdleMemory()` empties even this
     /// between bursts. 128 MB is comfortably above one distill generation's working set.
     static let gpuCacheLimitBytes = 128 * 1024 * 1024
-    /// Hard ceiling on total MLX allocation. Never reached in normal use (a distill run
-    /// needs ~1–2GB); it only throttles a pathological concurrent burst instead of letting
-    /// the process blow past it on a 16GB machine. malloc waits on scheduled work when hit.
-    static let gpuMemoryLimitBytes = 6 * 1024 * 1024 * 1024
+    /// Hard ceiling on total MLX allocation. A distill run needs ~1–2GB; the previous
+    /// 6GB ceiling allowed a single live sidecar (plus any orphan) to pin most of a
+    /// 16GB machine and freeze RemoteCode/UI under memory pressure. 3GB still admits
+    /// a healthy concurrent burst while leaving headroom for agent/provider children.
+    static let gpuMemoryLimitBytes = 3 * 1024 * 1024 * 1024
 
     /// Deterministic-first content router (G4): structured payloads are compressed
     /// losslessly on the CPU and never reach the model.

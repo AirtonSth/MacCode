@@ -14,6 +14,15 @@ import CoreModel
 @MainActor
 final class AgentAppViewModelTests: XCTestCase {
 
+    override func setUp() {
+        super.setUp()
+        // AgentLastModelStore.shared persists to the test runner's
+        // UserDefaults, so model choices remembered by EARLIER test runs leak
+        // into preferredModelForCurrentProvider and make these tests
+        // machine-dependent. Key literal mirrors AgentLastModelStore.key.
+        UserDefaults.standard.removeObject(forKey: "agent.lastModel.byProvider.v1")
+    }
+
     private func makeVM(provider: AgentProviderRunner? = nil) throws -> (AgentAppViewModel, AgentThreadRepository) {
         let tmp = NSTemporaryDirectory() + "rc2-vm-agent-" + UUID().uuidString
         let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
@@ -89,7 +98,11 @@ final class AgentAppViewModelTests: XCTestCase {
         AgentProviderSnapshotFactory.snapshot(
             provider: .codex,
             models: [AgentModelDescriptor(id: "gpt-5", label: "GPT-5", provider: .codex)],
-            binaryPath: "/usr/local/bin/codex",
+            // Runnable on any machine: send()'s fail-closed provider gate probes
+            // the real binary path, so a fixture path that only exists on some
+            // dev machines silently blocks the sends this test asserts on.
+            binaryPath: "/usr/bin/true",
+            authenticated: true,
             capabilitiesOverride: AgentProviderCapabilities(
                 supportsAttachments: true,
                 supportedAttachmentKinds: [.file, .image],
@@ -291,6 +304,10 @@ final class AgentAppViewModelTests: XCTestCase {
         for snapshot in snapshots {
             vm.providerSnapshots = [snapshot]
             vm.providerInstanceId = snapshot.id
+            // send() re-probes via loadProviderSnapshots(); with no injected loader it
+            // would fall back to the REAL machine (CLIs installed) and admit the run,
+            // making the test non-hermetic. Pin the reload to the same unrunnable snapshot.
+            vm.providerSnapshotLoader = { [snapshot] }
             vm.prompt = "must not send"
             await vm.send()
             XCTAssertFalse(vm.selectedProviderCanRun,
@@ -384,6 +401,64 @@ final class AgentAppViewModelTests: XCTestCase {
                       "a marker-declared stall must surface as awaiting regardless of phrasing")
     }
 
+    func test_composerPlaceholder_reflectsIncompleteTurnStateInsteadOfReadingFinished() throws {
+        // UX-MAC_AGENT-BG-AWAIT: the reported defect — a run that ended still awaiting
+        // background work presented a normal "Ask <Provider> for changes…" composer, so
+        // the thread read as finished. The composer placeholder must instead reflect the
+        // incomplete state (background-await vs mid-workflow), while staying a redirect,
+        // and must revert to the neutral prompt for genuinely finished / running threads.
+        let (vm, _) = try makeVM()
+        let neutral = "Ask \(vm.provider.rawValue.capitalized) for changes…"
+
+        // Genuinely finished turn → neutral composer (regression guard for the else branch).
+        vm.status = .completed
+        vm.timeline.apply(.turnStarted(turnId: "done"))
+        vm.timeline.apply(.turnCompleted(turnId: "done", finalMessage: "All steps are done; the build is green and the PR is open."))
+        XCTAssertEqual(vm.composerPlaceholder, neutral,
+                       "a real final answer must keep the normal composer prompt")
+
+        // Background-await stall → awaiting-specific copy, not the finished-state default.
+        vm.timeline.apply(.turnStarted(turnId: "await"))
+        vm.timeline.apply(.turnCompleted(turnId: "await", finalMessage: "Standing by for the demo recording to complete."))
+        XCTAssertEqual(vm.composerPlaceholder, "Waiting on a background task — send to redirect…",
+                       "an awaiting run must make the composer read as not-finished so the user does not mistake it for a done thread")
+
+        // Mid multi-phase workflow handoff → handoff-specific copy.
+        vm.timeline.apply(.turnStarted(turnId: "phase"))
+        vm.timeline.apply(.turnCompleted(turnId: "phase", finalMessage: "Phase 2 done.\nNext: Phase 3 — Review"))
+        XCTAssertEqual(vm.composerPlaceholder, "Paused mid-workflow — send to redirect…",
+                       "a run stopped between numbered workflow phases must say so in the composer, not invite a fresh unrelated ask")
+
+        // A running turn is never incomplete: incompleteTurnReason is nil (its own
+        // status==.completed guard), so the composer returns to the neutral prompt.
+        vm.status = .running
+        XCTAssertEqual(vm.composerPlaceholder, neutral,
+                       "a running thread must not show the awaiting placeholder")
+    }
+
+    func test_composerPlaceholder_staysNeutralWhenRunIsLiveDespiteStaleCompletedStatus() throws {
+        // The load-bearing `!selectedThreadRunIsStartingOrRunning` guard: this VM's
+        // `status` can be a stale `.completed` (e.g. a run started/owned elsewhere —
+        // a scheduled LaunchAgent run or another tab sharing the thread) while a run is
+        // actually live. In that state `incompleteTurnReason` is non-nil (status is
+        // completed) yet the thread is NOT idle, so the composer must stay neutral — an
+        // "awaiting/redirect" prompt on top of a live run would be wrong. Removing the
+        // guard from composerPlaceholder makes this assertion fail.
+        let (vm, _) = try makeVM()
+        vm.createThread(title: "live in another tab")
+        vm.isScheduledThreadRunning = { _ in true }   // force selectedThreadRunIsStartingOrRunning == true
+        vm.status = .completed                          // stale completed status
+        vm.timeline.apply(.turnStarted(turnId: "await"))
+        vm.timeline.apply(.turnCompleted(turnId: "await", finalMessage: "Standing by for the demo recording to complete."))
+
+        XCTAssertNotNil(vm.incompleteTurnReason,
+                        "precondition: the stale-completed final message classifies as incomplete")
+        XCTAssertTrue(vm.selectedThreadRunIsStartingOrRunning,
+                      "precondition: a live/scheduled run is tracked for the selected thread")
+        XCTAssertEqual(vm.composerPlaceholder, "Ask \(vm.provider.rawValue.capitalized) for changes…",
+                       "a live run must keep the neutral composer even when status is a stale completed with an awaiting final message")
+    }
+
     func test_renameThread_trimsUpdatesAndPersists() throws {
         let (vm, repo) = try makeVM()
         vm.createThread(title: "first")
@@ -443,6 +518,9 @@ final class AgentAppViewModelTests: XCTestCase {
             )
         ]
         vm.setProviderInstance("codex-cli")
+        // Pin the model the UI way (setModel remembers it for the provider) so
+        // createThread's preferred-model re-resolution lands on it.
+        vm.setModel("gpt-5.5")
         vm.createThread(title: "locked source")
         let id = try XCTUnwrap(vm.selectedThreadId)
         vm.messages.append(AgentMessage(threadId: id, role: .user, content: "first turn"))
@@ -519,6 +597,140 @@ final class AgentAppViewModelTests: XCTestCase {
                        "snapshot load failure must still seed local provider rows so Full access/Grok is not permanently blocked")
         XCTAssertNotNil(vm.providerSnapshots.first(where: { $0.provider == .grok }),
                         "fallback seed must include Grok, not only Codex/Claude")
+    }
+
+    /// WHY: new threads must reopen the last model the user used for that
+    /// provider; Codex without history defaults to gpt-5.6-sol.
+    func test_createThread_usesLastModelThenCodexBuiltInDefault() throws {
+        let (vm, repo) = try makeVM()
+        let suiteName = "rc2-last-model-" + UUID().uuidString
+        let suite = UserDefaults(suiteName: suiteName)!
+        defer { suite.removePersistentDomain(forName: suiteName) }
+        let store = AgentLastModelStore(defaults: suite)
+        vm.lastModelStore = store
+
+        XCTAssertEqual(vm.preferredModelForCurrentProvider(), "gpt-5.6-sol",
+                       "Codex with no last-used model defaults to gpt-5.6-sol")
+
+        // Fixture snapshots expose gpt-5.5; remember only accepts known/custom ids.
+        vm.setModel("gpt-5.5")
+        XCTAssertEqual(store.model(for: .codex), "gpt-5.5")
+
+        // Simulate browsing an older thread whose model differs from last-used.
+        vm.model = "gpt-5.2"
+        vm.createThread(title: "from last used")
+        let id = try XCTUnwrap(vm.selectedThreadId)
+        let thread = try XCTUnwrap(try repo.get(id: id))
+        XCTAssertEqual(thread.model, "gpt-5.5",
+                       "createThread must not inherit a stale selected-thread model")
+        XCTAssertEqual(vm.model, "gpt-5.5")
+    }
+
+    /// WHY: council SC-ux-1 — auto-rebind must reset model like setProvider,
+    /// not keep gpt-5.6-sol (Codex) after switching to Claude.
+    func test_autoRebind_appliesPreferredModelForNewProvider() async throws {
+        let (vm, _) = try makeVM()
+        let suiteName = "rc2-rebind-model-" + UUID().uuidString
+        let suite = UserDefaults(suiteName: suiteName)!
+        defer { suite.removePersistentDomain(forName: suiteName) }
+        vm.lastModelStore = AgentLastModelStore(defaults: suite)
+        vm.sourceSelectionUserPinned = false
+        vm.provider = .codex
+        vm.providerInstanceId = "codex"
+        vm.model = "gpt-5.6-sol"
+        let missingCodex = AgentProviderSnapshotFactory.snapshot(
+            provider: .codex,
+            models: [AgentModelDescriptor(id: "gpt-5.5", label: "GPT-5.5", provider: .codex)],
+            binaryPath: "",
+            id: "codex-cli"
+        )
+        let claude = AgentProviderSnapshotFactory.snapshot(
+            provider: .claude,
+            models: [
+                AgentModelDescriptor(id: "opus", label: "Opus", provider: .claude),
+                AgentModelDescriptor(id: "sonnet", label: "Sonnet", provider: .claude)
+            ],
+            binaryPath: "/usr/bin/true",
+            authenticated: true,
+            id: "claude-cli"
+        )
+        vm.providerSnapshotLoader = { [missingCodex, claude] }
+        await vm.loadProviderSnapshots()
+        XCTAssertEqual(vm.provider, .claude)
+        XCTAssertEqual(vm.model, "opus",
+                       "auto-rebind must apply preferred Claude model, not keep Codex gpt-5.6-sol")
+        XCTAssertNotEqual(vm.model, "gpt-5.6-sol")
+    }
+
+    /// WHY: explicit Source pick of an unrunnable provider must stay sticky so
+    /// recovery UI is not thrashed by snapshot refresh.
+    func test_userPinnedUnrunnableSource_notReboundOnSnapshotRefresh() async throws {
+        let (vm, _) = try makeVM()
+        let missingCodex = AgentProviderSnapshotFactory.snapshot(
+            provider: .codex,
+            models: [AgentModelDescriptor(id: "gpt-5.5", label: "GPT-5.5", provider: .codex)],
+            binaryPath: "",
+            id: "codex-cli"
+        )
+        let claude = AgentProviderSnapshotFactory.snapshot(
+            provider: .claude,
+            models: [AgentModelDescriptor(id: "opus", label: "Opus", provider: .claude)],
+            binaryPath: "/usr/bin/true",
+            authenticated: true,
+            id: "claude-cli"
+        )
+        vm.providerSnapshotLoader = { [missingCodex, claude] }
+        await vm.loadProviderSnapshots()
+        XCTAssertEqual(vm.provider, .claude)
+        vm.setProviderInstance("codex-cli")
+        XCTAssertTrue(vm.sourceSelectionUserPinned)
+        XCTAssertEqual(vm.provider, .codex)
+        await vm.loadProviderSnapshots()
+        XCTAssertEqual(vm.provider, .codex,
+                       "pinned unrunnable Codex must survive snapshot refresh for recovery")
+    }
+
+    /// WHY: Airton had Claude + Grok installed, Codex path missing. Empty Agent
+    /// App defaulted to Codex and blocked send — no provider is mandatory.
+    func test_missingCodexDoesNotBlockClaudeOrGrokOnEmptyAgentApp() async throws {
+        let (vm, _) = try makeVM()
+        // Fresh empty surface defaults to Codex before discovery.
+        vm.provider = .codex
+        vm.providerInstanceId = "codex"
+        vm.model = "gpt-5.5"
+        let missingCodex = AgentProviderSnapshotFactory.snapshot(
+            provider: .codex,
+            models: [AgentModelDescriptor(id: "gpt-5.5", label: "GPT-5.5", provider: .codex)],
+            binaryPath: "",
+            id: "codex-cli"
+        )
+        let claude = AgentProviderSnapshotFactory.snapshot(
+            provider: .claude,
+            models: [AgentModelDescriptor(id: "opus", label: "Opus", provider: .claude)],
+            binaryPath: "/Users/airtonempath/.local/bin/claude",
+            authenticated: true,
+            id: "claude-cli"
+        )
+        let grok = AgentProviderSnapshotFactory.snapshot(
+            provider: .grok,
+            models: [AgentModelDescriptor(id: "grok-4.5", label: "Grok 4.5", provider: .grok)],
+            binaryPath: "/Users/airtonjunior/.grok/bin/grok",
+            authenticated: true,
+            id: "grok-cli"
+        )
+        vm.providerSnapshotLoader = { [missingCodex, claude, grok] }
+
+        await vm.loadProviderSnapshots()
+
+        XCTAssertNotEqual(vm.provider, .codex,
+                          "missing Codex CLI must not remain selected when Claude/Grok can run")
+        XCTAssertEqual(vm.provider, .claude,
+                       "rebind to first runnable provider in allCases order (Claude before Grok)")
+        XCTAssertEqual(vm.providerInstanceId, "claude-cli")
+        XCTAssertTrue(vm.selectedProviderCanRun,
+                      "composer send/controls must enable on a runnable non-Codex provider")
+        XCTAssertEqual(vm.model, "opus",
+                       "model list must follow the rebound provider")
     }
 
     /// WHY: nil snapshot used to look runnable (canRun true), so send hit
@@ -991,8 +1203,17 @@ final class AgentAppViewModelTests: XCTestCase {
                       "/plan must remain discoverable on bare / even when dozens of skills exist")
         XCTAssertTrue(suggestions.filter { $0.kind == .slashCommand }.count >= 6,
                       "the first page of bare-/ suggestions must be dominated by commands, not skills")
-        XCTAssertFalse(titles.contains(where: { $0.hasPrefix("/ads-skill-") }),
-                       "ads-* skills must not occupy the entire first page ahead of /goal /plan")
+        // Commands are never truncated and always rank ahead; skills then get
+        // their OWN bounded budget (they must stay discoverable, not banned —
+        // the old page-exclusion hid every project/user skill on bare `/`).
+        let lastCommandIndex = suggestions.lastIndex { $0.kind == .slashCommand }
+        let firstSkillIndex = suggestions.firstIndex { $0.kind == .skill }
+        if let lastCommandIndex, let firstSkillIndex {
+            XCTAssertLessThan(lastCommandIndex, firstSkillIndex,
+                              "every command must rank ahead of the first ads-* skill")
+        }
+        XCTAssertLessThanOrEqual(suggestions.filter { $0.kind == .skill }.count, 8,
+                                 "flooding skills stay within their own page budget")
     }
 
     func test_normalizingComposerTriggerPrefix_commandsAndSkillsWithEitherTrigger() {
@@ -1989,14 +2210,20 @@ final class AgentAppViewModelTests: XCTestCase {
     func test_createThreadCopiesCurrentConfigFromLastThread() throws {
         let (vm, repo) = try makeVM()
         vm.provider = .codex
-        vm.model = "gpt-5.5"
+        vm.availableModels = [
+            AgentModelDescriptor(id: "gpt-5.5", label: "GPT-5.5", provider: .codex)
+        ]
+        // createThread re-resolves the model from the last one the USER chose
+        // for the provider (setModel → rememberCurrentModel), not from whatever
+        // an older selected thread left on the VM — so choose it the UI way.
+        vm.setModel("gpt-5.5")
         vm.permissionMode = .fullAccess
         vm.reasoningEffort = .medium
         vm.createThread(title: "next")
 
         let id = try XCTUnwrap(vm.selectedThreadId)
         let t = try repo.get(id: id)
-        XCTAssertEqual(t?.model, "gpt-5.5")
+        XCTAssertEqual(t?.model, "gpt-5.5", "new threads must inherit the last model the user chose for the provider")
         XCTAssertEqual(t?.permissionMode, .fullAccess,
                        "new threads must inherit the last active permission mode")
         XCTAssertEqual(t?.reasoningEffort, .medium,
@@ -2147,6 +2374,11 @@ final class AgentAppViewModelTests: XCTestCase {
         await vm.send()
         XCTAssertEqual(try repo.get(id: id)?.title, "Refactor the auth module please",
                        "the first message must rename a still-default thread")
+        // send() and the didFinish fan-out each schedule an off-main history
+        // reload; poll until the durable user row lands in the published array.
+        await waitAsync("user message lands in reloaded history", timeout: 2) {
+            vm.messages.contains { $0.role == .user && $0.content == "Refactor the auth module please" }
+        }
         XCTAssertTrue(vm.messages.contains { $0.role == .user && $0.content == "Refactor the auth module please" })
     }
 
@@ -2204,6 +2436,119 @@ final class AgentAppViewModelTests: XCTestCase {
                              "a user send must re-pin the timeline to the bottom instead of relying on a pre-layout message-count change")
         XCTAssertEqual(runner.prompts, ["next message"],
                        "clearing stale plan state must not block the provider run")
+        XCTAssertTrue(vm.messages.contains { $0.role == .user && $0.content == "next message" },
+                      "the user bubble must appear in the transcript immediately on send")
+    }
+
+    func test_queuedFollowupStaysOutOfTranscriptAndClearsActivePlan() async throws {
+        // WHY: while a provider turn is live, follow-ups enqueue instead of
+        // starting. The queue UI is the only place they should appear until
+        // drain starts the turn — a transcript bubble would look like the agent
+        // already received the message. The prior Active plan still leaves the
+        // bottom of the view because the user has superseded it.
+        let tmp = NSTemporaryDirectory() + "rc2-vm-agent-queue-plan-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let queuedRepo = AgentQueuedMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let runner = SlowStartRunner()
+        let coord = AgentRunCoordinator(runRepo: runRepo, messageRepo: messageRepo,
+                                        threadRepo: threadRepo,
+                                        providers: [.codex: runner])
+        let vm = AgentAppViewModel(workspaceID: WorkspaceID(), cwd: tmp,
+                                   coordinator: coord,
+                                   threadRepo: threadRepo,
+                                   messageRepo: messageRepo,
+                                   queuedMessageRepo: queuedRepo,
+                                   promptHistoryStore: PromptHistoryStore(db: db))
+        installRunnableProviderFixtures(on: vm)
+        vm.createThread(title: "busy plan")
+        let id = try XCTUnwrap(vm.selectedThreadId)
+        vm.prompt = "start slow run"
+        Task { await vm.send() }
+        await waitAsync("selected thread becomes a real active run") {
+            vm.status == .running && vm.currentRunId != nil
+        }
+        vm.timeline.apply(.activePlanUpdated(AssistantActivePlan(
+            explanation: "Still running checklist",
+            steps: [
+                AssistantPlanStep(id: "s1", title: "Done step", status: .completed),
+                AssistantPlanStep(id: "s2", title: "In progress", status: .inProgress)
+            ],
+            updatedAtMs: 99
+        )))
+        XCTAssertNotNil(vm.activePlan)
+
+        vm.prompt = "follow up after current run"
+        await vm.send()
+
+        XCTAssertEqual((try? queuedRepo.list(threadId: id).map(\.text)) ?? [], ["follow up after current run"],
+                       "follow-up must still enqueue while the provider turn is active")
+        XCTAssertEqual(vm.queuedMessages.map(\.text), ["follow up after current run"],
+                       "queued follow-ups must render in the queue UI")
+        XCTAssertFalse(vm.messages.contains { $0.role == .user && $0.content == "follow up after current run" },
+                       "queued follow-ups must not appear as a transcript bubble until the turn starts")
+        XCTAssertEqual(vm.queueStatusMessage, "Queued — will run after the current turn.")
+        XCTAssertNil(vm.activePlan,
+                     "sending a follow-up must clear the prior turn's Active plan even when the turn is still running")
+
+        // Stale plan events from the still-running turn must not resurrect the checklist
+        // via the stream observer path (flushStreamEvents filter).
+        vm.runCoordinator(
+            vm.coordinator,
+            didReceive: .activePlanUpdated(AssistantActivePlan(
+                explanation: "stale stream plan",
+                steps: [AssistantPlanStep(id: "sx", title: "Should not show", status: .pending)],
+                updatedAtMs: 101
+            )),
+            run: try XCTUnwrap(vm.currentRunId),
+            threadId: id
+        )
+        await waitAsync("stale plan stream events are suppressed") {
+            vm.activePlan == nil
+        }
+
+        vm.stop()
+        await waitAsync("slow run can still be stopped after queueing") {
+            runner.cancelled
+        }
+    }
+
+    func test_mergeLoadedMessagesPreservesInMemoryUserMirror() {
+        // WHY: concurrent same-thread reloads must not drop the optimistic user
+        // bubble before the coordinator has persisted the durable run-id row.
+        // Merge is by id so two legitimate identical prompts stay distinct.
+        let tid = AgentThreadID()
+        let sharedId = AgentMessageID()
+        let durable = AgentMessage(threadId: tid, role: .assistant, content: "prior answer")
+        let mirror = AgentMessage(id: sharedId, threadId: tid, role: .user, content: "just sent")
+        let merged = AgentAppViewModel.mergeLoadedMessagesWithInMemoryMirrors(
+            loadedRows: [durable],
+            inMemory: [durable, mirror],
+            threadId: tid
+        )
+        XCTAssertEqual(merged.map(\.content), ["prior answer", "just sent"],
+                       "in-memory user mirrors absent from the durable page must survive the merge")
+        let afterDurableUser = AgentAppViewModel.mergeLoadedMessagesWithInMemoryMirrors(
+            loadedRows: [
+                durable,
+                AgentMessage(id: sharedId, threadId: tid, role: .user, content: "just sent")
+            ],
+            inMemory: [mirror],
+            threadId: tid
+        )
+        XCTAssertEqual(afterDurableUser.filter { $0.id == sharedId }.count, 1,
+                       "id-merge must collapse the optimistic mirror once the durable run-id row lands")
+        let firstId = AgentMessageID()
+        let secondId = AgentMessageID()
+        let twoIdentical = AgentAppViewModel.mergeLoadedMessagesWithInMemoryMirrors(
+            loadedRows: [AgentMessage(id: firstId, threadId: tid, role: .user, content: "same")],
+            inMemory: [AgentMessage(id: secondId, threadId: tid, role: .user, content: "same")],
+            threadId: tid
+        )
+        XCTAssertEqual(twoIdentical.filter { $0.content == "same" }.count, 2,
+                       "identical prompt text with distinct ids must not be collapsed")
     }
 
     func test_send_runningThreadQueuesFollowupPrompt() async throws {
@@ -2780,14 +3125,15 @@ final class AgentAppViewModelTests: XCTestCase {
         )
     }
 
-    func test_userMessageDisplayTextCapsLongPromptsForLayout() {
-        let longPrompt = String(repeating: "a", count: AgentAppView.userMessagePreviewCharacterLimit + 50)
-        let display = AgentAppView.userMessageDisplayText(longPrompt)
-
-        XCTAssertLessThanOrEqual(display.count, AgentAppView.userMessagePreviewCharacterLimit + 160,
-                                 "long user prompts must render as a bounded preview so transcript layout and accessibility snapshots stay responsive")
-        XCTAssertTrue(display.contains("Copy message"),
-                      "the preview must tell users the full prompt is still available through the existing copy action")
+    /// WHY: user messages must never be character-truncated in the bubble; long
+    /// paths and full prompts stay intact (layout wraps / Show more by lines only).
+    func test_userMessageDisplayTextPreservesFullPromptWithoutCharacterCap() {
+        let longPrompt = String(repeating: "a", count: 2_500)
+        let pathPrompt = "/Users/samuelfajreldines/Desktop/Screenshot 2026-07-18 at 5.23.56 PM.png"
+        XCTAssertEqual(AgentAppView.userMessageDisplayText(longPrompt), longPrompt,
+                       "user bubbles must show the full stored prompt, not a character-capped preview")
+        XCTAssertEqual(AgentAppView.userMessageDisplayText(pathPrompt), pathPrompt,
+                       "file-path prompts must keep the full path visible without ellipsis in the model text")
     }
 
     func test_visibleLiveTurnItemsKeepsOnlyRecentUpdatesWhileRunning() {
@@ -2876,6 +3222,11 @@ final class AgentAppViewModelTests: XCTestCase {
                           finalMessage: "done", providerThreadId: nil)
         await fulfillment(of: [callbackFinished], timeout: 2)
 
+        // The rail reload is coalesced (scheduleReloadThreads, ~50ms) so many
+        // open Agent Apps don't stampede on one finish fan-out — poll for it.
+        await waitAsync("rail reflects coordinator-owned unread", timeout: 2) {
+            vm.threads.first { $0.id == id }?.hasUnread == true
+        }
         XCTAssertTrue(vm.threads.first { $0.id == id }?.hasUnread ?? false,
                       "the callback must reflect coordinator-owned unread state in the rail")
 
@@ -3840,14 +4191,15 @@ final class AgentAppViewModelTests: XCTestCase {
     }
 
     func test_loadModels_keepsModelValidForProvider() async throws {
-        // F8 update: loadModels no longer rewrites a non-empty pinned model
-        // against a fallback list (see AgentAppModelPickerFixesTests). The B8
-        // contract lives in the real switch flow: setProvider clears the model
-        // and loadModels must then fill in a valid one for the new provider.
+        // Auto-routing update: setProvider no longer clears the model — it
+        // immediately resolves the provider's preferred model (last-used →
+        // built-in default → first listed) so the composer never shows an
+        // empty or foreign model while the async list loads.
         let (vm, _) = try makeVM()
         vm.providerSnapshots = []
         vm.setProvider(.codex)
-        XCTAssertEqual(vm.model, "", "a provider switch clears the model before the async load")
+        XCTAssertEqual(vm.model, AgentDefaultModelSelection.codexBuiltInDefault,
+                       "a provider switch resolves the built-in default before the async load")
         await vm.loadModels()
         if !vm.availableModels.isEmpty {
             XCTAssertTrue(vm.availableModels.contains { $0.id == vm.model },
@@ -4072,7 +4424,9 @@ final class AgentAppViewModelTests: XCTestCase {
             )
         ]
 
-        vm.providerInstanceId = "claude-cli"
+        // The Source picker row calls setProviderInstance (AgentAppSurface
+        // :9484); a raw property write is not a product path.
+        vm.setProviderInstance("claude-cli")
 
         XCTAssertEqual(vm.selectedProviderSnapshot?.provider, .claude)
         XCTAssertEqual(vm.modelOptionsForSelectedProvider.map(\.provider), [.claude],
@@ -4191,7 +4545,7 @@ final class AgentAppViewModelTests: XCTestCase {
 
     // MARK: Full-thread message history (replaces the old viewport window)
 
-    func test_selectingThreadLoadsEntireThreadWithBodiesRetained() throws {
+    func test_selectingThreadLoadsEntireThreadWithBodiesRetained() async throws {
         let (vm, _) = try makeVM()
         vm.createThread(title: "long")
         let tid = vm.selectedThreadId!
@@ -4201,11 +4555,13 @@ final class AgentAppViewModelTests: XCTestCase {
                 content: "m\(i)", createdAt: base.addingTimeInterval(Double(i))))
         }
         vm.selectThread(tid)
-        // The fix: the entire thread loads at once — no infinite-scroll paging and no
-        // off-screen body eviction. Paging + evict flipped row heights mid-scroll, which
-        // is what made auto-scroll jump. Full load makes every row's height stable.
+        // selectThread hydrates history via a bounded off-main page (500 rows /
+        // 24 MB budget) so thread-open never blocks MainActor; await it before
+        // asserting. A 100-row thread fits the page, so the full-load contract
+        // below is unchanged for normal threads.
+        await vm.waitForMessageHistoryLoad()
         XCTAssertEqual(vm.messages.count, 100,
-                       "the whole thread must load up front, not a 30-row viewport window")
+                       "a normal thread loads fully within one bounded page, not a 30-row viewport window")
         XCTAssertEqual(vm.messages.first?.content, "m0", "oldest message present and ordered first")
         XCTAssertEqual(vm.messages.last?.content, "m99", "newest message present and ordered last")
         XCTAssertTrue(vm.messages.allSatisfy { !$0.content.isEmpty },
@@ -4262,7 +4618,7 @@ final class AgentAppViewModelTests: XCTestCase {
         XCTAssertEqual(AgentAppViewModel.chooseReplayEvents(persisted: persisted, snapshot: nil).count, 5)
     }
 
-    func test_loadWindowClipsHugePersistedMessagesBeforeRendering() throws {
+    func test_loadWindowClipsHugePersistedMessagesBeforeRendering() async throws {
         let (vm, _) = try makeVM()
         vm.createThread(title: "huge")
         let tid = vm.selectedThreadId!
@@ -4273,6 +4629,7 @@ final class AgentAppViewModelTests: XCTestCase {
         ))
 
         vm.selectThread(tid)
+        await vm.waitForMessageHistoryLoad()
 
         XCTAssertEqual(vm.messages.first?.content.count, AssistantTimelineState.liveTextLimit,
                        "a huge persisted transcript must be clipped before SwiftUI renders it")
@@ -4317,9 +4674,10 @@ final class AgentAppViewModelTests: XCTestCase {
         // Reopen from a COLD state (fresh VM has no live timeline) — this exercises the
         // replay-from-persisted-events path, which used to cap at the last 500 events.
         vm.selectThread(threadId)
+        await vm.waitForMessageHistoryLoad()
         let persistedCount = (try? vm.messageRepo.list(threadId: threadId).count) ?? -1
         XCTAssertEqual(vm.messages.count, persistedCount,
-                       "reopening a long thread loads the ENTIRE thread (no infinite-scroll window)")
+                       "reopening a long thread loads the whole persisted history within the bounded page")
         XCTAssertGreaterThan(vm.timeline.turns.count, 80,
                              "reopen replays the WHOLE persisted thread (>500-event window, >80-turn cap) — the long run's turns must come back, not just the last few")
 
@@ -4359,6 +4717,74 @@ final class AgentAppViewModelTests: XCTestCase {
                                  "rendering must consume the bounded work-log window instead of retaining every long-run row")
         XCTAssertTrue(vm.contextHealthMessage?.contains("compacted") ?? false,
                       "rendering must keep long-run context/compaction telemetry visible")
+    }
+
+    func test_selectThread_scheduledOwnedRun_seedsWorkingClockFromDurableAgentRun() throws {
+        // WHY: Path B LaunchAgent runs have no local coordinator session. The old
+        // selectThread branch cleared runStartedAt, so "Working for 0s" stuck while
+        // tools ran in the other process. Durable agent_runs.started_at is shared SQLite.
+        let tmp = NSTemporaryDirectory() + "rc2-vm-sched-clock-" + UUID().uuidString
+        let (_, db) = try Bootstrap(channel: .debug, appSupportOverride: tmp).run()
+        let threadRepo = AgentThreadRepository(db: db)
+        let messageRepo = AgentMessageRepository(db: db)
+        let runRepo = AgentRunRepository(db: db)
+        let coord = AgentRunCoordinator(
+            runRepo: runRepo,
+            messageRepo: messageRepo,
+            threadRepo: threadRepo,
+            providers: [.codex: FakeProviderRunner(provider: .codex)]
+        )
+        let workspaceID = WorkspaceID()
+        let vm = AgentAppViewModel(
+            workspaceID: workspaceID,
+            cwd: tmp,
+            coordinator: coord,
+            threadRepo: threadRepo,
+            messageRepo: messageRepo
+        )
+        installRunnableProviderFixtures(on: vm)
+        wireCanonicalThreadRead(vm, repo: threadRepo)
+
+        var thread = AgentThread(
+            workspaceId: workspaceID,
+            title: "Elephant - Task 1",
+            provider: .codex,
+            model: "gpt-5.5"
+        )
+        thread.status = .running
+        try threadRepo.upsert(thread)
+        vm.reloadThreads()
+
+        let startedAt = Date(timeIntervalSince1970: 1_700_000_000)
+        let run = AgentRun(
+            id: AgentRunID(),
+            threadId: thread.id,
+            provider: .codex,
+            model: "gpt-5.5",
+            status: .running,
+            startedAt: startedAt
+        )
+        try runRepo.upsert(run)
+
+        // No local coordinator session — only the SQLite scheduled-ownership signal.
+        vm.isScheduledThreadRunning = { $0 == thread.id }
+        XCTAssertNil(coord.activeRunId(threadId: thread.id),
+                     "fixture must not plant a local coordinator session")
+
+        vm.selectThread(thread.id)
+
+        XCTAssertEqual(vm.runStartedAt, startedAt,
+                       "Working for Xs must count from durable agent_runs.started_at for LaunchAgent-owned runs")
+        XCTAssertEqual(vm.currentRunId, run.id,
+                       "Stop must target the durable agent run id written by the LaunchAgent")
+        XCTAssertTrue(vm.selectedThreadRunIsStartingOrRunning,
+                      "scheduled ownership alone must keep the Working/Stop chrome visible")
+
+        // Store-change rebind must not wipe the clock again.
+        vm.selectThread(thread.id, markRead: false)
+        XCTAssertEqual(vm.runStartedAt, startedAt,
+                       "re-select on scheduled store change must keep the durable start clock")
+        vm.dispose()
     }
 
     // MARK: B3 — composer attachments
@@ -4434,6 +4860,46 @@ final class AgentAppViewModelTests: XCTestCase {
                        "a previous attachment error must never block a later ordinary text message")
         XCTAssertTrue(vm.statusMessage.isEmpty,
                       "a successful new send must clear the obsolete attachment error")
+    }
+
+    /// WHY: sqlite "database is locked" banners are durability noise. Once the
+    /// thread streams more content, the outage is over — keep the banner and
+    /// users think the run is still broken.
+    func test_transientPersistenceError_autoClearsWhenStreamProgresses() {
+        let locked = "Persistence failure during run.stream_event.append: sqlite step: database is locked"
+        XCTAssertTrue(AgentAppViewModel.isTransientPersistenceTimelineError(locked),
+                      "the exact banner text from stream_event.append must classify as transient")
+        XCTAssertTrue(
+            AgentAppViewModel.shouldAutoClearTransientTimelineError(
+                errorAfterBatch: locked,
+                appliedEvents: [
+                    .error(message: locked, recoverable: false),
+                    .itemDelta(itemId: "i1", bodyAppend: "ok", outputAppend: nil, summary: nil),
+                ]
+            ),
+            "progress after a lock error must clear the banner"
+        )
+        XCTAssertTrue(
+            AgentAppViewModel.shouldAutoClearTransientTimelineError(
+                errorAfterBatch: locked,
+                appliedEvents: [.turnStarted(turnId: "t2")]
+            ),
+            "a later batch with only progress must clear a sticky lock banner from an earlier batch"
+        )
+        XCTAssertFalse(
+            AgentAppViewModel.shouldAutoClearTransientTimelineError(
+                errorAfterBatch: locked,
+                appliedEvents: [.error(message: locked, recoverable: false)]
+            ),
+            "a batch that is only the lock error must keep the banner visible"
+        )
+        XCTAssertFalse(
+            AgentAppViewModel.shouldAutoClearTransientTimelineError(
+                errorAfterBatch: "Provider request failed: 401 unauthorized",
+                appliedEvents: [.itemDelta(itemId: "i1", bodyAppend: "x", outputAppend: nil, summary: nil)]
+            ),
+            "real provider failures must stay until the user dismisses or retries — not auto-clear on progress"
+        )
     }
 
     func test_errorDismissActionsClearEachVisibleErrorChannel() throws {
@@ -4740,6 +5206,7 @@ final class AgentAppViewModelTests: XCTestCase {
                                            coordinator: coordinator, threadRepo: threadRepo,
                                            messageRepo: messageRepo)
         reloadedVM.selectThread(streamedThread)
+        await reloadedVM.waitForMessageHistoryLoad()
 
         XCTAssertTrue(reloadedVM.timeline.turns.flatMap(\.items).contains {
             $0.type == .assistantMessage && $0.body.contains("partial stream")
@@ -5107,7 +5574,7 @@ final class AgentAppViewModelTests: XCTestCase {
             runRepo: AgentRunRepository(db: db), messageRepo: messageRepo, threadRepo: threadRepo,
             providerSessionRepo: ProviderSessionRuntimeRepository(db: db), providerAdapters: [.codex: adapter]
         )
-        coordinator.recoveryEnvironmentProvider = { provider in
+        coordinator.recoveryEnvironmentProvider = { provider, _ in
             provider == .codex ? ["CODEX_HOME": isolatedCodexHome] : [:]
         }
         let surface = AgentAppViewModel(
@@ -5206,7 +5673,7 @@ final class AgentAppViewModelTests: XCTestCase {
             providerSessionRepo: sessionRepo,
             providerAdapters: [.codex: firstAdapter]
         )
-        firstCoordinator.recoveryEnvironmentProvider = { provider in
+        firstCoordinator.recoveryEnvironmentProvider = { provider, _ in
             provider == .codex ? ["CODEX_HOME": isolatedCodexHome] : [:]
         }
         let firstSurface = AgentAppViewModel(
@@ -5260,7 +5727,7 @@ final class AgentAppViewModelTests: XCTestCase {
             providerSessionRepo: sessionRepo,
             providerAdapters: [.codex: relaunchedAdapter]
         )
-        relaunchedCoordinator.recoveryEnvironmentProvider = { provider in
+        relaunchedCoordinator.recoveryEnvironmentProvider = { provider, _ in
             provider == .codex ? ["CODEX_HOME": isolatedCodexHome] : [:]
         }
         try relaunchedCoordinator.reconcileOnLaunch()
@@ -6166,7 +6633,8 @@ final class AgentAppViewModelTests: XCTestCase {
     /// output. The default must be a model the CLI actually accepts.
     func test_defaultModel_isARealCodexModel() async throws {
         let (vm, _) = try makeVM()
-        XCTAssertEqual(vm.model, "gpt-5.5", "fresh threads must start on a live codex model")
+        XCTAssertEqual(vm.model, AgentDefaultModelSelection.codexBuiltInDefault,
+                       "fresh threads must start on the product's built-in codex default")
         await vm.loadModels()
         XCTAssertTrue(vm.availableModels.contains { $0.id == vm.model },
                       "the default model must be one the picker actually offers")

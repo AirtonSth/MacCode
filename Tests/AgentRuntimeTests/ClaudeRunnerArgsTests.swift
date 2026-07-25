@@ -41,6 +41,22 @@ final class ClaudeRunnerArgsTests: XCTestCase {
                        "the streaming fallback must not silently disable Claude tools and degrade into chat-only mode")
     }
 
+    func test_streamingLoadsUserProjectLocalSettingSources() {
+        // WHY: without --setting-sources, `claude --print` ignores ~/.claude and
+        // ./.claude, so project/user skills (e.g. `/task`), custom slash
+        // commands, MCP servers, agents, and hooks are invisible to the agent —
+        // the exact "agent mode doesn't see my skills / MCPs" report. This must
+        // match what an interactive `claude` session loads.
+        let a = ClaudeRunner.buildStreamingArgs(req())
+        let i = a.firstIndex(of: "--setting-sources")
+        XCTAssertNotNil(i, "streaming args must load filesystem settings so skills/MCP/commands resolve")
+        let value = a[a.index(after: i!)]
+        // Order-independent: must include all three sources.
+        let sources = Set(value.split(separator: ",").map(String.init))
+        XCTAssertEqual(sources, ["user", "project", "local"],
+                       "must load user + project + local to match interactive claude's `/` surface")
+    }
+
     func test_uncaughtSignalIsFailureUnlessCancellationWasRequested() {
         XCTAssertEqual(
             ClaudeRunner.terminalStatus(cancelRequested: false, terminationReason: .uncaughtSignal, terminationStatus: 9),
@@ -61,11 +77,8 @@ final class ClaudeRunnerArgsTests: XCTestCase {
                      "resumed Claude streaming sessions must not also request a new session id")
     }
 
-    func test_streamingAlwaysAppendsBackgroundAwaitDirective_andDistillOnlyWithTokenSaver() {
-        // UX-MAC_AGENT-BG-AWAIT: the background-await self-declaration rule must ride
-        // in the system prompt on EVERY Claude run (independent of Token Saver) so the
-        // agent marks any unavoidable wait with the recovery marker. Token Saver's
-        // distill rules ride in the SAME `--append-system-prompt` value when on.
+    func test_streamingAppendsBackgroundAwaitAlwaysAndDistillOnlyWithTokenSaver() {
+        // Background-await always; Distill only with Token Saver hint.
         let on = AgentRunRequest(threadId: AgentThreadID(), provider: .claude,
                                  model: "claude-opus-4-7", cwd: "/tmp", prompt: "hi",
                                  environment: ["RC_TOKEN_SAVER_DISTILL_HINT": "1"])
@@ -77,19 +90,56 @@ final class ClaudeRunnerArgsTests: XCTestCase {
         XCTAssertTrue(promptOn.contains(BackgroundAwaitContinuation.awaitingMarker),
                       "appended system prompt must instruct the agent to self-declare a stall with the recovery marker")
         XCTAssertTrue(promptOn.contains("| distill"),
-                      "with Token Saver on, the same appended prompt must also carry the `| distill` piping rule")
+                      "Token Saver on injects the `| distill` piping rule")
+        XCTAssertEqual(promptOn.components(separatedBy: TokenSaverProviderSafetyABI.block).count - 1, 1,
+                       "Claude CLI runtime context must carry the safety ABI exactly once without disk instructions")
+        XCTAssertEqual(
+            (AgentSkillInstaller.distillAgentInstructionsTemplate + "\n\n" + promptOn)
+                .components(separatedBy: TokenSaverProviderSafetyABI.block).count - 1,
+            1,
+            "Claude CLI effective disk plus runtime context must carry the safety ABI exactly once"
+        )
 
-        let off = AgentRunRequest(threadId: AgentThreadID(), provider: .claude,
+        let emptyEnv = AgentRunRequest(threadId: AgentThreadID(), provider: .claude,
                                   model: "claude-opus-4-7", cwd: "/tmp", prompt: "hi")
-        let aOff = ClaudeRunner.buildStreamingArgs(off)
-        guard let idxOff = aOff.firstIndex(of: "--append-system-prompt") else {
-            return XCTFail("even with Token Saver off, the background-await rule must still be appended")
+        let aEmpty = ClaudeRunner.buildStreamingArgs(emptyEnv)
+        guard let idxEmpty = aEmpty.firstIndex(of: "--append-system-prompt") else {
+            return XCTFail("system prompt must always be appended")
         }
-        let promptOff = aOff[aOff.index(after: idxOff)]
-        XCTAssertTrue(promptOff.contains(BackgroundAwaitContinuation.awaitingMarker),
-                      "the background-await rule must be present regardless of Token Saver")
-        XCTAssertFalse(promptOff.contains("| distill"),
-                       "with Token Saver off (CLI uninstalled) the distill rules must NOT be appended")
+        let promptEmpty = aEmpty[aEmpty.index(after: idxEmpty)]
+        XCTAssertTrue(promptEmpty.contains(BackgroundAwaitContinuation.awaitingMarker),
+                      "the background-await rule must be present on every Claude call")
+        XCTAssertFalse(promptEmpty.contains("| distill"),
+                       "Token Saver off must not inject Distill")
+        XCTAssertFalse(promptEmpty.contains(TokenSaverProviderSafetyABI.block),
+                       "Token Saver off must not inject safety ABI")
+    }
+
+    func test_mcpAvailabilityDirectiveRidesBothLiveClaudeRoutes() {
+        // WHY: in --print / autonomous mode Claude preemptively declared a connected
+        // OAuth MCP server (Linear) "unauthenticated / unavailable in this
+        // non-interactive session" and returned BLOCKED WITHOUT ever calling the
+        // tool — even though it had loaded `mcp__linear__get_issue` via ToolSearch
+        // and the cached token works headlessly. The corrective rule must ride EVERY
+        // Claude turn on BOTH live routes (CLI streaming + SDK bridge) from one
+        // shared source (`alwaysOnClaudeDirectives`) so the two routes cannot drift.
+        // Asserts the LIVE builder `buildStreamingArgs` and `claudeSystemPrompt`,
+        // never the dead `buildArgs` (unused for turns), so a green test is meaningful.
+        let request = req()
+        let cliArgs = ClaudeRunner.buildStreamingArgs(request)
+        guard let idx = cliArgs.firstIndex(of: "--append-system-prompt") else {
+            return XCTFail("streaming runs must append a system prompt carrying the MCP-availability rule")
+        }
+        let cliPrompt = cliArgs[cliArgs.index(after: idx)]
+        XCTAssertTrue(cliPrompt.contains(BackgroundAwaitContinuation.mcpToolAvailabilityDirective),
+                      "the live CLI streaming route must carry the MCP-availability rule so the agent stops preemptively refusing connected MCP tools")
+
+        let sdkPrompt = ClaudeAgentSDKBridgeAdapter.claudeSystemPrompt(environment: request.environment)
+        XCTAssertTrue(sdkPrompt.contains(BackgroundAwaitContinuation.mcpToolAvailabilityDirective),
+                      "the SDK bridge route must carry the identical MCP-availability rule (both routes share one source so they cannot drift)")
+
+        XCTAssertTrue(BackgroundAwaitContinuation.alwaysOnClaudeDirectives.contains(BackgroundAwaitContinuation.awaitingMarker),
+                      "the shared directive bundle must retain the background-await rule alongside the new MCP rule")
     }
 
     func test_modelAndPromptPlacement() {

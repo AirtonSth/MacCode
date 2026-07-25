@@ -1,7 +1,7 @@
 import Foundation
 import CoreModel
 
-public enum ScheduledTaskStoreError: Error, CustomStringConvertible {
+public enum ScheduledTaskStoreError: Error, CustomStringConvertible, LocalizedError {
     case invalidRow(String)
     case missingTask(UUID)
 
@@ -11,6 +11,10 @@ public enum ScheduledTaskStoreError: Error, CustomStringConvertible {
         case .missingTask(let id): return "Scheduled task not found: \(id.uuidString)"
         }
     }
+
+    /// WHY: LaunchAgent XPC replies use `error.localizedDescription`. Without
+    /// LocalizedError the associated message is lost over the wire.
+    public var errorDescription: String? { description }
 }
 
 public struct ScheduledTaskClaim: Sendable, Equatable {
@@ -28,7 +32,11 @@ public final class ScheduledTaskStore: @unchecked Sendable {
         self.db = db
         self.encoder = JSONEncoder()
         self.decoder = JSONDecoder()
+        // Whole-second ISO8601 (no fractional seconds). Matches
+        // ScheduledTaskOccurrenceCalculator.canonicalInstant so next_run_at /
+        // scheduled_at / occurrence keys stay on the same precision.
         self.dates = ISO8601DateFormatter()
+        self.dates.formatOptions = [.withInternetDateTime]
     }
 
     public func list(search: String = "") throws -> [ScheduledTask] {
@@ -71,15 +79,16 @@ public final class ScheduledTaskStore: @unchecked Sendable {
                 INSERT INTO scheduled_tasks(
                     id, title, prompt, workspace_id, workspace_path_snapshot, run_as_user, run_as_uid,
                     provider, provider_instance_id,
-                    model, reasoning_effort, recurrence_json, timezone_id, enabled, next_run_at,
+                    model, reasoning_effort, routing_mode, recurrence_json, timezone_id, enabled, next_run_at,
                     last_run_at, lease_owner, lease_expires_at, created_at, updated_at
-                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                     title=excluded.title, prompt=excluded.prompt, workspace_id=excluded.workspace_id,
                     workspace_path_snapshot=excluded.workspace_path_snapshot,
                     run_as_user=excluded.run_as_user, run_as_uid=excluded.run_as_uid, provider=excluded.provider,
                     provider_instance_id=excluded.provider_instance_id, model=excluded.model,
-                    reasoning_effort=excluded.reasoning_effort, recurrence_json=excluded.recurrence_json,
+                    reasoning_effort=excluded.reasoning_effort, routing_mode=excluded.routing_mode,
+                    recurrence_json=excluded.recurrence_json,
                     timezone_id=excluded.timezone_id, enabled=excluded.enabled,
                     next_run_at=excluded.next_run_at, last_run_at=excluded.last_run_at,
                     updated_at=excluded.updated_at;
@@ -153,6 +162,38 @@ public final class ScheduledTaskStore: @unchecked Sendable {
         }
     }
 
+    /// Active scheduled occurrence for a given agent thread, if any.
+    public func activeRun(forThreadID threadID: AgentThreadID) throws -> ScheduledTaskRun? {
+        try db.performSync { database in
+            let statement = try database.prepare(
+                Self.runSelect
+                    + " WHERE status IN ('queued', 'running') AND thread_id = ? ORDER BY queued_at DESC LIMIT 1;"
+            )
+            defer { statement.reset() }
+            try statement.bind(1, threadID.value.uuidString.lowercased())
+            guard try statement.step() else { return nil }
+            return try decodeRun(statement)
+        }
+    }
+
+    /// Thread IDs currently owned by a live scheduled occurrence (LaunchAgent).
+    /// Used so interactive launch reconciliation does not interrupt them.
+    public func activeOwnedThreadIDs() throws -> Set<AgentThreadID> {
+        try db.performSync { database in
+            let statement = try database.prepare(
+                "SELECT thread_id FROM scheduled_task_runs WHERE status IN ('queued', 'running') AND thread_id IS NOT NULL;"
+            )
+            defer { statement.reset() }
+            var result = Set<AgentThreadID>()
+            while try statement.step() {
+                if let raw = statement.columnText(0), let uuid = UUID(uuidString: raw) {
+                    result.insert(AgentThreadID(uuid))
+                }
+            }
+            return result
+        }
+    }
+
     public func runCounts() throws -> [UUID: Int] {
         try db.performSync { database in
             let statement = try database.prepare("SELECT task_id, COUNT(*) FROM scheduled_task_runs GROUP BY task_id;")
@@ -204,7 +245,15 @@ public final class ScheduledTaskStore: @unchecked Sendable {
                     heartbeatAt: now
                 )
                 guard try insertRunIfNew(run) else {
-                    try advance(taskID: task.id, nextRunAt: task.calculatedNextRun(after: scheduledAt), lastRunAt: task.lastRunAt, at: now)
+                    // Duplicate occurrence_key: advance past the spent slot
+                    // (not `after: scheduledAt` alone — subsecond truncation
+                    // would re-select the same hourly/once instant forever).
+                    try advance(
+                        taskID: task.id,
+                        nextRunAt: task.calculatedNextRunAfterSpent(scheduledAt),
+                        lastRunAt: task.lastRunAt,
+                        at: now
+                    )
                     continue
                 }
                 let update = try db.prepare("""
@@ -255,6 +304,51 @@ public final class ScheduledTaskStore: @unchecked Sendable {
             try statement.bind(4, taskID.uuidString.lowercased())
             _ = try statement.step()
             return ScheduledTaskClaim(task: task, run: run)
+        }
+    }
+
+    /// Link a scheduled occurrence to its agent thread before provider start so
+    /// main-app Stop can resolve ownership during the create→send window.
+    ///
+    /// Metadata-only: does **not** change status. Path B calls this while the
+    /// run is still `queued`; feeding `updateRun(status: .queued)` fails because
+    /// `canTransition` rejects queued→queued (identity is not a lifecycle step).
+    public func attachThread(runID: UUID, threadID: AgentThreadID) throws {
+        try db.performSync { database in
+            let current = try database.prepare("""
+                SELECT status, thread_id FROM scheduled_task_runs WHERE id = ? LIMIT 1;
+                """)
+            defer { current.reset() }
+            try current.bind(1, runID.uuidString.lowercased())
+            guard try current.step(), let statusRaw = current.columnText(0),
+                  let status = ScheduledTaskRunStatus(rawValue: statusRaw) else {
+                throw ScheduledTaskStoreError.invalidRow("run \(runID.uuidString) is missing")
+            }
+            guard status == .queued else {
+                throw ScheduledTaskStoreError.invalidRow(
+                    "can only attach a thread while the run is queued (current: \(status.rawValue))"
+                )
+            }
+            if let existing = current.columnText(1),
+               let existingID = UUID(uuidString: existing) {
+                if existingID == threadID.value {
+                    return // idempotent re-attach of the same thread
+                }
+                throw ScheduledTaskStoreError.invalidRow(
+                    "run already linked to a different agent thread"
+                )
+            }
+            let update = try database.prepare("""
+                UPDATE scheduled_task_runs
+                SET thread_id = ?, heartbeat_at = ?
+                WHERE id = ? AND status = 'queued';
+                """)
+            defer { update.reset() }
+            let now = Date()
+            try update.bind(1, threadID.value.uuidString.lowercased())
+            try update.bind(2, string(now))
+            try update.bind(3, runID.uuidString.lowercased())
+            _ = try update.step()
         }
     }
 
@@ -463,13 +557,14 @@ public final class ScheduledTaskStore: @unchecked Sendable {
         try statement.bind(9, task.providerInstanceID)
         try statement.bind(10, task.model)
         try statement.bind(11, task.reasoningEffort.rawValue)
-        try statement.bind(12, recurrenceJSON)
-        try statement.bind(13, task.timeZoneIdentifier)
-        try statement.bind(14, task.isEnabled)
-        try statement.bind(15, string(task.nextRunAt))
-        try statement.bind(16, string(task.lastRunAt))
-        try statement.bind(17, string(task.createdAt))
-        try statement.bind(18, string(task.updatedAt))
+        try statement.bind(12, task.effectiveRoutingMode.rawValue)
+        try statement.bind(13, recurrenceJSON)
+        try statement.bind(14, task.timeZoneIdentifier)
+        try statement.bind(15, task.isEnabled)
+        try statement.bind(16, string(task.nextRunAt))
+        try statement.bind(17, string(task.lastRunAt))
+        try statement.bind(18, string(task.createdAt))
+        try statement.bind(19, string(task.updatedAt))
     }
 
     private func decodeTask(_ statement: SQLiteStatement) throws -> ScheduledTask {
@@ -482,17 +577,19 @@ public final class ScheduledTaskStore: @unchecked Sendable {
             let providerRaw = statement.columnText(7), let provider = AgentProvider(rawValue: providerRaw),
             let instance = statement.columnText(8), let model = statement.columnText(9),
             let reasoningRaw = statement.columnText(10), let reasoning = AgentReasoningEffort(rawValue: reasoningRaw),
-            let recurrenceRaw = statement.columnText(11),
+            let routingRaw = statement.columnText(11), let routingMode = AgentRoutingMode(rawValue: routingRaw),
+            let recurrenceRaw = statement.columnText(12),
             let recurrence = try? decodeRecurrence(recurrenceRaw),
-            let timeZone = statement.columnText(12),
-            let created = date(statement.columnText(18)), let updated = date(statement.columnText(19))
+            let timeZone = statement.columnText(13),
+            let created = date(statement.columnText(19)), let updated = date(statement.columnText(20))
         else { throw ScheduledTaskStoreError.invalidRow("missing or invalid scheduled_tasks column") }
         return ScheduledTask(
             id: id, title: title, prompt: prompt, workspaceID: WorkspaceID(workspaceUUID), workspacePathSnapshot: workspacePath,
             runAsUser: runAs, runAsUID: UInt32(statement.columnInt64(6)), provider: provider, providerInstanceID: instance, model: model,
-            reasoningEffort: reasoning, recurrence: recurrence, timeZoneIdentifier: timeZone,
-            isEnabled: statement.columnInt64(13) != 0,
-            nextRunAt: date(statement.columnText(14)), lastRunAt: date(statement.columnText(15)),
+            reasoningEffort: reasoning, routingMode: routingMode,
+            recurrence: recurrence, timeZoneIdentifier: timeZone,
+            isEnabled: statement.columnInt64(14) != 0,
+            nextRunAt: date(statement.columnText(15)), lastRunAt: date(statement.columnText(16)),
             createdAt: created, updatedAt: updated
         )
     }
@@ -528,8 +625,13 @@ public final class ScheduledTaskStore: @unchecked Sendable {
         return try decoder.decode(ScheduledTaskRecurrence.self, from: data)
     }
 
-    private func string(_ date: Date?) -> String? { date.map(dates.string(from:)) }
-    private func date(_ string: String?) -> Date? { string.flatMap(dates.date(from:)) }
+    private func string(_ date: Date?) -> String? {
+        date.map { dates.string(from: ScheduledTaskOccurrenceCalculator.canonicalInstant($0)) }
+    }
+
+    private func date(_ string: String?) -> Date? {
+        string.flatMap(dates.date(from:)).map(ScheduledTaskOccurrenceCalculator.canonicalInstant)
+    }
 
     private static func safeErrorSummary(_ value: String?, removingPrompt prompt: String? = nil) -> String? {
         guard let value else { return nil }
@@ -570,7 +672,7 @@ public final class ScheduledTaskStore: @unchecked Sendable {
 
     private static let taskSelect = """
         SELECT id, title, prompt, workspace_id, workspace_path_snapshot, run_as_user, run_as_uid,
-               provider, provider_instance_id, model, reasoning_effort, recurrence_json, timezone_id, enabled, next_run_at,
+               provider, provider_instance_id, model, reasoning_effort, routing_mode, recurrence_json, timezone_id, enabled, next_run_at,
                last_run_at, lease_owner, lease_expires_at, created_at, updated_at
         FROM scheduled_tasks
         """
