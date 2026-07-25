@@ -4180,10 +4180,10 @@ public struct SidebarRootView: View {
         func path(in rect: CGRect) -> Path {
             var path = Path()
             let bounded = min(max(progress, 0), 1)
-            guard bounded > 0 else { return path }
+            let radius = min(rect.width, rect.height) / 2
             path.addArc(
                 center: CGPoint(x: rect.midX, y: rect.midY),
-                radius: min(rect.width, rect.height) / 2,
+                radius: radius,
                 startAngle: .degrees(-88),
                 endAngle: .degrees((360 * bounded) - 88),
                 clockwise: false

@@ -156,6 +156,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     @Published public var userInputSelections: [String: Set<String>] = [:]
     @Published public var userInputDrafts: [String: String] = [:]
     @Published public var focusTick: Int = 0
+    /// P1/F4: number of hidden pre-run transcript items revealed read-only.
+    /// Reset to zero on each new run and paged so one tap cannot render a huge history.
+    @Published public var transcriptHistoryRevealCount: Int = 0
     /// F1: composer text lives on `composerState` so keystrokes don't republish the
     /// transcript-bearing view model. This proxy keeps every existing `vm.prompt`
     /// read/write working unchanged; because it is a computed (non-@Published)
@@ -6376,9 +6379,6 @@ public struct AgentAppView: View {
     // UX-MAC_AGENT-013: inline custom-model entry replaces the blocking NSAlert.
     @State private var showCustomModelField = false
     @State private var customModelDraft = ""
-    /// P1/F4: number of hidden pre-run transcript items revealed read-only.
-    /// Reset to zero on each new run and paged so one tap cannot render a huge history.
-    @State private var transcriptHistoryRevealCount = 0
 
     public init(vm: AgentAppViewModel) { self.vm = vm }
 
@@ -8112,7 +8112,7 @@ public struct AgentAppView: View {
                                 visibleCount: entries.count
                             )
                             let revealedHiddenCount = min(
-                                transcriptHistoryRevealCount,
+                                vm.transcriptHistoryRevealCount,
                                 hiddenCount
                             )
                             TimelineScrollFollower(
@@ -8136,9 +8136,9 @@ public struct AgentAppView: View {
                                     revealedCount: revealedHiddenCount,
                                     pageCount: Self.hiddenTranscriptRevealPageCount,
                                     onReveal: {
-                                        transcriptHistoryRevealCount = min(
+                                        vm.transcriptHistoryRevealCount = min(
                                             hiddenCount,
-                                            transcriptHistoryRevealCount + Self.hiddenTranscriptRevealPageCount
+                                            vm.transcriptHistoryRevealCount + Self.hiddenTranscriptRevealPageCount
                                         )
                                     }
                                 )
@@ -8279,7 +8279,7 @@ public struct AgentAppView: View {
             // revealed flag carried into a different long thread would eagerly
             // render its whole history with no user action — reintroducing the hang.
             .onChange(of: vm.selectedThreadId) { _ in
-                transcriptHistoryRevealCount = 0
+                vm.transcriptHistoryRevealCount = 0
                 pendingSessionApproval = nil
             }
         }
@@ -9263,9 +9263,9 @@ public struct AgentAppView: View {
     }
 
     /// Collapse reveal + open disclosures so a new follow-up paints like a
-    /// fresh chat turn. @State only — no model mutation.
+    /// fresh chat turn. Atomically resets both model and view state.
     private func collapseTranscriptForNewTurn() {
-        transcriptHistoryRevealCount = 0
+        vm.transcriptHistoryRevealCount = 0
         expandedCompletedWorkTurns = []
         expandedTools = []
         expandedToolGroups = []
