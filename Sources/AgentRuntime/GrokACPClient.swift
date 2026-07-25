@@ -538,7 +538,17 @@ public final class GrokACPClient: @unchecked Sendable {
             request.providerPrompt,
             environment: request.environment
         )
-        if !providerPrompt.isEmpty { blocks.append(["type": "text", "text": providerPrompt]) }
+        // Additive: background-await self-declare marker so shell-detached
+        // orchestration stalls reach the host's [[RC_AWAITING]] recovery path.
+        // systemPromptDirective only — NOT alwaysOnClaudeDirectives (MCP rules
+        // are Claude-CLI-specific).
+        let composed: String
+        if providerPrompt.isEmpty {
+            composed = BackgroundAwaitContinuation.systemPromptDirective
+        } else {
+            composed = providerPrompt + "\n\n" + BackgroundAwaitContinuation.systemPromptDirective
+        }
+        if !composed.isEmpty { blocks.append(["type": "text", "text": composed]) }
         for attachment in request.attachments {
             switch attachment.kind {
             case .image:

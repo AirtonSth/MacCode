@@ -2070,6 +2070,146 @@ final class ClaudeStreamingCLIAdapterTests: ProviderProcessTestCase {
         try adapter.stopSession(threadId: threadId)
     }
 
+    // MARK: - Shell-detached workers (CLI-unowned; stamp [[RC_AWAITING]], do not defer)
+
+    /// Real incident shape: foreground Bash tool_use (NO `run_in_background`)
+    /// shell-detaches workers with `... & PID=$!`. CLI never emits
+    /// `background_tasks_changed` / `task_started`. Without the adapter stamp the
+    /// run finishes green while workers still run.
+    func test_shellDetachedForegroundBash_stampsAwaitingMarkerOnCompletedTurn() async throws {
+        let tmp = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("rc2-claude-detach-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
+        let script = tmp.appendingPathComponent("fake-claude")
+        // Command shape captured from run 2D47AD8B (foreground Bash + shell &; no run_in_background).
+        try #"""
+        #!/usr/bin/env python3
+        import json, sys
+        S = "claude-detach-session"
+        def e(o):
+            print(json.dumps(o), flush=True)
+        e({"type":"system","subtype":"init","session_id":S})
+        for line in sys.stdin:
+            if not line.strip():
+                continue
+            cmd = "grok --prompt-file /tmp/w2-c02.txt --output-format json > /tmp/w2-c02-result.json 2>&1 &\nPID_C02=$!\necho started"
+            e({"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_detach","name":"Bash","input":{"command":cmd,"description":"launch workers"}}]},"session_id":S})
+            e({"type":"assistant","message":{"content":[{"type":"text","text":"Workers launched; keeping polling active."}]},"session_id":S})
+            e({"type":"result","subtype":"success","is_error":False,"result":"Workers launched; keeping polling active.","session_id":S})
+        """#.write(to: script, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: script.path)
+
+        let adapter = ClaudeStreamingCLIAdapter(binaryNameOverride: script.path)
+        let threadId = AgentThreadID()
+        let sink = EventSink()
+        _ = try await adapter.sendTurn(AgentRunRequest(
+            threadId: threadId,
+            provider: .claude,
+            model: "claude-haiku-4-5-20251001",
+            cwd: tmp.path,
+            prompt: "fan out workers"
+        )) { event in
+            Task { await sink.record(event) }
+        }
+        let deadline = Date().addingTimeInterval(4)
+        while Date() < deadline {
+            let finished = await sink.snapshot().contains { if case .finished = $0 { return true }; return false }
+            if finished { break }
+            try? await Task.sleep(nanoseconds: 30_000_000)
+        }
+        try? await Task.sleep(nanoseconds: 100_000_000)
+        let events = await sink.snapshot()
+        let finishes = Self.finishedPairs(events)
+        let marker = BackgroundAwaitContinuation.awaitingMarker
+
+        XCTAssertEqual(finishes.count, 1,
+                       "shell-detached work must NOT defer: exactly one terminal (CLI never auto-resumes these)")
+        XCTAssertEqual(finishes.first?.0, .completed)
+        XCTAssertTrue(finishes.first?.1?.contains(marker) == true,
+                      "finished.finalMessage must carry [[RC_AWAITING]] so the coordinator auto-nudge fires; got \(finishes.first?.1 ?? "nil")")
+
+        let turnFinals = events.compactMap { event -> String? in
+            if case .event(.turnCompleted(_, let msg)) = event { return msg }
+            return nil
+        }
+        XCTAssertTrue(turnFinals.contains(where: { $0.contains(marker) }),
+                      "persisted turnCompleted finalMessage must also carry the marker (UI pill/banner reload source); got \(turnFinals)")
+        try? adapter.stopSession(threadId: threadId)
+    }
+
+    /// Ordinary foreground Bash that does not detach — and a detaching command
+    /// that ends with `wait` — must not be stamped.
+    func test_nonDetachingBash_andWaitBuiltin_doNotStampAwaitingMarker() async throws {
+        let cases: [(name: String, command: String)] = [
+            ("no_detach", "swift build && echo ok"),
+            ("wait_after_detach", "sleep 30 & wait"),
+        ]
+        for testCase in cases {
+            let tmp = URL(fileURLWithPath: NSTemporaryDirectory())
+                .appendingPathComponent("rc2-claude-nodetach-\(testCase.name)-\(UUID().uuidString)", isDirectory: true)
+            try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
+            let script = tmp.appendingPathComponent("fake-claude")
+            let escaped = testCase.command
+                .replacingOccurrences(of: "\\", with: "\\\\")
+                .replacingOccurrences(of: "\"", with: "\\\"")
+            try """
+            #!/usr/bin/env python3
+            import json, sys
+            S = "claude-nodetach-\(testCase.name)"
+            def e(o):
+                print(json.dumps(o), flush=True)
+            e({"type":"system","subtype":"init","session_id":S})
+            for line in sys.stdin:
+                if not line.strip():
+                    continue
+                e({"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_x","name":"Bash","input":{"command":"\(escaped)"}}]},"session_id":S})
+                e({"type":"assistant","message":{"content":[{"type":"text","text":"DONE_\(testCase.name)"}]},"session_id":S})
+                e({"type":"result","subtype":"success","is_error":False,"result":"DONE_\(testCase.name)","session_id":S})
+            """.write(to: script, atomically: true, encoding: .utf8)
+            try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: script.path)
+
+            let adapter = ClaudeStreamingCLIAdapter(binaryNameOverride: script.path)
+            let threadId = AgentThreadID()
+            let sink = EventSink()
+            _ = try await adapter.sendTurn(AgentRunRequest(
+                threadId: threadId,
+                provider: .claude,
+                model: "claude-haiku-4-5-20251001",
+                cwd: tmp.path,
+                prompt: testCase.name
+            )) { event in
+                Task { await sink.record(event) }
+            }
+            try await waitForFinish(in: sink, expected: "DONE_\(testCase.name)")
+            let events = await sink.snapshot()
+            let finishes = Self.finishedPairs(events)
+            XCTAssertEqual(finishes.count, 1, "\(testCase.name): exactly one finished")
+            XCTAssertEqual(finishes.first?.1, "DONE_\(testCase.name)",
+                           "\(testCase.name): must not stamp [[RC_AWAITING]] on non-detaching / wait-blocked Bash")
+            try? adapter.stopSession(threadId: threadId)
+        }
+    }
+
+    func test_bashCommandDetachesShellWork_classifier() {
+        // Pure string cases for the detach detector used by trackDetachedShellSpawn.
+        XCTAssertTrue(ClaudeStreamingCLIAdapter.bashCommandDetachesShellWork("cmd &"),
+                      "trailing & backgrounds")
+        XCTAssertTrue(ClaudeStreamingCLIAdapter.bashCommandDetachesShellWork("cmd &\nPID=$!"),
+                      "background + capture PID")
+        XCTAssertTrue(ClaudeStreamingCLIAdapter.bashCommandDetachesShellWork("nohup cmd &"),
+                      "nohup detaches")
+        XCTAssertTrue(ClaudeStreamingCLIAdapter.bashCommandDetachesShellWork("cmd 2>&1 &"),
+                      "redirect then background &")
+        XCTAssertFalse(ClaudeStreamingCLIAdapter.bashCommandDetachesShellWork("a && b"),
+                       "&& is not background")
+        XCTAssertFalse(ClaudeStreamingCLIAdapter.bashCommandDetachesShellWork("cmd > f 2>&1"),
+                       "2>&1 alone is not background")
+        XCTAssertFalse(ClaudeStreamingCLIAdapter.bashCommandDetachesShellWork("cmd & wait"),
+                       "wait means the shell blocked on children")
+        XCTAssertFalse(ClaudeStreamingCLIAdapter.bashCommandDetachesShellWork("ls -la"),
+                       "plain foreground command")
+    }
+
     private func waitForFinish(in sink: EventSink, expected: String) async throws {
         let deadline = Date().addingTimeInterval(3)
         while Date() < deadline {

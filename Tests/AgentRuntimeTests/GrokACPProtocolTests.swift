@@ -266,6 +266,154 @@ final class GrokACPProtocolTests: XCTestCase {
         XCTAssertFalse(emptyEnvPrompt.contains("| distill"))
     }
 
+    func test_promptBlocksInjectBackgroundAwaitDirectiveNotClaudeMCP() throws {
+        // WHY: Grok never received systemPromptDirective, so the deterministic
+        // [[RC_AWAITING]] self-declare path was dead. Inject only that directive —
+        // not Claude-only MCP rules.
+        let request = AgentRunRequest(
+            threadId: AgentThreadID(),
+            provider: .grok,
+            model: "grok-4.5",
+            cwd: "/tmp",
+            prompt: "inspect"
+        )
+        let blocks = try GrokACPClient.promptBlocks(
+            for: request,
+            capabilities: .init(protocolVersion: 1, loadSession: true, embeddedContext: true)
+        )
+        let prompt = try XCTUnwrap(blocks.first?["text"] as? String)
+        XCTAssertTrue(
+            prompt.contains(BackgroundAwaitContinuation.awaitingMarker),
+            "Grok prompt blocks must include the exact [[RC_AWAITING]] token"
+        )
+        XCTAssertTrue(
+            prompt.contains("Background-await protocol"),
+            "Grok must receive systemPromptDirective"
+        )
+        XCTAssertFalse(
+            prompt.contains(BackgroundAwaitContinuation.mcpToolAvailabilityDirective),
+            "must not inject Claude-only mcpToolAvailabilityDirective"
+        )
+        XCTAssertFalse(
+            prompt.contains(BackgroundAwaitContinuation.mcpConnectWaitDirective),
+            "must not inject Claude-only mcpConnectWaitDirective"
+        )
+        XCTAssertFalse(
+            prompt.contains("RefreshMcpTools"),
+            "Claude-only MCP connect-wait wording must not appear on Grok"
+        )
+    }
+
+    func test_mapperShellDetachedToolCall_stampsAwaitingMarkerExactlyOnceOnCompletedTurn() {
+        let mapper = GrokACPEventMapper(sessionId: "grok-detach")
+        var events: [AssistantEvent] = []
+        events += mapper.beginTurn()
+        let detachCmd = "grok --prompt-file /tmp/w2-c02.txt --output-format json > /tmp/w2-c02-result.json 2>&1 &\nPID_C02=$!\necho started"
+        events += mapper.consumeSessionUpdate([
+            "sessionUpdate": "tool_call",
+            "toolCallId": "tool-detach",
+            "title": "run_terminal_command",
+            "rawInput": ["command": detachCmd]
+        ])
+        events += mapper.consumeSessionUpdate([
+            "sessionUpdate": "agent_message_chunk",
+            "content": ["type": "text", "text": "Workers launched"]
+        ])
+        events += mapper.finishTurn(stopReason: "end_turn", usage: nil)
+
+        let marker = BackgroundAwaitContinuation.awaitingMarker
+        let turnFinals = events.compactMap { event -> String? in
+            if case .turnCompleted(_, let msg) = event { return msg }
+            return nil
+        }
+        XCTAssertEqual(turnFinals.count, 1)
+        let final = try! XCTUnwrap(turnFinals.first)
+        XCTAssertTrue(final.contains(marker),
+                      "turnCompleted must carry [[RC_AWAITING]]; got \(final)")
+        XCTAssertEqual(final.components(separatedBy: marker).count - 1, 1,
+                       "marker must appear exactly once")
+        XCTAssertEqual(mapper.finalAssistantMessage, final,
+                       "adapter .finished reads finalAssistantMessage — same stamped text")
+        XCTAssertTrue(final.contains("Workers launched"))
+    }
+
+    func test_mapperNonDetachingAndFailedTerminals_doNotStampAwaitingMarker() {
+        let marker = BackgroundAwaitContinuation.awaitingMarker
+
+        // Non-detaching command → no stamp.
+        do {
+            let mapper = GrokACPEventMapper(sessionId: "grok-nodetach")
+            var events: [AssistantEvent] = []
+            events += mapper.beginTurn()
+            events += mapper.consumeSessionUpdate([
+                "sessionUpdate": "tool_call",
+                "toolCallId": "tool-build",
+                "title": "run_terminal_command",
+                "rawInput": ["command": "swift build && echo ok"]
+            ])
+            events += mapper.consumeSessionUpdate([
+                "sessionUpdate": "agent_message_chunk",
+                "content": ["type": "text", "text": "build ok"]
+            ])
+            events += mapper.finishTurn(stopReason: "end_turn", usage: nil)
+            let final = events.compactMap { event -> String? in
+                if case .turnCompleted(_, let msg) = event { return msg }
+                return nil
+            }.first
+            XCTAssertEqual(final, "build ok")
+            XCTAssertFalse(final?.contains(marker) == true)
+            XCTAssertEqual(mapper.finalAssistantMessage, "build ok")
+        }
+
+        // Failed terminal with detaching command → no stamp.
+        do {
+            let mapper = GrokACPEventMapper(sessionId: "grok-fail-detach")
+            var events: [AssistantEvent] = []
+            events += mapper.beginTurn()
+            events += mapper.consumeSessionUpdate([
+                "sessionUpdate": "tool_call",
+                "toolCallId": "tool-d",
+                "title": "run_terminal_command",
+                "rawInput": ["command": "nohup sleep 99 &"]
+            ])
+            events += mapper.consumeSessionUpdate([
+                "sessionUpdate": "agent_message_chunk",
+                "content": ["type": "text", "text": "oops"]
+            ])
+            events += mapper.finishTurn(stopReason: "failed", usage: nil)
+            let final = events.compactMap { event -> String? in
+                if case .turnCompleted(_, let msg) = event { return msg }
+                return nil
+            }.first
+            XCTAssertEqual(final, "oops")
+            XCTAssertFalse(final?.contains(marker) == true)
+        }
+
+        // Cancelled terminal with detaching command → no stamp.
+        do {
+            let mapper = GrokACPEventMapper(sessionId: "grok-cancel-detach")
+            var events: [AssistantEvent] = []
+            events += mapper.beginTurn()
+            events += mapper.consumeSessionUpdate([
+                "sessionUpdate": "tool_call",
+                "toolCallId": "tool-c",
+                "title": "run_terminal_command",
+                "rawInput": ["command": "sleep 30 &"]
+            ])
+            events += mapper.consumeSessionUpdate([
+                "sessionUpdate": "agent_message_chunk",
+                "content": ["type": "text", "text": "cancelling"]
+            ])
+            events += mapper.finishTurn(stopReason: "cancelled", usage: nil)
+            let final = events.compactMap { event -> String? in
+                if case .turnCompleted(_, let msg) = event { return msg }
+                return nil
+            }.first
+            XCTAssertEqual(final, "cancelling")
+            XCTAssertFalse(final?.contains(marker) == true)
+        }
+    }
+
     func test_mapperStreamsThoughtTextToolsPlanAndKeepsLastTextPhaseFinal() {
         let mapper = GrokACPEventMapper(sessionId: "grok-session")
         var events: [AssistantEvent] = []

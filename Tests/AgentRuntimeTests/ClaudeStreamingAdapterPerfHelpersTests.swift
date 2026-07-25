@@ -45,6 +45,7 @@ final class ClaudeStreamingAdapterPerfHelpersTests: XCTestCase {
         pending: Set<String> = [],
         userInput: Set<String> = [],
         inFlight: Set<String> = [],
+        backgroundTasks: Set<String> = [],
         providerThreadId: String? = nil,
         activeTurnId: String? = nil,
         lastCompletedTurnId: String? = nil,
@@ -53,6 +54,7 @@ final class ClaudeStreamingAdapterPerfHelpersTests: XCTestCase {
         ClaudeStreamingCLIAdapter.snapshotStateSignature(
             model: model, turnCount: turnCount,
             pendingRequestIds: pending, pendingUserInputIds: userInput, inFlightToolIds: inFlight,
+            pendingBackgroundTaskIds: backgroundTasks,
             providerThreadId: providerThreadId, activeTurnId: activeTurnId,
             lastCompletedTurnId: lastCompletedTurnId, lastAssistantUuid: lastAssistantUuid
         )
@@ -79,6 +81,27 @@ final class ClaudeStreamingAdapterPerfHelpersTests: XCTestCase {
                           "a completed tool (in-flight cleared) must change the signature")
         XCTAssertNotEqual(base, signature(turnCount: 1, inFlight: ["a"], activeTurnId: "turn-2"),
                           "a turn transition must change the signature")
+    }
+
+    func test_snapshotSignature_changesWhenOnlyBackgroundWorkChanges() {
+        // THE REPORTED GAP: the pending background-task set was in neither the
+        // snapshot payload nor this signature, so a snapshot whose ONLY change was
+        // "a background shell started / finished" coalesced away and was never
+        // broadcast. Measured consequence: across 7,093 persisted snapshots in a
+        // real user DB, the `background_work_pending` reason appeared ZERO times
+        // (it is emitted right after a `turn_completed` snapshot, whose state
+        // fields are identical) — so no UI could ever show running shells.
+        // The turn-end state below is exactly that case: same turn/tool state,
+        // different background work.
+        let turnEnded = signature(turnCount: 1, inFlight: [], activeTurnId: nil)
+        XCTAssertNotEqual(turnEnded, signature(turnCount: 1, inFlight: [], backgroundTasks: ["T1"], activeTurnId: nil),
+                          "a background shell still running at turn end must change the signature, or the snapshot that reports it is coalesced away")
+        XCTAssertNotEqual(signature(backgroundTasks: ["T1"]), signature(backgroundTasks: ["T1", "T2"]),
+                          "a second background shell must change the signature so the chip count updates")
+        XCTAssertNotEqual(signature(backgroundTasks: ["T1"]), signature(backgroundTasks: []),
+                          "background work finishing must change the signature so the chip clears")
+        XCTAssertEqual(signature(backgroundTasks: ["T1", "T2"]), signature(backgroundTasks: ["T2", "T1"]),
+                       "set order must not change the signature (would defeat the coalesce)")
     }
 
     func test_snapshotSignature_distinguishesAdjacentFields() {

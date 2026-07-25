@@ -436,6 +436,70 @@ final class AgentAppViewModelTests: XCTestCase {
                        "a running thread must not show the awaiting placeholder")
     }
 
+    // MARK: - CLAUDE-BG-LIFECYCLE: live "N shells" chip
+
+    func test_backgroundShellCount_isReadFromClaudeSessionSnapshotOnly() {
+        // The provider's pending background-work set reaches the UI ONLY through the
+        // claude.session.snapshot runtime payload — nothing else exports it. This is
+        // what makes running background shells visible at all (previously the app had
+        // no equivalent of the Claude CLI's own "1 shell" indicator).
+        let snapshot = { (payload: String) in
+            AssistantEvent.providerRuntime(ProviderRuntimeEvent(
+                id: "snap",
+                provider: .claude,
+                source: "claude.stream-json.session",
+                method: "claude.session.snapshot",
+                payloadJSON: payload,
+                receivedAtMs: 1
+            ))
+        }
+        XCTAssertEqual(
+            AgentAppViewModel.backgroundShellCount(fromRuntimeEvent: snapshot(#"{"reason":"tool_started","pendingBackgroundTaskIds":["T1","T2"]}"#)),
+            2,
+            "two CLI-tracked background shells must be reported so the chip can show them"
+        )
+        XCTAssertEqual(
+            AgentAppViewModel.backgroundShellCount(fromRuntimeEvent: snapshot(#"{"reason":"tool_started","pendingBackgroundTaskIds":[]}"#)),
+            0,
+            "an empty set is authoritative — background work finished, so the chip must clear"
+        )
+        // nil (not 0) for anything that does not carry the field: an unrelated event
+        // must never silently clear a live count.
+        XCTAssertNil(
+            AgentAppViewModel.backgroundShellCount(fromRuntimeEvent: snapshot(#"{"reason":"turn_started"}"#)),
+            "a snapshot without the field (older payload / SDK-bridge route) must not clear the count"
+        )
+        XCTAssertNil(
+            AgentAppViewModel.backgroundShellCount(fromRuntimeEvent: .turnStarted(turnId: "t1")),
+            "a non-runtime event carries no background state"
+        )
+        XCTAssertNil(
+            AgentAppViewModel.backgroundShellCount(fromRuntimeEvent: .providerRuntime(ProviderRuntimeEvent(
+                id: "other", provider: .claude, source: "claude.stream-json",
+                method: "assistant", payloadJSON: #"{"pendingBackgroundTaskIds":["T1"]}"#, receivedAtMs: 1
+            ))),
+            "only the session snapshot is authoritative; another method must be ignored even if it happens to carry the key"
+        )
+    }
+
+    func test_visibleBackgroundShellCount_hidesStaleCountOnceRunIsNoLongerLive() {
+        // The adapter clears its pending set inside emitTerminal WITHOUT emitting a
+        // further snapshot, so the last count the UI receives for a run can be
+        // non-zero. Without the live-run gate a finished thread would keep claiming
+        // shells are running forever.
+        XCTAssertEqual(AgentAppViewModel.visibleBackgroundShellCount(reported: 2, runIsLive: true), 2,
+                       "while the run is live the reported count is shown")
+        XCTAssertEqual(AgentAppViewModel.visibleBackgroundShellCount(reported: 2, runIsLive: false), 0,
+                       "a finished run must not keep advertising background shells (the awaiting pill covers the after-case)")
+    }
+
+    func test_backgroundShellLabel_matchesClaudeCLIWording() {
+        // Same wording as the CLI status line ("1 shell") so the two surfaces read
+        // consistently; the chip is hidden at 0 by the call site.
+        XCTAssertEqual(AgentAppView.backgroundShellLabel(1), "1 shell")
+        XCTAssertEqual(AgentAppView.backgroundShellLabel(3), "3 shells")
+    }
+
     func test_composerPlaceholder_staysNeutralWhenRunIsLiveDespiteStaleCompletedStatus() throws {
         // The load-bearing `!selectedThreadRunIsStartingOrRunning` guard: this VM's
         // `status` can be a stale `.completed` (e.g. a run started/owned elsewhere —

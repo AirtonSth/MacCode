@@ -60,6 +60,19 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
         /// `result` that races ahead of the first snapshot still sees "busy".
         /// Non-empty ⇒ the provider is NOT idle and a turn `result` is premature.
         var pendingBackgroundTaskIds = Set<String>()
+        /// Shell-detached work the CLI does NOT track: a foreground Bash tool
+        /// whose command backgrounds children with `&` / `nohup` / `setsid` /
+        /// `disown` (no `run_in_background`, no `task_started`). When set and the
+        /// CLI pending set is empty at turn end, we prefix `[[RC_AWAITING]]` so
+        /// the host's existing marker path surfaces awaiting + auto-nudge — but
+        /// we do NOT defer the terminal (the CLI never auto-resumes shell-detached
+        /// children; withholding would hang until the inactivity watchdog).
+        ///
+        /// Accepted false-positive: a turn that backgrounds a long-lived process
+        /// as the deliverable (e.g. starts a dev server) is marked awaiting once;
+        /// one bounded auto-nudge then clears the streak. Preferred over silently
+        /// reporting orchestration threads as finished.
+        var sawDetachedShellSpawn = false
         /// A turn `result` withheld because background work was still pending.
         /// Re-armed by every later `result`; only the one observed while the
         /// pending set is empty becomes the run's single terminal event.
@@ -619,7 +632,30 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
            let runtimeEvent = ProviderRuntimeEvent.fromJSONObject(rawObject, provider: .claude, source: "claude.stream-json") {
             emit(.event(.providerRuntime(runtimeEvent)), session: session)
         }
-        let parsed = session.parser.parseLine(line)
+        let rawParsed = session.parser.parseLine(line)
+        // New-turn reset MUST run before shell-detach observation: the first
+        // assistant line of a turn often carries both turnStarted and a Bash
+        // tool_use. Resetting after tracking would wipe the detach signal.
+        for event in rawParsed {
+            if case .turnStarted = event {
+                lock.lock()
+                session.sawDetachedShellSpawn = false
+                lock.unlock()
+            }
+        }
+        if let rawObject {
+            // Shell-detach signal (CLI-unowned workers): observe foreground Bash
+            // tool_use commands that background children so the turn-end path can
+            // stamp [[RC_AWAITING]] without deferring the terminal.
+            trackDetachedShellSpawn(in: rawObject, session: session)
+        }
+        // Rewrite turnCompleted finalMessage BEFORE record/emit/concludeTurn so
+        // both the persisted stream event (UI reload source) and the coordinator
+        // nudge path see the same marked text.
+        let parsed = applyingDetachedShellAwaitingMarkerIfNeeded(
+            to: rawParsed,
+            session: session
+        )
         for event in parsed {
             record(event, session: session)
             emit(.event(event), session: session)
@@ -760,6 +796,7 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
         session.pendingRequestIds.removeAll()
         session.pendingUserInputIds.removeAll()
         session.pendingBackgroundTaskIds.removeAll()
+        session.sawDetachedShellSpawn = false
         lock.unlock()
     }
 
@@ -837,6 +874,65 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
         }
     }
 
+    /// Observes raw `assistant` lines for foreground Bash tool_use commands that
+    /// shell-detach work the CLI will not track (`task_started` / lifecycle).
+    /// Skips `run_in_background: true` — that path is owned by CLAUDE-BG-LIFECYCLE.
+    private func trackDetachedShellSpawn(in obj: [String: Any], session: Session) {
+        guard (obj["type"] as? String) == "assistant",
+              let message = obj["message"] as? [String: Any],
+              let content = message["content"] as? [[String: Any]] else { return }
+        for block in content {
+            guard (block["type"] as? String) == "tool_use",
+                  (block["name"] as? String) == "Bash",
+                  let input = block["input"] as? [String: Any],
+                  let command = input["command"] as? String else { continue }
+            // CLI-owned background Bash is already covered by pendingBackgroundTaskIds.
+            if let flag = input["run_in_background"] as? Bool, flag { continue }
+            if let flag = input["run_in_background"] as? NSNumber, flag.boolValue { continue }
+            if Self.bashCommandDetachesShellWork(command) {
+                lock.lock()
+                session.sawDetachedShellSpawn = true
+                lock.unlock()
+                return
+            }
+        }
+    }
+
+    /// When a completed turn ends with shell-detached (CLI-unowned) work and no
+    /// CLI-tracked pending tasks, prefix `[[RC_AWAITING]]` on the final message.
+    /// Does not defer the finish — only CLI-tracked work may withhold the terminal.
+    private func applyingDetachedShellAwaitingMarkerIfNeeded(
+        to events: [AssistantEvent],
+        session: Session
+    ) -> [AssistantEvent] {
+        lock.lock()
+        // Mirror concludeTurn's completed gate: never stamp cancelled/failed.
+        let wouldComplete = !session.cancellationRequested && !session.sawError
+        let shouldMark = wouldComplete
+            && session.sawDetachedShellSpawn
+            && session.pendingBackgroundTaskIds.isEmpty
+        lock.unlock()
+        guard shouldMark else { return events }
+        return events.map { event in
+            guard case .turnCompleted(let turnId, let finalMessage) = event else { return event }
+            return .turnCompleted(
+                turnId: turnId,
+                finalMessage: Self.prefixAwaitingMarkerIfNeeded(finalMessage)
+            )
+        }
+    }
+
+    /// Thin forwarder to the shared CoreModel implementation (one classifier for
+    /// Claude / Codex / Grok). Kept so existing call sites and tests stay stable.
+    private static func prefixAwaitingMarkerIfNeeded(_ finalMessage: String?) -> String? {
+        BackgroundAwaitContinuation.prefixingAwaitingMarker(finalMessage)
+    }
+
+    /// Thin forwarder to `BackgroundAwaitContinuation.commandDetachesShellWork`.
+    static func bashCommandDetachesShellWork(_ command: String) -> Bool {
+        BackgroundAwaitContinuation.commandDetachesShellWork(command)
+    }
+
     private func handleStderr(_ data: Data, session: Session) {
         let raw = String(data: data, encoding: .utf8) ?? ""
         guard let visible = ClaudeRunner.displayableStderr(raw) else { return }
@@ -896,9 +992,12 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
     }
 
     private func handleFinalizedEvent(_ event: AssistantEvent, session: Session) {
-        record(event, session: session)
-        emit(.event(event), session: session)
-        guard case .turnCompleted(let turnId, let finalMessage) = event else { return }
+        // Same marker rewrite as handleLine so a turnCompleted that only surfaces
+        // on finalize still carries [[RC_AWAITING]] for both record and concludeTurn.
+        let rewritten = applyingDetachedShellAwaitingMarkerIfNeeded(to: [event], session: session)[0]
+        record(rewritten, session: session)
+        emit(.event(rewritten), session: session)
+        guard case .turnCompleted(let turnId, let finalMessage) = rewritten else { return }
 
         lock.lock()
         if !session.completedTurnIds.contains(turnId) {
@@ -911,6 +1010,8 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
 
         // Reached only while finalizing a dead/closing stream: the CLI can no
         // longer resume, so this turn is terminal and must not be deferred.
+        // Marker may still apply for a genuine `.completed` path; never for
+        // cancelled/failed (gated inside applyingDetachedShellAwaitingMarkerIfNeeded).
         concludeTurn(finalMessage: finalMessage, session: session, allowDeferral: false)
     }
 
@@ -1149,7 +1250,12 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
             "turnCount": session.completedTurnIds.count,
             "pendingApprovalRequestIds": Array(session.pendingRequestIds).sorted(),
             "pendingUserInputRequestIds": Array(session.pendingUserInputIds).sorted(),
-            "inFlightToolIds": Array(session.inFlightToolIds).sorted()
+            "inFlightToolIds": Array(session.inFlightToolIds).sorted(),
+            // CLAUDE-BG-LIFECYCLE: the CLI-owned background shells / async
+            // subagents still running. This is the ONLY path by which the pending
+            // set leaves the adapter, so it is what lets the UI show a live
+            // "N shells" chip (mirroring the CLI's own `1 shell` indicator).
+            "pendingBackgroundTaskIds": Array(session.pendingBackgroundTaskIds).sorted()
         ]
         if let providerThreadId = session.providerThreadId {
             payload["providerThreadId"] = providerThreadId
@@ -1175,6 +1281,7 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
             pendingRequestIds: session.pendingRequestIds,
             pendingUserInputIds: session.pendingUserInputIds,
             inFlightToolIds: session.inFlightToolIds,
+            pendingBackgroundTaskIds: session.pendingBackgroundTaskIds,
             providerThreadId: session.providerThreadId,
             activeTurnId: session.activeTurnId,
             lastCompletedTurnId: session.completedTurnIds.last,
@@ -1194,6 +1301,9 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
         pendingRequestIds: Set<String>,
         pendingUserInputIds: Set<String>,
         inFlightToolIds: Set<String>,
+        // Defaulted so existing call sites (and the perf-helper tests) are
+        // unaffected; the adapter always passes the live set.
+        pendingBackgroundTaskIds: Set<String> = [],
         providerThreadId: String?,
         activeTurnId: String?,
         lastCompletedTurnId: String?,
@@ -1205,6 +1315,10 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
             pendingRequestIds.sorted().joined(separator: ","),
             pendingUserInputIds.sorted().joined(separator: ","),
             inFlightToolIds.sorted().joined(separator: ","),
+            // Load-bearing: without the pending set in the signature, a snapshot
+            // whose ONLY change is background work is coalesced away — which is
+            // why `background_work_pending` never once reached the DB.
+            pendingBackgroundTaskIds.sorted().joined(separator: ","),
             providerThreadId ?? "",
             activeTurnId ?? "",
             lastCompletedTurnId ?? "",

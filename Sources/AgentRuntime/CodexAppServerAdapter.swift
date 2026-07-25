@@ -99,6 +99,23 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         /// missing item/completed or turn/completed notifications cannot leave
         /// the coordinator owning a turn the server already considers finished.
         var turnReconcileGeneration: Int
+        /// Shell-detached work the app-server does NOT track as an active thread:
+        /// a command_execution item whose command backgrounds children with
+        /// `&` / `nohup` / `setsid` / `disown`. When set and the turn would complete
+        /// without PendingFinish deferral, we prefix `[[RC_AWAITING]]` so the host's
+        /// existing marker path surfaces awaiting + auto-nudge — but we do NOT
+        /// defer the terminal (Codex never auto-resumes shell-detached children;
+        /// withholding would hang until thread status flips or the watchdog).
+        ///
+        /// Accepted false-positive: a turn that backgrounds a long-lived process
+        /// as the deliverable (e.g. starts a dev server) is marked awaiting once;
+        /// one bounded auto-nudge then clears the streak. Preferred over silently
+        /// reporting orchestration threads as finished.
+        ///
+        /// Accepted limitation: if PendingFinish deferral IS armed (thread status
+        /// still active) we do not stamp; if that deferral later releases while
+        /// detached work is still around, recovery falls to the phrase backstop.
+        var sawDetachedShellSpawn: Bool
     }
 
     private struct PendingFinish {
@@ -1056,6 +1073,7 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
                 )))
             }
             if Self.assistantItemType(for: rawType) == .commandExecution {
+                trackDetachedShellSpawn(in: item, threadId: threadId)
                 scheduleTurnReconciliation(threadId: threadId, turnId: turnId)
             }
         case "item/autoApprovalReview/started", "item.autoApprovalReview.started", "item/autoApprovalReview/completed", "item.autoApprovalReview.completed":
@@ -1080,6 +1098,10 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
             let rawType = string(item, "type") ?? string(payload, "type") ?? "unknown"
             if Self.isUserMessageItem(item, type: rawType) { break }
             let itemType = Self.assistantItemType(for: rawType)
+            if itemType == .commandExecution {
+                // Command text may only arrive on completed (started can omit it).
+                trackDetachedShellSpawn(in: item, threadId: threadId)
+            }
             let summary = Self.summary(for: item, type: rawType)
             if rawType == "plan",
                let body = Self.body(for: item, type: rawType),
@@ -1399,11 +1421,22 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
             )))
         case "turn/completed", "turn.completed":
             let turnId = string(payload, "turnId") ?? (payload["turn"] as? [String: Any]).flatMap({ string($0, "id") }) ?? activeTurnId(threadId: threadId) ?? ""
-            let final = Self.turnCompletedFinalMessage(from: payload) ?? finalMessage(threadId: threadId)
+            var final = Self.turnCompletedFinalMessage(from: payload) ?? finalMessage(threadId: threadId)
             if let markdown = Self.proposedPlanMarkdown(in: final) ?? planModeFinalMarkdown(threadId: threadId, final: final) {
                 let planId = "plan-\(turnId)"
                 if markProposedPlanEmitted(threadId: threadId, planId: planId) {
                     events.append(.proposedPlan(AssistantProposedPlan(id: planId, turnId: turnId.isEmpty ? nil : turnId, markdown: markdown)))
+                }
+            }
+            // Stamp [[RC_AWAITING]] when shell-detached work was observed and the
+            // turn will finish immediately (no PendingFinish deferral). Do NOT stamp
+            // when deferring: thread-status deferral is the stronger signal. Do NOT
+            // add deferral for detached work — Codex never auto-resumes a detached
+            // process; withholding the terminal would hang until idle/watchdog.
+            let deferring = shouldDeferFinishUntilIdle(threadId: threadId)
+            if !deferring, sawDetachedShellSpawn(threadId: threadId) {
+                if let marked = BackgroundAwaitContinuation.prefixingAwaitingMarker(final.isEmpty ? nil : final) {
+                    final = marked
                 }
             }
             events.append(.turnCompleted(turnId: turnId, finalMessage: final.isEmpty ? nil : final))
@@ -1413,7 +1446,7 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
                 providerThreadId: providerThreadId(threadId: threadId),
                 turnId: turnId
             )
-            if shouldDeferFinishUntilIdle(threadId: threadId) {
+            if deferring {
                 recordPendingFinish(threadId: threadId, pending: pending)
             } else {
                 finished = .finished(pending.status, finalMessage: pending.finalMessage, providerThreadId: pending.providerThreadId)
@@ -1591,7 +1624,8 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
             startedItemIds: [],
             streamedItemIds: [],
             permissionMode: permissionMode,
-            turnReconcileGeneration: 0
+            turnReconcileGeneration: 0,
+            sawDetachedShellSpawn: false
         )
         lock.unlock()
     }
@@ -1618,6 +1652,8 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         lock.lock()
         if sessions[threadId]?.completedTurnIds.contains(turnId) == false {
             sessions[threadId]?.activeTurnId = turnId
+            // New turn must not inherit a prior turn's shell-detach signal.
+            sessions[threadId]?.sawDetachedShellSpawn = false
         }
         lock.unlock()
     }
@@ -1642,6 +1678,24 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         lock.lock()
         sessions[threadId]?.pendingFinish = pending
         lock.unlock()
+    }
+
+    /// Observes command_execution items for shell-detached work. Uses the same
+    /// command key fallbacks already used for approval/detail (`command`,
+    /// `commandLine`, `cmd`).
+    private func trackDetachedShellSpawn(in item: [String: Any], threadId: AgentThreadID) {
+        let command = Self.string(item, "command")
+            ?? Self.string(item, "commandLine")
+            ?? Self.string(item, "cmd")
+        guard let command, BackgroundAwaitContinuation.commandDetachesShellWork(command) else { return }
+        lock.lock()
+        sessions[threadId]?.sawDetachedShellSpawn = true
+        lock.unlock()
+    }
+
+    private func sawDetachedShellSpawn(threadId: AgentThreadID) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        return sessions[threadId]?.sawDetachedShellSpawn == true
     }
 
     private func activeTurnId(threadId: AgentThreadID) -> String? {
@@ -1813,6 +1867,7 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         sessions[threadId]?.startedItemIds.removeAll(keepingCapacity: false)
         sessions[threadId]?.streamedItemIds.removeAll(keepingCapacity: false)
         sessions[threadId]?.proposedPlanBuffers.removeAll(keepingCapacity: false)
+        sessions[threadId]?.sawDetachedShellSpawn = false
         lock.unlock()
     }
 

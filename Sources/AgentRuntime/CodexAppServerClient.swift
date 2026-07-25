@@ -800,13 +800,21 @@ public final class CodexAppServerClient: @unchecked Sendable {
     }
 
     /// Codex per-turn `developer_instructions`: base mode + Distill (Token Saver) +
-    /// Graphify query-first rules when the host set `RC_GRAPHIFY_ENABLED=1`.
+    /// Graphify query-first rules when the host set `RC_GRAPHIFY_ENABLED=1` +
+    /// background-await self-declare marker (so shell-detached orchestration
+    /// stalls reach the host's [[RC_AWAITING]] recovery path).
     private static func developerInstructions(
         for mode: AgentInteractionMode,
         environment: [String: String]
     ) -> String {
         let base = AgentProviderInstructionText.developerInstructions(for: mode)
         // tokenSaverProviderPrompt also chains graphifyProviderPrompt.
-        return AgentSkillInstaller.tokenSaverProviderPrompt(base, environment: environment)
+        let withTokenSaver = AgentSkillInstaller.tokenSaverProviderPrompt(base, environment: environment)
+        // Additive only: systemPromptDirective (NOT alwaysOnClaudeDirectives —
+        // those carry Claude-CLI-only MCP rules).
+        if withTokenSaver.isEmpty {
+            return BackgroundAwaitContinuation.systemPromptDirective
+        }
+        return withTokenSaver + "\n\n" + BackgroundAwaitContinuation.systemPromptDirective
     }
 }

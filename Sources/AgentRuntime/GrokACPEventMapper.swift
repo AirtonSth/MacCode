@@ -17,6 +17,14 @@ public final class GrokACPEventMapper: @unchecked Sendable {
     private var currentAssistantPhase = ""
     private var finished = false
     private var seenEventIds = Set<String>()
+    /// Shell-detached work Grok does NOT track: a tool_call whose rawInput
+    /// command backgrounds children with `&` / `nohup` / `setsid` / `disown`.
+    /// When set at a completed turn end, we prefix `[[RC_AWAITING]]` onto
+    /// `finalAssistantMessage` (single source for both `.turnCompleted` and
+    /// adapter `.finished`) so the host's existing marker path surfaces awaiting
+    /// + auto-nudge. Grok has no provider deferral; this stamp is the only
+    /// protection. Reset per turn.
+    private var sawDetachedShellSpawn = false
     private let lock = NSLock()
 
     public init(sessionId: String) { self.sessionId = sessionId }
@@ -43,6 +51,7 @@ public final class GrokACPEventMapper: @unchecked Sendable {
             finished = false
             currentAssistantPhase = ""
             finalAssistantMessage = nil
+            sawDetachedShellSpawn = false
             events.append(.turnStarted(turnId: id))
         }
         return events
@@ -90,6 +99,7 @@ public final class GrokACPEventMapper: @unchecked Sendable {
             currentAssistantPhase = ""
             let id = update["toolCallId"] as? String ?? UUID().uuidString
             let title = update["title"] as? String ?? "Grok tool"
+            trackDetachedShellSpawn(in: update["rawInput"])
             events.append(.itemStarted(item: AssistantItem(
                 id: id,
                 turnId: turnId ?? "",
@@ -104,6 +114,8 @@ public final class GrokACPEventMapper: @unchecked Sendable {
             let id = update["toolCallId"] as? String ?? UUID().uuidString
             let output = Self.toolOutput(update)
             let title = update["title"] as? String
+            // rawInput may only appear on update for some tools; accept it too.
+            trackDetachedShellSpawn(in: update["rawInput"])
             if output != nil || title != nil {
                 events.append(.itemDelta(itemId: id, bodyAppend: nil, outputAppend: output, summary: title))
             }
@@ -191,11 +203,31 @@ public final class GrokACPEventMapper: @unchecked Sendable {
         closeOpenItems(&events)
         guard let turnId else { return events }
         finished = true
-        finalAssistantMessage = currentAssistantPhase.isEmpty ? nil : currentAssistantPhase
+        var final = currentAssistantPhase.isEmpty ? nil : currentAssistantPhase
+        // Stamp only for a COMPLETED turn (end_turn). Never for failed/cancelled.
+        // Single stamp on finalAssistantMessage so both .turnCompleted here and
+        // adapter .finished (which reads the same property) see the marker once.
+        if stopReason == "end_turn", sawDetachedShellSpawn {
+            final = BackgroundAwaitContinuation.prefixingAwaitingMarker(final)
+        }
+        finalAssistantMessage = final
         events.append(.turnCompleted(turnId: turnId, finalMessage: finalAssistantMessage))
         self.turnId = nil
         currentAssistantPhase = ""
+        sawDetachedShellSpawn = false
         return events
+    }
+
+    /// Inspect tool rawInput for a shell command string that detaches work.
+    /// Accepts `command` / `cmd` / `script` string keys only.
+    private func trackDetachedShellSpawn(in rawInput: Any?) {
+        guard let dict = rawInput as? [String: Any] else { return }
+        for key in ["command", "cmd", "script"] {
+            guard let command = dict[key] as? String,
+                  BackgroundAwaitContinuation.commandDetachesShellWork(command) else { continue }
+            sawDetachedShellSpawn = true
+            return
+        }
     }
 
     private func ensureThread(_ events: inout [AssistantEvent]) {
@@ -210,6 +242,7 @@ public final class GrokACPEventMapper: @unchecked Sendable {
         turnId = id
         finished = false
         currentAssistantPhase = ""
+        sawDetachedShellSpawn = false
         events.append(.turnStarted(turnId: id))
     }
 

@@ -47,7 +47,7 @@ public enum BackgroundAwaitContinuation {
     /// user" so the host never auto-nudges those (auto-nudging a user-wait in
     /// full-access mode could make the agent act without the approval it awaits).
     public static let systemPromptDirective = """
-    Background-await protocol: if you end your turn while still waiting on background or asynchronous work to finish — a deploy, build, CI job, poller, recording, download, or anything that completes later and is expected to resume you — you MUST begin that final message with the exact marker \(awaitingMarker) on its own first line. Emit the marker ONLY when you are genuinely blocked waiting on such external work; never when the task is actually finished, never when you are waiting on the user, and never for multi-phase skill handoffs (e.g. "Proceeding to Phase N", "Next: Phase N", "PHASE N RESULT"). Prefer to keep working across phases in one turn, or to poll external work to completion within this turn, rather than stopping — use the marker only when stopping on external async work is truly unavoidable.
+    Background-await protocol: if you end your turn while still waiting on background or asynchronous work to finish — a deploy, build, CI job, poller, recording, download, a background shell process you started with &/nohup, other agent/CLI workers or subprocesses you spawned whose results you intend to collect or poll later, or anything that completes later and is expected to resume you — you MUST begin that final message with the exact marker \(awaitingMarker) on its own first line. The marker is required whenever you END YOUR TURN while such work you launched is still running, EVEN IF you intend to keep polling or believe you are still working — ending the turn is what stops you. Emit the marker ONLY when you are genuinely blocked waiting on such external work; never when the task is actually finished, never when you are waiting on the user, and never for multi-phase skill handoffs (e.g. "Proceeding to Phase N", "Next: Phase N", "PHASE N RESULT"). Prefer to keep working across phases in one turn, or to poll external work to completion within this turn, rather than stopping — use the marker only when stopping on external async work is truly unavoidable.
     """
 
     /// System-prompt rule injected for the Claude provider on every run so the agent
@@ -107,7 +107,9 @@ public enum BackgroundAwaitContinuation {
     /// just the present-continuous / "standing by" forms seen in the first incident.
     private static let awaitingPhrases = [
         "standing by", "stand by for", "awaiting", "await the", "waiting for", "waiting on",
-        "i'll wait", "i will wait", "i'm waiting", "i am waiting"
+        "i'll wait", "i will wait", "i'm waiting", "i am waiting",
+        // pt-BR narration (matched against lowercased text; accents preserved)
+        "aguardando", "aguardo", "vou aguardar", "esperando", "vou esperar", "no aguardo"
     ]
 
     /// Nouns that mark the thing being waited on as a *background job* (not a user
@@ -175,5 +177,93 @@ public enum BackgroundAwaitContinuation {
         guard status == .completed, isAutonomous else { return false }
         guard priorAutoContinuations < maxAutoContinuations else { return false }
         return isAwaitingBackgroundWork(finalMessage)
+    }
+
+    // MARK: - Shell-detach classifier (shared by Claude / Codex / Grok adapters)
+
+    /// Idempotent prefix of `awaitingMarker` + newline onto a turn's final message.
+    ///
+    /// No-op when the marker is already present (case-insensitive). Returns the bare
+    /// marker when the message is empty or nil so a host-stamped stall still reaches
+    /// the four UI surfaces that key on final-message text.
+    public static func prefixingAwaitingMarker(_ finalMessage: String?) -> String? {
+        let body = finalMessage ?? ""
+        if body.range(of: awaitingMarker, options: .caseInsensitive) != nil {
+            return finalMessage
+        }
+        if body.isEmpty { return awaitingMarker }
+        return awaitingMarker + "\n" + body
+    }
+
+    /// Pure classifier: true when a shell `command` detaches work from the turn.
+    ///
+    /// Detaching: a line-ending background `&` (not `&&` / `||` / `&>` / `>&` /
+    /// bare `2>&1`), or a word-boundary `nohup` / `setsid` / `disown`. Not detaching
+    /// when the command also invokes the `wait` builtin (shell blocked on children).
+    /// Allocation-cheap for per-stream-line use: regexes are static, no per-call compile.
+    public static func commandDetachesShellWork(_ command: String) -> Bool {
+        let range = NSRange(command.startIndex..<command.endIndex, in: command)
+        // Precision: `wait` means the shell blocked until children finished.
+        if waitBuiltinRegex.firstMatch(in: command, options: [], range: range) != nil {
+            return false
+        }
+        if detachWordRegex.firstMatch(in: command, options: [], range: range) != nil {
+            return true
+        }
+        for line in command.split(separator: "\n", omittingEmptySubsequences: false) {
+            if lineHasTrailingBackgroundAmpersand(String(line)) { return true }
+        }
+        return false
+    }
+
+    private static let waitBuiltinRegex: NSRegularExpression = {
+        // Word-boundary so `waiting` / `await` do not match.
+        try! NSRegularExpression(pattern: #"\bwait\b"#)
+    }()
+
+    private static let detachWordRegex: NSRegularExpression = {
+        try! NSRegularExpression(pattern: #"\b(?:nohup|setsid|disown)\b"#)
+    }()
+
+    /// True when `line` backgrounds a command: last non-whitespace (post-comment)
+    /// character is a bare `&` that is not part of `&&`, `||`, `&>`, or `>&`.
+    private static func lineHasTrailingBackgroundAmpersand(_ line: String) -> Bool {
+        let stripped = stripTrailingShellCommentAndWhitespace(line)
+        guard !stripped.isEmpty, stripped.last == "&" else { return false }
+        if stripped.count >= 2 {
+            let prev = stripped[stripped.index(stripped.endIndex, offsetBy: -2)]
+            // `&&`, `||`, `&>` / `>&` are redirections or boolean ops, not background.
+            if prev == "&" || prev == "|" || prev == ">" { return false }
+        }
+        return true
+    }
+
+    /// Strips a trailing `# ...` comment when `#` is outside single/double quotes,
+    /// then trims whitespace. Cheap quote tracking only (no escapes beyond `\'`/`\"`).
+    private static func stripTrailingShellCommentAndWhitespace(_ line: String) -> String {
+        var inSingle = false
+        var inDouble = false
+        var commentStart: String.Index?
+        var i = line.startIndex
+        while i < line.endIndex {
+            let ch = line[i]
+            if ch == "\\" && (inSingle || inDouble) {
+                // Skip escaped character inside quotes.
+                i = line.index(after: i)
+                if i < line.endIndex { i = line.index(after: i) }
+                continue
+            }
+            if ch == "'" && !inDouble {
+                inSingle.toggle()
+            } else if ch == "\"" && !inSingle {
+                inDouble.toggle()
+            } else if ch == "#" && !inSingle && !inDouble {
+                commentStart = i
+                break
+            }
+            i = line.index(after: i)
+        }
+        let withoutComment = commentStart.map { String(line[..<$0]) } ?? line
+        return withoutComment.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }

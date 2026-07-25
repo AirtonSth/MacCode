@@ -541,6 +541,54 @@ final class CodexAppServerClientTests: ProviderProcessTestCase {
         )
     }
 
+    func test_developerInstructions_includeBackgroundAwaitDirectiveNotClaudeMCP() async throws {
+        // WHY: Codex never received systemPromptDirective, so the deterministic
+        // [[RC_AWAITING]] self-declare path was dead even when the model would
+        // comply. Injection must be additive and must NOT pull Claude-only MCP rules.
+        let script = try makeFakeAppServerPeer()
+        let client = try CodexAppServerClient(
+            binary: script,
+            arguments: [],
+            cwd: FileManager.default.temporaryDirectory.path
+        )
+        defer { client.stop() }
+        _ = try await client.initialize()
+
+        let response = try await client.startTurn(
+            providerThreadId: "thread-app-server-1",
+            for: AgentRunRequest(
+                threadId: AgentThreadID(),
+                provider: .codex,
+                model: "gpt-5.5",
+                cwd: "/tmp/remotecode-app-server-test",
+                prompt: "explore"
+            )
+        )
+        let instructions = try XCTUnwrap(
+            try collaborationSettings(from: response)["developer_instructions"] as? String
+        )
+        XCTAssertTrue(
+            instructions.contains(BackgroundAwaitContinuation.awaitingMarker),
+            "Codex developer_instructions must include the exact [[RC_AWAITING]] token"
+        )
+        XCTAssertTrue(
+            instructions.contains("Background-await protocol"),
+            "Codex must receive systemPromptDirective"
+        )
+        XCTAssertFalse(
+            instructions.contains(BackgroundAwaitContinuation.mcpToolAvailabilityDirective),
+            "must not inject Claude-only mcpToolAvailabilityDirective"
+        )
+        XCTAssertFalse(
+            instructions.contains(BackgroundAwaitContinuation.mcpConnectWaitDirective),
+            "must not inject Claude-only mcpConnectWaitDirective"
+        )
+        XCTAssertFalse(
+            instructions.contains("RefreshMcpTools"),
+            "Claude-only MCP connect-wait wording must not appear on Codex"
+        )
+    }
+
     func test_nonJSONStdoutNoiseLineDoesNotFailPendingRPCs() async throws {
         // WHY: the codex binary can print plain-text banners/update notices to
         // stdout between JSON-RPC frames. One such line must not fail every

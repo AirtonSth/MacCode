@@ -140,6 +140,128 @@ final class BackgroundAwaitContinuationTests: XCTestCase {
         // for the exact token the detector keys on, or recovery silently breaks.
         XCTAssertTrue(BackgroundAwaitContinuation.systemPromptDirective.contains(BackgroundAwaitContinuation.awaitingMarker),
                       "the injected directive must reference the exact marker the detector matches")
+        XCTAssertTrue(
+            BackgroundAwaitContinuation.systemPromptDirective.contains("&/nohup")
+                || BackgroundAwaitContinuation.systemPromptDirective.contains("nohup"),
+            "directive must enumerate shell-detached background processes"
+        )
+        XCTAssertTrue(
+            BackgroundAwaitContinuation.systemPromptDirective.lowercased().contains("ending the turn"),
+            "directive must state that ending the turn stops the agent even if it intends to keep polling"
+        )
+    }
+
+    func test_commandDetachesShellWork_classifier() {
+        // Shared pure classifier used by Claude / Codex / Grok adapters when a
+        // foreground shell tool backgrounds children the provider will not track.
+        XCTAssertTrue(BackgroundAwaitContinuation.commandDetachesShellWork("cmd &"),
+                      "trailing & backgrounds")
+        XCTAssertTrue(BackgroundAwaitContinuation.commandDetachesShellWork("cmd &\nPID=$!"),
+                      "background + capture PID")
+        XCTAssertTrue(BackgroundAwaitContinuation.commandDetachesShellWork("nohup cmd &"),
+                      "nohup detaches")
+        XCTAssertTrue(BackgroundAwaitContinuation.commandDetachesShellWork("cmd 2>&1 &"),
+                      "redirect then background &")
+        XCTAssertFalse(BackgroundAwaitContinuation.commandDetachesShellWork("a && b"),
+                       "&& is not background")
+        XCTAssertFalse(BackgroundAwaitContinuation.commandDetachesShellWork("cmd > f 2>&1"),
+                       "2>&1 alone is not background")
+        XCTAssertFalse(BackgroundAwaitContinuation.commandDetachesShellWork("cmd & wait"),
+                       "wait means the shell blocked on children")
+        XCTAssertFalse(BackgroundAwaitContinuation.commandDetachesShellWork("ls -la"),
+                       "plain foreground command")
+    }
+
+    func test_prefixingAwaitingMarker_isIdempotentAndHandlesEmpty() {
+        let marker = BackgroundAwaitContinuation.awaitingMarker
+        XCTAssertEqual(BackgroundAwaitContinuation.prefixingAwaitingMarker(nil), marker)
+        XCTAssertEqual(BackgroundAwaitContinuation.prefixingAwaitingMarker(""), marker)
+        XCTAssertEqual(BackgroundAwaitContinuation.prefixingAwaitingMarker("done"), "\(marker)\ndone")
+        // Already stamped → no double prefix (case-insensitive).
+        let already = "\(marker)\nalready"
+        XCTAssertEqual(BackgroundAwaitContinuation.prefixingAwaitingMarker(already), already)
+        let lower = "\(marker.lowercased())\nalready"
+        XCTAssertEqual(BackgroundAwaitContinuation.prefixingAwaitingMarker(lower), lower)
+    }
+
+    // MARK: - Detector: shell-detached orchestration stalls (en + pt-BR fixtures)
+
+    /// FIXTURE A — run 2D47AD8B-600F-4604-BFA4-A91F8445BB31 (verbatim tail).
+    /// Plain text has no awaiting phrase in any language; the machine marker from
+    /// the adapter (shell-detach stamp) is the intended recovery path.
+    private let fixtureAShellDetachedWorkersEnglish = """
+    Wrapping for token efficiency. Summary of action taken:
+
+    **LAUNCHED 2 Additional Workers:**
+    - **C-02** (non-blocking socket writes) — highest-risk Wave 2 P0, critical for write failures
+    - **C-03** (snapshot budget separation) — high-complexity Wave 2 P0, essential for 3G snapshots
+
+    **TOTAL ACTIVE WORKERS:** 7 (5 from before + C-02/C-03 launching now)
+
+    **REMAINING TOKEN BUDGET:** ~50–55k (27–28% left)
+
+    Given token constraints, further parallel scaling will exhaust budget before completion. Current strategy maximizes the 4 core P0s:
+    - ✓ C-04/C-05/C-06 (in-progress from earlier)
+    - ✓ C-02/C-03 (launching now)
+
+    When tokens near zero, I'll provide final consolidated report with all completed items.
+
+    **Status check:** Will auto-report when C-02/C-03 complete.
+    """
+
+    /// FIXTURE B — run 57FF789A-D6A8-46D5-B266-99BEC004A8E4 (verbatim first/last).
+    private let fixtureBPortuguesePollingStall = """
+    5 workers still inicializando (expected, complex tasks). Aguardando com polling contínuo...
+
+    **Token budget:** ~45-50k restantes
+
+    🔄 **Mantendo polling ativo. Não para até terminar.**
+    """
+
+    func test_fixtureB_portuguesePolling_classifiesAsBackgroundAwait() {
+        // pt-BR "Aguardando" + background noun "polling" must trip the heuristic
+        // (English-only awaitingPhrases previously missed this user).
+        XCTAssertTrue(
+            BackgroundAwaitContinuation.isAwaitingBackgroundWork(fixtureBPortuguesePollingStall),
+            "FIXTURE B must be detected via Portuguese awaiting phrases + poll noun"
+        )
+        XCTAssertEqual(
+            IncompleteTurnContinuation.classify(fixtureBPortuguesePollingStall),
+            .backgroundAwait
+        )
+    }
+
+    func test_fixtureA_marked_classifiesAsBackgroundAwait_plainTextDoesNot() {
+        // Plain FIXTURE A is deliberately NOT expected to trip the text-only
+        // heuristic (no awaiting phrase); CHANGE 1 stamps the marker at the adapter.
+        XCTAssertFalse(
+            BackgroundAwaitContinuation.isAwaitingBackgroundWork(fixtureAShellDetachedWorkersEnglish),
+            "plain FIXTURE A must remain outside the text-only heuristic"
+        )
+        XCTAssertNil(IncompleteTurnContinuation.classify(fixtureAShellDetachedWorkersEnglish))
+
+        let marked = "\(BackgroundAwaitContinuation.awaitingMarker)\n\(fixtureAShellDetachedWorkersEnglish)"
+        XCTAssertTrue(BackgroundAwaitContinuation.isAwaitingBackgroundWork(marked))
+        XCTAssertEqual(IncompleteTurnContinuation.classify(marked), .backgroundAwait)
+    }
+
+    func test_portugueseUserWait_withoutBackgroundNoun_doesNotTrip() {
+        // Keep the false-positive guard: Portuguese user-waits must not auto-nudge
+        // full-access runs (no background noun present).
+        let userWaits = [
+            "Aguardando sua aprovação para continuar.",
+            "Aguardando você revisar o plano antes de eu seguir."
+        ]
+        for message in userWaits {
+            XCTAssertFalse(
+                BackgroundAwaitContinuation.isAwaitingBackgroundWork(message),
+                "must NOT treat a Portuguese user-wait as background-await: \(message)"
+            )
+            XCTAssertNil(
+                IncompleteTurnContinuation.classify(message),
+                "must not classify Portuguese user-wait as incomplete: \(message)"
+            )
+        }
     }
 
     // MARK: - Decision: bounded, autonomous-only, completed-only.

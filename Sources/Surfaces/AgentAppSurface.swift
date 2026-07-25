@@ -200,6 +200,14 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     @Published public private(set) var customModelsByProvider: [AgentProvider: [String]] = [:]
     @Published public var status: AgentRunStatus = .pending
     @Published public var statusMessage: String = ""
+    /// CLAUDE-BG-LIFECYCLE: how many CLI-owned background shells / async
+    /// subagents the provider last reported as still running, from the
+    /// `claude.session.snapshot` runtime event. Mirrors the Claude CLI's own
+    /// `1 shell` status-line indicator, which the app previously had no
+    /// equivalent of — the pending set never left the adapter. Reset on thread
+    /// switch; read through `backgroundShellCount`, which also gates on a live
+    /// run so a finished run cannot leave a stale count on screen.
+    @Published public private(set) var liveBackgroundShellCount: Int = 0
     @Published public var currentRunId: AgentRunID?
     @Published public var hasUnreadActivity: Bool = false
     @Published public var showPlanSidebar: Bool = false
@@ -778,6 +786,10 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             // from the opened thread's replayed timeline.
             sr1TranslatedMessageIds = []
             sr1OriginalTextsByMessageId = [:]
+            // Per-thread provider state: the opened thread republishes its own
+            // count on its next snapshot, so carrying the previous thread's
+            // shell count over would advertise work that isn't this thread's.
+            liveBackgroundShellCount = 0
             // Plan-suppression is per open thread session: do not carry a queued
             // follow-up suppress flag onto a different thread's durable plan.
             suppressStaleActivePlanUpdates = false
@@ -1674,6 +1686,27 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     public var isAwaitingBackgroundWork: Bool {
         status == .completed
             && IncompleteTurnContinuation.isIncompleteTurn(latestFinalAssistantMessage)
+    }
+
+    /// CLAUDE-BG-LIFECYCLE: background shells/subagents to advertise right now.
+    ///
+    /// Gated on a live run on purpose. The adapter clears its pending set inside
+    /// `emitTerminal` WITHOUT emitting a further snapshot, so the last count the
+    /// UI ever receives for a run can be non-zero; without this gate a finished
+    /// thread would keep claiming shells are running. While a run is live the
+    /// snapshots are authoritative (an empty `tasks` list replaces the set).
+    /// Complements `isAwaitingBackgroundWork`, which covers the *after* case —
+    /// this covers *during*.
+    public var backgroundShellCount: Int {
+        Self.visibleBackgroundShellCount(
+            reported: liveBackgroundShellCount,
+            runIsLive: selectedThreadRunIsStartingOrRunning
+        )
+    }
+
+    /// Pure seam for the staleness gate above.
+    nonisolated static func visibleBackgroundShellCount(reported: Int, runIsLive: Bool) -> Int {
+        runIsLive ? reported : 0
     }
 
     /// Reason for the incomplete-turn chrome, if any (drives Continue prompt).
@@ -4785,6 +4818,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         var nextStatus = status
         var nextLastErrorRecoverable = lastErrorRecoverable
         var appliedEvent = false
+        var nextBackgroundShellCount = liveBackgroundShellCount
         var appliedEvents: [AssistantEvent] = []
         appliedEvents.reserveCapacity(pending.count)
         for (event, run, threadId) in pending {
@@ -4811,6 +4845,13 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             }
             appliedEvent = true
             appliedEvents.append(event)
+            // CLAUDE-BG-LIFECYCLE: the provider's pending background-work set
+            // rides the session snapshot; pick off the count for the "N shells"
+            // chip. Cheap: only claude.session.snapshot events are decoded, and
+            // the adapter already coalesces snapshots whose state did not change.
+            if let count = Self.backgroundShellCount(fromRuntimeEvent: event) {
+                nextBackgroundShellCount = count
+            }
             if !self.terminalRunIds.contains(run) {
                 nextCurrentRunId = run
                 self.runThreads[run] = threadId
@@ -4857,6 +4898,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         if self.lastErrorRecoverable != nextLastErrorRecoverable {
             self.lastErrorRecoverable = nextLastErrorRecoverable
         }
+        if self.liveBackgroundShellCount != nextBackgroundShellCount {
+            self.liveBackgroundShellCount = nextBackgroundShellCount
+        }
         self.timeline = nextTimeline
         self.refreshSR1TranslationStateFromTimeline()
         self.scheduleTimelineUpdateTick()
@@ -4871,6 +4915,21 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         if !quantum.hasMore, streamUIBackpressured, let tid = selectedThreadId {
             rehydrateTimelineAfterStreamBackpressure(threadId: tid)
         }
+    }
+
+    /// Count of CLI-owned background shells / async subagents carried by a
+    /// `claude.session.snapshot` runtime event, or nil when `event` is not such a
+    /// snapshot (or predates the field — e.g. the SDK-bridge route, which does not
+    /// report background tasks). Returning nil rather than 0 is deliberate: an
+    /// unrelated event must not clear a live count. Pure, for unit testing.
+    nonisolated static func backgroundShellCount(fromRuntimeEvent event: AssistantEvent) -> Int? {
+        guard case .providerRuntime(let runtime) = event,
+              runtime.provider == .claude,
+              runtime.method == "claude.session.snapshot",
+              let data = runtime.payloadJSON.data(using: .utf8),
+              let payload = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let ids = payload["pendingBackgroundTaskIds"] as? [String] else { return nil }
+        return ids.count
     }
 
     /// Apply one event that the hot queue refused, without growing the queue.
@@ -7873,6 +7932,14 @@ public struct AgentAppView: View {
                 .foregroundColor(DS.Palette.textTertiary)
                 .lineLimit(1).truncationMode(.middle)
             Spacer(minLength: 0)
+            // CLAUDE-BG-LIFECYCLE: mirrors the Claude CLI's own "1 shell"
+            // status-line indicator, so background shells / async subagents are
+            // visible WHILE they run — not only after the turn ends via the
+            // awaiting pill beside it.
+            if vm.backgroundShellCount > 0 {
+                DSPill(Self.backgroundShellLabel(vm.backgroundShellCount), tone: .accent)
+                    .help("Claude is running background work; the turn is held open until it finishes")
+            }
             DSPill(vm.isAwaitingBackgroundWork ? "awaiting" : vm.status.rawValue,
                    tone: vm.isAwaitingBackgroundWork ? .warning : statusTone(vm.status))
             DSIconButton("list.bullet.rectangle", help: "Toggle plan") {
@@ -8071,6 +8138,12 @@ public struct AgentAppView: View {
         if decision.didChangeAutomatically {
             lastAutomaticThreadRailChange = now
         }
+    }
+
+    /// "1 shell" / "2 shells" — matches the Claude CLI's own wording so the two
+    /// surfaces read the same. Pure, for unit testing the pluralization.
+    nonisolated static func backgroundShellLabel(_ count: Int) -> String {
+        count == 1 ? "1 shell" : "\(count) shells"
     }
 
     private func statusTone(_ s: AgentRunStatus) -> DSPill.Tone {

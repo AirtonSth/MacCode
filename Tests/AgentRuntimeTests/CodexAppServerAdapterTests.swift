@@ -2873,6 +2873,206 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
         XCTAssertTrue(events.contains { if case .tokenUsage(let usage) = $0 { return usage.totalTokens == 12 && usage.contextWindow == 100 } else { return false } })
         XCTAssertTrue(events.contains { if case .contextCompaction(let summary) = $0 { return summary == "Snapshot compacted" } else { return false } })
     }
+
+    /// Shell-detached foreground command_execution (e.g. `cmd > f 2>&1 &` + `PID=$!`)
+    /// with idle thread status must stamp [[RC_AWAITING]] onto both turnCompleted
+    /// and finished — host recovery keys on final-message text only.
+    func test_shellDetachedCommandExecution_stampsAwaitingMarkerOnCompletedTurn() async throws {
+        let client = MockCodexAppServerClient(autoComplete: false)
+        let adapter = CodexAppServerAdapter { _, notificationHandler, _ in
+            client.notificationHandler = notificationHandler
+            return client
+        }
+        let threadId = AgentThreadID()
+        let sink = EventSink()
+        _ = try await adapter.sendTurn(AgentRunRequest(
+            threadId: threadId,
+            provider: .codex,
+            model: "gpt-5.5",
+            cwd: "/tmp/remotecode-app-server-adapter",
+            prompt: "fan out workers"
+        )) { event in
+            Task { await sink.record(event) }
+        }
+
+        let detachCmd = "grok --prompt-file /tmp/w2-c02.txt --output-format json > /tmp/w2-c02-result.json 2>&1 &\nPID_C02=$!\necho started"
+        client.notificationHandler?("item/started", [
+            "threadId": "codex-thread-1",
+            "turnId": "turn-detach-1",
+            "item": [
+                "id": "cmd-detach-1",
+                "type": "commandExecution",
+                "command": detachCmd,
+                "status": "inProgress"
+            ]
+        ])
+        client.notificationHandler?("turn/completed", [
+            "threadId": "codex-thread-1",
+            "turnId": "turn-detach-1",
+            "finalMessage": "Workers launched; keeping polling active."
+        ])
+
+        let finish = try await waitForFinish(in: sink, timeout: 3)
+        let marker = BackgroundAwaitContinuation.awaitingMarker
+        XCTAssertEqual(finish.0, .completed)
+        XCTAssertTrue(finish.1?.contains(marker) == true,
+                      "finished.finalMessage must carry [[RC_AWAITING]]; got \(finish.1 ?? "nil")")
+        let events = await sink.snapshot()
+        let turnFinals = events.compactMap { event -> String? in
+            if case .turnCompleted(_, let msg) = event { return msg }
+            return nil
+        }
+        XCTAssertTrue(turnFinals.contains(where: { $0.contains(marker) }),
+                      "turnCompleted finalMessage must also carry the marker; got \(turnFinals)")
+        // Exactly once in the finished text.
+        let finished = try XCTUnwrap(finish.1)
+        XCTAssertEqual(finished.components(separatedBy: marker).count - 1, 1,
+                       "marker must appear exactly once in finished finalMessage")
+    }
+
+    /// Non-detaching commands and deferred / failed turns must never be stamped.
+    func test_nonDetachingDeferredAndFailedTurns_doNotStampAwaitingMarker() async throws {
+        let marker = BackgroundAwaitContinuation.awaitingMarker
+
+        // 1) Ordinary non-detaching command.
+        do {
+            let client = MockCodexAppServerClient(autoComplete: false)
+            let adapter = CodexAppServerAdapter { _, notificationHandler, _ in
+                client.notificationHandler = notificationHandler
+                return client
+            }
+            let threadId = AgentThreadID()
+            let sink = EventSink()
+            _ = try await adapter.sendTurn(AgentRunRequest(
+                threadId: threadId,
+                provider: .codex,
+                model: "gpt-5.5",
+                cwd: "/tmp/remotecode-app-server-adapter",
+                prompt: "build"
+            )) { event in
+                Task { await sink.record(event) }
+            }
+            client.notificationHandler?("item/started", [
+                "threadId": "codex-thread-1",
+                "turnId": "turn-build-1",
+                "item": [
+                    "id": "cmd-build-1",
+                    "type": "commandExecution",
+                    "command": "swift build && echo ok",
+                    "status": "inProgress"
+                ]
+            ])
+            client.notificationHandler?("turn/completed", [
+                "threadId": "codex-thread-1",
+                "turnId": "turn-build-1",
+                "finalMessage": "build ok"
+            ])
+            let finish = try await waitForFinish(in: sink, timeout: 3)
+            XCTAssertEqual(finish.1, "build ok",
+                           "non-detaching command must not stamp [[RC_AWAITING]]")
+            XCTAssertFalse(finish.1?.contains(marker) == true)
+        }
+
+        // 2) Detaching command but thread status active → PendingFinish deferral;
+        //    must NOT stamp (deferral is the stronger signal).
+        do {
+            let client = MockCodexAppServerClient(autoComplete: false)
+            let adapter = CodexAppServerAdapter { _, notificationHandler, _ in
+                client.notificationHandler = notificationHandler
+                return client
+            }
+            let threadId = AgentThreadID()
+            let sink = EventSink()
+            _ = try await adapter.sendTurn(AgentRunRequest(
+                threadId: threadId,
+                provider: .codex,
+                model: "gpt-5.5",
+                cwd: "/tmp/remotecode-app-server-adapter",
+                prompt: "deferred detach"
+            )) { event in
+                Task { await sink.record(event) }
+            }
+            client.notificationHandler?("thread/status/changed", [
+                "threadId": "codex-thread-1",
+                "status": ["type": "active", "activeFlags": ["runningCommand"]]
+            ])
+            client.notificationHandler?("item/started", [
+                "threadId": "codex-thread-1",
+                "turnId": "turn-deferred-detach",
+                "item": [
+                    "id": "cmd-deferred",
+                    "type": "commandExecution",
+                    "command": "sleep 30 &\nPID=$!\necho started",
+                    "status": "inProgress"
+                ]
+            ])
+            client.notificationHandler?("turn/completed", [
+                "threadId": "codex-thread-1",
+                "turnId": "turn-deferred-detach",
+                "finalMessage": "still working"
+            ])
+            try await Task.sleep(nanoseconds: 50_000_000)
+            let premature = await sink.finish
+            XCTAssertNil(premature,
+                         "active thread status must defer finish")
+            let midEvents = await sink.snapshot()
+            let midFinals = midEvents.compactMap { event -> String? in
+                if case .turnCompleted(_, let msg) = event { return msg }
+                return nil
+            }
+            XCTAssertTrue(midFinals.contains(where: { $0 == "still working" }),
+                          "deferred turnCompleted must keep unmarked finalMessage; got \(midFinals)")
+            XCTAssertFalse(midFinals.contains(where: { $0.contains(marker) }),
+                           "must not stamp when PendingFinish deferral is armed")
+            // Release deferral — still no stamp on the PendingFinish path.
+            client.notificationHandler?("thread/status/changed", [
+                "threadId": "codex-thread-1",
+                "status": ["type": "idle"]
+            ])
+            let finish = try await waitForFinish(in: sink, timeout: 3)
+            XCTAssertEqual(finish.1, "still working",
+                           "deferred release must not retroactively stamp detached work")
+        }
+
+        // 3) turn/failed is never stamped.
+        do {
+            let client = MockCodexAppServerClient(autoComplete: false)
+            let adapter = CodexAppServerAdapter { _, notificationHandler, _ in
+                client.notificationHandler = notificationHandler
+                return client
+            }
+            let threadId = AgentThreadID()
+            let sink = EventSink()
+            _ = try await adapter.sendTurn(AgentRunRequest(
+                threadId: threadId,
+                provider: .codex,
+                model: "gpt-5.5",
+                cwd: "/tmp/remotecode-app-server-adapter",
+                prompt: "fail"
+            )) { event in
+                Task { await sink.record(event) }
+            }
+            client.notificationHandler?("item/started", [
+                "threadId": "codex-thread-1",
+                "turnId": "turn-fail-1",
+                "item": [
+                    "id": "cmd-fail",
+                    "type": "commandExecution",
+                    "command": "nohup sleep 99 &",
+                    "status": "inProgress"
+                ]
+            ])
+            client.notificationHandler?("turn/failed", [
+                "threadId": "codex-thread-1",
+                "turnId": "turn-fail-1",
+                "error": ["message": "boom"]
+            ])
+            let finish = try await waitForFinish(in: sink, timeout: 3)
+            XCTAssertEqual(finish.0, .failed)
+            XCTAssertFalse(finish.1?.contains(marker) == true,
+                           "turn/failed must never stamp [[RC_AWAITING]]")
+        }
+    }
 }
 
 // Records assistant events synchronously in emission order (the adapter's emit
