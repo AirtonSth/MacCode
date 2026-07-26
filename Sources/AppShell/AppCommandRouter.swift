@@ -353,7 +353,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                             }
                             return nil
                         }()
-                        let agent = AgentAppSurface(workspaceID: wid, cwd: cwd, coordinator: ctx.coordinator, threadRepo: ctx.threadRepo, messageRepo: ctx.messageRepo, queuedMessageRepo: ctx.queuedMessageRepo, pendingCallbackRepo: ctx.providerPendingCallbackRepo, proposedPlanRepo: ctx.proposedPlanRepo, checkpointRepo: ctx.turnCheckpointRepo, promptHistoryStore: PromptHistoryStore(db: ctx.db), customModelStore: AgentCustomModelStore(repo: ctx.settingsRepo), planNotesStore: PlanNotesStore(db: ctx.db), title: title, initialThreadId: restoredThreadId)
+                        let agent = AgentAppSurface(workspaceID: wid, cwd: cwd, coordinator: ctx.coordinator, threadRepo: ctx.threadRepo, messageRepo: ctx.messageRepo, queuedMessageRepo: ctx.queuedMessageRepo, providerSessionRepo: ctx.providerSessionRuntimeRepo, pendingCallbackRepo: ctx.providerPendingCallbackRepo, proposedPlanRepo: ctx.proposedPlanRepo, checkpointRepo: ctx.turnCheckpointRepo, promptHistoryStore: PromptHistoryStore(db: ctx.db), customModelStore: AgentCustomModelStore(repo: ctx.settingsRepo), planNotesStore: PlanNotesStore(db: ctx.db), title: title, initialThreadId: restoredThreadId)
                         agent.viewModel.onSelectedThreadChanged = { [weak self, weak agent] threadID in
                             guard let self, let agent else { return }
                             self.persistAgentSelectedThread(surfaceID: agent.descriptor.id, threadID: threadID)
@@ -2489,6 +2489,19 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
               let thread = try ctx.threadRepo.get(id: queued.threadId) else {
             throw JSONRPCError.invalidParams
         }
+        if let dispatch = try ctx.queuedMessageRepo.dispatch(id: queued.id),
+           dispatch.state == .prepared,
+           let runId = dispatch.runId {
+            if try preparedQueueRunHasProviderEvidence(threadId: queued.threadId, runId: runId) {
+                guard let drained = try ctx.queuedMessageRepo.acknowledgePreparedWithRunEvidence(id: queued.id, runId: runId) else {
+                    throw JSONRPCError(code: -32000, message: "Queued message recovery is already being reconciled.")
+                }
+                publishQueuedMessage(kind: "agent.message.queue.drained", drained)
+                refreshAgentSurfaces(thread: queued.threadId)
+                return AgentMessageSendResult(status: .started, runId: runId)
+            }
+            throw unconfirmedQueuedMessageStartError()
+        }
         if thread.status == .running
             || ctx.coordinator.hasProviderSession(threadId: queued.threadId) {
             guard let promoted = try ctx.queuedMessageRepo.promoteToFront(id: id) else {
@@ -2508,17 +2521,6 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             return AgentMessageSendResult(status: .queued, queuedMessage: promoted)
         }
         if let dispatch = try ctx.queuedMessageRepo.dispatch(id: queued.id) {
-            if dispatch.state == .prepared, let runId = dispatch.runId {
-                if try preparedQueueRunHasProviderEvidence(threadId: queued.threadId, runId: runId) {
-                    guard let drained = try ctx.queuedMessageRepo.acknowledgePreparedWithRunEvidence(id: queued.id, runId: runId) else {
-                        throw JSONRPCError(code: -32000, message: "Queued message recovery is already being reconciled.")
-                    }
-                    publishQueuedMessage(kind: "agent.message.queue.drained", drained)
-                    refreshAgentSurfaces(thread: queued.threadId)
-                    return AgentMessageSendResult(status: .started, runId: runId)
-                }
-                throw unconfirmedQueuedMessageStartError()
-            }
             if dispatch.state == .dispatched, let runId = dispatch.runId {
                 guard let drained = try ctx.queuedMessageRepo.acknowledgeDispatched(id: queued.id, runId: runId) else {
                     throw JSONRPCError(code: -32000, message: "Queued message acknowledgement is already being recovered.")
@@ -2569,15 +2571,12 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             return result
         } catch {
             if !providerStartConfirmed {
-                if (try? ctx.runRepo.get(id: dispatchRunId)) != nil {
-                    if let drained = try? ctx.queuedMessageRepo.acknowledgePreparedWithRunEvidence(
-                        id: queued.id,
-                        runId: dispatchRunId
-                    ) {
-                        publishQueuedMessage(kind: "agent.message.queue.drained", drained)
-                    }
-                } else {
-                    _ = try? ctx.queuedMessageRepo.releasePrepared(lease, runId: dispatchRunId)
+                if let drained = try? reconcileSameCallPreparedDispatch(
+                    context: ctx,
+                    lease: lease,
+                    runId: dispatchRunId
+                ) {
+                    publishQueuedMessage(kind: "agent.message.queue.drained", drained)
                 }
             }
             refreshAgentSurfaces(thread: queued.threadId)
@@ -2941,15 +2940,12 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             refreshAgentSurfaces(thread: thread)
         } catch {
             if !providerStartConfirmed {
-                if (try? ctx.runRepo.get(id: dispatchRunId)) != nil {
-                    if let drained = try? ctx.queuedMessageRepo.acknowledgePreparedWithRunEvidence(
-                        id: queued.id,
-                        runId: dispatchRunId
-                    ) {
-                        publishQueuedMessage(kind: "agent.message.queue.drained", drained)
-                    }
-                } else {
-                    _ = try? ctx.queuedMessageRepo.releasePrepared(lease, runId: dispatchRunId)
+                if let drained = try? reconcileSameCallPreparedDispatch(
+                    context: ctx,
+                    lease: lease,
+                    runId: dispatchRunId
+                ) {
+                    publishQueuedMessage(kind: "agent.message.queue.drained", drained)
                 }
             }
             refreshAgentSurfaces(thread: thread)
@@ -2962,6 +2958,30 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         context: AppContext
     ) throws -> AgentQueuedMessageRoutingSnapshot? {
         try context.queuedMessageRepo.routingSnapshot(id: message.id)
+    }
+
+    /// A same-process start failure still leaves a durable run row before the
+    /// provider accepts the turn. Only the same positive evidence used by Force
+    /// and relaunch recovery may remove that prepared intent.
+    private func reconcileSameCallPreparedDispatch(
+        context: AppContext,
+        lease: AgentQueuedMessageLease,
+        runId: AgentRunID
+    ) throws -> AgentQueuedMessage? {
+        guard try context.runRepo.get(id: runId) != nil else {
+            _ = try context.queuedMessageRepo.releasePrepared(lease, runId: runId)
+            return nil
+        }
+        guard try preparedQueueRunHasProviderEvidence(
+            threadId: lease.message.threadId,
+            runId: runId
+        ) else {
+            return nil
+        }
+        return try context.queuedMessageRepo.acknowledgePreparedWithRunEvidence(
+            id: lease.message.id,
+            runId: runId
+        )
     }
 
     /// Relaunch recovery for queue rows left between durable prepare and provider
@@ -2996,9 +3016,10 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
 
     /// A run row is written before `runner.sendTurn`, so it cannot by itself
     /// prove that the provider accepted a prepared queue dispatch. The provider
-    /// session stays at `run.pending` until that boundary advances. Missing or
-    /// still-pending session evidence must preserve the queue row to avoid both
-    /// silent loss and an unsafe replay after relaunch.
+    /// session records `run.started`, a turn boundary, or `run.finished` only
+    /// after that boundary succeeds. Missing, thread-started stream-event,
+    /// start-failure, or still-pending evidence must preserve the queue row to
+    /// avoid both silent loss and an unsafe replay after relaunch.
     private func preparedQueueRunHasProviderEvidence(
         threadId: AgentThreadID,
         runId: AgentRunID
@@ -3012,7 +3033,10 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
               !lastEventKind.isEmpty else {
             return false
         }
-        return lastEventKind != "run.pending"
+        return lastEventKind == "run.started"
+            || lastEventKind == "run.finished"
+            || lastEventKind.hasPrefix("turnStarted(")
+            || lastEventKind.hasPrefix("turnCompleted(")
     }
 
     private func unconfirmedQueuedMessageStartError() -> JSONRPCError {
@@ -5044,7 +5068,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 surface = configureBrowserSurface(BrowserSurface(workspaceID: workspace, initialURL: nil, title: baseTitle))
             case .agentApp:
                 guard let ctx = context else { return descriptor }
-                let agent = AgentAppSurface(workspaceID: workspace, cwd: cwd, coordinator: ctx.coordinator, threadRepo: ctx.threadRepo, messageRepo: ctx.messageRepo, draftRepo: AgentThreadDraftRepository(db: ctx.db), attachmentStore: AgentAttachmentStore(root: ctx.appSupportDirectory.appendingPathComponent("agent-attachments", isDirectory: true)), queuedMessageRepo: ctx.queuedMessageRepo, pendingCallbackRepo: ctx.providerPendingCallbackRepo, proposedPlanRepo: ctx.proposedPlanRepo, checkpointRepo: ctx.turnCheckpointRepo, promptHistoryStore: PromptHistoryStore(db: ctx.db), customModelStore: AgentCustomModelStore(repo: ctx.settingsRepo), planNotesStore: PlanNotesStore(db: ctx.db), title: baseTitle, initialThreadId: initialThreadId)
+                let agent = AgentAppSurface(workspaceID: workspace, cwd: cwd, coordinator: ctx.coordinator, threadRepo: ctx.threadRepo, messageRepo: ctx.messageRepo, draftRepo: AgentThreadDraftRepository(db: ctx.db), attachmentStore: AgentAttachmentStore(root: ctx.appSupportDirectory.appendingPathComponent("agent-attachments", isDirectory: true)), queuedMessageRepo: ctx.queuedMessageRepo, providerSessionRepo: ctx.providerSessionRuntimeRepo, pendingCallbackRepo: ctx.providerPendingCallbackRepo, proposedPlanRepo: ctx.proposedPlanRepo, checkpointRepo: ctx.turnCheckpointRepo, promptHistoryStore: PromptHistoryStore(db: ctx.db), customModelStore: AgentCustomModelStore(repo: ctx.settingsRepo), planNotesStore: PlanNotesStore(db: ctx.db), title: baseTitle, initialThreadId: initialThreadId)
                 // Per-surface thread binding: persist this surface's selected
                 // thread into its descriptor metadata so app restart restores it.
                 agent.viewModel.onSelectedThreadChanged = { [weak self, weak agent] threadID in

@@ -859,6 +859,127 @@ final class CodexAppServerAdapterTests: ProviderProcessTestCase {
                        "a passive relaunch recovery must allow Continue on the same provider context")
     }
 
+    func test_adapterReplacesTimedOutResumeClientBeforeStartingFreshThread() async throws {
+        let timedOut = MockCodexAppServerClient(
+            autoComplete: false,
+            openThreadError: CodexAppServerError.requestTimedOut(method: "thread/resume", timeout: 30)
+        )
+        let fresh = MockCodexAppServerClient(autoComplete: false)
+        let factoryCalls = LockedCounter()
+        let adapter = CodexAppServerAdapter { _, notificationHandler, _ in
+            factoryCalls.increment()
+            let client = factoryCalls.value == 1 ? timedOut : fresh
+            client.notificationHandler = notificationHandler
+            return client
+        }
+        let threadId = AgentThreadID()
+
+        _ = try await adapter.sendTurn(AgentRunRequest(
+            threadId: threadId,
+            provider: .codex,
+            model: "gpt-5.5",
+            cwd: "/tmp/remotecode-app-server-adapter",
+            prompt: "continue after a dead app server",
+            providerThreadId: "persisted-thread"
+        )) { _ in }
+
+        XCTAssertTrue(timedOut.didStop,
+                      "the deadline-stopped resume client must never receive a fallback request")
+        XCTAssertEqual(timedOut.openedRequests.map(\.providerThreadId), ["persisted-thread"],
+                       "the first client must attempt the persisted resume exactly once")
+        XCTAssertEqual(fresh.openedRequests.map(\.providerThreadId), [nil],
+                       "the replacement client must start fresh instead of replaying the timed-out resume")
+        XCTAssertEqual(fresh.startedTurns.map(\.providerThreadId), ["codex-thread-1"],
+                       "only the replacement client may begin the requested provider turn")
+    }
+
+    func test_adapterIgnoresDelayedTerminationFromReplacedTimedOutResumeClient() async throws {
+        // WHY: stopping the timed-out resume client does not guarantee its
+        // process-exit callback cannot arrive after the fresh session is stored.
+        let timedOut = MockCodexAppServerClient(
+            autoComplete: false,
+            openThreadError: CodexAppServerError.requestTimedOut(method: "thread/resume", timeout: 30)
+        )
+        let fresh = MockCodexAppServerClient(autoComplete: false)
+        let factoryCalls = LockedCounter()
+        let adapter = CodexAppServerAdapter { _, notificationHandler, _ in
+            factoryCalls.increment()
+            let client = factoryCalls.value == 1 ? timedOut : fresh
+            client.notificationHandler = notificationHandler
+            return client
+        }
+        let threadId = AgentThreadID()
+
+        _ = try await adapter.sendTurn(AgentRunRequest(
+            threadId: threadId,
+            provider: .codex,
+            model: "gpt-5.5",
+            cwd: "/tmp/remotecode-app-server-adapter",
+            prompt: "continue after a dead app server",
+            providerThreadId: "persisted-thread"
+        )) { _ in }
+
+        timedOut.simulateTermination()
+
+        XCTAssertTrue(adapter.hasSession(threadId: threadId),
+                      "a delayed callback from the stopped resume client must not remove the fresh session")
+        XCTAssertFalse(fresh.didStop,
+                       "the replacement client must remain usable after the old client exits late")
+    }
+
+    func test_adapterRecoveryFallbackDoesNotRestoreStaleActiveTurn() async throws {
+        // WHY: the persisted active turn belongs to the timed-out thread/resume
+        // client, not the replacement thread/start session.
+        let timedOut = MockCodexAppServerClient(
+            autoComplete: false,
+            openThreadError: CodexAppServerError.requestTimedOut(method: "thread/resume", timeout: 30)
+        )
+        let fresh = MockCodexAppServerClient(autoComplete: false)
+        let factoryCalls = LockedCounter()
+        let adapter = CodexAppServerAdapter { _, notificationHandler, _ in
+            factoryCalls.increment()
+            let client = factoryCalls.value == 1 ? timedOut : fresh
+            client.notificationHandler = notificationHandler
+            return client
+        }
+        let threadId = AgentThreadID()
+        let sink = EventSink()
+
+        try await adapter.recoverSession(AgentRunRequest(
+            threadId: threadId,
+            provider: .codex,
+            model: "gpt-5.5",
+            cwd: "/tmp/remotecode-app-server-adapter",
+            prompt: "",
+            providerThreadId: "persisted-thread",
+            extraArgs: ["remotecode.recovery.activeTurnId=stale-turn"]
+        )) { event in
+            Task { await sink.record(event) }
+        }
+        try adapter.interruptTurn(threadId: threadId)
+
+        XCTAssertTrue(timedOut.didStop)
+        XCTAssertEqual(fresh.openedRequests.map(\.providerThreadId), [nil])
+        XCTAssertEqual(adapter.listSessions().first?.status, .completed,
+                       "a fresh fallback has no recovered active turn and must not be marked running")
+        XCTAssertTrue(fresh.interruptedTurns.isEmpty,
+                      "Stop must not send the stale turn id to the new provider thread")
+        let events = try await waitForEvents(in: sink) { events in
+            events.contains {
+                if case .error(let message, let recoverable) = $0 {
+                    return recoverable && message.contains("starting a new session")
+                }
+                return false
+            }
+        }
+        XCTAssertTrue(events.contains {
+            if case .error(let message, let recoverable) = $0 {
+                return recoverable && message.contains("starting a new session")
+            }
+            return false
+        }, "recovery must disclose that it opened a new session instead of resuming the old turn")
+    }
+
     func test_adapterRecoveryRestoresActiveTurnForInterrupt() async throws {
         let client = MockCodexAppServerClient(autoComplete: false)
         let adapter = CodexAppServerAdapter { _, notificationHandler, _ in
@@ -3440,6 +3561,7 @@ private final class MockCodexAppServerClient: CodexAppServerControlling, @unchec
     let autoComplete: Bool
     let interruptDelayNanoseconds: UInt64
     let startTurnError: Error?
+    let openThreadError: Error?
     let updateSettingsError: Error?
     private let lock = NSLock()
     private var _didStop = false
@@ -3458,12 +3580,14 @@ private final class MockCodexAppServerClient: CodexAppServerControlling, @unchec
         autoComplete: Bool = true,
         interruptDelayNanoseconds: UInt64 = 0,
         startTurnError: Error? = nil,
+        openThreadError: Error? = nil,
         updateSettingsError: Error? = nil,
         supportsForkReconciliation: Bool = false
     ) {
         self.autoComplete = autoComplete
         self.interruptDelayNanoseconds = interruptDelayNanoseconds
         self.startTurnError = startTurnError
+        self.openThreadError = openThreadError
         self.updateSettingsError = updateSettingsError
         self.forkProtocolSupport = supportsForkReconciliation
             ? CodexForkProtocolSupport(isSupported: true, reason: "test schema")
@@ -3545,6 +3669,7 @@ private final class MockCodexAppServerClient: CodexAppServerControlling, @unchec
 
     func openThread(for request: AgentRunRequest) async throws -> CodexAppServerThreadOpenResult {
         recordOpened(request)
+        if let openThreadError { throw openThreadError }
         let providerThreadId = request.providerThreadId?.isEmpty == false ? request.providerThreadId! : "codex-thread-1"
         return CodexAppServerThreadOpenResult(providerThreadId: providerThreadId, response: ["id": providerThreadId])
     }

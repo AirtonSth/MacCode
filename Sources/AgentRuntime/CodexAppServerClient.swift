@@ -674,6 +674,17 @@ public final class CodexAppServerClient: @unchecked Sendable {
         ].contains { message.contains($0) }
     }
 
+    /// A timed-out request stops this client because its JSON-RPC stream may be
+    /// desynchronized. The adapter may only recover a timed-out resume by
+    /// creating a new client and starting a fresh thread.
+    public static func requiresFreshClientAfterThreadResumeFailure(_ error: Error) -> Bool {
+        guard let appServerError = error as? CodexAppServerError,
+              case .requestTimedOut(let method, _) = appServerError else {
+            return false
+        }
+        return method == "thread/resume"
+    }
+
     private static func threadId(from response: JSONObject) throws -> String {
         if let thread = response["thread"] as? JSONObject,
            let id = thread["id"] as? String,

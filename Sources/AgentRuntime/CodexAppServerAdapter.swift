@@ -118,6 +118,12 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         var sawDetachedShellSpawn: Bool
     }
 
+    private struct OpenedClient {
+        let client: CodexAppServerControlling
+        let result: CodexAppServerThreadOpenResult
+        let resumeFellBackToStart: Bool
+    }
+
     private struct PendingFinish {
         let status: AgentRunStatus
         let finalMessage: String?
@@ -358,19 +364,13 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
             providerThreadId = reusableSession.providerThreadId
             resumeFellBackToStart = false
         } else {
-            client = try clientFor(request: request, onEvent: onEvent)
-            client.terminationHandler = { [weak self] error in
-                self?.handleClientTermination(threadId: request.threadId, error: error)
-            }
-            _ = try await client.initialize(clientName: "remotecode", clientTitle: "RemoteCode", clientVersion: "0.0.0")
-            let opened = try await client.openThread(for: request)
-            providerThreadId = opened.providerThreadId
+            let opened = try await openClientAndThread(for: request, onEvent: onEvent)
+            client = opened.client
+            providerThreadId = opened.result.providerThreadId
             resumeFellBackToStart = opened.resumeFellBackToStart
             recordSession(threadId: request.threadId, client: client, providerThreadId: providerThreadId, interactionMode: request.interactionMode, onEvent: onEvent, permissionMode: request.permissionMode)
         }
-        client.terminationHandler = { [weak self] error in
-            self?.handleClientTermination(threadId: request.threadId, error: error)
-        }
+        installTerminationHandler(for: client, threadId: request.threadId)
         onEvent(.status(.running))
         onEvent(.event(.threadStarted(threadId: providerThreadId, providerThreadId: providerThreadId)))
         if resumeFellBackToStart {
@@ -531,15 +531,17 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         guard request.providerThreadId?.isEmpty == false else {
             throw AgentProviderAdapterError.unsupported("Codex app-server recovery requires providerThreadId")
         }
-        let client = try clientFor(request: request, onEvent: onEvent)
+        var openedClient: OpenedClient?
         do {
-            _ = try await client.initialize(clientName: "remotecode", clientTitle: "RemoteCode", clientVersion: "0.0.0")
-            let opened = try await client.openThread(for: request)
-            let activeTurnId = Self.recoveryActiveTurnId(from: request.extraArgs)
+            let opened = try await openClientAndThread(for: request, onEvent: onEvent)
+            openedClient = opened
+            let activeTurnId = opened.resumeFellBackToStart
+                ? nil
+                : Self.recoveryActiveTurnId(from: request.extraArgs)
             recordSession(
                 threadId: request.threadId,
-                client: client,
-                providerThreadId: opened.providerThreadId,
+                client: opened.client,
+                providerThreadId: opened.result.providerThreadId,
                 interactionMode: request.interactionMode,
                 onEvent: onEvent,
                 permissionMode: request.permissionMode,
@@ -548,9 +550,12 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
             if let activeTurnId {
                 setActiveTurn(threadId: request.threadId, turnId: activeTurnId)
             }
-            onEvent(.event(.threadStarted(threadId: opened.providerThreadId, providerThreadId: opened.providerThreadId)))
+            onEvent(.event(.threadStarted(threadId: opened.result.providerThreadId, providerThreadId: opened.result.providerThreadId)))
+            if opened.resumeFellBackToStart {
+                onEvent(.event(.error(message: "Previous session could not be resumed; starting a new session.", recoverable: true)))
+            }
         } catch {
-            client.stop()
+            openedClient?.client.stop()
             throw error
         }
     }
@@ -828,6 +833,64 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
                 }
                 return try await self.handleServerRequest(method: method, params: params, threadId: request.threadId)
             }
+        )
+    }
+
+    private func openClientAndThread(
+        for request: AgentRunRequest,
+        onEvent: @escaping @Sendable (AgentRunEvent) -> Void
+    ) async throws -> OpenedClient {
+        let client = try clientFor(request: request, onEvent: onEvent)
+        installTerminationHandler(for: client, threadId: request.threadId)
+        do {
+            _ = try await client.initialize(clientName: "remotecode", clientTitle: "RemoteCode", clientVersion: "0.0.0")
+            let opened = try await client.openThread(for: request)
+            return OpenedClient(
+                client: client,
+                result: opened,
+                resumeFellBackToStart: opened.resumeFellBackToStart
+            )
+        } catch {
+            client.stop()
+            guard request.providerThreadId?.isEmpty == false,
+                  CodexAppServerClient.requiresFreshClientAfterThreadResumeFailure(error) else {
+                throw error
+            }
+        }
+
+        let freshRequest = Self.requestStartingFreshThread(from: request)
+        let replacement = try clientFor(request: freshRequest, onEvent: onEvent)
+        installTerminationHandler(for: replacement, threadId: request.threadId)
+        do {
+            _ = try await replacement.initialize(clientName: "remotecode", clientTitle: "RemoteCode", clientVersion: "0.0.0")
+            let opened = try await replacement.openThread(for: freshRequest)
+            return OpenedClient(client: replacement, result: opened, resumeFellBackToStart: true)
+        } catch {
+            replacement.stop()
+            throw error
+        }
+    }
+
+    private static func requestStartingFreshThread(from request: AgentRunRequest) -> AgentRunRequest {
+        AgentRunRequest(
+            runId: request.runId,
+            threadId: request.threadId,
+            provider: request.provider,
+            providerInstanceId: request.providerInstanceId,
+            model: request.model,
+            cwd: request.cwd,
+            prompt: request.prompt,
+            userMessageContent: request.userMessageContent,
+            attachments: request.attachments,
+            providerThreadId: nil,
+            permissionMode: request.permissionMode,
+            reasoningEffort: request.reasoningEffort,
+            serviceTier: request.serviceTier,
+            interactionMode: request.interactionMode,
+            providerBinary: request.providerBinary,
+            environment: request.environment,
+            extraArgs: request.extraArgs,
+            runAsUser: request.runAsUser
         )
     }
 
@@ -1589,8 +1652,26 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
         }
     }
 
-    private func handleClientTermination(threadId: AgentThreadID, error: Error) {
-        guard let session = removeSession(threadId: threadId) else { return }
+    private func installTerminationHandler(
+        for client: CodexAppServerControlling,
+        threadId: AgentThreadID
+    ) {
+        let clientIdentity = ObjectIdentifier(client)
+        client.terminationHandler = { [weak self] error in
+            self?.handleClientTermination(
+                threadId: threadId,
+                clientIdentity: clientIdentity,
+                error: error
+            )
+        }
+    }
+
+    private func handleClientTermination(
+        threadId: AgentThreadID,
+        clientIdentity: ObjectIdentifier,
+        error: Error
+    ) {
+        guard let session = removeSession(threadId: threadId, clientIdentity: clientIdentity) else { return }
         guard session.status == .running else { return }
         settlePendingCallbacks(session: session)
         let message = "Codex app-server process exited before completing the turn: \(error)"
@@ -1653,6 +1734,14 @@ public final class CodexAppServerAdapter: AgentProviderAdapter, @unchecked Senda
 
     private func removeSession(threadId: AgentThreadID) -> Session? {
         lock.lock(); defer { lock.unlock() }
+        return sessions.removeValue(forKey: threadId)
+    }
+
+    private func removeSession(threadId: AgentThreadID, clientIdentity: ObjectIdentifier) -> Session? {
+        lock.lock(); defer { lock.unlock() }
+        guard let session = sessions[threadId], ObjectIdentifier(session.client) == clientIdentity else {
+            return nil
+        }
         return sessions.removeValue(forKey: threadId)
     }
 

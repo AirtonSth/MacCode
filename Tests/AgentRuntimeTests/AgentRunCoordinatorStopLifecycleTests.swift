@@ -47,6 +47,23 @@ final class AgentRunCoordinatorStopLifecycleTests: XCTestCase {
         }
     }
 
+    /// Mirrors the app-shell listener that turns coordinator events into visible
+    /// surface updates. Recovery must use this same path, not silently consume
+    /// adapter events while changing only in-memory adapter state.
+    private final class AssistantEventRecorder: @unchecked Sendable {
+        private let lock = NSLock()
+        private var _received: [(AssistantEvent, AgentThreadID, AgentRunID)] = []
+
+        var received: [(AssistantEvent, AgentThreadID, AgentRunID)] {
+            lock.lock(); defer { lock.unlock() }
+            return _received
+        }
+
+        func record(_ event: AssistantEvent, threadId: AgentThreadID, runId: AgentRunID) {
+            lock.lock(); _received.append((event, threadId, runId)); lock.unlock()
+        }
+    }
+
     private func waitUntil(_ timeout: TimeInterval = 5, _ condition: @escaping () -> Bool) async {
         let deadline = Date().addingTimeInterval(timeout)
         while Date() < deadline {
@@ -121,12 +138,16 @@ final class AgentRunCoordinatorStopLifecycleTests: XCTestCase {
         let provider: AgentProvider = .codex
         private let lock = NSLock()
         private var _hasSession: Bool
+        private let recoveryEvents: [AgentRunEvent]
         private var _recoverCalls = 0
         private var _stopSessionCalls = 0
         var recoverCalls: Int { lock.lock(); defer { lock.unlock() }; return _recoverCalls }
         var stopSessionCalls: Int { lock.lock(); defer { lock.unlock() }; return _stopSessionCalls }
 
-        init(hasSession: Bool = false) { _hasSession = hasSession }
+        init(hasSession: Bool = false, recoveryEvents: [AgentRunEvent] = []) {
+            _hasSession = hasSession
+            self.recoveryEvents = recoveryEvents
+        }
 
         func listModels() async -> [AgentModelDescriptor] { [] }
         func startSession(_ request: AgentRunRequest, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) async throws -> AgentRunHandle {
@@ -142,7 +163,14 @@ final class AgentRunCoordinatorStopLifecycleTests: XCTestCase {
             lock.lock(); _stopSessionCalls += 1; _hasSession = false; lock.unlock()
         }
         func recoverSession(_ request: AgentRunRequest, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) async throws {
-            lock.lock(); _recoverCalls += 1; _hasSession = true; lock.unlock()
+            let events = lock.withLock { () -> [AgentRunEvent] in
+                _recoverCalls += 1
+                _hasSession = true
+                return recoveryEvents
+            }
+            for event in events {
+                onEvent(event)
+            }
         }
         func listSessions() -> [AgentProviderSessionSummary] { [] }
         func hasSession(threadId: AgentThreadID) -> Bool { lock.lock(); defer { lock.unlock() }; return _hasSession }
@@ -216,6 +244,65 @@ final class AgentRunCoordinatorStopLifecycleTests: XCTestCase {
                        "thread nobody stopped (F19)")
         XCTAssertTrue(recorder.runFinishedCallbacks.isEmpty,
                       "no onRunFinished from an idle-session release")
+    }
+
+    func test_recoverSessionPersistsFallbackCursorAndPublishesRecoverableDisclosure() async throws {
+        let (threadRepo, messageRepo, runRepo, sessionRepo, tmp) = try makeRepos("recover-fallback-events")
+        var thread = AgentThread(title: "recover fallback", provider: .codex, model: "fake-model")
+        thread.status = .interrupted
+        thread.providerThreadId = "stale-provider-thread"
+        try threadRepo.upsert(thread)
+        let priorRun = AgentRun(
+            threadId: thread.id,
+            provider: .codex,
+            model: "fake-model",
+            status: .interrupted
+        )
+        try runRepo.upsert(priorRun)
+        try sessionRepo.upsert(ProviderSessionRuntime(
+            threadId: thread.id,
+            provider: .codex,
+            status: .interrupted,
+            resumeCursor: "stale-provider-thread",
+            cwd: tmp,
+            model: "fake-model",
+            lastRunId: priorRun.id,
+            lastEventKind: "error"
+        ))
+        let adapter = SpyRecoverAdapter(
+            hasSession: false,
+            recoveryEvents: [
+                .event(.threadStarted(threadId: "fresh-provider-thread", providerThreadId: "fresh-provider-thread")),
+                .error("Previous session could not be resumed; starting a new session.")
+            ]
+        )
+        let coordinator = AgentRunCoordinator(
+            runRepo: runRepo,
+            messageRepo: messageRepo,
+            threadRepo: threadRepo,
+            providerSessionRepo: sessionRepo,
+            providerAdapters: [.codex: adapter]
+        )
+        let recorder = AssistantEventRecorder()
+        coordinator.onAssistantEvent = { event, threadId, runId in
+            recorder.record(event, threadId: threadId, runId: runId)
+        }
+
+        _ = try await coordinator.readThread(threadId: thread.id)
+
+        XCTAssertEqual(adapter.recoverCalls, 1)
+        XCTAssertEqual(try threadRepo.get(id: thread.id)?.providerThreadId, "fresh-provider-thread",
+                       "fallback threadStarted must replace the stale thread cursor before the next Resume")
+        XCTAssertEqual(try sessionRepo.get(threadId: thread.id)?.resumeCursor, "fresh-provider-thread",
+                       "fallback threadStarted must durably replace the stale provider-session cursor")
+        XCTAssertTrue(
+            recorder.received.contains { event, threadId, runId in
+                guard threadId == thread.id, runId == priorRun.id,
+                      case .error(let message, let recoverable) = event else { return false }
+                return message == "Previous session could not be resumed; starting a new session." && recoverable
+            },
+            "the recoverable fallback disclosure must reach the app-shell listener with the durable prior run id"
+        )
     }
 
     // MARK: - F22: runner-level errors are persisted

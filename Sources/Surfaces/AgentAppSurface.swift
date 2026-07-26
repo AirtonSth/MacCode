@@ -347,6 +347,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     public let draftRepo: AgentThreadDraftRepository?
     public let attachmentStore: AgentAttachmentStore?
     public let queuedMessageRepo: AgentQueuedMessageRepository?
+    public let providerSessionRepo: ProviderSessionRuntimeRepository?
     public let pendingCallbackRepo: ProviderPendingCallbackRepository?
     public let proposedPlanRepo: AgentProposedPlanRepository?
     public let checkpointRepo: AgentTurnCheckpointRepository?
@@ -425,6 +426,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         draftRepo: AgentThreadDraftRepository? = nil,
         attachmentStore: AgentAttachmentStore? = nil,
         queuedMessageRepo: AgentQueuedMessageRepository? = nil,
+        providerSessionRepo: ProviderSessionRuntimeRepository? = nil,
         pendingCallbackRepo: ProviderPendingCallbackRepository? = nil,
         proposedPlanRepo: AgentProposedPlanRepository? = nil,
         checkpointRepo: AgentTurnCheckpointRepository? = nil,
@@ -445,6 +447,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         self.draftRepo = draftRepo
         self.attachmentStore = attachmentStore
         self.queuedMessageRepo = queuedMessageRepo
+        self.providerSessionRepo = providerSessionRepo
         self.pendingCallbackRepo = pendingCallbackRepo
         self.proposedPlanRepo = proposedPlanRepo
         self.checkpointRepo = checkpointRepo
@@ -1032,6 +1035,24 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         var preparedDispatch: (lease: AgentQueuedMessageLease, runId: AgentRunID)?
         var providerStartConfirmed = false
         do {
+            if let dispatch = try queuedMessageRepo.dispatch(id: message.id),
+               dispatch.state == .prepared,
+               let runId = dispatch.runId {
+                if try preparedQueueRunHasProviderEvidence(threadId: message.threadId, runId: runId) {
+                    guard let drained = try queuedMessageRepo.acknowledgePreparedWithRunEvidence(id: message.id, runId: runId) else {
+                        queueStatusMessage = "Queue recovery is already being reconciled."
+                        reloadQueuedMessages()
+                        return
+                    }
+                    queueStatusMessage = nil
+                    reloadQueuedMessages()
+                    onQueuedMessageEvent?(AgentQueueEventKinds.drained, drained)
+                    return
+                }
+                reloadQueuedMessages()
+                queueStatusMessage = "Start confirmation is pending. The message was not replayed."
+                return
+            }
             if selectedThreadCanQueuePrompt {
                 guard try queuedMessageRepo.promoteToFront(id: message.id) != nil else {
                     queueStatusMessage = "Already processing."
@@ -1051,22 +1072,6 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 return
             }
             if let dispatch = try queuedMessageRepo.dispatch(id: message.id) {
-                if dispatch.state == .prepared, let runId = dispatch.runId {
-                    if try coordinator.runStatus(runId) != nil {
-                        guard let drained = try queuedMessageRepo.acknowledgePreparedWithRunEvidence(id: message.id, runId: runId) else {
-                            queueStatusMessage = "Queue recovery is already being reconciled."
-                            reloadQueuedMessages()
-                            return
-                        }
-                        queueStatusMessage = nil
-                        reloadQueuedMessages()
-                        onQueuedMessageEvent?(AgentQueueEventKinds.drained, drained)
-                        return
-                    }
-                    reloadQueuedMessages()
-                    queueStatusMessage = "Already processing. Relaunch recovery will reconcile this message if startup was interrupted."
-                    return
-                }
                 if dispatch.state == .dispatched, let runId = dispatch.runId {
                     guard let drained = try queuedMessageRepo.acknowledgeDispatched(id: message.id, runId: runId) else {
                         queueStatusMessage = "Queue acknowledgement is already being recovered."
@@ -1107,15 +1112,12 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
                 queuedRoutingSnapshot: try queuedMessageRepo.routingSnapshot(id: queued.id)
             )
             guard runId != nil else {
-                if (try? coordinator.runStatus(dispatchRunId)) != nil {
-                    if let drained = try queuedMessageRepo.acknowledgePreparedWithRunEvidence(
-                        id: queued.id,
-                        runId: dispatchRunId
-                    ) {
-                        onQueuedMessageEvent?(AgentQueueEventKinds.drained, drained)
-                    }
-                } else {
-                    _ = try queuedMessageRepo.releasePrepared(lease, runId: dispatchRunId)
+                if let drained = try reconcileSameCallPreparedDispatch(
+                    lease: lease,
+                    runId: dispatchRunId,
+                    queuedMessageRepo: queuedMessageRepo
+                ) {
+                    onQueuedMessageEvent?(AgentQueueEventKinds.drained, drained)
                 }
                 claimedLease = nil
                 preparedDispatch = nil
@@ -1147,15 +1149,12 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             }
         } catch {
             if let preparedDispatch, !providerStartConfirmed {
-                if (try? coordinator.runStatus(preparedDispatch.runId)) != nil {
-                    if let drained = try? queuedMessageRepo.acknowledgePreparedWithRunEvidence(
-                        id: preparedDispatch.lease.message.id,
-                        runId: preparedDispatch.runId
-                    ) {
-                        onQueuedMessageEvent?(AgentQueueEventKinds.drained, drained)
-                    }
-                } else {
-                    _ = try? queuedMessageRepo.releasePrepared(preparedDispatch.lease, runId: preparedDispatch.runId)
+                if let drained = try? reconcileSameCallPreparedDispatch(
+                    lease: preparedDispatch.lease,
+                    runId: preparedDispatch.runId,
+                    queuedMessageRepo: queuedMessageRepo
+                ) {
+                    onQueuedMessageEvent?(AgentQueueEventKinds.drained, drained)
                 }
                 reloadQueuedMessages()
             } else if let claimedLease, preparedDispatch == nil {
@@ -1164,6 +1163,48 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
             }
             queueStatusMessage = "Queue force failed: \(error)"
         }
+    }
+
+    private func preparedQueueRunHasProviderEvidence(
+        threadId: AgentThreadID,
+        runId: AgentRunID
+    ) throws -> Bool {
+        guard try coordinator.runStatus(runId) != nil,
+              let session = try providerSessionRepo?.get(threadId: threadId),
+              session.lastRunId == runId,
+              let lastEventKind = session.lastEventKind?
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+              !lastEventKind.isEmpty else {
+            return false
+        }
+        // Only these post-acceptance lifecycle markers prove the provider
+        // accepted the turn. A thread-started stream event or start failure can
+        // arrive while the start outcome is still unknown, so it keeps intent.
+        return lastEventKind == "run.started"
+            || lastEventKind == "run.finished"
+            || lastEventKind.hasPrefix("turnStarted(")
+            || lastEventKind.hasPrefix("turnCompleted(")
+    }
+
+    private func reconcileSameCallPreparedDispatch(
+        lease: AgentQueuedMessageLease,
+        runId: AgentRunID,
+        queuedMessageRepo: AgentQueuedMessageRepository
+    ) throws -> AgentQueuedMessage? {
+        guard try coordinator.runStatus(runId) != nil else {
+            _ = try queuedMessageRepo.releasePrepared(lease, runId: runId)
+            return nil
+        }
+        guard try preparedQueueRunHasProviderEvidence(
+            threadId: lease.message.threadId,
+            runId: runId
+        ) else {
+            return nil
+        }
+        return try queuedMessageRepo.acknowledgePreparedWithRunEvidence(
+            id: lease.message.id,
+            runId: runId
+        )
     }
 
     public func cancelQueuedMessage(_ message: AgentQueuedMessage) {
@@ -12713,11 +12754,11 @@ public final class AgentAppSurface: NSObject, Surface {
     /// Set by AppCommandRouter immediately after subscribe (mirrors Feed pattern).
     public var onClose: (() -> Void)?
 
-    public init(workspaceID: WorkspaceID, cwd: String, coordinator: AgentRunCoordinator, threadRepo: AgentThreadRepository, messageRepo: AgentMessageRepository, draftRepo: AgentThreadDraftRepository? = nil, attachmentStore: AgentAttachmentStore? = nil, queuedMessageRepo: AgentQueuedMessageRepository? = nil, pendingCallbackRepo: ProviderPendingCallbackRepository? = nil, proposedPlanRepo: AgentProposedPlanRepository? = nil, checkpointRepo: AgentTurnCheckpointRepository? = nil, promptHistoryStore: PromptHistoryStore? = nil, customModelStore: AgentCustomModelStore? = nil, planNotesStore: PlanNotesStore? = nil, title: String = "Agent App", initialThreadId: AgentThreadID? = nil) {
+    public init(workspaceID: WorkspaceID, cwd: String, coordinator: AgentRunCoordinator, threadRepo: AgentThreadRepository, messageRepo: AgentMessageRepository, draftRepo: AgentThreadDraftRepository? = nil, attachmentStore: AgentAttachmentStore? = nil, queuedMessageRepo: AgentQueuedMessageRepository? = nil, providerSessionRepo: ProviderSessionRuntimeRepository? = nil, pendingCallbackRepo: ProviderPendingCallbackRepository? = nil, proposedPlanRepo: AgentProposedPlanRepository? = nil, checkpointRepo: AgentTurnCheckpointRepository? = nil, promptHistoryStore: PromptHistoryStore? = nil, customModelStore: AgentCustomModelStore? = nil, planNotesStore: PlanNotesStore? = nil, title: String = "Agent App", initialThreadId: AgentThreadID? = nil) {
         var metadata = ["workspace": workspaceID.value.uuidString, "cwd": cwd]
         if let initialThreadId { metadata["selected_thread"] = initialThreadId.value.uuidString }
         self.descriptor = SurfaceDescriptor(type: .agentApp, title: title, iconName: "sparkle", metadata: metadata)
-        self.viewModel = AgentAppViewModel(workspaceID: workspaceID, cwd: cwd, coordinator: coordinator, threadRepo: threadRepo, messageRepo: messageRepo, draftRepo: draftRepo, attachmentStore: attachmentStore, queuedMessageRepo: queuedMessageRepo, pendingCallbackRepo: pendingCallbackRepo, proposedPlanRepo: proposedPlanRepo, checkpointRepo: checkpointRepo, promptHistoryStore: promptHistoryStore, customModelStore: customModelStore, planNotesStore: planNotesStore, initialThreadId: initialThreadId, initialRoutingMode: .auto, newThreadDefaultsStore: .shared)
+        self.viewModel = AgentAppViewModel(workspaceID: workspaceID, cwd: cwd, coordinator: coordinator, threadRepo: threadRepo, messageRepo: messageRepo, draftRepo: draftRepo, attachmentStore: attachmentStore, queuedMessageRepo: queuedMessageRepo, providerSessionRepo: providerSessionRepo, pendingCallbackRepo: pendingCallbackRepo, proposedPlanRepo: proposedPlanRepo, checkpointRepo: checkpointRepo, promptHistoryStore: promptHistoryStore, customModelStore: customModelStore, planNotesStore: planNotesStore, initialThreadId: initialThreadId, initialRoutingMode: .auto, newThreadDefaultsStore: .shared)
         let host = NSHostingView(rootView: AgentAppView(vm: viewModel))
         host.translatesAutoresizingMaskIntoConstraints = false
         let container = NSView()
