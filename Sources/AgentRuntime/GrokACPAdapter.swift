@@ -71,6 +71,7 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
         var status: AgentRunStatus = .completed
         var isLive = true
         var inFlight = false
+        var promptAccepted = false
         var cancelRequested = false
         var forcedKillByUs = false
         var turnTerminalEmitted = false
@@ -434,6 +435,7 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
     public func stopAll() {
         lock.lock()
         let all = Array(sessions.values)
+        all.forEach { $0.isLive = false }
         sessions.removeAll()
         lock.unlock()
         all.forEach { $0.client.stop() }
@@ -442,6 +444,7 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
     public func stopAllForAppTermination() {
         lock.lock()
         let all = Array(sessions.values)
+        all.forEach { $0.isLive = false }
         sessions.removeAll()
         lock.unlock()
         all.forEach { $0.client.stopImmediatelyForAppTermination() }
@@ -565,10 +568,10 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
                 throw AgentProviderAdapterError.unsupported("Grok ACP session already has an in-flight prompt")
             }
             session.inFlight = true
+            session.promptAccepted = false
             session.cancelRequested = false
             session.forcedKillByUs = false
             session.turnTerminalEmitted = false
-            session.status = .running
             session.onEvent = onEvent
         }
 
@@ -619,12 +622,15 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
                             capabilities: session.capabilities,
                             onAccepted: { [weak self, weak session] in
                                 guard let self, let session else {
-                                    acceptance.settle(.failure(
-                                        AgentProviderAdapterError.sessionNotFound(request.threadId)
-                                    ))
-                                    return
+                                    throw AgentProviderAdapterError.sessionNotFound(request.threadId)
                                 }
-                                self.synchronized {
+                                try self.synchronized {
+                                    guard self.sessions[request.threadId] === session,
+                                          session.isLive else {
+                                        throw AgentProviderAdapterError.sessionNotFound(request.threadId)
+                                    }
+                                    session.promptAccepted = true
+                                    session.status = .running
                                     self.promptWriteAcceptanceCountForTestingStorage += 1
                                 }
                                 for event in session.mapper.beginTurn() {
@@ -718,7 +724,7 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
         error: Error
     ) {
         lock.lock()
-        let active = session.inFlight && !session.turnTerminalEmitted
+        let active = session.inFlight && session.promptAccepted && !session.turnTerminalEmitted
         let forced = session.forcedKillByUs
         let cancelled = session.cancelRequested
         if sessions[session.threadId] === session {
@@ -747,7 +753,7 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
         if forced { lock.lock(); session.forcedKillByUs = true; lock.unlock() }
         lock.lock()
         let terminal = session.cancelRequested && session.forcedKillByUs ? AgentRunStatus.cancelled : .failed
-        let active = session.inFlight && !session.turnTerminalEmitted
+        let active = session.inFlight && session.promptAccepted && !session.turnTerminalEmitted
         lock.unlock()
         guard active else { return }
         if terminal == .failed {

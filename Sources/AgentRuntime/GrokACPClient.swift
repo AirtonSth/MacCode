@@ -498,12 +498,13 @@ public final class GrokACPClient: @unchecked Sendable {
         sessionId: String,
         request: AgentRunRequest,
         capabilities: GrokACPInitializeResult,
-        onAccepted: @escaping @Sendable () -> Void
+        onAccepted: @escaping @Sendable () throws -> Void
     ) async throws -> JSONObject {
         try await requestJSONObject(
             method: "session/prompt",
             params: ["sessionId": sessionId, "prompt": try Self.promptBlocks(for: request, capabilities: capabilities)],
             timeout: nil,
+            acceptancePermit: request.acceptancePermit,
             onAccepted: onAccepted
         )
     }
@@ -599,12 +600,14 @@ public final class GrokACPClient: @unchecked Sendable {
         method: String,
         params: Any?,
         timeout: TimeInterval?,
-        onAccepted: (@Sendable () -> Void)? = nil
+        acceptancePermit: AgentRunAcceptancePermit? = nil,
+        onAccepted: (@Sendable () throws -> Void)? = nil
     ) async throws -> JSONObject {
         let value: Any? = try await request(
             method: method,
             params: params,
             timeout: timeout,
+            acceptancePermit: acceptancePermit,
             onAccepted: onAccepted
         )
         guard let object = value as? JSONObject else { throw GrokACPError.responseTypeMismatch(method) }
@@ -615,7 +618,8 @@ public final class GrokACPClient: @unchecked Sendable {
         method: String,
         params: Any?,
         timeout: TimeInterval?,
-        onAccepted: (@Sendable () -> Void)? = nil
+        acceptancePermit: AgentRunAcceptancePermit? = nil,
+        onAccepted: (@Sendable () throws -> Void)? = nil
     ) async throws -> Any? {
         let id = reserveId()
         return try await withCheckedThrowingContinuation { continuation in
@@ -627,8 +631,15 @@ public final class GrokACPClient: @unchecked Sendable {
             do {
                 if let onAccepted {
                     let writeAndAccept = {
-                        try self.write(payload)
-                        onAccepted()
+                        let write = {
+                            try self.write(payload)
+                            try onAccepted()
+                        }
+                        if let acceptancePermit {
+                            try acceptancePermit.withAcceptance(write)
+                        } else {
+                            try write()
+                        }
                     }
                     if DispatchQueue.getSpecific(key: parseQueueKey) != nil {
                         try writeAndAccept()

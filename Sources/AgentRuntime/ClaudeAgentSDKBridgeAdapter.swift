@@ -399,20 +399,26 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
         session.cancellationRequested = false
         lock.unlock()
 
-        onEvent(.status(.running))
         do {
             // Per-turn Graphify path hint: persistent SDK sessions do not re-apply
             // system_prompt after creation, so App Support graph paths must ride on
             // each turn when the host sets RC_GRAPHIFY_* on the environment.
-            try write([
-                "type": "rc_turn",
-                "prompt": GraphifyStableSkillText.augmentTurnPrompt(
-                    request.providerPrompt,
-                    environment: request.environment
-                ),
-                "attachments": Self.attachmentPayload(request.attachments),
-                "session_id": session.providerThreadId ?? request.threadId.value.uuidString
-            ], to: session)
+            let writeTurn = {
+                try self.write([
+                    "type": "rc_turn",
+                    "prompt": GraphifyStableSkillText.augmentTurnPrompt(
+                        request.providerPrompt,
+                        environment: request.environment
+                    ),
+                    "attachments": Self.attachmentPayload(request.attachments),
+                    "session_id": session.providerThreadId ?? request.threadId.value.uuidString
+                ], to: session)
+            }
+            if let acceptancePermit = request.acceptancePermit {
+                try acceptancePermit.withAcceptance(writeTurn)
+            } else {
+                try writeTurn()
+            }
         } catch {
             lock.lock()
             if session.inFlightRunId == request.runId {
@@ -424,6 +430,7 @@ public final class ClaudeAgentSDKBridgeAdapter: AgentProviderAdapter, @unchecked
             invalidateSessionAfterControlWriteFailure(session)
             throw error
         }
+        onEvent(.status(.running))
         return AgentRunHandle(runId: request.runId, process: session.process) { [weak self] in
             try? self?.requestCancellation(threadId: request.threadId)
         }

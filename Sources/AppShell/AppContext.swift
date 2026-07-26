@@ -196,6 +196,7 @@ public final class AppContext {
     }
     private var queueDrainWaiters: [AgentThreadID: QueueDrainWaiter] = [:]
     private var queueDrainSuppressionLeases: [AgentThreadID: Set<UUID>] = [:]
+    private var queueDispatchAcceptancePermits: [AgentThreadID: AgentRunAcceptancePermit] = [:]
     private var isTerminating = false
     var queueDrainWaiterCountForTesting: Int { queueDrainWaiters.count }
     var queueDrainSuppressedThreadCountForTesting: Int { queueDrainSuppressionLeases.count }
@@ -994,17 +995,55 @@ public final class AppContext {
         queueDrainWaiters.removeValue(forKey: threadId)?.task.cancel()
     }
 
+    func registerQueueDispatchAcceptancePermit(
+        _ permit: AgentRunAcceptancePermit,
+        threadId: AgentThreadID
+    ) {
+        queueDispatchAcceptancePermits[threadId]?.invalidate()
+        queueDispatchAcceptancePermits[threadId] = permit
+    }
+
+    func unregisterQueueDispatchAcceptancePermit(
+        _ permit: AgentRunAcceptancePermit,
+        threadId: AgentThreadID
+    ) {
+        guard queueDispatchAcceptancePermits[threadId] === permit else { return }
+        queueDispatchAcceptancePermits.removeValue(forKey: threadId)
+    }
+
     func acquireQueueDrainSuppression(threadId: AgentThreadID) async -> UUID {
-        let lease = UUID()
-        queueDrainSuppressionLeases[threadId, default: []].insert(lease)
+        await acquireQueueDrainSuppressions(threadIds: [threadId])[0].1
+    }
+
+    /// Installs every lease and invalidates every pending provider acceptance
+    /// before awaiting any one drain task. This prevents an idle sibling thread
+    /// from starting while a stuck sibling is still cancelling.
+    func acquireQueueDrainSuppressions(
+        threadIds: [AgentThreadID]
+    ) async -> [(AgentThreadID, UUID)] {
+        var seen: Set<AgentThreadID> = []
+        let ordered = threadIds.filter { seen.insert($0).inserted }
+        var leases: [(AgentThreadID, UUID)] = []
+        var waiters: [Task<Void, Never>] = []
+        for threadId in ordered {
+            let lease = UUID()
+            queueDrainSuppressionLeases[threadId, default: []].insert(lease)
+            leases.append((threadId, lease))
+            queueDispatchAcceptancePermits.removeValue(forKey: threadId)?.invalidate()
+            if let waiter = queueDrainWaiters.removeValue(forKey: threadId) {
+                waiter.task.cancel()
+                waiters.append(waiter.task)
+            }
+        }
         if let queueDrainSuppressionAcquiredForTesting {
-            await queueDrainSuppressionAcquiredForTesting(threadId)
+            for threadId in ordered {
+                await queueDrainSuppressionAcquiredForTesting(threadId)
+            }
         }
-        if let waiter = queueDrainWaiters.removeValue(forKey: threadId) {
-            waiter.task.cancel()
-            await waiter.task.value
+        for waiter in waiters {
+            await waiter.value
         }
-        return lease
+        return leases
     }
 
     func releaseQueueDrainSuppression(threadId: AgentThreadID, lease: UUID) {
@@ -1028,6 +1067,9 @@ public final class AppContext {
     }
 
     private func cancelAllQueueDrainWaiters() -> [Task<Void, Never>] {
+        let permits = queueDispatchAcceptancePermits.values
+        queueDispatchAcceptancePermits.removeAll()
+        for permit in permits { permit.invalidate() }
         let tasks = queueDrainWaiters.values.map(\.task)
         queueDrainWaiters.removeAll()
         for task in tasks { task.cancel() }

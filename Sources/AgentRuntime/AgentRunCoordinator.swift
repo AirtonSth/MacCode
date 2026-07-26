@@ -576,7 +576,8 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             providerBinary: request.providerBinary,
             environment: effectiveEnvironment,
             extraArgs: request.extraArgs,
-            runAsUser: request.runAsUser
+            runAsUser: request.runAsUser,
+            acceptancePermit: request.acceptancePermit
         )
         guard let runner = providers[effectiveRequest.provider] else {
             throw AgentRunError.missingBinary(effectiveRequest.provider.rawValue)

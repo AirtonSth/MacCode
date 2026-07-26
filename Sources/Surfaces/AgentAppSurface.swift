@@ -255,6 +255,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// termination. AppContext owns queue draining, so the surface requests the
     /// same suppression used by mirror-driven deletion.
     public var acquireQueueDrainSuppression: ((AgentThreadID) async -> UUID)?
+    public var acquireQueueDrainSuppressions: (([AgentThreadID]) async -> [(AgentThreadID, UUID)])?
     public var releaseQueueDrainSuppression: ((AgentThreadID, UUID) -> Void)?
     /// UX-MAC_AGENT-OPEN-SPLIT: wired by AppCommandRouter. A clicked file mention
     /// (absolute path, already resolved) opens — or reuses — a Files split panel
@@ -3513,11 +3514,18 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     @discardableResult
     public func deleteThreads(_ ids: Set<AgentThreadID>) async -> Bool {
         guard !ids.isEmpty else { return true }
-        var suppressionLeases: [(AgentThreadID, UUID)] = []
-        if let acquireQueueDrainSuppression {
+        let orderedIDs = ids.sorted { $0.value.uuidString < $1.value.uuidString }
+        let suppressionLeases: [(AgentThreadID, UUID)]
+        if let acquireQueueDrainSuppressions {
+            suppressionLeases = await acquireQueueDrainSuppressions(orderedIDs)
+        } else if let acquireQueueDrainSuppression {
+            var acquired: [(AgentThreadID, UUID)] = []
             for id in ids {
-                suppressionLeases.append((id, await acquireQueueDrainSuppression(id)))
+                acquired.append((id, await acquireQueueDrainSuppression(id)))
             }
+            suppressionLeases = acquired
+        } else {
+            suppressionLeases = []
         }
         defer {
             for (id, lease) in suppressionLeases {

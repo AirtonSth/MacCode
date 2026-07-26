@@ -2069,6 +2069,10 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             guard let context else { return UUID() }
             return await context.acquireQueueDrainSuppression(threadId: threadID)
         }
+        viewModel.acquireQueueDrainSuppressions = { [weak context] threadIDs in
+            guard let context else { return [] }
+            return await context.acquireQueueDrainSuppressions(threadIds: threadIDs)
+        }
         viewModel.releaseQueueDrainSuppression = { [weak context] threadID, lease in
             context?.releaseQueueDrainSuppression(threadId: threadID, lease: lease)
         }
@@ -2837,6 +2841,15 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             attachments: resolvedAttachments,
             baseEnvironment: autoRoutingActive ? [:] : providerEnvironment(provider: prov, instanceId: t.providerInstanceId, threadId: thread)
         )
+        let acceptancePermit = queueMessageId.map { _ in AgentRunAcceptancePermit() }
+        if let acceptancePermit {
+            ctx.registerQueueDispatchAcceptancePermit(acceptancePermit, threadId: thread)
+        }
+        defer {
+            if let acceptancePermit {
+                ctx.unregisterQueueDispatchAcceptancePermit(acceptancePermit, threadId: thread)
+            }
+        }
         let req = AgentRunRequest(
             runId: queueMessageId.map { AgentRunID($0.value) } ?? AgentRunID(),
             threadId: thread,
@@ -2853,7 +2866,8 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             interactionMode: interactionMode ?? .default,
             providerBinary: autoRoutingActive ? nil : providerBinary(provider: prov, instanceId: t.providerInstanceId),
             environment: graphifyEnv,
-            runAsUser: t.runAsUser
+            runAsUser: t.runAsUser,
+            acceptancePermit: acceptancePermit
         )
         // Prefer a full orchestration snapshot (scheduled Path B / Auto admit)
         // so launch binary+catalog match preflight. Queued messages only carry
@@ -3585,13 +3599,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
 
     public func deleteAgentThreads(_ threads: [AgentThreadID]) async throws {
         guard let ctx = context else { throw LayoutError.workspaceNotFound }
-        var suppressionLeases: [(AgentThreadID, UUID)] = []
-        for thread in threads {
-            suppressionLeases.append((
-                thread,
-                await ctx.acquireQueueDrainSuppression(threadId: thread)
-            ))
-        }
+        let suppressionLeases = await ctx.acquireQueueDrainSuppressions(threadIds: threads)
         defer {
             for (thread, lease) in suppressionLeases {
                 ctx.releaseQueueDrainSuppression(threadId: thread, lease: lease)

@@ -189,9 +189,14 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
             ))
             onEvent(.event(resuming))
         }
-        onEvent(.status(.running))
         do {
-            try sendPrompt(request.providerPrompt, to: session)
+            if let acceptancePermit = request.acceptancePermit {
+                try acceptancePermit.withAcceptance {
+                    try sendPrompt(request.providerPrompt, to: session)
+                }
+            } else {
+                try sendPrompt(request.providerPrompt, to: session)
+            }
         } catch {
             lock.lock()
             if session.inFlightRunId == request.runId {
@@ -202,6 +207,7 @@ public final class ClaudeStreamingCLIAdapter: AgentProviderAdapter, @unchecked S
             lock.unlock()
             throw error
         }
+        onEvent(.status(.running))
         return AgentRunHandle(runId: request.runId, process: session.process) { [weak self] in
             try? self?.interruptTurn(threadId: request.threadId)
         }

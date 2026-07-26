@@ -411,6 +411,35 @@ public struct AgentRoutingConfiguration: Codable, Sendable, Equatable {
     }
 }
 
+public enum AgentRunAcceptanceError: Error, LocalizedError, Sendable {
+    case cancelled
+
+    public var errorDescription: String? {
+        "Provider start was cancelled before prompt acceptance."
+    }
+}
+
+/// Linearizes a queued dispatch's final cancellation check with the provider's
+/// actual prompt write. Suppression either invalidates the pending permit first,
+/// or waits for an already-entered write to leave the critical section.
+public final class AgentRunAcceptancePermit: @unchecked Sendable {
+    private let lock = NSLock()
+    private var valid = true
+
+    public init() {}
+
+    public func invalidate() {
+        lock.withLock { valid = false }
+    }
+
+    public func withAcceptance<T>(_ body: () throws -> T) throws -> T {
+        try lock.withLock {
+            guard valid else { throw AgentRunAcceptanceError.cancelled }
+            return try body()
+        }
+    }
+}
+
 public struct AgentRunRequest: Codable, Sendable, Equatable {
     public let runId: AgentRunID
     public let threadId: AgentThreadID
@@ -430,6 +459,9 @@ public struct AgentRunRequest: Codable, Sendable, Equatable {
     public let environment: [String: String]
     public let extraArgs: [String]
     public let runAsUser: AgentRunAsUser?
+    /// Runtime-only queue dispatch gate. Intentionally excluded from Codable and
+    /// value equality; it has no meaning outside the current host process.
+    public var acceptancePermit: AgentRunAcceptancePermit?
 
     public init(
         runId: AgentRunID = AgentRunID(),
@@ -449,7 +481,8 @@ public struct AgentRunRequest: Codable, Sendable, Equatable {
         providerBinary: String? = nil,
         environment: [String: String] = [:],
         extraArgs: [String] = [],
-        runAsUser: AgentRunAsUser? = nil
+        runAsUser: AgentRunAsUser? = nil,
+        acceptancePermit: AgentRunAcceptancePermit? = nil
     ) {
         self.runId = runId
         self.threadId = threadId
@@ -469,6 +502,7 @@ public struct AgentRunRequest: Codable, Sendable, Equatable {
         self.environment = environment
         self.extraArgs = extraArgs
         self.runAsUser = runAsUser
+        self.acceptancePermit = acceptancePermit
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -495,6 +529,28 @@ public struct AgentRunRequest: Codable, Sendable, Equatable {
         environment = try c.decodeIfPresent([String: String].self, forKey: .environment) ?? [:]
         extraArgs = try c.decodeIfPresent([String].self, forKey: .extraArgs) ?? []
         runAsUser = try c.decodeIfPresent(AgentRunAsUser.self, forKey: .runAsUser)
+        acceptancePermit = nil
+    }
+
+    public static func == (lhs: AgentRunRequest, rhs: AgentRunRequest) -> Bool {
+        lhs.runId == rhs.runId
+            && lhs.threadId == rhs.threadId
+            && lhs.provider == rhs.provider
+            && lhs.providerInstanceId == rhs.providerInstanceId
+            && lhs.model == rhs.model
+            && lhs.cwd == rhs.cwd
+            && lhs.prompt == rhs.prompt
+            && lhs.userMessageContent == rhs.userMessageContent
+            && lhs.attachments == rhs.attachments
+            && lhs.providerThreadId == rhs.providerThreadId
+            && lhs.permissionMode == rhs.permissionMode
+            && lhs.reasoningEffort == rhs.reasoningEffort
+            && lhs.serviceTier == rhs.serviceTier
+            && lhs.interactionMode == rhs.interactionMode
+            && lhs.providerBinary == rhs.providerBinary
+            && lhs.environment == rhs.environment
+            && lhs.extraArgs == rhs.extraArgs
+            && lhs.runAsUser == rhs.runAsUser
     }
 
     public var providerPrompt: String {

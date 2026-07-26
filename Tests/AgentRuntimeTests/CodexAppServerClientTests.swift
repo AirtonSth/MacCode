@@ -40,6 +40,38 @@ final class CodexAppServerClientTests: ProviderProcessTestCase {
         XCTAssertFalse(store.aggregates()[0].isValidForGate)
     }
 
+    func test_invalidatedAcceptancePermitBlocksTurnStartBeforeWireWrite() async throws {
+        let script = try makeFakeAppServerPeer()
+        let store = TokenSaverCensusStore()
+        TokenSaverCensusSeam.sharedStore = store
+        let client = try CodexAppServerClient(
+            binary: script,
+            arguments: [],
+            cwd: FileManager.default.temporaryDirectory.path,
+            tokenSaverCensusAllowed: true
+        )
+        defer { client.stop() }
+        _ = try await client.initialize()
+        let permit = AgentRunAcceptancePermit()
+        permit.invalidate()
+        let request = AgentRunRequest(
+            threadId: AgentThreadID(),
+            provider: .codex,
+            model: "test-model",
+            cwd: FileManager.default.temporaryDirectory.path,
+            prompt: "must not cross turn/start",
+            acceptancePermit: permit
+        )
+
+        do {
+            _ = try await client.startTurn(providerThreadId: "thread-1", for: request)
+            XCTFail("suppression must win before the Codex turn/start write")
+        } catch is AgentRunAcceptanceError {}
+
+        XCTAssertTrue(store.snapshot().isEmpty,
+                      "the provider-visible census proves no turn/start bytes were written")
+    }
+
     func test_rpcDeadlineFailsAndStopsSilentAppServer() async throws {
         let script = try makeSilentAppServerPeer()
         let client = try CodexAppServerClient(

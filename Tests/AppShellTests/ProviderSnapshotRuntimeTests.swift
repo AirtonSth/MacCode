@@ -1182,6 +1182,8 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
             )
             ctx.queueDrainProviderIdleTimeout = 0.05
             ctx.queueDrainProviderIdlePollInterval = 0.005
+            let sleeper = QueueDrainTestSleeper()
+            ctx.queueDrainSleepForTesting = { try await sleeper.sleep(threadId: $0, duration: $1) }
             let router = AppCommandRouter(context: ctx)
             ctx.router = router
             let runner = DelayedCancelQueueRunner(provider: provider)
@@ -1219,20 +1221,26 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
                 interactionMode: .default
             )
             let failures = QueueFailureCounter(threadId: thread.id)
+            let drained = QueueEventSignal(
+                threadId: thread.id,
+                kind: "agent.message.queue.drained"
+            )
             let subscription = EventBus.shared.subscribe(since: EventBus.shared.currentSeq) {
                 failures.record($0)
+                drained.record($0)
             }
             defer { EventBus.shared.unsubscribe(subscription) }
 
             let result = try await router.forceAgentQueuedMessageNow(id: forced.id)
             XCTAssertEqual(result.status, .queued)
-
-            let deadline = Date().addingTimeInterval(3)
-            while runner.startCount < 2, Date() < deadline {
-                try await Task.sleep(nanoseconds: 20_000_000)
+            for _ in 0..<10 {
+                await sleeper.advanceNext(threadId: thread.id)
             }
-
-            try await Task.sleep(nanoseconds: 200_000_000)
+            await failures.waitForCount(1)
+            runner.finishRun(ordinal: 1, status: .cancelled)
+            await sleeper.advanceNext(threadId: thread.id)
+            await runner.waitForStartCount(2)
+            await drained.waitForCount(1)
             XCTAssertEqual(runner.startCount, 2,
                            "\(provider.rawValue) Force must retry after delayed provider idle and start once")
             XCTAssertEqual(
@@ -1246,7 +1254,6 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
                 1,
                 "\(provider.rawValue) delayed cancellation must not duplicate the forced user message"
             )
-            try await Task.sleep(nanoseconds: 150_000_000)
             XCTAssertEqual(runner.startCount, 2,
                            "\(provider.rawValue) must remain at exactly one forced restart after settling")
             XCTAssertEqual(try ctx.queuedMessageRepo.list(threadId: thread.id).map(\.text), ["later"])
@@ -1375,6 +1382,8 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
         )
         ctx.queueDrainProviderIdleTimeout = 0.05
         ctx.queueDrainProviderIdlePollInterval = 0.005
+        let sleeper = QueueDrainTestSleeper()
+        ctx.queueDrainSleepForTesting = { try await sleeper.sleep(threadId: $0, duration: $1) }
         let router = AppCommandRouter(context: ctx)
         ctx.router = router
         let runner = DelayedCancelQueueRunner(provider: provider, cancellationDelay: nil)
@@ -1407,7 +1416,10 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
         defer { EventBus.shared.unsubscribe(subscription) }
 
         _ = try await router.forceAgentQueuedMessageNow(id: forced.id)
-        try await Task.sleep(nanoseconds: 200_000_000)
+        for _ in 0..<10 {
+            await sleeper.advanceNext(threadId: thread.id)
+        }
+        await failures.waitForCount(1)
 
         XCTAssertEqual(failures.count, 1)
         XCTAssertEqual(runner.startCount, 1)
@@ -1418,7 +1430,7 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
             0
         )
 
-        try await Task.sleep(nanoseconds: 150_000_000)
+        await sleeper.advanceNext(threadId: thread.id)
         XCTAssertEqual(failures.count, 1)
         XCTAssertEqual(runner.startCount, 1)
         XCTAssertEqual(try ctx.queuedMessageRepo.list(threadId: thread.id).map(\.text), ["preserve after timeout"])
@@ -1467,7 +1479,6 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
         )
 
         ctx.coordinator.stopRun(threadId: thread.id)
-        try await Task.sleep(nanoseconds: 100_000_000)
 
         XCTAssertEqual(ctx.queueDrainWaiterCountForTesting, 0)
         XCTAssertEqual(failures.count, 0)
@@ -1492,6 +1503,8 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
             )
             ctx.queueDrainProviderIdleTimeout = 0.05
             ctx.queueDrainProviderIdlePollInterval = 0.005
+            let sleeper = QueueDrainTestSleeper()
+            ctx.queueDrainSleepForTesting = { try await sleeper.sleep(threadId: $0, duration: $1) }
             let router = AppCommandRouter(context: ctx)
             ctx.router = router
             let runner = DelayedCancelQueueRunner(provider: provider, cancellationDelay: nil)
@@ -1517,8 +1530,13 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
                 reasoningEffort: nil
             )
             let failures = QueueFailureCounter(threadId: thread.id)
+            let drained = QueueEventSignal(
+                threadId: thread.id,
+                kind: "agent.message.queue.drained"
+            )
             let subscription = EventBus.shared.subscribe(since: EventBus.shared.currentSeq) {
                 failures.record($0)
+                drained.record($0)
             }
             defer { EventBus.shared.unsubscribe(subscription) }
 
@@ -1545,34 +1563,24 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
             XCTAssertEqual(ctx.queueDrainWaiterCountForTesting, 1,
                            "\(provider.rawValue) repeated enqueue must coalesce to one waiter")
 
-            try await Task.sleep(nanoseconds: 150_000_000)
+            for _ in 0..<10 {
+                await sleeper.advanceNext(threadId: thread.id)
+            }
+            await failures.waitForCount(1)
             XCTAssertEqual(failures.count, 1,
                            "\(provider.rawValue) one waiter may publish only one delayed-idle status")
             runner.finishRun(ordinal: 1, status: .cancelled)
-
-            var deadline = Date().addingTimeInterval(3)
-            while Date() < deadline {
-                let remaining = try ctx.queuedMessageRepo.list(threadId: thread.id).map(\.text)
-                if runner.startCount >= 2, remaining == ["late second"] { break }
-                try await Task.sleep(nanoseconds: 10_000_000)
-            }
+            await sleeper.advanceNext(threadId: thread.id)
+            await runner.waitForStartCount(2)
+            await drained.waitForCount(1)
             XCTAssertEqual(runner.startCount, 2)
             XCTAssertEqual(try ctx.queuedMessageRepo.list(threadId: thread.id).map(\.text), ["late second"])
-            while ctx.queueDrainWaiterCountForTesting != 0, Date() < deadline {
-                try await Task.sleep(nanoseconds: 10_000_000)
-            }
 
             runner.finishRun(ordinal: 2, status: .completed)
-            deadline = Date().addingTimeInterval(3)
-            while runner.startCount < 3, Date() < deadline {
-                try await Task.sleep(nanoseconds: 10_000_000)
-            }
+            await runner.waitForStartCount(3)
+            await drained.waitForCount(2)
             XCTAssertEqual(runner.startCount, 3)
             runner.finishRun(ordinal: 3, status: .completed)
-            while (ctx.coordinator.hasProviderSession(threadId: thread.id)
-                   || ctx.queueDrainWaiterCountForTesting != 0), Date() < deadline {
-                try await Task.sleep(nanoseconds: 10_000_000)
-            }
 
             XCTAssertFalse(ctx.coordinator.hasProviderSession(threadId: thread.id))
             XCTAssertEqual(ctx.queueDrainWaiterCountForTesting, 0)
@@ -1673,17 +1681,18 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
             attachments: [],
             interactionMode: .default
         )
+        let drained = QueueEventSignal(
+            threadId: thread.id,
+            kind: "agent.message.queue.drained"
+        )
+        let subscription = EventBus.shared.subscribe(since: EventBus.shared.currentSeq) {
+            drained.record($0)
+        }
+        defer { EventBus.shared.unsubscribe(subscription) }
 
         ctx.ensureQueueDrainWaiterIfNeeded(threadId: thread.id)
-
-        let deadline = Date().addingTimeInterval(3)
-        while Date() < deadline {
-            if runner.startCount >= 1,
-               try ctx.queuedMessageRepo.list(threadId: thread.id).isEmpty {
-                break
-            }
-            try await Task.sleep(nanoseconds: 10_000_000)
-        }
+        await runner.waitForStartCount(1)
+        await drained.waitForCount(1)
         XCTAssertEqual(runner.startCount, 1)
         XCTAssertTrue(try ctx.queuedMessageRepo.list(threadId: thread.id).isEmpty)
         runner.finishRun(ordinal: 1, status: .completed)
@@ -1704,6 +1713,8 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
         )
         ctx.queueDrainProviderIdleTimeout = 1
         ctx.queueDrainProviderIdlePollInterval = 1
+        let sleeper = QueueDrainTestSleeper()
+        ctx.queueDrainSleepForTesting = { try await sleeper.sleep(threadId: $0, duration: $1) }
         let router = AppCommandRouter(context: ctx)
         ctx.router = router
         let runner = DelayedCancelQueueRunner(provider: .claude, cancellationDelay: nil)
@@ -1731,8 +1742,16 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
             attachments: [],
             interactionMode: .default
         )
+        let drained = QueueEventSignal(
+            threadId: thread.id,
+            kind: "agent.message.queue.drained"
+        )
+        let subscription = EventBus.shared.subscribe(since: EventBus.shared.currentSeq) {
+            drained.record($0)
+        }
+        defer { EventBus.shared.unsubscribe(subscription) }
         ctx.ensureQueueDrainWaiterIfNeeded(threadId: thread.id)
-        await Task.yield()
+        await sleeper.waitForRequestCount(1, threadId: thread.id)
         XCTAssertEqual(ctx.queueDrainWaiterCountForTesting, 1)
 
         _ = try router.cancelAgentQueuedMessage(id: first.id)
@@ -1743,21 +1762,15 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
             interactionMode: .default
         )
         ctx.ensureQueueDrainWaiterIfNeeded(threadId: thread.id)
+        await sleeper.waitForRequestCount(2, threadId: thread.id)
         XCTAssertEqual(ctx.queueDrainWaiterCountForTesting, 1)
 
-        await Task.yield()
-        try await Task.sleep(nanoseconds: 20_000_000)
         XCTAssertEqual(ctx.queueDrainWaiterCountForTesting, 1,
                        "old cancellation cleanup must be token-checked")
         runner.finishRun(ordinal: 1, status: .cancelled)
-        let deadline = Date().addingTimeInterval(3)
-        while Date() < deadline {
-            if runner.startCount >= 2,
-               try ctx.queuedMessageRepo.list(threadId: thread.id).isEmpty {
-                break
-            }
-            try await Task.sleep(nanoseconds: 10_000_000)
-        }
+        await sleeper.advanceNext(threadId: thread.id)
+        await runner.waitForStartCount(2)
+        await drained.waitForCount(1)
         XCTAssertEqual(runner.startCount, 2)
         XCTAssertTrue(try ctx.queuedMessageRepo.list(threadId: thread.id).isEmpty)
         runner.finishRun(ordinal: 2, status: .completed)
@@ -1806,6 +1819,14 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
             interactionMode: .default
         )
         ctx.ensureQueueDrainWaiterIfNeeded(threadId: thread.id)
+        let drained = QueueEventSignal(
+            threadId: thread.id,
+            kind: "agent.message.queue.drained"
+        )
+        let subscription = EventBus.shared.subscribe(since: EventBus.shared.currentSeq) {
+            drained.record($0)
+        }
+        defer { EventBus.shared.unsubscribe(subscription) }
 
         let finishTask = Task.detached {
             runner.finishRun(ordinal: 1, status: .cancelled)
@@ -1819,17 +1840,8 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
         )
         ctx.ensureQueueDrainWaiterIfNeeded(threadId: thread.id)
         await finishTask.value
-
-        let deadline = Date().addingTimeInterval(3)
-        while Date() < deadline {
-            let queueIsEmpty = try ctx.queuedMessageRepo.list(threadId: thread.id).isEmpty
-            if runner.startCount >= 2,
-               ctx.queueDrainWaiterCountForTesting == 0,
-               queueIsEmpty {
-                break
-            }
-            try await Task.sleep(nanoseconds: 10_000_000)
-        }
+        await runner.waitForStartCount(2)
+        await drained.waitForCount(1)
         XCTAssertFalse(runner.lastFinishWasMainThread)
         XCTAssertEqual(runner.startCount, 2)
         XCTAssertEqual(ctx.queueDrainWaiterCountForTesting, 0)
@@ -2107,6 +2119,97 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
             ["preserve across delete"],
             "pre-start cancellation must release the prepared lease before deletion snapshots it"
         )
+    }
+
+    func test_agentAppBulkDeletionSuppressesEveryThreadBeforeAwaitingStuckDrain() async throws {
+        // WHY: bulk deletion must not await thread A's already-entered drain
+        // before protecting idle thread B; B can become idle during that wait.
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let workspaceDir = root.appendingPathComponent("workspace", isDirectory: true)
+        try FileManager.default.createDirectory(at: workspaceDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        defer { closeAndUnregisterAllSurfaces() }
+        let ctx = try AppContext(
+            channel: .debug,
+            appSupportOverride: root.appendingPathComponent("support").path
+        )
+        ctx.queueDrainProviderIdlePollInterval = 0.005
+        let router = AppCommandRouter(context: ctx)
+        ctx.router = router
+        let runner = DelayedCancelQueueRunner(provider: .claude, cancellationDelay: nil)
+        ctx.coordinator.replaceProvider(.claude, runner: runner)
+        let workspace = try router.createWorkspace(name: "bulk-delete-barrier", cwd: workspaceDir.path)
+        let threads = try (0..<2).map { index in
+            try router.createAgentThread(
+                workspace: workspace.id,
+                title: "bulk \(index)",
+                provider: .claude,
+                model: "test-model",
+                permissionMode: .supervised,
+                reasoningEffort: .medium
+            )
+        }
+        let descriptor = try router.createSurface(
+            workspace: workspace.id,
+            type: .agentApp,
+            paneID: nil,
+            title: "Agent App"
+        )
+        let surface = try XCTUnwrap(
+            SurfaceRegistry.shared.surface(descriptor.id) as? AgentAppSurface
+        )
+        for (index, thread) in threads.enumerated() {
+            _ = try await router.sendAgentMessage(
+                thread: thread.id,
+                text: "running \(index)",
+                provider: nil,
+                model: nil,
+                permissionMode: nil,
+                reasoningEffort: nil
+            )
+            _ = try await router.sendAgentMessage(
+                thread: thread.id,
+                text: "recover \(index)",
+                provider: nil,
+                model: nil,
+                permissionMode: nil,
+                reasoningEffort: nil
+            )
+        }
+
+        let barrier = QueueDrainAsyncBarrier()
+        router.queueDispatchBeforeProviderStartForTesting = { await barrier.enterAndWait() }
+        runner.finishRun(ordinal: 1, status: .completed)
+        await barrier.waitUntilEntered()
+
+        let allSuppressed = QueueDrainAsyncSignal()
+        ctx.queueDrainSuppressionAcquiredForTesting = { _ in await allSuppressed.signal() }
+        let deletion = Task {
+            await surface.viewModel.deleteThreads(Set(threads.map(\.id)))
+        }
+        await allSuppressed.wait()
+
+        XCTAssertEqual(
+            ctx.queueDrainSuppressedThreadCountForTesting,
+            2,
+            "both leases must exist before bulk deletion awaits A's stuck waiter"
+        )
+        runner.finishRun(ordinal: 2, status: .completed)
+        XCTAssertEqual(runner.startCount, 2,
+                       "B becoming idle while A is stuck must not start B's queued prompt")
+
+        await barrier.release()
+        let deleted = await deletion.value
+        XCTAssertTrue(deleted)
+        XCTAssertEqual(runner.startCount, 2)
+        XCTAssertTrue(surface.viewModel.undoLastThreadDeletion())
+        for (index, thread) in threads.enumerated() {
+            XCTAssertEqual(
+                try ctx.queuedMessageRepo.list(threadId: thread.id).map(\.text),
+                ["recover \(index)"]
+            )
+        }
     }
 
     func test_applicationTerminationBlocksDrainAlreadyAtDispatchBarrier() async throws {
@@ -2470,6 +2573,132 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
             XCTAssertEqual(try ctx.runRepo.get(id: AgentRunID(queued.id.value))?.status, .failed)
             XCTAssertEqual(failing.startCount, 1)
           }
+        }
+    }
+
+    func test_grokPromptWriteFailurePersistsCanonicalStartFailureAndPreparedQueueAcrossRelaunch() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let workspaceDir = root.appendingPathComponent("workspace", isDirectory: true)
+        try FileManager.default.createDirectory(at: workspaceDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        defer { closeAndUnregisterAllSurfaces() }
+        let peer = try PromptWriteFailureGrokPeer(root: root.appendingPathComponent("peer"))
+        let ctx = try AppContext(
+            channel: .debug,
+            appSupportOverride: root.appendingPathComponent("support").path
+        )
+        let router = AppCommandRouter(context: ctx)
+        ctx.router = router
+        ctx.coordinator.replaceProviderAdapter(
+            .grok,
+            adapter: GrokACPAdapter(binaryNameOverride: peer.path)
+        )
+        let workspace = try router.createWorkspace(name: "grok-write-failure", cwd: workspaceDir.path)
+        var thread = try router.createAgentThread(
+            workspace: workspace.id,
+            title: "grok write failure",
+            provider: .grok,
+            model: "account-live-model",
+            permissionMode: .supervised,
+            reasoningEffort: .medium
+        )
+        thread.status = .failed
+        try ctx.threadRepo.upsert(thread)
+        let queued = try ctx.queuedMessageRepo.enqueue(
+            threadId: thread.id,
+            text: "preserve exact prompt",
+            attachments: [],
+            interactionMode: .default
+        )
+
+        do {
+            _ = try await router.forceAgentQueuedMessageNow(id: queued.id)
+            XCTFail("the real ACP prompt write must fail")
+        } catch {}
+
+        let runId = AgentRunID(queued.id.value)
+        XCTAssertEqual(try ctx.queuedMessageRepo.dispatch(id: queued.id)?.state, .prepared)
+        XCTAssertEqual(
+            try ctx.providerSessionRuntimeRepo.get(threadId: thread.id)?.lastEventKind,
+            "run.start_failed"
+        )
+        XCTAssertEqual(try ctx.runRepo.get(id: runId)?.status, .failed)
+        let launchCountBeforeRecovery = peer.launchCount
+
+        await router.reconcileQueuedAgentMessagesOnLaunch()
+
+        XCTAssertEqual(peer.launchCount, launchCountBeforeRecovery,
+                       "relaunch reconciliation must not replay an unaccepted prepared prompt")
+        XCTAssertEqual(try ctx.queuedMessageRepo.get(id: queued.id)?.text, "preserve exact prompt")
+        XCTAssertEqual(try ctx.queuedMessageRepo.dispatch(id: queued.id)?.state, .prepared)
+    }
+
+    func test_routerCoordinatorPreservesRevokedAcceptancePermitToEveryProviderWire() async throws {
+        // WHY: queued requests are rebuilt inside AgentRunCoordinator. The
+        // runtime-only permit must survive that copy or the real provider write
+        // boundary silently receives nil and suppression cannot win.
+        for provider in AgentProvider.allCases {
+            let root = FileManager.default.temporaryDirectory
+                .appendingPathComponent("provider-permit-\(provider.rawValue)-\(UUID().uuidString)", isDirectory: true)
+            let workspaceDir = root.appendingPathComponent("workspace", isDirectory: true)
+            try FileManager.default.createDirectory(at: workspaceDir, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: root) }
+            defer { closeAndUnregisterAllSurfaces() }
+            let peer = try ProviderAcceptanceProbePeer(provider: provider, root: root.appendingPathComponent("peer"))
+            let concrete: AgentProviderAdapter
+            switch provider {
+            case .codex:
+                concrete = CodexAppServerAdapter(binaryNameOverride: peer.path)
+            case .claude:
+                concrete = ClaudeStreamingCLIAdapter(binaryNameOverride: peer.path)
+            case .grok:
+                concrete = GrokACPAdapter(binaryNameOverride: peer.path)
+            }
+            let revoking = RevokingAcceptanceAdapter(inner: concrete)
+            let ctx = try AppContext(
+                channel: .debug,
+                appSupportOverride: root.appendingPathComponent("support").path
+            )
+            let router = AppCommandRouter(context: ctx)
+            ctx.router = router
+            ctx.coordinator.replaceProviderAdapter(provider, adapter: revoking)
+            let workspace = try router.createWorkspace(
+                name: "permit \(provider.rawValue)",
+                cwd: workspaceDir.path
+            )
+            var thread = try router.createAgentThread(
+                workspace: workspace.id,
+                title: "permit \(provider.rawValue)",
+                provider: provider,
+                model: "account-live-model",
+                permissionMode: .supervised,
+                reasoningEffort: .medium
+            )
+            thread.status = .failed
+            try ctx.threadRepo.upsert(thread)
+            let queued = try ctx.queuedMessageRepo.enqueue(
+                threadId: thread.id,
+                text: "must not cross \(provider.rawValue) wire",
+                attachments: [],
+                interactionMode: .default
+            )
+
+            do {
+                _ = try await router.forceAgentQueuedMessageNow(id: queued.id)
+                XCTFail("\(provider.rawValue) start must be revoked at its wire boundary")
+            } catch {}
+
+            XCTAssertTrue(revoking.sawAcceptancePermit,
+                          "coordinator must preserve the \(provider.rawValue) permit")
+            XCTAssertEqual(peer.acceptedPromptCount, 0,
+                           "\(provider.rawValue) must receive no prompt bytes after revocation")
+            XCTAssertEqual(try ctx.queuedMessageRepo.dispatch(id: queued.id)?.state, .prepared)
+            XCTAssertEqual(
+                try ctx.providerSessionRuntimeRepo.get(threadId: thread.id)?.lastEventKind,
+                "run.start_failed"
+            )
+            concrete.stopAll()
         }
     }
 
@@ -2886,12 +3115,13 @@ private final class DelayedCancelQueueRunner: AgentProviderRunner, @unchecked Se
     private let lock = NSLock()
     private var starts = 0
     private var callbacks: [Int: @Sendable (AgentRunEvent) -> Void] = [:]
+    private var startWaiters: [(Int, CheckedContinuation<Void, Never>)] = []
     private var finishWasMainThread = true
-    private let cancellationDelay: TimeInterval?
+    private let finishOnCancel: Bool
 
-    init(provider: AgentProvider, cancellationDelay: TimeInterval? = 0.15) {
+    init(provider: AgentProvider, cancellationDelay: TimeInterval? = nil) {
         self.provider = provider
-        self.cancellationDelay = cancellationDelay
+        self.finishOnCancel = cancellationDelay != nil
     }
 
     var startCount: Int {
@@ -2910,14 +3140,27 @@ private final class DelayedCancelQueueRunner: AgentProviderRunner, @unchecked Se
         let ordinal = lock.withLock { () -> Int in
             starts += 1
             callbacks[starts] = onEvent
+            let ready = startWaiters.filter { $0.0 <= starts }
+            startWaiters.removeAll { $0.0 <= starts }
+            ready.forEach { $0.1.resume() }
             return starts
         }
         onEvent(.status(.running))
         return AgentRunHandle(runId: request.runId, process: nil) {
-            guard ordinal == 1, let cancellationDelay = self.cancellationDelay else { return }
-            DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + cancellationDelay) {
-                self.finishRun(ordinal: ordinal, status: .cancelled)
+            guard ordinal == 1, self.finishOnCancel else { return }
+            self.finishRun(ordinal: ordinal, status: .cancelled)
+        }
+    }
+
+    func waitForStartCount(_ count: Int) async {
+        if lock.withLock({ starts >= count }) { return }
+        await withCheckedContinuation { continuation in
+            let resumeNow = lock.withLock { () -> Bool in
+                guard starts < count else { return true }
+                startWaiters.append((count, continuation))
+                return false
             }
+            if resumeNow { continuation.resume() }
         }
     }
 
@@ -2935,6 +3178,7 @@ private final class QueueFailureCounter: @unchecked Sendable {
     private let lock = NSLock()
     private let threadId: String
     private var value = 0
+    private var waiters: [(Int, CheckedContinuation<Void, Never>)] = []
 
     init(threadId: AgentThreadID) {
         self.threadId = threadId.value.uuidString
@@ -2945,7 +3189,62 @@ private final class QueueFailureCounter: @unchecked Sendable {
     func record(_ event: EventBus.Event) {
         guard event.kind == "agent.message.queue.failed",
               event.payload.objectValue?["thread_id"]?.stringValue == threadId else { return }
-        lock.withLock { value += 1 }
+        let ready = lock.withLock { () -> [CheckedContinuation<Void, Never>] in
+            value += 1
+            let ready = waiters.filter { $0.0 <= value }.map(\.1)
+            waiters.removeAll { $0.0 <= value }
+            return ready
+        }
+        ready.forEach { $0.resume() }
+    }
+
+    func waitForCount(_ count: Int) async {
+        if lock.withLock({ value >= count }) { return }
+        await withCheckedContinuation { continuation in
+            let resumeNow = lock.withLock { () -> Bool in
+                guard value < count else { return true }
+                waiters.append((count, continuation))
+                return false
+            }
+            if resumeNow { continuation.resume() }
+        }
+    }
+}
+
+private final class QueueEventSignal: @unchecked Sendable {
+    private let lock = NSLock()
+    private let threadId: String
+    private let kind: String
+    private var count = 0
+    private var waiters: [(Int, CheckedContinuation<Void, Never>)] = []
+
+    init(threadId: AgentThreadID, kind: String) {
+        self.threadId = threadId.value.uuidString
+        self.kind = kind
+    }
+
+    func record(_ event: EventBus.Event) {
+        guard event.kind == kind,
+              event.payload.objectValue?["thread_id"]?.stringValue == threadId else { return }
+        let ready = lock.withLock { () -> [CheckedContinuation<Void, Never>] in
+            count += 1
+            let ready = waiters.filter { $0.0 <= count }.map(\.1)
+            waiters.removeAll { $0.0 <= count }
+            return ready
+        }
+        ready.forEach { $0.resume() }
+    }
+
+    func waitForCount(_ expected: Int) async {
+        if lock.withLock({ count >= expected }) { return }
+        await withCheckedContinuation { continuation in
+            let resumeNow = lock.withLock { () -> Bool in
+                guard count < expected else { return true }
+                waiters.append((expected, continuation))
+                return false
+            }
+            if resumeNow { continuation.resume() }
+        }
     }
 }
 
@@ -3074,5 +3373,217 @@ private actor QueueDrainAsyncBarrier {
         released = true
         releaseWaiter?.resume()
         releaseWaiter = nil
+    }
+}
+
+private final class PromptWriteFailureGrokPeer {
+    let root: URL
+    let path: String
+    private let launchCountPath: String
+
+    var launchCount: Int {
+        ((try? String(contentsOfFile: launchCountPath, encoding: .utf8)) ?? "").count
+    }
+
+    init(root: URL) throws {
+        self.root = root
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let script = root.appendingPathComponent("grok")
+        launchCountPath = root.appendingPathComponent("launch-count").path
+        let source = #"""
+        #!/bin/sh
+        printf x >> "COUNT_PATH"
+        while IFS= read -r line; do
+          id=$(printf '%s' "$line" | sed -E 's/.*"id":([0-9]+).*/\1/')
+          if printf '%s' "$line" | grep -q '"method":"initialize"'; then
+            printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentCapabilities":{"loadSession":true,"promptCapabilities":{"image":false,"audio":false,"embeddedContext":true},"sessionCapabilities":{}}}}\n' "$id"
+          elif printf '%s' "$line" | grep -q '"method":"session.*new"'; then
+            exec 0<&-
+            printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"session-fixed","models":{"currentModelId":"account-live-model","availableModels":[{"modelId":"account-live-model","name":"Live"}]},"modes":{"currentModeId":"default","availableModes":[{"id":"default","name":"Default"}]}}}\n' "$id"
+            exec tail -f "COUNT_PATH" >/dev/null
+          fi
+        done
+        """#
+            .replacingOccurrences(of: "COUNT_PATH", with: launchCountPath)
+        try source.write(to: script, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o755],
+            ofItemAtPath: script.path
+        )
+        path = script.path
+    }
+}
+
+private final class RevokingAcceptanceAdapter: AgentProviderAdapter, @unchecked Sendable {
+    private let inner: AgentProviderAdapter
+    private let lock = NSLock()
+    private var sawPermit = false
+
+    init(inner: AgentProviderAdapter) {
+        self.inner = inner
+    }
+
+    var provider: AgentProvider { inner.provider }
+    var forkSafety: AgentProviderForkSafety { inner.forkSafety }
+    var sawAcceptancePermit: Bool { lock.withLock { sawPermit } }
+
+    func forkSafety(threadId: AgentThreadID) -> AgentProviderForkSafety {
+        inner.forkSafety(threadId: threadId)
+    }
+
+    func listModels() async -> [AgentModelDescriptor] { await inner.listModels() }
+
+    func startSession(
+        _ request: AgentRunRequest,
+        onEvent: @escaping @Sendable (AgentRunEvent) -> Void
+    ) async throws -> AgentRunHandle {
+        try await revokeAndSend(request, onEvent: onEvent)
+    }
+
+    func sendTurn(
+        _ request: AgentRunRequest,
+        onEvent: @escaping @Sendable (AgentRunEvent) -> Void
+    ) async throws -> AgentRunHandle {
+        try await revokeAndSend(request, onEvent: onEvent)
+    }
+
+    private func revokeAndSend(
+        _ request: AgentRunRequest,
+        onEvent: @escaping @Sendable (AgentRunEvent) -> Void
+    ) async throws -> AgentRunHandle {
+        if let permit = request.acceptancePermit {
+            lock.withLock { sawPermit = true }
+            permit.invalidate()
+        }
+        return try await inner.sendTurn(request, onEvent: onEvent)
+    }
+
+    func interruptTurn(threadId: AgentThreadID) throws {
+        try inner.interruptTurn(threadId: threadId)
+    }
+
+    func respondToRequest(
+        threadId: AgentThreadID,
+        requestId: String,
+        response: AgentProviderRequestResponse
+    ) async throws {
+        try await inner.respondToRequest(threadId: threadId, requestId: requestId, response: response)
+    }
+
+    func respondToUserInput(threadId: AgentThreadID, requestId: String, text: String) throws {
+        try inner.respondToUserInput(threadId: threadId, requestId: requestId, text: text)
+    }
+
+    func cancelUserInput(threadId: AgentThreadID, requestId: String) throws {
+        try inner.cancelUserInput(threadId: threadId, requestId: requestId)
+    }
+
+    func stopSession(threadId: AgentThreadID) throws {
+        try inner.stopSession(threadId: threadId)
+    }
+
+    func recoverSession(
+        _ request: AgentRunRequest,
+        onEvent: @escaping @Sendable (AgentRunEvent) -> Void
+    ) async throws {
+        try await inner.recoverSession(request, onEvent: onEvent)
+    }
+
+    func listSessions() -> [AgentProviderSessionSummary] { inner.listSessions() }
+    func hasSession(threadId: AgentThreadID) -> Bool { inner.hasSession(threadId: threadId) }
+    func readThread(threadId: AgentThreadID) async throws -> [AssistantEvent] {
+        try await inner.readThread(threadId: threadId)
+    }
+    func forkThread(threadId: AgentThreadID) async throws -> String {
+        try await inner.forkThread(threadId: threadId)
+    }
+    func forkThread(_ request: AgentProviderForkRequest) async throws -> String {
+        try await inner.forkThread(request)
+    }
+    func compensateFork(
+        _ request: AgentProviderForkRequest,
+        providerChildThreadId: String
+    ) async throws {
+        try await inner.compensateFork(request, providerChildThreadId: providerChildThreadId)
+    }
+    func rollbackThread(threadId: AgentThreadID, toTurnId: String) async throws {
+        try await inner.rollbackThread(threadId: threadId, toTurnId: toTurnId)
+    }
+    func stopAll() { inner.stopAll() }
+    func stopAllForAppTermination() { inner.stopAllForAppTermination() }
+    func streamEvents(
+        threadId: AgentThreadID,
+        onEvent: @escaping @Sendable (AgentRunEvent) -> Void
+    ) throws {
+        try inner.streamEvents(threadId: threadId, onEvent: onEvent)
+    }
+}
+
+private final class ProviderAcceptanceProbePeer {
+    let path: String
+    private let markerPath: String
+
+    var acceptedPromptCount: Int {
+        ((try? String(contentsOfFile: markerPath, encoding: .utf8)) ?? "").count
+    }
+
+    init(provider: AgentProvider, root: URL) throws {
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        markerPath = root.appendingPathComponent("accepted-prompts").path
+        let script = root.appendingPathComponent(provider.rawValue)
+        let source: String
+        switch provider {
+        case .codex:
+            source = """
+            #!/usr/bin/env python3
+            import json, pathlib, sys
+            marker = pathlib.Path(\(String(reflecting: markerPath)))
+            for line in sys.stdin:
+                message = json.loads(line)
+                method = message.get("method")
+                if method == "initialize":
+                    result = {"userAgent": "permit-probe"}
+                elif method == "thread/start":
+                    result = {"thread": {"id": "codex-thread", "turns": [], "status": {"state": "idle"}}}
+                elif method == "turn/start":
+                    marker.write_text("x")
+                    result = {"turn": {"id": "codex-turn"}}
+                else:
+                    result = {}
+                print(json.dumps({"id": message["id"], "result": result}), flush=True)
+            """
+        case .claude:
+            source = """
+            #!/usr/bin/env python3
+            import json, pathlib, sys
+            marker = pathlib.Path(\(String(reflecting: markerPath)))
+            print(json.dumps({"type":"system","subtype":"init","session_id":"claude-thread"}), flush=True)
+            for line in sys.stdin:
+                if line.strip():
+                    marker.write_text("x")
+            """
+        case .grok:
+            source = """
+            #!/usr/bin/env python3
+            import json, pathlib, sys
+            marker = pathlib.Path(\(String(reflecting: markerPath)))
+            for line in sys.stdin:
+                message = json.loads(line)
+                method = message.get("method")
+                if method == "initialize":
+                    result = {"protocolVersion":1,"agentCapabilities":{"loadSession":True,"promptCapabilities":{"image":False,"audio":False,"embeddedContext":True},"sessionCapabilities":{}}}
+                elif method == "session/new":
+                    result = {"sessionId":"grok-thread","models":{"currentModelId":"account-live-model","availableModels":[{"modelId":"account-live-model","name":"Live"}]},"modes":{"currentModeId":"default","availableModes":[{"id":"default","name":"Default"}]}}
+                elif method == "session/prompt":
+                    marker.write_text("x")
+                    result = {"stopReason":"end_turn"}
+                else:
+                    result = {}
+                print(json.dumps({"jsonrpc":"2.0","id":message["id"],"result":result}), flush=True)
+            """
+        }
+        try source.write(to: script, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: script.path)
+        path = script.path
     }
 }
