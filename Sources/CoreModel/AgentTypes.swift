@@ -419,23 +419,113 @@ public enum AgentRunAcceptanceError: Error, LocalizedError, Sendable {
     }
 }
 
-/// Linearizes a queued dispatch's final cancellation check with the provider's
-/// actual prompt write. Suppression either invalidates the pending permit first,
-/// or waits for an already-entered write to leave the critical section.
-public final class AgentRunAcceptancePermit: @unchecked Sendable {
+public enum AgentRunAcceptanceOutcome: Sendable, Equatable {
+    case notAccepted
+    case accepted
+    case unknown
+}
+
+/// Completion for a provider write that already claimed its acceptance permit.
+/// Invalidation never waits on provider I/O; destructive callers may await this
+/// object asynchronously after issuing provider stop.
+public final class AgentRunAcceptanceAttempt: @unchecked Sendable {
     private let lock = NSLock()
-    private var valid = true
+    private var isComplete = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    fileprivate init() {}
+
+    public func wait() async {
+        if lock.withLock({ isComplete }) { return }
+        await withCheckedContinuation { continuation in
+            let resumeNow = lock.withLock { () -> Bool in
+                guard !isComplete else { return true }
+                waiters.append(continuation)
+                return false
+            }
+            if resumeNow { continuation.resume() }
+        }
+    }
+
+    fileprivate func complete() {
+        let pending = lock.withLock { () -> [CheckedContinuation<Void, Never>] in
+            guard !isComplete else { return [] }
+            isComplete = true
+            let pending = waiters
+            waiters.removeAll()
+            return pending
+        }
+        pending.forEach { $0.resume() }
+    }
+}
+
+/// Linearizes a queued dispatch's final cancellation check with the provider's
+/// actual prompt write without holding a lock across provider I/O. A claimed
+/// write linearizes before later invalidation; destructive flows then stop and
+/// await that provider instead of blocking the MainActor on a pipe write.
+public final class AgentRunAcceptancePermit: @unchecked Sendable {
+    private enum State {
+        case pending
+        case invalidated
+        case claimed(AgentRunAcceptanceAttempt)
+        case accepted
+        case unknown
+    }
+
+    private let lock = NSLock()
+    private var state: State = .pending
 
     public init() {}
 
-    public func invalidate() {
-        lock.withLock { valid = false }
+    @discardableResult
+    public func invalidate() -> AgentRunAcceptanceAttempt? {
+        lock.withLock {
+            if case .pending = state {
+                state = .invalidated
+                return nil
+            }
+            if case .claimed(let attempt) = state {
+                return attempt
+            }
+            return nil
+        }
     }
 
-    public func withAcceptance<T>(_ body: () throws -> T) throws -> T {
-        try lock.withLock {
-            guard valid else { throw AgentRunAcceptanceError.cancelled }
-            return try body()
+    public var outcome: AgentRunAcceptanceOutcome {
+        lock.withLock {
+            switch state {
+            case .pending, .invalidated:
+                return .notAccepted
+            case .accepted:
+                return .accepted
+            case .claimed, .unknown:
+                return .unknown
+            }
+        }
+    }
+
+    public func withAcceptance<T>(
+        failureOutcome: AgentRunAcceptanceOutcome = .unknown,
+        _ body: () throws -> T
+    ) throws -> T {
+        let attempt = try lock.withLock { () throws -> AgentRunAcceptanceAttempt in
+            guard case .pending = state else {
+                throw AgentRunAcceptanceError.cancelled
+            }
+            let attempt = AgentRunAcceptanceAttempt()
+            state = .claimed(attempt)
+            return attempt
+        }
+        defer { attempt.complete() }
+        do {
+            let result = try body()
+            lock.withLock { state = .accepted }
+            return result
+        } catch {
+            lock.withLock {
+                state = failureOutcome == .notAccepted ? .invalidated : .unknown
+            }
+            throw error
         }
     }
 }

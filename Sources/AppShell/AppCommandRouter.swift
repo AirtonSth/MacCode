@@ -434,7 +434,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                             self?.publishAgentThreadLifecycle(event)
                         }
                         Self.wireScheduledRunControl(on: agent.viewModel, db: ctx.db)
-                        Self.wireQueueDrainControl(on: agent.viewModel, context: ctx)
+                        wireQueueDrainControl(on: agent.viewModel, context: ctx)
                         agent.viewModel.onPlanNotesPersisted = { [weak self] thread, notes in
                             self?.publishAgentPlanNotesUpdated(thread: thread, notes: notes)
                         }
@@ -2064,7 +2064,13 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         viewModel.stopScheduledThread = nil
     }
 
-    private static func wireQueueDrainControl(on viewModel: AgentAppViewModel, context: AppContext) {
+    private func wireQueueDrainControl(on viewModel: AgentAppViewModel, context: AppContext) {
+        viewModel.forceQueuedMessage = { [weak self] messageID in
+            guard let self else {
+                throw JSONRPCError(code: -32000, message: "App router is not ready.")
+            }
+            return try await self.forceAgentQueuedMessageNow(id: messageID)
+        }
         viewModel.acquireQueueDrainSuppression = { [weak context] threadID in
             guard let context else { return UUID() }
             return await context.acquireQueueDrainSuppression(threadId: threadID)
@@ -2524,9 +2530,13 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             }
             throw unconfirmedQueuedMessageStartError()
         }
+        let hasPendingProviderStart = ctx.coordinator.hasPendingProviderStart(threadId: queued.threadId)
         if thread.status == .running
+            || hasPendingProviderStart
             || ctx.coordinator.hasProviderSession(threadId: queued.threadId) {
-            guard let promoted = try ctx.queuedMessageRepo.promoteToFront(id: id) else {
+            let promoted = try ctx.queuedMessageRepo.promoteToFront(id: id)
+                ?? (hasPendingProviderStart ? ctx.queuedMessageRepo.get(id: id) : nil)
+            guard let promoted else {
                 throw JSONRPCError.invalidParams
             }
             for message in try ctx.queuedMessageRepo.list(threadId: queued.threadId) {
@@ -2560,6 +2570,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             _ = try? ctx.queuedMessageRepo.release(lease)
             throw JSONRPCError(code: -32000, message: "Queued message dispatch could not be prepared.")
         }
+        let acceptancePermit = AgentRunAcceptancePermit()
         var providerStartConfirmed = false
         do {
             let queuedRouting = try routingSnapshotForQueuedMessage(queued, context: ctx)
@@ -2576,9 +2587,10 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 providerInstanceId: nil,
                 attachments: queued.attachments,
                 queueMessageId: queued.id,
+                queueAcceptancePermit: acceptancePermit,
                 routingSnapshot: queuedRouting
             )
-            providerStartConfirmed = true
+            providerStartConfirmed = acceptancePermit.outcome == .accepted
             guard try ctx.queuedMessageRepo.markDispatched(lease, runId: dispatchRunId) else {
                 throw JSONRPCError(code: -32000, message: "Provider started; queue acknowledgement needs recovery.")
             }
@@ -2596,7 +2608,8 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 if let drained = try? reconcileSameCallPreparedDispatch(
                     context: ctx,
                     lease: lease,
-                    runId: dispatchRunId
+                    runId: dispatchRunId,
+                    acceptanceOutcome: acceptancePermit.outcome
                 ) {
                     publishQueuedMessage(kind: "agent.message.queue.drained", drained)
                 }
@@ -2759,7 +2772,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
         }
     }
 
-    private func sendAgentMessage(thread: AgentThreadID, text: String, provider: AgentProvider?, model: String?, permissionMode: AgentPermissionMode?, reasoningEffort: AgentReasoningEffort?, serviceTier: AgentServiceTier?, interactionMode: AgentInteractionMode?, modelSelection: AgentModelSelection?, providerInstanceId: String?, attachments: [AgentAttachment], queueMessageId: AgentQueuedMessageID?, routingConfiguration: AgentRoutingConfiguration? = nil, routingSnapshot: AgentQueuedMessageRoutingSnapshot? = nil, orchestrationRoutingSnapshot: AgentOrchestrationRoutingSnapshot? = nil) async throws -> AgentMessageSendResult {
+    private func sendAgentMessage(thread: AgentThreadID, text: String, provider: AgentProvider?, model: String?, permissionMode: AgentPermissionMode?, reasoningEffort: AgentReasoningEffort?, serviceTier: AgentServiceTier?, interactionMode: AgentInteractionMode?, modelSelection: AgentModelSelection?, providerInstanceId: String?, attachments: [AgentAttachment], queueMessageId: AgentQueuedMessageID?, queueAcceptancePermit: AgentRunAcceptancePermit? = nil, routingConfiguration: AgentRoutingConfiguration? = nil, routingSnapshot: AgentQueuedMessageRoutingSnapshot? = nil, orchestrationRoutingSnapshot: AgentOrchestrationRoutingSnapshot? = nil) async throws -> AgentMessageSendResult {
         guard let ctx = context else { throw LayoutError.workspaceNotFound }
         guard let existing = try ctx.threadRepo.get(id: thread) else { throw LayoutError.workspaceNotFound }
         let effectiveRouting = orchestrationRoutingSnapshot?.configuration
@@ -2779,6 +2792,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             )
         }
         if existing.status == .running
+            || ctx.coordinator.hasPendingProviderStart(threadId: thread)
             || ctx.coordinator.hasProviderSession(threadId: thread) {
             if queueMessageId != nil {
                 throw JSONRPCError(code: -32000, message: "Thread became active before queued dispatch started.")
@@ -2841,7 +2855,9 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             attachments: resolvedAttachments,
             baseEnvironment: autoRoutingActive ? [:] : providerEnvironment(provider: prov, instanceId: t.providerInstanceId, threadId: thread)
         )
-        let acceptancePermit = queueMessageId.map { _ in AgentRunAcceptancePermit() }
+        let acceptancePermit = queueMessageId.map { _ in
+            queueAcceptancePermit ?? AgentRunAcceptancePermit()
+        }
         if let acceptancePermit {
             ctx.registerQueueDispatchAcceptancePermit(acceptancePermit, threadId: thread)
         }
@@ -2959,6 +2975,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
             _ = try? ctx.queuedMessageRepo.release(lease)
             throw JSONRPCError(code: -32000, message: "Queued message dispatch could not be prepared.")
         }
+        let acceptancePermit = AgentRunAcceptancePermit()
         var providerStartConfirmed = false
         do {
             let queuedRouting = try routingSnapshotForQueuedMessage(queued, context: ctx)
@@ -2979,9 +2996,10 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 providerInstanceId: nil,
                 attachments: queued.attachments,
                 queueMessageId: queued.id,
+                queueAcceptancePermit: acceptancePermit,
                 routingSnapshot: queuedRouting
             )
-            providerStartConfirmed = true
+            providerStartConfirmed = acceptancePermit.outcome == .accepted
             guard try ctx.queuedMessageRepo.markDispatched(lease, runId: dispatchRunId) else {
                 throw JSONRPCError(code: -32000, message: "Provider started; queue acknowledgement needs recovery.")
             }
@@ -2995,7 +3013,8 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 if let drained = try? reconcileSameCallPreparedDispatch(
                     context: ctx,
                     lease: lease,
-                    runId: dispatchRunId
+                    runId: dispatchRunId,
+                    acceptanceOutcome: acceptancePermit.outcome
                 ) {
                     publishQueuedMessage(kind: "agent.message.queue.drained", drained)
                 }
@@ -3018,22 +3037,20 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
     private func reconcileSameCallPreparedDispatch(
         context: AppContext,
         lease: AgentQueuedMessageLease,
-        runId: AgentRunID
+        runId: AgentRunID,
+        acceptanceOutcome: AgentRunAcceptanceOutcome
     ) throws -> AgentQueuedMessage? {
-        guard try context.runRepo.get(id: runId) != nil else {
+        if acceptanceOutcome == .notAccepted {
             _ = try context.queuedMessageRepo.releasePrepared(lease, runId: runId)
             return nil
         }
-        guard try preparedQueueRunHasProviderEvidence(
-            threadId: lease.message.threadId,
-            runId: runId
-        ) else {
-            return nil
+        if acceptanceOutcome == .accepted {
+            return try context.queuedMessageRepo.acknowledgePreparedWithRunEvidence(
+                id: lease.message.id,
+                runId: runId
+            )
         }
-        return try context.queuedMessageRepo.acknowledgePreparedWithRunEvidence(
-            id: lease.message.id,
-            runId: runId
-        )
+        return nil
     }
 
     /// Relaunch recovery for queue rows left between durable prepare and provider
@@ -3605,9 +3622,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                 ctx.releaseQueueDrainSuppression(threadId: thread, lease: lease)
             }
         }
-        for thread in threads {
-            try await ctx.coordinator.stopAndAwaitTermination(threadId: thread)
-        }
+        try await ctx.coordinator.stopAndAwaitTermination(threadIds: threads)
         try ctx.threadRepo.delete(ids: threads)
     }
 
@@ -5210,7 +5225,7 @@ public final class AppCommandRouter: CommandRouting, TerminalCommandRouting, Lay
                     self?.publishAgentThreadLifecycle(event)
                 }
                 Self.wireScheduledRunControl(on: agent.viewModel, db: ctx.db)
-                Self.wireQueueDrainControl(on: agent.viewModel, context: ctx)
+                wireQueueDrainControl(on: agent.viewModel, context: ctx)
                 agent.viewModel.onPlanNotesPersisted = { [weak self] thread, notes in
                     self?.publishAgentPlanNotesUpdated(thread: thread, notes: notes)
                 }

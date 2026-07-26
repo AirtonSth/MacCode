@@ -1181,7 +1181,6 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
                 appSupportOverride: root.appendingPathComponent("support").path
             )
             ctx.queueDrainProviderIdleTimeout = 0.05
-            ctx.queueDrainProviderIdlePollInterval = 0.005
             let sleeper = QueueDrainTestSleeper()
             ctx.queueDrainSleepForTesting = { try await sleeper.sleep(threadId: $0, duration: $1) }
             let router = AppCommandRouter(context: ctx)
@@ -1233,12 +1232,9 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
 
             let result = try await router.forceAgentQueuedMessageNow(id: forced.id)
             XCTAssertEqual(result.status, .queued)
-            for _ in 0..<10 {
-                await sleeper.advanceNext(threadId: thread.id)
-            }
+            await sleeper.advanceNext(threadId: thread.id)
             await failures.waitForCount(1)
             runner.finishRun(ordinal: 1, status: .cancelled)
-            await sleeper.advanceNext(threadId: thread.id)
             await runner.waitForStartCount(2)
             await drained.waitForCount(1)
             XCTAssertEqual(runner.startCount, 2,
@@ -1284,7 +1280,6 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
                 appSupportOverride: root.appendingPathComponent("support").path
             )
             ctx.queueDrainProviderIdleTimeout = 0.02
-            ctx.queueDrainProviderIdlePollInterval = 0.005
             let router = AppCommandRouter(context: ctx)
             ctx.router = router
             let runner = DelayedCancelQueueRunner(provider: provider, cancellationDelay: nil)
@@ -1325,10 +1320,7 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
                 permissionMode: nil,
                 reasoningEffort: nil
             )
-            for _ in 0..<5 {
-                await sleeper.advanceNext(threadId: thread.id)
-            }
-            await sleeper.waitForRequestCount(6, threadId: thread.id)
+            await sleeper.advanceNext(threadId: thread.id)
 
             XCTAssertEqual(failures.count, 0,
                            "\(provider.rawValue) normal queue residence must not look like stop failure")
@@ -1349,7 +1341,6 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
             }
             defer { EventBus.shared.unsubscribe(drainedSubscription) }
             runner.finishRun(ordinal: 1, status: .completed)
-            await sleeper.advanceNext(threadId: thread.id)
             await drained.wait()
 
             XCTAssertEqual(runner.startCount, 2)
@@ -1381,7 +1372,6 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
             appSupportOverride: root.appendingPathComponent("support").path
         )
         ctx.queueDrainProviderIdleTimeout = 0.05
-        ctx.queueDrainProviderIdlePollInterval = 0.005
         let sleeper = QueueDrainTestSleeper()
         ctx.queueDrainSleepForTesting = { try await sleeper.sleep(threadId: $0, duration: $1) }
         let router = AppCommandRouter(context: ctx)
@@ -1416,9 +1406,7 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
         defer { EventBus.shared.unsubscribe(subscription) }
 
         _ = try await router.forceAgentQueuedMessageNow(id: forced.id)
-        for _ in 0..<10 {
-            await sleeper.advanceNext(threadId: thread.id)
-        }
+        await sleeper.advanceNext(threadId: thread.id)
         await failures.waitForCount(1)
 
         XCTAssertEqual(failures.count, 1)
@@ -1430,7 +1418,6 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
             0
         )
 
-        await sleeper.advanceNext(threadId: thread.id)
         XCTAssertEqual(failures.count, 1)
         XCTAssertEqual(runner.startCount, 1)
         XCTAssertEqual(try ctx.queuedMessageRepo.list(threadId: thread.id).map(\.text), ["preserve after timeout"])
@@ -1450,7 +1437,6 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
             appSupportOverride: root.appendingPathComponent("support").path
         )
         ctx.queueDrainProviderIdleTimeout = 0.02
-        ctx.queueDrainProviderIdlePollInterval = 0.005
         let router = AppCommandRouter(context: ctx)
         ctx.router = router
         let runner = DelayedCancelQueueRunner(provider: provider, cancellationDelay: nil)
@@ -1502,7 +1488,6 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
                 appSupportOverride: root.appendingPathComponent("support").path
             )
             ctx.queueDrainProviderIdleTimeout = 0.05
-            ctx.queueDrainProviderIdlePollInterval = 0.005
             let sleeper = QueueDrainTestSleeper()
             ctx.queueDrainSleepForTesting = { try await sleeper.sleep(threadId: $0, duration: $1) }
             let router = AppCommandRouter(context: ctx)
@@ -1563,14 +1548,11 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
             XCTAssertEqual(ctx.queueDrainWaiterCountForTesting, 1,
                            "\(provider.rawValue) repeated enqueue must coalesce to one waiter")
 
-            for _ in 0..<10 {
-                await sleeper.advanceNext(threadId: thread.id)
-            }
+            await sleeper.advanceNext(threadId: thread.id)
             await failures.waitForCount(1)
             XCTAssertEqual(failures.count, 1,
                            "\(provider.rawValue) one waiter may publish only one delayed-idle status")
             runner.finishRun(ordinal: 1, status: .cancelled)
-            await sleeper.advanceNext(threadId: thread.id)
             await runner.waitForStartCount(2)
             await drained.waitForCount(1)
             XCTAssertEqual(runner.startCount, 2)
@@ -1607,7 +1589,6 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
             appSupportOverride: root.appendingPathComponent("support").path
         )
         ctx.queueDrainProviderIdleTimeout = 0.5
-        ctx.queueDrainProviderIdlePollInterval = 0.005
         let router = AppCommandRouter(context: ctx)
         ctx.router = router
         let runner = DelayedCancelQueueRunner(provider: .claude, cancellationDelay: nil)
@@ -1712,7 +1693,6 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
             appSupportOverride: root.appendingPathComponent("support").path
         )
         ctx.queueDrainProviderIdleTimeout = 1
-        ctx.queueDrainProviderIdlePollInterval = 1
         let sleeper = QueueDrainTestSleeper()
         ctx.queueDrainSleepForTesting = { try await sleeper.sleep(threadId: $0, duration: $1) }
         let router = AppCommandRouter(context: ctx)
@@ -1768,7 +1748,6 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
         XCTAssertEqual(ctx.queueDrainWaiterCountForTesting, 1,
                        "old cancellation cleanup must be token-checked")
         runner.finishRun(ordinal: 1, status: .cancelled)
-        await sleeper.advanceNext(threadId: thread.id)
         await runner.waitForStartCount(2)
         await drained.waitForCount(1)
         XCTAssertEqual(runner.startCount, 2)
@@ -1790,7 +1769,6 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
             channel: .debug,
             appSupportOverride: root.appendingPathComponent("support").path
         )
-        ctx.queueDrainProviderIdlePollInterval = 0.005
         let router = AppCommandRouter(context: ctx)
         ctx.router = router
         let runner = DelayedCancelQueueRunner(provider: .claude, cancellationDelay: nil)
@@ -1867,7 +1845,6 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
             channel: .debug,
             appSupportOverride: root.appendingPathComponent("support").path
         )
-        ctx.queueDrainProviderIdlePollInterval = 0.005
         let router = AppCommandRouter(context: ctx)
         ctx.router = router
         let runner = DelayedCancelQueueRunner(provider: .claude, cancellationDelay: 0.05)
@@ -1979,7 +1956,6 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
             channel: .debug,
             appSupportOverride: root.appendingPathComponent("support").path
         )
-        ctx.queueDrainProviderIdlePollInterval = 0.005
         let router = AppCommandRouter(context: ctx)
         ctx.router = router
         let runner = DelayedCancelQueueRunner(provider: .claude, cancellationDelay: nil)
@@ -2045,7 +2021,6 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
             channel: .debug,
             appSupportOverride: root.appendingPathComponent("support").path
         )
-        ctx.queueDrainProviderIdlePollInterval = 0.005
         let router = AppCommandRouter(context: ctx)
         ctx.router = router
         let runner = DelayedCancelQueueRunner(provider: .claude, cancellationDelay: nil)
@@ -2134,7 +2109,6 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
             channel: .debug,
             appSupportOverride: root.appendingPathComponent("support").path
         )
-        ctx.queueDrainProviderIdlePollInterval = 0.005
         let router = AppCommandRouter(context: ctx)
         ctx.router = router
         let runner = DelayedCancelQueueRunner(provider: .claude, cancellationDelay: nil)
@@ -2212,6 +2186,82 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
         }
     }
 
+    func test_routerBulkDeletionStartsEveryStopTogetherAndPreservesAllRowsWhenOneFails() async throws {
+        // WHY: bulk deletion is one transaction from the user's perspective.
+        // Every provider gets the same shutdown window, and a partial shutdown
+        // must not partially delete the durable thread set.
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let workspaceDir = root.appendingPathComponent("workspace", isDirectory: true)
+        try FileManager.default.createDirectory(at: workspaceDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let ctx = try AppContext(
+            channel: .debug,
+            appSupportOverride: root.appendingPathComponent("support").path
+        )
+        let router = AppCommandRouter(context: ctx)
+        ctx.router = router
+        let workspace = try router.createWorkspace(
+            name: "concurrent bulk stop",
+            cwd: workspaceDir.path
+        )
+        let threads = try (0..<2).map { index in
+            try router.createAgentThread(
+                workspace: workspace.id,
+                title: "bulk stop \(index)",
+                provider: .claude,
+                model: "test-model",
+                permissionMode: .supervised,
+                reasoningEffort: .medium
+            )
+        }
+        let stopBarrier = ConcurrentBulkStopBarrier()
+        let runner = ConcurrentBulkStopRunner(
+            failingThreadId: threads[1].id,
+            barrier: stopBarrier
+        )
+        ctx.coordinator.replaceProvider(.claude, runner: runner)
+        ctx.coordinator.gracefulStopTimeout = 0.05
+        ctx.coordinator.hardStopTimeout = 0.15
+        for thread in threads {
+            _ = try await router.sendAgentMessage(
+                thread: thread.id,
+                text: "running",
+                provider: nil,
+                model: nil,
+                permissionMode: nil,
+                reasoningEffort: nil
+            )
+        }
+
+        let deletion = Task { () -> Error? in
+            do {
+                try await router.deleteAgentThreads(threads.map(\.id))
+                return nil
+            } catch {
+                return error
+            }
+        }
+        await stopBarrier.waitUntilEntered(2)
+
+        for thread in threads {
+            XCTAssertNotNil(
+                try ctx.threadRepo.get(id: thread.id),
+                "no row may be deleted while any member of the batch is still stopping"
+            )
+        }
+        stopBarrier.releaseAll(2)
+
+        let failure = await deletion.value
+        XCTAssertNotNil(failure, "one unconfirmed provider termination must fail the whole batch")
+        for thread in threads {
+            XCTAssertNotNil(
+                try ctx.threadRepo.get(id: thread.id),
+                "a failed batch must preserve every selected thread row"
+            )
+        }
+    }
+
     func test_applicationTerminationBlocksDrainAlreadyAtDispatchBarrier() async throws {
         // WHY: app termination is synchronous and cannot await waiter tasks.
         // Its gate must make a waiter already inside drain abandon dispatch as
@@ -2226,7 +2276,6 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
             channel: .debug,
             appSupportOverride: root.appendingPathComponent("support").path
         )
-        ctx.queueDrainProviderIdlePollInterval = 0.005
         let router = AppCommandRouter(context: ctx)
         ctx.router = router
         let runner = DelayedCancelQueueRunner(provider: .claude, cancellationDelay: nil)
@@ -2274,9 +2323,10 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
         XCTAssertEqual(ctx.queueDrainWaiterCountForTesting, 0)
     }
 
-    func test_lateIdleWaitersBackOffPollingAcrossThreads() async throws {
-        // WHY: late-idle recovery remains eventual, but many legitimately long
-        // turns must not wake the MainActor every 50ms after the warning deadline.
+    func test_hundredLateIdleWaitersScheduleOneDeadlineAndZeroPeriodicPolls() async throws {
+        // WHY: queue recovery is provider-idle driven. One hundred live threads
+        // may each own one warning deadline, but must schedule zero periodic
+        // MainActor/SQLite poll wakeups.
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
         let workspaceDir = root.appendingPathComponent("workspace", isDirectory: true)
@@ -2287,62 +2337,50 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
             channel: .debug,
             appSupportOverride: root.appendingPathComponent("support").path
         )
-        ctx.queueDrainProviderIdleTimeout = 0.02
-        ctx.queueDrainProviderIdlePollInterval = 0.005
-        ctx.queueDrainProviderLateIdlePollInterval = 0.05
+        ctx.queueDrainProviderIdleTimeout = 1_000
         let router = AppCommandRouter(context: ctx)
         ctx.router = router
         let runner = DelayedCancelQueueRunner(provider: .claude, cancellationDelay: nil)
         ctx.coordinator.replaceProvider(.claude, runner: runner)
         let sleeper = QueueDrainTestSleeper()
         ctx.queueDrainSleepForTesting = { try await sleeper.sleep(threadId: $0, duration: $1) }
-        let workspace = try router.createWorkspace(name: "late-idle-backoff", cwd: workspaceDir.path)
+        let workspace = try router.createWorkspace(name: "causal-idle-scale", cwd: workspaceDir.path)
         var threads: [AgentThread] = []
-        for index in 1...2 {
+        for index in 1...100 {
             let thread = try router.createAgentThread(
                 workspace: workspace.id,
-                title: "backoff \(index)",
+                title: "causal \(index)",
                 provider: .claude,
                 model: "test-model",
                 permissionMode: .supervised,
                 reasoningEffort: .medium
             )
             threads.append(thread)
-            _ = try await router.sendAgentMessage(
-                thread: thread.id,
-                text: "long turn \(index)",
-                provider: nil,
-                model: nil,
-                permissionMode: nil,
-                reasoningEffort: nil
-            )
-            _ = try await router.sendAgentMessage(
-                thread: thread.id,
+            _ = try await ctx.coordinator.startRun(AgentRunRequest(
+                threadId: thread.id,
+                provider: .claude,
+                model: "test-model",
+                cwd: workspaceDir.path,
+                prompt: "long turn \(index)"
+            ))
+            _ = try ctx.queuedMessageRepo.enqueue(
+                threadId: thread.id,
                 text: "queued \(index)",
-                provider: nil,
-                model: nil,
-                permissionMode: nil,
-                reasoningEffort: nil
+                attachments: [],
+                interactionMode: .default
             )
+            ctx.ensureQueueDrainWaiterIfNeeded(threadId: thread.id)
         }
 
         for thread in threads {
-            for _ in 0..<4 {
-                await sleeper.advanceNext(threadId: thread.id)
-            }
-            await sleeper.waitForRequestCount(5, threadId: thread.id)
+            await sleeper.waitForRequestCount(1, threadId: thread.id)
             let intervals = await sleeper.requestedIntervals(threadId: thread.id)
-            XCTAssertEqual(intervals, [
-                .seconds(0.005),
-                .seconds(0.005),
-                .seconds(0.005),
-                .seconds(0.005),
-                .seconds(0.05)
-            ], "post-deadline polling must switch to the low-rate interval")
-            _ = await ctx.acquireQueueDrainSuppression(threadId: thread.id)
+            XCTAssertEqual(intervals, [.seconds(1_000)],
+                           "each thread may schedule one warning deadline and no periodic polls")
         }
-        runner.finishRun(ordinal: 1, status: .cancelled)
-        runner.finishRun(ordinal: 2, status: .cancelled)
+        XCTAssertEqual(ctx.queueDrainWaiterCountForTesting, 100)
+        _ = await ctx.acquireQueueDrainSuppressions(threadIds: threads.map(\.id))
+        XCTAssertEqual(ctx.queueDrainWaiterCountForTesting, 0)
     }
 
     func test_agentAppDeleteThreadSuppressesQueuedDrainBeforeAwaitingProviderTermination() async throws {
@@ -2359,7 +2397,6 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
             channel: .debug,
             appSupportOverride: root.appendingPathComponent("support").path
         )
-        ctx.queueDrainProviderIdlePollInterval = 0.005
         let router = AppCommandRouter(context: ctx)
         ctx.router = router
         let runner = DelayedCancelQueueRunner(provider: .claude, cancellationDelay: 0.05)
@@ -2498,7 +2535,7 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
         adapter.stopAll()
     }
 
-    func test_drainQueue_startFailurePreservesPreparedIntentWithoutReplay() async throws {
+    func test_drainQueue_definiteStartFailureRequeuesForOneExplicitRetry() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         let workspaceDir = root.appendingPathComponent("workspace", isDirectory: true)
         try FileManager.default.createDirectory(at: workspaceDir, withIntermediateDirectories: true)
@@ -2522,8 +2559,8 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
         } catch {}
 
         XCTAssertEqual(try ctx.queuedMessageRepo.list(threadId: thread.id).map(\.id), [queued.id],
-                       "same-call start failure does not prove provider acceptance, so drain must preserve the prepared queue intent")
-        XCTAssertEqual(try ctx.queuedMessageRepo.dispatch(id: queued.id)?.state, .prepared)
+                       "a definite pre-write failure must preserve the queue intent")
+        XCTAssertEqual(try ctx.queuedMessageRepo.dispatch(id: queued.id)?.state, .queued)
         XCTAssertEqual(try ctx.messageRepo.list(threadId: thread.id).filter { $0.role == .user }.count, 1)
         let failedRun = try XCTUnwrap(ctx.runRepo.get(id: AgentRunID(queued.id.value)))
         XCTAssertEqual(failedRun.status, .failed,
@@ -2535,12 +2572,20 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
         )
         XCTAssertEqual(failing.startCount, 1,
                        "the same-call cleanup must not replay a failed provider start")
+
+        do {
+            _ = try await router.forceAgentQueuedMessageNow(id: queued.id)
+            XCTFail("the explicit retry must surface the provider failure")
+        } catch {}
+        XCTAssertEqual(failing.startCount, 2,
+                       "Force must retry the definitely unaccepted prompt exactly once per action")
+        XCTAssertEqual(try ctx.queuedMessageRepo.dispatch(id: queued.id)?.state, .queued)
     }
 
-    func test_forceQueue_startFailureAndTimeoutPreservePreparedIntentWithoutReplay() async throws {
-        let startErrors: [(label: String, error: Error)] = [
-            ("failure", AgentRunError.spawnFailed("intentional queue-start failure")),
-            ("timeout", CodexAppServerError.requestTimedOut(method: "turn/start", timeout: 30))
+    func test_forceQueue_requeuesDefiniteFailureButPreservesAmbiguousTimeout() async throws {
+        let startErrors: [(label: String, error: Error, claimsWrite: Bool, expectedState: AgentQueuedMessageDispatchState)] = [
+            ("failure", AgentRunError.spawnFailed("intentional queue-start failure"), false, .queued),
+            ("timeout", CodexAppServerError.requestTimedOut(method: "turn/start", timeout: 30), true, .prepared)
         ]
 
         for provider in AgentProvider.allCases {
@@ -2558,7 +2603,11 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
             thread.status = .failed
             try ctx.threadRepo.upsert(thread)
             let queued = try ctx.queuedMessageRepo.enqueue(threadId: thread.id, text: "one recovery surface", attachments: [], interactionMode: .default)
-            let failing = ThrowingStartRunner(provider: provider, error: startError.error)
+            let failing = ThrowingStartRunner(
+                provider: provider,
+                error: startError.error,
+                claimAcceptanceBeforeThrow: startError.claimsWrite
+            )
             ctx.coordinator.replaceProvider(provider, runner: failing)
 
             do {
@@ -2568,7 +2617,7 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
 
             XCTAssertEqual(try ctx.queuedMessageRepo.list(threadId: thread.id).map(\.id), [queued.id],
                            "same-call \(startError.label) is not positive provider acceptance evidence")
-            XCTAssertEqual(try ctx.queuedMessageRepo.dispatch(id: queued.id)?.state, .prepared)
+            XCTAssertEqual(try ctx.queuedMessageRepo.dispatch(id: queued.id)?.state, startError.expectedState)
             XCTAssertEqual(try ctx.messageRepo.list(threadId: thread.id).filter { $0.role == .user }.count, 1)
             XCTAssertEqual(try ctx.runRepo.get(id: AgentRunID(queued.id.value))?.status, .failed)
             XCTAssertEqual(failing.startCount, 1)
@@ -2618,7 +2667,7 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
         } catch {}
 
         let runId = AgentRunID(queued.id.value)
-        XCTAssertEqual(try ctx.queuedMessageRepo.dispatch(id: queued.id)?.state, .prepared)
+        XCTAssertEqual(try ctx.queuedMessageRepo.dispatch(id: queued.id)?.state, .queued)
         XCTAssertEqual(
             try ctx.providerSessionRuntimeRepo.get(threadId: thread.id)?.lastEventKind,
             "run.start_failed"
@@ -2628,10 +2677,10 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
 
         await router.reconcileQueuedAgentMessagesOnLaunch()
 
-        XCTAssertEqual(peer.launchCount, launchCountBeforeRecovery,
-                       "relaunch reconciliation must not replay an unaccepted prepared prompt")
+        XCTAssertEqual(peer.launchCount, launchCountBeforeRecovery + 1,
+                       "relaunch reconciliation must retry a definitely rejected prompt once")
         XCTAssertEqual(try ctx.queuedMessageRepo.get(id: queued.id)?.text, "preserve exact prompt")
-        XCTAssertEqual(try ctx.queuedMessageRepo.dispatch(id: queued.id)?.state, .prepared)
+        XCTAssertEqual(try ctx.queuedMessageRepo.dispatch(id: queued.id)?.state, .queued)
     }
 
     func test_routerCoordinatorPreservesRevokedAcceptancePermitToEveryProviderWire() async throws {
@@ -2677,6 +2726,16 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
             )
             thread.status = .failed
             try ctx.threadRepo.upsert(thread)
+            let descriptor = try router.createSurface(
+                workspace: workspace.id,
+                type: .agentApp,
+                paneID: nil,
+                title: "Agent App"
+            )
+            let surface = try XCTUnwrap(
+                SurfaceRegistry.shared.surface(descriptor.id) as? AgentAppSurface
+            )
+            surface.viewModel.selectThread(thread.id)
             let queued = try ctx.queuedMessageRepo.enqueue(
                 threadId: thread.id,
                 text: "must not cross \(provider.rawValue) wire",
@@ -2684,22 +2743,514 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
                 interactionMode: .default
             )
 
-            do {
-                _ = try await router.forceAgentQueuedMessageNow(id: queued.id)
-                XCTFail("\(provider.rawValue) start must be revoked at its wire boundary")
-            } catch {}
+            await surface.viewModel.forceQueuedMessageNow(queued)
 
             XCTAssertTrue(revoking.sawAcceptancePermit,
-                          "coordinator must preserve the \(provider.rawValue) permit")
+                          "local macOS Force must delegate through router/coordinator and preserve the \(provider.rawValue) permit")
             XCTAssertEqual(peer.acceptedPromptCount, 0,
                            "\(provider.rawValue) must receive no prompt bytes after revocation")
-            XCTAssertEqual(try ctx.queuedMessageRepo.dispatch(id: queued.id)?.state, .prepared)
+            XCTAssertEqual(try ctx.queuedMessageRepo.dispatch(id: queued.id)?.state, .queued)
             XCTAssertEqual(
                 try ctx.providerSessionRuntimeRepo.get(threadId: thread.id)?.lastEventKind,
                 "run.start_failed"
             )
             concrete.stopAll()
         }
+    }
+
+    func test_localAgentAppForceCannotCrossDeleteBulkOrTerminationSuppressionAcrossProviders() async throws {
+        let destructiveActions = ["delete", "bulk", "termination"]
+        for provider in AgentProvider.allCases {
+            for action in destructiveActions {
+                let root = FileManager.default.temporaryDirectory
+                    .appendingPathComponent("local-force-\(provider.rawValue)-\(action)-\(UUID().uuidString)", isDirectory: true)
+                let workspaceDir = root.appendingPathComponent("workspace", isDirectory: true)
+                try FileManager.default.createDirectory(at: workspaceDir, withIntermediateDirectories: true)
+                defer { try? FileManager.default.removeItem(at: root) }
+                defer { closeAndUnregisterAllSurfaces() }
+                let peer = try ProviderAcceptanceProbePeer(
+                    provider: provider,
+                    root: root.appendingPathComponent("peer")
+                )
+                let concrete: AgentProviderAdapter
+                switch provider {
+                case .codex:
+                    concrete = CodexAppServerAdapter(binaryNameOverride: peer.path)
+                case .claude:
+                    concrete = ClaudeStreamingCLIAdapter(binaryNameOverride: peer.path)
+                case .grok:
+                    concrete = GrokACPAdapter(binaryNameOverride: peer.path)
+                }
+                let ctx = try AppContext(
+                    channel: .debug,
+                    appSupportOverride: root.appendingPathComponent("support").path
+                )
+                let router = AppCommandRouter(context: ctx)
+                ctx.router = router
+                ctx.coordinator.replaceProviderAdapter(provider, adapter: concrete)
+                let workspace = try router.createWorkspace(
+                    name: "local force \(provider.rawValue) \(action)",
+                    cwd: workspaceDir.path
+                )
+                var thread = try router.createAgentThread(
+                    workspace: workspace.id,
+                    title: action,
+                    provider: provider,
+                    model: "account-live-model",
+                    permissionMode: .supervised,
+                    reasoningEffort: .medium
+                )
+                thread.status = .failed
+                try ctx.threadRepo.upsert(thread)
+                let descriptor = try router.createSurface(
+                    workspace: workspace.id,
+                    type: .agentApp,
+                    paneID: nil,
+                    title: "Agent App"
+                )
+                let surface = try XCTUnwrap(
+                    SurfaceRegistry.shared.surface(descriptor.id) as? AgentAppSurface
+                )
+                surface.viewModel.selectThread(thread.id)
+                let queued = try ctx.queuedMessageRepo.enqueue(
+                    threadId: thread.id,
+                    text: "must not survive \(action)",
+                    attachments: [],
+                    interactionMode: .default
+                )
+                let barrier = QueueDrainAsyncBarrier()
+                router.queueDispatchBeforeProviderStartForTesting = {
+                    await barrier.enterAndWait()
+                }
+                let force = Task {
+                    await surface.viewModel.forceQueuedMessageNow(queued)
+                }
+                await barrier.waitUntilEntered()
+
+                var terminationWaiters: [Task<Void, Never>] = []
+                switch action {
+                case "delete":
+                    let deleted = await surface.viewModel.deleteThread(thread.id)
+                    XCTAssertTrue(deleted)
+                case "bulk":
+                    let deleted = await surface.viewModel.deleteThreads([thread.id])
+                    XCTAssertTrue(deleted)
+                default:
+                    terminationWaiters = ctx.prepareForApplicationTermination()
+                }
+
+                await barrier.release()
+                await force.value
+                for waiter in terminationWaiters { await waiter.value }
+                XCTAssertEqual(
+                    peer.acceptedPromptCount,
+                    0,
+                    "\(provider.rawValue) local Force must not cross \(action) suppression"
+                )
+                concrete.stopAll()
+            }
+        }
+    }
+
+    func test_localAgentAppPostClaimPreHandleForceSettlesBeforeDeleteBulkOrTerminationCompletes() async throws {
+        // WHY: once the physical write claims acceptance, invalidation cannot
+        // revoke it. Destructive flows must stop promptly, then await both that
+        // claimed write and coordinator handle registration before they delete
+        // durable state or certify termination.
+        for action in ["delete", "bulk", "termination"] {
+            let root = FileManager.default.temporaryDirectory
+                .appendingPathComponent("post-claim-\(action)-\(UUID().uuidString)", isDirectory: true)
+            let workspaceDir = root.appendingPathComponent("workspace", isDirectory: true)
+            try FileManager.default.createDirectory(at: workspaceDir, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: root) }
+            defer { closeAndUnregisterAllSurfaces() }
+            let ctx = try AppContext(
+                channel: .debug,
+                appSupportOverride: root.appendingPathComponent("support").path
+            )
+            let router = AppCommandRouter(context: ctx)
+            ctx.router = router
+            let startBarrier = PostClaimPreHandleStartBarrier()
+            let runner = PostClaimPreHandleRunner(barrier: startBarrier)
+            ctx.coordinator.replaceProvider(.claude, runner: runner)
+            let workspace = try router.createWorkspace(
+                name: "post claim \(action)",
+                cwd: workspaceDir.path
+            )
+            var thread = try router.createAgentThread(
+                workspace: workspace.id,
+                title: action,
+                provider: .claude,
+                model: "test-model",
+                permissionMode: .supervised,
+                reasoningEffort: .medium
+            )
+            thread.status = .failed
+            try ctx.threadRepo.upsert(thread)
+            let descriptor = try router.createSurface(
+                workspace: workspace.id,
+                type: .agentApp,
+                paneID: nil,
+                title: "Agent App"
+            )
+            let surface = try XCTUnwrap(
+                SurfaceRegistry.shared.surface(descriptor.id) as? AgentAppSurface
+            )
+            surface.viewModel.selectThread(thread.id)
+            let queued = try ctx.queuedMessageRepo.enqueue(
+                threadId: thread.id,
+                text: "claimed before \(action)",
+                attachments: [],
+                interactionMode: .default
+            )
+            let force = Task {
+                await surface.viewModel.forceQueuedMessageNow(queued)
+            }
+            await startBarrier.waitUntilClaimed()
+
+            switch action {
+            case "delete":
+                let stopIssued = QueueDrainAsyncSignal()
+                ctx.queueDrainSuppressionAcquiredForTesting = {
+                    guard $0 == thread.id else { return }
+                    await stopIssued.signal()
+                }
+                let deletion = Task {
+                    await surface.viewModel.deleteThread(thread.id)
+                }
+                await stopIssued.wait()
+                XCTAssertNotNil(
+                    try ctx.threadRepo.get(id: thread.id),
+                    "delete must wait while the claimed write has no provider handle"
+                )
+                startBarrier.releaseWrite()
+                let deleted = await deletion.value
+                XCTAssertTrue(deleted)
+                XCTAssertNil(try ctx.threadRepo.get(id: thread.id))
+            case "bulk":
+                let stopIssued = QueueDrainAsyncSignal()
+                ctx.queueDrainSuppressionAcquiredForTesting = {
+                    guard $0 == thread.id else { return }
+                    await stopIssued.signal()
+                }
+                let deletion = Task {
+                    await surface.viewModel.deleteThreads([thread.id])
+                }
+                await stopIssued.wait()
+                XCTAssertNotNil(
+                    try ctx.threadRepo.get(id: thread.id),
+                    "bulk delete must preserve every row until the claimed start settles"
+                )
+                startBarrier.releaseWrite()
+                let deleted = await deletion.value
+                XCTAssertTrue(deleted)
+                XCTAssertNil(try ctx.threadRepo.get(id: thread.id))
+            default:
+                let terminationWaiters = ctx.prepareForApplicationTermination()
+                XCTAssertNotNil(
+                    try ctx.threadRepo.get(id: thread.id),
+                    "termination must return waiters for a claimed pre-handle write"
+                )
+                startBarrier.releaseWrite()
+                for waiter in terminationWaiters {
+                    await waiter.value
+                }
+            }
+
+            await startBarrier.waitUntilCancelled()
+            await force.value
+            XCTAssertEqual(startBarrier.physicalWriteCount, 1)
+            XCTAssertGreaterThanOrEqual(startBarrier.cancelCount, 1)
+        }
+    }
+
+    func test_secondForceDuringPostClaimPreHandleStartKeepsFirstOwnerAndQueueIntent() async throws {
+        // WHY: a claimed provider write has durable `.pending` state before its
+        // adapter session/handle exists. A second Force must queue behind that
+        // owner, not claim a second write or replace coordinator ownership.
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("post-claim-second-force-\(UUID().uuidString)", isDirectory: true)
+        let workspaceDir = root.appendingPathComponent("workspace", isDirectory: true)
+        try FileManager.default.createDirectory(at: workspaceDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        defer { closeAndUnregisterAllSurfaces() }
+        let ctx = try AppContext(
+            channel: .debug,
+            appSupportOverride: root.appendingPathComponent("support").path
+        )
+        let router = AppCommandRouter(context: ctx)
+        ctx.router = router
+        let startBarrier = PostClaimPreHandleStartBarrier()
+        let runner = PostClaimPreHandleRunner(barrier: startBarrier)
+        ctx.coordinator.replaceProvider(.claude, runner: runner)
+        let workspace = try router.createWorkspace(
+            name: "post claim second Force",
+            cwd: workspaceDir.path
+        )
+        var thread = try router.createAgentThread(
+            workspace: workspace.id,
+            title: "second Force",
+            provider: .claude,
+            model: "test-model",
+            permissionMode: .supervised,
+            reasoningEffort: .medium
+        )
+        thread.status = .failed
+        try ctx.threadRepo.upsert(thread)
+        let first = try ctx.queuedMessageRepo.enqueue(
+            threadId: thread.id,
+            text: "first pending owner",
+            attachments: [],
+            interactionMode: .default
+        )
+        let second = try ctx.queuedMessageRepo.enqueue(
+            threadId: thread.id,
+            text: "second preserved intent",
+            attachments: [],
+            interactionMode: .default
+        )
+
+        let firstForce = Task {
+            try? await router.forceAgentQueuedMessageNow(id: first.id)
+        }
+        await startBarrier.waitUntilClaimed()
+
+        let secondResult = try await router.forceAgentQueuedMessageNow(id: second.id)
+        XCTAssertEqual(secondResult.status, .queued)
+        XCTAssertEqual(secondResult.queuedMessage?.id, second.id)
+        XCTAssertTrue(ctx.coordinator.hasPendingProviderStart(threadId: thread.id))
+        XCTAssertEqual(
+            try ctx.providerSessionRuntimeRepo.get(threadId: thread.id)?.lastRunId,
+            AgentRunID(first.id.value),
+            "the first claimed run must retain pending provider ownership"
+        )
+        XCTAssertEqual(startBarrier.claimCount, 1,
+                       "the second Force must not reach a second physical write")
+        XCTAssertEqual(try ctx.queuedMessageRepo.dispatch(id: second.id)?.state, .queued)
+        XCTAssertEqual(try ctx.queuedMessageRepo.get(id: second.id)?.text, "second preserved intent")
+
+        let secondDrained = QueueDrainAsyncSignal()
+        let drainedSubscription = EventBus.shared.subscribe(since: EventBus.shared.currentSeq) {
+            guard $0.kind == "agent.message.queue.drained",
+                  $0.payload.objectValue?["queued_message_id"]?.stringValue
+                    == second.id.value.uuidString else {
+                return
+            }
+            Task { await secondDrained.signal() }
+        }
+        defer { EventBus.shared.unsubscribe(drainedSubscription) }
+        startBarrier.releaseWrite()
+        _ = await firstForce.value
+        await startBarrier.waitUntilCancelled()
+        await secondDrained.wait()
+        XCTAssertEqual(startBarrier.claimCount, 2,
+                       "the preserved second intent must drain only after the first owner settles")
+        XCTAssertEqual(startBarrier.physicalWriteCount, 2)
+        XCTAssertNil(try ctx.queuedMessageRepo.get(id: second.id))
+        ctx.coordinator.stopRun(threadId: thread.id)
+    }
+
+    func test_secondForceDuringOnRunPreparedPendingWindowStopsFirstOwnerAndDrains() async throws {
+        // WHY: durable `.pending` is exposed before the adapter session and
+        // physical-write helper exist. Pending ownership must already be
+        // registered so Force interrupts that first owner instead of attempting
+        // a competing start during the onRunPrepared suspension.
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("prepared-second-force-\(UUID().uuidString)", isDirectory: true)
+        let workspaceDir = root.appendingPathComponent("workspace", isDirectory: true)
+        try FileManager.default.createDirectory(at: workspaceDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        defer { closeAndUnregisterAllSurfaces() }
+        let ctx = try AppContext(
+            channel: .debug,
+            appSupportOverride: root.appendingPathComponent("support").path
+        )
+        let router = AppCommandRouter(context: ctx)
+        ctx.router = router
+        let startBarrier = PostClaimPreHandleStartBarrier()
+        ctx.coordinator.replaceProvider(
+            .claude,
+            runner: PostClaimPreHandleRunner(barrier: startBarrier)
+        )
+        let preparedBarrier = QueueDrainAsyncBarrier()
+        let originalOnRunPrepared = ctx.coordinator.onRunPrepared
+        ctx.coordinator.onRunPrepared = { request, prompt in
+            await originalOnRunPrepared?(request, prompt)
+            await preparedBarrier.enterAndWait()
+        }
+        let workspace = try router.createWorkspace(
+            name: "prepared second Force",
+            cwd: workspaceDir.path
+        )
+        var thread = try router.createAgentThread(
+            workspace: workspace.id,
+            title: "prepared second Force",
+            provider: .claude,
+            model: "test-model",
+            permissionMode: .supervised,
+            reasoningEffort: .medium
+        )
+        thread.status = .failed
+        try ctx.threadRepo.upsert(thread)
+        let first = try ctx.queuedMessageRepo.enqueue(
+            threadId: thread.id,
+            text: "durable pending owner",
+            attachments: [],
+            interactionMode: .default
+        )
+        let second = try ctx.queuedMessageRepo.enqueue(
+            threadId: thread.id,
+            text: "force during prepared callback",
+            attachments: [],
+            interactionMode: .default
+        )
+
+        let firstForce = Task {
+            try? await router.forceAgentQueuedMessageNow(id: first.id)
+        }
+        await preparedBarrier.waitUntilEntered()
+
+        XCTAssertTrue(ctx.coordinator.hasPendingProviderStart(threadId: thread.id))
+        XCTAssertEqual(try ctx.threadRepo.get(id: thread.id)?.status, .pending)
+        XCTAssertEqual(try ctx.runRepo.get(id: AgentRunID(first.id.value))?.status, .pending)
+        XCTAssertEqual(startBarrier.claimCount, 0,
+                       "the adapter write helper must not exist yet at this seam")
+
+        let secondResult = try await router.forceAgentQueuedMessageNow(id: second.id)
+        XCTAssertEqual(secondResult.status, .queued)
+        XCTAssertEqual(try ctx.queuedMessageRepo.dispatch(id: second.id)?.state, .queued)
+        XCTAssertEqual(
+            try ctx.providerSessionRuntimeRepo.get(threadId: thread.id)?.lastRunId,
+            AgentRunID(first.id.value),
+            "the first durable pending run must retain ownership"
+        )
+
+        let secondDrained = QueueDrainAsyncSignal()
+        let drainedSubscription = EventBus.shared.subscribe(since: EventBus.shared.currentSeq) {
+            guard $0.kind == "agent.message.queue.drained",
+                  $0.payload.objectValue?["queued_message_id"]?.stringValue
+                    == second.id.value.uuidString else {
+                return
+            }
+            Task { await secondDrained.signal() }
+        }
+        defer { EventBus.shared.unsubscribe(drainedSubscription) }
+        await preparedBarrier.release()
+        await startBarrier.waitUntilClaimed()
+        XCTAssertEqual(startBarrier.claimCount, 1)
+        startBarrier.releaseWrite()
+        _ = await firstForce.value
+        await startBarrier.waitUntilCancelled()
+        await secondDrained.wait()
+
+        XCTAssertEqual(startBarrier.claimCount, 2,
+                       "the second intent must write only after the stopped first owner settles")
+        XCTAssertNil(try ctx.queuedMessageRepo.get(id: second.id))
+        ctx.coordinator.stopRun(threadId: thread.id)
+    }
+
+    func test_earlyAdmissionFailureCompletesConcurrentTerminationWithoutProviderWrite() async throws {
+        // WHY: pending ownership is registered before provider admission. If
+        // admission throws before sendTurn, a destructive waiter must observe
+        // that failed completion rather than waiting five seconds for a handle
+        // that can never exist. The prepared queue intent must roll back safely.
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("admission-failure-stop-\(UUID().uuidString)", isDirectory: true)
+        let workspaceDir = root.appendingPathComponent("workspace", isDirectory: true)
+        try FileManager.default.createDirectory(at: workspaceDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        defer { closeAndUnregisterAllSurfaces() }
+        let ctx = try AppContext(
+            channel: .debug,
+            appSupportOverride: root.appendingPathComponent("support").path
+        )
+        let router = AppCommandRouter(context: ctx)
+        ctx.router = router
+        let runner = RequestCaptureRunner(provider: .claude)
+        ctx.coordinator.replaceProvider(.claude, runner: runner)
+        ctx.coordinator.hardStopTimeout = 0.25
+        let admissionBarrier = QueueDrainAsyncBarrier()
+        ctx.coordinator.providerAdmissionCheck = { _, _ in
+            await admissionBarrier.enterAndWait()
+            throw NSError(
+                domain: "ProviderSnapshotRuntimeTests.Admission",
+                code: 503,
+                userInfo: [NSLocalizedDescriptionKey: "intentional admission rejection"]
+            )
+        }
+        let workspace = try router.createWorkspace(
+            name: "admission failure stop",
+            cwd: workspaceDir.path
+        )
+        let thread = try router.createAgentThread(
+            workspace: workspace.id,
+            title: "admission failure stop",
+            provider: .claude,
+            model: "test-model",
+            permissionMode: .supervised,
+            reasoningEffort: .medium
+        )
+        let queued = try ctx.queuedMessageRepo.enqueue(
+            threadId: thread.id,
+            text: "preserve before provider admission",
+            attachments: [],
+            interactionMode: .default
+        )
+
+        let force = Task {
+            do {
+                _ = try await router.forceAgentQueuedMessageNow(id: queued.id)
+                return false
+            } catch {
+                return true
+            }
+        }
+        await admissionBarrier.waitUntilEntered()
+
+        XCTAssertTrue(ctx.coordinator.hasPendingProviderStart(threadId: thread.id))
+        XCTAssertEqual(try ctx.queuedMessageRepo.dispatch(id: queued.id)?.state, .prepared)
+        XCTAssertNil(runner.lastRequest)
+        XCTAssertNil(try ctx.runRepo.get(id: AgentRunID(queued.id.value)))
+
+        let terminationFinished = QueueDrainAsyncSignal()
+        let termination = Task {
+            do {
+                try await ctx.coordinator.stopAndAwaitTermination(threadId: thread.id)
+                await terminationFinished.signal()
+                return true
+            } catch {
+                await terminationFinished.signal()
+                return false
+            }
+        }
+        for _ in 0..<1_000 {
+            if try ctx.threadRepo.get(id: thread.id)?.status == .cancelled { break }
+            await Task.yield()
+        }
+        XCTAssertEqual(try ctx.threadRepo.get(id: thread.id)?.status, .cancelled,
+                       "the concurrent termination task must reach the pending owner before admission is released")
+        let terminationCompletedBeforeRelease = await terminationFinished.isSignalled
+        XCTAssertFalse(terminationCompletedBeforeRelease)
+
+        let releasedAt = ContinuousClock.now
+        await admissionBarrier.release()
+        let forceFailed = await force.value
+        let terminationSucceeded = await termination.value
+        XCTAssertTrue(forceFailed)
+        XCTAssertTrue(terminationSucceeded,
+                      "an early admission failure must complete termination without a hard timeout")
+        XCTAssertLessThan(releasedAt.duration(to: .now), .milliseconds(200))
+
+        XCTAssertFalse(ctx.coordinator.hasPendingProviderStart(threadId: thread.id))
+        XCTAssertNil(runner.lastRequest,
+                     "provider admission failure must not cross the physical write boundary")
+        XCTAssertEqual(try ctx.queuedMessageRepo.dispatch(id: queued.id)?.state, .queued)
+        XCTAssertEqual(
+            try ctx.queuedMessageRepo.get(id: queued.id)?.text,
+            "preserve before provider admission"
+        )
+        XCTAssertNil(try ctx.runRepo.get(id: AgentRunID(queued.id.value)))
+        XCTAssertTrue(try ctx.messageRepo.list(threadId: thread.id).isEmpty)
     }
 
     func test_drainQueue_relaunchAcknowledgesDispatchedHeadWithoutProviderReplay() async throws {
@@ -3037,19 +3588,25 @@ final class ProviderSnapshotRuntimeTests: XCTestCase {
 private final class ThrowingStartRunner: AgentProviderRunner, @unchecked Sendable {
     let provider: AgentProvider
     let error: Error
+    let claimAcceptanceBeforeThrow: Bool
     private let lock = NSLock()
     private var starts = 0
     init(
         provider: AgentProvider,
-        error: Error = AgentRunError.spawnFailed("intentional queue-start failure")
+        error: Error = AgentRunError.spawnFailed("intentional queue-start failure"),
+        claimAcceptanceBeforeThrow: Bool = false
     ) {
         self.provider = provider
         self.error = error
+        self.claimAcceptanceBeforeThrow = claimAcceptanceBeforeThrow
     }
     var startCount: Int { lock.withLock { starts } }
     func listModels() async -> [AgentModelDescriptor] { [] }
     func startRun(_ request: AgentRunRequest, onEvent: @escaping @Sendable (AgentRunEvent) -> Void) async throws -> AgentRunHandle {
         lock.withLock { starts += 1 }
+        if claimAcceptanceBeforeThrow, let acceptancePermit = request.acceptancePermit {
+            try acceptancePermit.withAcceptance { throw error }
+        }
         throw error
     }
 }
@@ -3174,6 +3731,167 @@ private final class DelayedCancelQueueRunner: AgentProviderRunner, @unchecked Se
     }
 }
 
+private final class ConcurrentBulkStopRunner: AgentProviderRunner, @unchecked Sendable {
+    let provider: AgentProvider = .claude
+    private let failingThreadId: AgentThreadID
+    private let barrier: ConcurrentBulkStopBarrier
+
+    init(failingThreadId: AgentThreadID, barrier: ConcurrentBulkStopBarrier) {
+        self.failingThreadId = failingThreadId
+        self.barrier = barrier
+    }
+
+    func listModels() async -> [AgentModelDescriptor] { [] }
+
+    func startRun(
+        _ request: AgentRunRequest,
+        onEvent: @escaping @Sendable (AgentRunEvent) -> Void
+    ) async throws -> AgentRunHandle {
+        onEvent(.status(.running))
+        return AgentRunHandle(runId: request.runId, process: nil) {
+            self.barrier.enterAndBlock(threadId: request.threadId)
+            guard request.threadId != self.failingThreadId else { return }
+            onEvent(.status(.cancelled))
+            onEvent(.finished(.cancelled, finalMessage: nil, providerThreadId: nil))
+        }
+    }
+}
+
+private final class PostClaimPreHandleRunner: AgentProviderRunner, @unchecked Sendable {
+    let provider: AgentProvider = .claude
+    private let barrier: PostClaimPreHandleStartBarrier
+
+    init(barrier: PostClaimPreHandleStartBarrier) {
+        self.barrier = barrier
+    }
+
+    func listModels() async -> [AgentModelDescriptor] { [] }
+
+    func startRun(
+        _ request: AgentRunRequest,
+        onEvent: @escaping @Sendable (AgentRunEvent) -> Void
+    ) async throws -> AgentRunHandle {
+        guard let acceptancePermit = request.acceptancePermit else {
+            throw AgentRunAcceptanceError.cancelled
+        }
+        try acceptancePermit.withAcceptance {
+            barrier.claimAndBlockPhysicalWrite()
+        }
+        onEvent(.status(.running))
+        return AgentRunHandle(runId: request.runId, process: nil) {
+            self.barrier.recordCancellation()
+            onEvent(.status(.cancelled))
+            onEvent(.finished(.cancelled, finalMessage: nil, providerThreadId: nil))
+        }
+    }
+}
+
+private final class PostClaimPreHandleStartBarrier: @unchecked Sendable {
+    private let lock = NSLock()
+    private let writeRelease = DispatchSemaphore(value: 0)
+    private var claimed = false
+    private var claims = 0
+    private var writes = 0
+    private var cancellations = 0
+    private var claimWaiters: [CheckedContinuation<Void, Never>] = []
+    private var cancellationWaiters: [CheckedContinuation<Void, Never>] = []
+
+    var physicalWriteCount: Int { lock.withLock { writes } }
+    var claimCount: Int { lock.withLock { claims } }
+    var cancelCount: Int { lock.withLock { cancellations } }
+
+    func claimAndBlockPhysicalWrite() {
+        let claim = lock.withLock { () -> (Int, [CheckedContinuation<Void, Never>]) in
+            claimed = true
+            claims += 1
+            let waiters = claimWaiters
+            claimWaiters.removeAll()
+            return (claims, waiters)
+        }
+        claim.1.forEach { $0.resume() }
+        if claim.0 == 1 {
+            writeRelease.wait()
+        }
+        lock.withLock { writes += 1 }
+    }
+
+    func waitUntilClaimed() async {
+        if lock.withLock({ claimed }) { return }
+        await withCheckedContinuation { continuation in
+            let resumeNow = lock.withLock { () -> Bool in
+                guard !claimed else { return true }
+                claimWaiters.append(continuation)
+                return false
+            }
+            if resumeNow { continuation.resume() }
+        }
+    }
+
+    func releaseWrite() {
+        writeRelease.signal()
+    }
+
+    func recordCancellation() {
+        let waiters = lock.withLock { () -> [CheckedContinuation<Void, Never>] in
+            cancellations += 1
+            let waiters = cancellationWaiters
+            cancellationWaiters.removeAll()
+            return waiters
+        }
+        waiters.forEach { $0.resume() }
+    }
+
+    func waitUntilCancelled() async {
+        if lock.withLock({ cancellations > 0 }) { return }
+        await withCheckedContinuation { continuation in
+            let resumeNow = lock.withLock { () -> Bool in
+                guard cancellations == 0 else { return true }
+                cancellationWaiters.append(continuation)
+                return false
+            }
+            if resumeNow { continuation.resume() }
+        }
+    }
+}
+
+private final class ConcurrentBulkStopBarrier: @unchecked Sendable {
+    private let lock = NSLock()
+    private let releaseSemaphore = DispatchSemaphore(value: 0)
+    private var enteredThreadIds = Set<AgentThreadID>()
+    private var waiters: [(Int, CheckedContinuation<Void, Never>)] = []
+
+    func enterAndBlock(threadId: AgentThreadID) {
+        let entry = lock.withLock { () -> (Bool, [CheckedContinuation<Void, Never>]) in
+            guard enteredThreadIds.insert(threadId).inserted else { return (false, []) }
+            let count = enteredThreadIds.count
+            let ready = waiters.filter { $0.0 <= count }.map(\.1)
+            waiters.removeAll { $0.0 <= count }
+            return (true, ready)
+        }
+        guard entry.0 else { return }
+        entry.1.forEach { $0.resume() }
+        releaseSemaphore.wait()
+    }
+
+    func waitUntilEntered(_ expected: Int) async {
+        if lock.withLock({ enteredThreadIds.count >= expected }) { return }
+        await withCheckedContinuation { continuation in
+            let resumeNow = lock.withLock { () -> Bool in
+                guard enteredThreadIds.count < expected else { return true }
+                waiters.append((expected, continuation))
+                return false
+            }
+            if resumeNow { continuation.resume() }
+        }
+    }
+
+    func releaseAll(_ count: Int) {
+        for _ in 0..<count {
+            releaseSemaphore.signal()
+        }
+    }
+}
+
 private final class QueueFailureCounter: @unchecked Sendable {
     private let lock = NSLock()
     private let threadId: String
@@ -3263,6 +3981,8 @@ private actor QueueDrainAsyncSignal {
         guard !signalled else { return }
         await withCheckedContinuation { waiters.append($0) }
     }
+
+    var isSignalled: Bool { signalled }
 }
 
 private actor QueueDrainTestSleeper {

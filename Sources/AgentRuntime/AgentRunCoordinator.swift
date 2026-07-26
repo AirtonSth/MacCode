@@ -9,6 +9,53 @@ import os
 // through the unified logging system, keyed by thread/run ids.
 private let agentRunLog = Logger(subsystem: "io.remotecode.agent", category: "run")
 
+private final class PendingProviderStart: @unchecked Sendable {
+    let runId: AgentRunID
+    private let lock = NSLock()
+    private var isComplete = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+    private var settledHandle: AgentRunHandle?
+    private var startFailed = false
+
+    init(runId: AgentRunID) {
+        self.runId = runId
+    }
+
+    func wait() async {
+        if lock.withLock({ isComplete }) { return }
+        await withCheckedContinuation { continuation in
+            let resumeNow = lock.withLock { () -> Bool in
+                guard !isComplete else { return true }
+                waiters.append(continuation)
+                return false
+            }
+            if resumeNow { continuation.resume() }
+        }
+    }
+
+    func record(handle: AgentRunHandle) {
+        lock.withLock { settledHandle = handle }
+    }
+
+    func result() -> (handle: AgentRunHandle?, failed: Bool) {
+        lock.withLock { (settledHandle, startFailed) }
+    }
+
+    func complete() {
+        let pending = lock.withLock { () -> [CheckedContinuation<Void, Never>] in
+            guard !isComplete else { return [] }
+            if settledHandle == nil {
+                startFailed = true
+            }
+            isComplete = true
+            let pending = waiters
+            waiters.removeAll()
+            return pending
+        }
+        pending.forEach { $0.resume() }
+    }
+}
+
 /// Immutable host-authoritative view of the runs currently registered in the
 /// coordinator. The list is sorted by run ID so consumers never inherit
 /// dictionary iteration order when choosing a primary run.
@@ -148,6 +195,10 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     /// commits; a new run on the same thread must not overtake it.
     private var pendingStartFailures: [AgentRunID: PendingStartFailure] = [:]
     private var startFailureRetryScheduled: Set<AgentRunID> = []
+    /// Provider sendTurn calls that have durable pending rows but have not yet
+    /// returned a cancellable handle or failed. Destructive waits must not treat
+    /// `activeThreads[thread] == nil` as terminal while one of these exists.
+    private var pendingProviderStarts: [AgentThreadID: PendingProviderStart] = [:]
     private var pendingThreadStops: Set<AgentThreadID> = []
     /// Runs whose destructive caller is waiting for provider/process teardown.
     /// The matching terminal callback is recorded even when markStopRequested
@@ -223,6 +274,9 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     public var onRunStarted: ((AgentThreadID, AgentRunID) -> Void)?
     public var onAssistantEvent: ((AssistantEvent, AgentThreadID, AgentRunID) -> Void)?
     public var onRunFinished: ((AgentThreadID, AgentRunID, AgentRunStatus) -> Void)?
+    /// Provider-native terminal acknowledgement used to wake queued work
+    /// causally instead of polling resident adapter sessions.
+    public var onProviderIdle: ((AgentThreadID) -> Void)?
     /// Fires only after `activeThreads` commits. Consumers can therefore project
     /// aggregate state without racing the provider's async start/finish path.
     public var onActiveRunProjectionChanged: ((ActiveRunProjection, ActiveRunProjectionCause) -> Void)?
@@ -494,6 +548,30 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         }
         try beginExclusiveThreadMutation(request.threadId, operation: "provider run start")
         defer { endExclusiveThreadMutation(request.threadId) }
+        let runId = request.runId
+        let pendingProviderStart = PendingProviderStart(runId: runId)
+        lock.lock()
+        let registeredPendingStart: Bool
+        if pendingProviderStarts[request.threadId] == nil {
+            pendingProviderStarts[request.threadId] = pendingProviderStart
+            registeredPendingStart = true
+        } else {
+            registeredPendingStart = false
+        }
+        lock.unlock()
+        guard registeredPendingStart else {
+            throw AgentProviderAdapterError.unsupported(
+                "Provider start cannot replace another pending start for this thread"
+            )
+        }
+        defer {
+            lock.lock()
+            if pendingProviderStarts[request.threadId] === pendingProviderStart {
+                pendingProviderStarts.removeValue(forKey: request.threadId)
+            }
+            lock.unlock()
+            pendingProviderStart.complete()
+        }
         guard !hasProviderSession(threadId: request.threadId) else {
             throw AgentProviderAdapterError.unsupported("Provider session already has an in-flight turn")
         }
@@ -629,7 +707,6 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         await onRunPrepared?(effectiveRequest, preservedUserContent)
         agentRunLog.info("run.started thread=\(effectiveRequest.threadId.value.uuidString, privacy: .public) run=\(effectiveRequest.runId.value.uuidString, privacy: .public) provider=\(effectiveRequest.provider.rawValue, privacy: .public) model=\(effectiveRequest.model, privacy: .public)")
 
-        let runId = effectiveRequest.runId
         let coordinator = self
         let handle: AgentRunHandle
         let expectsDistillOutput = Self.promptInvokesDistill(effectiveRequest.prompt) ||
@@ -641,6 +718,7 @@ public final class AgentRunCoordinator: @unchecked Sendable {
             handle = try await runner.sendTurn(effectiveRequest) { ev in
                 coordinator.handle(event: ev, runId: runId, threadId: effectiveRequest.threadId)
             }
+            pendingProviderStart.record(handle: handle)
             lock.lock()
             providerTurnScopes[effectiveRequest.threadId] = ProviderTurnScope(environment: effectiveRequest.environment)
             lock.unlock()
@@ -1064,10 +1142,37 @@ public final class AgentRunCoordinator: @unchecked Sendable {
     /// cancel gets a two-second grace window; hard escalation is bounded by the
     /// five-second deadline. Destructive callers must abort deletion on error.
     public func stopAndAwaitTermination(threadId: AgentThreadID) async throws {
+        var awaitingRunIds = Set<AgentRunID>()
+        var settledPendingStart: PendingProviderStart?
+
+        // A provider write may already be claimed while sendTurn has not yet
+        // returned its handle. Record the pending run before stopping so a
+        // synchronous terminal callback counts as provider acknowledgement,
+        // then wait causally for handle registration/start failure.
+        while true {
+            lock.lock()
+            let pendingStart = pendingProviderStarts[threadId]
+            if let pendingStart {
+                awaitingTerminationRuns.insert(pendingStart.runId)
+                awaitingRunIds.insert(pendingStart.runId)
+            }
+            lock.unlock()
+            guard let pendingStart else { break }
+            stopRun(threadId: threadId)
+            await pendingStart.wait()
+            settledPendingStart = pendingStart
+        }
+
         lock.lock()
-        let runId = activeThreads[threadId]
-        let handle = runId.flatMap { active[$0] }
-        if let runId { awaitingTerminationRuns.insert(runId) }
+        let activeRunId = activeThreads[threadId]
+        let activeHandle = activeRunId.flatMap { active[$0] }
+        let pendingResult = settledPendingStart?.result()
+        let runId = activeRunId ?? (pendingResult?.failed == true ? nil : settledPendingStart?.runId)
+        let handle = activeHandle ?? pendingResult?.handle
+        if let runId {
+            awaitingTerminationRuns.insert(runId)
+            awaitingRunIds.insert(runId)
+        }
         lock.unlock()
 
         let adapter = try? adapterForThread(threadId)
@@ -1079,12 +1184,12 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         var escalated = false
 
         defer {
-            if let runId {
-                lock.lock()
+            lock.lock()
+            for runId in awaitingRunIds {
                 awaitingTerminationRuns.remove(runId)
                 providerTerminatedRuns.remove(runId)
-                lock.unlock()
             }
+            lock.unlock()
         }
 
         stopRun(threadId: threadId)
@@ -1145,11 +1250,56 @@ public final class AgentRunCoordinator: @unchecked Sendable {
         }
     }
 
+    /// Starts every provider stop before awaiting any one thread. Each member
+    /// shares the same wall-clock stop window, and callers mutate durable rows
+    /// only after the whole batch confirms termination.
+    public func stopAndAwaitTermination(threadIds: [AgentThreadID]) async throws {
+        var seen: Set<AgentThreadID> = []
+        let ordered = threadIds.filter { seen.insert($0).inserted }
+        let failures = await withTaskGroup(
+            of: (AgentThreadID, String?).self,
+            returning: [(AgentThreadID, String)].self
+        ) { group in
+            for threadId in ordered {
+                group.addTask { [self] in
+                    do {
+                        try await stopAndAwaitTermination(threadId: threadId)
+                        return (threadId, nil)
+                    } catch {
+                        return (threadId, error.localizedDescription)
+                    }
+                }
+            }
+            var failures: [(AgentThreadID, String)] = []
+            for await (threadId, failure) in group {
+                if let failure { failures.append((threadId, failure)) }
+            }
+            return failures.sorted { $0.0.value.uuidString < $1.0.value.uuidString }
+        }
+        guard !failures.isEmpty else { return }
+        let details = failures
+            .map { "\($0.0.value.uuidString): \($0.1)" }
+            .joined(separator: "; ")
+        throw NSError(
+            domain: "RemoteCode.AgentRunCoordinator.TerminationBatch",
+            code: 504,
+            userInfo: [NSLocalizedDescriptionKey: "Provider termination failed for \(failures.count) thread(s): \(details)"]
+        )
+    }
+
     /// Provider-authoritative busy state. This remains true when a surface or
     /// coordinator projection is stale but the adapter still owns a live turn.
     public func hasProviderSession(threadId: AgentThreadID) -> Bool {
         guard let adapter = try? adapterForThread(threadId) else { return false }
         return providerSessionIsLive(adapter, threadId: threadId)
+    }
+
+    /// True after durable pending state is committed and before the provider
+    /// returns a cancellable handle (or fails). Router admission must treat this
+    /// window as active even when the adapter has not registered a session yet.
+    public func hasPendingProviderStart(threadId: AgentThreadID) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        return pendingProviderStarts[threadId] != nil
     }
 
     private func providerSessionIsLive(
@@ -2779,6 +2929,9 @@ public final class AgentRunCoordinator: @unchecked Sendable {
                 providerTerminatedRuns.insert(runId)
             }
             lock.unlock()
+            if providerTerminalAcknowledged {
+                onProviderIdle?(threadId)
+            }
             if let row = try? runRepo.get(id: runId), row.finishedAt != nil {
                 // Durable row is terminal (possibly written by another process's
                 // launch reconciliation or a partial finish). If this process still

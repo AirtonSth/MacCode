@@ -184,10 +184,8 @@ public final class AppContext {
     /// sidecar status. Production code never sets this.
     var distillClientOverrideForTesting: DistillServiceClient?
     var queueDrainProviderIdleTimeout: TimeInterval = 10
-    var queueDrainProviderIdlePollInterval: TimeInterval = 0.05
-    var queueDrainProviderLateIdlePollInterval: TimeInterval = 1
-    var queueDrainPollObserverForTesting: ((AgentThreadID) -> Void)?
     var queueDrainBeforeDispatchForTesting: (() async -> Void)?
+    /// Test seam for the single warning deadline; queue progress is causal.
     var queueDrainSleepForTesting: ((AgentThreadID, Duration) async throws -> Duration)?
     var queueDrainSuppressionAcquiredForTesting: ((AgentThreadID) async -> Void)?
     private struct QueueDrainWaiter {
@@ -785,6 +783,15 @@ public final class AppContext {
                 }
             }
         }
+        coordinator.onProviderIdle = { [weak self] threadId in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                // Adapters finalize their resident-session status immediately
+                // after returning from the terminal callback.
+                await Task.yield()
+                await self.providerBecameIdle(threadId: threadId)
+            }
+        }
 
         // HC-1: stream terminal/surface frames to the mirror so iOS renders
         // a live terminal (not a poll). PTY bytes are base64; idle geometry
@@ -883,83 +890,45 @@ public final class AppContext {
             return
         }
         guard queueDrainWaiters[threadId] == nil else { return }
-        let clock = ContinuousClock()
-        let startedAt = clock.now
         let timeout = Duration.seconds(max(0.001, queueDrainProviderIdleTimeout))
-        let pollInterval = Duration.seconds(max(0.001, queueDrainProviderIdlePollInterval))
         let token = UUID()
 
         let task = Task { @MainActor [weak self] in
-            var publishedTimeoutFailure = false
-            var evaluatedDeadline = false
-            var elapsed = Duration.zero
-            while !Task.isCancelled {
-                guard let self else { return }
-                guard self.queueDrainAllowsWork(threadId: threadId) else {
-                    self.removeQueueDrainWaiter(threadId: threadId, token: token)
-                    return
-                }
-                guard (try? self.threadRepo.get(id: threadId)) != nil,
-                      let queuedMessages = try? self.queuedMessageRepo.list(threadId: threadId),
-                      !queuedMessages.isEmpty else {
-                    self.removeQueueDrainWaiter(threadId: threadId, token: token)
-                    return
-                }
-                if !self.coordinator.hasProviderSession(threadId: threadId) {
-                    await self.finishScheduledQueueDrain(threadId: threadId, token: token)
-                    return
-                }
-                // Crossing the deadline means provider state is still uncertain,
-                // not failed. Keep the single waiter alive so a late native
-                // cancellation can drain exactly once without replaying the row.
-                let remaining = elapsed < timeout ? timeout - elapsed : .zero
-                let latePollInterval = Duration.seconds(max(0.001, self.queueDrainProviderLateIdlePollInterval))
-                let interval: Duration
-                if remaining > .zero {
-                    interval = min(pollInterval, remaining)
+            guard let self else { return }
+            do {
+                if let queueDrainSleepForTesting = self.queueDrainSleepForTesting {
+                    _ = try await queueDrainSleepForTesting(threadId, timeout)
                 } else {
-                    interval = evaluatedDeadline ? latePollInterval : pollInterval
+                    try await ContinuousClock().sleep(for: timeout)
                 }
-                self.queueDrainPollObserverForTesting?(threadId)
-                do {
-                    if let queueDrainSleepForTesting = self.queueDrainSleepForTesting {
-                        elapsed = try await queueDrainSleepForTesting(threadId, interval)
-                    } else {
-                        try await clock.sleep(for: interval)
-                        elapsed = startedAt.duration(to: clock.now)
-                    }
-                } catch {
-                    self.removeQueueDrainWaiter(threadId: threadId, token: token)
-                    return
-                }
-                if !self.coordinator.hasProviderSession(threadId: threadId) {
-                    await self.finishScheduledQueueDrain(threadId: threadId, token: token)
-                    return
-                }
-                let threadStatus = (try? self.threadRepo.get(id: threadId))?.status
-                if elapsed >= timeout {
-                    evaluatedDeadline = true
-                }
-                let hasTerminalOrStopEvidence: Bool
-                switch threadStatus {
-                case .completed, .failed, .cancelled, .interrupted:
-                    hasTerminalOrStopEvidence = true
-                case .pending, .running, nil:
-                    hasTerminalOrStopEvidence = false
-                }
-                if !publishedTimeoutFailure,
-                   elapsed >= timeout,
-                   hasTerminalOrStopEvidence {
-                    publishedTimeoutFailure = true
-                    EventBus.shared.publish(kind: "agent.message.queue.failed", payload: .object([
-                        "thread_id": .string(threadId.value.uuidString),
-                        "message": .string("Provider is still stopping. The queued message remains safe and will start when the provider becomes idle.")
-                    ]))
-                }
+            } catch {
+                return
             }
-            self?.removeQueueDrainWaiter(threadId: threadId, token: token)
+            guard self.queueDrainWaiters[threadId]?.token == token,
+                  self.queueDrainAllowsWork(threadId: threadId),
+                  self.coordinator.hasProviderSession(threadId: threadId) else { return }
+            switch (try? self.threadRepo.get(id: threadId))?.status {
+            case .completed, .failed, .cancelled, .interrupted:
+                EventBus.shared.publish(kind: "agent.message.queue.failed", payload: .object([
+                    "thread_id": .string(threadId.value.uuidString),
+                    "message": .string("Provider is still stopping. The queued message remains safe and will start when the provider becomes idle.")
+                ]))
+            case .pending, .running, nil:
+                break
+            }
         }
         queueDrainWaiters[threadId] = QueueDrainWaiter(token: token, task: task)
+        if !coordinator.hasProviderSession(threadId: threadId) {
+            Task { @MainActor [weak self] in
+                await self?.finishScheduledQueueDrain(threadId: threadId, token: token)
+            }
+        }
+    }
+
+    private func providerBecameIdle(threadId: AgentThreadID) async {
+        guard let waiter = queueDrainWaiters[threadId],
+              !coordinator.hasProviderSession(threadId: threadId) else { return }
+        await finishScheduledQueueDrain(threadId: threadId, token: waiter.token)
     }
 
     private func finishScheduledQueueDrain(threadId: AgentThreadID, token: UUID) async {
@@ -1025,22 +994,41 @@ public final class AppContext {
         let ordered = threadIds.filter { seen.insert($0).inserted }
         var leases: [(AgentThreadID, UUID)] = []
         var waiters: [Task<Void, Never>] = []
+        var acceptanceAttempts: [(AgentThreadID, AgentRunAcceptanceAttempt)] = []
         for threadId in ordered {
             let lease = UUID()
             queueDrainSuppressionLeases[threadId, default: []].insert(lease)
             leases.append((threadId, lease))
-            queueDispatchAcceptancePermits.removeValue(forKey: threadId)?.invalidate()
+            if let attempt = queueDispatchAcceptancePermits
+                .removeValue(forKey: threadId)?
+                .invalidate() {
+                acceptanceAttempts.append((threadId, attempt))
+            }
             if let waiter = queueDrainWaiters.removeValue(forKey: threadId) {
                 waiter.task.cancel()
                 waiters.append(waiter.task)
             }
+        }
+        // A claimed write linearized before suppression. Stop every affected
+        // provider before awaiting any write completion so a stuck pipe cannot
+        // delay cancellation of its siblings.
+        for (threadId, _) in acceptanceAttempts {
+            coordinator.stopRun(threadId: threadId)
         }
         if let queueDrainSuppressionAcquiredForTesting {
             for threadId in ordered {
                 await queueDrainSuppressionAcquiredForTesting(threadId)
             }
         }
+        let acceptanceWaiters = acceptanceAttempts.map { _, attempt in
+            Task.detached {
+                await attempt.wait()
+            }
+        }
         for waiter in waiters {
+            await waiter.value
+        }
+        for waiter in acceptanceWaiters {
             await waiter.value
         }
         return leases
@@ -1063,16 +1051,22 @@ public final class AppContext {
 
     private func removeQueueDrainWaiter(threadId: AgentThreadID, token: UUID) {
         guard queueDrainWaiters[threadId]?.token == token else { return }
-        queueDrainWaiters.removeValue(forKey: threadId)
+        queueDrainWaiters.removeValue(forKey: threadId)?.task.cancel()
     }
 
     private func cancelAllQueueDrainWaiters() -> [Task<Void, Never>] {
-        let permits = queueDispatchAcceptancePermits.values
+        let permits = queueDispatchAcceptancePermits
         queueDispatchAcceptancePermits.removeAll()
-        for permit in permits { permit.invalidate() }
-        let tasks = queueDrainWaiters.values.map(\.task)
+        var tasks = queueDrainWaiters.values.map(\.task)
         queueDrainWaiters.removeAll()
         for task in tasks { task.cancel() }
+        for (threadId, permit) in permits {
+            guard let attempt = permit.invalidate() else { continue }
+            coordinator.stopRun(threadId: threadId)
+            tasks.append(Task.detached {
+                await attempt.wait()
+            })
+        }
         return tasks
     }
 

@@ -75,6 +75,7 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
         var cancelRequested = false
         var forcedKillByUs = false
         var turnTerminalEmitted = false
+        var promptWritePermit = AgentRunAcceptancePermit()
         var onEvent: (@Sendable (AgentRunEvent) -> Void)?
         var history: [AssistantEvent] = []
         var pendingPermissions: [String: PendingPermission] = [:]
@@ -121,6 +122,7 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
     private var sessions: [AgentThreadID: Session] = [:]
     private var promptWriteAcceptanceCountForTestingStorage = 0
     var beforePromptWriteForTesting: (() -> Void)?
+    var beforePhysicalPromptWriteForTesting: (() -> Void)?
     var afterPromptWriteForTesting: (() -> Void)?
     var promptWriteAcceptanceCountForTesting: Int {
         synchronized { promptWriteAcceptanceCountForTestingStorage }
@@ -384,6 +386,7 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
             throw AgentProviderAdapterError.sessionNotFound(threadId)
         }
         session.isLive = false
+        session.promptWritePermit.invalidate()
         let pending = Array(session.pendingPermissions.values)
         session.pendingPermissions.removeAll()
         lock.unlock()
@@ -435,7 +438,10 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
     public func stopAll() {
         lock.lock()
         let all = Array(sessions.values)
-        all.forEach { $0.isLive = false }
+        all.forEach {
+            $0.isLive = false
+            $0.promptWritePermit.invalidate()
+        }
         sessions.removeAll()
         lock.unlock()
         all.forEach { $0.client.stop() }
@@ -444,7 +450,10 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
     public func stopAllForAppTermination() {
         lock.lock()
         let all = Array(sessions.values)
-        all.forEach { $0.isLive = false }
+        all.forEach {
+            $0.isLive = false
+            $0.promptWritePermit.invalidate()
+        }
         sessions.removeAll()
         lock.unlock()
         all.forEach { $0.client.stopImmediatelyForAppTermination() }
@@ -527,7 +536,10 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
             }
             let replaced = synchronized { () -> Session? in
                 let replaced = sessions.updateValue(session, forKey: request.threadId)
-                replaced?.isLive = false
+                if let replaced {
+                    replaced.isLive = false
+                    replaced.promptWritePermit.invalidate()
+                }
                 return replaced
             }
             replaced?.client.stop()
@@ -569,6 +581,7 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
             }
             session.inFlight = true
             session.promptAccepted = false
+            session.promptWritePermit = AgentRunAcceptancePermit()
             session.cancelRequested = false
             session.forcedKillByUs = false
             session.turnTerminalEmitted = false
@@ -620,6 +633,10 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
                             sessionId: session.providerThreadId,
                             request: request,
                             capabilities: session.capabilities,
+                            writePermit: session.promptWritePermit,
+                            beforeWrite: { [weak self] in
+                                self?.beforePhysicalPromptWriteForTesting?()
+                            },
                             onAccepted: { [weak self, weak session] in
                                 guard let self, let session else {
                                     throw AgentProviderAdapterError.sessionNotFound(request.threadId)
@@ -731,6 +748,7 @@ public final class GrokACPAdapter: AgentProviderAdapter, @unchecked Sendable {
             sessions.removeValue(forKey: session.threadId)
         }
         session.isLive = false
+        session.promptWritePermit.invalidate()
         lock.unlock()
         guard active else { return }
         let terminal = GrokACPTerminalClassifier.status(

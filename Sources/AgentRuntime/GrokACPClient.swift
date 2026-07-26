@@ -498,6 +498,8 @@ public final class GrokACPClient: @unchecked Sendable {
         sessionId: String,
         request: AgentRunRequest,
         capabilities: GrokACPInitializeResult,
+        writePermit: AgentRunAcceptancePermit,
+        beforeWrite: @escaping @Sendable () -> Void,
         onAccepted: @escaping @Sendable () throws -> Void
     ) async throws -> JSONObject {
         try await requestJSONObject(
@@ -505,6 +507,8 @@ public final class GrokACPClient: @unchecked Sendable {
             params: ["sessionId": sessionId, "prompt": try Self.promptBlocks(for: request, capabilities: capabilities)],
             timeout: nil,
             acceptancePermit: request.acceptancePermit,
+            writePermit: writePermit,
+            beforeWrite: beforeWrite,
             onAccepted: onAccepted
         )
     }
@@ -601,6 +605,8 @@ public final class GrokACPClient: @unchecked Sendable {
         params: Any?,
         timeout: TimeInterval?,
         acceptancePermit: AgentRunAcceptancePermit? = nil,
+        writePermit: AgentRunAcceptancePermit? = nil,
+        beforeWrite: (@Sendable () -> Void)? = nil,
         onAccepted: (@Sendable () throws -> Void)? = nil
     ) async throws -> JSONObject {
         let value: Any? = try await request(
@@ -608,6 +614,8 @@ public final class GrokACPClient: @unchecked Sendable {
             params: params,
             timeout: timeout,
             acceptancePermit: acceptancePermit,
+            writePermit: writePermit,
+            beforeWrite: beforeWrite,
             onAccepted: onAccepted
         )
         guard let object = value as? JSONObject else { throw GrokACPError.responseTypeMismatch(method) }
@@ -619,6 +627,8 @@ public final class GrokACPClient: @unchecked Sendable {
         params: Any?,
         timeout: TimeInterval?,
         acceptancePermit: AgentRunAcceptancePermit? = nil,
+        writePermit: AgentRunAcceptancePermit? = nil,
+        beforeWrite: (@Sendable () -> Void)? = nil,
         onAccepted: (@Sendable () throws -> Void)? = nil
     ) async throws -> Any? {
         let id = reserveId()
@@ -631,15 +641,22 @@ public final class GrokACPClient: @unchecked Sendable {
             do {
                 if let onAccepted {
                     let writeAndAccept = {
-                        let write = {
-                            try self.write(payload)
-                            try onAccepted()
+                        beforeWrite?()
+                        let queueGuardedWrite = {
+                            if let acceptancePermit {
+                                try acceptancePermit.withAcceptance(failureOutcome: .notAccepted) {
+                                    try self.write(payload)
+                                }
+                            } else {
+                                try self.write(payload)
+                            }
                         }
-                        if let acceptancePermit {
-                            try acceptancePermit.withAcceptance(write)
+                        if let writePermit {
+                            try writePermit.withAcceptance(failureOutcome: .notAccepted, queueGuardedWrite)
                         } else {
-                            try write()
+                            try queueGuardedWrite()
                         }
+                        try onAccepted()
                     }
                     if DispatchQueue.getSpecific(key: parseQueueKey) != nil {
                         try writeAndAccept()

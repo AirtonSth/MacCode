@@ -251,6 +251,9 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     /// Canonical host mutation used when local selection acknowledges unread work.
     public var markThreadRead: ((AgentThreadID) throws -> Void)?
     public var onQueuedMessageEvent: ((String, AgentQueuedMessage) -> Void)?
+    /// Canonical host queue mutation. Local Force must cross the same acceptance
+    /// permit and durable dispatch state machine as RPC/iOS Force.
+    public var forceQueuedMessage: ((AgentQueuedMessageID) async throws -> AgentMessageSendResult)?
     /// Host lifecycle gate used while destructive thread deletion awaits provider
     /// termination. AppContext owns queue draining, so the surface requests the
     /// same suppression used by mirror-driven deletion.
@@ -1036,181 +1039,21 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
     }
 
     public func forceQueuedMessageNow(_ message: AgentQueuedMessage) async {
-        guard let queuedMessageRepo else { return }
-        var claimedLease: AgentQueuedMessageLease?
-        var preparedDispatch: (lease: AgentQueuedMessageLease, runId: AgentRunID)?
-        var providerStartConfirmed = false
+        guard let forceQueuedMessage else {
+            queueStatusMessage = "Force is unavailable while the app router is not ready."
+            return
+        }
         do {
-            if let dispatch = try queuedMessageRepo.dispatch(id: message.id),
-               dispatch.state == .prepared,
-               let runId = dispatch.runId {
-                if try preparedQueueRunHasProviderEvidence(threadId: message.threadId, runId: runId) {
-                    guard let drained = try queuedMessageRepo.acknowledgePreparedWithRunEvidence(id: message.id, runId: runId) else {
-                        queueStatusMessage = "Queue recovery is already being reconciled."
-                        reloadQueuedMessages()
-                        return
-                    }
-                    queueStatusMessage = nil
-                    reloadQueuedMessages()
-                    onQueuedMessageEvent?(AgentQueueEventKinds.drained, drained)
-                    return
-                }
-                reloadQueuedMessages()
-                queueStatusMessage = "Start confirmation is pending. The message was not replayed."
-                return
-            }
-            if selectedThreadCanQueuePrompt {
-                guard try queuedMessageRepo.promoteToFront(id: message.id) != nil else {
-                    queueStatusMessage = "Already processing."
-                    reloadQueuedMessages()
-                    return
-                }
-                queueStatusMessage = "Stopping current run to start this now."
-                reloadQueuedMessages()
-                for queued in queuedMessages {
-                    onQueuedMessageEvent?(AgentQueueEventKinds.updated, queued)
-                }
-                // Force = run now: interrupt the in-flight turn so the just-promoted
-                // front-of-queue message starts immediately via the run-finished
-                // drain (AppContext.onRunFinished -> drainNextQueuedAgentMessage).
-                // The cancel resolves to .cancelled, which is drain-eligible.
-                coordinator.stopRun(threadId: message.threadId)
-                return
-            }
-            if let dispatch = try queuedMessageRepo.dispatch(id: message.id) {
-                if dispatch.state == .dispatched, let runId = dispatch.runId {
-                    guard let drained = try queuedMessageRepo.acknowledgeDispatched(id: message.id, runId: runId) else {
-                        queueStatusMessage = "Queue acknowledgement is already being recovered."
-                        reloadQueuedMessages()
-                        return
-                    }
-                    queueStatusMessage = nil
-                    reloadQueuedMessages()
-                    onQueuedMessageEvent?(AgentQueueEventKinds.drained, drained)
-                    for remaining in queuedMessages {
-                        onQueuedMessageEvent?(AgentQueueEventKinds.updated, remaining)
-                    }
-                    return
-                }
-            }
-            guard let lease = try queuedMessageRepo.claim(id: message.id) else {
-                queueStatusMessage = "Already processing."
-                reloadQueuedMessages()
-                return
-            }
-            claimedLease = lease
-            let queued = lease.message
-            let dispatchRunId = AgentRunID(queued.id.value)
-            guard try queuedMessageRepo.prepareDispatch(lease, runId: dispatchRunId) else {
-                _ = try? queuedMessageRepo.release(lease)
-                claimedLease = nil
-                queueStatusMessage = "Already processing."
-                reloadQueuedMessages()
-                return
-            }
-            preparedDispatch = (lease, dispatchRunId)
-            let runId = await startProviderRun(
-                text: queued.text,
-                attached: queued.attachments,
-                recordHistory: false,
-                interactionMode: queued.interactionMode,
-                requestedRunId: dispatchRunId,
-                queuedRoutingSnapshot: try queuedMessageRepo.routingSnapshot(id: queued.id)
-            )
-            guard runId != nil else {
-                if let drained = try reconcileSameCallPreparedDispatch(
-                    lease: lease,
-                    runId: dispatchRunId,
-                    queuedMessageRepo: queuedMessageRepo
-                ) {
-                    onQueuedMessageEvent?(AgentQueueEventKinds.drained, drained)
-                }
-                claimedLease = nil
-                preparedDispatch = nil
-                reloadQueuedMessages()
-                return
-            }
-            providerStartConfirmed = true
-            guard try queuedMessageRepo.markDispatched(lease, runId: dispatchRunId) else {
-                queueStatusMessage = "Provider started; queue acknowledgement needs recovery."
-                reloadQueuedMessages()
-                return
-            }
-            guard let drained = try queuedMessageRepo.acknowledge(lease) else {
-                queueStatusMessage = "Provider started; queue acknowledgement needs recovery."
-                reloadQueuedMessages()
-                return
-            }
-            claimedLease = nil
-            preparedDispatch = nil
-            if editingQueuedMessage?.id == message.id {
-                editingQueuedMessage = nil
-                queuedMessageDraft = ""
-            }
+            let result = try await forceQueuedMessage(message.id)
             queueStatusMessage = nil
             reloadQueuedMessages()
-            onQueuedMessageEvent?(AgentQueueEventKinds.drained, drained)
-            for remaining in queuedMessages {
-                onQueuedMessageEvent?(AgentQueueEventKinds.updated, remaining)
+            if result.status == .queued {
+                queueStatusMessage = "Stopping current run to start this now."
             }
         } catch {
-            if let preparedDispatch, !providerStartConfirmed {
-                if let drained = try? reconcileSameCallPreparedDispatch(
-                    lease: preparedDispatch.lease,
-                    runId: preparedDispatch.runId,
-                    queuedMessageRepo: queuedMessageRepo
-                ) {
-                    onQueuedMessageEvent?(AgentQueueEventKinds.drained, drained)
-                }
-                reloadQueuedMessages()
-            } else if let claimedLease, preparedDispatch == nil {
-                _ = try? queuedMessageRepo.release(claimedLease)
-                reloadQueuedMessages()
-            }
             queueStatusMessage = "Queue force failed: \(error)"
+            reloadQueuedMessages()
         }
-    }
-
-    private func preparedQueueRunHasProviderEvidence(
-        threadId: AgentThreadID,
-        runId: AgentRunID
-    ) throws -> Bool {
-        guard try coordinator.runStatus(runId) != nil,
-              let session = try providerSessionRepo?.get(threadId: threadId),
-              session.lastRunId == runId,
-              let lastEventKind = session.lastEventKind?
-                .trimmingCharacters(in: .whitespacesAndNewlines),
-              !lastEventKind.isEmpty else {
-            return false
-        }
-        // Only these post-acceptance lifecycle markers prove the provider
-        // accepted the turn. A thread-started stream event or start failure can
-        // arrive while the start outcome is still unknown, so it keeps intent.
-        return lastEventKind == "run.started"
-            || lastEventKind == "run.finished"
-            || lastEventKind.hasPrefix("turnStarted(")
-            || lastEventKind.hasPrefix("turnCompleted(")
-    }
-
-    private func reconcileSameCallPreparedDispatch(
-        lease: AgentQueuedMessageLease,
-        runId: AgentRunID,
-        queuedMessageRepo: AgentQueuedMessageRepository
-    ) throws -> AgentQueuedMessage? {
-        guard try coordinator.runStatus(runId) != nil else {
-            _ = try queuedMessageRepo.releasePrepared(lease, runId: runId)
-            return nil
-        }
-        guard try preparedQueueRunHasProviderEvidence(
-            threadId: lease.message.threadId,
-            runId: runId
-        ) else {
-            return nil
-        }
-        return try queuedMessageRepo.acknowledgePreparedWithRunEvidence(
-            id: lease.message.id,
-            runId: runId
-        )
     }
 
     public func cancelQueuedMessage(_ message: AgentQueuedMessage) {
@@ -3536,9 +3379,7 @@ public final class AgentAppViewModel: ObservableObject, AgentRunObserver {
         // its data or evict UI caches until every selected provider has confirmed
         // terminal state and its process tree is dead.
         do {
-            for id in ids {
-                try await coordinator.stopAndAwaitTermination(threadId: id)
-            }
+            try await coordinator.stopAndAwaitTermination(threadIds: orderedIDs)
         } catch {
             timeline.apply(.error(
                 message: "Could not delete thread because its provider is still running: \(error.localizedDescription)",

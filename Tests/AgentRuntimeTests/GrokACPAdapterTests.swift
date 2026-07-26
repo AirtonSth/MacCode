@@ -331,6 +331,50 @@ final class GrokACPAdapterTests: ProviderProcessTestCase {
         adapter.stopAll()
     }
 
+    func test_replacementAfterFinalGuardInvalidatesPhysicalWritePermitBeforeOldPeerBytes() async throws {
+        let peer = try FakeGrokACPPeer(mode: .load)
+        defer { peer.remove() }
+        let adapter = GrokACPAdapter(binaryNameOverride: peer.path)
+        let threadId = AgentThreadID()
+        try await adapter.recoverSession(makeRequest(
+            threadId: threadId,
+            providerThreadId: "old-session"
+        )) { _ in }
+        let entered = GrokACPAsyncSignal()
+        let release = DispatchSemaphore(value: 0)
+        adapter.beforePhysicalPromptWriteForTesting = {
+            Task { await entered.signal() }
+            release.wait()
+        }
+        let events = GrokACPEventBox()
+        let oldSend = Task {
+            try await adapter.sendTurn(makeRequest(
+                threadId: threadId,
+                providerThreadId: "old-session"
+            )) { events.append($0) }
+        }
+        await entered.wait()
+
+        try await adapter.recoverSession(makeRequest(
+            threadId: threadId,
+            providerThreadId: "replacement-session"
+        )) { _ in }
+        release.signal()
+        do {
+            _ = try await oldSend.value
+            XCTFail("the replaced session must fail its old physical prompt write")
+        } catch {}
+
+        XCTAssertEqual(peer.promptCount, 0,
+                       "replacement after the adapter guard must invalidate the permit before old-peer bytes")
+        XCTAssertEqual(events.turnStartedCount, 0)
+        XCTAssertEqual(events.runningStatusCount, 0)
+        XCTAssertEqual(events.finishedCount, 0)
+        XCTAssertEqual(adapter.promptWriteAcceptanceCountForTesting, 0)
+        XCTAssertEqual(adapter.listSessions().first?.providerThreadId, "replacement-session")
+        adapter.stopAll()
+    }
+
     func test_sendTurnKeepsSuccessfulPromptWriteAcceptedWhenSessionDiesImmediatelyAfterward() async throws {
         // WHY: once the ACP prompt is registered and written, provider
         // acceptance is positive evidence. A transport death after that point
@@ -834,9 +878,13 @@ private final class FakeGrokACPPeer {
     let root: URL
     let path: String
     let launchCountPath: String
+    let promptCountPath: String
 
     var launchCount: Int {
         ((try? String(contentsOfFile: launchCountPath, encoding: .utf8)) ?? "").count
+    }
+    var promptCount: Int {
+        ((try? String(contentsOfFile: promptCountPath, encoding: .utf8)) ?? "").count
     }
 
     init(mode: Mode) throws {
@@ -844,6 +892,7 @@ private final class FakeGrokACPPeer {
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         let script = root.appendingPathComponent("grok")
         launchCountPath = root.appendingPathComponent("launch-count").path
+        promptCountPath = root.appendingPathComponent("prompt-count").path
         let body = #"""
         #!/bin/sh
         mode="MODE"
@@ -883,6 +932,7 @@ private final class FakeGrokACPPeer {
               current_mode=$(printf '%s' "$line" | sed -E 's/.*"modeId":"([^"]+)".*/\1/')
               printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id"
           elif printf '%s' "$line" | grep -q '"method":"session.*prompt"'; then
+              printf p >> "PROMPT_COUNT_PATH"
               id=$(printf '%s' "$line" | sed -E 's/.*"id":([0-9]+).*/\1/')
               if [ "$mode" = crash ]; then kill -ABRT $$; fi
               if [ "$mode" = cancel ] || [ "$mode" = ignoreCancel ]; then prompt_id="$id"; continue; fi
@@ -930,6 +980,7 @@ private final class FakeGrokACPPeer {
         done
         """#
             .replacingOccurrences(of: "MODE", with: mode.rawValue)
+            .replacingOccurrences(of: "PROMPT_COUNT_PATH", with: promptCountPath)
             .replacingOccurrences(of: "COUNT_PATH", with: launchCountPath)
         try body.write(to: script, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: script.path)
@@ -937,6 +988,23 @@ private final class FakeGrokACPPeer {
     }
 
     func remove() { try? FileManager.default.removeItem(at: root) }
+}
+
+private actor GrokACPAsyncSignal {
+    private var signalled = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func signal() {
+        signalled = true
+        let pending = waiters
+        waiters.removeAll()
+        for waiter in pending { waiter.resume() }
+    }
+
+    func wait() async {
+        guard !signalled else { return }
+        await withCheckedContinuation { waiters.append($0) }
+    }
 }
 
 private extension NSLock {
