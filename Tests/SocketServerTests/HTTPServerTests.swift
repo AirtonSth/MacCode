@@ -119,6 +119,9 @@ final class HTTPServerTests: XCTestCase {
             let obj = (try? JSONSerialization.jsonObject(with: data ?? Data())) as? [String: Any]
             XCTAssertEqual(obj?["app"] as? String, "remotecode")
             XCTAssertEqual(obj?["relay"] as? Bool, false)
+            // boot_epoch is the process generation iOS compares before bearer catch-up RPC.
+            XCTAssertEqual(obj?["boot_epoch"] as? Int, 1,
+                           "GET /v1/discovery must advertise server bootEpoch")
             disco.fulfill()
         }.resume()
         wait(for: [healthEx, disco], timeout: 4)

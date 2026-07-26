@@ -1957,6 +1957,7 @@ public final class DirectHTTPServer: @unchecked Sendable {
                 "host_v6": bindLoopbackOnly ? "::1" : "::",
                 "ipv6_listener": listenFD6 >= 0,
                 "port": port,
+                "boot_epoch": Int64(bootEpoch),
                 "vpn_required": !bindLoopbackOnly,
                 "relay": false,
                 // Optional stream control negotiated on welcome, not here.
